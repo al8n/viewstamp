@@ -1,0 +1,13 @@
+[package]
+name = "vsrr-simulation"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Deterministic simulation testing harness for vsrr-proto"
+
+[dependencies]
+vsrr-proto = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
