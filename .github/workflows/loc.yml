@@ -1,24 +1,24 @@
-name: loc 
+name: loc
 
 on:
   push:
     branches:
       - main
     paths-ignore:
-      - 'README.md'
-      - 'COPYRIGHT'
-      - 'LICENSE*'
-      - '**.md'
-      - '**.txt'
-      - 'art'
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
   pull_request:
     paths-ignore:
-      - 'README.md'
-      - 'COPYRIGHT'
-      - 'LICENSE*'
-      - '**.md'
-      - '**.txt'
-      - 'art'
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
   workflow_dispatch:
 
 jobs:
@@ -32,11 +32,11 @@ jobs:
           rustup update stable && rustup default stable
           rustup component add clippy
           rustup component add rustfmt
-      
+
       - name: Install tokeit
         run: |
           cargo install tokeit --force
-      
+
       - name: Count total lines of code
         run: |
           tokeit --lang rust
@@ -51,7 +51,7 @@ jobs:
             await github.rest.gists.update({
               gist_id: gistId,
               files: {
-                "template-rs": {
+                "vsrr": {
                   content: output
                 }
               }
