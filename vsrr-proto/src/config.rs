@@ -13,11 +13,15 @@ impl Config {
   /// Creates a configuration.
   ///
   /// # Panics
-  /// Panics if `replica_count == 0` or `replica.get() >= replica_count`.
+  /// Panics if `replica_count == 0`, `replica.get() >= replica_count`, or `replica_count > 64`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(cluster: u128, replica: ReplicaId, replica_count: u8) -> Self {
     assert!(replica_count > 0, "replica_count must be > 0");
     assert!(replica.get() < replica_count, "replica index out of range");
+    assert!(
+      replica_count <= 64,
+      "replica_count must be <= 64 (prepare-ok quorum uses a u64 bitset)"
+    );
     Self {
       cluster,
       replica,

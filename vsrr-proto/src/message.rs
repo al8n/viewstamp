@@ -1,6 +1,6 @@
 //! Wire message types for the Viewstamped Replication protocol.
 
-use alloc::vec::Vec;
+use bytes::Bytes;
 
 use crate::{ClientId, OpNumber, Recipient, ReplicaId, RequestNumber, View};
 
@@ -12,7 +12,7 @@ pub struct Request {
   /// Per-client monotonic request number.
   pub request: RequestNumber,
   /// Opaque application payload (interpreted only by the `StateMachine`).
-  pub body: Vec<u8>,
+  pub body: Bytes,
 }
 
 /// Primary → backups: replicate a prepared operation. Carries the primary's
@@ -30,7 +30,7 @@ pub struct Prepare {
   /// Client request number.
   pub request: RequestNumber,
   /// Opaque application payload.
-  pub body: Vec<u8>,
+  pub body: Bytes,
 }
 
 /// Backup → primary: acknowledge a prepared op.
@@ -54,7 +54,7 @@ pub struct Reply {
   /// Request number this reply answers.
   pub request: RequestNumber,
   /// Opaque application result.
-  pub body: Vec<u8>,
+  pub body: Bytes,
 }
 
 /// Primary → backups: commit heartbeat advancing the commit number.
@@ -98,7 +98,6 @@ pub struct Outgoing {
 mod tests {
   use super::*;
   use crate::{ClientId, OpNumber, RequestNumber, View};
-  use alloc::vec;
 
   #[test]
   fn construct_and_match() {
@@ -108,7 +107,7 @@ mod tests {
       commit: OpNumber::with(0),
       client: ClientId::new(9),
       request: RequestNumber::with(1),
-      body: vec![1, 2, 3],
+      body: Bytes::copy_from_slice(&[1, 2, 3]),
     });
     match m {
       Message::Prepare(p) => assert_eq!(p.op, OpNumber::with(1)),

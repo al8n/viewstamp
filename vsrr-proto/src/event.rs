@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use bytes::Bytes;
 
 use crate::{ClientId, OpNumber, RequestNumber};
 
@@ -15,6 +15,6 @@ pub enum Event {
     /// The client request number.
     request: RequestNumber,
     /// The reply payload produced by the state machine.
-    reply: Vec<u8>,
+    reply: Bytes,
   },
 }

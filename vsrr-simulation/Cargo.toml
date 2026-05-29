@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 description = "Deterministic simulation testing harness for vsrr-proto"
 
 [dependencies]
+bytes = { workspace = true }
 vsrr-proto = { workspace = true, features = ["std"] }
 
 [lints]

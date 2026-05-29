@@ -34,6 +34,24 @@ impl Status {
   pub const fn is_normal(&self) -> bool {
     matches!(self, Self::Normal)
   }
+
+  /// True iff `self == Status::ViewChange`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_view_change(&self) -> bool {
+    matches!(self, Self::ViewChange)
+  }
+
+  /// True iff `self == Status::Recovering`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_recovering(&self) -> bool {
+    matches!(self, Self::Recovering)
+  }
+
+  /// True iff `self == Status::RecoveringHead`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_recovering_head(&self) -> bool {
+    matches!(self, Self::RecoveringHead)
+  }
 }
 
 #[cfg(test)]

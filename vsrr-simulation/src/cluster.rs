@@ -66,6 +66,11 @@ impl Cluster {
     &self.clients[i]
   }
 
+  /// Number of replicas (for invariant checking).
+  pub fn replica_count(&self) -> usize {
+    self.replicas.len()
+  }
+
   /// Number of clients.
   pub fn client_count(&self) -> usize {
     self.clients.len()
@@ -87,7 +92,7 @@ impl Cluster {
 
     let primary = self.primary_index();
     for ci in 0..self.clients.len() {
-      if let Some(req) = self.clients[ci].pending() {
+      if let Some(req) = self.clients[ci].pending(now) {
         let from = Peer::Client(self.clients[ci].id());
         self.schedule(now, from, Target::Replica(primary), Message::Request(req));
       }
