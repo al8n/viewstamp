@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use bytes::Bytes;
 
 use crate::OpNumber;
 
@@ -9,5 +9,5 @@ use crate::OpNumber;
 /// identical state. (Persistence/snapshotting is added in milestone M3.)
 pub trait StateMachine {
   /// Applies a committed operation and returns the reply payload.
-  fn apply(&mut self, op: OpNumber, body: &[u8]) -> Vec<u8>;
+  fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes;
 }

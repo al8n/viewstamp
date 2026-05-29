@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use vsrr_proto::{OpNumber, StateMachine};
 
 /// A deterministic state machine that records the sequence of applied operations.
@@ -16,9 +17,9 @@ impl LogSm {
 }
 
 impl StateMachine for LogSm {
-  fn apply(&mut self, op: OpNumber, body: &[u8]) -> Vec<u8> {
+  fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
     self.applied.push((op.get(), body.to_vec()));
-    (self.applied.len() as u64).to_be_bytes().to_vec()
+    Bytes::from((self.applied.len() as u64).to_be_bytes().to_vec())
   }
 }
 
@@ -29,8 +30,14 @@ mod tests {
   #[test]
   fn apply_records_and_counts() {
     let mut sm = LogSm::default();
-    assert_eq!(sm.apply(OpNumber::with(1), b"a"), 1u64.to_be_bytes());
-    assert_eq!(sm.apply(OpNumber::with(2), b"b"), 2u64.to_be_bytes());
+    assert_eq!(
+      sm.apply(OpNumber::with(1), b"a").as_ref(),
+      &1u64.to_be_bytes()
+    );
+    assert_eq!(
+      sm.apply(OpNumber::with(2), b"b").as_ref(),
+      &2u64.to_be_bytes()
+    );
     assert_eq!(sm.applied().len(), 2);
   }
 }

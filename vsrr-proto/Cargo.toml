@@ -10,9 +10,10 @@ description = "Sans-I/O state machine for the Viewstamped Replication protocol"
 [features]
 default = ["std"]
 alloc = []
-std = ["alloc"]
+std = ["alloc", "bytes/std"]
 
 [dependencies]
+bytes = { workspace = true }
 derive_more = { workspace = true, features = ["display"] }
 thiserror = { workspace = true }
 
