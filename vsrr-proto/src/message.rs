@@ -1,7 +1,7 @@
 //! Wire message types for the Viewstamped Replication protocol.
 
-use alloc::vec::Vec;
 use bytes::Bytes;
+use std::vec::Vec;
 
 use crate::{ClientId, OpNumber, Recipient, ReplicaId, RequestNumber, View};
 
@@ -581,7 +581,7 @@ mod tests {
       OpNumber::with(3),
       OpNumber::with(1),
       ReplicaId::new(2),
-      alloc::vec![PreparedEntry::new(
+      std::vec![PreparedEntry::new(
         OpNumber::with(1),
         ClientId::new(7),
         RequestNumber::with(1),

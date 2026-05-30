@@ -6,14 +6,21 @@ use crate::client::ClientModel;
 use crate::clock::Clock;
 use crate::network::{Faults, InFlight, Network, Target};
 use crate::sm::LogSm;
+use crate::storage::{InMemorySuperblock, InMemoryWal};
 
 /// A deterministic single-thread cluster of `Endpoint<LogSm>` replicas + clients.
 pub struct Cluster {
   replicas: Vec<Endpoint<LogSm>>,
+  /// Per-replica write-ahead logs (persist across crashes; see `crash`).
+  wals: Vec<InMemoryWal>,
+  /// Per-replica superblocks (persist across crashes; see `crash`).
+  sbs: Vec<InMemorySuperblock>,
   clients: Vec<ClientModel>,
   net: Network,
   clock: Clock,
   prng: Prng,
+  /// The base seed, retained to re-derive a replica's per-replica seed on `restart`.
+  seed: u64,
   faults: Faults,
   replica_count: u8,
   crashed: Vec<bool>,
@@ -40,12 +47,17 @@ impl Cluster {
       .map(|i| ClientModel::new((i as u128) + 1, requests_per_client))
       .collect();
     let n = replicas as usize;
+    let wals: Vec<InMemoryWal> = (0..replicas).map(|_| InMemoryWal::new()).collect();
+    let sbs: Vec<InMemorySuperblock> = (0..replicas).map(|_| InMemorySuperblock::new()).collect();
     Self {
       replicas: replica_set,
+      wals,
+      sbs,
       clients: client_set,
       net: Network::new(),
       clock: Clock::new(),
       prng: Prng::new(seed),
+      seed,
       faults: Faults::none(),
       replica_count: replicas,
       crashed: vec![false; n],
@@ -93,9 +105,23 @@ impl Cluster {
     self.net.is_empty() && self.clients.iter().all(ClientModel::is_done)
   }
 
-  /// Crash-stop replica `i`: it stops being ticked and its messages are dropped.
+  /// Crash-stop replica `i`: it stops being ticked and its messages are dropped. Its durable
+  /// `wals[i]`/`sbs[i]` are left intact so a later `restart` can recover from them.
   pub fn crash(&mut self, i: usize) {
     self.crashed[i] = true;
+  }
+
+  /// Restart a previously-crashed replica: rebuild it from its durable WAL + superblock via
+  /// `Endpoint::recover`. Re-derives the same per-replica config + seed used in `new`, so the
+  /// recovered replica keeps its identity. Its in-memory state (log cache, SM) is reconstructed
+  /// from storage; everything not yet durable is lost (as a real crash would lose it).
+  pub fn restart(&mut self, i: usize) {
+    let cfg = Config::try_new(1, ReplicaId::new(i as u8), self.replica_count)
+      .expect("valid cluster config");
+    let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
+    self.replicas[i] =
+      Endpoint::recover(cfg, seed, LogSm::default(), &mut self.wals[i], &self.sbs[i]);
+    self.crashed[i] = false;
   }
 
   /// Whether replica `i` is crashed.
@@ -144,20 +170,35 @@ impl Cluster {
       }
     }
 
+    // Collect outgoing messages from each replica first, then route — avoids a
+    // simultaneous &mut self.replicas[ri] + &mut self borrow conflict in route().
+    let mut outgoing: Vec<(ReplicaId, Outgoing)> = Vec::new();
     for ri in 0..self.replicas.len() {
       if self.crashed[ri] {
         continue;
       }
       while let Some(out) = self.replicas[ri].poll_message() {
-        self.route(now, ReplicaId::new(ri as u8), out);
+        outgoing.push((ReplicaId::new(ri as u8), out));
       }
     }
+    for (from, out) in outgoing {
+      self.route(now, from, out);
+    }
 
+    // Deliver due network messages. handle_message indexes self.replicas/wals/sbs
+    // directly — those are disjoint from self.net, self.clients, self.crashed.
     for m in self.net.take_due(now) {
       match m.target {
         Target::Replica(idx) => {
-          if !self.crashed[idx as usize] {
-            self.replicas[idx as usize].handle_message(now, m.from, m.msg);
+          let ri = idx as usize;
+          if !self.crashed[ri] {
+            self.replicas[ri].handle_message(
+              now,
+              &mut self.wals[ri],
+              &mut self.sbs[ri],
+              m.from,
+              m.msg,
+            );
           }
         }
         Target::Client(id) => {
@@ -166,6 +207,14 @@ impl Cluster {
           }
         }
       }
+    }
+
+    // Pump storage completions: drives append-before-ack (on_wal_done) + durable-view (on_sb_done).
+    for ri in 0..self.replicas.len() {
+      if self.crashed[ri] {
+        continue;
+      }
+      self.replicas[ri].handle_storage(now, &mut self.wals[ri], &mut self.sbs[ri]);
     }
 
     for ri in 0..self.replicas.len() {
@@ -199,7 +248,9 @@ impl Cluster {
       if self.crashed[ri] {
         continue;
       }
-      self.replicas[ri].handle_timeout(now);
+      self.replicas[ri].handle_timeout(now, &mut self.wals[ri], &mut self.sbs[ri]);
+      // Pump storage after timeout: drives append-before-ack (on_wal_done) + durable-view (on_sb_done).
+      self.replicas[ri].handle_storage(now, &mut self.wals[ri], &mut self.sbs[ri]);
     }
   }
 

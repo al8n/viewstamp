@@ -57,7 +57,7 @@ impl Status {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use alloc::string::ToString;
+  use std::string::ToString;
 
   #[test]
   fn as_str_and_display() {

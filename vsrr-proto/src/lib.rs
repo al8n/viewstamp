@@ -6,10 +6,15 @@
 //! correctness reference for the protocol logic.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-extern crate alloc;
+// no_std switch: alias `alloc` to the name `std` so genuine-heap `std::` paths
+// (Vec, String, BTreeMap, …) resolve to their `alloc::` home unchanged in
+// no_std+alloc builds, and to real `std` when the `std` feature is on.
+#[cfg(all(not(feature = "std"), feature = "alloc"))]
+extern crate alloc as std;
 
 #[cfg(feature = "std")]
 extern crate std;
