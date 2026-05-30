@@ -26,6 +26,32 @@ enum PendingSbAction {
   AdoptedStartView,
 }
 
+/// Which of a checkpoint's two superblock writes is outstanding. Kept SEPARATE from
+/// `PendingSbAction` (durable-view writes) and matched by its own minted `OpId`, so a durable-view
+/// write completion and a checkpoint write completion never alias on the single `OpId`-match
+/// dispatch (`on_sb_done`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointStep {
+  /// The snapshot write is in flight; on its completion, write the new `VsrState` root.
+  AwaitSnapshot { id: crate::OpId },
+  /// The `VsrState` root write is in flight; on its completion, the checkpoint is durable.
+  AwaitRoot { id: crate::OpId },
+}
+
+/// Staging for an in-flight checkpoint, sequencing the two superblock writes. Holds the target op
+/// (the committed+applied boundary the snapshot reflects), its content id, and which step is
+/// outstanding. While `Some`, no second checkpoint and no durable-view write may start (and any
+/// view-change transition drops it — see the view-change exclusion in the status transitions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingCheckpoint {
+  /// The op the snapshot reflects (`commit_min` at trigger time): the new `checkpoint_op` once durable.
+  target_op: OpNumber,
+  /// The FNV-1a-128 content id of the snapshot envelope (stored in the durable `VsrState` root).
+  checkpoint_id: u128,
+  /// Which superblock write is currently outstanding.
+  step: CheckpointStep,
+}
+
 const PREPARE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
 const COMMIT_HEARTBEAT: core::time::Duration = core::time::Duration::from_millis(50);
 const PRIMARY_IDLE: core::time::Duration = core::time::Duration::from_millis(200);
@@ -136,6 +162,19 @@ pub struct Endpoint<S> {
   /// is in flight at a time; a newer transition supersedes by overwriting this field.
   /// `on_sb_done` runs the action only when the completed `OpId` matches the stored one.
   pending_sb: Option<(crate::OpId, PendingSbAction)>,
+  /// An in-flight checkpoint, sequencing its two superblock writes. Kept separate from `pending_sb`
+  /// (their `OpId`s never alias). `None` unless a checkpoint is mid-sequence; a view-change drops it.
+  pending_checkpoint: Option<PendingCheckpoint>,
+  /// The op number of this replica's latest durable checkpoint (0 until the first checkpoint
+  /// goes durable). Carried on `Commit` and `PrepareOk` as the checkpoint-quorum signal.
+  checkpoint_op: OpNumber,
+  /// Per-replica last-reported `checkpoint_op` (keyed by replica index), filled by the primary from
+  /// incoming `PrepareOk` (and recorded on backups from `Commit`, harmlessly). The primary derives
+  /// [`quorum_checkpoint_op`](Self::quorum_checkpoint_op) from this to gate WAL/session GC: it never
+  /// frees an op a `quorum` of replicas has not yet checkpointed. Bounded by `replica_count` (<= 64);
+  /// cleared on every view-change transition (a new generation re-establishes the pipeline, so old
+  /// reports are stale — clearing keeps the primary conservative until fresh `PrepareOk`s arrive).
+  peer_checkpoint: BTreeMap<u8, OpNumber>,
 }
 
 impl<S: StateMachine> Endpoint<S> {
@@ -170,40 +209,90 @@ impl<S: StateMachine> Endpoint<S> {
       next_op_id: 1,
       pending: BTreeMap::new(),
       pending_sb: None,
+      pending_checkpoint: None,
+      checkpoint_op: OpNumber::new(),
+      peer_checkpoint: BTreeMap::new(),
     }
   }
 
-  /// Reconstructs an endpoint from durable storage after a restart.
+  /// Reconstructs an endpoint from durable storage after a restart, restoring from the durable
+  /// checkpoint (not op 0).
   ///
-  /// M3.1b: reads the superblock root for `(view, log_view)`, rebuilds the in-memory log cache
-  /// from the WAL `[1..=op_head]` (headers AND real bodies), and returns to `Status::Normal` with
-  /// `commit_min = commit_max = 0`. The committed prefix is re-applied lazily by `advance_commit`
-  /// as the primary re-announces its commit — the fresh `S` is NOT replayed here
-  /// (checkpoint-based SM restore is M3.2). `commit` is taken as 0 because no checkpoint has
-  /// persisted a commit point yet in M3.1b.
+  /// Reads the superblock root for `(view, log_view, checkpoint_op, checkpoint_id)` and returns to
+  /// `Status::Normal`. Two cases, on `state.checkpoint_op()`:
   ///
-  /// **Durable-view.** M3.1b persists the view to the superblock before any view-change
-  /// participation, so `state.view()` is trustworthy: a recovered replica resumes the view it
-  /// was in when it last participated. The async `Status::Recovering` loop (for disk faults) is
-  /// deferred to M3.3.
+  /// - **A checkpoint exists (`checkpoint_op > 0`).** Reads the durable checkpoint snapshot
+  ///   (`submit_read_checkpoint` → synchronous `CheckpointRead` drain — see the drain note below),
+  ///   splits the envelope into `(sessions, sm_snapshot)`, restores the state machine
+  ///   (`sm.restore(sm_snapshot)`) and the client-session table, and sets
+  ///   `commit_min = commit_max = checkpoint_op`. The restored SM already reflects the applied
+  ///   prefix `[1..=checkpoint_op]`, so `commit_min = checkpoint_op` (NOT 0) prevents double-applying
+  ///   those ops; only the committed tail above the checkpoint (`> checkpoint_op`) is re-applied, as
+  ///   the primary re-announces commit via `advance_commit`.
+  /// - **No checkpoint yet (`checkpoint_op == 0`).** Identical to the M3.1b behavior: a fresh `S`,
+  ///   `commit_min = commit_max = 0`, and the committed prefix is re-applied lazily by
+  ///   `advance_commit` as the primary re-announces its commit (no checkpoint has persisted a commit
+  ///   point yet).
   ///
-  /// Bodies live behind the async `submit_read`/`poll` interface; M3.1b drains them synchronously
-  /// against the in-memory `Wal` (whose reads complete immediately), which is why this takes
-  /// `&mut W`. When M3.3 makes reads truly async, recovery moves into a `Status::Recovering`
-  /// `handle_storage` read loop and this synchronous drain is removed.
+  /// In both cases the in-memory log cache is rebuilt **dense** from the WAL `[1..=op_head]` (headers
+  /// AND real bodies). M3.2a never prunes the WAL (GC is deferred to after M3.4) AND view change is
+  /// not yet checkpoint-aware, so the recovered replica must keep the full log to participate safely
+  /// in a view change — a sparse log below the checkpoint would make its DoViewChange/StartView omit
+  /// committed ops (the same hazard that defers GC). `commit_min = checkpoint_op` means
+  /// `advance_commit` never RE-APPLIES `<= checkpoint_op` (those are in the restored SM); the
+  /// `[1..=checkpoint_op]` cache entries serve only view-change/retransmit. Post-M3.4 (GC +
+  /// checkpoint-aware view change), this rebuild becomes tail-only.
+  ///
+  /// **Durable-view.** The view is persisted to the superblock before any view-change participation,
+  /// so `state.view()` is trustworthy: a recovered replica resumes the view it was in when it last
+  /// participated.
+  ///
+  /// **Synchronous checkpoint/body-read drain.** Bodies and the checkpoint snapshot live behind the
+  /// async `submit_read`/`submit_read_checkpoint` + `poll` interface; recovery drains them
+  /// synchronously against the in-memory `Wal`/`Superblock` (whose reads complete immediately),
+  /// which is why this takes `&mut W` and `&mut B`. When M3.3 makes reads truly async (and able to
+  /// return `Fault`/torn), recovery moves into a `Status::Recovering` `handle_storage` read loop that
+  /// retries on `Fault`, and these synchronous drains are removed.
   pub fn recover<W: Wal, B: Superblock>(
     config: Config,
     seed: u64,
-    sm: S,
+    mut sm: S,
     wal: &mut W,
-    sb: &B,
+    sb: &mut B,
   ) -> Self {
     let state = sb.state();
     let nonce = Prng::new(seed).next_u64();
     let head = wal.op_head().get();
+    let checkpoint_op = state.checkpoint_op().get();
 
-    // Rebuild the log cache: headers from the synchronous metadata view, bodies via a
-    // synchronous read drain (M3.1a in-memory Wal completes reads immediately).
+    // Restore the checkpoint, if one is durable: read the snapshot envelope (synchronous drain — the
+    // in-memory superblock completes the read immediately; the async `Status::Recovering` loop is
+    // M3.3), then restore the SM + the client-session table from it. `OpId::new(0)` is a reserved
+    // correlation id for the recovery read: `next_op_id` starts at 1, so 0 never aliases a real op.
+    // When `checkpoint_op == 0` no checkpoint exists; the SM stays fresh and `clients` stays empty
+    // (exactly the M3.1b behavior — the regression guard).
+    let mut clients: BTreeMap<u128, Session> = BTreeMap::new();
+    if checkpoint_op > 0 {
+      sb.submit_read_checkpoint(crate::OpId::new(0));
+      while let Some(done) = sb.poll() {
+        if let SuperblockDone::CheckpointRead(cr) = done {
+          let (restored_sessions, sm_tail) = Self::decode_checkpoint(cr.snapshot());
+          sm.restore(sm_tail);
+          clients = restored_sessions;
+        }
+        // M3.2a: a `Fault` here cannot happen — the durable root only ever names a fully-written
+        // snapshot (the root write is step 2, after the snapshot write is durable). M3.3 handles
+        // `Fault`/torn reads via the async recovery loop.
+      }
+    }
+
+    // Rebuild the log cache DENSE [1..=head] from the WAL. M3.2a never prunes the WAL and view change
+    // is not yet checkpoint-aware, so a recovered replica must hold the FULL log to participate in a
+    // view change safely — a sparse log below the checkpoint would omit committed ops from its
+    // DoViewChange/StartView (the very hazard that defers GC). `commit_min = checkpoint_op` already
+    // prevents re-applying [1..=checkpoint_op] (they are in the restored SM); these cache entries
+    // serve only view-change/retransmit. Post-M3.4 (GC + checkpoint-aware view change) this becomes
+    // tail-only. Headers from the sync metadata view; bodies via a sync read drain.
     let mut log = BTreeMap::new();
     for op in 1..=head {
       if let Some(h) = wal.header(OpNumber::with(op)) {
@@ -237,8 +326,11 @@ impl<S: StateMachine> Endpoint<S> {
       status: Status::Normal,
       view: state.view(),
       op: OpNumber::with(head),
-      commit_min: OpNumber::new(),
-      commit_max: OpNumber::new(),
+      // The restored SM reflects [1..=checkpoint_op] exactly; commit_min = checkpoint_op so those
+      // ops are NOT re-applied. commit_max = checkpoint_op too (monotone: op >= commit_max >=
+      // commit_min). The committed tail (> checkpoint_op) re-applies as the primary re-announces it.
+      commit_min: OpNumber::with(checkpoint_op),
+      commit_max: OpNumber::with(checkpoint_op),
       log_view: state.log_view(),
       svc_from: 0,
       svc_target: state.view(),
@@ -249,7 +341,7 @@ impl<S: StateMachine> Endpoint<S> {
       log,
       inflight: BTreeMap::new(),
       buffer: BTreeMap::new(),
-      clients: BTreeMap::new(),
+      clients,
       sm,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
@@ -257,6 +349,9 @@ impl<S: StateMachine> Endpoint<S> {
       next_op_id: 1,
       pending: BTreeMap::new(),
       pending_sb: None,
+      pending_checkpoint: None,
+      checkpoint_op: OpNumber::with(checkpoint_op),
+      peer_checkpoint: BTreeMap::new(),
     }
   }
 
@@ -288,6 +383,36 @@ impl<S: StateMachine> Endpoint<S> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn commit_max(&self) -> OpNumber {
     self.commit_max
+  }
+
+  /// The op number of this replica's latest durable checkpoint.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
+  }
+
+  /// The highest op a `quorum` of replicas (including self) has reported checkpointing.
+  ///
+  /// Computed from `self.checkpoint_op` plus the per-replica `peer_checkpoint` reports (defaulting an
+  /// unheard peer to 0): sort all replicas' reported checkpoints descending and take the `quorum`-th
+  /// highest — the largest op `v` such that at least `quorum` replicas report a checkpoint `>= v`.
+  /// The primary uses this as the floor below which WAL/session GC is safe (no op a quorum still
+  /// needs is freed). Conservative by construction: an unheard peer counts as 0, so a fresh primary
+  /// prunes nothing until enough fresh `PrepareOk`s arrive — it never frees an op too early.
+  pub fn quorum_checkpoint_op(&self) -> OpNumber {
+    let count = self.config.replica_count();
+    let mut cps: std::vec::Vec<u64> = std::vec::Vec::with_capacity(count as usize);
+    let me = self.config.replica().get();
+    cps.push(self.checkpoint_op.get()); // self always counts its own durable checkpoint
+    for r in 0..count {
+      if r == me {
+        continue;
+      }
+      cps.push(self.peer_checkpoint.get(&r).map_or(0, |c| c.get()));
+    }
+    cps.sort_unstable_by(|a, b| b.cmp(a)); // descending
+    // `cps.len() == replica_count >= quorum`, so `cps[quorum - 1]` is always in bounds.
+    OpNumber::with(cps[self.config.quorum() - 1])
   }
 
   /// The latest view in which this replica changed its head log.
@@ -332,9 +457,9 @@ impl<S: StateMachine> Endpoint<S> {
   ) {
     match msg {
       Message::Request(r) => self.on_request(now, wal, from, r),
-      Message::Prepare(p) => self.on_prepare(now, wal, p),
-      Message::PrepareOk(ok) => self.on_prepare_ok(now, ok),
-      Message::Commit(c) => self.on_commit(now, c),
+      Message::Prepare(p) => self.on_prepare(now, wal, sb, p),
+      Message::PrepareOk(ok) => self.on_prepare_ok(now, sb, ok),
+      Message::Commit(c) => self.on_commit(now, sb, c),
       Message::StartViewChange(m) => self.on_start_view_change(now, sb, m),
       Message::DoViewChange(m) => self.on_do_view_change(now, sb, m),
       Message::StartView(m) => self.on_start_view(now, sb, m),
@@ -367,14 +492,14 @@ impl<S: StateMachine> Endpoint<S> {
   /// Drain completed storage ops and react.
   pub fn handle_storage<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     while let Some(done) = wal.poll() {
-      self.on_wal_done(now, done);
+      self.on_wal_done(now, sb, done);
     }
     while let Some(done) = sb.poll() {
-      self.on_sb_done(now, done);
+      self.on_sb_done(now, sb, done);
     }
   }
 
-  fn on_wal_done(&mut self, now: Instant, done: WalDone) {
+  fn on_wal_done<B: Superblock>(&mut self, now: Instant, sb: &mut B, done: WalDone) {
     let WalDone::Appended(id) = done else {
       return;
     }; // M3.1a: only appends (reads/faults are later)
@@ -387,42 +512,131 @@ impl<S: StateMachine> Endpoint<S> {
       if let Some(inf) = self.inflight.get_mut(&op.get()) {
         inf.oks |= own;
       }
-      self.try_commit(now);
+      self.try_commit(now, sb);
     } else {
       self.send_prepare_ok(op);
     }
   }
 
-  fn on_sb_done(&mut self, now: Instant, done: SuperblockDone) {
+  fn on_sb_done<B: Superblock>(&mut self, now: Instant, sb: &mut B, done: SuperblockDone) {
     let SuperblockDone::Wrote(id) = done else {
-      return; // CheckpointRead/Fault are later milestones
+      return; // CheckpointRead is drained synchronously in recover(); Fault is M3.3
     };
-    let Some((pending_id, action)) = self.pending_sb else {
-      return;
-    };
-    if pending_id != id {
-      return; // a superseded (older-view) write completed after we moved on — ignore
+    // Durable-view write? (matched first; its OpId never aliases a checkpoint write's.)
+    if let Some((pending_id, action)) = self.pending_sb {
+      if pending_id == id {
+        self.pending_sb = None;
+        match action {
+          PendingSbAction::SendDoViewChange => self.send_do_view_change(now),
+          PendingSbAction::StartViewAsPrimary => self.start_view_participate(now, sb),
+          PendingSbAction::AdoptedStartView => self.start_view_acks(now),
+        }
+        return;
+      }
     }
-    self.pending_sb = None;
-    match action {
-      PendingSbAction::SendDoViewChange => self.send_do_view_change(now),
-      PendingSbAction::StartViewAsPrimary => self.start_view_participate(now),
-      PendingSbAction::AdoptedStartView => self.start_view_acks(now),
+    // Checkpoint write? Distinguish the two steps by their own minted OpIds.
+    if let Some(pc) = self.pending_checkpoint {
+      match pc.step {
+        CheckpointStep::AwaitSnapshot { id: sid } if sid == id => {
+          // The snapshot is durable → advance the durable root to name the new checkpoint.
+          // `commit_min >= target_op` always (target_op was commit_min at trigger; commit_min only
+          // grows), so the VsrState `commit >= checkpoint_op` invariant holds → try_new can't fail.
+          let root_id = self.mint_op_id();
+          let state = crate::VsrState::try_new(
+            self.view,
+            self.log_view,
+            self.commit_min,
+            pc.target_op,
+            pc.checkpoint_id,
+          )
+          .expect("checkpoint root: commit_min >= target_op and log_view <= view");
+          sb.submit_write(root_id, state);
+          self.pending_checkpoint = Some(PendingCheckpoint {
+            step: CheckpointStep::AwaitRoot { id: root_id },
+            ..pc
+          });
+        }
+        CheckpointStep::AwaitRoot { id: rid } if rid == id => {
+          // The root is durable → the checkpoint is COMPLETE: advance the in-memory checkpoint_op.
+          // (GC / prune of the WAL + maps below the checkpoint lands in Task 5.)
+          self.checkpoint_op = pc.target_op;
+          self.pending_checkpoint = None;
+        }
+        _ => {} // a stale/superseded completion (e.g. from before a view change) — ignore
+      }
     }
   }
 
+  /// If `commit_min` has reached the next checkpoint boundary and no superblock write is pending,
+  /// begin a checkpoint: snapshot the SM + client sessions, write the snapshot, and stage step 2.
+  ///
+  /// Called at the tails of `try_commit` and `advance_commit` — the only two sites that advance
+  /// `commit_min`. The snapshot reflects the SM state at `commit_min` exactly (all ops `<= commit_min`
+  /// applied, none above), so the checkpoint covers a committed+applied prefix; `target_op = commit_min`
+  /// keeps the snapshot↔op correspondence exact even when a batch commit jumps past the boundary.
+  fn maybe_checkpoint<B: Superblock>(&mut self, sb: &mut B) {
+    // Only checkpoint once the view is settled and durable-consistent: Normal status AND
+    // `log_view == view`. `advance_commit` is also called mid-view-change (in
+    // `start_view_as_new_primary` / `on_start_view`, applying prior-view committed ops) — there
+    // `self.view` is already the NEW view but `log_view` is still the old view and a
+    // `submit_durable_view` is imminent; this gate keeps a checkpoint from racing that durable-view
+    // write (a checkpoint and a view-change root must never both be in flight on the superblock). A
+    // checkpoint due during a transition re-triggers cleanly once Normal resumes — `commit_min` is
+    // preserved across the transition. In steady Normal `log_view == view` holds, so this never
+    // blocks a legitimate checkpoint.
+    if !self.status.is_normal() || self.log_view.get() != self.view.get() {
+      return;
+    }
+    // Exclusion: never start while a durable-view write OR another checkpoint is in flight. (In
+    // Normal, `pending_sb` is set only by a deferred view-participation write whose completion will
+    // re-enter Normal; `maybe_checkpoint` then re-triggers. This is the no-double-trigger gate.)
+    if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
+      return;
+    }
+    let boundary = self.checkpoint_op.get() + self.config.checkpoint_ops();
+    if self.commit_min.get() < boundary {
+      return;
+    }
+    // Checkpoint at `commit_min` (a committed+applied boundary), not at the raw `boundary` op:
+    // `commit_min` may have jumped past `boundary` in a batch commit, and the SM has applied through
+    // `commit_min` (apply is forward-only) — so the snapshot reflects state through `commit_min`.
+    let target_op = self.commit_min;
+    let snapshot = self.sm.snapshot();
+    let envelope = Self::encode_checkpoint(&self.clients, &snapshot);
+    let checkpoint_id = crate::checkpoint_id(&envelope);
+    let id = self.mint_op_id();
+    sb.submit_write_checkpoint(id, target_op, envelope);
+    self.pending_checkpoint = Some(PendingCheckpoint {
+      target_op,
+      checkpoint_id,
+      step: CheckpointStep::AwaitSnapshot { id },
+    });
+  }
+
   /// Persist the durable VSR root for the current `(view, log_view, commit_min)` and arm the
-  /// participation deferred until the write completes. M3.1b passes checkpoint_op=0, id=0.
+  /// participation deferred until the write completes.
   /// Overwrites any prior `pending_sb` (supersession): an older-view completion is then ignored.
+  ///
+  /// **Preserves the durable checkpoint pointer.** This write must carry the CURRENT checkpoint
+  /// (`self.checkpoint_op` + the durable `checkpoint_id`), NOT zeros — a view-change root that
+  /// zeroed `checkpoint_op` would regress the durable checkpoint and, once the WAL below it is GC'd
+  /// (M3.2 Task 5), lose committed ops on recovery. The view transitions drop the LOGICAL
+  /// `pending_checkpoint`, so `self.checkpoint_op` equals the durable checkpoint op and
+  /// `sb.state().checkpoint_id()` is its matching id. (A checkpoint's step-2 root write may still be
+  /// PHYSICALLY in flight when a view change issues this durable-view root write; the `Superblock`
+  /// serialized root-write ordering contract guarantees this later write is the final durable root,
+  /// so the stale checkpoint root cannot win.) `commit_min >= checkpoint_op` always holds, so
+  /// `try_new`'s `commit >= checkpoint_op` invariant cannot fail.
   fn submit_durable_view(&mut self, action: PendingSbAction, sb: &mut impl Superblock) {
+    let checkpoint_id = sb.state().checkpoint_id();
     let state = crate::VsrState::try_new(
       self.view,
       self.log_view,
       self.commit_min,
-      OpNumber::new(),
-      0,
+      self.checkpoint_op,
+      checkpoint_id,
     )
-    .expect("durable view: log_view <= view");
+    .expect("durable view: log_view <= view and commit_min >= checkpoint_op");
     let id = self.mint_op_id();
     sb.submit_write(id, state);
     self.pending_sb = Some((id, action));
@@ -436,7 +650,7 @@ impl<S: StateMachine> Endpoint<S> {
     if self.timers.commit.is_some_and(|d| d <= now) {
       self.outgoing.push_back(Outgoing::new(
         Recipient::Backups,
-        Message::Commit(Commit::new(self.view, self.commit_min)),
+        Message::Commit(Commit::new(self.view, self.commit_min, self.checkpoint_op)),
       ));
       self.timers.commit = Some(now + COMMIT_HEARTBEAT); // re-arm THIS timer only
     }
@@ -584,9 +798,16 @@ impl<S: StateMachine> Endpoint<S> {
     self.svc_target = view_new; // collect future escalations above this view
     self.inflight.clear();
     self.buffer.clear();
+    // Drop stale per-replica checkpoint reports: the new generation re-establishes the pipeline, so
+    // old-view reports must not gate the next primary's GC. A fresh primary rebuilds the map from
+    // incoming PrepareOk/Commit, staying conservative (unheard peers count as 0) until then.
+    self.peer_checkpoint.clear();
     // Abandon in-flight WAL appends from the old view: their bytes are already durable, but a
     // late completion must not emit a stale-view PrepareOk or vote on a wrong-generation op.
     self.pending.clear();
+    // Supersede any in-flight checkpoint: a view change drops it (its stale superblock completion is
+    // then ignored in on_sb_done). It re-triggers once Normal resumes — commit_min is preserved.
+    self.pending_checkpoint = None;
     self.svc_from = 0;
     self.dvc_from.clear();
     self.dvc_quorum = false;
@@ -732,11 +953,22 @@ impl<S: StateMachine> Endpoint<S> {
   /// `select_canonical_log`. Participation (StartView broadcast + try_commit) is deferred to
   /// `start_view_participate` via `on_sb_done`, once the new view is durable.
   fn start_view_as_new_primary<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+    // A checkpoint is never logically armed when forming a new primary's view: `maybe_checkpoint`
+    // is gated on Normal status, and entering ViewChange dropped `pending_checkpoint`. (A physically
+    // in-flight checkpoint root write is handled by the Superblock serialized root-write ordering
+    // contract — see `submit_durable_view`.)
+    debug_assert!(
+      self.pending_checkpoint.is_none(),
+      "no checkpoint may be logically in flight when forming a new primary's view"
+    );
     // Canonical-log selection + nack-prepare truncation (see `select_canonical_log`).
     let (canonical_log, op_head, commit_star) = self.select_canonical_log();
     self.adopt_log(&canonical_log);
     self.op = OpNumber::with(op_head);
-    self.advance_commit(now, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
+    // status is still ViewChange here, so the maybe_checkpoint at advance_commit's tail is a no-op
+    // (checkpoints only start in Normal) — a checkpoint must not race the StartViewAsPrimary
+    // durable-view write submitted below.
+    self.advance_commit(now, sb, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
 
     // Reconstruct client sessions from the adopted log. A backup-turned-primary has no
     // session state; without this, a client's retry of an already-adopted request would be
@@ -782,7 +1014,7 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// Runs once the new-primary superblock write is durable: broadcast StartView + begin committing.
-  fn start_view_participate(&mut self, now: Instant) {
+  fn start_view_participate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // Broadcast the canonical log to all backups.
     self.outgoing.push_back(Outgoing::new(
       Recipient::Backups,
@@ -796,7 +1028,7 @@ impl<S: StateMachine> Endpoint<S> {
     ));
 
     self.arm_timers(now);
-    self.try_commit(now);
+    self.try_commit(now, sb);
   }
 
   /// Replace the in-memory log with the given wire entries.
@@ -837,7 +1069,10 @@ impl<S: StateMachine> Endpoint<S> {
     self.view = m.view();
     self.adopt_log(m.log_slice());
     self.op = m.op();
-    self.advance_commit(now, m.commit().get());
+    // status is still ViewChange here, so the maybe_checkpoint at advance_commit's tail is a no-op
+    // (checkpoints only start in Normal) — a checkpoint must not race the AdoptedStartView
+    // durable-view write submitted below.
+    self.advance_commit(now, sb, m.commit().get());
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = m.view();
     self.status = Status::Normal;
@@ -846,6 +1081,12 @@ impl<S: StateMachine> Endpoint<S> {
     self.dvc_from.clear();
     // Abandon in-flight WAL appends from the old view (see transition_to_view_change_status).
     self.pending.clear();
+    // Drop stale per-replica checkpoint reports from the old generation (see
+    // transition_to_view_change_status); a backup-turned-... primary rebuilds from fresh PrepareOk.
+    self.peer_checkpoint.clear();
+    // Supersede any in-flight checkpoint from the old view (its stale superblock completion is then
+    // ignored). The view-change root below preserves the durable checkpoint_op via submit_durable_view.
+    self.pending_checkpoint = None;
     self.dvc_quorum = false;
     self.arm_timers(now);
     // Defer held-op re-acks to on_sb_done: persist the new view before acking in it.
@@ -872,11 +1113,15 @@ impl<S: StateMachine> Endpoint<S> {
     self.catching_up = true;
     self.inflight.clear();
     self.buffer.clear();
+    // Drop stale per-replica checkpoint reports (see transition_to_view_change_status).
+    self.peer_checkpoint.clear();
     // Abandon in-flight WAL appends from the old view (see transition_to_view_change_status).
     self.pending.clear();
     // GetView is a catch-up probe, not a vote; no superblock write needed. Clear any prior-view
     // pending_sb (supersession): a stale completion from the prior view must not fire.
     self.pending_sb = None;
+    // Likewise drop any in-flight checkpoint from the prior view; it re-triggers once Normal resumes.
+    self.pending_checkpoint = None;
     self.svc_target = view;
     self.svc_from = 0;
     self.dvc_from.clear();
@@ -1000,7 +1245,7 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// Commits the longest contiguous quorum-acked prefix beyond `commit_min`.
-  fn try_commit(&mut self, _now: Instant) {
+  fn try_commit<B: Superblock>(&mut self, _now: Instant, sb: &mut B) {
     let quorum = self.config.quorum() as u32;
     let mut advanced = false;
     loop {
@@ -1024,9 +1269,11 @@ impl<S: StateMachine> Endpoint<S> {
       // Tell backups the commit advanced (also serves as a heartbeat).
       self.outgoing.push_back(Outgoing::new(
         Recipient::Backups,
-        Message::Commit(Commit::new(self.view, self.commit_min)),
+        Message::Commit(Commit::new(self.view, self.commit_min, self.checkpoint_op)),
       ));
     }
+    // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
+    self.maybe_checkpoint(sb);
   }
 
   /// Applies op `op` on the primary, caches + sends the reply, emits the event.
@@ -1090,7 +1337,13 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
-  fn on_prepare<W: Wal>(&mut self, now: Instant, wal: &mut W, p: Prepare) {
+  fn on_prepare<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    p: Prepare,
+  ) {
     if p.view().get() > self.view.get() {
       self.catch_up_to_view(now, p.view());
       return;
@@ -1107,7 +1360,7 @@ impl<S: StateMachine> Endpoint<S> {
       return;
     }
     // Learn the primary's commit (apply anything we already have).
-    self.advance_commit(now, p.commit().get());
+    self.advance_commit(now, sb, p.commit().get());
 
     let pop = p.op().get();
     if pop <= self.op.get() {
@@ -1127,7 +1380,7 @@ impl<S: StateMachine> Endpoint<S> {
       }
       // After appending, apply any ops now available up to the learned commit.
       let target = self.commit_max.get();
-      self.advance_commit(now, target);
+      self.advance_commit(now, sb, target);
     } else {
       // Future op: buffer until the gap fills (primary also retransmits).
       self.buffer.insert(pop, p);
@@ -1155,13 +1408,18 @@ impl<S: StateMachine> Endpoint<S> {
     let primary = self.config.primary(self.view);
     self.outgoing.push_back(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
-      Message::PrepareOk(PrepareOk::new(self.view, op, self.config.replica())),
+      Message::PrepareOk(PrepareOk::new(
+        self.view,
+        op,
+        self.config.replica(),
+        self.checkpoint_op,
+      )),
     ));
   }
 
   /// Applies committed ops we hold, up to `min(target, op)`. Backups discard the
   /// reply but emit `Committed` so observers can verify agreement.
-  fn advance_commit(&mut self, _now: Instant, target: u64) {
+  fn advance_commit<B: Superblock>(&mut self, _now: Instant, sb: &mut B, target: u64) {
     // Record the learned commit regardless of whether we hold the ops yet.
     self.commit_max = OpNumber::with(self.commit_max.get().max(target));
     while self.commit_min.get() < target && self.commit_min.get() < self.op.get() {
@@ -1182,9 +1440,11 @@ impl<S: StateMachine> Endpoint<S> {
           reply,
         )));
     }
+    // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
+    self.maybe_checkpoint(sb);
   }
 
-  fn on_prepare_ok(&mut self, now: Instant, ok: PrepareOk) {
+  fn on_prepare_ok<B: Superblock>(&mut self, now: Instant, sb: &mut B, ok: PrepareOk) {
     if ok.view().get() > self.view.get() {
       self.catch_up_to_view(now, ok.view());
       return;
@@ -1195,13 +1455,19 @@ impl<S: StateMachine> Endpoint<S> {
     if ok.replica().get() >= self.config.replica_count() {
       return; // ignore malformed/out-of-range replica id
     }
+    // Record this backup's reported checkpoint for the checkpoint-quorum (the range check above
+    // guards the key). Independent of inflight: even an ok for an op we no longer track still
+    // carries a fresh checkpoint report. Drives `quorum_checkpoint_op` → the GC prune floor.
+    self
+      .peer_checkpoint
+      .insert(ok.replica().get(), ok.checkpoint_op());
     if let Some(inflight) = self.inflight.get_mut(&ok.op().get()) {
       inflight.oks |= 1u64 << ok.replica().get();
     }
-    self.try_commit(now);
+    self.try_commit(now, sb);
   }
 
-  fn on_commit(&mut self, now: Instant, c: Commit) {
+  fn on_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B, c: Commit) {
     if c.view().get() > self.view.get() {
       self.catch_up_to_view(now, c.view());
       return;
@@ -1211,7 +1477,13 @@ impl<S: StateMachine> Endpoint<S> {
     }
     // Heard from the primary — defer the idle timeout.
     self.note_primary_contact(now);
-    self.advance_commit(now, c.commit().get());
+    // Record the primary's reported checkpoint. Harmless on a backup (only the primary reads
+    // `peer_checkpoint` for GC), but it pre-seeds the map so a backup-turned-primary starts with the
+    // primary's last-known checkpoint rather than 0. Bounded by `replica_count`.
+    self
+      .peer_checkpoint
+      .insert(self.config.primary(self.view).get(), c.checkpoint_op());
+    self.advance_commit(now, sb, c.commit().get());
   }
 
   /// Pulls the next message to send, if any.
@@ -1241,15 +1513,73 @@ impl<S: StateMachine> Endpoint<S> {
     .flatten()
     .min()
   }
+
+  /// Encodes the client-session table + an SM snapshot into one checkpoint envelope.
+  ///
+  /// Layout: `sessions_len: u32 BE | repeat[ client: u128 BE | request: u64 BE | has_reply: u8 |
+  /// (if has_reply) reply_request: u64 BE, reply_len: u32 BE, reply_bytes ] | sm_snapshot_bytes`.
+  fn encode_checkpoint(sessions: &BTreeMap<u128, Session>, snapshot: &[u8]) -> Bytes {
+    let mut out = std::vec::Vec::new();
+    out.extend_from_slice(&(sessions.len() as u32).to_be_bytes());
+    for (client, s) in sessions {
+      out.extend_from_slice(&client.to_be_bytes());
+      out.extend_from_slice(&s.request.get().to_be_bytes());
+      match &s.reply {
+        Some((rn, body)) => {
+          out.push(1);
+          out.extend_from_slice(&rn.get().to_be_bytes());
+          out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+          out.extend_from_slice(body);
+        }
+        None => out.push(0),
+      }
+    }
+    out.extend_from_slice(snapshot);
+    Bytes::from(out)
+  }
+
+  /// Decodes a checkpoint envelope produced by [`Self::encode_checkpoint`] into
+  /// `(sessions, sm_snapshot_slice)`.
+  ///
+  /// **Panics on malformed input** — for M3.2a the envelope is always proto-produced; fallibility
+  /// is deferred to M3.3 when checkpoint reads can return `Faulty`.
+  fn decode_checkpoint(env: &[u8]) -> (BTreeMap<u128, Session>, &[u8]) {
+    let mut i = 0usize;
+    let count = u32::from_be_bytes(env[i..i + 4].try_into().unwrap()) as usize;
+    i += 4;
+    let mut sessions = BTreeMap::new();
+    for _ in 0..count {
+      let client = u128::from_be_bytes(env[i..i + 16].try_into().unwrap());
+      i += 16;
+      let request =
+        crate::RequestNumber::with(u64::from_be_bytes(env[i..i + 8].try_into().unwrap()));
+      i += 8;
+      let has_reply = env[i];
+      i += 1;
+      let reply = if has_reply == 1 {
+        let rn = crate::RequestNumber::with(u64::from_be_bytes(env[i..i + 8].try_into().unwrap()));
+        i += 8;
+        let len = u32::from_be_bytes(env[i..i + 4].try_into().unwrap()) as usize;
+        i += 4;
+        let body = Bytes::copy_from_slice(&env[i..i + len]);
+        i += len;
+        Some((rn, body))
+      } else {
+        None
+      };
+      sessions.insert(client, Session { request, reply });
+    }
+    (sessions, &env[i..])
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::{
-    ClientId, Config, DoViewChange, GetView, Header, OpId, OpNumber, Prepare, PreparedEntry,
-    ReadOk, ReplicaId, Request, RequestNumber, SlotStatus, StartView, StartViewChange, Superblock,
-    SuperblockDone, View, VsrState, Wal, WalDone,
+    CheckpointRead, ClientId, Config, DoViewChange, GetView, Header, OpId, OpNumber, Prepare,
+    PreparedEntry, ReadOk, ReplicaId, Request, RequestNumber, SlotStatus, StartView,
+    StartViewChange, Superblock, SuperblockDone, View, VsrState, Wal, WalDone,
   };
   use std::collections::VecDeque;
 
@@ -1279,6 +1609,52 @@ mod tests {
     }
 
     fn restore(&mut self, _snapshot: &[u8]) {}
+  }
+
+  /// Records every applied `(op, body)` and round-trips them through `snapshot`/`restore`
+  /// (mirrors the sim's `LogSm`). Used to prove `recover` restores the SM from the durable
+  /// checkpoint snapshot (a fresh SM has 0 applied; a restored one reflects the checkpoint).
+  #[derive(Default)]
+  struct CountSm {
+    applied: std::vec::Vec<(u64, std::vec::Vec<u8>)>,
+  }
+  impl CountSm {
+    fn applied(&self) -> &[(u64, std::vec::Vec<u8>)] {
+      &self.applied
+    }
+  }
+  impl StateMachine for CountSm {
+    fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
+      self.applied.push((op.get(), body.to_vec()));
+      Bytes::copy_from_slice(body)
+    }
+
+    fn snapshot(&self) -> Bytes {
+      let mut out = std::vec::Vec::new();
+      out.extend_from_slice(&(self.applied.len() as u64).to_be_bytes());
+      for (op, body) in &self.applied {
+        out.extend_from_slice(&op.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        out.extend_from_slice(body);
+      }
+      Bytes::from(out)
+    }
+
+    fn restore(&mut self, snapshot: &[u8]) {
+      let mut applied = std::vec::Vec::new();
+      let mut i = 0usize;
+      let count = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap());
+      i += 8;
+      for _ in 0..count {
+        let op = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap());
+        i += 8;
+        let len = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap()) as usize;
+        i += 8;
+        applied.push((op, snapshot[i..i + len].to_vec()));
+        i += len;
+      }
+      self.applied = applied;
+    }
   }
 
   #[derive(Default)]
@@ -1327,12 +1703,16 @@ mod tests {
   struct TestSb {
     state: VsrState,
     done: VecDeque<SuperblockDone>,
+    /// The last checkpoint snapshot written (op, bytes) — stored so a recover/read test can read it
+    /// back, mirroring `InMemorySuperblock`.
+    checkpoint: Option<(OpNumber, Bytes)>,
   }
   impl Default for TestSb {
     fn default() -> Self {
       Self {
         state: VsrState::initial(),
         done: VecDeque::new(),
+        checkpoint: None,
       }
     }
   }
@@ -1344,14 +1724,91 @@ mod tests {
       self.state = state;
       self.done.push_back(SuperblockDone::Wrote(id));
     }
-    fn submit_write_checkpoint(&mut self, id: OpId, _op: OpNumber, _snapshot: Bytes) {
+    fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes) {
+      self.checkpoint = Some((op, snapshot));
       self.done.push_back(SuperblockDone::Wrote(id));
     }
     fn submit_read_checkpoint(&mut self, id: OpId) {
-      self.done.push_back(SuperblockDone::Fault(id));
+      let done = match &self.checkpoint {
+        Some((op, snap)) => {
+          SuperblockDone::CheckpointRead(CheckpointRead::new(id, *op, snap.clone()))
+        }
+        None => SuperblockDone::Fault(id),
+      };
+      self.done.push_back(done);
     }
     fn poll(&mut self) -> Option<SuperblockDone> {
       self.done.pop_front()
+    }
+  }
+
+  /// A superblock that completes writes *lazily*, one durability round at a time — modelling a real
+  /// async superblock where a write submitted during a `handle_storage` drain does NOT complete in
+  /// that same drain (it lands on disk between ticks). Submissions queue in `inflight`; `flush()`
+  /// (called by the test between `handle_storage` rounds) makes the currently-inflight writes
+  /// durable (`ready`). This lets a test step the 3-step checkpoint sequence one superblock write at
+  /// a time and observe the intermediate (not-yet-durable) states the synchronous `TestSb` hides.
+  struct StepSb {
+    state: VsrState,
+    inflight: VecDeque<SuperblockDone>,
+    ready: VecDeque<SuperblockDone>,
+    /// The state each inflight write will publish once flushed (paired by position with `inflight`).
+    inflight_states: VecDeque<VsrState>,
+    checkpoint: Option<(OpNumber, Bytes)>,
+  }
+  impl Default for StepSb {
+    fn default() -> Self {
+      Self {
+        state: VsrState::initial(),
+        inflight: VecDeque::new(),
+        ready: VecDeque::new(),
+        inflight_states: VecDeque::new(),
+        checkpoint: None,
+      }
+    }
+  }
+  impl StepSb {
+    /// Make all currently-inflight writes durable: publish their states and move completions to
+    /// `ready`. Writes submitted *after* this call wait for the next `flush`.
+    fn flush(&mut self) {
+      while let Some(done) = self.inflight.pop_front() {
+        if let Some(state) = self.inflight_states.pop_front() {
+          self.state = state;
+        }
+        self.ready.push_back(done);
+      }
+    }
+    /// Whether a checkpoint write or root write is still inflight (not yet flushed).
+    fn has_inflight(&self) -> bool {
+      !self.inflight.is_empty()
+    }
+  }
+  impl Superblock for StepSb {
+    fn state(&self) -> VsrState {
+      self.state
+    }
+    fn submit_write(&mut self, id: OpId, state: VsrState) {
+      self.inflight.push_back(SuperblockDone::Wrote(id));
+      self.inflight_states.push_back(state);
+    }
+    fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes) {
+      // The checkpoint snapshot becomes readable only once this write is flushed; record it eagerly
+      // for simplicity (the durability gate that matters is the VsrState root ordering).
+      self.checkpoint = Some((op, snapshot));
+      self.inflight.push_back(SuperblockDone::Wrote(id));
+      self.inflight_states.push_back(self.state); // a checkpoint write does not change the root
+    }
+    fn submit_read_checkpoint(&mut self, id: OpId) {
+      let done = match &self.checkpoint {
+        Some((op, snap)) => {
+          SuperblockDone::CheckpointRead(CheckpointRead::new(id, *op, snap.clone()))
+        }
+        None => SuperblockDone::Fault(id),
+      };
+      self.ready.push_back(done);
+    }
+    fn poll(&mut self) -> Option<SuperblockDone> {
+      self.ready.pop_front()
     }
   }
 
@@ -2037,7 +2494,7 @@ mod tests {
       0,
       NoopSm,
       &mut wal,
-      &sb,
+      &mut sb,
     );
     assert_eq!(
       recovered.op(),
@@ -2076,13 +2533,13 @@ mod tests {
     e.handle_storage(now, &mut wal, &mut sb);
     drop(e); // crash
 
-    let mut recovered = Endpoint::recover(cfg(), 0, EchoSm, &mut wal, &sb);
+    let mut recovered = Endpoint::recover(cfg(), 0, EchoSm, &mut wal, &mut sb);
     recovered.handle_message(
       now,
       &mut wal,
       &mut sb,
       primary_peer(),
-      Message::Commit(Commit::new(View::new(), OpNumber::with(2))),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
     );
 
     let mut applied = std::vec::Vec::new();
@@ -2339,6 +2796,41 @@ mod tests {
   }
 
   #[test]
+  fn checkpoint_envelope_round_trips_sessions_and_snapshot() {
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+      7u128,
+      Session {
+        request: RequestNumber::with(3),
+        reply: Some((RequestNumber::with(3), Bytes::from_static(b"r3"))),
+      },
+    );
+    sessions.insert(
+      9u128,
+      Session {
+        request: RequestNumber::with(1),
+        reply: None,
+      },
+    );
+    let snap = Bytes::from_static(b"SM-SNAPSHOT");
+    let env = Endpoint::<NoopSm>::encode_checkpoint(&sessions, &snap);
+    let (decoded_sessions, decoded_snap) = Endpoint::<NoopSm>::decode_checkpoint(&env);
+    assert_eq!(decoded_snap, &b"SM-SNAPSHOT"[..]);
+    assert_eq!(decoded_sessions.len(), 2);
+    assert_eq!(decoded_sessions[&7].request, RequestNumber::with(3));
+    assert_eq!(
+      decoded_sessions[&7].reply.as_ref().unwrap().1,
+      Bytes::from_static(b"r3")
+    );
+    assert_eq!(decoded_sessions[&9].reply, None);
+    // empty sessions + empty snapshot is a valid envelope
+    let empty = Endpoint::<NoopSm>::encode_checkpoint(&BTreeMap::new(), &Bytes::new());
+    let (es, esnap) = Endpoint::<NoopSm>::decode_checkpoint(&empty);
+    assert!(es.is_empty());
+    assert!(esnap.is_empty());
+  }
+
+  #[test]
   fn recover_restores_a_nonzero_durable_view() {
     // A replica that advanced its view persists it; recover() restores it (no regression to view 0,
     // which would risk a cross-view double-vote). Drive a backup into ViewChange(view 1) so it writes
@@ -2368,7 +2860,7 @@ mod tests {
       0,
       NoopSm,
       &mut wal,
-      &sb,
+      &mut sb,
     );
     assert_eq!(
       recovered.view(),
@@ -2376,5 +2868,487 @@ mod tests {
       "recover() restores the advanced durable view (no regression to view 0)"
     );
     assert_eq!(recovered.status(), Status::Normal);
+  }
+
+  #[test]
+  fn primary_checkpoints_after_interval_ops_via_two_superblock_writes() {
+    // Single-replica cluster (quorum 1): the primary commits each op as soon as its append is
+    // durable. With checkpoint_ops=2, committing op 2 makes commit_min=2 >= checkpoint_op(0)+2 →
+    // the checkpoint sequence runs (TWO superblock writes), and checkpoint_op advances to 2 ONLY
+    // after BOTH writes are durable. `StepSb` completes writes lazily (`flush` between rounds) so
+    // each of the three steps is observed in isolation.
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
+    let mut e = Endpoint::new(cfg, 0, EchoSm);
+    let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+    let now = Instant::ZERO;
+    let req = |rn: u64| {
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      ))
+    };
+
+    // Commit op 1: not yet at the interval; no checkpoint, nothing inflight on the superblock.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      req(1),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // append durable → commit op 1
+    assert_eq!(e.commit(), OpNumber::with(1));
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "no checkpoint before the interval"
+    );
+    assert!(
+      !sb.has_inflight(),
+      "no superblock write before the interval"
+    );
+
+    // Commit op 2: commit_min reaches checkpoint_op(0)+checkpoint_ops(2)=2 → step 1: the snapshot
+    // write is submitted (inflight) but NOT yet durable.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      req(2),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // append durable → commit op 2 → submit_write_checkpoint
+    assert_eq!(e.commit(), OpNumber::with(2));
+    assert!(sb.has_inflight(), "step 1: the snapshot write is inflight");
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "checkpoint not durable until BOTH sb writes complete"
+    );
+    assert_eq!(
+      sb.state().checkpoint_op(),
+      OpNumber::with(0),
+      "the durable root still names the OLD checkpoint after only step 1's submit"
+    );
+
+    // Flush step 1 (snapshot durable) → step 2: the VsrState root write is submitted (inflight).
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert!(sb.has_inflight(), "step 2: the root write is inflight");
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "still not durable after only the snapshot write completed"
+    );
+
+    // Flush step 2 (root durable) → step 3: the checkpoint officially advances in-memory.
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert!(!sb.has_inflight(), "the sequence is complete");
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(2),
+      "checkpoint durable after both writes"
+    );
+    // The durable root now names the new checkpoint, with a non-zero content id (hash of envelope).
+    assert_eq!(sb.state().checkpoint_op(), OpNumber::with(2));
+    assert_ne!(sb.state().checkpoint_id(), 0);
+  }
+
+  #[test]
+  fn checkpoint_does_not_double_trigger_while_in_flight() {
+    // While a checkpoint's superblock writes are pending, commit_min may keep advancing; a second
+    // overlapping checkpoint must NOT start. checkpoint_ops=2: after op 2 triggers a checkpoint,
+    // committing ops 3,4 (which also cross a 2-op boundary) must not arm a second checkpoint while
+    // the first is in flight — only ONE checkpoint completes, landing at the op it staged (2).
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
+    let mut e = Endpoint::new(cfg, 0, EchoSm);
+    let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+    let now = Instant::ZERO;
+    let req = |rn: u64| {
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      ))
+    };
+
+    // Commit ops 1,2 → checkpoint triggers (step 1: snapshot write inflight, NOT durable).
+    for rn in 1..=2 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        req(rn),
+      );
+      e.handle_storage(now, &mut wal, &mut sb);
+    }
+    assert_eq!(e.commit(), OpNumber::with(2));
+    assert_eq!(e.checkpoint_op(), OpNumber::with(0));
+    assert!(
+      sb.has_inflight(),
+      "the first checkpoint's snapshot write is inflight"
+    );
+
+    // Commit ops 3,4 WITHOUT flushing the in-flight checkpoint. The append completions advance
+    // commit_min to 4, but maybe_checkpoint must bail (a checkpoint is in flight) — no second
+    // snapshot write is armed. (We do NOT flush, so the only inflight write remains the first
+    // checkpoint's step-1 snapshot write.)
+    for rn in 3..=4 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        req(rn),
+      );
+      e.handle_storage(now, &mut wal, &mut sb);
+    }
+    assert_eq!(e.commit(), OpNumber::with(4));
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "the first checkpoint is still in flight"
+    );
+
+    // Drive the first (and only) in-flight checkpoint — staged at target_op=2 — to completion by
+    // flushing its two writes. It advances checkpoint_op to 2 exactly (NOT 4 — it was staged at 2,
+    // and no second checkpoint started for ops 3,4 while it was in flight).
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb); // step 1 done → step 2 (root write) inflight
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb); // step 2 done → checkpoint advances to 2
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(2),
+      "exactly one checkpoint completed at its staged op (2), no double-trigger"
+    );
+    assert_eq!(sb.state().checkpoint_op(), OpNumber::with(2));
+
+    // Now that the first checkpoint is durable, the NEXT commit re-evaluates the boundary:
+    // commit_min=4 >= checkpoint_op(2)+2=4 → a SECOND checkpoint triggers (at op 4) and completes.
+    // This proves the gate only suppressed the OVERLAP, not all future checkpoints.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      req(5),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // commit op 5 → maybe_checkpoint at commit_min=5 → snapshot write
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb); // snapshot done → root write
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb); // root done → checkpoint advances
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(5),
+      "a fresh checkpoint runs once the prior one is durable (boundary re-evaluated at commit_min)"
+    );
+  }
+
+  #[test]
+  fn checkpoint_completes_in_one_drain_with_synchronous_superblock() {
+    // The sim's real `InMemorySuperblock` completes ALL queued writes (including ones submitted
+    // mid-drain) in a single `handle_storage`. `TestSb` models that. Confirm the whole 3-step
+    // sequence completes in the single drain that commits the boundary op — this is the path the
+    // sim `Cluster` exercises each tick, so a long-enough sim run checkpoints.
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
+    let mut e = Endpoint::new(cfg, 0, EchoSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    let req = |rn: u64| {
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      ))
+    };
+    for rn in 1..=2 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        req(rn),
+      );
+      e.handle_storage(now, &mut wal, &mut sb);
+    }
+    assert_eq!(e.commit(), OpNumber::with(2));
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(2),
+      "synchronous superblock completes both checkpoint writes in the boundary-commit drain"
+    );
+    assert_eq!(sb.state().checkpoint_op(), OpNumber::with(2));
+    assert_ne!(sb.state().checkpoint_id(), 0);
+  }
+
+  #[test]
+  fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
+    // A single-replica primary commits past a checkpoint (checkpoint_ops=2), so the checkpoint is
+    // durable; then it "crashes". recover() MUST restore the SM from the checkpoint snapshot and set
+    // commit_min == checkpoint_op (NOT 0) — re-applying [1..=checkpoint_op] would double-apply.
+    // (M3.2a never prunes the WAL — Task 5/GC is deferred — so the WAL still holds ops [1..=head];
+    //  the log cache is rebuilt for the tail (checkpoint_op..=head] only, the snapshot owns the rest.)
+    let cfg = || Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    let req = |rn: u64| {
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      ))
+    };
+    let mut e = Endpoint::new(cfg(), 0, CountSm::default());
+    for rn in 1..=2 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        req(rn),
+      );
+      e.handle_storage(now, &mut wal, &mut sb); // append durable → commit → (at op 2) checkpoint
+    }
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(2),
+      "checkpoint is durable"
+    );
+    assert_eq!(
+      e.state_machine().applied().len(),
+      2,
+      "the live SM applied ops 1,2 before the crash"
+    );
+    drop(e); // crash
+
+    // recover() restores from the checkpoint snapshot, NOT by replaying from op 0.
+    let recovered = Endpoint::recover(cfg(), 0, CountSm::default(), &mut wal, &mut sb);
+    assert_eq!(
+      recovered.commit(),
+      OpNumber::with(2),
+      "commit_min restored to the checkpoint op, not 0"
+    );
+    assert_eq!(
+      recovered.checkpoint_op(),
+      OpNumber::with(2),
+      "checkpoint_op restored from the durable root"
+    );
+    assert_eq!(
+      recovered.op(),
+      OpNumber::with(2),
+      "op restored from the WAL head (head >= commit_min == checkpoint_op)"
+    );
+    // commit_max is restored to checkpoint_op too (monotone bounds: op >= commit_max >= commit_min).
+    assert_eq!(recovered.commit_max(), OpNumber::with(2));
+    // The SM was restored from the snapshot: it already reflects ops 1,2 (NOT re-applied → exactly 2).
+    assert_eq!(
+      recovered.state_machine().applied().len(),
+      2,
+      "SM restored from the checkpoint snapshot (no double-apply)"
+    );
+    assert_eq!(
+      recovered.state_machine().applied(),
+      &[(1u64, std::vec![1u8]), (2u64, std::vec![2u8])],
+      "the restored SM reflects exactly the checkpointed applied prefix"
+    );
+  }
+
+  #[test]
+  fn recover_with_no_checkpoint_is_unchanged() {
+    // Backward-compat guard: with checkpoint_op == 0 (no checkpoint yet), recover() behaves EXACTLY
+    // as the M3.1b path — commit_min == commit_max == 0, a fresh SM (0 applied), log cache [1..=head].
+    let cfg = || Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    let mut e = Endpoint::new(cfg(), 0, CountSm::default());
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(e.checkpoint_op(), OpNumber::with(0), "no checkpoint taken");
+    drop(e);
+
+    let recovered = Endpoint::recover(cfg(), 0, CountSm::default(), &mut wal, &mut sb);
+    assert_eq!(recovered.op(), OpNumber::with(2), "op from the WAL head");
+    assert_eq!(
+      recovered.commit(),
+      OpNumber::with(0),
+      "no checkpoint → commit_min stays 0 (M3.1b behavior)"
+    );
+    assert_eq!(recovered.commit_max(), OpNumber::with(0));
+    assert_eq!(recovered.checkpoint_op(), OpNumber::with(0));
+    assert_eq!(
+      recovered.state_machine().applied().len(),
+      0,
+      "no checkpoint → fresh SM, nothing restored/applied"
+    );
+  }
+
+  #[test]
+  fn view_change_preserves_the_durable_checkpoint_pointer() {
+    // SAFETY REGRESSION GUARD: a view-change durable-view write must NOT regress the durable
+    // checkpoint_op to 0 (that would, once the WAL below it is GC'd in Task 5, lose committed ops on
+    // recovery). Drive a single-replica primary to a durable checkpoint at op 2, then force a view
+    // change (escalate to view 1) and let its durable-view write land; the durable root must still
+    // name checkpoint_op=2 with its original id.
+    use crate::StartViewChange;
+    // N=3 so a view change is reachable, but checkpoint_ops=2 and we commit 2 ops as primary first.
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 2).unwrap();
+    let mut e = Endpoint::new(cfg, 0, EchoSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    let req = |rn: u64| {
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      ))
+    };
+    // Commit 2 ops with a 2-of-3 quorum (replica 1 acks), so commit_min reaches 2 and a checkpoint
+    // is taken. The primary's own append + replica 1's PrepareOk = quorum 2.
+    for rn in 1..=2 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        req(rn),
+      );
+      e.handle_storage(now, &mut wal, &mut sb); // primary's own append durable (own vote)
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Replica(ReplicaId::new(1)),
+        Message::PrepareOk(PrepareOk::new(
+          View::new(),
+          OpNumber::with(rn),
+          ReplicaId::new(1),
+          OpNumber::new(),
+        )),
+      );
+      e.handle_storage(now, &mut wal, &mut sb); // drain any checkpoint writes
+    }
+    assert_eq!(e.commit(), OpNumber::with(2));
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(2),
+      "checkpoint is durable at op 2"
+    );
+    let id_before = sb.state().checkpoint_id();
+    assert_ne!(id_before, 0);
+
+    // Force a view change: two peers send StartViewChange(view 1) → SVC quorum → ViewChange(1),
+    // which submits a durable-view write. Pump it.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(1))),
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
+    );
+    assert_eq!(e.status(), Status::ViewChange);
+    e.handle_storage(now, &mut wal, &mut sb); // the durable-view write completes
+    assert_eq!(
+      sb.state().checkpoint_op(),
+      OpNumber::with(2),
+      "the view-change durable-view write must PRESERVE the checkpoint_op (not regress to 0)"
+    );
+    assert_eq!(
+      sb.state().checkpoint_id(),
+      id_before,
+      "and preserve the matching checkpoint id"
+    );
+    // The in-memory checkpoint_op is likewise unchanged by the view change.
+    assert_eq!(e.checkpoint_op(), OpNumber::with(2));
+  }
+
+  #[test]
+  fn primary_tracks_quorum_checkpoint_op() {
+    // N=3, quorum=2. Primary self.checkpoint_op=0. Backups report checkpoints 5 and 3 via PrepareOk.
+    // self(0)=0, r1=5, r2=3 → sorted desc [5,3,0]; the quorum(2)-th highest (index 1) is 3 — the
+    // highest op a quorum (2 of 3) has reported checkpointing.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // A fresh primary in Normal view 0 with no peers heard from has quorum_checkpoint_op == 0.
+    assert_eq!(e.quorum_checkpoint_op(), OpNumber::new());
+    // Quorum-checkpoint tracking is independent of inflight: the ok is recorded for its replica even
+    // without a matching inflight op (the replica-id range check is the only guard).
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::PrepareOk(PrepareOk::new(
+        View::new(),
+        OpNumber::with(1),
+        ReplicaId::new(1),
+        OpNumber::with(5),
+      )),
+    );
+    // Only one backup heard from: self(0)=0, r1=5, r2=unheard(0) → desc [5,0,0] → index 1 = 0.
+    assert_eq!(
+      e.quorum_checkpoint_op(),
+      OpNumber::new(),
+      "one backup is not yet a quorum-checkpoint above 0"
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::PrepareOk(PrepareOk::new(
+        View::new(),
+        OpNumber::with(1),
+        ReplicaId::new(2),
+        OpNumber::with(3),
+      )),
+    );
+    assert_eq!(e.quorum_checkpoint_op(), OpNumber::with(3));
+  }
+
+  #[test]
+  fn quorum_checkpoint_op_single_replica_is_self() {
+    // N=1, quorum=1 → the quorum checkpoint is exactly self's checkpoint (no peers to wait for).
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
+    let mut e = Endpoint::new(cfg, 0, EchoSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    assert_eq!(e.quorum_checkpoint_op(), OpNumber::new());
+    let req = |rn: u64| {
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      ))
+    };
+    for rn in 1..=2 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        req(rn),
+      );
+      e.handle_storage(now, &mut wal, &mut sb);
+    }
+    assert_eq!(e.checkpoint_op(), OpNumber::with(2));
+    assert_eq!(
+      e.quorum_checkpoint_op(),
+      OpNumber::with(2),
+      "single-replica quorum checkpoint follows self's checkpoint"
+    );
   }
 }

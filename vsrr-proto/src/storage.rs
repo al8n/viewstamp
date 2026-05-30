@@ -379,10 +379,22 @@ pub trait Wal {
 
 /// A pluggable durable root (superblock). Writes the VSR state and checkpoint
 /// snapshots atomically; completions arrive via [`Superblock::poll`].
+///
+/// **Root-write ordering contract (load-bearing for VSR safety).** The durable root is a single
+/// serialized writer: when several [`submit_write`](Superblock::submit_write) calls are
+/// outstanding, their completions MUST be delivered in submission order, and once they have all
+/// completed the durable [`state`](Superblock::state) MUST equal the LAST-submitted root. The proto
+/// can briefly have a checkpoint root write and a view-change root write in flight together — it
+/// drops the *logical* checkpoint tracker on a view change but cannot un-submit an already-issued
+/// write — and relies on this ordering so the later (view-change) root wins rather than a stale
+/// checkpoint root rolling back the durable view/commit. A backend with a single fsync'd superblock
+/// slot satisfies this naturally (as TigerBeetle's does); one that completes root writes out of
+/// order would violate VSR safety.
 pub trait Superblock {
-  /// The current durable root.
+  /// The current durable root (the last root write that has completed).
   fn state(&self) -> VsrState;
-  /// Submit an atomic write of the durable root.
+  /// Submit an atomic write of the durable root. Completions are delivered in submission order
+  /// relative to other `submit_write` calls (see the trait-level root-write ordering contract).
   fn submit_write(&mut self, id: OpId, state: VsrState);
   /// Submit a write of a checkpoint snapshot at `op`.
   fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes);
@@ -390,6 +402,13 @@ pub trait Superblock {
   fn submit_read_checkpoint(&mut self, id: OpId);
   /// Drain the next completed op, if any.
   fn poll(&mut self) -> Option<SuperblockDone>;
+}
+
+/// The content id of a checkpoint snapshot: a deterministic FNV-1a-128 hash of its bytes.
+/// `VsrState::checkpoint_id` stores this; recovery + state-sync compare against it.
+#[cfg_attr(not(tarpaulin), inline(always))]
+pub fn checkpoint_id(snapshot: &[u8]) -> u128 {
+  fnv1a_128(snapshot)
 }
 
 // ── deterministic FNV-1a-128 (no_std, no deps) ──
@@ -412,6 +431,18 @@ fn fnv1a_128_mix(mut acc: u128, bytes: &[u8]) -> u128 {
 mod tests {
   use super::*;
   use crate::{ClientId, OpNumber, RequestNumber, View};
+
+  #[test]
+  fn checkpoint_id_is_deterministic_and_sensitive() {
+    let a = checkpoint_id(b"snapshot-bytes");
+    assert_eq!(a, checkpoint_id(b"snapshot-bytes"), "deterministic");
+    assert_ne!(
+      a,
+      checkpoint_id(b"snapshot-byteS"),
+      "a flipped byte changes the id"
+    );
+    assert_ne!(a, checkpoint_id(b""), "empty differs from non-empty");
+  }
 
   #[test]
   fn header_checksum_detects_corruption() {

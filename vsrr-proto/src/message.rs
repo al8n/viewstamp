@@ -129,12 +129,18 @@ pub struct PrepareOk {
   view: View,
   op: OpNumber,
   replica: ReplicaId,
+  checkpoint_op: OpNumber,
 }
 
 impl PrepareOk {
   /// Creates a prepare acknowledgement.
-  pub const fn new(view: View, op: OpNumber, replica: ReplicaId) -> Self {
-    Self { view, op, replica }
+  pub const fn new(view: View, op: OpNumber, replica: ReplicaId, checkpoint_op: OpNumber) -> Self {
+    Self {
+      view,
+      op,
+      replica,
+      checkpoint_op,
+    }
   }
 
   /// The view of the acknowledged prepare.
@@ -153,6 +159,12 @@ impl PrepareOk {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn replica(&self) -> ReplicaId {
     self.replica
+  }
+
+  /// The op number of the sender's latest durable checkpoint (the quorum signal).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
   }
 }
 
@@ -212,12 +224,17 @@ impl Reply {
 pub struct Commit {
   view: View,
   commit: OpNumber,
+  checkpoint_op: OpNumber,
 }
 
 impl Commit {
   /// Creates a commit heartbeat.
-  pub const fn new(view: View, commit: OpNumber) -> Self {
-    Self { view, commit }
+  pub const fn new(view: View, commit: OpNumber, checkpoint_op: OpNumber) -> Self {
+    Self {
+      view,
+      commit,
+      checkpoint_op,
+    }
   }
 
   /// The current view.
@@ -230,6 +247,12 @@ impl Commit {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn commit(&self) -> OpNumber {
     self.commit
+  }
+
+  /// The op number of the primary's latest durable checkpoint (the quorum signal).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
   }
 }
 
@@ -552,7 +575,20 @@ impl Outgoing {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{ClientId, OpNumber, RequestNumber, View};
+  use crate::{ClientId, OpNumber, ReplicaId, RequestNumber, View};
+
+  #[test]
+  fn commit_and_prepare_ok_carry_checkpoint_op() {
+    let c = Commit::new(View::with(1), OpNumber::with(5), OpNumber::with(4));
+    assert_eq!(c.checkpoint_op(), OpNumber::with(4));
+    let ok = PrepareOk::new(
+      View::with(1),
+      OpNumber::with(5),
+      ReplicaId::new(2),
+      OpNumber::with(4),
+    );
+    assert_eq!(ok.checkpoint_op(), OpNumber::with(4));
+  }
 
   #[test]
   fn construct_and_match() {

@@ -1,6 +1,9 @@
 use core::time::Duration;
 
-use vsrr_proto::{Config, Endpoint, Instant, Message, Outgoing, Peer, Prng, Recipient, ReplicaId};
+use vsrr_proto::{
+  Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Instant, Message, Outgoing, Peer, Prng, Recipient,
+  ReplicaId,
+};
 
 use crate::client::ClientModel;
 use crate::clock::Clock;
@@ -23,6 +26,8 @@ pub struct Cluster {
   seed: u64,
   faults: Faults,
   replica_count: u8,
+  /// The checkpoint interval, retained so `restart` rebuilds a replica with the same config.
+  checkpoint_ops: u64,
   crashed: Vec<bool>,
   /// Partition group id per replica. Replica↔replica messages between different groups are
   /// dropped. All replicas start in group 0 (no partition).
@@ -33,9 +38,28 @@ impl Cluster {
   /// Creates a cluster of `replicas` replicas and `clients` clients, each client
   /// issuing `requests_per_client` requests. No faults by default.
   pub fn new(replicas: u8, clients: u32, requests_per_client: u64, seed: u64) -> Self {
+    Self::with_checkpoint_ops(
+      replicas,
+      clients,
+      requests_per_client,
+      seed,
+      DEFAULT_CHECKPOINT_OPS,
+    )
+  }
+
+  /// Like [`Cluster::new`] but with an explicit checkpoint interval, so short runs can exercise
+  /// checkpoints + checkpoint-based recovery.
+  pub fn with_checkpoint_ops(
+    replicas: u8,
+    clients: u32,
+    requests_per_client: u64,
+    seed: u64,
+    checkpoint_ops: u64,
+  ) -> Self {
     let replica_set: Vec<Endpoint<LogSm>> = (0..replicas)
       .map(|i| {
-        let cfg = Config::try_new(1, ReplicaId::new(i), replicas).expect("valid cluster config");
+        let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(i), replicas, checkpoint_ops)
+          .expect("valid cluster config");
         Endpoint::new(
           cfg,
           seed ^ (i as u64).wrapping_mul(0x1234_5678),
@@ -60,6 +84,7 @@ impl Cluster {
       seed,
       faults: Faults::none(),
       replica_count: replicas,
+      checkpoint_ops,
       crashed: vec![false; n],
       groups: vec![0; n],
     }
@@ -83,6 +108,11 @@ impl Cluster {
   /// Replica `i`'s current view (for invariant checking).
   pub fn replica_view(&self, i: usize) -> vsrr_proto::View {
     self.replicas[i].view()
+  }
+
+  /// Replica `i`'s current checkpoint op (for invariant checking / boundedness gates).
+  pub fn replica_checkpoint_op(&self, i: usize) -> vsrr_proto::OpNumber {
+    self.replicas[i].checkpoint_op()
   }
 
   /// Read access to client `i` (for invariant checking).
@@ -116,11 +146,21 @@ impl Cluster {
   /// recovered replica keeps its identity. Its in-memory state (log cache, SM) is reconstructed
   /// from storage; everything not yet durable is lost (as a real crash would lose it).
   pub fn restart(&mut self, i: usize) {
-    let cfg = Config::try_new(1, ReplicaId::new(i as u8), self.replica_count)
-      .expect("valid cluster config");
+    let cfg = Config::with_checkpoint_ops(
+      1,
+      ReplicaId::new(i as u8),
+      self.replica_count,
+      self.checkpoint_ops,
+    )
+    .expect("valid cluster config");
     let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
-    self.replicas[i] =
-      Endpoint::recover(cfg, seed, LogSm::default(), &mut self.wals[i], &self.sbs[i]);
+    self.replicas[i] = Endpoint::recover(
+      cfg,
+      seed,
+      LogSm::default(),
+      &mut self.wals[i],
+      &mut self.sbs[i],
+    );
     self.crashed[i] = false;
   }
 
