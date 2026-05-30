@@ -14,7 +14,7 @@ std = ["alloc", "bytes/std"]
 
 [dependencies]
 bytes = { workspace = true }
-derive_more = { workspace = true, features = ["display"] }
+derive_more = { workspace = true, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]

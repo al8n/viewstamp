@@ -11,6 +11,18 @@ pub enum CheckResult {
   Violation(String),
 }
 
+impl CheckResult {
+  /// True iff all invariants held.
+  pub const fn is_ok(&self) -> bool {
+    matches!(self, Self::Ok)
+  }
+
+  /// True iff an invariant was violated.
+  pub const fn is_violation(&self) -> bool {
+    matches!(self, Self::Violation(_))
+  }
+}
+
 /// Checks the M1 safety invariants:
 /// 1. **Contiguity/uniqueness** — each replica's applied ops are `1,2,3,…` (no gap, no duplicate).
 /// 2. **Agreement** — across replicas, the shorter applied `(op, body)` sequence is a prefix of

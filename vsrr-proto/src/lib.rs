@@ -26,11 +26,14 @@ mod prng;
 mod state_machine;
 mod status;
 mod time;
-pub use config::Config;
+pub use config::{Config, ConfigError};
 pub use endpoint::Endpoint;
-pub use event::Event;
+pub use event::{Committed, Event};
 pub use id::{ClientId, Peer, Recipient, ReplicaId};
-pub use message::{Commit, Message, Outgoing, Prepare, PrepareOk, Reply, Request};
+pub use message::{
+  Commit, DoViewChange, GetView, Message, Outgoing, Prepare, PrepareOk, PreparedEntry, Reply,
+  Request, StartView, StartViewChange,
+};
 pub use number::{OpNumber, RequestNumber, View};
 pub use prng::Prng;
 pub use state_machine::StateMachine;

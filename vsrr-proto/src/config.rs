@@ -1,5 +1,28 @@
 use crate::{ReplicaId, View};
 
+/// Error constructing a [`Config`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+  /// `replica_count` was zero.
+  #[error("replica_count must be > 0")]
+  ZeroReplicaCount,
+  /// `replica` index is not in `0..replica_count`.
+  #[error("replica index {index} out of range for a {count}-replica cluster")]
+  ReplicaIndexOutOfRange {
+    /// The offending replica index.
+    index: u8,
+    /// The cluster size.
+    count: u8,
+  },
+  /// `replica_count` exceeds the 64-replica limit (the prepare-ok quorum uses a u64 bitset).
+  #[error("replica_count {count} exceeds the maximum of 64 (prepare-ok quorum uses a u64 bitset)")]
+  TooManyReplicas {
+    /// The offending cluster size.
+    count: u8,
+  },
+}
+
 /// Static cluster configuration for one replica. Immutable in v1
 /// (reconfiguration is deferred).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,23 +33,36 @@ pub struct Config {
 }
 
 impl Config {
-  /// Creates a configuration.
+  /// Creates a configuration, validating the cluster invariants.
   ///
-  /// # Panics
-  /// Panics if `replica_count == 0`, `replica.get() >= replica_count`, or `replica_count > 64`.
+  /// # Errors
+  /// Returns [`ConfigError`] if `replica_count == 0`, `replica >= replica_count`,
+  /// or `replica_count > 64`.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(cluster: u128, replica: ReplicaId, replica_count: u8) -> Self {
-    assert!(replica_count > 0, "replica_count must be > 0");
-    assert!(replica.get() < replica_count, "replica index out of range");
-    assert!(
-      replica_count <= 64,
-      "replica_count must be <= 64 (prepare-ok quorum uses a u64 bitset)"
-    );
-    Self {
+  pub const fn try_new(
+    cluster: u128,
+    replica: ReplicaId,
+    replica_count: u8,
+  ) -> Result<Self, ConfigError> {
+    if replica_count == 0 {
+      return Err(ConfigError::ZeroReplicaCount);
+    }
+    if replica.get() >= replica_count {
+      return Err(ConfigError::ReplicaIndexOutOfRange {
+        index: replica.get(),
+        count: replica_count,
+      });
+    }
+    if replica_count > 64 {
+      return Err(ConfigError::TooManyReplicas {
+        count: replica_count,
+      });
+    }
+    Ok(Self {
       cluster,
       replica,
       replica_count,
-    }
+    })
   }
 
   /// The cluster id.
@@ -53,6 +89,22 @@ impl Config {
     (self.replica_count as usize) / 2 + 1
   }
 
+  /// The view-change / DoViewChange quorum: `replica_count − quorum + 1`.
+  ///
+  /// Intersects every replication quorum (`quorum + quorum_view_change > replica_count`),
+  /// so a view change cannot start while normal commit is still possible.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn quorum_view_change(&self) -> usize {
+    self.replica_count as usize - self.quorum() + 1
+  }
+
+  /// The nack-prepare quorum (used by view change to truncate uncommitted ops):
+  /// `replica_count − quorum + 1`. Equal to `quorum_view_change`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn quorum_nack_prepare(&self) -> usize {
+    self.replica_count as usize - self.quorum() + 1
+  }
+
   /// The primary for a given view: `view % replica_count`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn primary(&self, view: View) -> ReplicaId {
@@ -73,7 +125,7 @@ mod tests {
 
   #[test]
   fn quorum_and_primary() {
-    let c = Config::new(42, ReplicaId::new(1), 3);
+    let c = Config::try_new(42, ReplicaId::new(1), 3).expect("valid cluster config");
     assert_eq!(c.replica_count(), 3);
     assert_eq!(c.quorum(), 2); // floor(3/2)+1
     assert_eq!(c.primary(View::with(0)), ReplicaId::new(0));
@@ -85,7 +137,35 @@ mod tests {
 
   #[test]
   fn quorum_five() {
-    let c = Config::new(0, ReplicaId::new(0), 5);
+    let c = Config::try_new(0, ReplicaId::new(0), 5).expect("valid cluster config");
     assert_eq!(c.quorum(), 3);
+  }
+
+  #[test]
+  fn view_change_and_nack_quorums() {
+    // N=3: quorum=2, vc=nack=3-2+1=2.  N=5: quorum=3, vc=nack=3.  N=4: quorum=3, vc=nack=2.
+    let c3 = Config::try_new(0, ReplicaId::new(0), 3).unwrap();
+    assert_eq!(c3.quorum_view_change(), 2);
+    assert_eq!(c3.quorum_nack_prepare(), 2);
+    let c5 = Config::try_new(0, ReplicaId::new(0), 5).unwrap();
+    assert_eq!(c5.quorum_view_change(), 3);
+    let c4 = Config::try_new(0, ReplicaId::new(0), 4).unwrap();
+    assert_eq!(c4.quorum_view_change(), 2); // 4 - 3 + 1
+  }
+
+  #[test]
+  fn try_new_errors() {
+    assert_eq!(
+      Config::try_new(0, ReplicaId::new(0), 0),
+      Err(ConfigError::ZeroReplicaCount)
+    );
+    assert_eq!(
+      Config::try_new(0, ReplicaId::new(3), 3),
+      Err(ConfigError::ReplicaIndexOutOfRange { index: 3, count: 3 })
+    );
+    assert_eq!(
+      Config::try_new(0, ReplicaId::new(0), 65),
+      Err(ConfigError::TooManyReplicas { count: 65 })
+    );
   }
 }
