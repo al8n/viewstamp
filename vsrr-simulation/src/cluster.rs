@@ -157,6 +157,29 @@ impl Cluster {
     self.replicas[i].checkpoint_op()
   }
 
+  /// Replica `i`'s in-memory `log` cache size (for the M3.4b boundedness checker). After GC this is
+  /// bounded by the un-checkpointed tail + pipeline headroom.
+  pub fn replica_log_len(&self, i: usize) -> usize {
+    self.replicas[i].log_len()
+  }
+
+  /// Replica `i`'s primary-pipeline (`inflight`) size (for the M3.4b boundedness checker).
+  pub fn replica_inflight_len(&self, i: usize) -> usize {
+    self.replicas[i].inflight_len()
+  }
+
+  /// Replica `i`'s client-session table size (for the M3.4b boundedness checker). Bounded by the
+  /// active client set, independent of op count.
+  pub fn replica_clients_len(&self, i: usize) -> usize {
+    self.replicas[i].clients_len()
+  }
+
+  /// Replica `i`'s durable WAL entry count (for the M3.4b boundedness checker). After GC this is
+  /// bounded by the un-pruned tail.
+  pub fn wal_len(&self, i: usize) -> usize {
+    self.wals[i].len()
+  }
+
   /// True iff replica `i` is participating in consensus (`Normal` or `ViewChange`) — i.e. it is NOT
   /// still recovering (`Recovering`/`RecoveringHead`). Used by the disk-fault gate to confirm a
   /// restarted replica drove its `Recovering` loop to a participating state.
@@ -241,6 +264,16 @@ impl Cluster {
   pub fn wal_head_for_test(&self, i: usize) -> u64 {
     use vsrr_proto::Wal;
     self.wals[i].op_head().get()
+  }
+
+  /// Test-only (M3.4a): how many state-syncs have fully applied + become durable on replica `i` since
+  /// it was last constructed (`new`/`restart`). The state-sync gate asserts the restarted laggard's
+  /// count goes from 0 to `>= 1` — proving it genuinely STATE-SYNCED (fetched + restored a checkpoint
+  /// past its head) rather than merely catching up op-by-op via retransmit. Mirrors the proto's
+  /// `Endpoint::state_syncs_applied` observability counter.
+  #[doc(hidden)]
+  pub fn replica_state_sync_count(&self, i: usize) -> u64 {
+    self.replicas[i].state_syncs_applied()
   }
 
   /// Test-only: how many of replica `i`'s WAL slots in `1..=op` are PERMANENTLY corrupt (bit-rot or

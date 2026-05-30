@@ -7,9 +7,11 @@
 //! crashes) WITHOUT divergence — committed ops survive crash+restart THROUGH a checkpoint, and
 //! checkpoint-recovery does not strand the replica.
 //!
-//! (GC/prune is deferred to after M3.4 state-sync, so the WAL still holds every op and the recovered
-//! log is rebuilt dense; this gate validates the checkpoint mechanism + checkpoint-based recovery +
-//! dense-log view-change participation — not pruning.)
+//! (As of M3.4b, GC/prune is ENABLED: a replica frees its WAL + per-op caches below its prune floor
+//! once a checkpoint is durable, so the recovered log is the OFFSET tail `(floor .. head]`, not dense
+//! from op 1. This gate still validates the checkpoint mechanism + checkpoint-based recovery + the
+//! recovered replica's view-change participation; the dedicated boundedness + through-the-prune
+//! state-sync gate is `boundedness.rs`.)
 
 use vsrr_simulation::{CheckResult, Cluster, ViewMonotonicChecker, check_safety};
 

@@ -123,6 +123,17 @@ impl InMemoryWal {
       })
       .count()
   }
+
+  /// The number of durable slots currently held (after any prune/truncate). Used by the M3.4b
+  /// boundedness checker to assert the WAL stays bounded over a long run with checkpoint GC.
+  pub fn len(&self) -> usize {
+    self.entries.len()
+  }
+
+  /// True iff the WAL holds no durable slots.
+  pub fn is_empty(&self) -> bool {
+    self.entries.is_empty()
+  }
 }
 
 /// Flips one byte of a body so `Header::verify` fails on read-back (a torn write). An empty body

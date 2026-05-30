@@ -52,6 +52,21 @@ struct PendingCheckpoint {
   step: CheckpointStep,
 }
 
+/// In-flight state-sync bookkeeping (M3.4a). `Some` while a lagging replica is awaiting (or
+/// re-soliciting) a `SyncCheckpoint` for a `RequestSync` it broadcast — and continues to hold while
+/// the synced checkpoint's two superblock writes are being made durable. `None` otherwise. Holds the
+/// highest cluster `checkpoint_op` this replica has LEARNED it is behind (the target — a SyncCheckpoint
+/// that does not advance us past it is ignored) plus the freshness nonce. Cleared only once the synced
+/// checkpoint's durable root write completes (so a crash mid-persist re-solicits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncState {
+  /// The cluster `checkpoint_op` we learned we are behind (from a Commit/Prepare/PrepareOk). We only
+  /// adopt a SyncCheckpoint whose `checkpoint_op >= this`.
+  target: OpNumber,
+  /// Freshness nonce echoed in the SyncCheckpoint (a per-attempt bump of `self.nonce`).
+  nonce: u64,
+}
+
 const PREPARE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
 const COMMIT_HEARTBEAT: core::time::Duration = core::time::Duration::from_millis(50);
 const PRIMARY_IDLE: core::time::Duration = core::time::Duration::from_millis(200);
@@ -74,6 +89,10 @@ const RECOVER_HEAD_SOLICIT: core::time::Duration = core::time::Duration::from_mi
 /// `RequestPrepare` for each unrepaired op, until a peer answers with the missing `Prepare`. Mirrors
 /// the recover-read retransmit cadence; the commit is HELD below the hole until the op arrives.
 const REPAIR_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
+/// State-sync (`Status::Normal`): how often a lagging replica re-broadcasts its `RequestSync`
+/// solicitation while awaiting a `SyncCheckpoint` (and while the adopted checkpoint is being made
+/// durable). Mirrors the other solicitation cadences; cleared once the synced checkpoint is durable.
+const SYNC_SOLICIT: core::time::Duration = core::time::Duration::from_millis(100);
 
 /// In-flight recovery read-bookkeeping for a `Status::Recovering`/`RecoveringHead` replica.
 ///
@@ -159,6 +178,10 @@ struct Timers {
   /// read back permanently faulty). Armed only while `repair` is non-empty; cleared when the last
   /// hole is filled. Active in BOTH primary and backup roles — either may hold a hole after recovery.
   repair_retry: Option<Instant>,
+  /// Normal (state-sync): re-broadcast `RequestSync` while a sync is outstanding (awaiting a
+  /// `SyncCheckpoint` or persisting the adopted one). Armed only while `sync.is_some()`; cleared once
+  /// the synced checkpoint is durable.
+  sync_solicit: Option<Instant>,
 }
 
 /// The Sans-I/O Viewstamped Replication state machine for one replica.
@@ -251,6 +274,27 @@ pub struct Endpoint<S> {
   /// empty once every committed op below the head is present; cleared wholesale when an adopted
   /// canonical log (StartView / new-primary selection) supplies the full committed prefix.
   repair: std::collections::BTreeSet<u64>,
+  /// State-sync (M3.4a): `Some` while this replica is catching up a stale checkpoint via the
+  /// `RequestSync` → `SyncCheckpoint` handshake — set when the trigger fires (it learned the cluster
+  /// checkpointed past its WAL head), held through the durable re-persist of the adopted checkpoint,
+  /// and cleared on the persist's root-write completion. While `Some`, ordinary tail-apply paths are
+  /// not relied upon to catch up (the needed ops are below the cluster checkpoint and may be pruned);
+  /// the `sync_solicit` timer re-broadcasts until a valid `SyncCheckpoint` is applied + made durable.
+  sync: Option<SyncState>,
+  /// State-sync peer side (M3.4a): in-flight checkpoint reads this replica issued to SERVE peers'
+  /// `RequestSync`s, keyed by the read's `OpId` → `(requester, echoed nonce)`. When the read completes
+  /// (`on_sb_done`), the durable snapshot is shipped as a `SyncCheckpoint` to the recorded requester.
+  /// A `Fault` drops the entry silently (the requester re-solicits; another peer answers). Bounded by
+  /// the number of distinct requesters (<= `replica_count`); cleared per entry on completion/fault.
+  sync_serving: BTreeMap<u64, (ReplicaId, u64)>,
+  /// Test/observability counter (M3.4a): how many times a state-sync has fully applied on this
+  /// replica — incremented when an `apply_sync`'s durable re-persist completes (the root write lands
+  /// in `on_sb_done`, the synced checkpoint becomes durable, and the replica resumes as a Normal
+  /// backup). Lets the state-sync sim gate assert NON-VACUITY (the laggard genuinely state-synced
+  /// rather than catching up op-by-op via retransmit). Never reset; monotone across this process's
+  /// lifetime (a fresh `new`/`recover` after a crash starts it back at 0, which is correct — the
+  /// gate counts syncs since the laggard's restart). Exposed only via `state_syncs_applied()`.
+  state_syncs_applied: u64,
 }
 
 impl<S: StateMachine> Endpoint<S> {
@@ -290,6 +334,9 @@ impl<S: StateMachine> Endpoint<S> {
       peer_checkpoint: BTreeMap::new(),
       recover: None,
       repair: std::collections::BTreeSet::new(),
+      sync: None,
+      sync_serving: BTreeMap::new(),
+      state_syncs_applied: 0,
     }
   }
 
@@ -305,15 +352,17 @@ impl<S: StateMachine> Endpoint<S> {
   ///   restored SM already reflects `[1..=checkpoint_op]`, so this prevents a double-apply; monotone
   ///   `op >= commit_max >= commit_min` holds). With no checkpoint (`checkpoint_op == 0`) this is the
   ///   M3.1b behaviour: a fresh `S`, `commit_min == commit_max == 0`.
-  /// - the in-memory log cache built **dense from headers only** (`wal.header(op)` for `op in
-  ///   1..=head`, bodies left empty — filled by Phase 2). Dense because M3.2a never prunes the WAL and
-  ///   view change is not yet checkpoint-aware, so the recovered replica must hold the full log to
-  ///   participate safely; `commit_min == checkpoint_op` means `[1..=checkpoint_op]` are never
-  ///   re-applied (they live in the restored SM) — those cache entries serve only view-change/
-  ///   retransmit. A slot whose `header()` is absent/faulty is still recorded as pending (the read
-  ///   resolves it).
-  /// - `status = Status::Recovering`, and a fresh [`RecoverState`]: every `op in 1..=head` is
-  ///   submitted via `submit_read` (minted `OpId` recorded in `recover.reads`) with a
+  /// - the in-memory log cache built **from headers only over the OFFSET tail** `(checkpoint_op ..
+  ///   head]` (`wal.header(op)`, bodies left empty — filled by Phase 2). NOT dense `[1..=head]`: the
+  ///   committed prefix `[1..=checkpoint_op]` lives in the restored SM snapshot (and a state-synced
+  ///   replica has pruned its WAL there), so the cache holds only ops ABOVE the checkpoint;
+  ///   `commit_min == checkpoint_op` means `[1..=checkpoint_op]` are never re-applied. View change is
+  ///   **offset-aware** (B3: `select_canonical_log` UNIONs the committed band across DVCs, so an
+  ///   offset log carrying only `(checkpoint_op .. head]` is safe — no committed op a different-floor
+  ///   participant needs is dropped). A slot whose `header()` is absent/faulty is still recorded as
+  ///   pending (the read resolves it).
+  /// - `status = Status::Recovering`, and a fresh [`RecoverState`]: every `op in (checkpoint_op ..
+  ///   head]` is submitted via `submit_read` (minted `OpId` recorded in `recover.reads`) with a
   ///   [`RECOVER_READ_RETRIES`] budget in `recover.pending`; if `checkpoint_op > 0` the checkpoint
   ///   read is submitted too (its `OpId` in `recover.checkpoint`).
   ///
@@ -343,12 +392,22 @@ impl<S: StateMachine> Endpoint<S> {
     let nonce = Prng::new(seed).next_u64();
     let head = wal.op_head().get();
     let checkpoint_op = state.checkpoint_op().get();
+    // The recovered head is the WAL head, but never BELOW the durable checkpoint: a STATE-SYNCED
+    // replica (M3.4a) holds no WAL at or below the synced checkpoint (it pruned the WAL there and
+    // never appended the tail), so its `wal.op_head()` can be below `checkpoint_op`. The SM snapshot
+    // owns `[1..=checkpoint_op]`, so the recovered head must be at least `checkpoint_op` to preserve
+    // `op >= commit_max >= commit_min == checkpoint_op`; the tail above re-applies as the primary
+    // re-announces it. (Before state-sync this was a no-op: GC is deferred, so a checkpoint-bearing
+    // WAL always held `[1..=head]` with `head >= checkpoint_op`.) The cache below covers only the
+    // OFFSET tail `(checkpoint_op .. head]` — for a synced replica that range is empty, exactly the
+    // post-sync shape; the prefix `[1..=checkpoint_op]` lives in the restored SM snapshot.
+    let op = head.max(checkpoint_op);
 
     let mut endpoint = Self {
       config,
       status: Status::Recovering,
       view: state.view(),
-      op: OpNumber::with(head),
+      op: OpNumber::with(op),
       // The restored SM reflects [1..=checkpoint_op] exactly; commit_min = checkpoint_op so those
       // ops are NOT re-applied. commit_max = checkpoint_op too (monotone: op >= commit_max >=
       // commit_min). The committed tail (> checkpoint_op) re-applies as the primary re-announces it.
@@ -379,11 +438,22 @@ impl<S: StateMachine> Endpoint<S> {
       peer_checkpoint: BTreeMap::new(),
       recover: None,
       repair: std::collections::BTreeSet::new(),
+      sync: None,
+      sync_serving: BTreeMap::new(),
+      state_syncs_applied: 0,
     };
 
     // Phase 1: build the dense header cache (bodies empty) and submit the tail + checkpoint reads.
+    // The cache + reads cover ONLY the tail ABOVE the checkpoint, `(checkpoint_op..=head]`: the SM
+    // snapshot is authoritative for `[1..=checkpoint_op]` (those ops are never re-applied —
+    // `commit_min == checkpoint_op` — and a STATE-SYNCED replica has pruned its WAL there, so reading
+    // them would spuriously class pruned slots faulty). A recover-from-checkpoint replica and a
+    // state-synced one are thus identical: both hold only the tail above the checkpoint, and the DVC
+    // they later send carries that (offset) tail with `commit == checkpoint_op` (the B3-safe shape
+    // asserted by the A6 tests). `head` may be below `checkpoint_op` for a synced replica → the range
+    // is empty and recovery completes immediately at the synced point.
     let mut rec = RecoverState::default();
-    for op in 1..=head {
+    for op in (checkpoint_op + 1)..=head {
       if let Some(h) = wal.header(OpNumber::with(op)) {
         endpoint.log.insert(
           op,
@@ -501,6 +571,55 @@ impl<S: StateMachine> Endpoint<S> {
     &self.sm
   }
 
+  /// The number of entries in this replica's in-memory `log` cache (the per-op tail cache).
+  ///
+  /// Exposed for the simulation boundedness checker: after M3.4b GC, this is bounded by
+  /// `O(checkpoint_ops + pipeline)` — the un-checkpointed tail `(prune_floor .. head]` plus in-flight
+  /// headroom. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn log_len(&self) -> usize {
+    self.log.len()
+  }
+
+  /// The number of entries in this replica's primary pipeline (`inflight`) map.
+  ///
+  /// Exposed for the simulation boundedness checker (same bound argument as [`Self::log_len`]). Not
+  /// part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn inflight_len(&self) -> usize {
+    self.inflight.len()
+  }
+
+  /// The number of entries in this replica's client-session table (`clients`).
+  ///
+  /// Exposed for the simulation boundedness checker: `clients` is bounded by the active client set
+  /// (one session per client), independent of op count. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn clients_len(&self) -> usize {
+    self.clients.len()
+  }
+
+  /// Test-only: the smallest op number still held in the in-memory `log` cache, or `None` if empty.
+  /// Used to assert GC trimmed the cache below the prune floor.
+  #[cfg(test)]
+  fn min_log_op(&self) -> Option<u64> {
+    self.log.keys().next().copied()
+  }
+
+  /// Test/observability counter (M3.4a): how many state-syncs have fully applied + become durable on
+  /// this replica since it was constructed. Incremented when an `apply_sync`'s durable re-persist
+  /// completes (`on_sb_done` lands the synced checkpoint's root write). The state-sync sim gate uses
+  /// this to assert NON-VACUITY — the laggard genuinely state-synced (>= 1) rather than catching up
+  /// op-by-op via ordinary retransmit. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn state_syncs_applied(&self) -> u64 {
+    self.state_syncs_applied
+  }
+
   /// Mint a fresh storage correlation id.
   fn mint_op_id(&mut self) -> crate::OpId {
     let id = self.next_op_id;
@@ -553,6 +672,10 @@ impl<S: StateMachine> Endpoint<S> {
       Message::RequestPrepare(m) => self.on_request_prepare(now, m),
       Message::Recovery(m) => self.on_recovery(now, m),
       Message::RecoveryResponse(m) => self.on_recovery_response(now, sb, m),
+      // State-sync (M3.4a): a peer's sync solicitation is answered from our durable checkpoint
+      // (`on_request_sync`); a sync response is verified + applied (`on_sync_checkpoint`).
+      Message::RequestSync(m) => self.on_request_sync(now, sb, m),
+      Message::SyncCheckpoint(m) => self.on_sync_checkpoint(now, wal, sb, m),
       Message::Reply(_) => {}
     }
   }
@@ -583,6 +706,9 @@ impl<S: StateMachine> Endpoint<S> {
     // and adopt the reply). It re-solicits every unrepaired committed-op hole until each is filled.
     if self.status.is_normal() {
       self.repair_timeouts(now);
+      // State-sync re-solicitation likewise runs only in Normal: re-broadcast RequestSync while a
+      // sync is outstanding (awaiting a SyncCheckpoint or persisting the adopted one).
+      self.sync_timeouts(now);
     }
   }
 
@@ -707,8 +833,22 @@ impl<S: StateMachine> Endpoint<S> {
       self.on_recover_sb_done(now, wal, sb, done);
       return;
     }
-    let SuperblockDone::Wrote(id) = done else {
-      return; // Outside recovery only durable-root/checkpoint *writes* are expected.
+    // State-sync peer side: outside recovery a `CheckpointRead`/`Fault` means a read WE issued to
+    // serve a peer's `RequestSync` completed — ship the durable snapshot (or drop the serving entry
+    // on a fault; the requester re-solicits). This is status-gated apart from the recover loop above
+    // (that handles reads only while recovering; this handles them while Normal).
+    let id = match done {
+      SuperblockDone::Wrote(id) => id,
+      SuperblockDone::CheckpointRead(cr) => {
+        self.serve_sync_checkpoint(cr);
+        return;
+      }
+      SuperblockDone::Fault(id) => {
+        // A faulted serve-read: drop the serving entry (if any) and stay silent. (A faulted root/
+        // checkpoint WRITE outside recovery is not produced by our backends; dropping is defensive.)
+        self.sync_serving.remove(&id.get());
+        return;
+      }
     };
     // Durable-view write? (matched first; its OpId never aliases a checkpoint write's.)
     if let Some((pending_id, action)) = self.pending_sb {
@@ -745,10 +885,28 @@ impl<S: StateMachine> Endpoint<S> {
           });
         }
         CheckpointStep::AwaitRoot { id: rid } if rid == id => {
-          // The root is durable → the checkpoint is COMPLETE: advance the in-memory checkpoint_op.
-          // (GC / prune of the WAL + maps below the checkpoint lands in Task 5.)
+          // The root is durable → the checkpoint is COMPLETE: advance the in-memory checkpoint_op,
+          // then GC the WAL + per-op caches below the prune floor (M3.4b). GC runs AFTER the durable
+          // root so the recovery point is the new checkpoint; a lost/failing prune is then safe (a
+          // later checkpoint re-prunes). For a state-sync re-persist (below), the WAL was already
+          // truncated+pruned in `apply_sync`, so this is idempotent (prunes below the same floor).
           self.checkpoint_op = pc.target_op;
           self.pending_checkpoint = None;
+          self.run_gc(wal);
+          // State-sync: if this root write completed a SYNC's durable re-persist (rather than an
+          // ordinary checkpoint), the synced checkpoint is now durable → resume as a Normal backup.
+          // Clear the sync bookkeeping + solicit timer and re-arm the Normal timers. (A sync and an
+          // ordinary checkpoint can never be staged together: `apply_sync` runs only while
+          // `sync.is_some()` and gates on `pending_checkpoint.is_none()`, and `maybe_checkpoint`
+          // gates on `pending_checkpoint.is_none()` too — so `sync.is_some()` here means this root
+          // belongs to the sync.)
+          if self.sync.is_some() {
+            self.sync = None;
+            self.timers.sync_solicit = None;
+            // Non-vacuity signal (M3.4a): a state-sync just fully applied + became durable.
+            self.state_syncs_applied += 1;
+            self.arm_timers(now);
+          }
         }
         _ => {} // a stale/superseded completion (e.g. from before a view change) — ignore
       }
@@ -1011,6 +1169,7 @@ impl<S: StateMachine> Endpoint<S> {
       self.view,
       OpNumber::with(op),
       self.commit_min,
+      self.checkpoint_op,
       entry.client,
       entry.request,
       entry.body.clone(),
@@ -1077,6 +1236,263 @@ impl<S: StateMachine> Endpoint<S> {
     true
   }
 
+  // ── State-sync (M3.4a): the trigger + the lagging replica's solicitation ──
+
+  /// The state-sync TRIGGER. A replica enters state-sync iff it is `Normal` AND it learns of a cluster
+  /// checkpoint strictly ABOVE its own head (`incoming_checkpoint > self.op`), via a `checkpoint_op`
+  /// carried on a `Commit`/`Prepare`/`PrepareOk`. A checkpoint at op `C` means a quorum committed AND
+  /// applied through `C`, so ops `[1..=C]` are committed cluster-wide and may be pruned at the source;
+  /// if `C > self.op`, this replica's entire WAL is below the cluster checkpoint, so neither retransmit
+  /// (`commit_min+1..=op`) nor peer fault-repair (a single in-reach op) can close a gap that starts
+  /// under its own head — it must fetch the checkpoint itself. (`> self.op`, not `>= self.op`: an equal
+  /// head means it holds exactly up to the checkpoint and can apply forward by the ordinary path; and
+  /// not `> self.checkpoint_op`, because a replica whose tail still reaches the cluster checkpoint
+  /// catches up by ordinary commit-application — state-sync is only for an out-of-reach gap.) This is
+  /// the conservative, minimal trigger: it never fires when ordinary catch-up suffices, so by
+  /// construction it never syncs past uncommitted state.
+  ///
+  /// Anti-thrash: if a sync is already outstanding (`self.sync.is_some()`) we only RAISE the target
+  /// and re-solicit; we do not start a second handshake.
+  fn maybe_request_sync(&mut self, now: Instant, incoming_checkpoint: OpNumber) {
+    if !self.status.is_normal() {
+      return; // Recovering/RecoveringHead/ViewChange have their own catch-up; never sync from there.
+    }
+    if incoming_checkpoint.get() <= self.op.get() {
+      return; // in reach — ordinary commit-application (or peer-repair) catches us up.
+    }
+    // Already syncing? Only raise the target if this checkpoint is newer, then re-solicit on the
+    // timer cadence — do not emit a fresh handshake per heartbeat.
+    if let Some(s) = self.sync {
+      if incoming_checkpoint.get() > s.target.get() {
+        self.sync = Some(SyncState {
+          target: incoming_checkpoint,
+          nonce: s.nonce,
+        });
+      }
+      return;
+    }
+    // Fresh trigger: bump the nonce deterministically (the sim seeds `self.nonce` from the prng;
+    // a simple increment keeps it deterministic + distinct from the prior recovery/get-view nonce),
+    // record the target, and broadcast the solicitation.
+    self.nonce = self.nonce.wrapping_add(1);
+    self.sync = Some(SyncState {
+      target: incoming_checkpoint,
+      nonce: self.nonce,
+    });
+    self.send_request_sync(now);
+  }
+
+  /// Broadcast a `RequestSync` advertising our CURRENT (stale) checkpoint + the live sync nonce, and
+  /// (re)arm the solicit timer. Any `Normal` peer with a strictly-newer durable checkpoint answers.
+  fn send_request_sync(&mut self, now: Instant) {
+    let nonce = self.sync.map_or(self.nonce, |s| s.nonce);
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::Backups,
+      Message::RequestSync(crate::RequestSync::new(
+        self.view,
+        self.checkpoint_op,
+        self.config.replica(),
+        nonce,
+      )),
+    ));
+    self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+  }
+
+  /// State-sync solicit timer: while a sync is outstanding, re-broadcast `RequestSync` and re-arm.
+  /// Cleared when the synced checkpoint goes durable (`on_sb_done` clears `sync` + this timer).
+  fn sync_timeouts(&mut self, now: Instant) {
+    if !self.timers.sync_solicit.is_some_and(|d| d <= now) {
+      return;
+    }
+    if self.sync.is_none() {
+      self.timers.sync_solicit = None;
+      return;
+    }
+    self.send_request_sync(now);
+  }
+
+  // ── State-sync (M3.4a): the peer side — answer a RequestSync from the durable checkpoint ──
+
+  /// Answer a peer's `RequestSync` by shipping our latest DURABLE checkpoint, iff we are `Normal` and
+  /// hold a checkpoint strictly NEWER than the requester's (else stay silent — never ship a megabyte
+  /// snapshot for a no-op). Any caught-up replica (primary or backup) may answer: a committed
+  /// checkpoint is immutable cluster-wide, so any holder is authoritative for its content. We do not
+  /// keep the encoded envelope in memory after a checkpoint completes, so we read it back from the
+  /// superblock (`submit_read_checkpoint`) and record the read in `sync_serving`; the completion
+  /// (`on_sb_done`) ships the `SyncCheckpoint`.
+  fn on_request_sync<B: Superblock>(&mut self, _now: Instant, sb: &mut B, m: crate::RequestSync) {
+    if !self.status.is_normal() {
+      return; // only a Normal replica has a trustworthy durable checkpoint to serve
+    }
+    if m.replica().get() >= self.config.replica_count() {
+      return; // ignore malformed/out-of-range replica id
+    }
+    if self.checkpoint_op.get() == 0 || self.checkpoint_op.get() <= m.checkpoint_op().get() {
+      return; // nothing durable, or nothing strictly newer than the requester — silent.
+    }
+    let id = self.mint_op_id();
+    sb.submit_read_checkpoint(id);
+    self.sync_serving.insert(id.get(), (m.replica(), m.nonce()));
+  }
+
+  /// Ship a `SyncCheckpoint` for a completed serve-read (the read `on_request_sync` issued). Binds the
+  /// shipped `checkpoint_id` to the shipped bytes via `checkpoint_id(cr.snapshot())` — so even a buggy
+  /// superblock that returned a snapshot inconsistent with its root id cannot make us advertise
+  /// mismatched bytes (the requester re-verifies, but we must not lie cheaply). Re-checks status +
+  /// replica range at SHIP time (both may have changed between submit and completion): if we are no
+  /// longer Normal we drop the reply.
+  fn serve_sync_checkpoint(&mut self, cr: crate::CheckpointRead) {
+    let Some((to, nonce)) = self.sync_serving.remove(&cr.id().get()) else {
+      return; // not a serve-read we issued (a stale/foreign completion) — ignore.
+    };
+    if !self.status.is_normal() {
+      return; // no longer a trustworthy server (entered a view change / recovery) — drop.
+    }
+    if to.get() >= self.config.replica_count() {
+      return; // defensive range re-check.
+    }
+    let snapshot = cr.snapshot_bytes();
+    let id = crate::checkpoint_id(&snapshot);
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::To(Peer::Replica(to)),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        self.view,
+        cr.op(),
+        id,
+        self.config.replica(),
+        nonce,
+        snapshot,
+      )),
+    ));
+  }
+
+  // ── State-sync (M3.4a): apply a verified SyncCheckpoint (the safety-critical core) ──
+
+  /// Receive a `SyncCheckpoint`. Runs the §2.5 guard cascade (status; matching outstanding sync;
+  /// nonce; advances past `target`, our head, and our checkpoint), then the LOAD-BEARING integrity
+  /// gate — `checkpoint_id(snapshot) == checkpoint_id` — and only then `apply_sync`. A failed
+  /// integrity check (a corrupt/forged snapshot) is REJECTED without touching the SM, leaving `sync`
+  /// armed so the timer re-solicits (another peer answers).
+  fn on_sync_checkpoint<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    m: crate::SyncCheckpoint,
+  ) {
+    // Freshness + relevance: we must be a Normal replica with an outstanding sync whose nonce matches.
+    if !self.status.is_normal() {
+      return;
+    }
+    let Some(s) = self.sync else {
+      return; // no sync outstanding (already applied / never triggered) — ignore.
+    };
+    if m.nonce() != s.nonce {
+      return; // a reply to a prior solicitation / forged — not fresh.
+    }
+    // Idempotency under the persist window: while the adopted checkpoint is being made durable a
+    // `pending_checkpoint` is staged; a second SyncCheckpoint arriving then must be dropped (we have
+    // already chosen a snapshot and are persisting it).
+    if self.pending_checkpoint.is_some() {
+      return;
+    }
+    if m.checkpoint_op().get() < s.target.get() {
+      return; // does not advance us past what we know the cluster has committed — ignore.
+    }
+    if m.checkpoint_op().get() <= self.op.get() {
+      return; // a racing tail-apply already covered the checkpoint — no sync needed (re-assert trigger).
+    }
+    if m.checkpoint_op().get() <= self.checkpoint_op.get() {
+      return; // never regress our own checkpoint (monotone).
+    }
+    // The load-bearing integrity gate: never restore a snapshot whose bytes do not hash to the
+    // advertised id (corrupt / forged / torn). Verified BEFORE any SM mutation. Keep `sync` armed so
+    // the solicit timer re-fetches from another peer.
+    if crate::checkpoint_id(m.snapshot()) != m.checkpoint_id() {
+      return;
+    }
+    self.apply_sync(now, wal, sb, &m);
+  }
+
+  /// Apply a verified `SyncCheckpoint`: restore the SM + sessions, advance the metadata to the synced
+  /// point, rebuild the WAL/log for it, and stage the durable re-persist (two superblock writes, reusing
+  /// the checkpoint sequence). `sync` stays `Some` until the root write completes (`on_sb_done`), so a
+  /// crash mid-persist re-solicits.
+  ///
+  /// **No committed op the replica already held AHEAD of the sync can be lost.** The trigger requires
+  /// the synced `checkpoint_op > self.op` (re-asserted by the release-active assert below), so the
+  /// replica's entire held log `[..=self.op]` is at or below the synced point — every op `<=
+  /// checkpoint_op` is already reflected in the restored SM. A *committed* op above `self.op` is
+  /// impossible (committing an op requires having prepared it, which would put it `<= self.op`); the
+  /// only thing discarded is a stale/uncommitted tail at or below the synced checkpoint, which is safe.
+  /// The assert makes any future trigger-loosening that violates this fail loudly rather than silently
+  /// drop a committed op (matching `select_canonical_log`'s fail-stop style).
+  ///
+  /// **Never sync past uncommitted state.** The synced `checkpoint_op` is, by definition, a checkpoint
+  /// a peer made durable — a quorum committed+applied through it — and we additionally gate on
+  /// `>= sync.target`, itself derived from a committed-cluster message. So we never adopt a snapshot
+  /// above the committed frontier.
+  fn apply_sync<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    m: &crate::SyncCheckpoint,
+  ) {
+    let checkpoint_op = m.checkpoint_op();
+    // Release-active safety assert: the synced checkpoint is strictly above our head, so discarding
+    // our held log `[..=op]` cannot drop a committed op (see the method doc's reasoning).
+    assert!(
+      checkpoint_op.get() > self.op.get(),
+      "state-sync must not discard a held op above the synced checkpoint (checkpoint_op {} <= op {})",
+      checkpoint_op.get(),
+      self.op.get()
+    );
+    // Decode + restore the SM and the client-session table from the verified envelope.
+    let (sessions, sm_tail) = Self::decode_checkpoint(m.snapshot());
+    self.sm.restore(sm_tail);
+    self.clients = sessions;
+    // Advance metadata monotonically to the synced point: it becomes the new head (we hold no log
+    // above it) and the applied+committed frontier. `op == commit_max == commit_min == checkpoint_op`
+    // respects `op >= commit_max >= commit_min >= checkpoint_op` with equality at the synced point.
+    self.op = checkpoint_op;
+    self.commit_min = checkpoint_op;
+    self.commit_max = checkpoint_op;
+    // Drop all in-memory tail/pipeline state: we hold no ops below the checkpoint (subsumed by the
+    // snapshot) and none above yet — exactly the post-recover-from-checkpoint shape. Any pending-repair
+    // hole was necessarily `<= checkpoint_op` (it was a committed op below our old head), so it is
+    // subsumed too; clear it and stop the repair timer (mirrors `adopt_canonical_head`).
+    self.log.clear();
+    self.inflight.clear();
+    self.buffer.clear();
+    self.repair.clear();
+    self.timers.repair_retry = None;
+    self.pending.clear();
+    // Rebuild the durable WAL for "head == checkpoint_op, nothing below needed": drop any stale tail
+    // slots ABOVE the synced point (a stale generation that would otherwise read back as a higher,
+    // wrong head on a later restart), then free slots BELOW it (superseded by the snapshot). After
+    // this, `wal.op_head() <= checkpoint_op` with no slot above; we do NOT require the WAL head to
+    // EQUAL `self.op` — state-sync replicas, like recover-from-checkpoint replicas, rebuild the tail
+    // from the primary's next Prepare. The durable ROOT below names `commit = checkpoint_op`, so a
+    // later `recover()` restores cleanly at the synced point.
+    wal.truncate(checkpoint_op);
+    wal.prune(checkpoint_op);
+    // Stage the durable re-persist, reusing the checkpoint two-write sequence so a crash recovers to
+    // the synced point (not the stale one). Step 1: write the snapshot under our own superblock; step
+    // 2 (in `on_sb_done`) writes the new VsrState root naming it. `sync` stays armed until step 2
+    // completes. (No checkpoint can already be in flight — `on_sync_checkpoint` gates on
+    // `pending_checkpoint.is_none()`.)
+    let id = self.mint_op_id();
+    sb.submit_write_checkpoint(id, checkpoint_op, m.snapshot_bytes());
+    self.pending_checkpoint = Some(PendingCheckpoint {
+      target_op: checkpoint_op,
+      checkpoint_id: m.checkpoint_id(),
+      step: CheckpointStep::AwaitSnapshot { id },
+    });
+    // Keep re-soliciting until the persist's root write completes (defends a fault mid-persist).
+    self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+  }
+
   /// If `commit_min` has reached the next checkpoint boundary and no superblock write is pending,
   /// begin a checkpoint: snapshot the SM + client sessions, write the snapshot, and stage step 2.
   ///
@@ -1121,6 +1537,94 @@ impl<S: StateMachine> Endpoint<S> {
       checkpoint_id,
       step: CheckpointStep::AwaitSnapshot { id },
     });
+  }
+
+  // M3.2b: physical bounded-WAL slot reuse + stall-before-wrap (the `Wal` exposes a capacity; the
+  // primary refuses to assign an op that would overwrite an un-pruned slot below `quorum_checkpoint_op`)
+  // is a SEPARATE milestone — see the M3.2b plan. `run_gc` below is the *logical* safety half (the
+  // prune floor a bounded-WAL backend would enforce as a physical stall): it tells the WAL what is
+  // safe to free, never authorizing a free above what a quorum still needs.
+  //
+  /// Post-checkpoint garbage collection: free WAL slots + in-memory per-op cache entries the replica
+  /// no longer needs, once a checkpoint's durable root has landed (called from `on_sb_done`'s
+  /// `AwaitRoot` arm). Run AFTER the root is durable, so the recovery point is the new checkpoint root
+  /// — a crash before/after a (possibly lost or failing) prune is safe: `recover()` re-derives the
+  /// prunable prefix from the durable root and a later checkpoint re-prunes.
+  ///
+  /// # The prune floor (THE safety decision)
+  ///
+  /// An op `N` is freed only when `N <= floor`, and the floor is chosen so that **every freed op is
+  /// already captured in this replica's own durable checkpoint snapshot** (`floor <= self.checkpoint_op`
+  /// always). Concretely:
+  /// - **primary:** `floor = min(self.checkpoint_op, quorum_checkpoint_op())` — never free an op a
+  ///   `quorum` has not yet checkpointed, so a peer still in the live tail (below `quorum_checkpoint_op`)
+  ///   can be served the op it is missing from THIS primary's WAL (`on_request_prepare` /
+  ///   retransmit). Conservative: an unheard peer counts as 0, so a fresh primary frees nothing until
+  ///   fresh `PrepareOk`s raise the quorum floor.
+  /// - **backup:** `floor = self.checkpoint_op` — a backup collects no `PrepareOk`s, so its
+  ///   `quorum_checkpoint_op()` is ~0 (peers default 0); gating a backup on the quorum floor would mean
+  ///   it NEVER prunes and its WAL/log grow unbounded (defeating the boundedness deliverable). A backup
+  ///   instead prunes below its OWN durable checkpoint — those ops are in its snapshot, so it loses
+  ///   nothing locally, and it serves no peer WAL reads that the cluster relies on (the primary +
+  ///   another up-to-date backup retain the live tail).
+  ///
+  /// # Proof no committed op is permanently lost (state-sync is the safety net)
+  ///
+  /// Take any committed op `N` that a laggard `L` might need, and any replica `R` that freed `N`
+  /// (so `N <= R.floor <= R.checkpoint_op` — `N` is in `R`'s snapshot). Two exhaustive cases for `L`:
+  ///
+  /// 1. **`L` is below the cluster checkpoint** (some caught-up replica's `checkpoint_op > L.op`).
+  ///    Then `L`'s state-sync trigger fires on the next `Commit`/`Prepare`/`PrepareOk` it hears
+  ///    (`maybe_request_sync`: `incoming.checkpoint_op() > self.op`), and `L` fetches a checkpoint at
+  ///    op `>= N` (the snapshot subsumes every op `<= N`). `L` recovers `N` via the snapshot — it never
+  ///    needs the freed slot. This is exactly why GC is safe NOW (M3.4a state-sync) but was not before.
+  /// 2. **`N` is above every operational replica's checkpoint** (it is in the recent committed tail).
+  ///    Then NO replica has freed `N` (freeing requires `N <= checkpoint_op`), so `N` is still held by
+  ///    the quorum that committed it, and `L` obtains it by ordinary retransmit (`commit_min+1..=op`)
+  ///    or single-op peer fault-repair (`RequestPrepare` → `Prepare`).
+  ///
+  /// The load-bearing local invariant: **the apply loops never read a freed op.** `commit_op` /
+  /// `advance_commit` read `self.log.get(op)` only for `op > commit_min`, and
+  /// `commit_min >= checkpoint_op >= floor`, so every applied op is strictly above the floor and was
+  /// never freed. Retransmit (`primary_timeouts`, op in `commit_min+1..=op`) is likewise all `> floor`.
+  /// The only reads at/below the floor are *peer-serve* paths (`on_request_prepare`), which return
+  /// silently on a freed op — and case (1)/(2) above show such a peer always has another route.
+  ///
+  /// (Residual, flagged for a later milestone: a `Normal` replica holding a PERMANENTLY-faulty hole at
+  /// `N` *below its own head but above its own checkpoint*, where every replica that ever held `N` has
+  /// pruned it — a correlated multi-replica permanent fault on a single pruned op. Its head `>=`
+  /// the cluster checkpoint, so the `> self.op` sync trigger may not fire, and no peer can serve the
+  /// pruned op: it is stuck (a liveness gap, not an agreement/durability violation — no committed op is
+  /// rewritten). Unreachable under the honest crash-stop + no-fault model of this milestone's gate
+  /// (`StorageFaults::none()` ⇒ append-before-ack ⇒ no hole below a live head). A future
+  /// "stuck-below-the-cluster-checkpoint ⇒ force state-sync" escalation closes it.)
+  fn run_gc<W: Wal>(&mut self, wal: &mut W) {
+    let floor = if self.is_primary() {
+      self
+        .checkpoint_op
+        .get()
+        .min(self.quorum_checkpoint_op().get())
+    } else {
+      // A backup prunes below its OWN checkpoint (it serves no peer WAL reads the cluster relies on);
+      // gating it on the quorum floor would never prune → unbounded WAL/log. See the method doc.
+      self.checkpoint_op.get()
+    };
+    if floor == 0 {
+      return; // nothing safe to free yet (no quorum-acknowledged checkpoint / no own checkpoint)
+    }
+    // `prune(below)` frees slots strictly below `below`; to free ops `<= floor` pass `below = floor+1`.
+    wal.prune(OpNumber::with(floor + 1));
+    // Trim the in-memory per-op caches to `(floor .. head]`. SAFE: the apply loops read only ops
+    // `> commit_min >= checkpoint_op >= floor`, so nothing they touch is removed here; the freed
+    // entries are committed+checkpointed (durable in the SM snapshot) and out of every reach path
+    // except peer-serve, which has the state-sync/retransmit fallbacks proven above.
+    self.log.retain(|&op, _| op > floor);
+    self.inflight.retain(|&op, _| op > floor);
+    self.buffer.retain(|&op, _| op > floor);
+    // `clients` is intentionally NOT trimmed here: it grows per-CLIENT (bounded by the active client
+    // set), not per-op, and dropping a LIVE session risks a dedup miss for a retry whose cached reply
+    // is still needed. Every session was captured in the checkpoint envelope, so a crash + recover
+    // rebuilds them; the unbounded-in-op structures (WAL, log, inflight, buffer) are the ones GC'd.
   }
 
   /// Persist the durable VSR root for the current `(view, log_view, commit_min)` and arm the
@@ -1181,6 +1685,7 @@ impl<S: StateMachine> Endpoint<S> {
               self.view,
               OpNumber::with(op),
               self.commit_min,
+              self.checkpoint_op,
               entry.client,
               entry.request,
               entry.body,
@@ -1318,6 +1823,17 @@ impl<S: StateMachine> Endpoint<S> {
     // Supersede any in-flight checkpoint: a view change drops it (its stale superblock completion is
     // then ignored in on_sb_done). It re-triggers once Normal resumes — commit_min is preserved.
     self.pending_checkpoint = None;
+    // Abandon any in-flight state-sync (M3.4a): a view change supersedes it (state-sync and view
+    // change are mutually exclusive by status — §2.6). If the sync was mid-persist its
+    // `pending_checkpoint` is dropped above; the synced checkpoint is NOT made durable, so the
+    // view-change root below names the prior durable `checkpoint_op` (the Superblock serialized
+    // root-write ordering makes that the winning root). The in-memory SM may already reflect the
+    // synced point (apply_sync restored it) with `commit_min == op == synced_op`, which is internally
+    // consistent; a later crash recovers either clean (empty WAL) or via RecoveringHead (pruned tail
+    // → re-fetch the canonical head from a peer) — both safe, no committed op lost cluster-wide. The
+    // replica re-triggers state-sync from Normal if it is still behind.
+    self.sync = None;
+    self.timers.sync_solicit = None;
     self.svc_from = 0;
     self.dvc_from.clear();
     self.dvc_quorum = false;
@@ -1342,7 +1858,11 @@ impl<S: StateMachine> Endpoint<S> {
     ));
   }
 
-  /// The full in-memory log `[1..=op]` as wire entries.
+  /// The in-memory log as wire entries — the OFFSET tail `(checkpoint_op .. op]` for a
+  /// recover-from-checkpoint / state-synced replica (the committed prefix `[1..=checkpoint_op]` lives
+  /// in the SM snapshot, not the cache), or dense `[1..=op]` for a replica that never checkpointed.
+  /// `select_canonical_log` is offset-aware (B3) and UNIONs these across DVCs, so a DVC carrying only
+  /// the offset tail loses no committed op at view change.
   fn log_entries(&self) -> std::vec::Vec<crate::PreparedEntry> {
     self
       .log
@@ -1355,9 +1875,11 @@ impl<S: StateMachine> Endpoint<S> {
 
   fn on_do_view_change<B: Superblock>(&mut self, now: Instant, sb: &mut B, m: crate::DoViewChange) {
     // NOTE (deferred to M3 message-hardening): we do not yet validate incoming DVC well-formedness
-    // (commit <= op, dense log [1..=op]). Safe under honest crash-stop peers; matters once
-    // untrusted/real-driver inputs land. The cross-DVC commit* <= op_head invariant is enforced
-    // (fail-stop) in `select_canonical_log`.
+    // (commit <= op; the log is the OFFSET tail `(checkpoint .. op]`, dense WITHIN that range — it is
+    // NOT required to be dense from op 1, since a recover-from-checkpoint / state-synced sender
+    // legitimately omits the prefix that lives in its SM snapshot). Safe under honest crash-stop
+    // peers; matters once untrusted/real-driver inputs land. The cross-DVC commit* <= op_head
+    // invariant is enforced (fail-stop) in `select_canonical_log`.
     if m.view() != self.view
       || !self.config.is_primary(self.view)
       || !self.status.is_view_change()
@@ -1396,13 +1918,53 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
-  /// VSR canonical-log selection + nack-prepare truncation.
+  /// VSR canonical-log selection + nack-prepare truncation — **offset-aware** (B3).
   ///
   /// Returns `(canonical log truncated to op_head, op_head, commit*)`:
   /// - the canonical generation is the DVCs with the greatest `log_view`;
   /// - `op_head` is that generation's head, less any provably-uncommitted tail truncated by a
   ///   `quorum_nack_prepare` of nacks (contiguous ⟹ replica `r` nacks op `X` iff `r.op < X`);
-  /// - `commit*` is the greatest commit across all DVCs (commit never rewinds).
+  /// - `commit*` is the greatest commit across all DVCs (commit never rewinds);
+  /// - the canonical log is the **UNION** of the canonical generation's entries up to `op_head` —
+  ///   each op is sourced from ANY canonical-generation DVC that holds it — NOT a copy of one DVC's
+  ///   `log_slice()`.
+  ///
+  /// **Why the union (the B3 safety fix).** Since M3.2a+ a DVC log is the *offset tail*
+  /// `(checkpoint_op .. op]` — a recover-from-checkpoint or state-synced donor holds only ops above
+  /// its own checkpoint (the prefix `[1..=checkpoint_op]` lives in its SM snapshot). Two
+  /// canonical-generation donors can therefore have DIFFERENT floors: e.g. r0 (checkpoint 4) holds
+  /// `5..=10`, r1 (checkpoint 8) holds `9,10`, both head 10 commit 8. The old code copied ONE DVC's
+  /// `log_slice()` via `max_by_key(op)` (ties → highest replica id), which would pick r1's `[9,10]`
+  /// and **silently drop committed ops 5,6,7 that only r0 holds** — the `commit* <= op_head`
+  /// fail-stop does not catch it (the dropped ops are interior). Unioning takes ops 5,6,7 from r0,
+  /// so no committed op held by any canonical donor is dropped.
+  ///
+  /// **The present-set is the log entries themselves (no separate bitset).** An op IS present in a
+  /// DVC iff a `PreparedEntry` for it is in that DVC's `log_slice()`. The `Recovering` loop drops a
+  /// faulty/absent op from the in-memory `log` cache rather than caching an empty body, so
+  /// `log_entries()` (and hence every DVC's `log_slice()`) already omits faulty ops: absence from a
+  /// slice means "this donor cannot supply this op" — whether because it is below the donor's
+  /// checkpoint floor (fine; it is in the donor's snapshot) or because the slot read back faulty
+  /// (then another donor supplies it, or peer-repair does). An explicit `u64` present-bitset would be
+  /// redundant with the slice AND would cap the band at 64 ops, which the offset tail (arbitrarily
+  /// many ops above a checkpoint) can exceed; the slice has no such cap.
+  ///
+  /// **Coverage / no-committed-op-dropped proof.** Let `floor_d = (min op in d.log) - 1` (or `d.op`
+  /// if d's log is empty) be donor `d`'s present-floor, and `min_floor` the minimum over the
+  /// canonical generation. The committed band the canonical log must cover for the worst (lowest-
+  /// floor) adopter is `(min_floor .. commit*]`. For each such op the union includes it iff SOME
+  /// canonical donor holds it. By quorum intersection a committed op was held by some current-DVC
+  /// sender, and the lowest-floor canonical donor `L` (with `floor_L == min_floor`) covers
+  /// `(min_floor .. op_L]`. If `op_L >= commit*`, `L` alone covers the whole band. In the residual
+  /// case where a committed op in `(min_floor .. commit*]` is held by NO canonical donor (the donor
+  /// that committed+checkpointed it past, plus a low-floor donor that lagged the tail), the union
+  /// omits it — but this is **never a silent loss**: the adopter's `advance_commit` HOLDS the commit
+  /// at the missing op and `request_repair`s it from a peer (the B4 `RequestPrepare` → `Prepare`
+  /// safety net, mirroring TigerBeetle's `repair_prepares_between`). The adopt path is fixed to NOT
+  /// destroy a held copy and NOT clear that repair request (see `adopt_log` / `adopt_canonical_head`).
+  /// So the SAFETY property — no committed op is ever dropped — holds: a committed op is present in
+  /// the union when any canonical donor holds it, and otherwise is repaired (commit blocks until
+  /// then), never skipped.
   ///
   /// Run by the prospective primary once it holds `>= quorum_view_change` DoViewChange messages.
   /// NOTE: with exactly `quorum_view_change` DVCs the truncation loop provably never fires in the
@@ -1431,7 +1993,8 @@ impl<S: StateMachine> Endpoint<S> {
     );
 
     // Truncate the uncommitted tail at the first op with a nack quorum (ascending; nacks are
-    // monotonic in op, so the first crossing truncates everything above it).
+    // monotonic in op, so the first crossing truncates everything above it). Unchanged: this acts on
+    // the UNCOMMITTED tail `(commit* .. op_head]` only — a committed op is never truncated.
     let threshold = self.config.quorum_nack_prepare();
     let mut op = commit_star + 1;
     while op <= op_head {
@@ -1443,18 +2006,25 @@ impl<S: StateMachine> Endpoint<S> {
       op += 1;
     }
 
-    // Adopt the canonical DVC with the greatest op, truncated to op_head.
-    let chosen = canonical
-      .iter()
-      .copied()
-      .max_by_key(|d| d.op().get())
-      .expect("canonical set is non-empty");
-    let log: std::vec::Vec<crate::PreparedEntry> = chosen
-      .log_slice()
-      .iter()
-      .filter(|entry| entry.op().get() <= op_head)
-      .cloned()
-      .collect();
+    // Build the canonical log by UNIONING the canonical generation's entries up to op_head: for each
+    // op, take its `PreparedEntry` from any canonical donor that holds it. A committed op present in a
+    // low-floor donor's offset log but absent from a higher-floor donor is therefore STILL included.
+    // The BTreeMap keys by op so the result is ordered+gapless-where-present; `or_insert_with` keeps
+    // the FIRST canonical donor's copy of each op. The donor choice is immaterial: every donor of the
+    // canonical generation agrees on a committed op's content (same prior-view prepare), and an
+    // uncommitted tail op `(commit* .. op_head]` is identical across the canonical generation too (it
+    // is the same prepared op — the canonical `op_head` holder's value).
+    let mut merged: BTreeMap<u64, crate::PreparedEntry> = BTreeMap::new();
+    for d in &canonical {
+      for entry in d.log_slice() {
+        if entry.op().get() <= op_head {
+          merged
+            .entry(entry.op().get())
+            .or_insert_with(|| entry.clone());
+        }
+      }
+    }
+    let log: std::vec::Vec<crate::PreparedEntry> = merged.into_values().collect();
     (log, op_head, commit_star)
   }
 
@@ -1471,29 +2041,41 @@ impl<S: StateMachine> Endpoint<S> {
       self.pending_checkpoint.is_none(),
       "no checkpoint may be logically in flight when forming a new primary's view"
     );
-    // Canonical-log selection + nack-prepare truncation (see `select_canonical_log`).
+    // Offset-aware canonical-log selection (UNION) + nack-prepare truncation (see
+    // `select_canonical_log`). The canonical log is the offset tail `(min_floor .. op_head]`, NOT
+    // necessarily dense `[1..=op_head]`.
     let (canonical_log, op_head, commit_star) = self.select_canonical_log();
-    self.adopt_log(&canonical_log);
+    self.adopt_log(&canonical_log, commit_star);
     self.op = OpNumber::with(op_head);
-    // The adopted canonical log supplies the full committed prefix `[1..=op_head]`; any pending-repair
-    // holes (committed ⟹ <= op_head) are now filled by `adopt_log`. Retire the repair set + its timer.
-    self.repair.clear();
+    // Retire any pending-repair holes the adopted canonical log NOW supplies; leave the rest (a
+    // committed op held by no canonical donor) for `advance_commit` below to re-`request_repair` from
+    // a peer. We must NOT blanket-clear `repair` here: a committed op the union could not carry is a
+    // real hole that must stay solicited, not be silently forgotten.
+    let supplied: std::collections::BTreeSet<u64> =
+      canonical_log.iter().map(|e| e.op().get()).collect();
+    self.repair.retain(|op| !supplied.contains(op));
+    if self.repair.is_empty() {
+      self.timers.repair_retry = None;
+    }
     // status is still ViewChange here, so the maybe_checkpoint at advance_commit's tail is a no-op
     // (checkpoints only start in Normal) — a checkpoint must not race the StartViewAsPrimary
     // durable-view write submitted below.
     self.advance_commit(now, sb, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
 
-    // Reconstruct client sessions from the adopted log. A backup-turned-primary has no
-    // session state; without this, a client's retry of an already-adopted request would be
-    // mis-deduplicated by `on_request` — re-executed (request 1) or stalled (request > 1).
-    // Record each client's highest accepted request so retries deduplicate.
+    // Backfill the client-session request high-water from the adopted in-memory log tail. This is a
+    // fallback that only covers the ops still cached in `self.log` (the offset tail `(floor .. op]`).
+    // The AUTHORITATIVE source of the dedup watermark is now apply-time tracking in `advance_commit`
+    // (and `on_request`/`commit_op` on the primary) plus the checkpoint snapshot restored on
+    // recover/state-sync — those survive M3.4b GC, whereas this loop does NOT (GC prunes `self.log`
+    // below the checkpoint, so for a backup whose log is empty this loop finds nothing). Keeping it is
+    // harmless (it can only RAISE the watermark for ops the new primary still holds) and guards the
+    // edge where a session row was somehow not yet recorded. Without the apply-time tracking, a
+    // backup-turned-primary with a GC'd log would carry `session.request == 0` and wedge every client
+    // on `on_request`'s gap check — the M3.4b boundedness/offset-view-change hang this fixed.
     //
-    // NOTE (deferred to the message-loss fault-sweep milestone): we do NOT yet reconstruct the
-    // cached *reply* body, so a client whose prior-view reply was LOST cannot be re-served the
-    // cached reply here (it relies on the in-flight op re-committing, or — for already-committed
-    // ops under loss — must be handled when the loss/partition faults land). Session-request
-    // reconstruction below closes the at-most-once SAFETY hole; the lost-reply resend is liveness
-    // under loss and is owned by the later fault-sweep milestone.
+    // NOTE (deferred to the message-loss fault-sweep milestone): we still do NOT reconstruct the
+    // cached *reply* body, so a client whose prior-view reply was LOST relies on the in-flight op
+    // re-committing; the lost-reply resend is liveness under loss, owned by the later milestone.
     for op in 1..=self.op.get() {
       let Some((client, request)) = self.log.get(&op).map(|e| (e.client.get(), e.request)) else {
         continue;
@@ -1544,9 +2126,27 @@ impl<S: StateMachine> Endpoint<S> {
     self.try_commit(now, sb);
   }
 
-  /// Replace the in-memory log with the given wire entries.
-  fn adopt_log(&mut self, entries: &[crate::PreparedEntry]) {
-    self.log.clear();
+  /// Adopt the canonical (`entries`) log for a view whose committed frontier is `commit`.
+  ///
+  /// The canonical log is now built by UNIONING the canonical generation (see
+  /// `select_canonical_log`) and is the offset tail `(min_floor .. op_head]` — it is NOT necessarily
+  /// dense `[1..=op]`, and it may even OMIT a committed op held by NO canonical donor. So adoption
+  /// must be **defensive**: it preserves any *committed* op the adopter already holds (in
+  /// `(.. =commit]`) that `entries` does not supply, rather than blindly clearing the log and
+  /// destroying the adopter's own durable copy of a committed op. Held *uncommitted* ops (above
+  /// `commit`) are governed solely by the canonical tail (a nack-truncated / lower-generation tail
+  /// must not be resurrected from a stale local copy), so they are dropped; the canonical entries
+  /// then overwrite/insert authoritatively. A committed op that neither side supplies is left for
+  /// `advance_commit` to `request_repair` from a peer (it is never silently skipped).
+  fn adopt_log(&mut self, entries: &[crate::PreparedEntry], commit: u64) {
+    let supplied: std::collections::BTreeSet<u64> = entries.iter().map(|e| e.op().get()).collect();
+    // Retain only the committed ops the canonical log omits (`op <= commit` and not in `supplied`):
+    // those are the adopter's own authoritative copies of committed ops a different-floor canonical
+    // generation could not carry. Everything else (uncommitted tail, ops the canonical log supplies)
+    // is dropped so the canonical entries below are authoritative.
+    self
+      .log
+      .retain(|&op, _| op <= commit && !supplied.contains(&op));
     for e in entries {
       self.log.insert(
         e.op().get(),
@@ -1587,10 +2187,16 @@ impl<S: StateMachine> Endpoint<S> {
   /// **No committed op is lost.** A `RecoveringHead` replica has already restored its durable
   /// checkpoint prefix `[1..=checkpoint_op]` into the SM during `Recovering` (so
   /// `commit_min == checkpoint_op`); the `op >= commit_min` assert below rejects any head that would
-  /// rewind below that durable prefix. The adopted log is dense `[1..=op]` from the canonical primary
-  /// and therefore supplies every committed op above the checkpoint; `advance_commit` then applies
-  /// `[commit_min+1..=commit]` from those adopted bodies. The checkpointed prefix lives in the SM,
-  /// the rest comes from the canonical log — the committed prefix is reconstructed end to end.
+  /// rewind below that durable prefix. The adopted log is the offset tail `(min_floor .. op]` from the
+  /// canonical primary (NOT necessarily dense `[1..=op]` — the primary may itself be a
+  /// recover-from-checkpoint / state-synced replica whose log starts above op 1). `adopt_log` is
+  /// therefore defensive: it **preserves any committed op the adopter already holds** that the
+  /// incoming offset log omits, instead of clearing the log and destroying the adopter's own durable
+  /// copy. `advance_commit` then applies `(commit_min .. commit]` from the union of the preserved
+  /// held copies and the adopted entries; should a committed op be supplied by NEITHER, it
+  /// `request_repair`s it from a peer and HOLDS the commit there (never skips it). The checkpointed
+  /// prefix lives in the SM, the committed tail in the (preserved+adopted) log — the committed prefix
+  /// is reconstructed end to end, with peer-repair as the backstop for any op neither side carries.
   fn adopt_canonical_head<B: Superblock>(
     &mut self,
     now: Instant,
@@ -1609,8 +2215,18 @@ impl<S: StateMachine> Endpoint<S> {
       "must not rewind below our committed op"
     );
     self.view = view;
-    self.adopt_log(log);
+    self.adopt_log(log, commit.get());
     self.op = op;
+    // Retire any pending-repair holes the adopted canonical log NOW supplies (or that the adopter's
+    // own preserved copy now covers, since `adopt_log` kept committed held ops). Holes the canonical
+    // log omits AND the adopter does not hold remain solicited; `advance_commit` below re-requests
+    // them. This MUST happen before `advance_commit` (which may add new holes) so we never wipe a
+    // freshly-requested committed-op repair.
+    let now_held: std::collections::BTreeSet<u64> = self.log.keys().copied().collect();
+    self.repair.retain(|op| !now_held.contains(op));
+    if self.repair.is_empty() {
+      self.timers.repair_retry = None;
+    }
     // status is still ViewChange/RecoveringHead here, so the maybe_checkpoint at advance_commit's
     // tail is a no-op (checkpoints only start in Normal) — a checkpoint must not race the
     // AdoptedStartView durable-view write submitted below.
@@ -1625,10 +2241,10 @@ impl<S: StateMachine> Endpoint<S> {
     // RecoveringHead replica that reaches here via this path leaves `recover` = None (the field is
     // structurally None in every non-recovering status). A non-recovering adopter already has None.
     self.recover = None;
-    // The adopted canonical log is dense `[1..=op]` with real bodies, supplying every committed op the
-    // adopter was peer-repairing — `adopt_log` filled those slots, so any pending-repair holes (all
-    // <= op, since they were committed) are now resolved. Retire the repair set + its timer.
-    self.repair.clear();
+    // (The pending-repair set was reconciled above — holes the adopted log / preserved held copies now
+    // cover were retired; any committed op neither side carries stays solicited and was re-requested by
+    // `advance_commit`. We deliberately do NOT blanket-clear `repair` here: that was the B3 stranding
+    // bug — clearing right after `advance_commit` requested a hole silently forgot a committed op.)
     // Abandon in-flight WAL appends from the old view (see transition_to_view_change_status).
     self.pending.clear();
     // Drop stale per-replica checkpoint reports from the old generation (see
@@ -1637,6 +2253,12 @@ impl<S: StateMachine> Endpoint<S> {
     // Supersede any in-flight checkpoint from the old view (its stale superblock completion is then
     // ignored). The view-change root below preserves the durable checkpoint_op via submit_durable_view.
     self.pending_checkpoint = None;
+    // Abandon any in-flight state-sync: adopting an authoritative canonical head supersedes it (the
+    // adopted canonical log + the adopter's preserved committed ops supply the committed prefix, with
+    // peer-repair as the backstop). See the note in `transition_to_view_change_status` on the
+    // mid-persist case (safe; re-syncs from Normal if still behind).
+    self.sync = None;
+    self.timers.sync_solicit = None;
     self.dvc_quorum = false;
     self.arm_timers(now);
     // Defer held-op re-acks to on_sb_done: persist the new view before acking in it.
@@ -1672,6 +2294,11 @@ impl<S: StateMachine> Endpoint<S> {
     self.pending_sb = None;
     // Likewise drop any in-flight checkpoint from the prior view; it re-triggers once Normal resumes.
     self.pending_checkpoint = None;
+    // Abandon any in-flight state-sync (mutually exclusive with view change; see
+    // `transition_to_view_change_status`). A replica catching up to a newer view re-triggers
+    // state-sync from Normal if it is still behind the cluster checkpoint.
+    self.sync = None;
+    self.timers.sync_solicit = None;
     self.svc_target = view;
     self.svc_from = 0;
     self.dvc_from.clear();
@@ -1856,6 +2483,7 @@ impl<S: StateMachine> Endpoint<S> {
         self.view,
         self.op,
         self.commit_min,
+        self.checkpoint_op,
         client,
         request,
         body_bytes,
@@ -1989,6 +2617,12 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.repair.is_empty() {
       self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
     }
+    // State-sync solicitation runs alongside the role timers: while a sync is outstanding (awaiting a
+    // SyncCheckpoint or persisting the adopted one), keep re-soliciting. Only Normal triggers/serves a
+    // sync, so a non-Normal status structurally carries no `sync` (it is cleared on durability).
+    if self.sync.is_some() {
+      self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+    }
   }
 
   fn on_prepare<W: Wal, B: Superblock>(
@@ -2016,6 +2650,16 @@ impl<S: StateMachine> Endpoint<S> {
     }
     // Heard from the primary — defer the idle timeout.
     self.note_primary_contact(now);
+    // State-sync trigger: a `Prepare` from a fresh primary may be the first signal a lagging backup
+    // sees of the cluster's checkpoint. If the cluster checkpointed past our WAL head, solicit a
+    // SyncCheckpoint instead of buffering this (unreachable) prepare forever.
+    self.maybe_request_sync(now, p.checkpoint_op());
+    // While a sync is outstanding we will catch up via the snapshot, not by tail-apply: drop the
+    // prepare (do not buffer ops we can never reach below the cluster checkpoint). The synced
+    // checkpoint's apply rebuilds the head; the primary's next Prepare/Commit then extends the tail.
+    if self.sync.is_some() {
+      return;
+    }
     // Durable-view-before-participate: a pending superblock view-change write means status==Normal
     // but our view is not yet persisted. Acking a prepare now would cast a vote in a view we could
     // regress out of on crash → cross-view double-vote. Drop it; the primary retransmits the prepare.
@@ -2098,6 +2742,18 @@ impl<S: StateMachine> Endpoint<S> {
       };
       let reply = self.sm.apply(OpNumber::with(op), &entry.body);
       self.commit_min = OpNumber::with(op);
+      // Maintain the client-session request high-water as we apply (mirrors the primary's `commit_op`,
+      // minus the reply body a backup discards). This is the at-most-once dedup watermark a
+      // backup-turned-primary needs in `on_request`. It MUST be tracked here on every apply — NOT
+      // reconstructed from the `log` cache when becoming primary — because M3.4b GC prunes the `log`
+      // below the checkpoint, so a backup whose log is empty (everything checkpointed+pruned) would
+      // otherwise carry a stale `session.request` of 0 and wedge every client on the gap check
+      // (`r.request() != session.request + 1`). The snapshot also restores these on recover/state-sync,
+      // so the watermark survives both GC and a checkpoint restore.
+      let session = self.clients.entry(entry.client.get()).or_default();
+      if entry.request.get() > session.request.get() {
+        session.request = entry.request;
+      }
       self
         .events
         .push_back(Event::Committed(crate::Committed::new(
@@ -2128,6 +2784,9 @@ impl<S: StateMachine> Endpoint<S> {
     self
       .peer_checkpoint
       .insert(ok.replica().get(), ok.checkpoint_op());
+    // State-sync trigger (symmetric): a backup reporting a checkpoint above our head means we are the
+    // laggard (e.g. a partition-healed old primary). The `> self.op` gate keeps this a no-op normally.
+    self.maybe_request_sync(now, ok.checkpoint_op());
     if let Some(inflight) = self.inflight.get_mut(&ok.op().get()) {
       inflight.oks |= 1u64 << ok.replica().get();
     }
@@ -2150,6 +2809,9 @@ impl<S: StateMachine> Endpoint<S> {
     self
       .peer_checkpoint
       .insert(self.config.primary(self.view).get(), c.checkpoint_op());
+    // State-sync trigger: if the cluster has checkpointed past our WAL head, solicit a SyncCheckpoint
+    // (the ops we'd need are below the cluster checkpoint and may be pruned — tail-apply can't reach).
+    self.maybe_request_sync(now, c.checkpoint_op());
     self.advance_commit(now, sb, c.commit().get());
   }
 
@@ -2178,6 +2840,7 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.recover_retry,
       self.timers.recover_head,
       self.timers.repair_retry,
+      self.timers.sync_solicit,
     ]
     .into_iter()
     .flatten()
@@ -2613,10 +3276,16 @@ mod tests {
   }
 
   fn prepare(op: u64, commit: u64) -> Message {
+    prepare_ck(op, commit, 0)
+  }
+
+  /// A `Prepare` carrying an explicit `checkpoint_op` (the state-sync trigger signal).
+  fn prepare_ck(op: u64, commit: u64, checkpoint_op: u64) -> Message {
     Message::Prepare(Prepare::new(
       View::new(),
       OpNumber::with(op),
       OpNumber::with(commit),
+      OpNumber::with(checkpoint_op),
       ClientId::new(7),
       RequestNumber::with(op),
       Bytes::copy_from_slice(&[op as u8]),
@@ -3068,6 +3737,7 @@ mod tests {
         View::with(1),
         OpNumber::with(1),
         OpNumber::with(0),
+        OpNumber::with(0),
         ClientId::new(7),
         RequestNumber::with(1),
         bytes::Bytes::from_static(b"x"),
@@ -3364,6 +4034,7 @@ mod tests {
       View::with(view),
       OpNumber::with(op),
       OpNumber::with(commit),
+      OpNumber::with(0),
       ClientId::new(7),
       RequestNumber::with(op),
       Bytes::copy_from_slice(&[op as u8]),
@@ -3886,6 +4557,7 @@ mod tests {
         View::with(5),
         OpNumber::with(3),
         OpNumber::with(2),
+        OpNumber::with(0),
         ClientId::new(7),
         RequestNumber::with(3),
         Bytes::from_static(b"z"),
@@ -4034,6 +4706,7 @@ mod tests {
       View::with(5),
       OpNumber::with(3),
       OpNumber::with(2),
+      OpNumber::with(0),
       ClientId::new(7),
       RequestNumber::with(3),
       Bytes::from_static(b"z"),
@@ -4370,6 +5043,7 @@ mod tests {
         View::with(1),
         OpNumber::with(2),
         OpNumber::with(1),
+        OpNumber::with(0),
         ClientId::new(7),
         RequestNumber::with(2),
         bytes::Bytes::from_static(b"b"),
@@ -4713,6 +5387,142 @@ mod tests {
   }
 
   #[test]
+  fn checkpoint_gcs_wal_and_maps_below_the_quorum_checkpoint() {
+    // M3.4b GC: once a checkpoint is durable, the WAL slots + in-memory caches below the prune floor
+    // are freed. Single replica (quorum 1) → quorum_checkpoint_op == self.checkpoint_op, so the floor
+    // is the checkpoint op (2): ops <= 2 are pruned from the WAL and the log/inflight caches, while a
+    // NEW request still commits (apply reads from commit_min, not from a pruned op).
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
+    let mut e = Endpoint::new(cfg, 0, EchoSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    let req = |rn: u64| {
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      ))
+    };
+    for rn in 1..=2 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        req(rn),
+      );
+      e.handle_storage(now, &mut wal, &mut sb); // append durable → commit; on op 2, checkpoint completes
+    }
+    assert_eq!(e.checkpoint_op(), OpNumber::with(2));
+    // Quorum=1 → prune floor = checkpoint_op = 2 → ops <= 2 are freed from the WAL.
+    assert!(
+      wal.header(OpNumber::with(1)).is_none(),
+      "op 1 pruned from the WAL"
+    );
+    assert!(
+      wal.header(OpNumber::with(2)).is_none(),
+      "op 2 pruned from the WAL"
+    );
+    // The in-memory log + inflight caches are trimmed to (floor .. head] = empty here (head == 2).
+    assert_eq!(
+      e.min_log_op(),
+      None,
+      "log cache trimmed entirely below the checkpoint (nothing above op 2 yet)"
+    );
+    assert_eq!(e.log_len(), 0, "log cache empty after the prune");
+    assert_eq!(
+      e.inflight_len(),
+      0,
+      "inflight cache trimmed below the checkpoint"
+    );
+    // A NEW request still commits (op 3) — the SM applies from commit_min, not from a pruned op.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      req(3),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(
+      e.commit(),
+      OpNumber::with(3),
+      "commit continues past the pruned checkpoint"
+    );
+    assert_eq!(
+      e.min_log_op(),
+      Some(3),
+      "op 3 is cached above the floor; the pruned prefix stays gone"
+    );
+  }
+
+  #[test]
+  fn backup_gcs_below_its_own_checkpoint_even_without_quorum_reports() {
+    // A backup never collects PrepareOks, so its `quorum_checkpoint_op` would be 0 (peers default 0)
+    // — if GC used the quorum floor on a backup, the backup would never prune and its WAL/log would
+    // grow unbounded. M3.4b's asymmetric floor lets a BACKUP prune below its OWN durable checkpoint
+    // (those ops are in its snapshot; a laggard below it state-syncs). This test drives a backup
+    // (replica 1 of 3) to a durable checkpoint via Prepares + Commits and asserts it pruned.
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+    let mut e = Endpoint::new(cfg, 0, EchoSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // The backup has heard from no peers → its quorum_checkpoint_op is 0 (conservative).
+    assert_eq!(e.quorum_checkpoint_op(), OpNumber::with(0));
+    // Append ops 1,2 via Prepares from the primary (replica 0, view 0), pumping the durable append.
+    for op in 1..=2u64 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Replica(ReplicaId::new(0)),
+        Message::Prepare(Prepare::new(
+          View::new(),
+          OpNumber::with(op),
+          OpNumber::with(op - 1), // commit lags by one so each Prepare also commits the prior op
+          OpNumber::new(),        // primary's checkpoint_op (0; irrelevant here)
+          ClientId::new(7),
+          RequestNumber::with(op),
+          Bytes::from(std::vec![op as u8]),
+        )),
+      );
+      e.handle_storage(now, &mut wal, &mut sb);
+    }
+    // Commit op 2 so the backup's commit_min reaches the boundary and it checkpoints.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(e.commit(), OpNumber::with(2), "backup committed op 2");
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(2),
+      "backup took a durable checkpoint at op 2"
+    );
+    // The backup's quorum floor is STILL 0: N=3 needs 2 replicas to report a checkpoint, but only
+    // self reports 2 (peers default 0) → the quorum-th-highest is 0. This is exactly why a backup
+    // cannot use the quorum floor (it would never prune). It pruned below its OWN checkpoint instead.
+    assert_eq!(
+      e.quorum_checkpoint_op(),
+      OpNumber::with(0),
+      "the backup's quorum floor is 0 (only self reports a checkpoint) — yet it still pruned"
+    );
+    assert!(
+      wal.header(OpNumber::with(1)).is_none() && wal.header(OpNumber::with(2)).is_none(),
+      "a backup prunes its WAL below its own checkpoint (boundedness), no quorum reports needed"
+    );
+    assert_eq!(
+      e.log_len(),
+      0,
+      "backup log cache trimmed below its own checkpoint"
+    );
+  }
+
+  #[test]
   fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
     // A single-replica primary commits past a checkpoint (checkpoint_ops=2), so the checkpoint is
     // durable; then it "crashes". recover() MUST restore the SM from the checkpoint snapshot and set
@@ -4983,6 +5793,1045 @@ mod tests {
       e.quorum_checkpoint_op(),
       OpNumber::with(2),
       "single-replica quorum checkpoint follows self's checkpoint"
+    );
+  }
+
+  // ── State-sync (M3.4a) ──
+
+  /// Drive a real 3-replica primary (replica 0) to a DURABLE checkpoint at `ckpt`, returning the
+  /// endpoint + its storage so a test can read the checkpoint envelope back (the donor for sync apply
+  /// tests). `checkpoint_ops == ckpt`, so committing `ckpt` ops takes exactly one checkpoint.
+  fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb) {
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, ckpt).unwrap();
+    let mut e = Endpoint::new(cfg, 0, CountSm::default());
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    let req = |rn: u64| {
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      ))
+    };
+    for rn in 1..=ckpt {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        req(rn),
+      );
+      e.handle_storage(now, &mut wal, &mut sb); // primary's own append durable (own vote)
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Replica(ReplicaId::new(1)),
+        Message::PrepareOk(PrepareOk::new(
+          View::new(),
+          OpNumber::with(rn),
+          ReplicaId::new(1),
+          OpNumber::new(),
+        )),
+      );
+      e.handle_storage(now, &mut wal, &mut sb); // drain checkpoint writes
+    }
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(ckpt),
+      "donor checkpoint is durable"
+    );
+    (e, wal, sb)
+  }
+
+  /// Read the durable checkpoint envelope (+ its id) back from a donor's superblock.
+  fn donor_envelope(sb: &TestSb) -> (Bytes, u128) {
+    let (_op, env) = sb
+      .checkpoint
+      .clone()
+      .expect("donor has a durable checkpoint snapshot");
+    let id = sb.state().checkpoint_id();
+    assert_eq!(
+      crate::checkpoint_id(&env),
+      id,
+      "donor envelope hashes to its durable id"
+    );
+    (env, id)
+  }
+
+  /// Capture the nonce of the `RequestSync` a replica just emitted (and drain the rest).
+  fn captured_sync_nonce(e: &mut Endpoint<CountSm>) -> u64 {
+    let mut nonce = None;
+    while let Some(out) = e.poll_message() {
+      if let Message::RequestSync(r) = out.msg_ref() {
+        nonce = Some(r.nonce());
+      }
+    }
+    nonce.expect("a RequestSync was emitted")
+  }
+
+  // A backup over CountSm (replica 1 of 3) — the laggard in sync tests.
+  fn sync_backup() -> Endpoint<CountSm> {
+    Endpoint::new(
+      Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap(),
+      0,
+      CountSm::default(),
+    )
+  }
+
+  #[test]
+  fn stale_checkpoint_commit_triggers_request_sync() {
+    // replica 1 of 3, Normal, head op 0, checkpoint 0. A Commit advertising checkpoint_op=8 (> our
+    // head) means the cluster checkpointed past our entire WAL → we must state-sync.
+    let mut e = sync_backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(10),
+        OpNumber::with(8),
+      )),
+    );
+    let mut saw = None;
+    while let Some(out) = e.poll_message() {
+      if let Message::RequestSync(r) = out.msg_ref() {
+        saw = Some(*r);
+      }
+    }
+    let r = saw.expect("a stale-checkpoint replica broadcasts RequestSync");
+    assert_eq!(
+      r.checkpoint_op(),
+      OpNumber::with(0),
+      "advertises our stale checkpoint"
+    );
+    assert_eq!(r.replica(), ReplicaId::new(1));
+    assert_eq!(
+      e.status(),
+      Status::Normal,
+      "still Normal (sync is in-band, not a status)"
+    );
+  }
+
+  #[test]
+  fn stale_checkpoint_prepare_triggers_request_sync() {
+    // A `Prepare` (not just a Commit) carrying checkpoint_op > our head also triggers the sync — the
+    // A2 signal closes the last trigger gap for a backup that only ever hears Prepares.
+    let mut e = sync_backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare_ck(9, 8, 8));
+    let mut saw_sync = false;
+    while let Some(out) = e.poll_message() {
+      saw_sync |= out.msg_ref().is_request_sync();
+    }
+    assert!(
+      saw_sync,
+      "a Prepare advertising a far-ahead checkpoint triggers state-sync"
+    );
+  }
+
+  #[test]
+  fn in_reach_checkpoint_does_not_trigger_sync() {
+    // checkpoint_op == our head (8) and we hold the tail → ordinary catch-up suffices, NO sync.
+    let mut e = sync_backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    for op in 1..=8 {
+      e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(op, 0));
+      e.handle_storage(now, &mut wal, &mut sb);
+    }
+    while e.poll_message().is_some() {}
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(8),
+        OpNumber::with(8),
+      )),
+    );
+    let mut saw_sync = false;
+    while let Some(out) = e.poll_message() {
+      saw_sync |= out.msg_ref().is_request_sync();
+    }
+    assert!(!saw_sync, "checkpoint within our held log → no state-sync");
+  }
+
+  #[test]
+  fn already_syncing_does_not_emit_a_second_handshake_per_heartbeat() {
+    // Once a sync is outstanding, a second Commit only RAISES the target — it does not emit a fresh
+    // RequestSync per heartbeat (only the timer re-solicits).
+    let mut e = sync_backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(10),
+        OpNumber::with(8),
+      )),
+    );
+    let first: usize = {
+      let mut n = 0;
+      while let Some(out) = e.poll_message() {
+        n += usize::from(out.msg_ref().is_request_sync());
+      }
+      n
+    };
+    assert_eq!(first, 1, "the trigger emits exactly one RequestSync");
+    // A second heartbeat (even a higher checkpoint) must NOT emit another handshake immediately.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(12),
+        OpNumber::with(10),
+      )),
+    );
+    let second: usize = {
+      let mut n = 0;
+      while let Some(out) = e.poll_message() {
+        n += usize::from(out.msg_ref().is_request_sync());
+      }
+      n
+    };
+    assert_eq!(
+      second, 0,
+      "a second heartbeat raises the target but emits no fresh handshake"
+    );
+  }
+
+  #[test]
+  fn primary_answers_request_sync_with_sync_checkpoint() {
+    // A donor primary with a durable checkpoint at op 2 answers a lagging replica's RequestSync by
+    // shipping a SyncCheckpoint with the right op/id/snapshot/nonce, addressed back to the requester.
+    let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
+    let now = Instant::ZERO;
+    while e.poll_message().is_some() {} // drain prepares/replies from the warm-up
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::RequestSync(crate::RequestSync::new(
+        e.view(),
+        OpNumber::with(0),
+        ReplicaId::new(2),
+        0xCAFE,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // the checkpoint read completes → ship SyncCheckpoint
+    let mut shipped = None;
+    while let Some(out) = e.poll_message() {
+      if let Message::SyncCheckpoint(s) = out.msg_ref() {
+        shipped = Some((out.to(), s.clone()));
+      }
+    }
+    let (to, s) = shipped.expect("primary ships a SyncCheckpoint");
+    assert_eq!(to, Recipient::To(Peer::Replica(ReplicaId::new(2))));
+    assert_eq!(s.checkpoint_op(), OpNumber::with(2));
+    assert_eq!(s.checkpoint_id(), sb.state().checkpoint_id());
+    assert_eq!(s.nonce(), 0xCAFE);
+    assert_eq!(
+      crate::checkpoint_id(s.snapshot()),
+      s.checkpoint_id(),
+      "shipped snapshot provably matches its advertised id"
+    );
+  }
+
+  #[test]
+  fn peer_without_newer_checkpoint_does_not_answer_request_sync() {
+    // A replica whose checkpoint == requester's (or 0) ships nothing (no megabyte for a no-op).
+    let mut e = sync_backup(); // checkpoint 0
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::RequestSync(crate::RequestSync::new(
+        e.view(),
+        OpNumber::with(0),
+        ReplicaId::new(0),
+        1,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert!(e.poll_message().is_none(), "nothing newer → silent");
+  }
+
+  /// Trigger a sync on a laggard backup and deliver `m`, returning the post-delivery endpoint state.
+  /// `donor_sb` provides the durable checkpoint snapshot the laggard re-persists to.
+  fn sync_apply_harness(checkpoint_op: u64) -> (Endpoint<CountSm>, TestWal, TestSb, Bytes, u128) {
+    let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(checkpoint_op);
+    let (env, id) = donor_envelope(&dsb);
+    let e = sync_backup();
+    let wal = TestWal::default();
+    let sb = TestSb::default();
+    (e, wal, sb, env, id)
+  }
+
+  #[test]
+  fn sync_checkpoint_restores_and_resumes_at_the_synced_point() {
+    let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+    let now = Instant::ZERO;
+    // Trigger sync (Commit advertising checkpoint_op=4), capture the nonce it used.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(4),
+        OpNumber::with(4),
+      )),
+    );
+    let nonce = captured_sync_nonce(&mut e);
+    // Deliver the SyncCheckpoint.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id,
+        ReplicaId::new(0),
+        nonce,
+        env.clone(),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // drive the durable re-persist (TestSb synchronous)
+    assert_eq!(e.checkpoint_op(), OpNumber::with(4));
+    assert_eq!(e.commit(), OpNumber::with(4));
+    assert_eq!(e.commit_max(), OpNumber::with(4));
+    assert_eq!(e.op(), OpNumber::with(4));
+    assert_eq!(e.status(), Status::Normal);
+    assert_eq!(
+      e.state_machine().applied().len(),
+      4,
+      "SM restored from the snapshot, not replayed"
+    );
+    assert_eq!(
+      sb.state().checkpoint_op(),
+      OpNumber::with(4),
+      "synced checkpoint is now durable"
+    );
+    assert_eq!(sb.state().checkpoint_id(), id);
+  }
+
+  #[test]
+  fn sync_checkpoint_with_mismatched_id_is_rejected_not_restored() {
+    // A corrupt/forged snapshot whose bytes don't hash to the advertised id MUST NOT be restored.
+    let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(4),
+        OpNumber::with(4),
+      )),
+    );
+    let nonce = captured_sync_nonce(&mut e);
+    let bad_env = Bytes::from_static(b"not the real envelope");
+    let advertised = 0xDEAD_BEEF_u128; // != checkpoint_id(bad_env)
+    assert_ne!(advertised, crate::checkpoint_id(&bad_env));
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        advertised,
+        ReplicaId::new(0),
+        nonce,
+        bad_env,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "rejected: checkpoint not advanced"
+    );
+    assert_eq!(
+      e.state_machine().applied().len(),
+      0,
+      "rejected: SM untouched"
+    );
+    // sync stays armed → it re-solicits on the timer.
+    assert!(
+      e.poll_timeout().is_some(),
+      "sync remains armed to re-solicit"
+    );
+  }
+
+  #[test]
+  fn stale_nonce_sync_checkpoint_is_ignored() {
+    let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(4),
+        OpNumber::with(4),
+      )),
+    );
+    let nonce = captured_sync_nonce(&mut e);
+    // Deliver a SyncCheckpoint with the WRONG nonce — must be ignored.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id,
+        ReplicaId::new(0),
+        nonce.wrapping_add(1),
+        env,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "wrong nonce → ignored"
+    );
+    assert_eq!(e.state_machine().applied().len(), 0);
+  }
+
+  #[test]
+  fn sync_checkpoint_below_target_is_ignored() {
+    // A SyncCheckpoint whose checkpoint_op does not even reach the target we learned the cluster has
+    // committed (an out-of-date peer answering with an OLDER checkpoint) → ignored: it would not
+    // advance us past the committed frontier. (Target 6; a reply at op 4 is dropped.)
+    let mut e = sync_backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let (_d, _dw, dsb) = donor_primary_at_checkpoint(4);
+    let (env4, id4) = donor_envelope(&dsb);
+    let now = Instant::ZERO;
+    // Trigger a sync targeting 6 (the cluster's known checkpoint).
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(6),
+        OpNumber::with(6),
+      )),
+    );
+    let nonce = captured_sync_nonce(&mut e);
+    // A stale peer answers with checkpoint 4 (< target 6): must be ignored.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id4,
+        ReplicaId::new(0),
+        nonce,
+        env4,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "a SyncCheckpoint below the learned target is ignored (would not reach the committed frontier)"
+    );
+    assert!(
+      e.poll_timeout().is_some(),
+      "sync stays armed to await a checkpoint >= target"
+    );
+  }
+
+  #[test]
+  fn sync_checkpoint_without_an_outstanding_sync_is_ignored() {
+    // A SyncCheckpoint arriving with NO sync outstanding (never triggered, or already applied) is
+    // dropped — never an unsolicited restore. This also covers the "duplicate after apply" case (the
+    // first apply clears `sync`, so a re-delivery finds no outstanding sync).
+    let mut e = sync_backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let (_d, _dw, dsb) = donor_primary_at_checkpoint(4);
+    let (env, id) = donor_envelope(&dsb);
+    let now = Instant::ZERO;
+    // No trigger fired → sync is None. Deliver a (valid) SyncCheckpoint anyway.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id,
+        ReplicaId::new(0),
+        0xABCD,
+        env,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "an unsolicited SyncCheckpoint (no outstanding sync) is ignored"
+    );
+    assert_eq!(e.state_machine().applied().len(), 0);
+  }
+
+  #[test]
+  fn lower_sync_checkpoint_is_ignored_after_a_higher_one() {
+    // Monotonicity: after syncing to checkpoint 4, a later SyncCheckpoint advertising a LOWER
+    // checkpoint must never regress us. (We forge a stale reply at the same nonce/below our point.)
+    let (mut e, mut wal, mut sb, env4, id4) = sync_apply_harness(4);
+    let (_d2, _dw2, dsb2) = donor_primary_at_checkpoint(2);
+    let (env2, id2) = donor_envelope(&dsb2);
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(4),
+        OpNumber::with(4),
+      )),
+    );
+    let nonce = captured_sync_nonce(&mut e);
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id4,
+        ReplicaId::new(0),
+        nonce,
+        env4,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(e.checkpoint_op(), OpNumber::with(4));
+    // A stale lower SyncCheckpoint (op 2) arriving now: sync is already cleared, and even if it
+    // weren't, `> self.checkpoint_op` fails. It must be ignored — no regression.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(2),
+        id2,
+        ReplicaId::new(0),
+        nonce,
+        env2,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(4),
+      "a lower SyncCheckpoint never regresses us"
+    );
+    assert_eq!(e.commit(), OpNumber::with(4));
+  }
+
+  #[test]
+  fn sync_checkpoint_clears_a_pending_repair_hole_below_the_synced_point() {
+    // A replica with a `repair` hole at op 2 that then syncs a checkpoint at op 5 drops the hole
+    // (subsumed by the snapshot) and stops the repair timer.
+    let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(6);
+    // Use a checkpoint at 6 so it is strictly above the hole at 2 and the head.
+    let (env, id) = donor_envelope(&dsb);
+    let mut e = sync_backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // Manufacture a pending-repair hole at op 2 (as the recover loop would).
+    e.request_repair(now, 2);
+    assert!(e.repair.contains(&2), "hole registered");
+    assert!(e.timers.repair_retry.is_some(), "repair timer armed");
+    // Trigger + apply a sync to checkpoint 6 (above the hole).
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(6),
+        OpNumber::with(6),
+      )),
+    );
+    let nonce = captured_sync_nonce(&mut e);
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(6),
+        id,
+        ReplicaId::new(0),
+        nonce,
+        env,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(e.checkpoint_op(), OpNumber::with(6));
+    assert!(
+      e.repair.is_empty(),
+      "the hole below the synced point is subsumed + cleared"
+    );
+    assert!(e.timers.repair_retry.is_none(), "repair timer stopped");
+  }
+
+  #[test]
+  fn recover_after_state_sync_restores_the_synced_checkpoint() {
+    // Durability-before-resume: after a sync goes durable, a crash + recover() must come back at the
+    // synced checkpoint (the durable root names it), not the stale one.
+    let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(4),
+        OpNumber::with(4),
+      )),
+    );
+    let nonce = captured_sync_nonce(&mut e);
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id,
+        ReplicaId::new(0),
+        nonce,
+        env,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
+    drop(e); // crash
+    // Recover from the same wal/sb: the synced checkpoint is the durable root.
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+    let mut recovered = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+    assert_eq!(
+      recovered.checkpoint_op(),
+      OpNumber::with(4),
+      "recovered at the synced checkpoint"
+    );
+    assert_eq!(recovered.commit(), OpNumber::with(4));
+    assert_eq!(
+      recovered.op(),
+      OpNumber::with(4),
+      "op >= commit_min must hold after recover (the synced head, not a sub-checkpoint WAL head)"
+    );
+    recovered.handle_storage(now, &mut wal, &mut sb); // restore SM from the synced snapshot → Normal
+    assert_eq!(recovered.status(), Status::Normal);
+    assert_eq!(
+      recovered.state_machine().applied().len(),
+      4,
+      "recovered SM reflects the synced checkpoint prefix"
+    );
+  }
+
+  // ── State-sync (M3.4a) — A6: view-change / B3-interaction safety (regression guards) ──
+
+  #[test]
+  fn synced_replica_reports_its_checkpoint_in_view_change() {
+    // After syncing to checkpoint 4, force the replica into a view change and inspect its DVC: it must
+    // report commit == 4 (the synced point) with log_view <= view and a tail that does NOT start at
+    // op 1 — exactly the recover-from-checkpoint shape (this is the B3 interaction; no B3 code here).
+    // Use replica 2 of 3 as the laggard: in view 1 the primary is replica 1 (not itself), so it sends
+    // a DoViewChange we can capture (a replica that is itself the next primary would form the
+    // canonical log directly instead of sending a DVC).
+    let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(4);
+    let (env, id) = donor_envelope(&dsb);
+    let mut e = Endpoint::new(
+      Config::with_checkpoint_ops(1, ReplicaId::new(2), 3, 2).unwrap(),
+      0,
+      CountSm::default(),
+    );
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(4),
+        OpNumber::with(4),
+      )),
+    );
+    let nonce = {
+      let mut nonce = None;
+      while let Some(out) = e.poll_message() {
+        if let Message::RequestSync(r) = out.msg_ref() {
+          nonce = Some(r.nonce());
+        }
+      }
+      nonce.expect("a RequestSync was emitted")
+    };
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(4),
+        id,
+        ReplicaId::new(0),
+        nonce,
+        env,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(e.checkpoint_op(), OpNumber::with(4));
+    assert_eq!(e.status(), Status::Normal);
+    while e.poll_message().is_some() {}
+
+    // Force a view change to view 1 (primary = replica 1): replica 2 proposes view 1 on idle, a peer
+    // SVC completes the quorum → ViewChange(1) → it sends a DoViewChange to replica 1.
+    let later = now + core::time::Duration::from_millis(300);
+    e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1 (own bit)
+    e.handle_message(
+      later,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    );
+    assert_eq!(e.status(), Status::ViewChange);
+    assert_eq!(e.view(), View::with(1));
+    e.handle_storage(later, &mut wal, &mut sb); // durable-view write completes → DVC is sent
+    let mut dvc = None;
+    while let Some(out) = e.poll_message() {
+      if let Message::DoViewChange(d) = out.msg_ref() {
+        dvc = Some(d.clone());
+      }
+    }
+    let dvc = dvc.expect("a synced backup sends a DoViewChange");
+    assert_eq!(
+      dvc.commit(),
+      OpNumber::with(4),
+      "reports the synced checkpoint as commit, not a sparse log"
+    );
+    assert_eq!(
+      dvc.op(),
+      OpNumber::with(4),
+      "head is the synced point (tail-empty)"
+    );
+    assert!(dvc.log_view().get() <= dvc.view().get(), "log_view <= view");
+    // The carried log is the (empty) tail above the checkpoint — it does NOT fabricate ops [1..=4].
+    assert!(
+      dvc.log_slice().iter().all(|e| e.op().get() > 4),
+      "the DVC log is the tail above the synced checkpoint (no fabricated sub-checkpoint ops)"
+    );
+  }
+
+  /// A DVC whose dense log starts at `floor+1` (a state-synced donor, checkpoint at `floor`), head
+  /// `op`, commit `commit`. Models the offset log a synced replica carries.
+  fn dvc_offset(replica: u8, log_view: u64, floor: u64, op: u64, commit: u64) -> DoViewChange {
+    let log = ((floor + 1)..=op)
+      .map(|i| {
+        PreparedEntry::new(
+          OpNumber::with(i),
+          ClientId::new(1),
+          RequestNumber::with(i),
+          bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
+        )
+      })
+      .collect();
+    DoViewChange::new(
+      View::with(log_view + 10),
+      View::with(log_view),
+      OpNumber::with(op),
+      OpNumber::with(commit),
+      ReplicaId::new(replica),
+      log,
+    )
+  }
+
+  #[test]
+  fn canonical_selection_with_a_checkpoint_offset_log_is_safe() {
+    // A canonical generation where one DVC's log starts above op 1 (its donor was state-synced to
+    // checkpoint 4, commit 4) must not be mis-truncated, and the commit* <= op_head fail-stop must not
+    // trip for a synced participant (its commit == op_head == checkpoint when tail-empty).
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+    // r0: a full-from-1 log (head 5, commit 4). r1: the SAME generation but state-synced — its log
+    // starts at op 5 (checkpoint 4), head 5, commit 4. Same log_view → both canonical.
+    e.dvc_from.insert(0, dvc(0, 1, 5, 4));
+    e.dvc_from.insert(1, dvc_offset(1, 1, 4, 5, 4));
+    let (log, op_head, commit_star) = e.select_canonical_log();
+    assert_eq!(
+      op_head, 5,
+      "the offset log does not shorten the canonical head"
+    );
+    assert_eq!(commit_star, 4, "commit* preserved");
+    assert!(
+      commit_star <= op_head,
+      "the fail-stop invariant holds for an offset-log participant"
+    );
+    // The UNION covers [1..=5]: r0 supplies the prefix the offset r1 omits, so no op is dropped.
+    let present: std::collections::BTreeSet<u64> = log.iter().map(|e| e.op().get()).collect();
+    assert_eq!(
+      present,
+      (1..=5u64).collect::<std::collections::BTreeSet<u64>>(),
+      "the union of r0's full log and r1's offset log covers ops 1..=5"
+    );
+  }
+
+  #[test]
+  fn view_change_abandons_an_outstanding_sync() {
+    // State-sync and view change are mutually exclusive by status: a higher-view message arriving
+    // while a sync is outstanding takes the replica into ViewChange and clears the stale sync (so the
+    // sync_solicit timer does not linger). The replica re-triggers state-sync from Normal if still
+    // behind.
+    let mut e = sync_backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // Trigger a sync (in view 0).
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(8),
+        OpNumber::with(8),
+      )),
+    );
+    while e.poll_message().is_some() {}
+    assert!(e.poll_timeout().is_some(), "sync armed");
+    // A higher-view Commit arrives → catch_up_to_view → ViewChange, which must clear the sync.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::Commit(Commit::new(
+        View::with(1),
+        OpNumber::with(8),
+        OpNumber::with(8),
+      )),
+    );
+    assert_eq!(e.status(), Status::ViewChange);
+    assert!(
+      e.sync.is_none(),
+      "the outstanding sync is abandoned on entering a view change"
+    );
+    assert!(
+      e.timers.sync_solicit.is_none(),
+      "the sync solicit timer is cleared"
+    );
+  }
+
+  #[test]
+  fn canonical_selection_with_a_fully_checkpoint_synced_participant_is_safe() {
+    // The extreme: a state-synced participant whose tail is EMPTY (head == commit == checkpoint 4, no
+    // log entries at all). select_canonical_log must handle commit == op_head with an empty offset log
+    // without panicking or fabricating ops.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+    e.dvc_from.insert(0, dvc(0, 1, 5, 4));
+    e.dvc_from.insert(1, dvc_offset(1, 1, 4, 4, 4)); // tail-empty synced participant
+    let (_log, op_head, commit_star) = e.select_canonical_log();
+    assert_eq!(op_head, 5);
+    assert_eq!(commit_star, 4);
+    assert!(commit_star <= op_head);
+  }
+
+  // ── B3: offset-aware canonical-log selection (UNION committed entries across DVCs) ──
+
+  #[test]
+  fn select_canonical_log_unions_committed_ops_across_different_floor_dvcs() {
+    // The reviewer's reproduction (the heart of B3): TWO different-floor offset DVCs in the SAME
+    // canonical generation, both head op 10 commit 8. r0 (floor 4) holds ops 5..=10; r1 (floor 8) holds
+    // only 9,10. Both tie at op 10, so the OLD `max_by_key(op)` (ties → highest replica id) picks r1's
+    // log [9,10] and SILENTLY DROPS committed ops 5,6,7 — which only r0 holds. The `commit* <= op_head`
+    // fail-stop does NOT trip (the dropped ops are interior). select_canonical_log MUST instead UNION:
+    // the returned canonical log must cover EVERY committed op (5..=8) that ANY canonical DVC holds.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+    e.dvc_from.insert(0, dvc_offset(0, 1, 4, 10, 8)); // floor 4: holds 5,6,7,8,9,10
+    e.dvc_from.insert(1, dvc_offset(1, 1, 8, 10, 8)); // floor 8: holds 9,10 only
+    let (log, op_head, commit_star) = e.select_canonical_log();
+    assert_eq!(op_head, 10, "canonical head is the generation's head");
+    assert_eq!(commit_star, 8, "commit* is the greatest commit");
+    // The committed band the union MUST cover: ops 5..=8 (above the lowest floor 4, up to commit*).
+    // Without the union fix the log would be just [9,10] and these would be absent.
+    let present: std::collections::BTreeSet<u64> = log.iter().map(|e| e.op().get()).collect();
+    for op in 5..=8u64 {
+      assert!(
+        present.contains(&op),
+        "committed op {op} (held only by r0's offset log) must be in the canonical log, not dropped"
+      );
+    }
+    // And the uncommitted tail r0 holds (9,10) is included too (no nack quorum truncates it here).
+    assert!(
+      present.contains(&9) && present.contains(&10),
+      "the head ops are present"
+    );
+    // The entries are the real ones (op-tagged bodies), not fabricated.
+    for entry in &log {
+      assert_eq!(
+        entry.body(),
+        &entry.op().get().to_be_bytes()[..],
+        "each unioned entry carries the donor's real body"
+      );
+    }
+  }
+
+  #[test]
+  fn select_canonical_log_stitches_the_band_across_three_offset_donors() {
+    // Three canonical-generation donors with staggered floors must be STITCHED so the committed band
+    // is fully covered even though NO single donor holds it all. N=5, quorum_view_change=3.
+    //   r0: floor 0, holds 1,2,3 (head 3)         — the prefix
+    //   r1: floor 3, holds 4,5,6 (head 6)         — the middle
+    //   r2: floor 6, holds 7,8 (head 8, commit 8) — the suffix + the committed frontier
+    // commit* = 8, op_head = 8. The union must produce a dense [1..=8] — dropping any of 1..=8 would
+    // lose a committed op some lower-floor adopter needs.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+    e.dvc_from.insert(0, dvc_offset(0, 1, 0, 3, 3));
+    e.dvc_from.insert(1, dvc_offset(1, 1, 3, 6, 6));
+    e.dvc_from.insert(2, dvc_offset(2, 1, 6, 8, 8));
+    let (log, op_head, commit_star) = e.select_canonical_log();
+    assert_eq!(op_head, 8);
+    assert_eq!(commit_star, 8);
+    let present: std::collections::BTreeSet<u64> = log.iter().map(|e| e.op().get()).collect();
+    assert_eq!(
+      present,
+      (1..=8u64).collect::<std::collections::BTreeSet<u64>>(),
+      "the union stitches all three offset donors into a gapless committed band 1..=8"
+    );
+  }
+
+  #[test]
+  fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
+    // End-to-end defence: a backup holds committed ops 5..=8 in its OFFSET log (checkpoint 4, those ops
+    // committed by a prior-view quorum but not yet locally applied: commit_min == 4, op == 8). It then
+    // adopts a StartView whose canonical log is itself OFFSET and starts at op 9 (it does NOT carry
+    // 5..=8) but whose commit is 8. The OLD adopt_log `self.log.clear()` would DESTROY the backup's own
+    // copies of 5..=8, advance_commit would `request_repair(5)`, and adopt_canonical_head's
+    // `repair.clear()` would then WIPE that request — stranding the replica below commit with a divergent
+    // SM. After the fix the backup keeps 5..=8, applies them, commit reaches 8, and the SM holds 5..=8.
+    let mut e = Endpoint::new(
+      Config::try_new(1, ReplicaId::new(2), 3).unwrap(),
+      0,
+      CountSm::default(),
+    );
+    // Hand-build the offset-backup state: checkpoint 4, committed prefix [1..=4] in the SM (commit_min
+    // == commit_max == checkpoint_op == 4), and the offset tail 5..=8 held in the in-memory log.
+    e.checkpoint_op = OpNumber::with(4);
+    e.commit_min = OpNumber::with(4);
+    e.commit_max = OpNumber::with(4);
+    e.op = OpNumber::with(8);
+    for op in 5..=8u64 {
+      e.log.insert(
+        op,
+        LogEntry {
+          client: ClientId::new(7),
+          request: RequestNumber::with(op),
+          body: Bytes::copy_from_slice(&op.to_be_bytes()),
+        },
+      );
+    }
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // The canonical StartView for view 1 from primary 1: an OFFSET log starting at op 9 (head 10),
+    // commit 8. It does NOT carry ops 5..=8 — those must survive from the adopter's own log.
+    let sv = StartView::new(
+      View::with(1),
+      OpNumber::with(10),
+      OpNumber::with(8),
+      ReplicaId::new(1),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(9),
+          ClientId::new(7),
+          RequestNumber::with(9),
+          Bytes::copy_from_slice(&9u64.to_be_bytes()),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(10),
+          ClientId::new(7),
+          RequestNumber::with(10),
+          Bytes::copy_from_slice(&10u64.to_be_bytes()),
+        ),
+      ],
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::StartView(sv),
+    );
+    assert_eq!(e.status(), Status::Normal, "adoption completes");
+    assert_eq!(
+      e.commit(),
+      OpNumber::with(8),
+      "commit reaches 8: the committed ops 5..=8 were applied, not lost"
+    );
+    // The SM applied exactly ops 5..=8 (the prior prefix [1..=4] lived in the checkpoint, not re-applied).
+    let applied: std::vec::Vec<u64> = e.sm.applied().iter().map(|(op, _)| *op).collect();
+    assert_eq!(
+      applied,
+      std::vec![5, 6, 7, 8],
+      "the SM has the committed ops 5..=8 the offset StartView omitted"
+    );
+    assert!(
+      e.repair.is_empty(),
+      "no committed op is left stranded in the repair set"
     );
   }
 }
