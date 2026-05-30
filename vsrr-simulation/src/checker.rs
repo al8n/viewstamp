@@ -195,6 +195,70 @@ impl ViewMonotonicChecker {
   }
 }
 
+/// Asserts the per-op in-memory maps (`log` cache, `inflight` pipeline) and each replica's durable
+/// WAL stay **bounded** over a run — the M3.4b promise that post-checkpoint GC bounds the structures
+/// that previously grew without bound in op count.
+///
+/// Without GC these grow with the total committed-op count (one `log`/WAL entry per op forever); with
+/// GC they plateau near the un-checkpointed tail (a few `checkpoint_ops` intervals) plus pipeline
+/// headroom. The bounds are generous constants chosen so a real leak (no GC) trips while normal
+/// fluctuation does not. The `clients` table is bounded separately by the active client set (one
+/// session per client), so it is checked against a client-count-derived bound, not the per-op bound.
+#[derive(Debug)]
+pub struct BoundednessChecker {
+  /// Max allowed entries in any per-op map (`log`, `inflight`) and any WAL.
+  max_per_op: usize,
+  /// Max allowed client-session entries on any replica.
+  max_clients: usize,
+}
+
+impl BoundednessChecker {
+  /// A checker bounding each per-op map + WAL to `max_per_op` entries and each session table to
+  /// `max_clients` entries.
+  pub const fn new(max_per_op: usize, max_clients: usize) -> Self {
+    Self {
+      max_per_op,
+      max_clients,
+    }
+  }
+
+  /// Sample the cluster; a violation if any per-op map, WAL, or session table exceeds its bound.
+  /// Call every tick — a single over-bound observation anywhere in the run fails the gate.
+  pub fn observe(&self, cluster: &Cluster) -> CheckResult {
+    for i in 0..cluster.replica_count() {
+      let log = cluster.replica_log_len(i);
+      if log > self.max_per_op {
+        return CheckResult::Violation(format!(
+          "replica {i}: log cache {log} exceeds bound {} (GC not bounding the per-op cache)",
+          self.max_per_op
+        ));
+      }
+      let inflight = cluster.replica_inflight_len(i);
+      if inflight > self.max_per_op {
+        return CheckResult::Violation(format!(
+          "replica {i}: inflight {inflight} exceeds bound {}",
+          self.max_per_op
+        ));
+      }
+      let wal = cluster.wal_len(i);
+      if wal > self.max_per_op {
+        return CheckResult::Violation(format!(
+          "replica {i}: WAL {wal} exceeds bound {} (prune not freeing slots below the checkpoint)",
+          self.max_per_op
+        ));
+      }
+      let clients = cluster.replica_clients_len(i);
+      if clients > self.max_clients {
+        return CheckResult::Violation(format!(
+          "replica {i}: client sessions {clients} exceeds bound {}",
+          self.max_clients
+        ));
+      }
+    }
+    CheckResult::Ok
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

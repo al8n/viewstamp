@@ -49,12 +49,15 @@ impl Request {
 }
 
 /// Primary → backups: replicate a prepared operation. Carries the primary's
-/// current commit number (piggybacked).
+/// current commit number (piggybacked) and its latest durable `checkpoint_op` (the state-sync
+/// trigger signal — `Commit`/`PrepareOk` carry it too, so a lagging backup that only ever sees a
+/// `Prepare` from a fresh primary still learns the cluster's checkpoint).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepare {
   view: View,
   op: OpNumber,
   commit: OpNumber,
+  checkpoint_op: OpNumber,
   client: ClientId,
   request: RequestNumber,
   body: Bytes,
@@ -66,6 +69,7 @@ impl Prepare {
     view: View,
     op: OpNumber,
     commit: OpNumber,
+    checkpoint_op: OpNumber,
     client: ClientId,
     request: RequestNumber,
     body: Bytes,
@@ -74,6 +78,7 @@ impl Prepare {
       view,
       op,
       commit,
+      checkpoint_op,
       client,
       request,
       body,
@@ -96,6 +101,12 @@ impl Prepare {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn commit(&self) -> OpNumber {
     self.commit
+  }
+
+  /// The op number of the sender's latest durable checkpoint (the state-sync trigger signal).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
   }
 
   /// The issuing client.
@@ -394,7 +405,10 @@ impl DoViewChange {
     self.replica
   }
 
-  /// The sender's full in-memory log `[1..=op]` as a slice.
+  /// The sender's in-memory log as a slice — the OFFSET tail `(checkpoint .. op]` for a
+  /// recover-from-checkpoint / state-synced sender (its committed prefix lives in its SM snapshot),
+  /// or dense `[1..=op]` otherwise. The new primary's `select_canonical_log` is offset-aware and
+  /// UNIONs these across DVCs, so an offset slice drops no committed op at view change.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn log_slice(&self) -> &[PreparedEntry] {
     &self.log
@@ -459,7 +473,9 @@ impl StartView {
     self.replica
   }
 
-  /// The canonical full log `[1..=op]` as a slice.
+  /// The canonical log as a slice — the new primary's UNIONed offset tail `(min_floor .. op]` (B3),
+  /// which an adopter merges with its own preserved committed ops (it is not necessarily dense
+  /// `[1..=op]` if the primary itself checkpointed/state-synced).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn log_slice(&self) -> &[PreparedEntry] {
     &self.log
@@ -643,7 +659,9 @@ impl RecoveryResponse {
     self.nonce
   }
 
-  /// The canonical full log `[1..=op]` as a slice (empty from a backup).
+  /// The canonical log as a slice (empty from a backup) — a primary's UNIONed offset tail
+  /// `(min_floor .. op]` (B3), merged by the adopter with its own preserved committed ops; not
+  /// necessarily dense `[1..=op]`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn log_slice(&self) -> &[PreparedEntry] {
     &self.log
@@ -653,6 +671,140 @@ impl RecoveryResponse {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn into_log(self) -> Vec<PreparedEntry> {
     self.log
+  }
+}
+
+/// Lagging replica → peers (state-sync solicitation): "my checkpoint is stale; send me the latest
+/// checkpoint". Broadcast (like `RequestPrepare`/`Recovery`) when a replica learns the cluster has
+/// checkpointed PAST its own WAL head — it cannot catch its tail by retransmit/peer-repair because
+/// the ops below the cluster checkpoint may already be pruned at the source. Any `Normal` replica
+/// whose durable checkpoint is strictly newer answers with a [`SyncCheckpoint`]. `checkpoint_op` is
+/// the requester's CURRENT (stale) checkpoint, so a peer can cheaply skip answering if it has nothing
+/// newer; `nonce` is a freshness token echoed in the reply (a stale reply from a prior solicitation is
+/// ignored). `view` is carried for routing/freshness only — a committed checkpoint's content is
+/// view-independent, so a reply from any view that holds a newer checkpoint is acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestSync {
+  view: View,
+  checkpoint_op: OpNumber,
+  replica: ReplicaId,
+  nonce: u64,
+}
+
+impl RequestSync {
+  /// Creates a RequestSync advertising the requester's current (stale) `checkpoint_op`.
+  pub const fn new(view: View, checkpoint_op: OpNumber, replica: ReplicaId, nonce: u64) -> Self {
+    Self {
+      view,
+      checkpoint_op,
+      replica,
+      nonce,
+    }
+  }
+
+  /// The requester's current view.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The requester's CURRENT (stale) checkpoint op — a peer answers only if it has something newer.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
+  }
+
+  /// The requesting replica (the [`SyncCheckpoint`] reply is addressed back to it).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// Freshness nonce echoed in the reply.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+}
+
+/// Peer → lagging replica (state-sync response): the latest durable checkpoint — its op, its content
+/// id, and the opaque snapshot envelope (the client-session table + `sm.snapshot()` produced by the
+/// proto's `encode_checkpoint`, modelled as one `Bytes`; the wire codec / chunking of a large snapshot
+/// is M4). The requester MUST verify `checkpoint_id == checkpoint_id(snapshot)` (a content hash) BEFORE
+/// restoring — never restore a corrupt/mismatched checkpoint — then `sm.restore` + restore the session
+/// table + set `commit_min == commit_max == checkpoint_op`. `nonce` echoes the soliciting
+/// [`RequestSync`] (a stale reply is dropped). Not `Copy` (it carries owned `Bytes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncCheckpoint {
+  view: View,
+  checkpoint_op: OpNumber,
+  checkpoint_id: u128,
+  replica: ReplicaId,
+  nonce: u64,
+  snapshot: Bytes,
+}
+
+impl SyncCheckpoint {
+  /// Creates a SyncCheckpoint carrying the durable checkpoint snapshot envelope.
+  pub fn new(
+    view: View,
+    checkpoint_op: OpNumber,
+    checkpoint_id: u128,
+    replica: ReplicaId,
+    nonce: u64,
+    snapshot: Bytes,
+  ) -> Self {
+    Self {
+      view,
+      checkpoint_op,
+      checkpoint_id,
+      replica,
+      nonce,
+      snapshot,
+    }
+  }
+
+  /// The responder's current view (routing/freshness; the checkpoint content is view-independent).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The op number at which this checkpoint was taken (the new `checkpoint_op` for the requester).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
+  }
+
+  /// The content id of the snapshot — the requester verifies `checkpoint_id(snapshot) == this` before
+  /// restoring (the load-bearing integrity gate).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_id(&self) -> u128 {
+    self.checkpoint_id
+  }
+
+  /// The responding replica.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// The freshness nonce echoed from the soliciting [`RequestSync`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+
+  /// The opaque checkpoint snapshot envelope as a slice.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn snapshot(&self) -> &[u8] {
+    &self.snapshot
+  }
+
+  /// The opaque checkpoint snapshot envelope as a cloned [`Bytes`] handle.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn snapshot_bytes(&self) -> Bytes {
+    self.snapshot.clone()
   }
 }
 
@@ -691,6 +843,10 @@ pub enum Message {
   Recovery(Recovery),
   /// Answer a `Recovery` with the canonical head (from the primary) or just the current view.
   RecoveryResponse(RecoveryResponse),
+  /// Solicit the latest durable checkpoint (a replica whose checkpoint is below the cluster's).
+  RequestSync(RequestSync),
+  /// Answer a `RequestSync` with the latest durable checkpoint (snapshot + op + content id).
+  SyncCheckpoint(SyncCheckpoint),
 }
 
 /// A message the state machine wants the driver to send.
@@ -744,10 +900,25 @@ mod tests {
   }
 
   #[test]
+  fn prepare_carries_checkpoint_op() {
+    let p = Prepare::new(
+      View::with(1),
+      OpNumber::with(5),
+      OpNumber::with(4),
+      OpNumber::with(2), // checkpoint_op
+      ClientId::new(7),
+      RequestNumber::with(5),
+      Bytes::from_static(b"x"),
+    );
+    assert_eq!(p.checkpoint_op(), OpNumber::with(2));
+  }
+
+  #[test]
   fn construct_and_match() {
     let m = Message::Prepare(Prepare::new(
       View::with(0),
       OpNumber::with(1),
+      OpNumber::with(0),
       OpNumber::with(0),
       ClientId::new(9),
       RequestNumber::with(1),
@@ -829,6 +1000,44 @@ mod tests {
     assert_eq!(rp.view(), View::with(2));
     assert_eq!(rp.op(), OpNumber::with(7));
     assert_eq!(rp.replica(), ReplicaId::new(3));
+  }
+
+  #[test]
+  fn sync_messages_construct_and_round_trip() {
+    use crate::ReplicaId;
+    // A lagging replica solicits with its CURRENT (stale) checkpoint + a nonce.
+    let rq = Message::RequestSync(RequestSync::new(
+      View::with(4),
+      OpNumber::with(2),
+      ReplicaId::new(3),
+      0xBEEF,
+    ));
+    assert!(rq.is_request_sync());
+    let r = rq.unwrap_request_sync();
+    assert_eq!(r.view(), View::with(4));
+    assert_eq!(r.checkpoint_op(), OpNumber::with(2));
+    assert_eq!(r.replica(), ReplicaId::new(3));
+    assert_eq!(r.nonce(), 0xBEEF);
+
+    // The peer answers with the newer checkpoint: op, id, opaque snapshot, echoed nonce.
+    let snap = Bytes::from_static(b"snapshot-envelope");
+    let sc = Message::SyncCheckpoint(SyncCheckpoint::new(
+      View::with(4),
+      OpNumber::with(8),
+      0x1234_5678_9abc,
+      ReplicaId::new(0),
+      0xBEEF,
+      snap.clone(),
+    ));
+    assert!(sc.is_sync_checkpoint());
+    let s = sc.unwrap_sync_checkpoint();
+    assert_eq!(s.view(), View::with(4));
+    assert_eq!(s.checkpoint_op(), OpNumber::with(8));
+    assert_eq!(s.checkpoint_id(), 0x1234_5678_9abc);
+    assert_eq!(s.replica(), ReplicaId::new(0));
+    assert_eq!(s.nonce(), 0xBEEF);
+    assert_eq!(s.snapshot(), b"snapshot-envelope");
+    assert_eq!(s.snapshot_bytes(), snap);
   }
 
   #[test]
