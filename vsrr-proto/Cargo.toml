@@ -9,8 +9,12 @@ description = "Sans-I/O state machine for the Viewstamped Replication protocol"
 
 [features]
 default = ["std"]
+# `std` and `alloc` are INDEPENDENT: in `std` mode the real `std` crate already
+# provides the heap, so `std` must NOT pull in `alloc`. The crate requires the
+# heap, so its minimal viable config is `alloc` (the bare no-feature build does
+# not compile — that is the intended signal).
 alloc = []
-std = ["alloc", "bytes/std"]
+std = ["bytes/std"]
 
 [dependencies]
 bytes = { workspace = true }
