@@ -30,7 +30,7 @@ mod state_machine;
 mod status;
 mod storage;
 mod time;
-pub use config::{Config, ConfigError};
+pub use config::{Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS};
 pub use endpoint::Endpoint;
 pub use event::{Committed, Event};
 pub use id::{ClientId, Peer, Recipient, ReplicaId};
@@ -44,6 +44,6 @@ pub use state_machine::StateMachine;
 pub use status::Status;
 pub use storage::{
   CheckpointRead, HEADER_VERSION, Header, OpId, ReadOk, SlotStatus, Superblock, SuperblockDone,
-  VsrState, VsrStateError, Wal, WalDone,
+  VsrState, VsrStateError, Wal, WalDone, checkpoint_id,
 };
 pub use time::Instant;

@@ -1,5 +1,11 @@
 use crate::{ReplicaId, View};
 
+/// Default ops between checkpoints (matches a small TB-style interval for fast sim coverage).
+pub const DEFAULT_CHECKPOINT_OPS: u64 = 32;
+/// Upper bound on the checkpoint interval: keeps the WAL/pipeline headroom finite so the maps
+/// stay bounded and a checkpoint cannot be outrun by in-flight prepares.
+pub const MAX_CHECKPOINT_OPS: u64 = 1 << 20;
+
 /// Error constructing a [`Config`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -21,6 +27,15 @@ pub enum ConfigError {
     /// The offending cluster size.
     count: u8,
   },
+  /// `checkpoint_ops` was zero.
+  #[error("checkpoint_ops must be > 0")]
+  ZeroCheckpointOps,
+  /// `checkpoint_ops` exceeds the maximum interval.
+  #[error("checkpoint_ops {ops} exceeds the maximum of 2^20")]
+  CheckpointOpsTooLarge {
+    /// The offending interval.
+    ops: u64,
+  },
 }
 
 /// Static cluster configuration for one replica. Immutable in v1
@@ -30,6 +45,7 @@ pub struct Config {
   cluster: u128,
   replica: ReplicaId,
   replica_count: u8,
+  checkpoint_ops: u64,
 }
 
 impl Config {
@@ -62,7 +78,38 @@ impl Config {
       cluster,
       replica,
       replica_count,
+      checkpoint_ops: DEFAULT_CHECKPOINT_OPS,
     })
+  }
+
+  /// Like [`Config::try_new`] but with an explicit checkpoint interval.
+  ///
+  /// # Errors
+  /// In addition to [`Config::try_new`]'s errors: [`ConfigError::ZeroCheckpointOps`] if
+  /// `checkpoint_ops == 0`, [`ConfigError::CheckpointOpsTooLarge`] if it exceeds [`MAX_CHECKPOINT_OPS`].
+  pub const fn with_checkpoint_ops(
+    cluster: u128,
+    replica: ReplicaId,
+    replica_count: u8,
+    checkpoint_ops: u64,
+  ) -> Result<Self, ConfigError> {
+    if checkpoint_ops == 0 {
+      return Err(ConfigError::ZeroCheckpointOps);
+    }
+    if checkpoint_ops > MAX_CHECKPOINT_OPS {
+      return Err(ConfigError::CheckpointOpsTooLarge {
+        ops: checkpoint_ops,
+      });
+    }
+    match Self::try_new(cluster, replica, replica_count) {
+      Ok(c) => Ok(Self {
+        cluster: c.cluster,
+        replica: c.replica,
+        replica_count: c.replica_count,
+        checkpoint_ops,
+      }),
+      Err(e) => Err(e),
+    }
   }
 
   /// The cluster id.
@@ -105,6 +152,12 @@ impl Config {
     self.replica_count as usize - self.quorum() + 1
   }
 
+  /// Ops between checkpoints (a checkpoint is taken when commit_min reaches checkpoint_op + this).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_ops(&self) -> u64 {
+    self.checkpoint_ops
+  }
+
   /// The primary for a given view: `view % replica_count`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn primary(&self, view: View) -> ReplicaId {
@@ -122,6 +175,26 @@ impl Config {
 mod tests {
   use super::*;
   use crate::{ReplicaId, View};
+
+  #[test]
+  fn checkpoint_ops_is_validated_and_accessible() {
+    let c = Config::try_new(0, ReplicaId::new(0), 3).unwrap();
+    assert_eq!(c.checkpoint_ops(), DEFAULT_CHECKPOINT_OPS); // default interval
+    let c2 = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 8).unwrap();
+    assert_eq!(c2.checkpoint_ops(), 8);
+    // zero interval is rejected (a checkpoint every 0 ops is meaningless / would loop)
+    assert_eq!(
+      Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 0),
+      Err(ConfigError::ZeroCheckpointOps)
+    );
+    // an interval beyond the pipeline-headroom cap is rejected
+    assert_eq!(
+      Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, MAX_CHECKPOINT_OPS + 1),
+      Err(ConfigError::CheckpointOpsTooLarge {
+        ops: MAX_CHECKPOINT_OPS + 1
+      })
+    );
+  }
 
   #[test]
   fn quorum_and_primary() {
