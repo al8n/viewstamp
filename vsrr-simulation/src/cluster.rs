@@ -210,7 +210,7 @@ impl Cluster {
     if self.crashed[from.get() as usize] {
       return;
     }
-    let Outgoing { to, msg } = out;
+    let (to, msg) = (out.to(), out.into_msg());
     match to {
       Recipient::To(Peer::Replica(r)) => {
         self.schedule(now, Peer::Replica(from), Target::Replica(r.get()), msg);

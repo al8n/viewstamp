@@ -88,23 +88,21 @@ pub struct Endpoint<S> {
   nonce: u64,
   /// In-memory log, keyed by op number.
   ///
-  /// M1: these maps are never pruned (committed entries accumulate). Bounded for
-  /// M1's finite runs; a checkpoint/GC trim is an M2/M3 follow-up.
+  /// These maps are never pruned (committed entries accumulate). Bounded for the
+  /// simulator's finite runs; a checkpoint/GC trim is deferred to M3.
   log: BTreeMap<u64, LogEntry>,
   /// Primary pipeline: op → ack tracking.
   ///
-  /// M1: these maps are never pruned (committed entries accumulate). Bounded for
-  /// M1's finite runs; a checkpoint/GC trim is an M2/M3 follow-up.
+  /// These maps are never pruned (committed entries accumulate). Bounded for the
+  /// simulator's finite runs; a checkpoint/GC trim is deferred to M3.
   inflight: BTreeMap<u64, Inflight>,
   /// Backup reorder buffer: future prepares awaiting contiguity.
   buffer: BTreeMap<u64, Prepare>,
   /// Client session table.
   ///
-  /// M1: these maps are never pruned (committed entries accumulate). Bounded for
-  /// M1's finite runs; a checkpoint/GC trim is an M2/M3 follow-up.
+  /// These maps are never pruned (committed entries accumulate). Bounded for the
+  /// simulator's finite runs; a checkpoint/GC trim is deferred to M3.
   clients: BTreeMap<u128, Session>,
-  #[allow(dead_code)] // consumed by escalation jitter (M2.3)
-  prng: Prng,
   sm: S,
   outgoing: VecDeque<Outgoing>,
   events: VecDeque<Event>,
@@ -117,8 +115,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// (M1 starts in `Normal`; the `Recovering`/`RecoveringHead` startup path is
   /// added in M3.)
   pub fn new(config: Config, seed: u64, sm: S) -> Self {
-    let mut prng = Prng::new(seed);
-    let nonce = prng.next_u64();
+    let nonce = Prng::new(seed).next_u64();
     Self {
       config,
       status: Status::Normal,
@@ -136,7 +133,6 @@ impl<S: StateMachine> Endpoint<S> {
       inflight: BTreeMap::new(),
       buffer: BTreeMap::new(),
       clients: BTreeMap::new(),
-      prng,
       sm,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
@@ -233,13 +229,10 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.commit = Some(now + COMMIT_HEARTBEAT);
     }
     if self.timers.commit.is_some_and(|d| d <= now) {
-      self.outgoing.push_back(Outgoing {
-        to: Recipient::Backups,
-        msg: Message::Commit(Commit {
-          view: self.view,
-          commit: self.commit,
-        }),
-      });
+      self.outgoing.push_back(Outgoing::new(
+        Recipient::Backups,
+        Message::Commit(Commit::new(self.view, self.commit)),
+      ));
       self.timers.commit = Some(now + COMMIT_HEARTBEAT); // re-arm THIS timer only
     }
     if self.timers.prepare.is_some_and(|d| d <= now) {
@@ -253,17 +246,17 @@ impl<S: StateMachine> Endpoint<S> {
       let hi = self.op.get();
       for op in lo..=hi {
         if let Some(entry) = self.log.get(&op).cloned() {
-          self.outgoing.push_back(Outgoing {
-            to: Recipient::Backups,
-            msg: Message::Prepare(Prepare {
-              view: self.view,
-              op: OpNumber::with(op),
-              commit: self.commit,
-              client: entry.client,
-              request: entry.request,
-              body: entry.body,
-            }),
-          });
+          self.outgoing.push_back(Outgoing::new(
+            Recipient::Backups,
+            Message::Prepare(Prepare::new(
+              self.view,
+              OpNumber::with(op),
+              self.commit,
+              entry.client,
+              entry.request,
+              entry.body,
+            )),
+          ));
         }
       }
       // re-arm THIS timer only (clear once everything is committed)
@@ -300,13 +293,10 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Broadcast a `StartViewChange` for `view` to the other replicas.
   fn push_svc(&mut self, view: View) {
-    self.outgoing.push_back(Outgoing {
-      to: Recipient::Backups,
-      msg: Message::StartViewChange(crate::StartViewChange {
-        view,
-        replica: self.config.replica(),
-      }),
-    });
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::Backups,
+      Message::StartViewChange(crate::StartViewChange::new(view, self.config.replica())),
+    ));
   }
 
   fn view_change_timeouts(&mut self, now: Instant) {
@@ -339,14 +329,14 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_start_view_change(&mut self, now: Instant, m: crate::StartViewChange) {
-    let target = m.view;
+    let target = m.view();
     if target.get() <= self.view.get() || target.get() > self.view.get() + 1 {
       // stale (≤ our view), OR a jump beyond our immediate next view — do not drive an
       // unverified inflated target from a lone SVC; we catch up to a genuinely-higher view
       // via a real Prepare/Commit from its primary (the higher-view rule), not via SVCs.
       return;
     }
-    if m.replica.get() >= self.config.replica_count() {
+    if m.replica().get() >= self.config.replica_count() {
       return; // ignore malformed/out-of-range replica id
     }
     if target.get() > self.svc_target.get() {
@@ -356,7 +346,7 @@ impl<S: StateMachine> Endpoint<S> {
       self.join_svc(now);
     }
     if target.get() == self.svc_target.get() {
-      self.svc_from |= 1u64 << m.replica.get();
+      self.svc_from |= 1u64 << m.replica().get();
       self.maybe_start_view_change(now);
     }
   }
@@ -369,7 +359,10 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Enter `ViewChange` for `view_new`, reset pipeline + quorums, send our DoViewChange.
   fn transition_to_view_change_status(&mut self, now: Instant, view_new: View) {
-    debug_assert!(view_new.get() > self.view.get());
+    assert!(
+      view_new.get() > self.view.get(),
+      "view change must strictly advance the view"
+    );
     self.view = view_new;
     self.status = Status::ViewChange;
     self.catching_up = false; // a real, self-driven change (not catch-up)
@@ -386,17 +379,17 @@ impl<S: StateMachine> Endpoint<S> {
   /// Send our full log + position to the prospective primary of the current view.
   fn send_do_view_change(&mut self, _now: Instant) {
     let primary = self.config.primary(self.view);
-    self.outgoing.push_back(Outgoing {
-      to: Recipient::To(Peer::Replica(primary)),
-      msg: Message::DoViewChange(crate::DoViewChange {
-        view: self.view,
-        log_view: self.log_view,
-        op: self.op,
-        commit: self.commit,
-        replica: self.config.replica(),
-        log: self.log_entries(),
-      }),
-    });
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::To(Peer::Replica(primary)),
+      Message::DoViewChange(crate::DoViewChange::new(
+        self.view,
+        self.log_view,
+        self.op,
+        self.commit,
+        self.config.replica(),
+        self.log_entries(),
+      )),
+    ));
   }
 
   /// The full in-memory log `[1..=op]` as wire entries.
@@ -404,11 +397,8 @@ impl<S: StateMachine> Endpoint<S> {
     self
       .log
       .iter()
-      .map(|(&op, e)| crate::PreparedEntry {
-        op: OpNumber::with(op),
-        client: e.client,
-        request: e.request,
-        body: e.body.clone(),
+      .map(|(&op, e)| {
+        crate::PreparedEntry::new(OpNumber::with(op), e.client, e.request, e.body.clone())
       })
       .collect()
   }
@@ -418,38 +408,38 @@ impl<S: StateMachine> Endpoint<S> {
     // (commit <= op, dense log [1..=op]). Safe under honest crash-stop peers; matters once
     // untrusted/real-driver inputs land. The cross-DVC commit* <= op_head invariant is enforced
     // (fail-stop) in `select_canonical_log`.
-    if m.view != self.view
+    if m.view() != self.view
       || !self.config.is_primary(self.view)
       || !self.status.is_view_change()
       || self.dvc_quorum
     {
       return;
     }
-    if m.replica.get() >= self.config.replica_count() {
+    if m.replica().get() >= self.config.replica_count() {
       return; // ignore malformed/out-of-range replica id
     }
     // Ensure our own DVC is represented (keyed by replica → a self-addressed DVC is idempotent).
     // Compute the own-DVC into a local FIRST to avoid a self borrow conflict, then insert.
     let own = self.config.replica().get();
     if !self.dvc_from.contains_key(&own) {
-      let own_dvc = crate::DoViewChange {
-        view: self.view,
-        log_view: self.log_view,
-        op: self.op,
-        commit: self.commit,
-        replica: self.config.replica(),
-        log: self.log_entries(),
-      };
+      let own_dvc = crate::DoViewChange::new(
+        self.view,
+        self.log_view,
+        self.op,
+        self.commit,
+        self.config.replica(),
+        self.log_entries(),
+      );
       self.dvc_from.insert(own, own_dvc);
     }
     // Keep the most-advanced DVC per replica.
     let replace = self
       .dvc_from
-      .get(&m.replica.get())
-      .map(|cur| (m.log_view.get(), m.op.get()) > (cur.log_view.get(), cur.op.get()))
+      .get(&m.replica().get())
+      .map(|cur| (m.log_view().get(), m.op().get()) > (cur.log_view().get(), cur.op().get()))
       .unwrap_or(true);
     if replace {
-      self.dvc_from.insert(m.replica.get(), m);
+      self.dvc_from.insert(m.replica().get(), m);
     }
     if self.dvc_from.len() >= self.config.quorum_view_change() {
       self.start_view_as_new_primary(now);
@@ -472,15 +462,15 @@ impl<S: StateMachine> Endpoint<S> {
     let dvcs: alloc::vec::Vec<&crate::DoViewChange> = self.dvc_from.values().collect();
     debug_assert!(!dvcs.is_empty(), "selection requires at least one DVC");
 
-    let log_view_star = dvcs.iter().map(|d| d.log_view.get()).max().unwrap_or(0);
+    let log_view_star = dvcs.iter().map(|d| d.log_view().get()).max().unwrap_or(0);
     let canonical: alloc::vec::Vec<&crate::DoViewChange> = dvcs
       .iter()
       .copied()
-      .filter(|d| d.log_view.get() == log_view_star)
+      .filter(|d| d.log_view().get() == log_view_star)
       .collect();
 
-    let mut op_head = canonical.iter().map(|d| d.op.get()).max().unwrap_or(0);
-    let commit_star = dvcs.iter().map(|d| d.commit.get()).max().unwrap_or(0);
+    let mut op_head = canonical.iter().map(|d| d.op().get()).max().unwrap_or(0);
+    let commit_star = dvcs.iter().map(|d| d.commit().get()).max().unwrap_or(0);
     // Fail-stop (in ALL builds): if a committed op exceeds the canonical generation's head, the
     // cross-DVC VSR view-change invariant is broken — panicking is strictly safer than silently
     // dropping the committed op (which a release build's `advance_commit` cap would otherwise do).
@@ -495,7 +485,7 @@ impl<S: StateMachine> Endpoint<S> {
     let threshold = self.config.quorum_nack_prepare();
     let mut op = commit_star + 1;
     while op <= op_head {
-      let nacks = dvcs.iter().filter(|d| d.op.get() < op).count();
+      let nacks = dvcs.iter().filter(|d| d.op().get() < op).count();
       if nacks >= threshold {
         op_head = op - 1;
         break;
@@ -507,12 +497,12 @@ impl<S: StateMachine> Endpoint<S> {
     let chosen = canonical
       .iter()
       .copied()
-      .max_by_key(|d| d.op.get())
+      .max_by_key(|d| d.op().get())
       .expect("canonical set is non-empty");
     let log: alloc::vec::Vec<crate::PreparedEntry> = chosen
-      .log
+      .log_slice()
       .iter()
-      .filter(|entry| entry.op.get() <= op_head)
+      .filter(|entry| entry.op().get() <= op_head)
       .cloned()
       .collect();
     (log, op_head, commit_star)
@@ -567,16 +557,16 @@ impl<S: StateMachine> Endpoint<S> {
     }
 
     // Broadcast the canonical log to all backups.
-    self.outgoing.push_back(Outgoing {
-      to: Recipient::Backups,
-      msg: Message::StartView(crate::StartView {
-        view: self.view,
-        op: self.op,
-        commit: self.commit,
-        replica: self.config.replica(),
-        log: self.log_entries(),
-      }),
-    });
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::Backups,
+      Message::StartView(crate::StartView::new(
+        self.view,
+        self.op,
+        self.commit,
+        self.config.replica(),
+        self.log_entries(),
+      )),
+    ));
 
     self.arm_timers(now);
     self.try_commit(now);
@@ -587,11 +577,11 @@ impl<S: StateMachine> Endpoint<S> {
     self.log.clear();
     for e in entries {
       self.log.insert(
-        e.op.get(),
+        e.op().get(),
         LogEntry {
-          client: e.client,
-          request: e.request,
-          body: e.body.clone(),
+          client: e.client(),
+          request: e.request(),
+          body: e.body_bytes(),
         },
       );
     }
@@ -601,27 +591,27 @@ impl<S: StateMachine> Endpoint<S> {
     // Adopt only a strictly newer view, or the current view while we have not yet
     // returned to Normal in it. Re-applying a StartView for a view we are already
     // Normal in would rewind `op` and clobber locally-appended ops.
-    if m.view.get() < self.view.get()
-      || (m.view.get() == self.view.get() && self.status.is_normal())
+    if m.view().get() < self.view.get()
+      || (m.view().get() == self.view.get() && self.status.is_normal())
     {
       return;
     }
-    if m.replica != self.config.primary(m.view) {
+    if m.replica() != self.config.primary(m.view()) {
       return; // must come from the view's primary
     }
-    debug_assert!(
-      m.commit.get() <= m.op.get(),
+    assert!(
+      m.commit().get() <= m.op().get(),
       "StartView commit must not exceed its op (malformed primary)"
     );
-    debug_assert!(
-      m.op.get() >= self.commit.get(),
-      "StartView must not rewind below our committed op (VSR safety invariant)"
+    assert!(
+      m.op().get() >= self.commit.get(),
+      "must not rewind below our committed op"
     );
-    self.view = m.view;
-    self.adopt_log(&m.log);
-    self.op = m.op;
-    self.advance_commit(now, m.commit.get());
-    self.log_view = m.view;
+    self.view = m.view();
+    self.adopt_log(m.log_slice());
+    self.op = m.op();
+    self.advance_commit(now, m.commit().get());
+    self.log_view = m.view();
     self.status = Status::Normal;
     self.catching_up = false;
     self.svc_from = 0;
@@ -637,7 +627,10 @@ impl<S: StateMachine> Endpoint<S> {
   /// are merely stale. Fetch its log via GetView; do NOT broadcast a StartViewChange. If catch-up
   /// stalls, `view_change_status` escalates us to a real, self-driven change.
   fn catch_up_to_view(&mut self, now: Instant, view: View) {
-    debug_assert!(view.get() > self.view.get());
+    assert!(
+      view.get() > self.view.get(),
+      "catch-up target must be strictly newer than our view"
+    );
     self.view = view;
     self.status = Status::ViewChange;
     self.catching_up = true;
@@ -653,30 +646,30 @@ impl<S: StateMachine> Endpoint<S> {
 
   fn send_get_view(&mut self, now: Instant) {
     let primary = self.config.primary(self.view);
-    self.outgoing.push_back(Outgoing {
-      to: Recipient::To(Peer::Replica(primary)),
-      msg: Message::GetView(crate::GetView {
-        view: self.view,
-        replica: self.config.replica(),
-        nonce: self.nonce,
-      }),
-    });
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::To(Peer::Replica(primary)),
+      Message::GetView(crate::GetView::new(
+        self.view,
+        self.config.replica(),
+        self.nonce,
+      )),
+    ));
     self.timers.get_view_message = Some(now + VC_MESSAGE_RETRANSMIT);
   }
 
   fn on_get_view(&mut self, _now: Instant, m: crate::GetView) {
     // Only a Normal primary at the requested view (or higher) can answer authoritatively.
-    if self.status.is_normal() && self.is_primary() && self.view.get() >= m.view.get() {
-      self.outgoing.push_back(Outgoing {
-        to: Recipient::To(Peer::Replica(m.replica)),
-        msg: Message::StartView(crate::StartView {
-          view: self.view,
-          op: self.op,
-          commit: self.commit,
-          replica: self.config.replica(),
-          log: self.log_entries(),
-        }),
-      });
+    if self.status.is_normal() && self.is_primary() && self.view.get() >= m.view().get() {
+      self.outgoing.push_back(Outgoing::new(
+        Recipient::To(Peer::Replica(m.replica())),
+        Message::StartView(crate::StartView::new(
+          self.view,
+          self.op,
+          self.commit,
+          self.config.replica(),
+          self.log_entries(),
+        )),
+      ));
     }
   }
 
@@ -684,52 +677,47 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || !self.is_primary() {
       return; // backups ignore; the client retries to the primary
     }
-    let key = r.client.get();
+    let key = r.client().get();
     let session = self.clients.entry(key).or_default();
 
     // Dedup against the session (clients send one request at a time, numbered 1..).
-    if r.request.get() < session.request.get() {
+    if r.request().get() < session.request.get() {
       return; // stale
     }
-    if r.request.get() == session.request.get() {
+    if r.request().get() == session.request.get() {
       // Duplicate of the latest accepted request.
       // Clone the cached reply data out before dropping the session borrow so
       // that pushing to self.outgoing (which requires &mut self) is borrow-safe.
       let cached = session.reply.as_ref().and_then(|(rn, body)| {
-        if *rn == r.request {
+        if *rn == r.request() {
           Some((*rn, body.clone()))
         } else {
           None
         }
       });
       if let Some((rn, body)) = cached {
-        let reply = Reply {
-          view: self.view,
-          client: r.client,
-          request: rn,
-          body,
-        };
-        self.outgoing.push_back(Outgoing {
-          to: Recipient::To(Peer::Client(r.client)),
-          msg: Message::Reply(reply),
-        });
+        let reply = Reply::new(self.view, r.client(), rn, body);
+        self.outgoing.push_back(Outgoing::new(
+          Recipient::To(Peer::Client(r.client())),
+          Message::Reply(reply),
+        ));
       }
       return; // either resent the cached reply, or it's still in flight
     }
-    if r.request.get() != session.request.get() + 1 {
+    if r.request().get() != session.request.get() + 1 {
       return; // gap: client violated one-in-flight; ignore
     }
 
     // Accept: assign the next op, append, record, broadcast Prepare.
-    session.request = r.request;
+    session.request = r.request();
     self.op = self.op.next();
     let op = self.op.get();
     self.log.insert(
       op,
       LogEntry {
-        client: r.client,
-        request: r.request,
-        body: r.body.clone(),
+        client: r.client(),
+        request: r.request(),
+        body: r.body_bytes(),
       },
     );
     let mut oks = 0u64;
@@ -742,17 +730,17 @@ impl<S: StateMachine> Endpoint<S> {
       },
     );
 
-    self.outgoing.push_back(Outgoing {
-      to: Recipient::Backups,
-      msg: Message::Prepare(Prepare {
-        view: self.view,
-        op: self.op,
-        commit: self.commit,
-        client: r.client,
-        request: r.request,
-        body: r.body,
-      }),
-    });
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::Backups,
+      Message::Prepare(Prepare::new(
+        self.view,
+        self.op,
+        self.commit,
+        r.client(),
+        r.request(),
+        r.body_bytes(),
+      )),
+    ));
 
     self.arm_timers(now);
     self.try_commit(now);
@@ -780,13 +768,10 @@ impl<S: StateMachine> Endpoint<S> {
     }
     if advanced {
       // Tell backups the commit advanced (also serves as a heartbeat).
-      self.outgoing.push_back(Outgoing {
-        to: Recipient::Backups,
-        msg: Message::Commit(Commit {
-          view: self.view,
-          commit: self.commit,
-        }),
-      });
+      self.outgoing.push_back(Outgoing::new(
+        Recipient::Backups,
+        Message::Commit(Commit::new(self.view, self.commit)),
+      ));
     }
   }
 
@@ -805,15 +790,15 @@ impl<S: StateMachine> Endpoint<S> {
     let session = self.clients.entry(entry.client.get()).or_default();
     session.reply = Some((entry.request, reply_body.clone()));
 
-    self.outgoing.push_back(Outgoing {
-      to: Recipient::To(Peer::Client(entry.client)),
-      msg: Message::Reply(Reply {
-        view: self.view,
-        client: entry.client,
-        request: entry.request,
-        body: reply_body.clone(),
-      }),
-    });
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::To(Peer::Client(entry.client)),
+      Message::Reply(Reply::new(
+        self.view,
+        entry.client,
+        entry.request,
+        reply_body.clone(),
+      )),
+    ));
     self
       .events
       .push_back(Event::Committed(crate::Committed::new(
@@ -852,25 +837,25 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_prepare(&mut self, now: Instant, p: Prepare) {
-    if p.view.get() > self.view.get() {
-      self.catch_up_to_view(now, p.view);
+    if p.view().get() > self.view.get() {
+      self.catch_up_to_view(now, p.view());
       return;
     }
-    if !self.status.is_normal() || p.view != self.view || self.is_primary() {
+    if !self.status.is_normal() || p.view() != self.view || self.is_primary() {
       return;
     }
     // Heard from the primary — defer the idle timeout.
     self.note_primary_contact(now);
     // Learn the primary's commit (apply anything we already have).
-    self.advance_commit(now, p.commit.get());
+    self.advance_commit(now, p.commit().get());
 
-    let pop = p.op.get();
+    let pop = p.op().get();
     if pop <= self.op.get() {
       // Already have this op; (re)ack so a lost prepare_ok is recovered.
-      // M1 single-view: ops are immutable so a re-received prepare for a held op
-      // is identical and blind re-ack is safe. M2 view change will require a
-      // view/header check before re-acking.
-      self.send_prepare_ok(p.op);
+      // Ops are immutable within a view. The higher-view rule (top of this fn)
+      // and the `view != self.view` reject mean this re-ack only fires for a
+      // current-view prepare, so blind re-ack is safe.
+      self.send_prepare_ok(p.op());
       return;
     }
     if pop == self.op.get() + 1 {
@@ -886,14 +871,14 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn append_prepare(&mut self, p: Prepare) {
-    let op = p.op.get();
-    self.op = p.op;
+    let op = p.op().get();
+    self.op = p.op();
     self.log.insert(
       op,
       LogEntry {
-        client: p.client,
-        request: p.request,
-        body: p.body,
+        client: p.client(),
+        request: p.request(),
+        body: p.body_bytes(),
       },
     );
     self.send_prepare_ok(OpNumber::with(op));
@@ -901,14 +886,10 @@ impl<S: StateMachine> Endpoint<S> {
 
   fn send_prepare_ok(&mut self, op: OpNumber) {
     let primary = self.config.primary(self.view);
-    self.outgoing.push_back(Outgoing {
-      to: Recipient::To(Peer::Replica(primary)),
-      msg: Message::PrepareOk(PrepareOk {
-        view: self.view,
-        op,
-        replica: self.config.replica(),
-      }),
-    });
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::To(Peer::Replica(primary)),
+      Message::PrepareOk(PrepareOk::new(self.view, op, self.config.replica())),
+    ));
   }
 
   /// Applies committed ops we hold, up to `min(target, op)`. Backups discard the
@@ -935,33 +916,33 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_prepare_ok(&mut self, now: Instant, ok: PrepareOk) {
-    if ok.view.get() > self.view.get() {
-      self.catch_up_to_view(now, ok.view);
+    if ok.view().get() > self.view.get() {
+      self.catch_up_to_view(now, ok.view());
       return;
     }
-    if !self.status.is_normal() || !self.is_primary() || ok.view != self.view {
+    if !self.status.is_normal() || !self.is_primary() || ok.view() != self.view {
       return;
     }
-    if ok.replica.get() >= self.config.replica_count() {
+    if ok.replica().get() >= self.config.replica_count() {
       return; // ignore malformed/out-of-range replica id
     }
-    if let Some(inflight) = self.inflight.get_mut(&ok.op.get()) {
-      inflight.oks |= 1u64 << ok.replica.get();
+    if let Some(inflight) = self.inflight.get_mut(&ok.op().get()) {
+      inflight.oks |= 1u64 << ok.replica().get();
     }
     self.try_commit(now);
   }
 
   fn on_commit(&mut self, now: Instant, c: Commit) {
-    if c.view.get() > self.view.get() {
-      self.catch_up_to_view(now, c.view);
+    if c.view().get() > self.view.get() {
+      self.catch_up_to_view(now, c.view());
       return;
     }
-    if !self.status.is_normal() || c.view != self.view || self.is_primary() {
+    if !self.status.is_normal() || c.view() != self.view || self.is_primary() {
       return;
     }
     // Heard from the primary — defer the idle timeout.
     self.note_primary_contact(now);
-    self.advance_commit(now, c.commit.get());
+    self.advance_commit(now, c.commit().get());
   }
 
   /// Pulls the next message to send, if any.
@@ -1033,14 +1014,14 @@ mod tests {
   }
 
   fn prepare(op: u64, commit: u64) -> Message {
-    Message::Prepare(Prepare {
-      view: View::new(),
-      op: OpNumber::with(op),
-      commit: OpNumber::with(commit),
-      client: ClientId::new(7),
-      request: RequestNumber::with(op),
-      body: Bytes::copy_from_slice(&[op as u8]),
-    })
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(op),
+      OpNumber::with(commit),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      Bytes::copy_from_slice(&[op as u8]),
+    ))
   }
 
   #[test]
@@ -1053,10 +1034,10 @@ mod tests {
     e.handle_message(now, primary_peer(), prepare(1, 0));
     assert_eq!(e.op(), OpNumber::with(1));
     assert_eq!(e.commit(), OpNumber::with(0));
-    match e.poll_message().expect("prepare_ok emitted").msg {
+    match e.poll_message().expect("prepare_ok emitted").into_msg() {
       Message::PrepareOk(ok) => {
-        assert_eq!(ok.op, OpNumber::with(1));
-        assert_eq!(ok.replica, ReplicaId::new(1));
+        assert_eq!(ok.op(), OpNumber::with(1));
+        assert_eq!(ok.replica(), ReplicaId::new(1));
       }
       _ => panic!("expected PrepareOk"),
     }
@@ -1106,19 +1087,16 @@ mod tests {
     e.handle_message(
       later,
       Peer::Replica(ReplicaId::new(2)),
-      Message::StartViewChange(StartViewChange {
-        view: View::with(1),
-        replica: ReplicaId::new(2),
-      }),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
     );
     assert_eq!(e.status(), Status::ViewChange);
     assert_eq!(e.view(), View::with(1));
     // it should have emitted a DoViewChange to primary(view 1) = replica 1 (itself).
     let mut saw_dvc = false;
     while let Some(out) = e.poll_message() {
-      if let Message::DoViewChange(d) = out.msg {
-        assert_eq!(d.view, View::with(1));
-        assert_eq!(d.replica, ReplicaId::new(1));
+      if let Message::DoViewChange(d) = out.into_msg() {
+        assert_eq!(d.view(), View::with(1));
+        assert_eq!(d.replica(), ReplicaId::new(1));
         saw_dvc = true;
       }
     }
@@ -1135,35 +1113,32 @@ mod tests {
     e.handle_message(
       now,
       Peer::Replica(ReplicaId::new(0)),
-      Message::StartViewChange(StartViewChange {
-        view: View::with(1),
-        replica: ReplicaId::new(0),
-      }),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
     );
     assert_eq!(e.status(), Status::ViewChange); // now collecting DVCs as primary(view 1)
     while e.poll_message().is_some() {} // discard outgoing so far
     // Feed a DoViewChange from replica 2 with a richer log (log_view 0, op 2, commit 1):
-    let dvc = DoViewChange {
-      view: View::with(1),
-      log_view: View::with(0),
-      op: OpNumber::with(2),
-      commit: OpNumber::with(1),
-      replica: ReplicaId::new(2),
-      log: alloc::vec![
-        PreparedEntry {
-          op: OpNumber::with(1),
-          client: ClientId::new(7),
-          request: RequestNumber::with(1),
-          body: bytes::Bytes::from_static(b"a")
-        },
-        PreparedEntry {
-          op: OpNumber::with(2),
-          client: ClientId::new(7),
-          request: RequestNumber::with(2),
-          body: bytes::Bytes::from_static(b"b")
-        },
+    let dvc = DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      ReplicaId::new(2),
+      alloc::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b"),
+        ),
       ],
-    };
+    );
     e.handle_message(
       now,
       Peer::Replica(ReplicaId::new(2)),
@@ -1177,9 +1152,9 @@ mod tests {
     // It must broadcast a StartView carrying the canonical log.
     let mut saw_sv = false;
     while let Some(out) = e.poll_message() {
-      if let Message::StartView(sv) = out.msg {
-        assert_eq!(sv.op, OpNumber::with(2));
-        assert_eq!(sv.log.len(), 2);
+      if let Message::StartView(sv) = out.into_msg() {
+        assert_eq!(sv.op(), OpNumber::with(2));
+        assert_eq!(sv.log_slice().len(), 2);
         saw_sv = true;
       }
     }
@@ -1195,36 +1170,33 @@ mod tests {
     e.handle_message(
       now,
       Peer::Replica(ReplicaId::new(0)),
-      Message::StartViewChange(StartViewChange {
-        view: View::with(1),
-        replica: ReplicaId::new(0),
-      }),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
     );
     while e.poll_message().is_some() {}
     e.handle_message(
       now,
       Peer::Replica(ReplicaId::new(2)),
-      Message::DoViewChange(DoViewChange {
-        view: View::with(1),
-        log_view: View::with(0),
-        op: OpNumber::with(2),
-        commit: OpNumber::with(1),
-        replica: ReplicaId::new(2),
-        log: alloc::vec![
-          PreparedEntry {
-            op: OpNumber::with(1),
-            client: ClientId::new(7),
-            request: RequestNumber::with(1),
-            body: bytes::Bytes::from_static(b"a")
-          },
-          PreparedEntry {
-            op: OpNumber::with(2),
-            client: ClientId::new(7),
-            request: RequestNumber::with(2),
-            body: bytes::Bytes::from_static(b"b")
-          },
+      Message::DoViewChange(DoViewChange::new(
+        View::with(1),
+        View::with(0),
+        OpNumber::with(2),
+        OpNumber::with(1),
+        ReplicaId::new(2),
+        alloc::vec![
+          PreparedEntry::new(
+            OpNumber::with(1),
+            ClientId::new(7),
+            RequestNumber::with(1),
+            bytes::Bytes::from_static(b"a"),
+          ),
+          PreparedEntry::new(
+            OpNumber::with(2),
+            ClientId::new(7),
+            RequestNumber::with(2),
+            bytes::Bytes::from_static(b"b"),
+          ),
         ],
-      }),
+      )),
     );
     assert!(e.is_primary());
     assert_eq!(e.op(), OpNumber::with(2));
@@ -1234,11 +1206,11 @@ mod tests {
     e.handle_message(
       now,
       Peer::Client(ClientId::new(7)),
-      Message::Request(Request {
-        client: ClientId::new(7),
-        request: RequestNumber::with(1),
-        body: bytes::Bytes::from_static(b"a"),
-      }),
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      )),
     );
     assert_eq!(
       e.op(),
@@ -1250,11 +1222,11 @@ mod tests {
     e.handle_message(
       now,
       Peer::Client(ClientId::new(7)),
-      Message::Request(Request {
-        client: ClientId::new(7),
-        request: RequestNumber::with(3),
-        body: bytes::Bytes::from_static(b"c"),
-      }),
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(3),
+        bytes::Bytes::from_static(b"c"),
+      )),
     );
     assert_eq!(
       e.op(),
@@ -1266,21 +1238,23 @@ mod tests {
   /// Build a DoViewChange whose log is the contiguous prefix `[1..=op]`.
   fn dvc(replica: u8, log_view: u64, op: u64, commit: u64) -> DoViewChange {
     let log = (1..=op)
-      .map(|i| PreparedEntry {
-        op: OpNumber::with(i),
-        client: ClientId::new(1),
-        request: RequestNumber::with(i),
-        body: bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
+      .map(|i| {
+        PreparedEntry::new(
+          OpNumber::with(i),
+          ClientId::new(1),
+          RequestNumber::with(i),
+          bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
+        )
       })
       .collect();
-    DoViewChange {
-      view: View::with(log_view + 10),
-      log_view: View::with(log_view),
-      op: OpNumber::with(op),
-      commit: OpNumber::with(commit),
-      replica: ReplicaId::new(replica),
+    DoViewChange::new(
+      View::with(log_view + 10),
+      View::with(log_view),
+      OpNumber::with(op),
+      OpNumber::with(commit),
+      ReplicaId::new(replica),
       log,
-    }
+    )
   }
 
   #[test]
@@ -1352,18 +1326,12 @@ mod tests {
     e.handle_message(
       t,
       Peer::Replica(ReplicaId::new(0)),
-      Message::StartViewChange(StartViewChange {
-        view: View::with(1),
-        replica: ReplicaId::new(0),
-      }),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
     ); // 2/3
     e.handle_message(
       t,
       Peer::Replica(ReplicaId::new(1)),
-      Message::StartViewChange(StartViewChange {
-        view: View::with(1),
-        replica: ReplicaId::new(1),
-      }),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(1))),
     ); // 3/3 → ViewChange(1)
     assert_eq!(e.view(), View::with(1));
     assert_eq!(e.status(), Status::ViewChange);
@@ -1375,18 +1343,12 @@ mod tests {
     e.handle_message(
       t2,
       Peer::Replica(ReplicaId::new(0)),
-      Message::StartViewChange(StartViewChange {
-        view: View::with(2),
-        replica: ReplicaId::new(0),
-      }),
+      Message::StartViewChange(StartViewChange::new(View::with(2), ReplicaId::new(0))),
     );
     e.handle_message(
       t2,
       Peer::Replica(ReplicaId::new(1)),
-      Message::StartViewChange(StartViewChange {
-        view: View::with(2),
-        replica: ReplicaId::new(1),
-      }),
+      Message::StartViewChange(StartViewChange::new(View::with(2), ReplicaId::new(1))),
     );
     assert_eq!(e.view(), View::with(2), "escalated to the next view");
     assert_eq!(e.status(), Status::ViewChange);
@@ -1397,26 +1359,26 @@ mod tests {
     // replica 2 of 3 receives a StartView for view 1 from primary(1)=replica 1.
     let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
     let now = Instant::ZERO;
-    let sv = StartView {
-      view: View::with(1),
-      op: OpNumber::with(2),
-      commit: OpNumber::with(1),
-      replica: ReplicaId::new(1),
-      log: alloc::vec![
-        PreparedEntry {
-          op: OpNumber::with(1),
-          client: ClientId::new(7),
-          request: RequestNumber::with(1),
-          body: bytes::Bytes::from_static(b"a"),
-        },
-        PreparedEntry {
-          op: OpNumber::with(2),
-          client: ClientId::new(7),
-          request: RequestNumber::with(2),
-          body: bytes::Bytes::from_static(b"b"),
-        },
+    let sv = StartView::new(
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      alloc::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b"),
+        ),
       ],
-    };
+    );
     e.handle_message(
       now,
       Peer::Replica(ReplicaId::new(1)),
@@ -1430,8 +1392,8 @@ mod tests {
     // it should send PrepareOk for the held uncommitted op (op 2) to primary 1.
     let mut acked_op2 = false;
     while let Some(out) = e.poll_message() {
-      if let Message::PrepareOk(ok) = out.msg {
-        if ok.op == OpNumber::with(2) {
+      if let Message::PrepareOk(ok) = out.into_msg() {
+        if ok.op() == OpNumber::with(2) {
           acked_op2 = true;
         }
       }
@@ -1450,21 +1412,21 @@ mod tests {
     e.handle_message(
       now,
       Peer::Replica(ReplicaId::new(1)),
-      Message::Prepare(Prepare {
-        view: View::with(1),
-        op: OpNumber::with(1),
-        commit: OpNumber::with(0),
-        client: ClientId::new(7),
-        request: RequestNumber::with(1),
-        body: bytes::Bytes::from_static(b"x"),
-      }),
+      Message::Prepare(Prepare::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(0),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"x"),
+      )),
     );
     assert_eq!(e.view(), View::with(1));
     assert_eq!(e.status(), Status::ViewChange);
     let mut saw_get_view = false;
     while let Some(out) = e.poll_message() {
-      if let Message::GetView(g) = out.msg {
-        assert_eq!(g.view, View::with(1));
+      if let Message::GetView(g) = out.into_msg() {
+        assert_eq!(g.view(), View::with(1));
         saw_get_view = true;
       }
     }
@@ -1477,18 +1439,18 @@ mod tests {
     e.handle_message(
       now,
       Peer::Replica(ReplicaId::new(1)),
-      Message::StartView(StartView {
-        view: View::with(1),
-        op: OpNumber::with(1),
-        commit: OpNumber::with(1),
-        replica: ReplicaId::new(1),
-        log: alloc::vec![PreparedEntry {
-          op: OpNumber::with(1),
-          client: ClientId::new(7),
-          request: RequestNumber::with(1),
-          body: bytes::Bytes::from_static(b"x"),
-        }],
-      }),
+      Message::StartView(StartView::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(1),
+        ReplicaId::new(1),
+        alloc::vec![PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"x"),
+        )],
+      )),
     );
     assert_eq!(e.status(), Status::Normal);
     assert_eq!(e.view(), View::with(1));
@@ -1500,17 +1462,13 @@ mod tests {
     e.handle_message(
       Instant::ZERO,
       Peer::Replica(ReplicaId::new(1)),
-      Message::GetView(GetView {
-        view: View::with(0),
-        replica: ReplicaId::new(1),
-        nonce: 5,
-      }),
+      Message::GetView(GetView::new(View::with(0), ReplicaId::new(1), 5)),
     );
     let mut saw_sv = false;
     while let Some(out) = e.poll_message() {
-      if let Message::StartView(sv) = out.msg {
-        assert_eq!(sv.view, View::with(0));
-        assert_eq!(sv.replica, ReplicaId::new(0));
+      if let Message::StartView(sv) = out.into_msg() {
+        assert_eq!(sv.view(), View::with(0));
+        assert_eq!(sv.replica(), ReplicaId::new(0));
         saw_sv = true;
       }
     }
@@ -1525,10 +1483,7 @@ mod tests {
     e.handle_message(
       Instant::ZERO,
       Peer::Replica(ReplicaId::new(0)),
-      Message::StartViewChange(StartViewChange {
-        view: View::with(100),
-        replica: ReplicaId::new(0),
-      }),
+      Message::StartViewChange(StartViewChange::new(View::with(100), ReplicaId::new(0))),
     );
     assert_eq!(
       e.view(),
@@ -1536,5 +1491,54 @@ mod tests {
       "a lone high SVC must not inflate our view"
     );
     assert_eq!(e.status(), Status::Normal);
+  }
+
+  #[test]
+  #[should_panic(expected = "must not rewind below our committed op")]
+  fn on_start_view_rewind_below_commit_panics() {
+    // Adopt a StartView for view 1 with op 2 (commit 2), then a StartView for view 2 with op 1
+    // (< our committed op 2). The second must fail-stop, not silently rewind.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+    e.handle_message(
+      Instant::ZERO,
+      Peer::Replica(ReplicaId::new(1)), // primary of view 1
+      Message::StartView(StartView::new(
+        View::with(1),
+        OpNumber::with(2),
+        OpNumber::with(2),
+        ReplicaId::new(1),
+        alloc::vec![
+          PreparedEntry::new(
+            OpNumber::with(1),
+            ClientId::new(7),
+            RequestNumber::with(1),
+            bytes::Bytes::from_static(b"a")
+          ),
+          PreparedEntry::new(
+            OpNumber::with(2),
+            ClientId::new(7),
+            RequestNumber::with(2),
+            bytes::Bytes::from_static(b"b")
+          ),
+        ],
+      )),
+    );
+    assert_eq!(e.commit(), OpNumber::with(2));
+    e.handle_message(
+      Instant::ZERO,
+      Peer::Replica(ReplicaId::new(2)), // primary of view 2
+      Message::StartView(StartView::new(
+        View::with(2),
+        OpNumber::with(1),
+        OpNumber::with(1),
+        ReplicaId::new(2),
+        alloc::vec![PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a")
+        )],
+      )),
+    );
   }
 }
