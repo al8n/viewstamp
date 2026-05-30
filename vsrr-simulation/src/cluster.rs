@@ -16,6 +16,7 @@ pub struct Cluster {
   prng: Prng,
   faults: Faults,
   replica_count: u8,
+  crashed: Vec<bool>,
 }
 
 impl Cluster {
@@ -35,6 +36,7 @@ impl Cluster {
     let client_set: Vec<ClientModel> = (0..clients)
       .map(|i| ClientModel::new((i as u128) + 1, requests_per_client))
       .collect();
+    let n = replicas as usize;
     Self {
       replicas: replica_set,
       clients: client_set,
@@ -43,6 +45,7 @@ impl Cluster {
       prng: Prng::new(seed),
       faults: Faults::none(),
       replica_count: replicas,
+      crashed: vec![false; n],
     }
   }
 
@@ -59,6 +62,11 @@ impl Cluster {
   /// Read access to replica `i`'s state machine (for invariant checking).
   pub fn replica_sm(&self, i: usize) -> &LogSm {
     self.replicas[i].state_machine()
+  }
+
+  /// Replica `i`'s current view (for invariant checking).
+  pub fn replica_view(&self, i: usize) -> vsrr_proto::View {
+    self.replicas[i].view()
   }
 
   /// Read access to client `i` (for invariant checking).
@@ -81,24 +89,40 @@ impl Cluster {
     self.net.is_empty() && self.clients.iter().all(ClientModel::is_done)
   }
 
-  /// The current primary index (M1: always view 0 -> replica 0).
-  fn primary_index(&self) -> u8 {
-    0
+  /// Crash-stop replica `i`: it stops being ticked and its messages are dropped.
+  pub fn crash(&mut self, i: usize) {
+    self.crashed[i] = true;
+  }
+
+  /// Whether replica `i` is crashed.
+  pub fn is_crashed(&self, i: usize) -> bool {
+    self.crashed[i]
   }
 
   /// One simulation step.
   pub fn tick(&mut self) {
     let now = self.clock.now();
 
-    let primary = self.primary_index();
     for ci in 0..self.clients.len() {
       if let Some(req) = self.clients[ci].pending(now) {
         let from = Peer::Client(self.clients[ci].id());
-        self.schedule(now, from, Target::Replica(primary), Message::Request(req));
+        for ri in 0..self.replicas.len() {
+          if !self.crashed[ri] {
+            self.schedule(
+              now,
+              from,
+              Target::Replica(ri as u8),
+              Message::Request(req.clone()),
+            );
+          }
+        }
       }
     }
 
     for ri in 0..self.replicas.len() {
+      if self.crashed[ri] {
+        continue;
+      }
       while let Some(out) = self.replicas[ri].poll_message() {
         self.route(now, ReplicaId::new(ri as u8), out);
       }
@@ -107,7 +131,9 @@ impl Cluster {
     for m in self.net.take_due(now) {
       match m.target {
         Target::Replica(idx) => {
-          self.replicas[idx as usize].handle_message(now, m.from, m.msg);
+          if !self.crashed[idx as usize] {
+            self.replicas[idx as usize].handle_message(now, m.from, m.msg);
+          }
         }
         Target::Client(id) => {
           if let Some(c) = self.clients.iter_mut().find(|c| c.id().get() == id) {
@@ -118,6 +144,9 @@ impl Cluster {
     }
 
     for ri in 0..self.replicas.len() {
+      if self.crashed[ri] {
+        continue;
+      }
       while self.replicas[ri].poll_event().is_some() {}
     }
 
@@ -126,7 +155,9 @@ impl Cluster {
       self
         .replicas
         .iter()
-        .filter_map(Endpoint::poll_timeout)
+        .enumerate()
+        .filter(|(ri, _)| !self.crashed[*ri])
+        .filter_map(|(_, ep)| ep.poll_timeout())
         .min(),
     ]
     .into_iter()
@@ -140,12 +171,20 @@ impl Cluster {
 
     let now = self.clock.now();
     for ri in 0..self.replicas.len() {
+      if self.crashed[ri] {
+        continue;
+      }
       self.replicas[ri].handle_timeout(now);
     }
   }
 
   /// Expands a `Recipient` into concrete `Target`s and schedules each.
   fn route(&mut self, now: Instant, from: ReplicaId, out: Outgoing) {
+    // Belt-and-suspenders: a crashed replica should never be polled, but
+    // drop any outgoing it might emit just in case.
+    if self.crashed[from.get() as usize] {
+      return;
+    }
     let Outgoing { to, msg } = out;
     match to {
       Recipient::To(Peer::Replica(r)) => {
@@ -202,5 +241,19 @@ mod tests {
       cluster.tick();
     }
     assert!(cluster.now() > t0, "virtual clock must advance");
+  }
+
+  #[test]
+  fn crashed_replica_stops_and_is_skipped() {
+    let mut c = Cluster::new(3, 1, 1, 7);
+    c.crash(0);
+    assert!(c.is_crashed(0));
+    // ticking must not panic and must not deliver to/from the crashed replica.
+    for _ in 0..20 {
+      c.tick();
+    }
+    // a crashed primary means no commits; the (single) client cannot finish without view change,
+    // but the loop must run cleanly.
+    assert!(c.now().as_nanos() > 0);
   }
 }
