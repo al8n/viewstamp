@@ -7,15 +7,13 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
 #[cfg(feature = "std")]
 extern crate std;
 
-// Modules are declared here as empty placeholders in this task. Each later task
-// fills its module and appends the matching `pub use` re-export. Do NOT add any
-// `pub use` lines now — the modules are empty.
 mod config;
 mod endpoint;
 mod event;

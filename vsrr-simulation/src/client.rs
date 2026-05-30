@@ -1,7 +1,7 @@
 use core::time::Duration;
 
 use bytes::Bytes;
-use vsrr_proto::{ClientId, Instant, Message, Reply, Request, RequestNumber};
+use vsrr_proto::{ClientId, Instant, Message, Request, RequestNumber};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -53,11 +53,11 @@ impl ClientModel {
   pub fn pending(&mut self, now: Instant) -> Option<Request> {
     if self.inflight.is_none() && self.next_request <= self.total {
       let body = Bytes::from(self.next_request.to_be_bytes().to_vec());
-      self.inflight = Some(Request {
-        client: self.id,
-        request: RequestNumber::with(self.next_request),
+      self.inflight = Some(Request::new(
+        self.id,
+        RequestNumber::with(self.next_request),
         body,
-      });
+      ));
       self.last_sent = None;
     }
     let due = match self.last_sent {
@@ -74,10 +74,10 @@ impl ClientModel {
 
   /// Handles a reply: if it matches the in-flight request, record it and advance.
   pub fn handle(&mut self, msg: Message) {
-    if let Message::Reply(Reply { request, body, .. }) = msg {
+    if let Message::Reply(r) = msg {
       if let Some(req) = &self.inflight {
-        if req.request == request {
-          self.replies.push((request.get(), body.to_vec()));
+        if req.request() == r.request() {
+          self.replies.push((r.request().get(), r.body().to_vec()));
           self.inflight = None;
           self.last_sent = None;
           self.next_request += 1;
