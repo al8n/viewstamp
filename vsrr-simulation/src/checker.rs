@@ -63,6 +63,36 @@ pub fn check_safety(cluster: &Cluster) -> CheckResult {
   CheckResult::Ok
 }
 
+/// Stateful checker: each replica's `view` must never decrease across observations.
+#[derive(Debug)]
+pub struct ViewMonotonicChecker {
+  max_view: Vec<u64>,
+}
+
+impl ViewMonotonicChecker {
+  /// A checker for a cluster of `replica_count` replicas (all start at view 0).
+  pub fn new(replica_count: usize) -> Self {
+    Self {
+      max_view: vec![0; replica_count],
+    }
+  }
+
+  /// Sample the cluster: returns a violation if any replica's view dropped below a prior maximum.
+  pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
+    for i in 0..cluster.replica_count() {
+      let v = cluster.replica_view(i).get();
+      if v < self.max_view[i] {
+        return CheckResult::Violation(format!(
+          "replica {i}: view regressed to {v} (was {})",
+          self.max_view[i]
+        ));
+      }
+      self.max_view[i] = v;
+    }
+    CheckResult::Ok
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -78,5 +108,26 @@ mod tests {
       }
     }
     assert_eq!(check_safety(&c), CheckResult::Ok);
+  }
+
+  #[test]
+  fn views_are_monotonic_across_a_crash() {
+    let mut c = Cluster::new(3, 1, 2, 5);
+    let mut vm = ViewMonotonicChecker::new(c.replica_count());
+    for _ in 0..2000 {
+      c.tick();
+      assert!(vm.observe(&c).is_ok(), "no view regression");
+      if c.is_quiescent() {
+        break;
+      }
+    }
+    c.crash(0);
+    for _ in 0..200_000 {
+      c.tick();
+      assert!(vm.observe(&c).is_ok(), "no view regression after failover");
+      if c.client(0).is_done() {
+        break;
+      }
+    }
   }
 }

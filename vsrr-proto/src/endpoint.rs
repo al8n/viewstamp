@@ -11,6 +11,7 @@ const PREPARE_RETRANSMIT: core::time::Duration = core::time::Duration::from_mill
 const COMMIT_HEARTBEAT: core::time::Duration = core::time::Duration::from_millis(50);
 const PRIMARY_IDLE: core::time::Duration = core::time::Duration::from_millis(200);
 const VC_MESSAGE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
+const VIEW_CHANGE_STATUS: core::time::Duration = core::time::Duration::from_millis(500);
 
 /// One entry in the in-memory log (M1; persistence arrives in M3).
 #[derive(Debug, Clone)]
@@ -50,6 +51,10 @@ struct Timers {
   svc_message: Option<Instant>,
   /// ViewChange: retransmit own DoViewChange.
   dvc_message: Option<Instant>,
+  /// ViewChange: escalate to the next view if the change has not completed.
+  view_change_status: Option<Instant>,
+  /// ViewChange (catch-up): retransmit GetView.
+  get_view_message: Option<Instant>,
 }
 
 /// The Sans-I/O Viewstamped Replication state machine for one replica.
@@ -70,12 +75,16 @@ pub struct Endpoint<S> {
   log_view: View,
   /// ViewChange: bitset of replicas that sent StartViewChange for `view+1` (includes our own bit once we propose).
   svc_from: u64,
+  /// ViewChange: the highest view this replica is currently collecting StartViewChanges for.
+  svc_target: View,
+  /// ViewChange: true when this replica is merely catching up to an existing newer view
+  /// (higher-view rule) rather than driving a new view change — it sends GetView, not SVC/DVC.
+  catching_up: bool,
   /// ViewChange (prospective primary): collected DoViewChange messages by replica index.
   dvc_from: BTreeMap<u8, DoViewChange>,
   /// ViewChange (prospective primary): the canonical log has been formed this view.
   dvc_quorum: bool,
   /// Freshness nonce for GetView, drawn once from the prng.
-  #[allow(dead_code)] // used from M2 T4/T5
   nonce: u64,
   /// In-memory log, keyed by op number.
   ///
@@ -94,7 +103,7 @@ pub struct Endpoint<S> {
   /// M1: these maps are never pruned (committed entries accumulate). Bounded for
   /// M1's finite runs; a checkpoint/GC trim is an M2/M3 follow-up.
   clients: BTreeMap<u128, Session>,
-  #[allow(dead_code)] // used from M2 T4/T5
+  #[allow(dead_code)] // consumed by escalation jitter (M2.3)
   prng: Prng,
   sm: S,
   outgoing: VecDeque<Outgoing>,
@@ -118,6 +127,8 @@ impl<S: StateMachine> Endpoint<S> {
       commit: OpNumber::new(),
       log_view: View::new(),
       svc_from: 0,
+      svc_target: View::new(),
+      catching_up: false,
       dvc_from: BTreeMap::new(),
       dvc_quorum: false,
       nonce,
@@ -265,9 +276,26 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_primary_idle(&mut self, now: Instant) {
-    // Propose moving to the next view (this milestone: single-step; escalation is later).
-    self.broadcast_svc(now);
+    self.propose_next_view(now);
+  }
+
+  /// Propose moving to `self.view + 1`: adopt it as the SVC target (if higher than the current
+  /// target), set our own bit, broadcast `StartViewChange{target}`, and transition on quorum.
+  fn propose_next_view(&mut self, now: Instant) {
+    let target = View::with(self.view.get() + 1);
+    if target.get() > self.svc_target.get() {
+      self.svc_target = target;
+      self.svc_from = 0;
+    }
+    self.join_svc(now);
     self.maybe_start_view_change(now);
+  }
+
+  /// Set our own bit for `svc_target` and broadcast a `StartViewChange{svc_target}`.
+  fn join_svc(&mut self, now: Instant) {
+    self.svc_from |= 1u64 << self.config.replica().get();
+    self.push_svc(self.svc_target);
+    self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
   }
 
   /// Broadcast a `StartViewChange` for `view` to the other replicas.
@@ -281,26 +309,25 @@ impl<S: StateMachine> Endpoint<S> {
     });
   }
 
-  /// Set our own SVC bit and broadcast `StartViewChange{view+1}` to the other replicas.
-  fn broadcast_svc(&mut self, now: Instant) {
-    let target = View::with(self.view.get() + 1);
-    self.svc_from |= 1u64 << self.config.replica().get();
-    self.push_svc(target);
-    // keep the svc retransmit timer alive while collecting
-    self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
-  }
-
   fn view_change_timeouts(&mut self, now: Instant) {
-    // Retransmit our SVC and DVC so the change makes progress under loss.
-    // (Escalation to view+1 is added in a later milestone.)
     if self.timers.svc_message.is_some_and(|d| d <= now) {
-      // re-broadcast our SVC for the view we're trying to reach
-      self.push_svc(self.view);
+      self.push_svc(self.svc_target); // re-broadcast the live SVC target (drives escalation under loss)
       self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
     }
     if self.timers.dvc_message.is_some_and(|d| d <= now) {
       self.send_do_view_change(now);
       self.timers.dvc_message = Some(now + VC_MESSAGE_RETRANSMIT);
+    }
+    if self.timers.get_view_message.is_some_and(|d| d <= now) {
+      self.send_get_view(now); // re-sends and re-arms get_view_message
+    }
+    if self.timers.view_change_status.is_some_and(|d| d <= now) {
+      // The change did not complete (the next primary is also down, or our catch-up target is
+      // unreachable): become an active SVC-driver for the next view and re-arm timers for that
+      // role (clears the now-stale get_view_message; arms svc/dvc/view_change_status).
+      self.catching_up = false;
+      self.propose_next_view(now);
+      self.arm_timers(now);
     }
   }
 
@@ -312,26 +339,31 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_start_view_change(&mut self, now: Instant, m: crate::StartViewChange) {
-    // This milestone: only collect proposals for our immediate next view; jumps are later.
-    if m.view.get() != self.view.get() + 1 {
+    let target = m.view;
+    if target.get() <= self.view.get() || target.get() > self.view.get() + 1 {
+      // stale (≤ our view), OR a jump beyond our immediate next view — do not drive an
+      // unverified inflated target from a lone SVC; we catch up to a genuinely-higher view
+      // via a real Prepare/Commit from its primary (the higher-view rule), not via SVCs.
       return;
     }
     if m.replica.get() >= self.config.replica_count() {
       return; // ignore malformed/out-of-range replica id
     }
-    self.svc_from |= 1u64 << m.replica.get();
-    // join the proposal if we haven't yet
-    if (self.svc_from & (1u64 << self.config.replica().get())) == 0 {
-      self.broadcast_svc(now);
+    if target.get() > self.svc_target.get() {
+      // A higher target is proposed — adopt it, reset collection, and join it.
+      self.svc_target = target;
+      self.svc_from = 0;
+      self.join_svc(now);
     }
-    self.maybe_start_view_change(now);
+    if target.get() == self.svc_target.get() {
+      self.svc_from |= 1u64 << m.replica.get();
+      self.maybe_start_view_change(now);
+    }
   }
 
   fn maybe_start_view_change(&mut self, now: Instant) {
-    if self.status.is_normal()
-      && (self.svc_from.count_ones() as usize) >= self.config.quorum_view_change()
-    {
-      self.transition_to_view_change_status(now, View::with(self.view.get() + 1));
+    if (self.svc_from.count_ones() as usize) >= self.config.quorum_view_change() {
+      self.transition_to_view_change_status(now, self.svc_target);
     }
   }
 
@@ -340,6 +372,8 @@ impl<S: StateMachine> Endpoint<S> {
     debug_assert!(view_new.get() > self.view.get());
     self.view = view_new;
     self.status = Status::ViewChange;
+    self.catching_up = false; // a real, self-driven change (not catch-up)
+    self.svc_target = view_new; // collect future escalations above this view
     self.inflight.clear();
     self.buffer.clear();
     self.svc_from = 0;
@@ -380,6 +414,10 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_do_view_change(&mut self, now: Instant, m: crate::DoViewChange) {
+    // NOTE (deferred to M3 message-hardening): we do not yet validate incoming DVC well-formedness
+    // (commit <= op, dense log [1..=op]). Safe under honest crash-stop peers; matters once
+    // untrusted/real-driver inputs land. The cross-DVC commit* <= op_head invariant is enforced
+    // (fail-stop) in `select_canonical_log`.
     if m.view != self.view
       || !self.config.is_primary(self.view)
       || !self.status.is_view_change()
@@ -418,33 +456,77 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
-  /// Adopt the canonical log from the DVC quorum and become the active primary.
-  /// This milestone: single-log selection (highest `(log_view, op)`); nack-prepare truncation
-  /// is a later milestone.
-  fn start_view_as_new_primary(&mut self, now: Instant) {
-    // Canonical = the DVC with the greatest (log_view, op). Clone its log out first.
-    let canonical = self
-      .dvc_from
-      .values()
-      .max_by_key(|d| (d.log_view.get(), d.op.get()))
-      .expect("dvc quorum non-empty");
-    let canonical_op = canonical.op;
-    let canonical_log = canonical.log.clone();
-    let commit_max = self
-      .dvc_from
-      .values()
-      .map(|d| d.commit.get())
-      .max()
-      .unwrap_or(0);
+  /// VSR canonical-log selection + nack-prepare truncation.
+  ///
+  /// Returns `(canonical log truncated to op_head, op_head, commit*)`:
+  /// - the canonical generation is the DVCs with the greatest `log_view`;
+  /// - `op_head` is that generation's head, less any provably-uncommitted tail truncated by a
+  ///   `quorum_nack_prepare` of nacks (contiguous ⟹ replica `r` nacks op `X` iff `r.op < X`);
+  /// - `commit*` is the greatest commit across all DVCs (commit never rewinds).
+  ///
+  /// Run by the prospective primary once it holds `>= quorum_view_change` DoViewChange messages.
+  /// NOTE: with exactly `quorum_view_change` DVCs the truncation loop provably never fires in the
+  /// contiguous model (the head-holder is one of them); truncation activates only with a larger
+  /// collected set. See the `no_truncation_at_minimal_quorum` test.
+  fn select_canonical_log(&self) -> (alloc::vec::Vec<crate::PreparedEntry>, u64, u64) {
+    let dvcs: alloc::vec::Vec<&crate::DoViewChange> = self.dvc_from.values().collect();
+    debug_assert!(!dvcs.is_empty(), "selection requires at least one DVC");
 
-    debug_assert!(
-      commit_max <= canonical_op.get(),
-      "newest-log-view canonical log must hold every committed op (VSR safety invariant)"
+    let log_view_star = dvcs.iter().map(|d| d.log_view.get()).max().unwrap_or(0);
+    let canonical: alloc::vec::Vec<&crate::DoViewChange> = dvcs
+      .iter()
+      .copied()
+      .filter(|d| d.log_view.get() == log_view_star)
+      .collect();
+
+    let mut op_head = canonical.iter().map(|d| d.op.get()).max().unwrap_or(0);
+    let commit_star = dvcs.iter().map(|d| d.commit.get()).max().unwrap_or(0);
+    // Fail-stop (in ALL builds): if a committed op exceeds the canonical generation's head, the
+    // cross-DVC VSR view-change invariant is broken — panicking is strictly safer than silently
+    // dropping the committed op (which a release build's `advance_commit` cap would otherwise do).
+    assert!(
+      commit_star <= op_head,
+      "VSR safety invariant violated: commit* ({commit_star}) > op_head ({op_head}) — a committed op \
+       is above the canonical log head; refusing to silently drop it"
     );
 
+    // Truncate the uncommitted tail at the first op with a nack quorum (ascending; nacks are
+    // monotonic in op, so the first crossing truncates everything above it).
+    let threshold = self.config.quorum_nack_prepare();
+    let mut op = commit_star + 1;
+    while op <= op_head {
+      let nacks = dvcs.iter().filter(|d| d.op.get() < op).count();
+      if nacks >= threshold {
+        op_head = op - 1;
+        break;
+      }
+      op += 1;
+    }
+
+    // Adopt the canonical DVC with the greatest op, truncated to op_head.
+    let chosen = canonical
+      .iter()
+      .copied()
+      .max_by_key(|d| d.op.get())
+      .expect("canonical set is non-empty");
+    let log: alloc::vec::Vec<crate::PreparedEntry> = chosen
+      .log
+      .iter()
+      .filter(|entry| entry.op.get() <= op_head)
+      .cloned()
+      .collect();
+    (log, op_head, commit_star)
+  }
+
+  /// Adopt the canonical log from the DVC quorum and become the active primary.
+  /// Canonical-log selection + nack-prepare truncation are now performed via
+  /// `select_canonical_log`.
+  fn start_view_as_new_primary(&mut self, now: Instant) {
+    // Canonical-log selection + nack-prepare truncation (see `select_canonical_log`).
+    let (canonical_log, op_head, commit_star) = self.select_canonical_log();
     self.adopt_log(&canonical_log);
-    self.op = canonical_op;
-    self.advance_commit(now, commit_max); // apply newly-exposed committed ops
+    self.op = OpNumber::with(op_head);
+    self.advance_commit(now, commit_star); // apply newly-exposed committed ops
 
     // Reconstruct client sessions from the adopted log. A backup-turned-primary has no
     // session state; without this, a client's retry of an already-adopted request would be
@@ -516,18 +598,32 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_start_view(&mut self, now: Instant, m: crate::StartView) {
-    if m.view.get() < self.view.get() {
+    // Adopt only a strictly newer view, or the current view while we have not yet
+    // returned to Normal in it. Re-applying a StartView for a view we are already
+    // Normal in would rewind `op` and clobber locally-appended ops.
+    if m.view.get() < self.view.get()
+      || (m.view.get() == self.view.get() && self.status.is_normal())
+    {
       return;
     }
     if m.replica != self.config.primary(m.view) {
       return; // must come from the view's primary
     }
+    debug_assert!(
+      m.commit.get() <= m.op.get(),
+      "StartView commit must not exceed its op (malformed primary)"
+    );
+    debug_assert!(
+      m.op.get() >= self.commit.get(),
+      "StartView must not rewind below our committed op (VSR safety invariant)"
+    );
     self.view = m.view;
     self.adopt_log(&m.log);
     self.op = m.op;
     self.advance_commit(now, m.commit.get());
     self.log_view = m.view;
     self.status = Status::Normal;
+    self.catching_up = false;
     self.svc_from = 0;
     self.dvc_from.clear();
     self.dvc_quorum = false;
@@ -537,7 +633,52 @@ impl<S: StateMachine> Endpoint<S> {
       self.send_prepare_ok(OpNumber::with(op));
     }
   }
-  fn on_get_view(&mut self, _now: Instant, _m: crate::GetView) {}
+  /// Higher-view rule: a newer primary already exists (we saw its Prepare/Commit/PrepareOk) and we
+  /// are merely stale. Fetch its log via GetView; do NOT broadcast a StartViewChange. If catch-up
+  /// stalls, `view_change_status` escalates us to a real, self-driven change.
+  fn catch_up_to_view(&mut self, now: Instant, view: View) {
+    debug_assert!(view.get() > self.view.get());
+    self.view = view;
+    self.status = Status::ViewChange;
+    self.catching_up = true;
+    self.inflight.clear();
+    self.buffer.clear();
+    self.svc_target = view;
+    self.svc_from = 0;
+    self.dvc_from.clear();
+    self.dvc_quorum = false;
+    self.arm_timers(now);
+    self.send_get_view(now);
+  }
+
+  fn send_get_view(&mut self, now: Instant) {
+    let primary = self.config.primary(self.view);
+    self.outgoing.push_back(Outgoing {
+      to: Recipient::To(Peer::Replica(primary)),
+      msg: Message::GetView(crate::GetView {
+        view: self.view,
+        replica: self.config.replica(),
+        nonce: self.nonce,
+      }),
+    });
+    self.timers.get_view_message = Some(now + VC_MESSAGE_RETRANSMIT);
+  }
+
+  fn on_get_view(&mut self, _now: Instant, m: crate::GetView) {
+    // Only a Normal primary at the requested view (or higher) can answer authoritatively.
+    if self.status.is_normal() && self.is_primary() && self.view.get() >= m.view.get() {
+      self.outgoing.push_back(Outgoing {
+        to: Recipient::To(Peer::Replica(m.replica)),
+        msg: Message::StartView(crate::StartView {
+          view: self.view,
+          op: self.op,
+          commit: self.commit,
+          replica: self.config.replica(),
+          log: self.log_entries(),
+        }),
+      });
+    }
+  }
 
   fn on_request(&mut self, now: Instant, _from: Peer, r: crate::Request) {
     if !self.status.is_normal() || !self.is_primary() {
@@ -697,15 +838,24 @@ impl<S: StateMachine> Endpoint<S> {
       Status::Normal => {
         self.timers.primary_idle = Some(now + PRIMARY_IDLE);
       }
+      Status::ViewChange if self.catching_up => {
+        self.timers.get_view_message = Some(now + VC_MESSAGE_RETRANSMIT);
+        self.timers.view_change_status = Some(now + VIEW_CHANGE_STATUS);
+      }
       Status::ViewChange => {
         self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
         self.timers.dvc_message = Some(now + VC_MESSAGE_RETRANSMIT);
+        self.timers.view_change_status = Some(now + VIEW_CHANGE_STATUS);
       }
       Status::Recovering | Status::RecoveringHead => {}
     }
   }
 
   fn on_prepare(&mut self, now: Instant, p: Prepare) {
+    if p.view.get() > self.view.get() {
+      self.catch_up_to_view(now, p.view);
+      return;
+    }
     if !self.status.is_normal() || p.view != self.view || self.is_primary() {
       return;
     }
@@ -785,6 +935,10 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_prepare_ok(&mut self, now: Instant, ok: PrepareOk) {
+    if ok.view.get() > self.view.get() {
+      self.catch_up_to_view(now, ok.view);
+      return;
+    }
     if !self.status.is_normal() || !self.is_primary() || ok.view != self.view {
       return;
     }
@@ -798,6 +952,10 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_commit(&mut self, now: Instant, c: Commit) {
+    if c.view.get() > self.view.get() {
+      self.catch_up_to_view(now, c.view);
+      return;
+    }
     if !self.status.is_normal() || c.view != self.view || self.is_primary() {
       return;
     }
@@ -826,6 +984,8 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.primary_idle,
       self.timers.svc_message,
       self.timers.dvc_message,
+      self.timers.view_change_status,
+      self.timers.get_view_message,
     ]
     .into_iter()
     .flatten()
@@ -837,7 +997,8 @@ impl<S: StateMachine> Endpoint<S> {
 mod tests {
   use super::*;
   use crate::{
-    ClientId, Config, DoViewChange, PreparedEntry, ReplicaId, Request, StartView, StartViewChange,
+    ClientId, Config, DoViewChange, GetView, OpNumber, Prepare, PreparedEntry, ReplicaId, Request,
+    RequestNumber, StartView, StartViewChange, View,
   };
 
   struct NoopSm;
@@ -1102,6 +1263,135 @@ mod tests {
     );
   }
 
+  /// Build a DoViewChange whose log is the contiguous prefix `[1..=op]`.
+  fn dvc(replica: u8, log_view: u64, op: u64, commit: u64) -> DoViewChange {
+    let log = (1..=op)
+      .map(|i| PreparedEntry {
+        op: OpNumber::with(i),
+        client: ClientId::new(1),
+        request: RequestNumber::with(i),
+        body: bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
+      })
+      .collect();
+    DoViewChange {
+      view: View::with(log_view + 10),
+      log_view: View::with(log_view),
+      op: OpNumber::with(op),
+      commit: OpNumber::with(commit),
+      replica: ReplicaId::new(replica),
+      log,
+    }
+  }
+
+  #[test]
+  fn canonical_selection_prefers_highest_log_view_over_longer_log() {
+    // r0 has the newest generation (log_view 2) but a SHORTER log; r1/r2 are longer but stale.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+    e.dvc_from.insert(0, dvc(0, 2, 3, 1));
+    e.dvc_from.insert(1, dvc(1, 1, 5, 1));
+    e.dvc_from.insert(2, dvc(2, 1, 5, 1));
+    let (log, op_head, commit_star) = e.select_canonical_log();
+    assert_eq!(op_head, 3, "newest log_view wins, not the longer stale log");
+    assert_eq!(log.len(), 3);
+    assert_eq!(commit_star, 1);
+  }
+
+  #[test]
+  fn nack_prepare_truncates_provably_uncommitted_tail() {
+    // N=5 → quorum_nack_prepare = 3. Head op 5 held only by r0; r1,r2,r3 stop at op 2.
+    // ops 3..=5 each get 3 nacks (r1,r2,r3) ≥ 3 → truncated to op 2.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+    e.dvc_from.insert(0, dvc(0, 1, 5, 2));
+    e.dvc_from.insert(1, dvc(1, 1, 2, 2));
+    e.dvc_from.insert(2, dvc(2, 1, 2, 2));
+    e.dvc_from.insert(3, dvc(3, 1, 2, 2));
+    let (log, op_head, _) = e.select_canonical_log();
+    assert_eq!(op_head, 2, "ops 3..=5 had a nack quorum → truncated");
+    assert_eq!(log.len(), 2);
+  }
+
+  #[test]
+  fn committed_ops_are_never_truncated() {
+    // commit* = 4: op 5 is the only uncommitted op, nacked by 3 → truncated; 1..=4 survive.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+    e.dvc_from.insert(0, dvc(0, 1, 5, 4));
+    e.dvc_from.insert(1, dvc(1, 1, 4, 4));
+    e.dvc_from.insert(2, dvc(2, 1, 4, 4));
+    e.dvc_from.insert(3, dvc(3, 1, 4, 4));
+    let (log, op_head, commit_star) = e.select_canonical_log();
+    assert_eq!(commit_star, 4);
+    assert_eq!(
+      op_head, 4,
+      "uncommitted op 5 truncated, committed 1..=4 kept"
+    );
+    assert_eq!(log.len(), 4);
+  }
+
+  #[test]
+  fn no_truncation_at_minimal_quorum() {
+    // Documents the contiguous-model property: with exactly quorum_view_change=3 DVCs,
+    // the head-holder (r0) prevents a nack quorum (≤ 2 nacks < 3) → adopt whole.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+    e.dvc_from.insert(0, dvc(0, 1, 5, 2));
+    e.dvc_from.insert(1, dvc(1, 1, 2, 2));
+    e.dvc_from.insert(2, dvc(2, 1, 2, 2));
+    let (_, op_head, _) = e.select_canonical_log();
+    assert_eq!(
+      op_head, 5,
+      "no nack quorum possible at minimal quorum → no truncation"
+    );
+  }
+
+  #[test]
+  fn stalled_view_change_escalates_to_the_next_view() {
+    // replica 3 of 5 (a backup at views 0,1,2). Drive it into ViewChange(1); the new primary(1)
+    // never sends a StartView, so view_change_status escalates it toward view 2.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(3), 5).unwrap(), 0, NoopSm);
+    let t = Instant::ZERO + core::time::Duration::from_millis(300);
+    e.handle_timeout(t); // primary_idle → propose view 1 (own bit, 1/3)
+    e.handle_message(
+      t,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::StartViewChange(StartViewChange {
+        view: View::with(1),
+        replica: ReplicaId::new(0),
+      }),
+    ); // 2/3
+    e.handle_message(
+      t,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::StartViewChange(StartViewChange {
+        view: View::with(1),
+        replica: ReplicaId::new(1),
+      }),
+    ); // 3/3 → ViewChange(1)
+    assert_eq!(e.view(), View::with(1));
+    assert_eq!(e.status(), Status::ViewChange);
+
+    // Stuck: fire view_change_status (~500ms after transition) → escalate, proposing view 2.
+    let t2 = t + core::time::Duration::from_millis(600);
+    e.handle_timeout(t2);
+    // Two peers also propose view 2 → quorum → transition to view 2.
+    e.handle_message(
+      t2,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::StartViewChange(StartViewChange {
+        view: View::with(2),
+        replica: ReplicaId::new(0),
+      }),
+    );
+    e.handle_message(
+      t2,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::StartViewChange(StartViewChange {
+        view: View::with(2),
+        replica: ReplicaId::new(1),
+      }),
+    );
+    assert_eq!(e.view(), View::with(2), "escalated to the next view");
+    assert_eq!(e.status(), Status::ViewChange);
+  }
+
   #[test]
   fn backup_adopts_start_view() {
     // replica 2 of 3 receives a StartView for view 1 from primary(1)=replica 1.
@@ -1150,5 +1440,101 @@ mod tests {
       acked_op2,
       "backup must ack its held uncommitted ops in the new view"
     );
+  }
+
+  #[test]
+  fn higher_view_prepare_triggers_get_view_catch_up() {
+    // replica 0 at view 0 receives a Prepare for view 1 → catch up, sending GetView to primary(1)=1.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::Prepare(Prepare {
+        view: View::with(1),
+        op: OpNumber::with(1),
+        commit: OpNumber::with(0),
+        client: ClientId::new(7),
+        request: RequestNumber::with(1),
+        body: bytes::Bytes::from_static(b"x"),
+      }),
+    );
+    assert_eq!(e.view(), View::with(1));
+    assert_eq!(e.status(), Status::ViewChange);
+    let mut saw_get_view = false;
+    while let Some(out) = e.poll_message() {
+      if let Message::GetView(g) = out.msg {
+        assert_eq!(g.view, View::with(1));
+        saw_get_view = true;
+      }
+    }
+    assert!(
+      saw_get_view,
+      "catch-up sends GetView (not a StartViewChange)"
+    );
+
+    // The StartView reply ends the catch-up: replica 0 becomes Normal in view 1.
+    e.handle_message(
+      now,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::StartView(StartView {
+        view: View::with(1),
+        op: OpNumber::with(1),
+        commit: OpNumber::with(1),
+        replica: ReplicaId::new(1),
+        log: alloc::vec![PreparedEntry {
+          op: OpNumber::with(1),
+          client: ClientId::new(7),
+          request: RequestNumber::with(1),
+          body: bytes::Bytes::from_static(b"x"),
+        }],
+      }),
+    );
+    assert_eq!(e.status(), Status::Normal);
+    assert_eq!(e.view(), View::with(1));
+  }
+
+  #[test]
+  fn normal_primary_answers_get_view_with_start_view() {
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+    e.handle_message(
+      Instant::ZERO,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::GetView(GetView {
+        view: View::with(0),
+        replica: ReplicaId::new(1),
+        nonce: 5,
+      }),
+    );
+    let mut saw_sv = false;
+    while let Some(out) = e.poll_message() {
+      if let Message::StartView(sv) = out.msg {
+        assert_eq!(sv.view, View::with(0));
+        assert_eq!(sv.replica, ReplicaId::new(0));
+        saw_sv = true;
+      }
+    }
+    assert!(saw_sv, "a Normal primary answers GetView with a StartView");
+  }
+
+  #[test]
+  fn lone_high_svc_is_ignored_not_driven() {
+    // A single StartViewChange for a far-future view must NOT inflate our view (C1 guard):
+    // an SVC is not evidence a primary exists at that view.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 5).unwrap(), 0, NoopSm);
+    e.handle_message(
+      Instant::ZERO,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::StartViewChange(StartViewChange {
+        view: View::with(100),
+        replica: ReplicaId::new(0),
+      }),
+    );
+    assert_eq!(
+      e.view(),
+      View::new(),
+      "a lone high SVC must not inflate our view"
+    );
+    assert_eq!(e.status(), Status::Normal);
   }
 }

@@ -11,6 +11,6 @@ pub mod cluster;
 pub mod network;
 pub mod sm;
 
-pub use checker::{CheckResult, check_safety};
+pub use checker::{CheckResult, ViewMonotonicChecker, check_safety};
 pub use cluster::Cluster;
 pub use network::Faults;
