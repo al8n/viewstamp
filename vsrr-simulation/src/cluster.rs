@@ -24,7 +24,7 @@ impl Cluster {
   pub fn new(replicas: u8, clients: u32, requests_per_client: u64, seed: u64) -> Self {
     let replica_set: Vec<Endpoint<LogSm>> = (0..replicas)
       .map(|i| {
-        let cfg = Config::new(1, ReplicaId::new(i), replicas);
+        let cfg = Config::try_new(1, ReplicaId::new(i), replicas).expect("valid cluster config");
         Endpoint::new(
           cfg,
           seed ^ (i as u64).wrapping_mul(0x1234_5678),

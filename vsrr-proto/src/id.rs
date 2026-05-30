@@ -78,6 +78,15 @@ impl Peer {
       Self::Client(_) => None,
     }
   }
+
+  /// The client id, if this is a client peer.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_client(&self) -> Option<ClientId> {
+    match self {
+      Self::Client(c) => Some(*c),
+      Self::Replica(_) => None,
+    }
+  }
 }
 
 /// The intended destination set for an outgoing message.
@@ -89,6 +98,35 @@ pub enum Recipient {
   Backups,
   /// Every replica including this one (loopback handled by the driver).
   AllReplicas,
+}
+
+impl Recipient {
+  /// True iff this targets a single peer.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_to(&self) -> bool {
+    matches!(self, Self::To(_))
+  }
+
+  /// True iff this targets every backup (every replica but this one).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_backups(&self) -> bool {
+    matches!(self, Self::Backups)
+  }
+
+  /// True iff this targets every replica.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_all_replicas(&self) -> bool {
+    matches!(self, Self::AllReplicas)
+  }
+
+  /// The single peer, if this targets one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_to(&self) -> Option<Peer> {
+    match self {
+      Self::To(p) => Some(*p),
+      _ => None,
+    }
+  }
 }
 
 #[cfg(test)]
