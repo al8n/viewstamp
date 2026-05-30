@@ -17,6 +17,9 @@ pub struct Cluster {
   faults: Faults,
   replica_count: u8,
   crashed: Vec<bool>,
+  /// Partition group id per replica. Replica↔replica messages between different groups are
+  /// dropped. All replicas start in group 0 (no partition).
+  groups: Vec<u8>,
 }
 
 impl Cluster {
@@ -46,6 +49,7 @@ impl Cluster {
       faults: Faults::none(),
       replica_count: replicas,
       crashed: vec![false; n],
+      groups: vec![0; n],
     }
   }
 
@@ -97,6 +101,27 @@ impl Cluster {
   /// Whether replica `i` is crashed.
   pub fn is_crashed(&self, i: usize) -> bool {
     self.crashed[i]
+  }
+
+  /// Partition the replicas into groups: `groups[i]` is replica `i`'s group id. Replica↔replica
+  /// messages between different groups are dropped until `heal`. (Client↔replica traffic is unaffected.)
+  pub fn partition(&mut self, groups: Vec<u8>) {
+    assert_eq!(
+      groups.len(),
+      self.replicas.len(),
+      "one group id per replica"
+    );
+    self.groups = groups;
+  }
+
+  /// Heal all partitions (a single group).
+  pub fn heal(&mut self) {
+    self.groups = vec![0; self.replicas.len()];
+  }
+
+  /// Whether replica↔replica traffic between replicas `a` and `b` is currently partitioned.
+  pub fn partitioned(&self, a: u8, b: u8) -> bool {
+    self.groups[a as usize] != self.groups[b as usize]
   }
 
   /// One simulation step.
@@ -210,6 +235,11 @@ impl Cluster {
 
   /// Applies the fault model and (unless dropped) enqueues a message.
   fn schedule(&mut self, now: Instant, from: Peer, target: Target, msg: Message) {
+    if let (Peer::Replica(from_r), Target::Replica(to_r)) = (from, target) {
+      if self.partitioned(from_r.get(), to_r) {
+        return;
+      }
+    }
     if self.faults.drop_per_mille > 0 && self.prng.chance(self.faults.drop_per_mille, 1000) {
       return;
     }
@@ -255,5 +285,17 @@ mod tests {
     // a crashed primary means no commits; the (single) client cannot finish without view change,
     // but the loop must run cleanly.
     assert!(c.now().as_nanos() > 0);
+  }
+
+  #[test]
+  fn partition_groups_block_cross_group_traffic() {
+    let mut c = Cluster::new(5, 1, 1, 3);
+    assert!(!c.partitioned(0, 3), "no partition by default");
+    c.partition(vec![0, 0, 0, 1, 1]); // {0,1,2} | {3,4}
+    assert!(c.partitioned(0, 3), "cross-group is blocked");
+    assert!(!c.partitioned(0, 1), "same-group is not blocked");
+    assert!(!c.partitioned(3, 4), "same-group is not blocked");
+    c.heal();
+    assert!(!c.partitioned(0, 3), "heal removes all partitions");
   }
 }
