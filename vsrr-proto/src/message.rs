@@ -509,6 +509,153 @@ impl GetView {
   }
 }
 
+/// Replica → peers (TB request_prepare): solicit a single committed op whose body this replica read
+/// back permanently faulty (bit-rot / torn) from its own durable WAL. A replica holding a hole at a
+/// committed op `op` (below its head, above its applied frontier) broadcasts this; any peer that
+/// holds `op` answers with the [`Prepare`] carrying it. The repair fills the hole so the replica can
+/// resume applying its committed prefix in order — it NEVER advances its commit past the hole until
+/// the op arrives. The view is carried for routing/freshness; the op's committed content is
+/// view-independent, so a reply from any view that holds `op` is acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestPrepare {
+  view: View,
+  op: OpNumber,
+  replica: ReplicaId,
+}
+
+impl RequestPrepare {
+  /// Creates a RequestPrepare for the missing committed op `op`.
+  pub const fn new(view: View, op: OpNumber, replica: ReplicaId) -> Self {
+    Self { view, op, replica }
+  }
+
+  /// The requester's current view.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The op number being requested (a committed op missing locally).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op(&self) -> OpNumber {
+    self.op
+  }
+
+  /// The requesting replica (the reply is addressed back to it).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+}
+
+/// Recovering replica → all (TB recovery): solicit the canonical head when the local head slot is
+/// permanently faulty. A `RecoveringHead` replica that cannot trust its own durable head broadcasts
+/// this; peers answer with a [`RecoveryResponse`]. The `nonce` is a freshness token echoed back so a
+/// stale response (from a prior recovery attempt) is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recovery {
+  replica: ReplicaId,
+  nonce: u64,
+}
+
+impl Recovery {
+  /// Creates a Recovery solicitation.
+  pub const fn new(replica: ReplicaId, nonce: u64) -> Self {
+    Self { replica, nonce }
+  }
+
+  /// The recovering replica.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// Freshness nonce echoed in the reply.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+}
+
+/// Replica → recovering replica (TB recovery response): the sender's view, position, and — from the
+/// view's primary — its canonical log + head + commit, so a `RecoveringHead` replica can re-establish
+/// a head it cannot read locally. A non-primary answers with only its view + echoed `nonce` (empty
+/// `log`, zero `op`/`commit`): it has no authority to hand out a canonical head, but its view lets the
+/// recovering replica learn the current generation. The `nonce` echoes the soliciting [`Recovery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryResponse {
+  view: View,
+  op: OpNumber,
+  commit: OpNumber,
+  replica: ReplicaId,
+  nonce: u64,
+  log: Vec<PreparedEntry>,
+}
+
+impl RecoveryResponse {
+  /// Creates a RecoveryResponse. The primary fills `op`/`commit`/`log` from its canonical state; a
+  /// backup passes `op = commit = 0` and an empty `log` (view + nonce only).
+  pub fn new(
+    view: View,
+    op: OpNumber,
+    commit: OpNumber,
+    replica: ReplicaId,
+    nonce: u64,
+    log: Vec<PreparedEntry>,
+  ) -> Self {
+    Self {
+      view,
+      op,
+      commit,
+      replica,
+      nonce,
+      log,
+    }
+  }
+
+  /// The responder's current view.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The canonical head op (from the primary; `0` from a backup).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op(&self) -> OpNumber {
+    self.op
+  }
+
+  /// The canonical commit number (from the primary; `0` from a backup).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn commit(&self) -> OpNumber {
+    self.commit
+  }
+
+  /// The responding replica.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// The freshness nonce echoed from the soliciting [`Recovery`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+
+  /// The canonical full log `[1..=op]` as a slice (empty from a backup).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn log_slice(&self) -> &[PreparedEntry] {
+    &self.log
+  }
+
+  /// Consumes the message and returns the log vector.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_log(self) -> Vec<PreparedEntry> {
+    self.log
+  }
+}
+
 /// A Viewstamped Replication protocol message.
 ///
 /// Client traffic is not a separate API: a request arrives as `Message::Request`
@@ -538,6 +685,12 @@ pub enum Message {
   StartView(StartView),
   /// Request the current view (catch-up).
   GetView(GetView),
+  /// Solicit a single committed op whose local copy read back faulty (peer fault-repair).
+  RequestPrepare(RequestPrepare),
+  /// Solicit the canonical head (a `RecoveringHead` replica whose head slot is faulty).
+  Recovery(Recovery),
+  /// Answer a `Recovery` with the canonical head (from the primary) or just the current view.
+  RecoveryResponse(RecoveryResponse),
 }
 
 /// A message the state machine wants the driver to send.
@@ -625,5 +778,73 @@ mod tests {
       )],
     ));
     assert_eq!(dvc.unwrap_do_view_change().op(), OpNumber::with(3));
+  }
+
+  #[test]
+  fn recovery_messages_construct_and_round_trip() {
+    use crate::ReplicaId;
+    // A RecoveringHead replica broadcasts Recovery{replica, nonce}.
+    let rec = Message::Recovery(Recovery::new(ReplicaId::new(2), 0xABCD));
+    assert!(rec.is_recovery());
+    let r = rec.unwrap_recovery();
+    assert_eq!(r.replica(), ReplicaId::new(2));
+    assert_eq!(r.nonce(), 0xABCD);
+
+    // The primary's RecoveryResponse carries its view + head + commit + canonical log, echoing nonce.
+    let resp = Message::RecoveryResponse(RecoveryResponse::new(
+      View::with(3),
+      OpNumber::with(5),
+      OpNumber::with(4),
+      ReplicaId::new(0),
+      0xABCD,
+      std::vec![PreparedEntry::new(
+        OpNumber::with(5),
+        ClientId::new(7),
+        RequestNumber::with(5),
+        bytes::Bytes::from_static(b"e"),
+      )],
+    ));
+    assert!(resp.is_recovery_response());
+    let rr = resp.unwrap_recovery_response();
+    assert_eq!(rr.view(), View::with(3));
+    assert_eq!(rr.op(), OpNumber::with(5));
+    assert_eq!(rr.commit(), OpNumber::with(4));
+    assert_eq!(rr.replica(), ReplicaId::new(0));
+    assert_eq!(rr.nonce(), 0xABCD);
+    assert_eq!(rr.log_slice().len(), 1);
+    assert_eq!(rr.into_log().len(), 1);
+  }
+
+  #[test]
+  fn request_prepare_constructs_and_round_trips() {
+    use crate::ReplicaId;
+    // A replica holding a faulty committed op `op` broadcasts RequestPrepare{view, op, replica}.
+    let m = Message::RequestPrepare(RequestPrepare::new(
+      View::with(2),
+      OpNumber::with(7),
+      ReplicaId::new(3),
+    ));
+    assert!(m.is_request_prepare());
+    let rp = m.unwrap_request_prepare();
+    assert_eq!(rp.view(), View::with(2));
+    assert_eq!(rp.op(), OpNumber::with(7));
+    assert_eq!(rp.replica(), ReplicaId::new(3));
+  }
+
+  #[test]
+  fn backup_recovery_response_carries_no_log() {
+    use crate::ReplicaId;
+    // A non-primary's RecoveryResponse carries only its view + nonce (no canonical log/head/commit).
+    let rr = RecoveryResponse::new(
+      View::with(3),
+      OpNumber::new(),
+      OpNumber::new(),
+      ReplicaId::new(2),
+      0xFEED,
+      std::vec![],
+    );
+    assert!(rr.log_slice().is_empty());
+    assert_eq!(rr.nonce(), 0xFEED);
+    assert_eq!(rr.view(), View::with(3));
   }
 }

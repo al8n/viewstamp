@@ -57,6 +57,52 @@ const COMMIT_HEARTBEAT: core::time::Duration = core::time::Duration::from_millis
 const PRIMARY_IDLE: core::time::Duration = core::time::Duration::from_millis(200);
 const VC_MESSAGE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
 const VIEW_CHANGE_STATUS: core::time::Duration = core::time::Duration::from_millis(500);
+/// Recovery (`Status::Recovering`): how often the recover-read timer re-submits any still
+/// pending/faulty WAL-tail reads. Covers a real async driver that drops a completion, and the
+/// transient-clears-on-retry case where a `Fault` only resolves on a later read.
+const RECOVER_READ_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
+/// Recovery: per-slot read-retry budget. A `Fault`/`Absent`/checksum-mismatch on a WAL-tail read is
+/// re-submitted up to this many times (transient faults clear within the budget); once exhausted the
+/// slot is classed *permanently* faulty, which drives the `Normal`-vs-`RecoveringHead` decision.
+const RECOVER_READ_RETRIES: u8 = 8;
+/// RecoveringHead (`Status::RecoveringHead`): how often the replica re-broadcasts its `Recovery`
+/// solicitation while waiting for the canonical head. A permanently-faulty head cannot be repaired
+/// from local disk, so the replica keeps soliciting a peer until a `RecoveryResponse`/`StartView`
+/// re-establishes its head.
+const RECOVER_HEAD_SOLICIT: core::time::Duration = core::time::Duration::from_millis(100);
+/// Peer fault-repair: how often a replica holding a permanently-faulty committed-op hole re-broadcasts
+/// `RequestPrepare` for each unrepaired op, until a peer answers with the missing `Prepare`. Mirrors
+/// the recover-read retransmit cadence; the commit is HELD below the hole until the op arrives.
+const REPAIR_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
+
+/// In-flight recovery read-bookkeeping for a `Status::Recovering`/`RecoveringHead` replica.
+///
+/// `recover()` builds the dense log cache from headers only (bodies empty), submits the WAL-tail +
+/// checkpoint reads, and stashes one of these. `handle_storage` then verifies each `ReadOk`'s
+/// checksum, fills the body, retries `Fault`/`Absent`/checksum-mismatch, and — once every read is
+/// satisfied — transitions to `Normal` (tail consistent) or `RecoveringHead` (head permanently
+/// faulty). Private to `endpoint.rs`; never crosses the API boundary, so no accessors. All maps are
+/// bounded by the WAL-tail length (bounded by the checkpoint-interval headroom).
+#[derive(Debug, Default)]
+struct RecoverState {
+  /// Ops whose body read is still outstanding → remaining retry budget. Non-empty ⇒ reads in flight.
+  pending: BTreeMap<u64, u8>,
+  /// Maps an in-flight read's `OpId` → the op it reads, so a `Fault`/`Absent` completion (which
+  /// carries only the `OpId`) is attributed to the right slot.
+  reads: BTreeMap<u64, u64>,
+  /// Ops that read back permanently faulty/absent (retry budget exhausted). Drives the
+  /// `Normal`-vs-`RecoveringHead` decision in `recover_progress`.
+  faulty: std::collections::BTreeSet<u64>,
+  /// The in-flight checkpoint-read `OpId` (`Some` until the snapshot is restored), or `None` if no
+  /// checkpoint exists / it is already restored.
+  checkpoint: Option<u64>,
+  /// Remaining retry budget for the checkpoint read (the per-op `pending` analog). A transient
+  /// checkpoint-read `Fault` is re-submitted within this budget; a *permanent* one is unreachable in
+  /// M3.3a — the durable root only ever names a fully-written snapshot (the root write is step 2,
+  /// after the snapshot is durable) — so the budget always clears. Exhausting it is a state-sync
+  /// (M3.4) concern, asserted unreachable here.
+  checkpoint_retries: u8,
+}
 
 /// One entry in the in-memory log (M1; persistence arrives in M3).
 #[derive(Debug, Clone)]
@@ -100,6 +146,19 @@ struct Timers {
   view_change_status: Option<Instant>,
   /// ViewChange (catch-up): retransmit GetView.
   get_view_message: Option<Instant>,
+  /// Recovering: re-submit any still-pending/faulty WAL-tail (and checkpoint) reads. Drives the
+  /// recover loop to termination under a transient fault whose completion was dropped or whose retry
+  /// only clears on a later read.
+  recover_retry: Option<Instant>,
+  /// RecoveringHead: re-broadcast the `Recovery` solicitation. A replica whose durable head slot is
+  /// permanently faulty cannot recover from its own disk; it solicits the canonical head from a peer
+  /// (the primary answers with a `RecoveryResponse`) and retries on this cadence until it adopts a
+  /// head (via that response or a `StartView`) and returns to Normal.
+  recover_head: Option<Instant>,
+  /// Normal: re-broadcast `RequestPrepare` for each op in the pending-repair set (a committed-op hole
+  /// read back permanently faulty). Armed only while `repair` is non-empty; cleared when the last
+  /// hole is filled. Active in BOTH primary and backup roles — either may hold a hole after recovery.
+  repair_retry: Option<Instant>,
 }
 
 /// The Sans-I/O Viewstamped Replication state machine for one replica.
@@ -175,6 +234,23 @@ pub struct Endpoint<S> {
   /// cleared on every view-change transition (a new generation re-establishes the pipeline, so old
   /// reports are stale — clearing keeps the primary conservative until fresh `PrepareOk`s arrive).
   peer_checkpoint: BTreeMap<u8, OpNumber>,
+  /// Active only while `status` is `Recovering`/`RecoveringHead`: the in-flight recovery-read
+  /// bookkeeping (see [`RecoverState`]). Cleared to `None` by the `→ Normal` recovery transition
+  /// (`recover_progress`); structurally `None` in every other status, since a recovering replica does
+  /// not participate in consensus (the `handle_message` guard) and so cannot enter a view change
+  /// while recovering. (M3.3b's `RecoveringHead → StartView` adoption will clear it on that path too.)
+  recover: Option<RecoverState>,
+  /// Peer fault-repair (B4): committed ops whose body read back PERMANENTLY faulty (bit-rot / torn)
+  /// from this replica's own durable WAL and must be re-fetched from a peer (`RequestPrepare` →
+  /// `Prepare`). An op lands here when the recover loop classes a non-head committed slot permanently
+  /// faulty (it is dropped from the dense `log` cache so it cannot be applied with a wrong/empty body)
+  /// or when the apply path (`commit_op`/`advance_commit`) finds a committed op's body missing. While
+  /// an op is in this set the commit is HELD strictly below it (ops apply in order; a hole at op `N`
+  /// stops the apply at `N-1`); the `repair_retry` timer re-solicits each op until a verified
+  /// `Prepare` fills it. Bounded by the WAL-tail length (same bound as `recover`/`log`). Structurally
+  /// empty once every committed op below the head is present; cleared wholesale when an adopted
+  /// canonical log (StartView / new-primary selection) supplies the full committed prefix.
+  repair: std::collections::BTreeSet<u64>,
 }
 
 impl<S: StateMachine> Endpoint<S> {
@@ -212,51 +288,54 @@ impl<S: StateMachine> Endpoint<S> {
       pending_checkpoint: None,
       checkpoint_op: OpNumber::new(),
       peer_checkpoint: BTreeMap::new(),
+      recover: None,
+      repair: std::collections::BTreeSet::new(),
     }
   }
 
-  /// Reconstructs an endpoint from durable storage after a restart, restoring from the durable
-  /// checkpoint (not op 0).
+  /// Reconstructs an endpoint from durable storage after a restart — a **metadata-only constructor**
+  /// that enters [`Status::Recovering`] and defers all fallible reads to an async `handle_storage`
+  /// loop (faults-as-data; spec §2/§6). It does NOT return in `Normal`.
   ///
-  /// Reads the superblock root for `(view, log_view, checkpoint_op, checkpoint_id)` and returns to
-  /// `Status::Normal`. Two cases, on `state.checkpoint_op()`:
+  /// **Phase 1 (here, sync + infallible).** Reads only synchronous trait metadata — the superblock
+  /// root via `sb.state()` for `(view, log_view, checkpoint_op, checkpoint_id)` and `wal.op_head()` /
+  /// `wal.header(op)` — and constructs the endpoint with:
+  /// - `view = state.view()`, `log_view = state.log_view()`, `op = wal.op_head()`,
+  ///   `checkpoint_op = state.checkpoint_op()`, and `commit_min = commit_max = checkpoint_op` (the
+  ///   restored SM already reflects `[1..=checkpoint_op]`, so this prevents a double-apply; monotone
+  ///   `op >= commit_max >= commit_min` holds). With no checkpoint (`checkpoint_op == 0`) this is the
+  ///   M3.1b behaviour: a fresh `S`, `commit_min == commit_max == 0`.
+  /// - the in-memory log cache built **dense from headers only** (`wal.header(op)` for `op in
+  ///   1..=head`, bodies left empty — filled by Phase 2). Dense because M3.2a never prunes the WAL and
+  ///   view change is not yet checkpoint-aware, so the recovered replica must hold the full log to
+  ///   participate safely; `commit_min == checkpoint_op` means `[1..=checkpoint_op]` are never
+  ///   re-applied (they live in the restored SM) — those cache entries serve only view-change/
+  ///   retransmit. A slot whose `header()` is absent/faulty is still recorded as pending (the read
+  ///   resolves it).
+  /// - `status = Status::Recovering`, and a fresh [`RecoverState`]: every `op in 1..=head` is
+  ///   submitted via `submit_read` (minted `OpId` recorded in `recover.reads`) with a
+  ///   [`RECOVER_READ_RETRIES`] budget in `recover.pending`; if `checkpoint_op > 0` the checkpoint
+  ///   read is submitted too (its `OpId` in `recover.checkpoint`).
   ///
-  /// - **A checkpoint exists (`checkpoint_op > 0`).** Reads the durable checkpoint snapshot
-  ///   (`submit_read_checkpoint` → synchronous `CheckpointRead` drain — see the drain note below),
-  ///   splits the envelope into `(sessions, sm_snapshot)`, restores the state machine
-  ///   (`sm.restore(sm_snapshot)`) and the client-session table, and sets
-  ///   `commit_min = commit_max = checkpoint_op`. The restored SM already reflects the applied
-  ///   prefix `[1..=checkpoint_op]`, so `commit_min = checkpoint_op` (NOT 0) prevents double-applying
-  ///   those ops; only the committed tail above the checkpoint (`> checkpoint_op`) is re-applied, as
-  ///   the primary re-announces commit via `advance_commit`.
-  /// - **No checkpoint yet (`checkpoint_op == 0`).** Identical to the M3.1b behavior: a fresh `S`,
-  ///   `commit_min = commit_max = 0`, and the committed prefix is re-applied lazily by
-  ///   `advance_commit` as the primary re-announces its commit (no checkpoint has persisted a commit
-  ///   point yet).
+  /// It submits the reads (a sync, infallible trait call, mirroring `on_request`'s `submit_append`)
+  /// but performs **no `poll()`** — completion handling, checksum verification, and retry all live in
+  /// Phase 2. Hence the `&mut W, &mut B`.
   ///
-  /// In both cases the in-memory log cache is rebuilt **dense** from the WAL `[1..=op_head]` (headers
-  /// AND real bodies). M3.2a never prunes the WAL (GC is deferred to after M3.4) AND view change is
-  /// not yet checkpoint-aware, so the recovered replica must keep the full log to participate safely
-  /// in a view change — a sparse log below the checkpoint would make its DoViewChange/StartView omit
-  /// committed ops (the same hazard that defers GC). `commit_min = checkpoint_op` means
-  /// `advance_commit` never RE-APPLIES `<= checkpoint_op` (those are in the restored SM); the
-  /// `[1..=checkpoint_op]` cache entries serve only view-change/retransmit. Post-M3.4 (GC +
-  /// checkpoint-aware view change), this rebuild becomes tail-only.
+  /// **Phase 2 (`handle_storage`, async + fallible).** `on_wal_done`/`on_sb_done` drive the reads to
+  /// a consistent tail: each `ReadOk`'s body is adopted only after `Header::verify` (a torn write /
+  /// bit-rot surfaces as a checksum mismatch and is treated as a fault); `Fault`/`Absent`/mismatch is
+  /// retried within the budget, then classed permanently faulty; the checkpoint `CheckpointRead`
+  /// restores the SM + sessions. Once every read is satisfied, `recover_progress` transitions to
+  /// `Normal` (tail consistent) or `RecoveringHead` (the head slot is permanently faulty — it cannot
+  /// trust its head and awaits a `StartView`, completed in M3.3b). A recovered backup re-emits
+  /// nothing; it waits for the primary's `Prepare`/`Commit` to re-announce commit, exactly as before.
   ///
-  /// **Durable-view.** The view is persisted to the superblock before any view-change participation,
-  /// so `state.view()` is trustworthy: a recovered replica resumes the view it was in when it last
-  /// participated.
-  ///
-  /// **Synchronous checkpoint/body-read drain.** Bodies and the checkpoint snapshot live behind the
-  /// async `submit_read`/`submit_read_checkpoint` + `poll` interface; recovery drains them
-  /// synchronously against the in-memory `Wal`/`Superblock` (whose reads complete immediately),
-  /// which is why this takes `&mut W` and `&mut B`. When M3.3 makes reads truly async (and able to
-  /// return `Fault`/torn), recovery moves into a `Status::Recovering` `handle_storage` read loop that
-  /// retries on `Fault`, and these synchronous drains are removed.
+  /// **Durable-view.** The view is persisted before any view-change participation, so `state.view()`
+  /// is trustworthy: a recovered replica resumes the view it was in when it last participated.
   pub fn recover<W: Wal, B: Superblock>(
     config: Config,
     seed: u64,
-    mut sm: S,
+    sm: S,
     wal: &mut W,
     sb: &mut B,
   ) -> Self {
@@ -265,65 +344,9 @@ impl<S: StateMachine> Endpoint<S> {
     let head = wal.op_head().get();
     let checkpoint_op = state.checkpoint_op().get();
 
-    // Restore the checkpoint, if one is durable: read the snapshot envelope (synchronous drain — the
-    // in-memory superblock completes the read immediately; the async `Status::Recovering` loop is
-    // M3.3), then restore the SM + the client-session table from it. `OpId::new(0)` is a reserved
-    // correlation id for the recovery read: `next_op_id` starts at 1, so 0 never aliases a real op.
-    // When `checkpoint_op == 0` no checkpoint exists; the SM stays fresh and `clients` stays empty
-    // (exactly the M3.1b behavior — the regression guard).
-    let mut clients: BTreeMap<u128, Session> = BTreeMap::new();
-    if checkpoint_op > 0 {
-      sb.submit_read_checkpoint(crate::OpId::new(0));
-      while let Some(done) = sb.poll() {
-        if let SuperblockDone::CheckpointRead(cr) = done {
-          let (restored_sessions, sm_tail) = Self::decode_checkpoint(cr.snapshot());
-          sm.restore(sm_tail);
-          clients = restored_sessions;
-        }
-        // M3.2a: a `Fault` here cannot happen — the durable root only ever names a fully-written
-        // snapshot (the root write is step 2, after the snapshot write is durable). M3.3 handles
-        // `Fault`/torn reads via the async recovery loop.
-      }
-    }
-
-    // Rebuild the log cache DENSE [1..=head] from the WAL. M3.2a never prunes the WAL and view change
-    // is not yet checkpoint-aware, so a recovered replica must hold the FULL log to participate in a
-    // view change safely — a sparse log below the checkpoint would omit committed ops from its
-    // DoViewChange/StartView (the very hazard that defers GC). `commit_min = checkpoint_op` already
-    // prevents re-applying [1..=checkpoint_op] (they are in the restored SM); these cache entries
-    // serve only view-change/retransmit. Post-M3.4 (GC + checkpoint-aware view change) this becomes
-    // tail-only. Headers from the sync metadata view; bodies via a sync read drain.
-    let mut log = BTreeMap::new();
-    for op in 1..=head {
-      if let Some(h) = wal.header(OpNumber::with(op)) {
-        log.insert(
-          op,
-          LogEntry {
-            client: h.client(),
-            request: h.request(),
-            body: Bytes::new(),
-          },
-        );
-      }
-    }
-    for op in 1..=head {
-      wal.submit_read(crate::OpId::new(op), OpNumber::with(op));
-    }
-    // Drain every completion, matching each ReadOk to its op, rather than counting reads: a
-    // counter could be tripped early by a stray pre-existing completion in the queue, leaving a
-    // real op's body empty and silently diverging the SM on re-apply. Draining to `None` fills
-    // every requested op exactly (a stray ReadOk for the same op carries the same durable body).
-    while let Some(done) = wal.poll() {
-      if let WalDone::ReadOk(r) = done {
-        if let Some(entry) = log.get_mut(&r.op().get()) {
-          entry.body = r.body_bytes();
-        }
-      }
-    }
-
-    Self {
+    let mut endpoint = Self {
       config,
-      status: Status::Normal,
+      status: Status::Recovering,
       view: state.view(),
       op: OpNumber::with(head),
       // The restored SM reflects [1..=checkpoint_op] exactly; commit_min = checkpoint_op so those
@@ -338,10 +361,12 @@ impl<S: StateMachine> Endpoint<S> {
       dvc_from: BTreeMap::new(),
       dvc_quorum: false,
       nonce,
-      log,
+      // Dense headers-only cache; bodies filled by the Recovering loop (Phase 2).
+      log: BTreeMap::new(),
       inflight: BTreeMap::new(),
       buffer: BTreeMap::new(),
-      clients,
+      // Sessions are restored from the checkpoint snapshot in `on_sb_done` (Phase 2).
+      clients: BTreeMap::new(),
       sm,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
@@ -352,7 +377,44 @@ impl<S: StateMachine> Endpoint<S> {
       pending_checkpoint: None,
       checkpoint_op: OpNumber::with(checkpoint_op),
       peer_checkpoint: BTreeMap::new(),
+      recover: None,
+      repair: std::collections::BTreeSet::new(),
+    };
+
+    // Phase 1: build the dense header cache (bodies empty) and submit the tail + checkpoint reads.
+    let mut rec = RecoverState::default();
+    for op in 1..=head {
+      if let Some(h) = wal.header(OpNumber::with(op)) {
+        endpoint.log.insert(
+          op,
+          LogEntry {
+            client: h.client(),
+            request: h.request(),
+            body: Bytes::new(),
+          },
+        );
+      }
+      // Submit a read for EVERY tail op (even one whose header is absent/faulty now): the read is
+      // the authoritative resolution, and a `Fault`/`Absent` completion routes through the retry
+      // path. Each read gets a minted OpId (never aliases a future real op — next_op_id grows).
+      let id = endpoint.mint_op_id();
+      wal.submit_read(id, OpNumber::with(op));
+      rec.reads.insert(id.get(), op);
+      rec.pending.insert(op, RECOVER_READ_RETRIES);
     }
+    if checkpoint_op > 0 {
+      let id = endpoint.mint_op_id();
+      sb.submit_read_checkpoint(id);
+      rec.checkpoint = Some(id.get());
+      rec.checkpoint_retries = RECOVER_READ_RETRIES;
+    }
+    endpoint.recover = Some(rec);
+    // Settle the transition decider once: an EMPTY WAL with no checkpoint (head == 0) has nothing to
+    // read, so it must reach Normal here (no completion would ever arrive to drive the loop).
+    // Otherwise this arms the recover_retry timer so an owner driving `poll_timeout`/`handle_timeout`
+    // re-submits any read whose completion is dropped or whose transient fault clears on a later read.
+    endpoint.recover_progress(Instant::ZERO, sb);
+    endpoint
   }
 
   /// The current status.
@@ -455,6 +517,30 @@ impl<S: StateMachine> Endpoint<S> {
     from: Peer,
     msg: Message,
   ) {
+    // A Recovering replica does NOT process ANY consensus message: it is still draining its own
+    // durable storage (the async `handle_storage` loop) and does not even know its true head yet, so
+    // it casts no PrepareOk/vote/DVC and adopts no peer's view until it reaches Normal. This also
+    // blocks the higher-view `catch_up_to_view` pre-checks inside the per-message handlers (which
+    // would otherwise yank a recovering replica into ViewChange mid-recovery).
+    if self.status.is_recovering() {
+      return;
+    }
+    // A RecoveringHead replica (its durable head slot is permanently faulty) is the ONE exception:
+    // it cannot recover its head from its own disk, so it must LEARN the canonical head from an
+    // authoritative peer. We relax the guard for EXACTLY the two head-learning messages — a
+    // `StartView` (the new primary's full canonical log+head+commit) and a `RecoveryResponse` from
+    // the primary (the recovery-handshake equivalent). It still does NOT participate: every other
+    // message (Prepare/PrepareOk/Commit/SVC/DVC/GetView/Recovery/Request) is dropped, so it casts no
+    // ack/vote until adoption returns it to Normal. (Dropping a peer's `Recovery` here is correct: a
+    // replica that cannot read its own head has no canonical head to hand out.)
+    if self.status.is_recovering_head() {
+      match msg {
+        Message::StartView(m) => self.on_start_view(now, sb, m),
+        Message::RecoveryResponse(m) => self.on_recovery_response(now, sb, m),
+        _ => {}
+      }
+      return;
+    }
     match msg {
       Message::Request(r) => self.on_request(now, wal, from, r),
       Message::Prepare(p) => self.on_prepare(now, wal, sb, p),
@@ -464,13 +550,15 @@ impl<S: StateMachine> Endpoint<S> {
       Message::DoViewChange(m) => self.on_do_view_change(now, sb, m),
       Message::StartView(m) => self.on_start_view(now, sb, m),
       Message::GetView(m) => self.on_get_view(now, m),
+      Message::RequestPrepare(m) => self.on_request_prepare(now, m),
+      Message::Recovery(m) => self.on_recovery(now, m),
+      Message::RecoveryResponse(m) => self.on_recovery_response(now, sb, m),
       Message::Reply(_) => {}
     }
   }
 
   /// Fires any timers due at `now`, dispatching by status/role.
   pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
-    let _ = &mut *wal; // WAL unused in timeouts
     match self.status {
       Status::Normal if self.is_primary() => self.primary_timeouts(now),
       Status::Normal => {
@@ -485,24 +573,44 @@ impl<S: StateMachine> Endpoint<S> {
         }
       }
       Status::ViewChange => self.view_change_timeouts(now, sb),
-      Status::Recovering | Status::RecoveringHead => {}
+      // Recovering re-submits any still-outstanding/faulty reads on its timer (termination under a
+      // dropped completion / slow-clearing transient). RecoveringHead re-broadcasts its Recovery
+      // solicitation until a peer hands it the canonical head.
+      Status::Recovering => self.recover_timeouts(now, wal, sb),
+      Status::RecoveringHead => self.recover_head_timeouts(now),
+    }
+    // Peer fault-repair retransmit runs only in Normal (the only status that can solicit/serve a hole
+    // and adopt the reply). It re-solicits every unrepaired committed-op hole until each is filled.
+    if self.status.is_normal() {
+      self.repair_timeouts(now);
     }
   }
 
   /// Drain completed storage ops and react.
   pub fn handle_storage<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     while let Some(done) = wal.poll() {
-      self.on_wal_done(now, sb, done);
+      self.on_wal_done(now, wal, sb, done);
     }
     while let Some(done) = sb.poll() {
-      self.on_sb_done(now, sb, done);
+      self.on_sb_done(now, wal, sb, done);
     }
   }
 
-  fn on_wal_done<B: Superblock>(&mut self, now: Instant, sb: &mut B, done: WalDone) {
-    let WalDone::Appended(id) = done else {
+  fn on_wal_done<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    done: WalDone,
+  ) {
+    // Recovery read completions route through the recover loop (verify + retry + progress).
+    if self.status.is_recovering() || self.status.is_recovering_head() {
+      self.on_recover_wal_done(now, wal, sb, done);
       return;
-    }; // M3.1a: only appends (reads/faults are later)
+    }
+    let WalDone::Appended(id) = done else {
+      return; // Normal op: only an append matters (reads/faults occur during recovery).
+    };
     let Some(Pending::Ack(op)) = self.pending.remove(&id.get()) else {
       return;
     };
@@ -518,9 +626,89 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
-  fn on_sb_done<B: Superblock>(&mut self, now: Instant, sb: &mut B, done: SuperblockDone) {
+  /// Handles a WAL completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`). Adopts a
+  /// body ONLY after `Header::verify` (the faults-as-data chokepoint: a torn write / bit-rot fails
+  /// verify and is treated as a `Fault`); retries `Fault`/`Absent`/mismatch within the per-slot
+  /// budget, then classes the slot permanently faulty. Calls `recover_progress` after each.
+  fn on_recover_wal_done<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    done: WalDone,
+  ) {
+    // The OpId of the completed read identifies which tail op it resolves (recover.reads). An
+    // append completion (Appended) or an OpId we are not tracking is a stale/foreign completion —
+    // ignore it (never panic): faults-as-data.
+    let id = match &done {
+      WalDone::ReadOk(r) => r.id(),
+      WalDone::Absent(id) | WalDone::Fault(id) => *id,
+      WalDone::Appended(_) => return,
+    };
+    let Some(rec) = self.recover.as_mut() else {
+      return;
+    };
+    let Some(&op) = rec.reads.get(&id.get()) else {
+      return; // not one of our outstanding recovery reads (stale/superseded) — ignore.
+    };
+    // Decide the outcome: an Ok body that verifies is adopted; everything else is a fault to retry.
+    let verified_body = match &done {
+      // Adopt only a body that BOTH verifies (header + body checksums) AND lands on the op we asked
+      // for. A misdirected read (a different valid slot returned under our OpId) would checksum-verify
+      // cleanly, so the placement check (`header.op() == op`) guards against pairing another op's body
+      // with this op's metadata — the placement-integrity defense TigerBeetle makes for misdirected IO.
+      WalDone::ReadOk(r)
+        if r.header().op() == OpNumber::with(op) && r.header().verify(r.body()) =>
+      {
+        Some(r.body_bytes())
+      }
+      _ => None, // Absent, Fault, misdirected, OR a ReadOk that fails verify (torn/bit-rot) — a fault.
+    };
+    match verified_body {
+      Some(body) => {
+        // Adopt the verified body, retiring this read.
+        rec.reads.remove(&id.get());
+        rec.pending.remove(&op);
+        rec.faulty.remove(&op);
+        if let Some(entry) = self.log.get_mut(&op) {
+          entry.body = body;
+        }
+      }
+      None => {
+        // A fault on this op: spend a retry if any remain, else class it permanently faulty.
+        rec.reads.remove(&id.get());
+        let budget = rec.pending.get(&op).copied().unwrap_or(0);
+        if budget > 0 {
+          rec.pending.insert(op, budget - 1);
+          let new_id = self.mint_op_id();
+          // mint_op_id reborrows self; re-borrow rec to record the new in-flight read.
+          if let Some(rec) = self.recover.as_mut() {
+            rec.reads.insert(new_id.get(), op);
+          }
+          wal.submit_read(new_id, OpNumber::with(op));
+        } else {
+          rec.pending.remove(&op);
+          rec.faulty.insert(op);
+        }
+      }
+    }
+    self.recover_progress(now, sb);
+  }
+
+  fn on_sb_done<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    done: SuperblockDone,
+  ) {
+    // Recovery checkpoint-read completions route through the recover loop (restore SM + retry).
+    if self.status.is_recovering() || self.status.is_recovering_head() {
+      self.on_recover_sb_done(now, wal, sb, done);
+      return;
+    }
     let SuperblockDone::Wrote(id) = done else {
-      return; // CheckpointRead is drained synchronously in recover(); Fault is M3.3
+      return; // Outside recovery only durable-root/checkpoint *writes* are expected.
     };
     // Durable-view write? (matched first; its OpId never aliases a checkpoint write's.)
     if let Some((pending_id, action)) = self.pending_sb {
@@ -565,6 +753,328 @@ impl<S: StateMachine> Endpoint<S> {
         _ => {} // a stale/superseded completion (e.g. from before a view change) — ignore
       }
     }
+  }
+
+  /// Handles a superblock completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`).
+  /// A `CheckpointRead` restores the SM + client sessions (moved out of the old synchronous drain);
+  /// a `Fault` is retried within the checkpoint budget. Calls `recover_progress` after each.
+  fn on_recover_sb_done<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    done: SuperblockDone,
+  ) {
+    match done {
+      SuperblockDone::CheckpointRead(cr) => {
+        // Only react to the checkpoint read WE are awaiting (recover.checkpoint); a foreign/stale
+        // completion is ignored, never trusted.
+        let is_ours = self
+          .recover
+          .as_ref()
+          .and_then(|r| r.checkpoint)
+          .is_some_and(|want| want == cr.id().get());
+        if !is_ours {
+          return;
+        }
+        let (sessions, sm_tail) = Self::decode_checkpoint(cr.snapshot());
+        self.sm.restore(sm_tail);
+        self.clients = sessions;
+        if let Some(rec) = self.recover.as_mut() {
+          rec.checkpoint = None;
+        }
+        self.recover_progress(now, sb);
+      }
+      SuperblockDone::Fault(id) => {
+        let is_ours = self
+          .recover
+          .as_ref()
+          .and_then(|r| r.checkpoint)
+          .is_some_and(|want| want == id.get());
+        if !is_ours {
+          return;
+        }
+        // Retry the checkpoint read within budget. A *permanent* checkpoint-read fault is
+        // unreachable in M3.3a: the durable root only ever names a fully-written snapshot, so the
+        // sim injects only TRANSIENT checkpoint faults — the budget always clears. Exhaustion would
+        // mean the durable root names an unreadable checkpoint, which is a state-sync (M3.4) repair
+        // concern, not something we can resolve locally; we assert it unreachable rather than hang.
+        let budget = self
+          .recover
+          .as_ref()
+          .map(|r| r.checkpoint_retries)
+          .unwrap_or(0);
+        assert!(
+          budget > 0,
+          "recover: checkpoint read faulted past its retry budget — the durable root names an \
+           unreadable snapshot (a permanent checkpoint fault is an M3.4 state-sync concern, \
+           unreachable in M3.3a where the root always names a fully-written snapshot)"
+        );
+        let new_id = self.mint_op_id();
+        if let Some(rec) = self.recover.as_mut() {
+          rec.checkpoint = Some(new_id.get());
+          rec.checkpoint_retries = budget - 1;
+        }
+        sb.submit_read_checkpoint(new_id);
+        // No progress to report yet (still awaiting the snapshot); but keep wal in the signature
+        // uniform with on_recover_wal_done for the handle_storage call site.
+        let _ = &mut *wal;
+      }
+      SuperblockDone::Wrote(_) => {
+        // A stale durable-root/checkpoint *write* completion from before the crash cannot occur
+        // (a fresh recover issues no writes); ignore defensively rather than panic.
+      }
+    }
+  }
+
+  /// The recovery transition decider (Phase 2), called after every recovery read completion. Stays
+  /// `Recovering` while any tail read or the checkpoint read is still outstanding; once all reads are
+  /// satisfied it transitions to `Normal` (tail consistent / non-head holes peer-repaired) or
+  /// `RecoveringHead` (the HEAD slot is permanently faulty — it cannot trust its head and must learn
+  /// the canonical head from a peer).
+  ///
+  /// A non-head permanently-faulty committed slot is repaired peer-to-peer (B4): it is necessarily
+  /// ABOVE the applied frontier (`commit_min == checkpoint_op`; the restored SM already holds
+  /// `[1..=checkpoint_op]`, so a faulty `op <= checkpoint_op` is never re-applied and does not block
+  /// the apply path), so the replica safely returns to `Normal` and re-fetches the op on demand via
+  /// `RequestPrepare` when its commit reaches it — HOLDING the commit below the hole until then. This
+  /// is what lets a recovering replica with a rotted committed slot rejoin without losing the op.
+  fn recover_progress<B: Superblock>(&mut self, now: Instant, _sb: &mut B) {
+    let Some(rec) = self.recover.as_ref() else {
+      return;
+    };
+    // Still draining? (tail reads pending OR the checkpoint snapshot not yet restored). Keep the
+    // recover_retry timer armed (via arm_timers for the current Recovering status) so an owner
+    // re-submits any dropped/slow read.
+    if !rec.pending.is_empty() || rec.checkpoint.is_some() {
+      self.arm_timers(now);
+      return;
+    }
+    if rec.faulty.is_empty() {
+      // Tail consistent: every body is present + checksum-verified → return to Normal. A recovered
+      // backup re-emits nothing; it waits for the primary's Prepare/Commit to re-announce commit.
+      self.recover = None;
+      self.status = Status::Normal;
+      self.arm_timers(now);
+      return;
+    }
+    // Some slot read back permanently faulty (the per-slot retry budget — and the on-disk recover_retry
+    // re-reads — were exhausted, so it cannot be cleared from this replica's own disk).
+    let head = self.op.get();
+    if rec.faulty.contains(&head) {
+      // The head cannot be trusted → RecoveringHead: do not participate. Solicit the canonical head
+      // from a peer (the primary answers with a `RecoveryResponse`; a `StartView` also adopts), and
+      // keep `recover` so the head stays flagged until adoption returns to Normal.
+      self.status = Status::RecoveringHead;
+      self.arm_timers(now);
+      self.send_recovery(now);
+      return;
+    }
+    // Only non-head committed slots are faulty: hand each to peer fault-repair (B4) and return to
+    // Normal. Each faulty op is dropped from the dense `log` cache (so it is never applied with a
+    // wrong/empty body) and recorded in `repair`; the apply loops HOLD the commit at the first hole
+    // and the repair timer re-fetches it from a peer. We must reach Normal first — a Recovering
+    // replica drops all messages, so it could not receive the repair `Prepare` while Recovering.
+    let faulty: std::vec::Vec<u64> = rec.faulty.iter().copied().collect();
+    self.recover = None;
+    self.status = Status::Normal;
+    for op in faulty {
+      self.log.remove(&op);
+      self.repair.insert(op);
+    }
+    self.arm_timers(now);
+    // Solicit every hole now (the timer also re-solicits on a cadence until each is filled).
+    let ops: std::vec::Vec<u64> = self.repair.iter().copied().collect();
+    for op in ops {
+      self.send_request_prepare(op);
+    }
+  }
+
+  /// Recover-retry timer: re-submit every still-unsatisfied tail read (and the checkpoint read), so
+  /// the loop terminates even if a real async driver dropped a completion or a transient fault only
+  /// clears on a later read. Resets each unsatisfied op to exactly ONE fresh outstanding read with a
+  /// full budget (dropping its stale `reads` entries), avoiding duplicate-completion ambiguity.
+  fn recover_timeouts<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
+    if !self.timers.recover_retry.is_some_and(|d| d <= now) {
+      return;
+    }
+    // Collect the ops needing a (re)read: those still pending OR classed faulty. (Snapshot the set
+    // first so we can mutate `recover` while iterating.)
+    let (ops, want_checkpoint) = match self.recover.as_ref() {
+      Some(rec) => {
+        let mut ops: std::vec::Vec<u64> = rec.pending.keys().copied().collect();
+        ops.extend(rec.faulty.iter().copied());
+        ops.sort_unstable();
+        ops.dedup();
+        (ops, rec.checkpoint)
+      }
+      None => (std::vec::Vec::new(), None),
+    };
+    for op in ops {
+      let new_id = self.mint_op_id();
+      if let Some(rec) = self.recover.as_mut() {
+        // Drop any prior in-flight read entries for this op (a dropped/duplicate completion now
+        // resolves to nothing), then register exactly one fresh read with a full budget.
+        rec.reads.retain(|_, &mut o| o != op);
+        rec.reads.insert(new_id.get(), op);
+        rec.faulty.remove(&op);
+        rec.pending.insert(op, RECOVER_READ_RETRIES);
+      }
+      wal.submit_read(new_id, OpNumber::with(op));
+    }
+    // Re-issue the checkpoint read if it is still outstanding and its prior completion was dropped.
+    if want_checkpoint.is_some() {
+      let new_id = self.mint_op_id();
+      if let Some(rec) = self.recover.as_mut() {
+        rec.checkpoint = Some(new_id.get());
+        rec.checkpoint_retries = RECOVER_READ_RETRIES;
+      }
+      sb.submit_read_checkpoint(new_id);
+    }
+    // Re-arm so we keep retrying until the loop completes.
+    self.timers.recover_retry = Some(now + RECOVER_READ_RETRANSMIT);
+  }
+
+  /// RecoveringHead solicitation timer: re-broadcast the `Recovery` request (and re-arm) until a
+  /// peer's `RecoveryResponse`/`StartView` re-establishes the head and adoption returns us to Normal.
+  fn recover_head_timeouts(&mut self, now: Instant) {
+    if self.timers.recover_head.is_some_and(|d| d <= now) {
+      self.send_recovery(now); // re-broadcasts and re-arms recover_head
+    }
+  }
+
+  /// Register op `op` for peer fault-repair (B4): its committed body read back permanently faulty, so
+  /// we drop any stale (header-only / wrong) cache entry, record the hole, immediately solicit the op
+  /// from peers, and arm the repair-retry timer. The COMMIT IS HELD below `op` by the apply loops
+  /// (they break at the first missing op) — this never advances `commit_min` past the hole. Idempotent
+  /// per op (a re-request while already pending just re-solicits + re-arms).
+  fn request_repair(&mut self, now: Instant, op: u64) {
+    // Drop the cache entry so the apply path keeps treating this slot as a hole until a VERIFIED
+    // Prepare fills it (never apply a wrong/empty body). A torn slot's header-only entry is removed;
+    // a bit-rotted slot was never inserted.
+    self.log.remove(&op);
+    self.repair.insert(op);
+    self.send_request_prepare(op);
+    self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
+  }
+
+  /// Broadcast a `RequestPrepare` for the single missing committed op `op` to all peers. Any peer
+  /// that holds `op` answers with the `Prepare` carrying it (`on_request_prepare`). Broadcast (not
+  /// primary-only) so the repair completes even mid-view-change / when the primary itself is the one
+  /// missing the op.
+  fn send_request_prepare(&mut self, op: u64) {
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::Backups,
+      Message::RequestPrepare(crate::RequestPrepare::new(
+        self.view,
+        OpNumber::with(op),
+        self.config.replica(),
+      )),
+    ));
+  }
+
+  /// Peer-fault-repair retransmit timer: while the repair set is non-empty, re-solicit every
+  /// unrepaired op and re-arm. Terminates when the last hole is filled (`fill_repair` clears the op
+  /// and stops re-arming once `repair` is empty).
+  fn repair_timeouts(&mut self, now: Instant) {
+    if !self.timers.repair_retry.is_some_and(|d| d <= now) {
+      return;
+    }
+    if self.repair.is_empty() {
+      self.timers.repair_retry = None;
+      return;
+    }
+    let ops: std::vec::Vec<u64> = self.repair.iter().copied().collect();
+    for op in ops {
+      self.send_request_prepare(op);
+    }
+    self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
+  }
+
+  /// Answer a peer's `RequestPrepare` for a committed op it read back faulty: if we are `Normal` and
+  /// hold the op's body in our log cache, reply with the `Prepare` carrying it. Only a Normal replica
+  /// answers (a recovering / view-changing replica may itself hold a hole at that op). The reply's
+  /// `commit` field carries our commit so the requester can also learn fresh commit progress; the
+  /// op's content is view-independent, so the requester accepts it regardless of our view.
+  fn on_request_prepare(&mut self, _now: Instant, m: crate::RequestPrepare) {
+    if !self.status.is_normal() {
+      return; // only a Normal replica has a trustworthy committed log to serve from
+    }
+    if m.replica().get() >= self.config.replica_count() {
+      return; // ignore malformed/out-of-range replica id
+    }
+    let op = m.op().get();
+    let Some(entry) = self.log.get(&op) else {
+      return; // we do not hold this op (or it is a hole for us too) — stay silent; another peer answers
+    };
+    let prepare = Prepare::new(
+      self.view,
+      OpNumber::with(op),
+      self.commit_min,
+      entry.client,
+      entry.request,
+      entry.body.clone(),
+    );
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::To(Peer::Replica(m.replica())),
+      Message::Prepare(prepare),
+    ));
+  }
+
+  /// Fill a peer-supplied `Prepare` for an op in our pending-repair set (B4), then resume the held
+  /// commit. Two guards protect the committed slot:
+  /// - **Placement** (`p.op()` equals a hole in `self.repair`): the load-bearing check — a misdirected
+  ///   or mismatched reply for any other op is rejected, so a committed slot is never filled with a
+  ///   different op's body. This mirrors the recovery read-path's `header.op() == op` placement check.
+  /// - **Body checksum** (`Header::verify`): the body's `body_checksum` must be self-consistent. (For
+  ///   an in-process `Prepare` value the header is reconstructed from its own fields, so this is a
+  ///   structural belt-and-suspenders; it becomes a genuine integrity gate when a `Prepare` arrives
+  ///   over a wire codec that carries the checksum independently of the body.)
+  ///
+  /// The integrity of the repaired *content* rests on the VSR durability guarantee that a quorum holds
+  /// every committed op's correct body (the honest-peer model) plus the placement guard above. On
+  /// success the body is inserted into the dense `log` cache and persisted durably via a WAL append
+  /// (so future reads / DVCs / a later crash-restart serve the repaired op), the hole is cleared, and
+  /// the held commit resumes. A `Prepare` whose op is not a hole (or whose body fails the checksum) is
+  /// rejected (returns `false`) so the caller falls through to the normal prepare path.
+  fn fill_repair<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    p: &Prepare,
+  ) -> bool {
+    let op = p.op().get();
+    if !self.repair.contains(&op) {
+      return false; // placement: not a hole we are repairing — let on_prepare handle it normally
+    }
+    // Reconstruct the header (also needed for the durable append below) and gate on its body checksum.
+    let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
+    if !header.verify(p.body()) {
+      return false; // unverifiable body — never adopt it for a committed op; keep the hole + re-solicit
+    }
+    // Fill the dense cache and persist the repaired op durably (append-after-verify), so a subsequent
+    // crash/restart reads it cleanly and a DVC/StartView we send carries it.
+    self.log.insert(
+      op,
+      LogEntry {
+        client: p.client(),
+        request: p.request(),
+        body: p.body_bytes(),
+      },
+    );
+    let id = self.mint_op_id();
+    wal.submit_append(id, p.op(), header, p.body_bytes());
+    // NOTE: this append's completion is a bare durability write, NOT a prepare vote — we do not add it
+    // to `self.pending` (no PrepareOk/own-vote is owed for a repair fill), so on_wal_done ignores it.
+    self.repair.remove(&op);
+    if self.repair.is_empty() {
+      self.timers.repair_retry = None;
+    }
+    // The hole is filled → resume applying the held committed prefix from exactly where it stalled.
+    let target = self.commit_max.get();
+    self.advance_commit(now, sb, target);
+    true
   }
 
   /// If `commit_min` has reached the next checkpoint boundary and no superblock write is pending,
@@ -965,6 +1475,9 @@ impl<S: StateMachine> Endpoint<S> {
     let (canonical_log, op_head, commit_star) = self.select_canonical_log();
     self.adopt_log(&canonical_log);
     self.op = OpNumber::with(op_head);
+    // The adopted canonical log supplies the full committed prefix `[1..=op_head]`; any pending-repair
+    // holes (committed ⟹ <= op_head) are now filled by `adopt_log`. Retire the repair set + its timer.
+    self.repair.clear();
     // status is still ViewChange here, so the maybe_checkpoint at advance_commit's tail is a no-op
     // (checkpoints only start in Normal) — a checkpoint must not race the StartViewAsPrimary
     // durable-view write submitted below.
@@ -1047,9 +1560,10 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_start_view<B: Superblock>(&mut self, now: Instant, sb: &mut B, m: crate::StartView) {
-    // Adopt only a strictly newer view, or the current view while we have not yet
-    // returned to Normal in it. Re-applying a StartView for a view we are already
-    // Normal in would rewind `op` and clobber locally-appended ops.
+    // Adopt only a strictly newer view, or the current view while we have not yet returned to Normal
+    // in it. Re-applying a StartView for a view we are already Normal in would rewind `op` and
+    // clobber locally-appended ops. A RecoveringHead replica is NOT Normal, so a same-view StartView
+    // is (correctly) adopted: it is exactly how such a replica re-establishes its faulty head.
     if m.view().get() < self.view.get()
       || (m.view().get() == self.view.get() && self.status.is_normal())
     {
@@ -1058,27 +1572,63 @@ impl<S: StateMachine> Endpoint<S> {
     if m.replica() != self.config.primary(m.view()) {
       return; // must come from the view's primary
     }
+    self.adopt_canonical_head(now, sb, m.view(), m.op(), m.commit(), m.log_slice());
+  }
+
+  /// Adopt an authoritative primary's canonical head + log for `view` and return to `Normal`.
+  ///
+  /// Shared by [`on_start_view`](Self::on_start_view) and
+  /// [`on_recovery_response`](Self::on_recovery_response): both learn the canonical head from the
+  /// view's primary (a `StartView` carries it directly; a primary's `RecoveryResponse` is the
+  /// recovery-handshake equivalent). Callers MUST have already verified the message is from
+  /// `config.primary(view)` and is not stale (`view >= self.view`, and not a same-view re-adoption
+  /// while already Normal).
+  ///
+  /// **No committed op is lost.** A `RecoveringHead` replica has already restored its durable
+  /// checkpoint prefix `[1..=checkpoint_op]` into the SM during `Recovering` (so
+  /// `commit_min == checkpoint_op`); the `op >= commit_min` assert below rejects any head that would
+  /// rewind below that durable prefix. The adopted log is dense `[1..=op]` from the canonical primary
+  /// and therefore supplies every committed op above the checkpoint; `advance_commit` then applies
+  /// `[commit_min+1..=commit]` from those adopted bodies. The checkpointed prefix lives in the SM,
+  /// the rest comes from the canonical log — the committed prefix is reconstructed end to end.
+  fn adopt_canonical_head<B: Superblock>(
+    &mut self,
+    now: Instant,
+    sb: &mut B,
+    view: View,
+    op: OpNumber,
+    commit: OpNumber,
+    log: &[crate::PreparedEntry],
+  ) {
     assert!(
-      m.commit().get() <= m.op().get(),
-      "StartView commit must not exceed its op (malformed primary)"
+      commit.get() <= op.get(),
+      "canonical head commit must not exceed its op (malformed primary)"
     );
     assert!(
-      m.op().get() >= self.commit_min.get(),
+      op.get() >= self.commit_min.get(),
       "must not rewind below our committed op"
     );
-    self.view = m.view();
-    self.adopt_log(m.log_slice());
-    self.op = m.op();
-    // status is still ViewChange here, so the maybe_checkpoint at advance_commit's tail is a no-op
-    // (checkpoints only start in Normal) — a checkpoint must not race the AdoptedStartView
-    // durable-view write submitted below.
-    self.advance_commit(now, sb, m.commit().get());
+    self.view = view;
+    self.adopt_log(log);
+    self.op = op;
+    // status is still ViewChange/RecoveringHead here, so the maybe_checkpoint at advance_commit's
+    // tail is a no-op (checkpoints only start in Normal) — a checkpoint must not race the
+    // AdoptedStartView durable-view write submitted below.
+    self.advance_commit(now, sb, commit.get());
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
-    self.log_view = m.view();
+    self.log_view = view;
     self.status = Status::Normal;
     self.catching_up = false;
     self.svc_from = 0;
     self.dvc_from.clear();
+    // Adoption re-established a trustworthy head, so the recovery bookkeeping is retired: a
+    // RecoveringHead replica that reaches here via this path leaves `recover` = None (the field is
+    // structurally None in every non-recovering status). A non-recovering adopter already has None.
+    self.recover = None;
+    // The adopted canonical log is dense `[1..=op]` with real bodies, supplying every committed op the
+    // adopter was peer-repairing — `adopt_log` filled those slots, so any pending-repair holes (all
+    // <= op, since they were committed) are now resolved. Retire the repair set + its timer.
+    self.repair.clear();
     // Abandon in-flight WAL appends from the old view (see transition_to_view_change_status).
     self.pending.clear();
     // Drop stale per-replica checkpoint reports from the old generation (see
@@ -1143,6 +1693,17 @@ impl<S: StateMachine> Endpoint<S> {
     self.timers.get_view_message = Some(now + VC_MESSAGE_RETRANSMIT);
   }
 
+  /// Broadcast a `Recovery` solicitation (RecoveringHead) and re-arm the solicitation timer. The
+  /// stable `self.nonce` tags the request so a `RecoveryResponse` to THIS replica's recovery is
+  /// distinguished from unrelated traffic and matched across retries.
+  fn send_recovery(&mut self, now: Instant) {
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::Backups,
+      Message::Recovery(crate::Recovery::new(self.config.replica(), self.nonce)),
+    ));
+    self.timers.recover_head = Some(now + RECOVER_HEAD_SOLICIT);
+  }
+
   fn on_get_view(&mut self, _now: Instant, m: crate::GetView) {
     // Only a Normal primary at the requested view (or higher) can answer authoritatively.
     if self.status.is_normal() && self.is_primary() && self.view.get() >= m.view().get() {
@@ -1157,6 +1718,68 @@ impl<S: StateMachine> Endpoint<S> {
         )),
       ));
     }
+  }
+
+  /// Answer a peer's `Recovery` solicitation (it is in `RecoveringHead`, soliciting the canonical
+  /// head). Only a `Normal` replica answers — a recovering/view-changing replica has no stable head
+  /// to report. The primary answers authoritatively with its canonical log + head + commit (the
+  /// recovery-handshake equivalent of a `StartView`); a Normal backup answers with only its view +
+  /// echoed nonce (empty log), which still lets the soliciting replica learn the current generation
+  /// and re-target the primary. The `nonce` is echoed for the requester's freshness check.
+  fn on_recovery(&mut self, _now: Instant, m: crate::Recovery) {
+    if !self.status.is_normal() {
+      return; // only a Normal replica has a trustworthy view/head to report
+    }
+    if m.replica().get() >= self.config.replica_count() {
+      return; // ignore malformed/out-of-range replica id
+    }
+    let (op, commit, log) = if self.is_primary() {
+      (self.op, self.commit_min, self.log_entries())
+    } else {
+      // A backup cannot hand out a canonical head; it reports only its view (+ echoed nonce).
+      (OpNumber::new(), OpNumber::new(), std::vec::Vec::new())
+    };
+    self.outgoing.push_back(Outgoing::new(
+      Recipient::To(Peer::Replica(m.replica())),
+      Message::RecoveryResponse(crate::RecoveryResponse::new(
+        self.view,
+        op,
+        commit,
+        self.config.replica(),
+        m.nonce(),
+        log,
+      )),
+    ));
+  }
+
+  /// Handle a `RecoveryResponse` to our own `Recovery` solicitation. Only meaningful while
+  /// `RecoveringHead` (awaiting the canonical head): in any other status it is a stale completion
+  /// from a prior recovery and is ignored. A response is adopted ONLY if (a) its nonce matches our
+  /// outstanding solicitation (freshness — a stale response from an earlier attempt is rejected) and
+  /// (b) it is from the responder's view's primary (only the primary hands out a canonical head). A
+  /// backup's response (empty log) merely confirms a view; the `recover_head` timer re-solicits.
+  fn on_recovery_response<B: Superblock>(
+    &mut self,
+    now: Instant,
+    sb: &mut B,
+    m: crate::RecoveryResponse,
+  ) {
+    if !self.status.is_recovering_head() {
+      return; // not awaiting a head (already Normal, or never solicited) — ignore the stale reply
+    }
+    if m.nonce() != self.nonce {
+      return; // a response to a prior solicitation (or forged) — not fresh, ignore
+    }
+    if m.view().get() < self.view.get() {
+      return; // a stale-view response cannot re-establish our head
+    }
+    if m.replica() != self.config.primary(m.view()) {
+      // A non-primary response (empty log) only confirms the current generation; we cannot adopt a
+      // head from it. Stay RecoveringHead; the recover_head timer keeps soliciting until the
+      // primary answers (or a StartView arrives).
+      return;
+    }
+    self.adopt_canonical_head(now, sb, m.view(), m.op(), m.commit(), m.log_slice());
   }
 
   fn on_request<W: Wal>(&mut self, now: Instant, wal: &mut W, _from: Peer, r: crate::Request) {
@@ -1245,7 +1868,7 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// Commits the longest contiguous quorum-acked prefix beyond `commit_min`.
-  fn try_commit<B: Superblock>(&mut self, _now: Instant, sb: &mut B) {
+  fn try_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     let quorum = self.config.quorum() as u32;
     let mut advanced = false;
     loop {
@@ -1261,7 +1884,12 @@ impl<S: StateMachine> Endpoint<S> {
       if !ready {
         break;
       }
-      self.commit_op(next);
+      // `commit_op` HOLDS the commit (returns false without advancing) if `next`'s body read back
+      // permanently faulty and must be peer-repaired — never skip a hole. Stop the loop; the repair
+      // timer re-fetches it and a later try_commit resumes from exactly here.
+      if !self.commit_op(now, next) {
+        break;
+      }
       advanced = true;
     }
     self.commit_max = OpNumber::with(self.commit_max.get().max(self.commit_min.get()));
@@ -1276,13 +1904,20 @@ impl<S: StateMachine> Endpoint<S> {
     self.maybe_checkpoint(sb);
   }
 
-  /// Applies op `op` on the primary, caches + sends the reply, emits the event.
-  fn commit_op(&mut self, op: u64) {
-    let entry = self
-      .log
-      .get(&op)
-      .expect("committed op present in log")
-      .clone();
+  /// Applies op `op` on the primary, caches + sends the reply, emits the event. Returns `true` if it
+  /// applied; `false` if the body is missing (read back permanently faulty) — in which case it
+  /// registers the op for peer fault-repair and does NOT advance `commit_min`, so the caller HOLDS
+  /// the commit at the hole until a peer supplies the op (B4).
+  #[must_use]
+  fn commit_op(&mut self, now: Instant, op: u64) -> bool {
+    // Faults-as-data (the M3.3b peer fault-repair conversion): a committed op whose body read back
+    // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
+    // dropped it rather than adopt a wrong/empty body). Instead of panicking, hold the commit and
+    // fetch the op from a peer (`RequestPrepare` → `Prepare`); a later try_commit resumes here.
+    let Some(entry) = self.log.get(&op).cloned() else {
+      self.request_repair(now, op);
+      return false;
+    };
     let reply_body = self.sm.apply(OpNumber::with(op), &entry.body);
     self.commit_min = OpNumber::with(op);
     if let Some(inflight) = self.inflight.get_mut(&op) {
@@ -1308,6 +1943,7 @@ impl<S: StateMachine> Endpoint<S> {
         entry.request,
         reply_body,
       )));
+    true
   }
 
   /// (Re)arms this replica's timers for its current role/status.
@@ -1333,7 +1969,25 @@ impl<S: StateMachine> Endpoint<S> {
         self.timers.dvc_message = Some(now + VC_MESSAGE_RETRANSMIT);
         self.timers.view_change_status = Some(now + VIEW_CHANGE_STATUS);
       }
-      Status::Recovering | Status::RecoveringHead => {}
+      // Recovering: re-submit any still-outstanding/faulty WAL-tail (+ checkpoint) reads on a cadence,
+      // so the loop terminates even if a real async driver drops a completion or a transient fault
+      // only clears on a later read.
+      Status::Recovering => {
+        self.timers.recover_retry = Some(now + RECOVER_READ_RETRANSMIT);
+      }
+      // RecoveringHead: re-broadcast the `Recovery` solicitation on a cadence. A permanently-faulty
+      // head cannot be repaired from local disk, so the replica solicits the canonical head from a
+      // peer until a `RecoveryResponse`/`StartView` re-establishes it (then adoption arms the Normal
+      // timers).
+      Status::RecoveringHead => {
+        self.timers.recover_head = Some(now + RECOVER_HEAD_SOLICIT);
+      }
+    }
+    // Peer fault-repair runs alongside the role timers: while a committed-op hole is outstanding,
+    // keep the repair-retry timer armed (only Normal actually solicits/serves, but arming defensively
+    // is harmless — a non-Normal status carries no hole, since adoption clears `repair`).
+    if !self.repair.is_empty() {
+      self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
     }
   }
 
@@ -1344,6 +1998,15 @@ impl<S: StateMachine> Endpoint<S> {
     sb: &mut B,
     p: Prepare,
   ) {
+    // Peer fault-repair (B4): a `Prepare` answering our `RequestPrepare` for a committed-op hole is
+    // handled BEFORE the view/role guards below — its op's content is view-independent (a committed op
+    // is immutable), so a reply from a holder in any view fills the hole; we must NOT let the
+    // higher-view rule yank us into a view change, nor the `is_primary`/same-view guards drop it (a
+    // recovered PRIMARY can also hold a hole). `fill_repair` verifies (checksum + placement) and
+    // returns false for a non-hole / unverifiable body, so a normal Prepare falls through unchanged.
+    if self.fill_repair(now, wal, sb, &p) {
+      return;
+    }
     if p.view().get() > self.view.get() {
       self.catch_up_to_view(now, p.view());
       return;
@@ -1417,18 +2080,22 @@ impl<S: StateMachine> Endpoint<S> {
     ));
   }
 
-  /// Applies committed ops we hold, up to `min(target, op)`. Backups discard the
+  /// Applies committed ops we hold, up to `min(target, op)`, strictly in order. Backups discard the
   /// reply but emit `Committed` so observers can verify agreement.
-  fn advance_commit<B: Superblock>(&mut self, _now: Instant, sb: &mut B, target: u64) {
+  fn advance_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B, target: u64) {
     // Record the learned commit regardless of whether we hold the ops yet.
     self.commit_max = OpNumber::with(self.commit_max.get().max(target));
     while self.commit_min.get() < target && self.commit_min.get() < self.op.get() {
       let op = self.commit_min.get() + 1;
-      let entry = self
-        .log
-        .get(&op)
-        .expect("committed op present in log")
-        .clone();
+      // Faults-as-data (the M3.3b peer fault-repair conversion): a committed op whose body read back
+      // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
+      // dropped it rather than adopt a wrong/empty body). Instead of panicking, HOLD the commit at the
+      // hole — never skip op N to apply N+1 — and fetch op N from a peer (`RequestPrepare` →
+      // `Prepare`); a later advance_commit (after the op arrives) resumes from exactly here.
+      let Some(entry) = self.log.get(&op).cloned() else {
+        self.request_repair(now, op);
+        break;
+      };
       let reply = self.sm.apply(OpNumber::with(op), &entry.body);
       self.commit_min = OpNumber::with(op);
       self
@@ -1508,6 +2175,9 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.dvc_message,
       self.timers.view_change_status,
       self.timers.get_view_message,
+      self.timers.recover_retry,
+      self.timers.recover_head,
+      self.timers.repair_retry,
     ]
     .into_iter()
     .flatten()
@@ -1578,8 +2248,9 @@ mod tests {
   use super::*;
   use crate::{
     CheckpointRead, ClientId, Config, DoViewChange, GetView, Header, OpId, OpNumber, Prepare,
-    PreparedEntry, ReadOk, ReplicaId, Request, RequestNumber, SlotStatus, StartView,
-    StartViewChange, Superblock, SuperblockDone, View, VsrState, Wal, WalDone,
+    PreparedEntry, ReadOk, Recovery, RecoveryResponse, ReplicaId, Request, RequestNumber,
+    SlotStatus, StartView, StartViewChange, Superblock, SuperblockDone, View, VsrState, Wal,
+    WalDone,
   };
   use std::collections::VecDeque;
 
@@ -1809,6 +2480,111 @@ mod tests {
     }
     fn poll(&mut self) -> Option<SuperblockDone> {
       self.ready.pop_front()
+    }
+  }
+
+  /// A WAL whose reads can be *scripted* to fault, so a test can drive the async `Recovering`
+  /// loop's retry/RecoveringHead branches deterministically. Each slot carries a real
+  /// `(header, body)` (so a clean read verifies) plus an optional fault script:
+  /// - `read_faults[op] = n` → the next `n` reads of `op` return `WalDone::Fault` (a TRANSIENT
+  ///   fault: the `n+1`-th read succeeds). `u8::MAX` models a fault that outlives any finite
+  ///   retry budget (→ a *permanently* faulty slot from the proto's view).
+  /// - `corrupt[op]` → every read of `op` returns a `ReadOk` whose body does NOT match its header
+  ///   (a torn write / bit-rot the backend cannot hide): the proto's `Header::verify` chokepoint
+  ///   must reject it rather than adopt the corrupt body.
+  ///
+  /// Reads complete synchronously into the queue (like `TestWal`); the fault is in the *verdict*,
+  /// not the timing, which is exactly what the recover loop must tolerate.
+  struct ScriptedWal {
+    entries: BTreeMap<u64, (Header, Bytes)>,
+    head: u64,
+    read_faults: BTreeMap<u64, u8>,
+    corrupt: std::collections::BTreeSet<u64>,
+    done: VecDeque<WalDone>,
+  }
+  impl ScriptedWal {
+    /// A WAL holding dense ops `1..=n`, each with header+body `[op]` (a clean read verifies).
+    fn with_entries(n: u64) -> Self {
+      let mut entries = BTreeMap::new();
+      for op in 1..=n {
+        let body = Bytes::copy_from_slice(&[op as u8]);
+        let h = Header::new(
+          OpNumber::with(op),
+          View::new(),
+          ClientId::new(7),
+          RequestNumber::with(op),
+          &body,
+        );
+        entries.insert(op, (h, body));
+      }
+      Self {
+        entries,
+        head: n,
+        read_faults: BTreeMap::new(),
+        corrupt: std::collections::BTreeSet::new(),
+        done: VecDeque::new(),
+      }
+    }
+    /// Script the next `times` reads of `op` to fault (transient). `u8::MAX` ⇒ never clears.
+    fn script_read_fault(&mut self, op: OpNumber, times: u8) {
+      self.read_faults.insert(op.get(), times);
+    }
+    /// Script every read of `op` to return a ReadOk whose body fails `Header::verify` (permanent).
+    fn script_corrupt_body(&mut self, op: OpNumber) {
+      self.corrupt.insert(op.get());
+    }
+  }
+  impl Wal for ScriptedWal {
+    fn op_head(&self) -> OpNumber {
+      OpNumber::with(self.head)
+    }
+    fn header(&self, op: OpNumber) -> Option<Header> {
+      self.entries.get(&op.get()).map(|(h, _)| *h)
+    }
+    fn status(&self, op: OpNumber) -> SlotStatus {
+      if self.entries.contains_key(&op.get()) {
+        SlotStatus::Clean
+      } else {
+        SlotStatus::Empty
+      }
+    }
+    fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+      self.entries.insert(op.get(), (header, body));
+      self.head = self.head.max(op.get());
+      self.done.push_back(WalDone::Appended(id));
+    }
+    fn submit_read(&mut self, id: OpId, op: OpNumber) {
+      // A scripted transient fault takes precedence and decrements its remaining count.
+      if let Some(remaining) = self.read_faults.get_mut(&op.get()) {
+        if *remaining > 0 {
+          if *remaining != u8::MAX {
+            *remaining -= 1;
+          }
+          self.done.push_back(WalDone::Fault(id));
+          return;
+        }
+      }
+      let done = match self.entries.get(&op.get()) {
+        Some((h, b)) if self.corrupt.contains(&op.get()) => {
+          // A corrupt slot returns the ORIGINAL header with a flipped body so verify fails.
+          let mut torn = b.to_vec();
+          torn.push(0xFF);
+          WalDone::ReadOk(ReadOk::new(id, *h, Bytes::from(torn)))
+        }
+        Some((h, b)) => WalDone::ReadOk(ReadOk::new(id, *h, b.clone())),
+        None => WalDone::Absent(id),
+      };
+      self.done.push_back(done);
+    }
+    fn truncate(&mut self, above: OpNumber) {
+      self.entries.retain(|&op, _| op <= above.get());
+      self.head = self.head.min(above.get());
+    }
+    fn prune(&mut self, below: OpNumber) {
+      self.entries.retain(|&op, _| op >= below.get());
+    }
+    fn poll(&mut self) -> Option<WalDone> {
+      self.done.pop_front()
     }
   }
 
@@ -2478,9 +3254,848 @@ mod tests {
   }
 
   #[test]
+  fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
+    // recover() is now a metadata-only constructor: it returns in Recovering and only reaches
+    // Normal after handle_storage drains the tail reads. (Was: synchronous → Normal immediately.)
+    let mut e = backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+    e.handle_storage(now, &mut wal, &mut sb);
+    drop(e);
+
+    let mut r = Endpoint::recover(
+      Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+      0,
+      NoopSm,
+      &mut wal,
+      &mut sb,
+    );
+    assert_eq!(
+      r.status(),
+      Status::Recovering,
+      "recover is now a metadata-only constructor (Recovering)"
+    );
+    r.handle_storage(now, &mut wal, &mut sb); // drain the tail reads
+    assert_eq!(r.status(), Status::Normal, "tail consistent => Normal");
+    assert_eq!(r.op(), OpNumber::with(2));
+  }
+
+  #[test]
+  fn recover_retries_a_transient_read_fault_then_reaches_normal() {
+    // A ScriptedWal faults op 2's read ONCE, then reads clean. The Recovering loop retries and
+    // reaches Normal with the real body — a transient storage fault during recovery is tolerated.
+    let mut wal = ScriptedWal::with_entries(2);
+    wal.script_read_fault(OpNumber::with(2), 1);
+    let mut sb = TestSb::default();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(
+      Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+      0,
+      EchoSm,
+      &mut wal,
+      &mut sb,
+    );
+    assert_eq!(r.status(), Status::Recovering);
+    // Pump until the retry clears (bounded): each handle_storage drains one round + re-submits.
+    for _ in 0..8 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if r.status() == Status::Normal {
+        break;
+      }
+    }
+    assert_eq!(
+      r.status(),
+      Status::Normal,
+      "transient read-fault retried => Normal"
+    );
+    assert_eq!(r.op(), OpNumber::with(2));
+  }
+
+  #[test]
+  fn recover_head_permanently_faulty_enters_recovering_head() {
+    // A ScriptedWal faults op 2's (the head's) read PERMANENTLY (beyond the retry budget). The
+    // replica cannot trust its head => RecoveringHead, never Normal. It then SOLICITS the canonical
+    // head (a Recovery broadcast) but still casts no ack/vote in response to a re-delivered prepare.
+    let mut wal = ScriptedWal::with_entries(2);
+    wal.script_read_fault(OpNumber::with(2), u8::MAX); // exceeds the retry budget
+    let mut sb = TestSb::default();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(
+      Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+      0,
+      NoopSm,
+      &mut wal,
+      &mut sb,
+    );
+    for _ in 0..16 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if r.status() != Status::Recovering {
+        break;
+      }
+    }
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "permanently-faulty head => RecoveringHead"
+    );
+    // On entry it solicits the canonical head (Recovery); drain that — it is NOT participation.
+    while let Some(out) = r.poll_message() {
+      assert!(
+        out.msg_ref().is_recovery(),
+        "the only message a RecoveringHead replica emits on entry is a Recovery solicitation"
+      );
+    }
+    // A RecoveringHead replica must not participate: it casts no PrepareOk on a re-delivered prepare.
+    r.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+    assert!(
+      r.poll_message().is_none(),
+      "RecoveringHead replica emits no ack/vote in response to a prepare"
+    );
+  }
+
+  // ── B4: peer fault-repair (RequestPrepare → Prepare) ──
+
+  /// A real `Prepare` for op `op` from `view`, carrying client 7 / request `op` / body `[op]` (the
+  /// exact bytes `ScriptedWal::with_entries` stores), so a repair fill verifies against it.
+  fn repair_prepare(view: u64, op: u64, commit: u64) -> Message {
+    Message::Prepare(Prepare::new(
+      View::with(view),
+      OpNumber::with(op),
+      OpNumber::with(commit),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      Bytes::copy_from_slice(&[op as u8]),
+    ))
+  }
+
+  #[test]
+  fn on_request_prepare_holder_replies_with_the_prepare() {
+    // A Normal replica that holds a committed op answers a peer's RequestPrepare with the Prepare
+    // carrying that op's body — the peer-fault-repair *server* side.
+    let mut e = backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // Hold ops 1 + 2 (apply 1 via the piggybacked commit).
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+    e.handle_storage(now, &mut wal, &mut sb);
+    while e.poll_message().is_some() {} // discard acks
+
+    // Replica 2 asks us for op 1.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::RequestPrepare(crate::RequestPrepare::new(
+        View::new(),
+        OpNumber::with(1),
+        ReplicaId::new(2),
+      )),
+    );
+    let out = e.poll_message().expect("holder answers RequestPrepare");
+    assert_eq!(
+      out.to(),
+      Recipient::To(Peer::Replica(ReplicaId::new(2))),
+      "the Prepare is addressed back to the requester"
+    );
+    match out.into_msg() {
+      Message::Prepare(p) => {
+        assert_eq!(p.op(), OpNumber::with(1));
+        assert_eq!(p.body(), &[1u8], "carries op 1's real body");
+      }
+      other => panic!("expected a Prepare reply, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn on_request_prepare_for_an_op_we_lack_is_silent() {
+    // A replica that does NOT hold the requested op stays silent (another peer answers) — never
+    // fabricates a Prepare.
+    let mut e = backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::RequestPrepare(crate::RequestPrepare::new(
+        View::new(),
+        OpNumber::with(9),
+        ReplicaId::new(2),
+      )),
+    );
+    assert!(
+      e.poll_message().is_none(),
+      "a replica that lacks the op answers no RequestPrepare"
+    );
+  }
+
+  /// Recover replica 1 of 3 from a WAL holding dense ops `1..=head` where the single NON-head
+  /// committed slot `faulty_op` read back permanently faulty (bit-rot). Returns the recovered
+  /// endpoint (now Normal, holding a peer-repair hole at `faulty_op`) + its wal/sb.
+  fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, ScriptedWal, TestSb) {
+    assert!(faulty_op < head, "the hole must be below the head");
+    let mut wal = ScriptedWal::with_entries(head);
+    wal.script_read_fault(OpNumber::with(faulty_op), u8::MAX); // permanent: never clears on disk
+    let mut sb = TestSb::default();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(
+      Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+      0,
+      CountSm::default(),
+      &mut wal,
+      &mut sb,
+    );
+    for _ in 0..32 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if !r.status().is_recovering() {
+        break;
+      }
+    }
+    (r, wal, sb)
+  }
+
+  #[test]
+  fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
+    // A permanently-faulty NON-head committed slot must NOT strand the replica (the old behaviour) and
+    // must NOT panic: the replica returns to Normal, drops the unreadable slot from its cache, and
+    // broadcasts a RequestPrepare for it (peer fault-repair). It HOLDS its commit below the hole.
+    let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
+    assert_eq!(
+      r.status(),
+      Status::Normal,
+      "a non-head faulty committed slot peer-repairs from Normal (never strands in Recovering)"
+    );
+    // It solicited op 2 from peers.
+    let mut asked_for_2 = false;
+    while let Some(out) = r.poll_message() {
+      if let Message::RequestPrepare(rp) = out.into_msg() {
+        assert_eq!(rp.op(), OpNumber::with(2));
+        asked_for_2 = true;
+      }
+    }
+    assert!(asked_for_2, "the replica solicits the faulty committed op");
+
+    // Learn commit up to 3 (e.g. a Commit from the primary): op 1 applies, op 2 is a HOLE → commit
+    // HELD at 1 (never skips to apply op 3 with op 2 missing).
+    let now = Instant::ZERO;
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(1),
+      "commit is HELD below the hole — op 2's body is missing, so op 3 must not apply"
+    );
+    assert_eq!(
+      r.state_machine().applied(),
+      &[(1, std::vec![1u8])],
+      "only op 1 applied; the hole stops the apply strictly in order"
+    );
+  }
+
+  #[test]
+  fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
+    // End to end: a held-commit replica receives the peer-supplied Prepare for its hole, verifies it
+    // (checksum + placement), fills the cache, and resumes applying the committed prefix in order —
+    // the committed op is restored, NOT lost.
+    let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
+    while r.poll_message().is_some() {} // discard the solicitation
+    let now = Instant::ZERO;
+    // Learn commit up to 3 → applies op 1, holds at the op-2 hole.
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    );
+    assert_eq!(r.commit(), OpNumber::with(1), "held at the hole");
+
+    // A peer answers our RequestPrepare with op 2's Prepare → fill + resume.
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      repair_prepare(0, 2, 3),
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(3),
+      "the hole filled → the held commit resumes and applies ops 2 then 3 in order"
+    );
+    assert_eq!(
+      r.state_machine().applied(),
+      &[
+        (1, std::vec![1u8]),
+        (2, std::vec![2u8]),
+        (3, std::vec![3u8])
+      ],
+      "every committed op applied in order — the rotted op 2 was repaired from a peer, not lost"
+    );
+    // The repaired op was persisted durably (a later read serves it), so the hole cannot reopen.
+    use crate::Wal as _;
+    assert!(
+      wal.header(OpNumber::with(2)).is_some(),
+      "the repaired op 2 is re-appended to the WAL (durable for future reads / DVCs)"
+    );
+  }
+
+  #[test]
+  fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
+    // Placement guard (the misdirected-IO defense the recovery read path makes, applied to a peer
+    // reply): a Prepare for an op that is NOT our hole must NOT fill it. The hole stays open, the
+    // commit stays HELD, and no wrong op's body is applied to the held slot.
+    let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
+    while r.poll_message().is_some() {}
+    let now = Instant::ZERO;
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    );
+    assert_eq!(r.commit(), OpNumber::with(1));
+    // A Prepare for op 5 (not our hole, op 2) is rejected by the placement check (`repair.contains`).
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      repair_prepare(0, 5, 3),
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(1),
+      "a Prepare whose op is not the hole does not fill it (placement mismatch)"
+    );
+    assert_eq!(
+      r.state_machine().applied(),
+      &[(1, std::vec![1u8])],
+      "no wrong body applied; the commit stays held until the CORRECT op 2 arrives"
+    );
+    // The correct op 2 still repairs it (liveness: a wrong reply did not poison the hole).
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      repair_prepare(0, 2, 3),
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(3),
+      "the correct op 2 fills the hole"
+    );
+  }
+
+  #[test]
+  fn repair_holds_the_commit_across_a_long_unrepaired_window() {
+    // Liveness/safety under delay: while the hole is unrepaired the commit stays HELD no matter how
+    // much further commit the primary announces — a committed op above the hole is NEVER applied
+    // before the hole is filled (strict in-order apply). Then a single repair fills it and the whole
+    // suffix applies at once.
+    let (mut r, mut wal, mut sb) = recovering_with_hole(4, 2);
+    while r.poll_message().is_some() {}
+    let now = Instant::ZERO;
+    // Repeatedly learn commit up to the head; the hole at op 2 pins the applied frontier at op 1.
+    for _ in 0..5 {
+      r.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        primary_peer(),
+        Message::Commit(Commit::new(View::new(), OpNumber::with(4), OpNumber::new())),
+      );
+      assert_eq!(
+        r.commit(),
+        OpNumber::with(1),
+        "commit pinned at the hole regardless of how far the primary's commit advances"
+      );
+    }
+    // One repair → the entire held suffix (2,3,4) applies in order.
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      repair_prepare(0, 2, 4),
+    );
+    assert_eq!(r.commit(), OpNumber::with(4));
+    assert_eq!(
+      r.state_machine().applied(),
+      &[
+        (1, std::vec![1u8]),
+        (2, std::vec![2u8]),
+        (3, std::vec![3u8]),
+        (4, std::vec![4u8])
+      ],
+      "every committed op applied in order once the single hole was repaired"
+    );
+  }
+
+  /// Drive a replica (replica 1 of 3) into `RecoveringHead` by permanently faulting its head op's
+  /// read, returning the recovered endpoint + its (still-faulty) wal/sb. The head op is `head`.
+  fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
+    let mut wal = ScriptedWal::with_entries(head);
+    wal.script_read_fault(OpNumber::with(head), u8::MAX); // head read never clears → permanently faulty
+    let mut sb = TestSb::default();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(
+      Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+      0,
+      NoopSm,
+      &mut wal,
+      &mut sb,
+    );
+    for _ in 0..16 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if r.status() != Status::Recovering {
+        break;
+      }
+    }
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "setup: head faulty → RecoveringHead"
+    );
+    (r, wal, sb)
+  }
+
+  #[test]
+  fn recovering_head_solicits_recovery_on_entry() {
+    // On entering RecoveringHead the replica broadcasts a Recovery solicitation (it cannot recover
+    // its head from its own disk) carrying its replica id + nonce.
+    let (mut r, _wal, _sb) = recovering_head(2);
+    let mut saw_recovery = false;
+    while let Some(out) = r.poll_message() {
+      if let Message::Recovery(rec) = out.into_msg() {
+        assert_eq!(rec.replica(), ReplicaId::new(1));
+        saw_recovery = true;
+      }
+    }
+    assert!(
+      saw_recovery,
+      "RecoveringHead solicits the canonical head via Recovery"
+    );
+    // It also armed the solicitation timer so an owner driving poll_timeout keeps re-soliciting.
+    assert!(
+      r.poll_timeout().is_some(),
+      "RecoveringHead arms the recover_head timer"
+    );
+  }
+
+  #[test]
+  fn recovering_head_adopts_start_view_and_becomes_normal() {
+    // A replica stuck in RecoveringHead (head slot permanently lost) receives a StartView from the
+    // view's primary; it adopts the canonical head + log, persists the view, and becomes Normal —
+    // the committed op it could not read locally is restored from the canonical log.
+    let (mut r, mut wal, mut sb) = recovering_head(2);
+    while r.poll_message().is_some() {} // discard the solicitation
+    let now = Instant::ZERO;
+    // primary(view 1) of a 3-cluster is replica 1 — but THIS replica is replica 1, so use view 0's
+    // primary (replica 0) at a view >= ours (view 0). A same-view StartView from the primary adopts
+    // because a RecoveringHead replica is not Normal.
+    let sv = StartView::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(2),
+      ReplicaId::new(0), // primary of view 0
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b"),
+        ),
+      ],
+    );
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::StartView(sv),
+    );
+    assert_eq!(
+      r.status(),
+      Status::Normal,
+      "RecoveringHead adopts the StartView → Normal"
+    );
+    assert_eq!(
+      r.op(),
+      OpNumber::with(2),
+      "head re-established from the canonical log"
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(2),
+      "the committed prefix is restored"
+    );
+    // The recovery bookkeeping is cleared (structurally None in Normal).
+    assert!(r.recover.is_none(), "recover state cleared on adoption");
+    // The new view is persisted before participation; pump the durable-view write, then it re-acks.
+    r.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(sb.state().view(), View::new());
+  }
+
+  #[test]
+  fn recovering_head_adopts_recovery_response_from_primary() {
+    // The full handshake: a RecoveringHead replica's Recovery is answered by the primary with a
+    // RecoveryResponse carrying the canonical head; the replica adopts it and returns to Normal.
+    let (mut r, mut wal, mut sb) = recovering_head(2);
+    // Capture the nonce the replica solicited with (so we echo it in the primary's response).
+    let mut nonce = 0;
+    while let Some(out) = r.poll_message() {
+      if let Message::Recovery(rec) = out.into_msg() {
+        nonce = rec.nonce();
+      }
+    }
+    let now = Instant::ZERO;
+    // The primary of view 0 (replica 0) answers with its canonical log + head + commit, echoing nonce.
+    let resp = RecoveryResponse::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(2),
+      ReplicaId::new(0),
+      nonce,
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b"),
+        ),
+      ],
+    );
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::RecoveryResponse(resp),
+    );
+    assert_eq!(
+      r.status(),
+      Status::Normal,
+      "adopt the primary's RecoveryResponse → Normal"
+    );
+    assert_eq!(r.op(), OpNumber::with(2));
+    assert_eq!(r.commit(), OpNumber::with(2));
+    assert!(r.recover.is_none());
+  }
+
+  #[test]
+  fn recovering_head_ignores_stale_or_non_primary_recovery_response() {
+    // A RecoveryResponse with the WRONG nonce (a stale prior solicitation) is ignored, and a
+    // response from a NON-primary (empty log) cannot re-establish a head — the replica stays
+    // RecoveringHead in both cases, never adopting an unauthoritative head.
+    let (mut r, mut wal, mut sb) = recovering_head(2);
+    let mut nonce = 0;
+    while let Some(out) = r.poll_message() {
+      if let Message::Recovery(rec) = out.into_msg() {
+        nonce = rec.nonce();
+      }
+    }
+    let now = Instant::ZERO;
+    // Wrong nonce → ignored.
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::RecoveryResponse(RecoveryResponse::new(
+        View::new(),
+        OpNumber::with(2),
+        OpNumber::with(2),
+        ReplicaId::new(0),
+        nonce.wrapping_add(1), // stale/forged
+        std::vec![PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        )],
+      )),
+    );
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "a wrong-nonce response is ignored"
+    );
+    // A response from a non-primary (replica 2, with empty log) → ignored (no canonical head).
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::RecoveryResponse(RecoveryResponse::new(
+        View::new(),
+        OpNumber::new(),
+        OpNumber::new(),
+        ReplicaId::new(2), // NOT primary(view 0)
+        nonce,
+        std::vec![],
+      )),
+    );
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "a non-primary response cannot re-establish the head"
+    );
+  }
+
+  #[test]
+  fn recovering_head_does_not_participate_on_non_head_learning_messages() {
+    // The guard relaxation is SURGICAL: a RecoveringHead replica processes only StartView /
+    // RecoveryResponse. A Prepare/Commit/PrepareOk must NOT be acted on (no vote/ack), and must NOT
+    // pull it into a view change via the higher-view rule.
+    let (mut r, mut wal, mut sb) = recovering_head(2);
+    while r.poll_message().is_some() {} // discard the solicitation
+    let now = Instant::ZERO;
+    // A higher-view Prepare would normally trigger catch_up_to_view → ViewChange. It must be dropped.
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Prepare(Prepare::new(
+        View::with(5),
+        OpNumber::with(3),
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(3),
+        Bytes::from_static(b"z"),
+      )),
+    );
+    // A current-view Prepare for an op we hold would normally re-ack. It must be dropped too.
+    r.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+    // A Commit would normally advance commit. Dropped.
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+    );
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "no message pulled it out of RecoveringHead"
+    );
+    assert_eq!(r.view(), View::new(), "view unchanged (no catch-up)");
+    assert!(
+      r.poll_message().is_none(),
+      "RecoveringHead casts no ack/vote on non-head-learning messages"
+    );
+  }
+
+  #[test]
+  fn normal_primary_answers_recovery_with_canonical_response() {
+    // A Normal primary answers a peer's Recovery with a RecoveryResponse carrying its canonical
+    // log + head + commit, echoing the nonce. (Replica 0 is primary of view 0.)
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, EchoSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // Give the primary one committed op so its response is non-trivial.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(1),
+        Bytes::from_static(b"a"),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // own append durable → commit op 1 (quorum 2 in N=3? no)
+    while e.poll_message().is_some() {}
+    // A peer (replica 2) solicits recovery.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::Recovery(Recovery::new(ReplicaId::new(2), 0x1234)),
+    );
+    let mut resp = None;
+    while let Some(out) = e.poll_message() {
+      if let Message::RecoveryResponse(rr) = out.into_msg() {
+        resp = Some(rr);
+      }
+    }
+    let rr = resp.expect("Normal primary answers Recovery with a RecoveryResponse");
+    assert_eq!(rr.replica(), ReplicaId::new(0), "answered by the primary");
+    assert_eq!(rr.nonce(), 0x1234, "the nonce is echoed");
+    assert_eq!(rr.op(), OpNumber::with(1), "carries the primary's head");
+    assert_eq!(rr.log_slice().len(), 1, "carries the canonical log");
+  }
+
+  #[test]
+  fn normal_backup_answers_recovery_with_view_only() {
+    // A Normal BACKUP answers a Recovery with only its view + echoed nonce (no canonical head):
+    // op/commit are 0 and the log is empty. (Replica 2 is a backup of view 0.)
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::Recovery(Recovery::new(ReplicaId::new(1), 0x5678)),
+    );
+    let mut rr = None;
+    while let Some(out) = e.poll_message() {
+      if let Message::RecoveryResponse(r) = out.into_msg() {
+        rr = Some(r);
+      }
+    }
+    let rr = rr.expect("a Normal backup also answers a Recovery (view only)");
+    assert_eq!(rr.nonce(), 0x5678);
+    assert!(
+      rr.log_slice().is_empty(),
+      "a backup carries no canonical log"
+    );
+    assert_eq!(rr.op(), OpNumber::new(), "a backup reports no head");
+  }
+
+  #[test]
+  fn recover_read_ok_with_bad_checksum_does_not_adopt_the_corrupt_body() {
+    // The verify chokepoint (spec §3): a ReadOk whose body fails Header::verify is treated as a
+    // fault, not adopted. With it as the head and permanently corrupt => RecoveringHead.
+    let mut wal = ScriptedWal::with_entries(1);
+    wal.script_corrupt_body(OpNumber::with(1)); // ReadOk with a body that fails verify, forever
+    let mut sb = TestSb::default();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(
+      Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+      0,
+      NoopSm,
+      &mut wal,
+      &mut sb,
+    );
+    for _ in 0..16 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if r.status() != Status::Recovering {
+        break;
+      }
+    }
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "a checksum-failing head body is never adopted"
+    );
+  }
+
+  #[test]
+  fn recovering_replica_ignores_messages_and_does_not_join_a_view_change() {
+    // Non-participation: a Recovering replica must NOT process consensus messages — in particular a
+    // higher-view Prepare must NOT pull it into ViewChange (the catch_up_to_view leak). It stays
+    // Recovering and emits nothing until its own storage loop completes.
+    let mut wal = ScriptedWal::with_entries(2);
+    wal.script_read_fault(OpNumber::with(2), 2); // keep it Recovering (not yet drained)
+    let mut sb = TestSb::default();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(
+      Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+      0,
+      NoopSm,
+      &mut wal,
+      &mut sb,
+    );
+    assert_eq!(r.status(), Status::Recovering);
+    // A higher-view Prepare (view 5) — would normally trigger catch_up_to_view → ViewChange.
+    let higher = Message::Prepare(Prepare::new(
+      View::with(5),
+      OpNumber::with(3),
+      OpNumber::with(2),
+      ClientId::new(7),
+      RequestNumber::with(3),
+      Bytes::from_static(b"z"),
+    ));
+    r.handle_message(now, &mut wal, &mut sb, primary_peer(), higher);
+    assert_eq!(
+      r.status(),
+      Status::Recovering,
+      "a Recovering replica ignores a higher-view message (no catch_up_to_view)"
+    );
+    assert_eq!(r.view(), View::new(), "view is unchanged (no adoption)");
+    assert!(
+      r.poll_message().is_none(),
+      "Recovering replica emits nothing"
+    );
+  }
+
+  #[test]
+  fn recover_timer_resubmits_a_dropped_transient_fault() {
+    // Robustness for a real async driver: if a transient fault's completion never produces a clean
+    // read in the SAME drain, the recover_retry timer must re-submit pending/faulty reads so the
+    // loop still terminates. Here op 2 faults twice (so one pump leaves it faulty-with-budget); a
+    // timeout fires the retry, the next read is clean, and we reach Normal.
+    let mut wal = ScriptedWal::with_entries(2);
+    wal.script_read_fault(OpNumber::with(2), 2);
+    let mut sb = TestSb::default();
+    let mut now = Instant::ZERO;
+    let mut r = Endpoint::recover(
+      Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+      0,
+      EchoSm,
+      &mut wal,
+      &mut sb,
+    );
+    // A Recovering replica must arm a timer (so an owner driving poll_timeout makes progress).
+    assert!(
+      r.poll_timeout().is_some(),
+      "Recovering arms the recover_retry timer"
+    );
+    for _ in 0..8 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if r.status() == Status::Normal {
+        break;
+      }
+      // Advance to the next timer deadline and fire it (re-submits pending/faulty reads).
+      if let Some(t) = r.poll_timeout() {
+        now = t;
+        r.handle_timeout(now, &mut wal, &mut sb);
+      }
+    }
+    assert_eq!(
+      r.status(),
+      Status::Normal,
+      "the recover_retry timer drives the loop to termination"
+    );
+  }
+
+  #[test]
   fn recover_rebuilds_log_and_op_from_wal() {
-    // A backup appends ops 1,2 durably, then "crashes". recover() from the SAME wal/sb
-    // rebuilds op=2 with REAL bodies, view from the superblock, status Normal.
+    // A backup appends ops 1,2 durably, then "crashes". recover() from the SAME wal/sb rebuilds
+    // op=2 with REAL bodies, view from the superblock. recover() is now metadata-only (returns
+    // Recovering); a no-fault TestWal completes the tail reads in one handle_storage → Normal.
     let mut e = backup();
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     let now = Instant::ZERO;
@@ -2489,13 +4104,19 @@ mod tests {
     e.handle_storage(now, &mut wal, &mut sb);
     // Drop `e` (crash). Recover a fresh endpoint from the SAME durable wal/sb.
     drop(e);
-    let recovered = Endpoint::recover(
+    let mut recovered = Endpoint::recover(
       Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
       0,
       NoopSm,
       &mut wal,
       &mut sb,
     );
+    assert_eq!(
+      recovered.status(),
+      Status::Recovering,
+      "recover is a metadata-only constructor (Recovering)"
+    );
+    recovered.handle_storage(now, &mut wal, &mut sb); // drain the tail reads → Normal
     assert_eq!(
       recovered.op(),
       OpNumber::with(2),
@@ -2534,6 +4155,9 @@ mod tests {
     drop(e); // crash
 
     let mut recovered = Endpoint::recover(cfg(), 0, EchoSm, &mut wal, &mut sb);
+    assert_eq!(recovered.status(), Status::Recovering);
+    recovered.handle_storage(now, &mut wal, &mut sb); // restore the tail bodies → Normal
+    assert_eq!(recovered.status(), Status::Normal);
     recovered.handle_message(
       now,
       &mut wal,
@@ -2867,6 +4491,8 @@ mod tests {
       View::with(1),
       "recover() restores the advanced durable view (no regression to view 0)"
     );
+    // No op was ever appended (op_head == 0) and there is no checkpoint, so recovery has nothing to
+    // read: the empty-WAL fast path reaches Normal directly in recover() (no handle_storage needed).
     assert_eq!(recovered.status(), Status::Normal);
   }
 
@@ -3126,8 +4752,11 @@ mod tests {
     );
     drop(e); // crash
 
-    // recover() restores from the checkpoint snapshot, NOT by replaying from op 0.
-    let recovered = Endpoint::recover(cfg(), 0, CountSm::default(), &mut wal, &mut sb);
+    // recover() restores from the checkpoint snapshot, NOT by replaying from op 0. The consensus
+    // metadata (commit/checkpoint/op) is set synchronously in Phase 1; the SM snapshot restore
+    // happens in the Recovering handle_storage loop (Phase 2), so pump it before the SM asserts.
+    let mut recovered = Endpoint::recover(cfg(), 0, CountSm::default(), &mut wal, &mut sb);
+    assert_eq!(recovered.status(), Status::Recovering);
     assert_eq!(
       recovered.commit(),
       OpNumber::with(2),
@@ -3145,6 +4774,8 @@ mod tests {
     );
     // commit_max is restored to checkpoint_op too (monotone bounds: op >= commit_max >= commit_min).
     assert_eq!(recovered.commit_max(), OpNumber::with(2));
+    recovered.handle_storage(now, &mut wal, &mut sb); // restore the SM snapshot + tail bodies → Normal
+    assert_eq!(recovered.status(), Status::Normal);
     // The SM was restored from the snapshot: it already reflects ops 1,2 (NOT re-applied → exactly 2).
     assert_eq!(
       recovered.state_machine().applied().len(),
@@ -3172,7 +4803,10 @@ mod tests {
     assert_eq!(e.checkpoint_op(), OpNumber::with(0), "no checkpoint taken");
     drop(e);
 
-    let recovered = Endpoint::recover(cfg(), 0, CountSm::default(), &mut wal, &mut sb);
+    let mut recovered = Endpoint::recover(cfg(), 0, CountSm::default(), &mut wal, &mut sb);
+    assert_eq!(recovered.status(), Status::Recovering);
+    recovered.handle_storage(now, &mut wal, &mut sb); // drain the tail reads → Normal
+    assert_eq!(recovered.status(), Status::Normal);
     assert_eq!(recovered.op(), OpNumber::with(2), "op from the WAL head");
     assert_eq!(
       recovered.commit(),

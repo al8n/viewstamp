@@ -35,8 +35,8 @@ pub use endpoint::Endpoint;
 pub use event::{Committed, Event};
 pub use id::{ClientId, Peer, Recipient, ReplicaId};
 pub use message::{
-  Commit, DoViewChange, GetView, Message, Outgoing, Prepare, PrepareOk, PreparedEntry, Reply,
-  Request, StartView, StartViewChange,
+  Commit, DoViewChange, GetView, Message, Outgoing, Prepare, PrepareOk, PreparedEntry, Recovery,
+  RecoveryResponse, Reply, Request, RequestPrepare, StartView, StartViewChange,
 };
 pub use number::{OpNumber, RequestNumber, View};
 pub use prng::Prng;
