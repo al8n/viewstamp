@@ -1,0 +1,495 @@
+//! Pluggable durable-storage contract: value types + the `Wal`/`Superblock` traits.
+//!
+//! The proto owns no log; it orchestrates consensus over a user-supplied `Wal` +
+//! `Superblock` (wired in M3.1). All faults surface as data (`SlotStatus::Faulty`,
+//! `WalDone::Fault`) — never as panics; the proto verifies `Header` checksums itself.
+
+use bytes::Bytes;
+
+use crate::{ClientId, OpNumber, RequestNumber, View};
+
+/// On-disk header format version (bumped on any wire/disk layout change).
+pub const HEADER_VERSION: u16 = 1;
+
+/// Correlation id matching a submitted storage op to its completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OpId(u64);
+impl OpId {
+  /// Creates an `OpId`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(n: u64) -> Self {
+    Self(n)
+  }
+
+  /// The underlying value.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn get(self) -> u64 {
+    self.0
+  }
+}
+
+/// Per-WAL-slot status (the present/nack tracking, derived by the impl).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant, derive_more::Display)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+pub enum SlotStatus {
+  /// No entry has occupied this slot.
+  Empty,
+  /// An append is in flight (submitted, not yet durable).
+  Dirty,
+  /// A durable, checksum-valid entry.
+  Clean,
+  /// Read back corrupt/absent — present-but-unusable (nacked in view change).
+  Faulty,
+}
+impl SlotStatus {
+  /// The stable lowercase slug for this status.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Empty => "empty",
+      Self::Dirty => "dirty",
+      Self::Clean => "clean",
+      Self::Faulty => "faulty",
+    }
+  }
+}
+
+/// Checksummed, versioned WAL-entry header (a small fixed-size all-`Copy` value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+  version: u16,
+  checksum: u128,
+  op: OpNumber,
+  view: View,
+  client: ClientId,
+  request: RequestNumber,
+  body_checksum: u128,
+}
+impl Header {
+  /// Creates a header for `body`, computing the body + header checksums.
+  pub fn new(
+    op: OpNumber,
+    view: View,
+    client: ClientId,
+    request: RequestNumber,
+    body: &[u8],
+  ) -> Self {
+    let body_checksum = fnv1a_128(body);
+    let mut h = Self {
+      version: HEADER_VERSION,
+      checksum: 0,
+      op,
+      view,
+      client,
+      request,
+      body_checksum,
+    };
+    h.checksum = h.compute_checksum();
+    h
+  }
+
+  /// The header format version.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn version(&self) -> u16 {
+    self.version
+  }
+
+  /// The header checksum.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checksum(&self) -> u128 {
+    self.checksum
+  }
+
+  /// The operation number this entry records.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op(&self) -> OpNumber {
+    self.op
+  }
+
+  /// The view in which this entry was written.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The client that submitted this operation.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn client(&self) -> ClientId {
+    self.client
+  }
+
+  /// The client request number.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn request(&self) -> RequestNumber {
+    self.request
+  }
+
+  /// The checksum of the body bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn body_checksum(&self) -> u128 {
+    self.body_checksum
+  }
+
+  /// Whether this header + `body` are self-consistent (header checksum valid AND body matches).
+  pub fn verify(&self, body: &[u8]) -> bool {
+    self.checksum == self.compute_checksum() && self.body_checksum == fnv1a_128(body)
+  }
+
+  fn compute_checksum(&self) -> u128 {
+    let mut acc = FNV_OFFSET;
+    for word in [
+      self.version as u128,
+      self.op.get() as u128,
+      self.view.get() as u128,
+      self.client.get(),
+      self.request.get() as u128,
+      self.body_checksum,
+    ] {
+      acc = fnv1a_128_mix(acc, &word.to_be_bytes());
+    }
+    acc
+  }
+}
+
+/// The durable VSR root written to the superblock. Invariants checked ⇒ `try_new`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsrState {
+  view: View,
+  log_view: View,
+  commit: OpNumber,
+  checkpoint_op: OpNumber,
+  checkpoint_id: u128,
+}
+impl VsrState {
+  /// Creates a durable root, validating `log_view <= view` and `commit >= checkpoint_op`.
+  pub const fn try_new(
+    view: View,
+    log_view: View,
+    commit: OpNumber,
+    checkpoint_op: OpNumber,
+    checkpoint_id: u128,
+  ) -> Result<Self, VsrStateError> {
+    if log_view.get() > view.get() {
+      return Err(VsrStateError::LogViewAboveView);
+    }
+    if commit.get() < checkpoint_op.get() {
+      return Err(VsrStateError::CommitBelowCheckpoint);
+    }
+    Ok(Self {
+      view,
+      log_view,
+      commit,
+      checkpoint_op,
+      checkpoint_id,
+    })
+  }
+
+  /// The fresh-cluster root (all zero).
+  pub const fn initial() -> Self {
+    Self {
+      view: View::new(),
+      log_view: View::new(),
+      commit: OpNumber::new(),
+      checkpoint_op: OpNumber::new(),
+      checkpoint_id: 0,
+    }
+  }
+
+  /// The current view.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The view in which the log was last written.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn log_view(&self) -> View {
+    self.log_view
+  }
+
+  /// The highest committed op number.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn commit(&self) -> OpNumber {
+    self.commit
+  }
+
+  /// The op number at which the latest checkpoint was taken.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
+  }
+
+  /// An opaque id for the latest checkpoint (e.g. a content hash).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_id(&self) -> u128 {
+    self.checkpoint_id
+  }
+}
+
+/// Error constructing a [`VsrState`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum VsrStateError {
+  /// `log_view` exceeded `view`.
+  #[error("log_view exceeds view")]
+  LogViewAboveView,
+  /// `commit` was below `checkpoint_op`.
+  #[error("commit is below the checkpoint op")]
+  CommitBelowCheckpoint,
+}
+
+/// A successful WAL read result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOk {
+  id: OpId,
+  header: Header,
+  body: Bytes,
+}
+impl ReadOk {
+  /// Creates a read result.
+  pub fn new(id: OpId, header: Header, body: Bytes) -> Self {
+    Self { id, header, body }
+  }
+
+  /// The correlation id of the storage op that produced this result.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn id(&self) -> OpId {
+    self.id
+  }
+
+  /// The WAL entry header.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn header(&self) -> Header {
+    self.header
+  }
+
+  /// The operation number from the entry header.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op(&self) -> OpNumber {
+    self.header.op()
+  }
+
+  /// The body bytes as a slice.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn body(&self) -> &[u8] {
+    &self.body
+  }
+
+  /// The body bytes as a cloned [`Bytes`] handle.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn body_bytes(&self) -> Bytes {
+    self.body.clone()
+  }
+}
+
+/// Completion of a submitted `Wal` op.
+#[derive(
+  Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
+#[non_exhaustive]
+pub enum WalDone {
+  /// An append became durable.
+  Appended(OpId),
+  /// A read returned a valid entry.
+  ReadOk(ReadOk),
+  /// A read found no entry at that slot.
+  Absent(OpId),
+  /// A storage-level fault (or proto-detected corruption).
+  Fault(OpId),
+}
+
+/// A successful checkpoint read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRead {
+  id: OpId,
+  op: OpNumber,
+  snapshot: Bytes,
+}
+impl CheckpointRead {
+  /// Creates a checkpoint read result.
+  pub fn new(id: OpId, op: OpNumber, snapshot: Bytes) -> Self {
+    Self { id, op, snapshot }
+  }
+
+  /// The correlation id of the storage op that produced this result.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn id(&self) -> OpId {
+    self.id
+  }
+
+  /// The op number at which this checkpoint was taken.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op(&self) -> OpNumber {
+    self.op
+  }
+
+  /// The snapshot bytes as a slice.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn snapshot(&self) -> &[u8] {
+    &self.snapshot
+  }
+
+  /// The snapshot bytes as a cloned [`Bytes`] handle.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn snapshot_bytes(&self) -> Bytes {
+    self.snapshot.clone()
+  }
+}
+
+/// Completion of a submitted `Superblock` op.
+#[derive(
+  Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
+#[non_exhaustive]
+pub enum SuperblockDone {
+  /// A superblock/checkpoint write became durable.
+  Wrote(OpId),
+  /// A checkpoint read returned its snapshot.
+  CheckpointRead(CheckpointRead),
+  /// A storage-level fault.
+  Fault(OpId),
+}
+
+/// A pluggable write-ahead log. The implementation owns all log bytes and a header
+/// index; the proto orchestrates consensus over it. Sync methods serve consensus
+/// decisions; `submit_*` queue durability work whose completions arrive via `poll`.
+pub trait Wal {
+  /// The highest op number held.
+  fn op_head(&self) -> OpNumber;
+  /// The header at `op`, or `None` if absent or known-faulty.
+  fn header(&self, op: OpNumber) -> Option<Header>;
+  /// The slot status for `op` (the present/nack signal).
+  fn status(&self, op: OpNumber) -> SlotStatus;
+  /// Submit a durable append of `(header, body)` at `op`. Completion via [`Wal::poll`].
+  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes);
+  /// Submit a read of `op`'s entry. Completion via [`Wal::poll`].
+  fn submit_read(&mut self, id: OpId, op: OpNumber);
+  /// Drop all slots strictly above `op` (view-change tail truncation).
+  fn truncate(&mut self, above: OpNumber);
+  /// Free all slots strictly below `op` (post-checkpoint GC).
+  fn prune(&mut self, below: OpNumber);
+  /// Drain the next completed op, if any.
+  fn poll(&mut self) -> Option<WalDone>;
+}
+
+/// A pluggable durable root (superblock). Writes the VSR state and checkpoint
+/// snapshots atomically; completions arrive via [`Superblock::poll`].
+pub trait Superblock {
+  /// The current durable root.
+  fn state(&self) -> VsrState;
+  /// Submit an atomic write of the durable root.
+  fn submit_write(&mut self, id: OpId, state: VsrState);
+  /// Submit a write of a checkpoint snapshot at `op`.
+  fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes);
+  /// Submit a read of the latest checkpoint snapshot.
+  fn submit_read_checkpoint(&mut self, id: OpId);
+  /// Drain the next completed op, if any.
+  fn poll(&mut self) -> Option<SuperblockDone>;
+}
+
+// ── deterministic FNV-1a-128 (no_std, no deps) ──
+const FNV_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+const FNV_PRIME: u128 = 0x0000000001000000000000000000013B;
+
+fn fnv1a_128(bytes: &[u8]) -> u128 {
+  fnv1a_128_mix(FNV_OFFSET, bytes)
+}
+
+fn fnv1a_128_mix(mut acc: u128, bytes: &[u8]) -> u128 {
+  for &b in bytes {
+    acc ^= b as u128;
+    acc = acc.wrapping_mul(FNV_PRIME);
+  }
+  acc
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{ClientId, OpNumber, RequestNumber, View};
+
+  #[test]
+  fn header_checksum_detects_corruption() {
+    let h = Header::new(
+      OpNumber::with(1),
+      View::with(0),
+      ClientId::new(7),
+      RequestNumber::with(1),
+      b"hello",
+    );
+    assert!(h.verify(b"hello"));
+    assert!(!h.verify(b"hellp")); // a flipped body byte fails verification
+    assert_eq!(h.version(), HEADER_VERSION);
+
+    // A tampered header field (without recomputing the checksum) must also fail verify.
+    let mut tampered = h;
+    tampered.op = OpNumber::with(2);
+    assert!(
+      !tampered.verify(b"hello"),
+      "a tampered header field must fail verify"
+    );
+  }
+
+  #[test]
+  fn vsr_state_rejects_bad_invariants() {
+    assert!(
+      VsrState::try_new(
+        View::with(1),
+        View::with(2),
+        OpNumber::with(0),
+        OpNumber::with(0),
+        0
+      )
+      .is_err()
+    );
+    assert!(
+      VsrState::try_new(
+        View::with(2),
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(3),
+        0
+      )
+      .is_err()
+    );
+    let s = VsrState::try_new(
+      View::with(3),
+      View::with(3),
+      OpNumber::with(5),
+      OpNumber::with(4),
+      99,
+    )
+    .unwrap();
+    assert_eq!(s.commit(), OpNumber::with(5));
+    assert_eq!(s.checkpoint_id(), 99);
+  }
+
+  #[test]
+  fn slot_status_as_str_and_predicates() {
+    assert_eq!(SlotStatus::Faulty.as_str(), "faulty");
+    assert!(SlotStatus::Clean.is_clean());
+  }
+
+  #[test]
+  fn wal_done_variants() {
+    let r = ReadOk::new(
+      OpId::new(1),
+      Header::new(
+        OpNumber::with(1),
+        View::new(),
+        ClientId::new(1),
+        RequestNumber::with(1),
+        b"x",
+      ),
+      bytes::Bytes::from_static(b"x"),
+    );
+    let d = WalDone::ReadOk(r);
+    assert!(d.is_read_ok());
+    assert_eq!(d.unwrap_read_ok().op(), OpNumber::with(1));
+  }
+}

@@ -10,7 +10,9 @@ pub mod clock;
 pub mod cluster;
 pub mod network;
 pub mod sm;
+pub mod storage;
 
 pub use checker::{CheckResult, ViewMonotonicChecker, check_safety};
 pub use cluster::Cluster;
 pub use network::Faults;
+pub use storage::{InMemorySuperblock, InMemoryWal};

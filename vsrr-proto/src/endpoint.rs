@@ -987,6 +987,12 @@ mod tests {
     fn apply(&mut self, _op: OpNumber, _body: &[u8]) -> Bytes {
       Bytes::new()
     }
+
+    fn snapshot(&self) -> Bytes {
+      Bytes::new()
+    }
+
+    fn restore(&mut self, _snapshot: &[u8]) {}
   }
 
   #[test]

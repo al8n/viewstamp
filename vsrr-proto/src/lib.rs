@@ -23,6 +23,7 @@ mod number;
 mod prng;
 mod state_machine;
 mod status;
+mod storage;
 mod time;
 pub use config::{Config, ConfigError};
 pub use endpoint::Endpoint;
@@ -36,4 +37,8 @@ pub use number::{OpNumber, RequestNumber, View};
 pub use prng::Prng;
 pub use state_machine::StateMachine;
 pub use status::Status;
+pub use storage::{
+  CheckpointRead, HEADER_VERSION, Header, OpId, ReadOk, SlotStatus, Superblock, SuperblockDone,
+  VsrState, VsrStateError, Wal, WalDone,
+};
 pub use time::Instant;
