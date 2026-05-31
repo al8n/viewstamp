@@ -83,6 +83,7 @@ fn primary_crash_with_uncommitted_tail_preserves_committed_ops() {
     latency: Duration::from_millis(1),
     jitter: Duration::from_millis(4),
     drop_per_mille: 80, // lossy: the primary will have uncommitted ops in flight
+    duplicate_per_mille: 0,
   });
 
   // Warm up until the primary has committed at least one op (a shared committed prefix exists).

@@ -76,6 +76,7 @@ fn the_m3_gate_committed_ops_survive_everything() {
       latency: Duration::from_millis(1),
       jitter: Duration::from_millis(3),
       drop_per_mille: 10,
+      duplicate_per_mille: 0,
     });
     // PERMANENT WAL corruption on every replica (torn + bit-rot; NO transient read-fault — that would
     // mask the permanent path by clearing on retry). High enough that some committed slot rots across

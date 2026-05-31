@@ -165,27 +165,44 @@ impl DurabilityChecker {
   }
 }
 
-/// Stateful checker: each replica's `view` must never decrease across observations.
+/// Stateful checker: each replica's **DURABLE (superblock) view** must never decrease across
+/// observations.
+///
+/// The quantity tracked is the durable view ([`Cluster::replica_durable_view`]), **not** the volatile
+/// in-memory `view`. The in-memory view is NOT monotone across a crash + restart, and correctly so: a
+/// self-driven view change advances `self.view` to the new view *before* the matching superblock
+/// durable-view write lands, and the proto defers EVERY binding participation in a view (PrepareOk /
+/// DoViewChange / StartView / Prepare / Commit) until that write completes (durable-view-before-
+/// participate). So a replica that bumped its in-memory view, did not yet persist it, and crashed has
+/// **acted in no higher view than its durable view** — on restart `recover()` legitimately restores
+/// the durable view, regressing the in-memory view, and the replica is self-correcting (the next
+/// higher-view message re-catches it up). Asserting monotonicity on the in-memory view would flag this
+/// safe, expected behaviour (observed at VOPR seed 151: a replica entered a view change for view 1,
+/// crashed before the view-1 root was durable, and recovered to view 0 — having sent NOTHING in view
+/// 1). The DURABLE view is the right invariant: it only advances when a view-change/adoption root
+/// write lands, so it is monotone AND it is exactly "the highest view the replica could have acted in".
+/// A regression THERE would be a real durable-state safety violation.
 #[derive(Debug)]
 pub struct ViewMonotonicChecker {
   max_view: Vec<u64>,
 }
 
 impl ViewMonotonicChecker {
-  /// A checker for a cluster of `replica_count` replicas (all start at view 0).
+  /// A checker for a cluster of `replica_count` replicas (all start at durable view 0).
   pub fn new(replica_count: usize) -> Self {
     Self {
       max_view: vec![0; replica_count],
     }
   }
 
-  /// Sample the cluster: returns a violation if any replica's view dropped below a prior maximum.
+  /// Sample the cluster: returns a violation if any replica's DURABLE view dropped below a prior
+  /// maximum (a real durable-view regression — never legitimate). Call every tick.
   pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
     for i in 0..cluster.replica_count() {
-      let v = cluster.replica_view(i).get();
+      let v = cluster.replica_durable_view(i).get();
       if v < self.max_view[i] {
         return CheckResult::Violation(format!(
-          "replica {i}: view regressed to {v} (was {})",
+          "replica {i}: durable view regressed to {v} (was {})",
           self.max_view[i]
         ));
       }
@@ -355,6 +372,125 @@ mod tests {
       c.tick();
       assert!(vm.observe(&c).is_ok(), "no view regression after failover");
       if c.client(0).is_done() {
+        break;
+      }
+    }
+  }
+
+  #[test]
+  fn view_checker_tracks_the_durable_view_across_an_undurable_catch_up_regression() {
+    // Regression for VOPR seed 151: a replica that caught its IN-MEMORY view up to a higher view via
+    // the higher-view rule (`catch_up_to_view` — a non-binding GetView probe, NO durable write, NO
+    // participation), then crashed and recovered to its (lower) DURABLE view, legitimately regresses
+    // its in-memory view. That is SAFE (it acted in no higher view than it persisted), so the
+    // view-monotonic checker — which tracks the DURABLE view — must stay Ok, even though a naive
+    // in-memory-view checker WOULD have fired.
+    //
+    // Construction: a 5-node cluster, crash the primary (r0) so the survivors fail over to view 1. A
+    // lagging backup catches its in-memory view up to 1 BEFORE persisting it (the un-durable window:
+    // `replica_view > replica_durable_view`). We crash that backup IN that window and restart it — it
+    // recovers to durable view 0, regressing its in-memory view. The durable-view checker stays Ok
+    // throughout; we also assert the in-memory view actually regressed (non-vacuity: the bug this fixes
+    // would have tripped here).
+    use crate::Faults;
+    use core::time::Duration;
+
+    let mut c = Cluster::new(5, 2, 200, 151);
+    // Lossy network: drops keep a behind backup in the `catch_up_to_view` GetView-probe state (its
+    // in-memory view bumped via the higher-view rule, the StartView that would persist it delayed), so
+    // the un-durable window `replica_view > replica_durable_view` stays open long enough to observe.
+    c.set_faults(Faults {
+      latency: Duration::from_millis(1),
+      jitter: Duration::from_millis(2),
+      drop_per_mille: 200,
+      duplicate_per_mille: 0,
+    });
+    let mut vm = ViewMonotonicChecker::new(c.replica_count());
+    // Warm up.
+    for _ in 0..5_000 {
+      c.tick();
+      assert!(vm.observe(&c).is_ok());
+      if c.replica_commit(0).get() >= 3 {
+        break;
+      }
+    }
+    // Crash the view-0 primary; the survivors fail over toward higher views. Search (re-crashing the
+    // rotating primary to force fresh catch-ups) for a replica in the un-durable catch-up window.
+    c.crash(0);
+    let mut victim = None;
+    for step in 0..200_000usize {
+      c.tick();
+      assert!(
+        vm.observe(&c).is_ok(),
+        "durable view never regresses (pre-crash)"
+      );
+      if let Some(i) = (0..c.replica_count())
+        .find(|&i| !c.is_crashed(i) && c.replica_view(i).get() > c.replica_durable_view(i).get())
+      {
+        victim = Some(i);
+        break;
+      }
+      // Periodically crash whichever replica currently leads (the live primary) and restart a crashed
+      // one, to churn views and repeatedly drive lagging backups through the catch-up probe.
+      if step % 4_000 == 3_999 {
+        let leader = (0..c.replica_count())
+          .filter(|&i| !c.is_crashed(i))
+          .max_by_key(|&i| c.replica_view(i).get());
+        if let Some(l) = leader {
+          let live = (0..c.replica_count()).filter(|&i| !c.is_crashed(i)).count();
+          // Keep a quorum up (5 replicas → never knock the live set below 3).
+          if live > 3 {
+            c.crash(l);
+          }
+        }
+        for i in 0..c.replica_count() {
+          if c.is_crashed(i) {
+            c.restart(i);
+            break;
+          }
+        }
+      }
+    }
+    let v =
+      victim.expect("a replica entered the un-durable catch-up window (in-memory view > durable)");
+    let inmem_before = c.replica_view(v).get();
+    let durable_before = c.replica_durable_view(v).get();
+    assert!(
+      inmem_before > durable_before,
+      "the victim's in-memory view {inmem_before} leads its durable view {durable_before}"
+    );
+    // Crash + restart the victim: it recovers to its DURABLE view, regressing the in-memory view.
+    c.crash(v);
+    c.restart(v);
+    let inmem_after = c.replica_view(v).get();
+    assert!(
+      inmem_after <= durable_before,
+      "after recovery the in-memory view ({inmem_after}) is back at the durable view (<= {durable_before})"
+    );
+    assert!(
+      inmem_after < inmem_before,
+      "non-vacuity: the in-memory view genuinely REGRESSED ({inmem_before} -> {inmem_after}) — a naive \
+       in-memory-view checker would have fired here"
+    );
+    // The durable-view checker stays Ok across the regression and the subsequent re-convergence.
+    assert!(
+      vm.observe(&c).is_ok(),
+      "the durable-view checker tolerates the in-memory regression (the higher view was never durable)"
+    );
+    // Heal + run on: the durable view must stay monotone as the recovered replica re-catches up.
+    c.set_faults(Faults::none());
+    for i in 0..c.replica_count() {
+      if c.is_crashed(i) {
+        c.restart(i);
+      }
+    }
+    for _ in 0..50_000 {
+      c.tick();
+      assert!(
+        vm.observe(&c).is_ok(),
+        "durable view stays monotone as the recovered replica re-catches up"
+      );
+      if (0..c.client_count()).all(|i| c.client(i).is_done()) {
         break;
       }
     }
