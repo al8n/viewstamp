@@ -29,15 +29,23 @@ pub struct Faults {
   pub jitter: core::time::Duration,
   /// Per-message drop probability, out of 1000.
   pub drop_per_mille: u32,
+  /// Per-message DUPLICATE probability, out of 1000. When it fires, the (non-dropped) message is
+  /// enqueued a SECOND time at an independently-jittered delivery instant — so the receiver may see
+  /// the same `Prepare`/`Commit`/`PrepareOk`/… twice, out of order relative to the first copy. This
+  /// exercises the protocol's idempotency / re-ack paths (a re-delivered `Prepare` must not double
+  /// apply; a re-delivered `PrepareOk` must not double-count the quorum). Default 0 (existing tests
+  /// unaffected).
+  pub duplicate_per_mille: u32,
 }
 
 impl Faults {
-  /// No faults: fixed small latency, no jitter, no drops.
+  /// No faults: fixed small latency, no jitter, no drops, no duplicates.
   pub const fn none() -> Self {
     Self {
       latency: core::time::Duration::from_millis(1),
       jitter: core::time::Duration::ZERO,
       drop_per_mille: 0,
+      duplicate_per_mille: 0,
     }
   }
 }

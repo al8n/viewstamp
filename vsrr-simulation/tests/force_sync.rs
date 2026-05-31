@@ -68,6 +68,7 @@ fn a_stuck_pruned_committed_hole_converges_via_force_sync() {
       latency: Duration::from_millis(1),
       jitter: Duration::from_millis(2),
       drop_per_mille: 5,
+      duplicate_per_mille: 0,
     });
     // PERMANENT bit-rot (no transient read-fault — that would mask the permanent path by clearing on
     // retry; no torn — keep the fault model a single, crisp permanent class). High enough that a

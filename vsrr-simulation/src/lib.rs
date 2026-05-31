@@ -11,6 +11,7 @@ pub mod cluster;
 pub mod network;
 pub mod sm;
 pub mod storage;
+pub mod vopr;
 
 pub use checker::{
   BoundednessChecker, CheckResult, DurabilityChecker, ViewMonotonicChecker, check_safety,
@@ -18,3 +19,4 @@ pub use checker::{
 pub use cluster::Cluster;
 pub use network::Faults;
 pub use storage::{InMemorySuperblock, InMemoryWal, StorageFaults};
+pub use vopr::{DEFAULT_TICKS, VoprReport, run_vopr, run_vopr_one};

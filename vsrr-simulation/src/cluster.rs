@@ -1,8 +1,8 @@
 use core::time::Duration;
 
 use vsrr_proto::{
-  Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Instant, Message, Outgoing, Peer, Prng, Recipient,
-  ReplicaId,
+  Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Instant, Message, OpNumber, Outgoing, Peer, Prng,
+  Recipient, ReplicaId, Wal,
 };
 
 use crate::client::ClientModel;
@@ -40,6 +40,17 @@ pub struct Cluster {
   /// Partition group id per replica. Replica↔replica messages between different groups are
   /// dropped. All replicas start in group 0 (no partition).
   groups: Vec<u8>,
+  /// Set by [`tick`](Self::tick) when a replica emitted a `PrepareOk(op)` for an op that is NOT
+  /// durable in its OWN WAL+snapshot at emission time — the append-before-ack invariant, checked
+  /// structurally "via the sim's storage view". Stays `None` in the absence of a violation; a checker
+  /// (the VOPR driver) drains it each tick via [`take_append_before_ack_violation`]. Existing gates
+  /// never read it, so it is inert for them.
+  append_before_ack_violation: Option<String>,
+  /// `None` (default) ⇒ every replica's WAL appends SYNCHRONOUSLY (existing-gate behaviour). `Some(d)`
+  /// ⇒ async-append mode with per-append delay `d` polls — the Phase-A in-flight window the
+  /// append-before-ack invariant must survive. Set via [`set_async_wal_delay`] before running;
+  /// persists across `crash`/`restart` because the WAL struct does.
+  async_wal_delay: Option<u32>,
 }
 
 impl Cluster {
@@ -80,7 +91,7 @@ impl Cluster {
       .collect();
     let n = replicas as usize;
     let storage_faults = StorageFaults::none();
-    let (wals, sbs) = Self::seed_storage(replicas, seed, storage_faults);
+    let (wals, sbs) = Self::seed_storage(replicas, seed, storage_faults, None);
     Self {
       replicas: replica_set,
       wals,
@@ -96,19 +107,29 @@ impl Cluster {
       checkpoint_ops,
       crashed: vec![false; n],
       groups: vec![0; n],
+      append_before_ack_violation: None,
+      async_wal_delay: None,
     }
   }
 
   /// Builds the per-replica seeded WAL + superblock vectors. Each replica's storage gets a distinct
   /// seed derived from the base `seed`, its index, and [`STORAGE_SEED_MAGIC`], so fault decisions are
-  /// reproducible per (seed, replica) yet independent across replicas.
+  /// reproducible per (seed, replica) yet independent across replicas. When `async_delay` is `Some`,
+  /// every WAL is built in async-append mode (the in-flight window) composed with the fault plan.
   fn seed_storage(
     replicas: u8,
     seed: u64,
     faults: StorageFaults,
+    async_delay: Option<u32>,
   ) -> (Vec<InMemoryWal>, Vec<InMemorySuperblock>) {
     let wals = (0..replicas)
-      .map(|i| InMemoryWal::with_faults(faults, Self::storage_seed(seed, i)))
+      .map(|i| {
+        let s = Self::storage_seed(seed, i);
+        match async_delay {
+          Some(d) => InMemoryWal::with_async_appends_and_faults(faults, s, d),
+          None => InMemoryWal::with_faults(faults, s),
+        }
+      })
       .collect();
     let sbs = (0..replicas)
       .map(|i| InMemorySuperblock::with_faults(faults, Self::storage_seed(seed, i)))
@@ -132,7 +153,21 @@ impl Cluster {
   /// `crash` + `restart` unchanged — a restarted replica recovers from the same faulty medium.
   pub fn set_storage_faults(&mut self, faults: StorageFaults) {
     self.storage_faults = faults;
-    let (wals, sbs) = Self::seed_storage(self.replica_count, self.seed, faults);
+    let (wals, sbs) =
+      Self::seed_storage(self.replica_count, self.seed, faults, self.async_wal_delay);
+    self.wals = wals;
+    self.sbs = sbs;
+  }
+
+  /// Enables (or, with `None`, disables) **async-append mode** on every replica's WAL, with per-append
+  /// delay `delay` polls. In this mode an append stays not-yet-durable (`SlotStatus::Dirty`, reads
+  /// `Absent`) for `delay` polls — the in-flight window the append-before-ack invariant must survive
+  /// (Phase A). Composes with the current storage-fault plan. Call before running; the mode persists
+  /// across `crash`/`restart` because the WAL struct does. Rebuilds the (empty) WALs, like
+  /// [`set_storage_faults`](Self::set_storage_faults).
+  pub fn set_async_wal_delay(&mut self, delay: Option<u32>) {
+    self.async_wal_delay = delay;
+    let (wals, sbs) = Self::seed_storage(self.replica_count, self.seed, self.storage_faults, delay);
     self.wals = wals;
     self.sbs = sbs;
   }
@@ -165,6 +200,39 @@ impl Cluster {
   /// Replica `i`'s current commit (`commit_min`) — the applied frontier (for the M3 gate).
   pub fn replica_commit(&self, i: usize) -> vsrr_proto::OpNumber {
     self.replicas[i].commit()
+  }
+
+  /// Replica `i`'s `commit_max` (highest op it knows is committed cluster-wide). Used by the VOPR
+  /// driver's structural ordering invariant `op >= commit_max >= commit_min >= checkpoint_op`.
+  pub fn replica_commit_max(&self, i: usize) -> vsrr_proto::OpNumber {
+    self.replicas[i].commit_max()
+  }
+
+  /// True iff replica `i`'s WAL append for op `op` has COMPLETED (the slot was durably written) — or
+  /// `op <= checkpoint_op` (folded into the durable snapshot). Concretely the slot is `Clean` (a
+  /// durable, checksum-valid entry) OR `Faulty` (durably written, then later torn / bit-rotted: the
+  /// append still COMPLETED — `WalDone::Appended` fired — and the slot stays occupied; only the
+  /// *bytes* are corrupt, a separate, peer-repaired concern). A `Dirty` (still in flight) or `Empty`
+  /// (never submitted) slot above the checkpoint has NOT completed its append.
+  ///
+  /// This is the right primitive for the append-before-ack check (the proto emits `PrepareOk` only
+  /// after `Appended`, which a `Faulty` slot did fire) AND for the "a committed op stays in a quorum's
+  /// durable WAL+snapshot" check (a committed slot stays occupied — `prune`/`truncate` never drop a
+  /// committed slot above the checkpoint — even if its bytes later rot).
+  pub fn replica_appended_op(&self, i: usize, op: OpNumber) -> bool {
+    op.get() <= self.replicas[i].checkpoint_op().get()
+      || matches!(
+        self.wals[i].status(op),
+        vsrr_proto::SlotStatus::Clean | vsrr_proto::SlotStatus::Faulty
+      )
+  }
+
+  /// Drains the most recent append-before-ack violation observed during [`tick`](Self::tick) (a
+  /// replica emitted a `PrepareOk` for an op whose WAL append had not completed — `Dirty`/`Empty`), if
+  /// any. Returns `None` when no violation has occurred since the last drain. The violation is recorded
+  /// structurally each tick by checking every emitted `PrepareOk` against the sender's own WAL view.
+  pub fn take_append_before_ack_violation(&mut self) -> Option<String> {
+    self.append_before_ack_violation.take()
   }
 
   /// True iff replica `i` is the primary of its current view (for the M3 gate's failover schedule).
@@ -207,6 +275,20 @@ impl Cluster {
   pub fn replica_status_is_operational(&self, i: usize) -> bool {
     let s = self.replicas[i].status();
     s.is_normal() || s.is_view_change()
+  }
+
+  /// Replica `i`'s DURABLE (superblock) view — the view persisted in its on-disk VSR root, which is
+  /// what a crash + `restart` recovers it to. Unlike the volatile in-memory [`Self::replica_view`]
+  /// (which a self-driven view change advances BEFORE the matching `submit_durable_view` completes,
+  /// and which therefore legitimately regresses to this durable view on a restart that interrupted an
+  /// not-yet-durable view change), the durable view is MONOTONE: it only advances when a view-change /
+  /// adoption superblock write lands, and every binding participation (PrepareOk / DoViewChange /
+  /// StartView / Prepare / Commit) is deferred until that write completes (durable-view-before-
+  /// participate). So it is the correct quantity for the view-monotonicity invariant — the highest
+  /// view the replica could ever have ACTED in. (Read off the same superblock the proto recovers from.)
+  pub fn replica_durable_view(&self, i: usize) -> vsrr_proto::View {
+    use vsrr_proto::Superblock;
+    self.sbs[i].state().view()
   }
 
   /// Read access to client `i` (for invariant checking).
@@ -283,7 +365,6 @@ impl Cluster {
 
   #[doc(hidden)]
   pub fn wal_head_for_test(&self, i: usize) -> u64 {
-    use vsrr_proto::Wal;
     self.wals[i].op_head().get()
   }
 
@@ -363,6 +444,35 @@ impl Cluster {
         continue;
       }
       while let Some(out) = self.replicas[ri].poll_message() {
+        // Append-before-ack, checked structurally at the moment of emission: a replica must never
+        // emit a `PrepareOk(op)` whose WAL append has not COMPLETED on its own disk (the slot is
+        // `Dirty`/in-flight or `Empty`/never-submitted, AND the op is above the durable checkpoint).
+        // The proto defers the ack to the `WalDone::Appended` completion; a `Faulty` slot (durably
+        // written, then later rotted) still fired `Appended`, so acking it is legitimate — this only
+        // flags an ack of a genuinely-incomplete append. Record-only — a checker drains it; existing
+        // gates ignore it.
+        if let Message::PrepareOk(ok) = out.msg_ref() {
+          let op = ok.op();
+          if op.get() > 0
+            && !self.replica_appended_op(ri, op)
+            && self.append_before_ack_violation.is_none()
+          {
+            let r = &self.replicas[ri];
+            self.append_before_ack_violation = Some(format!(
+              "replica {ri} emitted PrepareOk(op={}) but its WAL append has not completed \
+               (wal_status={}, view={}, status={}, op={}, commit_min={}, commit_max={}, \
+               checkpoint_op={}) — append-before-ack violated",
+              op.get(),
+              self.wals[ri].status(op).as_str(),
+              r.view().get(),
+              r.status().as_str(),
+              r.op().get(),
+              r.commit().get(),
+              r.commit_max().get(),
+              r.checkpoint_op().get(),
+            ));
+          }
+        }
         outgoing.push((ReplicaId::new(ri as u8), out));
       }
     }
@@ -469,7 +579,9 @@ impl Cluster {
     }
   }
 
-  /// Applies the fault model and (unless dropped) enqueues a message.
+  /// Applies the fault model and (unless dropped) enqueues a message. With `duplicate_per_mille` a
+  /// non-dropped message is enqueued a SECOND time at an independently-jittered delivery instant,
+  /// exercising the protocol's idempotency / re-ack paths.
   fn schedule(&mut self, now: Instant, from: Peer, target: Target, msg: Message) {
     if let (Peer::Replica(from_r), Target::Replica(to_r)) = (from, target) {
       if self.partitioned(from_r.get(), to_r) {
@@ -479,19 +591,38 @@ impl Cluster {
     if self.faults.drop_per_mille > 0 && self.prng.chance(self.faults.drop_per_mille, 1000) {
       return;
     }
-    let jitter_ns = if self.faults.jitter.is_zero() {
-      0
-    } else {
-      self.prng.below(self.faults.jitter.as_nanos() as u64)
-    };
-    let deliver_at = now + self.faults.latency + Duration::from_nanos(jitter_ns);
+    // Roll the duplicate decision BEFORE enqueuing so the PRNG-draw order is fixed regardless of the
+    // (independent) jitter draws below — keeping the run a pure function of the seed.
+    let duplicate = self.faults.duplicate_per_mille > 0
+      && self.prng.chance(self.faults.duplicate_per_mille, 1000);
+    let deliver_at = now + self.faults.latency + Duration::from_nanos(self.jitter_ns());
     self.net.enqueue(InFlight {
       deliver_at,
       from,
       target,
-      msg,
+      msg: msg.clone(),
       seq: 0,
     });
+    if duplicate {
+      // The second copy gets its OWN jitter, so it can arrive before or after the first.
+      let dup_at = now + self.faults.latency + Duration::from_nanos(self.jitter_ns());
+      self.net.enqueue(InFlight {
+        deliver_at: dup_at,
+        from,
+        target,
+        msg,
+        seq: 0,
+      });
+    }
+  }
+
+  /// One independent jitter draw in nanoseconds (`0` when jitter is disabled).
+  fn jitter_ns(&mut self) -> u64 {
+    if self.faults.jitter.is_zero() {
+      0
+    } else {
+      self.prng.below(self.faults.jitter.as_nanos() as u64)
+    }
   }
 }
 
@@ -509,6 +640,64 @@ mod tests {
       cluster.tick();
     }
     assert!(cluster.now() > t0, "virtual clock must advance");
+  }
+
+  #[test]
+  fn duplicate_delivery_preserves_safety_and_liveness() {
+    // Every message duplicated (idempotency stress): a re-delivered Prepare must not double-apply and
+    // a re-delivered PrepareOk must not double-count the quorum, so the cluster still commits cleanly.
+    let mut c = Cluster::new(3, 2, 3, 4);
+    c.set_faults(Faults {
+      latency: Duration::from_millis(1),
+      jitter: Duration::from_millis(2),
+      drop_per_mille: 0,
+      duplicate_per_mille: 1000,
+    });
+    let mut done = false;
+    for _ in 0..20_000 {
+      c.tick();
+      // contiguity/agreement holds under duplication.
+      assert!(
+        crate::check_safety(&c).is_ok(),
+        "safety under duplicate delivery"
+      );
+      if (0..c.client_count()).all(|i| c.client(i).is_done()) {
+        done = true;
+        break;
+      }
+    }
+    assert!(
+      done,
+      "duplicated messages still let clients finish (idempotency)"
+    );
+  }
+
+  #[test]
+  fn duplicate_delivery_is_deterministic() {
+    // Same seed + same duplicate fault plan ⇒ identical applied logs (the dup roll uses the seeded PRNG).
+    let run = || {
+      let mut c = Cluster::new(3, 2, 3, 9);
+      c.set_faults(Faults {
+        latency: Duration::from_millis(1),
+        jitter: Duration::from_millis(2),
+        drop_per_mille: 0,
+        duplicate_per_mille: 1000,
+      });
+      for _ in 0..20_000 {
+        c.tick();
+        if (0..c.client_count()).all(|i| c.client(i).is_done()) {
+          break;
+        }
+      }
+      (0..c.replica_count())
+        .map(|i| c.replica_sm(i).applied().to_vec())
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(
+      run(),
+      run(),
+      "duplicate delivery is a pure function of the seed"
+    );
   }
 
   #[test]

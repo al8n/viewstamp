@@ -4,8 +4,8 @@ use bytes::Bytes;
 
 use crate::{
   ClientId, Commit, Config, DoViewChange, Event, Header, Instant, Message, OpNumber, Outgoing,
-  Peer, Prepare, PrepareOk, Prng, Recipient, ReplicaId, Reply, RequestNumber, StateMachine, Status,
-  Superblock, SuperblockDone, View, Wal, WalDone,
+  Peer, Prepare, PrepareOk, Prng, Recipient, ReplicaId, Reply, RequestNumber, SlotStatus,
+  StateMachine, Status, Superblock, SuperblockDone, View, Wal, WalDone,
 };
 
 /// What the endpoint does when a submitted WAL append completes. Append-before-ack: the vote/ack a
@@ -866,6 +866,27 @@ impl<S: StateMachine> Endpoint<S> {
   #[cfg(test)]
   fn has_repair_hole_for_test(&self, op: u64) -> bool {
     self.repair.contains(&op)
+  }
+
+  /// Test-only: seed an in-memory `log` entry at `op` (a placeholder body), so the held-tail
+  /// preservation of `apply_sync` can be observed (`force_state_for_test` deliberately leaves the
+  /// cache empty). Does not touch the WAL.
+  #[cfg(test)]
+  fn seed_log_entry_for_test(&mut self, op: u64) {
+    self.log.insert(
+      op,
+      LogEntry {
+        client: ClientId::new(1),
+        request: RequestNumber::with(op),
+        body: Bytes::new(),
+      },
+    );
+  }
+
+  /// Test-only: does the in-memory `log` cache hold `op`?
+  #[cfg(test)]
+  fn has_log_entry_for_test(&self, op: u64) -> bool {
+    self.log.contains_key(&op)
   }
 
   /// Test-only: the outstanding sync's target op, or `None` if no sync is outstanding.
@@ -2110,16 +2131,22 @@ impl<S: StateMachine> Endpoint<S> {
   ///
   /// On the M3.5 FORCED path ([`Self::maybe_force_sync`]) the synced `checkpoint_op` may instead be
   /// `<= self.op` (the replica holds a tail ABOVE a pruned committed hole). The held tail
-  /// `(checkpoint_op .. self.op]` is then discarded — still safe: each discarded op `M` is either
-  /// uncommitted (`M > commit_max`, a tail VSR may always re-decide) or committed (`M <= commit_max`),
-  /// and a committed `M` is held by the committing quorum and is re-fetched by ordinary `Prepare`/
-  /// `Commit` once `L` resumes from the synced point — identical to a recover-from-checkpoint replica
-  /// that holds only `[..=checkpoint]` and rebuilds its tail. The doomed hole `N (<= checkpoint_op)`
-  /// is subsumed by the restored snapshot. `commit_min` only moves FORWARD (`checkpoint_op >= N > N-1
-  /// == commit_min`), so no applied op is rewound. The release-active assert below therefore branches:
-  /// ordinary ⇒ `checkpoint_op > self.op`; forced ⇒ the true invariant `checkpoint_op >= commit_min`.
-  /// Either way it makes a trigger-loosening that violates safety fail loudly rather than silently
-  /// drop a committed op (matching `select_canonical_log`'s fail-stop style).
+  /// `(checkpoint_op .. self.op]` is then **PRESERVED, not discarded** (safety, VOPR seed 164). Those
+  /// ops were already durably APPENDED + ACKED by this replica (it voted for them), so the cluster may
+  /// have COMMITTED them off its vote. The old code reset `self.op = checkpoint_op` and truncated the
+  /// WAL — destroying this replica's only durable copy of a possibly-committed op while KEEPING its
+  /// `log_view`; a later view change then took its `(log_view, op)` as the canonical generation's head
+  /// and dropped those committed ops cluster-wide (no donor of that generation held them), which the
+  /// adopt-time `op >= commit_min` assert detected as a committed-op rewind. The "re-fetch via
+  /// `Prepare`/`Commit`" argument is NOT a safe substitute: a view change can intervene before the
+  /// re-fetch and finalize a head below the lost ops. The forced sync's *purpose* is only to recover
+  /// the doomed hole(s) `N (<= checkpoint_op)` (subsumed by the restored snapshot) — so we keep
+  /// `self.op` and the above-floor log entries, restore the SM/sessions at the snapshot, and re-apply
+  /// the retained committed tail from the natural `advance_commit` flow. `commit_min` only moves
+  /// FORWARD (`checkpoint_op >= N > N-1 == commit_min`), so no applied op is rewound. The release-active
+  /// assert below branches: ordinary ⇒ `checkpoint_op > self.op`; forced ⇒ the true invariant
+  /// `checkpoint_op >= commit_min`. Either way it makes a trigger-loosening that violates safety fail
+  /// loudly rather than silently drop a committed op (matching `select_canonical_log`'s fail-stop style).
   ///
   /// **Never sync past uncommitted state.** The synced `checkpoint_op` is, by definition, a checkpoint
   /// a peer made durable — a quorum committed+applied through it — and we additionally gate on
@@ -2172,36 +2199,56 @@ impl<S: StateMachine> Endpoint<S> {
     if bound_op != checkpoint_op {
       return;
     }
+    // PRESERVE-TAIL (safety, VOPR seed 164): does this sync land BELOW our held head? Only the FORCED
+    // path can (the ordinary assert above guarantees `checkpoint_op > self.op`). When it does, the band
+    // `(checkpoint_op .. self.op]` is ops we already durably APPENDED + ACKED (we voted for them with
+    // `PrepareOk`/`AdoptAck`), so the cluster may have COMMITTED them off our vote. Discarding them
+    // (the old `self.op = checkpoint_op` + `wal.truncate(checkpoint_op)` + `log.clear`) destroys our
+    // only durable copy of a possibly-committed op while keeping `log_view` — a later view change then
+    // takes our `(log_view, op)` as the canonical generation's head and drops those committed ops
+    // entirely (the loss the adopt-time `op >= commit_min` assert later trips on). The forced sync's
+    // *purpose* is only to recover the pruned holes AT/BELOW the floor (subsumed by the snapshot); the
+    // acked tail ABOVE the floor must survive. So keep `self.op` and the above-floor log entries,
+    // restore the SM/sessions at the snapshot, and let the recovered committed tail re-apply once the
+    // re-persist lands (the next Commit/Prepare drives `advance_commit` over the retained log).
+    let held_tail = checkpoint_op.get() < self.op.get();
     // Restore the SM and the client-session table from the decoded envelope.
     self.sm.restore(sm_tail);
     self.clients = sessions;
-    // Advance metadata monotonically to the synced point: it becomes the new head (we hold no log
-    // above it) and the applied+committed frontier. `op == commit_max == commit_min == checkpoint_op`
-    // respects `op >= commit_max >= commit_min >= checkpoint_op` with equality at the synced point.
-    self.op = checkpoint_op;
+    // Advance metadata monotonically to the synced point. `commit_min` becomes the synced frontier;
+    // `commit_max` keeps the higher learned commit (a held tail we are about to re-apply may already be
+    // known-committed). With no held tail, `op == commit_max == commit_min == checkpoint_op` (the
+    // post-recover-from-checkpoint shape); with a held tail, `self.op` and `commit_max` stay, so
+    // `op >= commit_max >= commit_min == checkpoint_op` still holds.
     self.commit_min = checkpoint_op;
-    self.commit_max = checkpoint_op;
-    // Drop all in-memory tail/pipeline state: we hold no ops below the checkpoint (subsumed by the
-    // snapshot) and none above yet — exactly the post-recover-from-checkpoint shape. Any pending-repair
-    // hole was necessarily `<= checkpoint_op` (it was a committed op below our old head), so it is
-    // subsumed too; clear it and stop the repair timer (mirrors `adopt_canonical_head`).
-    self.log.clear();
+    self.commit_max = OpNumber::with(self.commit_max.get().max(checkpoint_op.get()));
+    if !held_tail {
+      self.op = checkpoint_op;
+      self.commit_max = checkpoint_op;
+    }
+    // Drop in-memory state the snapshot subsumes. Below the checkpoint everything is folded into the
+    // snapshot; ABOVE it we keep the retained tail (held_tail) so a possibly-committed acked op is not
+    // lost. Any pending-repair hole AT/BELOW the checkpoint is subsumed (cleared); a hole strictly
+    // above it (held_tail only) stays solicited (the recovered tail may still have an interior faulty
+    // slot the snapshot does not cover).
+    self.log.retain(|&op, _| op > checkpoint_op.get());
     self.inflight.clear();
     self.buffer.clear();
-    self.repair.clear();
-    self.timers.repair_retry = None;
+    self.repair.retain(|&op| op > checkpoint_op.get());
+    if self.repair.is_empty() {
+      self.timers.repair_retry = None;
+    }
     self.pending.clear();
     // In-flight WAL appends are abandoned here too; their op numbers must not linger as "in flight"
     // (a stale completion finds no `pending` entry and is ignored) — keep `appending` in lockstep.
     self.appending.clear();
-    // Rebuild the durable WAL for "head == checkpoint_op, nothing below needed": drop any stale tail
-    // slots ABOVE the synced point (a stale generation that would otherwise read back as a higher,
-    // wrong head on a later restart), then free slots BELOW it (superseded by the snapshot). After
-    // this, `wal.op_head() <= checkpoint_op` with no slot above; we do NOT require the WAL head to
-    // EQUAL `self.op` — state-sync replicas, like recover-from-checkpoint replicas, rebuild the tail
-    // from the primary's next Prepare. The durable ROOT below names `commit = checkpoint_op`, so a
-    // later `recover()` restores cleanly at the synced point.
-    wal.truncate(checkpoint_op);
+    // Rebuild the durable WAL. Drop any stale slots strictly ABOVE our head (a stale higher generation
+    // that would otherwise read back as a wrong head on a later restart) — `truncate(self.op)`, which
+    // is a no-op when no tail is held (`self.op == checkpoint_op`) and preserves the retained tail
+    // `(checkpoint_op .. op]` otherwise. Then free slots BELOW the checkpoint (superseded by the
+    // snapshot). The durable ROOT below names `commit = checkpoint_op`, so a later `recover()` restores
+    // the SM at the synced point and re-reads the retained tail from the WAL.
+    wal.truncate(self.op);
     wal.prune(checkpoint_op);
     // Stage the durable re-persist, reusing the checkpoint two-write sequence so a crash recovers to
     // the synced point (not the stale one). Step 1: write the snapshot under our own superblock; step
@@ -2518,24 +2565,39 @@ impl<S: StateMachine> Endpoint<S> {
     self.maybe_forfeit(now, sb);
   }
 
-  /// M3.5 T3 — the forfeit gate. A `Normal` primary whose own durable `checkpoint_op` lags the
-  /// quorum's by at least a full checkpoint interval (`config.forfeit_checkpoint_lag()`) is stuck:
-  /// it cannot checkpoint because it is repairing/syncing while the cluster raced ahead. Rather than
-  /// wedge the cluster (clients whose requests sit above its stalled commit never finish), it steps
-  /// down so a caught-up replica leads.
+  /// M3.5 T3 — the forfeit gate. A `Normal` primary that is genuinely STUCK steps down (via a view
+  /// change) so a caught-up replica leads, rather than wedge the cluster (clients whose requests sit
+  /// above its stalled commit never finish). Two independent stuck-conditions, both grace-timed:
   ///
-  /// **Anti-storm (load-bearing).** Two gates ensure this fires ONLY for a genuinely-stuck primary,
-  /// never in steady state and never on every primary:
-  /// - **Quorum-gated + checkpoint-coupled.** The signal is `quorum_checkpoint_op()` (the quorum-th
-  ///   order statistic over the monotone, T1 per-peer checkpoint reports), so a single ahead peer
-  ///   cannot induce a forfeit, and the bound is a *full* checkpoint interval — a healthy primary
-  ///   checkpoints in lock-step with the cluster and never lags a whole interval behind a quorum.
-  /// - **Grace timer.** The condition must hold CONTINUOUSLY for `FORFEIT_GRACE` before the primary
-  ///   actually steps down. A primary that catches up within the window disarms and never forfeits,
-  ///   so a transient (e.g. heartbeat-window) lag cannot trigger a view change.
+  /// 1. **Checkpoint lag.** Its own durable `checkpoint_op` lags the quorum's by at least a full
+  ///    checkpoint interval (`config.forfeit_checkpoint_lag()`) — it cannot checkpoint because it is
+  ///    repairing/syncing while the cluster raced ahead.
+  /// 2. **Unfillable committed hole (liveness, VOPR seed 36).** It holds a `repair` hole — a COMMITTED
+  ///    op below its head it cannot apply (registered only for `commit_min + 1 <= commit_max`). If that
+  ///    op was CHECKPOINTED + PRUNED past on its holders (the residual case of `select_canonical_log`'s
+  ///    offset-union: a committed op no canonical donor's LOG carries, so it lives only inside a peer's
+  ///    checkpoint snapshot), NO peer can answer the primary's `RequestPrepare` and the only recovery is
+  ///    a state-sync of that snapshot — which a PRIMARY must NOT do (force-syncing a primary resets
+  ///    `self.op` below its head and reuses op numbers in this view → committed-state divergence; see
+  ///    `maybe_force_sync`'s primary guard). Such a primary cannot serve clients (its commit is stuck
+  ///    below the hole), cannot fill it, and — holding none of `(commit_min .. op]` — retransmits
+  ///    nothing, so backups never ack and never re-trigger any reactive check: it WEDGES the cluster.
+  ///    Forfeiting hands the view to a more-caught-up replica (the holder whose checkpoint covers the
+  ///    band leads cleanly; it does not re-forfeit), and THIS replica then recovers the band as a
+  ///    BACKUP via the ordinary force-sync escalation. The grace timer makes this self-limiting: a
+  ///    FILLABLE hole (a peer holds it un-pruned, in or out of the DVC quorum — the case the
+  ///    seeding-site B4 path covers) is repaired by the answering `Prepare` well within `FORFEIT_GRACE`,
+  ///    emptying `repair` and DISARMING the forfeit; only a hole that persists the WHOLE window — i.e.
+  ///    one no peer can serve — actually steps the primary down. No committed op is lost (it survives in
+  ///    the holder's checkpoint throughout).
   ///
-  /// `saturating_sub` guards the (impossible-by-construction but defensive) case where the primary's
-  /// own checkpoint is somehow ahead of the quorum's — that yields lag 0, which never arms.
+  /// **Anti-storm (load-bearing).** The grace timer is the key gate: the condition must hold
+  /// CONTINUOUSLY for `FORFEIT_GRACE` before the primary actually steps down, so a transient lag /
+  /// in-flight repair never triggers a view change. The checkpoint-lag signal is additionally
+  /// quorum-gated (`quorum_checkpoint_op()`, the quorum-th order statistic over the monotone per-peer
+  /// reports) and bounded at a *full* interval, so a single ahead peer cannot induce a forfeit and a
+  /// healthy primary that checkpoints in lock-step never arms it. `saturating_sub` guards the
+  /// (defensive) case where the primary's own checkpoint is somehow ahead of the quorum's.
   fn maybe_forfeit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // Only ever called from `primary_timeouts` (the Normal-primary tick); a backup behind on
     // checkpoint catches up via state-sync/force-sync and never forfeits.
@@ -2544,9 +2606,12 @@ impl<S: StateMachine> Endpoint<S> {
       .quorum_checkpoint_op()
       .get()
       .saturating_sub(self.checkpoint_op.get());
-    let stuck = lag >= self.config.forfeit_checkpoint_lag();
+    // Stuck iff EITHER the checkpoint lags a full interval OR an unfilled committed `repair` hole is
+    // outstanding (a committed op `<= commit_max` the apply loop is held below — see the doc). The
+    // grace timer disarms a hole that fills in time, so a fillable hole never forfeits.
+    let stuck = lag >= self.config.forfeit_checkpoint_lag() || !self.repair.is_empty();
     match (stuck, self.forfeit_armed) {
-      // Caught up (or never behind): disarm — a transient lag does not forfeit.
+      // Caught up (or never behind): disarm — a transient lag / in-flight repair does not forfeit.
       (false, _) => self.forfeit_armed = None,
       // Newly stuck: arm the grace timer; do NOT step down yet.
       (true, None) => self.forfeit_armed = Some(now + FORFEIT_GRACE),
@@ -3007,7 +3072,7 @@ impl<S: StateMachine> Endpoint<S> {
     // `select_canonical_log`). The canonical log is the offset tail `(min_floor .. op_head]`, NOT
     // necessarily dense `[1..=op_head]`.
     let (canonical_log, op_head, commit_star) = self.select_canonical_log();
-    self.adopt_log(&canonical_log, commit_star);
+    self.adopt_log(&canonical_log);
     self.op = OpNumber::with(op_head);
     // Retire any pending-repair holes the adopted canonical log NOW supplies; leave the rest (a
     // committed op held by no canonical donor) for `advance_commit` below to re-`request_repair` from
@@ -3147,15 +3212,33 @@ impl<S: StateMachine> Endpoint<S> {
   /// must not be resurrected from a stale local copy), so they are dropped; the canonical entries
   /// then overwrite/insert authoritatively. A committed op that neither side supplies is left for
   /// `advance_commit` to `request_repair` from a peer (it is never silently skipped).
-  fn adopt_log(&mut self, entries: &[crate::PreparedEntry], commit: u64) {
+  fn adopt_log(&mut self, entries: &[crate::PreparedEntry]) {
     let supplied: std::collections::BTreeSet<u64> = entries.iter().map(|e| e.op().get()).collect();
-    // Retain only the committed ops the canonical log omits (`op <= commit` and not in `supplied`):
-    // those are the adopter's own authoritative copies of committed ops a different-floor canonical
-    // generation could not carry. Everything else (uncommitted tail, ops the canonical log supplies)
-    // is dropped so the canonical entries below are authoritative.
+    // Preserve ONLY the adopter's APPLIED prefix (`op <= self.commit_min`) that the canonical log
+    // omits — those are committed ops the adopter has itself applied, so by VSR committed-op survival
+    // they are immutable and canonical-by-construction (no other view committed a different value
+    // there). Everything ABOVE the applied frontier is dropped so the canonical entries below are
+    // authoritative; the caller's `advance_commit(adopted_commit)` then reconstructs `(commit_min ..
+    // adopted_commit]` from the freshly-inserted canonical entries, falling to repair for any omission:
+    //
+    //   * an UNCOMMITTED tail op — superseded by the canonical tail;
+    //   * an op the canonical log itself SUPPLIES — re-inserted authoritatively below;
+    //   * a committed op in the UNAPPLIED band `(commit_min .. adopted_commit]` the canonical log omits —
+    //     this is the SAFETY fix (VOPR seed 24). The adopter holds a body it has NOT applied, which can
+    //     be a STALE uncommitted proposal from an earlier view a later view overwrote with a different
+    //     committed value (`LogEntry` carries no per-entry view, so a canonical-lineage held op is
+    //     indistinguishable from a superseded one). Preserving it would diverge the committed log.
+    //     Dropping it turns the slot into a hole; the caller's `advance_commit` then HOLDS the commit
+    //     there and `request_repair`s the CANONICAL value from a committed-vouching peer (force-sync if
+    //     the band was GC'd cluster-wide). No committed op is lost — it is fetched, never trusted local.
+    //
+    // This reads `self.commit_min` AT ADOPT TIME, BEFORE the caller advances the commit, so the
+    // predicate uses the OLD (pre-adoption) applied frontier — both callers (`adopt_canonical_head`,
+    // `start_view_as_new_primary`) run `adopt_log` strictly before their `advance_commit`.
+    let applied_floor = self.commit_min.get();
     self
       .log
-      .retain(|&op, _| op <= commit && !supplied.contains(&op));
+      .retain(|&op, _| op <= applied_floor && !supplied.contains(&op));
     for e in entries {
       self.log.insert(
         e.op().get(),
@@ -3193,19 +3276,22 @@ impl<S: StateMachine> Endpoint<S> {
   /// `config.primary(view)` and is not stale (`view >= self.view`, and not a same-view re-adoption
   /// while already Normal).
   ///
-  /// **No committed op is lost.** A `RecoveringHead` replica has already restored its durable
-  /// checkpoint prefix `[1..=checkpoint_op]` into the SM during `Recovering` (so
-  /// `commit_min == checkpoint_op`); the `op >= commit_min` assert below rejects any head that would
-  /// rewind below that durable prefix. The adopted log is the offset tail `(min_floor .. op]` from the
-  /// canonical primary (NOT necessarily dense `[1..=op]` — the primary may itself be a
-  /// recover-from-checkpoint / state-synced replica whose log starts above op 1). `adopt_log` is
-  /// therefore defensive: it **preserves any committed op the adopter already holds** that the
-  /// incoming offset log omits, instead of clearing the log and destroying the adopter's own durable
-  /// copy. `advance_commit` then applies `(commit_min .. commit]` from the union of the preserved
-  /// held copies and the adopted entries; should a committed op be supplied by NEITHER, it
-  /// `request_repair`s it from a peer and HOLDS the commit there (never skips it). The checkpointed
-  /// prefix lives in the SM, the committed tail in the (preserved+adopted) log — the committed prefix
-  /// is reconstructed end to end, with peer-repair as the backstop for any op neither side carries.
+  /// **No committed op is lost, and none is trusted from a possibly-stale local copy.** A
+  /// `RecoveringHead` replica has already restored its durable checkpoint prefix `[1..=checkpoint_op]`
+  /// into the SM during `Recovering` (so `commit_min == checkpoint_op`); the `op >= commit_min` assert
+  /// below rejects any head that would rewind below that durable prefix. The adopted log is the offset
+  /// tail `(min_floor .. op]` from the canonical primary (NOT necessarily dense `[1..=op]` — the
+  /// primary may itself be a recover-from-checkpoint / state-synced replica whose log starts above op
+  /// 1). `adopt_log` therefore preserves ONLY the adopter's APPLIED prefix (`op <= commit_min`) that
+  /// the incoming offset log omits — a committed op the adopter itself applied is immutable
+  /// (committed-op survival), so its local copy is canonical. A committed op in the UNAPPLIED band
+  /// `(commit_min .. commit]` that the offset log omits is NOT preserved: the held body is unapplied
+  /// and may be a stale superseded proposal (VOPR seed 24), so `adopt_log` drops it and `advance_commit`
+  /// below HOLDS the commit at it and `request_repair`s the CANONICAL value from a committed-vouching
+  /// peer (the existing force-sync path takes over if it was GC'd cluster-wide). The checkpointed
+  /// prefix lives in the SM, the committed tail in the (applied-preserved + adopted + repaired) log —
+  /// the committed prefix is reconstructed end to end, with peer-repair as the backstop for any omitted
+  /// committed op the adopter has not applied (never silently skipped, never filled from a stale local).
   fn adopt_canonical_head<B: Superblock>(
     &mut self,
     now: Instant,
@@ -3224,13 +3310,14 @@ impl<S: StateMachine> Endpoint<S> {
       "must not rewind below our committed op"
     );
     self.view = view;
-    self.adopt_log(log, commit.get());
+    self.adopt_log(log);
     self.op = op;
     // Retire any pending-repair holes the adopted canonical log NOW supplies (or that the adopter's
-    // own preserved copy now covers, since `adopt_log` kept committed held ops). Holes the canonical
-    // log omits AND the adopter does not hold remain solicited; `advance_commit` below re-requests
-    // them. This MUST happen before `advance_commit` (which may add new holes) so we never wipe a
-    // freshly-requested committed-op repair.
+    // own APPLIED-prefix copy now covers, since `adopt_log` kept committed held ops `op <= commit_min`).
+    // Holes the canonical log omits AND the adopter does not hold remain solicited; `advance_commit`
+    // below re-requests them — INCLUDING the unapplied committed band `adopt_log` just dropped. This
+    // MUST happen before `advance_commit` (which may add new holes) so we never wipe a freshly-requested
+    // committed-op repair.
     let now_held: std::collections::BTreeSet<u64> = self.log.keys().copied().collect();
     self.repair.retain(|op| !now_held.contains(op));
     if self.repair.is_empty() {
@@ -3250,10 +3337,11 @@ impl<S: StateMachine> Endpoint<S> {
     // RecoveringHead replica that reaches here via this path leaves `recover` = None (the field is
     // structurally None in every non-recovering status). A non-recovering adopter already has None.
     self.recover = None;
-    // (The pending-repair set was reconciled above — holes the adopted log / preserved held copies now
-    // cover were retired; any committed op neither side carries stays solicited and was re-requested by
-    // `advance_commit`. We deliberately do NOT blanket-clear `repair` here: that was the B3 stranding
-    // bug — clearing right after `advance_commit` requested a hole silently forgot a committed op.)
+    // (The pending-repair set was reconciled above — holes the adopted log / applied-prefix held copies
+    // now cover were retired; any committed op neither side carries — including the unapplied band
+    // `adopt_log` dropped — stays solicited and was re-requested by `advance_commit`. We deliberately do
+    // NOT blanket-clear `repair` here: that was the B3 stranding bug — clearing right after
+    // `advance_commit` requested a hole silently forgot a committed op.)
     // Abandon in-flight WAL appends from the old view (see transition_to_view_change_status).
     self.pending.clear();
     self.appending.clear(); // keep the R7-F1 in-flight set in lockstep with `pending`
@@ -3264,9 +3352,9 @@ impl<S: StateMachine> Endpoint<S> {
     // ignored). The view-change root below preserves the durable checkpoint_op via submit_durable_view.
     self.pending_checkpoint = None;
     // Abandon any in-flight state-sync: adopting an authoritative canonical head supersedes it (the
-    // adopted canonical log + the adopter's preserved committed ops supply the committed prefix, with
-    // peer-repair as the backstop). See the note in `transition_to_view_change_status` on the
-    // mid-persist case (safe; re-syncs from Normal if still behind).
+    // adopted canonical log + the adopter's preserved APPLIED prefix supply the committed prefix, with
+    // peer-repair as the backstop for the omitted unapplied committed band). See the note in
+    // `transition_to_view_change_status` on the mid-persist case (safe; re-syncs from Normal if still behind).
     self.sync = None;
     self.timers.sync_solicit = None;
     // Adopting a canonical head starts a fresh generation in `view`: clear any forfeit grace timer
@@ -3737,7 +3825,18 @@ impl<S: StateMachine> Endpoint<S> {
       // exactly one PrepareOk(pop) AFTER durability, so the backup still acks once, at the right time.
       // (A re-ack for an op that already completed — e.g. a genuinely lost PrepareOk — still re-acks,
       // recovering it: that is the legitimate purpose of this branch.)
-      if !self.appending.contains(&pop) {
+      //
+      // The durability oracle is the WAL itself (`op_durably_appended`), NOT just the `appending` set:
+      // a view change / catch-up clears `appending` (keeping it in lockstep with `pending`) while an
+      // async append abandoned in the old generation is STILL staged in the WAL — and once such an op
+      // is committed (commit_min advances past it), the view-change re-append range `(commit_min+1 ..=
+      // op]` never re-marks it, so `appending` alone would wrongly green-light a re-ack of a
+      // committed-but-still-in-flight op (codex vopr seed 17). Consulting the WAL closes that hole: a
+      // `Dirty` (in-flight) / `Empty` (truncated, not re-appended) slot above the checkpoint is not yet
+      // durable; a `Clean`/`Faulty` slot or one folded into the durable checkpoint is. (We keep the
+      // `appending` guard too, so the in-flight-then-just-completed window still defers its single ack
+      // to `on_wal_done` rather than emitting a redundant inline duplicate.)
+      if !self.appending.contains(&pop) && self.op_durably_appended(wal, pop) {
         self.send_prepare_ok(p.op());
       }
       return;
@@ -3805,6 +3904,23 @@ impl<S: StateMachine> Endpoint<S> {
     // (AdoptVote → own vote, AdoptAck → PrepareOk) defer their cast to completion; tracking the op
     // here keeps the durable predicate uniform so the choke-point gate covers the adoption path too.
     self.appending.insert(op);
+  }
+
+  /// Whether op `op` is DURABLY APPENDED on this replica's own disk — the ground-truth append-before-
+  /// ack oracle, read straight from the WAL/superblock rather than from the mutable `appending` set
+  /// (which is reset on view transitions, so it can lose track of an async append abandoned in an old
+  /// generation while its bytes are still staged). `op` is durable iff it is folded into the durable
+  /// checkpoint (`op <= checkpoint_op`, its body subsumed by the snapshot) OR its WAL slot has
+  /// COMPLETED its append: `Clean` (durable + checksum-valid) or `Faulty` (durably written, then later
+  /// torn / bit-rotted — the append still completed; the corrupt bytes are a separate, peer-repaired
+  /// concern). A `Dirty` (still in flight) or `Empty` (never written / truncated) slot above the
+  /// checkpoint is NOT yet durable.
+  fn op_durably_appended<W: Wal>(&self, wal: &W, op: u64) -> bool {
+    op <= self.checkpoint_op.get()
+      || matches!(
+        wal.status(OpNumber::with(op)),
+        SlotStatus::Clean | SlotStatus::Faulty
+      )
   }
 
   /// The single append-before-ack choke point: emits a `PrepareOk` for `op` to the primary. `op` MUST
@@ -6670,16 +6786,22 @@ mod tests {
       Message::StartView(sv),
     );
 
-    // Op 2 was NOT resurrected from the empty placeholder: the commit is HELD at 1 (op 2 is a repair
-    // hole the canonical log did not supply), and op 2 is solicited — it is NEVER applied empty.
+    // Op 2 was NOT resurrected from the empty placeholder: it stays a solicited repair hole, NEVER
+    // applied empty. This replica recovered from its WAL alone (no checkpoint, commit_min == 0), so it
+    // had APPLIED nothing — ops 1 AND 2 are both committed-but-unapplied at adopt time. The offset
+    // canonical log omits op 2 (and op 1), so BOTH become repair holes: the commit is HELD at 0 at the
+    // first hole (op 1), op 2 is registered once op 1 fills. (The seed-24 safety fix means an UNAPPLIED
+    // omitted committed op is never resurrected from the local cache — including op 1, whose clean-read
+    // WAL body could itself be a superseded proposal — so it is fetched from a peer, not trusted local.
+    // This only STRENGTHENS the original guard: still no empty/stale body is ever applied to op 2.)
     assert!(
-      r.has_repair_hole_for_test(2),
-      "the faulty non-head committed op stays a repair hole after adoption (not resurrected empty)"
+      r.has_repair_hole_for_test(2) || r.has_repair_hole_for_test(1),
+      "an omitted unapplied committed op (op 1 first, then op 2) is a repair hole — never resurrected"
     );
     assert_eq!(
       r.commit(),
-      OpNumber::with(1),
-      "the commit is HELD below the unfilled hole (op 2), never advanced over an empty body"
+      OpNumber::with(0),
+      "the commit is HELD below the first unfilled hole (op 1), never advanced over an empty/stale body"
     );
     // CRUCIAL: no op was ever applied with an empty body (the divergence signature).
     for (op, body) in r.state_machine().applied() {
@@ -6688,10 +6810,14 @@ mod tests {
         "op {op} was applied with an EMPTY body — the committed-op divergence this guards against"
       );
     }
-    // And op 2 specifically is not applied at all yet (held).
+    // And op 2 specifically is not applied at all yet (held — its faulty empty placeholder was dropped).
     assert!(
       !r.state_machine().applied().iter().any(|(op, _)| *op == 2),
       "op 2 is not applied until a verified body arrives"
+    );
+    assert!(
+      !r.log.contains_key(&2),
+      "op 2's faulty empty placeholder is never re-introduced into the log cache"
     );
   }
 
@@ -7504,6 +7630,85 @@ mod tests {
     assert!(
       wal.header(OpNumber::with(2)).is_some(),
       "op 2 is durable in the WAL before its PrepareOk (R6-F1 append-before-ack)"
+    );
+  }
+
+  #[test]
+  fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
+    // codex vopr seed 17 (append-before-ack): the `pop <= self.op` re-ack branch must consult the WAL
+    // for durability, NOT just the `appending` set. A view change / catch-up clears `appending` (to
+    // keep it in lockstep with `pending`); with an ASYNC WAL an append abandoned in the old generation
+    // is still in flight, and once that op is COMMITTED (commit_min advances past it) the view-change
+    // re-append range `(commit_min+1 ..= op]` never re-marks it. So `appending` is empty for an op the
+    // replica has NOT durably appended — and a retransmitted current-view Prepare(pop) would re-ack it,
+    // claiming a durability this replica does not have (it could lose the op on crash). We reproduce
+    // that exact divergent state directly: op 5 committed + at the head, but ABSENT from the WAL (a
+    // not-yet-durable slot, exactly like an in-flight async append) and not in `appending`.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // view 0 (primary is replica 0, so replica 2 is a backup), op 5 = commit_min (committed + at head),
+    // checkpoint_op 0, no repair holes. `appending` is empty (fresh) and the WAL holds nothing — the
+    // post-async-view-change divergence where op 5's local append never became durable.
+    e.force_state_for_test(
+      /*view*/ 0,
+      /*op*/ 5,
+      /*commit_min*/ 5,
+      /*checkpoint_op*/ 0,
+      &[],
+    );
+    assert_eq!(
+      wal.status(OpNumber::with(5)),
+      SlotStatus::Empty,
+      "precondition: op 5 not durable"
+    );
+
+    // The primary RETRANSMITS the current-view Prepare(5) (its PREPARE_RETRANSMIT). pop=5 <= self.op=5
+    // → the re-ack branch. It must NOT ack: op 5 is not durably appended on THIS replica.
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(5, 5));
+    let mut premature = 0;
+    while let Some(out) = e.poll_message() {
+      if let Message::PrepareOk(ok) = out.into_msg() {
+        if ok.op() == OpNumber::with(5) {
+          premature += 1;
+        }
+      }
+    }
+    assert_eq!(
+      premature, 0,
+      "append-before-ack: must not re-ack op 5 while it is not durably appended locally (pre-fix the \
+       `appending`-only guard let this through → premature PrepareOk(5))"
+    );
+
+    // Legitimacy check: once op 5 IS durably appended locally, the same retransmitted Prepare(5) DOES
+    // re-ack it — the fix suppresses only the non-durable case, preserving lost-PrepareOk recovery.
+    let h = Header::new(
+      OpNumber::with(5),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(5),
+      &[5u8],
+    );
+    wal.submit_append(
+      OpId::new(5),
+      OpNumber::with(5),
+      h,
+      Bytes::copy_from_slice(&[5u8]),
+    );
+    let _ = wal.poll(); // TestWal is synchronous: op 5 is now durable (Clean).
+    assert_eq!(wal.status(OpNumber::with(5)), SlotStatus::Clean);
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(5, 5));
+    let mut reacked = false;
+    while let Some(out) = e.poll_message() {
+      if let Message::PrepareOk(ok) = out.into_msg() {
+        if ok.op() == OpNumber::with(5) {
+          reacked = true;
+        }
+      }
+    }
+    assert!(
+      reacked,
+      "a durable committed op is still re-acked on retransmit (legitimate lost-PrepareOk recovery)"
     );
   }
 
@@ -10107,17 +10312,26 @@ mod tests {
   }
 
   #[test]
-  fn forced_sync_discards_a_held_tail_above_the_checkpoint_without_panic() {
-    // A forced sync where checkpoint_op (3) <= self.op (5): the held tail (3..5] is discarded. The
-    // ordinary-path assert (checkpoint_op > self.op) AND the `<= self.op` drop guard would BOTH reject
-    // it; the forced path must apply it without panic, rewinding the head to 3 and advancing commit.
+  fn forced_sync_preserves_a_held_tail_above_the_checkpoint_without_panic() {
+    // SAFETY (VOPR seed 164): a forced sync where checkpoint_op (3) <= self.op (5). The held tail
+    // (3..5] is ops this replica already durably appended + ACKED, so the cluster may have COMMITTED
+    // them off its vote. The OLD code discarded the tail (rewound the head to 3 + truncated the WAL),
+    // destroying its only durable copy while keeping `log_view` — a later view change then took its
+    // (log_view, op) as the canonical head and dropped those committed ops, the loss `adopt_canonical_
+    // head`'s `op >= commit_min` assert trips on. The forced path must instead apply WITHOUT panic,
+    // PRESERVE the above-floor tail (keep op 5 + its log entries), restore the SM at the snapshot, and
+    // subsume the doomed hole at 2.
     let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(3);
     let (env, id) = donor_envelope(&dsb);
     let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 4).unwrap();
     let mut ep = Endpoint::new(cfg, 1, CountSm::default());
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-    // A backup holding a tail at op 5, commit at 1, a committed hole at 2, own checkpoint 0.
+    // A backup holding a tail at op 5, commit at 1, a committed hole at 2, own checkpoint 0. Seed the
+    // in-memory tail entries (4, 5) it holds above the synced checkpoint (force_state_for_test leaves
+    // the cache empty); these must survive the forced sync.
     ep.force_state_for_test(0, 5, 1, 0, &[2]);
+    ep.seed_log_entry_for_test(4);
+    ep.seed_log_entry_for_test(5);
     ep.arm_forced_sync_for_test(3); // self.sync = Some { target: 3, forced: true }
     let nonce = ep.sync_nonce_for_test();
     // A valid SyncCheckpoint at op 3 (id matches its bytes) — must apply, not panic.
@@ -10138,8 +10352,12 @@ mod tests {
     ep.handle_storage(Instant::ZERO, &mut wal, &mut sb); // drive the durable re-persist
     assert_eq!(
       ep.op(),
-      OpNumber::with(3),
-      "head rewound to the synced checkpoint"
+      OpNumber::with(5),
+      "the held tail above the synced checkpoint is PRESERVED — the head is NOT rewound to 3"
+    );
+    assert!(
+      ep.has_log_entry_for_test(4) && ep.has_log_entry_for_test(5),
+      "the above-floor tail entries (4, 5) survive the forced sync"
     );
     assert_eq!(
       ep.commit(),
@@ -10153,7 +10371,7 @@ mod tests {
     );
     assert!(
       !ep.has_repair_hole_for_test(2),
-      "the pruned committed hole is subsumed by the snapshot"
+      "the pruned committed hole at/below the floor is subsumed by the snapshot"
     );
     assert_eq!(
       ep.state_syncs_applied(),
@@ -10647,6 +10865,105 @@ mod tests {
       }
     }
     assert!(!saw_svc, "no forfeit-driven view change after catch-up");
+  }
+
+  #[test]
+  fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_period() {
+    // LIVENESS REGRESSION (VOPR seed 36): a new primary can adopt a canonical head with a COMMITTED
+    // interior hole the offset-union could not carry (a committed op a holder checkpointed + pruned
+    // past, so it lives only inside a peer's checkpoint snapshot — unservable via `RequestPrepare`).
+    // Such a primary is stuck: its commit is HELD below the hole, it cannot serve clients, it cannot
+    // fill the hole (no peer can answer), and — holding none of the band above its commit — it
+    // retransmits nothing, so backups never ack and no reactive check re-fires. It must FORFEIT so a
+    // caught-up replica (the checkpoint holder) leads. Here: primary (replica 0 of 3), commit held at
+    // 1 with a committed `repair` hole at op 2 that NO peer answers; after the grace window it must
+    // forfeit by PROPOSING view 1 (StartViewChange) — even though its checkpoint does NOT lag (the
+    // OTHER forfeit condition is off), so this isolates the unfillable-hole trigger.
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 1, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    assert!(ep.is_primary());
+    // Head 10, commit 1, a committed hole at op 2, own checkpoint 8 == quorum (no checkpoint-lag).
+    ep.force_state_for_test(0, 10, 1, 8, &[2]);
+    ep.set_own_checkpoint_for_test(8);
+    ep.inject_peer_checkpoint_for_test(1, 8);
+    ep.inject_peer_checkpoint_for_test(2, 8); // quorum 8 == own 8 → lag 0 (the lag trigger is OFF)
+    // First primary tick ARMS the grace timer (the hole is outstanding) but does NOT forfeit yet.
+    ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+    assert!(
+      ep.forfeit_armed_for_test(),
+      "an outstanding committed repair hole arms the forfeit grace timer"
+    );
+    assert_eq!(ep.view().get(), 0, "no forfeit before the grace elapses");
+    while ep.poll_message().is_some() {}
+    // Past the grace window, with the hole STILL unfilled (no peer answered) → forfeit (propose view 1).
+    let later = Instant::ZERO + core::time::Duration::from_millis(400);
+    ep.handle_timeout(later, &mut wal, &mut sb);
+    let mut saw_svc_view1 = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::StartViewChange(svc) = out.into_msg() {
+        if svc.view().get() == 1 {
+          saw_svc_view1 = true;
+        }
+      }
+    }
+    assert!(
+      saw_svc_view1,
+      "a primary stuck on an unfillable committed hole forfeits (proposes view 1) after the grace window"
+    );
+  }
+
+  #[test]
+  fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
+    // ANTI-STORM complement of the above: a committed repair hole that a peer CAN serve is filled by
+    // the answering `Prepare` well within the grace window, emptying `repair` and DISARMING the
+    // forfeit — so a FILLABLE hole (the ordinary B4 repair case) never triggers a view change. Primary
+    // (replica 0 of 3), commit held at 1 with a hole at op 2; a peer answers with op 2's
+    // committed-vouching Prepare (commit 2 >= op 2) before the grace elapses.
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 1, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    assert!(ep.is_primary());
+    // Head 2, commit 1, a committed hole at op 2, own checkpoint 0 (no checkpoint-lag peers injected).
+    ep.force_state_for_test(0, 2, 1, 0, &[2]);
+    // First tick arms the grace timer (the hole is outstanding).
+    ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+    assert!(
+      ep.forfeit_armed_for_test(),
+      "the outstanding committed hole arms the grace timer"
+    );
+    while ep.poll_message().is_some() {}
+    // A peer answers our RequestPrepare with op 2's committed-vouching Prepare → fills the hole.
+    ep.handle_message(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      repair_prepare(0, 2, 2),
+    );
+    assert!(
+      !ep.has_repair_hole_for_test(2),
+      "the committed-vouching Prepare fills the hole"
+    );
+    // Next tick within the grace window: the hole is gone → the grace timer DISARMS, no forfeit.
+    let mid = Instant::ZERO + core::time::Duration::from_millis(100);
+    ep.handle_timeout(mid, &mut wal, &mut sb);
+    assert!(
+      !ep.forfeit_armed_for_test(),
+      "filling the hole disarms the grace timer (a fillable hole does not forfeit)"
+    );
+    let later = Instant::ZERO + core::time::Duration::from_millis(400);
+    ep.handle_timeout(later, &mut wal, &mut sb);
+    let mut saw_svc = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::StartViewChange(_) = out.into_msg() {
+        saw_svc = true;
+      }
+    }
+    assert!(
+      !saw_svc && ep.view().get() == 0,
+      "a primary whose committed hole filled in time never forfeits"
+    );
   }
 
   #[test]
@@ -11149,23 +11466,37 @@ mod tests {
 
   #[test]
   fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
-    // End-to-end defence: a backup holds committed ops 5..=8 in its OFFSET log (checkpoint 4, those ops
-    // committed by a prior-view quorum but not yet locally applied: commit_min == 4, op == 8). It then
-    // adopts a StartView whose canonical log is itself OFFSET and starts at op 9 (it does NOT carry
-    // 5..=8) but whose commit is 8. The OLD adopt_log `self.log.clear()` would DESTROY the backup's own
-    // copies of 5..=8, advance_commit would `request_repair(5)`, and adopt_canonical_head's
-    // `repair.clear()` would then WIPE that request — stranding the replica below commit with a divergent
-    // SM. After the fix the backup keeps 5..=8, applies them, commit reaches 8, and the SM holds 5..=8.
+    // B3 gate, CORRECTED to the safe semantics (this is a correctness CORRECTION, not a weakening — see
+    // below). A backup holds committed ops 5..=8 in its OFFSET log; the lower band 5,6 it has APPLIED
+    // (commit_min == 6), the upper band 7,8 it has NOT (committed by a prior-view quorum but unapplied;
+    // op == 8). It adopts a StartView whose canonical log is itself OFFSET, starts at op 9 (does NOT
+    // carry 5..=8), commit 8. The two bands are now handled DIFFERENTLY, and that distinction is the fix:
+    //
+    //   * APPLIED & omitted (5,6, `op <= commit_min`): a committed op the adopter ITSELF applied is
+    //     immutable (VSR committed-op survival ⇒ no other view committed a different value), so its local
+    //     copy is canonical. It is PRESERVED directly from `self.log` (kept, never re-fetched).
+    //   * UNAPPLIED & omitted (7,8, `op in (commit_min, commit]`): the held body is unapplied and may be a
+    //     STALE superseded proposal (VOPR seed 24) — `LogEntry` has no per-entry view to tell. It is
+    //     therefore DROPPED and REPAIRED: `advance_commit` HOLDS the commit at the first such op and
+    //     `request_repair`s the CANONICAL value from a committed-vouching peer.
+    //
+    // Why this is a CORRECTION, not a weakening of the original B3 safety property: B3's invariant is "no
+    // committed op an offset canonical log omits is ever LOST." That still holds end-to-end here — the
+    // omitted committed band ends up correct (applied to the SM after repair), never silently skipped. The
+    // ONLY change is the SOURCE for the UNAPPLIED band: a possibly-stale local copy (which diverged the
+    // committed log under seed 24) is replaced by the quorum's canonical value fetched via peer-repair.
+    // The original B3 bug (clearing the whole log + then `repair.clear()` stranding the op) stays fixed:
+    // the omitted committed op is never forgotten — it is a held hole until its canonical value arrives.
     let mut e = Endpoint::new(
       Config::try_new(1, ReplicaId::new(2), 3).unwrap(),
       0,
       CountSm::default(),
     );
-    // Hand-build the offset-backup state: checkpoint 4, committed prefix [1..=4] in the SM (commit_min
-    // == commit_max == checkpoint_op == 4), and the offset tail 5..=8 held in the in-memory log.
+    // Hand-build the offset-backup state: checkpoint 4, applied through 6 (commit_min == commit_max == 6;
+    // the [1..=6] prefix lives in the checkpoint, not the empty CountSm), head 8, offset tail 5..=8 held.
     e.checkpoint_op = OpNumber::with(4);
-    e.commit_min = OpNumber::with(4);
-    e.commit_max = OpNumber::with(4);
+    e.commit_min = OpNumber::with(6);
+    e.commit_max = OpNumber::with(6);
     e.op = OpNumber::with(8);
     for op in 5..=8u64 {
       e.log.insert(
@@ -11180,7 +11511,7 @@ mod tests {
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     let now = Instant::ZERO;
     // The canonical StartView for view 1 from primary 1: an OFFSET log starting at op 9 (head 10),
-    // commit 8. It does NOT carry ops 5..=8 — those must survive from the adopter's own log.
+    // commit 8. It does NOT carry ops 5..=8.
     let sv = StartView::new(
       View::with(1),
       OpNumber::with(10),
@@ -11209,21 +11540,193 @@ mod tests {
       Message::StartView(sv),
     );
     assert_eq!(e.status(), Status::Normal, "adoption completes");
+    // APPLIED & omitted (5,6): PRESERVED directly — still in the log cache, never turned into a hole.
+    assert!(
+      e.log.contains_key(&5) && e.log.contains_key(&6),
+      "an omitted committed op the adopter HAS applied is preserved directly from its own log"
+    );
+    assert!(
+      !e.has_repair_hole_for_test(5) && !e.has_repair_hole_for_test(6),
+      "the applied-and-preserved ops are not repaired"
+    );
+    // UNAPPLIED & omitted (7,8): REPAIRED. The commit is HELD at the first (6) until the canonical value
+    // arrives; op 7 is a registered hole (op 8 becomes one after 7 fills). The held copy was DROPPED.
+    assert_eq!(
+      e.commit(),
+      OpNumber::with(6),
+      "commit is HELD at the unapplied omitted band until the canonical value is repaired"
+    );
+    assert!(
+      e.has_repair_hole_for_test(7) && !e.log.contains_key(&7),
+      "the first unapplied omitted committed op (7) is a repair hole, its held body dropped"
+    );
+    // A committed-vouching peer (commit 8 >= op) supplies the canonical value for the repaired band.
+    for op in [7u64, 8] {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Replica(ReplicaId::new(1)),
+        repair_prepare(1, op, 8),
+      );
+    }
     assert_eq!(
       e.commit(),
       OpNumber::with(8),
-      "commit reaches 8: the committed ops 5..=8 were applied, not lost"
+      "commit reaches 8: the omitted committed band is repaired, not lost (the B3 safety property holds)"
     );
-    // The SM applied exactly ops 5..=8 (the prior prefix [1..=4] lived in the checkpoint, not re-applied).
+    // The SM applied exactly the unapplied band 7,8 (5,6 lived below commit_min, never re-applied; 1..=4
+    // in the checkpoint). SAFETY: no committed op the offset StartView omitted was lost.
     let applied: std::vec::Vec<u64> = e.sm.applied().iter().map(|(op, _)| *op).collect();
     assert_eq!(
       applied,
-      std::vec![5, 6, 7, 8],
-      "the SM has the committed ops 5..=8 the offset StartView omitted"
+      std::vec![7, 8],
+      "the unapplied omitted committed band 7..=8 is repaired to the SM (canonical value, not stale local)"
     );
     assert!(
       e.repair.is_empty(),
       "no committed op is left stranded in the repair set"
+    );
+  }
+
+  #[test]
+  fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() {
+    // SAFETY REGRESSION (VOPR seed 24): the B3 "preserve the omitted committed op from the adopter's
+    // own log" rule is only sound for ops the adopter has APPLIED (`op <= commit_min`) — those are
+    // committed+immutable. For a committed op in `(commit_min .. adopted_commit]` the adopter holds a
+    // body it has NOT applied: it can be a STALE UNCOMMITTED proposal from an earlier view that a later
+    // view overwrote with a DIFFERENT committed value (`LogEntry` carries no per-entry view, so the
+    // proto cannot tell a canonical-lineage held op from a superseded one). Preserving it diverges the
+    // adopter's committed log from the quorum's. The fix: preserve ONLY `op <= commit_min`; the omitted
+    // committed band `(commit_min .. adopted_commit]` becomes repair holes whose CANONICAL value is
+    // fetched from a committed-vouching peer (commit HELD until then) — never trusted from local.
+    //
+    // Setup mirrors seed 24: the adopter holds the two committed ops 5,6 TRANSPOSED (op 5 -> body[6],
+    // op 6 -> body[5] — stale superseded proposals), while the cluster committed op 5 -> body[5], op 6
+    // -> body[6]. checkpoint == commit_min == 4 (those held bodies are UNAPPLIED), op == 8. The adopted
+    // offset StartView (head 10, commit 8) OMITS 5,6 (its log starts at op 7).
+    let mut e = Endpoint::new(
+      Config::try_new(1, ReplicaId::new(2), 3).unwrap(),
+      0,
+      CountSm::default(),
+    );
+    e.checkpoint_op = OpNumber::with(4);
+    e.commit_min = OpNumber::with(4);
+    e.commit_max = OpNumber::with(4);
+    e.op = OpNumber::with(8);
+    // The STALE, TRANSPOSED held copies for the (commit_min .. commit] band: op 5 holds op 6's body and
+    // vice-versa. (Bodies are single-byte `[op]`, matching `repair_prepare`'s canonical encoding, so the
+    // post-repair canonical value `[5]`/`[6]` is provably DIFFERENT from the preserved-stale `[6]`/`[5]`.)
+    e.log.insert(
+      5,
+      LogEntry {
+        client: ClientId::new(7),
+        request: RequestNumber::with(5),
+        body: Bytes::copy_from_slice(&[6u8]),
+      },
+    );
+    e.log.insert(
+      6,
+      LogEntry {
+        client: ClientId::new(7),
+        request: RequestNumber::with(6),
+        body: Bytes::copy_from_slice(&[5u8]),
+      },
+    );
+    // op 7,8 are also in the (commit_min .. commit] band and OMITTED below; they ride the same repair
+    // path. Give the adopter NO held copy for them, so they are pure holes filled only from the peer.
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // The canonical offset StartView for view 1 (head 10, commit 8) starts at op 9 — it OMITS 5,6,7,8.
+    let sv = StartView::new(
+      View::with(1),
+      OpNumber::with(10),
+      OpNumber::with(8),
+      ReplicaId::new(1),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(9),
+          ClientId::new(7),
+          RequestNumber::with(9),
+          Bytes::copy_from_slice(&[9u8]),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(10),
+          ClientId::new(7),
+          RequestNumber::with(10),
+          Bytes::copy_from_slice(&[10u8]),
+        ),
+      ],
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::StartView(sv),
+    );
+    assert_eq!(e.status(), Status::Normal, "adoption completes");
+    // The stale held copies are DROPPED, not preserved: op 5 is a repair hole and the commit is HELD at
+    // the first omitted op (4) — never advanced past op 5 with the stale `[6]` body. (Fail-before: the
+    // old rule kept 5->[6] and 6->[5], APPLIED both, and commit jumped to 6 — the transposition — before
+    // holding at op 7, with NO hole at 5 or 6.)
+    assert_eq!(
+      e.commit(),
+      OpNumber::with(4),
+      "commit is HELD at the first omitted committed op (the stale body is not applied)"
+    );
+    // `advance_commit` registers a hole at the FIRST unfetched committed op (op 5) and HOLDS there —
+    // ops 6,7,8 become holes lazily as each fill resumes the apply loop. The decisive safety fact is
+    // that op 5's STALE held body `[6]` was DROPPED, so the commit could not advance past it. (Fail-
+    // before: the old rule kept 5->[6], 6->[5], applied them, and commit jumped to 6 with NO hole at 5.)
+    assert!(
+      e.has_repair_hole_for_test(5),
+      "the first omitted, unapplied committed op (5) becomes a repair hole (canonical value to be fetched)"
+    );
+    assert!(
+      !e.log.contains_key(&5) && !e.log.contains_key(&6),
+      "neither stale transposed body survives in the log cache"
+    );
+    assert!(
+      e.sm.applied().is_empty(),
+      "NOTHING is applied yet — no stale transposed body reached the SM"
+    );
+    // A committed-vouching peer Prepare (commit 8 >= op) supplies the CANONICAL value for each hole in
+    // order: op 5 -> body[5], op 6 -> body[6] (the un-transposed quorum values), then op 7,8. Each fill
+    // resumes the apply loop, which then registers + we fill the next hole.
+    for op in [5u64, 6, 7, 8] {
+      assert!(
+        e.has_repair_hole_for_test(op),
+        "op {op} is a registered repair hole before its canonical Prepare arrives"
+      );
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Replica(ReplicaId::new(1)),
+        repair_prepare(1, op, 8),
+      );
+    }
+    assert!(
+      e.repair.is_empty(),
+      "every committed hole is filled from the peer's canonical value"
+    );
+    assert_eq!(
+      e.commit(),
+      OpNumber::with(8),
+      "commit resumes to 8 once the canonical band is repaired"
+    );
+    // The applied log matches the QUORUM (op 5 -> [5], op 6 -> [6]) — NOT the adopter's stale transpose.
+    // This is the exact equality `check_safety` enforces; fail-before it would be [(5,[6]),(6,[5]),...].
+    assert_eq!(
+      e.sm.applied(),
+      &[
+        (5, std::vec![5u8]),
+        (6, std::vec![6u8]),
+        (7, std::vec![7u8]),
+        (8, std::vec![8u8]),
+      ],
+      "the repaired committed band carries the canonical (un-transposed) quorum values"
     );
   }
 }

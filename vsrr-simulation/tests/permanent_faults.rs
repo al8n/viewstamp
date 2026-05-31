@@ -53,6 +53,7 @@ fn committed_ops_survive_crash_permanent_fault_and_restart() {
       latency: Duration::from_millis(1),
       jitter: Duration::from_millis(3),
       drop_per_mille: 10,
+      duplicate_per_mille: 0,
     });
     // PERMANENT corruption on every replica's WAL: bit-rot + torn writes (NO transient read fault —
     // a transient could mask the permanent path by clearing on retry). A high rate makes it near
