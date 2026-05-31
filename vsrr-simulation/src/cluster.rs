@@ -157,6 +157,27 @@ impl Cluster {
     self.replicas[i].checkpoint_op()
   }
 
+  /// Replica `i`'s current head op (for the M3 gate's laggard/strand-window construction).
+  pub fn replica_op(&self, i: usize) -> vsrr_proto::OpNumber {
+    self.replicas[i].op()
+  }
+
+  /// Replica `i`'s current commit (`commit_min`) — the applied frontier (for the M3 gate).
+  pub fn replica_commit(&self, i: usize) -> vsrr_proto::OpNumber {
+    self.replicas[i].commit()
+  }
+
+  /// True iff replica `i` is the primary of its current view (for the M3 gate's failover schedule).
+  pub fn replica_is_primary(&self, i: usize) -> bool {
+    self.replicas[i].is_primary()
+  }
+
+  /// True iff any non-crashed replica has advanced to a view strictly greater than `v` — i.e. a real
+  /// view change occurred (used by the M3 gate's liveness assertions, including forfeit-driven VCs).
+  pub fn any_replica_view_advanced_beyond(&self, v: u64) -> bool {
+    (0..self.replicas.len()).any(|i| !self.crashed[i] && self.replicas[i].view().get() > v)
+  }
+
   /// Replica `i`'s in-memory `log` cache size (for the M3.4b boundedness checker). After GC this is
   /// bounded by the un-checkpointed tail + pipeline headroom.
   pub fn replica_log_len(&self, i: usize) -> usize {
@@ -274,6 +295,15 @@ impl Cluster {
   #[doc(hidden)]
   pub fn replica_state_sync_count(&self, i: usize) -> u64 {
     self.replicas[i].state_syncs_applied()
+  }
+
+  /// Test-only (M3.5 T6): how many of replica `i`'s applied syncs were FORCED (the escalation that
+  /// recovers a pruned committed hole below the quorum checkpoint), as opposed to ordinary `> self.op`
+  /// state-syncs. The focused force-sync gate asserts this goes `> 0` to prove the FORCED path fired
+  /// specifically. Mirrors the proto's `Endpoint::forced_syncs_applied`.
+  #[doc(hidden)]
+  pub fn replica_forced_sync_count(&self, i: usize) -> u64 {
+    self.replicas[i].forced_syncs_applied()
   }
 
   /// Test-only: how many of replica `i`'s WAL slots in `1..=op` are PERMANENTLY corrupt (bit-rot or
@@ -524,6 +554,31 @@ mod tests {
     // a crashed primary means no commits; the (single) client cannot finish without view change,
     // but the loop must run cleanly.
     assert!(c.now().as_nanos() > 0);
+  }
+
+  #[test]
+  fn gate_accessors_expose_op_commit_and_primary() {
+    let mut c = Cluster::new(3, 1, 2, 11);
+    for _ in 0..2000 {
+      c.tick();
+      if c.is_quiescent() {
+        break;
+      }
+    }
+    // replica 0 is the view-0 primary; its op/commit advanced as the client's requests committed.
+    assert!(c.replica_is_primary(0), "replica 0 is the view-0 primary");
+    assert!(c.replica_op(0).get() >= 1, "primary head advanced");
+    assert!(c.replica_commit(0).get() >= 1, "primary commit advanced");
+    assert!(
+      !c.any_replica_view_advanced_beyond(0),
+      "no view change in a clean run"
+    );
+    // A clean run never force-syncs (no pruned-hole strand).
+    assert_eq!(
+      c.replica_forced_sync_count(0),
+      0,
+      "no forced sync in a clean run"
+    );
   }
 
   #[test]

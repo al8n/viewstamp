@@ -158,6 +158,20 @@ impl Config {
     self.checkpoint_ops
   }
 
+  /// The checkpoint lag (in ops) at which a `Normal` primary FORFEITS primacy and steps down via a
+  /// view change (M3.5 T3): if a quorum has durably checkpointed at least this many ops beyond the
+  /// primary's own `checkpoint_op` — continuously for the grace window — the primary is genuinely
+  /// stuck (it cannot checkpoint because it is repairing/syncing while the cluster raced ahead) and
+  /// proposes a view change so a caught-up replica leads.
+  ///
+  /// Derived from `checkpoint_ops` (one full checkpoint interval), so it scales with the config and a
+  /// small-interval sim does not false-fire: a healthy primary checkpoints in lock-step with the
+  /// cluster and never falls a whole interval behind a quorum. No constructor argument.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn forfeit_checkpoint_lag(&self) -> u64 {
+    self.checkpoint_ops
+  }
+
   /// The primary for a given view: `view % replica_count`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn primary(&self, view: View) -> ReplicaId {

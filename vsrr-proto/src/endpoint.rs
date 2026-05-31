@@ -65,6 +65,12 @@ struct SyncState {
   target: OpNumber,
   /// Freshness nonce echoed in the SyncCheckpoint (a per-attempt bump of `self.nonce`).
   nonce: u64,
+  /// `true` when this sync was raised by the M3.5 force-sync escalation ([`Endpoint::maybe_force_sync`])
+  /// rather than the ordinary `> self.op` trigger. On the forced path the synced checkpoint may sit at
+  /// or BELOW our head (we hold a tail above a pruned committed hole), so `apply_sync` relaxes its
+  /// release-active assert from `checkpoint_op > self.op` to the true safety invariant
+  /// `checkpoint_op >= commit_min` (never rewind the applied frontier). See §2 of the M3.5 plan.
+  forced: bool,
 }
 
 const PREPARE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
@@ -72,6 +78,14 @@ const COMMIT_HEARTBEAT: core::time::Duration = core::time::Duration::from_millis
 const PRIMARY_IDLE: core::time::Duration = core::time::Duration::from_millis(200);
 const VC_MESSAGE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
 const VIEW_CHANGE_STATUS: core::time::Duration = core::time::Duration::from_millis(500);
+/// Forfeit (M3.5 T3, `Status::Normal` primary): how long the checkpoint-lag forfeit condition must
+/// hold CONTINUOUSLY before a stuck primary actually steps down (the anti-storm grace timer). Sits
+/// above `PRIMARY_IDLE` (200ms) — so a *silent* primary is failed over first by a backup's idle VC,
+/// and forfeit handles only the *alive-but-stuck* case where the primary keeps heartbeating yet
+/// cannot make checkpoint progress — and below `VIEW_CHANGE_STATUS` (500ms) — so a forfeit resolves
+/// before a redundant idle-driven view change escalates. A primary that catches up within the grace
+/// window disarms and never forfeits (a transient lag cannot trigger it).
+const FORFEIT_GRACE: core::time::Duration = core::time::Duration::from_millis(300);
 /// Recovery (`Status::Recovering`): how often the recover-read timer re-submits any still
 /// pending/faulty WAL-tail reads. Covers a real async driver that drops a completion, and the
 /// transient-clears-on-retry case where a `Fault` only resolves on a later read.
@@ -198,6 +212,10 @@ pub struct Endpoint<S> {
   /// Highest op durably applied to the state machine (applied frontier).
   commit_min: OpNumber,
   /// Highest op known committed cluster-wide (may exceed locally-held + applied ops).
+  ///
+  /// A re-learnable HINT, not a monotone invariant: re-learned via `advance_commit`'s `max` on the
+  /// next Commit/Prepare, and a forced state-sync (`maybe_force_sync`) resets it to the synced
+  /// `checkpoint_op`. Do NOT add a monotonicity assert on it — a forced sync may regress it.
   commit_max: OpNumber,
   /// Latest view in which this replica changed its head log.
   /// Invariants: `log_view <= view`; `log_view == view` when status==Normal.
@@ -217,20 +235,21 @@ pub struct Endpoint<S> {
   nonce: u64,
   /// In-memory log, keyed by op number.
   ///
-  /// These maps are never pruned (committed entries accumulate). Bounded for the
-  /// simulator's finite runs; a checkpoint/GC trim is deferred to M3.
+  /// Trimmed by post-checkpoint GC ([`Self::run_gc`], M3.4b) to the un-checkpointed tail
+  /// `(prune_floor .. head]`; bounded by `O(checkpoint_ops + pipeline)`.
   log: BTreeMap<u64, LogEntry>,
   /// Primary pipeline: op → ack tracking.
   ///
-  /// These maps are never pruned (committed entries accumulate). Bounded for the
-  /// simulator's finite runs; a checkpoint/GC trim is deferred to M3.
+  /// Trimmed by post-checkpoint GC ([`Self::run_gc`], M3.4b) to the un-checkpointed tail
+  /// `(prune_floor .. head]`; bounded by `O(checkpoint_ops + pipeline)`.
   inflight: BTreeMap<u64, Inflight>,
   /// Backup reorder buffer: future prepares awaiting contiguity.
   buffer: BTreeMap<u64, Prepare>,
   /// Client session table.
   ///
-  /// These maps are never pruned (committed entries accumulate). Bounded for the
-  /// simulator's finite runs; a checkpoint/GC trim is deferred to M3.
+  /// Bounded by the active client set (one session per client), independent of op count;
+  /// intentionally NOT trimmed by GC (dropping a live session risks an at-most-once dedup miss) —
+  /// captured in each checkpoint envelope instead so a recover/state-sync restores it.
   clients: BTreeMap<u128, Session>,
   sm: S,
   outgoing: VecDeque<Outgoing>,
@@ -295,6 +314,21 @@ pub struct Endpoint<S> {
   /// lifetime (a fresh `new`/`recover` after a crash starts it back at 0, which is correct — the
   /// gate counts syncs since the laggard's restart). Exposed only via `state_syncs_applied()`.
   state_syncs_applied: u64,
+  /// Test/observability counter (M3.5 T6): the subset of `state_syncs_applied` that were raised by the
+  /// FORCE-sync escalation ([`Self::maybe_force_sync`]) rather than the ordinary `> self.op` trigger —
+  /// incremented in the same `on_sb_done` arm as `state_syncs_applied` when the completing sync carried
+  /// `forced: true`. Lets the force-sync sim gate prove the FORCED path specifically fired (not just an
+  /// ordinary state-sync), since both route through `apply_sync` and would otherwise be indistinguishable
+  /// via `state_syncs_applied` alone. Same lifecycle as `state_syncs_applied` (reset to 0 on `new`/`recover`).
+  forced_syncs_applied: u64,
+  /// Forfeit grace timer (M3.5 T3): `Some(deadline)` while a `Normal` primary has observed the
+  /// checkpoint-lag forfeit condition (`quorum_checkpoint_op - self.checkpoint_op >=
+  /// config.forfeit_checkpoint_lag()`) but has not yet stepped down — the condition must persist
+  /// until `deadline` (armed `now + FORFEIT_GRACE`) before the primary forfeits, so a transient lag
+  /// cannot trigger a view change (anti-storm). Disarmed (`None`) the moment the primary catches up,
+  /// when it actually forfeits, and on every view-change transition (a fresh generation re-evaluates
+  /// from scratch). Only ever set on the primary path (`maybe_forfeit`); a backup never arms it.
+  forfeit_armed: Option<Instant>,
 }
 
 impl<S: StateMachine> Endpoint<S> {
@@ -337,6 +371,8 @@ impl<S: StateMachine> Endpoint<S> {
       sync: None,
       sync_serving: BTreeMap::new(),
       state_syncs_applied: 0,
+      forced_syncs_applied: 0,
+      forfeit_armed: None,
     }
   }
 
@@ -441,6 +477,8 @@ impl<S: StateMachine> Endpoint<S> {
       sync: None,
       sync_serving: BTreeMap::new(),
       state_syncs_applied: 0,
+      forced_syncs_applied: 0,
+      forfeit_armed: None,
     };
 
     // Phase 1: build the dense header cache (bodies empty) and submit the tail + checkpoint reads.
@@ -523,6 +561,20 @@ impl<S: StateMachine> Endpoint<S> {
     self.checkpoint_op
   }
 
+  /// Record a peer's reported `checkpoint_op` MONOTONICALLY: a peer's durable checkpoint never
+  /// regresses, so a reordered/older report (a delayed `Commit`/`PrepareOk`, or a stale message
+  /// after a partition heals) must never lower the value we hold. Keeping this monotone keeps the GC
+  /// prune floor (`quorum_checkpoint_op`) and the M3.5 force-sync/forfeit triggers that read it from
+  /// moving backward — a regressing floor could spuriously un-fire the force-sync escalation. (T1)
+  fn record_peer_checkpoint(&mut self, replica: u8, reported: OpNumber) {
+    let prev = self
+      .peer_checkpoint
+      .get(&replica)
+      .copied()
+      .unwrap_or_else(OpNumber::new);
+    self.peer_checkpoint.insert(replica, prev.max(reported));
+  }
+
   /// The highest op a `quorum` of replicas (including self) has reported checkpointing.
   ///
   /// Computed from `self.checkpoint_op` plus the per-replica `peer_checkpoint` reports (defaulting an
@@ -545,6 +597,27 @@ impl<S: StateMachine> Endpoint<S> {
     cps.sort_unstable_by(|a, b| b.cmp(a)); // descending
     // `cps.len() == replica_count >= quorum`, so `cps[quorum - 1]` is always in bounds.
     OpNumber::with(cps[self.config.quorum() - 1])
+  }
+
+  /// The highest `checkpoint_op` ANY single peer (or self) has reported — i.e. the newest durable
+  /// checkpoint snapshot we know a `Normal` peer could ship us via `SyncCheckpoint`.
+  ///
+  /// Unlike [`Self::quorum_checkpoint_op`] (the quorum-th order statistic, used as the GC prune
+  /// floor where a *quorum* must agree before freeing), this is the *maximum* over reporters. It is
+  /// the correct floor for the force-sync escalation ([`Self::maybe_force_sync`]): a backup only ever
+  /// records the PRIMARY's checkpoint (a backup hears `Commit` from the primary, never `PrepareOk`
+  /// from other backups — those go to the primary), so on a backup `quorum_checkpoint_op` is
+  /// structurally pinned to ~0 and the quorum-th floor can NEVER cross a hole. A single peer reporting
+  /// `checkpoint_op >= N` already proves a servable snapshot `>= N` exists (it is the exact source the
+  /// ordinary sync trusts, [`Self::maybe_request_sync`], which targets a *single* peer's reported
+  /// checkpoint, integrity-gated by `on_sync_checkpoint`). Monotone (each `peer_checkpoint` entry is,
+  /// via [`Self::record_peer_checkpoint`]), so the floor never regresses under reordering/partitions.
+  fn max_peer_checkpoint_op(&self) -> OpNumber {
+    let mut hi = self.checkpoint_op;
+    for cp in self.peer_checkpoint.values() {
+      hi = hi.max(*cp);
+    }
+    hi
   }
 
   /// The latest view in which this replica changed its head log.
@@ -609,6 +682,96 @@ impl<S: StateMachine> Endpoint<S> {
     self.log.keys().next().copied()
   }
 
+  /// Test-only: the per-peer recorded checkpoint (0 if unheard). Proves T1 monotonicity directly.
+  #[cfg(test)]
+  fn peer_checkpoint_for_test(&self, replica: u8) -> u64 {
+    self.peer_checkpoint.get(&replica).map_or(0, |c| c.get())
+  }
+
+  /// Test-only: directly seed a peer's reported checkpoint (bypassing a real PrepareOk/Commit), so a
+  /// test can construct a quorum-checkpoint floor without driving full message flows. Goes through the
+  /// MONOTONE recorder, so a lower injection cannot regress a higher recorded value.
+  #[cfg(test)]
+  fn inject_peer_checkpoint_for_test(&mut self, replica: u8, op: u64) {
+    self.record_peer_checkpoint(replica, OpNumber::with(op));
+  }
+
+  /// Test-only: set this replica's own durable `checkpoint_op` (the value the forfeit gate compares
+  /// against `quorum_checkpoint_op()`), so a test can model a primary that is/ isn't keeping pace.
+  #[cfg(test)]
+  fn set_own_checkpoint_for_test(&mut self, op: u64) {
+    self.checkpoint_op = OpNumber::with(op);
+  }
+
+  /// Test-only: is the forfeit grace timer currently armed (M3.5 T3)?
+  #[cfg(test)]
+  fn forfeit_armed_for_test(&self) -> bool {
+    self.forfeit_armed.is_some()
+  }
+
+  /// Test-only: force this endpoint into a `Normal` state with the given head/commit/checkpoint and a
+  /// set of pending-repair holes (with the repair-retry timer armed). Mirrors how the recover loop +
+  /// apply path would leave a replica holding a committed-op hole below its head. Does NOT touch the
+  /// `log` cache (the holes are, by construction, ABSENT from it — the apply path treats them as
+  /// missing bodies), so the commit is genuinely held below the first hole.
+  #[cfg(test)]
+  fn force_state_for_test(
+    &mut self,
+    view: u64,
+    op: u64,
+    commit_min: u64,
+    checkpoint_op: u64,
+    repair: &[u64],
+  ) {
+    self.status = Status::Normal;
+    self.view = View::with(view);
+    self.log_view = View::with(view);
+    self.op = OpNumber::with(op);
+    self.commit_min = OpNumber::with(commit_min);
+    self.commit_max = OpNumber::with(self.commit_max.get().max(commit_min));
+    self.checkpoint_op = OpNumber::with(checkpoint_op);
+    self.repair = repair.iter().copied().collect();
+    if !self.repair.is_empty() {
+      self.timers.repair_retry = Some(Instant::ZERO);
+    }
+  }
+
+  /// Test-only: is `op` a pending-repair hole?
+  #[cfg(test)]
+  fn has_repair_hole_for_test(&self, op: u64) -> bool {
+    self.repair.contains(&op)
+  }
+
+  /// Test-only: the outstanding sync's target op, or `None` if no sync is outstanding.
+  #[cfg(test)]
+  fn sync_target_for_test(&self) -> Option<u64> {
+    self.sync.map(|s| s.target.get())
+  }
+
+  /// Test-only: is the outstanding sync a FORCED (M3.5) sync?
+  #[cfg(test)]
+  fn sync_is_forced_for_test(&self) -> bool {
+    self.sync.is_some_and(|s| s.forced)
+  }
+
+  /// Test-only: the outstanding sync's nonce (panics if none) — to build a matching SyncCheckpoint.
+  #[cfg(test)]
+  fn sync_nonce_for_test(&self) -> u64 {
+    self.sync.expect("a sync is outstanding").nonce
+  }
+
+  /// Test-only: arm a FORCED sync to `target` directly (bypassing the trigger), so the forced
+  /// assert-relaxation in `apply_sync` can be exercised in isolation.
+  #[cfg(test)]
+  fn arm_forced_sync_for_test(&mut self, target: u64) {
+    self.nonce = self.nonce.wrapping_add(1);
+    self.sync = Some(SyncState {
+      target: OpNumber::with(target),
+      nonce: self.nonce,
+      forced: true,
+    });
+  }
+
   /// Test/observability counter (M3.4a): how many state-syncs have fully applied + become durable on
   /// this replica since it was constructed. Incremented when an `apply_sync`'s durable re-persist
   /// completes (`on_sb_done` lands the synced checkpoint's root write). The state-sync sim gate uses
@@ -618,6 +781,30 @@ impl<S: StateMachine> Endpoint<S> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn state_syncs_applied(&self) -> u64 {
     self.state_syncs_applied
+  }
+
+  /// Test/observability counter (M3.5 T6): the subset of [`Self::state_syncs_applied`] raised by the
+  /// FORCE-sync escalation ([`Self::maybe_force_sync`]) — a `Normal` replica that cleared a pruned
+  /// committed hole below the quorum checkpoint and fetched the snapshot, instead of looping
+  /// `RequestPrepare`. The focused force-sync sim gate uses this to prove the FORCED path fired
+  /// specifically (`> 0`), distinguishing it from an ordinary `> self.op` state-sync. Not part of the
+  /// stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn forced_syncs_applied(&self) -> u64 {
+    self.forced_syncs_applied
+  }
+
+  /// Test-only: the cached `(request_number, reply_body)` a client session holds (the at-most-once
+  /// reply cache a backup-turned-primary resends on a duplicate request). `None` if no session / no
+  /// cached reply.
+  #[cfg(test)]
+  fn session_reply_for_test(&self, client: u128) -> Option<(u64, std::vec::Vec<u8>)> {
+    self
+      .clients
+      .get(&client)
+      .and_then(|s| s.reply.as_ref())
+      .map(|(rn, body)| (rn.get(), body.to_vec()))
   }
 
   /// Mint a fresh storage correlation id.
@@ -683,7 +870,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// Fires any timers due at `now`, dispatching by status/role.
   pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     match self.status {
-      Status::Normal if self.is_primary() => self.primary_timeouts(now),
+      Status::Normal if self.is_primary() => self.primary_timeouts(now, sb),
       Status::Normal => {
         // backup: bootstrap + fire primary_idle, then re-arm THIS timer only so we
         // re-propose at the primary_idle cadence (not every tick).
@@ -900,11 +1087,16 @@ impl<S: StateMachine> Endpoint<S> {
           // `sync.is_some()` and gates on `pending_checkpoint.is_none()`, and `maybe_checkpoint`
           // gates on `pending_checkpoint.is_none()` too — so `sync.is_some()` here means this root
           // belongs to the sync.)
-          if self.sync.is_some() {
+          if let Some(s) = self.sync {
             self.sync = None;
             self.timers.sync_solicit = None;
             // Non-vacuity signal (M3.4a): a state-sync just fully applied + became durable.
             self.state_syncs_applied += 1;
+            // Non-vacuity signal (M3.5 T6): distinguish a FORCE-sync (the escalation that recovers a
+            // pruned committed hole below the quorum checkpoint) from an ordinary `> self.op` sync.
+            if s.forced {
+              self.forced_syncs_applied += 1;
+            }
             self.arm_timers(now);
           }
         }
@@ -1019,25 +1211,43 @@ impl<S: StateMachine> Endpoint<S> {
     // Some slot read back permanently faulty (the per-slot retry budget — and the on-disk recover_retry
     // re-reads — were exhausted, so it cannot be cleared from this replica's own disk).
     let head = self.op.get();
-    if rec.faulty.contains(&head) {
+    let faulty: std::vec::Vec<u64> = rec.faulty.iter().copied().collect();
+    // Every faulty slot MUST be dropped from the dense `log` cache so it can NEVER be applied with a
+    // wrong/empty body — the B4 durability invariant. The recover Phase-1 cache seeds each tail slot
+    // with an EMPTY body (`Bytes::new()`) and a verified read fills it; a slot left faulty still holds
+    // that empty placeholder. Dropping it here closes a real safety hole on the RecoveringHead path: a
+    // later canonical-head adoption (`adopt_log`) PRESERVES any committed op the adopter already holds
+    // that the canonical log omits, so a retained empty-bodied faulty op would be adopted as "held",
+    // its repair hole retired, and applied EMPTY — diverging the committed op. (Observed deterministically
+    // under the M3 sweep: a replica with BOTH a faulty head and a faulty non-head committed slot.)
+    for &op in &faulty {
+      self.log.remove(&op);
+    }
+    if faulty.contains(&head) {
       // The head cannot be trusted → RecoveringHead: do not participate. Solicit the canonical head
       // from a peer (the primary answers with a `RecoveryResponse`; a `StartView` also adopts), and
-      // keep `recover` so the head stays flagged until adoption returns to Normal.
+      // keep `recover` so the head stays flagged until adoption returns to Normal. Register the NON-head
+      // faulty committed slots as repair holes now: if the adopted canonical log later omits one, the
+      // hole survives `adopt_canonical_head`'s reconcile (it keeps holes not covered by the held/adopted
+      // ops) and is fetched from a peer — never resurrected from the dropped empty placeholder.
+      for &op in &faulty {
+        if op != head {
+          self.repair.insert(op);
+        }
+      }
       self.status = Status::RecoveringHead;
       self.arm_timers(now);
       self.send_recovery(now);
       return;
     }
     // Only non-head committed slots are faulty: hand each to peer fault-repair (B4) and return to
-    // Normal. Each faulty op is dropped from the dense `log` cache (so it is never applied with a
-    // wrong/empty body) and recorded in `repair`; the apply loops HOLD the commit at the first hole
-    // and the repair timer re-fetches it from a peer. We must reach Normal first — a Recovering
-    // replica drops all messages, so it could not receive the repair `Prepare` while Recovering.
-    let faulty: std::vec::Vec<u64> = rec.faulty.iter().copied().collect();
+    // Normal. Each faulty op was dropped from the cache above; record it in `repair` so the apply loops
+    // HOLD the commit at the first hole and the repair timer re-fetches it from a peer. We must reach
+    // Normal first — a Recovering replica drops all messages, so it could not receive the repair
+    // `Prepare` while Recovering.
     self.recover = None;
     self.status = Status::Normal;
     for op in faulty {
-      self.log.remove(&op);
       self.repair.insert(op);
     }
     self.arm_timers(now);
@@ -1114,6 +1324,10 @@ impl<S: StateMachine> Endpoint<S> {
     self.repair.insert(op);
     self.send_request_prepare(op);
     self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
+    // Force-sync escalation (M3.5): if a quorum already checkpointed past this just-registered hole
+    // (e.g. a replica recovered a rotted committed slot the cluster long since checkpointed+pruned),
+    // its `RequestPrepare` is futile from the outset — escalate straight to a forced `RequestSync`.
+    self.maybe_force_sync(now);
   }
 
   /// Broadcast a `RequestPrepare` for the single missing committed op `op` to all peers. Any peer
@@ -1267,6 +1481,9 @@ impl<S: StateMachine> Endpoint<S> {
         self.sync = Some(SyncState {
           target: incoming_checkpoint,
           nonce: s.nonce,
+          // Preserve the in-flight sync's forced-ness when only raising the target (an ordinary
+          // higher checkpoint does not downgrade an outstanding forced sync's assert-relaxation).
+          forced: s.forced,
         });
       }
       return;
@@ -1278,8 +1495,97 @@ impl<S: StateMachine> Endpoint<S> {
     self.sync = Some(SyncState {
       target: incoming_checkpoint,
       nonce: self.nonce,
+      forced: false,
     });
     self.send_request_sync(now);
+  }
+
+  /// The M3.5 force-state-sync escalation (the safety-critical core). A `Normal` replica holding a
+  /// peer-fault-`repair` hole at op `N` whose `RequestPrepare` has become FUTILE — because a peer has
+  /// checkpointed past `N` (`max_peer_checkpoint_op() >= N`), so that peer captured `N` in a checkpoint
+  /// snapshot and pruned the servable prepare — clears the doomed hole(s) and forces a `RequestSync` to
+  /// that peer checkpoint (which is `>= N`, so its snapshot subsumes `N`). This closes the GC +
+  /// permanent-fault + partition strand the `run_gc` doc-comment flagged: without it, such a replica's
+  /// ordinary sync trigger (`> self.op`) is FALSE (its head is above the cluster checkpoint) and no
+  /// peer can serve the pruned `N`, so it is stuck at `commit_min == N-1` forever.
+  ///
+  /// # The floor is the MAX peer checkpoint, not the quorum-th (the backup-visibility fix)
+  ///
+  /// The floor is [`Self::max_peer_checkpoint_op`] — the highest checkpoint ANY peer (or self) has
+  /// reported — NOT [`Self::quorum_checkpoint_op`]. A backup only ever records the PRIMARY's checkpoint
+  /// (it hears `Commit` from the primary; `PrepareOk`s — the only other checkpoint-bearing message —
+  /// flow to the primary, never between backups), so on a backup the quorum-th floor is structurally
+  /// pinned to ~0 and could NEVER cross a hole → the escalation would never fire and the backup would
+  /// hang forever (the exact strand this method exists to break). A single peer reporting
+  /// `checkpoint_op >= N` already proves a servable snapshot `>= N` exists — and that is precisely the
+  /// source the ordinary sync already trusts ([`Self::maybe_request_sync`] targets a single peer's
+  /// reported checkpoint, integrity-gated by `on_sync_checkpoint`'s `checkpoint_id` check). So keying
+  /// on a single peer's checkpoint is no weaker than the ordinary sync's own trust model.
+  ///
+  /// # Safety — never abandons a committed op without the snapshot replacing it
+  ///
+  /// We only clear holes `<= floor` and set the forced sync target to exactly `floor`. Every repair
+  /// hole is a COMMITTED op (`advance_commit`/`commit_op` register a hole only at `commit_min + 1 <=
+  /// commit_max`, never for an uncommitted op), so a cleared hole `M (<= floor)` is (a) subsumed by the
+  /// synced snapshot (`apply_sync` restores the SM through `floor >= M`, recovering `M`'s effect) and
+  /// (b) never an uncommitted decision we were free to drop anyway. A committed op `M` is never lost —
+  /// merely relocated from "a servable prepare" to "inside the checkpoint", exactly the case-(1)
+  /// argument in the `run_gc` proof. The forced sync target is a checkpoint a `Normal` peer demonstrably
+  /// made durable+pruned past, so that peer can answer the `RequestSync`. No commit advances past `N`
+  /// until the snapshot (`>= N`) is applied: the hole holds `commit_min` at `N-1` until `apply_sync`
+  /// sets `commit_min = floor >= N`. The forced path NEVER fires while every hole is still IN-REACH
+  /// (above the floor, i.e. no peer has pruned it yet) — it does not pre-empt the cheap single-op
+  /// `RequestPrepare` repair; and even if it fires while some lagging peer could still serve the
+  /// prepare, whichever recovery (the `Prepare` or the `SyncCheckpoint`) lands first wins, with no
+  /// committed op lost either way.
+  ///
+  /// # Anti-thrash
+  ///
+  /// A forced sync, once outstanding (`self.sync.is_some()`), is not re-issued — we only RAISE its
+  /// target if `floor` grew, exactly mirroring the ordinary trigger. Clearing the doomed holes stops
+  /// the futile `RequestPrepare` retransmit (the `repair_retry` timer disarms when `repair` empties).
+  fn maybe_force_sync(&mut self, now: Instant) {
+    if !self.status.is_normal() || self.repair.is_empty() {
+      return; // only a Normal replica with an outstanding repair hole can be in this strand.
+    }
+    let floor = self.max_peer_checkpoint_op();
+    if floor.get() == 0 {
+      return; // no peer-checkpoint floor known yet (e.g. partitioned) — stay dormant.
+    }
+    // Any hole AT/BELOW the peer-checkpoint floor is snapshot-only on its reporter: that peer pruned
+    // the prepare, so `RequestPrepare` for it cannot be answered there. A hole strictly ABOVE the floor
+    // is still in-reach (no peer has pruned it) → keep using the cheap single-op repair, do NOT escalate.
+    if !self.repair.iter().any(|&op| op <= floor.get()) {
+      return;
+    }
+    // Clear every snapshot-only hole; the forced sync to `floor` subsumes them all (its snapshot is
+    // `>= max such hole`). A hole above the floor (if any) stays and continues ordinary repair.
+    self.repair.retain(|&op| op > floor.get());
+    if self.repair.is_empty() {
+      self.timers.repair_retry = None;
+    }
+    // Solicit (or re-target) a FORCED sync to the peer-checkpoint floor.
+    match self.sync {
+      Some(s) if floor.get() > s.target.get() => {
+        // Raise an outstanding sync's target to the floor and mark it forced (the discard-direction
+        // assert in `apply_sync` must use the relaxed invariant for this synced checkpoint).
+        self.sync = Some(SyncState {
+          target: floor,
+          nonce: s.nonce,
+          forced: true,
+        });
+      }
+      Some(_) => {} // a sync to >= floor is already outstanding — let it run (anti-thrash).
+      None => {
+        self.nonce = self.nonce.wrapping_add(1);
+        self.sync = Some(SyncState {
+          target: floor,
+          nonce: self.nonce,
+          forced: true,
+        });
+        self.send_request_sync(now);
+      }
+    }
   }
 
   /// Broadcast a `RequestSync` advertising our CURRENT (stale) checkpoint + the live sync nonce, and
@@ -1399,7 +1705,13 @@ impl<S: StateMachine> Endpoint<S> {
     if m.checkpoint_op().get() < s.target.get() {
       return; // does not advance us past what we know the cluster has committed — ignore.
     }
-    if m.checkpoint_op().get() <= self.op.get() {
+    // The `<= self.op` drop is ONLY for the ordinary trigger: there, an equal/lower checkpoint means a
+    // racing tail-apply already covered it (no sync needed). A FORCED sync (M3.5) deliberately targets
+    // a checkpoint AT/BELOW our head — we hold a tail above a pruned committed hole — so this guard
+    // must NOT drop it; the forced sync MUST apply to subsume the hole. Forced safety is gated instead
+    // on `>= self.checkpoint_op` below (advances our own checkpoint) + `apply_sync`'s `>= commit_min`
+    // assert (never rewinds the applied frontier — which holds since target `>= N > commit_min`).
+    if !s.forced && m.checkpoint_op().get() <= self.op.get() {
       return; // a racing tail-apply already covered the checkpoint — no sync needed (re-assert trigger).
     }
     if m.checkpoint_op().get() <= self.checkpoint_op.get() {
@@ -1419,13 +1731,24 @@ impl<S: StateMachine> Endpoint<S> {
   /// the checkpoint sequence). `sync` stays `Some` until the root write completes (`on_sb_done`), so a
   /// crash mid-persist re-solicits.
   ///
-  /// **No committed op the replica already held AHEAD of the sync can be lost.** The trigger requires
-  /// the synced `checkpoint_op > self.op` (re-asserted by the release-active assert below), so the
-  /// replica's entire held log `[..=self.op]` is at or below the synced point — every op `<=
-  /// checkpoint_op` is already reflected in the restored SM. A *committed* op above `self.op` is
-  /// impossible (committing an op requires having prepared it, which would put it `<= self.op`); the
-  /// only thing discarded is a stale/uncommitted tail at or below the synced checkpoint, which is safe.
-  /// The assert makes any future trigger-loosening that violates this fail loudly rather than silently
+  /// **No committed op the replica already held AHEAD of the sync can be lost.** On the ORDINARY
+  /// trigger the synced `checkpoint_op > self.op`, so the replica's entire held log `[..=self.op]` is
+  /// at or below the synced point — every op `<= checkpoint_op` is already reflected in the restored
+  /// SM. A *committed* op above `self.op` is impossible (committing an op requires having prepared it,
+  /// which would put it `<= self.op`); the only thing discarded is a stale/uncommitted tail at or
+  /// below the synced checkpoint, which is safe.
+  ///
+  /// On the M3.5 FORCED path ([`Self::maybe_force_sync`]) the synced `checkpoint_op` may instead be
+  /// `<= self.op` (the replica holds a tail ABOVE a pruned committed hole). The held tail
+  /// `(checkpoint_op .. self.op]` is then discarded — still safe: each discarded op `M` is either
+  /// uncommitted (`M > commit_max`, a tail VSR may always re-decide) or committed (`M <= commit_max`),
+  /// and a committed `M` is held by the committing quorum and is re-fetched by ordinary `Prepare`/
+  /// `Commit` once `L` resumes from the synced point — identical to a recover-from-checkpoint replica
+  /// that holds only `[..=checkpoint]` and rebuilds its tail. The doomed hole `N (<= checkpoint_op)`
+  /// is subsumed by the restored snapshot. `commit_min` only moves FORWARD (`checkpoint_op >= N > N-1
+  /// == commit_min`), so no applied op is rewound. The release-active assert below therefore branches:
+  /// ordinary ⇒ `checkpoint_op > self.op`; forced ⇒ the true invariant `checkpoint_op >= commit_min`.
+  /// Either way it makes a trigger-loosening that violates safety fail loudly rather than silently
   /// drop a committed op (matching `select_canonical_log`'s fail-stop style).
   ///
   /// **Never sync past uncommitted state.** The synced `checkpoint_op` is, by definition, a checkpoint
@@ -1440,14 +1763,28 @@ impl<S: StateMachine> Endpoint<S> {
     m: &crate::SyncCheckpoint,
   ) {
     let checkpoint_op = m.checkpoint_op();
-    // Release-active safety assert: the synced checkpoint is strictly above our head, so discarding
-    // our held log `[..=op]` cannot drop a committed op (see the method doc's reasoning).
-    assert!(
-      checkpoint_op.get() > self.op.get(),
-      "state-sync must not discard a held op above the synced checkpoint (checkpoint_op {} <= op {})",
-      checkpoint_op.get(),
-      self.op.get()
-    );
+    // Release-active safety assert, branched on whether this is a FORCED sync (M3.5). On the ordinary
+    // path the synced checkpoint is strictly above our head, so discarding our held log `[..=op]`
+    // cannot drop a committed op. On the forced path it may be at/below our head (we hold a tail above
+    // a pruned committed hole); the TRUE invariant there is `checkpoint_op >= commit_min` — never
+    // rewind the applied frontier — and the trigger structurally guarantees `checkpoint_op >= N > N-1
+    // == commit_min`, so the held tail it discards is only uncommitted ops or committed ops the quorum
+    // holds and re-announces (see the method doc's case analysis).
+    if self.sync.is_some_and(|s| s.forced) {
+      assert!(
+        checkpoint_op.get() >= self.commit_min.get(),
+        "force-sync must not rewind the applied frontier (checkpoint_op {} < commit_min {})",
+        checkpoint_op.get(),
+        self.commit_min.get()
+      );
+    } else {
+      assert!(
+        checkpoint_op.get() > self.op.get(),
+        "state-sync must not discard a held op above the synced checkpoint (checkpoint_op {} <= op {})",
+        checkpoint_op.get(),
+        self.op.get()
+      );
+    }
     // Decode + restore the SM and the client-session table from the verified envelope.
     let (sessions, sm_tail) = Self::decode_checkpoint(m.snapshot());
     self.sm.restore(sm_tail);
@@ -1590,14 +1927,18 @@ impl<S: StateMachine> Endpoint<S> {
   /// The only reads at/below the floor are *peer-serve* paths (`on_request_prepare`), which return
   /// silently on a freed op — and case (1)/(2) above show such a peer always has another route.
   ///
-  /// (Residual, flagged for a later milestone: a `Normal` replica holding a PERMANENTLY-faulty hole at
-  /// `N` *below its own head but above its own checkpoint*, where every replica that ever held `N` has
-  /// pruned it — a correlated multi-replica permanent fault on a single pruned op. Its head `>=`
-  /// the cluster checkpoint, so the `> self.op` sync trigger may not fire, and no peer can serve the
-  /// pruned op: it is stuck (a liveness gap, not an agreement/durability violation — no committed op is
-  /// rewritten). Unreachable under the honest crash-stop + no-fault model of this milestone's gate
-  /// (`StorageFaults::none()` ⇒ append-before-ack ⇒ no hole below a live head). A future
-  /// "stuck-below-the-cluster-checkpoint ⇒ force state-sync" escalation closes it.)
+  /// (Formerly-residual strand, now CLOSED by the M3.5 force-state-sync escalation
+  /// ([`Self::maybe_force_sync`]): a `Normal` replica holding a PERMANENTLY-faulty hole at `N` *below
+  /// its own head but above its own checkpoint*, where every replica that ever held `N` has pruned it
+  /// — a correlated multi-replica permanent fault on a single pruned op. Its head `>=` the cluster
+  /// checkpoint, so the `> self.op` sync trigger does NOT fire, and no peer can serve the pruned op.
+  /// This is reachable under the M3 gate's envelope (GC + permanent disk-faults + partitions). The
+  /// escalation detects it via `quorum_checkpoint_op() >= N` (the op is now available ONLY as part of
+  /// a checkpoint snapshot, every quorum member pruned the prepare), clears the doomed hole, and forces
+  /// a `RequestSync` to the quorum checkpoint (`>= N`) — recovering `N` from the snapshot that subsumes
+  /// it. Liveness-only (no committed op is ever lost or rewritten — `N` survives in every checkpoint
+  /// snapshot, swapping a `RequestPrepare`-for-a-pruned-op for a satisfiable `RequestSync`). See §2 of
+  /// the M3.5 plan and [`Self::maybe_force_sync`]'s safety proof.)
   fn run_gc<W: Wal>(&mut self, wal: &mut W) {
     let floor = if self.is_primary() {
       self
@@ -1656,7 +1997,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.pending_sb = Some((id, action));
   }
 
-  fn primary_timeouts(&mut self, now: Instant) {
+  fn primary_timeouts<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // Bootstrap the heartbeat the first time we're ticked as primary.
     if self.timers.commit.is_none() {
       self.timers.commit = Some(now + COMMIT_HEARTBEAT);
@@ -1669,12 +2010,10 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.commit = Some(now + COMMIT_HEARTBEAT); // re-arm THIS timer only
     }
     if self.timers.prepare.is_some_and(|d| d <= now) {
-      // Retransmit every un-committed prepare, in op order.
-      // NOTE (M3): this only re-sends ops in `commit_min+1..=op`; a backup that has
-      // fallen BELOW `commit_min` (a gap at/under the commit point) cannot be repaired
-      // by retransmission and needs state transfer (GetState/NewState), which is
-      // out of scope for M1. Quorum still progresses via the primary + one healthy
-      // backup, so this is not an M1 liveness blocker.
+      // Retransmit every un-committed prepare, in op order (`commit_min+1 ..= op`). A backup that fell
+      // BELOW the primary's `commit_min` is caught up not by this (those ops are `<= commit_min`) but by
+      // its OWN tail-gap solicitation ([`Self::request_tail_gap`], driven on every Commit heartbeat),
+      // which fetches the missing committed band above its head via `RequestPrepare`.
       let lo = self.commit_min.get() + 1;
       let hi = self.op.get();
       for op in lo..=hi {
@@ -1700,6 +2039,66 @@ impl<S: StateMachine> Endpoint<S> {
         None
       };
     }
+    // M3.5 T3: a primary that has fallen a full checkpoint interval behind the quorum's durable
+    // checkpoint — continuously for the grace window — forfeits primacy (steps down via a view
+    // change). Checked each primary tick, AFTER the heartbeat/retransmit above (so an alive primary
+    // still heartbeats while it is being given its grace window to catch up).
+    self.maybe_forfeit(now, sb);
+  }
+
+  /// M3.5 T3 — the forfeit gate. A `Normal` primary whose own durable `checkpoint_op` lags the
+  /// quorum's by at least a full checkpoint interval (`config.forfeit_checkpoint_lag()`) is stuck:
+  /// it cannot checkpoint because it is repairing/syncing while the cluster raced ahead. Rather than
+  /// wedge the cluster (clients whose requests sit above its stalled commit never finish), it steps
+  /// down so a caught-up replica leads.
+  ///
+  /// **Anti-storm (load-bearing).** Two gates ensure this fires ONLY for a genuinely-stuck primary,
+  /// never in steady state and never on every primary:
+  /// - **Quorum-gated + checkpoint-coupled.** The signal is `quorum_checkpoint_op()` (the quorum-th
+  ///   order statistic over the monotone, T1 per-peer checkpoint reports), so a single ahead peer
+  ///   cannot induce a forfeit, and the bound is a *full* checkpoint interval — a healthy primary
+  ///   checkpoints in lock-step with the cluster and never lags a whole interval behind a quorum.
+  /// - **Grace timer.** The condition must hold CONTINUOUSLY for `FORFEIT_GRACE` before the primary
+  ///   actually steps down. A primary that catches up within the window disarms and never forfeits,
+  ///   so a transient (e.g. heartbeat-window) lag cannot trigger a view change.
+  ///
+  /// `saturating_sub` guards the (impossible-by-construction but defensive) case where the primary's
+  /// own checkpoint is somehow ahead of the quorum's — that yields lag 0, which never arms.
+  fn maybe_forfeit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+    // Only ever called from `primary_timeouts` (the Normal-primary tick); a backup behind on
+    // checkpoint catches up via state-sync/force-sync and never forfeits.
+    debug_assert!(self.status.is_normal() && self.is_primary());
+    let lag = self
+      .quorum_checkpoint_op()
+      .get()
+      .saturating_sub(self.checkpoint_op.get());
+    let stuck = lag >= self.config.forfeit_checkpoint_lag();
+    match (stuck, self.forfeit_armed) {
+      // Caught up (or never behind): disarm — a transient lag does not forfeit.
+      (false, _) => self.forfeit_armed = None,
+      // Newly stuck: arm the grace timer; do NOT step down yet.
+      (true, None) => self.forfeit_armed = Some(now + FORFEIT_GRACE),
+      // Stuck for the whole grace window: forfeit.
+      (true, Some(deadline)) if deadline <= now => self.forfeit(now, sb),
+      // Still within the grace window: wait.
+      (true, Some(_)) => {}
+    }
+  }
+
+  /// Forfeit primacy: step down by PROPOSING the next view (broadcast `StartViewChange`) via the
+  /// existing SVC machinery — exactly as a backup's idle timeout does (`on_primary_idle` →
+  /// `propose_next_view`). A caught-up replica's SVC quorum then forms and a more-up-to-date primary
+  /// takes over.
+  ///
+  /// It deliberately does **NOT** unilaterally jump the view (`transition_to_view_change_status`):
+  /// that would strand this replica alone in `ViewChange` if peers do not follow, wedging the cluster
+  /// until idle timers fire. A lone `StartViewChange` cannot inflate the view (a real SVC quorum is
+  /// required to transition), so proposing is the safe, established path. The grace + quorum gates in
+  /// `maybe_forfeit` ensure this only fires when genuinely stuck. The grace timer is disarmed here so
+  /// a primary cannot re-forfeit in the same generation (and `propose_next_view` changes the view).
+  fn forfeit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+    self.forfeit_armed = None;
+    self.propose_next_view(now, sb);
   }
 
   fn on_primary_idle<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
@@ -1834,6 +2233,10 @@ impl<S: StateMachine> Endpoint<S> {
     // replica re-triggers state-sync from Normal if it is still behind.
     self.sync = None;
     self.timers.sync_solicit = None;
+    // A view change ends this primary generation: clear any forfeit grace timer (M3.5 T3). The new
+    // generation re-evaluates the forfeit condition from scratch once it resumes Normal as primary,
+    // so a stale grace deadline must not carry across (no same-view re-forfeit / cross-view leak).
+    self.forfeit_armed = None;
     self.svc_from = 0;
     self.dvc_from.clear();
     self.dvc_quorum = false;
@@ -2259,6 +2662,9 @@ impl<S: StateMachine> Endpoint<S> {
     // mid-persist case (safe; re-syncs from Normal if still behind).
     self.sync = None;
     self.timers.sync_solicit = None;
+    // Adopting a canonical head starts a fresh generation in `view`: clear any forfeit grace timer
+    // (M3.5 T3) so a stale deadline does not carry into this view (re-evaluated from scratch).
+    self.forfeit_armed = None;
     self.dvc_quorum = false;
     self.arm_timers(now);
     // Defer held-op re-acks to on_sb_done: persist the new view before acking in it.
@@ -2299,6 +2705,9 @@ impl<S: StateMachine> Endpoint<S> {
     // state-sync from Normal if it is still behind the cluster checkpoint.
     self.sync = None;
     self.timers.sync_solicit = None;
+    // A primary catching up to a newer view ends its generation: clear any forfeit grace timer
+    // (M3.5 T3) — the new generation re-evaluates from scratch.
+    self.forfeit_armed = None;
     self.svc_target = view;
     self.svc_from = 0;
     self.dvc_from.clear();
@@ -2689,8 +3098,11 @@ impl<S: StateMachine> Endpoint<S> {
       let target = self.commit_max.get();
       self.advance_commit(now, sb, target);
     } else {
-      // Future op: buffer until the gap fills (primary also retransmits).
+      // Future op: buffer it, and solicit the committed band between our head and it that the primary's
+      // retransmit (only `commit_min+1..=op`) will never re-send (those ops are `<= commit_min`). This
+      // fills the gap so the buffered op becomes reachable instead of stranding the backup at its head.
       self.buffer.insert(pop, p);
+      self.request_tail_gap();
     }
   }
 
@@ -2742,17 +3154,28 @@ impl<S: StateMachine> Endpoint<S> {
       };
       let reply = self.sm.apply(OpNumber::with(op), &entry.body);
       self.commit_min = OpNumber::with(op);
-      // Maintain the client-session request high-water as we apply (mirrors the primary's `commit_op`,
-      // minus the reply body a backup discards). This is the at-most-once dedup watermark a
+      // Maintain the client-session request high-water + CACHED REPLY as we apply (mirrors the
+      // primary's `commit_op`). The request watermark is the at-most-once dedup watermark a
       // backup-turned-primary needs in `on_request`. It MUST be tracked here on every apply — NOT
       // reconstructed from the `log` cache when becoming primary — because M3.4b GC prunes the `log`
       // below the checkpoint, so a backup whose log is empty (everything checkpointed+pruned) would
       // otherwise carry a stale `session.request` of 0 and wedge every client on the gap check
       // (`r.request() != session.request + 1`). The snapshot also restores these on recover/state-sync,
       // so the watermark survives both GC and a checkpoint restore.
+      //
+      // Caching the REPLY body here (not just the watermark) closes a real liveness gap: if a client's
+      // reply is LOST in flight and then the primary fails over, the new primary (this former backup)
+      // sees the client's resend as a duplicate (`request == session.request`) and must resend the
+      // cached reply — but the OLD code cached the reply only on the primary's `commit_op`, so a
+      // backup-turned-primary had `session.reply == None` and stayed SILENT, hanging the client forever
+      // even though a healthy quorum exists. The reply is the SM's deterministic apply output, so every
+      // replica that applies the op can cache it (it survives the failover; for an op recovered via a
+      // checkpoint snapshot the dedup watermark still gates correctness, and the recent above-checkpoint
+      // ops that a lost reply concerns are always applied through here).
       let session = self.clients.entry(entry.client.get()).or_default();
       if entry.request.get() > session.request.get() {
         session.request = entry.request;
+        session.reply = Some((entry.request, reply.clone()));
       }
       self
         .events
@@ -2765,6 +3188,39 @@ impl<S: StateMachine> Endpoint<S> {
     }
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(sb);
+  }
+
+  /// Solicit committed ops that sit strictly ABOVE this replica's head — the band
+  /// `(max(self.op, checkpoint_op) .. commit_max]` — from peers via `RequestPrepare`, so they arrive as
+  /// ordinary `Prepare`s through [`Self::on_prepare`]'s append path (advancing the head + draining the
+  /// buffer). Closes a real liveness gap: the primary's prepare-retransmit only covers
+  /// `(commit_min_primary .. op_primary]` ([`Self::primary_timeouts`]), so a BACKUP whose head fell
+  /// BELOW the primary's `commit_min` (it missed those Prepares while briefly behind) never receives the
+  /// committed band `(head .. commit_min_primary]`: those ops are `<= commit_min_primary` (never
+  /// retransmitted), ABOVE the cluster checkpoint (so the `> self.op` state-sync trigger is FALSE — not
+  /// snapshot-only), and ABOVE its own head (so `advance_commit`'s apply loop can never reach them).
+  /// Without this it stalls at its head forever — and if it is in the only surviving quorum (another
+  /// replica crashed), the WHOLE cluster stalls (no caught-up quorum can form). Observed deterministically
+  /// under the M3 fault envelope (a laggard crashed while two backups were transiently behind).
+  ///
+  /// Self-driven + self-retrying: called on every `Commit`/`Prepare` from the primary (heartbeats every
+  /// `COMMIT_HEARTBEAT`), so it re-solicits until the head catches up — no dedicated timer, and it works
+  /// even when the primary's pipeline is idle (`commit_min == op`, so its prepare-retransmit is off).
+  /// The requested ops are NOT registered in `self.repair` (that path is for BELOW-head holes and does
+  /// not advance the head) — the answering `Prepare` flows through the normal append path instead. A
+  /// peer holding the op unpruned (the primary holds the whole `(checkpoint .. op]` band) answers via
+  /// `on_request_prepare`. Below the checkpoint is state-sync territory ([`Self::maybe_request_sync`]),
+  /// so only the above-checkpoint portion is requested. No-op for the primary, while syncing, or when
+  /// caught up (`commit_max <= self.op`). Bounded by `commit_max - max(op, checkpoint)`.
+  fn request_tail_gap(&mut self) {
+    if !self.status.is_normal() || self.is_primary() || self.sync.is_some() {
+      return;
+    }
+    let lo = self.op.get().max(self.checkpoint_op.get()) + 1;
+    let hi = self.commit_max.get();
+    for op in lo..=hi {
+      self.send_request_prepare(op);
+    }
   }
 
   fn on_prepare_ok<B: Superblock>(&mut self, now: Instant, sb: &mut B, ok: PrepareOk) {
@@ -2781,12 +3237,15 @@ impl<S: StateMachine> Endpoint<S> {
     // Record this backup's reported checkpoint for the checkpoint-quorum (the range check above
     // guards the key). Independent of inflight: even an ok for an op we no longer track still
     // carries a fresh checkpoint report. Drives `quorum_checkpoint_op` → the GC prune floor.
-    self
-      .peer_checkpoint
-      .insert(ok.replica().get(), ok.checkpoint_op());
+    // MONOTONE: a reordered older report must never lower the recorded value (the GC floor and the
+    // force-sync trigger that read it must not regress under reordering/partitions).
+    self.record_peer_checkpoint(ok.replica().get(), ok.checkpoint_op());
     // State-sync trigger (symmetric): a backup reporting a checkpoint above our head means we are the
     // laggard (e.g. a partition-healed old primary). The `> self.op` gate keeps this a no-op normally.
     self.maybe_request_sync(now, ok.checkpoint_op());
+    // Force-sync escalation (M3.5): a fresh quorum-checkpoint report may have just crossed a `repair`
+    // hole we hold, rendering its `RequestPrepare` futile (the op is pruned everywhere on the quorum).
+    self.maybe_force_sync(now);
     if let Some(inflight) = self.inflight.get_mut(&ok.op().get()) {
       inflight.oks |= 1u64 << ok.replica().get();
     }
@@ -2805,14 +3264,22 @@ impl<S: StateMachine> Endpoint<S> {
     self.note_primary_contact(now);
     // Record the primary's reported checkpoint. Harmless on a backup (only the primary reads
     // `peer_checkpoint` for GC), but it pre-seeds the map so a backup-turned-primary starts with the
-    // primary's last-known checkpoint rather than 0. Bounded by `replica_count`.
-    self
-      .peer_checkpoint
-      .insert(self.config.primary(self.view).get(), c.checkpoint_op());
+    // primary's last-known checkpoint rather than 0. Bounded by `replica_count`. MONOTONE: a
+    // reordered older Commit must never lower the recorded value (so the force-sync trigger this
+    // backup reads via `quorum_checkpoint_op` does not regress under reordering/partitions).
+    self.record_peer_checkpoint(self.config.primary(self.view).get(), c.checkpoint_op());
     // State-sync trigger: if the cluster has checkpointed past our WAL head, solicit a SyncCheckpoint
     // (the ops we'd need are below the cluster checkpoint and may be pruned — tail-apply can't reach).
     self.maybe_request_sync(now, c.checkpoint_op());
+    // Force-sync escalation (M3.5): the primary's just-recorded checkpoint may have crossed a `repair`
+    // hole we hold below it (pruned everywhere on the quorum) → escalate to a forced `RequestSync`.
+    self.maybe_force_sync(now);
     self.advance_commit(now, sb, c.commit().get());
+    // Tail-gap repair: if the primary's commit is ABOVE our head (committed ops we are missing, above
+    // the cluster checkpoint), solicit them via `RequestPrepare` — the primary's retransmit (only
+    // `commit_min+1..=op`) never re-sends a committed op below its own commit_min, so a backup that fell
+    // behind would otherwise be stranded at its head. Self-retrying on each heartbeat until caught up.
+    self.request_tail_gap();
   }
 
   /// Pulls the next message to send, if any.
@@ -2841,6 +3308,9 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.recover_head,
       self.timers.repair_retry,
       self.timers.sync_solicit,
+      // M3.5 T3: the forfeit grace deadline must wake the owner so a stuck primary re-evaluates and
+      // steps down promptly when the window elapses (not just on the next heartbeat tick).
+      self.forfeit_armed,
     ]
     .into_iter()
     .flatten()
@@ -3331,6 +3801,107 @@ mod tests {
     // op=1 arrives: append 1, then drain buffered op 2.
     e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
     assert_eq!(e.op(), OpNumber::with(2));
+  }
+
+  #[test]
+  fn backup_caches_the_reply_so_a_backup_turned_primary_can_resend_it() {
+    // REGRESSION (the lost-reply-across-failover hang the M3 sweep exposed): the primary caches each
+    // committed reply (`commit_op`), but a BACKUP used to discard it. So if a client's reply was LOST
+    // in flight and the primary then failed over, the new primary (a former backup) saw the client's
+    // resend as a duplicate (`request == session.request`) yet had NO cached reply to resend — staying
+    // SILENT and hanging the client forever, even with a healthy quorum. The fix caches the reply on
+    // the backup's apply path too (it is the SM's deterministic output). Here: a backup applies op 1
+    // (client 7, request 1) and must hold its cached reply.
+    let mut e = backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // Prepare op 1 (client 7, request 1), make it durable, then Commit to apply it.
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+    );
+    assert_eq!(e.commit(), OpNumber::with(1), "the backup applied op 1");
+    // The backup cached the reply for client 7's request 1 — so once it becomes primary it can resend
+    // it on a duplicate request (NoopSm's reply body is empty, but the cache ENTRY must be present and
+    // keyed to request 1, which is what the duplicate-resend path checks).
+    let cached = e.session_reply_for_test(7);
+    assert!(
+      cached.is_some(),
+      "a backup must cache the committed reply (so a backup-turned-primary can resend a lost reply)"
+    );
+    assert_eq!(
+      cached.unwrap().0,
+      1,
+      "the cached reply is keyed to the applied request number"
+    );
+  }
+
+  #[test]
+  fn backup_below_primary_commit_solicits_the_committed_tail_gap() {
+    // REGRESSION (the backup tail-gap liveness bug): a backup whose head fell BELOW the primary's
+    // commit_min is missing committed ops that are ABOVE the cluster checkpoint (so the `> self.op`
+    // state-sync trigger is FALSE) yet ABOVE its head (so advance_commit can't reach them). The
+    // primary's prepare-retransmit only covers `commit_min+1..=op`, so it never re-sends them. Without
+    // a backup-side solicitation the backup stalls at its head forever (and can wedge the whole cluster
+    // if it is in the only surviving quorum). The fix: on hearing a Commit whose commit is above our
+    // head, solicit the band `(head .. commit]` via RequestPrepare so it arrives as ordinary Prepares.
+    let mut e = backup();
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+
+    // Bring the backup to head op 2 (append 1, 2 via in-order Prepares; commit stays 0).
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 0));
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(e.op(), OpNumber::with(2));
+    while e.poll_message().is_some() {} // drain the acks
+
+    // A Commit learns the primary committed up to op 5 (checkpoint still 2, so 3,4,5 are above the
+    // checkpoint — NOT snapshot-only). The backup holds only up to op 2 → it must solicit 3,4,5.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(5),
+        OpNumber::with(2),
+      )),
+    );
+    // It does NOT advance commit past its head (it lacks 3,4,5) and does NOT state-sync (head >= ckpt).
+    assert_eq!(
+      e.commit(),
+      OpNumber::with(2),
+      "commit is held at the head until the gap fills"
+    );
+    // It solicits exactly the committed tail-gap (3,4,5) via RequestPrepare — NOT a state-sync.
+    let mut requested = std::collections::BTreeSet::new();
+    let mut saw_request_sync = false;
+    while let Some(out) = e.poll_message() {
+      match out.into_msg() {
+        Message::RequestPrepare(rp) => {
+          requested.insert(rp.op().get());
+        }
+        Message::RequestSync(_) => saw_request_sync = true,
+        _ => {}
+      }
+    }
+    assert_eq!(
+      requested,
+      [3, 4, 5].into_iter().collect(),
+      "the backup solicits exactly the committed tail-gap (3,4,5) above its head"
+    );
+    assert!(
+      !saw_request_sync,
+      "the gap is above the cluster checkpoint → ordinary tail-gap repair, not a state-sync"
+    );
   }
 
   #[test]
@@ -4425,6 +4996,96 @@ mod tests {
     // The new view is persisted before participation; pump the durable-view write, then it re-acks.
     r.handle_storage(now, &mut wal, &mut sb);
     assert_eq!(sb.state().view(), View::new());
+  }
+
+  #[test]
+  fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
+    // REGRESSION (the empty-body divergence the M3 sweep exposed): a replica that recovers with BOTH a
+    // faulty HEAD slot (→ RecoveringHead) AND a faulty NON-head committed slot must STILL drop the
+    // non-head slot from its `log` cache (it holds only an EMPTY placeholder body from recover Phase 1).
+    // Otherwise, when it later adopts a canonical head whose (offset) log OMITS that slot, `adopt_log`
+    // PRESERVES the empty-bodied held copy, `adopt_canonical_head` retires its repair hole (it is now
+    // "held"), and `advance_commit` applies it with the EMPTY body — diverging a committed op. The fix
+    // drops every faulty slot from the cache on the RecoveringHead path and registers the non-head ones
+    // as repair holes, so adoption keeps the hole and the commit is HELD until a peer serves the op.
+    let mut wal = ScriptedWal::with_entries(4);
+    wal.script_read_fault(OpNumber::with(4), u8::MAX); // faulty HEAD → RecoveringHead
+    wal.script_read_fault(OpNumber::with(2), u8::MAX); // faulty NON-head committed slot (empty in cache)
+    let mut sb = TestSb::default();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(
+      Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+      0,
+      CountSm::default(),
+      &mut wal,
+      &mut sb,
+    );
+    for _ in 0..32 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if r.status() != Status::Recovering {
+        break;
+      }
+    }
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "faulty head → RecoveringHead"
+    );
+    while r.poll_message().is_some() {} // discard the Recovery solicitation
+
+    // Adopt a StartView from the view-0 primary (replica 0): canonical head op 4, commit 4, but an
+    // OFFSET log carrying only ops 3,4 — it OMITS op 2 (modelling a primary whose log starts above 2).
+    let sv = StartView::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      ReplicaId::new(0),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(3),
+          ClientId::new(7),
+          RequestNumber::with(3),
+          bytes::Bytes::copy_from_slice(&[3u8]),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(4),
+          ClientId::new(7),
+          RequestNumber::with(4),
+          bytes::Bytes::copy_from_slice(&[4u8]),
+        ),
+      ],
+    );
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::StartView(sv),
+    );
+
+    // Op 2 was NOT resurrected from the empty placeholder: the commit is HELD at 1 (op 2 is a repair
+    // hole the canonical log did not supply), and op 2 is solicited — it is NEVER applied empty.
+    assert!(
+      r.has_repair_hole_for_test(2),
+      "the faulty non-head committed op stays a repair hole after adoption (not resurrected empty)"
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(1),
+      "the commit is HELD below the unfilled hole (op 2), never advanced over an empty body"
+    );
+    // CRUCIAL: no op was ever applied with an empty body (the divergence signature).
+    for (op, body) in r.state_machine().applied() {
+      assert!(
+        !body.is_empty(),
+        "op {op} was applied with an EMPTY body — the committed-op divergence this guards against"
+      );
+    }
+    // And op 2 specifically is not applied at all yet (held).
+    assert!(
+      !r.state_machine().applied().iter().any(|(op, _)| *op == 2),
+      "op 2 is not applied until a verified body arrives"
+    );
   }
 
   #[test]
@@ -5796,6 +6457,89 @@ mod tests {
     );
   }
 
+  // ── M3.5 T1: monotone peer_checkpoint ──
+
+  #[test]
+  fn peer_checkpoint_is_monotone_under_reordering() {
+    // A primary records a peer's checkpoint_op, then a REORDERED older report arrives. The recorded
+    // value must NOT regress — the GC floor + the force-sync trigger that read `quorum_checkpoint_op`
+    // all rely on monotone per-peer checkpoints (a regressing floor could un-fire the escalation).
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 1, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    assert!(ep.is_primary(), "replica 0 is the view-0 primary");
+    // A PrepareOk from replica 1 reporting checkpoint_op = 8.
+    ep.handle_message(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::PrepareOk(PrepareOk::new(
+        View::new(),
+        OpNumber::with(1),
+        ReplicaId::new(1),
+        OpNumber::with(8),
+      )),
+    );
+    assert_eq!(ep.peer_checkpoint_for_test(1), 8);
+    // A REORDERED older PrepareOk from replica 1 reporting checkpoint_op = 4 — must NOT regress.
+    ep.handle_message(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::PrepareOk(PrepareOk::new(
+        View::new(),
+        OpNumber::with(1),
+        ReplicaId::new(1),
+        OpNumber::with(4),
+      )),
+    );
+    assert_eq!(
+      ep.peer_checkpoint_for_test(1),
+      8,
+      "a reordered older report must not regress the recorded peer checkpoint"
+    );
+  }
+
+  #[test]
+  fn on_commit_records_the_primary_checkpoint_monotonically() {
+    // The backup-side record path (`on_commit`) is likewise monotone: a reordered older Commit from
+    // the primary must not lower the recorded primary checkpoint.
+    let mut e = sync_backup(); // replica 1 of 3, primary is replica 0
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(0),
+        OpNumber::with(6),
+      )),
+    );
+    assert_eq!(e.peer_checkpoint_for_test(0), 6);
+    // A reordered older Commit (checkpoint 2) must not regress the recorded value.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(0),
+        OpNumber::with(2),
+      )),
+    );
+    assert_eq!(
+      e.peer_checkpoint_for_test(0),
+      6,
+      "a reordered older Commit must not regress the recorded primary checkpoint"
+    );
+  }
+
   // ── State-sync (M3.4a) ──
 
   /// Drive a real 3-replica primary (replica 0) to a DURABLE checkpoint at `ckpt`, returning the
@@ -6422,6 +7166,423 @@ mod tests {
       "the hole below the synced point is subsumed + cleared"
     );
     assert!(e.timers.repair_retry.is_none(), "repair timer stopped");
+  }
+
+  // ── M3.5 T2: force-state-sync escalation ───────────────────────────────────────────────────────
+
+  #[test]
+  fn a_pruned_committed_hole_forces_a_state_sync() {
+    // A Normal BACKUP (replica 1 of 3) holds a repair hole at op N=2 with a head ABOVE it (op=4),
+    // where a QUORUM has checkpointed past N (so RequestPrepare is futile — the op is pruned on the
+    // quorum). It must (a) clear the doomed hole, (b) emit a RequestSync (not just RequestPrepare),
+    // (c) record a FORCED sync targeting the quorum checkpoint.
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 7, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    // Normal-backup state: head op 4, commit held at 1, own checkpoint 0, a committed hole at op 2.
+    ep.force_state_for_test(0, 4, 1, 0, &[2]);
+    assert!(!ep.is_primary());
+    assert!(ep.has_repair_hole_for_test(2), "the hole is registered");
+    // Teach it a QUORUM (2 of 3) has checkpointed past N=2: peers 0 and 2 report checkpoint_op = 4.
+    // (self reports 0; the 2nd-highest of {0,4,4} = 4 >= N=2 → the hole is snapshot-only.)
+    ep.inject_peer_checkpoint_for_test(0, 4);
+    ep.inject_peer_checkpoint_for_test(2, 4);
+    assert_eq!(
+      ep.quorum_checkpoint_op(),
+      OpNumber::with(4),
+      "the quorum-checkpoint floor is 4 (>= the hole at 2)"
+    );
+    // Drive a real checkpoint report (a Commit from the primary, replica 0) so the production
+    // `on_commit` → `maybe_force_sync` path runs the escalation.
+    ep.handle_message(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(1),
+        OpNumber::with(4),
+      )),
+    );
+    // (a) the doomed hole is cleared, and its retry timer stopped.
+    assert!(
+      !ep.has_repair_hole_for_test(2),
+      "the snapshot-only hole at N=2 is cleared"
+    );
+    assert!(
+      ep.timers.repair_retry.is_none(),
+      "the futile repair retransmit is stopped"
+    );
+    // (c) a FORCED sync to the quorum checkpoint (4) is recorded.
+    assert_eq!(
+      ep.sync_target_for_test(),
+      Some(4),
+      "the forced sync targets the quorum checkpoint"
+    );
+    assert!(
+      ep.sync_is_forced_for_test(),
+      "the sync is marked forced (the assert-relaxation path)"
+    );
+    // (b) a RequestSync was emitted (not merely a RequestPrepare).
+    let mut saw_request_sync = false;
+    let mut saw_request_prepare = false;
+    while let Some(out) = ep.poll_message() {
+      match out.msg_ref() {
+        Message::RequestSync(_) => saw_request_sync = true,
+        Message::RequestPrepare(_) => saw_request_prepare = true,
+        _ => {}
+      }
+    }
+    assert!(
+      saw_request_sync,
+      "a RequestSync is solicited instead of looping RequestPrepare"
+    );
+    let _ = saw_request_prepare; // an earlier futile RequestPrepare may have been emitted before the escalation
+    // SAFETY: the commit frontier did NOT advance past the hole — it stays at N-1 until the snapshot
+    // (>= N) is applied. No committed op is abandoned; it is recovered from the synced snapshot.
+    assert_eq!(
+      ep.commit(),
+      OpNumber::with(1),
+      "no commit advances past the hole until the forced snapshot lands"
+    );
+  }
+
+  #[test]
+  fn force_sync_does_not_fire_when_the_op_is_still_peer_repairable() {
+    // The escalation must NOT pre-empt the cheap single-op repair when the hole is still IN-REACH —
+    // i.e. NO peer has checkpointed past it, so every reporter may still hold it as a servable prepare.
+    // Here the only peer report (replica 0) is a checkpoint BELOW the hole (N=4, primary checkpoint=3),
+    // so the max-peer floor stays below N → no force-sync.
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 7, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    // Head op 6, commit held at 3, own checkpoint 0, a committed hole at op 4.
+    ep.force_state_for_test(0, 6, 3, 0, &[4]);
+    // The primary (replica 0) reports a checkpoint of 3 — BELOW the hole at 4. The max-peer floor is
+    // max{self=0, r0=3} = 3 < N=4 → the hole is still in-reach (the primary has NOT pruned op 4, so a
+    // RequestPrepare can still be answered) → no force-sync.
+    ep.handle_message(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(3),
+        OpNumber::with(3),
+      )),
+    );
+    assert_eq!(
+      ep.max_peer_checkpoint_op(),
+      OpNumber::with(3),
+      "the max-peer floor (3) stays below the hole (4)"
+    );
+    // The hole is RETAINED (still peer-repairable) and NO sync is armed.
+    assert!(
+      ep.has_repair_hole_for_test(4),
+      "an in-reach hole keeps using ordinary RequestPrepare repair"
+    );
+    assert_eq!(
+      ep.sync_target_for_test(),
+      None,
+      "no forced sync is armed while no peer has pruned the op (it may still be served)"
+    );
+    assert!(
+      ep.timers.repair_retry.is_some(),
+      "the repair retransmit timer stays armed"
+    );
+  }
+
+  #[test]
+  fn force_sync_fires_on_a_backup_that_only_hears_the_primary() {
+    // REGRESSION (the backup-visibility bug): a Normal BACKUP only ever records the PRIMARY's
+    // checkpoint (PrepareOks flow to the primary, never between backups), so `quorum_checkpoint_op`
+    // is structurally pinned at ~0 on a backup. The escalation MUST key on the max single-peer
+    // checkpoint instead — otherwise a backup stuck on a pruned committed hole below the cluster
+    // checkpoint (head above it) hangs at `commit_min == N-1` forever. Here a SINGLE peer report (the
+    // primary's Commit, checkpoint=8) past the hole (N=2) is enough to force the sync.
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 7, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    // Head op 10 (ABOVE the cluster checkpoint, so the ORDINARY `> self.op` sync stays FALSE — this is
+    // the precise force-sync regime), commit held at 1, own checkpoint 0, a committed hole at op 2.
+    ep.force_state_for_test(0, 10, 1, 0, &[2]);
+    assert!(!ep.is_primary());
+    // Only the primary (replica 0) reports — exactly a backup's real visibility. quorum_checkpoint_op
+    // is still 0 here (only self + one peer report), proving the OLD quorum-gated trigger could never
+    // have fired; the max-peer floor (8) is what rescues it. The primary's checkpoint (8) is BELOW the
+    // head (10), so `maybe_request_sync` (`8 > 10`?) does NOT fire — ONLY the forced path can.
+    ep.handle_message(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(1),
+        OpNumber::with(8),
+      )),
+    );
+    assert_eq!(
+      ep.quorum_checkpoint_op(),
+      OpNumber::with(0),
+      "the quorum-th floor is 0 on a backup (only the primary reports) — the OLD trigger was dead here"
+    );
+    assert!(
+      !ep.has_repair_hole_for_test(2),
+      "the snapshot-only hole is cleared via the max-peer floor (the backup no longer hangs)"
+    );
+    assert_eq!(
+      ep.sync_target_for_test(),
+      Some(8),
+      "the forced sync targets the primary's reported checkpoint"
+    );
+    assert!(ep.sync_is_forced_for_test(), "the sync is marked forced");
+  }
+
+  #[test]
+  fn force_sync_stays_dormant_until_a_quorum_floor_is_known() {
+    // Empty repair set, or no quorum-checkpoint floor → the escalation is a no-op (it must never fire
+    // spuriously). With a hole but a zero floor (partitioned: no peers heard), it stays dormant.
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 7, NoopSm);
+    // No holes at all → maybe_force_sync is a no-op.
+    ep.maybe_force_sync(Instant::ZERO);
+    assert_eq!(ep.sync_target_for_test(), None);
+    // A hole but no quorum floor (no peer reports) → still dormant.
+    ep.force_state_for_test(0, 4, 1, 0, &[2]);
+    ep.maybe_force_sync(Instant::ZERO);
+    assert!(
+      ep.has_repair_hole_for_test(2),
+      "the hole survives — no floor means no escalation"
+    );
+    assert_eq!(
+      ep.sync_target_for_test(),
+      None,
+      "no sync armed without a quorum floor"
+    );
+  }
+
+  #[test]
+  fn forced_sync_discards_a_held_tail_above_the_checkpoint_without_panic() {
+    // A forced sync where checkpoint_op (3) <= self.op (5): the held tail (3..5] is discarded. The
+    // ordinary-path assert (checkpoint_op > self.op) AND the `<= self.op` drop guard would BOTH reject
+    // it; the forced path must apply it without panic, rewinding the head to 3 and advancing commit.
+    let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(3);
+    let (env, id) = donor_envelope(&dsb);
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 1, CountSm::default());
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    // A backup holding a tail at op 5, commit at 1, a committed hole at 2, own checkpoint 0.
+    ep.force_state_for_test(0, 5, 1, 0, &[2]);
+    ep.arm_forced_sync_for_test(3); // self.sync = Some { target: 3, forced: true }
+    let nonce = ep.sync_nonce_for_test();
+    // A valid SyncCheckpoint at op 3 (id matches its bytes) — must apply, not panic.
+    ep.handle_message(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(3),
+        id,
+        ReplicaId::new(0),
+        nonce,
+        env,
+      )),
+    );
+    ep.handle_storage(Instant::ZERO, &mut wal, &mut sb); // drive the durable re-persist
+    assert_eq!(
+      ep.op(),
+      OpNumber::with(3),
+      "head rewound to the synced checkpoint"
+    );
+    assert_eq!(
+      ep.commit(),
+      OpNumber::with(3),
+      "the applied frontier advanced to the synced point (past the old hole at 2)"
+    );
+    assert_eq!(
+      ep.checkpoint_op(),
+      OpNumber::with(3),
+      "synced checkpoint adopted"
+    );
+    assert!(
+      !ep.has_repair_hole_for_test(2),
+      "the pruned committed hole is subsumed by the snapshot"
+    );
+    assert_eq!(
+      ep.state_syncs_applied(),
+      1,
+      "the forced sync routed through apply_sync → the durable re-persist completed"
+    );
+  }
+
+  // ── M3.5 T3: forfeit — a lagging primary steps down via a view change ───────────────────────────
+
+  #[test]
+  fn a_lagging_primary_forfeits_after_the_grace_period() {
+    // Primary (replica 0 of 3), checkpoint_ops=4 ⇒ forfeit lag bound = 4. A quorum reports
+    // checkpoint_op = 8 while the primary's own checkpoint_op stays 0 (it is stuck — repairing/
+    // syncing while the cluster raced ahead). After the grace period the primary must FORFEIT by
+    // PROPOSING a view change (broadcast StartViewChange for view 1) via the SVC machinery — NOT a
+    // unilateral view jump (it stays in its own view until a real SVC quorum forms).
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 1, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    assert!(ep.is_primary());
+    // Two peers report checkpoint_op = 8 (a quorum of 2-of-3 incl. neither self) → the primary's
+    // own checkpoint (0) lags the quorum checkpoint (8) by 8 >= the bound 4.
+    ep.inject_peer_checkpoint_for_test(1, 8);
+    ep.inject_peer_checkpoint_for_test(2, 8);
+    assert_eq!(
+      ep.quorum_checkpoint_op(),
+      OpNumber::with(8),
+      "the quorum-checkpoint floor is 8, a full interval beyond the primary's 0"
+    );
+    // First primary timeout ARMS the grace timer but does NOT forfeit yet (anti-storm: a transient
+    // lag must persist for the grace window before the primary steps down).
+    ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+    assert!(
+      ep.forfeit_armed_for_test(),
+      "the lagging primary armed the forfeit grace timer"
+    );
+    assert_eq!(
+      ep.view().get(),
+      0,
+      "no forfeit before the grace period elapses (no SVC yet)"
+    );
+    let mut saw_svc_before_grace = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::StartViewChange(svc) = out.into_msg() {
+        if svc.view().get() == 1 {
+          saw_svc_before_grace = true;
+        }
+      }
+    }
+    assert!(
+      !saw_svc_before_grace,
+      "the primary must NOT propose a view change before the grace period elapses"
+    );
+    // Advance past the grace period (300ms) and tick again → forfeit: it proposes view 1 (SVC).
+    let later = Instant::ZERO + core::time::Duration::from_millis(400);
+    ep.handle_timeout(later, &mut wal, &mut sb);
+    let mut saw_svc_view1 = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::StartViewChange(svc) = out.into_msg() {
+        if svc.view().get() == 1 {
+          saw_svc_view1 = true;
+        }
+      }
+    }
+    assert!(
+      saw_svc_view1,
+      "a stuck primary forfeits by PROPOSING the next view (StartViewChange for view 1), not a unilateral jump"
+    );
+    assert!(
+      !ep.forfeit_armed_for_test(),
+      "the grace timer is disarmed once the forfeit fires (no same-view re-forfeit)"
+    );
+  }
+
+  #[test]
+  fn a_healthy_primary_never_forfeits() {
+    // The primary keeps pace: its own checkpoint advances in step with the quorum's. The forfeit
+    // condition (lag >= a full checkpoint interval) is never satisfied, so the grace timer never
+    // arms and no view change is ever proposed — the anti-storm guarantee in steady state.
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 1, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    assert!(ep.is_primary());
+    ep.set_own_checkpoint_for_test(8); // the primary's own checkpoint is current
+    ep.inject_peer_checkpoint_for_test(1, 8);
+    ep.inject_peer_checkpoint_for_test(2, 8); // quorum checkpoint 8 == own 8 → lag 0 < bound 4
+    for ms in [0u64, 400, 800] {
+      ep.handle_timeout(
+        Instant::ZERO + core::time::Duration::from_millis(ms),
+        &mut wal,
+        &mut sb,
+      );
+      assert!(
+        !ep.forfeit_armed_for_test(),
+        "forfeit grace is never armed for a healthy primary (ms={ms})"
+      );
+    }
+    assert_eq!(ep.view().get(), 0, "a healthy primary never forfeits");
+    let mut saw_svc = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::StartViewChange(_) = out.into_msg() {
+        saw_svc = true;
+      }
+    }
+    assert!(
+      !saw_svc,
+      "a healthy primary never proposes a forfeit-driven view change"
+    );
+  }
+
+  #[test]
+  fn a_backup_never_forfeits_even_when_behind() {
+    // A BACKUP (replica 1) far behind the quorum checkpoint must NOT forfeit — forfeit is a PRIMARY
+    // stepping aside; a behind backup catches up via state-sync/force-sync. The forfeit check lives
+    // only on the primary path (primary_timeouts), so the backup never arms it.
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 1, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    assert!(!ep.is_primary());
+    ep.inject_peer_checkpoint_for_test(0, 8);
+    ep.inject_peer_checkpoint_for_test(2, 8);
+    for ms in [0u64, 400, 800] {
+      ep.handle_timeout(
+        Instant::ZERO + core::time::Duration::from_millis(ms),
+        &mut wal,
+        &mut sb,
+      );
+    }
+    assert!(
+      !ep.forfeit_armed_for_test(),
+      "a backup never arms forfeit (forfeit is exclusively a primary stepping aside)"
+    );
+  }
+
+  #[test]
+  fn a_transiently_lagging_primary_recovers_and_disarms_without_forfeiting() {
+    // Anti-storm: a primary that briefly lags (arming the grace timer) but CATCHES UP before the
+    // grace elapses must DISARM and never forfeit. Models a primary that was momentarily behind on
+    // checkpoint, then checkpointed in step with the cluster within the grace window.
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
+    let mut ep = Endpoint::new(cfg, 1, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    assert!(ep.is_primary());
+    ep.inject_peer_checkpoint_for_test(1, 8);
+    ep.inject_peer_checkpoint_for_test(2, 8); // quorum 8, own 0 → lag 8 >= 4 → arms
+    ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+    assert!(ep.forfeit_armed_for_test(), "the lag armed the grace timer");
+    // The primary catches its own checkpoint up to the quorum BEFORE the grace elapses.
+    ep.set_own_checkpoint_for_test(8); // lag now 0 < bound 4
+    let mid = Instant::ZERO + core::time::Duration::from_millis(100); // still within the 300ms grace
+    ep.handle_timeout(mid, &mut wal, &mut sb);
+    assert!(
+      !ep.forfeit_armed_for_test(),
+      "catching up disarms the grace timer (the transient lag does not forfeit)"
+    );
+    // Even well past the original grace deadline, no forfeit fires.
+    let later = Instant::ZERO + core::time::Duration::from_millis(400);
+    ep.handle_timeout(later, &mut wal, &mut sb);
+    assert_eq!(
+      ep.view().get(),
+      0,
+      "a primary that caught up never forfeits"
+    );
+    let mut saw_svc = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::StartViewChange(_) = out.into_msg() {
+        saw_svc = true;
+      }
+    }
+    assert!(!saw_svc, "no forfeit-driven view change after catch-up");
   }
 
   #[test]
