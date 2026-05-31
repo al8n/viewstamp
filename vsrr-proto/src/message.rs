@@ -689,16 +689,28 @@ pub struct RequestSync {
   checkpoint_op: OpNumber,
   replica: ReplicaId,
   nonce: u64,
+  recovery: bool,
 }
 
 impl RequestSync {
-  /// Creates a RequestSync advertising the requester's current (stale) `checkpoint_op`.
-  pub const fn new(view: View, checkpoint_op: OpNumber, replica: ReplicaId, nonce: u64) -> Self {
+  /// Creates a RequestSync advertising the requester's current (stale) `checkpoint_op`. `recovery` is
+  /// set only on the recovery peer-fetch escalation (a replica whose OWN durable checkpoint snapshot
+  /// read back permanently corrupt) — there a peer at the SAME `checkpoint_op` must still serve, since
+  /// the requester's local bytes are unusable; ordinary state-sync leaves it `false` (a peer answers
+  /// only with something strictly newer).
+  pub const fn new(
+    view: View,
+    checkpoint_op: OpNumber,
+    replica: ReplicaId,
+    nonce: u64,
+    recovery: bool,
+  ) -> Self {
     Self {
       view,
       checkpoint_op,
       replica,
       nonce,
+      recovery,
     }
   }
 
@@ -724,6 +736,15 @@ impl RequestSync {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn nonce(&self) -> u64 {
     self.nonce
+  }
+
+  /// `true` iff this is a RECOVERY peer-fetch (the requester's own durable checkpoint snapshot is
+  /// permanently unreadable). A peer at an EQUAL `checkpoint_op` serves a recovery request (the
+  /// requester needs the snapshot bytes even at the same op); an ordinary (`false`) state-sync request
+  /// is served only by a strictly-newer checkpoint.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn recovery(&self) -> bool {
+    self.recovery
   }
 }
 
@@ -1011,6 +1032,7 @@ mod tests {
       OpNumber::with(2),
       ReplicaId::new(3),
       0xBEEF,
+      false,
     ));
     assert!(rq.is_request_sync());
     let r = rq.unwrap_request_sync();
@@ -1018,6 +1040,16 @@ mod tests {
     assert_eq!(r.checkpoint_op(), OpNumber::with(2));
     assert_eq!(r.replica(), ReplicaId::new(3));
     assert_eq!(r.nonce(), 0xBEEF);
+    assert!(!r.recovery(), "ordinary state-sync request");
+    // A recovery peer-fetch sets the flag (a peer at an EQUAL checkpoint serves it).
+    let rec = RequestSync::new(
+      View::with(4),
+      OpNumber::with(2),
+      ReplicaId::new(3),
+      0xBEEF,
+      true,
+    );
+    assert!(rec.recovery());
 
     // The peer answers with the newer checkpoint: op, id, opaque snapshot, echoed nonce.
     let snap = Bytes::from_static(b"snapshot-envelope");
