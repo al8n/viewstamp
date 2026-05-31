@@ -70,3 +70,92 @@ fn committed_ops_survive_clean_crash_and_restart() {
     "restarted replica's committed prefix agrees with the primary"
   );
 }
+
+/// R4-F1 liveness: a PRIMARY crash + restart must not freeze the cluster.
+///
+/// Before the fix, a recovered primary resumed `Normal` with an EMPTY pipeline (`inflight`) and a
+/// session table only at `checkpoint_op`. It kept heartbeating `Commit(checkpoint_op)` (so backups
+/// never started a view change) while every re-acked `PrepareOk` dropped on the empty `inflight` —
+/// commit FROZE at `checkpoint_op` (a liveness deadlock), and a client request retried in
+/// `(checkpoint_op, op]` could execute twice. The fix abdicates the recovered primary to `view + 1`:
+/// the cluster runs a clean view change, rebuilds the pipeline via DVC collection, and makes
+/// progress; `on_request` returns early while not Normal, closing the double-execute hazard.
+///
+/// This crashes the primary and restarts it IMMEDIATELY (before the backups time out into their own
+/// view change), so the restarted replica recovers as the primary of its restored view and must
+/// abdicate. The cluster must then complete a view change AND advance commit past the pre-crash
+/// checkpoint, with no safety divergence.
+#[test]
+fn primary_crash_and_restart_does_not_freeze_commit() {
+  // checkpoint_ops = 2 so a checkpoint is reached during warm-up (the freeze, if any, pins commit at
+  // checkpoint_op > 0 — making the "commit advanced past checkpoint_op" assertion non-vacuous).
+  // 3 clients x 6 requests = 18 ops of work, far past the first checkpoint.
+  let mut c = Cluster::with_checkpoint_ops(3, 3, 6, /*seed*/ 7, /*checkpoint_ops*/ 2);
+
+  // Warm up until the primary (replica 0, view 0) has durably checkpointed at least once AND has
+  // uncommitted/committed ops beyond that checkpoint in its pipeline — so a recovered-primary freeze
+  // would be observable (commit stuck at checkpoint_op while ops above it exist).
+  let mut warm = false;
+  for _ in 0..50_000 {
+    c.tick();
+    if c.replica_checkpoint_op(0).get() >= 2
+      && c.replica_op(0).get() > c.replica_checkpoint_op(0).get()
+    {
+      warm = true;
+      break;
+    }
+  }
+  assert!(
+    warm,
+    "the primary checkpoints (>=2) and holds ops beyond the checkpoint before the crash"
+  );
+  assert!(
+    c.replica_is_primary(0),
+    "replica 0 leads view 0 before the crash"
+  );
+  let checkpoint_before = c.replica_checkpoint_op(0).get();
+
+  // Crash the primary and restart it IMMEDIATELY (before the backups escalate a view change), so it
+  // recovers AS the primary of view 0 and must abdicate rather than resume with an empty pipeline.
+  c.crash(0);
+  c.tick(); // a single tick: not enough for the backups' primary-idle to fire
+  c.restart(0);
+
+  // Liveness: the cluster must finish every client AND advance commit past the pre-crash checkpoint.
+  // Safety is checked every tick: an empty-body / diverged / double-executed op would trip it.
+  let mut done = false;
+  for _ in 0..400_000 {
+    c.tick();
+    assert_eq!(
+      check_safety(&c),
+      CheckResult::Ok,
+      "no divergence / double-execute across the primary crash + restart"
+    );
+    let clients_done = (0..c.client_count()).all(|i| c.client(i).is_done());
+    if clients_done {
+      done = true;
+      break;
+    }
+  }
+  assert!(
+    done,
+    "the cluster makes progress after a primary restart (no commit freeze at checkpoint_op)"
+  );
+
+  // A real view change occurred (the recovered ex-primary abdicated off view 0).
+  assert!(
+    c.any_replica_view_advanced_beyond(0),
+    "the recovered primary abdicated → the cluster advanced past view 0"
+  );
+
+  // Commit advanced strictly past the pre-crash checkpoint on a live replica — the deadlock is gone.
+  let max_commit = (0..c.replica_count())
+    .filter(|&i| !c.is_crashed(i))
+    .map(|i| c.replica_commit(i).get())
+    .max()
+    .unwrap_or(0);
+  assert!(
+    max_commit > checkpoint_before,
+    "commit advanced past the pre-crash checkpoint ({max_commit} > {checkpoint_before}), not frozen"
+  );
+}

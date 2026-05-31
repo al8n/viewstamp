@@ -1,7 +1,11 @@
 //! Deterministic in-memory `Wal`/`Superblock` impls for the DST harness.
 //!
 //! M3.0/M3.1: reliable + synchronous (each submit completes immediately into the
-//! completion queue). M3.3a adds **seeded** fault injection ([`StorageFaults`]): TRANSIENT WAL read
+//! completion queue). [`InMemoryWal::with_async_appends`] adds an OPT-IN async-append mode that
+//! STAGES each append as not-yet-durable for a seeded number of `poll`s — reopening the in-flight
+//! window a real `fsync`-between-ticks WAL has (and the synchronous default closes), which the
+//! append-before-ack invariant must survive (codex R7-F1). The default stays synchronous so existing
+//! gates are unaffected. M3.3a adds **seeded** fault injection ([`StorageFaults`]): TRANSIENT WAL read
 //! faults (each read independently rolls — a retry may succeed, exercising the proto's
 //! `Status::Recovering` retry loop), permanent torn writes (a flipped body byte ⇒ `Header::verify`
 //! fails on read-back), and permanent bit-rot (every read of the slot faults). All faults surface as
@@ -69,8 +73,38 @@ impl Default for StorageFaults {
   }
 }
 
+/// A staged, not-yet-durable append (async-append mode only). Submitted via `submit_append`, it
+/// becomes durable — moved into `entries`, with its `Appended` completion offered by `poll` — only
+/// after `remaining` `poll`s have ticked it down to zero. The torn/bit-rot verdict is decided at
+/// SUBMIT time (so the same seed reproduces it whether sync or async) and carried here: `body` is
+/// already the (possibly torn) bytes to store, and `rot` records whether the slot must land in
+/// `rotted` on completion. While staged, the slot is `SlotStatus::Dirty` and reads return `Absent`.
+#[derive(Debug, Clone)]
+struct PendingAppend {
+  /// Polls remaining before this append becomes durable (counts down in `poll`, releases at 0).
+  remaining: u32,
+  id: OpId,
+  op: u64,
+  header: Header,
+  /// The bytes to store on completion (already torn if the torn-write roll fired at submit time).
+  body: Bytes,
+  /// Whether to mark `op` permanently bit-rotted on completion (the bit-rot roll fired at submit).
+  rot: bool,
+}
+
 /// A seeded in-memory write-ahead log. With [`StorageFaults::none`] it is reliable + synchronous
 /// (M3.0/M3.1 behaviour); with faults it injects transient read faults + permanent torn/bit-rot.
+///
+/// # Async-append mode (opt-in, [`InMemoryWal::with_async_appends`])
+///
+/// By DEFAULT every `submit_append` completes SYNCHRONOUSLY (the entry is durable and its `Appended`
+/// completion is queued in the same call) — the M3.0/M3.1 behaviour all existing gates rely on.
+/// Async mode instead STAGES each append as not-yet-durable for a seeded number of `poll`s before it
+/// becomes durable, modelling a real WAL whose `fsync` lands between ticks rather than inline. This
+/// opens the window a real driver has — and the synchronous default closed — where the proto's head
+/// (`self.op`) has advanced past an op whose bytes are still in flight, which is exactly the state
+/// the append-before-ack invariant must hold across (codex R7-F1). It composes with the fault rolls:
+/// the torn/bit-rot verdict is still decided at submit time, just applied on completion.
 #[derive(Debug)]
 pub struct InMemoryWal {
   entries: BTreeMap<u64, (Header, Bytes)>,
@@ -84,6 +118,13 @@ pub struct InMemoryWal {
   /// Slots marked PERMANENTLY corrupt (bit-rot) at append time: every read faults, `status` reports
   /// `Faulty`, `header` reports `None`. Persists across restart (the struct survives crash/restart).
   rotted: BTreeSet<u64>,
+  /// `None` (default) ⇒ synchronous appends. `Some(d)` ⇒ async mode: each `submit_append` stages for
+  /// `d` `poll`s before becoming durable. `d == 0` releases on the very next `poll` (still NOT inline,
+  /// so the in-flight window still exists for at least one tick).
+  async_delay: Option<u32>,
+  /// Async mode: appends submitted but not yet durable, in submission order (a serial WAL writer
+  /// completes them FIFO). Empty in synchronous mode.
+  staged: VecDeque<PendingAppend>,
 }
 
 impl Default for InMemoryWal {
@@ -99,7 +140,7 @@ impl InMemoryWal {
   }
 
   /// Creates an empty WAL with a seeded fault plan. `seed` drives the transient read-fault rolls and
-  /// the per-append torn/bit-rot decisions deterministically.
+  /// the per-append torn/bit-rot decisions deterministically. Synchronous appends (no async delay).
   pub fn with_faults(faults: StorageFaults, seed: u64) -> Self {
     Self {
       entries: BTreeMap::new(),
@@ -108,7 +149,39 @@ impl InMemoryWal {
       faults,
       prng: Prng::new(seed),
       rotted: BTreeSet::new(),
+      async_delay: None,
+      staged: VecDeque::new(),
     }
+  }
+
+  /// Creates an empty, reliable WAL in **async-append mode**: every `submit_append` stages the entry
+  /// as not-yet-durable for `delay_ticks` `poll`s, then it becomes durable and `poll` yields its
+  /// `Appended`. Opt-in; the default ([`new`](Self::new)/[`with_faults`](Self::with_faults)) stays
+  /// synchronous so existing gates are unaffected. Until an append completes the slot is
+  /// [`SlotStatus::Dirty`] (never `Clean`) and a read of it returns `Absent` — modelling the in-flight
+  /// window a real async WAL has, where the proto's head has advanced past bytes not yet on disk
+  /// (codex R7-F1). `delay_ticks == 0` still defers to the next `poll` (never inline).
+  pub fn with_async_appends(delay_ticks: u32) -> Self {
+    let mut w = Self::with_faults(StorageFaults::none(), 0);
+    w.async_delay = Some(delay_ticks);
+    w
+  }
+
+  /// Enables async-append mode on an existing WAL with a seeded fault plan, so the in-flight window
+  /// composes with transient/permanent faults. Mirrors [`with_async_appends`](Self::with_async_appends)
+  /// but keeps the configured `faults`/`seed`.
+  pub fn with_async_appends_and_faults(faults: StorageFaults, seed: u64, delay_ticks: u32) -> Self {
+    let mut w = Self::with_faults(faults, seed);
+    w.async_delay = Some(delay_ticks);
+    w
+  }
+
+  /// Test-only: the number of staged (submitted-but-not-yet-durable) appends. `0` in synchronous
+  /// mode and whenever the async staging queue has drained. Lets a reproduction assert it is
+  /// genuinely exercising the in-flight window (an append is really pending when the re-ack fires).
+  #[doc(hidden)]
+  pub fn staged_len(&self) -> usize {
+    self.staged.len()
   }
 
   /// Test-only: the number of PERMANENTLY-corrupt slots in `1..=op` — bit-rotted (every read faults)
@@ -167,16 +240,22 @@ impl Wal for InMemoryWal {
       SlotStatus::Faulty
     } else if self.entries.contains_key(&op.get()) {
       SlotStatus::Clean
+    } else if self.staged.iter().any(|s| s.op == op.get()) {
+      // Async mode: a submitted-but-not-yet-durable append is DIRTY, never Clean — the bytes are not
+      // on disk yet, so the proto must not treat this slot as a durable voter copy (R7-F1).
+      SlotStatus::Dirty
     } else {
       SlotStatus::Empty
     }
   }
 
   fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+    // The fault verdict is decided HERE (at submit) in BOTH modes, so the same seed reproduces the
+    // same torn/bit-rot decisions whether appends are synchronous or staged. In async mode the
+    // verdict is merely carried on the staged entry and applied when it becomes durable.
     // PERMANENT bit-rot: mark the slot so every future read faults (and status/header report it).
-    if self.faults.bit_rot_per_mille > 0 && self.prng.chance(self.faults.bit_rot_per_mille, 1000) {
-      self.rotted.insert(op.get());
-    }
+    let rot =
+      self.faults.bit_rot_per_mille > 0 && self.prng.chance(self.faults.bit_rot_per_mille, 1000);
     // PERMANENT torn write: persist the ORIGINAL header with a corrupted body so `Header::verify`
     // fails on read-back. Never silently fix it — the proto's checksum chokepoint must detect it.
     let stored = if self.faults.torn_write_per_mille > 0
@@ -186,9 +265,28 @@ impl Wal for InMemoryWal {
     } else {
       body
     };
-    self.entries.insert(op.get(), (header, stored));
-    self.head = self.head.max(op.get());
-    self.completions.push_back(WalDone::Appended(id));
+    match self.async_delay {
+      // SYNCHRONOUS (default): durable immediately, completion queued in this call (M3.0/M3.1).
+      None => {
+        if rot {
+          self.rotted.insert(op.get());
+        }
+        self.entries.insert(op.get(), (header, stored));
+        self.head = self.head.max(op.get());
+        self.completions.push_back(WalDone::Appended(id));
+      }
+      // ASYNC: STAGE as not-yet-durable. `self.head`/`entries`/`rotted` are left untouched (so the
+      // slot reads `Dirty`/`Absent` and `op_head` does not yet count it) until `poll` releases it
+      // after `delay` ticks — opening the in-flight window the synchronous path never had (R7-F1).
+      Some(delay) => self.staged.push_back(PendingAppend {
+        remaining: delay,
+        id,
+        op: op.get(),
+        header,
+        body: stored,
+        rot,
+      }),
+    }
   }
 
   fn submit_read(&mut self, id: OpId, op: OpNumber) {
@@ -218,15 +316,39 @@ impl Wal for InMemoryWal {
     self.entries.retain(|&op, _| op <= above.get());
     // A truncated-away slot is no longer corrupt (it will be rewritten by a later append).
     self.rotted.retain(|&op| op <= above.get());
+    // Drop any staged (in-flight) append above the truncation point: those bytes are abandoned and
+    // must never later become durable above the new head (async mode only; a no-op otherwise).
+    self.staged.retain(|s| s.op <= above.get());
     self.head = self.head.min(above.get());
   }
 
   fn prune(&mut self, below: OpNumber) {
     self.entries.retain(|&op, _| op >= below.get());
     self.rotted.retain(|&op| op >= below.get());
+    // A staged append below the GC floor is moot; drop it (async mode only).
+    self.staged.retain(|s| s.op >= below.get());
   }
 
   fn poll(&mut self) -> Option<WalDone> {
+    // Async mode: tick the staged (in-flight) appends. A serial WAL writer completes them in
+    // submission order, so we count down the FRONT entry and make it durable when it reaches zero —
+    // at which point its bytes land in `entries`/`rotted` (the fault verdict taken at submit) and its
+    // `Appended` is queued. This is the ONLY place a staged append becomes durable: until then the
+    // slot is `Dirty`/`Absent` and the proto's head sits above not-yet-durable bytes (the R7-F1
+    // window). A no-op in synchronous mode (`staged` is always empty there).
+    if let Some(front) = self.staged.front_mut() {
+      if front.remaining == 0 {
+        let done = self.staged.pop_front().expect("front exists");
+        if done.rot {
+          self.rotted.insert(done.op);
+        }
+        self.entries.insert(done.op, (done.header, done.body));
+        self.head = self.head.max(done.op);
+        self.completions.push_back(WalDone::Appended(done.id));
+      } else {
+        front.remaining -= 1;
+      }
+    }
     self.completions.pop_front()
   }
 }
@@ -596,6 +718,190 @@ mod tests {
         Some(WalDone::ReadOk(r)) => assert!(r.header().verify(r.body())),
         other => panic!("no-faults WAL must always ReadOk a present slot, got {other:?}"),
       }
+    }
+  }
+
+  /// Submits (does NOT poll) an append at `op`, returning its `OpId` — for async-mode tests that must
+  /// observe the staged (in-flight) state before completion.
+  fn submit(w: &mut InMemoryWal, id: u64, op: u64, body: &'static [u8]) -> OpId {
+    let h = Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(1),
+      RequestNumber::with(op),
+      body,
+    );
+    let oid = OpId::new(id);
+    w.submit_append(oid, OpNumber::with(op), h, Bytes::from_static(body));
+    oid
+  }
+
+  #[test]
+  fn async_append_stays_dirty_until_the_delay_elapses_then_becomes_durable() {
+    // The core async-mode primitive (R7-F1 harness): a submitted append is NOT durable for `delay`
+    // polls — `status` is Dirty (never Clean), `op_head` does not count it, a read returns Absent, and
+    // `poll` yields no Appended — then exactly at the delay it becomes durable and `poll` yields it.
+    let mut w = InMemoryWal::with_async_appends(3);
+    let id = submit(&mut w, 1, 1, b"x");
+    assert_eq!(w.staged_len(), 1, "the append is staged, not yet durable");
+
+    // While in flight, the non-ticking inspectors (status/op_head/header) all report not-durable, and
+    // a read returns Absent. Verify the read FIRST (one poll for it — which also ticks 3→2).
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Dirty,
+      "in-flight: Dirty"
+    );
+    assert_eq!(
+      w.op_head(),
+      OpNumber::with(0),
+      "op_head ignores an in-flight slot"
+    );
+    assert!(
+      w.header(OpNumber::with(1)).is_none(),
+      "no readable header in flight"
+    );
+    w.submit_read(OpId::new(100), OpNumber::with(1));
+    assert!(
+      matches!(w.poll(), Some(WalDone::Absent(_))),
+      "a read of a staged slot returns Absent"
+    );
+    // `delay` was 3; one poll above ticked it to 2. Two more polls reach 0 WITHOUT releasing.
+    assert_eq!(
+      w.poll(),
+      None,
+      "still in flight (remaining 2→1): no Appended"
+    );
+    assert_eq!(
+      w.poll(),
+      None,
+      "still in flight (remaining 1→0): no Appended"
+    );
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Dirty,
+      "still Dirty at the boundary"
+    );
+    assert_eq!(w.staged_len(), 1, "still staged until the release poll");
+    // The next poll (remaining == 0) releases the append: it becomes durable and yields its Appended.
+    assert_eq!(
+      w.poll(),
+      Some(WalDone::Appended(id)),
+      "the staged append becomes durable and yields its Appended"
+    );
+    assert_eq!(w.staged_len(), 0, "the staging queue drained");
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Clean,
+      "now durable"
+    );
+    assert_eq!(w.op_head(), OpNumber::with(1));
+    w.submit_read(OpId::new(200), OpNumber::with(1));
+    match w.poll() {
+      Some(WalDone::ReadOk(r)) => {
+        assert_eq!(r.op(), OpNumber::with(1));
+        assert!(r.header().verify(r.body()));
+      }
+      other => panic!("a durable slot reads back ReadOk, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn async_delay_zero_still_defers_to_the_next_poll_never_inline() {
+    // `delay == 0` must NOT complete inline in `submit_append` (that would be the synchronous path):
+    // the in-flight window must exist for at least the gap until the next poll.
+    let mut w = InMemoryWal::with_async_appends(0);
+    let id = submit(&mut w, 1, 1, b"x");
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Dirty,
+      "delay=0 is still staged at submit time (not inline-durable)"
+    );
+    assert_eq!(
+      w.poll(),
+      Some(WalDone::Appended(id)),
+      "released on next poll"
+    );
+    assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Clean);
+  }
+
+  #[test]
+  fn async_appends_complete_in_submission_order() {
+    // A serial WAL writer: staged appends become durable FIFO. With delay=1, op1 releases, then op2.
+    let mut w = InMemoryWal::with_async_appends(1);
+    let id1 = submit(&mut w, 1, 1, b"a");
+    let id2 = submit(&mut w, 2, 2, b"b");
+    assert_eq!(w.staged_len(), 2);
+    assert_eq!(
+      w.poll(),
+      None,
+      "tick 1: op1 counts down from 1, nothing ready yet"
+    );
+    assert_eq!(w.poll(), Some(WalDone::Appended(id1)), "op1 durable first");
+    assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Clean);
+    assert_eq!(
+      w.status(OpNumber::with(2)),
+      SlotStatus::Dirty,
+      "op2 still in flight while op1's window closed"
+    );
+    assert_eq!(w.poll(), None, "op2 counts down from 1");
+    assert_eq!(w.poll(), Some(WalDone::Appended(id2)), "op2 durable second");
+    assert_eq!(w.op_head(), OpNumber::with(2));
+  }
+
+  #[test]
+  fn async_mode_composes_with_a_torn_write() {
+    // The torn-write verdict is taken at SUBMIT and applied on COMPLETION: while staged the slot is
+    // Dirty; once durable it carries the original header but a corrupt body (fails proto verify).
+    let mut w = InMemoryWal::with_async_appends_and_faults(
+      StorageFaults {
+        torn_write_per_mille: 1000,
+        ..StorageFaults::none()
+      },
+      1,
+      2,
+    );
+    submit(&mut w, 1, 1, b"intact");
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Dirty,
+      "staged: Dirty regardless of the (already-decided) torn verdict"
+    );
+    // Tick past the delay (delay=2 → 2 countdown polls, then release).
+    assert_eq!(w.poll(), None);
+    assert_eq!(w.poll(), None);
+    assert_eq!(w.poll(), Some(WalDone::Appended(OpId::new(1))));
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Clean,
+      "a torn slot is Clean (latent tear) once durable"
+    );
+    w.submit_read(OpId::new(9), OpNumber::with(1));
+    match w.poll() {
+      Some(WalDone::ReadOk(r)) => assert!(
+        !r.header().verify(r.body()),
+        "the durable torn body fails the proto's Header::verify"
+      ),
+      other => panic!("expected a (corrupt) ReadOk, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn sync_mode_is_the_default_and_unchanged() {
+    // The default constructors must NOT stage: an append is durable inline (existing-gate behaviour).
+    for mut w in [
+      InMemoryWal::new(),
+      InMemoryWal::with_faults(StorageFaults::none(), 7),
+    ] {
+      let id = submit(&mut w, 1, 1, b"x");
+      assert_eq!(w.staged_len(), 0, "default mode never stages");
+      assert_eq!(
+        w.status(OpNumber::with(1)),
+        SlotStatus::Clean,
+        "default append is durable inline"
+      );
+      assert_eq!(w.op_head(), OpNumber::with(1));
+      assert_eq!(w.poll(), Some(WalDone::Appended(id)));
     }
   }
 }
