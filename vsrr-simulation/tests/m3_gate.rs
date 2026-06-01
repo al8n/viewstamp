@@ -85,6 +85,7 @@ fn the_m3_gate_committed_ops_survive_everything() {
       read_fault_per_mille: 0,
       torn_write_per_mille: 150,
       bit_rot_per_mille: 150,
+      misdirect_read_per_mille: 0,
     });
 
     // Safety + boundedness, asserted EVERY tick in EVERY phase. (Liveness is asserted only in phase 4,

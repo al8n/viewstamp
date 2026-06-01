@@ -475,13 +475,28 @@ pub trait Wal {
 /// checkpoint root rolling back the durable view/commit. A backend with a single fsync'd superblock
 /// slot satisfies this naturally (as TigerBeetle's does); one that completes root writes out of
 /// order would violate VSR safety.
+///
+/// **Writes MUST NOT surface a [`SuperblockDone::Fault`] (audit finding C).** A `Fault` completion is
+/// reserved for a READ ([`submit_read_checkpoint`](Superblock::submit_read_checkpoint)) — recovery /
+/// state-sync treat a checkpoint-read fault as faults-as-data (retry within budget, then peer-fetch).
+/// An implementation MUST make a [`submit_write`](Superblock::submit_write) /
+/// [`submit_write_checkpoint`](Superblock::submit_write_checkpoint) durable, RETRYING internally until
+/// it succeeds, and complete it ONLY with [`SuperblockDone::Wrote`]; it must never report a write as
+/// faulted. The proto has no recovery path for a faulted root/checkpoint write outside the recover
+/// loop — `on_sb_done` treats a write-`Fault` it sees in Normal as not-produced-by-our-backends and
+/// drops it defensively (it does not retry it), so a backend that DID surface one would silently lose
+/// that durable write. (The durable root is the single source of truth a crash recovers from; a write
+/// that is allowed to "fail" without the proto re-issuing it has no owner.)
 pub trait Superblock {
   /// The current durable root (the last root write that has completed).
   fn state(&self) -> VsrState;
   /// Submit an atomic write of the durable root. Completions are delivered in submission order
-  /// relative to other `submit_write` calls (see the trait-level root-write ordering contract).
+  /// relative to other `submit_write` calls (see the trait-level root-write ordering contract). MUST
+  /// complete only as [`SuperblockDone::Wrote`] — never [`SuperblockDone::Fault`]; the implementation
+  /// retries internally until durable (see the trait-level write-fault contract).
   fn submit_write(&mut self, id: OpId, state: VsrState);
-  /// Submit a write of a checkpoint snapshot at `op`.
+  /// Submit a write of a checkpoint snapshot at `op`. MUST complete only as [`SuperblockDone::Wrote`]
+  /// — never [`SuperblockDone::Fault`] (see the trait-level write-fault contract).
   fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes);
   /// Submit a read of the latest checkpoint snapshot.
   fn submit_read_checkpoint(&mut self, id: OpId);

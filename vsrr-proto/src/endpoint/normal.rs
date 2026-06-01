@@ -11,9 +11,18 @@ impl<S: StateMachine> Endpoint<S> {
     // own view change), and the SVC retransmit timer is not serviced while Normal — the stuck primary
     // WEDGES the cluster below the unrepairable hole. Instead we keep forfeiting until the view
     // actually changes:
-    //   1. RE-PROPOSE the next view each tick — `propose_next_view` is idempotent at `view+1` (it only
-    //      resets the SVC collection when raising the target, never escalates to `view+2,+3` while we
-    //      stay Normal-primary), so this just RE-BROADCASTS the `StartViewChange{view+1}` under loss.
+    //   1. RE-PROPOSE the next view on the SVC RETRANSMIT CADENCE — `propose_next_view` is idempotent
+    //      at `view+1` (it only resets the SVC collection when raising the target, never escalates to
+    //      `view+2,+3` while we stay Normal-primary), so this just RE-BROADCASTS the
+    //      `StartViewChange{view+1}` under loss. It is gated on the `svc_message` timer (exactly as
+    //      `view_change_timeouts` re-broadcasts a backup's SVC), NOT fired every tick: an unconditional
+    //      per-tick re-broadcast is an unbounded StartViewChange STORM that, in the nanosecond-clock
+    //      simulator, floods the network and pins the virtual clock to sub-millisecond steps — starving
+    //      the LIVE view's primary's 50ms Commit heartbeat so a stale-view holdout never learns the new
+    //      view to catch up, livelocking the cluster (VOPR seed 622). `propose_next_view` → `join_svc`
+    //      re-arms `svc_message`, so this self-paces; the `is_none_or` also fires once if the timer is
+    //      somehow unset (it never is while latched — the transition handlers clear both together), so a
+    //      forfeit can never silently stop re-proposing.
     //   2. SKIP the commit heartbeat + prepare retransmit below (the early `return`), so backups STOP
     //      hearing this primary; their `primary_idle` fires and they JOIN the SVC for `view+1` → an
     //      SVC quorum forms → the view changes (a caught-up replica leads).
@@ -22,7 +31,9 @@ impl<S: StateMachine> Endpoint<S> {
     // `start_view_as_new_primary`) all clear `pending_forfeit`, so once the view changes the new
     // generation re-evaluates from scratch (no same-view re-forfeit, no cross-view leak).
     if self.pending_forfeit {
-      self.forfeit(now, sb);
+      if self.timers.svc_message.is_none_or(|d| d <= now) {
+        self.propose_next_view(now, sb);
+      }
       return;
     }
     // Durable-view-before-participate (codex R8-F1): until the new-primary view-change superblock

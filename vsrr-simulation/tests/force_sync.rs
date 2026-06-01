@@ -77,6 +77,7 @@ fn a_stuck_pruned_committed_hole_converges_via_force_sync() {
       read_fault_per_mille: 0,
       torn_write_per_mille: 0,
       bit_rot_per_mille: 250,
+      misdirect_read_per_mille: 0,
     });
     let laggard = 2usize;
 

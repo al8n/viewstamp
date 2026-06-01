@@ -279,7 +279,10 @@ impl<S: StateMachine> Endpoint<S> {
     //     re-derived from the stale WAL.
     //   * Fault — Absent / Fault / misdirected / a ReadOk that fails self-verify (torn/bit-rot) → retry.
     enum Outcome {
-      Verified(Bytes),
+      // The full verified entry identity (client, request, body) — NOT the body alone — so a slot that
+      // was already DROPPED from `self.log` as faulty (a transient that cleared on a later timer-driven
+      // read, after `drop_faulty_committed_slots` ran) can be RE-INSERTED in full, not lost.
+      Verified(ClientId, RequestNumber, Bytes),
       StaleCommitted,
       Fault,
     }
@@ -321,19 +324,32 @@ impl<S: StateMachine> Endpoint<S> {
           None if op > durable_commit && h.view().get() < durable_log_view => {
             Outcome::StaleCommitted
           }
-          _ => Outcome::Verified(r.body_bytes()),
+          _ => Outcome::Verified(h.client(), h.request(), r.body_bytes()),
         }
       }
       _ => Outcome::Fault, // Absent, Fault, misdirected, OR a ReadOk that fails verify (torn/bit-rot).
     };
     match outcome {
-      Outcome::Verified(body) => {
-        // Adopt the verified body, retiring this read.
+      Outcome::Verified(client, request, body) => {
+        // Adopt the verified body, retiring this read. Normally the Phase-1 header-only placeholder is
+        // still present and we just fill its body; but if this slot had earlier been classed faulty and
+        // DROPPED from `self.log` (`drop_faulty_committed_slots`), a later timer-driven re-read that
+        // clears the transient must RE-INSERT the full entry rather than silently lose the recovered op.
         rec.reads.remove(&id.get());
         rec.pending.remove(&op);
         rec.faulty.remove(&op);
-        if let Some(entry) = self.log.get_mut(&op) {
-          entry.body = body;
+        match self.log.get_mut(&op) {
+          Some(entry) => entry.body = body,
+          None => {
+            self.log.insert(
+              op,
+              LogEntry {
+                client,
+                request,
+                body,
+              },
+            );
+          }
         }
       }
       Outcome::StaleCommitted => {
@@ -515,6 +531,38 @@ impl<S: StateMachine> Endpoint<S> {
     self.arm_timers(now);
   }
 
+  /// Drop every permanently-faulty committed-band slot's EMPTY placeholder from the dense `log` cache,
+  /// turning it into a genuine repair hole — the B4 durability invariant, CENTRALIZED here so EVERY
+  /// recovery-completion / continuation path enforces it (codex audit critical).
+  ///
+  /// Phase 1 of `recover` seeds each tail slot with an EMPTY body (`Bytes::new()`) and a verified read
+  /// fills it; a slot whose read exhausted its retry budget stays in `rec.faulty` STILL HOLDING that
+  /// empty placeholder. If it is left in `self.log`, the apply path (`advance_commit`/`commit_op`) finds
+  /// `Some({body: EMPTY})` — NOT a hole — and applies the committed op with `&[]` → committed-state
+  /// divergence; and a canonical-head adoption (`adopt_log`, RecoveringHead path) would PRESERVE it as a
+  /// held op and retire its hole, applying it empty cluster-wide. Dropping it makes the slot a real
+  /// repair hole, so `advance_commit` request-repairs the canonical body from a committed-vouching peer
+  /// (safety + liveness). Every dropped slot is `> checkpoint_op` (Phase 1 materializes only the offset
+  /// tail `(checkpoint_op .. hi]`), so dropping it can never disturb the applied prefix `[1..=
+  /// checkpoint_op]`. It also closes the `committed_band_headers` corollary: with the empty slot gone
+  /// from `self.log`, a subsequent durable-root/checkpoint write can no longer persist an empty-body
+  /// canonical header (`body_checksum == fnv1a_128(&[])`) for it — so no poisoned self-justifying header
+  /// can make the empty body MATCH on a later recover.
+  ///
+  /// Idempotent (re-running drops nothing new). Call ONLY once tail verification is settled
+  /// (`rec.pending.is_empty()`), so `rec.faulty` is final and a still-in-flight retry cannot resurrect a
+  /// just-dropped slot; the `Outcome::Verified` arm re-inserts a body that arrives after a drop, so even
+  /// a timer-driven re-read that clears a transient fault is not lost.
+  fn drop_faulty_committed_slots(&mut self) {
+    let Some(rec) = self.recover.as_ref() else {
+      return;
+    };
+    let faulty: std::vec::Vec<u64> = rec.faulty.iter().copied().collect();
+    for op in faulty {
+      self.log.remove(&op);
+    }
+  }
+
   /// The recovery transition decider (Phase 2), called after every recovery read completion. Stays
   /// `Recovering` while any tail read or the checkpoint read is still outstanding; once all reads are
   /// satisfied it transitions to `Normal` (tail consistent / non-head holes peer-repaired) or
@@ -531,14 +579,33 @@ impl<S: StateMachine> Endpoint<S> {
     let Some(rec) = self.recover.as_ref() else {
       return;
     };
-    // Still draining? (tail reads pending OR the checkpoint snapshot not yet restored OR awaiting a
-    // PEER checkpoint after our own read exhausted, F1). Keep the recover_retry timer armed (via
-    // arm_timers for the current Recovering status) so an owner re-submits any dropped/slow read AND
-    // re-solicits the peer checkpoint. Crucially, `awaiting_peer_checkpoint` blocks completion: we
+    // Still draining the TAIL reads? Keep the recover_retry timer armed (via arm_timers for the current
+    // Recovering status) so an owner re-submits any dropped/slow read. While a tail read is in flight
+    // `rec.faulty` is not yet final, so we must NOT drop yet (a retry could resurrect the slot).
+    if !rec.pending.is_empty() {
+      self.arm_timers(now);
+      return;
+    }
+    // Tail verification is settled (no tail read in flight) → `rec.faulty` is FINAL. Drop every faulty
+    // committed-band slot's empty placeholder NOW, BEFORE the checkpoint/peer continuation early-return
+    // below: this is the CENTRALIZED enforcement so the awaiting-peer-checkpoint path (which stays
+    // Recovering and later completes via `on_recover_sync_checkpoint` → `apply_sync`, NOT through the
+    // finalize tail of this function) cannot leave an empty slot in `self.log` to be applied empty. The
+    // drop is idempotent, so re-running it on the finalize paths below is harmless. (Codex audit
+    // critical: previously the drop lived only at the finalize tail, BELOW this early-return, so the
+    // peer-fetch escalation skipped it.)
+    self.drop_faulty_committed_slots();
+    let Some(rec) = self.recover.as_ref() else {
+      return; // (defensive; the helper never clears `recover`)
+    };
+    // The checkpoint snapshot not yet restored, OR awaiting a PEER checkpoint after our own read
+    // exhausted (F1). Stay Recovering and re-arm: an owner re-submits any dropped/slow checkpoint read
+    // AND re-solicits the peer checkpoint. Crucially, `awaiting_peer_checkpoint` blocks completion: we
     // must NEVER reach Normal with the SM unrestored (`commit_min == checkpoint_op` would then be a
-    // silent committed-prefix loss) — recovery completes only once a verified `SyncCheckpoint`
-    // restores the SM (via `on_recover_sync_checkpoint` → `apply_sync`).
-    if !rec.pending.is_empty() || rec.checkpoint.is_some() || rec.awaiting_peer_checkpoint {
+    // silent committed-prefix loss) — recovery completes only once a verified `SyncCheckpoint` restores
+    // the SM (via `on_recover_sync_checkpoint` → `apply_sync`), which drops the faulty slots again
+    // (belt-and-suspenders) before applying.
+    if rec.checkpoint.is_some() || rec.awaiting_peer_checkpoint {
       self.arm_timers(now);
       return;
     }
@@ -551,20 +618,11 @@ impl<S: StateMachine> Endpoint<S> {
       return;
     }
     // Some slot read back permanently faulty (the per-slot retry budget — and the on-disk recover_retry
-    // re-reads — were exhausted, so it cannot be cleared from this replica's own disk).
+    // re-reads — were exhausted, so it cannot be cleared from this replica's own disk). Its empty
+    // placeholder was already dropped from `self.log` by `drop_faulty_committed_slots` above, so it is a
+    // genuine repair hole on every path below.
     let head = self.op.get();
     let faulty: std::vec::Vec<u64> = rec.faulty.iter().copied().collect();
-    // Every faulty slot MUST be dropped from the dense `log` cache so it can NEVER be applied with a
-    // wrong/empty body — the B4 durability invariant. The recover Phase-1 cache seeds each tail slot
-    // with an EMPTY body (`Bytes::new()`) and a verified read fills it; a slot left faulty still holds
-    // that empty placeholder. Dropping it here closes a real safety hole on the RecoveringHead path: a
-    // later canonical-head adoption (`adopt_log`) PRESERVES any committed op the adopter already holds
-    // that the canonical log omits, so a retained empty-bodied faulty op would be adopted as "held",
-    // its repair hole retired, and applied EMPTY — diverging the committed op. (Observed deterministically
-    // under the M3 sweep: a replica with BOTH a faulty head and a faulty non-head committed slot.)
-    for &op in &faulty {
-      self.log.remove(&op);
-    }
     if faulty.contains(&head) {
       // The head cannot be trusted → RecoveringHead: do not participate. Solicit the canonical head
       // from a peer (the primary answers with a `RecoveryResponse`; a `StartView` also adopts), and
@@ -771,6 +829,17 @@ impl<S: StateMachine> Endpoint<S> {
       Some((bound_op, _, _)) if bound_op == m.checkpoint_op() => {}
       _ => return, // unparsable, or the bound op disagrees with the advertised op — reject, keep awaiting.
     }
+    // CENTRALIZED faulty-slot drop (codex audit critical): before we abandon local recovery (`recover =
+    // None` discards `rec.faulty`) and `apply_sync` (whose held-tail retain KEEPS `self.log` entries
+    // above the synced checkpoint), drop every permanently-faulty committed-band slot's EMPTY
+    // placeholder. Otherwise such a slot survives `apply_sync` as `Some({body: EMPTY})` and a later
+    // `advance_commit` applies the committed op with `&[]` — committed-state divergence. This is the SAME
+    // invariant `recover_progress` enforces; the peer-checkpoint-fetch path completes HERE (not through
+    // `recover_progress`'s finalize tail), so it must enforce it too. After the drop the faulty slot is a
+    // genuine repair hole `advance_commit` peer-repairs on demand. (`recover_progress` already dropped
+    // these once tail verification settled, so this is normally a no-op; it is belt-and-suspenders for
+    // any path that reaches here with a faulty slot still in `self.log`.)
+    self.drop_faulty_committed_slots();
     // Fully verified → abandon local recovery and apply via the shared state-sync core. Flip to Normal
     // FIRST so the re-persist completions route through the ordinary `on_sb_done` (apply_sync leaves
     // `sync` armed until the durable root lands, which then clears it and resumes as a Normal backup).

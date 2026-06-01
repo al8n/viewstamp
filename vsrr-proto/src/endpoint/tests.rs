@@ -6473,6 +6473,234 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
 }
 
 #[test]
+fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empty() {
+  // AUDIT CRITICAL (committed-state divergence via the peer-checkpoint-fetch recovery path): Phase 1
+  // of `recover` seeds an EMPTY-body placeholder for every tail op (headers readable, bodies pending).
+  // Phase 2 verifies each; a permanently-faulty COMMITTED-band slot (op 2 here) exhausts its retry
+  // budget and lands in `rec.faulty` — but its empty placeholder stays in `self.log`. The protective
+  // drop that turns such a slot into a genuine repair hole lives at the END of `recover_progress`,
+  // BELOW the `awaiting_peer_checkpoint` early-return. So when the OWN checkpoint snapshot is ALSO
+  // unreadable, the replica escalates to a peer fetch, every later `recover_progress` early-returns
+  // ABOVE the drop, and `on_recover_sync_checkpoint` then sets `recover = None` + `apply_sync` WITHOUT
+  // dropping the faulty slot — `apply_sync`'s held-tail retain keeps `self.log[2] = {body: EMPTY}`. A
+  // later `Commit`/`advance_commit` finds `Some({body: EMPTY})` (NOT a hole) and applies the committed
+  // op with `&[]` → divergence. FAIL-BEFORE: `self.sm.apply(2, &[])` runs (op 2 applied empty) / op 2
+  // is not a repair hole.
+  //
+  // Setup: replica 1 of 3, checkpoint interval 2. Durable root: commit == commit_max == 3,
+  // checkpoint_op == 1, with the SPARSE canonical band headers [h2, h3]. WAL head 3 holds ops 2,3;
+  // op-2's body read permanently faults; op-3 is clean. The own checkpoint (op 1) snapshot is
+  // permanently unreadable, forcing the peer fetch. A peer then serves checkpoint op 1; we drive to
+  // completion, then deliver a Commit(3) and observe op 2 is a repair hole that is request-repaired
+  // and applied with its REAL body — never empty.
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+  let now = Instant::ZERO;
+
+  // The canonical bodies of the committed band. op-2's body is what a healthy peer holds and what the
+  // durable root's vsr_header h2 vouches for; the WAL slot carries the SAME identity (it is genuinely
+  // op 2 — only its READ faults), so the seeded `rec.canonical` is consistent.
+  let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
+  let body3 = Bytes::copy_from_slice(b"OP3-REAL-BODY");
+  let h2 = Header::new(
+    OpNumber::with(2),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(2),
+    &body2,
+  );
+  let h3 = Header::new(
+    OpNumber::with(3),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(3),
+    &body3,
+  );
+
+  // Durable root: known-committed frontier 3, checkpoint at op 1, SPARSE band headers [h2, h3].
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(3),
+    OpNumber::with(1),
+    0xDEAD_BEEF, // the OWN checkpoint id; its snapshot is unreadable, so this is never matched
+    std::vec![h2, h3],
+  )
+  .unwrap();
+  // ScriptedCheckpointSb with an EMPTY read script → every own checkpoint read FAULTS (the op-1
+  // snapshot is permanently unreadable, forcing the peer-fetch escalation).
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+
+  // WAL head 3 holds ops 2 and 3 with their canonical bodies; op-2's body read PERMANENTLY faults.
+  let mut entries = BTreeMap::new();
+  entries.insert(2u64, (h2, body2.clone()));
+  entries.insert(3u64, (h3, body3.clone()));
+  let mut wal = ScriptedWal {
+    entries,
+    head: 3,
+    read_faults: BTreeMap::new(),
+    corrupt: std::collections::BTreeSet::new(),
+    done: VecDeque::new(),
+  };
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // never clears within any finite budget
+
+  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  assert_eq!(e.status(), Status::Recovering);
+  assert_eq!(
+    e.commit_max(),
+    OpNumber::with(3),
+    "the durable known-committed frontier is preserved"
+  );
+
+  // Drive past the per-op + checkpoint retry budgets so op-2 classes permanently faulty AND the own
+  // checkpoint read exhausts → escalation to a peer fetch.
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "still recovering (own checkpoint unreadable → awaiting a peer)"
+  );
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "escalated to fetching the checkpoint from a peer"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(1),
+    "the forced sync targets our own checkpoint op (a peer >= it answers)"
+  );
+
+  // A peer serves checkpoint op 1. Its snapshot restores an SM that has applied exactly op 1.
+  let mut peer_sm = CountSm::default();
+  peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
+  let peer_snap = peer_sm.snapshot();
+  let peer_env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(1), &BTreeMap::new(), &peer_snap);
+  let peer_id = crate::checkpoint_id(&peer_env);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(1),
+      peer_id,
+      ReplicaId::new(0),
+      nonce,
+      peer_env,
+    )),
+  );
+  // Drive the durable re-persist (two superblock writes) to completion → Normal.
+  for _ in 0..3 {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the verified peer SyncCheckpoint completed recovery to Normal"
+  );
+  assert_eq!(e.checkpoint_op(), OpNumber::with(1), "recovered at op 1");
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "commit_min is the synced checkpoint op (op 2 is NOT applied empty)"
+  );
+
+  // THE CORE SAFETY PROPERTY (post-recovery): op 2's EMPTY placeholder was DROPPED from `self.log`, so
+  // the apply path treats it as a missing-body hole rather than a held empty entry that advance_commit
+  // would apply with `&[]`. (It is not yet REGISTERED in `self.repair` — codex R6-F2 defers that to the
+  // on-demand `advance_commit` once commit reaches it, asserted after the Commit below.) The SM reflects
+  // only the restored op 1 — op 2 was never applied (empty or otherwise) on any recovery-completion path.
+  assert!(
+    !e.has_log_entry_for_test(2),
+    "op 2's empty placeholder was dropped from the log cache (NOT a held empty entry to apply with &[])"
+  );
+  assert_eq!(
+    e.state_machine().applied(),
+    &[(1u64, b"OP1-REAL-BODY".to_vec())],
+    "only the restored op 1 is applied — op 2 was NEVER applied with an empty (or any) body yet"
+  );
+
+  // Drive the commit toward 3: at op 2 (a hole) advance_commit REGISTERS the repair hole, holds the
+  // commit, and (re-)solicits a RequestPrepare; it must NEVER apply op 2 with `&[]`.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::with(1),
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "commit is HELD below the op-2 hole — op 2 is not applied empty"
+  );
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "advance_commit registered op 2 as a genuine repair hole (request-repaired, NOT applied empty)"
+  );
+  let mut solicited_op2 = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::RequestPrepare(r) = out.msg_ref() {
+      if r.op() == OpNumber::with(2) {
+        solicited_op2 = true;
+      }
+    }
+  }
+  assert!(
+    solicited_op2,
+    "the held op-2 hole is request-repaired from a committed-vouching peer"
+  );
+
+  // A peer answers with the canonical op-2 Prepare (commit >= op, real body). fill_repair stages a
+  // durable append; on_wal_done then applies op 2 with its REAL body and resumes the held commit.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(3), // the answering holder's commit >= op (it committed op 2)
+      OpNumber::with(1),
+      ClientId::new(7),
+      RequestNumber::with(2),
+      body2.clone(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the repair-fill append lands → apply op 2 (real body)
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "the op-2 hole is filled once the canonical Prepare's append is durable"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(3),
+    "the held commit resumes through op 3 once op 2 is repaired"
+  );
+  // The decisive assertion: op 2 applied with its REAL body — the SM NEVER saw `&[]` for op 2.
+  assert_eq!(
+    e.state_machine().applied(),
+    &[
+      (1u64, b"OP1-REAL-BODY".to_vec()),
+      (2u64, b"OP2-REAL-BODY".to_vec()),
+      (3u64, b"OP3-REAL-BODY".to_vec()),
+    ],
+    "op 2 applied with its CANONICAL body (never `&[]`); the committed prefix is consistent"
+  );
+}
+
+#[test]
 fn recover_with_no_checkpoint_is_unchanged() {
   // Backward-compat guard: with checkpoint_op == 0 (no checkpoint yet), recover() behaves EXACTLY
   // as the M3.1b path — commit_min == commit_max == 0, a fresh SM (0 applied), log cache [1..=head].
@@ -8711,6 +8939,78 @@ fn a_backup_never_forfeits_even_when_behind() {
 }
 
 #[test]
+fn solo_primary_with_a_permanent_repair_hole_stays_normal_and_does_not_view_change() {
+  // AUDIT (LOW) REGRESSION: `maybe_forfeit` computed `stuck = lag >= forfeit_checkpoint_lag() ||
+  // !self.repair.is_empty()` with NO `replica_count > 1` gate (unlike its four sibling sites). For a
+  // SOLO cluster `quorum_view_change() == 1`, so a forfeit → `propose_next_view` →
+  // `maybe_start_view_change` would satisfy the VC quorum with the replica's OWN SVC bit alone →
+  // transition to ViewChange(view+1); no peer ever sends a StartView, and `view_change_timeouts`
+  // re-proposes forever → permanent livelock dropping all client traffic. A solo replica must instead
+  // stay Normal and hold commit below the unfillable hole (the precondition — a permanent
+  // committed-WAL-slot fault with no peer to repair from — is itself unrecoverable, hence LOW; but
+  // abdicating to a non-existent quorum is strictly worse than holding). FAIL-BEFORE: transitions to
+  // ViewChange / climbs views.
+  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 1, 4).unwrap();
+  let mut ep = Endpoint::new(cfg, 1, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  assert!(ep.is_primary(), "a solo replica is always its own primary");
+  // A permanent committed-but-faulty repair hole at op 3 (no peer exists to serve it); head at op 5,
+  // commit HELD at 2 below the hole. This is the unrecoverable solo precondition.
+  ep.force_state_for_test(0, 5, 2, 0, &[3]);
+  assert!(
+    ep.has_repair_hole_for_test(3),
+    "the permanent hole is registered"
+  );
+  assert_eq!(
+    ep.commit(),
+    OpNumber::with(2),
+    "commit starts held below the hole"
+  );
+
+  // Drive primary_timeouts WELL past FORFEIT_GRACE (300ms) + VIEW_CHANGE_STATUS (500ms): a buggy solo
+  // replica would arm the grace timer, forfeit, satisfy its own 1-of-1 VC quorum, enter ViewChange, and
+  // then climb views via view_change_status. The fixed solo replica never forfeits → stays Normal.
+  for ms in [0u64, 100, 350, 700, 1000, 1500, 2000] {
+    ep.handle_timeout(
+      Instant::ZERO + core::time::Duration::from_millis(ms),
+      &mut wal,
+      &mut sb,
+    );
+    assert_eq!(
+      ep.status(),
+      Status::Normal,
+      "a solo replica must STAY Normal — never abdicate to a non-existent quorum (ms={ms})"
+    );
+    assert_eq!(
+      ep.view().get(),
+      0,
+      "a solo replica never climbs views via a forfeit-driven view change (ms={ms})"
+    );
+  }
+  assert!(
+    !ep.forfeit_armed_for_test(),
+    "a solo replica never even arms the forfeit grace timer"
+  );
+  // It proposed no view change at all (no StartViewChange ever left the replica).
+  let mut saw_svc = false;
+  while let Some(out) = ep.poll_message() {
+    if let Message::StartViewChange(_) = out.into_msg() {
+      saw_svc = true;
+    }
+  }
+  assert!(
+    !saw_svc,
+    "a solo replica never proposes a forfeit-driven view change"
+  );
+  // The commit is STILL held below the hole — the op is not lost, it is simply unrecoverable here.
+  assert_eq!(
+    ep.commit(),
+    OpNumber::with(2),
+    "commit stays held below the unfillable hole (the op is held, not abandoned)"
+  );
+}
+
+#[test]
 fn a_transiently_lagging_primary_recovers_and_disarms_without_forfeiting() {
   // Anti-storm: a primary that briefly lags (arming the grace timer) but CATCHES UP before the
   // grace elapses must DISARM and never forfeit. Models a primary that was momentarily behind on
@@ -8855,11 +9155,13 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
   // StartViewChange is dropped/partitioned, the OLD code cleared `pending_forfeit` one-shot and the
   // primary RESUMED heartbeating — so every backup kept resetting its `primary_idle` (none started
   // its own VC) and the SVC retransmit timer was never serviced while Normal, wedging the cluster
-  // below the unrepairable hole. The fix keeps forfeiting until the view actually changes: each
-  // primary tick RE-PROPOSES view+1 AND skips the commit heartbeat + prepare retransmit, so backups
-  // stop hearing the primary and join the SVC. Here we DROP every emitted SVC and tick repeatedly:
-  // the primary must (a) re-broadcast the SVC each tick, (b) NEVER emit a Commit heartbeat, and
-  // (c) keep `pending_forfeit` latched — none of which the one-shot code did.
+  // below the unrepairable hole. The fix keeps forfeiting until the view actually changes: on the SVC
+  // retransmit cadence the primary RE-PROPOSES view+1 AND skips the commit heartbeat + prepare
+  // retransmit, so backups stop hearing the primary and join the SVC. Here we DROP every emitted SVC
+  // and tick repeatedly AT the retransmit cadence (100ms apart, so the `svc_message` timer is due each
+  // tick): the primary must (a) re-broadcast the SVC each due tick, (b) NEVER emit a Commit heartbeat,
+  // and (c) keep `pending_forfeit` latched — none of which the one-shot code did. (The companion test
+  // `..._rate_limits_its_svc_rebroadcast_...` ticks at SUB-cadence spacing to pin the rate limit.)
   let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
   let mut ep = Endpoint::new(cfg, 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
@@ -8902,7 +9204,7 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
     }
     assert!(
       saw_svc_view1,
-      "tick {i}: the forfeiting primary RE-PROPOSES view 1 each tick (idempotent re-broadcast under loss)"
+      "tick {i}: the forfeiting primary RE-PROPOSES view 1 each due tick (idempotent re-broadcast under loss)"
     );
     assert!(
       !saw_commit_heartbeat,
@@ -8946,6 +9248,94 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
   assert!(
     !ep.pending_forfeit_for_test(),
     "leaving Normal-primary clears the forfeit latch (no cross-view leak)"
+  );
+}
+
+#[test]
+fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_window() {
+  // LIVENESS REGRESSION (VOPR seed 622): a forfeiting primary RE-PROPOSES view+1 to keep stepping
+  // down under loss — but it must do so on the SVC-retransmit CADENCE, not on EVERY `handle_timeout`
+  // tick. The old code called `forfeit()` → `propose_next_view()` → `join_svc()` → `push_svc()`
+  // unconditionally each primary tick, so a primary stuck `pending_forfeit` while the cluster ran on
+  // in a higher view broadcast an SVC EVERY tick — an unbounded StartViewChange STORM. In the
+  // simulator (Instant is nanos; the clock advances to the nearest pending deadline) that storm
+  // floods the network and PINS the virtual clock to sub-millisecond steps, starving the live view's
+  // primary's 50ms Commit heartbeat → the stale-view holdout never hears the new view to catch up,
+  // and the cluster livelocks. The fix gates the re-broadcast on the `svc_message` timer (exactly
+  // like `view_change_timeouts`): one SVC per `VC_MESSAGE_RETRANSMIT` window, no per-tick storm.
+  //
+  // Here we tick the forfeiting primary MANY times all WITHIN a single retransmit window (sub-window
+  // spacing), dropping every message: exactly ONE SVC may be emitted across the whole window (the
+  // first), never one-per-tick. (Heartbeat suppression + latch persistence are covered by the sibling
+  // test above; this one isolates the rate limit.)
+  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
+  let mut ep = Endpoint::new(cfg, 7, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  assert!(ep.is_primary(), "replica 0 at view 0 is the primary");
+  // Enter the force-sync strand → the primary flags a deferred forfeit (a committed hole at op 2 a
+  // peer has already checkpointed + pruned past), mirroring the sibling persistence test's setup.
+  ep.force_state_for_test(0, 10, 1, 0, &[2]);
+  ep.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(2),
+      ReplicaId::new(1),
+      OpNumber::with(8),
+    )),
+  );
+  assert!(
+    ep.pending_forfeit_for_test(),
+    "the strand flagged a deferred forfeit"
+  );
+  while ep.poll_message().is_some() {} // discard the entry-time SVC
+
+  // Tick repeatedly WITHIN one VC_MESSAGE_RETRANSMIT (100ms) window — sub-window spacing (10ms apart,
+  // ten ticks span 0<t<100ms, none crossing the cadence boundary) — dropping every message. Across
+  // the WHOLE window the primary may emit at most ONE SVC (the storm emitted one PER tick).
+  let mut svc_count = 0usize;
+  for i in 0..10u64 {
+    // Times 10ms, 20ms, .. 100ms — all at or before the first retransmit deadline (armed at entry +
+    // 100ms). The 100ms tick is the boundary where exactly one re-broadcast is allowed.
+    let now = Instant::ZERO + core::time::Duration::from_millis(10 * (i + 1));
+    ep.handle_timeout(now, &mut wal, &mut sb);
+    while let Some(out) = ep.poll_message() {
+      if let Message::StartViewChange(svc) = out.into_msg() {
+        if svc.view().get() == 1 {
+          svc_count += 1;
+        }
+      }
+    }
+  }
+  assert!(
+    svc_count <= 1,
+    "a forfeiting primary rate-limits its SVC to the retransmit cadence (at most one per \
+     VC_MESSAGE_RETRANSMIT window) — got {svc_count} (the per-tick STORM that pins the sim clock and \
+     starves the live primary's heartbeat → VOPR seed 622 livelock)"
+  );
+  assert!(
+    ep.pending_forfeit_for_test(),
+    "the forfeit latch still persists (rate-limiting the broadcast does not abandon the step-down)"
+  );
+
+  // After the cadence elapses, the next due tick DOES re-broadcast (still stepping down under loss).
+  let past_window = Instant::ZERO + core::time::Duration::from_millis(250);
+  ep.handle_timeout(past_window, &mut wal, &mut sb);
+  let mut saw_svc_after_window = false;
+  while let Some(out) = ep.poll_message() {
+    if let Message::StartViewChange(svc) = out.into_msg() {
+      if svc.view().get() == 1 {
+        saw_svc_after_window = true;
+      }
+    }
+  }
+  assert!(
+    saw_svc_after_window,
+    "once the retransmit window elapses the forfeiting primary re-broadcasts the SVC (persistent \
+     step-down under loss is preserved — only the per-tick storm is removed)"
   );
 }
 

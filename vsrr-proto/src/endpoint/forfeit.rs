@@ -38,6 +38,21 @@ impl<S: StateMachine> Endpoint<S> {
     // Only ever called from `primary_timeouts` (the Normal-primary tick); a backup behind on
     // checkpoint catches up via state-sync/force-sync and never forfeits.
     debug_assert!(self.status.is_normal() && self.is_primary());
+    // SOLO guard (mirrors the four sibling sites: `complete_recovery`, `maybe_force_sync`,
+    // `on_sync_checkpoint`, `on_recover_sync_checkpoint`). A SOLO replica (`replica_count == 1`) is its
+    // own primary and CANNOT view-change — `quorum_view_change() == 1`, so forfeiting would propose
+    // `view + 1`, satisfy the VC quorum with its OWN SVC bit alone, transition to ViewChange, and then
+    // livelock in `view_change_timeouts` (no peer ever sends a StartView) — dropping all client traffic
+    // forever. A solo replica must instead stay Normal and HOLD commit below any unfillable hole. The
+    // forfeit precondition (a permanent committed-WAL-slot fault with no peer to repair from) is itself
+    // unrecoverable on a solo cluster, but abdicating to a non-existent quorum is strictly worse than
+    // holding. So a solo replica never forfeits (and never even arms the grace timer).
+    if self.config.replica_count() <= 1 {
+      // Disarm any stale grace timer defensively (it can only have been set before this guard existed;
+      // a solo replica never arms it now).
+      self.forfeit_armed = None;
+      return;
+    }
     let lag = self
       .quorum_checkpoint_op()
       .get()
