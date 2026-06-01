@@ -357,6 +357,40 @@ mod tests {
   }
 
   #[test]
+  fn durability_checker_final_assertion_stays_strict_when_no_operational_replica_retains_the_history()
+   {
+    // The end-of-run durability assertion (which the VOPR driver's final QUIESCE phase runs AFTER
+    // draining) must stay STRICT: if NO operational replica retains the committed history, it is a
+    // Violation. This is the "a committed op held by no operational holder still FAILS" direction — it
+    // pins that the seed-313 quiesce fix (drain THEN assert) did not weaken the no-loss guarantee.
+    let mut c = Cluster::new(3, 2, 3, 9);
+    let mut dur = DurabilityChecker::new(c.replica_count());
+    for _ in 0..50_000 {
+      c.tick();
+      assert!(dur.observe(&c).is_ok());
+      if (0..c.client_count()).all(|i| c.client(i).is_done()) {
+        break;
+      }
+    }
+    // Sanity: a real committed history was recorded and (healthy) it passes.
+    assert!(c.replica_commit(0).get() >= 1, "the cluster committed ops");
+    assert!(
+      dur.check(&c).is_ok(),
+      "healthy: the history survives operational"
+    );
+    // Now crash EVERY replica: none is operational, so no replica retains the committed history in an
+    // operational state → the strict no-loss assertion must fire (it is NOT silently satisfied).
+    for i in 0..c.replica_count() {
+      c.crash(i);
+    }
+    assert!(
+      dur.check(&c).is_violation(),
+      "with no operational replica retaining the committed history the final assertion must FAIL — \
+       the quiesce fix drains before this check but never relaxes its strictness"
+    );
+  }
+
+  #[test]
   fn views_are_monotonic_across_a_crash() {
     let mut c = Cluster::new(3, 1, 2, 5);
     let mut vm = ViewMonotonicChecker::new(c.replica_count());

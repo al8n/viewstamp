@@ -4,6 +4,8 @@
 //! `Superblock` (wired in M3.1). All faults surface as data (`SlotStatus::Faulty`,
 //! `WalDone::Fault`) — never as panics; the proto verifies `Header` checksums itself.
 
+use std::vec::Vec;
+
 use bytes::Bytes;
 
 use crate::{ClientId, OpNumber, RequestNumber, View};
@@ -153,22 +155,46 @@ impl Header {
 }
 
 /// The durable VSR root written to the superblock. Invariants checked ⇒ `try_new`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Carries — alongside `(view, log_view, commit, checkpoint_op, checkpoint_id)` — the CANONICAL
+/// [`Header`]s of the un-checkpointed COMMITTED band `(checkpoint_op .. commit]`, TigerBeetle's
+/// `vsr_headers` mechanism. These are written atomically with the view/commit they describe (one
+/// struct, one root write) and let `recover` independently verify each committed-band WAL slot against
+/// the canonical body checksum — a slot whose own (self-consistent) header kept a STALE superseded
+/// body is then DETECTED and routed to peer-repair instead of blindly re-derived from the WAL. The
+/// band is bounded by `Config::checkpoint_ops` (post-checkpoint GC keeps `commit - checkpoint_op`
+/// within ~one checkpoint interval), so the list stays small. Holding a `Vec` makes this `Clone` but
+/// not `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VsrState {
   view: View,
   log_view: View,
   commit: OpNumber,
   checkpoint_op: OpNumber,
   checkpoint_id: u128,
+  /// Canonical headers for the committed band `(checkpoint_op .. commit]`, CONTIGUOUS and ordered by
+  /// op (a possible repair hole truncates the list at the first gap; see [`Self::try_new`]). Private;
+  /// read via [`Self::committed_headers`]. The per-entry `body_checksum` is the load-bearing field
+  /// recovery checks the WAL against.
+  committed_headers: Vec<Header>,
 }
 impl VsrState {
   /// Creates a durable root, validating `log_view <= view` and `commit >= checkpoint_op`.
-  pub const fn try_new(
+  ///
+  /// `committed_headers` are the canonical headers of the committed band `(checkpoint_op .. commit]`,
+  /// ordered by op and CONTIGUOUS from `checkpoint_op + 1`. To keep the stored list trustworthy this
+  /// constructor KEEPS only the contiguous, in-band prefix: it walks `checkpoint_op + 1, +2, …` and
+  /// stops at the first op that is missing, out of order, or above `commit` (a repair hole in the
+  /// caller's log truncates the band there — what is recorded is always a contiguous canonical prefix,
+  /// never a list with holes). Headers strictly above `commit` are dropped (only the committed band is
+  /// persisted). An empty band (`commit == checkpoint_op`) yields an empty list.
+  pub fn try_new(
     view: View,
     log_view: View,
     commit: OpNumber,
     checkpoint_op: OpNumber,
     checkpoint_id: u128,
+    committed_headers: Vec<Header>,
   ) -> Result<Self, VsrStateError> {
     if log_view.get() > view.get() {
       return Err(VsrStateError::LogViewAboveView);
@@ -176,16 +202,30 @@ impl VsrState {
     if commit.get() < checkpoint_op.get() {
       return Err(VsrStateError::CommitBelowCheckpoint);
     }
+    // Keep only the contiguous in-band prefix `checkpoint_op + 1 .. ` (stop at the first gap / any op
+    // above `commit`). The caller derives these from its log in op order; this guard makes the stored
+    // band self-consistently contiguous regardless of a caller hole, so recovery can index it by op.
+    let mut headers = committed_headers;
+    let mut expected = checkpoint_op.get();
+    let kept = headers
+      .iter()
+      .take_while(|h| {
+        expected += 1;
+        h.op().get() == expected && expected <= commit.get()
+      })
+      .count();
+    headers.truncate(kept);
     Ok(Self {
       view,
       log_view,
       commit,
       checkpoint_op,
       checkpoint_id,
+      committed_headers: headers,
     })
   }
 
-  /// The fresh-cluster root (all zero).
+  /// The fresh-cluster root (all zero, no committed-band headers).
   pub const fn initial() -> Self {
     Self {
       view: View::new(),
@@ -193,6 +233,7 @@ impl VsrState {
       commit: OpNumber::new(),
       checkpoint_op: OpNumber::new(),
       checkpoint_id: 0,
+      committed_headers: Vec::new(),
     }
   }
 
@@ -224,6 +265,17 @@ impl VsrState {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checkpoint_id(&self) -> u128 {
     self.checkpoint_id
+  }
+
+  /// The canonical headers for the un-checkpointed committed band `(checkpoint_op .. commit]`, ordered
+  /// by op and contiguous from `checkpoint_op + 1` (TigerBeetle's `vsr_headers`). Recovery verifies
+  /// each committed-band WAL slot against the matching header's [`Header::body_checksum`]: a slot whose
+  /// own self-consistent header kept a stale superseded body mismatches the canonical checksum and is
+  /// routed to peer-repair rather than re-derived from the WAL. May be SHORTER than the full band if
+  /// the caller had a repair hole (the list is truncated at the first gap by [`Self::try_new`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn committed_headers(&self) -> &[Header] {
+    &self.committed_headers
   }
 }
 
@@ -474,7 +526,8 @@ mod tests {
         View::with(2),
         OpNumber::with(0),
         OpNumber::with(0),
-        0
+        0,
+        std::vec::Vec::new(),
       )
       .is_err()
     );
@@ -484,7 +537,8 @@ mod tests {
         View::with(1),
         OpNumber::with(1),
         OpNumber::with(3),
-        0
+        0,
+        std::vec::Vec::new(),
       )
       .is_err()
     );
@@ -494,10 +548,65 @@ mod tests {
       OpNumber::with(5),
       OpNumber::with(4),
       99,
+      std::vec::Vec::new(),
     )
     .unwrap();
     assert_eq!(s.commit(), OpNumber::with(5));
     assert_eq!(s.checkpoint_id(), 99);
+    assert!(s.committed_headers().is_empty());
+  }
+
+  #[test]
+  fn vsr_state_keeps_only_the_contiguous_in_band_header_prefix() {
+    // Build canonical headers for ops 3,4,5 (the committed band above checkpoint_op = 2, commit = 5).
+    let mk = |op: u64| {
+      Header::new(
+        OpNumber::with(op),
+        View::with(1),
+        ClientId::new(1),
+        RequestNumber::with(op),
+        &[op as u8],
+      )
+    };
+    // A contiguous full band (3,4,5) is kept verbatim.
+    let s = VsrState::try_new(
+      View::with(1),
+      View::with(1),
+      OpNumber::with(5),
+      OpNumber::with(2),
+      0,
+      std::vec![mk(3), mk(4), mk(5)],
+    )
+    .unwrap();
+    assert_eq!(s.committed_headers().len(), 3);
+    assert_eq!(s.committed_headers()[0].op(), OpNumber::with(3));
+
+    // A GAP after op 3 (3, then 5 — op 4 missing) truncates at the gap: only op 3 is kept, so the
+    // stored band is always a contiguous canonical prefix recovery can index by op.
+    let holed = VsrState::try_new(
+      View::with(1),
+      View::with(1),
+      OpNumber::with(5),
+      OpNumber::with(2),
+      0,
+      std::vec![mk(3), mk(5)],
+    )
+    .unwrap();
+    assert_eq!(holed.committed_headers().len(), 1);
+    assert_eq!(holed.committed_headers()[0].op(), OpNumber::with(3));
+
+    // Headers ABOVE commit are dropped (only the committed band is persisted): commit = 3 keeps op 3.
+    let capped = VsrState::try_new(
+      View::with(1),
+      View::with(1),
+      OpNumber::with(3),
+      OpNumber::with(2),
+      0,
+      std::vec![mk(3), mk(4)],
+    )
+    .unwrap();
+    assert_eq!(capped.committed_headers().len(), 1);
+    assert_eq!(capped.committed_headers()[0].op(), OpNumber::with(3));
   }
 
   #[test]

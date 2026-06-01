@@ -353,11 +353,52 @@ impl Wal for InMemoryWal {
   }
 }
 
+/// A staged, not-yet-durable superblock write (async-write mode only). Submitted via `submit_write`
+/// (a durable-root write) or `submit_write_checkpoint` (a snapshot write), it becomes durable — its
+/// effect PUBLISHED, with its `Wrote` completion offered by `poll` — only after `remaining` `poll`s
+/// have ticked it down to zero. Until then `state()` still returns the LAST-completed root and
+/// `submit_read_checkpoint` reads the last-completed snapshot, modelling a real superblock whose
+/// `fsync` lands between ticks. A serial writer completes these FIFO (preserving the trait's
+/// root-write ordering contract), and the effect is applied ON COMPLETION, in order.
+#[derive(Debug, Clone)]
+enum StagedSbWrite {
+  /// A durable-root write: on completion, publishes `state` as the new durable root.
+  Root { id: OpId, state: VsrState },
+  /// A checkpoint snapshot write: on completion, publishes `(op, snapshot)` as the readable checkpoint.
+  Checkpoint {
+    id: OpId,
+    op: OpNumber,
+    snapshot: Bytes,
+  },
+}
+
+impl StagedSbWrite {
+  fn id(&self) -> OpId {
+    match self {
+      StagedSbWrite::Root { id, .. } | StagedSbWrite::Checkpoint { id, .. } => *id,
+    }
+  }
+}
+
 /// A seeded in-memory superblock + checkpoint store. The only fault it injects is a TRANSIENT
 /// checkpoint-read fault (`read_fault_per_mille`): the recover loop retries it within budget. It
 /// NEVER permanently corrupts a checkpoint the durable root names (preserving the M3.2a invariant
 /// that the root only ever names a fully-written snapshot), so the M3.3a recover always eventually
 /// restores. Torn/bit-rot are WAL-only.
+///
+/// # Async-write mode (opt-in, [`InMemorySuperblock::with_async_writes_and_faults`])
+///
+/// By DEFAULT every `submit_write`/`submit_write_checkpoint` completes SYNCHRONOUSLY (the effect is
+/// applied and the `Wrote` completion queued in the same call) — the M3.0/M3.1 behaviour all existing
+/// gates rely on. Async mode instead STAGES each write as not-yet-durable for a seeded number of
+/// `poll`s before it becomes durable, modelling a real superblock whose `fsync` lands between ticks.
+/// This opens the **pending durable-view window** the proto's durable-view-before-participate gate
+/// must hold across (codex R8-F1): a replica that just became primary has set `Status::Normal` and
+/// minted the view-change root write, but that root is still in flight — so `pending_sb` is armed and
+/// `state()` still names the OLD view, exactly the window where a delayed `GetView`/`Recovery` or a
+/// primary timer must NOT make it act in the not-yet-durable view. The synchronous default never
+/// opens this window (the write is durable inline). Completions are FIFO so the root-write ordering
+/// contract holds; the effect (new root / new checkpoint bytes) is applied on completion.
 #[derive(Debug)]
 pub struct InMemorySuperblock {
   state: VsrState,
@@ -365,6 +406,13 @@ pub struct InMemorySuperblock {
   completions: VecDeque<SuperblockDone>,
   faults: StorageFaults,
   prng: Prng,
+  /// `None` (default) ⇒ synchronous writes. `Some(d)` ⇒ async mode: each submitted write stages for
+  /// `d` `poll`s before becoming durable. `d == 0` releases on the very next `poll` (still NOT inline,
+  /// so the pending-durable-view window exists for at least one tick).
+  async_delay: Option<u32>,
+  /// Async mode: writes submitted but not yet durable, in submission order (a serial superblock writer
+  /// completes them FIFO). Empty in synchronous mode.
+  staged: VecDeque<(u32, StagedSbWrite)>,
 }
 
 impl Default for InMemorySuperblock {
@@ -381,6 +429,7 @@ impl InMemorySuperblock {
 
   /// Creates a fresh-cluster superblock with a seeded fault plan. Only `read_fault_per_mille` (a
   /// transient checkpoint-read fault) is honoured; torn/bit-rot do not apply to the superblock.
+  /// Synchronous writes (no async delay).
   pub fn with_faults(faults: StorageFaults, seed: u64) -> Self {
     Self {
       state: VsrState::initial(),
@@ -388,23 +437,76 @@ impl InMemorySuperblock {
       completions: VecDeque::new(),
       faults,
       prng: Prng::new(seed),
+      async_delay: None,
+      staged: VecDeque::new(),
     }
+  }
+
+  /// Creates a fresh-cluster superblock with a seeded fault plan in **async-write mode**: every
+  /// `submit_write`/`submit_write_checkpoint` stages the write as not-yet-durable for `delay_ticks`
+  /// `poll`s, then it becomes durable and `poll` yields its `Wrote`. Opt-in; the default
+  /// ([`new`](Self::new)/[`with_faults`](Self::with_faults)) stays synchronous so existing gates are
+  /// unaffected. Until a write completes, `state()` returns the prior durable root and
+  /// `submit_read_checkpoint` reads the prior snapshot — opening the pending-durable-view window the
+  /// proto's durable-view-before-participate gate must survive (codex R8-F1). `delay_ticks == 0` still
+  /// defers to the next `poll` (never inline).
+  pub fn with_async_writes_and_faults(faults: StorageFaults, seed: u64, delay_ticks: u32) -> Self {
+    let mut sb = Self::with_faults(faults, seed);
+    sb.async_delay = Some(delay_ticks);
+    sb
+  }
+
+  /// Test-only: the number of staged (submitted-but-not-yet-durable) superblock writes. `0` in
+  /// synchronous mode and whenever the async staging queue has drained. Lets a reproduction assert it
+  /// is genuinely exercising the pending durable-view/checkpoint window.
+  #[doc(hidden)]
+  pub fn staged_len(&self) -> usize {
+    self.staged.len()
+  }
+
+  /// Drop every staged (not-yet-durable) write WITHOUT publishing its effect — modelling a crash that
+  /// loses any superblock `fsync` still in flight. The durable root / checkpoint are left at their
+  /// last COMPLETED values (what a restart recovers from). A no-op in synchronous mode (`staged` is
+  /// always empty). Called by the cluster's `crash` so a crash genuinely loses a not-yet-durable view
+  /// write (the precondition for the durable-view-before-participate property to mean anything).
+  pub fn discard_inflight(&mut self) {
+    self.staged.clear();
   }
 }
 
 impl Superblock for InMemorySuperblock {
   fn state(&self) -> VsrState {
-    self.state
+    self.state.clone()
   }
 
   fn submit_write(&mut self, id: OpId, state: VsrState) {
-    self.state = state;
-    self.completions.push_back(SuperblockDone::Wrote(id));
+    match self.async_delay {
+      // SYNCHRONOUS (default): durable immediately, completion queued in this call (M3.0/M3.1).
+      None => {
+        self.state = state;
+        self.completions.push_back(SuperblockDone::Wrote(id));
+      }
+      // ASYNC: STAGE as not-yet-durable. `self.state` is left at the prior durable root until `poll`
+      // releases this write after `delay` ticks — opening the pending durable-view window (R8-F1).
+      Some(delay) => self
+        .staged
+        .push_back((delay, StagedSbWrite::Root { id, state })),
+    }
   }
 
   fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes) {
-    self.checkpoint = Some((op, snapshot));
-    self.completions.push_back(SuperblockDone::Wrote(id));
+    match self.async_delay {
+      None => {
+        self.checkpoint = Some((op, snapshot));
+        self.completions.push_back(SuperblockDone::Wrote(id));
+      }
+      // ASYNC: STAGE; the snapshot is not readable until this write completes (the prior checkpoint
+      // stays readable meanwhile). The proto sequences the snapshot write before its root write, and
+      // FIFO completion preserves that ordering.
+      Some(delay) => self
+        .staged
+        .push_back((delay, StagedSbWrite::Checkpoint { id, op, snapshot })),
+    }
   }
 
   fn submit_read_checkpoint(&mut self, id: OpId) {
@@ -428,6 +530,25 @@ impl Superblock for InMemorySuperblock {
   }
 
   fn poll(&mut self) -> Option<SuperblockDone> {
+    // Async mode: tick the staged (in-flight) writes. A serial superblock writer completes them in
+    // submission order, so we count down the FRONT entry and PUBLISH its effect when it reaches zero —
+    // the new durable root, or the now-readable checkpoint snapshot. FIFO completion satisfies the
+    // trait's root-write ordering contract (the LAST-submitted root wins once all complete). This is
+    // the ONLY place a staged write becomes durable: until then `state()`/the readable checkpoint sit
+    // at their prior values (the R8-F1 pending-durable-view window). A no-op in synchronous mode.
+    if let Some((remaining, _)) = self.staged.front_mut() {
+      if *remaining == 0 {
+        let (_, write) = self.staged.pop_front().expect("front exists");
+        let id = write.id();
+        match write {
+          StagedSbWrite::Root { state, .. } => self.state = state,
+          StagedSbWrite::Checkpoint { op, snapshot, .. } => self.checkpoint = Some((op, snapshot)),
+        }
+        self.completions.push_back(SuperblockDone::Wrote(id));
+      } else {
+        *remaining -= 1;
+      }
+    }
     self.completions.pop_front()
   }
 }
@@ -501,17 +622,32 @@ mod tests {
   fn superblock_write_reflects_in_state() {
     let mut sb = InMemorySuperblock::new();
     assert_eq!(sb.state(), VsrState::initial());
+    // Include canonical committed-band headers (ops 1..=3) so the vsr_headers round-trip through
+    // submit_write/state() too (the superblock stores VsrState by value).
+    let headers: std::vec::Vec<Header> = (1..=3)
+      .map(|op| {
+        Header::new(
+          OpNumber::with(op),
+          View::with(2),
+          ClientId::new(1),
+          RequestNumber::with(op),
+          &[op as u8],
+        )
+      })
+      .collect();
     let next = VsrState::try_new(
       View::with(2),
       View::with(2),
       OpNumber::with(3),
       OpNumber::with(0),
       0,
+      headers,
     )
     .unwrap();
-    sb.submit_write(OpId::new(1), next);
+    sb.submit_write(OpId::new(1), next.clone());
     assert!(sb.poll().is_some());
     assert_eq!(sb.state(), next);
+    assert_eq!(sb.state().committed_headers().len(), 3);
   }
 
   /// Appends one entry `body` at `op` and drains the `Appended` completion.

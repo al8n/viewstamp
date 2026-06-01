@@ -179,6 +179,22 @@ struct RecoverState {
   /// a verified one restores the SM via `apply_sync` and completes recovery to `Normal`. Cleared on
   /// that success (alongside `recover = None`).
   awaiting_peer_checkpoint: bool,
+  /// The CANONICAL operation identity of the persisted committed band `(checkpoint_op ..
+  /// persisted_commit]` (op → `(client, request, body_checksum)`), seeded in `recover` from the durable
+  /// `VsrState`'s `committed_headers` (TigerBeetle's `vsr_headers`). A committed op's identity is the
+  /// FULL `(op, client, request, body)` tuple — NOT body bytes alone: two clients can submit identical
+  /// payload bytes, so a body-only check would trust a stale superseded slot that kept the same body
+  /// under a DIFFERENT `client`/`request` (codex R9-F2). When a committed-band tail read self-verifies,
+  /// `on_recover_wal_done` checks its `(client, request, body_checksum)` against the entry here: ANY
+  /// mismatch means the WAL slot is STALE/superseded (the seed-52 stale-body hazard, OR a same-body
+  /// different-identity slot whose own header is internally consistent), so the slot is DROPPED and
+  /// routed to peer-repair (the B4 path) instead of being re-derived from the WAL. The `view` is
+  /// deliberately NOT part of the identity here: `committed_band_headers()` rewrites each entry's view to
+  /// the current root view, so the persisted view is not the op's original view — comparing it would
+  /// spuriously mismatch every band entry. Ops NOT present here (above the persisted band, or with no
+  /// recorded canonical header) are trusted from the WAL as before. Bounded by the band length
+  /// (~checkpoint_ops).
+  canonical: BTreeMap<u64, (ClientId, RequestNumber, u128)>,
 }
 
 /// One entry in the in-memory log (M1; persistence arrives in M3).
@@ -450,10 +466,14 @@ impl<S: StateMachine> Endpoint<S> {
   /// root via `sb.state()` for `(view, log_view, checkpoint_op, checkpoint_id)` and `wal.op_head()` /
   /// `wal.header(op)` — and constructs the endpoint with:
   /// - `view = state.view()`, `log_view = state.log_view()`, `op = wal.op_head()`,
-  ///   `checkpoint_op = state.checkpoint_op()`, and `commit_min = commit_max = checkpoint_op` (the
-  ///   restored SM already reflects `[1..=checkpoint_op]`, so this prevents a double-apply; monotone
-  ///   `op >= commit_max >= commit_min` holds). With no checkpoint (`checkpoint_op == 0`) this is the
-  ///   M3.1b behaviour: a fresh `S`, `commit_min == commit_max == 0`.
+  ///   `checkpoint_op = state.checkpoint_op()`, `commit_min = checkpoint_op` (the restored SM already
+  ///   reflects `[1..=checkpoint_op]`, so this prevents a double-apply), and `commit_max = state.commit()`
+  ///   — the DURABLE known-committed frontier (codex R9-F1), `>= checkpoint_op` and possibly above it, so
+  ///   the replica never FORGETS a known-committed op on recover (its DVC would else under-report and a
+  ///   known-committed op could be truncated in a view change). `op >= commit_min` and `commit_max >=
+  ///   commit_min` hold; `op >= commit_max` does NOT (a stale/faulty/truncated head can leave
+  ///   `commit_max > op`, the tail-gap shape). With no checkpoint and a fresh root (`checkpoint_op ==
+  ///   commit == 0`) this is the M3.1b behaviour: a fresh `S`, `commit_min == commit_max == 0`.
   /// - the in-memory log cache built **from headers only over the OFFSET tail** `(checkpoint_op ..
   ///   head]` (`wal.header(op)`, bodies left empty — filled by Phase 2). NOT dense `[1..=head]`: the
   ///   committed prefix `[1..=checkpoint_op]` lives in the restored SM snapshot (and a state-synced
@@ -524,11 +544,21 @@ impl<S: StateMachine> Endpoint<S> {
       status: Status::Recovering,
       view: state.view(),
       op: OpNumber::with(op),
-      // The restored SM reflects [1..=checkpoint_op] exactly; commit_min = checkpoint_op so those
-      // ops are NOT re-applied. commit_max = checkpoint_op too (monotone: op >= commit_max >=
-      // commit_min). The committed tail (> checkpoint_op) re-applies as the primary re-announces it.
+      // The restored SM reflects [1..=checkpoint_op] exactly; commit_min = checkpoint_op so those ops
+      // are NOT re-applied. commit_max = state.commit() (the DURABLE known-committed frontier, codex
+      // R9-F1), which is `>= checkpoint_op` (a `VsrState` invariant) and may EXCEED it: a replica whose
+      // root says op N is committed must NOT forget that on recover, else its DoViewChange under-reports
+      // and a known-committed op N whose WAL slot is stale/faulty (dropped → repair hole) can be
+      // truncated in a view change whose quorum is this replica + a laggard. The committed band
+      // (checkpoint_op .. commit_max] re-applies via `advance_commit` from the WAL (HOLDING at any
+      // stale/faulty slot that became a repair hole, peer-repaired on demand). `op >= commit_max` is NOT
+      // an invariant here — a stale/faulty/truncated head can leave `commit_max > op` (the tail-gap
+      // shape: a committed op is KNOWN but not locally held), exactly as a normal lagging backup; only
+      // `op >= commit_min` and `commit_max >= commit_min` hold. After a state-sync the durable root names
+      // `commit == checkpoint_op` (apply_sync persists that), so `commit_max == checkpoint_op` there —
+      // unchanged behaviour.
       commit_min: OpNumber::with(checkpoint_op),
-      commit_max: OpNumber::with(checkpoint_op),
+      commit_max: state.commit(),
       log_view: state.log_view(),
       svc_from: 0,
       svc_target: state.view(),
@@ -573,6 +603,23 @@ impl<S: StateMachine> Endpoint<S> {
     // asserted by the A6 tests). `head` may be below `checkpoint_op` for a synced replica → the range
     // is empty and recovery completes immediately at the synced point.
     let mut rec = RecoverState::default();
+    // Seed the canonical committed-band IDENTITY from the durable `VsrState`'s `vsr_headers` (the
+    // persisted-header cross-check, mirroring TigerBeetle). Each header is keyed by op → canonical
+    // `(client, request, body_checksum)` — the FULL committed-op identity, not body bytes alone (codex
+    // R9-F2): two clients can submit identical payloads, so a body-only check would trust a stale slot
+    // bearing the same body under a different client/request. Phase 2 (`on_recover_wal_done`) checks a
+    // committed-band WAL slot's `(client, request, body_checksum)` against this, so a stale/superseded
+    // slot (seed 52, or a same-body-different-identity slot) is detected and peer-repaired instead of
+    // re-derived. The persisted `view` is intentionally excluded (see `RecoverState::canonical`):
+    // `committed_band_headers()` rewrites the entry view to the root view, so it is not the original.
+    // The persisted band is `(checkpoint_op .. commit]` (contiguous, ordered) — bounded by the
+    // checkpoint interval — and only ops at/below the persisted `commit` are committed, so we never
+    // cross-check (and thus never drop) an op the root did not record as committed.
+    for h in state.committed_headers() {
+      rec
+        .canonical
+        .insert(h.op().get(), (h.client(), h.request(), h.body_checksum()));
+    }
     // Bound the per-recover read-submission window (F3): a corrupt/buggy `Wal` reporting a huge
     // `op_head` must not force unbounded bookkeeping + reads here. SATURATING `checkpoint_op + 1`
     // (never overflow), with the high end `hi` (computed above) capped at `checkpoint_op +
@@ -738,6 +785,22 @@ impl<S: StateMachine> Endpoint<S> {
     self.config.is_primary(self.view)
   }
 
+  /// True iff this replica may participate AS the primary right now: `Normal`, the primary of its
+  /// view, AND its current view is already DURABLE (no pending superblock view write). The last
+  /// clause is durable-view-before-participate (codex R8-F1): [`Self::start_view_as_new_primary`]
+  /// sets `Normal` but DEFERS the StartView broadcast (and the rest of participation) to
+  /// [`Self::start_view_participate`] on `on_sb_done`, so until that durable-view write lands the new
+  /// view is not yet recoverable — a crash would regress out of it. Acting AS the primary in that
+  /// window (answering a delayed/duplicate `GetView` with a `StartView`, a peer's `Recovery` with our
+  /// canonical head, or heartbeating/retransmitting on the commit/prepare timers) would assert this
+  /// replica's authority in a view it might never have durably entered → cross-view
+  /// double-participation. Every such outbound PRIMARY path gates on this; the deferred
+  /// `start_view_participate` already runs AFTER the view is durable, so it does not.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn participates_as_primary(&self) -> bool {
+    self.status.is_normal() && self.is_primary() && self.pending_sb.is_none()
+  }
+
   /// Read access to the state machine (for tests / observers).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn state_machine(&self) -> &S {
@@ -821,6 +884,14 @@ impl<S: StateMachine> Endpoint<S> {
   #[cfg(test)]
   fn pending_forfeit_for_test(&self) -> bool {
     self.pending_forfeit
+  }
+
+  /// Test-only: is a view-change/adoption superblock write still pending (`pending_sb` armed)? True
+  /// exactly in the durable-view-before-participate window (codex R8-F1): after
+  /// `start_view_as_new_primary` sets `Normal` but before `on_sb_done` lands the durable-view write.
+  #[cfg(test)]
+  fn pending_sb_for_test(&self) -> bool {
+    self.pending_sb.is_some()
   }
 
   /// Test-only: stage a `pending_checkpoint` (bypassing the trigger), so the `on_request` defense guard
@@ -998,8 +1069,8 @@ impl<S: StateMachine> Endpoint<S> {
     // replica that cannot read its own head has no canonical head to hand out.)
     if self.status.is_recovering_head() {
       match msg {
-        Message::StartView(m) => self.on_start_view(now, sb, m),
-        Message::RecoveryResponse(m) => self.on_recovery_response(now, sb, m),
+        Message::StartView(m) => self.on_start_view(now, wal, sb, m),
+        Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
         _ => {}
       }
       return;
@@ -1011,11 +1082,11 @@ impl<S: StateMachine> Endpoint<S> {
       Message::Commit(c) => self.on_commit(now, sb, c),
       Message::StartViewChange(m) => self.on_start_view_change(now, sb, m),
       Message::DoViewChange(m) => self.on_do_view_change(now, wal, sb, m),
-      Message::StartView(m) => self.on_start_view(now, sb, m),
+      Message::StartView(m) => self.on_start_view(now, wal, sb, m),
       Message::GetView(m) => self.on_get_view(now, m),
       Message::RequestPrepare(m) => self.on_request_prepare(now, m),
       Message::Recovery(m) => self.on_recovery(now, m),
-      Message::RecoveryResponse(m) => self.on_recovery_response(now, sb, m),
+      Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
       // State-sync (M3.4a): a peer's sync solicitation is answered from our durable checkpoint
       // (`on_request_sync`); a sync response is verified + applied (`on_sync_checkpoint`).
       Message::RequestSync(m) => self.on_request_sync(now, sb, m),
@@ -1148,14 +1219,38 @@ impl<S: StateMachine> Endpoint<S> {
       WalDone::Absent(id) | WalDone::Fault(id) => *id,
       WalDone::Appended(_) => return,
     };
+    // Capture the durable known-committed frontier + log_view BEFORE borrowing `rec` (the verdict's
+    // seed-335 above-band view check reads them, and `rec` mutably borrows `self.recover`). Both are
+    // immutable during the recover loop (`advance_commit` runs only after recovery completes).
+    let durable_commit = self.commit_max.get();
+    let durable_log_view = self.log_view.get();
     let Some(rec) = self.recover.as_mut() else {
       return;
     };
     let Some(&op) = rec.reads.get(&id.get()) else {
       return; // not one of our outstanding recovery reads (stale/superseded) — ignore.
     };
-    // Decide the outcome: an Ok body that verifies is adopted; everything else is a fault to retry.
-    let verified_body = match &done {
+    // Decide the outcome. Four cases:
+    //   * Verified  — an Ok body that self-verifies, lands on the op we asked for, AND (if this op is in
+    //     the persisted committed band) MATCHES the canonical `body_checksum` → adopt it.
+    //   * StaleCommitted — an Ok body that self-verifies + lands right but is a STALE superseded slot,
+    //     detected one of two ways: (a) it is in the persisted committed band and its FULL identity
+    //     `(client, request, body_checksum)` MISMATCHES the persisted canonical header (TigerBeetle's
+    //     vsr_headers; seed 52 — a prior-view proposal whose own header is internally consistent); or
+    //     (b) it is ABOVE the durable known-committed frontier AND its header `view` is BELOW our durable
+    //     `log_view` (vopr seed 335) — a tail op from a generation this replica has already SUPERSEDED
+    //     (it advanced its `log_view` past that op's view, i.e. it re-wrote its log head in a newer view,
+    //     so the slot's body is an abandoned earlier-view proposal). Either way the verdict is DEFINITIVE
+    //     (re-reading the same slot cannot fix it), so the slot is dropped + routed to peer-repair WITHOUT
+    //     spending retries; once the cluster commits that op the canonical body is fetched, never
+    //     re-derived from the stale WAL.
+    //   * Fault — Absent / Fault / misdirected / a ReadOk that fails self-verify (torn/bit-rot) → retry.
+    enum Outcome {
+      Verified(Bytes),
+      StaleCommitted,
+      Fault,
+    }
+    let outcome = match &done {
       // Adopt only a body that BOTH verifies (header + body checksums) AND lands on the op we asked
       // for. A misdirected read (a different valid slot returned under our OpId) would checksum-verify
       // cleanly, so the placement check (`header.op() == op`) guards against pairing another op's body
@@ -1163,12 +1258,30 @@ impl<S: StateMachine> Endpoint<S> {
       WalDone::ReadOk(r)
         if r.header().op() == OpNumber::with(op) && r.header().verify(r.body()) =>
       {
-        Some(r.body_bytes())
+        // The self-consistent slot is canonical UNLESS it is detectably superseded. (1) In the persisted
+        // committed band, its FULL identity `(client, request, body_checksum)` must match the recorded
+        // canonical one (a different body, OR the SAME body under a different client/request, is stale;
+        // codex R9-F2). The committed-band `view` is NOT compared — `committed_band_headers()` rewrote it
+        // to the current root view, so it is not the op's original. (2) ABOVE the durable committed
+        // frontier (`op > commit_max`, so there is NO canonical header to compare), a slot whose ORIGINAL
+        // header `view` is below our durable `log_view` is a superseded earlier-view proposal (seed 335):
+        // we advanced `log_view` past it, so its body is abandoned. A current-generation uncommitted tail
+        // op has `view == log_view` and is kept (to be re-acked); only a strictly-older-view slot is dropped.
+        let h = r.header();
+        match rec.canonical.get(&op) {
+          Some(&canonical) if canonical != (h.client(), h.request(), h.body_checksum()) => {
+            Outcome::StaleCommitted
+          }
+          None if op > durable_commit && h.view().get() < durable_log_view => {
+            Outcome::StaleCommitted
+          }
+          _ => Outcome::Verified(r.body_bytes()),
+        }
       }
-      _ => None, // Absent, Fault, misdirected, OR a ReadOk that fails verify (torn/bit-rot) — a fault.
+      _ => Outcome::Fault, // Absent, Fault, misdirected, OR a ReadOk that fails verify (torn/bit-rot).
     };
-    match verified_body {
-      Some(body) => {
+    match outcome {
+      Outcome::Verified(body) => {
         // Adopt the verified body, retiring this read.
         rec.reads.remove(&id.get());
         rec.pending.remove(&op);
@@ -1177,7 +1290,16 @@ impl<S: StateMachine> Endpoint<S> {
           entry.body = body;
         }
       }
-      None => {
+      Outcome::StaleCommitted => {
+        // The persisted vsr_header says this committed slot's canonical body differs from the WAL's:
+        // class it permanently faulty IMMEDIATELY (no retry — the mismatch is authoritative). The
+        // existing B4 path then drops it from the `log` cache (`recover_progress`) and `advance_commit`
+        // peer-repairs it on demand; the canonical body is fetched, never re-derived from the stale WAL.
+        rec.reads.remove(&id.get());
+        rec.pending.remove(&op);
+        rec.faulty.insert(op);
+      }
+      Outcome::Fault => {
         // A fault on this op: spend a retry if any remain, else class it permanently faulty.
         rec.reads.remove(&id.get());
         let budget = rec.pending.get(&op).copied().unwrap_or(0);
@@ -1247,12 +1369,16 @@ impl<S: StateMachine> Endpoint<S> {
           // `commit_min >= target_op` always (target_op was commit_min at trigger; commit_min only
           // grows), so the VsrState `commit >= checkpoint_op` invariant holds → try_new can't fail.
           let root_id = self.mint_op_id();
+          // The committed band the NEW root names shrinks to `(target_op .. commit_min]` (the just-
+          // checkpointed prefix `[1..=target_op]` now lives in the snapshot, not the band) — pass
+          // `pc.target_op` as the floor so the persisted vsr_headers match this root's `checkpoint_op`.
           let state = crate::VsrState::try_new(
             self.view,
             self.log_view,
             self.commit_min,
             pc.target_op,
             pc.checkpoint_id,
+            self.committed_band_headers(pc.target_op),
           )
           .expect("checkpoint root: commit_min >= target_op and log_view <= view");
           sb.submit_write(root_id, state);
@@ -2114,6 +2240,29 @@ impl<S: StateMachine> Endpoint<S> {
     if crate::checkpoint_id(m.snapshot()) != m.checkpoint_id() {
       return;
     }
+    // SAFETY/LIVENESS (codex vopr seed 8, async-superblock): a PRIMARY must NOT APPLY a state-sync in
+    // place. `apply_sync` resets `commit_min` to the synced checkpoint and CLEARS `inflight` (the
+    // commit pipeline) while KEEPING `self.op` (the held tail) and staying Normal primary — but it does
+    // NOT rebuild the pipeline for the retained committed tail `(commit_min .. op]`, so the primary's
+    // `try_commit` wedges forever at the checkpoint (the missing inflight entry at `commit_min + 1`
+    // breaks the strictly-in-order commit loop, and re-acked PrepareOks drop on the empty `inflight`).
+    // `maybe_force_sync` ALREADY guards the ARM site (a primary reaching the unservable-hole strand
+    // sets `pending_forfeit` instead of force-syncing — see its safety note), but a forced/ordinary
+    // sync ARMED while this replica was a BACKUP can still be DELIVERED after it (re)gained primacy, so
+    // the guard must also hold at the APPLY site. Mirror the arm-site decision: a primary that would
+    // apply a sync STEPS DOWN — drop the sync and flag the deferred forfeit, which the next
+    // `primary_timeouts` acts on (re-propose `view + 1`). A caught-up replica then leads (every replica
+    // already holds the committed tail durably), and THIS replica recovers any pruned hole as a BACKUP
+    // via the ordinary force-sync escalation once it is no longer primary. No committed op is lost (the
+    // synced snapshot is never discarded — it is simply re-fetched as a backup; `commit_min` never
+    // rewinds). This is the same invariant `complete_recovery` enforces for a restarted primary
+    // (abdicate rather than resume with a torn-down pipeline).
+    if self.is_primary() {
+      self.pending_forfeit = true;
+      self.sync = None;
+      self.timers.sync_solicit = None;
+      return;
+    }
     self.apply_sync(now, wal, sb, &m);
   }
 
@@ -2322,6 +2471,23 @@ impl<S: StateMachine> Endpoint<S> {
     self.recover = None;
     self.status = Status::Normal;
     self.apply_sync(now, wal, sb, &m);
+    // STEP DOWN if we are the primary (codex vopr seed 8, async-superblock). This F1 peer-checkpoint
+    // fetch RESTORED our SM from a peer snapshot and KEPT our retained tail `(commit_min .. op]`, but —
+    // exactly like a state-sync on a Normal primary, and like a restarted primary in `complete_recovery`
+    // — it left `inflight` (the commit pipeline) CLEARED while we remain the primary of our view. A
+    // Normal primary with a torn-down pipeline wedges: `try_commit` cannot advance past `commit_min`
+    // (the missing inflight entry at `commit_min + 1` breaks the in-order loop; re-acked PrepareOks drop
+    // on the empty pipeline). A multi-replica primary therefore ABDICATES: flag the deferred forfeit so
+    // the next `primary_timeouts` re-proposes `view + 1` and a caught-up replica leads (every replica
+    // already holds the committed tail durably). The SM is restored (we needed the snapshot to recover
+    // at all), so we abdicate AFTER applying — unlike `on_sync_checkpoint`, where a Normal primary's SM
+    // is already valid and we step down without applying. SOLO (`replica_count == 1`) cannot view-change
+    // (no quorum), but a solo replica has no peers and so never reaches this peer-fetch path; the guard
+    // is belt-and-suspenders. (`complete_recovery` enforces the same abdication for a disk-recovered
+    // primary; this closes the parallel hole on the peer-fetch recovery path.)
+    if self.config.replica_count() > 1 && self.is_primary() {
+      self.pending_forfeit = true;
+    }
   }
 
   /// If `commit_min` has reached the next checkpoint boundary and no superblock write is pending,
@@ -2478,6 +2644,42 @@ impl<S: StateMachine> Endpoint<S> {
   /// serialized root-write ordering contract guarantees this later write is the final durable root,
   /// so the stale checkpoint root cannot win.) `commit_min >= checkpoint_op` always holds, so
   /// `try_new`'s `commit >= checkpoint_op` invariant cannot fail.
+  /// Derive the CANONICAL headers of the un-checkpointed committed band `(checkpoint_floor ..
+  /// commit_min]` from `self.log`, for persistence in the durable [`crate::VsrState`] root
+  /// (TigerBeetle's `vsr_headers`). `checkpoint_floor` is the `checkpoint_op` the SAME root write
+  /// records — `self.checkpoint_op` for an ordinary durable-view write, but `pc.target_op` (the NEW
+  /// checkpoint) for the checkpoint root write, whose band shrinks to `(target_op .. commit_min]`.
+  ///
+  /// After an ADOPTION (`adopt_log`) `self.log` holds the canonical bytes for the committed band, so
+  /// the body checksum each header records is canonical; in normal operation the band is the replica's
+  /// own committed ops (also canonical). The list is built in op order and stops at the FIRST op the
+  /// log is missing (a repair hole not yet filled): such an op is already non-durable / absent on this
+  /// replica, so recording only the contiguous prefix up to the gap is safe — `VsrState::try_new`
+  /// enforces the same contiguity defensively. Bounded by `commit_min - checkpoint_floor`, i.e. ~one
+  /// checkpoint interval (GC keeps the band small).
+  ///
+  /// The reconstructed `Header` carries the current root `view`; only its [`Header::body_checksum`] is
+  /// load-bearing for the recovery cross-check (it is `fnv1a_128(body)`, view-independent), so the view
+  /// field is informational. Empty when the band is empty (`commit_min == checkpoint_floor`).
+  fn committed_band_headers(&self, checkpoint_floor: OpNumber) -> std::vec::Vec<Header> {
+    let lo = checkpoint_floor.get().saturating_add(1);
+    let hi = self.commit_min.get();
+    let mut headers = std::vec::Vec::new();
+    for op in lo..=hi {
+      let Some(entry) = self.log.get(&op) else {
+        break; // a hole in the committed band — record only the contiguous canonical prefix below it.
+      };
+      headers.push(Header::new(
+        OpNumber::with(op),
+        self.view,
+        entry.client,
+        entry.request,
+        &entry.body,
+      ));
+    }
+    headers
+  }
+
   fn submit_durable_view(&mut self, action: PendingSbAction, sb: &mut impl Superblock) {
     let checkpoint_id = sb.state().checkpoint_id();
     let state = crate::VsrState::try_new(
@@ -2486,6 +2688,7 @@ impl<S: StateMachine> Endpoint<S> {
       self.commit_min,
       self.checkpoint_op,
       checkpoint_id,
+      self.committed_band_headers(self.checkpoint_op),
     )
     .expect("durable view: log_view <= view and commit_min >= checkpoint_op");
     let id = self.mint_op_id();
@@ -2515,6 +2718,18 @@ impl<S: StateMachine> Endpoint<S> {
     // generation re-evaluates from scratch (no same-view re-forfeit, no cross-view leak).
     if self.pending_forfeit {
       self.forfeit(now, sb);
+      return;
+    }
+    // Durable-view-before-participate (codex R8-F1): until the new-primary view-change superblock
+    // write is durable, status is Normal but the view is NOT yet recoverable. A primary must NOT
+    // heartbeat (`Commit`) nor retransmit prepares (`Prepare`) in a view it could regress out of on
+    // crash — those assert this replica's authority in the not-yet-durable view (the same hazard the
+    // `on_get_view`/`on_recovery` gates close on the message side). Skip the whole heartbeat /
+    // retransmit / forfeit-evaluation tick while the write is pending; `start_view_participate` (run
+    // from `on_sb_done` once the view IS durable) arms the timers and begins committing, after which
+    // ordinary ticks resume. The deferred forfeit above is exempt: it is a STEP-DOWN (it proposes a
+    // higher view via `propose_next_view`), not participation as this view's primary.
+    if self.pending_sb.is_some() {
       return;
     }
     // Bootstrap the heartbeat the first time we're ticked as primary.
@@ -2842,7 +3057,16 @@ impl<S: StateMachine> Endpoint<S> {
         self.view,
         self.log_view,
         self.op,
-        self.commit_min,
+        // The DVC reports the KNOWN committed frontier `commit_max` — VSR's commit-number `k` (the
+        // highest op this replica KNOWS is committed), NOT the locally-applied `commit_min` (codex
+        // R9-F1). `select_canonical_log` takes `commit* = max(d.commit())`, so under-reporting
+        // commit_min would let a known-committed op (whose slot is a dropped repair hole on this
+        // replica) fall ABOVE `commit*` and be truncated as an uncommitted gap when the DVC quorum is
+        // this replica + a laggard. Reporting commit_max keeps `commit*` at/above it, so it is a
+        // COMMITTED hole the new primary HOLDS + peer-repairs (never silently dropped). Fail-stop-safe:
+        // a committed op N is held by a write-quorum, which intersects the DVC quorum, so some donor
+        // claims `op >= N` → `commit* (<= max commit_max == N) <= op_head` holds.
+        self.commit_max,
         self.config.replica(),
         self.log_entries(),
       )),
@@ -2895,7 +3119,10 @@ impl<S: StateMachine> Endpoint<S> {
         self.view,
         self.log_view,
         self.op,
-        self.commit_min,
+        // Report the KNOWN committed frontier `commit_max` (VSR's `k`), not `commit_min` — see
+        // `send_do_view_change` (codex R9-F1). This own-DVC feeds the same `select_canonical_log`
+        // `commit*` union, so it must carry the same frontier the wire DVC does.
+        self.commit_max,
         self.config.replica(),
         self.log_entries(),
       );
@@ -3121,6 +3348,14 @@ impl<S: StateMachine> Endpoint<S> {
       }
     }
 
+    // SAFETY (vopr seed 253 et al.): physically DROP any WAL tail ABOVE the new primary's canonical head,
+    // mirroring `adopt_canonical_head`. A slot above `self.op` can only hold an UNCOMMITTED earlier-view
+    // proposal (the canonical head is this view's authoritative head); left in the WAL it is RE-LOADED by a
+    // later `recover` and applied for a committed op the cluster assigns at that number with a DIFFERENT
+    // value (a committed-divergence). Truncating drops only uncommitted ops, so no durability dip; the
+    // `adopt_append` loop below re-writes the canonical `(commit_min .. op]` slots authoritatively.
+    wal.truncate(self.op);
+
     // Backfill the client-session request high-water from the adopted in-memory log tail. This is a
     // fallback that only covers the ops still cached in `self.log` (the offset tail `(floor .. op]`).
     // The AUTHORITATIVE source of the dedup watermark is now apply-time tracking in `advance_commit`
@@ -3251,7 +3486,13 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
-  fn on_start_view<B: Superblock>(&mut self, now: Instant, sb: &mut B, m: crate::StartView) {
+  fn on_start_view<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    m: crate::StartView,
+  ) {
     // Adopt only a strictly newer view, or the current view while we have not yet returned to Normal
     // in it. Re-applying a StartView for a view we are already Normal in would rewind `op` and
     // clobber locally-appended ops. A RecoveringHead replica is NOT Normal, so a same-view StartView
@@ -3265,6 +3506,22 @@ impl<S: StateMachine> Endpoint<S> {
       return; // must come from the view's primary
     }
     self.adopt_canonical_head(now, sb, m.view(), m.op(), m.commit(), m.log_slice());
+    self.truncate_wal_above_adopted_head(wal);
+  }
+
+  /// Drop any WAL tail strictly ABOVE the head this replica just adopted (vopr seed 253 et al.). Run by
+  /// [`on_start_view`](Self::on_start_view) / [`on_recovery_response`](Self::on_recovery_response) right
+  /// after [`adopt_canonical_head`](Self::adopt_canonical_head) sets `self.op` to the canonical head. A
+  /// slot above that head can only hold an UNCOMMITTED earlier-view proposal (the canonical head is this
+  /// new view's authoritative head — nothing above it is committed), and `adopt_log` only cleared the
+  /// IN-MEMORY cache. Left in the WAL, such a stale slot is RE-LOADED by a later `recover` (which rebuilds
+  /// the cache from the un-truncated WAL and sets `self.op` back to it) and then APPLIED for a committed op
+  /// the new view assigns at that SAME number with a DIFFERENT value (committed-divergence). Truncating to
+  /// `self.op` drops ONLY uncommitted ops, so there is no durability dip; the uncommitted tail is simply
+  /// re-fetched from the primary as `Prepare`s. (`adopt_canonical_head` never lowers `self.op`, so this is
+  /// exactly the adopted head; done in the caller because it owns the `wal` handle.)
+  fn truncate_wal_above_adopted_head<W: Wal>(&self, wal: &mut W) {
+    wal.truncate(self.op);
   }
 
   /// Adopt an authoritative primary's canonical head + log for `view` and return to `Normal`.
@@ -3312,6 +3569,9 @@ impl<S: StateMachine> Endpoint<S> {
     self.view = view;
     self.adopt_log(log);
     self.op = op;
+    // (The WAL is truncated to this adopted head by the caller — `on_start_view` /
+    // `on_recovery_response` — via `truncate_wal_above_adopted_head`, dropping the uncommitted divergent
+    // suffix at the source so a later `recover` cannot re-load + apply a superseded body. See that helper.)
     // Retire any pending-repair holes the adopted canonical log NOW supplies (or that the adopter's
     // own APPLIED-prefix copy now covers, since `adopt_log` kept committed held ops `op <= commit_min`).
     // Holes the canonical log omits AND the adopter does not hold remain solicited; `advance_commit`
@@ -3454,8 +3714,13 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn on_get_view(&mut self, _now: Instant, m: crate::GetView) {
-    // Only a Normal primary at the requested view (or higher) can answer authoritatively.
-    if self.status.is_normal() && self.is_primary() && self.view.get() >= m.view().get() {
+    // Only a Normal primary at the requested view (or higher) can answer authoritatively — AND only
+    // once its view is DURABLE (codex R8-F1): `participates_as_primary` adds the `pending_sb.is_none()`
+    // clause, so a primary that just adopted its view but has not yet persisted it does NOT hand out a
+    // `StartView` for that not-yet-recoverable view (it would, on crash, regress out of a view it had
+    // already vouched for to a soliciting peer). The deferred `start_view_participate` broadcasts the
+    // StartView once the view is durable, and a later `GetView` is then answered normally.
+    if self.participates_as_primary() && self.view.get() >= m.view().get() {
       self.outgoing.push_back(Outgoing::new(
         Recipient::To(Peer::Replica(m.replica())),
         Message::StartView(crate::StartView::new(
@@ -3478,6 +3743,17 @@ impl<S: StateMachine> Endpoint<S> {
   fn on_recovery(&mut self, _now: Instant, m: crate::Recovery) {
     if !self.status.is_normal() {
       return; // only a Normal replica has a trustworthy view/head to report
+    }
+    // Durable-view-before-participate (codex R8-F1): while a view-change/adoption superblock write is
+    // pending, status is Normal but the current view is NOT yet durable. A primary answering here with
+    // its canonical `(op, commit, log)` — and even a Normal backup answering with its (non-durable)
+    // view + echoed nonce — reports authority in a view a crash could regress out of, the same
+    // cross-view hazard `on_get_view`'s StartView gate closes. Gate the WHOLE handler: a recovering
+    // peer simply re-solicits (its `recover_head` timer retransmits the `Recovery`) until our view is
+    // durable, at which point we answer normally. (Backups have no canonical head anyway; the strict
+    // gate keeps both branches from reporting a not-yet-recoverable view.)
+    if self.pending_sb.is_some() {
+      return;
     }
     if m.replica().get() >= self.config.replica_count() {
       return; // ignore malformed/out-of-range replica id
@@ -3507,9 +3783,10 @@ impl<S: StateMachine> Endpoint<S> {
   /// outstanding solicitation (freshness — a stale response from an earlier attempt is rejected) and
   /// (b) it is from the responder's view's primary (only the primary hands out a canonical head). A
   /// backup's response (empty log) merely confirms a view; the `recover_head` timer re-solicits.
-  fn on_recovery_response<B: Superblock>(
+  fn on_recovery_response<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
+    wal: &mut W,
     sb: &mut B,
     m: crate::RecoveryResponse,
   ) {
@@ -3529,6 +3806,7 @@ impl<S: StateMachine> Endpoint<S> {
       return;
     }
     self.adopt_canonical_head(now, sb, m.view(), m.op(), m.commit(), m.log_slice());
+    self.truncate_wal_above_adopted_head(wal);
   }
 
   fn on_request<W: Wal>(&mut self, now: Instant, wal: &mut W, _from: Peer, r: crate::Request) {
@@ -3546,6 +3824,20 @@ impl<S: StateMachine> Endpoint<S> {
     // step-down guards against). A primary should never be syncing in steady state, so this only ever
     // drops a request during an abnormal in-flight reset; the client retries once it settles.
     if self.pending_sb.is_some() || self.sync.is_some() || self.pending_checkpoint.is_some() {
+      return;
+    }
+    // SAFETY (codex vopr seed 52, async-superblock): a primary that has FLAGGED a forfeit (it has
+    // decided to step down — `maybe_force_sync`'s primary guard, or the F1 recovery-peer-fetch /
+    // state-sync apply that reset this replica's `op` back to a checkpoint) must NOT assign new ops. It
+    // has just RESET `self.op` to (a checkpoint at or below) a value the cluster has moved PAST — under
+    // a NEWER view a fresh primary already committed ops at those numbers. Accepting a client request
+    // now reuses a committed op number with DIFFERENT bytes (the stale-primary op-reuse divergence:
+    // VOPR seed 52 had a recovered view-0 primary reuse a committed op a view-1 primary had already
+    // committed). The forfeit is latched and acted on by the next `primary_timeouts` tick, but a client
+    // request can arrive (via `handle_message`) BEFORE that tick — so the op-assignment gate, not just
+    // the timer, must honour the abdication. Drop the request; once the view change completes a
+    // caught-up primary serves it.
+    if self.pending_forfeit {
       return;
     }
     // codex R5-F2: do not serve clients while our committed prefix is not yet applied. If commit_max >
@@ -4377,7 +4669,7 @@ mod tests {
   }
   impl Superblock for TestSb {
     fn state(&self) -> VsrState {
-      self.state
+      self.state.clone()
     }
     fn submit_write(&mut self, id: OpId, state: VsrState) {
       self.state = state;
@@ -4444,7 +4736,7 @@ mod tests {
   }
   impl Superblock for StepSb {
     fn state(&self) -> VsrState {
-      self.state
+      self.state.clone()
     }
     fn submit_write(&mut self, id: OpId, state: VsrState) {
       self.inflight.push_back(SuperblockDone::Wrote(id));
@@ -4455,7 +4747,7 @@ mod tests {
       // for simplicity (the durability gate that matters is the VsrState root ordering).
       self.checkpoint = Some((op, snapshot));
       self.inflight.push_back(SuperblockDone::Wrote(id));
-      self.inflight_states.push_back(self.state); // a checkpoint write does not change the root
+      self.inflight_states.push_back(self.state.clone()); // a checkpoint write does not change the root
     }
     fn submit_read_checkpoint(&mut self, id: OpId) {
       let done = match &self.checkpoint {
@@ -5475,6 +5767,182 @@ mod tests {
   }
 
   #[test]
+  fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated() {
+    // CONSENSUS-CRITICAL regression (codex R9-F1). `recover` set BOTH commit_min AND commit_max to
+    // checkpoint_op, DISCARDING the durable known-committed frontier `state.commit()` (which can exceed
+    // checkpoint_op). A replica whose durable root says op N is committed — but whose WAL slot N read back
+    // stale/faulty (now DROPPED → repair hole by the R9-F2 / seed-52 vsr_headers cross-check) — recovered
+    // having FORGOTTEN that N is committed. Its DoViewChange then UNDER-reported its commit (commit_min ==
+    // checkpoint_op), so if the DVC quorum is this recovered replica + a LAGGARD (the other old
+    // commit-quorum holder crashed/partitioned), `commit*` never reached N, the offset-union treated the
+    // missing op N as an UNCOMMITTED interior gap, and `start_view_as_new_primary` TRUNCATED — LOSING the
+    // known-committed op N.
+    //
+    // Fix: `recover` sets commit_max = state.commit() (the durable known frontier, keeping commit_min ==
+    // checkpoint_op), and the DVC reports commit_max (VSR's commit-number `k` = highest KNOWN committed),
+    // so `commit*` reaches N → N is a COMMITTED repair hole (held + peer-repaired), never truncated.
+    //
+    // Setup: replica 1 of 3. Durable root: view 0, commit 2 (op 2 is KNOWN committed), checkpoint_op 0,
+    // with canonical vsr_headers for ops 1 + 2. WAL head 3, but slot 2 reads back PERMANENTLY FAULTY → the
+    // recover loop drops it (an interior committed hole). Op 3 is the uncommitted tail.
+    let mk_header = |op: u64| {
+      Header::new(
+        OpNumber::with(op),
+        View::new(),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        &[op as u8],
+      )
+    };
+    let state = VsrState::try_new(
+      View::new(),
+      View::new(),
+      OpNumber::with(2), // durable commit — op 2 is KNOWN committed cluster-wide
+      OpNumber::new(),   // checkpoint_op 0
+      0,
+      std::vec![mk_header(1), mk_header(2)],
+    )
+    .unwrap();
+    let mut sb = TestSb {
+      state,
+      done: VecDeque::new(),
+      checkpoint: None,
+    };
+    let mut wal = ScriptedWal::with_entries(3);
+    wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot is permanently faulty → dropped
+    let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+    for _ in 0..32 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if !r.status().is_recovering() {
+        break;
+      }
+    }
+    assert_eq!(
+      r.status(),
+      Status::Normal,
+      "recovers to Normal (op 2 below the head 3 → peer-repair)"
+    );
+    assert!(
+      !r.log.contains_key(&2),
+      "the faulty committed slot is dropped from the cache (interior hole)"
+    );
+    // The durable known-committed frontier is CARRIED: commit_max == 2 (NOT checkpoint_op 0). commit_min
+    // stays at checkpoint_op 0 (the SM is restored to the checkpoint; the band re-applies via the WAL).
+    // (FAIL-BEFORE: recover set commit_max = checkpoint_op = 0, forgetting op 2 was committed.)
+    assert_eq!(
+      r.commit_max(),
+      OpNumber::with(2),
+      "recover carries the durable commit frontier (op 2 is KNOWN committed), not checkpoint_op"
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(0),
+      "commit_min stays at checkpoint_op — the committed band re-applies as it is repaired/re-announced"
+    );
+    while r.poll_message().is_some() {} // discard recovery chatter
+    while r.poll_event().is_some() {}
+
+    // Drive replica 1 to primary of view 1 with a DVC quorum of {replica 1 (recovered), replica 0 (a
+    // LAGGARD)}. The other old commit-quorum holder (replica 2) is ABSENT (crashed/partitioned). The
+    // laggard holds only op 1 (head 1, commit 0) — it does NOT supply op 2 and does NOT know op 2 is
+    // committed. So the ONLY donor that knows op 2 is committed is the recovered replica itself, via its
+    // carried commit_max.
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    );
+    assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
+    r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
+    // The recovered replica's OWN DVC must report its KNOWN committed frontier (commit_max == 2), not
+    // commit_min == 0 — otherwise the laggard quorum loses op 2. Verify it on the wire.
+    let own_dvc_commit = std::iter::from_fn(|| r.poll_message())
+      .filter_map(|out| match out.into_msg() {
+        Message::DoViewChange(d) => Some(d.commit()),
+        _ => None,
+      })
+      .next()
+      .expect("the recovered replica sends its DVC");
+    assert_eq!(
+      own_dvc_commit,
+      OpNumber::with(2),
+      "the DVC reports the KNOWN committed frontier (commit_max == 2), so commit* covers op 2 \
+       (FAIL-BEFORE: it reported commit_min == 0 and op 2 was treated as an uncommitted gap)"
+    );
+
+    // The laggard replica 0's DVC: same generation (log_view 0), head 1, commit 0, log {1} only — it
+    // neither supplies op 2 nor vouches it committed. With the recovered replica's own DVC (commit 2),
+    // commit* == 2, so op 2 is a COMMITTED hole — repaired, NOT truncated.
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::DoViewChange(DoViewChange::new(
+        View::with(1),
+        View::with(0),
+        OpNumber::with(1),
+        OpNumber::with(0),
+        ReplicaId::new(0),
+        std::vec![PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::copy_from_slice(&[1u8]),
+        )],
+      )),
+    );
+    assert!(r.is_primary(), "replica 1 became the primary of view 1");
+    // op 2 is NOT truncated: the head stays at op 3 (op 2 ≤ commit* == 2 is a committed hole). The
+    // commit is HELD at op 1 until op 2 is repaired. (FAIL-BEFORE: commit* == 0, op 2 was an uncommitted
+    // interior gap, the head truncated to op 1, and the known-committed op 2 was LOST.)
+    assert_eq!(
+      r.op(),
+      OpNumber::with(3),
+      "the known-committed op 2 is NOT truncated — the head stays at op 3"
+    );
+    assert!(
+      r.has_repair_hole_for_test(2),
+      "op 2 is a COMMITTED repair hole (held + peer-repaired), not silently dropped"
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(1),
+      "the commit is HELD below the known-committed hole until a peer supplies op 2"
+    );
+
+    // Pump the StartViewAsPrimary durable-view write, then a committed-vouching peer answers our
+    // RequestPrepare for op 2 (commit 2 >= op 2) → fill the hole and resume the held commit to op 2.
+    r.handle_storage(now, &mut wal, &mut sb);
+    while r.poll_message().is_some() {}
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      repair_prepare(0, 2, 2),
+    );
+    assert!(
+      !r.has_repair_hole_for_test(2),
+      "the committed-vouching Prepare fills the known-committed hole"
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(2),
+      "the held commit resumes — the known-committed op 2 is RETAINED, never lost"
+    );
+    assert_eq!(
+      r.state_machine().applied(),
+      &[(1, std::vec![1u8]), (2, std::vec![2u8])],
+      "the committed log retains op 2 end to end (FAIL-BEFORE: op 2 was truncated and lost)"
+    );
+  }
+
+  #[test]
   fn new_primary_reconstructs_sessions_so_retries_dedup() {
     // replica 1 becomes primary of view 1, adopting client 7's requests 1 (committed) and 2.
     let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
@@ -6305,6 +6773,239 @@ mod tests {
   }
 
   #[test]
+  fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_applied() {
+    // REGRESSION (vopr seed 253 / 299 / 335), CONSENSUS-CRITICAL committed-divergence. A replica's WAL can
+    // retain a STALE tail op from an EARLIER view that a later view never overwrote — a proposal it appended
+    // as an old-view primary, which a view change SUPERSEDED (the new view assigns that op number a DIFFERENT
+    // client request). Adoption only dropped it from the in-memory cache, not the WAL. On a later crash +
+    // `recover`, the loop rebuilds the cache from the WAL and re-loads that stale body; when the cluster then
+    // commits the op (whose CANONICAL value differs), `advance_commit` APPLIED the stale local body → the
+    // replica diverged from every other replica at that one committed op number (no second op number is minted
+    // and no request is committed twice — at-most-once holds — but a single committed slot carried two values).
+    //
+    // The seed-52 `vsr_headers` cross-check only guards the persisted committed band `(checkpoint .. commit]`;
+    // a slot ABOVE the durable known-committed frontier is not in that band, so it was trusted blindly. The fix
+    // generalises the cross-check: on `recover`, a self-verifying tail slot above `commit_max` whose ORIGINAL
+    // header `view` is BELOW the durable `log_view` is a SUPERSEDED earlier-view proposal (we advanced our
+    // `log_view` past it), so it is dropped and routed to peer-repair — the canonical body is fetched, never
+    // re-derived from the stale WAL. A current-generation uncommitted tail op (`view == log_view`) is KEPT.
+    //
+    // Reproduction (replica 2 of 3 = a BACKUP of view 1): durable root view 1, log_view 1, commit 2, checkpoint
+    // 0, with vsr_headers for the committed prefix ops 1 + 2 (current-view, canonical). The WAL holds an
+    // INTERIOR stale slot op 3 (a view-0 proposal — client 9, request 99, body 0xAA) ABOVE the durable commit 2,
+    // with current-view (view 1) ops 4 + 5 above it (a legitimate uncommitted tail that must be KEPT). The
+    // cluster's canonical op 3 is (client 7, request 3, body [3]). Recover must DROP slot 3 (not hold its stale
+    // body) yet keep 4 + 5; a committed-vouching peer-repair `Prepare` then supplies op 3's canonical body.
+    let now = Instant::ZERO;
+    let mk_header = |op: u64, view: u64, client: u128, request: u64, body: &[u8]| {
+      Header::new(
+        OpNumber::with(op),
+        View::with(view),
+        ClientId::new(client),
+        RequestNumber::with(request),
+        body,
+      )
+    };
+    // Ops 1 + 2: current-view (view 1) canonical committed prefix. Op 3: STALE view-0 superseded INTERIOR slot.
+    // Ops 4 + 5: current-view (view 1) uncommitted tail (kept — `view == log_view`), so op 3 is interior.
+    let mut wal = ScriptedWal::with_entries(2); // seeds ops 1, 2 — view/body overwritten next
+    wal.entries.insert(
+      1,
+      (mk_header(1, 1, 7, 1, &[1]), Bytes::copy_from_slice(&[1])),
+    );
+    wal.entries.insert(
+      2,
+      (mk_header(2, 1, 7, 2, &[2]), Bytes::copy_from_slice(&[2])),
+    );
+    wal.entries.insert(
+      3,
+      (
+        mk_header(3, 0, 9, 99, &[0xAA]),
+        Bytes::copy_from_slice(&[0xAA]),
+      ),
+    );
+    wal.entries.insert(
+      4,
+      (mk_header(4, 1, 7, 4, &[4]), Bytes::copy_from_slice(&[4])),
+    );
+    wal.entries.insert(
+      5,
+      (mk_header(5, 1, 7, 5, &[5]), Bytes::copy_from_slice(&[5])),
+    );
+    wal.head = 5;
+    let state = VsrState::try_new(
+      View::with(1), // durable view 1 — recovers as a backup of view 1 (primary is replica 1)
+      View::with(1), // durable log_view 1 — a view-0 tail slot is from a SUPERSEDED generation
+      OpNumber::with(2), // commit 2 — ops 1 + 2 are KNOWN committed; op 3 is ABOVE the frontier
+      OpNumber::new(), // checkpoint_op 0
+      0,
+      std::vec![mk_header(1, 1, 7, 1, &[1]), mk_header(2, 1, 7, 2, &[2])], // vsr_headers for 1 + 2
+    )
+    .unwrap();
+    let mut sb = TestSb {
+      state,
+      done: VecDeque::new(),
+      checkpoint: None,
+    };
+    let cfg = Config::try_new(1, ReplicaId::new(2), 3).unwrap();
+    let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+    for _ in 0..32 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if !r.status().is_recovering() {
+        break;
+      }
+    }
+    assert_eq!(r.status(), Status::Normal, "recovers to Normal in view 1");
+    assert_eq!(r.view(), View::with(1), "recovered into the durable view 1");
+    assert!(!r.is_primary(), "replica 2 is a BACKUP of view 1");
+    // The crux of the fix: the STALE view-0 slot 3 is DROPPED from the cache (FAIL-BEFORE: it was held as
+    // `(client 9, request 99, body 0xAA)` and would later be applied for the committed op). Ops 1 + 2 (current
+    // view, in the committed band) are kept.
+    assert!(
+      !r.log.contains_key(&3),
+      "FAIL-BEFORE: the superseded view-0 slot 3 must be dropped on recover (not re-loaded as committed)"
+    );
+    assert!(
+      r.log.contains_key(&1) && r.log.contains_key(&2),
+      "the current-view committed prefix (ops 1 + 2) is retained"
+    );
+    assert!(
+      r.log.contains_key(&4) && r.log.contains_key(&5),
+      "the current-view uncommitted tail (ops 4 + 5, view == log_view) is KEPT — only the older-view slot is dropped"
+    );
+    while r.poll_message().is_some() {} // discard recovery chatter
+    while r.poll_event().is_some() {}
+
+    // The cluster commits op 3 (canonical = client 7, request 3, body [3]). A Commit reaches op 3 → the backup
+    // holds at op 2 and solicits a peer-repair (op 3 is now a known-committed hole). A committed-vouching peer
+    // answers with the canonical `Prepare` (commit >= op), which `fill_repair` adopts.
+    let primary1 = Peer::Replica(ReplicaId::new(1));
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary1,
+      Message::Commit(Commit::new(
+        View::with(1),
+        OpNumber::with(3),
+        OpNumber::new(),
+      )),
+    );
+    r.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(2),
+      "commit HELD at op 2 — op 3's stale slot was dropped, so it is a hole until peer-repair supplies it"
+    );
+    assert!(
+      r.has_repair_hole_for_test(3),
+      "op 3 is solicited as a committed-op repair hole (its stale local body is never trusted)"
+    );
+    // A committed-vouching peer-repair Prepare for the CANONICAL op 3 (commit = 3 >= op) fills the hole.
+    let canonical_op3 = Message::Prepare(Prepare::new(
+      View::with(1),
+      OpNumber::with(3),
+      OpNumber::with(3), // commit >= op: the answerer vouches op 3 is committed (fill_repair gate)
+      OpNumber::new(),
+      ClientId::new(7),
+      RequestNumber::with(3),
+      Bytes::copy_from_slice(&[3]),
+    ));
+    r.handle_message(now, &mut wal, &mut sb, primary1, canonical_op3);
+    r.handle_storage(now, &mut wal, &mut sb);
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(3),
+      "the hole filled → committed through op 3"
+    );
+    // The crux: op 3 applied the CANONICAL body [3], NEVER the stale [0xAA]. With the bug, the applied log read
+    // `(3, [0xAA])` — a committed-state divergence from every replica that applied [3].
+    assert_eq!(
+      r.state_machine().applied(),
+      &[
+        (1, std::vec![1u8]),
+        (2, std::vec![2u8]),
+        (3, std::vec![3u8])
+      ],
+      "op 3 applied the canonical body [3]; the stale [0xAA] must NEVER be applied for the committed op"
+    );
+  }
+
+  #[test]
+  fn adopting_a_canonical_head_truncates_the_wal_above_it() {
+    // REGRESSION (vopr seed 253 / 299), the source-side half of the committed-divergence fix. When a replica
+    // adopts a new view's canonical head, any WAL slot ABOVE that head is an UNCOMMITTED earlier-view proposal
+    // (the canonical head is the new view's authoritative head — nothing above it is committed). Leaving such a
+    // slot in the WAL lets a later `recover` re-load it and apply its stale body for a committed op the new view
+    // assigns at that number. So adoption must physically TRUNCATE the WAL above the adopted head — dropping only
+    // uncommitted ops (no durability dip). Here replica 2 of 3 holds a stale tail op 3 in its WAL, then adopts a
+    // StartView for view 1 whose head is op 2; the WAL must no longer contain op 3.
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // Seed the WAL with a stale uncommitted tail op 3 (as if appended in an earlier generation).
+    let stale = Header::new(
+      OpNumber::with(3),
+      View::new(),
+      ClientId::new(9),
+      RequestNumber::with(99),
+      &[0xAA],
+    );
+    wal.submit_append(
+      OpId::new(999),
+      OpNumber::with(3),
+      stale,
+      Bytes::copy_from_slice(&[0xAA]),
+    );
+    while wal.poll().is_some() {} // discard the seed completion
+    assert_eq!(
+      wal.op_head(),
+      OpNumber::with(3),
+      "precondition: the WAL holds the stale tail op 3"
+    );
+
+    // Adopt a StartView for view 1 (from primary(1) = replica 1) whose canonical head is op 2.
+    let sv = StartView::new(
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          Bytes::from_static(b"b"),
+        ),
+      ],
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::StartView(sv),
+    );
+    assert_eq!(e.op(), OpNumber::with(2), "adopted the canonical head op 2");
+    // The crux: the stale slot 3 was TRUNCATED from the WAL (FAIL-BEFORE: it lingered, to be re-loaded by a
+    // later recover and applied as a stale committed body).
+    assert!(
+      !wal.entries.contains_key(&3),
+      "FAIL-BEFORE: the uncommitted tail op 3 above the adopted head must be truncated from the WAL"
+    );
+    assert!(
+      wal.op_head().get() <= 2,
+      "the WAL head no longer sits above the adopted canonical head"
+    );
+  }
+
+  #[test]
   fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hole() {
     // codex R6-F2 (REGRESSION): a faulty slot ABOVE the checkpoint may be UNCOMMITTED. At recovery the
     // replica only knows `commit_min == commit_max == checkpoint_op`, so it must NOT pre-register the
@@ -7001,6 +7702,7 @@ mod tests {
       OpNumber::new(),
       OpNumber::new(),
       0,
+      std::vec::Vec::new(),
     )
     .expect("log_view <= view, commit >= checkpoint");
     TestSb {
@@ -7293,6 +7995,397 @@ mod tests {
       r.status(),
       Status::RecoveringHead,
       "a checksum-failing head body is never adopted"
+    );
+  }
+
+  #[test]
+  fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_header() {
+    // CONSENSUS-CRITICAL regression (VOPR seed 52). `recover` blindly re-derived committed ops from
+    // the WAL bytes, so an ADOPTED committed slot whose WAL kept a STALE superseded body (a prior-view
+    // proposal whose OWN header is internally consistent) was resurrected on crash+recover → the
+    // recovered replica diverged. The fix: the durable `VsrState` carries the CANONICAL `vsr_headers`
+    // for the committed band `(checkpoint_op .. commit]`, and `recover` cross-checks each committed-band
+    // WAL slot's body against the persisted canonical `body_checksum`. A MISMATCH is routed to
+    // peer-repair (the B4 path) instead of being trusted — the canonical body is fetched from a peer.
+    //
+    // Setup: replica 1 of 3. Durable root: view 0, commit 2, checkpoint_op 0, with canonical headers
+    // recording op 1 = body [1] and op 2 = body [2] (bodyY). The WAL holds op 1 = [1] (canonical) but
+    // op 2 = [0xBB] (bodyX — STALE), with a SELF-CONSISTENT header for [0xBB] (so plain `Header::verify`
+    // passes, exactly the seed-52 hazard). Op 3 = [3] sits above the committed band (uncommitted tail).
+    let canonical_op1 = Header::new(
+      OpNumber::with(1),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(1),
+      &[1u8],
+    );
+    // op 2's CANONICAL header records body [2]; this is what the durable root persists (vsr_headers).
+    let canonical_op2 = Header::new(
+      OpNumber::with(2),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(2),
+      &[2u8],
+    );
+    let state = VsrState::try_new(
+      View::new(),
+      View::new(),
+      OpNumber::with(2), // commit
+      OpNumber::new(),   // checkpoint_op
+      0,
+      std::vec![canonical_op1, canonical_op2],
+    )
+    .unwrap();
+    let mut sb = TestSb {
+      state,
+      done: VecDeque::new(),
+      checkpoint: None,
+    };
+
+    // The WAL: ops 1 + 3 canonical, but op 2 holds the STALE body [0xBB] with a header self-consistent
+    // for [0xBB] (a superseded prior-view proposal the WAL never re-wrote on adoption).
+    let mut wal = ScriptedWal::with_entries(3);
+    let stale_body = Bytes::copy_from_slice(&[0xBBu8]);
+    let stale_header = Header::new(
+      OpNumber::with(2),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(2),
+      &stale_body,
+    );
+    assert!(
+      stale_header.verify(&stale_body),
+      "the stale slot is SELF-CONSISTENT (its own header matches its own body) — plain verify passes"
+    );
+    wal.entries.insert(2, (stale_header, stale_body));
+
+    let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+    for _ in 0..32 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if !r.status().is_recovering() {
+        break;
+      }
+    }
+    // The stale committed slot was DETECTED (canonical-header mismatch) and DROPPED — never adopted. The
+    // replica returns to Normal (op 2 is below the head 3, so it peer-repairs rather than RecoveringHead).
+    assert_eq!(
+      r.status(),
+      Status::Normal,
+      "a stale committed slot is dropped + peer-repaired (not stranded, not RecoveringHead)"
+    );
+    assert!(
+      !r.log.contains_key(&2),
+      "the stale slot is dropped from the in-memory log so it can never be applied with the stale body"
+    );
+    // Recovery did not apply anything yet (commit_min == checkpoint_op == 0); the stale body [0xBB] was
+    // never applied.
+    assert!(
+      r.state_machine().applied().is_empty(),
+      "nothing applied yet — the stale body [0xBB] is never re-derived from the WAL"
+    );
+
+    // The primary announces commit=2. advance_commit reaches op 2, finds the HOLE, HOLDS the commit at 1
+    // (only op 1 applies), and solicits op 2 via RequestPrepare (on-demand peer-repair).
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(1),
+      "commit HELD below the stale-detected hole — op 2's canonical body is not yet present"
+    );
+    assert!(
+      r.has_repair_hole_for_test(2),
+      "op 2 is registered as a repair hole once commit reaches it (on demand)"
+    );
+    let mut asked_for_2 = false;
+    while let Some(out) = r.poll_message() {
+      if let Message::RequestPrepare(rp) = out.into_msg() {
+        if rp.op() == OpNumber::with(2) {
+          asked_for_2 = true;
+        }
+      }
+    }
+    assert!(
+      asked_for_2,
+      "the replica solicits the canonical op 2 from a peer"
+    );
+
+    // A committed-vouching peer answers with the CANONICAL op 2 (body [2], commit=2 >= op 2). This fills
+    // the hole and resumes the held commit: op 2 applies with [2] (bodyY), NEVER [0xBB] (bodyX).
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      repair_prepare(0, 2, 2),
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(2),
+      "the canonical op 2 fills the hole → the held commit resumes"
+    );
+    assert_eq!(
+      r.state_machine().applied(),
+      &[(1, std::vec![1u8]), (2, std::vec![2u8])],
+      "the applied band is CANONICAL ([1],[2]) — the stale WAL body [0xBB] was never resurrected \
+       (FAIL-BEFORE: the old recover trusted the WAL and applied [0xBB], diverging)"
+    );
+    // The repaired canonical op 2 is durably (re)appended, so a subsequent restart reads it cleanly.
+    let (h2, b2) = wal.entries.get(&2).expect("op 2 present after repair");
+    assert_eq!(
+      b2.as_ref(),
+      &[2u8],
+      "the WAL slot now holds the CANONICAL body [2]"
+    );
+    assert_eq!(h2.body_checksum(), canonical_op2.body_checksum());
+  }
+
+  #[test]
+  fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_request() {
+    // CONSENSUS-CRITICAL regression (codex R9-F2). A committed op's identity is `(op, client, request,
+    // body)`, NOT body bytes alone. Two clients can submit IDENTICAL payload bytes, so a STALE superseded
+    // WAL slot that kept the SAME body but a DIFFERENT `client`/`request` would pass the body-only
+    // cross-check, be adopted, and applied under the WRONG session — corrupting dedup/reply (duplicate
+    // execution under the wrong client). The fix keys the canonical cross-check on FULL operation identity
+    // `(client, request, body_checksum)`: a same-body-different-identity slot now MISMATCHES and is dropped
+    // → peer-repaired, exactly like the seed-52 stale-body case.
+    //
+    // Setup: replica 1 of 3. Durable root: view 0, commit 2, checkpoint_op 0. The canonical header for op 2
+    // records identity `(clientB = 9, req 3, body [2])` — what the cluster actually committed. The WAL slot
+    // for op 2 SELF-VERIFIES but holds a DIFFERENT identity `(clientA = 7, req 5, body [2])` with the SAME
+    // body bytes [2] (so the body checksum is IDENTICAL — only client/request differ). Op 1 is clean
+    // canonical; op 3 sits above the committed band (uncommitted tail).
+    let client_a = ClientId::new(7);
+    let client_b = ClientId::new(9);
+    let canonical_op1 = Header::new(
+      OpNumber::with(1),
+      View::new(),
+      client_a,
+      RequestNumber::with(1),
+      &[1u8],
+    );
+    // op 2's CANONICAL identity: clientB / request 3 / body [2] — persisted in the durable root (vsr_headers).
+    let canonical_op2 = Header::new(
+      OpNumber::with(2),
+      View::new(),
+      client_b,
+      RequestNumber::with(3),
+      &[2u8],
+    );
+    let state = VsrState::try_new(
+      View::new(),
+      View::new(),
+      OpNumber::with(2), // commit
+      OpNumber::new(),   // checkpoint_op
+      0,
+      std::vec![canonical_op1, canonical_op2],
+    )
+    .unwrap();
+    let mut sb = TestSb {
+      state,
+      done: VecDeque::new(),
+      checkpoint: None,
+    };
+
+    // The WAL: ops 1 + 3 canonical, but op 2 holds the SAME body [2] under a DIFFERENT identity
+    // `(clientA = 7, req 5)`. Its header self-verifies (header checksum + body checksum both valid), so
+    // plain `Header::verify` passes — and its body checksum EQUALS the canonical one (same bytes). Only the
+    // FULL-identity check distinguishes it.
+    let mut wal = ScriptedWal::with_entries(3);
+    let same_body = Bytes::copy_from_slice(&[2u8]);
+    let wrong_identity_header = Header::new(
+      OpNumber::with(2),
+      View::new(),
+      client_a,               // WRONG client (canonical is clientB)
+      RequestNumber::with(5), // WRONG request (canonical is req 3)
+      &same_body,
+    );
+    assert!(
+      wrong_identity_header.verify(&same_body),
+      "the wrong-identity slot is SELF-CONSISTENT — plain verify passes; only full identity differs"
+    );
+    assert_eq!(
+      wrong_identity_header.body_checksum(),
+      canonical_op2.body_checksum(),
+      "the body checksum is IDENTICAL (same bytes) — a body-only check would WRONGLY trust this slot \
+       (FAIL-BEFORE: same-body-different-client slot is adopted under clientA/req5)"
+    );
+    wal.entries.insert(2, (wrong_identity_header, same_body));
+
+    let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+    for _ in 0..32 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if !r.status().is_recovering() {
+        break;
+      }
+    }
+    // The wrong-identity committed slot was DETECTED (identity mismatch) and DROPPED — never adopted.
+    assert_eq!(
+      r.status(),
+      Status::Normal,
+      "a wrong-identity committed slot is dropped + peer-repaired (not stranded, not RecoveringHead)"
+    );
+    assert!(
+      !r.log.contains_key(&2),
+      "the wrong-identity slot is dropped from the in-memory log so it can never be applied as clientA/req5"
+    );
+    assert!(
+      r.state_machine().applied().is_empty(),
+      "nothing applied yet — the wrong-identity body is never re-derived from the WAL"
+    );
+
+    // The primary announces commit=2. advance_commit reaches op 2, finds the HOLE, HOLDS the commit at 1,
+    // and solicits op 2 via RequestPrepare (on-demand peer-repair).
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(1),
+      "commit HELD below the wrong-identity hole — op 2's canonical identity is not yet present"
+    );
+    assert!(
+      r.has_repair_hole_for_test(2),
+      "op 2 is registered as a repair hole once commit reaches it (on demand)"
+    );
+    // Drop the events from applying op 1 so the assertion below sees ONLY op 2's commit.
+    while r.poll_event().is_some() {}
+
+    // A committed-vouching peer answers with the CANONICAL op 2: identity `(clientB = 9, req 3, body [2])`,
+    // commit = 2 >= op 2. This fills the hole and resumes the held commit.
+    let canonical_repair = Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(2), // commit >= op → a committed repair value
+      OpNumber::new(),
+      client_b,
+      RequestNumber::with(3),
+      Bytes::copy_from_slice(&[2u8]),
+    ));
+    r.handle_message(now, &mut wal, &mut sb, primary_peer(), canonical_repair);
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(2),
+      "the canonical op 2 fills the hole → the held commit resumes"
+    );
+    // The op 2 that COMMITTED carries the CANONICAL session `clientB / req 3`, NEVER the stale
+    // `clientA / req 5` the WAL slot held. (FAIL-BEFORE: the body-only check adopted clientA/req5.)
+    let committed_op2 = std::iter::from_fn(|| r.poll_event())
+      .map(|e| e.unwrap_committed())
+      .find(|c| c.op() == OpNumber::with(2))
+      .expect("op 2 committed event");
+    assert_eq!(
+      committed_op2.client(),
+      client_b,
+      "op 2 applied under the CANONICAL clientB — never the stale WAL clientA"
+    );
+    assert_eq!(
+      committed_op2.request(),
+      RequestNumber::with(3),
+      "op 2 applied under the CANONICAL request 3 — never the stale WAL request 5"
+    );
+    // The dedup session table reflects clientB/req3 (the canonical identity), and clientA was never
+    // advanced by op 2 (its only mention was the stale, dropped slot).
+    assert_eq!(
+      r.clients.get(&client_b.get()).map(|s| s.request),
+      Some(RequestNumber::with(3)),
+      "clientB's session watermark is the canonical request 3"
+    );
+    assert!(
+      r.clients
+        .get(&client_a.get())
+        .is_none_or(|s| s.request < RequestNumber::with(5)),
+      "clientA/req5 was NEVER applied — the stale slot's identity never touched a session"
+    );
+  }
+
+  #[test]
+  fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
+    // The complement of the seed-52 regression: a NORMAL-operation recover (no staleness) must NOT
+    // spuriously peer-repair. Every committed-band WAL slot matches its persisted canonical header, so
+    // recovery trusts them all — no repair hole, no dropped slot, the SM re-applies the canonical band
+    // directly from the WAL once commit is announced.
+    let mk_header = |op: u64| {
+      Header::new(
+        OpNumber::with(op),
+        View::new(),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        &[op as u8],
+      )
+    };
+    // Durable root: commit 2, checkpoint_op 0, canonical headers for ops 1 + 2 matching the WAL bodies.
+    let state = VsrState::try_new(
+      View::new(),
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::new(),
+      0,
+      std::vec![mk_header(1), mk_header(2)],
+    )
+    .unwrap();
+    let mut sb = TestSb {
+      state,
+      done: VecDeque::new(),
+      checkpoint: None,
+    };
+    let mut wal = ScriptedWal::with_entries(3); // ops 1,2,3 all canonical [op]
+    let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+    let now = Instant::ZERO;
+    let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+    for _ in 0..32 {
+      r.handle_storage(now, &mut wal, &mut sb);
+      if !r.status().is_recovering() {
+        break;
+      }
+    }
+    assert_eq!(
+      r.status(),
+      Status::Normal,
+      "a consistent tail recovers cleanly to Normal"
+    );
+    assert!(
+      r.repair.is_empty(),
+      "no spurious repair hole — every committed-band slot matched its persisted header"
+    );
+    assert!(
+      r.log.get(&2).is_some_and(|e| e.body.as_ref() == [2u8]),
+      "op 2 kept its canonical WAL body (trusted, not dropped)"
+    );
+    // Announce commit=2: both committed ops apply directly from the trusted WAL, no peer-repair needed.
+    r.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    );
+    assert_eq!(
+      r.commit(),
+      OpNumber::with(2),
+      "the consistent committed band applies straight through"
+    );
+    assert!(
+      r.repair.is_empty(),
+      "still no repair hole after applying the trusted band"
+    );
+    assert_eq!(
+      r.state_machine().applied(),
+      &[(1, std::vec![1u8]), (2, std::vec![2u8])],
+      "the trusted WAL band applied verbatim"
     );
   }
 
@@ -7793,6 +8886,248 @@ mod tests {
     assert!(
       acked_after,
       "once the view is durable, the retransmitted prepare is acked"
+    );
+  }
+
+  /// Drive replica 1 to become the NEW PRIMARY of view 1 (via a DVC quorum) over an ASYNC superblock
+  /// (`StepSb`), leaving it `Normal` with the durable-view write STILL inflight (`pending_sb` armed) —
+  /// the exact durable-view-before-participate window codex R8-F1 is about. The adopted canonical log
+  /// is op 1 (committed) + op 2 (uncommitted, commit* = 1), supplied by replica 2's DVC. The WAL
+  /// completions (the AdoptVote append for op 2) are pumped so they do not muddy the window; the
+  /// superblock write is left inflight (not flushed), so the view is NOT yet durable.
+  #[cfg(test)]
+  fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, StepSb) {
+    let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+    let now = Instant::ZERO;
+    // Drive into ViewChange(view 1) (replica 1 is primary of view 1): own SVC + replica 0's SVC.
+    e.handle_timeout(
+      now + core::time::Duration::from_millis(300),
+      &mut wal,
+      &mut sb,
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    );
+    assert_eq!(e.status(), Status::ViewChange);
+    while e.poll_message().is_some() {}
+    // A DVC quorum (own + replica 2) carrying op 1 committed, op 2 uncommitted.
+    let dvc = DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b"),
+        ),
+      ],
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::DoViewChange(dvc),
+    );
+    // Now Normal primary of view 1, op 2 — but the durable-view write is inflight (StepSb has not
+    // flushed it). Pump the WAL (so the op-2 AdoptVote append completes) WITHOUT flushing the SB, so
+    // the window stays open. Discard anything emitted by the transition itself.
+    e.handle_storage(now, &mut wal, &mut sb);
+    while e.poll_message().is_some() {}
+    assert_eq!(e.status(), Status::Normal);
+    assert!(e.is_primary());
+    assert_eq!(e.view(), View::with(1));
+    assert!(
+      e.pending_sb_for_test(),
+      "the durable-view write must still be pending (the R8-F1 window is open)"
+    );
+    assert!(
+      sb.has_inflight(),
+      "the superblock view write is inflight (not yet durable)"
+    );
+    (e, wal, sb)
+  }
+
+  #[test]
+  fn new_primary_does_not_answer_get_view_while_its_view_write_is_pending() {
+    // codex R8-F1 (REGRESSION, durable-view-before-participate, CONSENSUS-CRITICAL). A replica that
+    // just became primary of a new view but has not yet PERSISTED that view (the StartView broadcast
+    // is deferred to `on_sb_done`) must NOT answer a delayed/duplicate `GetView` with a `StartView`
+    // for the not-yet-durable view: on crash it could regress out of a view it had already vouched
+    // for, double-participating across views. FAIL-BEFORE: a `StartView` appears in the pending_sb
+    // window. PASS-AFTER: silent in the window; the deferred `StartView` fires once the view is
+    // durable, and a later `GetView` is then answered.
+    let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+    let now = Instant::ZERO;
+    // A peer solicits the canonical head for view 1 — delivered WHILE the view write is pending.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::GetView(GetView::new(View::with(1), ReplicaId::new(2), 9)),
+    );
+    let mut sv_in_window = false;
+    while let Some(out) = e.poll_message() {
+      if matches!(out.msg_ref(), Message::StartView(_)) {
+        sv_in_window = true;
+      }
+    }
+    assert!(
+      !sv_in_window,
+      "a primary must NOT hand out a StartView for a view that is not yet durable"
+    );
+    // Make the view durable: the deferred StartView broadcast fires now (start_view_participate).
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+    assert!(
+      !e.pending_sb_for_test(),
+      "the view is now durable (pending_sb cleared)"
+    );
+    let mut sv_after = false;
+    while let Some(out) = e.poll_message() {
+      if let Message::StartView(s) = out.msg_ref() {
+        assert_eq!(s.op(), OpNumber::with(2));
+        sv_after = true;
+      }
+    }
+    assert!(
+      sv_after,
+      "once the view is durable the deferred StartView broadcast fires"
+    );
+    // And a fresh GetView is now answered (the gate has lifted).
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::GetView(GetView::new(View::with(1), ReplicaId::new(2), 10)),
+    );
+    let mut answered = false;
+    while let Some(out) = e.poll_message() {
+      if matches!(out.msg_ref(), Message::StartView(_)) {
+        answered = true;
+      }
+    }
+    assert!(
+      answered,
+      "after the view is durable, a GetView is answered with a StartView"
+    );
+  }
+
+  #[test]
+  fn new_primary_does_not_answer_recovery_while_its_view_write_is_pending() {
+    // codex R8-F1 (REGRESSION): same window, the Recovery-solicitation path. A primary in the
+    // pending_sb window must NOT answer a peer's `Recovery` with its canonical `(op, commit, log)` in
+    // the not-yet-durable view. FAIL-BEFORE: a `RecoveryResponse` appears in the window. PASS-AFTER:
+    // silent in the window; once the view is durable a Recovery is answered normally.
+    let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+    let now = Instant::ZERO;
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::Recovery(Recovery::new(ReplicaId::new(2), 4242)),
+    );
+    let mut rr_in_window = false;
+    while let Some(out) = e.poll_message() {
+      if matches!(out.msg_ref(), Message::RecoveryResponse(_)) {
+        rr_in_window = true;
+      }
+    }
+    assert!(
+      !rr_in_window,
+      "a primary must NOT answer a Recovery in a view that is not yet durable"
+    );
+    // Make the view durable, then a fresh Recovery IS answered (with the canonical head).
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+    while e.poll_message().is_some() {} // discard the deferred StartView broadcast
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::Recovery(Recovery::new(ReplicaId::new(2), 4243)),
+    );
+    let mut answered = false;
+    while let Some(out) = e.poll_message() {
+      if let Message::RecoveryResponse(rr) = out.msg_ref() {
+        assert_eq!(rr.op(), OpNumber::with(2), "the canonical head op");
+        assert_eq!(rr.nonce(), 4243, "the echoed nonce");
+        answered = true;
+      }
+    }
+    assert!(
+      answered,
+      "after the view is durable, a Recovery is answered with a RecoveryResponse"
+    );
+  }
+
+  #[test]
+  fn new_primary_does_not_heartbeat_or_retransmit_while_its_view_write_is_pending() {
+    // codex R8-F1 (REGRESSION): the timer path. A primary in the pending_sb window must NOT emit a
+    // `Commit` heartbeat nor retransmit `Prepare`s — those assert its authority in a view that is not
+    // yet durable. FAIL-BEFORE: a `Commit`/`Prepare` appears when `primary_timeouts` fires in the
+    // window. PASS-AFTER: silent in the window; heartbeats resume once the view is durable.
+    let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+    // Tick the primary TWICE while the view write is still pending: the first tick would BOOTSTRAP the
+    // commit/prepare timers (the deferred `start_view_participate` has not armed them yet), the second
+    // — well past those deadlines — would FIRE the heartbeat/retransmit if the gate were absent. Both
+    // ticks happen entirely inside the pending_sb window (we never flush the superblock between them),
+    // exactly the multi-tick window a real driver leaves open. Nothing must be emitted in either.
+    let later = Instant::ZERO + core::time::Duration::from_secs(5);
+    e.handle_timeout(later, &mut wal, &mut sb);
+    let later_fire = later + core::time::Duration::from_secs(1); // >> COMMIT_HEARTBEAT/PREPARE_RETRANSMIT
+    e.handle_timeout(later_fire, &mut wal, &mut sb);
+    let mut emitted_in_window = false;
+    while let Some(out) = e.poll_message() {
+      if matches!(
+        out.msg_ref(),
+        Message::Commit(_) | Message::Prepare(_) | Message::StartView(_)
+      ) {
+        emitted_in_window = true;
+      }
+    }
+    assert!(
+      !emitted_in_window,
+      "a primary must not heartbeat/retransmit/StartView in a not-yet-durable view"
+    );
+    assert!(
+      e.pending_sb_for_test(),
+      "the ticks must not have force-completed the view write"
+    );
+    // Once the view is durable, the heartbeat resumes (start_view_participate arms the timers).
+    sb.flush();
+    e.handle_storage(later_fire, &mut wal, &mut sb);
+    while e.poll_message().is_some() {} // discard the deferred StartView
+    let later2 = later_fire + core::time::Duration::from_secs(5);
+    e.handle_timeout(later2, &mut wal, &mut sb);
+    let mut heartbeat_after = false;
+    while let Some(out) = e.poll_message() {
+      if matches!(out.msg_ref(), Message::Commit(_)) {
+        heartbeat_after = true;
+      }
+    }
+    assert!(
+      heartbeat_after,
+      "once the view is durable the primary heartbeats normally"
     );
   }
 
@@ -8396,7 +9731,7 @@ mod tests {
   }
   impl Superblock for ScriptedCheckpointSb {
     fn state(&self) -> VsrState {
-      self.state
+      self.state.clone()
     }
     fn submit_write(&mut self, id: OpId, state: VsrState) {
       self.state = state;
@@ -8455,6 +9790,7 @@ mod tests {
       OpNumber::with(2),
       OpNumber::with(2),
       good_id,
+      std::vec::Vec::new(),
     )
     .unwrap();
     let mut sb = ScriptedCheckpointSb::new(
@@ -8545,6 +9881,7 @@ mod tests {
       OpNumber::with(2),
       OpNumber::with(2),
       good_id,
+      std::vec::Vec::new(),
     )
     .unwrap();
     let mut sb = ScriptedCheckpointSb::new(
@@ -8604,6 +9941,7 @@ mod tests {
       OpNumber::with(2),
       OpNumber::with(2),
       0xDEAD_BEEF,
+      std::vec::Vec::new(),
     )
     .unwrap();
     let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → always faults
@@ -8731,6 +10069,7 @@ mod tests {
       OpNumber::with(2),
       OpNumber::with(2),
       good_id,
+      std::vec::Vec::new(),
     )
     .unwrap();
     let corrupt_reads: VecDeque<(OpNumber, Bytes)> = (0..(RECOVER_READ_RETRIES as usize + 6))
@@ -8859,6 +10198,7 @@ mod tests {
       OpNumber::with(near_max),
       OpNumber::with(near_max),
       0,
+      std::vec::Vec::new(),
     )
     .unwrap();
     let mut sb = TestSb {
@@ -8911,6 +10251,7 @@ mod tests {
       OpNumber::with(checkpoint_op),
       OpNumber::with(checkpoint_op),
       id,
+      std::vec::Vec::new(),
     )
     .unwrap();
     // A WAL whose head is the pathological value, but which actually HOLDS only the in-window tail
@@ -9611,6 +10952,7 @@ mod tests {
       OpNumber::with(2),
       OpNumber::with(2),
       0xDEAD_BEEF,
+      std::vec::Vec::new(),
     )
     .unwrap();
     let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
@@ -9743,6 +11085,191 @@ mod tests {
       "synced checkpoint is now durable"
     );
     assert_eq!(sb.state().checkpoint_id(), id);
+  }
+
+  #[test]
+  fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
+    // codex vopr seed 8 (REGRESSION). A `Normal` PRIMARY that receives a valid `SyncCheckpoint` for an
+    // outstanding sync must NOT apply it in place (that would reset commit_min to the checkpoint and
+    // clear the commit pipeline while it stays primary → a wedge: `try_commit` can never advance past
+    // the checkpoint, and a recovered/op-reset primary can REUSE committed op numbers — the seed-52
+    // divergence). Instead it STEPS DOWN: flags the deferred forfeit and drops the sync, unchanged. A
+    // caught-up replica then leads.
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap(); // huge interval: no checkpoint
+    let mut e = Endpoint::new(cfg, 0, CountSm::default());
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    // Drive the primary to op 4, commit 4 (no checkpoint — interval is huge).
+    for rn in 1..=4u64 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        Message::Request(Request::new(
+          ClientId::new(7),
+          RequestNumber::with(rn),
+          Bytes::from(std::vec![rn as u8]),
+        )),
+      );
+      e.handle_storage(now, &mut wal, &mut sb); // own append durable → own vote
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Replica(ReplicaId::new(1)),
+        Message::PrepareOk(PrepareOk::new(
+          View::new(),
+          OpNumber::with(rn),
+          ReplicaId::new(1),
+          OpNumber::new(),
+        )),
+      );
+    }
+    assert!(e.is_primary());
+    assert_eq!(e.op(), OpNumber::with(4));
+    assert_eq!(e.commit(), OpNumber::with(4));
+    assert_eq!(e.checkpoint_op(), OpNumber::with(0));
+    while e.poll_message().is_some() {}
+    // A valid checkpoint envelope at op 6 (from a donor), and an outstanding FORCED sync to it.
+    let (_d, _dw, dsb) = donor_primary_at_checkpoint(6);
+    let (env, id) = donor_envelope(&dsb);
+    e.arm_forced_sync_for_test(6);
+    let nonce = e.sync_nonce_for_test();
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(6),
+        id,
+        ReplicaId::new(0),
+        nonce,
+        env,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    // It must NOT have applied the sync: op/commit/checkpoint unchanged, SM not restored.
+    assert_eq!(e.op(), OpNumber::with(4), "op unchanged (no apply)");
+    assert_eq!(e.commit(), OpNumber::with(4), "commit unchanged (no apply)");
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "checkpoint unchanged (no apply)"
+    );
+    assert_eq!(
+      e.state_machine().applied().len(),
+      4,
+      "SM still reflects its own 4 applied ops — the peer snapshot was NOT restored"
+    );
+    // It stepped down instead: the deferred forfeit is flagged and the sync was dropped.
+    assert!(
+      e.pending_forfeit_for_test(),
+      "the primary flagged the deferred forfeit (it abdicates rather than apply a sync)"
+    );
+    assert_eq!(
+      e.sync_target_for_test(),
+      None,
+      "the sync was dropped (the primary is stepping down, not syncing)"
+    );
+  }
+
+  #[test]
+  fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
+    // codex vopr seed 52 (REGRESSION). A primary that has FLAGGED a forfeit (decided to step down)
+    // must NOT assign new ops to client requests: a primary reaches this state after an op-resetting
+    // recovery/state-sync left it primary of a view the cluster has moved PAST, so a fresh
+    // op-assignment would REUSE a committed op number with DIFFERENT bytes (the stale-primary op-reuse
+    // divergence). We reuse the sync-step-down path to arm the forfeit cleanly (NO repair hole and
+    // commit_max == commit_min, so the only guard that can drop the request is the `pending_forfeit`
+    // one — not the R5-F2 unapplied-prefix guard).
+    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
+    let mut e = Endpoint::new(cfg, 0, CountSm::default());
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let now = Instant::ZERO;
+    for rn in 1..=4u64 {
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Client(ClientId::new(7)),
+        Message::Request(Request::new(
+          ClientId::new(7),
+          RequestNumber::with(rn),
+          Bytes::from(std::vec![rn as u8]),
+        )),
+      );
+      e.handle_storage(now, &mut wal, &mut sb);
+      e.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Replica(ReplicaId::new(1)),
+        Message::PrepareOk(PrepareOk::new(
+          View::new(),
+          OpNumber::with(rn),
+          ReplicaId::new(1),
+          OpNumber::new(),
+        )),
+      );
+    }
+    assert_eq!(e.op(), OpNumber::with(4));
+    assert_eq!(e.commit(), OpNumber::with(4));
+    assert_eq!(e.commit_max(), OpNumber::with(4), "no unapplied prefix");
+    assert!(!e.has_repair_hole_for_test(3), "no repair hole");
+    // Arm the forfeit via the sync-step-down path (primary receiving a valid forced SyncCheckpoint).
+    let (_d, _dw, dsb) = donor_primary_at_checkpoint(6);
+    let (env, id) = donor_envelope(&dsb);
+    e.arm_forced_sync_for_test(6);
+    let nonce = e.sync_nonce_for_test();
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      primary_peer(),
+      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(6),
+        id,
+        ReplicaId::new(0),
+        nonce,
+        env,
+      )),
+    );
+    assert!(
+      e.pending_forfeit_for_test(),
+      "the primary is now forfeiting"
+    );
+    while e.poll_message().is_some() {}
+    // A fresh client request arrives while the forfeit is pending: it MUST be dropped (no op assigned).
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(9)),
+      Message::Request(Request::new(
+        ClientId::new(9),
+        RequestNumber::with(1),
+        Bytes::from_static(b"x"),
+      )),
+    );
+    assert_eq!(
+      e.op(),
+      OpNumber::with(4),
+      "a forfeiting primary must NOT assign a new op to a client request (op-reuse guard)"
+    );
+    let mut saw_prepare = false;
+    while let Some(out) = e.poll_message() {
+      if matches!(out.msg_ref(), Message::Prepare(_)) {
+        saw_prepare = true;
+      }
+    }
+    assert!(
+      !saw_prepare,
+      "a forfeiting primary emits no Prepare for a new request"
+    );
   }
 
   #[test]
