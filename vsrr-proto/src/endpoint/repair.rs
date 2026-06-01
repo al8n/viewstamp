@@ -102,10 +102,16 @@ impl<S: StateMachine> Endpoint<S> {
   ///
   /// The integrity of the repaired *content* rests on the VSR durability guarantee that a quorum holds
   /// every committed op's correct body (the honest-peer model) plus the placement guard above. On
-  /// success the body is inserted into the dense `log` cache and persisted durably via a WAL append
-  /// (so future reads / DVCs / a later crash-restart serve the repaired op), the hole is cleared, and
-  /// the held commit resumes. A `Prepare` whose op is not a hole (or whose body fails the checksum) is
-  /// rejected (returns `false`) so the caller falls through to the normal prepare path.
+  /// success the repaired body is persisted durably via a WAL append (so future reads / DVCs / a later
+  /// crash-restart serve the repaired op) as a DURABILITY BARRIER (codex R13-F2): the apply, the
+  /// hole-clear, and the exposure of the op all WAIT for that append to land. `fill_repair` stages the
+  /// body in a [`Pending::RepairFill`] (NOT in `self.log`) + `submit_append`s + marks `op` `appending`,
+  /// but keeps the hole OPEN and does NOT `advance_commit`; `on_wal_done` then inserts the body into
+  /// `self.log`, removes the hole, and resumes the held commit. So a crash before `WalDone::Appended`
+  /// loses only a non-durable staged copy this replica had NOT yet applied / exposed in a
+  /// DVC/StartView/checkpoint — append-before-participate (durable-source) holds for peer repair too. A
+  /// `Prepare` whose op is not a hole (or whose body fails the checksum) is rejected (returns `false`)
+  /// so the caller falls through to the normal prepare path.
   pub(crate) fn fill_repair<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -113,9 +119,19 @@ impl<S: StateMachine> Endpoint<S> {
     sb: &mut B,
     p: &Prepare,
   ) -> bool {
+    let _ = (now, &mut *sb); // the apply/advance is deferred to on_wal_done (R13-F2); no commit here
     let op = p.op().get();
     if !self.repair.contains(&op) {
       return false; // placement: not a hole we are repairing — let on_prepare handle it normally
+    }
+    // A RepairFill append for this op is already in flight (a duplicate/retransmitted repair Prepare):
+    // the op is still a hole (kept open until durable) but staging a SECOND append would double-write.
+    // Swallow the duplicate — it is a repair answer we are already making durable (R13-F2). A repair
+    // hole's slot can ONLY be `appending` via a RepairFill: the normal `on_prepare` re-ack/re-append
+    // branch now skips an op in `self.repair` (the repair-hole-ownership guard there), so this `appending`
+    // membership unambiguously means our own in-flight RepairFill, never a normal-path append.
+    if self.appending.contains(&op) {
+      return true;
     }
     // SAFETY (codex R5-F1): a committed repair hole may ONLY be filled with the committed value for
     // this op. A repair answer from a peer that holds op N committed carries commit >= op (it set
@@ -133,27 +149,26 @@ impl<S: StateMachine> Endpoint<S> {
     if !header.verify(p.body()) {
       return false; // unverifiable body — never adopt it for a committed op; keep the hole + re-solicit
     }
-    // Fill the dense cache and persist the repaired op durably (append-after-verify), so a subsequent
-    // crash/restart reads it cleanly and a DVC/StartView we send carries it.
-    self.log.insert(
-      op,
-      LogEntry {
-        client: p.client(),
-        request: p.request(),
-        body: p.body_bytes(),
-      },
-    );
+    // Persist the repaired op durably (append-after-verify) as a DURABILITY BARRIER (codex R13-F2). The
+    // body is staged in the `Pending::RepairFill` entry — NOT in `self.log` — so it is NOT exposed in a
+    // DVC/StartView/checkpoint nor applied by a concurrently-triggered `advance_commit` while the append
+    // is still in flight; `on_wal_done` inserts it into `self.log`, clears the hole, and advances the
+    // commit only once `WalDone::Appended` lands. The hole stays OPEN here (commit held, op not exposed)
+    // and `op` is marked `appending` so the durable-status oracle treats it as in-flight (and a
+    // duplicate repair Prepare hits the early `appending` guard above instead of double-appending).
+    let entry = LogEntry {
+      client: p.client(),
+      request: p.request(),
+      body: p.body_bytes(),
+    };
     let id = self.mint_op_id();
     wal.submit_append(id, p.op(), header, p.body_bytes());
-    // NOTE: this append's completion is a bare durability write, NOT a prepare vote — we do not add it
-    // to `self.pending` (no PrepareOk/own-vote is owed for a repair fill), so on_wal_done ignores it.
-    self.repair.remove(&op);
-    if self.repair.is_empty() {
-      self.timers.repair_retry = None;
-    }
-    // The hole is filled → resume applying the held committed prefix from exactly where it stalled.
-    let target = self.commit_max.get();
-    self.advance_commit(now, sb, target);
+    // This append owes NO PrepareOk/own-vote (peer repair is not a vote), but unlike the OLD bare write
+    // it IS tracked — as a `RepairFill`, so `on_wal_done` defers the apply + hole-clear to durability.
+    self
+      .pending
+      .insert(id.get(), Pending::RepairFill(p.op(), entry));
+    self.appending.insert(op);
     true
   }
 }

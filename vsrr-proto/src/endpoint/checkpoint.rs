@@ -16,15 +16,22 @@ impl<S: StateMachine> Endpoint<S> {
     let WalDone::Appended(id) = done else {
       return; // Normal op: only an append matters (reads/faults occur during recovery).
     };
-    // Append-before-ack dispatch by the recorded kind. An OpId not in `self.pending` is a repair-fill
-    // append (which owes no ack — see `fill_repair`) or a stale/superseded completion → ignore.
+    // Append-before-ack dispatch by the recorded kind. An OpId not in `self.pending` is a
+    // stale/superseded completion → ignore. (A peer-repair fill is now TRACKED as `Pending::RepairFill`
+    // — codex R13-F2 — so it is no longer an untracked bare write.)
     let resolved = self.pending.remove(&id.get());
-    // This op's WAL append is now durable: clear its in-flight mark BEFORE casting any ack/vote, so
-    // the choke point (`send_prepare_ok`) sees it as durable (R7-F1). Done for every tracked kind —
-    // each variant carries its op number — and never in the `None` arm (a stale/superseded completion
-    // must not retract an op a FRESH adopt-append just re-marked under a new OpId).
+    // This op's WAL append is now durable: clear its in-flight mark BEFORE casting any ack/vote (or
+    // clearing a repair hole), so the choke point (`send_prepare_ok`) sees it as durable (R7-F1) and the
+    // repair-fill apply runs off a no-longer-in-flight op. Done for every tracked kind — each variant
+    // carries its op number — and never in the `None` arm (a stale/superseded completion must not
+    // retract an op a FRESH adopt-/repair-append just re-marked under a new OpId).
     match &resolved {
-      Some(Pending::Ack(op) | Pending::AdoptVote(op) | Pending::AdoptAck(op)) => {
+      Some(
+        Pending::Ack(op)
+        | Pending::AdoptVote(op)
+        | Pending::AdoptAck(op)
+        | Pending::RepairFill(op, _),
+      ) => {
         self.appending.remove(&op.get());
       }
       None => {}
@@ -50,6 +57,21 @@ impl<S: StateMachine> Endpoint<S> {
       // codex R6-F1: a backup's adopted uncommitted-tail op is now durable → send the deferred
       // PrepareOk. No PrepareOk was sent for this op before its append completed (append-before-ack).
       Some(Pending::AdoptAck(op)) => self.send_prepare_ok(op),
+      // codex R13-F2: the peer-repair fill's WAL append is now durable. ONLY NOW expose + apply it: the
+      // staged canonical body lands in `self.log`, the repair hole clears, and the held commit resumes.
+      // No PrepareOk/own-vote is ever sent for a repair fill (peer repair is not a vote) — this is a
+      // pure durability barrier. The body was withheld from `self.log` until here, so it was never in a
+      // DVC/StartView/checkpoint nor applied by a concurrent `advance_commit` before its append landed.
+      Some(Pending::RepairFill(op, entry)) => {
+        self.log.insert(op.get(), entry);
+        self.repair.remove(&op.get());
+        if self.repair.is_empty() {
+          self.timers.repair_retry = None;
+        }
+        // The hole is filled + durable → resume applying the held committed prefix from where it stalled.
+        let target = self.commit_max.get();
+        self.advance_commit(now, sb, target);
+      }
       None => {}
     }
   }
@@ -100,21 +122,28 @@ impl<S: StateMachine> Endpoint<S> {
       match pc.step {
         CheckpointStep::AwaitSnapshot { id: sid } if sid == id => {
           // The snapshot is durable → advance the durable root to name the new checkpoint.
-          // `commit_min >= target_op` always (target_op was commit_min at trigger; commit_min only
-          // grows), so the VsrState `commit >= checkpoint_op` invariant holds → try_new can't fail.
+          // `commit_max >= commit_min >= target_op` always (target_op was commit_min at trigger;
+          // commit_min only grows; commit_max >= commit_min), so the VsrState `commit >= checkpoint_op`
+          // invariant holds → try_new can't fail.
           let root_id = self.mint_op_id();
           // The committed band the NEW root names shrinks to `(target_op .. commit_min]` (the just-
           // checkpointed prefix `[1..=target_op]` now lives in the snapshot, not the band) — pass
           // `pc.target_op` as the floor so the persisted vsr_headers match this root's `checkpoint_op`.
+          // Persist the KNOWN-committed frontier `commit_max` as the commit (codex R10-F2): a root that
+          // persisted the lower `commit_min` would let `recover` (which reads `state.commit()` as
+          // `commit_max`, R9-F1) read back a LOWERED frontier when this replica is held at a repair hole
+          // below `commit_max`. The band headers are the SPARSE canonical set — one per HELD op in
+          // `(target_op .. commit_max]`, skipping holes (codex R12-F1). On a state-sync re-persist
+          // `commit_min == commit_max == target_op`, so the band is empty there — unchanged.
           let state = crate::VsrState::try_new(
             self.view,
             self.log_view,
-            self.commit_min,
+            self.commit_max,
             pc.target_op,
             pc.checkpoint_id,
             self.committed_band_headers(pc.target_op),
           )
-          .expect("checkpoint root: commit_min >= target_op and log_view <= view");
+          .expect("checkpoint root: commit_max >= target_op and log_view <= view");
           sb.submit_write(root_id, state);
           self.pending_checkpoint = Some(PendingCheckpoint {
             step: CheckpointStep::AwaitRoot { id: root_id },
@@ -295,9 +324,18 @@ impl<S: StateMachine> Endpoint<S> {
     // rebuilds them; the unbounded-in-op structures (WAL, log, inflight, buffer) are the ones GC'd.
   }
 
-  /// Persist the durable VSR root for the current `(view, log_view, commit_min)` and arm the
+  /// Persist the durable VSR root for the current `(view, log_view, commit_max)` and arm the
   /// participation deferred until the write completes.
   /// Overwrites any prior `pending_sb` (supersession): an older-view completion is then ignored.
+  ///
+  /// **Persists the KNOWN-committed frontier, not the applied one (codex R10-F2).** The `VsrState`
+  /// commit is `self.commit_max` (the highest op KNOWN committed cluster-wide), NOT `self.commit_min`
+  /// (the locally-applied frontier). `recover` reads `state.commit()` back as `commit_max` (R9-F1), so
+  /// persisting the lower `commit_min` on a replica HELD at a repair hole below `commit_max` would lower
+  /// the recovered frontier and re-open the R9-F1 laggard-quorum truncation hazard. The committed-band
+  /// headers below are the SPARSE canonical set over `(checkpoint_op .. commit_max]` — one header per
+  /// HELD op, skipping holes (codex R12-F1) — so they may be SHORTER than `commit` and contain gaps,
+  /// which `try_new` allows.
   ///
   /// **Preserves the durable checkpoint pointer.** This write must carry the CURRENT checkpoint
   /// (`self.checkpoint_op` + the durable `checkpoint_id`), NOT zeros — a view-change root that
@@ -307,32 +345,56 @@ impl<S: StateMachine> Endpoint<S> {
   /// `sb.state().checkpoint_id()` is its matching id. (A checkpoint's step-2 root write may still be
   /// PHYSICALLY in flight when a view change issues this durable-view root write; the `Superblock`
   /// serialized root-write ordering contract guarantees this later write is the final durable root,
-  /// so the stale checkpoint root cannot win.) `commit_min >= checkpoint_op` always holds, so
-  /// `try_new`'s `commit >= checkpoint_op` invariant cannot fail.
+  /// so the stale checkpoint root cannot win.) `commit_max >= commit_min >= checkpoint_op` always holds,
+  /// so `try_new`'s `commit >= checkpoint_op` invariant cannot fail.
   /// Derive the CANONICAL headers of the un-checkpointed committed band `(checkpoint_floor ..
-  /// commit_min]` from `self.log`, for persistence in the durable [`crate::VsrState`] root
+  /// commit_max]` from `self.log`, for persistence in the durable [`crate::VsrState`] root
   /// (TigerBeetle's `vsr_headers`). `checkpoint_floor` is the `checkpoint_op` the SAME root write
   /// records — `self.checkpoint_op` for an ordinary durable-view write, but `pc.target_op` (the NEW
-  /// checkpoint) for the checkpoint root write, whose band shrinks to `(target_op .. commit_min]`.
+  /// checkpoint) for the checkpoint root write, whose band shrinks to `(target_op .. commit_max]`.
+  ///
+  /// **SPARSE, one header per HELD op (codex R12-F1).** The list records a header for EVERY op the log
+  /// holds in `(checkpoint_floor .. commit_max]`, in ascending op order, SKIPPING holes — it does NOT
+  /// stop at the first gap. This is the R12-F1 fix: the durable header set must vouch for the identity
+  /// of EVERY committed-band op this replica actually holds, so `recover` can verify each held op
+  /// individually rather than DROPPING a whole suffix because of one lower hole. A contiguous-prefix
+  /// list left a held committed op above a lower hole HEADER-LESS, and the R11-F1 recover guard then
+  /// deleted that op's only surviving copy when this replica was the quorum intersection for it.
+  ///
+  /// The band reaches the KNOWN-committed frontier `commit_max` (the value the same root persists,
+  /// R10-F2), NOT `commit_min`: a replica HELD at `commit_min < commit_max` by a lower repair hole still
+  /// HOLDS the committed ops in `(commit_min, commit_max]` (it appended+acked them; they are above the
+  /// checkpoint, un-GC'd), and each must keep its canonical header. The loop is bounded at `self.op` —
+  /// `min(commit_max, self.op)` — because `self.log` holds NO op above the head: ops in `(self.op,
+  /// commit_max]` are the tail-gap ops this replica does not hold, which would be skipped anyway, and the
+  /// cap keeps a bogus/huge learned `commit_max` (an unverified `Commit`/`Prepare` field can set it far
+  /// ahead, the same reason `request_tail_gap` caps its window) from spinning an unbounded loop in the
+  /// Sans-I/O core. Ops the log is missing within the bound (the held repair hole) are simply skipped —
+  /// `self.log.get` returns `None` and that op gets no header, exactly the UNPROVEN/peer-repair case on
+  /// `recover`.
   ///
   /// After an ADOPTION (`adopt_log`) `self.log` holds the canonical bytes for the committed band, so
   /// the body checksum each header records is canonical; in normal operation the band is the replica's
-  /// own committed ops (also canonical). The list is built in op order and stops at the FIRST op the
-  /// log is missing (a repair hole not yet filled): such an op is already non-durable / absent on this
-  /// replica, so recording only the contiguous prefix up to the gap is safe — `VsrState::try_new`
-  /// enforces the same contiguity defensively. Bounded by `commit_min - checkpoint_floor`, i.e. ~one
-  /// checkpoint interval (GC keeps the band small).
+  /// own committed ops (also canonical). `VsrState::try_new` validates this sparse set (in-range,
+  /// strictly-ascending ops; gaps allowed). Bounded by `min(commit_max, self.op) - checkpoint_floor`,
+  /// i.e. ~one checkpoint interval (GC keeps the band small).
   ///
   /// The reconstructed `Header` carries the current root `view`; only its [`Header::body_checksum`] is
   /// load-bearing for the recovery cross-check (it is `fnv1a_128(body)`, view-independent), so the view
-  /// field is informational. Empty when the band is empty (`commit_min == checkpoint_floor`).
+  /// field is informational. Empty when no held op lies in the band.
   fn committed_band_headers(&self, checkpoint_floor: OpNumber) -> std::vec::Vec<Header> {
     let lo = checkpoint_floor.get().saturating_add(1);
-    let hi = self.commit_min.get();
+    // Reach the known-committed frontier but never past the head: `self.log` holds nothing above
+    // `self.op`, so capping here drops no held op and keeps a bogus huge learned `commit_max` from
+    // spinning an unbounded loop (a defensive bound mirroring `request_tail_gap`).
+    let hi = self.commit_max.get().min(self.op.get());
     let mut headers = std::vec::Vec::new();
     for op in lo..=hi {
+      // SPARSE: record a header for every HELD op, SKIPPING (not stopping at) a hole. A held committed
+      // op above a lower repair hole thus keeps its canonical header (the R12-F1 fix); an op the log is
+      // missing gets none and is the UNPROVEN/peer-repair case recover handles.
       let Some(entry) = self.log.get(&op) else {
-        break; // a hole in the committed band — record only the contiguous canonical prefix below it.
+        continue;
       };
       headers.push(Header::new(
         OpNumber::with(op),
@@ -350,12 +412,22 @@ impl<S: StateMachine> Endpoint<S> {
     let state = crate::VsrState::try_new(
       self.view,
       self.log_view,
-      self.commit_min,
+      // Persist `commit_max` — the KNOWN-committed frontier — as the durable `VsrState` commit, NOT
+      // `commit_min` (codex R10-F2). The R9-F1 fix made `recover` read `state.commit()` as `commit_max`,
+      // so a root write that persisted the LOWER `commit_min` would, on a replica HELD at
+      // `commit_min < commit_max` by a stale/faulty repair hole, make `recover` read back a LOWERED
+      // frontier — the recovered DVC would then under-report the known commit and the R9-F1
+      // laggard-quorum truncation hazard reappears. `commit_max >= commit_min >= checkpoint_op`, so
+      // `try_new`'s `commit >= checkpoint_op` invariant still holds; the committed-band headers below
+      // are the SPARSE canonical set from `self.log` — one header per HELD op in `(checkpoint_op ..
+      // commit_max]`, SKIPPING holes (codex R12-F1) — so a held committed op above a lower repair hole
+      // keeps its header rather than being left header-less and dropped by recover.
+      self.commit_max,
       self.checkpoint_op,
       checkpoint_id,
       self.committed_band_headers(self.checkpoint_op),
     )
-    .expect("durable view: log_view <= view and commit_min >= checkpoint_op");
+    .expect("durable view: log_view <= view and commit_max >= checkpoint_op");
     let id = self.mint_op_id();
     sb.submit_write(id, state);
     self.pending_sb = Some((id, action));

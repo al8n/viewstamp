@@ -57,11 +57,26 @@ impl<S: StateMachine> Endpoint<S> {
     let nonce = Prng::new(seed).next_u64();
     let head = wal.op_head().get();
     let checkpoint_op = state.checkpoint_op().get();
-    // The high end of the tail read window (the VERIFIED read frontier): the WAL head, but capped at
-    // `checkpoint_op + RECOVER_TAIL_WINDOW` so a corrupt/buggy `op_head` cannot force unbounded reads
-    // (the cap rationale is on `RECOVER_TAIL_WINDOW`). The loop below materializes + reads exactly
-    // `(checkpoint_op .. hi]`, so `hi` is the highest op this `recover()` actually reads and verifies.
-    let hi = head.min(checkpoint_op.saturating_add(RECOVER_TAIL_WINDOW));
+    // The high end of the tail read window (the VERIFIED read frontier): the WAL head, but capped so a
+    // corrupt/buggy `op_head` cannot force unbounded reads (the cap rationale is on `RECOVER_TAIL_WINDOW`).
+    // The cap floor is the DURABLE committed frontier `state.commit()` (`>= checkpoint_op`), NOT
+    // `checkpoint_op` alone (codex R13-F1): `RECOVER_TAIL_WINDOW` must bound only the UNCOMMITTED tail
+    // above the committed band, never HIDE a committed op this replica HOLDS. `state.commit()` is the
+    // writer's `commit_max` — a DURABLE, checksum-validated (`VsrState`), quorum-bounded frontier; a
+    // corrupt superblock CANNOT inflate it (it would fail `VsrState` validation) and `commit_max` is at
+    // most the real committed frontier, so reading up to it never reads a bogus band. With the old
+    // `checkpoint_op + RECOVER_TAIL_WINDOW` floor, a durable root naming `commit_max` above that cap
+    // (reachable with `Config::with_checkpoint_ops > RECOVER_TAIL_WINDOW`: commit far past the last
+    // checkpoint, persist a durable-view root, crash) would cap `self.op` BELOW held committed ops — its
+    // DVC would then under-report `commit_max > self.op` with a short `log_slice`, tripping
+    // `select_canonical_log`'s `commit* > op_head` fail-stop (or a truncating adoption would DESTROY the
+    // hidden committed copies). The loop below materializes + reads exactly `(checkpoint_op .. hi]`, so
+    // `hi` is the highest op this `recover()` actually reads and verifies. When `commit_max > head` (a
+    // synced/truncated replica that does NOT hold the committed ops above its head) the `head.min(..)`
+    // still clamps `hi = head` — the band `(head, commit_max]` stays repair holes / peer-repaired,
+    // unchanged.
+    let committed_frontier = state.commit().get().max(checkpoint_op);
+    let hi = head.min(committed_frontier.saturating_add(RECOVER_TAIL_WINDOW));
     // The recovered head is the VERIFIED read FRONTIER `hi`, never BELOW the durable checkpoint — NOT
     // the RAW `head` (F1, safety). A STATE-SYNCED replica (M3.4a) holds no WAL at or below the synced
     // checkpoint (it pruned the WAL there and never appended the tail), so its `wal.op_head()` can be
@@ -155,9 +170,12 @@ impl<S: StateMachine> Endpoint<S> {
     // slot (seed 52, or a same-body-different-identity slot) is detected and peer-repaired instead of
     // re-derived. The persisted `view` is intentionally excluded (see `RecoverState::canonical`):
     // `committed_band_headers()` rewrites the entry view to the root view, so it is not the original.
-    // The persisted band is `(checkpoint_op .. commit]` (contiguous, ordered) — bounded by the
-    // checkpoint interval — and only ops at/below the persisted `commit` are committed, so we never
-    // cross-check (and thus never drop) an op the root did not record as committed.
+    // The persisted band is the SPARSE canonical set over `(checkpoint_op .. commit]` (codex R12-F1):
+    // one header per committed-band op the writer HELD, op-ascending, with GAPS where the writer had a
+    // hole — bounded by the checkpoint interval. Seeded as a per-op map keyed by `op`, so a gap is just
+    // an op with NO canonical entry; a held committed op above a lower hole keeps its entry and is
+    // verified individually (the R12-F1 fix). Only ops at/below the persisted `commit` are committed, so
+    // we never cross-check (and thus never drop) an op the root did not record as committed.
     for h in state.committed_headers() {
       rec
         .canonical
@@ -165,12 +183,14 @@ impl<S: StateMachine> Endpoint<S> {
     }
     // Bound the per-recover read-submission window (F3): a corrupt/buggy `Wal` reporting a huge
     // `op_head` must not force unbounded bookkeeping + reads here. SATURATING `checkpoint_op + 1`
-    // (never overflow), with the high end `hi` (computed above) capped at `checkpoint_op +
-    // RECOVER_TAIL_WINDOW` and at `head` — at most `RECOVER_TAIL_WINDOW` slots are materialized per
-    // pass. A legitimate tail (the small un-checkpointed pipeline) is far below the cap; a pathological
-    // head is clipped (its deep tail is recovered incrementally / via the head-fault path), never
-    // billions of reads. `self.op` was set to `hi.max(checkpoint_op)` above, so the window this loop
-    // reads and the held head agree EXACTLY (F1: no held op above the verified frontier).
+    // (never overflow), with the high end `hi` (computed above) capped at `committed_frontier +
+    // RECOVER_TAIL_WINDOW` and at `head` — at most `RECOVER_TAIL_WINDOW` slots ABOVE the durable
+    // committed frontier are materialized per pass (codex R13-F1: the cap bounds the uncommitted tail,
+    // never the committed band, which is read in full up to the validated `commit_max`). A legitimate
+    // uncommitted tail (the small un-checkpointed pipeline above the committed frontier) is far below the
+    // cap; a pathological head is clipped (its deep tail is recovered incrementally / via the head-fault
+    // path), never billions of reads. `self.op` was set to `hi.max(checkpoint_op)` above, so the window
+    // this loop reads and the held head agree EXACTLY (F1: no held op above the verified frontier).
     let lo = checkpoint_op.saturating_add(1);
     for op in lo..=hi {
       if let Some(h) = wal.header(OpNumber::with(op)) {
@@ -236,17 +256,24 @@ impl<S: StateMachine> Endpoint<S> {
     let Some(&op) = rec.reads.get(&id.get()) else {
       return; // not one of our outstanding recovery reads (stale/superseded) — ignore.
     };
-    // Decide the outcome. Four cases:
-    //   * Verified  — an Ok body that self-verifies, lands on the op we asked for, AND (if this op is in
-    //     the persisted committed band) MATCHES the canonical `body_checksum` → adopt it.
-    //   * StaleCommitted — an Ok body that self-verifies + lands right but is a STALE superseded slot,
-    //     detected one of two ways: (a) it is in the persisted committed band and its FULL identity
-    //     `(client, request, body_checksum)` MISMATCHES the persisted canonical header (TigerBeetle's
-    //     vsr_headers; seed 52 — a prior-view proposal whose own header is internally consistent); or
-    //     (b) it is ABOVE the durable known-committed frontier AND its header `view` is BELOW our durable
-    //     `log_view` (vopr seed 335) — a tail op from a generation this replica has already SUPERSEDED
-    //     (it advanced its `log_view` past that op's view, i.e. it re-wrote its log head in a newer view,
-    //     so the slot's body is an abandoned earlier-view proposal). Either way the verdict is DEFINITIVE
+    // Decide the outcome. Four cases (the canonical set is SPARSE — one entry per committed-band op the
+    // writer HELD — so it is keyed per-op and a gap is simply an op with NO entry; codex R12-F1):
+    //   * Verified  — an Ok body that self-verifies, lands on the op we asked for, AND (if this op has a
+    //     SPARSE canonical header) MATCHES its canonical `(client, request, body_checksum)` → adopt it.
+    //     This is what KEEPS a locally-held canonical committed op above a LOWER header-less hole (its
+    //     own sparse header vouches it), the R12-F1 fix — that op's only surviving copy is not deleted.
+    //   * StaleCommitted — an Ok body that self-verifies + lands right but is a STALE/UNPROVEN slot,
+    //     detected three ways: (a) it HAS a sparse canonical header and its FULL identity `(client,
+    //     request, body_checksum)` MISMATCHES it (TigerBeetle's vsr_headers; seed 52 — a prior-view
+    //     proposal whose own header is internally consistent, or a same-body-different-identity slot,
+    //     R9-F2); (b) it is KNOWN-COMMITTED (`op <= commit_max`) but has NO sparse header — an op the
+    //     writer did NOT hold when it persisted the root (a genuine hole / a stale leftover the headers
+    //     do not vouch), so the local self-verifying body is UNPROVEN and must be peer-repaired, never
+    //     trusted (codex R11-F1; now firing ONLY for not-held ops, since a HELD committed op gets a
+    //     sparse header via case-Verified above); or (c) it is ABOVE the durable known-committed frontier
+    //     AND its header `view` is BELOW our durable `log_view` (vopr seed 335) — a tail op from a
+    //     generation this replica has already SUPERSEDED (it advanced its `log_view` past that op's view,
+    //     so the slot's body is an abandoned earlier-view proposal). Each verdict is DEFINITIVE
     //     (re-reading the same slot cannot fix it), so the slot is dropped + routed to peer-repair WITHOUT
     //     spending retries; once the cluster commits that op the canonical body is fetched, never
     //     re-derived from the stale WAL.
@@ -264,20 +291,33 @@ impl<S: StateMachine> Endpoint<S> {
       WalDone::ReadOk(r)
         if r.header().op() == OpNumber::with(op) && r.header().verify(r.body()) =>
       {
-        // The self-consistent slot is canonical UNLESS it is detectably superseded. (1) In the persisted
-        // committed band, its FULL identity `(client, request, body_checksum)` must match the recorded
-        // canonical one (a different body, OR the SAME body under a different client/request, is stale;
-        // codex R9-F2). The committed-band `view` is NOT compared — `committed_band_headers()` rewrote it
-        // to the current root view, so it is not the op's original. (2) ABOVE the durable committed
-        // frontier (`op > commit_max`, so there is NO canonical header to compare), a slot whose ORIGINAL
-        // header `view` is below our durable `log_view` is a superseded earlier-view proposal (seed 335):
-        // we advanced `log_view` past it, so its body is abandoned. A current-generation uncommitted tail
-        // op has `view == log_view` and is kept (to be re-acked); only a strictly-older-view slot is dropped.
+        // The self-consistent slot is canonical UNLESS it is detectably superseded/unproven. (1) If it
+        // HAS a SPARSE canonical header (codex R12-F1: one entry per committed-band op the writer HELD),
+        // its FULL identity `(client, request, body_checksum)` must match that header (a different body,
+        // OR the SAME body under a different client/request, is stale; codex R9-F2). A MATCH here is what
+        // KEEPS a locally-held canonical committed op above a lower header-less hole — its own sparse
+        // header vouches it, so this replica's only surviving copy is not destroyed. The committed-band
+        // `view` is NOT compared — `committed_band_headers()` rewrote it to the current root view, so it
+        // is not the op's original. (2) ABOVE the durable committed frontier (`op > commit_max`, so there
+        // is NO canonical header to compare), a slot whose ORIGINAL header `view` is below our durable
+        // `log_view` is a superseded earlier-view proposal (seed 335): we advanced `log_view` past it, so
+        // its body is abandoned. A current-generation uncommitted tail op has `view == log_view` and is
+        // kept (to be re-acked); only a strictly-older-view slot is dropped.
         let h = r.header();
         match rec.canonical.get(&op) {
           Some(&canonical) if canonical != (h.client(), h.request(), h.body_checksum()) => {
             Outcome::StaleCommitted
           }
+          // (c) KNOWN-COMMITTED (`op <= durable_commit`, the persisted commit_max) but with NO sparse
+          // canonical header (codex R11-F1): the persisted set is SPARSE — one header per committed-band
+          // op the writer HELD (codex R12-F1) — so a missing header means the writer did NOT hold this op
+          // when it persisted the root (a genuine repair hole, or a stale leftover the headers do not
+          // vouch). Such a known-committed op is UNPROVEN — we must NOT trust the local self-verifying WAL
+          // body (it can be a stale earlier-view body that checksum-verifies); drop it so `advance_commit`
+          // peer-repairs the canonical value, never re-deriving it from the local WAL. Crucially, a HELD
+          // committed op DOES carry a sparse header and so takes the case-(1) `Verified` path above —
+          // this arm no longer drops a locally-held committed op above a lower hole (the R12-F1 fix).
+          None if op <= durable_commit => Outcome::StaleCommitted,
           None if op > durable_commit && h.view().get() < durable_log_view => {
             Outcome::StaleCommitted
           }

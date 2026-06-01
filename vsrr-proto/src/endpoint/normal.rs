@@ -336,31 +336,67 @@ impl<S: StateMachine> Endpoint<S> {
 
     let pop = p.op().get();
     if pop <= self.op.get() {
-      // Already have this op; (re)ack so a lost prepare_ok is recovered. Ops are immutable within a
+      // A REGISTERED REPAIR HOLE is owned EXCLUSIVELY by the repair path (codex R13-F2): `fill_repair`
+      // (run at the top of `on_prepare`) already had its chance and rejected this Prepare (a stale
+      // `commit < op`, an unverifiable body, or — returning `true` — a RepairFill already in flight), so
+      // reaching here means it is NOT the committed value for the hole. We must NOT let the re-ack /
+      // interior-re-append branch below write that body into the committed hole's WAL slot nor mark it
+      // `appending` (which would then masquerade as an in-flight RepairFill). Drop it; the repair
+      // solicitation re-asks until a committed-vouching `Prepare` fills the hole via `fill_repair`.
+      if self.repair.contains(&pop) {
+        return;
+      }
+      // Already at/below the head; (re)ack so a lost prepare_ok is recovered. Ops are immutable within a
       // view, and the higher-view rule (top of this fn) + the `view != self.view` reject mean this
-      // re-ack only fires for a current-view prepare.
+      // branch only fires for a current-view prepare.
       //
-      // Append-before-ack (codex R7-F1): re-ack INLINE only if op `pop` is DURABLE. If its WAL append
-      // is still IN FLIGHT (`self.op` advanced in `append_prepare`/`adopt_append` while the append is
-      // async), this branch must NOT ack — that would vote for an op the backup has not durably
-      // appended, the exact violation the primary's PREPARE_RETRANSMIT during the in-flight window
-      // could trigger. SUPPRESS the inline ack: the in-flight append's own `on_wal_done` already owes
-      // exactly one PrepareOk(pop) AFTER durability, so the backup still acks once, at the right time.
-      // (A re-ack for an op that already completed — e.g. a genuinely lost PrepareOk — still re-acks,
-      // recovering it: that is the legitimate purpose of this branch.)
+      // RE-ACK MUST PROVE IDENTITY (codex R10-F1). A re-ack is only sound if this replica genuinely holds
+      // the CANONICAL body for `pop`. For an op ABOVE the checkpoint that is required: `self.log[pop]` must
+      // EXIST and MATCH the incoming Prepare's identity `(client, request, body)`. Matching `self.log` ⇒
+      // the WAL slot is the canonical body (the dense `log` cache mirrors the durable WAL except for a
+      // dropped-stale slot). The OLD code consulted ONLY the WAL durability oracle (`op_durably_appended`),
+      // which a `recover`-DROPPED stale slot still satisfies: recover drops a superseded interior op (its
+      // header `view` < durable `log_view`, seed 335) from `self.log` but the WAL slot still holds the
+      // STALE view-0 body as `Clean`. So `op_durably_appended(pop)` was TRUE for a slot whose CANONICAL
+      // body this replica does NOT hold → it false-acked the canonical Prepare off the stale body
+      // (append-before-ack + committed-op-survival broken: a quorum could be this false ack + the primary,
+      // and the primary crashing loses the op).
       //
-      // The durability oracle is the WAL itself (`op_durably_appended`), NOT just the `appending` set:
-      // a view change / catch-up clears `appending` (keeping it in lockstep with `pending`) while an
-      // async append abandoned in the old generation is STILL staged in the WAL — and once such an op
-      // is committed (commit_min advances past it), the view-change re-append range `(commit_min+1 ..=
-      // op]` never re-marks it, so `appending` alone would wrongly green-light a re-ack of a
-      // committed-but-still-in-flight op (codex vopr seed 17). Consulting the WAL closes that hole: a
-      // `Dirty` (in-flight) / `Empty` (truncated, not re-appended) slot above the checkpoint is not yet
-      // durable; a `Clean`/`Faulty` slot or one folded into the durable checkpoint is. (We keep the
-      // `appending` guard too, so the in-flight-then-just-completed window still defers its single ack
-      // to `on_wal_done` rather than emitting a redundant inline duplicate.)
-      if !self.appending.contains(&pop) && self.op_durably_appended(wal, pop) {
-        self.send_prepare_ok(p.op());
+      // An op AT/BELOW the checkpoint (`pop <= checkpoint_op`) is folded into the DURABLE snapshot — the
+      // dense `log` cache was GC-pruned there, so it legitimately has no entry, yet the canonical body is
+      // held (in the snapshot). It is durable by definition (`op_durably_appended`'s checkpoint clause) and
+      // is NOT a dropped-stale slot, so it keeps the durability-gated re-ack (re-appending below the prune
+      // floor would be wrong). In practice a primary never retransmits such an op (it is below the
+      // primary's `commit_min`), so this fall-through is for a stray/buffered Prepare.
+      let canonical_held = pop <= self.checkpoint_op.get()
+        || self.log.get(&pop).is_some_and(|entry| {
+          entry.client == p.client() && entry.request == p.request() && entry.body == p.body_bytes()
+        });
+      if canonical_held {
+        // We hold the canonical body (in `self.log` above the checkpoint, or in the snapshot at/below it).
+        // Append-before-ack (codex R7-F1): re-ack INLINE only if `pop` is DURABLE and not still IN FLIGHT.
+        // The durability oracle is the WAL itself (`op_durably_appended`), NOT just `appending`: a view
+        // change / catch-up clears `appending` while an async append abandoned in an old generation is
+        // STILL staged in the WAL — and once such an op commits, the re-append range `(commit_min+1 ..=
+        // op]` never re-marks it, so `appending` alone would wrongly green-light a re-ack of a
+        // committed-but-still-in-flight op (vopr seed 17). We keep the `appending` guard too, so the
+        // in-flight-then-just-completed window defers its single ack to `on_wal_done` (whose
+        // `Pending::Ack(pop)` owes exactly one PrepareOk) rather than emitting a redundant inline duplicate.
+        if !self.appending.contains(&pop) && self.op_durably_appended(wal, pop) {
+          self.send_prepare_ok(p.op());
+        }
+        return;
+      }
+      // `self.log[pop]` is MISSING or MISMATCHED and `pop > checkpoint_op` — the dropped-stale interior
+      // case (seed 335). We must NOT re-ack (the stale/absent body is not the canonical one). The incoming
+      // current-view Prepare carries the CANONICAL body (the top-of-fn guards already proved
+      // `p.view() == self.view`), so durably (re)APPEND it — an INTERIOR overwrite at `pop < self.op` that
+      // overwrites the stale WAL slot — and DEFER the ack to `on_wal_done` (a `Pending::Ack(pop)`), WITHOUT
+      // rewinding `self.op`. The ack is then append-before-ack-correct: it waits for the canonical append
+      // to land. (If an append for `pop` is already in flight — `appending` set — do NOT start a second
+      // one; its own `on_wal_done` will ack once the in-flight append completes.)
+      if !self.appending.contains(&pop) {
+        self.reappend_canonical_prepare(wal, &p);
       }
       return;
     }
@@ -399,6 +435,33 @@ impl<S: StateMachine> Endpoint<S> {
     // Append-before-ack (R7-F1): mark op in-flight so neither this op's deferred ack NOR a
     // retransmit-driven re-ack (`on_prepare`'s `pop <= self.op` branch) can emit a PrepareOk before
     // `on_wal_done` clears it. PrepareOk is deferred to on_wal_done when the append is durable.
+    self.appending.insert(p.op().get());
+  }
+
+  /// Durably (re)append an INTERIOR current-view `Prepare` at `pop < self.op` whose `self.log` entry is
+  /// MISSING or MISMATCHED, then DEFER the ack to `on_wal_done` (codex R10-F1). Unlike [`Self::append_prepare`]
+  /// this does NOT advance (rewind) `self.op` — it is an interior overwrite of one stale/absent slot, not a
+  /// head extension — and it does not drain the buffer (a head concern). It overwrites the canonical body
+  /// into the `log` cache + the durable WAL slot (so a future read / DVC / crash-restart serves the canonical
+  /// op, never the stale one) and records a `Pending::Ack(pop)` so the single PrepareOk follows durability
+  /// (append-before-ack). Caller guarantees `pop` is not already `appending` (no double in-flight append) and
+  /// that the Prepare is current-view (`p.view() == self.view`), so overwriting the slot is safe: the op is
+  /// either committed-or-current-view-canonical, and only a stale superseded earlier-view body is replaced.
+  fn reappend_canonical_prepare<W: Wal>(&mut self, wal: &mut W, p: &Prepare) {
+    let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
+    let id = self.mint_op_id();
+    wal.submit_append(id, p.op(), header, p.body_bytes());
+    self.log.insert(
+      p.op().get(),
+      LogEntry {
+        client: p.client(),
+        request: p.request(),
+        body: p.body_bytes(),
+      },
+    );
+    self.pending.insert(id.get(), Pending::Ack(p.op()));
+    // Mark in-flight so a further retransmit-driven re-ack defers to `on_wal_done` (which clears it +
+    // sends the single PrepareOk once the canonical append is durable). NO head rewind: `self.op` stays.
     self.appending.insert(p.op().get());
   }
 

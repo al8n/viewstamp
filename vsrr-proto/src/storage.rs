@@ -161,33 +161,45 @@ impl Header {
 /// `vsr_headers` mechanism. These are written atomically with the view/commit they describe (one
 /// struct, one root write) and let `recover` independently verify each committed-band WAL slot against
 /// the canonical body checksum — a slot whose own (self-consistent) header kept a STALE superseded
-/// body is then DETECTED and routed to peer-repair instead of blindly re-derived from the WAL. The
-/// band is bounded by `Config::checkpoint_ops` (post-checkpoint GC keeps `commit - checkpoint_op`
-/// within ~one checkpoint interval), so the list stays small. Holding a `Vec` makes this `Clone` but
-/// not `Copy`.
+/// body is then DETECTED and routed to peer-repair instead of blindly re-derived from the WAL. The set
+/// is SPARSE (codex R12-F1): one header per committed-band op the writer HELD, so a repair hole omits
+/// only that op while later held ops keep their headers (recovery verifies each held op individually
+/// rather than dropping a whole suffix below one hole). The band is bounded by `Config::checkpoint_ops`
+/// (post-checkpoint GC keeps `commit - checkpoint_op` within ~one checkpoint interval), so the list
+/// stays small. Holding a `Vec` makes this `Clone` but not `Copy`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VsrState {
   view: View,
   log_view: View,
+  /// The KNOWN-committed frontier — VSR's commit-number `k`, the highest op the writer KNOWS is
+  /// committed cluster-wide (the replica's `commit_max`), which `recover` reads back as `commit_max`
+  /// (codex R9-F1/R10-F2). It may exceed the writer's locally-APPLIED `commit_min`: a replica held at a
+  /// stale/faulty repair hole knows op N is committed yet has not applied it, and the root must record N
+  /// so a re-recovered replica's DoViewChange does not under-report the frontier.
   commit: OpNumber,
   checkpoint_op: OpNumber,
   checkpoint_id: u128,
-  /// Canonical headers for the committed band `(checkpoint_op .. commit]`, CONTIGUOUS and ordered by
-  /// op (a possible repair hole truncates the list at the first gap; see [`Self::try_new`]). Private;
-  /// read via [`Self::committed_headers`]. The per-entry `body_checksum` is the load-bearing field
-  /// recovery checks the WAL against.
+  /// Canonical headers for the committed band `(checkpoint_op .. commit]` — a SPARSE, op-ascending set
+  /// holding ONE header per committed-band op the writer actually HELD (codex R12-F1). A repair hole —
+  /// or a hole in `(commit_min, commit]` when the writer's applied frontier lags — simply OMITS that
+  /// op's header; a held op above it keeps its own (so the list may be SHORTER than the full band AND
+  /// may contain gaps; see [`Self::try_new`], which validates in-range strictly-ascending ops but allows
+  /// gaps). Private; read via [`Self::committed_headers`]. The per-entry `body_checksum` is the
+  /// load-bearing field recovery checks the WAL against.
   committed_headers: Vec<Header>,
 }
 impl VsrState {
   /// Creates a durable root, validating `log_view <= view` and `commit >= checkpoint_op`.
   ///
-  /// `committed_headers` are the canonical headers of the committed band `(checkpoint_op .. commit]`,
-  /// ordered by op and CONTIGUOUS from `checkpoint_op + 1`. To keep the stored list trustworthy this
-  /// constructor KEEPS only the contiguous, in-band prefix: it walks `checkpoint_op + 1, +2, …` and
-  /// stops at the first op that is missing, out of order, or above `commit` (a repair hole in the
-  /// caller's log truncates the band there — what is recorded is always a contiguous canonical prefix,
-  /// never a list with holes). Headers strictly above `commit` are dropped (only the committed band is
-  /// persisted). An empty band (`commit == checkpoint_op`) yields an empty list.
+  /// `committed_headers` are the canonical headers of the committed band `(checkpoint_op .. commit]` —
+  /// a SPARSE canonical-header set over the committed-band ops the writer actually HELD, ordered by op
+  /// (codex R12-F1). It is NOT required to be contiguous: a repair hole the writer had simply omits that
+  /// op's header, and a LATER held op keeps its own header (so recovery can verify each held op
+  /// individually rather than dropping a whole suffix because of one lower hole). The set is VALIDATED,
+  /// not silently truncated — every header's op must be in `(checkpoint_op .. commit]` and the ops must
+  /// be STRICTLY INCREASING (gaps allowed; no duplicates, no descents); a header out of that range, a
+  /// duplicate, or a descent is REJECTED (so a valid sparse list is never quietly shortened). An empty
+  /// band (`commit == checkpoint_op`) yields an empty list.
   pub fn try_new(
     view: View,
     log_view: View,
@@ -202,26 +214,36 @@ impl VsrState {
     if commit.get() < checkpoint_op.get() {
       return Err(VsrStateError::CommitBelowCheckpoint);
     }
-    // Keep only the contiguous in-band prefix `checkpoint_op + 1 .. ` (stop at the first gap / any op
-    // above `commit`). The caller derives these from its log in op order; this guard makes the stored
-    // band self-consistently contiguous regardless of a caller hole, so recovery can index it by op.
-    let mut headers = committed_headers;
-    let mut expected = checkpoint_op.get();
-    let kept = headers
-      .iter()
-      .take_while(|h| {
-        expected += 1;
-        h.op().get() == expected && expected <= commit.get()
-      })
-      .count();
-    headers.truncate(kept);
+    // Validate the SPARSE in-band header set (codex R12-F1): every op strictly in `(checkpoint_op ..
+    // commit]`, in STRICTLY-INCREASING op order — GAPS ARE ALLOWED (a hole the writer held is simply
+    // omitted; a held op above it keeps its header). Reject (never silently truncate) an out-of-range,
+    // duplicate, or descending op, so the stored band remains a trustworthy per-op canonical-identity set
+    // recovery indexes by op. `prev` tracks the last accepted op (starting at `checkpoint_op`, so the
+    // first header must be strictly above it — the strict-increase check subsumes the lower-bound check).
+    let mut prev = checkpoint_op.get();
+    for h in &committed_headers {
+      let op = h.op().get();
+      if op <= prev {
+        // Either at/below the checkpoint (the first iteration) or not strictly above the previous op (a
+        // duplicate or a descent). The first case is an out-of-band-below header; the rest are ordering.
+        return Err(if prev == checkpoint_op.get() {
+          VsrStateError::HeaderOutOfBand
+        } else {
+          VsrStateError::HeadersNotAscending
+        });
+      }
+      if op > commit.get() {
+        return Err(VsrStateError::HeaderOutOfBand);
+      }
+      prev = op;
+    }
     Ok(Self {
       view,
       log_view,
       commit,
       checkpoint_op,
       checkpoint_id,
-      committed_headers: headers,
+      committed_headers,
     })
   }
 
@@ -249,7 +271,10 @@ impl VsrState {
     self.log_view
   }
 
-  /// The highest committed op number.
+  /// The KNOWN-committed frontier (VSR's commit-number `k`) — the highest op known committed
+  /// cluster-wide when this root was written (the writer's `commit_max`). `recover` reads this as
+  /// `commit_max`; it may exceed the locally-applied `commit_min` (a held repair hole), so it must not
+  /// be confused with the applied frontier.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn commit(&self) -> OpNumber {
     self.commit
@@ -267,12 +292,14 @@ impl VsrState {
     self.checkpoint_id
   }
 
-  /// The canonical headers for the un-checkpointed committed band `(checkpoint_op .. commit]`, ordered
-  /// by op and contiguous from `checkpoint_op + 1` (TigerBeetle's `vsr_headers`). Recovery verifies
-  /// each committed-band WAL slot against the matching header's [`Header::body_checksum`]: a slot whose
-  /// own self-consistent header kept a stale superseded body mismatches the canonical checksum and is
-  /// routed to peer-repair rather than re-derived from the WAL. May be SHORTER than the full band if
-  /// the caller had a repair hole (the list is truncated at the first gap by [`Self::try_new`]).
+  /// The canonical headers for the un-checkpointed committed band `(checkpoint_op .. commit]` — a SPARSE,
+  /// op-ascending set with ONE header per committed-band op the writer HELD (TigerBeetle's `vsr_headers`;
+  /// codex R12-F1). Recovery verifies each committed-band WAL slot against the matching header's
+  /// [`Header::body_checksum`]: a held slot whose own self-consistent header kept a stale superseded body
+  /// mismatches the canonical checksum and is routed to peer-repair rather than re-derived from the WAL,
+  /// while a known-committed op with NO header (one the writer did not hold) is dropped + peer-repaired.
+  /// May be SHORTER than the full band AND contain gaps when the caller had repair holes (each held op
+  /// keeps its header regardless of a lower hole; [`Self::try_new`] allows gaps).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn committed_headers(&self) -> &[Header] {
     &self.committed_headers
@@ -289,6 +316,12 @@ pub enum VsrStateError {
   /// `commit` was below `checkpoint_op`.
   #[error("commit is below the checkpoint op")]
   CommitBelowCheckpoint,
+  /// A committed-band header's op fell outside `(checkpoint_op .. commit]`.
+  #[error("a committed-band header op is outside (checkpoint_op .. commit]")]
+  HeaderOutOfBand,
+  /// The committed-band headers were not in strictly-ascending op order (a duplicate or a descent).
+  #[error("committed-band header ops are not strictly ascending")]
+  HeadersNotAscending,
 }
 
 /// A successful WAL read result.
@@ -557,8 +590,8 @@ mod tests {
   }
 
   #[test]
-  fn vsr_state_keeps_only_the_contiguous_in_band_header_prefix() {
-    // Build canonical headers for ops 3,4,5 (the committed band above checkpoint_op = 2, commit = 5).
+  fn vsr_state_keeps_a_sparse_in_band_header_set_verbatim() {
+    // Build canonical headers for ops in the committed band above checkpoint_op = 2, commit = 5.
     let mk = |op: u64| {
       Header::new(
         OpNumber::with(op),
@@ -581,8 +614,8 @@ mod tests {
     assert_eq!(s.committed_headers().len(), 3);
     assert_eq!(s.committed_headers()[0].op(), OpNumber::with(3));
 
-    // A GAP after op 3 (3, then 5 — op 4 missing) truncates at the gap: only op 3 is kept, so the
-    // stored band is always a contiguous canonical prefix recovery can index by op.
+    // A GAP after op 3 (3, then 5 — op 4 a hole) is now KEPT verbatim (codex R12-F1): the held op 5
+    // above the op-4 hole retains its canonical header so recovery can verify it individually.
     let holed = VsrState::try_new(
       View::with(1),
       View::with(1),
@@ -592,21 +625,114 @@ mod tests {
       std::vec![mk(3), mk(5)],
     )
     .unwrap();
-    assert_eq!(holed.committed_headers().len(), 1);
-    assert_eq!(holed.committed_headers()[0].op(), OpNumber::with(3));
+    assert_eq!(
+      holed
+        .committed_headers()
+        .iter()
+        .map(|h| h.op().get())
+        .collect::<std::vec::Vec<_>>(),
+      std::vec![3, 5],
+      "the sparse set (gap at op 4) is kept verbatim, not truncated at the gap"
+    );
 
-    // Headers ABOVE commit are dropped (only the committed band is persisted): commit = 3 keeps op 3.
-    let capped = VsrState::try_new(
+    // A header ABOVE commit is REJECTED (only the committed band is persisted): commit = 3, op 4 > commit.
+    assert_eq!(
+      VsrState::try_new(
+        View::with(1),
+        View::with(1),
+        OpNumber::with(3),
+        OpNumber::with(2),
+        0,
+        std::vec![mk(3), mk(4)],
+      ),
+      Err(VsrStateError::HeaderOutOfBand)
+    );
+  }
+
+  #[test]
+  fn vsr_state_accepts_a_sparse_in_band_header_set_but_rejects_a_malformed_one() {
+    // codex R12-F1: the committed-band header set is now a SPARSE canonical-header set over the held
+    // committed ops, NOT a contiguous prefix. `try_new` ACCEPTS an in-range, strictly-increasing set
+    // even with GAPS (a held op above a lower hole keeps its header), but REJECTS an out-of-range,
+    // non-ascending, or duplicate set rather than silently truncating a valid sparse list.
+    let mk = |op: u64| {
+      Header::new(
+        OpNumber::with(op),
+        View::with(1),
+        ClientId::new(1),
+        RequestNumber::with(op),
+        &[op as u8],
+      )
+    };
+    // ACCEPT: a sparse set [op1, op3] with commit = 3, checkpoint = 0 — the gap at op 2 is allowed and
+    // BOTH headers are kept verbatim (op 3 is a held canonical op above the op-2 hole).
+    let sparse = VsrState::try_new(
       View::with(1),
       View::with(1),
       OpNumber::with(3),
-      OpNumber::with(2),
+      OpNumber::new(),
       0,
-      std::vec![mk(3), mk(4)],
+      std::vec![mk(1), mk(3)],
     )
     .unwrap();
-    assert_eq!(capped.committed_headers().len(), 1);
-    assert_eq!(capped.committed_headers()[0].op(), OpNumber::with(3));
+    assert_eq!(
+      sparse
+        .committed_headers()
+        .iter()
+        .map(|h| h.op().get())
+        .collect::<std::vec::Vec<_>>(),
+      std::vec![1, 3],
+      "a sparse in-band set is kept verbatim (the gap at op 2 is allowed)"
+    );
+
+    // REJECT: an op AT/BELOW the checkpoint (out of band below).
+    assert_eq!(
+      VsrState::try_new(
+        View::with(1),
+        View::with(1),
+        OpNumber::with(5),
+        OpNumber::with(2),
+        0,
+        std::vec![mk(2), mk(3)], // op 2 == checkpoint_op — must be strictly above it
+      ),
+      Err(VsrStateError::HeaderOutOfBand)
+    );
+    // REJECT: an op ABOVE commit (out of band above).
+    assert_eq!(
+      VsrState::try_new(
+        View::with(1),
+        View::with(1),
+        OpNumber::with(3),
+        OpNumber::new(),
+        0,
+        std::vec![mk(1), mk(4)], // op 4 > commit 3
+      ),
+      Err(VsrStateError::HeaderOutOfBand)
+    );
+    // REJECT: a non-ascending set (op 3 then op 1).
+    assert_eq!(
+      VsrState::try_new(
+        View::with(1),
+        View::with(1),
+        OpNumber::with(5),
+        OpNumber::new(),
+        0,
+        std::vec![mk(3), mk(1)],
+      ),
+      Err(VsrStateError::HeadersNotAscending)
+    );
+    // REJECT: a duplicate op (op 3 twice) — not strictly increasing.
+    assert_eq!(
+      VsrState::try_new(
+        View::with(1),
+        View::with(1),
+        OpNumber::with(5),
+        OpNumber::new(),
+        0,
+        std::vec![mk(3), mk(3)],
+      ),
+      Err(VsrStateError::HeadersNotAscending)
+    );
   }
 
   #[test]
