@@ -46,11 +46,28 @@ pub struct Cluster {
   /// (the VOPR driver) drains it each tick via [`take_append_before_ack_violation`]. Existing gates
   /// never read it, so it is inert for them.
   append_before_ack_violation: Option<String>,
+  /// Set by [`tick`](Self::tick) when a replica emitted a primary-authority `StartView`/
+  /// `RecoveryResponse` for a view that is NOT yet DURABLE on its own superblock — the
+  /// durable-view-before-participate invariant (codex R8-F1), checked structurally at emission time
+  /// against the sim's superblock view. These two messages assert "I am the canonical primary of view
+  /// V" (a `StartView` is the primary's authoritative head broadcast; a primary's `RecoveryResponse`
+  /// is the recovery-handshake equivalent), so emitting one for a `V` above the durable view means the
+  /// replica participated AS the primary in a view a crash could regress out of. Stays `None` absent a
+  /// violation; the VOPR driver drains it each tick via [`take_durable_view_violation`]. Inert for
+  /// existing gates (they never read it).
+  durable_view_violation: Option<String>,
   /// `None` (default) ⇒ every replica's WAL appends SYNCHRONOUSLY (existing-gate behaviour). `Some(d)`
   /// ⇒ async-append mode with per-append delay `d` polls — the Phase-A in-flight window the
   /// append-before-ack invariant must survive. Set via [`set_async_wal_delay`] before running;
   /// persists across `crash`/`restart` because the WAL struct does.
   async_wal_delay: Option<u32>,
+  /// `None` (default) ⇒ every replica's superblock writes complete SYNCHRONOUSLY (existing-gate
+  /// behaviour). `Some(d)` ⇒ async-write mode with per-write delay `d` polls — the pending
+  /// durable-view window the durable-view-before-participate gate must survive (codex R8-F1). Set via
+  /// [`set_async_superblock_delay`] before running; persists across `crash`/`restart` because the
+  /// superblock struct does. A `crash` additionally DISCARDS any in-flight superblock write (a real
+  /// crash loses an `fsync` mid-flight), so a not-yet-durable view write is genuinely lost.
+  async_sb_delay: Option<u32>,
 }
 
 impl Cluster {
@@ -91,7 +108,7 @@ impl Cluster {
       .collect();
     let n = replicas as usize;
     let storage_faults = StorageFaults::none();
-    let (wals, sbs) = Self::seed_storage(replicas, seed, storage_faults, None);
+    let (wals, sbs) = Self::seed_storage(replicas, seed, storage_faults, None, None);
     Self {
       replicas: replica_set,
       wals,
@@ -108,31 +125,42 @@ impl Cluster {
       crashed: vec![false; n],
       groups: vec![0; n],
       append_before_ack_violation: None,
+      durable_view_violation: None,
       async_wal_delay: None,
+      async_sb_delay: None,
     }
   }
 
   /// Builds the per-replica seeded WAL + superblock vectors. Each replica's storage gets a distinct
   /// seed derived from the base `seed`, its index, and [`STORAGE_SEED_MAGIC`], so fault decisions are
-  /// reproducible per (seed, replica) yet independent across replicas. When `async_delay` is `Some`,
-  /// every WAL is built in async-append mode (the in-flight window) composed with the fault plan.
+  /// reproducible per (seed, replica) yet independent across replicas. When `async_wal_delay` is
+  /// `Some`, every WAL is built in async-append mode (the in-flight window); when `async_sb_delay` is
+  /// `Some`, every superblock is built in async-write mode (the pending durable-view window) — both
+  /// composed with the fault plan.
   fn seed_storage(
     replicas: u8,
     seed: u64,
     faults: StorageFaults,
-    async_delay: Option<u32>,
+    async_wal_delay: Option<u32>,
+    async_sb_delay: Option<u32>,
   ) -> (Vec<InMemoryWal>, Vec<InMemorySuperblock>) {
     let wals = (0..replicas)
       .map(|i| {
         let s = Self::storage_seed(seed, i);
-        match async_delay {
+        match async_wal_delay {
           Some(d) => InMemoryWal::with_async_appends_and_faults(faults, s, d),
           None => InMemoryWal::with_faults(faults, s),
         }
       })
       .collect();
     let sbs = (0..replicas)
-      .map(|i| InMemorySuperblock::with_faults(faults, Self::storage_seed(seed, i)))
+      .map(|i| {
+        let s = Self::storage_seed(seed, i);
+        match async_sb_delay {
+          Some(d) => InMemorySuperblock::with_async_writes_and_faults(faults, s, d),
+          None => InMemorySuperblock::with_faults(faults, s),
+        }
+      })
       .collect();
     (wals, sbs)
   }
@@ -153,8 +181,13 @@ impl Cluster {
   /// `crash` + `restart` unchanged — a restarted replica recovers from the same faulty medium.
   pub fn set_storage_faults(&mut self, faults: StorageFaults) {
     self.storage_faults = faults;
-    let (wals, sbs) =
-      Self::seed_storage(self.replica_count, self.seed, faults, self.async_wal_delay);
+    let (wals, sbs) = Self::seed_storage(
+      self.replica_count,
+      self.seed,
+      faults,
+      self.async_wal_delay,
+      self.async_sb_delay,
+    );
     self.wals = wals;
     self.sbs = sbs;
   }
@@ -167,7 +200,36 @@ impl Cluster {
   /// [`set_storage_faults`](Self::set_storage_faults).
   pub fn set_async_wal_delay(&mut self, delay: Option<u32>) {
     self.async_wal_delay = delay;
-    let (wals, sbs) = Self::seed_storage(self.replica_count, self.seed, self.storage_faults, delay);
+    let (wals, sbs) = Self::seed_storage(
+      self.replica_count,
+      self.seed,
+      self.storage_faults,
+      delay,
+      self.async_sb_delay,
+    );
+    self.wals = wals;
+    self.sbs = sbs;
+  }
+
+  /// Enables (or, with `None`, disables) **async-write mode** on every replica's superblock, with
+  /// per-write delay `delay` polls. In this mode a durable-root or checkpoint write stays
+  /// not-yet-durable (`state()` still names the prior root) for `delay` polls — the pending
+  /// durable-view window the durable-view-before-participate gate must survive (codex R8-F1): a
+  /// replica that just became primary has `pending_sb` armed while its view-change root write is in
+  /// flight, so a delayed `GetView`/`Recovery` or a primary timer in that window must not make it act
+  /// in the not-yet-durable view. Composes with the current storage-fault plan. Call before running;
+  /// the mode persists across `crash`/`restart` because the superblock struct does (and a `crash`
+  /// discards any in-flight write, genuinely losing a not-yet-durable view). Rebuilds the (empty)
+  /// superblocks, like [`set_async_wal_delay`](Self::set_async_wal_delay).
+  pub fn set_async_superblock_delay(&mut self, delay: Option<u32>) {
+    self.async_sb_delay = delay;
+    let (wals, sbs) = Self::seed_storage(
+      self.replica_count,
+      self.seed,
+      self.storage_faults,
+      self.async_wal_delay,
+      delay,
+    );
     self.wals = wals;
     self.sbs = sbs;
   }
@@ -233,6 +295,46 @@ impl Cluster {
   /// structurally each tick by checking every emitted `PrepareOk` against the sender's own WAL view.
   pub fn take_append_before_ack_violation(&mut self) -> Option<String> {
     self.append_before_ack_violation.take()
+  }
+
+  /// Drains the most recent durable-view-before-participate violation observed during
+  /// [`tick`](Self::tick) or [`probe_pending_view_window`](Self::probe_pending_view_window) (a replica
+  /// emitted a primary-authority `StartView`/`RecoveryResponse` for a view above its own durable
+  /// superblock view — codex R8-F1), if any. `None` when none has occurred since the last drain.
+  pub fn take_durable_view_violation(&mut self) -> Option<String> {
+    self.durable_view_violation.take()
+  }
+
+  /// Record a durable-view-before-participate violation (codex R8-F1) if `out` (emitted by replica
+  /// `ri`) is a primary-authority message — a `StartView`, or a `RecoveryResponse` carrying a head
+  /// (non-empty log OR a non-zero op, i.e. the PRIMARY's answer, not a backup's view-only echo) — for
+  /// a view STRICTLY ABOVE replica `ri`'s own DURABLE (superblock) view. Such a message asserts "I am
+  /// the canonical primary of view V" in a view that is not yet recoverable, which a crash could
+  /// regress out of. First violation only (subsequent ones are inert).
+  fn record_durable_view_violation(&mut self, ri: usize, out: &Outgoing) {
+    use vsrr_proto::Superblock;
+    if self.durable_view_violation.is_some() {
+      return;
+    }
+    let durable_view = self.sbs[ri].state().view().get();
+    let (kind, msg_view) = match out.msg_ref() {
+      Message::StartView(sv) => ("StartView", sv.view().get()),
+      // A primary's RecoveryResponse carries the canonical head (non-empty log or op > 0); a Normal
+      // backup answers with op == 0 + empty log (view-only echo), which reports its view but not a
+      // head — still a participation signal, but the head-bearing primary answer is the load-bearing
+      // R8-F1 case the gate suppresses. Flag the head-bearing one (op > 0).
+      Message::RecoveryResponse(rr) if rr.op().get() > 0 => ("RecoveryResponse", rr.view().get()),
+      _ => return,
+    };
+    if msg_view > durable_view {
+      self.durable_view_violation = Some(format!(
+        "replica {ri} emitted {kind}(view={msg_view}) while its DURABLE view is {durable_view} \
+         (volatile view={}, status={}) — durable-view-before-participate (R8-F1) violated: it \
+         asserted primary authority in a view not yet persisted",
+        self.replicas[ri].view().get(),
+        self.replicas[ri].status().as_str(),
+      ));
+    }
   }
 
   /// True iff replica `i` is the primary of its current view (for the M3 gate's failover schedule).
@@ -312,9 +414,17 @@ impl Cluster {
   }
 
   /// Crash-stop replica `i`: it stops being ticked and its messages are dropped. Its durable
-  /// `wals[i]`/`sbs[i]` are left intact so a later `restart` can recover from them.
+  /// `wals[i]`/`sbs[i]` are left intact so a later `restart` can recover from them — EXCEPT any
+  /// superblock write still in flight (async-write mode), which a real crash loses mid-`fsync`: we
+  /// `discard_inflight` it so the durable root/checkpoint stay at their last-COMPLETED values. This
+  /// is what makes the pending-durable-view window (R8-F1) a genuine crash hazard — a not-yet-durable
+  /// view write is actually lost, so the replica recovers to the OLD view (and the proto must never
+  /// have acted in the new one). In synchronous mode this is a no-op. (Staged WAL appends are left as
+  /// the existing async-WAL sweep does: a stale `Appended` completing post-restart carries a
+  /// superseded `OpId` the recovered replica ignores.)
   pub fn crash(&mut self, i: usize) {
     self.crashed[i] = true;
+    self.sbs[i].discard_inflight();
   }
 
   /// Restart a previously-crashed replica: rebuild it from its durable WAL + superblock via
@@ -366,6 +476,73 @@ impl Cluster {
   #[doc(hidden)]
   pub fn wal_head_for_test(&self, i: usize) -> u64 {
     self.wals[i].op_head().get()
+  }
+
+  /// Test-only: the number of staged (not-yet-durable) superblock writes on replica `i` — `> 0` iff
+  /// the async-write superblock has an in-flight write open RIGHT NOW (the pending durable-view /
+  /// checkpoint window). The async-superblock VOPR uses this to confirm the R8-F1 window is genuinely
+  /// exercised (a primary sits with `pending_sb` armed while a view-change root write is in flight).
+  #[doc(hidden)]
+  pub fn sb_staged_len_for_test(&self, i: usize) -> usize {
+    self.sbs[i].staged_len()
+  }
+
+  /// Test-only: whether replica `i` is a `Normal` primary whose current view is NOT yet durable —
+  /// i.e. its volatile in-memory view is strictly ahead of its durable (superblock) view while it is
+  /// the primary of that volatile view. This is EXACTLY the R8-F1 pending-durable-view window from the
+  /// proto's side (`pending_sb` armed for a `StartViewAsPrimary` write). Lets the async-superblock
+  /// VOPR confirm a seed actually opens the window (rather than merely staging unrelated writes).
+  #[doc(hidden)]
+  pub fn in_pending_primary_view_window_for_test(&self, i: usize) -> bool {
+    use vsrr_proto::Superblock;
+    let r = &self.replicas[i];
+    let durable_view = self.sbs[i].state().view().get();
+    r.status().is_normal() && r.is_primary() && r.view().get() > durable_view
+  }
+
+  /// Adversarially PROBE the R8-F1 pending-durable-view window (codex R8-F1): for every non-crashed
+  /// replica that is a `Normal` primary whose view is NOT yet durable (a `StartViewAsPrimary` root
+  /// write still in flight), deliver — RIGHT NOW, in this window — a `GetView` AND a `Recovery` from a
+  /// peer, plus fire its timers. A correct primary must answer NEITHER (no `StartView` for the
+  /// not-yet-durable view, no `RecoveryResponse` with its canonical head, no `Commit`/`Prepare`
+  /// heartbeat) until the view is durable; the durability/view-monotonic checkers then catch any
+  /// resulting cross-view double-participation. Returns the number of replicas probed in their window,
+  /// so the sweep can assert the window is genuinely EXERCISED (not merely opened). This is the
+  /// driver-side "deliver GetView/Recovery during the pending-superblock window" the R8-F1 closure
+  /// needs: the window is short, so relying on incidental message/timer coincidence misses it — this
+  /// makes the probe deterministic. Faithful: a delayed/duplicate `GetView`/`Recovery` and a primary
+  /// timer firing in that window are exactly the real events the gate must survive.
+  pub fn probe_pending_view_window(&mut self) -> u64 {
+    let now = self.clock.now();
+    let mut probed = 0u64;
+    for i in 0..self.replicas.len() {
+      if self.crashed[i] || !self.in_pending_primary_view_window_for_test(i) {
+        continue;
+      }
+      probed += 1;
+      // A peer (the next replica id) solicits — both a head (GetView) and a recovery handshake.
+      let peer = vsrr_proto::ReplicaId::new(((i + 1) % self.replicas.len()) as u8);
+      let from = Peer::Replica(peer);
+      let view = self.replicas[i].view();
+      let gv = Message::GetView(vsrr_proto::GetView::new(view, peer, 0xF1_u64));
+      self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, gv);
+      let rec = Message::Recovery(vsrr_proto::Recovery::new(peer, 0xF2_u64));
+      self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, rec);
+      // Fire the primary timers too (the `primary_timeouts` heartbeat/retransmit gate).
+      self.replicas[i].handle_timeout(now, &mut self.wals[i], &mut self.sbs[i]);
+      // Inspect EVERYTHING the probe made the replica emit: a correct (gated) primary emits no
+      // StartView/RecoveryResponse for its not-yet-durable view; an ungated one does → R8-F1
+      // violation. Drain the queue (re-enqueuing for normal routing) and check each message.
+      let mut drained = std::vec::Vec::new();
+      while let Some(out) = self.replicas[i].poll_message() {
+        self.record_durable_view_violation(i, &out);
+        drained.push(out);
+      }
+      for out in drained {
+        self.route(now, ReplicaId::new(i as u8), out);
+      }
+    }
+    probed
   }
 
   /// Test-only (M3.4a): how many state-syncs have fully applied + become durable on replica `i` since
@@ -473,6 +650,10 @@ impl Cluster {
             ));
           }
         }
+        // Durable-view-before-participate (R8-F1), checked at emission: a StartView / head-bearing
+        // RecoveryResponse for a view above the emitter's durable view is a participation in a
+        // not-yet-recoverable view.
+        self.record_durable_view_violation(ri, &out);
         outgoing.push((ReplicaId::new(ri as u8), out));
       }
     }

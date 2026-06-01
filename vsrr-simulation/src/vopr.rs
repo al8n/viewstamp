@@ -32,6 +32,16 @@
 //!   [`Cluster::tick`]); and every op in the cluster's committed history stays durably written (WAL
 //!   slot occupied — `Clean`/`Faulty` — or `<= checkpoint_op`) on at least a quorum.
 //! - **Liveness — over calm windows** (see above).
+//! - **End-of-run durability — after a final QUIESCE phase**: once the chaos loop ends, the driver
+//!   heals everything, restarts all crashed replicas, drops all faults, and ticks a healthy cluster to
+//!   convergence (bounded) — TigerBeetle's VOPR `transition_to_liveness_mode` — and only THEN asserts
+//!   the whole committed history is APPLIED on an operational replica. This is because the chaos loop
+//!   can stop on an instant where a committed op the survivors hold durably-but-unapplied was applied
+//!   only by a since-crashed replica (the per-tick quorum-durability check still passes — the op is
+//!   durably retained — but it is not yet applied by an operational replica); VSR's guarantee is
+//!   durable-quorum retention, with application a local catch-up that the drain completes. The per-tick
+//!   checks stay live through the drain, so a committed op held by NO quorum never converges and the
+//!   phase panics with a non-convergence wedge rather than passing (VOPR seed 313).
 //!
 //! On ANY violation the driver **panics** with `seed`, `tick`, and a one-line description, so the
 //! failure is reproducible by re-running that seed (see [`run_vopr_one`]).
@@ -74,6 +84,11 @@ pub struct VoprReport {
   max_view: u64,
   /// Whether every client completed all its requests by the end of the run.
   all_clients_done: bool,
+  /// Ticks on which at least one replica was observed in the R8-F1 pending-durable-view window (a
+  /// `Normal` primary whose volatile view is ahead of its durable view — a view-change root write in
+  /// flight). `> 0` proves the async-superblock mode actually opened the window this run exercises,
+  /// so the durable-view-before-participate gate was genuinely tested rather than vacuously skipped.
+  pending_view_windows_seen: u64,
 }
 
 impl VoprReport {
@@ -136,6 +151,13 @@ impl VoprReport {
   pub const fn all_clients_done(&self) -> bool {
     self.all_clients_done
   }
+
+  /// The number of ticks on which at least one replica was in the R8-F1 pending-durable-view window
+  /// (a `Normal` primary whose view is not yet durable). `> 0` ⇒ the async-superblock mode genuinely
+  /// opened the window this run, so the durable-view-before-participate gate was exercised.
+  pub const fn pending_view_windows_seen(&self) -> u64 {
+    self.pending_view_windows_seen
+  }
 }
 
 /// The driver's own seeded RNG + bookkeeping. Separate from the cluster's internal network/storage
@@ -164,9 +186,12 @@ struct Vopr {
 }
 
 /// Run one VOPR simulation for `ticks` ticks, seeded entirely by `seed`. Returns a [`VoprReport`]
-/// summarising the schedule explored. **Panics** (with `seed` + `tick` + a one-line description) on
-/// any safety, durability, view-monotonicity, boundedness, append-before-ack, structural-ordering, or
-/// liveness violation — so a failing seed is reproducible by re-running it via [`run_vopr_one`].
+/// summarising the schedule explored. After the chaos loop it runs a bounded final QUIESCE phase
+/// (heal everything, restart all, no faults, tick to convergence — the `run_final_quiesce` step)
+/// before the end-of-run durability assertion, so the survivors apply any durably-held committed tail
+/// first. **Panics** (with `seed` + `tick` + a one-line description) on any safety, durability,
+/// view-monotonicity, boundedness, append-before-ack, structural-ordering, or liveness (including
+/// final-quiesce non-convergence) violation — so a failing seed is reproducible via [`run_vopr_one`].
 pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
   let mut v = Vopr::new(seed);
   let mut c = v.build_cluster();
@@ -182,13 +207,33 @@ pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
     v.step_phase(&mut c, tick);
     v.apply_actions(&mut c, tick);
     c.tick();
+    // R8-F1: adversarially probe the pending-durable-view window THIS tick — deliver a GetView +
+    // Recovery and fire the primary timers to any replica that is a Normal primary whose view is not
+    // yet durable (a `StartViewAsPrimary` root write in flight). The window is short, so this targeted
+    // probe (rather than incidental coincidence) is what actually exercises the
+    // durable-view-before-participate gates; the checkers below catch any cross-view participation.
+    v.report.pending_view_windows_seen += c.probe_pending_view_window();
     v.check_invariants(&mut c, tick, &mut dur, &mut vm, &bound);
     v.update_report(&c);
   }
 
-  // Final durability assertion: the whole committed history survived somewhere operational.
+  // Final QUIESCE phase (TigerBeetle's VOPR `transition_to_liveness_mode`): heal everything, restart
+  // every crashed replica, drop all faults, and tick to convergence BEFORE the end-of-run assertions.
+  // Rationale (VOPR seed 313): the chaos loop can end on an arbitrary instant where the
+  // committed-history high-water op is APPLIED only by a since-crashed replica while the operational
+  // survivors hold that op DURABLY on a quorum's WAL but have not yet APPLIED it (commit catch-up in
+  // flight). That is NOT a lost op — VSR's guarantee is durable-quorum RETENTION, with application a
+  // local catch-up that completes once the cluster is healthy. So we drain first: the survivors apply
+  // the durably-held committed tail, and only THEN do we assert the (strict) end-of-run durability +
+  // applied invariants. The per-tick checks keep running THROUGHOUT the drain, so the drain can expose
+  // (never hide) a divergence, and a genuine loss — a committed op held by NO quorum — still fails (it
+  // cannot be reconstructed from a non-existent quorum source, so convergence times out below).
+  v.run_final_quiesce(&mut c, ticks, &mut dur, &mut vm, &bound);
+
+  // Final durability assertion: after convergence, the whole committed history survives, applied, on
+  // at least one operational replica — proving no committed op was lost across the run.
   if let crate::checker::CheckResult::Violation(why) = dur.check(&c) {
-    panic!("vopr seed {seed} tick {ticks} (final): {why}");
+    panic!("vopr seed {seed} tick {ticks} (final, post-quiesce): {why}");
   }
   v.report.ticks = ticks;
   v.report.all_clients_done = (0..c.client_count()).all(|i| c.client(i).is_done());
@@ -209,6 +254,14 @@ pub const DEFAULT_TICKS: u64 = 4_000;
 /// all-up cluster to complete any in-flight view change / peer-repair and commit several new ops, so
 /// "no progress here" is a true wedge, not just a slow convergence.
 const CALM_TICKS: u64 = 800;
+
+/// The bound (in ticks) on the final QUIESCE phase: a healed, all-up, fault-free cluster must apply
+/// the durably-held committed tail and converge well within this. It is generous (several calm windows
+/// over) so a legitimately slow drain — a far-behind replica state-syncing, peer-repairing rotted
+/// committed slots, or electing a stable primary across a few view changes — has ample room, while a
+/// cluster that still cannot converge a committed op a quorum holds durably is a real LIVENESS wedge
+/// (or a genuine loss the quorum cannot repair), which the phase then reports.
+const FINAL_QUIESCE_TICKS: u64 = 6_000;
 
 impl Vopr {
   fn new(seed: u64) -> Self {
@@ -258,6 +311,19 @@ impl Vopr {
     // Async WAL: a per-append in-flight window of 1..=4 polls (the append-before-ack window).
     let delay = 1 + self.prng.below(4) as u32;
     c.set_async_wal_delay(Some(delay));
+    // Async SUPERBLOCK: a per-write in-flight window of 1..=4 polls (the pending durable-view window
+    // the durable-view-before-participate gate must survive, codex R8-F1). With the superblock
+    // completing synchronously the `pending_sb` window never opened, so the VOPR could not see R8-F1;
+    // staging the view-change/checkpoint root writes opens it. Seeded per-run; a `crash` discards any
+    // in-flight write so a not-yet-durable view is genuinely lost.
+    // The `sb_delay` is drawn UNCONDITIONALLY (determinism); `VOPR_NO_ASYNC_SB` only suppresses
+    // APPLYING it, so a shrink run stays on the exact same PRNG stream/schedule — for root-causing
+    // whether a failure is async-superblock-induced (mirrors the `VOPR_NO_*` fault masks). NOT set by
+    // the committed sweep.
+    let sb_delay = 1 + self.prng.below(4) as u32;
+    if !env_flag("VOPR_NO_ASYNC_SB") {
+      c.set_async_superblock_delay(Some(sb_delay));
+    }
     // Baseline storage + network faults for the chaos phases (toggled around calm windows).
     c.set_storage_faults(self.chaos_storage_faults());
     c.set_faults(self.chaos_network_faults());
@@ -383,6 +449,86 @@ impl Vopr {
         self.seed
       );
     }
+  }
+
+  /// The final QUIESCE phase, run once after the chaos loop and BEFORE the end-of-run durability
+  /// assertion (TigerBeetle's VOPR `transition_to_liveness_mode`): heal every partition, restart every
+  /// crashed replica, drop all faults, then tick a healthy, fully-connected cluster until it converges
+  /// — the operational survivors have APPLIED the full committed-history high-water (so the end-of-run
+  /// `DurabilityChecker::check` would pass) — or the [`FINAL_QUIESCE_TICKS`] bound is exhausted.
+  ///
+  /// Why this is a correctness CORRECTION, not a weakening of the durability check: VSR guarantees a
+  /// committed op is durably RETAINED on a quorum (WAL/snapshot); APPLYING it is local catch-up that
+  /// completes once the cluster is healthy. The chaos loop can stop on an instant where a committed op
+  /// the operational replicas hold durably-but-unapplied was applied only by a now-crashed replica
+  /// (VOPR seed 313) — asserting applied-by-an-operational-replica THERE is stricter than the true
+  /// guarantee. Draining first lets the survivors apply the durably-held tail, so the subsequent
+  /// assertion tests the real invariant. It stays STRICT for a genuine loss: the per-tick checks run
+  /// throughout the drain (a divergence is exposed, never hidden), and a committed op held by NO quorum
+  /// cannot be repaired from a non-existent source — the cluster never converges it, so the drain hits
+  /// its bound and this panics with a liveness/non-convergence wedge (a real bug to STOP and report),
+  /// rather than silently passing.
+  fn run_final_quiesce(
+    &mut self,
+    c: &mut Cluster,
+    ticks: u64,
+    dur: &mut DurabilityChecker,
+    vm: &mut ViewMonotonicChecker,
+    bound: &BoundednessChecker,
+  ) {
+    // Heal: all partitions cleared, every crashed replica restarted, no network/storage chaos.
+    for i in 0..self.n {
+      self.isolated[i] = false;
+    }
+    c.heal();
+    for i in 0..self.n {
+      if c.is_crashed(i) {
+        c.restart(i);
+        self.report.restarts += 1;
+      }
+    }
+    c.set_faults(Faults::none());
+
+    // Already converged (the common case — nothing was owed)? Then no drain is needed.
+    if dur.check(c).is_ok() {
+      return;
+    }
+
+    for k in 0..FINAL_QUIESCE_TICKS {
+      c.tick();
+      // Keep the FULL per-tick invariant suite live during the drain: safety/agreement, durable-quorum
+      // retention (the strict structural check), append-before-ack, durable-view-before-participate,
+      // view-monotonicity, boundedness. The drain must heal, never mask — a divergence surfacing here
+      // is a real bug, and the strict quorum-durability invariant continues to hold every tick. (Tick
+      // label `ticks + k` locates a drain-phase violation.)
+      self.check_invariants(c, ticks + k, dur, vm, bound);
+      // Converged once the end-of-run durability assertion would pass: the committed history is
+      // applied on an operational replica.
+      if dur.check(c).is_ok() {
+        self.update_report(c);
+        return;
+      }
+    }
+
+    // Did not converge within the bound: a committed op a quorum holds durably is not being applied by
+    // ANY operational replica even after a long, fully-healthy drain. That is a genuine liveness wedge
+    // (or a loss the quorum cannot repair) — a real bug to STOP and report, NOT something to paper over.
+    if env_flag("VOPR_DUMP") {
+      self.dump_divergence(c, ticks);
+    }
+    let committed = max_committed(c);
+    let applied_hw = (0..self.n)
+      .filter(|&i| !c.is_crashed(i))
+      .map(|i| c.replica_sm(i).applied().len())
+      .max()
+      .unwrap_or(0);
+    panic!(
+      "vopr seed {} tick {ticks} (final quiesce): the cluster did NOT converge within \
+       {FINAL_QUIESCE_TICKS} ticks of a fully-healed, fault-free drain — committed-history high-water \
+       is {committed} but no operational replica has applied past {applied_hw}; a committed op a quorum \
+       holds durably is not being applied (a real liveness wedge / unrepairable loss)",
+      self.seed
+    );
   }
 
   /// Apply this tick's adversarial actions (suppressed during calm windows). Each action rolls
@@ -523,6 +669,11 @@ impl Vopr {
     if let Some(why) = c.take_append_before_ack_violation() {
       panic!("vopr seed {} tick {tick}: {why}", self.seed);
     }
+    // Durable-view-before-participate (R8-F1): a StartView / head-bearing RecoveryResponse for a view
+    // above the emitter's durable view, observed during the tick + the pending-view-window probe.
+    if let Some(why) = c.take_durable_view_violation() {
+      panic!("vopr seed {} tick {tick}: {why}", self.seed);
+    }
     if let Violation(why) = check_safety(c) {
       if std::env::var("VOPR_DUMP").is_ok() {
         self.dump_divergence(c, tick);
@@ -658,7 +809,8 @@ impl Vopr {
     }
   }
 
-  /// Fold the cluster's current state into the running report (high-waters only).
+  /// Fold the cluster's current state into the running report (high-waters only). The R8-F1
+  /// pending-view-window counter is maintained by the per-tick probe in [`run_vopr`], not here.
   fn update_report(&mut self, c: &Cluster) {
     self.report.max_committed = self.report.max_committed.max(max_committed(c));
     let mv = (0..self.n)
