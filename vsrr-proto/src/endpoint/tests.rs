@@ -1218,6 +1218,7 @@ fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
 
   // Pump the StartViewAsPrimary durable-view write, then a peer answers our RequestPrepare with op 2's
   // committed-vouching Prepare (commit 3 >= op 2) → fill the hole and resume the held commit to op 3.
+  // The fill is a durability barrier (R13-F2): complete the repaired append before the hole clears.
   r.handle_storage(now, &mut wal, &mut sb);
   while r.poll_message().is_some() {}
   r.handle_message(
@@ -1227,6 +1228,7 @@ fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
     primary_peer(),
     repair_prepare(0, 2, 3),
   );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → clear hole + resume
   assert!(
     !r.has_repair_hole_for_test(2),
     "the committed-vouching Prepare fills the hole"
@@ -1388,7 +1390,8 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   );
 
   // Pump the StartViewAsPrimary durable-view write, then a committed-vouching peer answers our
-  // RequestPrepare for op 2 (commit 2 >= op 2) → fill the hole and resume the held commit to op 2.
+  // RequestPrepare for op 2 (commit 2 >= op 2) → fill the hole and resume the held commit to op 2. The
+  // fill is a durability barrier (R13-F2): complete the repaired append before the hole clears.
   r.handle_storage(now, &mut wal, &mut sb);
   while r.poll_message().is_some() {}
   r.handle_message(
@@ -1398,6 +1401,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → clear hole + resume
   assert!(
     !r.has_repair_hole_for_test(2),
     "the committed-vouching Prepare fills the known-committed hole"
@@ -1411,6 +1415,170 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     r.state_machine().applied(),
     &[(1, std::vec![1u8]), (2, std::vec![2u8])],
     "the committed log retains op 2 end to end (FAIL-BEFORE: op 2 was truncated and lost)"
+  );
+}
+
+#[test]
+fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repair_hole() {
+  // CONSENSUS-CRITICAL regression (codex R10-F2), the follow-on gap in the R9-F1 fix. R9-F1 made
+  // `recover` read `state.commit()` as the DURABLE known-committed frontier `commit_max`. But every
+  // superblock ROOT write (`submit_durable_view`, the checkpoint root, a state-sync re-persist) still
+  // persisted `self.commit_min` as the `VsrState` commit. So a replica HELD at `commit_min < commit_max`
+  // by a stale/faulty repair hole — exactly the R9-F1 shape — that completes a durable-view (or
+  // checkpoint) root write and then crashes BEFORE its DoViewChange is delivered would, on `recover`,
+  // read `commit_max = state.commit() == commit_min` (LOWERED below the true known frontier). The
+  // recovered DVC then UNDER-reports the known commit and the R9-F1 truncation hazard reappears with a
+  // laggard quorum.
+  //
+  // Fix: persist `self.commit_max` (the known-committed frontier), NOT `commit_min`, in EVERY root
+  // write. `commit_max >= commit_min >= checkpoint_op`, so `try_new`'s `commit >= checkpoint_op`
+  // invariant still holds; the committed-band headers stay the CONTIGUOUS canonical prefix from the log
+  // (possibly SHORTER than `commit` when there are holes — `try_new` already allows that).
+  //
+  // Setup: replica 1 of 3, recovered into the R9-F1 held-at-repair-hole shape — durable root view 0,
+  // commit 2 (op 2 KNOWN committed), checkpoint_op 0, vsr_headers for ops 1 + 2; WAL head 3 with slot 2
+  // permanently faulty → dropped → an interior committed repair hole. So commit_max == 2 while
+  // commit_min == 0 (the SM is restored to the checkpoint; op 2 is a held hole).
+  let mk_header = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2), // durable commit — op 2 is KNOWN committed cluster-wide
+    OpNumber::new(),   // checkpoint_op 0
+    0,
+    std::vec![mk_header(1), mk_header(2)],
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(3);
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot is permanently faulty → dropped
+  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  for _ in 0..32 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovers to Normal as a backup of view 0"
+  );
+  assert_eq!(
+    r.commit_max(),
+    OpNumber::with(2),
+    "recover carries the durable known-committed frontier (op 2)"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(0),
+    "commit_min stays at checkpoint_op — op 2 is a held hole below the known frontier"
+  );
+  assert!(
+    !r.log.contains_key(&2),
+    "the faulty committed slot is dropped from the cache (interior hole, repaired on demand)"
+  );
+  while r.poll_message().is_some() {} // discard recovery chatter
+  while r.poll_event().is_some() {}
+
+  // Drive replica 1 into a view change: an SVC for view 1 (replica 1 is the primary of view 1) reaches
+  // the SVC quorum {replica 1 (own) + replica 0}, so `enter_view_change` fires the `SendDoViewChange`
+  // durable-view ROOT write while this replica is STILL held at commit_min 0 < commit_max 2.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
+  assert!(
+    r.pending_sb_for_test(),
+    "the SendDoViewChange durable-view root write is in flight"
+  );
+  // Complete the durable-view root write — this is the write the fix changed. The persisted `VsrState`
+  // must record the KNOWN-committed frontier `commit_max == 2`, NOT `commit_min == 0`. (FAIL-BEFORE:
+  // `submit_durable_view` persisted `self.commit_min`, so the root's commit was 0.)
+  r.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    !r.pending_sb_for_test(),
+    "the durable-view root write completed"
+  );
+  assert_eq!(
+    sb.state().commit(),
+    OpNumber::with(2),
+    "the durable-view ROOT persists the known-committed frontier commit_max == 2 \
+     (FAIL-BEFORE: it persisted commit_min == 0, lowering the durable frontier)"
+  );
+  // The committed band is now the SPARSE canonical set over `(checkpoint_op .. commit_max] == (0 .. 2]`
+  // (codex R12-F1): one header per HELD op, skipping the op-2 hole. This replica HOLDS op 1 (canonical)
+  // but op 2 read back faulty → dropped, so the band records ONLY op 1 — SHORTER than `commit == 2` and
+  // with a gap at op 2. This is the crux invariant R10-F2 relies on (the header list is legitimately
+  // shorter than `commit`), and the R12-F1 fix's whole point: op 1 (a held committed op) keeps its
+  // canonical header even though `commit_min == 0`, while the genuinely-not-held op 2 is left header-less
+  // and peer-repaired on the next recover. (FAIL-BEFORE the sparse change ranged only up to commit_min,
+  // so the band was empty.)
+  assert_eq!(
+    sb.state()
+      .committed_headers()
+      .iter()
+      .map(|h| h.op().get())
+      .collect::<std::vec::Vec<_>>(),
+    std::vec![1],
+    "the SPARSE band records the held op 1, skips the op-2 hole — shorter than commit == 2, with a gap"
+  );
+
+  // The recovered DVC for view 1 reports the KNOWN committed frontier (commit_max == 2). Drain it.
+  let own_dvc_commit = std::iter::from_fn(|| r.poll_message())
+    .filter_map(|out| match out.into_msg() {
+      Message::DoViewChange(d) => Some(d.commit()),
+      _ => None,
+    })
+    .next()
+    .expect("the replica sends its DVC once the view is durable");
+  assert_eq!(
+    own_dvc_commit,
+    OpNumber::with(2),
+    "the DVC reports commit_max == 2 (the known frontier), so commit* covers op 2"
+  );
+
+  // The crux: a SECOND `recover` from the persisted root reads back the frontier UNLOWERED. With the
+  // bug, `sb.state().commit() == 0`, so the re-recovered replica would forget op 2 was committed and its
+  // DVC would under-report — re-opening the laggard-quorum truncation hazard the whole fix-chain closes.
+  let mut wal2 = ScriptedWal::with_entries(3);
+  wal2.script_read_fault(OpNumber::with(2), u8::MAX);
+  let cfg2 = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let mut r2 = Endpoint::recover(cfg2, 0, CountSm::default(), &mut wal2, &mut sb);
+  for _ in 0..32 {
+    r2.handle_storage(now, &mut wal2, &mut sb);
+    if !r2.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(
+    r2.commit_max(),
+    OpNumber::with(2),
+    "the re-recovered replica reads back the UNLOWERED known frontier (commit_max == 2) \
+     (FAIL-BEFORE: the root persisted commit_min == 0, so the frontier was lost on re-recover)"
+  );
+  assert_eq!(
+    r2.view(),
+    View::with(1),
+    "the re-recovered replica is in the durable view 1 the root recorded"
   );
 }
 
@@ -2267,7 +2435,14 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   // INTERIOR stale slot op 3 (a view-0 proposal — client 9, request 99, body 0xAA) ABOVE the durable commit 2,
   // with current-view (view 1) ops 4 + 5 above it (a legitimate uncommitted tail that must be KEPT). The
   // cluster's canonical op 3 is (client 7, request 3, body [3]). Recover must DROP slot 3 (not hold its stale
-  // body) yet keep 4 + 5; a committed-vouching peer-repair `Prepare` then supplies op 3's canonical body.
+  // body) yet keep 4 + 5.
+  //
+  // EXTENDED for codex R10-F1 (CONSENSUS-CRITICAL, the re-ack follow-on gap): after recover drops the stale
+  // interior op 3, a RETRANSMITTED current-view `Prepare(op 3, CANONICAL body)` arriving BEFORE any Commit
+  // must NOT be re-acked off the stale Clean WAL slot. The re-ack branch now proves IDENTITY against
+  // `self.log`; a missing/mismatched current-view op is (re)appended CANONICALLY (interior overwrite at
+  // `pop < self.op`, NO head rewind) with the ack DEFERRED to `on_wal_done`. Asserted below: NO PrepareOk(3)
+  // until the canonical body is durably appended, then exactly one; the stale [0xAA] is never acked or applied.
   let now = Instant::ZERO;
   let mk_header = |op: u64, view: u64, client: u128, request: u64, body: &[u8]| {
     Header::new(
@@ -2347,11 +2522,90 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   );
   while r.poll_message().is_some() {} // discard recovery chatter
   while r.poll_event().is_some() {}
+  // Precondition for the R10-F1 sub-scenario: the WAL slot 3 STILL holds the stale view-0 body [0xAA]
+  // (recover dropped it only from the in-memory cache, not the durable WAL), and its slot is Clean —
+  // the exact false-ack bait below.
+  assert_eq!(
+    wal.entries.get(&3).map(|(_, b)| b.as_ref()),
+    Some(&[0xAAu8][..]),
+    "precondition: the WAL slot 3 still holds the stale [0xAA] body (Clean), dropped only from the cache"
+  );
+  assert_eq!(
+    wal.status(OpNumber::with(3)),
+    SlotStatus::Clean,
+    "precondition: the stale slot 3 is Clean (durably appended) — the op_durably_appended bait"
+  );
 
-  // The cluster commits op 3 (canonical = client 7, request 3, body [3]). A Commit reaches op 3 → the backup
-  // holds at op 2 and solicits a peer-repair (op 3 is now a known-committed hole). A committed-vouching peer
-  // answers with the canonical `Prepare` (commit >= op), which `fill_repair` adopts.
+  // ── R10-F1 (CONSENSUS-CRITICAL, the follow-on gap in the seed-335 drop): the primary RETRANSMITS the
+  // current-view canonical `Prepare(op 3)` BEFORE any Commit registers op 3 as a repair hole. The
+  // retransmit carries the primary's `commit_min` (= 2 here, < op 3), so it does NOT auto-register op 3
+  // for repair. op 3 is NOT in `self.repair`, NOT in `self.log` (dropped), and `pop = 3 <= self.op = 5`,
+  // so it hits the re-ack branch. FAIL-BEFORE: that branch saw `op_durably_appended(3) == true` (the
+  // stale Clean slot) and `appending` clear, and IMMEDIATELY sent `PrepareOk(3)` — false-acking an op
+  // whose CANONICAL body it does NOT durably hold (it holds the stale [0xAA]). A quorum could be that
+  // false ack + the primary; the primary then crashing would lose the op (append-before-ack + committed-
+  // op-survival broken). The fix: the re-ack must prove IDENTITY against `self.log`; a missing/mismatched
+  // current-view op is (re)appended CANONICALLY and the ack DEFERRED to `on_wal_done`.
   let primary1 = Peer::Replica(ReplicaId::new(1));
+  let canonical_retransmit = Message::Prepare(Prepare::new(
+    View::with(1),
+    OpNumber::with(3),
+    OpNumber::with(2), // primary's commit_min (< op 3): does NOT register op 3 for repair (before-Commit)
+    OpNumber::new(),
+    ClientId::new(7), // CANONICAL identity (client 7, request 3, body [3]) — differs from the
+    RequestNumber::with(3), // stale slot's (client 9, request 99, body [0xAA])
+    Bytes::copy_from_slice(&[3]),
+  ));
+  r.handle_message(now, &mut wal, &mut sb, primary1, canonical_retransmit);
+  // BEFORE the append completes (no handle_storage yet): NO PrepareOk(3) may have been emitted. The op was
+  // missing/mismatched, so the fix (re)appends the canonical body and DEFERS the ack — it must NOT have
+  // inline-acked off the stale slot. (FAIL-BEFORE: a PrepareOk(3) is emitted immediately here.)
+  let acks_before: std::vec::Vec<_> = std::iter::from_fn(|| r.poll_message())
+    .filter_map(|out| match out.into_msg() {
+      Message::PrepareOk(ok) if ok.op() == OpNumber::with(3) => Some(ok),
+      _ => None,
+    })
+    .collect();
+  assert!(
+    acks_before.is_empty(),
+    "FAIL-BEFORE: no PrepareOk(3) until the canonical body is durably appended — the stale Clean slot \
+     must NOT inline-ack the retransmitted Prepare (got {} premature ack(s))",
+    acks_before.len()
+  );
+  // The canonical body is (re)appended INTERIOR at op 3 (an overwrite at pop < self.op), WITHOUT rewinding
+  // the head: self.op stays 5, and the WAL slot 3 now holds the CANONICAL [3], overwriting the stale [0xAA].
+  assert_eq!(
+    r.op(),
+    OpNumber::with(5),
+    "the head is NOT rewound by the interior overwrite at op 3 (self.op stays 5)"
+  );
+  assert_eq!(
+    wal.entries.get(&3).map(|(_, b)| b.as_ref()),
+    Some(&[3u8][..]),
+    "the canonical body [3] overwrote the stale [0xAA] in WAL slot 3 (append-before-ack: durable first)"
+  );
+  assert!(
+    r.log.contains_key(&3),
+    "op 3 is back in the cache with the canonical body (re-appended, not a held hole)"
+  );
+
+  // Now the append completes → on_wal_done clears `appending(3)` and sends EXACTLY ONE deferred PrepareOk(3).
+  r.handle_storage(now, &mut wal, &mut sb);
+  let acks_after: std::vec::Vec<_> = std::iter::from_fn(|| r.poll_message())
+    .filter_map(|out| match out.into_msg() {
+      Message::PrepareOk(ok) if ok.op() == OpNumber::with(3) => Some(ok),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    acks_after.len(),
+    1,
+    "exactly ONE PrepareOk(3) is emitted, AFTER the canonical append landed (append-before-ack)"
+  );
+
+  // The crux: a Commit reaching op 3 now applies the CANONICAL body [3], NEVER the stale [0xAA]. With the
+  // bug the replica would have acked op 3 off the stale slot (above) and — if the cluster committed off that
+  // ack — applied [0xAA], a committed-state divergence from every replica that applied [3].
   r.handle_message(
     now,
     &mut wal,
@@ -2364,34 +2618,15 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
     )),
   );
   r.handle_storage(now, &mut wal, &mut sb);
-  assert_eq!(
-    r.commit(),
-    OpNumber::with(2),
-    "commit HELD at op 2 — op 3's stale slot was dropped, so it is a hole until peer-repair supplies it"
-  );
   assert!(
-    r.has_repair_hole_for_test(3),
-    "op 3 is solicited as a committed-op repair hole (its stale local body is never trusted)"
+    !r.has_repair_hole_for_test(3),
+    "op 3 needs no repair — its canonical body was re-appended, so the commit applies it directly"
   );
-  // A committed-vouching peer-repair Prepare for the CANONICAL op 3 (commit = 3 >= op) fills the hole.
-  let canonical_op3 = Message::Prepare(Prepare::new(
-    View::with(1),
-    OpNumber::with(3),
-    OpNumber::with(3), // commit >= op: the answerer vouches op 3 is committed (fill_repair gate)
-    OpNumber::new(),
-    ClientId::new(7),
-    RequestNumber::with(3),
-    Bytes::copy_from_slice(&[3]),
-  ));
-  r.handle_message(now, &mut wal, &mut sb, primary1, canonical_op3);
-  r.handle_storage(now, &mut wal, &mut sb);
   assert_eq!(
     r.commit(),
     OpNumber::with(3),
-    "the hole filled → committed through op 3"
+    "committed through op 3 off the re-appended canonical body"
   );
-  // The crux: op 3 applied the CANONICAL body [3], NEVER the stale [0xAA]. With the bug, the applied log read
-  // `(3, [0xAA])` — a committed-state divergence from every replica that applied [3].
   assert_eq!(
     r.state_machine().applied(),
     &[
@@ -2579,7 +2814,8 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
   );
   assert_eq!(r.commit(), OpNumber::with(1), "held at the hole");
 
-  // A peer answers our RequestPrepare with op 2's Prepare → fill + resume.
+  // A peer answers our RequestPrepare with op 2's Prepare → stage the durable fill (R13-F2: the apply +
+  // hole-clear + commit-resume DEFER to the append's completion), then complete it.
   r.handle_message(
     now,
     &mut wal,
@@ -2589,8 +2825,14 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
   );
   assert_eq!(
     r.commit(),
+    OpNumber::with(1),
+    "commit still held until the repaired append is durable (R13-F2 barrier)"
+  );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + resume
+  assert_eq!(
+    r.commit(),
     OpNumber::with(3),
-    "the hole filled → the held commit resumes and applies ops 2 then 3 in order"
+    "the hole filled (durably) → the held commit resumes and applies ops 2 then 3 in order"
   );
   assert_eq!(
     r.state_machine().applied(),
@@ -2643,7 +2885,8 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
     &[(1, std::vec![1u8])],
     "no wrong body applied; the commit stays held until the CORRECT op 2 arrives"
   );
-  // The correct op 2 still repairs it (liveness: a wrong reply did not poison the hole).
+  // The correct op 2 still repairs it (liveness: a wrong reply did not poison the hole). Its fill is a
+  // durability barrier (R13-F2), so complete the append before the commit resumes.
   r.handle_message(
     now,
     &mut wal,
@@ -2651,6 +2894,7 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
     primary_peer(),
     repair_prepare(0, 2, 3),
   );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + resume
   assert_eq!(
     r.commit(),
     OpNumber::with(3),
@@ -2705,7 +2949,8 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
   );
 
   // A Prepare that VOUCHES op 2 is committed (`commit = 2` >= op 2, from a peer that holds it
-  // committed) fills the hole and resumes the held commit — liveness preserved.
+  // committed) fills the hole and resumes the held commit — liveness preserved. The fill is a
+  // durability barrier (R13-F2): complete the append before the hole clears + the commit resumes.
   r.handle_message(
     now,
     &mut wal,
@@ -2713,6 +2958,7 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → clear hole + resume
   assert!(
     !r.has_repair_hole_for_test(2),
     "a committed-vouching Prepare (commit >= op) clears the hole"
@@ -2762,7 +3008,8 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
       "commit pinned at the hole regardless of how far the primary's commit advances"
     );
   }
-  // One repair → the entire held suffix (2,3,4) applies in order.
+  // One repair → the entire held suffix (2,3,4) applies in order (once the repaired append is durable —
+  // the R13-F2 barrier).
   r.handle_message(
     now,
     &mut wal,
@@ -2770,6 +3017,7 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
     primary_peer(),
     repair_prepare(0, 2, 4),
   );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply the held suffix
   assert_eq!(r.commit(), OpNumber::with(4));
   assert_eq!(
     r.state_machine().applied(),
@@ -3590,7 +3838,8 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   );
 
   // A committed-vouching peer answers with the CANONICAL op 2 (body [2], commit=2 >= op 2). This fills
-  // the hole and resumes the held commit: op 2 applies with [2] (bodyY), NEVER [0xBB] (bodyX).
+  // the hole and resumes the held commit: op 2 applies with [2] (bodyY), NEVER [0xBB] (bodyX). The fill
+  // is a durability barrier (R13-F2): complete the repaired append before the commit resumes.
   r.handle_message(
     now,
     &mut wal,
@@ -3598,6 +3847,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + resume
   assert_eq!(
     r.commit(),
     OpNumber::with(2),
@@ -3617,6 +3867,621 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
     "the WAL slot now holds the CANONICAL body [2]"
   );
   assert_eq!(h2.body_checksum(), canonical_op2.body_checksum());
+}
+
+#[test]
+fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
+  // CONSENSUS-CRITICAL regression (codex R11-F1). After R10-F2 the durable `VsrState` persists the
+  // KNOWN-committed frontier `commit_max`, but `committed_band_headers` is only the CONTIGUOUS canonical
+  // prefix above the checkpoint — so when a repair hole sits below `commit_max`, the committed-band ops
+  // ABOVE the header prefix (but `<= commit_max`) carry NO canonical header. The recover cross-check must
+  // NOT trust such an op's local self-verifying WAL body (it can be a STALE earlier-view body that
+  // checksum-verifies); a known-committed op without a header is UNPROVEN and must be peer-repaired.
+  //
+  // Setup: replica 1 of 3. Durable root: view 0, commit (= commit_max) 2, checkpoint_op 0, with canonical
+  // headers covering ONLY op 1 (body [1]) — the header prefix stops at op 1; op 2 is `<= commit 2` but
+  // ABOVE the prefix (no header). The WAL holds op 1 = [1] (canonical, header-matched) and op 2 = [0xBB]
+  // STALE with a SELF-CONSISTENT header (plain `Header::verify` passes — the exact bait). Op 3 = [3] is the
+  // uncommitted tail (current generation, kept).
+  let canonical_op1 = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(1),
+    &[1u8],
+  );
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2), // commit == commit_max (durable known-committed frontier)
+    OpNumber::new(),   // checkpoint_op
+    0,
+    std::vec![canonical_op1], // headers cover ONLY op 1 — op 2 is above the prefix, no header
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+
+  let mut wal = ScriptedWal::with_entries(3);
+  // op 1: canonical [1] (matches its header). op 3: canonical [3] (uncommitted tail). op 2: STALE [0xBB]
+  // with a self-consistent header — the false-ack/false-apply bait the R11-F1 fix must reject.
+  let stale_body = Bytes::copy_from_slice(&[0xBBu8]);
+  let stale_header = Header::new(
+    OpNumber::with(2),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(2),
+    &stale_body,
+  );
+  assert!(
+    stale_header.verify(&stale_body),
+    "the stale op-2 slot is self-consistent"
+  );
+  wal.entries.insert(2, (stale_header, stale_body));
+
+  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  for _ in 0..32 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal);
+  // op 1 (header-matched) is kept; op 2 (known-committed but NO header) is DROPPED — never trusted from
+  // the local WAL. FAIL-BEFORE: op 2 had `rec.canonical.get(2) == None` and `2 > durable_commit` was FALSE,
+  // so it fell through to `Verified` and the stale [0xBB] was adopted into `self.log` + later applied.
+  assert!(r.log.contains_key(&1), "op 1 (header-matched) is kept");
+  assert!(
+    !r.log.contains_key(&2),
+    "op 2 is a known-committed op above the header prefix → dropped (not trusted from the stale WAL)"
+  );
+
+  // The primary announces commit=2. advance_commit applies op 1 ([1]), HOLDS at the op-2 hole, solicits it.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(1),
+    "commit HELD below the op-2 hole"
+  );
+  assert!(
+    r.has_repair_hole_for_test(2),
+    "op 2 is a repair hole, peer-repaired on demand"
+  );
+
+  // A committed-vouching peer answers with the CANONICAL op 2 (body [2], commit=2 >= op 2). The fill is
+  // a durability barrier (R13-F2): complete the repaired append before the commit resumes.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    repair_prepare(0, 2, 2),
+  );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + resume
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(2),
+    "the canonical op 2 fills the hole"
+  );
+  assert_eq!(
+    r.state_machine().applied(),
+    &[(1, std::vec![1u8]), (2, std::vec![2u8])],
+    "the applied band is CANONICAL ([1],[2]) — the stale WAL body [0xBB] was never applied \
+     (FAIL-BEFORE: recover trusted the header-less committed op 2 and applied [0xBB], diverging)"
+  );
+}
+
+#[test]
+fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
+  // CONSENSUS-CRITICAL regression (codex R12-F1), the completion of the R9-F1→R10-F2→R11-F1 chain. The
+  // R11-F1 guard drops EVERY known-committed op (`op <= commit_max`) that lacks a persisted canonical
+  // header. While the persisted band was only the CONTIGUOUS prefix above the checkpoint, a SINGLE lower
+  // repair hole made all LATER committed ops header-less too — so recover deleted LOCALLY-HELD canonical
+  // copies of committed ops the R11-F1 rule was never meant to touch. When this replica was the quorum
+  // intersection for those ops (their only surviving copies), peer-repair could not vouch them → the
+  // committed tail WEDGES or is LOST.
+  //
+  // The fix persists a SPARSE canonical header for EVERY committed-band op this replica HOLDS (skipping
+  // holes), so recover verifies each held committed op individually (keep canonical) and only
+  // peer-repairs ops it genuinely did NOT hold at write time.
+  //
+  // Setup: replica 1 of 3. Durable root: view 0, commit (= commit_max) 4, checkpoint_op 0, with SPARSE
+  // canonical headers for ops 1, 3, 4 (op 2 is SKIPPED — it was a hole when the root was written). The
+  // WAL HOLDS canonical op 1 = [1], op 3 = [3], op 4 = [4] (each header-matched), but op 2 reads back
+  // PERMANENTLY FAULTY → a lower header-less HOLE. op 3 and op 4 sit ABOVE that hole yet are `<= commit
+  // 4` (known committed) and are the canonical copies THIS replica holds — they MUST be KEPT.
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(4), // commit == commit_max (durable known-committed frontier)
+    OpNumber::new(),   // checkpoint_op 0
+    0,
+    std::vec![mk(1), mk(3), mk(4)], // SPARSE: op 2 is a hole, skipped — ops 1,3,4 are held canonical
+  )
+  .unwrap();
+  // The sparse band is recorded VERBATIM (op 2's gap is allowed); FAIL-BEFORE the contiguous `try_new`
+  // truncated this to just [op 1], so ops 3 + 4 lost their canonical headers.
+  assert_eq!(
+    state
+      .committed_headers()
+      .iter()
+      .map(|h| h.op().get())
+      .collect::<std::vec::Vec<_>>(),
+    std::vec![1, 3, 4],
+    "the durable root records a SPARSE canonical header for every HELD committed op (op 2 skipped)"
+  );
+
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  // The WAL: ops 1, 3, 4 canonical (header-matched); op 2's slot reads back permanently faulty → a hole.
+  let mut wal = ScriptedWal::with_entries(4);
+  wal.script_read_fault(OpNumber::with(2), u8::MAX);
+  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  for _ in 0..32 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovers to Normal (the faulty op 2 is below the head 4 → peer-repair, not RecoveringHead)"
+  );
+  // THE CRUX (R12-F1): the locally-held canonical ops 3 + 4 above the lower header-less hole are KEPT —
+  // each verified individually against its SPARSE canonical header. (FAIL-BEFORE: the contiguous header
+  // prefix stopped at op 1, so ops 3 + 4 were header-less, `op <= commit_max` fired the R11-F1 rule, and
+  // recover DROPPED them — destroying this replica's only surviving copies of the committed tail.)
+  assert!(
+    r.log.get(&3).is_some_and(|e| e.body.as_ref() == [3u8]),
+    "op 3 (held canonical, sparse-header-matched) is KEPT with its canonical body \
+     (FAIL-BEFORE: dropped as a header-less committed op above the lower hole)"
+  );
+  assert!(
+    r.log.get(&4).is_some_and(|e| e.body.as_ref() == [4u8]),
+    "op 4 (held canonical, sparse-header-matched) is KEPT with its canonical body \
+     (FAIL-BEFORE: dropped as a header-less committed op above the lower hole)"
+  );
+  assert!(r.log.contains_key(&1), "op 1 (header-matched) is kept");
+  assert!(
+    !r.log.contains_key(&2),
+    "op 2 is the genuine hole (no sparse header, read back faulty) → dropped + peer-repaired"
+  );
+  assert_eq!(
+    r.commit_max(),
+    OpNumber::with(4),
+    "recover carries the durable known-committed frontier (commit_max == 4)"
+  );
+  while r.poll_message().is_some() {} // discard recovery chatter
+  while r.poll_event().is_some() {}
+
+  // The primary announces commit=4. advance_commit applies op 1 ([1]), HOLDS at the op-2 hole, solicits
+  // op 2 (the ONE op this replica did not hold). It must NOT skip op 2 to apply the held 3 + 4.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(View::new(), OpNumber::with(4), OpNumber::new())),
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(1),
+    "commit HELD below the op-2 hole — the in-order apply never skips the missing op"
+  );
+  assert!(
+    r.has_repair_hole_for_test(2),
+    "op 2 (the only NOT-held committed op) is the repair hole, peer-repaired on demand"
+  );
+
+  // A committed-vouching peer supplies the CANONICAL op 2 (body [2], commit=4 >= op 2). This fills the
+  // ONE hole and resumes the held commit straight through the LOCALLY-HELD ops 3 + 4 — the committed
+  // tail (op 3 / op 4) was never lost. The fill is a durability barrier (R13-F2): complete the repaired
+  // append before the commit resumes.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    repair_prepare(0, 2, 4),
+  );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply the held suffix
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(4),
+    "the single repaired op 2 lets the held commit resume through the retained ops 3 + 4 to op 4"
+  );
+  assert_eq!(
+    r.state_machine().applied(),
+    &[
+      (1, std::vec![1u8]),
+      (2, std::vec![2u8]),
+      (3, std::vec![3u8]),
+      (4, std::vec![4u8]),
+    ],
+    "the FULL canonical band 1,2,3,4 applied — ops 3 + 4 came from this replica's RETAINED copies \
+     (FAIL-BEFORE: ops 3 + 4 were dropped on recover, no peer held them, and the committed tail \
+     was permanently lost / the commit wedged)"
+  );
+}
+
+#[test]
+fn recover_reads_held_committed_ops_above_the_default_window() {
+  // CONSENSUS-CRITICAL regression (codex R13-F1). `recover`'s tail read window was capped at
+  // `checkpoint_op + RECOVER_TAIL_WINDOW`, which exists ONLY to bound reads against a BOGUS `op_head`
+  // (bit-rot → huge), NOT to hide the legitimate committed band. With `Config::with_checkpoint_ops >
+  // RECOVER_TAIL_WINDOW` a replica can durably commit FAR past its last checkpoint, persist a durable
+  // root naming `commit_max` ABOVE `checkpoint_op + RECOVER_TAIL_WINDOW`, and crash while HOLDING the
+  // canonical WAL ops + sparse headers up to `commit_max`. The old cap then set `self.op =
+  // checkpoint_op + RECOVER_TAIL_WINDOW` < commit_max, HIDING the held committed ops above it: the
+  // replica's DVC reported `commit_max > self.op` with a `log_slice` only through the read frontier, so
+  // if it is the quorum-intersection committed holder (old primary down, DVC quorum = this replica + a
+  // laggard) `select_canonical_log` hit `commit* > op_head` → FAIL-STOP, or a truncating adoption
+  // DESTROYED the hidden committed copies → committed-op LOSS.
+  //
+  // The fix raises the window floor from `checkpoint_op` to the DURABLE committed frontier
+  // `state.commit()` (a checksum-validated, quorum-bounded value a corrupt superblock cannot inflate):
+  // `RECOVER_TAIL_WINDOW` now bounds only the UNCOMMITTED tail above `commit_max`, so the full committed
+  // band is read + cached and `self.op >= commit_max`.
+  //
+  // Setup: replica 1 of 3, checkpoint_op 0, durable `commit_max` two ops ABOVE the old frontier
+  // (`RECOVER_TAIL_WINDOW + 2`). The WAL HOLDS canonical ops `1..=commit_max` (each header-matched) with
+  // a SPARSE canonical header per op. A large `with_checkpoint_ops` models the real reachability (commit
+  // far past the checkpoint without re-checkpointing).
+  let commit_max = RECOVER_TAIL_WINDOW + 2; // strictly above the OLD cap (checkpoint_op 0 + window)
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let headers: std::vec::Vec<Header> = (1..=commit_max).map(mk).collect();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(commit_max), // commit == commit_max (durable known-committed frontier)
+    OpNumber::new(),            // checkpoint_op 0
+    0,
+    headers, // SPARSE canonical set, here fully dense 1..=commit_max (every op is HELD)
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  // The WAL holds canonical ops 1..=commit_max (head == commit_max), each body [op] header-matched.
+  let mut wal = ScriptedWal::with_entries(commit_max);
+  // A checkpoint interval far above the window — the regime in which this hazard is reachable.
+  let cfg =
+    Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, crate::MAX_CHECKPOINT_OPS).unwrap();
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  // THE CORE assertion: the recovered head reads the FULL durable committed band — `self.op >=
+  // commit_max`, NOT the old `checkpoint_op + RECOVER_TAIL_WINDOW`. (FAIL-BEFORE: `self.op ==
+  // RECOVER_TAIL_WINDOW` < commit_max, hiding the top two held committed ops.)
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "recover reads up to the durable committed frontier, not checkpoint_op + RECOVER_TAIL_WINDOW \
+     (FAIL-BEFORE: self.op == {} < commit_max {commit_max})",
+    RECOVER_TAIL_WINDOW
+  );
+  assert!(
+    r.op().get() > RECOVER_TAIL_WINDOW,
+    "the held committed band above the OLD cap is NOT hidden"
+  );
+  // Drain the committed-band reads → Normal, every held op cached + verified.
+  for _ in 0..(commit_max + 8) {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal, "tail consistent → Normal");
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "the full committed band frontier is preserved into Normal"
+  );
+  assert_eq!(
+    r.commit_max(),
+    OpNumber::with(commit_max),
+    "recover carries the durable known-committed frontier"
+  );
+  // The two ops above the OLD cap are READ + CACHED (not hidden, not repair holes).
+  for op in [RECOVER_TAIL_WINDOW + 1, RECOVER_TAIL_WINDOW + 2] {
+    assert!(
+      r.log
+        .get(&op)
+        .is_some_and(|e| e.body.as_ref() == [op as u8]),
+      "op {op} (held committed, above the old cap) is read + cached with its canonical body"
+    );
+    assert!(
+      !r.has_repair_hole_for_test(op),
+      "op {op} is HELD, not a repair hole"
+    );
+  }
+  while r.poll_message().is_some() {}
+  while r.poll_event().is_some() {}
+
+  // A DVC quorum where THIS replica is the only committed holder must NOT fail-stop or lose those ops.
+  // Replica 1 (recovered, holds the full committed band, commit_max == commit_max) + replica 0 (a
+  // LAGGARD at head/commit RECOVER_TAIL_WINDOW); replica 2 (the other old commit-quorum holder) is
+  // ABSENT. Drive replica 1 to primary of view 1.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
+  r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
+  // The recovered replica's OWN DVC reports the KNOWN committed frontier == commit_max, with a
+  // log_slice carrying the held band up to commit_max — so `commit* == commit_max <= op_head ==
+  // commit_max` and the fail-stop does NOT trip. (FAIL-BEFORE: the DVC reported op == RECOVER_TAIL_WINDOW
+  // with commit_max > op, so `commit* > op_head` → FAIL-STOP, or truncation destroyed the hidden ops.)
+  let own_dvc = std::iter::from_fn(|| r.poll_message())
+    .filter_map(|out| match out.into_msg() {
+      Message::DoViewChange(d) => Some(d),
+      _ => None,
+    })
+    .next()
+    .expect("the recovered replica sends its DVC");
+  assert_eq!(
+    own_dvc.commit(),
+    OpNumber::with(commit_max),
+    "the DVC reports the durable known-committed frontier (== commit_max)"
+  );
+  assert_eq!(
+    own_dvc.op(),
+    OpNumber::with(commit_max),
+    "the DVC head covers the full committed band — commit_max is NOT above the reported head \
+     (FAIL-BEFORE: op == RECOVER_TAIL_WINDOW < commit_max)"
+  );
+  let top_op = own_dvc.log_slice().iter().map(|e| e.op().get()).max();
+  assert_eq!(
+    top_op,
+    Some(commit_max),
+    "the DVC log_slice carries the held committed ops up to commit_max (not just through the old cap)"
+  );
+
+  // The laggard replica 0's DVC: same generation (log_view 0), head/commit RECOVER_TAIL_WINDOW. With the
+  // recovered replica's own DVC (commit_max == commit_max), `commit* == commit_max` and the head holder
+  // is THIS replica — adoption must NOT fail-stop and must NOT truncate the committed band.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(RECOVER_TAIL_WINDOW),
+      OpNumber::with(RECOVER_TAIL_WINDOW),
+      ReplicaId::new(0),
+      std::vec::Vec::new(), // the laggard carries no entries (it does not supply the top band)
+    )),
+  );
+  assert!(
+    r.is_primary(),
+    "replica 1 became the primary of view 1 (no fail-stop panic)"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "the committed band is NOT truncated — the head stays at commit_max \
+     (FAIL-BEFORE: commit_max was above the reported head → fail-stop / committed-op loss)"
+  );
+  for op in [RECOVER_TAIL_WINDOW + 1, RECOVER_TAIL_WINDOW + 2] {
+    assert!(
+      r.log.contains_key(&op),
+      "op {op} (committed, this replica's only surviving copy) is RETAINED through the view change"
+    );
+  }
+}
+
+#[test]
+fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
+  // R13-F1 COMPANION (keep the bogus-`op_head` bound green): when `commit_max == checkpoint_op` (a
+  // synced/fresh root with NO committed band above the checkpoint) a HUGE `op_head` must STILL cap at
+  // `checkpoint_op + RECOVER_TAIL_WINDOW` — the window bounds the uncommitted tail against bit-rot, and
+  // a corrupt superblock cannot inflate `commit_max` to widen it. This is the bogus-head defense the
+  // R13-F1 fix must not weaken.
+  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let mut wal = ScriptedWal::with_entries(0);
+  wal.head = u64::MAX; // a pathological / bit-rotted head
+  let mut sb = TestSb::default(); // VsrState::initial(): commit == checkpoint_op == 0
+  assert_eq!(
+    sb.state().commit(),
+    sb.state().checkpoint_op(),
+    "the durable root has NO committed band above the checkpoint"
+  );
+  let now = Instant::ZERO;
+  let e = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  assert_eq!(e.status(), Status::Recovering);
+  // With commit_max == checkpoint_op == 0, the floor is checkpoint_op, so `hi` caps at
+  // `checkpoint_op + RECOVER_TAIL_WINDOW`: exactly RECOVER_TAIL_WINDOW reads, NOT u64::MAX.
+  assert_eq!(
+    wal.done.len() as u64,
+    RECOVER_TAIL_WINDOW,
+    "a bogus huge op_head with no committed band still caps at RECOVER_TAIL_WINDOW"
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(RECOVER_TAIL_WINDOW),
+    "self.op is the verified frontier checkpoint_op + RECOVER_TAIL_WINDOW (the bogus head is NOT held)"
+  );
+  let _ = now;
+}
+
+#[test]
+fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
+  // CONSENSUS-CRITICAL regression (codex R13-F2). `fill_repair` inserted the repaired body into
+  // `self.log`, `submit_append`ed it, REMOVED the repair hole, and immediately `advance_commit`ed — but
+  // the async `Wal`'s `submit_append` only STAGES the write. So with the async WAL the repaired op was
+  // APPLIED (and exposable in a DVC/StartView/checkpoint) BEFORE `WalDone::Appended`: a crash in that
+  // window LOSES the only durable copy of an op this replica had already participated on — breaking
+  // append-before-participate (durable-source) for peer repair.
+  //
+  // The fix makes the repaired append a DURABILITY BARRIER: `fill_repair` stages the body in a
+  // `Pending::RepairFill` (NOT in `self.log`) + `submit_append`s + marks `op` `appending`, but keeps the
+  // hole OPEN and does NOT advance the commit; `on_wal_done` inserts the body, clears the hole, and
+  // resumes the held commit ONLY once the append completes.
+  //
+  // Setup (the R9-F1 held-committed-hole shape): replica 1 of 3, durable commit 2 (op 2 KNOWN
+  // committed), checkpoint_op 0, canonical headers for ops 1 + 2. WAL head 3, slot 2 reads back
+  // PERMANENTLY FAULTY → recover drops it to a COMMITTED repair hole (op 1 held canonical, op 3 the
+  // uncommitted tail). commit_max == 2, commit_min == 0.
+  let mk_header = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![mk_header(1), mk_header(2)],
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(3);
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot is permanently faulty → dropped
+  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  for _ in 0..32 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal, "recovers to Normal");
+  assert_eq!(r.commit_max(), OpNumber::with(2), "op 2 is KNOWN committed");
+  while r.poll_message().is_some() {} // discard recovery chatter
+  while r.poll_event().is_some() {}
+
+  // The primary announces commit == 2. `advance_commit` applies the held op 1 (commit → 1), then HOLDS
+  // at the missing op 2 and registers it as a committed repair hole (`request_repair`). op 1 applied,
+  // commit held at 1, op 2 a hole below commit_max == 2.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+  );
+  assert!(
+    r.has_repair_hole_for_test(2),
+    "op 2 is a committed repair hole (held + peer-repaired)"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(1),
+    "commit held below the op-2 hole (op 1 applied)"
+  );
+  while r.poll_message().is_some() {} // discard the RequestPrepare for op 2
+  while r.poll_event().is_some() {}
+  // Drain any pre-existing WAL completions so the only outstanding append below is the repair fill's.
+  while wal.poll().is_some() {}
+
+  // A committed-vouching peer answers our RequestPrepare for op 2 (canonical body [2], commit 2 >= op 2).
+  // This calls `fill_repair`, which STAGES the body + `submit_append`s it — but the append is NOT yet
+  // delivered (no `handle_storage` / `on_wal_done` yet).
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    repair_prepare(0, 2, 2),
+  );
+
+  // BEFORE the append completes: the barrier holds. (FAIL-BEFORE: each of these is already violated — the
+  // hole is gone, op 2 applied, commit == 2 — on the staged, non-durable append.)
+  assert!(
+    r.has_repair_hole_for_test(2),
+    "the repair hole stays OPEN until the repaired append is durable \
+     (FAIL-BEFORE: fill_repair cleared the hole on the staged append)"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(1),
+    "commit is NOT advanced past the op-2 hole before durability \
+     (FAIL-BEFORE: commit advanced to 2 on the staged append)"
+  );
+  assert!(
+    r.state_machine().applied().iter().all(|(op, _)| *op != 2),
+    "op 2 is NOT applied to the SM before its append is durable \
+     (FAIL-BEFORE: op 2 applied immediately on the staged append)"
+  );
+  assert!(
+    !r.log_entries().iter().any(|e| e.op() == OpNumber::with(2)),
+    "op 2 is NOT exposed in a DoViewChange/StartView log_slice while its RepairFill is pending \
+     (it is still a repair hole — the body rides in Pending::RepairFill, not self.log)"
+  );
+
+  // Now the repaired append completes (on_wal_done's RepairFill arm): the body lands in self.log, the
+  // hole clears, and the held commit resumes through ops 1 + 2.
+  r.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    !r.has_repair_hole_for_test(2),
+    "the durable repair fill clears the hole"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(2),
+    "the held commit resumes to op 2 ONLY after the repaired append is durable"
+  );
+  assert_eq!(
+    r.state_machine().applied(),
+    &[(1, std::vec![1u8]), (2, std::vec![2u8])],
+    "ops 1 + 2 apply once op 2 is durable — the repaired body is never applied before its WAL append lands"
+  );
+  // And op 2 is now exposed (the hole is gone, the body is in self.log).
+  assert!(
+    r.log_entries().iter().any(|e| e.op() == OpNumber::with(2)),
+    "op 2 is exposed once its RepairFill is durable"
+  );
 }
 
 #[test]
@@ -3748,6 +4613,7 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
     Bytes::copy_from_slice(&[2u8]),
   ));
   r.handle_message(now, &mut wal, &mut sb, primary_peer(), canonical_repair);
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes (R13-F2 barrier) → resume
   assert_eq!(
     r.commit(),
     OpNumber::with(2),
@@ -4221,6 +5087,21 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
     /*commit_min*/ 5,
     /*checkpoint_op*/ 0,
     &[],
+  );
+  // Seed op 5 in the dense `log` cache with its CANONICAL identity (client 7, request 5, body [5]) —
+  // matching the `prepare(5, 5)` retransmit below. In real operation a committed op AT the head is
+  // ALWAYS in the dense cache (`append_prepare` inserts it; `enter_view_change` clears `pending`/
+  // `appending`/the WAL-in-flight mark but NOT `self.log`), even when its async WAL append was abandoned
+  // — `force_state_for_test` just omits it. The R10-F1 re-ack identity gate reads this entry to prove the
+  // replica holds the canonical body; the WAL-durability gate (this test's subject) then decides whether
+  // to ack. (Without the entry the re-ack would mis-classify a durable committed op as a dropped hole.)
+  e.log.insert(
+    5,
+    LogEntry {
+      client: ClientId::new(7),
+      request: RequestNumber::with(5),
+      body: Bytes::copy_from_slice(&[5u8]),
+    },
   );
   assert_eq!(
     wal.status(OpNumber::with(5)),
@@ -7648,9 +8529,9 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
     "no Prepare and no Reply is emitted during the committed gap"
   );
 
-  // Close the gap: the hole at op 2 is filled (a vouching repair Prepare, commit >= op), so
-  // `advance_commit` applies ops 2,3,4 in order → commit_min catches up to commit_max == 4, and the
-  // repair set empties.
+  // Close the gap: the hole at op 2 is filled (a vouching repair Prepare, commit >= op), so once the
+  // repaired append is DURABLE (the R13-F2 barrier) `advance_commit` applies ops 2,3,4 in order →
+  // commit_min catches up to commit_max == 4, and the repair set empties.
   ep.handle_message(
     Instant::ZERO,
     &mut wal,
@@ -7658,6 +8539,7 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
     primary_peer(),
     repair_prepare(0, 2, 4),
   );
+  ep.handle_storage(Instant::ZERO, &mut wal, &mut sb); // the repaired append completes → apply the suffix
   assert_eq!(
     ep.commit(),
     OpNumber::with(4),
@@ -7932,7 +8814,8 @@ fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
     "the outstanding committed hole arms the grace timer"
   );
   while ep.poll_message().is_some() {}
-  // A peer answers our RequestPrepare with op 2's committed-vouching Prepare → fills the hole.
+  // A peer answers our RequestPrepare with op 2's committed-vouching Prepare → fills the hole (once the
+  // repaired append is durable — the R13-F2 barrier).
   ep.handle_message(
     Instant::ZERO,
     &mut wal,
@@ -7940,6 +8823,7 @@ fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
+  ep.handle_storage(Instant::ZERO, &mut wal, &mut sb); // the repaired append completes → clear the hole
   assert!(
     !ep.has_repair_hole_for_test(2),
     "the committed-vouching Prepare fills the hole"
@@ -8559,7 +9443,9 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
     e.has_repair_hole_for_test(7) && !e.log.contains_key(&7),
     "the first unapplied omitted committed op (7) is a repair hole, its held body dropped"
   );
-  // A committed-vouching peer (commit 8 >= op) supplies the canonical value for the repaired band.
+  // A committed-vouching peer (commit 8 >= op) supplies the canonical value for the repaired band. Each
+  // fill is a durability barrier (R13-F2): the repaired append must complete before the op applies and
+  // the NEXT hole (op 8) is registered — so drive each fill to durability in turn.
   for op in [7u64, 8] {
     e.handle_message(
       now,
@@ -8568,6 +9454,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
       Peer::Replica(ReplicaId::new(1)),
       repair_prepare(1, op, 8),
     );
+    e.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + register next hole
   }
   assert_eq!(
     e.commit(),
@@ -8691,8 +9578,9 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
     "NOTHING is applied yet — no stale transposed body reached the SM"
   );
   // A committed-vouching peer Prepare (commit 8 >= op) supplies the CANONICAL value for each hole in
-  // order: op 5 -> body[5], op 6 -> body[6] (the un-transposed quorum values), then op 7,8. Each fill
-  // resumes the apply loop, which then registers + we fill the next hole.
+  // order: op 5 -> body[5], op 6 -> body[6] (the un-transposed quorum values), then op 7,8. Each fill is
+  // a durability barrier (R13-F2): once the repaired append is durable the apply loop resumes, which
+  // then registers the NEXT hole — so drive each fill to durability in turn.
   for op in [5u64, 6, 7, 8] {
     assert!(
       e.has_repair_hole_for_test(op),
@@ -8705,6 +9593,7 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
       Peer::Replica(ReplicaId::new(1)),
       repair_prepare(1, op, 8),
     );
+    e.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + register next hole
   }
   assert!(
     e.repair.is_empty(),

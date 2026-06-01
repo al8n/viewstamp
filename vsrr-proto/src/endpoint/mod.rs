@@ -18,8 +18,13 @@ mod view_change;
 
 /// What the endpoint does when a submitted WAL append completes. Append-before-ack: the vote/ack a
 /// completion owes is always deferred to `on_wal_done`, never cast before the op is durable. A
-/// repair-fill append (see `fill_repair`) is deliberately NOT recorded here — it owes no ack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// peer-repair fill (see `fill_repair`) owes NO ack, but is still a DURABILITY BARRIER — its apply +
+/// hole-clear + exposure wait for the append via `Pending::RepairFill` (codex R13-F2).
+///
+/// Not `Copy`: [`Pending::RepairFill`] carries the repaired [`LogEntry`] (a `Bytes` body) so the
+/// staged op is inserted into `self.log` only once its append is durable — never staged into the
+/// in-memory log while non-durable (which would expose / apply it before the barrier; R13-F2).
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
   /// A normal-path prepare append (a backup's `on_prepare`, or the primary's own `on_request`); on
   /// completion, record the ack/own-vote for this op (`send_prepare_ok` on a backup; own inflight bit
@@ -33,6 +38,13 @@ enum Pending {
   /// `StartView`/`RecoveryResponse`. On completion, send the deferred `PrepareOk` — no `PrepareOk` is
   /// sent for an adopted op before its WAL append is durable (append-before-ack).
   AdoptAck(OpNumber),
+  /// A peer-repair fill append (codex R13-F2): the canonical body for a committed repair hole, staged
+  /// to durability before it is applied or exposed. It owes NO ack/vote (peer repair is not a vote) —
+  /// instead, on completion `on_wal_done` inserts the carried [`LogEntry`] into `self.log`, removes the
+  /// repair hole, and only THEN `advance_commit`s. The body rides in the variant (not `self.log`) so a
+  /// non-durable repaired op is never exposed in a `DoViewChange`/`StartView`/checkpoint nor applied by
+  /// a concurrently-triggered `advance_commit` before its WAL append lands.
+  RepairFill(OpNumber, LogEntry),
 }
 
 /// What the endpoint does once its pending durable-view (superblock) write completes.
@@ -137,18 +149,22 @@ const SYNC_SOLICIT: core::time::Duration = core::time::Duration::from_millis(100
 /// many windows) catches up via state-sync, not tail-gap, so a modest window suffices; sized at a few
 /// pipeline depths so steady-state catch-up never needs more than one window.
 const TAIL_GAP_WINDOW: u64 = 64;
-/// Recovery (`recover()`): the maximum number of WAL-tail slots `recover()` will bookkeep + submit a
-/// read for in ONE pass — the size of the `(checkpoint_op .. head]` window it materializes. Bounds
-/// the synchronous work of constructing a `Recovering` replica: `recover()` inserts a dense-cache
-/// entry and submits one read per tail slot, so without a cap a corrupt/buggy `Wal` reporting a
-/// huge `op_head` (e.g. `u64::MAX` from bit-rot in the head slot) would force unbounded CPU /
-/// allocation / outgoing reads before the async fault-handling loop ever runs. A real recovery tail
-/// is the small un-checkpointed pipeline above the latest checkpoint (a handful to a few hundred
-/// ops), so this generous power-of-two bound never clips a legitimate recovery while capping a
-/// pathological head to a fixed budget. A head BEYOND the window means this replica cannot
-/// synchronously read its whole tail in one pass: the slots above `checkpoint_op + RECOVER_TAIL_WINDOW`
-/// are left unread (recovered incrementally as the primary re-announces them, or — if the head slot
-/// itself is unreadable — via the `RecoveringHead`/peer head-fault path), never billions of reads.
+/// Recovery (`recover()`): the maximum number of WAL-tail slots ABOVE the durable committed frontier
+/// `recover()` will bookkeep + submit a read for in ONE pass — the size of the uncommitted-tail window
+/// it materializes above `commit_max` (the full committed band `(checkpoint_op .. commit_max]` is ALWAYS
+/// read; the cap bounds only the uncommitted tail above it — codex R13-F1). Bounds the synchronous work
+/// of constructing a `Recovering` replica: `recover()` inserts a dense-cache entry and submits one read
+/// per tail slot, so without a cap a corrupt/buggy `Wal` reporting a huge `op_head` (e.g. `u64::MAX` from
+/// bit-rot in the head slot) would force unbounded CPU / allocation / outgoing reads before the async
+/// fault-handling loop ever runs. The committed frontier (`state.commit()`) cannot be inflated this way —
+/// `VsrState` is checksum-validated and `commit_max` is at most the real committed frontier — so reading
+/// the full committed band is always bounded by genuine, quorum-bounded progress. A real uncommitted tail
+/// is the small un-checkpointed pipeline above the committed frontier (a handful to a few hundred ops), so
+/// this generous power-of-two bound never clips a legitimate recovery while capping a pathological head to a
+/// fixed budget. A head BEYOND the window means this replica cannot synchronously read its whole tail in
+/// one pass: the slots above `commit_max + RECOVER_TAIL_WINDOW` are left unread (recovered incrementally
+/// as the primary re-announces them, or — if the head slot itself is unreadable — via the
+/// `RecoveringHead`/peer head-fault path), never billions of reads.
 const RECOVER_TAIL_WINDOW: u64 = 8192;
 
 /// In-flight recovery read-bookkeeping for a `Status::Recovering`/`RecoveringHead` replica.
@@ -206,7 +222,7 @@ struct RecoverState {
 }
 
 /// One entry in the in-memory log (M1; persistence arrives in M3).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LogEntry {
   client: ClientId,
   request: RequestNumber,
