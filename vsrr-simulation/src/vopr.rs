@@ -1,6 +1,7 @@
 //! A VOPR-style deterministic adversarial test driver (TigerBeetle's VOPR, in miniature).
 //!
-//! [`run_vopr`] runs a single seeded simulation: it builds a cluster (size 3 or 5, a handful of
+//! [`run_vopr`] runs a single seeded simulation: it builds a cluster (size 2..=6, including even N and
+//! the sharp N=2 unanimous-quorum case, a handful of
 //! clients, **async WAL** + seeded storage/network faults), then for `ticks` steps applies a
 //! seed-chosen mix of adversarial actions — client load, network chaos (reorder / duplicate / drop /
 //! delay), storage chaos (async-append delays + transient read faults + occasional permanent
@@ -48,7 +49,7 @@
 
 use core::time::Duration;
 
-use vsrr_proto::Prng;
+use vsrr_proto::{Instant, Prng};
 
 use crate::checker::{BoundednessChecker, DurabilityChecker, ViewMonotonicChecker, check_safety};
 use crate::cluster::Cluster;
@@ -64,7 +65,7 @@ pub struct VoprReport {
   seed: u64,
   /// The number of ticks executed.
   ticks: u64,
-  /// The replica count chosen for this run (3 or 5).
+  /// The replica count chosen for this run (2..=6, including even N and N=2).
   replicas: usize,
   /// The client count chosen for this run.
   clients: usize,
@@ -89,6 +90,30 @@ pub struct VoprReport {
   /// flight). `> 0` proves the async-superblock mode actually opened the window this run exercises,
   /// so the durable-view-before-participate gate was genuinely tested rather than vacuously skipped.
   pending_view_windows_seen: u64,
+  /// The high-water mark of MISDIRECTED WAL reads (a recover read for op X served a different valid
+  /// slot's bytes) across the run, summed over replicas. `> 0` proves the misdirected-read axis
+  /// genuinely fired, so the proto's recovery placement check (`header.op() == op`) was exercised
+  /// rather than merely armed. (Summed since each replica's WAL persists across crash/restart.)
+  misdirects_fired: u64,
+  /// The high-water mark of the RECOVERED COMMITTED BAND width (`commit_max - checkpoint_op`) sampled
+  /// on a replica IMMEDIATELY AFTER a `restart` (i.e. right after `recover` ran). `> ~12` proves the
+  /// large-`checkpoint_ops` axis genuinely materialized a NON-trivial committed band on a recovering
+  /// replica — so the R13-F1 recover read-window logic (`commit_max` well above `checkpoint_op`) was
+  /// exercised over a real multi-hundred-op band, not always the tiny ≈4..=12 the small-interval seeds
+  /// produce. Stays far below `RECOVER_TAIL_WINDOW = 8192` (the tick budget caps committed ops at
+  /// ~1.1k), so the extreme window-clip case remains unit-tested in the proto.
+  recovered_band_max: u64,
+  /// Cumulative count of FORCED state-syncs applied across the run, summed over replicas and
+  /// accumulated across crash/restart (each `recover` resets the proto's per-replica counter, so this
+  /// folds in the value before each reset). A forced sync is the proto's escalation when a replica
+  /// cannot recover a committed checkpoint/op from its OWN disk and must FETCH it from a peer — both
+  /// the M3.5 pruned-committed-hole strand AND the F1 recover-checkpoint peer-fetch (a replica whose
+  /// own durable checkpoint snapshot reads back unusable). It is the observability proxy for
+  /// "peer-fetch escalation": the two-slot-superblock fix (finding B) removes the SPURIOUS escalations
+  /// (an orphaned checkpoint a redundant-copy backend would still hold locally) while a GENUINELY
+  /// far-behind replica (its own checkpoint truly subsumed/gone) still escalates — so this count must
+  /// stay `> 0` after the fix, proving the path is still exercised.
+  forced_syncs: u64,
 }
 
 impl VoprReport {
@@ -102,7 +127,7 @@ impl VoprReport {
     self.ticks
   }
 
-  /// The replica count chosen for this run (3 or 5).
+  /// The replica count chosen for this run (2..=6, including even N and N=2).
   pub const fn replicas(&self) -> usize {
     self.replicas
   }
@@ -158,6 +183,28 @@ impl VoprReport {
   pub const fn pending_view_windows_seen(&self) -> u64 {
     self.pending_view_windows_seen
   }
+
+  /// The high-water of MISDIRECTED WAL reads across the run (summed over replicas). `> 0` ⇒ the
+  /// misdirected-read axis genuinely fired, so the proto's recovery placement check was exercised.
+  pub const fn misdirects_fired(&self) -> u64 {
+    self.misdirects_fired
+  }
+
+  /// The high-water of the RECOVERED COMMITTED BAND width (`commit_max - checkpoint_op`) sampled right
+  /// after a `restart`. A value well above the small-interval ceiling (≈12) ⇒ the large-`checkpoint_ops`
+  /// axis genuinely had a recovering replica reconstruct a non-trivial committed band (the R13-F1
+  /// recover read-window path), rather than always the trivially-tiny band the small interval yields.
+  pub const fn recovered_band_max(&self) -> u64 {
+    self.recovered_band_max
+  }
+
+  /// The cumulative FORCED-state-sync count across the run (peer-fetch escalation proxy; see the field
+  /// docs). `> 0` ⇒ a replica genuinely had to FETCH a checkpoint/op from a peer because its own disk
+  /// could not serve it — the path the two-slot-superblock fix must keep exercised (only the SPURIOUS
+  /// orphaned-checkpoint escalations are removed, not the genuine far-behind ones).
+  pub const fn forced_syncs(&self) -> u64 {
+    self.forced_syncs
+  }
 }
 
 /// The driver's own seeded RNG + bookkeeping. Separate from the cluster's internal network/storage
@@ -178,6 +225,21 @@ struct Vopr {
   calm: bool,
   /// The tick at which the current phase (chaos or calm) ends.
   phase_until: u64,
+  /// The VIRTUAL INSTANT at which the current calm window opened. A calm window ends (and liveness is
+  /// asserted) only once it has spanned BOTH `CALM_TICKS` ticks AND at least [`CALM_MIN_VIRTUAL`] of
+  /// VIRTUAL TIME — because the per-tick virtual-clock advance is NOT constant: under heavy continuous
+  /// message churn (a large recovered committed band with no GC, e.g. the large-`checkpoint_ops` axis)
+  /// the network always has an imminent delivery, so `clock.advance_to(next_deadline)` steps by mere
+  /// microseconds per tick and 800 ticks can span ~2ms — far less than the proto's 100ms
+  /// `PREPARE_RETRANSMIT` cadence. Convergence of the un-acked head op to a laggard backup is
+  /// retransmit-gated, so a tick-only calm window can end before a single retransmit fires and spuriously
+  /// flag a "livelock" that is really just timer-gated catch-up (the seed-622 nanosecond-clock lesson:
+  /// liveness must be judged over a virtual-time-meaningful window, not a raw tick count).
+  calm_start_virtual: Instant,
+  /// Per-replica last-observed FORCED-state-sync count, for cumulative accumulation across crash/restart
+  /// (a `recover` resets the proto's per-replica counter to 0, so we fold each positive delta into the
+  /// report's running total and a reset's downward step contributes nothing). Indexed by replica.
+  forced_sync_seen: Vec<u64>,
   /// Liveness baseline captured at the START of the current calm window: the cluster's committed-op
   /// high-water and whether any client still had outstanding work. Used to assert progress at the end.
   calm_baseline_committed: usize,
@@ -252,8 +314,22 @@ pub const DEFAULT_TICKS: u64 = 4_000;
 
 /// How long (in ticks) a calm window runs before liveness is asserted. Long enough for a healed,
 /// all-up cluster to complete any in-flight view change / peer-repair and commit several new ops, so
-/// "no progress here" is a true wedge, not just a slow convergence.
+/// "no progress here" is a true wedge, not just a slow convergence. A calm window must ALSO span at
+/// least [`CALM_MIN_VIRTUAL`] of virtual time (see that constant) — whichever bound is later wins.
 const CALM_TICKS: u64 = 800;
+
+/// The minimum VIRTUAL-TIME a calm window must span before its liveness assertion fires. The per-tick
+/// virtual-clock advance is variable: under heavy continuous message churn (e.g. a large recovered
+/// committed band with no GC — the large-`checkpoint_ops` axis) the network always has an imminent
+/// delivery, so the clock steps by microseconds per tick and 800 ticks span only ~2ms — far short of
+/// the proto's 100ms `PREPARE_RETRANSMIT` / 50ms `COMMIT_HEARTBEAT` / 500ms `VIEW_CHANGE_STATUS`
+/// cadences. Convergence of an un-acked head op to a laggard backup (or completing a view change) is
+/// retransmit/heartbeat-gated, so a tick-only window can end before a single retransmit fires and
+/// spuriously flag a "livelock" that is really timer-gated catch-up. 3000ms covers ≥30 prepare
+/// retransmits / 6 view-change-status periods — ample for a healed cluster to converge — while a
+/// cluster still wedged after that much virtual time is a genuine liveness bug. (The seed-622 lesson:
+/// liveness is a virtual-time property; never judge it on raw tick count under a nanosecond clock.)
+const CALM_MIN_VIRTUAL: Duration = Duration::from_millis(3_000);
 
 /// The bound (in ticks) on the final QUIESCE phase: a healed, all-up, fault-free cluster must apply
 /// the durably-held committed tail and converge well within this. It is generous (several calm windows
@@ -266,8 +342,16 @@ const FINAL_QUIESCE_TICKS: u64 = 6_000;
 impl Vopr {
   fn new(seed: u64) -> Self {
     let mut prng = Prng::new(seed);
-    // Cluster size from {3, 5}.
-    let n = if prng.chance(1, 2) { 3 } else { 5 };
+    // Cluster size from {2, 3, 4, 5, 6} — including EVEN N and the sharp N=2 case (audit coverage of
+    // the quorum/nack arithmetic). `Config::try_new` accepts any `1..=64`, and the derived quorums are
+    // sane for every size: quorum = ⌊n/2⌋+1, quorum_view_change = quorum_nack_prepare = n − quorum + 1
+    // (N=2 → quorum 2 = unanimous, vc/nack 1 = a single DVC/nack suffices; N=4 → 3 / 2; N=6 → 4 / 3),
+    // and the replication↔view-change intersection `quorum + quorum_view_change > n` holds for all.
+    let n = 2 + (prng.below(5) as usize);
+    // ⌊(N−1)/2⌋ — the minority a quorum survives: N=2→0, N=3→1, N=4→1, N=5→2, N=6→2. For N=2 the budget
+    // is 0, so the chaos chooser never knocks out a replica (any single fault would break the unanimous
+    // quorum 2 and stall progress LEGITIMATELY) — only network drop/dup/jitter and async storage churn
+    // apply, which a 2-node cluster must still make progress under.
     let minority_budget = (n - 1) / 2;
     // A handful of clients: 2..=4.
     let clients = 2 + (prng.below(3) as usize);
@@ -279,6 +363,8 @@ impl Vopr {
       isolated: vec![false; n],
       calm: false,
       phase_until: 0,
+      calm_start_virtual: Instant::ZERO,
+      forced_sync_seen: vec![0; n],
       calm_baseline_committed: 0,
       calm_had_outstanding: false,
       report: VoprReport {
@@ -299,8 +385,28 @@ impl Vopr {
     // Each client issues many requests; with a few thousand ticks and faults, the run rarely drains
     // them, so there is almost always pending load to commit (keeps the liveness check non-vacuous).
     let requests_per_client = 1_000;
-    // Small checkpoint interval (4..=12) so a few-thousand-tick run crosses several checkpoints.
-    let checkpoint_ops = 4 + self.prng.below(9);
+    // Checkpoint interval. MOST seeds use a SMALL interval (4..=12) so a few-thousand-tick run crosses
+    // several checkpoints (exercising checkpoint + GC + checkpoint-based recovery repeatedly). But a
+    // small interval keeps the durable `checkpoint_op` always close behind `commit_max`, so the
+    // RECOVERED COMMITTED BAND (`(checkpoint_op .. commit_max]` — the span the R13-F1 recover
+    // read-window logic materializes + re-applies) is ALWAYS trivially tiny. So ~1/3 of seeds instead
+    // pick a substantially LARGER interval (256..=768): such a run rarely (or never) reaches the first
+    // checkpoint within the tick budget, so `checkpoint_op` stays low while `commit_max` climbs into
+    // the hundreds — a restart then recovers a non-trivial committed band, genuinely exercising the
+    // R13-F1 path (`commit_max` far above `checkpoint_op`) rather than always the ≈4..=12 case. Both
+    // branches draw from the SAME prng position regardless (the `large_ckpt` roll is unconditional), so
+    // the schedule stays a pure function of the seed. NOTE (honest limitation): the 4000-tick budget
+    // commits at most ~1.1k ops (the longest historical run, seed 313), so even the largest band stays
+    // FAR below `RECOVER_TAIL_WINDOW = 8192` — this axis stops the band from being trivially small and
+    // exercises the read-window arithmetic over a real multi-hundred-op band, but the EXTREME R13-F1
+    // case (`commit_max > 8192`, where the window cap actually clips a held committed op) remains
+    // unit-tested in `vsrr-proto`, not reachable here.
+    let large_ckpt = self.prng.chance(1, 3);
+    let checkpoint_ops = if large_ckpt {
+      256 + self.prng.below(513)
+    } else {
+      4 + self.prng.below(9)
+    };
     let mut c = Cluster::with_checkpoint_ops(
       self.n as u8,
       clients,
@@ -352,9 +458,10 @@ impl Vopr {
   }
 
   /// A seed-chosen storage fault plan for chaos phases: transient read faults always on (recover-loop
-  /// retries clear them), plus an OCCASIONAL low permanent torn/bit-rot rate (a restarted replica may
-  /// then have to peer-repair a rotted committed slot). Rates kept low so recovery terminates against
-  /// the live quorum within the run.
+  /// retries clear them), an OCCASIONAL low permanent torn/bit-rot rate (a restarted replica may then
+  /// have to peer-repair a rotted committed slot), and a TRANSIENT misdirected-read rate (a recover
+  /// tail read for op X returns a different valid slot's bytes — the proto's placement check must
+  /// reject it). Rates kept low so recovery terminates against the live quorum within the run.
   fn chaos_storage_faults(&mut self) -> StorageFaults {
     // Permanent corruption only sometimes, and low when present — a high permanent rate on every
     // replica's whole log would make recovery arbitrarily slow under the other concurrent faults.
@@ -367,6 +474,13 @@ impl Vopr {
     } else {
       (0, 0)
     };
+    // TRANSIENT misdirected reads (TigerBeetle's misdirected-IO hazard), drawn UNCONDITIONALLY so a
+    // `VOPR_NO_MISDIRECT` shrink stays on the same stream. Low rate (0..=39 per mille) so a recover
+    // pass does not exhaust its per-slot retry budget on misdirects alone — a misdirected read is
+    // rejected by the proto's placement check (`recover`'s `header.op() == op`) and RETRIED, clearing
+    // on a later read (it never permanently removes a correct copy, so it is inherently quorum-safe:
+    // every replica's own disk still eventually reads each slot correctly).
+    let misdirect = self.prng.below(40) as u32;
     let mask_perm = env_flag("VOPR_NO_PERM");
     StorageFaults {
       read_fault_per_mille: if env_flag("VOPR_NO_READFAULT") {
@@ -376,6 +490,11 @@ impl Vopr {
       },
       torn_write_per_mille: if mask_perm { 0 } else { torn },
       bit_rot_per_mille: if mask_perm { 0 } else { rot },
+      misdirect_read_per_mille: if env_flag("VOPR_NO_MISDIRECT") {
+        0
+      } else {
+        misdirect
+      },
     }
   }
 
@@ -387,6 +506,17 @@ impl Vopr {
       return;
     }
     if self.calm {
+      // The calm window's TICK budget has elapsed — but liveness is a VIRTUAL-TIME property, so do not
+      // assert until the window has ALSO spanned `CALM_MIN_VIRTUAL`. Under heavy churn (the large-band
+      // axis) 800 ticks can be ~2ms, less than one `PREPARE_RETRANSMIT` (100ms), so a retransmit-gated
+      // catch-up would not yet have had a chance to fire. Extend the calm window (keep faults off, all
+      // up) by another tick budget and re-check; this loop terminates because each extension ticks the
+      // healthy cluster forward and the virtual clock is monotone. (The seed-622 lesson.)
+      let spanned = c.now().saturating_duration_since(self.calm_start_virtual);
+      if spanned < CALM_MIN_VIRTUAL {
+        self.phase_until = tick + CALM_TICKS;
+        return;
+      }
       // Calm window ending — assert liveness, then return to chaos.
       self.assert_calm_progress(c, tick);
       self.calm = false;
@@ -414,8 +544,7 @@ impl Vopr {
     c.heal();
     for i in 0..self.n {
       if c.is_crashed(i) {
-        c.restart(i);
-        self.report.restarts += 1;
+        self.restart_and_track(c, i);
       }
     }
     // No drops/dups/jitter during the calm window so pending messages actually deliver. (Keep the
@@ -425,6 +554,10 @@ impl Vopr {
     self.report.calm_windows += 1;
     self.calm_baseline_committed = max_committed(c);
     self.calm_had_outstanding = !(0..c.client_count()).all(|i| c.client(i).is_done());
+    // Snapshot the virtual instant the window opened: the liveness assertion is deferred until the
+    // window spans BOTH `CALM_TICKS` ticks AND `CALM_MIN_VIRTUAL` of virtual time (see `step_phase`),
+    // so a retransmit-gated catch-up under heavy churn is not mistaken for a wedge.
+    self.calm_start_virtual = c.now();
     // A calm window long enough to commit several ops + finish in-flight view changes / repairs.
     self.phase_until = tick + CALM_TICKS;
   }
@@ -483,8 +616,7 @@ impl Vopr {
     c.heal();
     for i in 0..self.n {
       if c.is_crashed(i) {
-        c.restart(i);
-        self.report.restarts += 1;
+        self.restart_and_track(c, i);
       }
     }
     c.set_faults(Faults::none());
@@ -571,8 +703,7 @@ impl Vopr {
         if trace {
           eprintln!("tick {tick}: RESTART replica {i}");
         }
-        c.restart(i);
-        self.report.restarts += 1;
+        self.restart_and_track(c, i);
       }
     }
 
@@ -645,6 +776,22 @@ impl Vopr {
     self.pick(&candidates)
   }
 
+  /// Restart replica `i` and SAMPLE its recovered committed band (`commit_max - checkpoint_op`,
+  /// reconstructed by `recover` and reflected immediately because `Cluster::restart` drains the
+  /// Recovering loop synchronously). Folds the band into the report high-water so the
+  /// large-`checkpoint_ops` axis (TASK 3) can be asserted non-vacuous — a recovering replica really did
+  /// materialize a non-trivial committed band via the R13-F1 read-window path. Every restart site goes
+  /// through here so the high-water captures the band wherever recovery fires (chaos action, calm
+  /// window, or final quiesce). Bumps the restart counter too (one place).
+  fn restart_and_track(&mut self, c: &mut Cluster, i: usize) {
+    c.restart(i);
+    self.report.restarts += 1;
+    self.report.recovered_band_max = self
+      .report
+      .recovered_band_max
+      .max(c.replica_recovered_band(i));
+  }
+
   /// Seeded choice from a candidate list (`None` if empty).
   fn pick(&mut self, candidates: &[usize]) -> Option<usize> {
     if candidates.is_empty() {
@@ -693,8 +840,11 @@ impl Vopr {
   }
 
   /// The structural per-replica invariants, read directly off the sim state each tick:
-  /// `op >= commit_max >= commit_min >= checkpoint_op`, and (for the cluster's committed history) that
-  /// every committed op is durably present on at least a quorum (WAL `Clean` or `<= checkpoint_op`).
+  /// `op >= commit_min >= checkpoint_op` and `commit_max >= commit_min` — but NOT `op >= commit_max`,
+  /// since `commit_max` is a re-learnable HINT that may EXCEED the locally-held head (`commit_max > op`
+  /// is a legal tail-gap shape: the replica has heard a higher op is committed but has not yet fetched
+  /// it). Plus, for the cluster's committed history, that every committed op is durably present on at
+  /// least a quorum (WAL `Clean` or `<= checkpoint_op`).
   fn check_structural(&self, c: &Cluster, tick: u64) {
     for i in 0..self.n {
       let op = c.replica_op(i).get();
@@ -818,6 +968,22 @@ impl Vopr {
       .max()
       .unwrap_or(0);
     self.report.max_view = self.report.max_view.max(mv);
+    // MISDIRECTED-read high-water (summed over replicas' persistent WAL counters). Tracked as a max so
+    // a mid-run WAL rebuild (none happens in the VOPR, but defensively) cannot lower it.
+    let md: u64 = (0..self.n).map(|i| c.wal_misdirects_fired(i)).sum();
+    self.report.misdirects_fired = self.report.misdirects_fired.max(md);
+    // FORCED-sync (peer-fetch escalation) cumulative accumulation. The proto's per-replica counter
+    // resets to 0 on `recover` (each restart), so we fold each POSITIVE delta into the running total
+    // and always re-baseline `forced_sync_seen` — a reset's downward step then contributes nothing and
+    // the next climb from 0 is counted afresh. This makes `forced_syncs` a true run-cumulative count of
+    // peer-fetch escalations, robust to the per-restart reset.
+    for i in 0..self.n {
+      let cur = c.replica_forced_sync_count(i);
+      if cur > self.forced_sync_seen[i] {
+        self.report.forced_syncs += cur - self.forced_sync_seen[i];
+      }
+      self.forced_sync_seen[i] = cur;
+    }
   }
 }
 

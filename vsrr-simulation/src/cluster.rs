@@ -414,17 +414,26 @@ impl Cluster {
   }
 
   /// Crash-stop replica `i`: it stops being ticked and its messages are dropped. Its durable
-  /// `wals[i]`/`sbs[i]` are left intact so a later `restart` can recover from them — EXCEPT any
-  /// superblock write still in flight (async-write mode), which a real crash loses mid-`fsync`: we
-  /// `discard_inflight` it so the durable root/checkpoint stay at their last-COMPLETED values. This
-  /// is what makes the pending-durable-view window (R8-F1) a genuine crash hazard — a not-yet-durable
-  /// view write is actually lost, so the replica recovers to the OLD view (and the proto must never
-  /// have acted in the new one). In synchronous mode this is a no-op. (Staged WAL appends are left as
-  /// the existing async-WAL sweep does: a stale `Appended` completing post-restart carries a
-  /// superseded `OpId` the recovered replica ignores.)
+  /// `wals[i]`/`sbs[i]` are left intact so a later `restart` can recover from them — EXCEPT anything
+  /// still in flight (async mode), which a real crash loses mid-`fsync`. We `discard_inflight` BOTH:
+  ///
+  /// - the superblock, so the durable root/checkpoint stay at their last-COMPLETED values. This is
+  ///   what makes the pending-durable-view window (R8-F1) a genuine crash hazard — a not-yet-durable
+  ///   view write is actually lost, so the replica recovers to the OLD view (and the proto must never
+  ///   have acted in the new one);
+  /// - the WAL, so any STAGED (not-yet-durable) append is genuinely LOST — the faithful
+  ///   fsync-loss-on-crash model. Previously a staged append was left in place, so the async-WAL
+  ///   `poll` later RELEASED it into the durable log AFTER recovery (a stale `Appended` carrying a
+  ///   superseded `OpId`) — inverting real crash semantics, where an un-`fsync`'d WAL write is lost.
+  ///   Dropping it means a crash exercises the "in-flight WAL write lost" case directly: the recovered
+  ///   replica's WAL head sits at most at its last DURABLE op, exactly the stale-WAL-slot class the
+  ///   proto's recovery (and `truncate_wal_above_adopted_head`) must defend.
+  ///
+  /// In synchronous mode both are no-ops (nothing is ever staged).
   pub fn crash(&mut self, i: usize) {
     self.crashed[i] = true;
     self.sbs[i].discard_inflight();
+    self.wals[i].discard_inflight();
   }
 
   /// Restart a previously-crashed replica: rebuild it from its durable WAL + superblock via
@@ -572,6 +581,30 @@ impl Cluster {
     self.wals[i].corrupt_slots_at_or_below_for_test(op)
   }
 
+  /// Test-only: how many reads replica `i`'s WAL has MISDIRECTED (returned a wrong-op valid sibling)
+  /// since it was last constructed. The VOPR sweep sums this across replicas to assert the
+  /// misdirected-read axis genuinely fired (so the proto's recovery placement check was exercised).
+  #[doc(hidden)]
+  pub fn wal_misdirects_fired(&self, i: usize) -> u64 {
+    self.wals[i].misdirects_fired()
+  }
+
+  /// Replica `i`'s RECOVERED COMMITTED BAND width: `commit_max - checkpoint_op`, the count of
+  /// known-committed ops the replica holds ABOVE its durable checkpoint. This is exactly the span the
+  /// R13-F1 recover read-window logic materializes (`recover` reads + re-applies `(checkpoint_op ..
+  /// commit_max]` from the WAL, bounded by `RECOVER_TAIL_WINDOW`). Read right after a `restart`, it is
+  /// the band that recovery actually reconstructed; the VOPR tracks its high-water across the run so
+  /// the large-`checkpoint_ops` axis can be asserted NON-vacuous (a replica really recovered a
+  /// non-trivial band, not always the tiny ≈4..=12 the small-interval seeds produce). Saturating, since
+  /// a re-learnable `commit_max` hint can momentarily exceed a freshly-recovered `checkpoint_op` only
+  /// upward (the subtraction floors at 0 when `checkpoint_op > commit_max`, which recovery never sets).
+  pub fn replica_recovered_band(&self, i: usize) -> u64 {
+    self.replicas[i]
+      .commit_max()
+      .get()
+      .saturating_sub(self.replicas[i].checkpoint_op().get())
+  }
+
   /// Partition the replicas into groups: `groups[i]` is replica `i`'s group id. Replica↔replica
   /// messages between different groups are dropped until `heal`. (Client↔replica traffic is unaffected.)
   pub fn partition(&mut self, groups: Vec<u8>) {
@@ -628,18 +661,36 @@ impl Cluster {
         // written, then later rotted) still fired `Appended`, so acking it is legitimate — this only
         // flags an ack of a genuinely-incomplete append. Record-only — a checker drains it; existing
         // gates ignore it.
+        //
+        // STALE-VIEW EXEMPTION (vopr seeds 21, 464): the invariant binds AT THE ACK'S VIEW. A
+        // `PrepareOk(op, view = V)` is built + queued by the proto in view V, where `op` IS durably
+        // appended; the sim drains `outgoing` only on the NEXT tick, and a view-change-to-`V+1` that
+        // ran in between (truncating the uncommitted tail above the new canonical head) can empty that
+        // slot before we observe the message. Re-checking such a stale ack against the replica's NOW
+        // (post-truncation) WAL is stricter than VSR truly requires: the message carries `view = V`,
+        // and the proto's `on_prepare_ok` DROPS any ack whose `view != self.view` (and routes a
+        // higher-view ack to catch-up, never a vote), so a `PrepareOk(view < current)` can never be
+        // counted toward a commit quorum — it is inert. Skip it when `msg_view < cur_view` (a
+        // legitimately-superseded prior-view ack), exactly the seed-151-class lesson: a per-tick proxy
+        // can over-fire on a message the proto itself neutralizes — fix the checker, never the proto. A
+        // `msg_view >= cur_view` non-durable ack (current view, or the impossible-but-flagged future)
+        // is still a real append-before-ack violation and trips.
         if let Message::PrepareOk(ok) = out.msg_ref() {
           let op = ok.op();
+          let msg_view = ok.view().get();
+          let cur_view = self.replicas[ri].view().get();
           if op.get() > 0
+            && msg_view >= cur_view
             && !self.replica_appended_op(ri, op)
             && self.append_before_ack_violation.is_none()
           {
             let r = &self.replicas[ri];
             self.append_before_ack_violation = Some(format!(
-              "replica {ri} emitted PrepareOk(op={}) but its WAL append has not completed \
+              "replica {ri} emitted PrepareOk(op={}, msg_view={}) but its WAL append has not completed \
                (wal_status={}, view={}, status={}, op={}, commit_min={}, commit_max={}, \
                checkpoint_op={}) — append-before-ack violated",
               op.get(),
+              msg_view,
               self.wals[ri].status(op).as_str(),
               r.view().get(),
               r.status().as_str(),

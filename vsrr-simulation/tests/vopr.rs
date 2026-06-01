@@ -1,8 +1,15 @@
 //! VOPR sweep: the seeded adversarial driver (`run_vopr`) over a seed range, asserting no panics.
 //!
-//! Each seed builds a fresh cluster (size 3 or 5, async WAL, seeded storage + network faults) and
-//! explores a randomized adversarial schedule WITHIN the crash-stop fault model (a quorum always
-//! survives), with safety/durability/view-monotonicity/boundedness/append-before-ack/structural
+//! Each seed builds a fresh cluster (size 2..=6 — including even N and the N=2 unanimous-quorum case)
+//! and explores a randomized adversarial schedule WITHIN the crash-stop fault model (a quorum always
+//! survives). Adversarial axes: async WAL + async Superblock, with a crash that DISCARDS in-flight WAL
+//! appends (modelling real fsync-loss-on-crash); network reorder/drop/duplicate/delay; storage
+//! read/torn/bit-rot faults + MISDIRECTED reads (a read returns a wrong-but-valid sibling slot,
+//! exercising the recovery/repair placement-integrity checks); small AND large `checkpoint_ops` (the
+//! latter recovers a non-trivial committed band — the R13-F1 read-window path); and a redundant-copy
+//! Superblock that retains the last-rooted checkpoint until a new one is durably rooted (finding B).
+//! Liveness is judged over calm windows gated on VIRTUAL time, not raw ticks (the seed-622 lesson).
+//! Safety/durability/view-monotonicity/boundedness/append-before-ack/structural
 //! invariants checked EVERY tick and liveness checked across calm windows. `run_vopr` panics on any
 //! violation with the seed + tick, so this test simply runs the sweep and lets a violation surface.
 //!
@@ -86,6 +93,26 @@
 //!   true durable-quorum-retention guarantee; `run_vopr` now runs a bounded final QUIESCE phase
 //!   (TigerBeetle's `transition_to_liveness_mode`) to converge the survivors before the end-of-run
 //!   assertions, kept strict (a committed op held by no quorum never converges and is reported).
+//! - **seeds 21 + 464** — an append-before-ack CHECKER over-sensitivity (surfaced by the misdirected-read
+//!   axis below), NOT a proto bug. A replica emits `PrepareOk(op, view = V)` legitimately in view V (op
+//!   IS durably appended); the sim drains `outgoing` only on the NEXT tick, and a view-change-to-`V+1`
+//!   that ran in between truncated the uncommitted tail above the new canonical head, emptying that WAL
+//!   slot. Re-checking the now-STALE `PrepareOk(view = V)` against the replica's post-truncation WAL is
+//!   stricter than VSR requires: the message carries `view = V`, and the proto's `on_prepare_ok` DROPS
+//!   any ack whose `view != self.view`, so a `view < current` ack can never count toward a commit quorum
+//!   — it is inert (seed 464 needs the misdirected recovery read to reach the shape; seed 21 reaches it
+//!   on the schedule alone). FIXED in the CHECKER (`Cluster::tick`): the append-before-ack proxy exempts
+//!   a `msg_view < cur_view` stale ack (same seed-151-class lesson — fix the checker, never the proto);
+//!   a `msg_view >= cur_view` non-durable ack still trips.
+//! - **seed 622** — a TRUE liveness wedge (forfeit StartViewChange STORM): a Normal primary stuck
+//!   `pending_forfeit` (it forfeited while the cluster ran on in a higher view) RE-BROADCAST a
+//!   `StartViewChange` on EVERY `handle_timeout` tick, because `primary_timeouts` called `forfeit()` →
+//!   `propose_next_view()` unconditionally. In the nanosecond-clock simulator that storm pins the virtual
+//!   clock to sub-millisecond steps, starving the LIVE view's primary's 50ms Commit heartbeat → the
+//!   stale-view holdout never hears the new view to catch up, livelocking the cluster. FIXED in the proto:
+//!   the forfeit re-propose is now gated on the `svc_message` retransmit timer (one SVC per
+//!   `VC_MESSAGE_RETRANSMIT` window, like `view_change_timeouts`) — the persistent step-down + heartbeat
+//!   suppression are preserved, only the per-tick storm is removed.
 
 use vsrr_simulation::{DEFAULT_TICKS, run_vopr, run_vopr_one};
 
@@ -102,7 +129,7 @@ const SEEDS: u64 = 64;
 /// specific divergences/wedges ever returning. Seed 52 (the `vsr_headers` recovery fix) is also covered
 /// by the contiguous range, but stays pinned here as an explicit named guard against its return.
 const REGRESSION_SEEDS: &[u64] = &[
-  52, 84, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335,
+  21, 52, 84, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622,
 ];
 
 #[test]
@@ -113,6 +140,9 @@ fn vopr_sweep_no_violations() {
   let mut total_partitions = 0u64;
   let mut seeds_with_view_change = 0u64;
   let mut total_pending_view_windows = 0u64;
+  let mut max_recovered_band = 0u64;
+  let mut total_forced_syncs = 0u64;
+  let mut total_misdirects = 0u64;
   for seed in (0..SEEDS).chain(REGRESSION_SEEDS.iter().copied()) {
     let r = run_vopr(seed, DEFAULT_TICKS);
     total_committed += r.max_committed();
@@ -120,6 +150,9 @@ fn vopr_sweep_no_violations() {
     total_restarts += r.restarts();
     total_partitions += r.partitions();
     total_pending_view_windows += r.pending_view_windows_seen();
+    max_recovered_band = max_recovered_band.max(r.recovered_band_max());
+    total_forced_syncs += r.forced_syncs();
+    total_misdirects += r.misdirects_fired();
     if r.max_view() >= 1 {
       seeds_with_view_change += 1;
     }
@@ -150,6 +183,29 @@ fn vopr_sweep_no_violations() {
   assert!(
     total_pending_view_windows > 0,
     "async-superblock never opened the pending-durable-view window — the R8-F1 gate is untested"
+  );
+  // Adversarial-coverage axes (audit hardening) must actually FIRE, or they are vacuous:
+  // - large `checkpoint_ops` materialized a NON-trivial recovered committed band (well above the small
+  //   interval's ~12 ceiling), so the R13-F1 recover read-window path (`commit_max` far above
+  //   `checkpoint_op`) is exercised over a real multi-hundred-op band, not always a tiny one;
+  // - the misdirected-read axis fired, exercising the recovery/repair placement-integrity checks
+  //   (`header.op() == op`) that the DST otherwise never reaches;
+  // - the two-slot/redundant-copy superblock (finding B) still drives GENUINE peer-fetch escalations
+  //   (only the SPURIOUS orphaned-checkpoint ones were removed) — `forced_syncs > 0` proves a replica
+  //   really had to fetch a checkpoint/op from a peer because its own disk could not serve it.
+  assert!(
+    max_recovered_band > 50,
+    "no seed recovered a non-trivial committed band (max={max_recovered_band}) — the \
+     large-checkpoint_ops axis is vacuous"
+  );
+  assert!(
+    total_misdirects > 0,
+    "the misdirected-read axis never fired — the recovery/repair placement-integrity checks are untested"
+  );
+  assert!(
+    total_forced_syncs > 0,
+    "no forced-sync/peer-fetch escalation occurred across the sweep — finding B may have silently \
+     removed that coverage (forced_syncs={total_forced_syncs})"
   );
 }
 

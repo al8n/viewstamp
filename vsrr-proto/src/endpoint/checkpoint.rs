@@ -62,6 +62,11 @@ impl<S: StateMachine> Endpoint<S> {
       // No PrepareOk/own-vote is ever sent for a repair fill (peer repair is not a vote) — this is a
       // pure durability barrier. The body was withheld from `self.log` until here, so it was never in a
       // DVC/StartView/checkpoint nor applied by a concurrent `advance_commit` before its append landed.
+      // Safe even if a view change has begun since the fill was staged (the prior comment covers only the
+      // PENDING window): the filled op is COMMITTED (`fill_repair` only accepts a Prepare with `commit >=
+      // op`), and a committed op's body is identical across all views (committed-op survival), so applying
+      // it here is CONSISTENT with adoption — a `select_canonical_log`/`adopt_log` that supersedes the log
+      // re-derives this exact canonical committed body, never a divergent one.
       Some(Pending::RepairFill(op, entry)) => {
         self.log.insert(op.get(), entry);
         self.repair.remove(&op.get());

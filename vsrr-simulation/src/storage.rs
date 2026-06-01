@@ -11,6 +11,14 @@
 //! fails on read-back), and permanent bit-rot (every read of the slot faults). All faults surface as
 //! data (`WalDone::Fault`/`Absent`, `SlotStatus::Faulty`) — the WAL never silently fixes a corrupt
 //! body, so the proto's checksum chokepoint always sees it.
+//!
+//! A later axis adds a TRANSIENT **misdirected-read** fault (`misdirect_read_per_mille`): a WAL read
+//! for op X occasionally returns a DIFFERENT present, valid, checksum-CORRECT slot's entry
+//! (`header.op() != X`) — TigerBeetle's misdirected-IO hazard, where a read lands on the wrong sector.
+//! A misdirected entry self-VERIFIES, so the checksum chokepoint cannot catch it; the proto's
+//! PLACEMENT check (recovery's `header.op() == op`) does, routing it to the retry path. It is the read
+//! analogue of the torn/bit-rot WRITE faults: faults-as-data the proto must defend against by op
+//! placement, not body checksum alone.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -54,15 +62,26 @@ pub struct StorageFaults {
   /// Per-append probability (out of 1000) that the slot is PERMANENTLY corrupt (bit-rot): every read
   /// of it faults, modelling unrecoverable media damage. (Used by M3.3b; `0` in M3.3a gates.)
   pub bit_rot_per_mille: u32,
+  /// Per-read probability (out of 1000) that a WAL read for op X is MISDIRECTED: instead of X's bytes
+  /// (or `Absent`), it returns a DIFFERENT present, valid, checksum-CORRECT slot's `ReadOk`
+  /// (`header.op() != X`) — TigerBeetle's misdirected-IO hazard, where a read lands on the wrong
+  /// sector and returns another op's self-consistent entry. TRANSIENT (re-rolled per read), so the
+  /// proto's recover/repair RETRY clears it. The defense is the proto's PLACEMENT check
+  /// (`recover`'s `header.op() == op`, `fill_repair`'s `repair.contains(op)`): a misdirected read
+  /// checksum-VERIFIES cleanly, so only the op/placement match catches it. `0` ⇒ no misdirection (all
+  /// pre-existing gates). Sibling slot is chosen deterministically from the durable `entries`, so the
+  /// fault stays a pure function of the per-replica seed.
+  pub misdirect_read_per_mille: u32,
 }
 
 impl StorageFaults {
-  /// No faults: every read succeeds, no torn writes, no bit-rot.
+  /// No faults: every read succeeds, no torn writes, no bit-rot, no misdirection.
   pub const fn none() -> Self {
     Self {
       read_fault_per_mille: 0,
       torn_write_per_mille: 0,
       bit_rot_per_mille: 0,
+      misdirect_read_per_mille: 0,
     }
   }
 }
@@ -125,6 +144,10 @@ pub struct InMemoryWal {
   /// Async mode: appends submitted but not yet durable, in submission order (a serial WAL writer
   /// completes them FIFO). Empty in synchronous mode.
   staged: VecDeque<PendingAppend>,
+  /// Observability: how many reads this WAL has actually MISDIRECTED (returned a wrong-op sibling)
+  /// since construction. Lets the VOPR sweep assert the misdirected-read axis is NON-vacuous (it
+  /// really fired, so the proto's placement check was genuinely exercised) rather than merely armed.
+  misdirects_fired: u64,
 }
 
 impl Default for InMemoryWal {
@@ -151,6 +174,7 @@ impl InMemoryWal {
       rotted: BTreeSet::new(),
       async_delay: None,
       staged: VecDeque::new(),
+      misdirects_fired: 0,
     }
   }
 
@@ -206,6 +230,61 @@ impl InMemoryWal {
   /// True iff the WAL holds no durable slots.
   pub fn is_empty(&self) -> bool {
     self.entries.is_empty()
+  }
+
+  /// Drop every STAGED (submitted-but-not-yet-durable) append WITHOUT letting it become durable —
+  /// modelling a crash that loses any WAL `fsync` still in flight (faithful fsync-loss-on-crash). The
+  /// already-durable log (`entries`/`head`, plus the permanent `rotted` verdicts of completed slots)
+  /// is left exactly at its last-COMPLETED state — what a restart recovers from. A no-op in
+  /// synchronous mode (`staged` is always empty there). Mirrors
+  /// [`InMemorySuperblock::discard_inflight`].
+  ///
+  /// Truncate/prune are applied synchronously (they mutate `entries`/`rotted`/`staged` inline, never
+  /// staged), so the only un-released queue to clear is `staged` — clearing it abandons exactly the
+  /// in-flight appends and nothing durable. Called by the cluster's `crash` so a not-yet-`fsync`'d WAL
+  /// append is genuinely LOST on crash (it never resurfaces as durable post-restart), exercising the
+  /// stale-WAL-slot class the proto must defend against.
+  pub fn discard_inflight(&mut self) {
+    self.staged.clear();
+  }
+
+  /// Pick a deterministic MISDIRECTED-read sibling for a read of `op`: a DIFFERENT durable slot
+  /// (`!= op`) whose stored `(header, body)` self-VERIFIES (`Header::verify` — excludes torn slots,
+  /// whose body is corrupt) and is NOT bit-rotted. Returns its `(Header, body)` to return under the
+  /// requesting read's `OpId` (so `header.op() != op` — the placement violation the proto's recovery
+  /// `header.op() == op` check must reject). `None` if no such sibling exists (then the caller does the
+  /// honest read). The candidate is chosen by a seeded index into the (op-ordered) candidate set, so
+  /// the misdirection target is a pure function of the per-replica seed. Draws from `self.prng` (hence
+  /// `&mut self`), AFTER the misdirect probability roll, keeping a masked (`VOPR_NO_MISDIRECT`) run on
+  /// the same stream as far as the probability gate.
+  fn misdirect_sibling(&mut self, op: u64) -> Option<(Header, Bytes)> {
+    // Candidate VALID sibling slots: present, op != requested, self-verifying, not bit-rotted. A torn
+    // slot (body fails verify) is excluded — a misdirected read returns a CHECKSUM-CORRECT entry, so
+    // the only thing the proto can use to reject it is the op/placement mismatch, not the checksum.
+    let candidates: VecDeque<u64> = self
+      .entries
+      .iter()
+      .filter(|&(&o, (h, b))| o != op && !self.rotted.contains(&o) && h.verify(b))
+      .map(|(&o, _)| o)
+      .collect();
+    if candidates.is_empty() {
+      return None;
+    }
+    let idx = self.prng.below(candidates.len() as u64) as usize;
+    let pick = candidates[idx];
+    let sib = self.entries.get(&pick).map(|(h, b)| (*h, b.clone()));
+    if sib.is_some() {
+      self.misdirects_fired += 1;
+    }
+    sib
+  }
+
+  /// Test-only: how many reads this WAL has MISDIRECTED (returned a wrong-op valid sibling) since
+  /// construction. `> 0` proves the misdirected-read axis genuinely fired (the proto's placement check
+  /// was actually exercised). Persists across `restart` because the WAL struct does.
+  #[doc(hidden)]
+  pub fn misdirects_fired(&self) -> u64 {
+    self.misdirects_fired
   }
 }
 
@@ -303,6 +382,23 @@ impl Wal for InMemoryWal {
       self.completions.push_back(WalDone::Fault(id));
       return;
     }
+    // MISDIRECTED READ (TigerBeetle's misdirected-IO hazard): occasionally return a DIFFERENT present,
+    // valid, checksum-CORRECT slot's entry under THIS read's `id` (so `header.op() != op`). A misdirect
+    // checksum-VERIFIES cleanly — the body is some real op's body — so the proto cannot reject it by
+    // `Header::verify` alone; only its PLACEMENT check (`recover`'s `header.op() == op`) catches it,
+    // routing it to the SAME retry path as a fault. TRANSIENT (re-rolled per read): a later read of the
+    // same slot lands correctly, so the recover loop clears it. We only misdirect when a valid sibling
+    // (`!= op`, present, self-verifying, not bit-rotted) exists — else fall through to the honest read.
+    if self.faults.misdirect_read_per_mille > 0
+      && self.prng.chance(self.faults.misdirect_read_per_mille, 1000)
+    {
+      if let Some((h, b)) = self.misdirect_sibling(op.get()) {
+        self
+          .completions
+          .push_back(WalDone::ReadOk(ReadOk::new(id, h, b)));
+        return;
+      }
+    }
     // Otherwise return the stored entry. A torn body is returned AS-IS (it fails the proto's
     // `Header::verify`), never repaired.
     let done = match self.entries.get(&op.get()) {
@@ -386,6 +482,32 @@ impl StagedSbWrite {
 /// that the root only ever names a fully-written snapshot), so the M3.3a recover always eventually
 /// restores. Torn/bit-rot are WAL-only.
 ///
+/// # Redundant checkpoint copies — retain the last-ROOTED snapshot (audit finding B)
+///
+/// The checkpoint store keeps a SMALL set of recent snapshot generations (`snapshots`, op → bytes),
+/// not a single clobberable slot, modelling a faithful redundant-copy superblock backend. A
+/// `submit_read_checkpoint` always serves the snapshot whose op the CURRENT durable root names
+/// (`state().checkpoint_op()`) — so the snapshot recovery reads ALWAYS satisfies recover's
+/// `cr.op() == state.checkpoint_op()` placement check. The proto writes a checkpoint in two steps —
+/// `submit_write_checkpoint(op, snapshot)` then a durable `submit_write(root)` whose
+/// `state.checkpoint_op() == op` — so a newly-written snapshot becomes READABLE only once a subsequent
+/// ROOT actually names it (the durable root is the authority for which generation is live). A
+/// staged-but-unrooted snapshot (its root never landed — e.g. the checkpoint was abandoned by a view
+/// change, or the crash interrupted the root write) is therefore NEVER served, and a `crash`
+/// ([`discard_inflight`](InMemorySuperblock::discard_inflight)) drops it, keeping the last-rooted
+/// snapshot readable. This is what lets `recover` restore from its OWN disk in the orphaned-checkpoint
+/// case (the new snapshot landed but its root did not) instead of escalating to a spurious peer fetch
+/// a redundant-copy backend would never need. (Before this, a single slot let a new snapshot clobber
+/// the last-rooted one even when its root never landed → the recover checkpoint read returned bytes
+/// whose op disagreed with the durable root → retry exhaustion → peer-fetch escalation.)
+///
+/// Retention stays bounded: snapshots STRICTLY OLDER than the live root's `checkpoint_op` are GC'd —
+/// but only once the in-flight `staged` queue has drained, since a later-completing root can still
+/// reset `state` to an older `checkpoint_op` (the proto's serialized-root-ordering supersession: a
+/// checkpoint's step-2 root, left in flight when a view change issues a durable-view root naming the
+/// OLD checkpoint, completes FIRST but is superseded by that later durable-view root). So an older
+/// rooted snapshot is retained until no queued root could re-name it — at most a couple of generations.
+///
 /// # Async-write mode (opt-in, [`InMemorySuperblock::with_async_writes_and_faults`])
 ///
 /// By DEFAULT every `submit_write`/`submit_write_checkpoint` completes SYNCHRONOUSLY (the effect is
@@ -402,7 +524,12 @@ impl StagedSbWrite {
 #[derive(Debug)]
 pub struct InMemorySuperblock {
   state: VsrState,
-  checkpoint: Option<(OpNumber, Bytes)>,
+  /// Recent checkpoint snapshot generations, keyed by op (the value `submit_write_checkpoint` was
+  /// called with). `submit_read_checkpoint` serves the entry the CURRENT durable root names
+  /// (`state().checkpoint_op()`); newer staged generations whose root has not landed are retained but
+  /// not served, and strictly-older-than-live generations are GC'd once no in-flight root could
+  /// re-name them. Modelling redundant copies, not a single clobberable slot (audit finding B).
+  snapshots: BTreeMap<u64, Bytes>,
   completions: VecDeque<SuperblockDone>,
   faults: StorageFaults,
   prng: Prng,
@@ -433,7 +560,7 @@ impl InMemorySuperblock {
   pub fn with_faults(faults: StorageFaults, seed: u64) -> Self {
     Self {
       state: VsrState::initial(),
-      checkpoint: None,
+      snapshots: BTreeMap::new(),
       completions: VecDeque::new(),
       faults,
       prng: Prng::new(seed),
@@ -465,12 +592,44 @@ impl InMemorySuperblock {
   }
 
   /// Drop every staged (not-yet-durable) write WITHOUT publishing its effect — modelling a crash that
-  /// loses any superblock `fsync` still in flight. The durable root / checkpoint are left at their
-  /// last COMPLETED values (what a restart recovers from). A no-op in synchronous mode (`staged` is
-  /// always empty). Called by the cluster's `crash` so a crash genuinely loses a not-yet-durable view
-  /// write (the precondition for the durable-view-before-participate property to mean anything).
+  /// loses any superblock `fsync` still in flight. The durable root is left at its last COMPLETED value
+  /// (what a restart recovers from). A no-op for the root in synchronous mode (`staged` is always
+  /// empty). Called by the cluster's `crash` so a crash genuinely loses a not-yet-durable view write
+  /// (the precondition for the durable-view-before-participate property to mean anything).
+  ///
+  /// It ALSO discards any staged-but-unrooted checkpoint snapshot — a generation whose bytes landed
+  /// but whose durable ROOT never did (the `state` still names an OLDER checkpoint). Such a snapshot
+  /// was never the live checkpoint, so a faithful redundant-copy backend's crash leaves only the
+  /// last-rooted snapshot readable (audit finding B). Concretely: drop every `snapshots` entry whose op
+  /// is NOT the live root's `checkpoint_op` (strictly newer unrooted generations; older ones are
+  /// already GC'd in steady state). After this the only retained snapshot is exactly the one the
+  /// durable root names, so a restart's recover restores from its OWN disk — not a spurious peer fetch.
   pub fn discard_inflight(&mut self) {
     self.staged.clear();
+    let live = self.state.checkpoint_op().get();
+    self.snapshots.retain(|&op, _| op == live);
+  }
+
+  /// The op the CURRENT durable root names as its checkpoint — the generation `submit_read_checkpoint`
+  /// must serve so recover's `cr.op() == state.checkpoint_op()` placement check always holds.
+  fn live_checkpoint_op(&self) -> u64 {
+    self.state.checkpoint_op().get()
+  }
+
+  /// GC checkpoint snapshot generations no longer reachable: drop every entry STRICTLY OLDER than the
+  /// live root's `checkpoint_op`. Deferred until the in-flight `staged` queue has drained, because a
+  /// later-completing root can still reset `state` to an OLDER `checkpoint_op` (the proto's serialized
+  /// root-ordering supersession — a stale in-flight checkpoint root completes before a durable-view
+  /// root naming the older checkpoint), and that older snapshot must stay readable until no queued root
+  /// could re-name it. Newer-than-live generations (a written snapshot whose root has not landed yet)
+  /// are RETAINED — a pending checkpoint root will promote one to live. Bounds the map to a couple of
+  /// generations in steady state.
+  fn gc_snapshots(&mut self) {
+    if !self.staged.is_empty() {
+      return;
+    }
+    let live = self.live_checkpoint_op();
+    self.snapshots.retain(|&op, _| op >= live);
   }
 }
 
@@ -481,9 +640,13 @@ impl Superblock for InMemorySuperblock {
 
   fn submit_write(&mut self, id: OpId, state: VsrState) {
     match self.async_delay {
-      // SYNCHRONOUS (default): durable immediately, completion queued in this call (M3.0/M3.1).
+      // SYNCHRONOUS (default): durable immediately, completion queued in this call (M3.0/M3.1). The new
+      // durable root may NAME a just-written snapshot generation (a checkpoint's step-2 root) — which
+      // becomes the live/readable checkpoint by virtue of `state.checkpoint_op()` now pointing at it;
+      // GC then drops strictly-older generations (staged is empty in sync mode, so GC runs inline).
       None => {
         self.state = state;
+        self.gc_snapshots();
         self.completions.push_back(SuperblockDone::Wrote(id));
       }
       // ASYNC: STAGE as not-yet-durable. `self.state` is left at the prior durable root until `poll`
@@ -496,13 +659,17 @@ impl Superblock for InMemorySuperblock {
 
   fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes) {
     match self.async_delay {
+      // SYNCHRONOUS (default): the snapshot generation lands in the store immediately, but is NOT yet
+      // the live/readable checkpoint — it becomes readable only when a subsequent ROOT write names its
+      // op (the proto's step 2). Until then `submit_read_checkpoint` still serves the last-rooted
+      // generation. (Modelling redundant copies: a written-but-unrooted snapshot is not yet authority.)
       None => {
-        self.checkpoint = Some((op, snapshot));
+        self.snapshots.insert(op.get(), snapshot);
         self.completions.push_back(SuperblockDone::Wrote(id));
       }
-      // ASYNC: STAGE; the snapshot is not readable until this write completes (the prior checkpoint
-      // stays readable meanwhile). The proto sequences the snapshot write before its root write, and
-      // FIFO completion preserves that ordering.
+      // ASYNC: STAGE; the snapshot is not even WRITTEN (let alone rooted) until this write completes
+      // (the prior live checkpoint stays readable meanwhile). The proto sequences the snapshot write
+      // before its root write, and FIFO completion preserves that ordering.
       Some(delay) => self
         .staged
         .push_back((delay, StagedSbWrite::Checkpoint { id, op, snapshot })),
@@ -510,19 +677,29 @@ impl Superblock for InMemorySuperblock {
   }
 
   fn submit_read_checkpoint(&mut self, id: OpId) {
+    // Serve the generation the CURRENT durable root names (`state().checkpoint_op()`), so a recover
+    // read ALWAYS satisfies `cr.op() == state.checkpoint_op()`. A newer staged-but-unrooted snapshot in
+    // the store is deliberately NOT served (its root has not landed). `live == 0` means no checkpoint
+    // has ever been rooted → Fault (the no-checkpoint case), as before.
+    let live = self.live_checkpoint_op();
+    let readable = if live == 0 {
+      None
+    } else {
+      self.snapshots.get(&live).map(|snap| (live, snap.clone()))
+    };
     // TRANSIENT checkpoint-read fault: rolled independently per read, so the proto's recover loop
-    // clears it within budget. NEVER permanent — the root always names a fully-written snapshot, so
-    // a real `None` (no checkpoint) is the only non-transient `Fault`, returned unconditionally.
-    if self.checkpoint.is_some()
+    // clears it within budget. NEVER permanent — the live root always names a fully-written snapshot,
+    // so a real `None` (no checkpoint rooted) is the only non-transient `Fault`.
+    if readable.is_some()
       && self.faults.read_fault_per_mille > 0
       && self.prng.chance(self.faults.read_fault_per_mille, 1000)
     {
       self.completions.push_back(SuperblockDone::Fault(id));
       return;
     }
-    let done = match &self.checkpoint {
+    let done = match readable {
       Some((op, snap)) => {
-        SuperblockDone::CheckpointRead(CheckpointRead::new(id, *op, snap.clone()))
+        SuperblockDone::CheckpointRead(CheckpointRead::new(id, OpNumber::with(op), snap))
       }
       None => SuperblockDone::Fault(id),
     };
@@ -541,8 +718,21 @@ impl Superblock for InMemorySuperblock {
         let (_, write) = self.staged.pop_front().expect("front exists");
         let id = write.id();
         match write {
-          StagedSbWrite::Root { state, .. } => self.state = state,
-          StagedSbWrite::Checkpoint { op, snapshot, .. } => self.checkpoint = Some((op, snapshot)),
+          // A root becoming durable publishes the new `state`; if it NAMES a written snapshot
+          // generation, that generation becomes the live/readable checkpoint (served by
+          // `submit_read_checkpoint` via `state.checkpoint_op()`). GC then trims strictly-older
+          // generations — but only once `staged` has drained, so a later root that re-names an older
+          // checkpoint (supersession) can still find its snapshot.
+          StagedSbWrite::Root { state, .. } => {
+            self.state = state;
+            self.gc_snapshots();
+          }
+          // A checkpoint snapshot becoming durable lands in the store, but is NOT yet readable — it
+          // becomes the live checkpoint only when a later ROOT names its op (above). Until then the
+          // prior rooted generation stays the one `submit_read_checkpoint` serves.
+          StagedSbWrite::Checkpoint { op, snapshot, .. } => {
+            self.snapshots.insert(op.get(), snapshot);
+          }
         }
         self.completions.push_back(SuperblockDone::Wrote(id));
       } else {
@@ -788,6 +978,110 @@ mod tests {
   }
 
   #[test]
+  fn misdirected_read_returns_a_wrong_op_but_valid_entry() {
+    // A misdirected read for op X returns a DIFFERENT present, valid slot's entry: the body
+    // checksum-VERIFIES (it is a real op's body), so only the PLACEMENT check (`header.op() == X`)
+    // catches it. We use a 1000-per-mille rate so it always fires, and several distinct durable slots
+    // so a sibling exists.
+    let mut w = InMemoryWal::with_faults(
+      StorageFaults {
+        misdirect_read_per_mille: 1000,
+        ..StorageFaults::none()
+      },
+      7,
+    );
+    for op in 1..=4u64 {
+      append(&mut w, op, b"body");
+    }
+    // Read op 2: every read is misdirected, so it returns SOME other op's (valid) entry, never op 2's.
+    let mut saw_misdirect = false;
+    for i in 0..20u64 {
+      w.submit_read(OpId::new(100 + i), OpNumber::with(2));
+      match w.poll() {
+        Some(WalDone::ReadOk(r)) => {
+          assert!(
+            r.header().verify(r.body()),
+            "a misdirected read still returns a CHECKSUM-CORRECT entry (only the op is wrong)"
+          );
+          assert_ne!(
+            r.header().op(),
+            OpNumber::with(2),
+            "the misdirected entry is for a DIFFERENT op — the placement check (header.op() == op) \
+             is exactly what must reject it"
+          );
+          saw_misdirect = true;
+        }
+        other => panic!("expected a (misdirected) ReadOk, got {other:?}"),
+      }
+    }
+    assert!(
+      saw_misdirect,
+      "misdirect_read_per_mille=1000 must misdirect"
+    );
+  }
+
+  #[test]
+  fn misdirected_read_falls_through_when_no_sibling_exists() {
+    // With only ONE durable slot there is no valid sibling to misdirect to, so the read is HONEST even
+    // at a 1000-per-mille misdirect rate (a misdirect never fabricates an entry — it can only return a
+    // real, different present slot, and there is none).
+    let mut w = InMemoryWal::with_faults(
+      StorageFaults {
+        misdirect_read_per_mille: 1000,
+        ..StorageFaults::none()
+      },
+      7,
+    );
+    append(&mut w, 1, b"only");
+    for i in 0..10u64 {
+      w.submit_read(OpId::new(i), OpNumber::with(1));
+      match w.poll() {
+        Some(WalDone::ReadOk(r)) => {
+          assert_eq!(
+            r.header().op(),
+            OpNumber::with(1),
+            "honest read of the sole slot"
+          );
+          assert_eq!(r.body(), b"only");
+        }
+        other => panic!("expected the honest ReadOk, got {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn misdirected_read_is_deterministic_per_seed() {
+    // Same seed + same plan ⇒ identical misdirect targets (the sibling pick uses the seeded PRNG).
+    let run = || {
+      let mut w = InMemoryWal::with_faults(
+        StorageFaults {
+          misdirect_read_per_mille: 500,
+          ..StorageFaults::none()
+        },
+        1234,
+      );
+      for op in 1..=4u64 {
+        append(&mut w, op, b"b");
+      }
+      let mut out = std::vec::Vec::new();
+      for i in 0..30u64 {
+        w.submit_read(OpId::new(i), OpNumber::with(2));
+        match w.poll() {
+          Some(WalDone::ReadOk(r)) => out.push(r.header().op().get()),
+          Some(WalDone::Absent(_)) => out.push(0),
+          other => panic!("unexpected {other:?}"),
+        }
+      }
+      out
+    };
+    assert_eq!(
+      run(),
+      run(),
+      "misdirected reads are a pure function of the seed"
+    );
+  }
+
+  #[test]
   fn permanent_verdicts_survive_a_restart_via_the_persisted_struct() {
     // A bit-rotted slot stays rotted across a crash/restart because the WAL struct persists in the
     // Cluster (the `rotted` set lives in the struct). This is what makes the M3.3b permanent-fault
@@ -809,6 +1103,49 @@ mod tests {
     }
   }
 
+  /// A durable VSR root naming `checkpoint_op` (with a matching `commit >= checkpoint_op` and no
+  /// committed-band headers) — the proto's step-2 root that makes a just-written snapshot the live
+  /// checkpoint. Used by the two-slot superblock tests to ROOT a snapshot the way `recover` expects.
+  fn root_naming_checkpoint(checkpoint_op: u64) -> VsrState {
+    VsrState::try_new(
+      View::new(),
+      View::new(),
+      OpNumber::with(checkpoint_op),
+      OpNumber::with(checkpoint_op),
+      // A non-zero checkpoint id; the exact value is irrelevant to these storage-level tests (the
+      // proto's id cross-check lives above this layer).
+      0x1234,
+      std::vec::Vec::new(),
+    )
+    .expect("commit == checkpoint_op and log_view <= view")
+  }
+
+  /// Pump an async-mode superblock until its staged writes have all become durable and all `Wrote`
+  /// completions are consumed (bounded). Used by the supersession test to land each staged root/
+  /// snapshot in FIFO order.
+  fn drain(sb: &mut InMemorySuperblock) {
+    for _ in 0..256 {
+      let had = sb.poll().is_some();
+      if !had && sb.staged_len() == 0 {
+        return;
+      }
+    }
+    panic!("superblock did not drain within the bound");
+  }
+
+  /// Sync-mode: write a checkpoint snapshot at `op` AND its durable root, so the snapshot becomes the
+  /// live/readable checkpoint (the full proto two-step sequence). Drains both `Wrote` completions.
+  fn write_rooted_checkpoint(sb: &mut InMemorySuperblock, op: u64, snap: &'static [u8]) {
+    sb.submit_write_checkpoint(
+      OpId::new(900 + op),
+      OpNumber::with(op),
+      Bytes::from_static(snap),
+    );
+    let _ = sb.poll();
+    sb.submit_write(OpId::new(800 + op), root_naming_checkpoint(op));
+    let _ = sb.poll();
+  }
+
   #[test]
   fn superblock_checkpoint_read_fault_is_transient() {
     use vsrr_proto::SuperblockDone;
@@ -819,9 +1156,9 @@ mod tests {
       },
       3,
     );
-    // Stage a checkpoint so reads have something to (transiently) fault on.
-    sb.submit_write_checkpoint(OpId::new(1), OpNumber::with(4), Bytes::from_static(b"snap"));
-    let _ = sb.poll();
+    // Write AND root a checkpoint (the proto two-step sequence) so reads have a live, readable
+    // checkpoint to (transiently) fault on.
+    write_rooted_checkpoint(&mut sb, 4, b"snap");
     let mut saw_fault = false;
     let mut saw_read = false;
     for i in 1..40u64 {
@@ -840,6 +1177,131 @@ mod tests {
       saw_read,
       "a transient checkpoint fault clears: some reads succeed"
     );
+  }
+
+  /// Reads the live checkpoint synchronously (no faults), asserting it is a `CheckpointRead` and
+  /// returning its `(op, body)`; panics on a `Fault`/unexpected completion.
+  fn read_live_checkpoint(sb: &mut InMemorySuperblock) -> (u64, Vec<u8>) {
+    use vsrr_proto::SuperblockDone;
+    sb.submit_read_checkpoint(OpId::new(7777));
+    match sb.poll() {
+      Some(SuperblockDone::CheckpointRead(cr)) => (cr.op().get(), cr.snapshot().to_vec()),
+      other => panic!("expected a live CheckpointRead, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn checkpoint_unreadable_until_a_root_names_it() {
+    use vsrr_proto::SuperblockDone;
+    // A written-but-unrooted snapshot is NOT yet the live checkpoint (redundant-copy model, finding B):
+    // the durable root is the authority for which generation is readable.
+    let mut sb = InMemorySuperblock::new();
+    // No checkpoint at all → read faults (the no-checkpoint case).
+    sb.submit_read_checkpoint(OpId::new(1));
+    assert!(matches!(sb.poll(), Some(SuperblockDone::Fault(_))));
+    // Write a snapshot at op 4 but do NOT root it → still no live checkpoint.
+    sb.submit_write_checkpoint(
+      OpId::new(2),
+      OpNumber::with(4),
+      Bytes::from_static(b"snap4"),
+    );
+    let _ = sb.poll();
+    sb.submit_read_checkpoint(OpId::new(3));
+    assert!(
+      matches!(sb.poll(), Some(SuperblockDone::Fault(_))),
+      "an unrooted snapshot is not yet readable"
+    );
+    // Now write the durable root naming op 4 → the snapshot becomes the live, readable checkpoint.
+    sb.submit_write(OpId::new(4), root_naming_checkpoint(4));
+    let _ = sb.poll();
+    assert_eq!(read_live_checkpoint(&mut sb), (4, b"snap4".to_vec()));
+  }
+
+  #[test]
+  fn orphaned_checkpoint_restores_the_last_rooted_snapshot() {
+    // THE finding-B case. Root a checkpoint at op 4; then write a NEWER snapshot at op 8 whose ROOT
+    // never lands (orphaned — e.g. the checkpoint was abandoned, or a crash interrupted its root). A
+    // faithful redundant-copy backend must still serve the last-ROOTED snapshot (op 4) — NOT the
+    // orphaned op-8 bytes — so recover restores from its own disk (`cr.op() == state.checkpoint_op()`)
+    // instead of escalating to a spurious peer fetch.
+    let mut sb = InMemorySuperblock::new();
+    write_rooted_checkpoint(&mut sb, 4, b"snap4");
+    assert_eq!(read_live_checkpoint(&mut sb), (4, b"snap4".to_vec()));
+    // A newer snapshot lands but its root never does.
+    sb.submit_write_checkpoint(
+      OpId::new(50),
+      OpNumber::with(8),
+      Bytes::from_static(b"snap8"),
+    );
+    let _ = sb.poll();
+    // The live checkpoint is STILL the rooted op-4 snapshot (the durable root still names op 4), and
+    // crucially its op MATCHES what `state().checkpoint_op()` reports — so recover's placement check
+    // (`cr.op() == state.checkpoint_op()`) passes and it restores locally.
+    assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
+    assert_eq!(read_live_checkpoint(&mut sb), (4, b"snap4".to_vec()));
+  }
+
+  #[test]
+  fn crash_discards_a_staged_but_unrooted_snapshot_keeping_the_rooted_one() {
+    // A crash (`discard_inflight`) drops a staged-but-unrooted snapshot, keeping the last-rooted one
+    // readable — the redundant-copy crash semantics (finding B).
+    let mut sb = InMemorySuperblock::new();
+    write_rooted_checkpoint(&mut sb, 4, b"snap4");
+    // A newer snapshot lands (root not yet written).
+    sb.submit_write_checkpoint(
+      OpId::new(50),
+      OpNumber::with(8),
+      Bytes::from_static(b"snap8"),
+    );
+    let _ = sb.poll();
+    // Crash: the unrooted op-8 snapshot is lost; the rooted op-4 one survives, readable and matching
+    // the durable root.
+    sb.discard_inflight();
+    assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
+    assert_eq!(read_live_checkpoint(&mut sb), (4, b"snap4".to_vec()));
+    // A subsequent root that DOES name op 8 cannot resurrect the discarded snapshot — it was lost.
+    sb.submit_write(OpId::new(60), root_naming_checkpoint(8));
+    let _ = sb.poll();
+    use vsrr_proto::SuperblockDone;
+    sb.submit_read_checkpoint(OpId::new(61));
+    assert!(
+      matches!(sb.poll(), Some(SuperblockDone::Fault(_))),
+      "the discarded op-8 snapshot is gone; naming it leaves no readable snapshot"
+    );
+  }
+
+  #[test]
+  fn supersession_keeps_the_older_rooted_snapshot_readable() {
+    // The serialized-root-ordering supersession (the proto's `submit_durable_view` comment): a
+    // checkpoint's step-2 root (naming the NEW op) is left in flight when a view change issues a
+    // durable-view root naming the OLD checkpoint; FIFO completes the new-op root FIRST but the later
+    // old-op root supersedes it. The live checkpoint must end up the OLD one, and its snapshot must
+    // still be readable (not GC'd by the transient new-op-rooted window). Async mode to stage both.
+    let mut sb = InMemorySuperblock::with_async_writes_and_faults(StorageFaults::none(), 1, 1);
+    // Establish a rooted checkpoint at op 4 first (drain fully).
+    sb.submit_write_checkpoint(
+      OpId::new(1),
+      OpNumber::with(4),
+      Bytes::from_static(b"snap4"),
+    );
+    drain(&mut sb);
+    sb.submit_write(OpId::new(2), root_naming_checkpoint(4));
+    drain(&mut sb);
+    assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
+    // A new checkpoint at op 8: snapshot written + its step-2 root staged...
+    sb.submit_write_checkpoint(
+      OpId::new(3),
+      OpNumber::with(8),
+      Bytes::from_static(b"snap8"),
+    );
+    drain(&mut sb); // snapshot durable; op-8 root not yet submitted
+    sb.submit_write(OpId::new(4), root_naming_checkpoint(8)); // step-2 root for op 8 (staged)
+    // ...then a view change supersedes it with a durable-view root naming the OLD op 4 (staged AFTER).
+    sb.submit_write(OpId::new(5), root_naming_checkpoint(4));
+    drain(&mut sb);
+    // The FINAL durable root names op 4 (supersession), and the op-4 snapshot is STILL readable.
+    assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
+    assert_eq!(read_live_checkpoint(&mut sb), (4, b"snap4".to_vec()));
   }
 
   #[test]
@@ -1039,5 +1501,65 @@ mod tests {
       assert_eq!(w.op_head(), OpNumber::with(1));
       assert_eq!(w.poll(), Some(WalDone::Appended(id)));
     }
+  }
+
+  #[test]
+  fn discard_inflight_drops_staged_appends_but_keeps_durable_entries() {
+    // The faithful fsync-loss-on-crash model: a crash drops every STAGED (not-yet-durable) append
+    // WITHOUT ever letting it become durable, while the already-durable log survives untouched.
+    let mut w = InMemoryWal::with_async_appends(3);
+    // op1 is appended and fully released → durable; op2 is submitted but still in flight.
+    let id1 = submit(&mut w, 1, 1, b"a");
+    // Release op1 (delay 3 → tick 3,2,1,0 then the release poll yields Appended).
+    for _ in 0..3 {
+      assert_eq!(w.poll(), None);
+    }
+    assert_eq!(
+      w.poll(),
+      Some(WalDone::Appended(id1)),
+      "op1 becomes durable"
+    );
+    assert_eq!(w.op_head(), OpNumber::with(1));
+    let _id2 = submit(&mut w, 2, 2, b"b");
+    assert_eq!(w.staged_len(), 1, "op2 is staged, in flight");
+    assert_eq!(w.status(OpNumber::with(2)), SlotStatus::Dirty);
+
+    // Crash: discard the in-flight op2. The durable op1 stays; op2 is GONE and never resurfaces.
+    w.discard_inflight();
+    assert_eq!(w.staged_len(), 0, "the in-flight append was discarded");
+    assert_eq!(
+      w.op_head(),
+      OpNumber::with(1),
+      "head sits at the last DURABLE op — the lost in-flight write never advanced it"
+    );
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Clean,
+      "the durable op survives the crash"
+    );
+    assert_eq!(
+      w.status(OpNumber::with(2)),
+      SlotStatus::Empty,
+      "the lost in-flight op leaves no slot behind"
+    );
+    // A post-crash poll never resurrects op2 as durable (no stale `Appended` after recovery).
+    for _ in 0..8 {
+      assert_eq!(w.poll(), None, "no staged append resurfaces post-discard");
+    }
+    assert_eq!(w.op_head(), OpNumber::with(1));
+    // op1 still reads back intact.
+    w.submit_read(OpId::new(99), OpNumber::with(1));
+    assert!(matches!(w.poll(), Some(WalDone::ReadOk(_))));
+  }
+
+  #[test]
+  fn discard_inflight_is_a_noop_in_sync_mode() {
+    // Synchronous mode never stages, so a crash-time discard is a harmless no-op (durable log intact).
+    let mut w = InMemoryWal::new();
+    let id = submit(&mut w, 1, 1, b"x");
+    assert_eq!(w.poll(), Some(WalDone::Appended(id)));
+    w.discard_inflight();
+    assert_eq!(w.op_head(), OpNumber::with(1), "sync durable op untouched");
+    assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Clean);
   }
 }
