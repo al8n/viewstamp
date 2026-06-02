@@ -870,6 +870,71 @@ pub enum Message {
   SyncCheckpoint(SyncCheckpoint),
 }
 
+impl Message {
+  /// The stable variant name of this message (serialization-stable; used in diagnostics and the
+  /// emission-chokepoint assert). One source of truth for the message's kind string.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn kind_str(&self) -> &'static str {
+    match self {
+      Self::Request(_) => "Request",
+      Self::Prepare(_) => "Prepare",
+      Self::PrepareOk(_) => "PrepareOk",
+      Self::Reply(_) => "Reply",
+      Self::Commit(_) => "Commit",
+      Self::StartViewChange(_) => "StartViewChange",
+      Self::DoViewChange(_) => "DoViewChange",
+      Self::StartView(_) => "StartView",
+      Self::GetView(_) => "GetView",
+      Self::RequestPrepare(_) => "RequestPrepare",
+      Self::Recovery(_) => "Recovery",
+      Self::RecoveryResponse(_) => "RecoveryResponse",
+      Self::RequestSync(_) => "RequestSync",
+      Self::SyncCheckpoint(_) => "SyncCheckpoint",
+    }
+  }
+
+  /// True iff this message ADVERTISES AN AUTHORITATIVE / PARTICIPATORY VIEW — i.e. it carries the
+  /// sender's `self.view` as an authority claim (a primary head / heartbeat / repair-serve, a recovery
+  /// head answer, a checkpoint serve) OR as a vote the recipient counts toward forming/committing in
+  /// that view. Such a message must NEVER leave a replica whose current view is not yet DURABLE on its
+  /// own superblock (`pending_sb.is_some()`), because `self.view` is then the not-yet-persisted view a
+  /// crash would roll back — the durable-view-before-participate invariant (codex R8-F1). This is the
+  /// GATED set the single emission chokepoint ([`Endpoint::emit`](crate::Endpoint)) asserts on; it
+  /// equals the set the VOPR durable-view checker flags.
+  ///
+  /// The complement — `StartViewChange` (a REQUEST to change view, not a vote), the solicitations
+  /// (`GetView`/`RequestPrepare`/`Recovery`/`RequestSync`), and the client-facing `Request`/`Reply`
+  /// (view-independent) — may be emitted while a view write is in flight, so they return `false`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn advertises_authoritative_view(&self) -> bool {
+    match self {
+      // Primary append broadcast / retransmit, AND the `on_request_prepare` repair serve — advertises
+      // `self.view` as the authoritative view of the op (R8-F1 / R17-F1).
+      Self::Prepare(_)
+      // A backup's VOTE the primary counts toward a COMMIT quorum (carries `self.view`).
+      | Self::PrepareOk(_)
+      // The primary's heartbeat / commit-advance authority broadcast (carries `self.view`).
+      | Self::Commit(_)
+      // A VOTE the prospective primary counts toward FORMING the new view (R16-F1).
+      | Self::DoViewChange(_)
+      // The new primary's "I am the canonical primary of view V" head broadcast.
+      | Self::StartView(_)
+      // The PRIMARY's recovery-handshake answer (the head-bearing equivalent of a StartView).
+      | Self::RecoveryResponse(_)
+      // The state-sync serve advertises `self.view` (R18-F1).
+      | Self::SyncCheckpoint(_) => true,
+      // Solicitations / requests-to-change / client-facing — view-independent, never an authority claim.
+      Self::Request(_)
+      | Self::Reply(_)
+      | Self::StartViewChange(_)
+      | Self::GetView(_)
+      | Self::RequestPrepare(_)
+      | Self::Recovery(_)
+      | Self::RequestSync(_) => false,
+    }
+  }
+}
+
 /// A message the state machine wants the driver to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing {
@@ -1070,6 +1135,132 @@ mod tests {
     assert_eq!(s.nonce(), 0xBEEF);
     assert_eq!(s.snapshot(), b"snapshot-envelope");
     assert_eq!(s.snapshot_bytes(), snap);
+  }
+
+  #[test]
+  fn advertises_authoritative_view_is_exactly_the_gated_set() {
+    use crate::ReplicaId;
+    let body = Bytes::from_static(b"x");
+    let entry = || {
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        body.clone(),
+      )
+    };
+    // The GATED set (a view-advertising authority / participation message) — must return `true`.
+    let gated: std::vec::Vec<Message> = std::vec![
+      Message::Prepare(Prepare::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(0),
+        OpNumber::with(0),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        body.clone()
+      )),
+      Message::PrepareOk(PrepareOk::new(
+        View::with(1),
+        OpNumber::with(1),
+        ReplicaId::new(2),
+        OpNumber::with(0)
+      )),
+      Message::Commit(Commit::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(0)
+      )),
+      Message::DoViewChange(DoViewChange::new(
+        View::with(1),
+        View::with(0),
+        OpNumber::with(1),
+        OpNumber::with(1),
+        ReplicaId::new(2),
+        std::vec![entry()]
+      )),
+      Message::StartView(StartView::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(1),
+        ReplicaId::new(0),
+        std::vec![entry()]
+      )),
+      Message::RecoveryResponse(RecoveryResponse::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(1),
+        ReplicaId::new(0),
+        0,
+        std::vec![entry()]
+      )),
+      Message::SyncCheckpoint(SyncCheckpoint::new(
+        View::with(1),
+        OpNumber::with(2),
+        0,
+        ReplicaId::new(0),
+        0,
+        body.clone()
+      )),
+    ];
+    for m in &gated {
+      assert!(
+        m.advertises_authoritative_view(),
+        "{} must be gated",
+        m.kind_str()
+      );
+    }
+    // The NON-gated set (solicitations / requests-to-change / client-facing) — must return `false`.
+    let ungated: std::vec::Vec<Message> = std::vec![
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(1),
+        body.clone()
+      )),
+      Message::Reply(Reply::new(
+        View::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        body.clone()
+      )),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
+      Message::GetView(GetView::new(View::with(1), ReplicaId::new(2), 0)),
+      Message::RequestPrepare(RequestPrepare::new(
+        View::with(1),
+        OpNumber::with(1),
+        ReplicaId::new(2)
+      )),
+      Message::Recovery(Recovery::new(ReplicaId::new(2), 0)),
+      Message::RequestSync(RequestSync::new(
+        View::with(1),
+        OpNumber::with(0),
+        ReplicaId::new(2),
+        0,
+        false
+      )),
+    ];
+    for m in &ungated {
+      assert!(
+        !m.advertises_authoritative_view(),
+        "{} must NOT be gated",
+        m.kind_str()
+      );
+    }
+    // Every variant is covered exactly once across the two sets (no Message kind missed).
+    assert_eq!(
+      gated.len() + ungated.len(),
+      14,
+      "all 14 Message variants are classified"
+    );
+    assert_eq!(
+      Message::Commit(Commit::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(0)
+      ))
+      .kind_str(),
+      "Commit"
+    );
   }
 
   #[test]

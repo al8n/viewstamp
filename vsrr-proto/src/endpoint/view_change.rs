@@ -19,8 +19,8 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// Broadcast a `StartViewChange` for `view` to the other replicas.
-  fn push_svc(&mut self, view: View) {
-    self.outgoing.push_back(Outgoing::new(
+  pub(crate) fn push_svc(&mut self, view: View) {
+    self.emit(Outgoing::new(
       Recipient::Backups,
       Message::StartViewChange(crate::StartViewChange::new(view, self.config.replica())),
     ));
@@ -31,7 +31,18 @@ impl<S: StateMachine> Endpoint<S> {
       self.push_svc(self.svc_target); // re-broadcast the live SVC target (drives escalation under loss)
       self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
     }
-    if self.timers.dvc_message.is_some_and(|d| d <= now) {
+    // Gate the DVC retransmit on a DURABLE view (codex R16-F1, durable-view-before-participate in the
+    // retransmit path). `enter_view_change` arms `dvc_message` AND submits the SendDoViewChange
+    // durable-view write (so `pending_sb` is set), with the INITIAL DVC deferred to `on_sb_done`. If
+    // the async superblock write is slower than `VC_MESSAGE_RETRANSMIT`, this retransmit would
+    // otherwise fire FIRST and cast the DVC — a VOTE the new primary counts toward forming the view —
+    // BEFORE this replica has PERSISTED the view; a crash before the write lands then recovers the OLD
+    // view after this replica helped form a quorum for the new one. So skip the send while the view
+    // write is pending (the deferred `on_sb_done` casts the initial DVC and the retransmit resumes once
+    // the view is durable). Kept in LOCKSTEP with `serviceable_now(DvcMessage)` (which also gates on
+    // `pending_sb.is_none()`), so a `dvc_message` armed-and-due during `pending_sb` is non-serviceable:
+    // `poll_timeout` filters it out (no spin) and the `handle_timeout` no-orphan-due assert ignores it.
+    if self.pending_sb.is_none() && self.timers.dvc_message.is_some_and(|d| d <= now) {
       self.send_do_view_change(now);
       self.timers.dvc_message = Some(now + VC_MESSAGE_RETRANSMIT);
     }
@@ -183,7 +194,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// Send our full log + position to the prospective primary of the current view.
   pub(crate) fn send_do_view_change(&mut self, _now: Instant) {
     let primary = self.config.primary(self.view);
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
       Message::DoViewChange(crate::DoViewChange::new(
         self.view,
@@ -552,7 +563,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// Runs once the new-primary superblock write is durable: broadcast StartView + begin committing.
   pub(crate) fn start_view_participate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // Broadcast the canonical log to all backups.
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::Backups,
       Message::StartView(crate::StartView::new(
         self.view,

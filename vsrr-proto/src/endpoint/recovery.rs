@@ -861,7 +861,11 @@ impl<S: StateMachine> Endpoint<S> {
     // is belt-and-suspenders. (`complete_recovery` enforces the same abdication for a disk-recovered
     // primary; this closes the parallel hole on the peer-fetch recovery path.)
     if self.config.replica_count() > 1 && self.is_primary() {
-      self.pending_forfeit = true;
+      // `defer_forfeit` sets the latch AND bootstraps a serviceable `svc_message` wake (codex R15) so a
+      // poll_timeout driver reaches the re-propose tick. (`apply_sync` above left `sync_solicit` armed —
+      // also serviceable while Normal — but arming `svc_message` keeps the step-down's wake uniform with
+      // the other two step-down sites and independent of the sync-persist lifetime.)
+      self.defer_forfeit(now);
     }
   }
 
@@ -908,7 +912,7 @@ impl<S: StateMachine> Endpoint<S> {
 
   pub(crate) fn send_get_view(&mut self, now: Instant) {
     let primary = self.config.primary(self.view);
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
       Message::GetView(crate::GetView::new(
         self.view,
@@ -923,7 +927,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// stable `self.nonce` tags the request so a `RecoveryResponse` to THIS replica's recovery is
   /// distinguished from unrelated traffic and matched across retries.
   fn send_recovery(&mut self, now: Instant) {
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::Backups,
       Message::Recovery(crate::Recovery::new(self.config.replica(), self.nonce)),
     ));
@@ -938,7 +942,7 @@ impl<S: StateMachine> Endpoint<S> {
     // already vouched for to a soliciting peer). The deferred `start_view_participate` broadcasts the
     // StartView once the view is durable, and a later `GetView` is then answered normally.
     if self.participates_as_primary() && self.view.get() >= m.view().get() {
-      self.outgoing.push_back(Outgoing::new(
+      self.emit(Outgoing::new(
         Recipient::To(Peer::Replica(m.replica())),
         Message::StartView(crate::StartView::new(
           self.view,
@@ -981,7 +985,7 @@ impl<S: StateMachine> Endpoint<S> {
       // A backup cannot hand out a canonical head; it reports only its view (+ echoed nonce).
       (OpNumber::new(), OpNumber::new(), std::vec::Vec::new())
     };
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(m.replica())),
       Message::RecoveryResponse(crate::RecoveryResponse::new(
         self.view,

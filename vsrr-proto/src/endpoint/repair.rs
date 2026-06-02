@@ -25,7 +25,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// primary-only) so the repair completes even mid-view-change / when the primary itself is the one
   /// missing the op.
   pub(crate) fn send_request_prepare(&mut self, op: u64) {
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::Backups,
       Message::RequestPrepare(crate::RequestPrepare::new(
         self.view,
@@ -53,14 +53,23 @@ impl<S: StateMachine> Endpoint<S> {
     self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
   }
 
-  /// Answer a peer's `RequestPrepare` for a committed op it read back faulty: if we are `Normal` and
-  /// hold the op's body in our log cache, reply with the `Prepare` carrying it. Only a Normal replica
-  /// answers (a recovering / view-changing replica may itself hold a hole at that op). The reply's
-  /// `commit` field carries our commit so the requester can also learn fresh commit progress; the
-  /// op's content is view-independent, so the requester accepts it regardless of our view.
+  /// Answer a peer's `RequestPrepare` for a committed op it read back faulty: if we are `Normal`, our
+  /// view is DURABLE, and we hold the op's body in our log cache, reply with the `Prepare` carrying it.
+  /// Only a Normal replica answers (a recovering / view-changing replica may itself hold a hole at that
+  /// op). The reply's `commit` field carries our commit so the requester can also learn fresh commit
+  /// progress; the op's content is view-independent, so the requester accepts it regardless of our view.
   pub(crate) fn on_request_prepare(&mut self, _now: Instant, m: crate::RequestPrepare) {
-    if !self.status.is_normal() {
-      return; // only a Normal replica has a trustworthy committed log to serve from
+    // Durable-view-before-participate (codex R17-F1): the served `Prepare` advertises `self.view` (see
+    // below). A replica in its `pending_sb` window (a new primary between `start_view_as_new_primary`
+    // and the `on_sb_done` that makes its view durable — or any replica mid `AdoptedStartView`/
+    // `SendDoViewChange` write) is `Normal` but its view is NOT yet recoverable; serving a repair
+    // `Prepare(self.view)` now would advertise a view a crash could roll back — the same hazard the
+    // primary `Prepare`/`Commit`/`StartView` paths gate on. The served op is committed and its CONTENT
+    // is view-independent, so the requester loses nothing by waiting: it broadcasts the `RequestPrepare`
+    // to ALL peers and retries on the repair-retransmit timer, so another Normal+durable peer answers
+    // (and we answer once our own view is durable). Negligible liveness cost; consistent with the class.
+    if !self.status.is_normal() || self.pending_sb.is_some() {
+      return; // only a Normal replica whose view is durable may serve a (view-advertising) repair Prepare
     }
     if m.replica().get() >= self.config.replica_count() {
       return; // ignore malformed/out-of-range replica id
@@ -84,7 +93,7 @@ impl<S: StateMachine> Endpoint<S> {
       entry.request,
       entry.body.clone(),
     );
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(m.replica())),
       Message::Prepare(prepare),
     ));

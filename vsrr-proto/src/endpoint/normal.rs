@@ -23,14 +23,42 @@ impl<S: StateMachine> Endpoint<S> {
     //      re-arms `svc_message`, so this self-paces; the `is_none_or` also fires once if the timer is
     //      somehow unset (it never is while latched — the transition handlers clear both together), so a
     //      forfeit can never silently stop re-proposing.
-    //   2. SKIP the commit heartbeat + prepare retransmit below (the early `return`), so backups STOP
-    //      hearing this primary; their `primary_idle` fires and they JOIN the SVC for `view+1` → an
-    //      SVC quorum forms → the view changes (a caught-up replica leads).
+    //   2. RETIRE the commit heartbeat + prepare retransmit (clear both timers, then the early `return`
+    //      skips the arming code below), so backups STOP hearing this primary; their `primary_idle` fires
+    //      and they JOIN the SVC for `view+1` → an SVC quorum forms → the view changes (a caught-up replica
+    //      leads). RETIRING — not merely skipping — `commit`/`prepare` is load-bearing for a deadline-driven
+    //      driver (codex R14): a real driver advances virtual time to `poll_timeout()` (the EARLIEST armed
+    //      deadline) before each `handle_timeout`, so a still-armed-and-due `commit` (50ms, earlier than the
+    //      SVC retransmit cadence) — which this branch never services — would be re-returned every step,
+    //      pinning the clock at that instant and never reaching `svc_message`: the view change stalls (the
+    //      old primary silent but not stepping down). Clearing them makes `svc_message` the SOLE primary-side
+    //      driver while forfeiting.
     // The flag is cleared ONLY when this replica LEAVES Normal-primary — the transition handlers
     // (`transition_to_view_change_status` / `adopt_canonical_head` / `catch_up_to_view` /
     // `start_view_as_new_primary`) all clear `pending_forfeit`, so once the view changes the new
     // generation re-evaluates from scratch (no same-view re-forfeit, no cross-view leak).
     if self.pending_forfeit {
+      // RETIRE the normal-primary cadence timers: a forfeiting primary STOPS heartbeating/retransmitting,
+      // so leaving `commit`/`prepare` armed-and-due wedges a poll_timeout()-driven driver (it advances only
+      // to the next armed deadline) by spinning at the stale commit deadline, never reaching `svc_message`
+      // (codex R14 — a timer-level wedge replacing the seed-622 message storm). `svc_message` is the SOLE
+      // primary-side driver while forfeiting; `propose_next_view` -> `join_svc` keeps it armed. Clearing them
+      // on every forfeit tick is intended (idempotent once None; nothing re-arms them while `pending_forfeit`,
+      // since the heartbeat/retransmit arming below sits under this early return).
+      self.timers.commit = None;
+      self.timers.prepare = None;
+      // FIX 2 (codex R15-F2, the timer-wedge class): also RETIRE the forfeit grace timer. A primary can
+      // reach `pending_forfeit` via the M3.5 force-sync / sync-checkpoint STEP-DOWN
+      // (`maybe_force_sync` / `on_sync_checkpoint` / `on_recover_sync_checkpoint`) rather than via
+      // `forfeit()` — and that path does NOT disarm `forfeit_armed` (only `forfeit()` does). This branch
+      // never calls `maybe_forfeit` (the early `return` below skips the heartbeat/forfeit tick), so a
+      // `forfeit_armed` left over from a pre-step-down `maybe_forfeit` (e.g. this primary was already
+      // grace-armed on a committed `repair` hole) would be armed-but-never-serviced — the SAME spin a
+      // poll_timeout()-driven driver hits on the stale `commit` deadline above (the grace deadline,
+      // 300ms, is later than the svc cadence, so the spin surfaces once virtual time reaches it).
+      // Clearing it (idempotent once None; the deferred-forfeit latch, not the grace timer, drives the
+      // step-down retries now) keeps `svc_message` the sole primary-side driver while forfeiting.
+      self.forfeit_armed = None;
       if self.timers.svc_message.is_none_or(|d| d <= now) {
         self.propose_next_view(now, sb);
       }
@@ -46,6 +74,23 @@ impl<S: StateMachine> Endpoint<S> {
     // ordinary ticks resume. The deferred forfeit above is exempt: it is a STEP-DOWN (it proposes a
     // higher view via `propose_next_view`), not participation as this view's primary.
     if self.pending_sb.is_some() {
+      // RETIRE every cadence timer for this window (codex R14-F1 class-audit sibling — the SAME
+      // timer-level wedge as the forfeit branch above). `start_view_as_new_primary` flips status to
+      // Normal-primary but DEFERS `arm_timers` to `start_view_participate` (on `on_sb_done`), so the
+      // STALE ViewChange timers (`svc_message`/`dvc_message`/`view_change_status`, armed by
+      // `enter_view_change`) are still armed here AND are status-foreign: this branch never services
+      // them and `view_change_timeouts` (which would) runs only in ViewChange status. Left armed, the
+      // earliest stale deadline spins a poll_timeout()-driven driver (it advances to that deadline, this
+      // branch does nothing, `poll_timeout()` re-returns it) — the clock never reaches the in-flight
+      // superblock completion that begins participation, wedging the new primary. This window is driven
+      // SOLELY by that superblock completion (no timer), so clearing them is correct: `poll_timeout()`
+      // then yields `None` until `on_sb_done` → `start_view_participate` arms the real Normal-primary
+      // timers. Idempotent (once None they stay None; nothing re-arms them while `pending_sb` holds).
+      self.timers.commit = None;
+      self.timers.prepare = None;
+      self.timers.svc_message = None;
+      self.timers.dvc_message = None;
+      self.timers.view_change_status = None;
       return;
     }
     // Bootstrap the heartbeat the first time we're ticked as primary.
@@ -53,7 +98,7 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.commit = Some(now + COMMIT_HEARTBEAT);
     }
     if self.timers.commit.is_some_and(|d| d <= now) {
-      self.outgoing.push_back(Outgoing::new(
+      self.emit(Outgoing::new(
         Recipient::Backups,
         Message::Commit(Commit::new(self.view, self.commit_min, self.checkpoint_op)),
       ));
@@ -68,7 +113,7 @@ impl<S: StateMachine> Endpoint<S> {
       let hi = self.op.get();
       for op in lo..=hi {
         if let Some(entry) = self.log.get(&op).cloned() {
-          self.outgoing.push_back(Outgoing::new(
+          self.emit(Outgoing::new(
             Recipient::Backups,
             Message::Prepare(Prepare::new(
               self.view,
@@ -162,7 +207,7 @@ impl<S: StateMachine> Endpoint<S> {
       });
       if let Some((rn, body)) = cached {
         let reply = Reply::new(self.view, r.client(), rn, body);
-        self.outgoing.push_back(Outgoing::new(
+        self.emit(Outgoing::new(
           Recipient::To(Peer::Client(r.client())),
           Message::Reply(reply),
         ));
@@ -204,7 +249,7 @@ impl<S: StateMachine> Endpoint<S> {
     // "durable?" predicate uniform across every votable append (and the choke-point debug_assert).
     self.appending.insert(self.op.get());
 
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::Backups,
       Message::Prepare(Prepare::new(
         self.view,
@@ -250,7 +295,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.commit_max = OpNumber::with(self.commit_max.get().max(self.commit_min.get()));
     if advanced {
       // Tell backups the commit advanced (also serves as a heartbeat).
-      self.outgoing.push_back(Outgoing::new(
+      self.emit(Outgoing::new(
         Recipient::Backups,
         Message::Commit(Commit::new(self.view, self.commit_min, self.checkpoint_op)),
       ));
@@ -281,7 +326,7 @@ impl<S: StateMachine> Endpoint<S> {
     let session = self.clients.entry(entry.client.get()).or_default();
     session.reply = Some((entry.request, reply_body.clone()));
 
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::To(Peer::Client(entry.client)),
       Message::Reply(Reply::new(
         self.view,
@@ -506,7 +551,7 @@ impl<S: StateMachine> Endpoint<S> {
       op.get()
     );
     let primary = self.config.primary(self.view);
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
       Message::PrepareOk(PrepareOk::new(
         self.view,
