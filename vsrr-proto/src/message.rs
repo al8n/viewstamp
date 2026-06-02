@@ -3,7 +3,13 @@
 use bytes::Bytes;
 use std::vec::Vec;
 
-use crate::{ClientId, OpNumber, Recipient, ReplicaId, RequestNumber, View};
+use crate::codec::{CodecError, Reader, write_bytes_u32};
+use crate::{ClientId, OpNumber, Recipient, ReplicaId, RequestNumber, View, WIRE_VERSION};
+
+/// The minimum encoded length of one [`PreparedEntry`] in a log slice: `op` (`u64`) + `client`
+/// (`u128`) + `request` (`u64`) + an empty body's `u32` length prefix = `8 + 16 + 8 + 4`. Used to
+/// reject a hostile log-slice element count before parsing (see [`Reader::seq_len`]).
+const PREPARED_ENTRY_MIN_LEN: usize = 8 + 16 + 8 + 4;
 
 /// A client request to the primary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -933,6 +939,314 @@ impl Message {
       | Self::RequestSync(_) => false,
     }
   }
+
+  /// The stable wire discriminant tag for each variant, matching declaration order. One source of
+  /// truth shared by [`Self::encode`] (writes it) and [`Self::decode`] (dispatches on it); the
+  /// `match` is EXHAUSTIVE (no wildcard) so a future 15th variant fails to compile until it is
+  /// assigned a tag here.
+  #[cfg_attr(not(tarpaulin), inline)]
+  const fn tag(&self) -> u8 {
+    match self {
+      Self::Request(_) => 0,
+      Self::Prepare(_) => 1,
+      Self::PrepareOk(_) => 2,
+      Self::Reply(_) => 3,
+      Self::Commit(_) => 4,
+      Self::StartViewChange(_) => 5,
+      Self::DoViewChange(_) => 6,
+      Self::StartView(_) => 7,
+      Self::GetView(_) => 8,
+      Self::RequestPrepare(_) => 9,
+      Self::Recovery(_) => 10,
+      Self::RecoveryResponse(_) => 11,
+      Self::RequestSync(_) => 12,
+      Self::SyncCheckpoint(_) => 13,
+    }
+  }
+
+  /// Encodes this message to a versioned, canonical, self-describing byte vector for the wire.
+  ///
+  /// Layout: [`WIRE_VERSION`](crate::WIRE_VERSION) (`u16` BE), then the variant's discriminant tag
+  /// (`u8`), then the variant's fields in canonical order — all scalars big-endian, every `Bytes`
+  /// payload + snapshot envelope `u32`-length-prefixed, every `Vec<PreparedEntry>` log slice a
+  /// `u32` count followed by each entry (`op`/`client`/`request` then a length-prefixed body).
+  /// Nested [`crate::Header`]s (none appear in messages today) would reuse the fixed-size
+  /// `Header::encode`. The `match` over every variant is EXHAUSTIVE (no wildcard), preserving the
+  /// codebase's exhaustive-`Message`-match property.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+    out.push(self.tag());
+    match self {
+      Self::Request(m) => {
+        out.extend_from_slice(&m.client.get().to_be_bytes());
+        out.extend_from_slice(&m.request.get().to_be_bytes());
+        write_bytes_u32(&mut out, &m.body);
+      }
+      Self::Prepare(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.op.get().to_be_bytes());
+        out.extend_from_slice(&m.commit.get().to_be_bytes());
+        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
+        out.extend_from_slice(&m.client.get().to_be_bytes());
+        out.extend_from_slice(&m.request.get().to_be_bytes());
+        write_bytes_u32(&mut out, &m.body);
+      }
+      Self::PrepareOk(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.op.get().to_be_bytes());
+        out.push(m.replica.get());
+        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
+      }
+      Self::Reply(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.client.get().to_be_bytes());
+        out.extend_from_slice(&m.request.get().to_be_bytes());
+        write_bytes_u32(&mut out, &m.body);
+      }
+      Self::Commit(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.commit.get().to_be_bytes());
+        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
+      }
+      Self::StartViewChange(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.push(m.replica.get());
+      }
+      Self::DoViewChange(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.log_view.get().to_be_bytes());
+        out.extend_from_slice(&m.op.get().to_be_bytes());
+        out.extend_from_slice(&m.commit.get().to_be_bytes());
+        out.push(m.replica.get());
+        write_log(&mut out, &m.log);
+      }
+      Self::StartView(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.op.get().to_be_bytes());
+        out.extend_from_slice(&m.commit.get().to_be_bytes());
+        out.push(m.replica.get());
+        write_log(&mut out, &m.log);
+      }
+      Self::GetView(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.push(m.replica.get());
+        out.extend_from_slice(&m.nonce.to_be_bytes());
+      }
+      Self::RequestPrepare(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.op.get().to_be_bytes());
+        out.push(m.replica.get());
+      }
+      Self::Recovery(m) => {
+        out.push(m.replica.get());
+        out.extend_from_slice(&m.nonce.to_be_bytes());
+      }
+      Self::RecoveryResponse(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.op.get().to_be_bytes());
+        out.extend_from_slice(&m.commit.get().to_be_bytes());
+        out.push(m.replica.get());
+        out.extend_from_slice(&m.nonce.to_be_bytes());
+        write_log(&mut out, &m.log);
+      }
+      Self::RequestSync(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
+        out.push(m.replica.get());
+        out.extend_from_slice(&m.nonce.to_be_bytes());
+        out.push(m.recovery as u8);
+      }
+      Self::SyncCheckpoint(m) => {
+        out.extend_from_slice(&m.view.get().to_be_bytes());
+        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
+        out.extend_from_slice(&m.checkpoint_id.to_be_bytes());
+        out.push(m.replica.get());
+        out.extend_from_slice(&m.nonce.to_be_bytes());
+        write_bytes_u32(&mut out, &m.snapshot);
+      }
+    }
+    out
+  }
+
+  /// Decodes a message produced by [`Self::encode`], bounds-checked and panic-free on any
+  /// truncated / corrupt / adversarial input.
+  ///
+  /// Rejects (never panics): an unknown leading version ([`CodecError::UnknownVersion`]), an
+  /// unknown variant tag ([`CodecError::UnknownTag`]), a buffer that ends mid-field
+  /// ([`CodecError::Truncated`]), a body/log length prefix exceeding the remaining bytes
+  /// ([`CodecError::LengthOverflow`]), or trailing bytes after the variant
+  /// ([`CodecError::TrailingBytes`]). The tag dispatch covers the 14 known tags, with any other
+  /// byte falling through to [`CodecError::UnknownTag`] — adding a 15th variant means adding its
+  /// discriminant tag + a decode arm here (the encode `match` will not compile until the variant
+  /// is handled, preserving the exhaustive-`Message`-match property).
+  pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+    let mut r = Reader::new(buf);
+    let version = r.u16()?;
+    if version != WIRE_VERSION {
+      return Err(CodecError::UnknownVersion(version));
+    }
+    let tag = r.u8()?;
+    let msg = match tag {
+      0 => Self::Request(Request {
+        client: read_client(&mut r)?,
+        request: read_request(&mut r)?,
+        body: read_body(&mut r)?,
+      }),
+      1 => Self::Prepare(Prepare {
+        view: read_view(&mut r)?,
+        op: read_op(&mut r)?,
+        commit: read_op(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+        client: read_client(&mut r)?,
+        request: read_request(&mut r)?,
+        body: read_body(&mut r)?,
+      }),
+      2 => Self::PrepareOk(PrepareOk {
+        view: read_view(&mut r)?,
+        op: read_op(&mut r)?,
+        replica: read_replica(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+      }),
+      3 => Self::Reply(Reply {
+        view: read_view(&mut r)?,
+        client: read_client(&mut r)?,
+        request: read_request(&mut r)?,
+        body: read_body(&mut r)?,
+      }),
+      4 => Self::Commit(Commit {
+        view: read_view(&mut r)?,
+        commit: read_op(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+      }),
+      5 => Self::StartViewChange(StartViewChange {
+        view: read_view(&mut r)?,
+        replica: read_replica(&mut r)?,
+      }),
+      6 => Self::DoViewChange(DoViewChange {
+        view: read_view(&mut r)?,
+        log_view: read_view(&mut r)?,
+        op: read_op(&mut r)?,
+        commit: read_op(&mut r)?,
+        replica: read_replica(&mut r)?,
+        log: read_log(&mut r)?,
+      }),
+      7 => Self::StartView(StartView {
+        view: read_view(&mut r)?,
+        op: read_op(&mut r)?,
+        commit: read_op(&mut r)?,
+        replica: read_replica(&mut r)?,
+        log: read_log(&mut r)?,
+      }),
+      8 => Self::GetView(GetView {
+        view: read_view(&mut r)?,
+        replica: read_replica(&mut r)?,
+        nonce: r.u64()?,
+      }),
+      9 => Self::RequestPrepare(RequestPrepare {
+        view: read_view(&mut r)?,
+        op: read_op(&mut r)?,
+        replica: read_replica(&mut r)?,
+      }),
+      10 => Self::Recovery(Recovery {
+        replica: read_replica(&mut r)?,
+        nonce: r.u64()?,
+      }),
+      11 => Self::RecoveryResponse(RecoveryResponse {
+        view: read_view(&mut r)?,
+        op: read_op(&mut r)?,
+        commit: read_op(&mut r)?,
+        replica: read_replica(&mut r)?,
+        nonce: r.u64()?,
+        log: read_log(&mut r)?,
+      }),
+      12 => Self::RequestSync(RequestSync {
+        view: read_view(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+        replica: read_replica(&mut r)?,
+        nonce: r.u64()?,
+        recovery: read_bool(&mut r)?,
+      }),
+      13 => Self::SyncCheckpoint(SyncCheckpoint {
+        view: read_view(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+        checkpoint_id: r.u128()?,
+        replica: read_replica(&mut r)?,
+        nonce: r.u64()?,
+        snapshot: read_body(&mut r)?,
+      }),
+      other => return Err(CodecError::UnknownTag(other)),
+    };
+    r.finish()?;
+    Ok(msg)
+  }
+}
+
+// ── per-field readers (narrow a bounds-checked scalar to its newtype) + log slice codec ──
+
+#[cfg_attr(not(tarpaulin), inline)]
+fn read_view(r: &mut Reader<'_>) -> Result<View, CodecError> {
+  Ok(View::with(r.u64()?))
+}
+
+#[cfg_attr(not(tarpaulin), inline)]
+fn read_op(r: &mut Reader<'_>) -> Result<OpNumber, CodecError> {
+  Ok(OpNumber::with(r.u64()?))
+}
+
+#[cfg_attr(not(tarpaulin), inline)]
+fn read_request(r: &mut Reader<'_>) -> Result<RequestNumber, CodecError> {
+  Ok(RequestNumber::with(r.u64()?))
+}
+
+#[cfg_attr(not(tarpaulin), inline)]
+fn read_client(r: &mut Reader<'_>) -> Result<ClientId, CodecError> {
+  Ok(ClientId::new(r.u128()?))
+}
+
+#[cfg_attr(not(tarpaulin), inline)]
+fn read_replica(r: &mut Reader<'_>) -> Result<ReplicaId, CodecError> {
+  Ok(ReplicaId::new(r.u8()?))
+}
+
+#[cfg_attr(not(tarpaulin), inline)]
+fn read_bool(r: &mut Reader<'_>) -> Result<bool, CodecError> {
+  Ok(r.u8()? != 0)
+}
+
+#[cfg_attr(not(tarpaulin), inline)]
+fn read_body(r: &mut Reader<'_>) -> Result<Bytes, CodecError> {
+  Ok(Bytes::copy_from_slice(r.bytes_u32()?))
+}
+
+/// Writes a `Vec<PreparedEntry>` log slice: a `u32` element count, then each entry as
+/// `op`(u64) `client`(u128) `request`(u64) + a length-prefixed body.
+fn write_log(out: &mut Vec<u8>, log: &[PreparedEntry]) {
+  out.extend_from_slice(&(log.len() as u32).to_be_bytes());
+  for e in log {
+    out.extend_from_slice(&e.op.get().to_be_bytes());
+    out.extend_from_slice(&e.client.get().to_be_bytes());
+    out.extend_from_slice(&e.request.get().to_be_bytes());
+    write_bytes_u32(out, &e.body);
+  }
+}
+
+/// Reads a `Vec<PreparedEntry>` log slice written by [`write_log`]. The element count is validated
+/// against the remaining bytes ([`Reader::seq_len`] with [`PREPARED_ENTRY_MIN_LEN`]) before any
+/// allocation, so a hostile count cannot drive an unbounded pre-allocation; each entry's body is
+/// length-checked individually.
+fn read_log(r: &mut Reader<'_>) -> Result<Vec<PreparedEntry>, CodecError> {
+  let count = r.seq_len(PREPARED_ENTRY_MIN_LEN)?;
+  let mut log = Vec::with_capacity(count);
+  for _ in 0..count {
+    log.push(PreparedEntry {
+      op: read_op(r)?,
+      client: read_client(r)?,
+      request: read_request(r)?,
+      body: read_body(r)?,
+    });
+  }
+  Ok(log)
 }
 
 /// A message the state machine wants the driver to send.
@@ -1278,5 +1592,281 @@ mod tests {
     assert!(rr.log_slice().is_empty());
     assert_eq!(rr.nonce(), 0xFEED);
     assert_eq!(rr.view(), View::with(3));
+  }
+
+  // ── wire codec (audit P0): all 14 Message variants ──
+
+  use crate::codec::CodecError;
+
+  fn entry(op: u64, body: &[u8]) -> PreparedEntry {
+    PreparedEntry::new(
+      OpNumber::with(op),
+      ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+      RequestNumber::with(op),
+      Bytes::copy_from_slice(body),
+    )
+  }
+
+  /// One representative [`Message`] per variant, deliberately exercising the edge cases each
+  /// variant's codec must handle: an EMPTY body (`Request`), a POPULATED body (`Prepare`/`Reply`/
+  /// `SyncCheckpoint`), an EMPTY log slice (`StartView`), a POPULATED multi-entry log
+  /// (`DoViewChange`/`RecoveryResponse`), the `recovery` bool both ways, and `u64::MAX`/`u128::MAX`
+  /// edge scalars. Covers all 14 tags so the round-trip + fuzz tests sweep the whole surface.
+  fn one_of_each_variant() -> std::vec::Vec<Message> {
+    std::vec![
+      Message::Request(Request::new(
+        ClientId::new(u128::MAX),
+        RequestNumber::with(0),
+        Bytes::new(), // empty body edge
+      )),
+      Message::Prepare(Prepare::new(
+        View::with(1),
+        OpNumber::with(u64::MAX),
+        OpNumber::with(2),
+        OpNumber::with(3),
+        ClientId::new(7),
+        RequestNumber::with(9),
+        Bytes::from_static(b"prepare-body"),
+      )),
+      Message::PrepareOk(PrepareOk::new(
+        View::with(4),
+        OpNumber::with(5),
+        ReplicaId::new(255),
+        OpNumber::with(6),
+      )),
+      Message::Reply(Reply::new(
+        View::with(2),
+        ClientId::new(8),
+        RequestNumber::with(3),
+        Bytes::from_static(b"reply-body"),
+      )),
+      Message::Commit(Commit::new(
+        View::with(4),
+        OpNumber::with(9),
+        OpNumber::with(7),
+      )),
+      Message::StartViewChange(StartViewChange::new(View::with(11), ReplicaId::new(2))),
+      Message::DoViewChange(DoViewChange::new(
+        View::with(3),
+        View::with(2),
+        OpNumber::with(5),
+        OpNumber::with(4),
+        ReplicaId::new(6),
+        std::vec![entry(4, b""), entry(5, b"hi")], // populated, incl. an empty-body entry
+      )),
+      Message::StartView(StartView::new(
+        View::with(7),
+        OpNumber::with(0),
+        OpNumber::with(0),
+        ReplicaId::new(0),
+        std::vec![], // empty log slice edge
+      )),
+      Message::GetView(GetView::new(View::with(5), ReplicaId::new(3), u64::MAX)),
+      Message::RequestPrepare(RequestPrepare::new(
+        View::with(2),
+        OpNumber::with(7),
+        ReplicaId::new(3),
+      )),
+      Message::Recovery(Recovery::new(ReplicaId::new(9), 0xABCD)),
+      Message::RecoveryResponse(RecoveryResponse::new(
+        View::with(3),
+        OpNumber::with(5),
+        OpNumber::with(4),
+        ReplicaId::new(0),
+        0xBEEF,
+        std::vec![entry(5, b"e")],
+      )),
+      Message::RequestSync(RequestSync::new(
+        View::with(4),
+        OpNumber::with(2),
+        ReplicaId::new(3),
+        0xBEEF,
+        true, // recovery flag set
+      )),
+      Message::SyncCheckpoint(SyncCheckpoint::new(
+        View::with(4),
+        OpNumber::with(8),
+        u128::MAX,
+        ReplicaId::new(0),
+        0xBEEF,
+        Bytes::from_static(b"snapshot-envelope"),
+      )),
+    ]
+  }
+
+  #[test]
+  fn every_variant_round_trips_through_the_wire_codec() {
+    let all = one_of_each_variant();
+    assert_eq!(all.len(), 14, "every Message variant is represented");
+    for m in &all {
+      let bytes = m.encode();
+      let back = Message::decode(&bytes).expect("round-trip decodes");
+      assert_eq!(&back, m, "decode(encode(m)) == m for {}", m.kind_str());
+      // The encoding leads with the wire version then the variant tag.
+      assert_eq!(
+        &bytes[..2],
+        &crate::WIRE_VERSION.to_be_bytes(),
+        "leads with WIRE_VERSION"
+      );
+    }
+    // Also exercise an ordinary state-sync (recovery = false) so both bool encodings round-trip.
+    let rq = Message::RequestSync(RequestSync::new(
+      View::with(4),
+      OpNumber::with(2),
+      ReplicaId::new(3),
+      0xBEEF,
+      false,
+    ));
+    assert_eq!(Message::decode(&rq.encode()).unwrap(), rq);
+  }
+
+  #[test]
+  fn commit_golden_bytes_pin_the_wire_layout() {
+    // A small variant pinned exactly: WIRE_VERSION(u16) ++ tag 4 ++ view ++ commit ++ checkpoint_op.
+    let c = Message::Commit(Commit::new(
+      View::with(4),
+      OpNumber::with(9),
+      OpNumber::with(7),
+    ));
+    let expected: std::vec::Vec<u8> = std::vec![
+      0, 1, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7,
+    ];
+    assert_eq!(c.encode(), expected, "Commit wire layout is pinned");
+  }
+
+  #[test]
+  fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
+    // A nested variant pinned exactly: header (ver+tag 6), scalars, then a 1-entry log slice
+    // (count=1, op, client, request, length-prefixed body "hi").
+    let dvc = Message::DoViewChange(DoViewChange::new(
+      View::with(3),
+      View::with(2),
+      OpNumber::with(5),
+      OpNumber::with(4),
+      ReplicaId::new(6),
+      std::vec![PreparedEntry::new(
+        OpNumber::with(5),
+        ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+        RequestNumber::with(9),
+        Bytes::from_static(b"hi"),
+      )],
+    ));
+    let expected: std::vec::Vec<u8> = std::vec![
+      0, 1, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+      0, 0, 0, 4, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+      14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 2, 104, 105,
+    ];
+    assert_eq!(dvc.encode(), expected, "DoViewChange wire layout is pinned");
+  }
+
+  #[test]
+  fn decode_rejects_bad_version_unknown_tag_and_truncation_without_panicking() {
+    let bytes = Message::Commit(Commit::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(0),
+    ))
+    .encode();
+    // Empty / too-short to even hold the version → Truncated.
+    assert!(matches!(
+      Message::decode(&[]),
+      Err(CodecError::Truncated { .. })
+    ));
+    assert!(matches!(
+      Message::decode(&[0]),
+      Err(CodecError::Truncated { .. })
+    ));
+    // A bad leading version → UnknownVersion.
+    let mut badver = bytes.clone();
+    badver[1] = 9;
+    assert!(matches!(
+      Message::decode(&badver),
+      Err(CodecError::UnknownVersion(9))
+    ));
+    // An unknown variant tag (99) → UnknownTag.
+    let mut badtag = bytes.clone();
+    badtag[2] = 99;
+    assert!(matches!(
+      Message::decode(&badtag),
+      Err(CodecError::UnknownTag(99))
+    ));
+    // Truncating a variant mid-field → Truncated (never an OOB panic).
+    assert!(matches!(
+      Message::decode(&bytes[..bytes.len() - 1]),
+      Err(CodecError::Truncated { .. })
+    ));
+    // Trailing bytes after a fully-decoded variant → TrailingBytes.
+    let mut over = bytes;
+    over.push(0);
+    assert!(matches!(
+      Message::decode(&over),
+      Err(CodecError::TrailingBytes(1))
+    ));
+  }
+
+  #[test]
+  fn decode_rejects_an_oversized_length_prefix_without_panicking() {
+    // A SyncCheckpoint's snapshot length prefix overstated past the buffer → LengthOverflow, not
+    // an out-of-range slice.
+    let sc = Message::SyncCheckpoint(SyncCheckpoint::new(
+      View::with(1),
+      OpNumber::with(1),
+      0,
+      ReplicaId::new(0),
+      0,
+      Bytes::from_static(b"abc"),
+    ));
+    let mut bytes = sc.encode();
+    // The snapshot length prefix is the last 4 bytes before the 3 body bytes.
+    let n = bytes.len();
+    bytes[n - 7..n - 3].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    assert!(matches!(
+      Message::decode(&bytes),
+      Err(CodecError::LengthOverflow { .. })
+    ));
+
+    // A DoViewChange whose log COUNT is absurd → LengthOverflow, caught before allocating.
+    let dvc = Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(1),
+      OpNumber::with(0),
+      ReplicaId::new(0),
+      std::vec![entry(1, b"x")],
+    ));
+    let mut d = dvc.encode();
+    // Locate the log count: ver(2)+tag(1)+view(8)+log_view(8)+op(8)+commit(8)+replica(1) = 36.
+    d[36..40].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    assert!(matches!(
+      Message::decode(&d),
+      Err(CodecError::LengthOverflow { .. })
+    ));
+  }
+
+  #[test]
+  fn decode_never_panics_on_truncations_or_random_bytes() {
+    // Fuzz-style no-panic sweep: every prefix of every variant's encoding, plus a pseudo-random
+    // stream of growing length (with a valid version/tag header sometimes prepended), must always
+    // yield a typed error — never a panic / out-of-range index.
+    for m in one_of_each_variant() {
+      let enc = m.encode();
+      for n in 0..=enc.len() {
+        let _ = Message::decode(&enc[..n]);
+      }
+    }
+    let mut x = 0x1357_9bdfu32;
+    for len in 0..600usize {
+      let mut v = std::vec::Vec::with_capacity(len + 3);
+      // Sometimes prepend a well-formed version + a random tag to drive deeper into the parsers.
+      if len % 3 == 0 {
+        v.extend_from_slice(&crate::WIRE_VERSION.to_be_bytes());
+        v.push((len as u8) % 16);
+      }
+      for _ in 0..len {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        v.push((x >> 24) as u8);
+      }
+      let _ = Message::decode(&v); // must not panic
+    }
   }
 }

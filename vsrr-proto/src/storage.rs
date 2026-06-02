@@ -8,12 +8,38 @@ use std::vec::Vec;
 
 use bytes::Bytes;
 
+use crate::codec::{CodecError, Reader};
 use crate::{ClientId, OpNumber, RequestNumber, View};
 
 /// On-disk header format version (bumped on any wire/disk layout change).
 pub const HEADER_VERSION: u16 = 1;
 
+/// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
+/// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are
+/// the bytes shared between [`Header::encode`] and the checksum, so the on-disk checksum can
+/// never disagree with the codec output.
+const HEADER_CANONICAL_LEN: usize = 6 * 16;
+
+/// The fixed on-disk size of an encoded [`Header`]. Layout: the stored `checksum` (16 bytes,
+/// big-endian) followed by the canonical body (the six checksummed fields, each a big-endian
+/// `u128`), zero-padded to this sector-friendly fixed width. The trailing reserved bytes are
+/// written as zero and ignored
+/// on decode, leaving room for future fields without a length change (a real WAL writes
+/// fixed-size header slots). `16 (checksum) + 96 (canonical) = 112`, padded to `128`.
+pub const HEADER_ENCODED_LEN: usize = 128;
+
 /// Correlation id matching a submitted storage op to its completion.
+///
+/// **Lifetime contract (load-bearing for a driver that retains a completion-correlation table).**
+/// `OpId`s are unique only WITHIN a single `Endpoint` instance's lifetime: both `Endpoint::new` and
+/// `Endpoint::recover` RESTART the sequence (the first storage op after a crash + `recover` reuses
+/// `OpId(1)`). This is safe for the proto itself — a fresh `recover` issues no writes whose stale
+/// completions could alias, and the in-memory sim drops in-flight ops on crash — but a driver keeping
+/// a `user_data → op` table (e.g. an io_uring `user_data` map) ACROSS a RESTART-IN-PLACE (the endpoint
+/// rebuilt via `recover` WITHOUT tearing down the underlying io_uring fd) could collide a stale
+/// completion's `OpId(1)` with the new endpoint's `OpId(1)`. A driver that retains such a table across
+/// endpoint re-creation MUST therefore DRAIN or CANCEL all in-flight storage ops before constructing
+/// the new endpoint, so no pre-restart completion is delivered against a post-restart `OpId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OpId(u64);
 impl OpId {
@@ -138,8 +164,14 @@ impl Header {
     self.checksum == self.compute_checksum() && self.body_checksum == fnv1a_128(body)
   }
 
-  fn compute_checksum(&self) -> u128 {
-    let mut acc = FNV_OFFSET;
+  /// Writes the CANONICAL body of this header — the six checksummed fields, each widened to a
+  /// big-endian `u128`, in the fixed order `version, op, view, client, request, body_checksum`
+  /// — into `out`. This is the single source of truth shared by BOTH `compute_checksum`
+  /// (which hashes exactly these bytes) AND [`Self::encode`] (which embeds them after the stored
+  /// checksum), so the on-disk checksum can never disagree with the codec output. The order +
+  /// `u128` widening match the original ad-hoc checksum loop verbatim, so the checksum VALUE is
+  /// unchanged for already-persisted data. Exactly [`HEADER_CANONICAL_LEN`] bytes are appended.
+  fn write_canonical(&self, out: &mut Vec<u8>) {
     for word in [
       self.version as u128,
       self.op.get() as u128,
@@ -148,9 +180,75 @@ impl Header {
       self.request.get() as u128,
       self.body_checksum,
     ] {
-      acc = fnv1a_128_mix(acc, &word.to_be_bytes());
+      out.extend_from_slice(&word.to_be_bytes());
     }
-    acc
+  }
+
+  fn compute_checksum(&self) -> u128 {
+    // Hash exactly the canonical body bytes — the same bytes [`Self::encode`] embeds — so the
+    // codec output and the checksum are derived from one definition (audit P3).
+    let mut buf = Vec::with_capacity(HEADER_CANONICAL_LEN);
+    self.write_canonical(&mut buf);
+    fnv1a_128(&buf)
+  }
+
+  /// Encodes this header as a FIXED-SIZE [`HEADER_ENCODED_LEN`]-byte buffer (sector-friendly for
+  /// a real WAL). Layout: the stored `checksum` (16 bytes, big-endian) then the canonical body
+  /// (`write_canonical`), zero-padded to the fixed width. The canonical body bytes are EXACTLY
+  /// what the header checksum (`compute_checksum`) hashes, so a decode can re-verify integrity.
+  /// Total (panic-free): `16 + 96` content bytes + reserved zero padding.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn encode(&self) -> [u8; HEADER_ENCODED_LEN] {
+    let mut buf = Vec::with_capacity(HEADER_ENCODED_LEN);
+    buf.extend_from_slice(&self.checksum.to_be_bytes());
+    self.write_canonical(&mut buf);
+    buf.resize(HEADER_ENCODED_LEN, 0); // reserved tail (future fields), written as zero
+    buf
+      .try_into()
+      .expect("buffer is resized to exactly HEADER_ENCODED_LEN")
+  }
+
+  /// Decodes a fixed-size [`HEADER_ENCODED_LEN`]-byte header buffer, bounds-checked and
+  /// panic-free on any truncated / corrupt / adversarial input.
+  ///
+  /// Rejects (never panics) a short buffer ([`CodecError::Truncated`]) or an unknown
+  /// `version` ([`CodecError::UnknownVersion`]). The decoded `checksum` is the value the
+  /// writer stored; it is NOT re-validated here (a faulty WAL slot is faults-as-data the proto
+  /// checks via [`Self::verify`]) — but the round-trip identity holds: `decode(h.encode()) == h`,
+  /// and the re-derived checksum equals the stored one for an intact buffer. The trailing
+  /// reserved padding is ignored. Accepts a buffer of EXACTLY [`HEADER_ENCODED_LEN`] bytes;
+  /// trailing bytes beyond that are [`CodecError::TrailingBytes`].
+  pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+    let mut r = Reader::new(buf);
+    let checksum = r.u128()?;
+    // The canonical body widens EVERY field to a big-endian u128 (that is what the checksum
+    // hashes), so the leading `version` occupies a full 16-byte word here too. Read it widened
+    // and narrow to u16: a value that does not fit u16 — or is not HEADER_VERSION — is a corrupt
+    // or foreign buffer and is rejected as UnknownVersion (saturating the report at u16::MAX).
+    let version_raw = r.u128()?;
+    let version = u16::try_from(version_raw).unwrap_or(u16::MAX);
+    if version_raw != HEADER_VERSION as u128 {
+      return Err(CodecError::UnknownVersion(version));
+    }
+    // Read each remaining widened word and narrow back to the field's native type (the high bits
+    // are always zero for a value this codec produced).
+    let op = OpNumber::with(r.u128()? as u64);
+    let view = View::with(r.u128()? as u64);
+    let client = ClientId::new(r.u128()?);
+    let request = RequestNumber::with(r.u128()? as u64);
+    let body_checksum = r.u128()?;
+    // Consume + ignore the reserved zero padding, then assert nothing trails the fixed slot.
+    r.take(HEADER_ENCODED_LEN.saturating_sub(16 + HEADER_CANONICAL_LEN))?;
+    r.finish()?;
+    Ok(Self {
+      version,
+      checksum,
+      op,
+      view,
+      client,
+      request,
+      body_checksum,
+    })
   }
 }
 
@@ -304,6 +402,70 @@ impl VsrState {
   pub fn committed_headers(&self) -> &[Header] {
     &self.committed_headers
   }
+
+  /// Encodes this durable root to a length-prefixed, versioned byte vector (the superblock
+  /// on-disk form). Layout (all scalars big-endian): [`WIRE_VERSION`](crate::WIRE_VERSION) `u16`,
+  /// then `view`/`log_view` (`u64` each), `commit`/`checkpoint_op` (`u64` each), `checkpoint_id`
+  /// (`u128`), then the committed-band header set as a `u32` count followed by that many
+  /// fixed-size [`Header::encode`] blocks (one [`HEADER_ENCODED_LEN`]-byte block per header). The
+  /// scalar field order matches the [`Self::try_new`] parameter order. Variable-length because the
+  /// header set is sparse + bounded by one checkpoint interval.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out =
+      Vec::with_capacity(2 + 8 * 4 + 16 + 4 + self.committed_headers.len() * HEADER_ENCODED_LEN);
+    out.extend_from_slice(&crate::WIRE_VERSION.to_be_bytes());
+    out.extend_from_slice(&self.view.get().to_be_bytes());
+    out.extend_from_slice(&self.log_view.get().to_be_bytes());
+    out.extend_from_slice(&self.commit.get().to_be_bytes());
+    out.extend_from_slice(&self.checkpoint_op.get().to_be_bytes());
+    out.extend_from_slice(&self.checkpoint_id.to_be_bytes());
+    out.extend_from_slice(&(self.committed_headers.len() as u32).to_be_bytes());
+    for h in &self.committed_headers {
+      out.extend_from_slice(&h.encode());
+    }
+    out
+  }
+
+  /// Decodes a durable root produced by [`Self::encode`], bounds-checked and panic-free on any
+  /// truncated / corrupt / adversarial input.
+  ///
+  /// Rejects (never panics): a short buffer ([`CodecError::Truncated`]), an unknown leading
+  /// version ([`CodecError::UnknownVersion`]), a header-count prefix that overruns the buffer
+  /// ([`CodecError::LengthOverflow`]), trailing bytes after the last header
+  /// ([`CodecError::TrailingBytes`]), or a per-header decode error. The decoded fields are
+  /// re-validated through [`Self::try_new`], so a corrupt root whose fields break the VSR
+  /// invariants surfaces as [`CodecError::InvalidVsrState`] rather than constructing an illegal
+  /// state — i.e. `decode` returns ONLY roots `try_new` would have accepted.
+  pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+    let mut r = Reader::new(buf);
+    let version = r.u16()?;
+    if version != crate::WIRE_VERSION {
+      return Err(CodecError::UnknownVersion(version));
+    }
+    let view = View::with(r.u64()?);
+    let log_view = View::with(r.u64()?);
+    let commit = OpNumber::with(r.u64()?);
+    let checkpoint_op = OpNumber::with(r.u64()?);
+    let checkpoint_id = r.u128()?;
+    // Reject an oversized header count before allocating: each header is a fixed block, so a
+    // count that could not fit is a corrupt length, not an honestly-short tail.
+    let count = r.seq_len(HEADER_ENCODED_LEN)?;
+    let mut committed_headers = Vec::with_capacity(count);
+    for _ in 0..count {
+      committed_headers.push(Header::decode(r.take(HEADER_ENCODED_LEN)?)?);
+    }
+    r.finish()?;
+    // Re-validate the invariants (log_view <= view, commit >= checkpoint_op, in-band ascending
+    // headers): a corrupt root that breaks them is rejected, not silently constructed.
+    Ok(Self::try_new(
+      view,
+      log_view,
+      commit,
+      checkpoint_op,
+      checkpoint_id,
+      committed_headers,
+    )?)
+  }
 }
 
 /// Error constructing a [`VsrState`].
@@ -443,6 +605,40 @@ pub enum SuperblockDone {
 /// A pluggable write-ahead log. The implementation owns all log bytes and a header
 /// index; the proto orchestrates consensus over it. Sync methods serve consensus
 /// decisions; `submit_*` queue durability work whose completions arrive via `poll`.
+///
+/// **Poll-ordering / durability-visibility contract (load-bearing for append-before-ack).** The
+/// synchronous views ([`op_head`](Wal::op_head), [`header`](Wal::header), and a
+/// [`SlotStatus::Clean`] from [`status`](Wal::status)) MUST reflect ONLY durably-COMPLETED appends —
+/// NEVER an in-flight one (a slot whose [`submit_append`](Wal::submit_append) has been issued but
+/// whose [`WalDone::Appended`] has not yet been delivered by [`poll`](Wal::poll)). Concretely, for
+/// an append that is submitted but not yet completed:
+/// - [`op_head`](Wal::op_head) MUST NOT count it, [`header`](Wal::header) at its op MUST report the
+///   PRIOR durable header (or `None` if the slot was empty), and [`status`](Wal::status) MUST report
+///   [`SlotStatus::Dirty`] — never [`Clean`](SlotStatus::Clean).
+/// - A [`submit_read`](Wal::submit_read) of that slot MUST resolve to [`WalDone::Absent`] (or the
+///   PRIOR durable bytes, if the slot held a completed entry) — NEVER the in-flight bytes.
+///
+/// This is load-bearing for append-before-ack (codex R7-F1): the proto's head (`self.op`) advances
+/// at SUBMIT, but the ack/vote it owes is deferred until the matching [`WalDone::Appended`]. A driver
+/// that advanced [`op_head`](Wal::op_head) (or flipped a slot to [`Clean`](SlotStatus::Clean)) on
+/// SUBMIT rather than on COMPLETION would silently let a `PrepareOk` be cast for a not-yet-durable op,
+/// breaking the invariant — so the "only-durable" rule above is a CONTRACT, not an implementation
+/// detail. Append completions ([`WalDone::Appended`]) are correlated by [`OpId`] and MAY arrive in
+/// ANY order — a real proactor (io_uring with several SQEs in flight) reorders completions — so the
+/// proto MUST NOT assume FIFO completion; the synchronous views above MUST stay consistent with
+/// "only-durable" regardless of the order completions are drained in.
+///
+/// **Capacity / back-pressure contract (the M3.2b WAL-wrap shape).** [`capacity`](Wal::capacity) is
+/// the total number of slots the log can hold (`u64::MAX` ⇒ effectively unbounded; the default).
+/// `submit_*` stay INFALLIBLE — they return `()` and never signal "queue full" — so the back-pressure
+/// model is **the proto's job, not the driver's** (TigerBeetle-faithful: the WAL is a fixed ring and
+/// the replica stalls op-assignment before it would wrap): the proto MUST NOT
+/// [`submit_append`](Wal::submit_append) an op that would require more than [`capacity`](Wal::capacity)
+/// un-pruned slots to be live at once (it stalls assigning the next op until a
+/// [`prune`](Wal::prune) frees room — the M3.2b wrap-stall). A conforming driver MAY
+/// `debug_assert`/panic if the proto violates this (submits past `capacity()` un-pruned slots); it is
+/// NOT required to grow, queue, or reject the append. (M3.2b fills in the proto-side stall against
+/// this accessor; until then the sim reports `u64::MAX` and nothing stalls.)
 pub trait Wal {
   /// The highest op number held.
   fn op_head(&self) -> OpNumber;
@@ -450,7 +646,16 @@ pub trait Wal {
   fn header(&self, op: OpNumber) -> Option<Header>;
   /// The slot status for `op` (the present/nack signal).
   fn status(&self, op: OpNumber) -> SlotStatus;
-  /// Submit a durable append of `(header, body)` at `op`. Completion via [`Wal::poll`].
+  /// The total WAL slot capacity — the maximum number of un-pruned slots that can be live at once
+  /// (`u64::MAX` ⇒ effectively unbounded). The proto observes this to stall op-assignment before it
+  /// would wrap a fixed ring (the M3.2b back-pressure model); see the trait-level capacity contract.
+  /// Defaults to `u64::MAX` (unbounded) so a backend with no fixed bound need not override it.
+  fn capacity(&self) -> u64 {
+    u64::MAX
+  }
+  /// Submit a durable append of `(header, body)` at `op`. Completion via [`Wal::poll`]. INFALLIBLE
+  /// (returns `()`): the proto guarantees it never submits past [`capacity`](Wal::capacity) un-pruned
+  /// slots (see the trait-level capacity contract), so a backend MAY assume room exists.
   fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes);
   /// Submit a read of `op`'s entry. Completion via [`Wal::poll`].
   fn submit_read(&mut self, id: OpId, op: OpNumber);
@@ -458,7 +663,9 @@ pub trait Wal {
   fn truncate(&mut self, above: OpNumber);
   /// Free all slots strictly below `op` (post-checkpoint GC).
   fn prune(&mut self, below: OpNumber);
-  /// Drain the next completed op, if any.
+  /// Drain the next completed op, if any. Completions for appends ([`WalDone::Appended`]) MAY be
+  /// delivered in ANY order relative to their submission (a real proactor reorders); see the
+  /// trait-level poll-ordering contract.
   fn poll(&mut self) -> Option<WalDone>;
 }
 
@@ -772,5 +979,307 @@ mod tests {
     let d = WalDone::ReadOk(r);
     assert!(d.is_read_ok());
     assert_eq!(d.unwrap_read_ok().op(), OpNumber::with(1));
+  }
+
+  // ── disk codec (audit P0): Header + VsrState ──
+
+  use crate::codec::CodecError;
+
+  fn mk_header(op: u64, view: u64, client: u128, req: u64, body: &[u8]) -> Header {
+    Header::new(
+      OpNumber::with(op),
+      View::with(view),
+      ClientId::new(client),
+      RequestNumber::with(req),
+      body,
+    )
+  }
+
+  #[test]
+  fn header_round_trips_including_edge_values() {
+    for h in [
+      Header::new(
+        OpNumber::new(),
+        View::new(),
+        ClientId::new(0),
+        RequestNumber::new(),
+        b"",
+      ),
+      mk_header(7, 3, 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, 9, b"body"),
+      mk_header(u64::MAX, u64::MAX, u128::MAX, u64::MAX, b"max-edge-values"),
+    ] {
+      let bytes = h.encode();
+      assert_eq!(bytes.len(), HEADER_ENCODED_LEN, "fixed-size encoding");
+      let back = Header::decode(&bytes).expect("round-trip decodes");
+      assert_eq!(back, h, "decode(encode(h)) == h");
+    }
+  }
+
+  #[test]
+  fn header_decode_re_derives_the_same_checksum_and_shares_canonical_bytes() {
+    let h = mk_header(
+      7,
+      3,
+      0x1234_5678_9abc_def0_1122_3344_5566_7788,
+      9,
+      b"payload",
+    );
+    let bytes = h.encode();
+    // The decoded header carries the stored checksum unchanged …
+    let back = Header::decode(&bytes).expect("decodes");
+    assert_eq!(back.checksum(), h.checksum(), "stored checksum preserved");
+    // … and is self-consistent (re-derived checksum == stored) on its original body.
+    assert!(back.verify(b"payload"), "decoded header verifies");
+    // The encoded buffer's canonical region (after the 16-byte checksum, before the reserved
+    // padding) is EXACTLY the bytes compute_checksum hashes — i.e. the codec and the checksum
+    // share one definition (audit P3): hashing the embedded canonical region reproduces the
+    // checksum the writer stored.
+    let canonical = &bytes[16..16 + HEADER_CANONICAL_LEN];
+    assert_eq!(
+      fnv1a_128(canonical),
+      h.checksum(),
+      "the encoded canonical bytes are what the checksum hashes"
+    );
+  }
+
+  #[test]
+  fn header_checksum_value_is_unchanged_by_the_canonical_refactor() {
+    // Pin the checksum of a fixed input: if write_canonical ever reorders/rewidens a field
+    // (changing the on-disk checksum for already-persisted data), this golden value FAILS,
+    // surfacing the format break the task said to STOP on.
+    let h = mk_header(7, 3, 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, 9, b"body");
+    assert_eq!(
+      h.checksum(),
+      0xe72c_624b_7c30_e993_d822_b02e_38c3_c2d9,
+      "the canonical refactor must not change an existing checksum value"
+    );
+  }
+
+  #[test]
+  fn header_golden_bytes_pin_the_layout() {
+    // A future field reorder / layout change FAILS this exact-bytes assertion (format-stability
+    // guard): checksum(16) ++ version|op|view|client|request|body_checksum (each u128 BE) ++
+    // reserved zero padding, totalling HEADER_ENCODED_LEN.
+    let h = mk_header(7, 3, 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, 9, b"body");
+    let expected: [u8; HEADER_ENCODED_LEN] = [
+      231, 44, 98, 75, 124, 48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 105, 137, 79, 111, 118, 117, 114, 119, 184, 6, 233,
+      126, 145, 224, 157, 189, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    assert_eq!(h.encode(), expected, "Header wire layout is pinned");
+  }
+
+  #[test]
+  fn header_decode_rejects_truncation_and_bad_version_without_panicking() {
+    let good = mk_header(1, 1, 1, 1, b"x").encode();
+    // A short buffer → Truncated, never a panic.
+    assert!(matches!(
+      Header::decode(&good[..HEADER_ENCODED_LEN - 1]),
+      Err(CodecError::Truncated { .. })
+    ));
+    assert!(matches!(
+      Header::decode(&[]),
+      Err(CodecError::Truncated { .. })
+    ));
+    // Trailing bytes beyond the fixed slot → TrailingBytes.
+    let mut over = good.to_vec();
+    over.push(0);
+    assert!(matches!(
+      Header::decode(&over),
+      Err(CodecError::TrailingBytes(1))
+    ));
+    // A bad version → UnknownVersion. The version is the widened u128 at bytes 16..32 (after the
+    // 16-byte checksum); its significant low byte is index 31. Setting it to 9 makes version_raw
+    // = 9 (fits u16), so the report is UnknownVersion(9).
+    let mut badver = good;
+    badver[31] = 9;
+    assert!(matches!(
+      Header::decode(&badver),
+      Err(CodecError::UnknownVersion(9))
+    ));
+    // A version whose widened word does not even fit u16 (a high byte set) saturates the report
+    // at u16::MAX rather than panicking.
+    let mut hugever = good;
+    hugever[16] = 1; // top byte of the u128 version word
+    assert!(matches!(
+      Header::decode(&hugever),
+      Err(CodecError::UnknownVersion(u16::MAX))
+    ));
+  }
+
+  #[test]
+  fn header_decode_never_panics_on_arbitrary_short_or_random_bytes() {
+    // Fuzz-style no-panic loop over truncations + a pseudo-random stream: every length-checked
+    // read returns an error, so no input panics / indexes out of range.
+    let good = mk_header(3, 3, 3, 3, b"abc").encode();
+    for n in 0..=HEADER_ENCODED_LEN + 4 {
+      let mut v = good.to_vec();
+      v.truncate(n.min(v.len()));
+      while v.len() < n {
+        v.push((n as u8).wrapping_mul(31));
+      }
+      let _ = Header::decode(&v); // must not panic
+    }
+    let mut x = 0x1234_5678u32;
+    for len in 0..300usize {
+      let mut v = std::vec::Vec::with_capacity(len);
+      for _ in 0..len {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        v.push((x >> 24) as u8);
+      }
+      let _ = Header::decode(&v); // must not panic
+    }
+  }
+
+  #[test]
+  fn vsr_state_round_trips_empty_and_populated() {
+    // Empty committed-band header set.
+    let empty = VsrState::initial();
+    assert_eq!(
+      VsrState::decode(&empty.encode()).expect("empty round-trips"),
+      empty
+    );
+    // Populated, sparse (gap at op 4), with edge scalar values.
+    let populated = VsrState::try_new(
+      View::with(u64::MAX),
+      View::with(u64::MAX - 1),
+      OpNumber::with(9),
+      OpNumber::with(2),
+      u128::MAX,
+      std::vec![mk_header(3, 1, 7, 3, b"a"), mk_header(5, 1, 7, 5, b"bb")],
+    )
+    .unwrap();
+    let back = VsrState::decode(&populated.encode()).expect("populated round-trips");
+    assert_eq!(back, populated, "decode(encode(state)) == state");
+    assert_eq!(
+      back
+        .committed_headers()
+        .iter()
+        .map(|h| h.op().get())
+        .collect::<std::vec::Vec<_>>(),
+      std::vec![3, 5],
+      "the sparse header set survives the round-trip verbatim"
+    );
+  }
+
+  #[test]
+  fn vsr_state_golden_bytes_pin_the_layout() {
+    let h = mk_header(7, 3, 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, 9, b"body");
+    let st = VsrState::try_new(
+      View::with(4),
+      View::with(2),
+      OpNumber::with(7),
+      OpNumber::with(5),
+      0xAABB_CCDD,
+      std::vec![h],
+    )
+    .unwrap();
+    let expected: std::vec::Vec<u8> = std::vec![
+      0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0,
+      0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 187, 204, 221, 0, 0, 0, 1, 231, 44, 98, 75,
+      124, 48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 9, 105, 137, 79, 111, 118, 117, 114, 119, 184, 6, 233, 126, 145, 224,
+      157, 189, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    assert_eq!(st.encode(), expected, "VsrState wire layout is pinned");
+  }
+
+  #[test]
+  fn vsr_state_decode_rejects_corruption_without_panicking() {
+    let st = VsrState::try_new(
+      View::with(4),
+      View::with(2),
+      OpNumber::with(7),
+      OpNumber::with(5),
+      0xAABB_CCDD,
+      std::vec![mk_header(6, 1, 1, 6, b"z")],
+    )
+    .unwrap();
+    let good = st.encode();
+    // Truncation WITHIN the fixed scalar prefix (before the header count) → Truncated (a scalar
+    // read ran off the end). `&[]` likewise fails the very first u16 read.
+    assert!(matches!(
+      VsrState::decode(&good[..40]),
+      Err(CodecError::Truncated { .. })
+    ));
+    assert!(matches!(
+      VsrState::decode(&[]),
+      Err(CodecError::Truncated { .. })
+    ));
+    // Dropping the last byte leaves the count (1) promising a 128-byte header where only 127
+    // remain — a length/count prefix exceeding the remaining bytes → LengthOverflow.
+    assert!(matches!(
+      VsrState::decode(&good[..good.len() - 1]),
+      Err(CodecError::LengthOverflow { .. })
+    ));
+    // Bad leading version → UnknownVersion.
+    let mut badver = good.clone();
+    badver[1] = 7;
+    assert!(matches!(
+      VsrState::decode(&badver),
+      Err(CodecError::UnknownVersion(7))
+    ));
+    // A header-count prefix that overruns the buffer → LengthOverflow (not an OOB slice). The
+    // count u32 sits at offset 2+8+8+8+8+16 = 50.
+    let mut huge = good.clone();
+    huge[50..54].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    assert!(matches!(
+      VsrState::decode(&huge),
+      Err(CodecError::LengthOverflow { .. })
+    ));
+    // Trailing bytes after the last header → TrailingBytes.
+    let mut over = good.clone();
+    over.push(0);
+    assert!(matches!(
+      VsrState::decode(&over),
+      Err(CodecError::TrailingBytes(1))
+    ));
+    // A structurally-valid buffer whose decoded fields break the invariants (log_view > view) is
+    // rejected as InvalidVsrState rather than constructing an illegal root. Build it by hand: an
+    // empty-header root with log_view = 5 > view = 4.
+    let mut bad = std::vec::Vec::new();
+    bad.extend_from_slice(&crate::WIRE_VERSION.to_be_bytes());
+    bad.extend_from_slice(&4u64.to_be_bytes()); // view
+    bad.extend_from_slice(&5u64.to_be_bytes()); // log_view > view
+    bad.extend_from_slice(&0u64.to_be_bytes()); // commit
+    bad.extend_from_slice(&0u64.to_be_bytes()); // checkpoint_op
+    bad.extend_from_slice(&0u128.to_be_bytes()); // checkpoint_id
+    bad.extend_from_slice(&0u32.to_be_bytes()); // header count
+    assert!(matches!(
+      VsrState::decode(&bad),
+      Err(CodecError::InvalidVsrState(_))
+    ));
+  }
+
+  #[test]
+  fn vsr_state_decode_never_panics_on_random_bytes() {
+    // Fuzz-style no-panic loop: a pseudo-random byte stream of growing length must always yield
+    // a typed error, never a panic / OOB index.
+    let good = VsrState::try_new(
+      View::with(2),
+      View::with(2),
+      OpNumber::with(3),
+      OpNumber::with(1),
+      9,
+      std::vec![mk_header(2, 2, 2, 2, b"q")],
+    )
+    .unwrap()
+    .encode();
+    for n in 0..=good.len() + 2 {
+      let _ = VsrState::decode(&good[..n.min(good.len())]); // truncations
+    }
+    let mut x = 0xDEAD_BEEFu32;
+    for len in 0..400usize {
+      let mut v = std::vec::Vec::with_capacity(len);
+      for _ in 0..len {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        v.push((x >> 16) as u8);
+      }
+      let _ = VsrState::decode(&v); // must not panic
+    }
   }
 }

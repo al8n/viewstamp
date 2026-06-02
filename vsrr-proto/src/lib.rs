@@ -33,6 +33,7 @@ extern crate alloc as std;
 #[cfg(feature = "std")]
 extern crate std;
 
+mod codec;
 mod config;
 mod endpoint;
 mod event;
@@ -44,6 +45,7 @@ mod state_machine;
 mod status;
 mod storage;
 mod time;
+pub use codec::{CodecError, WIRE_VERSION};
 pub use config::{Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS};
 pub use endpoint::Endpoint;
 pub use event::{Committed, Event};
@@ -58,7 +60,7 @@ pub use prng::Prng;
 pub use state_machine::StateMachine;
 pub use status::Status;
 pub use storage::{
-  CheckpointRead, HEADER_VERSION, Header, OpId, ReadOk, SlotStatus, Superblock, SuperblockDone,
-  VsrState, VsrStateError, Wal, WalDone, checkpoint_id,
+  CheckpointRead, HEADER_ENCODED_LEN, HEADER_VERSION, Header, OpId, ReadOk, SlotStatus, Superblock,
+  SuperblockDone, VsrState, VsrStateError, Wal, WalDone, checkpoint_id,
 };
 pub use time::Instant;

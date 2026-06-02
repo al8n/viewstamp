@@ -1,0 +1,2405 @@
+use super::*;
+use crate::{
+  ClientId, Config, DoViewChange, GetView, Header, OpId, OpNumber, Prepare, PreparedEntry,
+  Recovery, ReplicaId, Request, RequestNumber, StartView, StartViewChange, Superblock, View,
+  VsrState, Wal,
+};
+
+#[test]
+fn backup_transitions_on_svc_quorum_and_sends_dvc() {
+  // replica 1 of 3. After primary_idle and one peer SVC, the SVC quorum (2) is met:
+  // it transitions to ViewChange(view 1) and sends a DoViewChange to primary(1)=replica 1.
+  use crate::StartViewChange;
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(now, &mut wal, &mut sb); // status=Normal backup → bootstraps primary_idle; not yet due
+  let later = now + core::time::Duration::from_millis(300);
+  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle due → on_primary_idle → broadcast SVC(view 1), own bit set
+  assert_eq!(e.status(), Status::Normal); // 1 of 2 — not yet quorum
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  assert_eq!(e.view(), View::with(1));
+  // DoViewChange is deferred until the view is durable — pump storage first.
+  e.handle_storage(later, &mut wal, &mut sb);
+  // it should have emitted a DoViewChange to primary(view 1) = replica 1 (itself).
+  let mut saw_dvc = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::DoViewChange(d) = out.into_msg() {
+      assert_eq!(d.view(), View::with(1));
+      assert_eq!(d.replica(), ReplicaId::new(1));
+      saw_dvc = true;
+    }
+  }
+  assert!(saw_dvc, "must send a DoViewChange to the new primary");
+}
+
+#[test]
+fn new_primary_adopts_canonical_log_and_starts_view() {
+  // replica 1 is primary of view 1. Feed a DVC quorum (2 of 3) of DoViewChange for view 1.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // drive it into ViewChange(view 1) first (reuse the SVC path):
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  ); // primary_idle → SVC(view1), own bit
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange); // now collecting DVCs as primary(view 1)
+  while e.poll_message().is_some() {} // discard outgoing so far
+  // Feed a DoViewChange from replica 2 with a richer log (log_view 0, op 2, commit 1):
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::new(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        bytes::Bytes::from_static(b"b"),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  // replica 1's own DVC (op 0) + replica 2's DVC (op 2) = quorum 2 → adopt op 2, become Normal primary.
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(e.view(), View::with(1));
+  assert_eq!(e.op(), OpNumber::with(2));
+  // StartView is deferred until the view is durable — pump storage first.
+  e.handle_storage(now, &mut wal, &mut sb);
+  // It must broadcast a StartView carrying the canonical log.
+  let mut saw_sv = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::StartView(sv) = out.into_msg() {
+      assert_eq!(sv.op(), OpNumber::with(2));
+      assert_eq!(sv.log_slice().len(), 2);
+      saw_sv = true;
+    }
+  }
+  assert!(saw_sv, "new primary must broadcast StartView");
+}
+
+#[test]
+fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
+  // codex R6-F1 (REGRESSION, the cardinal append-before-ack invariant): a new primary that adopts an
+  // uncommitted-tail op it learned from a PEER's DVC (it did NOT hold the op before) must NOT count
+  // its OWN vote for that op — and must NOT commit it — until the op's WAL append is durable. The
+  // own vote could only be cast from memory before, so a crash+recover would lose the op it voted
+  // for. Here replica 1 becomes primary of view 1 and adopts op 2 (uncommitted: commit* = 1) supplied
+  // ONLY by replica 2's DVC; replica 1's own DVC holds op 0, so op 2 is peer-learned + memory-only.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  ); // primary_idle → SVC(view1), own bit
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::new(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        bytes::Bytes::from_static(b"b"),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  // Now the new primary (replica 1) is Normal with op 2 adopted, commit* = 1 — BEFORE any storage.
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(2));
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "op 1 applied; op 2 still uncommitted"
+  );
+  let own_bit = 1u64 << 1; // replica 1
+  // THE INVARIANT: op 2's inflight entry carries NO own vote yet — the WAL append has not completed.
+  // Fail-before (the bug): the own vote was seeded immediately (`oks: own`), so this was `own_bit`.
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some(0),
+    "the new primary must NOT vote for the adopted op 2 before its WAL append is durable (R6-F1)"
+  );
+
+  // Pump storage: the AdoptVote append for op 2 completes → on_wal_done sets the own vote; the
+  // durable-view write completes → start_view_participate broadcasts StartView + try_commit. With a
+  // 3-cluster quorum of 2, the lone own vote still cannot commit op 2.
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some(own_bit),
+    "after the WAL append completes the own vote is recorded (append-before-ack honoured)"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the own vote alone is below quorum (2) — op 2 is not yet committed"
+  );
+  use crate::Wal as _;
+  assert!(
+    wal.header(OpNumber::with(2)).is_some(),
+    "op 2 was durably appended to the WAL before its own vote was counted (R6-F1)"
+  );
+
+  // A backup PrepareOk for op 2 now reaches quorum (own + backup) → op 2 commits.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(2),
+      OpNumber::new(),
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "op 2 commits once the durable own vote + a backup ack reach quorum"
+  );
+}
+
+#[test]
+fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
+  // codex R6-F1 (REGRESSION): after the new primary records its OWN vote for an adopted peer-learned
+  // op, that op MUST be in its durable WAL — so a crash+recover BEFORE any checkpoint still produces
+  // it. We drive the adoption, pump until the AdoptVote append lands (own vote recorded), then CRASH
+  // (drop all in-memory state) and RECOVER from the durable WAL+Superblock; op 2 must be present.
+  // Fail-before: the vote was memory-only, so the op was absent from the WAL and lost on recover.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::new(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        bytes::Bytes::from_static(b"b"),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  // Pump until the AdoptVote append is durable (the own vote is recorded only then).
+  let own_bit = 1u64 << 1;
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+    if e.inflight.get(&2).map(|i| i.oks) == Some(own_bit) {
+      break;
+    }
+  }
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some(own_bit),
+    "precondition: the new primary recorded its own vote for op 2"
+  );
+
+  // CRASH: discard `e` (all in-memory state) and RECOVER from the durable WAL + Superblock — exactly
+  // what the simulation's crash/restart does. The op the primary voted for must survive.
+  drop(e);
+  let mut recovered = Endpoint::recover(
+    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+  );
+  for _ in 0..16 {
+    recovered.handle_storage(now, &mut wal, &mut sb);
+    if !recovered.status().is_recovering() {
+      break;
+    }
+  }
+  use crate::Wal as _;
+  assert!(
+    wal.header(OpNumber::with(2)).is_some(),
+    "op 2 the new primary voted for is in the durable WAL after crash+recover (R6-F1)"
+  );
+  assert!(
+    recovered.op().get() >= 2,
+    "the recovered replica re-establishes its head through the voted-for op (it was durable)"
+  );
+}
+
+#[test]
+fn backup_adopted_ack_survives_crash_before_checkpoint() {
+  // codex R6-F1 (REGRESSION, backup side): after a backup sends its PrepareOk for an adopted
+  // StartView tail op, that op MUST be in its durable WAL — a crash+recover before any checkpoint
+  // still produces it. Drive the adoption, pump until the PrepareOk is emitted (its AdoptAck append
+  // landed), then CRASH + RECOVER; op 2 must be present. Fail-before: the ack was memory-only.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let sv = StartView::new(
+    View::with(1),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(1),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::new(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        bytes::Bytes::from_static(b"b"),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(sv),
+  );
+  // Pump until the PrepareOk for op 2 is emitted (which is gated on its AdoptAck append landing).
+  let mut acked = false;
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+    while let Some(out) = e.poll_message() {
+      if let Message::PrepareOk(ok) = out.into_msg() {
+        if ok.op() == OpNumber::with(2) {
+          acked = true;
+        }
+      }
+    }
+    if acked {
+      break;
+    }
+  }
+  assert!(acked, "precondition: the backup acked the adopted op 2");
+
+  // CRASH + RECOVER from durable storage.
+  drop(e);
+  let mut recovered = Endpoint::recover(
+    Config::try_new(1, ReplicaId::new(2), 3).unwrap(),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+  );
+  for _ in 0..16 {
+    recovered.handle_storage(now, &mut wal, &mut sb);
+    if !recovered.status().is_recovering() {
+      break;
+    }
+  }
+  use crate::Wal as _;
+  assert!(
+    wal.header(OpNumber::with(2)).is_some(),
+    "op 2 the backup acked is in the durable WAL after crash+recover (R6-F1 append-before-ack)"
+  );
+  assert!(
+    recovered.op().get() >= 2,
+    "the recovered backup re-establishes its head through the acked op (it was durable)"
+  );
+}
+
+#[test]
+fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
+  // codex R7-F2 (CONSENSUS-CRITICAL): a replica that recovered with a faulty INTERIOR slot (here
+  // checkpoint 0, head 3, op 2 read back permanently faulty + still uncommitted) drops op 2 from its
+  // cache, so its log is `{1, 3}` with an interior GAP at op 2. It then becomes the new primary via a
+  // DVC quorum where no donor supplies op 2 (op 2 is uncommitted and unique — no quorum holds it). The
+  // adopted canonical log is `{1, 3}`, op_head 3, commit* 0; op 2 is ABOVE the committed frontier
+  // (commit* == 0) yet held by NO canonical donor, so it is provably UNCOMMITTED (a committed op would
+  // be held by a quorum and thus by some canonical donor → present in the offset-union).
+  //
+  // Fail-before: the seeding loop registered an `inflight` entry for EVERY op in `(commit_min, op_head]`
+  // and `adopt_append`ed each — but `adopt_append` only appends ops PRESENT in `self.log`, so the gap op
+  // 2 was silently skipped, its own vote was never recorded (`inflight[2].oks == 0` forever), and
+  // `try_commit` (strictly in order) wedged at op 2 — no fresh client op above it could ever commit, and
+  // no peer can supply the unique uncommitted op. The fix truncates the head at the first gap above
+  // commit* BEFORE seeding, dropping the uncommitted suffix `{2, 3}`.
+  let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
+  assert_eq!(r.op(), OpNumber::with(3), "recovered head is op 3");
+  assert!(
+    !r.log.contains_key(&2),
+    "precondition: the faulty op 2 is absent from the cache (interior gap)"
+  );
+  assert!(
+    !r.has_repair_hole_for_test(2),
+    "precondition: op 2 is uncommitted, so it is NOT a repair hole (R6-F2)"
+  );
+  while r.poll_message().is_some() {} // discard the recovery-time chatter
+  let now = Instant::ZERO;
+
+  // Drive replica 1 to primary of view 1: an SVC quorum (own + replica 0) enters ViewChange(1); pump
+  // the durable-view write so it sends its own DVC; then a peer DVC reaches the DVC quorum.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
+  r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
+  while r.poll_message().is_some() {}
+  // Replica 2's DVC ALSO lacks op 2 (uncommitted+unique: no quorum holds it), same generation
+  // (log_view 0), head 3, commit 0 → the offset-union still has the interior gap at op 2.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(3),
+      OpNumber::with(0),
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::copy_from_slice(&[1u8]),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(3),
+          ClientId::new(7),
+          RequestNumber::with(3),
+          bytes::Bytes::copy_from_slice(&[3u8]),
+        ),
+      ],
+    )),
+  );
+  assert!(r.is_primary(), "replica 1 became the primary of view 1");
+
+  // The head is truncated to op 1 (just below the uncommitted gap at op 2); the uncommitted suffix
+  // `{2, 3}` is dropped from the cache.
+  assert_eq!(
+    r.op(),
+    OpNumber::with(1),
+    "the head is truncated below the first uncommitted interior gap (op 2)"
+  );
+  assert!(
+    !r.log.contains_key(&2) && !r.log.contains_key(&3),
+    "the uncommitted suffix above the gap is dropped from the cache"
+  );
+  assert!(
+    !r.has_repair_hole_for_test(2) && !r.has_repair_hole_for_test(3),
+    "an uncommitted gap above commit* is truncated, NOT left as a (futile) repair hole"
+  );
+  assert!(
+    !r.inflight.contains_key(&2),
+    "no stuck inflight entry for the gap op (fail-before: inflight[2].oks == 0 forever)"
+  );
+
+  // Pump the StartViewAsPrimary durable-view write so the new primary begins participating.
+  r.handle_storage(now, &mut wal, &mut sb);
+  while r.poll_message().is_some() {}
+  // Land the AdoptVote append for the surviving tail op 1 (its own vote is recorded then).
+  for _ in 0..4 {
+    r.handle_storage(now, &mut wal, &mut sb);
+  }
+
+  // Liveness: a fresh client request is accepted (commit_max == commit_min == 0, repair empty) and —
+  // crucially — COMMITS. It is assigned op 2 (the truncated head + 1), and with a backup ack it reaches
+  // the commit quorum, proving `try_commit` is NOT wedged at the former gap.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"fresh"),
+    )),
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(2),
+    "the fresh client op fills the truncated head's next slot (op 2), not op 4"
+  );
+  for _ in 0..4 {
+    r.handle_storage(now, &mut wal, &mut sb); // land the fresh op's own-vote append
+  }
+  // Both backups ack the surviving tail op 1 AND the fresh op 2 → each reaches the quorum of 2.
+  for ack_op in [1u64, 2] {
+    for backup in [0u8, 2] {
+      r.handle_message(
+        now,
+        &mut wal,
+        &mut sb,
+        Peer::Replica(ReplicaId::new(backup)),
+        Message::PrepareOk(PrepareOk::new(
+          View::with(1),
+          OpNumber::with(ack_op),
+          ReplicaId::new(backup),
+          OpNumber::new(),
+        )),
+      );
+    }
+  }
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(2),
+    "commit progresses through the fresh op — try_commit is not wedged at the former interior gap"
+  );
+}
+
+#[test]
+fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
+  // codex R7-F2 (the COMPLEMENT — a COMMITTED gap must NOT be truncated). Same faulty-interior-slot
+  // replica (checkpoint 0, head 3, op 2 absent), but this time the DVC quorum reports commit* == 3, so
+  // op 2 is BELOW the committed frontier — a real B4 repair hole the offset-union could not carry, NOT
+  // an uncommitted gap. The seeding-site truncation only scans `(commit* .. op]`, so op 2 (≤ commit*)
+  // is OUTSIDE it: the head is NOT truncated, op 2 stays a `repair` hole, the commit is HELD at op 1,
+  // and a peer-supplied (committed-vouching) Prepare fills it and resumes the held commit. This guards
+  // the truncation from over-reaching into a committed op (which would silently drop it).
+  let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
+  while r.poll_message().is_some() {}
+  let now = Instant::ZERO;
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
+  while r.poll_message().is_some() {}
+  // Replica 2's DVC: same generation (log_view 0), head 3, but commit 3 (it committed past op 2). Its
+  // own offset log still lacks op 2, so the union has the gap at op 2 — but commit* now == 3.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(3),
+      OpNumber::with(3),
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::copy_from_slice(&[1u8]),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(3),
+          ClientId::new(7),
+          RequestNumber::with(3),
+          bytes::Bytes::copy_from_slice(&[3u8]),
+        ),
+      ],
+    )),
+  );
+  assert!(r.is_primary(), "replica 1 became the primary of view 1");
+
+  // The head is NOT truncated (op 2 is committed, ≤ commit* == 3) — it stays at op 3 — and op 2 is a
+  // repair hole with the commit HELD at op 1 (the apply loop never skips the committed hole).
+  assert_eq!(
+    r.op(),
+    OpNumber::with(3),
+    "a committed interior gap does NOT truncate the head (op 2 ≤ commit*)"
+  );
+  assert!(
+    r.has_repair_hole_for_test(2),
+    "the committed gap is a repair hole (on-demand B4 repair), not silently dropped"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(1),
+    "the commit is HELD below the committed hole until a peer supplies op 2"
+  );
+
+  // Pump the StartViewAsPrimary durable-view write, then a peer answers our RequestPrepare with op 2's
+  // committed-vouching Prepare (commit 3 >= op 2) → fill the hole and resume the held commit to op 3.
+  // The fill is a durability barrier (R13-F2): complete the repaired append before the hole clears.
+  r.handle_storage(now, &mut wal, &mut sb);
+  while r.poll_message().is_some() {}
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    repair_prepare(0, 2, 3),
+  );
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → clear hole + resume
+  assert!(
+    !r.has_repair_hole_for_test(2),
+    "the committed-vouching Prepare fills the hole"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(3),
+    "the held commit resumes once the committed gap is repaired (op 2 then 3 apply in order)"
+  );
+}
+
+#[test]
+fn new_primary_reconstructs_sessions_so_retries_dedup() {
+  // replica 1 becomes primary of view 1, adopting client 7's requests 1 (committed) and 2.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  ); // primary_idle → SVC
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b"),
+        ),
+      ],
+    )),
+  );
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(2));
+  while e.poll_message().is_some() {}
+  // The new primary deferred participation until its view is durable; pump storage so the
+  // durable-view write completes and it may serve requests (durable-view-before-participate).
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+
+  // A retry of request 1 (already adopted+committed) must NOT create a new op (dedup, no re-exec).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"a"),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "retry of an adopted request must be deduplicated, not re-executed"
+  );
+
+  // A genuinely new request (3) IS accepted → op advances to 3.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(3),
+      bytes::Bytes::from_static(b"c"),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(3),
+    "a new request after the adopted ones is accepted"
+  );
+}
+
+#[test]
+fn canonical_selection_prefers_highest_log_view_over_longer_log() {
+  // r0 has the newest generation (log_view 2) but a SHORTER log; r1/r2 are longer but stale.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 2, 3, 1));
+  e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 5, 1));
+  e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 5, 1));
+  let (log, op_head, commit_star) = e.select_canonical_log();
+  assert_eq!(op_head, 3, "newest log_view wins, not the longer stale log");
+  assert_eq!(log.len(), 3);
+  assert_eq!(commit_star, 1);
+}
+
+#[test]
+fn nack_prepare_truncates_provably_uncommitted_tail() {
+  // N=5 → quorum_nack_prepare = 3. Head op 5 held only by r0; r1,r2,r3 stop at op 2.
+  // ops 3..=5 each get 3 nacks (r1,r2,r3) ≥ 3 → truncated to op 2.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 2));
+  e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 2, 2));
+  e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 2, 2));
+  e.dvc_from_mut_for_test().insert(3, dvc(3, 1, 2, 2));
+  let (log, op_head, _) = e.select_canonical_log();
+  assert_eq!(op_head, 2, "ops 3..=5 had a nack quorum → truncated");
+  assert_eq!(log.len(), 2);
+}
+
+#[test]
+fn committed_ops_are_never_truncated() {
+  // commit* = 4: op 5 is the only uncommitted op, nacked by 3 → truncated; 1..=4 survive.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 4));
+  e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 4, 4));
+  e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 4, 4));
+  e.dvc_from_mut_for_test().insert(3, dvc(3, 1, 4, 4));
+  let (log, op_head, commit_star) = e.select_canonical_log();
+  assert_eq!(commit_star, 4);
+  assert_eq!(
+    op_head, 4,
+    "uncommitted op 5 truncated, committed 1..=4 kept"
+  );
+  assert_eq!(log.len(), 4);
+}
+
+#[test]
+fn no_truncation_at_minimal_quorum() {
+  // Documents the contiguous-model property: with exactly quorum_view_change=3 DVCs,
+  // the head-holder (r0) prevents a nack quorum (≤ 2 nacks < 3) → adopt whole.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 2));
+  e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 2, 2));
+  e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 2, 2));
+  let (_, op_head, _) = e.select_canonical_log();
+  assert_eq!(
+    op_head, 5,
+    "no nack quorum possible at minimal quorum → no truncation"
+  );
+}
+
+#[test]
+fn stalled_view_change_escalates_to_the_next_view() {
+  // replica 3 of 5 (a backup at views 0,1,2). Drive it into ViewChange(1); the new primary(1)
+  // never sends a StartView, so view_change_status escalates it toward view 2.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(3), 5).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let t = Instant::ZERO + core::time::Duration::from_millis(300);
+  e.handle_timeout(t, &mut wal, &mut sb); // primary_idle → propose view 1 (own bit, 1/3)
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  ); // 2/3
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(1))),
+  ); // 3/3 → ViewChange(1)
+  assert_eq!(e.view(), View::with(1));
+  assert_eq!(e.status(), Status::ViewChange);
+
+  // Stuck: fire view_change_status (~500ms after transition) → escalate, proposing view 2.
+  let t2 = t + core::time::Duration::from_millis(600);
+  e.handle_timeout(t2, &mut wal, &mut sb);
+  // Two peers also propose view 2 → quorum → transition to view 2.
+  e.handle_message(
+    t2,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(2), ReplicaId::new(0))),
+  );
+  e.handle_message(
+    t2,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartViewChange(StartViewChange::new(View::with(2), ReplicaId::new(1))),
+  );
+  assert_eq!(e.view(), View::with(2), "escalated to the next view");
+  assert_eq!(e.status(), Status::ViewChange);
+}
+
+#[test]
+fn backup_adopts_start_view() {
+  // replica 2 of 3 receives a StartView for view 1 from primary(1)=replica 1.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let sv = StartView::new(
+    View::with(1),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(1),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::new(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        bytes::Bytes::from_static(b"b"),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(sv),
+  );
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::with(1));
+  assert_eq!(e.log_view(), View::with(1));
+  assert_eq!(e.op(), OpNumber::with(2));
+  assert_eq!(e.commit(), OpNumber::with(1)); // op 1 applied
+  // codex R6-F1: the PrepareOk for the held uncommitted op (op 2) is deferred until BOTH the new
+  // view is durable AND op 2 is durably (re-)appended to the WAL (append-before-ack). Two sequential
+  // storage steps: (1) the durable-view write completes → `start_view_acks` submits the WAL append;
+  // (2) the append completes → `on_wal_done` sends the PrepareOk. Pump until it appears (bounded).
+  let mut acked_op2 = false;
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+    while let Some(out) = e.poll_message() {
+      if let Message::PrepareOk(ok) = out.into_msg() {
+        if ok.op() == OpNumber::with(2) {
+          acked_op2 = true;
+        }
+      }
+    }
+    if acked_op2 {
+      break;
+    }
+  }
+  assert!(
+    acked_op2,
+    "backup must ack its held uncommitted ops in the new view"
+  );
+  // Append-before-ack: op 2 is in the durable WAL by the time it is acked (so a crash+recover after
+  // the ack still produces it). The committed op 1 below the ack range is also durably present.
+  use crate::Wal as _;
+  assert!(
+    wal.header(OpNumber::with(2)).is_some(),
+    "the acked op 2 was durably (re-)appended to the WAL before the PrepareOk (R6-F1)"
+  );
+}
+
+/// Audit D3: NO old-generation in-flight state survives a view transition. Each of the THREE
+/// transition entries — `enter_view_change` (self-driven), `catch_up_to_view` (higher-view catch-up),
+/// and `adopt_canonical_head` (adopt an authoritative head) — must tear down the SAME union of
+/// old-view sub-state via the single `reset_for_view_transition` chokepoint. This seeds the FULL set
+/// (quorum collection, in-flight appends, peer-checkpoint reports, in-flight checkpoint, the
+/// state-sync `sync`+`pending_install` pair + its solicit timer, and the forfeit sub-state) before
+/// each transition and asserts the chokepoint cleared it — freezing the invariant the helper
+/// centralizes so a future field added to one path but not the others is caught here.
+#[test]
+fn no_old_generation_state_survives_a_view_transition() {
+  let mut sb = TestSb::default();
+  let now = Instant::ZERO;
+
+  // (1) enter_view_change (the self-driven entry, reached here via the recovery wrapper that shares
+  // the identical body). A backup at view 0 → view 1: catching_up must end FALSE.
+  let mut e = backup();
+  e.seed_old_generation_state_for_test();
+  e.enter_view_change_from_recovery(now, &mut sb, View::with(1));
+  assert_eq!(e.status(), Status::ViewChange);
+  assert_eq!(e.view(), View::with(1));
+  assert!(
+    e.old_generation_state_cleared_for_test(),
+    "enter_view_change must clear the entire old-generation in-flight set"
+  );
+  assert!(
+    !e.catching_up(),
+    "a self-driven view change ends catching_up"
+  );
+  while e.poll_message().is_some() {}
+
+  // (2) catch_up_to_view (the higher-view catch-up entry). A backup at view 0 → view 1: catching_up
+  // must end TRUE (the one field the shared reset sets false and this entry re-sets after).
+  let mut e = backup();
+  e.seed_old_generation_state_for_test();
+  e.catch_up_to_view(now, View::with(1));
+  assert_eq!(e.status(), Status::ViewChange);
+  assert_eq!(e.view(), View::with(1));
+  assert!(
+    e.old_generation_state_cleared_for_test(),
+    "catch_up_to_view must clear the entire old-generation in-flight set"
+  );
+  assert!(
+    e.catching_up(),
+    "catch_up_to_view re-sets the catch-up flag"
+  );
+  assert!(
+    !e.pending_sb_for_test(),
+    "catch-up issues no durable-view write"
+  );
+  while e.poll_message().is_some() {}
+
+  // (3) adopt_canonical_head (adopt an authoritative StartView head → Normal). op 1, commit 0 so the
+  // adoption neither rewinds nor needs to advance the commit. catching_up must end FALSE.
+  let mut e = backup();
+  e.seed_old_generation_state_for_test();
+  e.adopt_canonical_head(
+    now,
+    &mut sb,
+    View::with(1),
+    OpNumber::with(1),
+    OpNumber::with(0),
+    &[PreparedEntry::new(
+      OpNumber::with(1),
+      ClientId::new(7),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"a"),
+    )],
+  );
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::with(1));
+  assert!(
+    e.old_generation_state_cleared_for_test(),
+    "adopt_canonical_head must clear the entire old-generation in-flight set"
+  );
+  assert!(!e.catching_up(), "adoption ends catching_up");
+}
+
+#[test]
+fn higher_view_prepare_triggers_get_view_catch_up() {
+  // replica 0 at view 0 receives a Prepare for view 1 → catch up, sending GetView to primary(1)=1.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Prepare(Prepare::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(0),
+      OpNumber::with(0),
+      ClientId::new(7),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"x"),
+    )),
+  );
+  assert_eq!(e.view(), View::with(1));
+  assert_eq!(e.status(), Status::ViewChange);
+  let mut saw_get_view = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::GetView(g) = out.into_msg() {
+      assert_eq!(g.view(), View::with(1));
+      saw_get_view = true;
+    }
+  }
+  assert!(
+    saw_get_view,
+    "catch-up sends GetView (not a StartViewChange)"
+  );
+
+  // The StartView reply ends the catch-up: replica 0 becomes Normal in view 1.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      std::vec![PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"x"),
+      )],
+    )),
+  );
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::with(1));
+}
+
+#[test]
+fn normal_primary_answers_get_view_with_start_view() {
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::GetView(GetView::new(View::with(0), ReplicaId::new(1), 5)),
+  );
+  let mut saw_sv = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::StartView(sv) = out.into_msg() {
+      assert_eq!(sv.view(), View::with(0));
+      assert_eq!(sv.replica(), ReplicaId::new(0));
+      saw_sv = true;
+    }
+  }
+  assert!(saw_sv, "a Normal primary answers GetView with a StartView");
+}
+
+#[test]
+fn lone_high_svc_is_ignored_not_driven() {
+  // A single StartViewChange for a far-future view must NOT inflate our view (C1 guard):
+  // an SVC is not evidence a primary exists at that view.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 5).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(100), ReplicaId::new(0))),
+  );
+  assert_eq!(
+    e.view(),
+    View::new(),
+    "a lone high SVC must not inflate our view"
+  );
+  assert_eq!(e.status(), Status::Normal);
+}
+
+#[test]
+#[should_panic(expected = "must not rewind below our committed op")]
+fn on_start_view_rewind_below_commit_panics() {
+  // Adopt a StartView for view 1 with op 2 (commit 2), then a StartView for view 2 with op 1
+  // (< our committed op 2). The second must fail-stop, not silently rewind.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)), // primary of view 1
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::with(2),
+      ReplicaId::new(1),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a")
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b")
+        ),
+      ],
+    )),
+  );
+  assert_eq!(e.commit(), OpNumber::with(2));
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)), // primary of view 2
+    Message::StartView(StartView::new(
+      View::with(2),
+      OpNumber::with(1),
+      OpNumber::with(1),
+      ReplicaId::new(2),
+      std::vec![PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a")
+      )],
+    )),
+  );
+}
+
+#[test]
+fn adopting_a_canonical_head_truncates_the_wal_above_it() {
+  // REGRESSION (vopr seed 253 / 299), the source-side half of the committed-divergence fix. When a replica
+  // adopts a new view's canonical head, any WAL slot ABOVE that head is an UNCOMMITTED earlier-view proposal
+  // (the canonical head is the new view's authoritative head — nothing above it is committed). Leaving such a
+  // slot in the WAL lets a later `recover` re-load it and apply its stale body for a committed op the new view
+  // assigns at that number. So adoption must physically TRUNCATE the WAL above the adopted head — dropping only
+  // uncommitted ops (no durability dip). Here replica 2 of 3 holds a stale tail op 3 in its WAL, then adopts a
+  // StartView for view 1 whose head is op 2; the WAL must no longer contain op 3.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Seed the WAL with a stale uncommitted tail op 3 (as if appended in an earlier generation).
+  let stale = Header::new(
+    OpNumber::with(3),
+    View::new(),
+    ClientId::new(9),
+    RequestNumber::with(99),
+    &[0xAA],
+  );
+  wal.submit_append(
+    OpId::new(999),
+    OpNumber::with(3),
+    stale,
+    Bytes::copy_from_slice(&[0xAA]),
+  );
+  while wal.poll().is_some() {} // discard the seed completion
+  assert_eq!(
+    wal.op_head(),
+    OpNumber::with(3),
+    "precondition: the WAL holds the stale tail op 3"
+  );
+
+  // Adopt a StartView for view 1 (from primary(1) = replica 1) whose canonical head is op 2.
+  let sv = StartView::new(
+    View::with(1),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(1),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::new(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        Bytes::from_static(b"b"),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(sv),
+  );
+  assert_eq!(e.op(), OpNumber::with(2), "adopted the canonical head op 2");
+  // The crux: the stale slot 3 was TRUNCATED from the WAL (FAIL-BEFORE: it lingered, to be re-loaded by a
+  // later recover and applied as a stale committed body).
+  assert!(
+    !wal.entries.contains_key(&3),
+    "FAIL-BEFORE: the uncommitted tail op 3 above the adopted head must be truncated from the WAL"
+  );
+  assert!(
+    wal.op_head().get() <= 2,
+    "the WAL head no longer sits above the adopted canonical head"
+  );
+}
+
+#[test]
+fn dvc_is_deferred_until_view_is_durable() {
+  use crate::StartViewChange;
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let later = Instant::ZERO + core::time::Duration::from_millis(300);
+  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  assert_eq!(e.view(), View::with(1));
+  let mut saw_dvc_before = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.into_msg(), Message::DoViewChange(_)) {
+      saw_dvc_before = true;
+    }
+  }
+  assert!(
+    !saw_dvc_before,
+    "DoViewChange must NOT be sent before the view is durable"
+  );
+  assert_eq!(
+    sb.state().view(),
+    View::with(1),
+    "new view submitted to the superblock"
+  );
+  e.handle_storage(later, &mut wal, &mut sb);
+  let mut saw_dvc_after = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::DoViewChange(d) = out.into_msg() {
+      assert_eq!(d.view(), View::with(1));
+      saw_dvc_after = true;
+    }
+  }
+  assert!(
+    saw_dvc_after,
+    "DoViewChange is sent once the view is durable"
+  );
+}
+
+#[test]
+fn dvc_retransmit_waits_for_the_durable_view_write() {
+  // codex R16-F1 (REGRESSION, durable-view-before-participate, CONSENSUS-CRITICAL). A ViewChange
+  // replica arms `dvc_message` (the DVC retransmit) AND submits the SendDoViewChange durable-view
+  // write in `enter_view_change`. The INITIAL DVC is deferred to `on_sb_done` (see
+  // `dvc_is_deferred_until_view_is_durable`), BUT if the async superblock write is slower than
+  // `VC_MESSAGE_RETRANSMIT` the `dvc_message` retransmit would (pre-fix) fire FIRST and CAST a DVC
+  // vote — which the new primary counts toward forming the view — BEFORE this replica has PERSISTED
+  // the view. A crash before the write lands recovers the OLD view after this replica helped form a
+  // quorum for the new one: the exact durable-view-before-participate hazard, in the retransmit path.
+  // FAIL-BEFORE: a DoViewChange is emitted at the `dvc_message` deadline while `pending_sb` is set.
+  // PASS-AFTER: silent across many retransmit cadences while the write is inflight; the DVC fires once
+  // the view is durable (`on_sb_done`), and retransmits resume thereafter.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut now = Instant::ZERO;
+  // Drive replica 0 into ViewChange(view 1) as a DRIVER (primary(1) = replica 1, a peer): its own
+  // idle-SVC + replica 2's SVC meet the SVC quorum (2), so `enter_view_change` fires.
+  e.handle_timeout(now, &mut wal, &mut sb); // bootstrap primary_idle
+  now = now + core::time::Duration::from_millis(300);
+  e.handle_timeout(now, &mut wal, &mut sb); // primary_idle due → propose view 1 (own SVC)
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  assert_eq!(e.view(), View::with(1));
+  assert!(
+    e.pending_sb_for_test(),
+    "the SendDoViewChange durable-view write is in flight"
+  );
+  assert!(
+    sb.has_inflight(),
+    "the superblock view write is inflight (not yet durable)"
+  );
+  while e.poll_message().is_some() {} // drain the StartViewChange(s) emitted by entering ViewChange
+
+  // Drive the `dvc_message` retransmit cadence (100ms) MANY times WITHOUT flushing the superblock —
+  // the view stays non-durable across every retransmit deadline.
+  for _ in 0..6 {
+    now = now + VC_MESSAGE_RETRANSMIT;
+    e.handle_timeout(now, &mut wal, &mut sb);
+    assert!(
+      e.pending_sb_for_test(),
+      "the view write is still inflight across the retransmit cadence"
+    );
+    while let Some(out) = e.poll_message() {
+      assert!(
+        !matches!(out.into_msg(), Message::DoViewChange(_)),
+        "a ViewChange replica must NOT retransmit its DoViewChange vote before the view is durable"
+      );
+    }
+  }
+
+  // Now make the view durable: the deferred initial DVC fires from `on_sb_done`.
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  let mut saw_dvc_after = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::DoViewChange(d) = out.into_msg() {
+      assert_eq!(d.view(), View::with(1));
+      assert_eq!(d.replica(), ReplicaId::new(0));
+      saw_dvc_after = true;
+    }
+  }
+  assert!(
+    saw_dvc_after,
+    "the DoViewChange fires once the view is durable (on_sb_done)"
+  );
+
+  // And the retransmit cadence RESUMES now that the view is durable.
+  now = now + VC_MESSAGE_RETRANSMIT;
+  e.handle_timeout(now, &mut wal, &mut sb);
+  let mut saw_dvc_retransmit = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.into_msg(), Message::DoViewChange(_)) {
+      saw_dvc_retransmit = true;
+    }
+  }
+  assert!(
+    saw_dvc_retransmit,
+    "the DoViewChange retransmit resumes once the view is durable"
+  );
+}
+
+#[test]
+fn superseded_view_write_is_ignored() {
+  use crate::StartViewChange;
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(3), 5).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let t = Instant::ZERO + core::time::Duration::from_millis(300);
+  e.handle_timeout(t, &mut wal, &mut sb);
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(1))),
+  );
+  assert_eq!(e.view(), View::with(1));
+  while e.poll_message().is_some() {}
+  let t2 = t + core::time::Duration::from_millis(600);
+  e.handle_timeout(t2, &mut wal, &mut sb);
+  e.handle_message(
+    t2,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(2), ReplicaId::new(0))),
+  );
+  e.handle_message(
+    t2,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartViewChange(StartViewChange::new(View::with(2), ReplicaId::new(1))),
+  );
+  assert_eq!(e.view(), View::with(2));
+  while e.poll_message().is_some() {}
+  e.handle_storage(t2, &mut wal, &mut sb);
+  let mut dvc_views = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::DoViewChange(d) = out.into_msg() {
+      dvc_views.push(d.view().get());
+    }
+  }
+  assert!(
+    !dvc_views.contains(&1),
+    "superseded view-1 DoViewChange must never be sent"
+  );
+  assert!(
+    dvc_views.contains(&2),
+    "live view-2 DoViewChange is sent once view 2 is durable"
+  );
+}
+
+#[test]
+fn backup_does_not_prepare_ok_before_start_view_is_durable() {
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let sv = StartView::new(
+    View::with(1),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(1),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a")
+      ),
+      PreparedEntry::new(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        bytes::Bytes::from_static(b"b")
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(sv),
+  );
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::with(1));
+  assert!(
+    e.poll_message().is_none(),
+    "backup must NOT PrepareOk before the view is durable"
+  );
+  assert_eq!(sb.state().view(), View::with(1));
+  // codex R6-F1: the re-ack now ALSO waits for op 2's WAL (re-)append (append-before-ack), so it
+  // arrives after two sequential storage steps (durable-view → submit append; append → PrepareOk).
+  let mut acked_op2 = false;
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+    while let Some(out) = e.poll_message() {
+      if let Message::PrepareOk(ok) = out.into_msg() {
+        if ok.op() == OpNumber::with(2) {
+          acked_op2 = true;
+        }
+      }
+    }
+    if acked_op2 {
+      break;
+    }
+  }
+  assert!(
+    acked_op2,
+    "held uncommitted ops re-acked once the new view AND their WAL append are durable"
+  );
+  use crate::Wal as _;
+  assert!(
+    wal.header(OpNumber::with(2)).is_some(),
+    "op 2 is durable in the WAL before its PrepareOk (R6-F1 append-before-ack)"
+  );
+}
+
+#[test]
+fn new_prepare_not_acked_while_view_write_pending() {
+  // Durable-view completeness: after adopting a StartView the backup is Normal in the new view but
+  // the view is not yet durable (pending_sb armed). A new prepare arriving in this window must NOT
+  // be acked until the view is durable; the primary retransmits it afterward.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Adopt a StartView for view 1 with op 1 fully committed (no held re-acks to muddy the assertion).
+  let sv = StartView::new(
+    View::with(1),
+    OpNumber::with(1),
+    OpNumber::with(1),
+    ReplicaId::new(1),
+    std::vec![PreparedEntry::new(
+      OpNumber::with(1),
+      ClientId::new(7),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"a"),
+    )],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(sv),
+  );
+  assert_eq!(e.status(), Status::Normal);
+  let prep2 = || {
+    Message::Prepare(Prepare::new(
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      OpNumber::with(0),
+      ClientId::new(7),
+      RequestNumber::with(2),
+      bytes::Bytes::from_static(b"b"),
+    ))
+  };
+  // A new prepare (op 2) arrives BEFORE the durable-view write is pumped (pending_sb still armed).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    prep2(),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // drains the StartView write; would pump op 2 if accepted
+  let mut acked_op2 = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.into_msg() {
+      if ok.op() == OpNumber::with(2) {
+        acked_op2 = true;
+      }
+    }
+  }
+  assert!(
+    !acked_op2,
+    "a new prepare must NOT be acked while the view-change write is pending"
+  );
+  // Re-deliver (as the primary retransmits) now that the view is durable → it is acked.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    prep2(),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // append-before-ack: pump the WAL append
+  let mut acked_after = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.into_msg() {
+      if ok.op() == OpNumber::with(2) {
+        acked_after = true;
+      }
+    }
+  }
+  assert!(
+    acked_after,
+    "once the view is durable, the retransmitted prepare is acked"
+  );
+}
+
+#[test]
+fn new_primary_does_not_answer_get_view_while_its_view_write_is_pending() {
+  // codex R8-F1 (REGRESSION, durable-view-before-participate, CONSENSUS-CRITICAL). A replica that
+  // just became primary of a new view but has not yet PERSISTED that view (the StartView broadcast
+  // is deferred to `on_sb_done`) must NOT answer a delayed/duplicate `GetView` with a `StartView`
+  // for the not-yet-durable view: on crash it could regress out of a view it had already vouched
+  // for, double-participating across views. FAIL-BEFORE: a `StartView` appears in the pending_sb
+  // window. PASS-AFTER: silent in the window; the deferred `StartView` fires once the view is
+  // durable, and a later `GetView` is then answered.
+  let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  let now = Instant::ZERO;
+  // A peer solicits the canonical head for view 1 — delivered WHILE the view write is pending.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::GetView(GetView::new(View::with(1), ReplicaId::new(2), 9)),
+  );
+  let mut sv_in_window = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.msg_ref(), Message::StartView(_)) {
+      sv_in_window = true;
+    }
+  }
+  assert!(
+    !sv_in_window,
+    "a primary must NOT hand out a StartView for a view that is not yet durable"
+  );
+  // Make the view durable: the deferred StartView broadcast fires now (start_view_participate).
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    !e.pending_sb_for_test(),
+    "the view is now durable (pending_sb cleared)"
+  );
+  let mut sv_after = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::StartView(s) = out.msg_ref() {
+      assert_eq!(s.op(), OpNumber::with(2));
+      sv_after = true;
+    }
+  }
+  assert!(
+    sv_after,
+    "once the view is durable the deferred StartView broadcast fires"
+  );
+  // And a fresh GetView is now answered (the gate has lifted).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::GetView(GetView::new(View::with(1), ReplicaId::new(2), 10)),
+  );
+  let mut answered = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.msg_ref(), Message::StartView(_)) {
+      answered = true;
+    }
+  }
+  assert!(
+    answered,
+    "after the view is durable, a GetView is answered with a StartView"
+  );
+}
+
+#[test]
+fn new_primary_does_not_answer_recovery_while_its_view_write_is_pending() {
+  // codex R8-F1 (REGRESSION): same window, the Recovery-solicitation path. A primary in the
+  // pending_sb window must NOT answer a peer's `Recovery` with its canonical `(op, commit, log)` in
+  // the not-yet-durable view. FAIL-BEFORE: a `RecoveryResponse` appears in the window. PASS-AFTER:
+  // silent in the window; once the view is durable a Recovery is answered normally.
+  let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Recovery(Recovery::new(ReplicaId::new(2), 4242)),
+  );
+  let mut rr_in_window = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.msg_ref(), Message::RecoveryResponse(_)) {
+      rr_in_window = true;
+    }
+  }
+  assert!(
+    !rr_in_window,
+    "a primary must NOT answer a Recovery in a view that is not yet durable"
+  );
+  // Make the view durable, then a fresh Recovery IS answered (with the canonical head).
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {} // discard the deferred StartView broadcast
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Recovery(Recovery::new(ReplicaId::new(2), 4243)),
+  );
+  let mut answered = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::RecoveryResponse(rr) = out.msg_ref() {
+      assert_eq!(rr.op(), OpNumber::with(2), "the canonical head op");
+      assert_eq!(rr.nonce(), 4243, "the echoed nonce");
+      answered = true;
+    }
+  }
+  assert!(
+    answered,
+    "after the view is durable, a Recovery is answered with a RecoveryResponse"
+  );
+}
+
+#[test]
+fn new_primary_does_not_heartbeat_or_retransmit_while_its_view_write_is_pending() {
+  // codex R8-F1 (REGRESSION): the timer path. A primary in the pending_sb window must NOT emit a
+  // `Commit` heartbeat nor retransmit `Prepare`s — those assert its authority in a view that is not
+  // yet durable. FAIL-BEFORE: a `Commit`/`Prepare` appears when `primary_timeouts` fires in the
+  // window. PASS-AFTER: silent in the window; heartbeats resume once the view is durable.
+  let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  // Tick the primary TWICE while the view write is still pending: the first tick would BOOTSTRAP the
+  // commit/prepare timers (the deferred `start_view_participate` has not armed them yet), the second
+  // — well past those deadlines — would FIRE the heartbeat/retransmit if the gate were absent. Both
+  // ticks happen entirely inside the pending_sb window (we never flush the superblock between them),
+  // exactly the multi-tick window a real driver leaves open. Nothing must be emitted in either.
+  let later = Instant::ZERO + core::time::Duration::from_secs(5);
+  e.handle_timeout(later, &mut wal, &mut sb);
+  let later_fire = later + core::time::Duration::from_secs(1); // >> COMMIT_HEARTBEAT/PREPARE_RETRANSMIT
+  e.handle_timeout(later_fire, &mut wal, &mut sb);
+  let mut emitted_in_window = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(
+      out.msg_ref(),
+      Message::Commit(_) | Message::Prepare(_) | Message::StartView(_)
+    ) {
+      emitted_in_window = true;
+    }
+  }
+  assert!(
+    !emitted_in_window,
+    "a primary must not heartbeat/retransmit/StartView in a not-yet-durable view"
+  );
+  assert!(
+    e.pending_sb_for_test(),
+    "the ticks must not have force-completed the view write"
+  );
+  // Once the view is durable, the heartbeat resumes (start_view_participate arms the timers).
+  sb.flush();
+  e.handle_storage(later_fire, &mut wal, &mut sb);
+  while e.poll_message().is_some() {} // discard the deferred StartView
+  let later2 = later_fire + core::time::Duration::from_secs(5);
+  e.handle_timeout(later2, &mut wal, &mut sb);
+  let mut heartbeat_after = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.msg_ref(), Message::Commit(_)) {
+      heartbeat_after = true;
+    }
+  }
+  assert!(
+    heartbeat_after,
+    "once the view is durable the primary heartbeats normally"
+  );
+}
+
+#[test]
+fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
+  // codex R17-F1 (REGRESSION, durable-view-before-participate, CONSENSUS-CRITICAL). A replica in its
+  // `pending_sb` window — here a NEW PRIMARY that just adopted view 1 but has NOT yet persisted it (the
+  // StartView broadcast is deferred to `on_sb_done`) — is `Normal` but its view is not yet recoverable.
+  // The repair-server path `on_request_prepare` previously gated only on `status.is_normal()` and then
+  // served `Prepare::new(self.view, ..)` for a held committed op, ADVERTISING the not-yet-durable view:
+  // on crash it could regress out of a view it had already vouched for to a soliciting peer (the same
+  // cross-view hazard the primary `Prepare`/`Commit`/`StartView` paths gate on). FAIL-BEFORE: a
+  // `Prepare` appears in the window. PASS-AFTER: silent in the window; once the view is durable the same
+  // `RequestPrepare` IS answered with a `Prepare` carrying the now-durable view.
+  let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  let now = Instant::ZERO;
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the new primary committed op 1 (so op 1 is a committed op it may serve as a repair source)"
+  );
+  // A peer solicits the committed op 1 (op <= commit_min) — delivered WHILE the view write is pending.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestPrepare(crate::RequestPrepare::new(
+      View::with(1),
+      OpNumber::with(1),
+      ReplicaId::new(2),
+    )),
+  );
+  let mut prepare_in_window = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.msg_ref(), Message::Prepare(_)) {
+      prepare_in_window = true;
+    }
+  }
+  assert!(
+    !prepare_in_window,
+    "a replica must NOT serve a repair Prepare (which advertises self.view) in a not-yet-durable view"
+  );
+  assert!(
+    e.pending_sb_for_test(),
+    "handling the RequestPrepare must not have force-completed the view write"
+  );
+  // Make the view durable (this fires the deferred StartView broadcast — discard it), then the SAME
+  // RequestPrepare IS answered with a Prepare carrying the now-durable view 1.
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    !e.pending_sb_for_test(),
+    "the view is now durable (pending_sb cleared)"
+  );
+  while e.poll_message().is_some() {} // discard the deferred StartView broadcast
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestPrepare(crate::RequestPrepare::new(
+      View::with(1),
+      OpNumber::with(1),
+      ReplicaId::new(2),
+    )),
+  );
+  let mut served = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::Prepare(p) = out.msg_ref() {
+      assert_eq!(
+        p.op(),
+        OpNumber::with(1),
+        "serves the requested committed op"
+      );
+      assert_eq!(
+        p.view(),
+        View::with(1),
+        "the served Prepare advertises the now-durable view"
+      );
+      served = true;
+    }
+  }
+  assert!(
+    served,
+    "after the view is durable, the RequestPrepare is answered with a Prepare"
+  );
+}
+
+#[test]
+fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
+  // codex R18-F1 (REGRESSION, durable-view-before-participate, CONSENSUS-CRITICAL). A replica in its
+  // `pending_sb` window — here a NEW PRIMARY that just adopted view 1 but has NOT yet persisted it (the
+  // StartView broadcast is deferred to `on_sb_done`) — is `Normal` but its view is not yet recoverable.
+  // The state-sync serve path `serve_sync_checkpoint` previously gated only on `status.is_normal()` and
+  // then shipped `SyncCheckpoint::new(self.view, ..)` for a held durable checkpoint, ADVERTISING the
+  // not-yet-durable view: on crash it could regress out of a view it had already vouched for to a
+  // soliciting peer (the same cross-view hazard the primary `Prepare`/`Commit`/`StartView` and the
+  // R17-F1 `on_request_prepare` paths gate on). FAIL-BEFORE: a `SyncCheckpoint` appears in the window.
+  // PASS-AFTER: silent in the window; once the view is durable the same `RequestSync` IS answered with
+  // a `SyncCheckpoint` carrying the now-durable view.
+  let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  let now = Instant::ZERO;
+  // Give this primed primary a DURABLE checkpoint to serve: a `checkpoint_op` of 1 (a committed op it
+  // holds — its `commit_min` is 1) and a readable snapshot envelope in the StepSb at that op. The
+  // serve's F3 ship-time gate requires `cr.op() == self.checkpoint_op`, so the injected op must match;
+  // the R23-F1 integrity gate additionally requires the read bytes to hash to the DURABLE checkpoint id,
+  // so the durable ROOT must NAME this snapshot — set `sb.state` to a root at checkpoint_op 1 whose
+  // `checkpoint_id == checkpoint_id(snapshot)` (a genuinely durable checkpoint, not a half-faked one).
+  // The view stays 0 (the prior, still-durable view): the view-1 write is the one held inflight, which
+  // is exactly the not-yet-durable-view window this test exercises.
+  let snapshot = Bytes::from_static(b"durable-checkpoint-snapshot");
+  e.set_own_checkpoint_for_test(1);
+  sb.checkpoint = Some((OpNumber::with(1), snapshot.clone()));
+  sb.state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(1),
+    OpNumber::with(1),
+    crate::checkpoint_id(&snapshot),
+    std::vec::Vec::new(),
+  )
+  .expect("durable root: commit == checkpoint_op, log_view <= view");
+  // A lagging peer solicits the checkpoint (its own `checkpoint_op` is 0, strictly below ours) — the
+  // RequestSync is delivered WHILE the view write is pending. `on_request_sync` submits the checkpoint
+  // read (it does not itself gate on `pending_sb`); the read completes into `serve_sync_checkpoint`,
+  // which is the load-bearing SHIP-time gate.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSync(crate::RequestSync::new(
+      View::with(1),
+      OpNumber::with(0),
+      ReplicaId::new(2),
+      0xD18F,
+      false, // ordinary state-sync (not a recovery peer-fetch)
+    )),
+  );
+  // Pump storage so the checkpoint read completes (StepSb serves reads eagerly into `ready`) and
+  // `serve_sync_checkpoint` runs — but WITHOUT flushing the inflight view write, so the window stays
+  // open. The serve must DROP (no SyncCheckpoint) because our view is not yet durable.
+  e.handle_storage(now, &mut wal, &mut sb);
+  let mut sync_checkpoint_in_window = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.msg_ref(), Message::SyncCheckpoint(_)) {
+      sync_checkpoint_in_window = true;
+    }
+  }
+  assert!(
+    !sync_checkpoint_in_window,
+    "a replica must NOT serve a SyncCheckpoint (which advertises self.view) in a not-yet-durable view"
+  );
+  assert!(
+    e.pending_sb_for_test(),
+    "handling the RequestSync / read completion must not have force-completed the view write"
+  );
+  // Make the view durable (this fires the deferred StartView broadcast — discard it), then the SAME
+  // RequestSync IS answered with a SyncCheckpoint carrying the now-durable view 1.
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    !e.pending_sb_for_test(),
+    "the view is now durable (pending_sb cleared)"
+  );
+  // The flushed view-1 root was SUBMITTED by the shared harness before the checkpoint was injected
+  // (when the durable root was `initial()`), so the StepSb published it with checkpoint_id 0 — a harness
+  // artifact: the real `submit_durable_view` PRESERVES the durable checkpoint id (see its doc-comment).
+  // Re-establish the proto-correct durable root (now at view 1, still naming the op-1 checkpoint) so the
+  // R23-F1 integrity gate sees the genuine durable id the post-flush serve must match.
+  sb.state = VsrState::try_new(
+    View::with(1),
+    View::with(1),
+    OpNumber::with(1),
+    OpNumber::with(1),
+    crate::checkpoint_id(&snapshot),
+    std::vec::Vec::new(),
+  )
+  .expect("durable root: commit == checkpoint_op, log_view <= view");
+  while e.poll_message().is_some() {} // discard the deferred StartView broadcast
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSync(crate::RequestSync::new(
+      View::with(1),
+      OpNumber::with(0),
+      ReplicaId::new(2),
+      0xD18F,
+      false,
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the checkpoint read completes → ship SyncCheckpoint
+  let mut served = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::SyncCheckpoint(s) = out.msg_ref() {
+      assert_eq!(
+        s.checkpoint_op(),
+        OpNumber::with(1),
+        "serves the durable checkpoint op"
+      );
+      assert_eq!(
+        s.view(),
+        View::with(1),
+        "the served SyncCheckpoint advertises the now-durable view"
+      );
+      assert_eq!(s.nonce(), 0xD18F, "echoes the soliciting nonce");
+      assert_eq!(
+        crate::checkpoint_id(s.snapshot()),
+        s.checkpoint_id(),
+        "shipped snapshot provably matches its advertised id"
+      );
+      served = true;
+    }
+  }
+  assert!(
+    served,
+    "after the view is durable, the RequestSync is answered with a SyncCheckpoint"
+  );
+}
+
+#[test]
+fn canonical_selection_with_a_checkpoint_offset_log_is_safe() {
+  // A canonical generation where one DVC's log starts above op 1 (its donor was state-synced to
+  // checkpoint 4, commit 4) must not be mis-truncated, and the commit* <= op_head fail-stop must not
+  // trip for a synced participant (its commit == op_head == checkpoint when tail-empty).
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  // r0: a full-from-1 log (head 5, commit 4). r1: the SAME generation but state-synced — its log
+  // starts at op 5 (checkpoint 4), head 5, commit 4. Same log_view → both canonical.
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 4));
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_offset(1, 1, 4, 5, 4));
+  let (log, op_head, commit_star) = e.select_canonical_log();
+  assert_eq!(
+    op_head, 5,
+    "the offset log does not shorten the canonical head"
+  );
+  assert_eq!(commit_star, 4, "commit* preserved");
+  assert!(
+    commit_star <= op_head,
+    "the fail-stop invariant holds for an offset-log participant"
+  );
+  // The UNION covers [1..=5]: r0 supplies the prefix the offset r1 omits, so no op is dropped.
+  let present: std::collections::BTreeSet<u64> = log.iter().map(|e| e.op().get()).collect();
+  assert_eq!(
+    present,
+    (1..=5u64).collect::<std::collections::BTreeSet<u64>>(),
+    "the union of r0's full log and r1's offset log covers ops 1..=5"
+  );
+}
+
+#[test]
+fn view_change_abandons_an_outstanding_sync() {
+  // State-sync and view change are mutually exclusive by status: a higher-view message arriving
+  // while a sync is outstanding takes the replica into ViewChange and clears the stale sync (so the
+  // sync_solicit timer does not linger). The replica re-triggers state-sync from Normal if still
+  // behind.
+  let mut e = sync_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Trigger a sync (in view 0).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(8),
+      OpNumber::with(8),
+    )),
+  );
+  while e.poll_message().is_some() {}
+  assert!(e.poll_timeout().is_some(), "sync armed");
+  // A higher-view Commit arrives → catch_up_to_view → ViewChange, which must clear the sync.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Commit(Commit::new(
+      View::with(1),
+      OpNumber::with(8),
+      OpNumber::with(8),
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  assert!(
+    e.sync.is_none(),
+    "the outstanding sync is abandoned on entering a view change"
+  );
+  assert!(
+    e.timers.sync_solicit.is_none(),
+    "the sync solicit timer is cleared"
+  );
+}
+
+#[test]
+fn canonical_selection_with_a_fully_checkpoint_synced_participant_is_safe() {
+  // The extreme: a state-synced participant whose tail is EMPTY (head == commit == checkpoint 4, no
+  // log entries at all). select_canonical_log must handle commit == op_head with an empty offset log
+  // without panicking or fabricating ops.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 4));
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_offset(1, 1, 4, 4, 4)); // tail-empty synced participant
+  let (_log, op_head, commit_star) = e.select_canonical_log();
+  assert_eq!(op_head, 5);
+  assert_eq!(commit_star, 4);
+  assert!(commit_star <= op_head);
+}
+
+// ── B3: offset-aware canonical-log selection (UNION committed entries across DVCs) ──
+
+#[test]
+fn select_canonical_log_unions_committed_ops_across_different_floor_dvcs() {
+  // The reviewer's reproduction (the heart of B3): TWO different-floor offset DVCs in the SAME
+  // canonical generation, both head op 10 commit 8. r0 (floor 4) holds ops 5..=10; r1 (floor 8) holds
+  // only 9,10. Both tie at op 10, so the OLD `max_by_key(op)` (ties → highest replica id) picks r1's
+  // log [9,10] and SILENTLY DROPS committed ops 5,6,7 — which only r0 holds. The `commit* <= op_head`
+  // fail-stop does NOT trip (the dropped ops are interior). select_canonical_log MUST instead UNION:
+  // the returned canonical log must cover EVERY committed op (5..=8) that ANY canonical DVC holds.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+  e.dvc_from_mut_for_test()
+    .insert(0, dvc_offset(0, 1, 4, 10, 8)); // floor 4: holds 5,6,7,8,9,10
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_offset(1, 1, 8, 10, 8)); // floor 8: holds 9,10 only
+  let (log, op_head, commit_star) = e.select_canonical_log();
+  assert_eq!(op_head, 10, "canonical head is the generation's head");
+  assert_eq!(commit_star, 8, "commit* is the greatest commit");
+  // The committed band the union MUST cover: ops 5..=8 (above the lowest floor 4, up to commit*).
+  // Without the union fix the log would be just [9,10] and these would be absent.
+  let present: std::collections::BTreeSet<u64> = log.iter().map(|e| e.op().get()).collect();
+  for op in 5..=8u64 {
+    assert!(
+      present.contains(&op),
+      "committed op {op} (held only by r0's offset log) must be in the canonical log, not dropped"
+    );
+  }
+  // And the uncommitted tail r0 holds (9,10) is included too (no nack quorum truncates it here).
+  assert!(
+    present.contains(&9) && present.contains(&10),
+    "the head ops are present"
+  );
+  // The entries are the real ones (op-tagged bodies), not fabricated.
+  for entry in &log {
+    assert_eq!(
+      entry.body(),
+      &entry.op().get().to_be_bytes()[..],
+      "each unioned entry carries the donor's real body"
+    );
+  }
+}
+
+#[test]
+fn select_canonical_log_stitches_the_band_across_three_offset_donors() {
+  // Three canonical-generation donors with staggered floors must be STITCHED so the committed band
+  // is fully covered even though NO single donor holds it all. N=5, quorum_view_change=3.
+  //   r0: floor 0, holds 1,2,3 (head 3)         — the prefix
+  //   r1: floor 3, holds 4,5,6 (head 6)         — the middle
+  //   r2: floor 6, holds 7,8 (head 8, commit 8) — the suffix + the committed frontier
+  // commit* = 8, op_head = 8. The union must produce a dense [1..=8] — dropping any of 1..=8 would
+  // lose a committed op some lower-floor adopter needs.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+  e.dvc_from_mut_for_test()
+    .insert(0, dvc_offset(0, 1, 0, 3, 3));
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_offset(1, 1, 3, 6, 6));
+  e.dvc_from_mut_for_test()
+    .insert(2, dvc_offset(2, 1, 6, 8, 8));
+  let (log, op_head, commit_star) = e.select_canonical_log();
+  assert_eq!(op_head, 8);
+  assert_eq!(commit_star, 8);
+  let present: std::collections::BTreeSet<u64> = log.iter().map(|e| e.op().get()).collect();
+  assert_eq!(
+    present,
+    (1..=8u64).collect::<std::collections::BTreeSet<u64>>(),
+    "the union stitches all three offset donors into a gapless committed band 1..=8"
+  );
+}
+
+#[test]
+fn select_canonical_log_bounds_a_dvc_claiming_a_huge_op() {
+  // F4 REGRESSION (unbounded nack-scan + overflow): DoViewChanges whose CLAIMED `op` is enormous
+  // (here `u64::MAX`) but whose `log_slice()` carries only a few real entries must NOT make the
+  // nack-truncation loop scan `commit*+1 ..= u64::MAX` op-by-op. The UNBOUNDED case is when a NACK
+  // quorum's worth of donors claim a huge op: then the loop's nack count never reaches the threshold
+  // for any finite op, so the OLD `while op <= op_head { ...; op += 1 }` would iterate ~u64::MAX
+  // times and finally OVERFLOW `op += 1` at `u64::MAX`. With the fix the scan is derived from the
+  // sorted donor ops (bounded by the DVC count) and `op_head` is bounded to the represented log.
+  // N=3 → quorum_nack_prepare = 2, so we make TWO donors claim the phantom head.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  // r0: honest — holds ops 1,2,3 (head 3, commit 2).
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 3, 2));
+  // r1, r2 (SAME generation): MALFORMED — each claims op == u64::MAX but carries only ops 1..=3.
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_claiming(1, 1, u64::MAX, 2, 3));
+  e.dvc_from_mut_for_test()
+    .insert(2, dvc_claiming(2, 1, u64::MAX, 2, 3));
+  // Must return PROMPTLY (no unbounded scan, no overflow panic) and bound op_head to the represented
+  // log: the max op actually present across the canonical donors is 3, so op_head <= 3.
+  let (log, op_head, commit_star) = e.select_canonical_log();
+  assert!(
+    op_head <= 3,
+    "op_head must be bounded to the represented log (<= 3), not the claimed u64::MAX, got {op_head}"
+  );
+  assert_eq!(commit_star, 2, "commit* is the greatest claimed commit");
+  assert!(
+    commit_star <= op_head,
+    "the fail-stop invariant still holds"
+  );
+  // The merged log contains only real, present entries — never a phantom op near u64::MAX.
+  for entry in &log {
+    assert!(
+      entry.op().get() <= 3,
+      "no fabricated entry above the represented log"
+    );
+  }
+}
+
+#[test]
+fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
+  // B3 gate, CORRECTED to the safe semantics (this is a correctness CORRECTION, not a weakening — see
+  // below). A backup holds committed ops 5..=8 in its OFFSET log; the lower band 5,6 it has APPLIED
+  // (commit_min == 6), the upper band 7,8 it has NOT (committed by a prior-view quorum but unapplied;
+  // op == 8). It adopts a StartView whose canonical log is itself OFFSET, starts at op 9 (does NOT
+  // carry 5..=8), commit 8. The two bands are now handled DIFFERENTLY, and that distinction is the fix:
+  //
+  //   * APPLIED & omitted (5,6, `op <= commit_min`): a committed op the adopter ITSELF applied is
+  //     immutable (VSR committed-op survival ⇒ no other view committed a different value), so its local
+  //     copy is canonical. It is PRESERVED directly from `self.log` (kept, never re-fetched).
+  //   * UNAPPLIED & omitted (7,8, `op in (commit_min, commit]`): the held body is unapplied and may be a
+  //     STALE superseded proposal (VOPR seed 24) — `LogEntry` has no per-entry view to tell. It is
+  //     therefore DROPPED and REPAIRED: `advance_commit` HOLDS the commit at the first such op and
+  //     `request_repair`s the CANONICAL value from a committed-vouching peer.
+  //
+  // Why this is a CORRECTION, not a weakening of the original B3 safety property: B3's invariant is "no
+  // committed op an offset canonical log omits is ever LOST." That still holds end-to-end here — the
+  // omitted committed band ends up correct (applied to the SM after repair), never silently skipped. The
+  // ONLY change is the SOURCE for the UNAPPLIED band: a possibly-stale local copy (which diverged the
+  // committed log under seed 24) is replaced by the quorum's canonical value fetched via peer-repair.
+  // The original B3 bug (clearing the whole log + then `repair.clear()` stranding the op) stays fixed:
+  // the omitted committed op is never forgotten — it is a held hole until its canonical value arrives.
+  let mut e = Endpoint::new(
+    Config::try_new(1, ReplicaId::new(2), 3).unwrap(),
+    0,
+    CountSm::default(),
+  );
+  // Hand-build the offset-backup state: checkpoint 4, applied through 6 (commit_min == commit_max == 6;
+  // the [1..=6] prefix lives in the checkpoint, not the empty CountSm), head 8, offset tail 5..=8 held.
+  e.checkpoint_op = OpNumber::with(4);
+  e.commit_min = OpNumber::with(6);
+  e.commit_max = OpNumber::with(6);
+  e.op = OpNumber::with(8);
+  for op in 5..=8u64 {
+    e.log.insert(
+      op,
+      LogEntry {
+        client: ClientId::new(7),
+        request: RequestNumber::with(op),
+        body: Bytes::copy_from_slice(&op.to_be_bytes()),
+      },
+    );
+  }
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // The canonical StartView for view 1 from primary 1: an OFFSET log starting at op 9 (head 10),
+  // commit 8. It does NOT carry ops 5..=8.
+  let sv = StartView::new(
+    View::with(1),
+    OpNumber::with(10),
+    OpNumber::with(8),
+    ReplicaId::new(1),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(9),
+        ClientId::new(7),
+        RequestNumber::with(9),
+        Bytes::copy_from_slice(&9u64.to_be_bytes()),
+      ),
+      PreparedEntry::new(
+        OpNumber::with(10),
+        ClientId::new(7),
+        RequestNumber::with(10),
+        Bytes::copy_from_slice(&10u64.to_be_bytes()),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(sv),
+  );
+  assert_eq!(e.status(), Status::Normal, "adoption completes");
+  // APPLIED & omitted (5,6): PRESERVED directly — still in the log cache, never turned into a hole.
+  assert!(
+    e.log.contains_key(&5) && e.log.contains_key(&6),
+    "an omitted committed op the adopter HAS applied is preserved directly from its own log"
+  );
+  assert!(
+    !e.has_repair_hole_for_test(5) && !e.has_repair_hole_for_test(6),
+    "the applied-and-preserved ops are not repaired"
+  );
+  // UNAPPLIED & omitted (7,8): REPAIRED. The commit is HELD at the first (6) until the canonical value
+  // arrives; op 7 is a registered hole (op 8 becomes one after 7 fills). The held copy was DROPPED.
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(6),
+    "commit is HELD at the unapplied omitted band until the canonical value is repaired"
+  );
+  assert!(
+    e.has_repair_hole_for_test(7) && !e.log.contains_key(&7),
+    "the first unapplied omitted committed op (7) is a repair hole, its held body dropped"
+  );
+  // A committed-vouching peer (commit 8 >= op) supplies the canonical value for the repaired band. Each
+  // fill is a durability barrier (R13-F2): the repaired append must complete before the op applies and
+  // the NEXT hole (op 8) is registered — so drive each fill to durability in turn.
+  for op in [7u64, 8] {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      repair_prepare(1, op, 8),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + register next hole
+  }
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(8),
+    "commit reaches 8: the omitted committed band is repaired, not lost (the B3 safety property holds)"
+  );
+  // The SM applied exactly the unapplied band 7,8 (5,6 lived below commit_min, never re-applied; 1..=4
+  // in the checkpoint). SAFETY: no committed op the offset StartView omitted was lost.
+  let applied: std::vec::Vec<u64> = e.sm.applied().iter().map(|(op, _)| *op).collect();
+  assert_eq!(
+    applied,
+    std::vec![7, 8],
+    "the unapplied omitted committed band 7..=8 is repaired to the SM (canonical value, not stale local)"
+  );
+  assert!(
+    e.repair.is_empty(),
+    "no committed op is left stranded in the repair set"
+  );
+}
+
+#[test]
+fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() {
+  // SAFETY REGRESSION (VOPR seed 24): the B3 "preserve the omitted committed op from the adopter's
+  // own log" rule is only sound for ops the adopter has APPLIED (`op <= commit_min`) — those are
+  // committed+immutable. For a committed op in `(commit_min .. adopted_commit]` the adopter holds a
+  // body it has NOT applied: it can be a STALE UNCOMMITTED proposal from an earlier view that a later
+  // view overwrote with a DIFFERENT committed value (`LogEntry` carries no per-entry view, so the
+  // proto cannot tell a canonical-lineage held op from a superseded one). Preserving it diverges the
+  // adopter's committed log from the quorum's. The fix: preserve ONLY `op <= commit_min`; the omitted
+  // committed band `(commit_min .. adopted_commit]` becomes repair holes whose CANONICAL value is
+  // fetched from a committed-vouching peer (commit HELD until then) — never trusted from local.
+  //
+  // Setup mirrors seed 24: the adopter holds the two committed ops 5,6 TRANSPOSED (op 5 -> body[6],
+  // op 6 -> body[5] — stale superseded proposals), while the cluster committed op 5 -> body[5], op 6
+  // -> body[6]. checkpoint == commit_min == 4 (those held bodies are UNAPPLIED), op == 8. The adopted
+  // offset StartView (head 10, commit 8) OMITS 5,6 (its log starts at op 7).
+  let mut e = Endpoint::new(
+    Config::try_new(1, ReplicaId::new(2), 3).unwrap(),
+    0,
+    CountSm::default(),
+  );
+  e.checkpoint_op = OpNumber::with(4);
+  e.commit_min = OpNumber::with(4);
+  e.commit_max = OpNumber::with(4);
+  e.op = OpNumber::with(8);
+  // The STALE, TRANSPOSED held copies for the (commit_min .. commit] band: op 5 holds op 6's body and
+  // vice-versa. (Bodies are single-byte `[op]`, matching `repair_prepare`'s canonical encoding, so the
+  // post-repair canonical value `[5]`/`[6]` is provably DIFFERENT from the preserved-stale `[6]`/`[5]`.)
+  e.log.insert(
+    5,
+    LogEntry {
+      client: ClientId::new(7),
+      request: RequestNumber::with(5),
+      body: Bytes::copy_from_slice(&[6u8]),
+    },
+  );
+  e.log.insert(
+    6,
+    LogEntry {
+      client: ClientId::new(7),
+      request: RequestNumber::with(6),
+      body: Bytes::copy_from_slice(&[5u8]),
+    },
+  );
+  // op 7,8 are also in the (commit_min .. commit] band and OMITTED below; they ride the same repair
+  // path. Give the adopter NO held copy for them, so they are pure holes filled only from the peer.
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // The canonical offset StartView for view 1 (head 10, commit 8) starts at op 9 — it OMITS 5,6,7,8.
+  let sv = StartView::new(
+    View::with(1),
+    OpNumber::with(10),
+    OpNumber::with(8),
+    ReplicaId::new(1),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(9),
+        ClientId::new(7),
+        RequestNumber::with(9),
+        Bytes::copy_from_slice(&[9u8]),
+      ),
+      PreparedEntry::new(
+        OpNumber::with(10),
+        ClientId::new(7),
+        RequestNumber::with(10),
+        Bytes::copy_from_slice(&[10u8]),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(sv),
+  );
+  assert_eq!(e.status(), Status::Normal, "adoption completes");
+  // The stale held copies are DROPPED, not preserved: op 5 is a repair hole and the commit is HELD at
+  // the first omitted op (4) — never advanced past op 5 with the stale `[6]` body. (Fail-before: the
+  // old rule kept 5->[6] and 6->[5], APPLIED both, and commit jumped to 6 — the transposition — before
+  // holding at op 7, with NO hole at 5 or 6.)
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(4),
+    "commit is HELD at the first omitted committed op (the stale body is not applied)"
+  );
+  // `advance_commit` registers a hole at the FIRST unfetched committed op (op 5) and HOLDS there —
+  // ops 6,7,8 become holes lazily as each fill resumes the apply loop. The decisive safety fact is
+  // that op 5's STALE held body `[6]` was DROPPED, so the commit could not advance past it. (Fail-
+  // before: the old rule kept 5->[6], 6->[5], applied them, and commit jumped to 6 with NO hole at 5.)
+  assert!(
+    e.has_repair_hole_for_test(5),
+    "the first omitted, unapplied committed op (5) becomes a repair hole (canonical value to be fetched)"
+  );
+  assert!(
+    !e.log.contains_key(&5) && !e.log.contains_key(&6),
+    "neither stale transposed body survives in the log cache"
+  );
+  assert!(
+    e.sm.applied().is_empty(),
+    "NOTHING is applied yet — no stale transposed body reached the SM"
+  );
+  // A committed-vouching peer Prepare (commit 8 >= op) supplies the CANONICAL value for each hole in
+  // order: op 5 -> body[5], op 6 -> body[6] (the un-transposed quorum values), then op 7,8. Each fill is
+  // a durability barrier (R13-F2): once the repaired append is durable the apply loop resumes, which
+  // then registers the NEXT hole — so drive each fill to durability in turn.
+  for op in [5u64, 6, 7, 8] {
+    assert!(
+      e.has_repair_hole_for_test(op),
+      "op {op} is a registered repair hole before its canonical Prepare arrives"
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      repair_prepare(1, op, 8),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + register next hole
+  }
+  assert!(
+    e.repair.is_empty(),
+    "every committed hole is filled from the peer's canonical value"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(8),
+    "commit resumes to 8 once the canonical band is repaired"
+  );
+  // The applied log matches the QUORUM (op 5 -> [5], op 6 -> [6]) — NOT the adopter's stale transpose.
+  // This is the exact equality `check_safety` enforces; fail-before it would be [(5,[6]),(6,[5]),...].
+  assert_eq!(
+    e.sm.applied(),
+    &[
+      (5, std::vec![5u8]),
+      (6, std::vec![6u8]),
+      (7, std::vec![7u8]),
+      (8, std::vec![8u8]),
+    ],
+    "the repaired committed band carries the canonical (un-transposed) quorum values"
+  );
+}
+
+// ── Sender-binding at ingress (codex R19-F1): a message's self-claimed sender must agree with the
+// authenticated `from`, or it is dropped. A non-Byzantine, cheap defense-in-depth backstop against a
+// buggy/misrouting driver (or a trivially-mislabeled message) spoofing a quorum vote. ──

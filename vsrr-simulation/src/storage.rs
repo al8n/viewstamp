@@ -317,6 +317,13 @@ impl Wal for InMemoryWal {
     OpNumber::with(self.head)
   }
 
+  fn capacity(&self) -> u64 {
+    // Uncapped until M3.2b (the WAL-wrap milestone) adds a fixed ring + the proto-side wrap-stall.
+    // `u64::MAX` (unbounded) ⇒ the proto's capacity back-pressure never engages, so today's behaviour
+    // is unchanged; M3.2b turns this into the real ring size and fills in the stall against it.
+    u64::MAX
+  }
+
   fn header(&self, op: OpNumber) -> Option<Header> {
     // A known-permanently-faulty (bit-rotted) slot reports no header, per the trait contract
     // ("None = absent OR known-faulty"). A torn slot still has its original header (the tear is
