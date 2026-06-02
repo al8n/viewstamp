@@ -46,15 +46,19 @@ pub struct Cluster {
   /// (the VOPR driver) drains it each tick via [`take_append_before_ack_violation`]. Existing gates
   /// never read it, so it is inert for them.
   append_before_ack_violation: Option<String>,
-  /// Set by [`tick`](Self::tick) when a replica emitted a primary-authority `StartView`/
-  /// `RecoveryResponse` for a view that is NOT yet DURABLE on its own superblock — the
-  /// durable-view-before-participate invariant (codex R8-F1), checked structurally at emission time
-  /// against the sim's superblock view. These two messages assert "I am the canonical primary of view
-  /// V" (a `StartView` is the primary's authoritative head broadcast; a primary's `RecoveryResponse`
-  /// is the recovery-handshake equivalent), so emitting one for a `V` above the durable view means the
-  /// replica participated AS the primary in a view a crash could regress out of. Stays `None` absent a
-  /// violation; the VOPR driver drains it each tick via [`take_durable_view_violation`]. Inert for
-  /// existing gates (they never read it).
+  /// Set by [`tick`](Self::tick) when a replica emitted ANY view-advertising / primary-authority
+  /// participation message — a `StartView`/`RecoveryResponse`, a `DoViewChange` vote, a `Prepare`, a
+  /// `PrepareOk` vote, or a `Commit` — for a view that is NOT yet DURABLE on its own superblock. This
+  /// is the ORACLE for the WHOLE durable-view-before-participate CLASS (codex R8-F1 for the primary
+  /// `StartView`/`RecoveryResponse` paths, R16-F1 for the `DoViewChange` retransmit, R17-F1 for the
+  /// `on_request_prepare` repair `Prepare`, plus the `PrepareOk`/`Commit` participation messages),
+  /// checked structurally at emission time against the sim's MONOTONE superblock view. A
+  /// `StartView`/`RecoveryResponse`/`Commit`/`Prepare` asserts authority in view V; a
+  /// `DoViewChange`/`PrepareOk` is a VOTE the prospective/current primary counts toward FORMING view V
+  /// / committing an op in it. Emitting any of them for a `V` above the durable view means the replica
+  /// participated in a view a crash could regress it out of. Stays `None` absent a violation; the VOPR
+  /// driver drains it each tick via [`take_durable_view_violation`]. Inert for existing gates (they
+  /// never read it). See [`record_durable_view_violation`](Self::record_durable_view_violation).
   durable_view_violation: Option<String>,
   /// `None` (default) ⇒ every replica's WAL appends SYNCHRONOUSLY (existing-gate behaviour). `Some(d)`
   /// ⇒ async-append mode with per-append delay `d` polls — the Phase-A in-flight window the
@@ -299,18 +303,44 @@ impl Cluster {
 
   /// Drains the most recent durable-view-before-participate violation observed during
   /// [`tick`](Self::tick) or [`probe_pending_view_window`](Self::probe_pending_view_window) (a replica
-  /// emitted a primary-authority `StartView`/`RecoveryResponse` for a view above its own durable
-  /// superblock view — codex R8-F1), if any. `None` when none has occurred since the last drain.
+  /// emitted ANY view-advertising / primary-authority participation message — `StartView`,
+  /// head-bearing `RecoveryResponse`, `DoViewChange`, `Prepare`, `PrepareOk`, or `Commit` — for a view
+  /// above its own durable superblock view; the whole class, codex R8-F1 + R16-F1 + R17-F1), if any.
+  /// `None` when none has occurred since the last drain.
   pub fn take_durable_view_violation(&mut self) -> Option<String> {
     self.durable_view_violation.take()
   }
 
-  /// Record a durable-view-before-participate violation (codex R8-F1) if `out` (emitted by replica
-  /// `ri`) is a primary-authority message — a `StartView`, or a `RecoveryResponse` carrying a head
-  /// (non-empty log OR a non-zero op, i.e. the PRIMARY's answer, not a backup's view-only echo) — for
-  /// a view STRICTLY ABOVE replica `ri`'s own DURABLE (superblock) view. Such a message asserts "I am
-  /// the canonical primary of view V" in a view that is not yet recoverable, which a crash could
-  /// regress out of. First violation only (subsequent ones are inert).
+  /// Record a durable-view-before-participate violation if `out` (emitted by replica `ri`) advertises
+  /// a view STRICTLY ABOVE replica `ri`'s own DURABLE (superblock) view — i.e. it acts authoritatively
+  /// for, or votes in, a view that is not yet recoverable and which a crash could regress it out of.
+  /// This is the ORACLE for the WHOLE durable-view-before-participate CLASS (codex R8-F1 + R16-F1 +
+  /// R17-F1 + R18-F1), flagging every VIEW-ADVERTISING / primary-authority PARTICIPATION message a
+  /// replica could emit while its view write is still pending. Its flagged set EXACTLY equals the
+  /// proto's gated set ([`Message::advertises_authoritative_view`]):
+  ///
+  /// - `StartView` — the primary's authoritative "I am the canonical primary of view V" head broadcast
+  ///   (R8-F1, the load-bearing primary path).
+  /// - head-bearing `RecoveryResponse` (non-empty log OR `op > 0`, the PRIMARY's recovery-handshake
+  ///   answer, not a backup's view-only echo) — the recovery equivalent of a `StartView` (R8-F1).
+  /// - `DoViewChange` — a VOTE the prospective primary counts toward FORMING view V (R16-F1): voting
+  ///   in a view not yet persisted means a crash regresses it out of a view it helped a quorum form.
+  /// - `Prepare` — advertises `self.view` as authoritative. A primary's `on_request`/retransmit
+  ///   `Prepare`, or a repair `Prepare` served from `on_request_prepare` (R17-F1), in the
+  ///   not-yet-durable view advertises a view a crash could roll back.
+  /// - `PrepareOk` — a backup's VOTE the primary counts toward a COMMIT quorum (carries `self.view`):
+  ///   acking in a not-yet-durable view helps commit an op under a view this replica might regress out of.
+  /// - `Commit` — the primary's heartbeat/commit advance (carries `self.view`): a primary-authority
+  ///   broadcast in the not-yet-durable view.
+  /// - `SyncCheckpoint` — the state-sync serve answering a `RequestSync` (R18-F1): it advertises
+  ///   `self.view` as the server's authoritative view; shipping it from a not-yet-durable view
+  ///   advertises a view a crash could roll back (the blind spot that previously hid R18-F1).
+  ///
+  /// The durable view is read off the same superblock the proto recovers from; it is MONOTONE (it only
+  /// advances when a view-change/adoption write lands), so a message legitimately built while its view
+  /// WAS durable never trips here (`durable_view >= msg_view` permanently), and no volatile-view stale
+  /// exemption is needed — this is the durable-view analogue of the timer no-orphan-due assert, making
+  /// EVERY instance of the class deterministically visible. First violation only (subsequent inert).
   fn record_durable_view_violation(&mut self, ri: usize, out: &Outgoing) {
     use vsrr_proto::Superblock;
     if self.durable_view_violation.is_some() {
@@ -324,13 +354,41 @@ impl Cluster {
       // head — still a participation signal, but the head-bearing primary answer is the load-bearing
       // R8-F1 case the gate suppresses. Flag the head-bearing one (op > 0).
       Message::RecoveryResponse(rr) if rr.op().get() > 0 => ("RecoveryResponse", rr.view().get()),
+      // A DoViewChange is a VOTE the prospective primary counts toward FORMING the new view (codex
+      // R16-F1) — the participation message in the retransmit path the original R8-F1 checker did not
+      // cover. After the durable-view gate, a replica sends its DVC only once its view is persisted
+      // (the initial one from `on_sb_done`, the retransmit gated on `pending_sb.is_none()`), so a DVC
+      // whose advertised view is STRICTLY ABOVE the sender's durable view means it voted in a view it
+      // has not yet persisted — a crash would regress it out of a view it helped a quorum form.
+      Message::DoViewChange(dvc) => ("DoViewChange", dvc.view().get()),
+      // A Prepare advertises `self.view` as the authoritative view of the op (a new-op broadcast /
+      // retransmit from the primary, OR a committed-op repair served from `on_request_prepare`, codex
+      // R17-F1). Emitting it for a view above the sender's durable view advertises a view a crash could
+      // roll back — the same hazard as a StartView, on the prepare path.
+      Message::Prepare(p) => ("Prepare", p.view().get()),
+      // A PrepareOk is a backup's VOTE the primary counts toward a COMMIT quorum (it carries
+      // `self.view`). Acking in a not-yet-durable view helps commit an op under a view this replica
+      // could regress out of — a vote in a view it has not persisted, the backup-side analogue of the
+      // DoViewChange (R16-F1) vote.
+      Message::PrepareOk(ok) => ("PrepareOk", ok.view().get()),
+      // A Commit is the primary's heartbeat / commit-advance (carries `self.view`) — a primary-
+      // authority broadcast. In the not-yet-durable view it asserts this replica's primacy in a view a
+      // crash could regress out of, the same R8-F1 hazard as a StartView/Prepare on the heartbeat path.
+      Message::Commit(commit) => ("Commit", commit.view().get()),
+      // A SyncCheckpoint is the state-sync serve answering a peer's RequestSync (codex R18-F1): it
+      // advertises `self.view` as the serving replica's authoritative view. Shipping it from a
+      // not-yet-durable view advertises a view a crash could roll back — the blind spot that hid R18-F1
+      // (the checker covered StartView/RecoveryResponse/DoViewChange/Prepare/PrepareOk/Commit but not
+      // this serve). The checkpoint content is view-independent, so the requester re-solicits and a
+      // Normal+durable peer answers; serving it during `pending_sb` is the same class as the others.
+      Message::SyncCheckpoint(sc) => ("SyncCheckpoint", sc.view().get()),
       _ => return,
     };
     if msg_view > durable_view {
       self.durable_view_violation = Some(format!(
         "replica {ri} emitted {kind}(view={msg_view}) while its DURABLE view is {durable_view} \
          (volatile view={}, status={}) — durable-view-before-participate (R8-F1) violated: it \
-         asserted primary authority in a view not yet persisted",
+         advertised/participated in a view not yet persisted",
         self.replicas[ri].view().get(),
         self.replicas[ri].status().as_str(),
       ));
@@ -701,8 +759,9 @@ impl Cluster {
             ));
           }
         }
-        // Durable-view-before-participate (R8-F1), checked at emission: a StartView / head-bearing
-        // RecoveryResponse for a view above the emitter's durable view is a participation in a
+        // Durable-view-before-participate (R8-F1 + R16-F1), checked at emission: a StartView /
+        // head-bearing RecoveryResponse (the primary paths) OR a DoViewChange vote (the ViewChange
+        // retransmit path, R16-F1) for a view above the emitter's durable view is a participation in a
         // not-yet-recoverable view.
         self.record_durable_view_violation(ri, &out);
         outgoing.push((ReplicaId::new(ri as u8), out));
@@ -1012,5 +1071,56 @@ mod tests {
     assert!(!c.partitioned(3, 4), "same-group is not blocked");
     c.heal();
     assert!(!c.partitioned(0, 3), "heal removes all partitions");
+  }
+
+  #[test]
+  fn durable_view_checker_flags_a_sync_checkpoint_above_the_durable_view() {
+    // codex R18-F1 (CHECKER NON-VACUITY): the durable-view oracle must flag a `SyncCheckpoint`
+    // advertising a view ABOVE the emitter's durable view — the state-sync serve was the blind spot
+    // that previously hid R18-F1 (the checker covered StartView/RecoveryResponse/DoViewChange/
+    // Prepare/PrepareOk/Commit but NOT this serve). A fresh cluster's durable view is 0; a
+    // SyncCheckpoint(view=1) is therefore a participation in a not-yet-durable view and MUST trip.
+    let mut c = Cluster::new(3, 1, 1, 1);
+    assert_eq!(
+      c.replica_durable_view(0).get(),
+      0,
+      "fresh durable view is 0"
+    );
+    let serve = Outgoing::new(
+      Recipient::To(Peer::Replica(ReplicaId::new(2))),
+      Message::SyncCheckpoint(vsrr_proto::SyncCheckpoint::new(
+        vsrr_proto::View::with(1), // above the durable view 0
+        OpNumber::with(4),
+        0,
+        ReplicaId::new(0),
+        0xD18F,
+        bytes::Bytes::from_static(b"snapshot"),
+      )),
+    );
+    c.record_durable_view_violation(0, &serve);
+    let why = c
+      .take_durable_view_violation()
+      .expect("a SyncCheckpoint above the durable view must be flagged (the R18-F1 blind spot)");
+    assert!(
+      why.contains("SyncCheckpoint"),
+      "the violation names the offending message kind: {why}"
+    );
+    // Control: a SyncCheckpoint AT the durable view (view 0) is a legitimate serve — not flagged.
+    let ok_serve = Outgoing::new(
+      Recipient::To(Peer::Replica(ReplicaId::new(2))),
+      Message::SyncCheckpoint(vsrr_proto::SyncCheckpoint::new(
+        vsrr_proto::View::with(0), // == durable view 0
+        OpNumber::with(4),
+        0,
+        ReplicaId::new(0),
+        0xD18F,
+        bytes::Bytes::from_static(b"snapshot"),
+      )),
+    );
+    c.record_durable_view_violation(0, &ok_serve);
+    assert!(
+      c.take_durable_view_violation().is_none(),
+      "a SyncCheckpoint at the durable view is a legitimate serve and must NOT be flagged"
+    );
   }
 }

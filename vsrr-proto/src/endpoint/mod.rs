@@ -282,6 +282,68 @@ struct Timers {
   sync_solicit: Option<Instant>,
 }
 
+/// The twelve scheduled timers, as an enumerable kind. Used by [`Endpoint::serviceable_now`] (the
+/// single source of truth for "will the CURRENT (status, substate) actually SERVICE this timer if it
+/// fires?") so [`Endpoint::poll_timeout`] can filter to only-serviceable deadlines — making the
+/// timer-wedge spin (a `poll_timeout`-driven driver re-returning a stale, never-serviced deadline)
+/// impossible by construction (codex R15). `ALL` enumerates every kind for the filter + the
+/// `handle_timeout` no-orphan assert; `as_str` names it for that assert's diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerKind {
+  Prepare,
+  Commit,
+  PrimaryIdle,
+  SvcMessage,
+  DvcMessage,
+  ViewChangeStatus,
+  GetViewMessage,
+  RecoverRetry,
+  RecoverHead,
+  RepairRetry,
+  SyncSolicit,
+  /// The forfeit grace timer ([`Endpoint::forfeit_armed`]) — not in [`Timers`], but scheduled by
+  /// `poll_timeout` and serviced (via `maybe_forfeit`) on the same primary path as `commit`/`prepare`.
+  ForfeitArmed,
+}
+
+impl TimerKind {
+  /// Every timer kind, so `poll_timeout`'s filter and `handle_timeout`'s no-orphan assert iterate the
+  /// complete set (a new timer added to [`Timers`] must be added here, to `arm`-edness, and to
+  /// `serviceable_now`).
+  const ALL: [TimerKind; 12] = [
+    TimerKind::Prepare,
+    TimerKind::Commit,
+    TimerKind::PrimaryIdle,
+    TimerKind::SvcMessage,
+    TimerKind::DvcMessage,
+    TimerKind::ViewChangeStatus,
+    TimerKind::GetViewMessage,
+    TimerKind::RecoverRetry,
+    TimerKind::RecoverHead,
+    TimerKind::RepairRetry,
+    TimerKind::SyncSolicit,
+    TimerKind::ForfeitArmed,
+  ];
+
+  /// A stable name for the no-orphan-due `debug_assert` diagnostic in `handle_timeout`.
+  const fn as_str(self) -> &'static str {
+    match self {
+      TimerKind::Prepare => "prepare",
+      TimerKind::Commit => "commit",
+      TimerKind::PrimaryIdle => "primary_idle",
+      TimerKind::SvcMessage => "svc_message",
+      TimerKind::DvcMessage => "dvc_message",
+      TimerKind::ViewChangeStatus => "view_change_status",
+      TimerKind::GetViewMessage => "get_view_message",
+      TimerKind::RecoverRetry => "recover_retry",
+      TimerKind::RecoverHead => "recover_head",
+      TimerKind::RepairRetry => "repair_retry",
+      TimerKind::SyncSolicit => "sync_solicit",
+      TimerKind::ForfeitArmed => "forfeit_armed",
+    }
+  }
+}
+
 /// The Sans-I/O Viewstamped Replication state machine for one replica.
 ///
 /// Push inputs with `handle_*`; pull outputs with `poll_*` (drain each to `None`
@@ -928,6 +990,25 @@ impl<S: StateMachine> Endpoint<S> {
           self.on_primary_idle(now, sb);
           self.timers.primary_idle = Some(now + PRIMARY_IDLE);
         }
+        // FIX 1 (codex R15-F1, the timer-wedge class): once this backup has PROPOSED a view change off
+        // its idle timeout (`on_primary_idle` -> `propose_next_view` -> `join_svc`), it ARMS `svc_message`
+        // (the SVC retransmit) — but until a view-change quorum forms it stays Normal, and this branch
+        // would otherwise service ONLY `primary_idle`, orphaning `svc_message` (`view_change_timeouts`,
+        // which services it, runs only in ViewChange). A poll_timeout()-driven driver would then spin on
+        // the unserviced `svc_message` deadline (100ms — EARLIER than `primary_idle`'s 200ms), never
+        // re-broadcasting the StartViewChange under loss → no failover. So SERVICE `svc_message` here when
+        // armed-and-due: re-broadcast the live `StartViewChange{svc_target}` on the VC_MESSAGE_RETRANSMIT
+        // cadence (exactly as `view_change_timeouts` does), keeping the proposal alive until a quorum forms
+        // or a heard primary clears the idle path. The `primary_idle` re-propose above is idempotent at
+        // `view+1` (`propose_next_view` only raises the target), so any overlap is a harmless redundant
+        // SVC; firing the retransmit only when DUE (and on a strictly later cadence boundary than the
+        // 200ms idle) keeps the steady-state broadcast count minimal. Cleared when the backup leaves the
+        // proposal: `note_primary_contact` does NOT disarm `svc_message`, but a heard primary that resets
+        // `primary_idle` stops new proposals, and any real view-change transition re-arms timers afresh.
+        if self.timers.svc_message.is_some_and(|d| d <= now) {
+          self.push_svc(self.svc_target);
+          self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
+        }
       }
       Status::ViewChange => self.view_change_timeouts(now, sb),
       // Recovering re-submits any still-outstanding/faulty reads on its timer (termination under a
@@ -944,6 +1025,25 @@ impl<S: StateMachine> Endpoint<S> {
       // sync is outstanding (awaiting a SyncCheckpoint or persisting the adopted one).
       self.sync_timeouts(now);
     }
+    // No-orphan-due invariant (codex R15): after dispatch, NO serviceable timer may remain armed-and-due
+    // (`serviceable_now(kind) && armed(kind) <= now`). `poll_timeout` returns only serviceable timers, so
+    // every such timer either was just serviced (re-armed strictly forward, or cleared) or was never
+    // serviceable (filtered out). If one is left armed-and-due, a poll_timeout()-driven driver would
+    // re-return it next step and SPIN — exactly the timer-wedge this refactor closes. This fires
+    // DETERMINISTICALLY (independent of the clock model) on any future arm/service drift, so the existing
+    // test + VOPR suite now guard the whole class (the tick-driven sim cannot SEE the spin, but it CAN
+    // trip this assert). The bound `now` is the `now` handlers re-armed against; a serviced timer re-arms
+    // to `now + cadence > now`, so it is correctly not-due here.
+    debug_assert!(
+      !TimerKind::ALL
+        .into_iter()
+        .any(|kind| self.serviceable_now(kind) && self.armed(kind).is_some_and(|d| d <= now)),
+      "handle_timeout left a serviceable timer armed-and-due (would spin a poll_timeout driver): {:?}",
+      TimerKind::ALL
+        .into_iter()
+        .find(|&kind| self.serviceable_now(kind) && self.armed(kind).is_some_and(|d| d <= now))
+        .map(TimerKind::as_str)
+    );
   }
 
   /// Drain completed storage ops and react.
@@ -993,10 +1093,18 @@ impl<S: StateMachine> Endpoint<S> {
         self.timers.recover_head = Some(now + RECOVER_HEAD_SOLICIT);
       }
     }
-    // Peer fault-repair runs alongside the role timers: while a committed-op hole is outstanding,
-    // keep the repair-retry timer armed (only Normal actually solicits/serves, but arming defensively
-    // is harmless — a non-Normal status carries no hole, since adoption clears `repair`).
-    if !self.repair.is_empty() {
+    // Peer fault-repair runs alongside the role timers: while a committed-op hole is outstanding AND we
+    // are Normal, keep the repair-retry timer armed. The `is_normal()` gate MUST match `handle_timeout`'s
+    // servicing gate (which runs `repair_timeouts` only while Normal): a `repair` hole is NOT cleared on
+    // entering ViewChange/catch-up, so arming `repair_retry` in a non-Normal status would leave it
+    // armed-but-never-serviced (`view_change_timeouts` ignores it), spinning a poll_timeout()-driven
+    // driver on that stale deadline — the SAME timer-level wedge as the forfeit / pending-view cases
+    // (codex R14-F1 class audit). Gating the ARM on the same condition as the SERVICE keeps the two in
+    // lockstep, so no orphaned hole-timer can wake a non-Normal handler. (`arm_timers` clears all timers
+    // first, so an inherited Normal `repair_retry` is dropped on the transition into ViewChange.) The
+    // hole itself survives — it is re-solicited once Normal resumes (adoption clears it, or
+    // `request_repair`/`repair_timeouts` re-arm `repair_retry` then).
+    if self.status.is_normal() && !self.repair.is_empty() {
       self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
     }
     // State-sync solicitation runs alongside the role timers: while a sync is outstanding (awaiting a
@@ -1005,6 +1113,27 @@ impl<S: StateMachine> Endpoint<S> {
     if self.sync.is_some() {
       self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
     }
+  }
+
+  /// The single outbound-emission chokepoint. EVERY replica-originated message goes through here so the
+  /// durable-view-before-participate invariant (codex R8-F1) is enforced in ONE place: a view-advertising
+  /// AUTHORITY / participation message (the gated set — [`Message::advertises_authoritative_view`]) must
+  /// never be emitted while a durable-view write is in flight (`pending_sb.is_some()`), because
+  /// `self.view` is then not yet durable and a crash rolls it back. This is the proto-side analogue of
+  /// the VOPR durable-view checker, and the STRUCTURAL close of the class (codex R16-F1 / R17-F1 /
+  /// R18-F1): a NEW emission site cannot bypass the per-site gates because it routes here. The
+  /// `debug_assert!` is detection (it fails fast in every test/sim at the emission site, with zero
+  /// release cost) — the per-site gates (`participates_as_primary`, the R16-F1 dvc gate, the
+  /// `on_request_prepare` / `on_recovery` / `serve_sync_checkpoint` `pending_sb` drops) remain the
+  /// PREVENTION; this assert proves they are COMPLETE.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn emit(&mut self, out: Outgoing) {
+    debug_assert!(
+      !out.msg_ref().advertises_authoritative_view() || self.pending_sb.is_none(),
+      "durable-view-before-participate: emitted {} while a durable-view write is pending",
+      out.msg_ref().kind_str(),
+    );
+    self.outgoing.push_back(out);
   }
 
   /// Pulls the next message to send, if any.
@@ -1019,27 +1148,112 @@ impl<S: StateMachine> Endpoint<S> {
     self.events.pop_front()
   }
 
-  /// The earliest scheduled timer deadline, if any.
+  /// The currently-armed deadline for `kind` (the single field accessor backing both the `poll_timeout`
+  /// filter and the `handle_timeout` no-orphan assert). `None` if that timer is not armed.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn armed(&self, kind: TimerKind) -> Option<Instant> {
+    match kind {
+      TimerKind::Prepare => self.timers.prepare,
+      TimerKind::Commit => self.timers.commit,
+      TimerKind::PrimaryIdle => self.timers.primary_idle,
+      TimerKind::SvcMessage => self.timers.svc_message,
+      TimerKind::DvcMessage => self.timers.dvc_message,
+      TimerKind::ViewChangeStatus => self.timers.view_change_status,
+      TimerKind::GetViewMessage => self.timers.get_view_message,
+      TimerKind::RecoverRetry => self.timers.recover_retry,
+      TimerKind::RecoverHead => self.timers.recover_head,
+      TimerKind::RepairRetry => self.timers.repair_retry,
+      TimerKind::SyncSolicit => self.timers.sync_solicit,
+      TimerKind::ForfeitArmed => self.forfeit_armed,
+    }
+  }
+
+  /// The SINGLE SOURCE OF TRUTH for "will the CURRENT (status, substate) actually SERVICE `kind` if it
+  /// fires?" — i.e. does some branch of [`Self::handle_timeout`] act on this timer in this exact state?
+  /// It MIRRORS `handle_timeout`'s status dispatch + the per-handler substate gates EXACTLY (codex
+  /// R15). [`Self::poll_timeout`] filters every armed timer through this so it can NEVER return a
+  /// deadline the current state will not act on; the `debug_assert` at the end of `handle_timeout`
+  /// enforces the converse (no serviceable timer is left armed-and-due) so any future arm/service drift
+  /// trips deterministically (regardless of clock model — so the tick-driven VOPR catches it too). The
+  /// timer-wedge spin class (a deadline-driven driver re-returning a stale, never-serviced deadline) is
+  /// thereby closed by construction, not patched per-site.
+  ///
+  /// The table (each clause verified against the handler that services the timer):
+  /// - `commit` / `prepare` / `forfeit_armed`: the Normal-primary HEARTBEAT path
+  ///   (`primary_timeouts`) reaches the heartbeat/retransmit/`maybe_forfeit` ONLY when NOT stepping
+  ///   down (`!pending_forfeit`) and the view IS durable (`pending_sb.is_none()`); both early-return
+  ///   branches RETIRE these timers, so they are serviceable exactly on `participates_as_primary() &&
+  ///   !pending_forfeit`.
+  /// - `primary_idle`: the Normal-BACKUP branch.
+  /// - `svc_message`: re-broadcast by the Normal-primary forfeit re-propose (`pending_forfeit`), by the
+  ///   Normal-BACKUP idle-SVC retransmit (FIX 1), and by `view_change_timeouts` while not catching up.
+  /// - `dvc_message`: `view_change_timeouts`, not catching up, AND the view is durable
+  ///   (`pending_sb.is_none()`) — the DVC is a vote, so it must not be (re)cast before the view is
+  ///   recoverable (durable-view-before-participate in the retransmit path, codex R16-F1).
+  /// - `view_change_status`: `view_change_timeouts` (armed + serviced in BOTH catch-up and not).
+  /// - `get_view_message`: `view_change_timeouts`, catching up.
+  /// - `recover_retry`: `recover_timeouts` (Recovering).
+  /// - `recover_head`: `recover_head_timeouts` (RecoveringHead).
+  /// - `repair_retry`: `repair_timeouts` (Normal only — the `handle_timeout` gate).
+  /// - `sync_solicit`: `sync_timeouts` (Normal ONLY). While `Recovering`+awaiting-peer the `RequestSync`
+  ///   re-solicit rides the `recover_retry` deadline (`recover_timeouts`), NOT `sync_solicit` — so the
+  ///   `sync_solicit` deadline itself is NOT serviced there and must be filtered out of `poll_timeout`
+  ///   (a corrected entry vs. the draft table: had it been left "Recovering too", a `sync_solicit`
+  ///   armed during the F1 peer-fetch would have been the very spin this refactor forbids).
+  fn serviceable_now(&self, kind: TimerKind) -> bool {
+    match kind {
+      // The Normal-primary heartbeat tick services these only when NOT forfeiting and the view is
+      // durable; the `pending_forfeit` and `pending_sb` branches of `primary_timeouts` retire them.
+      TimerKind::Commit | TimerKind::Prepare | TimerKind::ForfeitArmed => {
+        self.participates_as_primary() && !self.pending_forfeit
+      }
+      TimerKind::PrimaryIdle => self.status.is_normal() && !self.is_primary(),
+      // Three disjoint servicers (see the doc): forfeit re-propose, FIX-1 backup retransmit, or the
+      // active view-change driver.
+      TimerKind::SvcMessage => {
+        (self.status.is_normal() && self.is_primary() && self.pending_forfeit)
+          || (self.status.is_normal() && !self.is_primary())
+          || (self.status.is_view_change() && !self.catching_up)
+      }
+      // The DVC retransmit is a VOTE the new primary counts toward forming the view, so it is
+      // serviceable only once this replica's view is DURABLE — durable-view-before-participate in the
+      // retransmit path (codex R16-F1). `enter_view_change` arms `dvc_message` AND submits the
+      // SendDoViewChange durable-view write (`pending_sb`), and the INITIAL DVC is sent by `on_sb_done`
+      // when that write lands; gating the retransmit on `pending_sb.is_none()` keeps a slow async
+      // superblock write from letting the retransmit cast the vote first (before the view is
+      // recoverable). Kept in lockstep with the `view_change_timeouts` handler so the no-orphan-due
+      // assert holds (an armed-and-due `dvc_message` during `pending_sb` is now non-serviceable, so the
+      // assert ignores it and `poll_timeout` filters it out — no spin, no premature vote). The other
+      // ViewChange retransmit timers stay ungated: `svc_message`/`view_change_status` re-broadcast a
+      // *request-to-change* (an SVC), not a vote, and `get_view_message` is a catch-up READ that (by the
+      // `catching_up` discriminant) never coexists with the SendDoViewChange `pending_sb` window.
+      TimerKind::DvcMessage => {
+        self.status.is_view_change() && !self.catching_up && self.pending_sb.is_none()
+      }
+      TimerKind::ViewChangeStatus => self.status.is_view_change(),
+      TimerKind::GetViewMessage => self.status.is_view_change() && self.catching_up,
+      TimerKind::RecoverRetry => self.status.is_recovering(),
+      TimerKind::RecoverHead => self.status.is_recovering_head(),
+      // `handle_timeout` runs `repair_timeouts`/`sync_timeouts` only while Normal.
+      TimerKind::RepairRetry | TimerKind::SyncSolicit => self.status.is_normal(),
+    }
+  }
+
+  /// The earliest SERVICEABLE timer deadline, if any.
+  ///
+  /// Returns the minimum over ONLY the timers the current (status, substate) will actually SERVICE
+  /// (the internal `serviceable_now` predicate) — NOT over every armed timer. A deadline this returns is therefore
+  /// always one that the next `handle_timeout` acts on (services/re-arms forward or clears), so a
+  /// deadline-driven driver that advances virtual time to it and fires it ALWAYS makes progress: it can
+  /// never re-return a stale, never-serviced deadline and spin (the timer-wedge class — codex R15).
+  /// Deadlines stay STATEFUL: this only FILTERS what is considered; it never resets a timer (the
+  /// handlers own arming/clearing).
   pub fn poll_timeout(&self) -> Option<Instant> {
-    [
-      self.timers.prepare,
-      self.timers.commit,
-      self.timers.primary_idle,
-      self.timers.svc_message,
-      self.timers.dvc_message,
-      self.timers.view_change_status,
-      self.timers.get_view_message,
-      self.timers.recover_retry,
-      self.timers.recover_head,
-      self.timers.repair_retry,
-      self.timers.sync_solicit,
-      // M3.5 T3: the forfeit grace deadline must wake the owner so a stuck primary re-evaluates and
-      // steps down promptly when the window elapses (not just on the next heartbeat tick).
-      self.forfeit_armed,
-    ]
-    .into_iter()
-    .flatten()
-    .min()
+    TimerKind::ALL
+      .into_iter()
+      .filter(|&kind| self.serviceable_now(kind))
+      .filter_map(|kind| self.armed(kind))
+      .min()
   }
 
   /// Encodes the checkpoint op + client-session table + an SM snapshot into one checkpoint envelope.

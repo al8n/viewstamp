@@ -119,8 +119,11 @@ impl<S: StateMachine> Endpoint<S> {
     // replica then leads and the subsumed hole is recovered via that primary's ordinary checkpoint flow.
     // (Gating force-sync off the primary WITHOUT this step-down would wedge a stuck laggard-primary,
     // since its lag may be below the checkpoint-interval forfeit threshold — hence forfeit, not no-op.)
+    // `defer_forfeit` also bootstraps a serviceable `svc_message` wake (codex R15) so a poll_timeout
+    // driver reaches the re-propose tick — a `pending_forfeit` primary has no other serviceable
+    // primary-side timer (the heartbeat timers are filtered out while forfeiting).
     if self.is_primary() {
-      self.pending_forfeit = true;
+      self.defer_forfeit(now);
       return;
     }
     // Clear every snapshot-only hole; the forced sync to `floor` subsumes them all (its snapshot is
@@ -162,7 +165,7 @@ impl<S: StateMachine> Endpoint<S> {
   pub(crate) fn send_request_sync(&mut self, now: Instant) {
     let nonce = self.sync.map_or(self.nonce, |s| s.nonce);
     let recovery = self.awaiting_peer_checkpoint();
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::Backups,
       Message::RequestSync(crate::RequestSync::new(
         self.view,
@@ -233,14 +236,26 @@ impl<S: StateMachine> Endpoint<S> {
   /// shipped `checkpoint_id` to the shipped bytes via `checkpoint_id(cr.snapshot())` — so even a buggy
   /// superblock that returned a snapshot inconsistent with its root id cannot make us advertise
   /// mismatched bytes (the requester re-verifies, but we must not lie cheaply). Re-checks status +
-  /// replica range at SHIP time (both may have changed between submit and completion): if we are no
-  /// longer Normal we drop the reply.
+  /// view-durability + replica range at SHIP time (all may have changed between submit and completion):
+  /// if we are no longer Normal, or our view is no longer durable, we drop the reply.
   pub(crate) fn serve_sync_checkpoint(&mut self, cr: crate::CheckpointRead) {
     let Some((to, nonce)) = self.sync_serving.remove(&cr.id().get()) else {
       return; // not a serve-read we issued (a stale/foreign completion) — ignore.
     };
-    if !self.status.is_normal() {
-      return; // no longer a trustworthy server (entered a view change / recovery) — drop.
+    // Durable-view-before-participate (codex R18-F1): the shipped `SyncCheckpoint` advertises
+    // `self.view` (see below). A replica in its `pending_sb` window (a new primary between
+    // `start_view_as_new_primary` and the `on_sb_done` that makes its view durable — or any replica mid
+    // `AdoptedStartView`/`SendDoViewChange` write) is `Normal` but its view is NOT yet recoverable;
+    // serving a `SyncCheckpoint(self.view)` now would advertise a view a crash could roll back — the
+    // same hazard the `Prepare`/`Commit`/`StartView`/`RecoveryResponse` paths gate on. The served
+    // checkpoint is committed and its CONTENT is view-independent, so the requester loses nothing by
+    // waiting: it re-solicits on its `sync_solicit` timer and a Normal+durable peer answers (and we
+    // answer once our own view is durable). Negligible liveness cost; consistent with the class — the
+    // same shape as the `on_request_prepare` (R17-F1) drop. (The submit side, `on_request_sync`, also
+    // gates on status, but this SHIP-time gate is the load-bearing one: the view may have advanced
+    // between the read submit and its completion.)
+    if !self.status.is_normal() || self.pending_sb.is_some() {
+      return; // no longer a trustworthy server, or our view is not yet durable — drop.
     }
     if to.get() >= self.config.replica_count() {
       return; // defensive range re-check.
@@ -255,7 +270,7 @@ impl<S: StateMachine> Endpoint<S> {
     }
     let snapshot = cr.snapshot_bytes();
     let id = crate::checkpoint_id(&snapshot);
-    self.outgoing.push_back(Outgoing::new(
+    self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(to)),
       Message::SyncCheckpoint(crate::SyncCheckpoint::new(
         self.view,
@@ -337,9 +352,13 @@ impl<S: StateMachine> Endpoint<S> {
     // rewinds). This is the same invariant `complete_recovery` enforces for a restarted primary
     // (abdicate rather than resume with a torn-down pipeline).
     if self.is_primary() {
-      self.pending_forfeit = true;
       self.sync = None;
       self.timers.sync_solicit = None;
+      // `defer_forfeit` sets the latch AND bootstraps a serviceable `svc_message` wake (codex R15): a
+      // forfeiting primary's heartbeat timers are filtered out of `poll_timeout`, so `svc_message` is
+      // its only serviceable primary-side driver — without it a poll_timeout driver would sleep forever
+      // (we just dropped the sync's `sync_solicit`, the only other timer this path had armed).
+      self.defer_forfeit(now);
       return;
     }
     self.apply_sync(now, wal, sb, &m);

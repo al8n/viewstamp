@@ -99,6 +99,33 @@ impl<S: StateMachine> Endpoint<S> {
     self.propose_next_view(now, sb);
   }
 
+  /// Flag the DEFERRED-forfeit step-down a PRIMARY raises off the M3.5 force-sync / sync-checkpoint
+  /// strand (`maybe_force_sync` / `on_sync_checkpoint` / `on_recover_sync_checkpoint`) — it must NOT
+  /// force-sync (that reuses op numbers; see those sites), so it steps down instead and the next
+  /// `primary_timeouts` tick re-proposes `view + 1`. Unlike [`Self::forfeit`] this is raised OUTSIDE a
+  /// primary tick (from a message handler), so it does NOT itself propose; but it MUST bootstrap a
+  /// SERVICEABLE wake so a `poll_timeout`-driven driver actually reaches that next tick.
+  ///
+  /// Bootstrapping `svc_message` (codex R15) is load-bearing: once `pending_forfeit` is set,
+  /// `serviceable_now` makes `commit`/`prepare`/`forfeit_armed` NON-serviceable (the `pending_forfeit`
+  /// branch of `primary_timeouts` retires them and never heartbeats), so the ONLY primary-side timer the
+  /// filtered `poll_timeout` may return while forfeiting is `svc_message`. Were it left unarmed here, a
+  /// step-down raised from a message handler would leave `poll_timeout` with no serviceable primary
+  /// timer — a deadline-driven driver would sleep forever and never reach the re-propose tick (a wedge
+  /// just as fatal as the spin).
+  ///
+  /// Armed at the retransmit cadence (`now + VC_MESSAGE_RETRANSMIT`), exactly as `forfeit()` (via
+  /// `propose_next_view` -> `join_svc`) and a backup's idle-SVC do — so the step-down re-proposes
+  /// `view + 1` on the NEXT svc_message window. `poll_timeout` therefore always returns a STRICTLY-FUTURE
+  /// serviceable deadline while forfeiting (no due-now first deadline that would alias the flag instant),
+  /// and the next `primary_timeouts` tick at-or-after that deadline services it (`svc_message <= now` ⇒
+  /// re-propose; `join_svc` then re-arms forward, so the no-orphan-due assert holds). Idempotent:
+  /// re-flagging just re-bootstraps the cadence (the latch is cleared only on leaving Normal-primary).
+  pub(crate) fn defer_forfeit(&mut self, now: Instant) {
+    self.pending_forfeit = true;
+    self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
+  }
+
   pub(crate) fn on_primary_idle<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     self.propose_next_view(now, sb);
   }
