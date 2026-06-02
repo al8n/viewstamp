@@ -986,6 +986,37 @@ impl<S: StateMachine> Endpoint<S> {
     &self.sm
   }
 
+  /// Whether this replica has ANY storage op (WAL append or superblock write/read) still in flight —
+  /// a submitted [`Wal`]/[`Superblock`] op whose completion the driver still owes.
+  ///
+  /// `true` iff at least one of the durability-relevant pending sets is non-empty: the outstanding WAL
+  /// appends (`pending`, plus its `appending` append-before-ack gate — a subset of `pending`, ORed for
+  /// explicitness), the in-flight durable-view superblock write (`pending_sb`), the in-flight
+  /// checkpoint write sequence (`pending_checkpoint`, and its deferred-install staging
+  /// `pending_install` — which structurally implies `pending_checkpoint`), and the in-flight
+  /// checkpoint READS this replica issued to serve peers' `RequestSync`s (`sync_serving` — a
+  /// `submit_read_checkpoint` whose completion is still owed). It deliberately covers BOTH writes we
+  /// owe durability for AND the serve-reads we issued, since both are storage completions the driver is
+  /// still holding for this endpoint.
+  ///
+  /// A real driver uses this for graceful shutdown (do not tear down the proactor while a write the
+  /// cluster may have acted on is un-acked) and for the restart-in-place drain (see the
+  /// [`OpId`](crate::OpId) lifetime contract: a driver retaining a completion-correlation table across
+  /// endpoint re-creation must drain/cancel all in-flight storage ops first, and this is the
+  /// proto-side "am I quiesced?" signal). The in-flight RECOVERY reads (`recover`) are deliberately NOT
+  /// included: they belong to a
+  /// `Recovering`/`RecoveringHead` endpoint that is itself the product of `recover()` (not a quiesce
+  /// target for a shutdown of a participating replica), and they resolve via `handle_storage`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn has_inflight_storage(&self) -> bool {
+    !self.pending.is_empty()
+      || !self.appending.is_empty()
+      || self.pending_sb.is_some()
+      || self.pending_checkpoint.is_some()
+      || self.pending_install.is_some()
+      || !self.sync_serving.is_empty()
+  }
+
   /// The number of entries in this replica's in-memory `log` cache (the per-op tail cache).
   ///
   /// Exposed for the simulation boundedness checker: after M3.4b GC, this is bounded by
