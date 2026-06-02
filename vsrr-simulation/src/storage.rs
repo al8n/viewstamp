@@ -72,6 +72,18 @@ pub struct StorageFaults {
   /// pre-existing gates). Sibling slot is chosen deterministically from the durable `entries`, so the
   /// fault stays a pure function of the per-replica seed.
   pub misdirect_read_per_mille: u32,
+  /// Per-read probability (out of 1000) that a CHECKPOINT read returns CORRUPT-but-PARSEABLE bytes:
+  /// the live snapshot with one trailing SM-tail byte flipped (codex R23-F1). The bytes STILL DECODE
+  /// (`Endpoint::decode_checkpoint` treats the SM snapshot as an opaque tail) and keep the right BOUND
+  /// op (only the tail flips, never the leading op u64), so a donor's `cr.op() == checkpoint_op` gate
+  /// passes — but they hash to a DIFFERENT id than the durable root. This is the in-model disk fault
+  /// (bit-rot in the snapshot region that still decodes) the serve/recover paths must NOT restore from:
+  /// a donor computing the shipped id FROM these bytes would otherwise ship a self-consistent-but-wrong
+  /// (id, snapshot) pair, and `recover` would restore corrupt SM/session state — both verify the read
+  /// against the DURABLE checkpoint id and DROP it. TRANSIENT (re-rolled per read), so a retry clears it
+  /// and a re-solicit / next clean read serves. `0` ⇒ no checkpoint-read content corruption (all
+  /// pre-existing gates). Distinct from `read_fault_per_mille`, which faults the read OUTRIGHT.
+  pub corrupt_checkpoint_read_per_mille: u32,
 }
 
 impl StorageFaults {
@@ -82,6 +94,7 @@ impl StorageFaults {
       torn_write_per_mille: 0,
       bit_rot_per_mille: 0,
       misdirect_read_per_mille: 0,
+      corrupt_checkpoint_read_per_mille: 0,
     }
   }
 }
@@ -697,6 +710,28 @@ impl Superblock for InMemorySuperblock {
       self.completions.push_back(SuperblockDone::Fault(id));
       return;
     }
+    // TRANSIENT corrupt-but-PARSEABLE checkpoint read (codex R23-F1): flip one trailing SM-tail byte of
+    // the live snapshot. The bytes still DECODE and keep the leading bound op (the envelope is >= 12
+    // bytes: op u64 + sessions_len u32, so the last byte is never the op), so a donor's `cr.op() ==
+    // checkpoint_op` gate passes — but they now hash to a DIFFERENT id than the durable root. The proto
+    // MUST reject these against the durable id (serve + recover) rather than restore corrupt SM/session
+    // state. Rolled INDEPENDENTLY of the outright-fault roll above so both stay a pure function of the
+    // per-replica seed; transient, so a re-read serves the clean bytes.
+    let readable = match readable {
+      Some((op, snap))
+        if !snap.is_empty()
+          && self.faults.corrupt_checkpoint_read_per_mille > 0
+          && self
+            .prng
+            .chance(self.faults.corrupt_checkpoint_read_per_mille, 1000) =>
+      {
+        let mut bytes = snap.to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        Some((op, Bytes::from(bytes)))
+      }
+      other => other,
+    };
     let done = match readable {
       Some((op, snap)) => {
         SuperblockDone::CheckpointRead(CheckpointRead::new(id, OpNumber::with(op), snap))
@@ -1176,6 +1211,60 @@ mod tests {
     assert!(
       saw_read,
       "a transient checkpoint fault clears: some reads succeed"
+    );
+  }
+
+  #[test]
+  fn superblock_corrupt_checkpoint_read_returns_parseable_but_altered_bytes() {
+    use vsrr_proto::SuperblockDone;
+    // codex R23-F1: the corrupt-checkpoint-read fault returns a `CheckpointRead` for the RIGHT op whose
+    // bytes are the live snapshot with one trailing byte flipped — still a `CheckpointRead` (parseable),
+    // but NOT byte-identical to the written snapshot, so it hashes to a different checkpoint id. Proven
+    // TRANSIENT: across many reads some return the GENUINE bytes (a re-read serves the clean snapshot).
+    let mut sb = InMemorySuperblock::with_faults(
+      StorageFaults {
+        corrupt_checkpoint_read_per_mille: 500,
+        ..StorageFaults::none()
+      },
+      3,
+    );
+    let genuine: &[u8] = b"a-genuine-checkpoint-snapshot";
+    write_rooted_checkpoint(&mut sb, 4, b"a-genuine-checkpoint-snapshot");
+    let mut saw_corrupt = false;
+    let mut saw_genuine = false;
+    for i in 1..64u64 {
+      sb.submit_read_checkpoint(OpId::new(i));
+      match sb.poll().unwrap() {
+        SuperblockDone::CheckpointRead(cr) => {
+          assert_eq!(
+            cr.op(),
+            OpNumber::with(4),
+            "the corrupt read keeps its bound op"
+          );
+          assert_eq!(
+            cr.snapshot().len(),
+            genuine.len(),
+            "the fault flips a byte in place, never changes the length",
+          );
+          if cr.snapshot() == genuine {
+            saw_genuine = true;
+          } else {
+            // Differs from the written bytes ⇒ a different content hash, but still a CheckpointRead.
+            assert_ne!(
+              vsrr_proto::checkpoint_id(cr.snapshot()),
+              vsrr_proto::checkpoint_id(genuine),
+              "corrupt bytes hash to a DIFFERENT id than the genuine snapshot",
+            );
+            saw_corrupt = true;
+          }
+        }
+        other => panic!("unexpected superblock completion: {other:?}"),
+      }
+    }
+    assert!(saw_corrupt, "the corrupt-checkpoint-read fault must fire");
+    assert!(
+      saw_genuine,
+      "the fault is transient: some reads return the genuine snapshot"
     );
   }
 

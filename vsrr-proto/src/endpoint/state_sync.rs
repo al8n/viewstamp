@@ -233,12 +233,14 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// Ship a `SyncCheckpoint` for a completed serve-read (the read `on_request_sync` issued). Binds the
-  /// shipped `checkpoint_id` to the shipped bytes via `checkpoint_id(cr.snapshot())` — so even a buggy
-  /// superblock that returned a snapshot inconsistent with its root id cannot make us advertise
-  /// mismatched bytes (the requester re-verifies, but we must not lie cheaply). Re-checks status +
-  /// view-durability + replica range at SHIP time (all may have changed between submit and completion):
-  /// if we are no longer Normal, or our view is no longer durable, we drop the reply.
-  pub(crate) fn serve_sync_checkpoint(&mut self, cr: crate::CheckpointRead) {
+  /// shipped `checkpoint_id` to the shipped bytes via `checkpoint_id(cr.snapshot())`, then VERIFIES that
+  /// id equals our DURABLE checkpoint id (`sb.state().checkpoint_id()`, codex R23-F1) — so a CORRUPT-but-
+  /// parseable read (an in-model disk fault) cannot make us ship a self-consistent-but-wrong (id, bytes)
+  /// pair the requester would accept and restore (it only re-checks `checkpoint_id(snapshot) == advertised
+  /// id`); a mismatch DROPS the read (the serve path is then as strict as `recover`'s `id_ok` gate). Also
+  /// re-checks status + view-durability + replica range at SHIP time (all may have changed between submit
+  /// and completion): if we are no longer Normal, or our view is no longer durable, we drop the reply.
+  pub(crate) fn serve_sync_checkpoint<B: Superblock>(&mut self, sb: &B, cr: crate::CheckpointRead) {
     let Some((to, nonce)) = self.sync_serving.remove(&cr.id().get()) else {
       return; // not a serve-read we issued (a stale/foreign completion) — ignore.
     };
@@ -270,6 +272,19 @@ impl<S: StateMachine> Endpoint<S> {
     }
     let snapshot = cr.snapshot_bytes();
     let id = crate::checkpoint_id(&snapshot);
+    // Integrity (codex R23-F1): a checkpoint READ may return CORRUPT-but-parseable bytes (an in-model
+    // DISK FAULT — bit-rot in the snapshot region that still decodes). Serving them would ship a
+    // SELF-CONSISTENT (id, snapshot) pair the requester cannot distinguish from a good one: it only
+    // re-checks `checkpoint_id(snapshot) == advertised id` (`on_sync_checkpoint`), which HOLDS because we
+    // computed `id` from the corrupt bytes — so it would restore CORRUPTED SM/session state. Verify the
+    // read bytes against our OWN DURABLE checkpoint id (`sb.state().checkpoint_id()` — the same authority
+    // `recover` uses for its `id_ok` gate, recovery.rs): a corrupt read does NOT hash to it. The `cr.op()
+    // == self.checkpoint_op` gate above already pinned the durable op, so this completes the (op, id)
+    // match against the durable root — the serve path is now exactly as strict as recover. On mismatch
+    // DROP it (the requester re-solicits and another peer, or our next clean read, serves).
+    if id != sb.state().checkpoint_id() {
+      return;
+    }
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(to)),
       Message::SyncCheckpoint(crate::SyncCheckpoint::new(

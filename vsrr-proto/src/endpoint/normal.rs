@@ -362,6 +362,17 @@ impl<S: StateMachine> Endpoint<S> {
     if self.fill_repair(now, wal, sb, &p) {
       return;
     }
+    // A registered repair hole is owned EXCLUSIVELY by the repair path (codex R13-F2 / R21-F1):
+    // `fill_repair` above already had its chance. If it DECLINED (a stale `commit < op`, an unverifiable
+    // body, or — returning `true`, handled above — a RepairFill already in flight), this `Prepare` is
+    // NOT the canonical fill for the hole, so drop it NOW — BEFORE the higher-view `catch_up_to_view`
+    // below or the normal append / re-ack path can act on a hole-targeted `Prepare`. In particular a
+    // higher-view non-canonical hole `Prepare` (which still passes the repair-hole ingress escape) must
+    // NOT yank us into a spurious view change off a body the repair path explicitly rejected; the repair
+    // solicitation re-asks until a committed-vouching `Prepare` fills the hole via `fill_repair`.
+    if self.repair.contains(&p.op().get()) {
+      return;
+    }
     if p.view().get() > self.view.get() {
       self.catch_up_to_view(now, p.view());
       return;
@@ -392,16 +403,11 @@ impl<S: StateMachine> Endpoint<S> {
 
     let pop = p.op().get();
     if pop <= self.op.get() {
-      // A REGISTERED REPAIR HOLE is owned EXCLUSIVELY by the repair path (codex R13-F2): `fill_repair`
-      // (run at the top of `on_prepare`) already had its chance and rejected this Prepare (a stale
-      // `commit < op`, an unverifiable body, or — returning `true` — a RepairFill already in flight), so
-      // reaching here means it is NOT the committed value for the hole. We must NOT let the re-ack /
-      // interior-re-append branch below write that body into the committed hole's WAL slot nor mark it
-      // `appending` (which would then masquerade as an in-flight RepairFill). Drop it; the repair
-      // solicitation re-asks until a committed-vouching `Prepare` fills the hole via `fill_repair`.
-      if self.repair.contains(&pop) {
-        return;
-      }
+      // NOTE: a hole-targeted `Prepare` that `fill_repair` declined was ALREADY dropped at the top of
+      // `on_prepare` (the R13-F2 / R21-F1 hole-ownership guard, moved up to run before the higher-view
+      // catch-up), so `pop` here is NEVER one of our registered repair holes — the re-ack /
+      // interior-re-append branch below can never write a declined hole `Prepare` into the committed
+      // hole's WAL slot nor mark it `appending` (which would masquerade as an in-flight RepairFill).
       // Already at/below the head; (re)ack so a lost prepare_ok is recovered. Ops are immutable within a
       // view, and the higher-view rule (top of this fn) + the `view != self.view` reject mean this
       // branch only fires for a current-view prepare.

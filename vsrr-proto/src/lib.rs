@@ -4,6 +4,20 @@
 //! (`handle_*`) and emits actions as outputs (`poll_*`), owning no I/O, no clock,
 //! and no randomness source. TigerBeetle's `src/vsr/replica.zig` is the
 //! correctness reference for the protocol logic.
+//!
+//! # Threat model (non-Byzantine, crash-fault-tolerant)
+//!
+//! vsrr is a **crash-fault-tolerant** Viewstamped Replication implementation for a **TRUSTED**
+//! cluster — exactly like TigerBeetle, and explicitly **NOT** a Byzantine-fault-tolerant /
+//! blockchain system. Authenticating a replica message's sender is the **DRIVER's** responsibility:
+//! the driver sets the `from: Peer` it passes to [`Endpoint::handle_message`] to the AUTHENTICATED
+//! transport peer (mirroring TigerBeetle's `message_bus.zig` `set_and_verify_peer`), and the proto
+//! TRUSTS that `from`. As a cheap **defense-in-depth** backstop, `handle_message`'s ingress binds each
+//! message's own self-claimed sender to `from` and drops any mismatch, so a BUGGY or misrouting driver
+//! (or a trivially-mislabeled message) cannot let a forged/misrouted message spoof a quorum vote — the
+//! ingress analogue of the single egress emission chokepoint. Full message authentication against a
+//! genuinely MALICIOUS sender (cryptographic signatures, Byzantine fault tolerance) is **OUT OF
+//! SCOPE** — a BFT/blockchain concern, not a crash-fault-tolerant one.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
