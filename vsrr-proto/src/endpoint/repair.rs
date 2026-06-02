@@ -12,6 +12,12 @@ impl<S: StateMachine> Endpoint<S> {
     // a bit-rotted slot was never inserted.
     self.log.remove(&op);
     self.repair.insert(op);
+    // Committed-survival backstop: this drop is a cache eviction, not a loss — `op` is now a TRACKED
+    // repair hole, so the canonical committed body is re-solicited below (and the apply loop holds the
+    // commit beneath it until it returns). Asserted AFTER the insert so the tracked-for-repair clause
+    // holds (a committed hole here is typically `checkpoint_op < op <= commit_max`, covered by neither
+    // the checkpoint nor the uncommitted clause).
+    self.assert_committed_survives(op, self.checkpoint_op.get());
     self.send_request_prepare(op);
     self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
     // Force-sync escalation (M3.5): if a quorum already checkpointed past this just-registered hole

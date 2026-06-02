@@ -58,7 +58,7 @@ impl<S: StateMachine> Endpoint<S> {
       // 300ms, is later than the svc cadence, so the spin surfaces once virtual time reaches it).
       // Clearing it (idempotent once None; the deferred-forfeit latch, not the grace timer, drives the
       // step-down retries now) keeps `svc_message` the sole primary-side driver while forfeiting.
-      self.forfeit_armed = None;
+      self.timers.forfeit_armed = None;
       if self.timers.svc_message.is_none_or(|d| d <= now) {
         self.propose_next_view(now, sb);
       }
@@ -319,7 +319,7 @@ impl<S: StateMachine> Endpoint<S> {
       return false;
     };
     let reply_body = self.sm.apply(OpNumber::with(op), &entry.body);
-    self.commit_min = OpNumber::with(op);
+    self.set_commit_min(OpNumber::with(op));
     if let Some(inflight) = self.inflight.get_mut(&op) {
       inflight.committed = true;
     }
@@ -571,6 +571,18 @@ impl<S: StateMachine> Endpoint<S> {
   /// Applies committed ops we hold, up to `min(target, op)`, strictly in order. Backups discard the
   /// reply but emit `Committed` so observers can verify agreement.
   pub(crate) fn advance_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B, target: u64) {
+    // Durable-before-install (codex R24-F1): while a state-sync install is STAGED but not yet durable,
+    // the SM is about to be wholesale-REPLACED at the synced point by `install_sync`, so do NOT apply
+    // ops over the soon-to-be-replaced SM in the meantime. This is load-bearing for the recovery
+    // peer-fetch path (`on_recover_sync_checkpoint`), whose SM is genuinely UNRESTORED during the window
+    // — applying a held tail op over it would corrupt committed state. It also keeps `commit_min`/
+    // `commit_max`/`self.op` FROZEN across the STAGE→install window so the install is the single atomic
+    // mutation point (the captured held-tail decision + the monotonic advances stay exactly as at STAGE,
+    // with no commit_max rewind). The install advances `commit_min` to the synced point and the retained
+    // committed tail re-applies via the next Commit/Prepare once `pending_install` clears.
+    if self.pending_install.is_some() {
+      return;
+    }
     // Record the learned commit regardless of whether we hold the ops yet.
     self.commit_max = OpNumber::with(self.commit_max.get().max(target));
     while self.commit_min.get() < target && self.commit_min.get() < self.op.get() {
@@ -585,7 +597,7 @@ impl<S: StateMachine> Endpoint<S> {
         break;
       };
       let reply = self.sm.apply(OpNumber::with(op), &entry.body);
-      self.commit_min = OpNumber::with(op);
+      self.set_commit_min(OpNumber::with(op));
       // Maintain the client-session request high-water + CACHED REPLY as we apply (mirrors the
       // primary's `commit_op`). The request watermark is the at-most-once dedup watermark a
       // backup-turned-primary needs in `on_request`. It MUST be tracked here on every apply — NOT

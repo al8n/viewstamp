@@ -114,16 +114,14 @@ impl<S: StateMachine> Endpoint<S> {
     // requests at REUSED op numbers in the SAME view, and backups still holding the old entries would
     // re-ack them from `on_prepare`'s `pop <= self.op` branch WITHOUT comparing bodies — the primary
     // commits body B while backups applied body A for the same op = committed-state divergence. So a
-    // primary that reaches this strand (an unservable, checkpoint-subsumed hole) steps DOWN instead:
-    // flag the deferred forfeit, which the next primary tick (`primary_timeouts`) acts on. A caught-up
-    // replica then leads and the subsumed hole is recovered via that primary's ordinary checkpoint flow.
-    // (Gating force-sync off the primary WITHOUT this step-down would wedge a stuck laggard-primary,
-    // since its lag may be below the checkpoint-interval forfeit threshold — hence forfeit, not no-op.)
-    // `defer_forfeit` also bootstraps a serviceable `svc_message` wake (codex R15) so a poll_timeout
-    // driver reaches the re-propose tick — a `pending_forfeit` primary has no other serviceable
-    // primary-side timer (the heartbeat timers are filtered out while forfeiting).
-    if self.is_primary() {
-      self.defer_forfeit(now);
+    // primary that reaches this strand (an unservable, checkpoint-subsumed hole) steps DOWN instead, via
+    // the single `abdicate_if_primary` chokepoint (audit D1): it flags the deferred forfeit (+ the
+    // serviceable `svc_message` wake) which the next primary tick (`primary_timeouts`) acts on, and we
+    // RETURN here without arming the forced sync. A caught-up replica then leads and the subsumed hole is
+    // recovered via that primary's ordinary checkpoint flow. (Gating force-sync off the primary WITHOUT
+    // this step-down would wedge a stuck laggard-primary, since its lag may be below the
+    // checkpoint-interval forfeit threshold — hence forfeit, not no-op.)
+    if self.abdicate_if_primary(now) {
       return;
     }
     // Clear every snapshot-only hole; the forced sync to `floor` subsumes them all (its snapshot is
@@ -308,7 +306,7 @@ impl<S: StateMachine> Endpoint<S> {
   pub(crate) fn on_sync_checkpoint<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
+    _wal: &mut W,
     sb: &mut B,
     m: crate::SyncCheckpoint,
   ) {
@@ -358,54 +356,66 @@ impl<S: StateMachine> Endpoint<S> {
     // `maybe_force_sync` ALREADY guards the ARM site (a primary reaching the unservable-hole strand
     // sets `pending_forfeit` instead of force-syncing — see its safety note), but a forced/ordinary
     // sync ARMED while this replica was a BACKUP can still be DELIVERED after it (re)gained primacy, so
-    // the guard must also hold at the APPLY site. Mirror the arm-site decision: a primary that would
-    // apply a sync STEPS DOWN — drop the sync and flag the deferred forfeit, which the next
-    // `primary_timeouts` acts on (re-propose `view + 1`). A caught-up replica then leads (every replica
-    // already holds the committed tail durably), and THIS replica recovers any pruned hole as a BACKUP
-    // via the ordinary force-sync escalation once it is no longer primary. No committed op is lost (the
-    // synced snapshot is never discarded — it is simply re-fetched as a backup; `commit_min` never
-    // rewinds). This is the same invariant `complete_recovery` enforces for a restarted primary
-    // (abdicate rather than resume with a torn-down pipeline).
-    if self.is_primary() {
+    // the guard must also hold at the APPLY site. Mirror the arm-site decision via the single
+    // `abdicate_if_primary` chokepoint (audit D1): a multi-replica primary that would apply a sync STEPS
+    // DOWN — the chokepoint flags the deferred forfeit (+ the serviceable `svc_message` wake) which the
+    // next `primary_timeouts` acts on (re-propose `view + 1`), and we DROP the rejected sync (its
+    // `sync_solicit`, the only other timer this path armed) and skip the in-place apply. A caught-up
+    // replica then leads (every replica already holds the committed tail durably), and THIS replica
+    // recovers any pruned hole as a BACKUP via the ordinary force-sync escalation once it is no longer
+    // primary. No committed op is lost (the synced snapshot is never discarded — it is simply re-fetched
+    // as a backup; `commit_min` never rewinds). This is the same invariant `complete_recovery` enforces
+    // for a restarted primary (abdicate rather than resume with a torn-down pipeline).
+    if self.abdicate_if_primary(now) {
       self.sync = None;
       self.timers.sync_solicit = None;
-      // `defer_forfeit` sets the latch AND bootstraps a serviceable `svc_message` wake (codex R15): a
-      // forfeiting primary's heartbeat timers are filtered out of `poll_timeout`, so `svc_message` is
-      // its only serviceable primary-side driver — without it a poll_timeout driver would sleep forever
-      // (we just dropped the sync's `sync_solicit`, the only other timer this path had armed).
-      self.defer_forfeit(now);
       return;
     }
-    self.apply_sync(now, wal, sb, &m);
+    self.apply_sync(now, sb, &m);
   }
 
-  /// Apply a verified `SyncCheckpoint`: restore the SM + sessions, advance the metadata to the synced
-  /// point, rebuild the WAL/log for it, and stage the durable re-persist (two superblock writes, reusing
-  /// the checkpoint sequence). `sync` stays `Some` until the root write completes (`on_sb_done`), so a
-  /// crash mid-persist re-solicits.
+  /// STAGE a verified `SyncCheckpoint` (codex R24-F1, durable-before-install). Runs the up-front
+  /// VERIFICATION (the forced-vs-ordinary release-active assert, the fallible decode, the F3 BIND-CHECK)
+  /// — these mutate nothing — then stages the durable re-persist (the two superblock writes, reusing the
+  /// checkpoint sequence) and REMEMBERS the install in `pending_install`. The DESTRUCTIVE install
+  /// (restore the SM/sessions, advance `commit_min`/`commit_max`/`op`, prune the WAL, advance
+  /// `checkpoint_op`) is DEFERRED to [`Self::install_sync`], which runs ATOMICALLY in `on_sb_done` only
+  /// once the sync ROOT (step 2) is durable. `sync` stays `Some` until then, so a crash mid-persist
+  /// re-solicits (the durable root still names the OLD checkpoint until step 2 lands).
+  ///
+  /// **Why defer the install (the R24-F1 root fix — durable-before-install).** The destructive effects
+  /// (pruning the WAL + advancing `commit_min`/`op`) are IRREVERSIBLE; the rest of vsrr only performs
+  /// such effects AFTER the durable record justifying them has landed (the normal checkpoint path GCs
+  /// only after its root is durable; durable-view gates participation on `pending_sb`). The old
+  /// `apply_sync` was the lone violator: it pruned the band + advanced `commit_min`/`op` EAGERLY, before
+  /// the sync checkpoint root was durable, leaving a window where the replica was `Normal` with
+  /// `commit_min == op == synced_op` and the band PRUNED but `checkpoint_op` STILL OLD. A view change in
+  /// that window dropped the (not-yet-durable) sync and could make the replica a PRIMARY advertising the
+  /// OLD `checkpoint_op` over a PRUNED committed band — a laggard below the band could then neither
+  /// `RequestPrepare` (pruned) nor was it triggered to `RequestSync` (the primary advertised the old
+  /// checkpoint) → cluster wedge if the donor crashed. Deferring the install to the durable root closes
+  /// the window: during STAGE the replica keeps its OLD (consistent, if stale) state, so a view change
+  /// finds it intact and cleanly cancels the install ([`Self::enter_view_change`] clears `sync` +
+  /// `pending_install`), and — since STAGE never advanced `commit_min`/`op` — the replica structurally
+  /// cannot advertise the synced commit until the install lands. This mirrors TigerBeetle, where the
+  /// superblock write is the commit point and the synced checkpoint installs only after it is durable.
   ///
   /// **No committed op the replica already held AHEAD of the sync can be lost.** On the ORDINARY
   /// trigger the synced `checkpoint_op > self.op`, so the replica's entire held log `[..=self.op]` is
-  /// at or below the synced point — every op `<= checkpoint_op` is already reflected in the restored
-  /// SM. A *committed* op above `self.op` is impossible (committing an op requires having prepared it,
-  /// which would put it `<= self.op`); the only thing discarded is a stale/uncommitted tail at or
-  /// below the synced checkpoint, which is safe.
+  /// at or below the synced point — every op `<= checkpoint_op` is already reflected in the snapshot the
+  /// install restores. A *committed* op above `self.op` is impossible (committing an op requires having
+  /// prepared it, which would put it `<= self.op`); the only thing discarded is a stale/uncommitted tail
+  /// at or below the synced checkpoint, which is safe.
   ///
   /// On the M3.5 FORCED path ([`Self::maybe_force_sync`]) the synced `checkpoint_op` may instead be
   /// `<= self.op` (the replica holds a tail ABOVE a pruned committed hole). The held tail
-  /// `(checkpoint_op .. self.op]` is then **PRESERVED, not discarded** (safety, VOPR seed 164). Those
-  /// ops were already durably APPENDED + ACKED by this replica (it voted for them), so the cluster may
-  /// have COMMITTED them off its vote. The old code reset `self.op = checkpoint_op` and truncated the
-  /// WAL — destroying this replica's only durable copy of a possibly-committed op while KEEPING its
-  /// `log_view`; a later view change then took its `(log_view, op)` as the canonical generation's head
-  /// and dropped those committed ops cluster-wide (no donor of that generation held them), which the
-  /// adopt-time `op >= commit_min` assert detected as a committed-op rewind. The "re-fetch via
-  /// `Prepare`/`Commit`" argument is NOT a safe substitute: a view change can intervene before the
-  /// re-fetch and finalize a head below the lost ops. The forced sync's *purpose* is only to recover
-  /// the doomed hole(s) `N (<= checkpoint_op)` (subsumed by the restored snapshot) — so we keep
-  /// `self.op` and the above-floor log entries, restore the SM/sessions at the snapshot, and re-apply
-  /// the retained committed tail from the natural `advance_commit` flow. `commit_min` only moves
-  /// FORWARD (`checkpoint_op >= N > N-1 == commit_min`), so no applied op is rewound. The release-active
+  /// `(checkpoint_op .. self.op]` is then **PRESERVED, not discarded** by the install (safety, VOPR seed
+  /// 164) — the `held_tail` decision captured HERE is what `install_sync` honours. Those ops were
+  /// already durably APPENDED + ACKED by this replica (it voted for them), so the cluster may have
+  /// COMMITTED them off its vote. The forced sync's *purpose* is only to recover the doomed hole(s) `N
+  /// (<= checkpoint_op)` (subsumed by the restored snapshot); the acked tail above the floor must
+  /// survive. `self.op` is FROZEN across the STAGE→install window (`on_prepare` drops while
+  /// `sync.is_some()`), so the `held_tail` decision is identical at install time. The release-active
   /// assert below branches: ordinary ⇒ `checkpoint_op > self.op`; forced ⇒ the true invariant
   /// `checkpoint_op >= commit_min`. Either way it makes a trigger-loosening that violates safety fail
   /// loudly rather than silently drop a committed op (matching `select_canonical_log`'s fail-stop style).
@@ -414,10 +424,9 @@ impl<S: StateMachine> Endpoint<S> {
   /// a peer made durable — a quorum committed+applied through it — and we additionally gate on
   /// `>= sync.target`, itself derived from a committed-cluster message. So we never adopt a snapshot
   /// above the committed frontier.
-  pub(crate) fn apply_sync<W: Wal, B: Superblock>(
+  pub(crate) fn apply_sync<B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
     sb: &mut B,
     m: &crate::SyncCheckpoint,
   ) {
@@ -428,7 +437,9 @@ impl<S: StateMachine> Endpoint<S> {
     // a pruned committed hole); the TRUE invariant there is `checkpoint_op >= commit_min` — never
     // rewind the applied frontier — and the trigger structurally guarantees `checkpoint_op >= N > N-1
     // == commit_min`, so the held tail it discards is only uncommitted ops or committed ops the quorum
-    // holds and re-announces (see the method doc's case analysis).
+    // holds and re-announces (see the method doc's case analysis). Both `commit_min` and `self.op` are
+    // FROZEN across the STAGE→install window (`advance_commit` is suppressed while `pending_install`,
+    // and `on_prepare` drops while `sync.is_some()`), so this assert holds identically at install time.
     if self.sync.is_some_and(|s| s.forced) {
       assert!(
         checkpoint_op.get() >= self.commit_min.get(),
@@ -444,45 +455,104 @@ impl<S: StateMachine> Endpoint<S> {
         self.op.get()
       );
     }
-    // Decode the verified envelope FIRST (before any state mutation). `on_sync_checkpoint` already
-    // verified `checkpoint_id(snapshot) == m.checkpoint_id()`, so the bytes are the right checkpoint;
-    // but a malformed/truncated envelope (a buggy encoder, or corruption that somehow preserved the
-    // hash) must NOT panic — reject it as a fault and leave `sync` armed so the solicit timer re-fetches
-    // from another peer. We have mutated nothing yet, so an early return is clean.
+    // Decode the verified envelope FIRST (before staging anything irreversible). `on_sync_checkpoint`
+    // already verified `checkpoint_id(snapshot) == m.checkpoint_id()`, so the bytes are the right
+    // checkpoint; but a malformed/truncated envelope (a buggy encoder, or corruption that somehow
+    // preserved the hash) must NOT panic — reject it as a fault and leave `sync` armed so the solicit
+    // timer re-fetches from another peer. We have mutated nothing yet, so an early return is clean.
     let Some((bound_op, sessions, sm_tail)) = Self::decode_checkpoint(m.snapshot()) else {
       return;
     };
     // BIND-CHECK (F3, safety): the op hashed INTO the snapshot must equal the advertised `checkpoint_op`
-    // we are about to advance `commit_min`/`commit_max`/`op` to. A faulty peer can ship STALE snapshot
+    // the install will advance `commit_min`/`commit_max`/`op` to. A faulty peer can ship STALE snapshot
     // bytes (whose real frontier is op A) under an OVERSTATED `checkpoint_op = B > A` whose hash still
-    // matches the old bytes; without this check we would restore the OLDER SM yet advance the frontier
-    // to B — silently dropping the committed ops in `(A, B]`. Reject (no mutation; `sync` stays armed so
-    // another peer answers) rather than drop committed state.
+    // matches the old bytes; without this check the install would restore the OLDER SM yet advance the
+    // frontier to B — silently dropping the committed ops in `(A, B]`. Reject (no staging; `sync` stays
+    // armed so another peer answers) rather than drop committed state.
     if bound_op != checkpoint_op {
       return;
     }
-    // PRESERVE-TAIL (safety, VOPR seed 164): does this sync land BELOW our held head? Only the FORCED
-    // path can (the ordinary assert above guarantees `checkpoint_op > self.op`). When it does, the band
-    // `(checkpoint_op .. self.op]` is ops we already durably APPENDED + ACKED (we voted for them with
-    // `PrepareOk`/`AdoptAck`), so the cluster may have COMMITTED them off our vote. Discarding them
-    // (the old `self.op = checkpoint_op` + `wal.truncate(checkpoint_op)` + `log.clear`) destroys our
-    // only durable copy of a possibly-committed op while keeping `log_view` — a later view change then
-    // takes our `(log_view, op)` as the canonical generation's head and drops those committed ops
-    // entirely (the loss the adopt-time `op >= commit_min` assert later trips on). The forced sync's
-    // *purpose* is only to recover the pruned holes AT/BELOW the floor (subsumed by the snapshot); the
-    // acked tail ABOVE the floor must survive. So keep `self.op` and the above-floor log entries,
-    // restore the SM/sessions at the snapshot, and let the recovered committed tail re-apply once the
-    // re-persist lands (the next Commit/Prepare drives `advance_commit` over the retained log).
+    // PRESERVE-TAIL decision (safety, VOPR seed 164), captured for the deferred install: does this sync
+    // land BELOW our held head? Only the FORCED path can (the ordinary assert above guarantees
+    // `checkpoint_op > self.op`). When it does, `install_sync` PRESERVES the band `(checkpoint_op ..
+    // self.op]` rather than discarding it — those ops were already durably APPENDED + ACKED, so the
+    // cluster may have committed them off our vote. `self.op` is frozen across the window, so this
+    // decision is stable until install. Own an OWNED zero-copy slice of the SM-tail bytes (the
+    // `decode_checkpoint` borrow into the wire envelope does not outlive `m`), so the install restores
+    // without re-decoding.
     let held_tail = checkpoint_op.get() < self.op.get();
-    // Restore the SM and the client-session table from the decoded envelope.
-    self.sm.restore(sm_tail);
+    let tail_offset = m.snapshot().len() - sm_tail.len();
+    let sm_tail = m.snapshot_bytes().slice(tail_offset..);
+    // Stage the durable re-persist, reusing the checkpoint two-write sequence so a crash recovers to
+    // the synced point (not the stale one) ONLY once the root lands. Step 1: write the snapshot under
+    // our own superblock; step 2 (in `on_sb_done`) writes the new VsrState root naming it, which then
+    // drives `install_sync`. `sync` + `pending_install` stay armed until step 2 completes. (No
+    // checkpoint can already be in flight — `on_sync_checkpoint` gates on `pending_checkpoint.is_none()`.)
+    let id = self.mint_op_id();
+    sb.submit_write_checkpoint(id, checkpoint_op, m.snapshot_bytes());
+    self.pending_checkpoint = Some(PendingCheckpoint {
+      target_op: checkpoint_op,
+      checkpoint_id: m.checkpoint_id(),
+      step: CheckpointStep::AwaitSnapshot { id },
+      // a STATE-SYNC re-persist: the root completion routes to the install (codex R24-F1)
+      kind: CheckpointKind::SyncRepersist,
+    });
+    // REMEMBER the install — applied atomically by `install_sync` when the root is durable. Until then
+    // the replica keeps its OLD (consistent, if stale) in-memory + durable state: NOTHING destructive
+    // (no SM restore, no `commit_min`/`op` advance, no WAL prune) happens yet, so a view change in this
+    // window cancels cleanly with no pruned-but-stale band (the R24-F1 fix).
+    self.pending_install = Some(PendingInstall {
+      checkpoint_op,
+      sessions,
+      sm_tail,
+      held_tail,
+    });
+    // Keep re-soliciting until the persist's root write completes (defends a fault mid-persist).
+    self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+  }
+
+  /// INSTALL a staged `SyncCheckpoint` (codex R24-F1, durable-before-install) — the DESTRUCTIVE half of
+  /// [`Self::apply_sync`]. Restores the SM + sessions, advances `commit_min`/`commit_max`/`op` to the
+  /// synced point (preserving the forced-sync held tail), and prunes the WAL. (The caller advances
+  /// `self.checkpoint_op` — see the note at the tail — so the durable checkpoint pointer moves only when
+  /// the synced root is durable.) On the DEFERRED Normal path this runs in `on_sb_done` once the sync
+  /// ROOT (step 2) is durable, the destructive effects then ATOMICALLY justified by that durable root; on
+  /// the EAGER recovery peer-fetch path it runs at flip-to-Normal (the recovery contract forbids reaching
+  /// Normal with an unrestored SM) while the re-persist completes in the background. After the caller
+  /// advances `checkpoint_op`, `(checkpoint_op, the durable root id)` and `commit_min`/`op` are ALL
+  /// consistent at the synced point: there is no window where `checkpoint_op` lags a pruned band, so a
+  /// synced replica can never become primary advertising a checkpoint below a pruned committed band. On
+  /// the deferred path it is idempotent against intervening state: `self.op`/`commit_min`/`commit_max`
+  /// are frozen across the STAGE→here window (`advance_commit` is suppressed while `pending_install`, and
+  /// `on_prepare` drops while `sync.is_some()`), so the captured `held_tail` and the monotonic advances
+  /// below are exactly as they would have been at STAGE time.
+  pub(crate) fn install_sync<W: Wal>(&mut self, wal: &mut W, install: PendingInstall) {
+    let PendingInstall {
+      checkpoint_op,
+      sessions,
+      sm_tail,
+      held_tail,
+    } = install;
+    // Defensive monotonicity (never rewind the applied frontier): `commit_min` is frozen below the
+    // doomed hole on the forced path (the hole `<= checkpoint_op` blocks `advance_commit`) and is `<
+    // checkpoint_op` on the ordinary path, so this advance is always forward. Asserted in debug builds
+    // to catch any future relaxation that would let the window advance `commit_min` past the snapshot.
+    debug_assert!(
+      checkpoint_op.get() >= self.commit_min.get(),
+      "install must not rewind the applied frontier (checkpoint_op {} < commit_min {})",
+      checkpoint_op.get(),
+      self.commit_min.get()
+    );
+    // Restore the SM and the client-session table from the decoded snapshot.
+    self.sm.restore(&sm_tail);
     self.clients = sessions;
     // Advance metadata monotonically to the synced point. `commit_min` becomes the synced frontier;
     // `commit_max` keeps the higher learned commit (a held tail we are about to re-apply may already be
     // known-committed). With no held tail, `op == commit_max == commit_min == checkpoint_op` (the
     // post-recover-from-checkpoint shape); with a held tail, `self.op` and `commit_max` stay, so
-    // `op >= commit_max >= commit_min == checkpoint_op` still holds.
-    self.commit_min = checkpoint_op;
+    // `op >= commit_max >= commit_min == checkpoint_op` still holds. The universal monotone floor is
+    // asserted in `set_commit_min`; the richer rewind assert above adds the forced-vs-ordinary proof.
+    self.set_commit_min(checkpoint_op);
     self.commit_max = OpNumber::with(self.commit_max.get().max(checkpoint_op.get()));
     if !held_tail {
       self.op = checkpoint_op;
@@ -493,7 +563,16 @@ impl<S: StateMachine> Endpoint<S> {
     // lost. Any pending-repair hole AT/BELOW the checkpoint is subsumed (cleared); a hole strictly
     // above it (held_tail only) stays solicited (the recovered tail may still have an interior faulty
     // slot the snapshot does not cover).
-    self.log.retain(|&op, _| op > checkpoint_op.get());
+    //
+    // The log cache trim is the SHARED post-checkpoint rule ([`Self::trim_log_to_checkpoint`], common
+    // with `run_gc`): drop every op `<= checkpoint_op`, retaining the held tail `(checkpoint_op ..
+    // head]`. The committed-survival witness floor is the LOCAL synced `checkpoint_op` (the snapshot
+    // restored above), NOT `self.checkpoint_op` — the R24-F1 deferred-advance leaves `self.checkpoint_op`
+    // at the OLD value until the caller records the synced root.
+    self.trim_log_to_checkpoint(checkpoint_op.get(), checkpoint_op.get());
+    // The remaining teardown is site-specific (NOT the shared trim): a sync lands as a BACKUP and
+    // fully tears the pipeline down — `clear()` (not retain-above-floor) so a far-future buffered
+    // prepare ABOVE the synced checkpoint cannot survive a snapshot that invalidates it.
     self.inflight.clear();
     self.buffer.clear();
     self.repair.retain(|&op| op > checkpoint_op.get());
@@ -507,24 +586,26 @@ impl<S: StateMachine> Endpoint<S> {
     // Rebuild the durable WAL. Drop any stale slots strictly ABOVE our head (a stale higher generation
     // that would otherwise read back as a wrong head on a later restart) — `truncate(self.op)`, which
     // is a no-op when no tail is held (`self.op == checkpoint_op`) and preserves the retained tail
-    // `(checkpoint_op .. op]` otherwise. Then free slots BELOW the checkpoint (superseded by the
-    // snapshot). The durable ROOT below names `commit = checkpoint_op`, so a later `recover()` restores
-    // the SM at the synced point and re-reads the retained tail from the WAL.
+    // `(checkpoint_op .. op]` otherwise. Then free slots strictly BELOW the checkpoint (superseded by
+    // the snapshot). The durable ROOT (already written) names `commit = checkpoint_op`, so a later
+    // `recover()` restores the SM at the synced point and re-reads the retained tail from the WAL.
+    //
+    // `prune(checkpoint_op)` frees `< checkpoint_op`, deliberately RETAINING the slot AT `checkpoint_op`
+    // — so a no-held-tail sync (`self.op == checkpoint_op`, just truncated above) leaves a NON-EMPTY WAL
+    // with `op_head() == checkpoint_op`, not an empty WAL that would read back head 0 on restart. This
+    // is why the WAL prune is NOT folded into the shared post-checkpoint trim: `run_gc` frees `<= floor`
+    // (`prune(floor+1)`) because it has no such WAL-head constraint, so the two sites legitimately use a
+    // different prune FLOOR. Only the in-memory log trim above is common ([`Self::trim_log_to_checkpoint`]).
     wal.truncate(self.op);
     wal.prune(checkpoint_op);
-    // Stage the durable re-persist, reusing the checkpoint two-write sequence so a crash recovers to
-    // the synced point (not the stale one). Step 1: write the snapshot under our own superblock; step
-    // 2 (in `on_sb_done`) writes the new VsrState root naming it. `sync` stays armed until step 2
-    // completes. (No checkpoint can already be in flight — `on_sync_checkpoint` gates on
-    // `pending_checkpoint.is_none()`.)
-    let id = self.mint_op_id();
-    sb.submit_write_checkpoint(id, checkpoint_op, m.snapshot_bytes());
-    self.pending_checkpoint = Some(PendingCheckpoint {
-      target_op: checkpoint_op,
-      checkpoint_id: m.checkpoint_id(),
-      step: CheckpointStep::AwaitSnapshot { id },
-    });
-    // Keep re-soliciting until the persist's root write completes (defends a fault mid-persist).
-    self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+    // NOTE: `self.checkpoint_op` is advanced to the synced op by the CALLER (`on_sb_done`'s sync
+    // re-persist arm) — NOT here — because it must move only when the synced checkpoint ROOT is durable.
+    // For the DEFERRED Normal path `install_sync` already runs at root completion, so the caller sets it
+    // immediately after. For the EAGER recovery path `install_sync` runs at flip-to-Normal (root not yet
+    // durable), and advancing `checkpoint_op` here would let a view change in the window persist a
+    // durable-view root naming a `checkpoint_op` whose snapshot is not yet durable (a `checkpoint_op`↔
+    // `checkpoint_id` mismatch); leaving it at the OLD value keeps any such root self-consistent (it
+    // names the prior durable checkpoint, exactly as the pre-R24-F1 recovery path did) until the
+    // re-persist root lands and the caller advances it.
   }
 }
