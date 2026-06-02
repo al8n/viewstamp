@@ -127,25 +127,39 @@ impl<S: StateMachine> Endpoint<S> {
       match pc.step {
         CheckpointStep::AwaitSnapshot { id: sid } if sid == id => {
           // The snapshot is durable → advance the durable root to name the new checkpoint.
-          // `commit_max >= commit_min >= target_op` always (target_op was commit_min at trigger;
-          // commit_min only grows; commit_max >= commit_min), so the VsrState `commit >= checkpoint_op`
-          // invariant holds → try_new can't fail.
           let root_id = self.mint_op_id();
-          // The committed band the NEW root names shrinks to `(target_op .. commit_min]` (the just-
+          // The committed band the NEW root names shrinks to `(target_op .. commit]` (the just-
           // checkpointed prefix `[1..=target_op]` now lives in the snapshot, not the band) — pass
           // `pc.target_op` as the floor so the persisted vsr_headers match this root's `checkpoint_op`.
           // Persist the KNOWN-committed frontier `commit_max` as the commit (codex R10-F2): a root that
           // persisted the lower `commit_min` would let `recover` (which reads `state.commit()` as
           // `commit_max`, R9-F1) read back a LOWERED frontier when this replica is held at a repair hole
           // below `commit_max`. The band headers are the SPARSE canonical set — one per HELD op in
-          // `(target_op .. commit_max]`, skipping holes (codex R12-F1). On a state-sync re-persist
-          // `commit_min == commit_max == target_op`, so the band is empty there — unchanged.
+          // `(target_op .. commit]`, skipping holes (codex R12-F1).
+          //
+          // commit = max(commit_max, target_op): for an ORDINARY checkpoint `commit_max >= commit_min >=
+          // target_op` already (target_op was commit_min at trigger; both only grow), so the `.max` is a
+          // no-op — unchanged. For a STATE-SYNC re-persist (codex R24-F1, durable-before-install) the
+          // destructive install is DEFERRED to `install_sync` (it has NOT advanced `commit_max` yet), so
+          // `commit_max` here may sit BELOW `target_op`; the `.max` lifts the persisted commit to the
+          // synced checkpoint op. This is correct — a synced checkpoint at `target_op` proves a quorum
+          // committed+applied THROUGH it — and reproduces exactly what the old eager `apply_sync`
+          // persisted (it set `commit_max = target_op` before this root write). It also keeps the
+          // `try_new` `commit >= checkpoint_op` invariant satisfied. The band headers over `(target_op ..
+          // max(commit_max, target_op)]` are then empty for a sync (the snapshot subsumes the prefix; any
+          // forced-sync held tail is still uncommitted here, so `commit_max < target_op` ⇒ empty band).
+          let root_commit = OpNumber::with(self.commit_max.get().max(pc.target_op.get()));
           let state = crate::VsrState::try_new(
             self.view,
             self.log_view,
-            self.commit_max,
+            root_commit,
             pc.target_op,
             pc.checkpoint_id,
+            // SPARSE band headers over `(target_op .. min(commit_max, op)]` — bounded by the ACTUAL
+            // known-committed frontier `commit_max` (NOT the lifted `root_commit`), so for a sync
+            // re-persist (where `commit_max <= target_op`) the band is empty: every op `<= target_op`
+            // lives in the snapshot, and any forced-sync held tail above is not yet committed. `try_new`
+            // permits a header list SHORTER than `commit` (the prefix is vouched by the snapshot id).
             self.committed_band_headers(pc.target_op),
           )
           .expect("checkpoint root: commit_max >= target_op and log_view <= view");
@@ -156,32 +170,65 @@ impl<S: StateMachine> Endpoint<S> {
           });
         }
         CheckpointStep::AwaitRoot { id: rid } if rid == id => {
-          // The root is durable → the checkpoint is COMPLETE: advance the in-memory checkpoint_op,
-          // then GC the WAL + per-op caches below the prune floor (M3.4b). GC runs AFTER the durable
-          // root so the recovery point is the new checkpoint; a lost/failing prune is then safe (a
-          // later checkpoint re-prunes). For a state-sync re-persist (below), the WAL was already
-          // truncated+pruned in `apply_sync`, so this is idempotent (prunes below the same floor).
-          self.checkpoint_op = pc.target_op;
+          // The root is durable → the checkpoint is COMPLETE. Route by the TYPED `pc.kind` — whether
+          // THIS root is a state-sync re-persist or an ordinary checkpoint. Matching on the kind carried
+          // in the completion token (NOT `self.sync.is_some()`) makes the R24-F1 footgun structurally
+          // impossible: a sync can be merely SOLICITED (armed, no staged install) while an ORDINARY
+          // checkpoint completes, and routing on `self.sync` would misroute that ordinary completion to
+          // the install branch — never advancing `checkpoint_op`, clearing the solicited sync, and
+          // livelocking the laggard. With the kind there is no ambient `sync` bool to confuse. (Only one
+          // checkpoint is ever in flight — `pending_checkpoint.is_some()` blocks both `maybe_checkpoint`
+          // and a second `apply_sync` — so exactly one kind applies to this root.)
           self.pending_checkpoint = None;
-          self.run_gc(wal);
-          // State-sync: if this root write completed a SYNC's durable re-persist (rather than an
-          // ordinary checkpoint), the synced checkpoint is now durable → resume as a Normal backup.
-          // Clear the sync bookkeeping + solicit timer and re-arm the Normal timers. (A sync and an
-          // ordinary checkpoint can never be staged together: `apply_sync` runs only while
-          // `sync.is_some()` and gates on `pending_checkpoint.is_none()`, and `maybe_checkpoint`
-          // gates on `pending_checkpoint.is_none()` too — so `sync.is_some()` here means this root
-          // belongs to the sync.)
-          if let Some(s) = self.sync {
-            self.sync = None;
-            self.timers.sync_solicit = None;
-            // Non-vacuity signal (M3.4a): a state-sync just fully applied + became durable.
-            self.state_syncs_applied += 1;
-            // Non-vacuity signal (M3.5 T6): distinguish a FORCE-sync (the escalation that recovers a
-            // pruned committed hole below the quorum checkpoint) from an ordinary `> self.op` sync.
-            if s.forced {
-              self.forced_syncs_applied += 1;
+          match pc.kind {
+            CheckpointKind::SyncRepersist => {
+              // SYNC re-persist (codex R24-F1, durable-before-install). The synced checkpoint root is now
+              // durable → INSTALL the synced state ATOMICALLY (the destructive half of `apply_sync`):
+              // restore the SM/sessions, advance `commit_min`/`commit_max`/`op` to the synced point, and
+              // prune the WAL (`install_sync` does its own `wal.prune` + `wal.truncate`, so no separate
+              // `run_gc` is needed) — all now justified by the durable root just written. After the
+              // `checkpoint_op` advance below there is NO window where the band is pruned / the commit
+              // advanced while `checkpoint_op` is stale. The Normal state-sync path DEFERRED its install
+              // to here (`pending_install` is `Some`); the RECOVERY peer-fetch path
+              // (`on_recover_sync_checkpoint`) installed EAGERLY at flip-to-Normal (it must not reach
+              // Normal with an unrestored SM), so its `pending_install` is already taken and this is a
+              // no-op install — only the `checkpoint_op` advance + completion bookkeeping below run.
+              if let Some(install) = self.pending_install.take() {
+                self.install_sync(wal, install);
+              }
+              // Advance the durable checkpoint pointer to the now-durable synced checkpoint — set HERE
+              // (the root is durable) for BOTH paths, NOT inside `install_sync`: the EAGER recovery
+              // install runs before this root lands, and advancing `checkpoint_op` there would risk a
+              // durable-view root (from a view change in the window) naming a checkpoint whose snapshot
+              // is not yet durable. `pc.target_op` is the synced op (== the staged install's
+              // `checkpoint_op`). After this, `checkpoint_op`, the durable root id, and `commit_min`/`op`
+              // all agree at the synced point.
+              self.advance_checkpoint_op(pc.target_op);
+              // Resume as a Normal backup: clear the sync bookkeeping + solicit timer and re-arm timers.
+              // (`self.sync` is `Some` here — the sync's re-persist completing means its handshake is the
+              // live one; this is the SAME sync whose `apply_sync` staged this root.)
+              let forced = self.sync.is_some_and(|s| s.forced);
+              self.sync = None;
+              self.timers.sync_solicit = None;
+              // Non-vacuity signal (M3.4a): a state-sync just fully applied + became durable.
+              self.state_syncs_applied += 1;
+              // Non-vacuity signal (M3.5 T6): distinguish a FORCE-sync (the escalation that recovers a
+              // pruned committed hole below the quorum checkpoint) from an ordinary `> self.op` sync.
+              if forced {
+                self.forced_syncs_applied += 1;
+              }
+              self.arm_timers(now);
             }
-            self.arm_timers(now);
+            CheckpointKind::Ordinary => {
+              // ORDINARY checkpoint: advance the in-memory checkpoint_op, then GC the WAL + per-op caches
+              // below the prune floor (M3.4b). GC runs AFTER the durable root so the recovery point is
+              // the new checkpoint; a lost/failing prune is then safe (a later checkpoint re-prunes). A
+              // sync may be concurrently SOLICITED (`self.sync` armed but not staged) — it is
+              // deliberately left intact here (this root is NOT its re-persist), so it completes on its
+              // own handshake.
+              self.advance_checkpoint_op(pc.target_op);
+              self.run_gc(wal);
+            }
           }
         }
         _ => {} // a stale/superseded completion (e.g. from before a view change) — ignore
@@ -234,6 +281,7 @@ impl<S: StateMachine> Endpoint<S> {
       target_op,
       checkpoint_id,
       step: CheckpointStep::AwaitSnapshot { id },
+      kind: CheckpointKind::Ordinary, // not a state-sync re-persist
     });
   }
 
@@ -314,19 +362,62 @@ impl<S: StateMachine> Endpoint<S> {
     if floor == 0 {
       return; // nothing safe to free yet (no quorum-acknowledged checkpoint / no own checkpoint)
     }
-    // `prune(below)` frees slots strictly below `below`; to free ops `<= floor` pass `below = floor+1`.
+    // Free the durable WAL slots the snapshot subsumes. `prune(below)` frees slots strictly below
+    // `below`; to free ops `<= floor` pass `below = floor+1`. KEPT site-specific (NOT folded into the
+    // shared trim): `install_sync` deliberately prunes `< checkpoint_op` (NOT `<= checkpoint_op`),
+    // retaining the slot AT its synced checkpoint so a no-held-tail sync leaves `wal.op_head() ==
+    // checkpoint_op` rather than an empty WAL — a different prune FLOOR for a different reason, so it
+    // cannot share this line. (run_gc has no such WAL-head constraint: its `floor <= checkpoint_op`
+    // ops are all in the snapshot, so freeing the boundary slot too is safe.)
     wal.prune(OpNumber::with(floor + 1));
-    // Trim the in-memory per-op caches to `(floor .. head]`. SAFE: the apply loops read only ops
-    // `> commit_min >= checkpoint_op >= floor`, so nothing they touch is removed here; the freed
-    // entries are committed+checkpointed (durable in the SM snapshot) and out of every reach path
-    // except peer-serve, which has the state-sync/retransmit fallbacks proven above.
-    self.log.retain(|&op, _| op > floor);
+    // Trim the in-memory `log` cache the snapshot subsumes (the canonical "the checkpoint covers it,
+    // drop it" rule shared with `install_sync` — see [`Self::trim_log_to_checkpoint`]). The witness
+    // floor is `self.checkpoint_op` (the durable snapshot this GC relies on).
+    self.trim_log_to_checkpoint(floor, self.checkpoint_op.get());
+    // Trim the primary pipeline + reorder buffer to `(floor .. head]`. KEPT site-specific (NOT folded):
+    // `install_sync` fully `clear()`s both (a sync TEARS DOWN the whole pipeline — it lands as a backup
+    // and a far-future buffered prepare ABOVE the synced checkpoint must NOT survive), whereas run_gc
+    // only RETAINs the live tail above the GC floor for an ongoing replica. Same per-op caches, but a
+    // genuinely different operation (retain-above-floor vs full clear), so each keeps its own. SAFE:
+    // the apply loops read only ops `> commit_min >= checkpoint_op >= floor`, so nothing they touch is
+    // removed; the freed entries are committed+checkpointed (durable in the SM snapshot).
     self.inflight.retain(|&op, _| op > floor);
     self.buffer.retain(|&op, _| op > floor);
     // `clients` is intentionally NOT trimmed here: it grows per-CLIENT (bounded by the active client
     // set), not per-op, and dropping a LIVE session risks a dedup miss for a retry whose cached reply
     // is still needed. Every session was captured in the checkpoint envelope, so a crash + recover
     // rebuilds them; the unbounded-in-op structures (WAL, log, inflight, buffer) are the ones GC'd.
+  }
+
+  /// Free the in-memory `log`-cache entries a durable checkpoint snapshot subsumes: drop every op
+  /// AT/BELOW `floor`, retaining the un-checkpointed tail `(floor .. head]`. This is the SINGLE
+  /// canonical "the snapshot covers it, so the log cache no longer needs it" trim, shared by
+  /// post-checkpoint GC ([`Self::run_gc`]) and the state-sync install ([`Self::install_sync`]) — the
+  /// one piece those two sites provably perform IDENTICALLY (both `log.retain(|op| op > floor)` behind
+  /// the same committed-survival witness), extracted so a future change to the log prune FLOOR can
+  /// never silently apply to one site but not the other (the audit's latent-drift concern).
+  ///
+  /// `checkpoint_floor` is the durable/just-restored checkpoint the SITE relies on for the
+  /// committed-survival witness (passed through to [`Self::assert_committed_survives`]): `run_gc` passes
+  /// `self.checkpoint_op` (its durable snapshot); `install_sync` passes its LOCAL synced checkpoint
+  /// (the R24-F1 deferred-advance leaves `self.checkpoint_op` STALE until the caller records the new
+  /// root, so the install's own witness is the snapshot it just restored). Naming it per call keeps the
+  /// witness exact and STRONG.
+  ///
+  /// The remaining post-checkpoint work is genuinely DIFFERENT per site and stays at each call site:
+  /// `run_gc` prunes the WAL `<= floor` + RETAINs the live `inflight`/`buffer` tail above the floor (an
+  /// ongoing replica's incremental GC); `install_sync` prunes the WAL `< checkpoint_op` (keeping the
+  /// WAL-head slot) + `wal.truncate`s the held tail + fully `clear()`s the pipeline (a sync's complete
+  /// teardown). Only this log trim is common. SAFE: the apply loops read only ops `> commit_min >=
+  /// checkpoint_op >= floor`, so nothing they touch is dropped; the freed entries are
+  /// committed+checkpointed (durable in the SM snapshot) and out of every reach path except peer-serve,
+  /// which has the state-sync/retransmit fallbacks the `run_gc` doc proves.
+  pub(super) fn trim_log_to_checkpoint(&mut self, floor: u64, checkpoint_floor: u64) {
+    // Committed-survival backstop on the BOUNDARY dropped op `floor`: it is `<= checkpoint_floor`, so
+    // every op dropped here (`<= floor`) is folded into the durable snapshot — the shared invariant of
+    // the destructive-site audit (Phase 1).
+    self.assert_committed_survives(floor, checkpoint_floor);
+    self.log.retain(|&op, _| op > floor);
   }
 
   /// Persist the durable VSR root for the current `(view, log_view, commit_max)` and arm the

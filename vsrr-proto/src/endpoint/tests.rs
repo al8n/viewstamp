@@ -1699,9 +1699,9 @@ fn dvc(replica: u8, log_view: u64, op: u64, commit: u64) -> DoViewChange {
 fn canonical_selection_prefers_highest_log_view_over_longer_log() {
   // r0 has the newest generation (log_view 2) but a SHORTER log; r1/r2 are longer but stale.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from.insert(0, dvc(0, 2, 3, 1));
-  e.dvc_from.insert(1, dvc(1, 1, 5, 1));
-  e.dvc_from.insert(2, dvc(2, 1, 5, 1));
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 2, 3, 1));
+  e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 5, 1));
+  e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 5, 1));
   let (log, op_head, commit_star) = e.select_canonical_log();
   assert_eq!(op_head, 3, "newest log_view wins, not the longer stale log");
   assert_eq!(log.len(), 3);
@@ -1713,10 +1713,10 @@ fn nack_prepare_truncates_provably_uncommitted_tail() {
   // N=5 → quorum_nack_prepare = 3. Head op 5 held only by r0; r1,r2,r3 stop at op 2.
   // ops 3..=5 each get 3 nacks (r1,r2,r3) ≥ 3 → truncated to op 2.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from.insert(0, dvc(0, 1, 5, 2));
-  e.dvc_from.insert(1, dvc(1, 1, 2, 2));
-  e.dvc_from.insert(2, dvc(2, 1, 2, 2));
-  e.dvc_from.insert(3, dvc(3, 1, 2, 2));
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 2));
+  e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 2, 2));
+  e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 2, 2));
+  e.dvc_from_mut_for_test().insert(3, dvc(3, 1, 2, 2));
   let (log, op_head, _) = e.select_canonical_log();
   assert_eq!(op_head, 2, "ops 3..=5 had a nack quorum → truncated");
   assert_eq!(log.len(), 2);
@@ -1726,10 +1726,10 @@ fn nack_prepare_truncates_provably_uncommitted_tail() {
 fn committed_ops_are_never_truncated() {
   // commit* = 4: op 5 is the only uncommitted op, nacked by 3 → truncated; 1..=4 survive.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from.insert(0, dvc(0, 1, 5, 4));
-  e.dvc_from.insert(1, dvc(1, 1, 4, 4));
-  e.dvc_from.insert(2, dvc(2, 1, 4, 4));
-  e.dvc_from.insert(3, dvc(3, 1, 4, 4));
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 4));
+  e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 4, 4));
+  e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 4, 4));
+  e.dvc_from_mut_for_test().insert(3, dvc(3, 1, 4, 4));
   let (log, op_head, commit_star) = e.select_canonical_log();
   assert_eq!(commit_star, 4);
   assert_eq!(
@@ -1744,9 +1744,9 @@ fn no_truncation_at_minimal_quorum() {
   // Documents the contiguous-model property: with exactly quorum_view_change=3 DVCs,
   // the head-holder (r0) prevents a nack quorum (≤ 2 nacks < 3) → adopt whole.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from.insert(0, dvc(0, 1, 5, 2));
-  e.dvc_from.insert(1, dvc(1, 1, 2, 2));
-  e.dvc_from.insert(2, dvc(2, 1, 2, 2));
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 2));
+  e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 2, 2));
+  e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 2, 2));
   let (_, op_head, _) = e.select_canonical_log();
   assert_eq!(
     op_head, 5,
@@ -1868,6 +1868,83 @@ fn backup_adopts_start_view() {
     wal.header(OpNumber::with(2)).is_some(),
     "the acked op 2 was durably (re-)appended to the WAL before the PrepareOk (R6-F1)"
   );
+}
+
+/// Audit D3: NO old-generation in-flight state survives a view transition. Each of the THREE
+/// transition entries — `enter_view_change` (self-driven), `catch_up_to_view` (higher-view catch-up),
+/// and `adopt_canonical_head` (adopt an authoritative head) — must tear down the SAME union of
+/// old-view sub-state via the single `reset_for_view_transition` chokepoint. This seeds the FULL set
+/// (quorum collection, in-flight appends, peer-checkpoint reports, in-flight checkpoint, the
+/// state-sync `sync`+`pending_install` pair + its solicit timer, and the forfeit sub-state) before
+/// each transition and asserts the chokepoint cleared it — freezing the invariant the helper
+/// centralizes so a future field added to one path but not the others is caught here.
+#[test]
+fn no_old_generation_state_survives_a_view_transition() {
+  let mut sb = TestSb::default();
+  let now = Instant::ZERO;
+
+  // (1) enter_view_change (the self-driven entry, reached here via the recovery wrapper that shares
+  // the identical body). A backup at view 0 → view 1: catching_up must end FALSE.
+  let mut e = backup();
+  e.seed_old_generation_state_for_test();
+  e.enter_view_change_from_recovery(now, &mut sb, View::with(1));
+  assert_eq!(e.status(), Status::ViewChange);
+  assert_eq!(e.view(), View::with(1));
+  assert!(
+    e.old_generation_state_cleared_for_test(),
+    "enter_view_change must clear the entire old-generation in-flight set"
+  );
+  assert!(
+    !e.catching_up(),
+    "a self-driven view change ends catching_up"
+  );
+  while e.poll_message().is_some() {}
+
+  // (2) catch_up_to_view (the higher-view catch-up entry). A backup at view 0 → view 1: catching_up
+  // must end TRUE (the one field the shared reset sets false and this entry re-sets after).
+  let mut e = backup();
+  e.seed_old_generation_state_for_test();
+  e.catch_up_to_view(now, View::with(1));
+  assert_eq!(e.status(), Status::ViewChange);
+  assert_eq!(e.view(), View::with(1));
+  assert!(
+    e.old_generation_state_cleared_for_test(),
+    "catch_up_to_view must clear the entire old-generation in-flight set"
+  );
+  assert!(
+    e.catching_up(),
+    "catch_up_to_view re-sets the catch-up flag"
+  );
+  assert!(
+    !e.pending_sb_for_test(),
+    "catch-up issues no durable-view write"
+  );
+  while e.poll_message().is_some() {}
+
+  // (3) adopt_canonical_head (adopt an authoritative StartView head → Normal). op 1, commit 0 so the
+  // adoption neither rewinds nor needs to advance the commit. catching_up must end FALSE.
+  let mut e = backup();
+  e.seed_old_generation_state_for_test();
+  e.adopt_canonical_head(
+    now,
+    &mut sb,
+    View::with(1),
+    OpNumber::with(1),
+    OpNumber::with(0),
+    &[PreparedEntry::new(
+      OpNumber::with(1),
+      ClientId::new(7),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"a"),
+    )],
+  );
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::with(1));
+  assert!(
+    e.old_generation_state_cleared_for_test(),
+    "adopt_canonical_head must clear the entire old-generation in-flight set"
+  );
+  assert!(!e.catching_up(), "adoption ends catching_up");
 }
 
 #[test]
@@ -6857,6 +6934,122 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
 }
 
 #[test]
+fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
+  // audit D1 (the `abdicate_if_primary` chokepoint, site 3 — `on_recover_sync_checkpoint`). The F1
+  // peer-checkpoint fetch RESTORES the SM from a peer snapshot but leaves `inflight` (the commit
+  // pipeline) CLEARED while this replica remains the PRIMARY of its view — a wedge if it resumed as
+  // primary (`try_commit` can never advance past commit_min). So a multi-replica primary that completes
+  // recovery via the peer fetch ABDICATES through the SAME deferred-forfeit chokepoint as the two
+  // state-sync sites: it flags `pending_forfeit` (the next `primary_timeouts` re-proposes view + 1)
+  // rather than resume Normal as the established primary. This is the path the existing peer-fetch test
+  // (a BACKUP) does NOT exercise; here the recovering replica IS the primary of view 0.
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 2).unwrap();
+  let now = Instant::ZERO;
+  // Durable root at VIEW 0 (so replica 0 is the primary) with a checkpoint at op 2. The scripted
+  // superblock has an EMPTY read script, so EVERY checkpoint read FAULTS — a permanently-unreadable
+  // own snapshot, forcing the peer-fetch escalation.
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let mut wal = TestWal {
+    entries: BTreeMap::new(),
+    head: 2,
+    done: VecDeque::new(),
+  };
+  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  assert!(
+    e.is_primary(),
+    "replica 0 recovered at view 0 is the primary of its view"
+  );
+  assert_eq!(e.status(), Status::Recovering);
+
+  // Exhaust the checkpoint-read budget → escalate to a peer fetch (still Recovering, SM not restored).
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "the primary escalated to a peer fetch (its own checkpoint is unreadable)"
+  );
+  assert!(
+    !e.pending_forfeit_for_test(),
+    "not stepped down yet (still awaiting the peer snapshot)"
+  );
+  while e.poll_message().is_some() {}
+
+  // A peer answers with a VALID SyncCheckpoint (op 2, matching nonce). The recovering PRIMARY restores
+  // the SM via apply_sync, flips Normal — and then the `abdicate_if_primary` chokepoint STEPS IT DOWN.
+  let good_snap = CountSm::default().snapshot();
+  let good_env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(2), &BTreeMap::new(), &good_snap);
+  let good_id = crate::checkpoint_id(&good_env);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(2),
+      good_id,
+      ReplicaId::new(1),
+      nonce,
+      good_env,
+    )),
+  );
+  // Drive the staged re-persist to completion.
+  for _ in 0..3 {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  // The SM was restored (recovery completed at the peer's checkpoint) AND the primary stepped down.
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "recovery completed at the peer's checkpoint op"
+  );
+  assert!(
+    e.pending_forfeit_for_test(),
+    "the recovered primary abdicated via the abdicate_if_primary chokepoint (audit D1) — it did not \
+     resume Normal as the established primary with a torn-down pipeline"
+  );
+}
+
+#[test]
+#[should_panic(expected = "survived into the terminal recovery status")]
+fn finalize_recovery_assert_catches_a_leaked_empty_faulty_slot() {
+  // audit D1 (the regression net): the `finalize_recovery` choke debug-asserts that no
+  // permanently-faulty committed-band slot survived as a POPULATED `self.log` entry (an empty-body
+  // placeholder that `advance_commit`/`adopt_log` would apply empty cluster-wide — the original
+  // empty-body CRITICAL). Here we LEAK one — op 5 is in `rec.faulty` AND still in `self.log` with an
+  // empty body (the exact shape a future edit that stops dropping it would produce) — and assert the
+  // tripwire fires. The happy paths drop the slot first, so this never trips in practice; this proves it
+  // WOULD catch a bypassed drop.
+  let mut e = backup();
+  let mut rec = RecoverState::default();
+  rec.faulty.insert(5); // op 5 read back permanently faulty …
+  e.recover = Some(rec);
+  e.log.insert(
+    5,
+    LogEntry {
+      client: ClientId::new(7),
+      request: RequestNumber::with(5),
+      body: Bytes::new(), // … but its EMPTY placeholder was NOT dropped from the cache (the leak).
+    },
+  );
+  e.assert_no_faulty_committed_survives(); // must panic in debug: the leaked slot would apply empty.
+}
+
+#[test]
 fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a_peer_serves() {
   // F1 REGRESSION (variant): the checkpoint read MATCHES our read id but its CONTENT is permanently
   // wrong (hash mismatch on every attempt) — the verify-failure path, not a raw Fault. It must route
@@ -8229,6 +8422,360 @@ fn sync_checkpoint_restores_and_resumes_at_the_synced_point() {
     "synced checkpoint is now durable"
   );
   assert_eq!(sb.state().checkpoint_id(), id);
+}
+
+#[test]
+fn state_sync_installs_atomically_only_after_the_root_is_durable() {
+  // codex R24-F1 (durable-before-install): a verified SyncCheckpoint STAGES the durable re-persist
+  // (the two superblock writes) but must NOT install the synced state — restore the SM, advance
+  // commit_min/op/commit_max/checkpoint_op, or prune the WAL — until the SYNC ROOT (step 2) is
+  // durable. The install is ATOMIC at the root completion: everything advances together, only then.
+  // FAIL-BEFORE: the old `apply_sync` mutated EAGERLY (it restored + advanced + pruned at STAGE time,
+  // before the snapshot write even completed), so the SM/commit/op/checkpoint advanced and the WAL was
+  // pruned the moment the SyncCheckpoint arrived — with `checkpoint_op` still old until the root.
+  let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  // The laggard: replica 1 of 3 over CountSm with a HUGE checkpoint interval (so committing its own
+  // little band does NOT auto-checkpoint and race the sync's persist — it stays at checkpoint 0).
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 1_000).unwrap();
+  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  // Give the laggard a small live WAL band (ops 1,2) below the synced point so the prune is OBSERVABLE.
+  let mut wal = TestWal::default();
+  let mut sb = StepSb::default();
+  let now = Instant::ZERO;
+  for op in 1..=2u64 {
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(op, 0));
+    e.handle_storage(now, &mut wal, &mut sb);
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  while e.poll_message().is_some() {}
+  assert!(
+    wal.entries.contains_key(&1) && wal.entries.contains_key(&2),
+    "the laggard holds a live WAL band {{1,2}} before syncing"
+  );
+  // Trigger a sync to checkpoint 4 (> head 2), then deliver the SyncCheckpoint → STAGE.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  // Baseline the OLD (pre-STAGE, post-trigger) frontier — the install must not move it before the root.
+  let (base_commit, base_op, base_ckpt) = (e.commit(), e.op(), e.checkpoint_op());
+  let base_applied = e.state_machine().applied().len();
+  assert_eq!(
+    base_ckpt,
+    OpNumber::with(0),
+    "the laggard is at its old checkpoint 0 before STAGE"
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+    )),
+  );
+  // STAGE only: the snapshot write is in flight (not yet flushed). NOTHING may have installed.
+  assert_eq!(
+    e.checkpoint_op(),
+    base_ckpt,
+    "checkpoint_op UNCHANGED at STAGE"
+  );
+  assert_eq!(
+    e.commit(),
+    base_commit,
+    "commit_min UNCHANGED at STAGE (NOT advanced to the synced 4)"
+  );
+  assert_eq!(
+    e.op(),
+    base_op,
+    "op UNCHANGED at STAGE (still the old head)"
+  );
+  assert!(
+    e.commit().get() < 4,
+    "commit_min did NOT jump to the synced point at STAGE"
+  );
+  assert_eq!(
+    e.state_machine().applied().len(),
+    base_applied,
+    "SM NOT restored at STAGE (still its old applied state, no snapshot installed yet)"
+  );
+  assert!(
+    wal.entries.contains_key(&1) && wal.entries.contains_key(&2),
+    "the WAL is NOT pruned at STAGE (the destructive prune is deferred to the install)"
+  );
+  // Complete step 1 (snapshot durable → root submitted), still NO install (the root is now in flight).
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.checkpoint_op(),
+    base_ckpt,
+    "checkpoint_op still UNCHANGED after step 1"
+  );
+  assert_eq!(
+    e.commit(),
+    base_commit,
+    "commit_min still UNCHANGED after step 1"
+  );
+  assert_eq!(e.op(), base_op, "op still UNCHANGED after step 1");
+  assert!(
+    wal.entries.contains_key(&1) && wal.entries.contains_key(&2),
+    "the WAL is still NOT pruned after step 1 (the root is not yet durable)"
+  );
+  // Complete step 2 (the SYNC ROOT durable) → INSTALL fires ATOMICALLY: everything advances together.
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "checkpoint_op advances on the durable root"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(4),
+    "commit_min advances on the durable root"
+  );
+  assert_eq!(e.commit_max(), OpNumber::with(4));
+  assert_eq!(e.op(), OpNumber::with(4), "op advances on the durable root");
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(
+    e.state_machine().applied().len(),
+    4,
+    "SM restored from the snapshot ONLY after the root is durable"
+  );
+  assert!(
+    !wal.entries.contains_key(&1) && !wal.entries.contains_key(&2),
+    "the WAL is pruned at the synced point only AFTER the install (durable-before-install)"
+  );
+  assert_eq!(
+    sb.state().checkpoint_op(),
+    OpNumber::with(4),
+    "synced checkpoint is durable"
+  );
+  assert_eq!(e.state_syncs_applied(), 1, "the sync fully applied");
+}
+
+#[test]
+fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_band() {
+  // codex R24-F1 REGRESSION (the wedge). A laggard STAGES a SyncCheckpoint but a VIEW CHANGE fires
+  // before the sync ROOT completes, and the laggard becomes the new PRIMARY. It must NOT advertise the
+  // synced commit while carrying a STALE `checkpoint_op` over a PRUNED committed band — that strands a
+  // lower laggard (which can neither RequestPrepare the pruned band nor is triggered to RequestSync,
+  // since the primary advertises the old checkpoint) → cluster wedge if the donor crashes. With the
+  // durable-before-install fix the STAGE no longer prunes/advances, so the view change finds the OLD
+  // consistent state intact (`enter_view_change` cleanly cancels the not-yet-applied install): the band
+  // is NOT pruned and `commit_min`/`checkpoint_op` are CONSISTENT (both old), so a lower laggard is not
+  // stranded. FAIL-BEFORE: the laggard becomes primary with `commit == synced (4)`, `checkpoint_op ==
+  // old (0)`, and the band pruned.
+  let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  // The laggard: replica 1 of 3 over CountSm with a HUGE checkpoint interval (so its own band does not
+  // auto-checkpoint and race the sync persist — it stays at its old durable checkpoint 0).
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 1_000).unwrap();
+  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let mut wal = TestWal::default();
+  let mut sb = StepSb::default();
+  let now = Instant::ZERO;
+  // The laggard (replica 1 of 3) holds a live WAL band {1,2} below the synced point.
+  for op in 1..=2u64 {
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(op, 0));
+    e.handle_storage(now, &mut wal, &mut sb);
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  while e.poll_message().is_some() {}
+  // Trigger + STAGE a sync to checkpoint 4 (> head 2). The trigger Commit carries commit=0, so the
+  // laggard does NOT learn a commit above its head (a known-commit above op would, correctly, fail-stop
+  // canonical-log selection — that R9-F1 hazard is orthogonal to this test).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      ReplicaId::new(0),
+      nonce,
+      env,
+    )),
+  );
+  // Advance step 1 (snapshot durable → root submitted) but withhold the ROOT (it stays in flight).
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "the sync is still armed (the root has NOT completed → the install is pending)"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(0),
+    "checkpoint_op is still old at this point"
+  );
+  // A VIEW CHANGE fires in this window: an SVC quorum drives the laggard into ViewChange(1), and a DVC
+  // quorum makes it (replica 1 = primary of view 1) the new primary — all BEFORE the sync root lands.
+  let later = now + core::time::Duration::from_millis(300);
+  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → SVC(view 1), own bit
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
+  );
+  assert_eq!(e.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
+  assert_eq!(
+    e.sync_target_for_test(),
+    None,
+    "entering ViewChange cancelled the pending install (sync cleared)"
+  );
+  sb.flush();
+  e.handle_storage(later, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
+  while e.poll_message().is_some() {}
+  // Feed a DVC from replica 0 (op 2, commit 0) → with our own DVC that is a quorum (2 of 3) → primary.
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(2),
+      OpNumber::with(0),
+      ReplicaId::new(0),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          Bytes::copy_from_slice(&[1u8]),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          Bytes::copy_from_slice(&[2u8]),
+        ),
+      ],
+    )),
+  );
+  assert!(e.is_primary(), "replica 1 became the new primary of view 1");
+  // THE R24-F1 ASSERTION. The new primary did NOT install the synced state behind a stale checkpoint:
+  // `commit_min` and `checkpoint_op` are CONSISTENT (both old, not commit==4/checkpoint==0), and the
+  // committed band {1,2} is NOT pruned — so a lower laggard can still be served + caught up.
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(0),
+    "the new primary advertises its OLD durable checkpoint (the synced install never landed)"
+  );
+  assert!(
+    e.commit().get() <= e.op().get() && e.checkpoint_op().get() <= e.commit().get(),
+    "commit_min/op/checkpoint_op are consistent (checkpoint <= commit <= op), not commit==synced over a stale checkpoint"
+  );
+  assert_ne!(
+    e.commit(),
+    OpNumber::with(4),
+    "commit_min was NOT advanced to the synced point by an uninstalled sync"
+  );
+  assert!(
+    wal.entries.contains_key(&1) && wal.entries.contains_key(&2),
+    "the committed band is NOT pruned (no stranded laggard): the STAGE never pruned the WAL"
+  );
+}
+
+#[test]
+fn an_ordinary_checkpoint_completing_during_a_solicited_sync_advances_without_clearing_it() {
+  // codex R24-F1 follow-up (REGRESSION). The `on_sb_done` root-completion arm must route by whether THIS
+  // root is the sync's re-persist (`pc.sync`), NOT by `self.sync.is_some()`. A sync can be merely
+  // SOLICITED (armed, awaiting a SyncCheckpoint — no staged install) while an ORDINARY checkpoint
+  // completes. If that ordinary completion were misrouted to the sync-install branch it would (a) NOT
+  // advance `checkpoint_op` and (b) CLEAR the solicited sync — so the laggard's checkpoint never moves
+  // and it re-solicits forever (the long-down-replica state-sync livelock). With the `pc.sync`
+  // discriminator the ordinary checkpoint advances `checkpoint_op` and LEAVES the solicited sync armed.
+  let mut e = sync_backup(); // replica 1 of 3, CountSm, checkpoint_ops = 2
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Hold a live band {1,2} (durable).
+  for op in 1..=2u64 {
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(op, 0));
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  while e.poll_message().is_some() {}
+  // A Commit carries commit=2 (applies the band → crosses the checkpoint boundary at op 2 → an ORDINARY
+  // checkpoint fires) AND checkpoint_op=99 (far above the head → SOLICITS a state-sync). Both happen in
+  // this one handler: `maybe_request_sync` arms the sync, then `advance_commit` applies + `maybe_
+  // checkpoint` stages the ordinary checkpoint.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(99),
+    )),
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(99),
+    "a state-sync is SOLICITED (armed) — but no SyncCheckpoint has been received, so nothing is staged"
+  );
+  // The in-flight checkpoint is TYPED `Ordinary`, even though a sync is concurrently solicited — the
+  // discriminator the routing uses lives in the completion token (`pc.kind`), NOT in `self.sync`. This
+  // is the structural property that types the R24-F1 footgun away: there is no ambient bool to confuse.
+  assert_eq!(
+    e.pending_checkpoint_is_sync_for_test(),
+    Some(false),
+    "the staged checkpoint is an ORDINARY one (CheckpointKind::Ordinary), not a sync re-persist, \
+     despite the concurrently-solicited sync"
+  );
+  let synced_before = e.state_syncs_applied();
+  // Complete the ordinary checkpoint's two superblock writes.
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "the ORDINARY checkpoint advanced checkpoint_op (it was NOT misrouted to the sync-install branch)"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(99),
+    "the SOLICITED sync is still armed — an ordinary checkpoint completion must NOT clear it"
+  );
+  assert_eq!(
+    e.state_syncs_applied(),
+    synced_before,
+    "no state-sync was counted as applied (the ordinary checkpoint is not a sync re-persist)"
+  );
 }
 
 #[test]
@@ -10025,7 +10572,10 @@ fn a_healthy_primary_never_forfeits() {
   let mut ep = Endpoint::new(cfg, 1, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary());
-  ep.set_own_checkpoint_for_test(8); // the primary's own checkpoint is current
+  // A consistent durable state at the checkpoint (commit_min == op == checkpoint_op == 8): a real
+  // checkpoint snapshots the SM at `commit_min`, so `checkpoint_op <= commit_min` always — set them
+  // together so the handler-exit `assert_invariants` (commit_min >= checkpoint_op) holds.
+  ep.force_state_for_test(0, 8, 8, 8, &[]);
   ep.inject_peer_checkpoint_for_test(1, 8);
   ep.inject_peer_checkpoint_for_test(2, 8); // quorum checkpoint 8 == own 8 → lag 0 < bound 4
   for ms in [0u64, 400, 800] {
@@ -10161,8 +10711,11 @@ fn a_transiently_lagging_primary_recovers_and_disarms_without_forfeiting() {
   ep.inject_peer_checkpoint_for_test(2, 8); // quorum 8, own 0 → lag 8 >= 4 → arms
   ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
   assert!(ep.forfeit_armed_for_test(), "the lag armed the grace timer");
-  // The primary catches its own checkpoint up to the quorum BEFORE the grace elapses.
-  ep.set_own_checkpoint_for_test(8); // lag now 0 < bound 4
+  // The primary catches its own checkpoint up to the quorum BEFORE the grace elapses. A real catch-up
+  // checkpoints at the (now-advanced) `commit_min`, so move commit/op/checkpoint together to 8 — a
+  // consistent durable state that satisfies the handler-exit `assert_invariants`. (`force_state_for_test`
+  // leaves the armed grace timer intact, which the next tick disarms once the lag is 0.)
+  ep.force_state_for_test(0, 8, 8, 8, &[]); // lag now 0 < bound 4
   let mid = Instant::ZERO + core::time::Duration::from_millis(100); // still within the 300ms grace
   ep.handle_timeout(mid, &mut wal, &mut sb);
   assert!(
@@ -10202,11 +10755,14 @@ fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_peri
   let mut ep = Endpoint::new(cfg, 1, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary());
-  // Head 10, commit 1, a committed hole at op 2, own checkpoint 8 == quorum (no checkpoint-lag).
-  ep.force_state_for_test(0, 10, 1, 8, &[2]);
-  ep.set_own_checkpoint_for_test(8);
-  ep.inject_peer_checkpoint_for_test(1, 8);
-  ep.inject_peer_checkpoint_for_test(2, 8); // quorum 8 == own 8 → lag 0 (the lag trigger is OFF)
+  // Head 10, commit HELD at 1 below a committed hole at op 2, own checkpoint 1 == quorum (no
+  // checkpoint-lag). Checkpoint == commit_min (a real checkpoint snapshots the SM at `commit_min`, so
+  // `checkpoint_op <= commit_min`) and the hole sits ABOVE the checkpoint — a consistent, reachable
+  // state that satisfies the handler-exit `assert_invariants` while still isolating the unfillable-hole
+  // forfeit trigger from the checkpoint-lag one (lag 0).
+  ep.force_state_for_test(0, 10, 1, 1, &[2]);
+  ep.inject_peer_checkpoint_for_test(1, 1);
+  ep.inject_peer_checkpoint_for_test(2, 1); // quorum 1 == own 1 → lag 0 (the lag trigger is OFF)
   // First primary tick ARMS the grace timer (the hole is outstanding) but does NOT forfeit yet.
   ep.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
   assert!(
@@ -10663,8 +11219,9 @@ fn canonical_selection_with_a_checkpoint_offset_log_is_safe() {
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
   // r0: a full-from-1 log (head 5, commit 4). r1: the SAME generation but state-synced — its log
   // starts at op 5 (checkpoint 4), head 5, commit 4. Same log_view → both canonical.
-  e.dvc_from.insert(0, dvc(0, 1, 5, 4));
-  e.dvc_from.insert(1, dvc_offset(1, 1, 4, 5, 4));
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 4));
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_offset(1, 1, 4, 5, 4));
   let (log, op_head, commit_star) = e.select_canonical_log();
   assert_eq!(
     op_head, 5,
@@ -10736,8 +11293,9 @@ fn canonical_selection_with_a_fully_checkpoint_synced_participant_is_safe() {
   // log entries at all). select_canonical_log must handle commit == op_head with an empty offset log
   // without panicking or fabricating ops.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
-  e.dvc_from.insert(0, dvc(0, 1, 5, 4));
-  e.dvc_from.insert(1, dvc_offset(1, 1, 4, 4, 4)); // tail-empty synced participant
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 4));
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_offset(1, 1, 4, 4, 4)); // tail-empty synced participant
   let (_log, op_head, commit_star) = e.select_canonical_log();
   assert_eq!(op_head, 5);
   assert_eq!(commit_star, 4);
@@ -10755,8 +11313,10 @@ fn select_canonical_log_unions_committed_ops_across_different_floor_dvcs() {
   // fail-stop does NOT trip (the dropped ops are interior). select_canonical_log MUST instead UNION:
   // the returned canonical log must cover EVERY committed op (5..=8) that ANY canonical DVC holds.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from.insert(0, dvc_offset(0, 1, 4, 10, 8)); // floor 4: holds 5,6,7,8,9,10
-  e.dvc_from.insert(1, dvc_offset(1, 1, 8, 10, 8)); // floor 8: holds 9,10 only
+  e.dvc_from_mut_for_test()
+    .insert(0, dvc_offset(0, 1, 4, 10, 8)); // floor 4: holds 5,6,7,8,9,10
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_offset(1, 1, 8, 10, 8)); // floor 8: holds 9,10 only
   let (log, op_head, commit_star) = e.select_canonical_log();
   assert_eq!(op_head, 10, "canonical head is the generation's head");
   assert_eq!(commit_star, 8, "commit* is the greatest commit");
@@ -10794,9 +11354,12 @@ fn select_canonical_log_stitches_the_band_across_three_offset_donors() {
   // commit* = 8, op_head = 8. The union must produce a dense [1..=8] — dropping any of 1..=8 would
   // lose a committed op some lower-floor adopter needs.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from.insert(0, dvc_offset(0, 1, 0, 3, 3));
-  e.dvc_from.insert(1, dvc_offset(1, 1, 3, 6, 6));
-  e.dvc_from.insert(2, dvc_offset(2, 1, 6, 8, 8));
+  e.dvc_from_mut_for_test()
+    .insert(0, dvc_offset(0, 1, 0, 3, 3));
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_offset(1, 1, 3, 6, 6));
+  e.dvc_from_mut_for_test()
+    .insert(2, dvc_offset(2, 1, 6, 8, 8));
   let (log, op_head, commit_star) = e.select_canonical_log();
   assert_eq!(op_head, 8);
   assert_eq!(commit_star, 8);
@@ -10850,10 +11413,12 @@ fn select_canonical_log_bounds_a_dvc_claiming_a_huge_op() {
   // N=3 → quorum_nack_prepare = 2, so we make TWO donors claim the phantom head.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
   // r0: honest — holds ops 1,2,3 (head 3, commit 2).
-  e.dvc_from.insert(0, dvc(0, 1, 3, 2));
+  e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 3, 2));
   // r1, r2 (SAME generation): MALFORMED — each claims op == u64::MAX but carries only ops 1..=3.
-  e.dvc_from.insert(1, dvc_claiming(1, 1, u64::MAX, 2, 3));
-  e.dvc_from.insert(2, dvc_claiming(2, 1, u64::MAX, 2, 3));
+  e.dvc_from_mut_for_test()
+    .insert(1, dvc_claiming(1, 1, u64::MAX, 2, 3));
+  e.dvc_from_mut_for_test()
+    .insert(2, dvc_claiming(2, 1, u64::MAX, 2, 3));
   // Must return PROMPTLY (no unbounded scan, no overflow panic) and bound op_head to the represented
   // log: the max op actually present across the canonical donors is 3, so op_head <= 3.
   let (log, op_head, commit_star) = e.select_canonical_log();
@@ -11770,4 +12335,139 @@ fn higher_view_non_canonical_hole_prepare_does_not_trigger_catch_up() {
     r.poll_message().is_none(),
     "no GetView (catch-up probe) is emitted for the dropped hole Prepare",
   );
+}
+
+// --- Item 1: `advance_checkpoint_op` is a MONOTONE chokepoint (non-vacuity). ---
+
+#[test]
+fn advance_checkpoint_op_allows_forward_moves() {
+  // The chokepoint must accept a non-decreasing move (the only legitimate direction): a forward step
+  // and an idempotent equal-step both succeed without tripping the monotonicity assert.
+  let mut e = backup();
+  e.advance_checkpoint_op(OpNumber::with(8));
+  assert_eq!(e.checkpoint_op(), OpNumber::with(8));
+  e.advance_checkpoint_op(OpNumber::with(8)); // equal is allowed (>=)
+  assert_eq!(e.checkpoint_op(), OpNumber::with(8));
+  e.advance_checkpoint_op(OpNumber::with(12));
+  assert_eq!(e.checkpoint_op(), OpNumber::with(12));
+}
+
+#[test]
+#[should_panic(expected = "checkpoint_op must not rewind")]
+fn advance_checkpoint_op_rewind_panics() {
+  // A rewind would prune a band a durable root still claims to cover — the chokepoint must fail-stop,
+  // not silently regress the durable-checkpoint pointer that gates the irreversible `wal.prune`.
+  let mut e = backup();
+  e.advance_checkpoint_op(OpNumber::with(10));
+  e.advance_checkpoint_op(OpNumber::with(9)); // rewind: must panic in debug
+}
+
+// --- Item 2: `set_commit_min` is a MONOTONE chokepoint (non-vacuity). ---
+
+#[test]
+fn set_commit_min_allows_forward_moves() {
+  // The applied frontier only ever advances; a forward step and an idempotent equal-step both succeed.
+  let mut e = backup();
+  e.set_commit_min(OpNumber::with(4));
+  assert_eq!(e.commit(), OpNumber::with(4));
+  e.set_commit_min(OpNumber::with(4)); // equal is allowed (>=)
+  assert_eq!(e.commit(), OpNumber::with(4));
+  e.set_commit_min(OpNumber::with(7));
+  assert_eq!(e.commit(), OpNumber::with(7));
+}
+
+#[test]
+#[should_panic(expected = "commit_min must not rewind")]
+fn set_commit_min_rewind_panics() {
+  // `commit_min` is the applied frontier — an applied op is immutable, so a regress would un-apply a
+  // committed op. The chokepoint must fail-stop rather than silently rewind it.
+  let mut e = backup();
+  e.set_commit_min(OpNumber::with(6));
+  e.set_commit_min(OpNumber::with(5)); // rewind: must panic in debug
+}
+
+// --- Item 3: `assert_committed_survives` catches a lost committed op (non-vacuity). ---
+
+#[test]
+fn assert_committed_survives_accepts_safe_drops() {
+  // The three legitimate witnesses each pass. State: checkpoint_op=3, commit_max=8 (a committed band
+  // (3..=8]), op=8, and op 5 registered as a tracked repair hole. (`force_state_for_test` raises
+  // commit_max to commit_min, so commit_min=8 gives commit_max=8.)
+  let mut e = backup();
+  e.force_state_for_test(0, 8, 8, 3, &[5]);
+  let floor = e.checkpoint_op().get();
+  e.assert_committed_survives(3, floor); // folded into the checkpoint (op <= floor)
+  e.assert_committed_survives(2, floor); // also below the checkpoint floor
+  e.assert_committed_survives(5, floor); // tracked-for-repair (in self.repair)
+  e.assert_committed_survives(9, floor); // uncommitted (op > commit_max == 8)
+  e.assert_committed_survives(100, floor); // far above the committed frontier
+}
+
+#[test]
+#[should_panic(expected = "destructive op on committed op")]
+fn assert_committed_survives_rejects_a_lost_committed_op() {
+  // Op 6 is in the committed band (checkpoint_op=3 < 6 <= commit_max=8), NOT checkpointed, NOT tracked
+  // for repair, and NOT above the known-committed frontier — dropping it would LOSE a committed op, so
+  // the backstop must fire.
+  let mut e = backup();
+  e.force_state_for_test(0, 8, 8, 3, &[]); // no repair holes; commit_min=8 ⇒ commit_max=8
+  e.assert_committed_survives(6, e.checkpoint_op().get());
+}
+
+// --- Item 4: `assert_invariants` (status × sub-state-flag) coupling (non-vacuity). ---
+
+#[test]
+fn assert_invariants_accepts_a_consistent_state() {
+  // A plain Normal backup with the monotone frontier bounds satisfied passes every clause.
+  let mut e = backup();
+  e.force_state_for_test(0, 8, 5, 3, &[]); // op 8 >= commit_min 5 >= checkpoint_op 3; commit_max 5
+  e.assert_invariants();
+}
+
+#[test]
+#[should_panic(expected = "view_change collection present iff Status::ViewChange")]
+fn assert_invariants_rejects_view_change_collection_while_normal() {
+  // The ViewChange-only collection (DVC + catch-up discriminant) is a ViewChange sub-state; a Normal
+  // replica must never carry it. Planting a `Some` collection while Normal violates clause (2)'s
+  // `view_change.is_some() == is_view_change()` coupling.
+  let mut e = backup();
+  e.force_view_change_present_for_test(); // status is Normal → present-but-not-ViewChange
+  e.assert_invariants();
+}
+
+#[test]
+#[should_panic(expected = "pending_forfeit off a Normal primary")]
+fn assert_invariants_rejects_pending_forfeit_on_a_backup() {
+  // The deferred-forfeit latch belongs to a Normal PRIMARY stepping down; replica 1 of 3 is a backup
+  // in view 0, so the latch must not be set.
+  let mut e = backup();
+  e.pending_forfeit = true; // backup → violates clause (3)
+  e.assert_invariants();
+}
+
+#[test]
+#[should_panic(expected = "commit_min")]
+fn assert_invariants_rejects_checkpoint_above_commit_min() {
+  // `checkpoint_op > commit_min` is impossible (a checkpoint snapshots the SM at `commit_min`), so the
+  // monotone-bounds clause (4) must fire.
+  let mut e = backup();
+  e.checkpoint_op = OpNumber::with(9);
+  e.commit_max = OpNumber::with(9);
+  // commit_min stays 0 < checkpoint_op 9 → violates commit_min >= checkpoint_op
+  e.assert_invariants();
+}
+
+#[test]
+#[should_panic(expected = "pending_install without an outstanding sync")]
+fn assert_invariants_rejects_pending_install_without_sync() {
+  // A staged deferred install must belong to an outstanding sync (clause (1)).
+  let mut e = backup();
+  e.pending_install = Some(PendingInstall {
+    checkpoint_op: OpNumber::with(0),
+    sessions: BTreeMap::new(),
+    sm_tail: Bytes::new(),
+    held_tail: false,
+  });
+  // self.sync is None → violates clause (1)
+  e.assert_invariants();
 }

@@ -70,10 +70,32 @@ enum CheckpointStep {
   AwaitRoot { id: crate::OpId },
 }
 
+/// Why an in-flight checkpoint root is being written — the typed completion discriminator the
+/// `on_sb_done` root-completion arm `match`es on to route the now-durable checkpoint. Carried INSIDE
+/// the `PendingCheckpoint` completion token (codex R24-F1 follow-up) so the routing is a `match` over a
+/// sum, NOT a bool beside the struct: there is no ambient `sync` flag left to confuse with
+/// `self.sync.is_some()` (the footgun that bit once — a sync can be merely SOLICITED, with no staged
+/// install, while an ORDINARY checkpoint completes; routing on `self.sync` would then misroute that
+/// ordinary completion to the install branch, never advancing `checkpoint_op` and clearing the
+/// solicited sync → a state-sync livelock). Kept SEPARATE from the durable-VIEW tracker `pending_sb`:
+/// this is a checkpoint-ROOT write (the view IS durable; only the checkpoint is being written, so it
+/// does NOT block participation), whereas `pending_sb` is a durable-view write that DOES.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointKind {
+  /// An ordinary [`Endpoint::maybe_checkpoint`]: the root completion advances `checkpoint_op` + GCs,
+  /// leaving any concurrently-SOLICITED sync intact (this root is not its re-persist).
+  Ordinary,
+  /// A STATE-SYNC re-persist staged by [`Endpoint::apply_sync`] (codex R24-F1, durable-before-install):
+  /// the root completion INSTALLS the synced state (or, on the recovery eager-install path, finds it
+  /// already installed) + runs the sync completion bookkeeping.
+  SyncRepersist,
+}
+
 /// Staging for an in-flight checkpoint, sequencing the two superblock writes. Holds the target op
-/// (the committed+applied boundary the snapshot reflects), its content id, and which step is
-/// outstanding. While `Some`, no second checkpoint and no durable-view write may start (and any
-/// view-change transition drops it — see the view-change exclusion in the status transitions).
+/// (the committed+applied boundary the snapshot reflects), its content id, which step is outstanding,
+/// and WHY it is being written ([`CheckpointKind`]). While `Some`, no second checkpoint and no
+/// durable-view write may start (and any view-change transition drops it — see the view-change
+/// exclusion in the status transitions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingCheckpoint {
   /// The op the snapshot reflects (`commit_min` at trigger time): the new `checkpoint_op` once durable.
@@ -82,6 +104,9 @@ struct PendingCheckpoint {
   checkpoint_id: u128,
   /// Which superblock write is currently outstanding.
   step: CheckpointStep,
+  /// Why this checkpoint root is being written (the typed completion discriminator). The `on_sb_done`
+  /// root-completion arm `match`es on this to route the now-durable checkpoint — see [`CheckpointKind`].
+  kind: CheckpointKind,
 }
 
 /// In-flight state-sync bookkeeping (M3.4a). `Some` while a lagging replica is awaiting (or
@@ -103,6 +128,74 @@ struct SyncState {
   /// release-active assert from `checkpoint_op > self.op` to the true safety invariant
   /// `checkpoint_op >= commit_min` (never rewind the applied frontier). See §2 of the M3.5 plan.
   forced: bool,
+}
+
+/// The DEFERRED INSTALL of a verified, staged `SyncCheckpoint` (codex R24-F1, durable-before-install).
+/// [`Endpoint::apply_sync`] STAGES the durable re-persist (the two superblock writes) and records this
+/// payload; the DESTRUCTIVE install — restore the SM/sessions, advance `commit_min`/`commit_max`/`op`
+/// to the synced point, prune the WAL, advance `checkpoint_op` — runs ATOMICALLY in
+/// [`Endpoint::install_sync`] only once the sync ROOT (step 2) is durable, so there is no window where
+/// the band is pruned / the commit advanced while `checkpoint_op` is still stale. `Some` exactly across
+/// the STAGE→root window; cleared on install AND on any cancellation (view change / step-down) that
+/// clears `sync`. Carries the OWNED decoded snapshot content (the borrow into the wire envelope does not
+/// outlive the message) so the install reconstructs the synced state without re-decoding.
+#[derive(Debug)]
+pub(crate) struct PendingInstall {
+  /// The synced checkpoint op (== the op BOUND into the snapshot, F3) the install advances to.
+  checkpoint_op: OpNumber,
+  /// The decoded client-session table to install (`self.clients`).
+  sessions: BTreeMap<u128, Session>,
+  /// The decoded SM snapshot tail to `restore` (an owned zero-copy slice of the wire envelope).
+  sm_tail: Bytes,
+  /// The forced-sync held-tail decision captured at STAGE (`checkpoint_op < self.op`): the band
+  /// `(checkpoint_op .. self.op]` is PRESERVED on install rather than discarded (safety, VOPR seed 164).
+  /// `self.op` is frozen across the window (`on_prepare` drops while `sync.is_some()`), so this decision
+  /// is identical at install time.
+  held_tail: bool,
+}
+
+/// The ViewChange-only collection state — reified as `Endpoint::view_change: Option<ViewChangeCollection>`
+/// so the coupling "these are meaningless outside `Status::ViewChange`" is TYPE-enforced rather than
+/// prose (audit Q1/Q2): the field is `Some` for EXACTLY the lifetime of `Status::ViewChange` and `None`
+/// in every other status, so a Normal/Recovering replica simply cannot hold (or read) garbage DVC /
+/// catch-up state. The two ViewChange entries ([`Endpoint::enter_view_change`], [`Endpoint::catch_up_to_view`])
+/// CONSTRUCT it (via [`ViewChangeCollection::entering`]); the four ViewChange exits — the two
+/// new-primary/adopt completions plus the catch-up/idle escalations — `take()` it back to `None` as
+/// status returns to Normal. The `assert_invariants` clause `view_change.is_some() == is_view_change()`
+/// freezes the coupling at every handler exit.
+///
+/// Scope NOTE (the deliberate split, audit Q1): the SVC-collection fields `svc_from`/`svc_target` are
+/// NOT folded in here — they are live in `Status::Normal` too (a backup that proposed a view change off
+/// its idle timer, or a primary forfeiting, accumulates `svc_from` toward the quorum and re-broadcasts
+/// `svc_target` while STILL Normal, only entering `ViewChange` once the SVC quorum forms — see
+/// `propose_next_view`/`join_svc`/the FIX-1 Normal-backup `svc_message` retransmit). They span the
+/// status boundary, so they stay flat; only the genuinely ViewChange-confined state is reified.
+#[derive(Debug)]
+struct ViewChangeCollection {
+  /// Prospective primary: collected DoViewChange messages, keyed by replica index. Empty for a
+  /// catching-up replica (it solicits a `StartView`, never collects DVCs).
+  dvc_from: BTreeMap<u8, DoViewChange>,
+  /// Prospective primary: the canonical log has been formed this view (the DVC quorum was reached and
+  /// `start_view_as_new_primary` ran). Gates `on_do_view_change` against re-forming a finished view.
+  dvc_quorum: bool,
+  /// `true` when this replica is merely catching up to an existing newer view (the higher-view rule)
+  /// rather than driving a new view change — it sends GetView, not SVC/DVC. Set by `catch_up_to_view`;
+  /// the steady self-driven entry leaves it `false`.
+  catching_up: bool,
+}
+
+impl ViewChangeCollection {
+  /// A fresh collection for a replica ENTERING `Status::ViewChange`: no DVCs collected, no quorum yet,
+  /// and `catching_up` per the entry kind (`true` for the higher-view catch-up entry, `false` for the
+  /// self-driven SVC-quorum entry). Replaces the old per-field `dvc_from.clear()` / `dvc_quorum = false`
+  /// / `catching_up = …` reset, now that these three live behind one Option.
+  fn entering(catching_up: bool) -> Self {
+    Self {
+      dvc_from: BTreeMap::new(),
+      dvc_quorum: false,
+      catching_up,
+    }
+  }
 }
 
 const PREPARE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
@@ -280,6 +373,16 @@ struct Timers {
   /// `SyncCheckpoint` or persisting the adopted one). Armed only while `sync.is_some()`; cleared once
   /// the synced checkpoint is durable.
   sync_solicit: Option<Instant>,
+  /// Normal primary (M3.5 T3): the forfeit GRACE timer. `Some(deadline)` while a `Normal` primary has
+  /// observed the checkpoint-lag / unfillable-committed-hole forfeit condition but has not yet stepped
+  /// down — the condition must persist until `deadline` (armed `now + FORFEIT_GRACE`) before the
+  /// primary forfeits, so a transient lag cannot trigger a view change (anti-storm). Disarmed (`None`)
+  /// the moment the primary catches up, when it actually forfeits, and on every view-change transition
+  /// (a fresh generation re-evaluates). Only ever set on the primary path (`maybe_forfeit`); a backup
+  /// never arms it. UNLIKE the role timers, `arm_timers` PRESERVES this across its `Timers::default()`
+  /// reset (it is a heartbeat-path deadline a Normal primary keeps ticking while it appends new ops),
+  /// so a steady client load does not keep re-zeroing the grace window.
+  forfeit_armed: Option<Instant>,
 }
 
 /// The twelve scheduled timers, as an enumerable kind. Used by [`Endpoint::serviceable_now`] (the
@@ -301,8 +404,8 @@ enum TimerKind {
   RecoverHead,
   RepairRetry,
   SyncSolicit,
-  /// The forfeit grace timer ([`Endpoint::forfeit_armed`]) — not in [`Timers`], but scheduled by
-  /// `poll_timeout` and serviced (via `maybe_forfeit`) on the same primary path as `commit`/`prepare`.
+  /// The forfeit grace timer ([`Timers::forfeit_armed`]), serviced (via `maybe_forfeit`) on the same
+  /// Normal-primary heartbeat path as `commit`/`prepare`.
   ForfeitArmed,
 }
 
@@ -348,6 +451,36 @@ impl TimerKind {
 ///
 /// Push inputs with `handle_*`; pull outputs with `poll_*` (drain each to `None`
 /// per wake). Every state-advancing entry takes a non-decreasing `now`.
+///
+/// # The durable-before-effect principle (the module invariant)
+///
+/// THE invariant of this module — the through-line behind the codex R6/R7/R8/R16/R17/R18/R24 fixes and
+/// the frontier-mutation audit — is: **an irreversible or externally-observable effect happens ONLY
+/// AFTER the durable record that justifies it has landed.** A crash must never roll back to a state the
+/// cluster already acted on. It is enforced STRUCTURALLY, each member at a single chokepoint, so a new
+/// call site cannot bypass it (the asserts are detection; the chokepoints are prevention):
+///
+/// - **Authoritative emit** ⇐ durable view. A view-advertising participation message is pushed only
+///   when `self.view` is durable (no `pending_sb` write in flight): `emit` is the sole egress point and
+///   asserts it (durable-view-before-participate, R8/R16/R17/R18).
+/// - **State-machine restore + band prune** ⇐ durable synced root. A state-sync's destructive install
+///   (SM restore, commit/op advance, WAL prune) is DEFERRED behind `pending_install` until the synced
+///   checkpoint root is durable (`on_sb_done` → `install_sync`), so a view change in the window cancels
+///   cleanly with no pruned-but-stale band (durable-before-install, R24).
+/// - **`checkpoint_op` advance** ⇐ durable checkpoint root. `advance_checkpoint_op` is the sole
+///   non-constructor writer and is MONOTONE — it gates the irreversible `wal.prune` in `run_gc` /
+///   `install_sync`, so a rewind would prune a band a durable root still claims to cover.
+/// - **`commit_min` advance** ⇐ applied op. `set_commit_min` is the sole non-constructor writer and is
+///   MONOTONE — the applied frontier never rewinds (an applied op is immutable).
+/// - **Destructive cache/WAL drop** ⇒ committed op survives. Every site that removes/truncates/prunes a
+///   log or WAL entry asserts via `assert_committed_survives` that the dropped op is folded into a
+///   checkpoint, tracked for peer-repair, or provably uncommitted — so no committed op is ever lost.
+/// - **Ack/vote** ⇐ durable append (append-before-ack). A `PrepareOk`/own-vote is cast only once the op's
+///   WAL append is durable: the `appending` set is the single gate (`send_prepare_ok` checks it), and
+///   every completion's deferred ack is cast from `on_wal_done` via the `Pending` action (R6/R7/R13).
+///
+/// The exit-time `assert_invariants` backstops the `(status × sub-state-flag)` coupling that these
+/// members assume, so any future drift trips deterministically across the suite + the VOPR sweep.
 #[derive(Debug)]
 pub struct Endpoint<S> {
   config: Config,
@@ -366,17 +499,21 @@ pub struct Endpoint<S> {
   /// Latest view in which this replica changed its head log.
   /// Invariants: `log_view <= view`; `log_view == view` when status==Normal.
   log_view: View,
-  /// ViewChange: bitset of replicas that sent StartViewChange for `view+1` (includes our own bit once we propose).
+  /// SVC collection: bitset of replicas that sent StartViewChange for `view+1` (includes our own bit
+  /// once we propose). Live in `Status::Normal` TOO, not just ViewChange — a backup proposing off its
+  /// idle timer (or a forfeiting primary) accumulates this toward the SVC quorum WHILE STILL Normal,
+  /// only transitioning once the quorum forms — so it stays flat (NOT in `view_change`, which is
+  /// `None` in Normal). See [`ViewChangeCollection`].
   svc_from: u64,
-  /// ViewChange: the highest view this replica is currently collecting StartViewChanges for.
+  /// SVC collection: the highest view this replica is currently collecting StartViewChanges for. Like
+  /// `svc_from`, live in `Status::Normal` too (the Normal SVC-accumulation / forfeit-retransmit
+  /// window), so it stays flat alongside it.
   svc_target: View,
-  /// ViewChange: true when this replica is merely catching up to an existing newer view
-  /// (higher-view rule) rather than driving a new view change — it sends GetView, not SVC/DVC.
-  catching_up: bool,
-  /// ViewChange (prospective primary): collected DoViewChange messages by replica index.
-  dvc_from: BTreeMap<u8, DoViewChange>,
-  /// ViewChange (prospective primary): the canonical log has been formed this view.
-  dvc_quorum: bool,
+  /// The ViewChange-only collection state (DVC collection + the catch-up discriminant), reified behind
+  /// an `Option` so it is `Some` for EXACTLY the lifetime of `Status::ViewChange` and `None` otherwise
+  /// (the `assert_invariants` `view_change.is_some() == is_view_change()` coupling). See
+  /// [`ViewChangeCollection`] for why the SVC fields above are deliberately NOT folded in.
+  view_change: Option<ViewChangeCollection>,
   /// Freshness nonce for GetView, drawn once from the prng.
   nonce: u64,
   /// In-memory log, keyed by op number.
@@ -456,6 +593,15 @@ pub struct Endpoint<S> {
   /// not relied upon to catch up (the needed ops are below the cluster checkpoint and may be pruned);
   /// the `sync_solicit` timer re-broadcasts until a valid `SyncCheckpoint` is applied + made durable.
   sync: Option<SyncState>,
+  /// State-sync deferred install (codex R24-F1, durable-before-install): the staged-but-not-yet-installed
+  /// synced checkpoint. `Some` exactly between `apply_sync` STAGING the durable re-persist and the sync
+  /// ROOT going durable (`on_sb_done` → `install_sync`); `None` otherwise. While `Some`, the replica
+  /// keeps its OLD (consistent, if stale) in-memory + durable state — the SM is NOT yet restored and
+  /// `commit_min`/`op`/`checkpoint_op` are NOT advanced, so a view change in this window finds the old
+  /// state intact and cleanly cancels the install (no pruned-but-stale window → no R24-F1 wedge). The
+  /// apply loop (`advance_commit`) is suppressed while this is `Some` so no op is applied over the
+  /// soon-to-be-replaced SM (load-bearing for the recovery peer-fetch path, whose SM is unrestored here).
+  pending_install: Option<PendingInstall>,
   /// State-sync peer side (M3.4a): in-flight checkpoint reads this replica issued to SERVE peers'
   /// `RequestSync`s, keyed by the read's `OpId` → `(requester, echoed nonce)`. When the read completes
   /// (`on_sb_done`), the durable snapshot is shipped as a `SyncCheckpoint` to the recorded requester.
@@ -477,14 +623,6 @@ pub struct Endpoint<S> {
   /// ordinary state-sync), since both route through `apply_sync` and would otherwise be indistinguishable
   /// via `state_syncs_applied` alone. Same lifecycle as `state_syncs_applied` (reset to 0 on `new`/`recover`).
   forced_syncs_applied: u64,
-  /// Forfeit grace timer (M3.5 T3): `Some(deadline)` while a `Normal` primary has observed the
-  /// checkpoint-lag forfeit condition (`quorum_checkpoint_op - self.checkpoint_op >=
-  /// config.forfeit_checkpoint_lag()`) but has not yet stepped down — the condition must persist
-  /// until `deadline` (armed `now + FORFEIT_GRACE`) before the primary forfeits, so a transient lag
-  /// cannot trigger a view change (anti-storm). Disarmed (`None`) the moment the primary catches up,
-  /// when it actually forfeits, and on every view-change transition (a fresh generation re-evaluates
-  /// from scratch). Only ever set on the primary path (`maybe_forfeit`); a backup never arms it.
-  forfeit_armed: Option<Instant>,
   /// Deferred-forfeit flag (M3.5, safety): set when [`Self::maybe_force_sync`] would have force-synced
   /// but we are the PRIMARY — a primary MUST NOT force-sync, as that resets `self.op` to the checkpoint
   /// (below its head) and lets it re-issue new client requests at REUSED op numbers in the same view,
@@ -514,9 +652,7 @@ impl<S: StateMachine> Endpoint<S> {
       log_view: View::new(),
       svc_from: 0,
       svc_target: View::new(),
-      catching_up: false,
-      dvc_from: BTreeMap::new(),
-      dvc_quorum: false,
+      view_change: None,
       nonce,
       log: BTreeMap::new(),
       inflight: BTreeMap::new(),
@@ -536,10 +672,10 @@ impl<S: StateMachine> Endpoint<S> {
       recover: None,
       repair: std::collections::BTreeSet::new(),
       sync: None,
+      pending_install: None,
       sync_serving: BTreeMap::new(),
       state_syncs_applied: 0,
       forced_syncs_applied: 0,
-      forfeit_armed: None,
       pending_forfeit: false,
     }
   }
@@ -578,6 +714,168 @@ impl<S: StateMachine> Endpoint<S> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checkpoint_op(&self) -> OpNumber {
     self.checkpoint_op
+  }
+
+  /// The sole non-constructor writer of `self.checkpoint_op` (codex/audit: it gates an irreversible
+  /// `wal.prune` in [`Self::run_gc`] / [`Self::install_sync`], so it MUST be monotone — a rewind would
+  /// prune a band a durable root still claims to cover, losing committed ops on a later recover). Both
+  /// advance sites (the ordinary-checkpoint and the state-sync re-persist root completions in
+  /// `on_sb_done`) route here so the non-decreasing property is asserted in ONE place rather than left
+  /// emergent. The `new` initial set is exempt (it SETS the genesis 0, it does not advance), as are the
+  /// `#[cfg(test)]` state-injection helpers (they construct arbitrary states, bypassing the gate).
+  fn advance_checkpoint_op(&mut self, to: OpNumber) {
+    debug_assert!(
+      to.get() >= self.checkpoint_op.get(),
+      "checkpoint_op must not rewind (to {} < current {})",
+      to.get(),
+      self.checkpoint_op.get(),
+    );
+    self.checkpoint_op = to;
+  }
+
+  /// The sole non-constructor writer of `self.commit_min` (the applied frontier). It NEVER rewinds —
+  /// an applied op is immutable, so the commit pointer is monotone — and this is the ONE place that
+  /// universal floor is asserted, rather than re-proven per site. Both ordinary advance sites (the
+  /// `commit_min+1` apply loops in [`Self::commit_op`] / [`Self::advance_commit`]) and the state-sync
+  /// install ([`Self::install_sync`], which advances to the synced checkpoint op) route here; the
+  /// install KEEPS its own richer assert (it proves the same direction against the forced-vs-ordinary
+  /// branch), so this just adds the universal monotone backstop. The `new` initial set is exempt (it
+  /// SETS the genesis 0), as are the `#[cfg(test)]` state-injection helpers (arbitrary construction).
+  fn set_commit_min(&mut self, to: OpNumber) {
+    debug_assert!(
+      to.get() >= self.commit_min.get(),
+      "commit_min must not rewind (to {} < current {})",
+      to.get(),
+      self.commit_min.get(),
+    );
+    self.commit_min = to;
+  }
+
+  /// Whether `op` is being re-fetched as a TRACKED repair hole — either an active peer-repair hole
+  /// (`self.repair`) or a still-in-flight recovery faulty slot (`rec.faulty`, which `recover_progress`
+  /// promotes to a `self.repair` hole on the `→ Normal` transition or drives the `RecoveringHead`
+  /// head-relearn). In both cases the committed body is RE-SOLICITED, not lost — used as a survival
+  /// witness by [`Self::assert_committed_survives`].
+  fn is_tracked_for_repair(&self, op: u64) -> bool {
+    self.repair.contains(&op)
+      || self
+        .recover
+        .as_ref()
+        .is_some_and(|r| r.faulty.contains(&op))
+  }
+
+  /// Assert dropping/overwriting `op` from the log cache / WAL cannot LOSE a committed op. The shared
+  /// proof every destructive site re-derives, encoded once: a dropped op is safe iff it is
+  /// - folded into the checkpoint whose snapshot justifies the drop (`op <= checkpoint_floor`) — its
+  ///   value lives in that snapshot; or
+  /// - being re-fetched as a TRACKED repair hole ([`Self::is_tracked_for_repair`]) — the committed value
+  ///   is actively re-solicited (`RequestPrepare` → `Prepare`), so the drop is a cache eviction, not a
+  ///   loss (the apply loop HOLDS the commit below it until the canonical body returns); or
+  /// - provably UNCOMMITTED (`op > commit_max`, the highest op known committed cluster-wide) — nothing at
+  ///   `op` was ever committed, so there is no committed value to lose.
+  ///
+  /// `checkpoint_floor` is the durable/just-restored checkpoint the SITE relies on, almost always
+  /// `self.checkpoint_op`; the ONE exception is [`Self::install_sync`], where the R24-F1 deferred-advance
+  /// keeps `self.checkpoint_op` at the OLD value until the caller records the new root, so the install
+  /// passes its LOCAL synced checkpoint (the snapshot it just restored into the SM). Naming the floor
+  /// per site keeps the witness exact and STRONG (no fall back to the weaker applied frontier).
+  ///
+  /// The historical committed-divergence seeds (24/253/335) all live at these sites. NOTE `commit_max`
+  /// is a re-learnable HINT, so the `> commit_max` clause is the *loosest* uncommitted witness; the
+  /// per-site safety arguments (quorum-intersection nack-truncation, the offset-tail materialization)
+  /// remain the real proofs — this is the shared backstop that fires if a NEW destructive site drops a
+  /// committed op that is neither checkpointed nor tracked-for-repair nor above the known-committed frontier.
+  /// Body is a `debug_assert!`, so the call is a no-op in release (zero cost, like the `emit` choke).
+  fn assert_committed_survives(&self, op: u64, checkpoint_floor: u64) {
+    debug_assert!(
+      op <= checkpoint_floor || self.is_tracked_for_repair(op) || op > self.commit_max.get(),
+      "destructive op on committed op {} (checkpoint_floor {}, commit_max {}, not tracked-for-repair)",
+      op,
+      checkpoint_floor,
+      self.commit_max.get(),
+    );
+  }
+
+  /// The aggregate `(Status × sub-state-flag)` coupling check — TigerBeetle's `assert_main`, run at the
+  /// END of every public entry point (`handle_message` / `handle_timeout` / `handle_storage`). The flag
+  /// rules previously lived only as scattered prose at each set/clear site; encoding them as ONE
+  /// handler-exit invariant makes any future drift (a transition that forgets to clear a flag, a new
+  /// sub-state that violates the coupling) trip DETERMINISTICALLY across the whole suite + VOPR, exactly
+  /// like the `serviceable_now` no-orphan-due assert does for timers. Each clause is verified to hold at
+  /// every handler exit (the `new`/transition handlers re-establish the coupling before returning); this
+  /// is detection, the per-site sets/clears remain the enforcement.
+  #[cfg(debug_assertions)]
+  fn assert_invariants(&self) {
+    // (1) A deferred state-sync install belongs to an OUTSTANDING sync: `apply_sync` stages
+    // `pending_install` and `sync` together, and every clear path drops `pending_install` no later than
+    // `sync` (the deferred root completion `take()`s the install before clearing `sync`; the eager
+    // recovery path `take()`s it at flip-to-Normal while `sync` rides on; the view-change resets drop
+    // both). It also implies an in-flight checkpoint re-persist (`pending_checkpoint`) — the same
+    // `apply_sync` submits the two-write checkpoint sequence that carries the install to durability.
+    debug_assert!(
+      self.pending_install.is_none() || self.sync.is_some(),
+      "pending_install without an outstanding sync"
+    );
+    debug_assert!(
+      self.pending_install.is_none() || self.pending_checkpoint.is_some(),
+      "pending_install without its in-flight re-persist checkpoint"
+    );
+    // (2) The ViewChange-only collection (DVC + catch-up discriminant) exists for EXACTLY the lifetime
+    // of `Status::ViewChange`: the two ViewChange entries (`enter_view_change` / `catch_up_to_view`)
+    // construct it, and every exit to Normal (`adopt_canonical_head` / `start_view_as_new_primary`)
+    // `take`s it. Reifying it as `Option<ViewChangeCollection>` makes the coupling TYPE-enforced (the
+    // DVC/catch-up state simply cannot be held in any other status); this clause checks the Option's
+    // presence tracks the status exactly — a strictly stronger form of the old `catching_up ⟹
+    // ViewChange` prose. (The SVC bits stay flat: they are live in Normal too — see the struct fields.)
+    debug_assert!(
+      self.view_change.is_some() == self.status.is_view_change(),
+      "view_change collection present iff Status::ViewChange (status {:?}, present {})",
+      self.status,
+      self.view_change.is_some(),
+    );
+    // (3) Both forfeit sub-states belong to a Normal PRIMARY that is stepping down: `forfeit_armed` is
+    // armed only on the Normal-primary tick (`maybe_forfeit`), and `pending_forfeit` is latched only by
+    // `forfeit` (a Normal-primary tick) or `defer_forfeit` (raised on a replica that is the primary of
+    // its view). `forfeit` PROPOSES `view+1` without leaving Normal, so the latch coexists with
+    // Normal-primary until the SVC quorum forms (the transition then clears it); every primacy/view
+    // transition clears both. So at any handler exit a set forfeit sub-state ⟹ Normal-primary.
+    debug_assert!(
+      self.timers.forfeit_armed.is_none() || (self.status.is_normal() && self.is_primary()),
+      "forfeit_armed off a Normal primary"
+    );
+    debug_assert!(
+      !self.pending_forfeit || (self.status.is_normal() && self.is_primary()),
+      "pending_forfeit off a Normal primary"
+    );
+    // (4) The monotone frontier bounds (the same chain `submit_durable_view`/`install_sync` document):
+    // `commit_max >= commit_min >= checkpoint_op`. NOTE `op >= commit_max` is deliberately NOT asserted —
+    // the tail-gap allows `commit_max > op` (a known-committed op this replica does not yet hold).
+    debug_assert!(
+      self.commit_max.get() >= self.commit_min.get(),
+      "commit_max {} < commit_min {}",
+      self.commit_max.get(),
+      self.commit_min.get()
+    );
+    debug_assert!(
+      self.commit_min.get() >= self.checkpoint_op.get(),
+      "commit_min {} < checkpoint_op {}",
+      self.commit_min.get(),
+      self.checkpoint_op.get()
+    );
+    // (5) The applied frontier never exceeds the head (apply is forward and in-bounds): `op >= commit_min`.
+    debug_assert!(
+      self.op.get() >= self.commit_min.get(),
+      "op {} < commit_min {}",
+      self.op.get(),
+      self.commit_min.get()
+    );
+    // (6) The peer-checkpoint fetch is a Recovering sub-state: `escalate_checkpoint_to_peer_fetch` sets
+    // it only on the Recovering checkpoint-read-exhausted path, and `recover` is structurally `None`
+    // (hence `awaiting_peer_checkpoint()` false) in every non-recovering status.
+    debug_assert!(
+      !self.awaiting_peer_checkpoint() || self.status.is_recovering(),
+      "awaiting_peer_checkpoint outside Recovering"
+    );
   }
 
   /// Record a peer's reported `checkpoint_op` MONOTONICALLY: a peer's durable checkpoint never
@@ -757,7 +1055,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// Test-only: is the forfeit grace timer currently armed (M3.5 T3)?
   #[cfg(test)]
   fn forfeit_armed_for_test(&self) -> bool {
-    self.forfeit_armed.is_some()
+    self.timers.forfeit_armed.is_some()
   }
 
   /// Test-only: is the deferred-forfeit flag set (the M3.5 safety step-down a primary raises instead of
@@ -784,7 +1082,20 @@ impl<S: StateMachine> Endpoint<S> {
       target_op: self.commit_min,
       checkpoint_id: 0,
       step: CheckpointStep::AwaitSnapshot { id },
+      kind: CheckpointKind::Ordinary, // models an ordinary checkpoint-persist in flight
     });
+  }
+
+  /// Test-only: the in-flight checkpoint's typed completion kind (the `on_sb_done` root-completion
+  /// discriminator) — `Some(true)` for a [`CheckpointKind::SyncRepersist`], `Some(false)` for a
+  /// [`CheckpointKind::Ordinary`], `None` when no checkpoint is in flight. Lets the R24-F1 regression
+  /// assert the STAGED kind directly (the typed discriminator that replaced the ambient `sync` bool),
+  /// not just the downstream routing behavior.
+  #[cfg(test)]
+  fn pending_checkpoint_is_sync_for_test(&self) -> Option<bool> {
+    self
+      .pending_checkpoint
+      .map(|pc| matches!(pc.kind, CheckpointKind::SyncRepersist))
   }
 
   /// Test-only: force this endpoint into a `Normal` state with the given head/commit/checkpoint and a
@@ -802,6 +1113,10 @@ impl<S: StateMachine> Endpoint<S> {
     repair: &[u64],
   ) {
     self.status = Status::Normal;
+    // Forcing a clean Normal state: the ViewChange-only collection must be absent (the
+    // `view_change.is_some() == is_view_change()` coupling), so a test that reuses an endpoint which had
+    // been in ViewChange does not carry a stale `Some` into the forced Normal scenario.
+    self.view_change = None;
     self.view = View::with(view);
     self.log_view = View::with(view);
     self.op = OpNumber::with(op);
@@ -904,6 +1219,107 @@ impl<S: StateMachine> Endpoint<S> {
       .get(&client)
       .and_then(|s| s.reply.as_ref())
       .map(|(rn, body)| (rn.get(), body.to_vec()))
+  }
+
+  /// Test-only: populate the ENTIRE old-generation in-flight set that the view-transition sites tear
+  /// down (audit D3 + Q1/Q2), so a transition test can prove every field is replaced/cleared. Sets each
+  /// member to a NON-empty / armed sentinel: the SVC bits (`svc_from`), the ViewChange-only collection
+  /// (a `Some(ViewChangeCollection)` carrying a sentinel DVC + `dvc_quorum = true` + `catching_up =
+  /// true`), the in-flight storage submissions (`pending`/`appending`), the per-replica checkpoint
+  /// reports (`peer_checkpoint`), the in-flight checkpoint (`pending_checkpoint`), the in-flight
+  /// state-sync PAIR (`sync` + `pending_install`) and its `sync_solicit` timer, and the forfeit
+  /// sub-state (`forfeit_armed` + `pending_forfeit`). Bypasses the real flows (it just plants
+  /// sentinels); the transition under test must replace the collection (entry → fresh, exit → `None`)
+  /// and clear the rest.
+  #[cfg(test)]
+  fn seed_old_generation_state_for_test(&mut self) {
+    self.svc_from = 0b101;
+    let mut dvc_from = BTreeMap::new();
+    dvc_from.insert(
+      0,
+      crate::DoViewChange::new(
+        self.view,
+        View::new(),
+        OpNumber::with(1),
+        OpNumber::new(),
+        ReplicaId::new(0),
+        std::vec::Vec::new(),
+      ),
+    );
+    self.view_change = Some(ViewChangeCollection {
+      dvc_from,
+      dvc_quorum: true,
+      catching_up: true,
+    });
+    self.pending.insert(7, Pending::Ack(OpNumber::with(1)));
+    self.appending.insert(1);
+    self.peer_checkpoint.insert(2, OpNumber::with(3));
+    self.pending_checkpoint = Some(PendingCheckpoint {
+      target_op: self.commit_min,
+      checkpoint_id: 0,
+      step: CheckpointStep::AwaitSnapshot {
+        id: crate::OpId::new(999),
+      },
+      kind: CheckpointKind::SyncRepersist,
+    });
+    self.sync = Some(SyncState {
+      target: self.checkpoint_op,
+      nonce: 0,
+      forced: false,
+    });
+    self.pending_install = Some(PendingInstall {
+      checkpoint_op: self.checkpoint_op,
+      sessions: BTreeMap::new(),
+      sm_tail: Bytes::new(),
+      held_tail: false,
+    });
+    self.timers.sync_solicit = Some(Instant::ZERO);
+    self.timers.forfeit_armed = Some(Instant::ZERO);
+    self.pending_forfeit = true;
+  }
+
+  /// Test-only: is the entire old-generation in-flight set the view-transition sites tear down now
+  /// empty/disarmed? The ViewChange-only collection is checked DVC-empty + quorum-false whether it was
+  /// `take`n to `None` (an exit to Normal) or replaced by a fresh entry collection — the seeded
+  /// sentinel DVC / quorum must not survive either way. Excludes `catching_up` (which the catch-up
+  /// entry legitimately re-sets `true`) — the caller asserts that discriminant per transition. Freezes
+  /// the D3 + Q1/Q2 invariant: NO old-generation collection state survives a view transition.
+  #[cfg(test)]
+  fn old_generation_state_cleared_for_test(&self) -> bool {
+    self.svc_from == 0
+      && self
+        .view_change
+        .as_ref()
+        .is_none_or(|vc| vc.dvc_from.is_empty() && !vc.dvc_quorum)
+      && self.pending.is_empty()
+      && self.appending.is_empty()
+      && self.peer_checkpoint.is_empty()
+      && self.pending_checkpoint.is_none()
+      && self.sync.is_none()
+      && self.pending_install.is_none()
+      && self.timers.sync_solicit.is_none()
+      && self.timers.forfeit_armed.is_none()
+      && !self.pending_forfeit
+  }
+
+  /// Test-only: the prospective-primary DVC collection (mutable), lazily creating an empty ViewChange
+  /// collection if absent. The `select_canonical_log` UNIT tests drive the pure selection function on a
+  /// freshly-`new`'d (Normal) endpoint without running a real ViewChange entry, so they seed the DVC map
+  /// directly through this — sidestepping the production `dvc_from_mut`'s "ViewChange only" `expect`.
+  #[cfg(test)]
+  fn dvc_from_mut_for_test(&mut self) -> &mut BTreeMap<u8, DoViewChange> {
+    &mut self
+      .view_change
+      .get_or_insert_with(|| ViewChangeCollection::entering(false))
+      .dvc_from
+  }
+
+  /// Test-only: plant a `Some` ViewChange collection while keeping the current status, so an invariant
+  /// test can violate the `view_change.is_some() == is_view_change()` coupling on a non-ViewChange
+  /// replica (the old `catching_up = true` poke, now that the discriminant lives behind the Option).
+  #[cfg(test)]
+  fn force_view_change_present_for_test(&mut self) {
+    self.view_change = Some(ViewChangeCollection::entering(true));
   }
 
   /// Mint a fresh storage correlation id.
@@ -1018,8 +1434,24 @@ impl<S: StateMachine> Endpoint<S> {
     claimed.get() < self.config.replica_count() && from == Peer::Replica(claimed)
   }
 
-  /// Feeds an incoming protocol message.
+  /// Feeds an incoming protocol message. Runs `assert_invariants` at exit (TigerBeetle's `assert_main`)
+  /// so the `(status × sub-state-flag)` coupling is re-checked after EVERY ingress, across all of
+  /// `handle_message_inner`'s early-return paths.
   pub fn handle_message<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    from: Peer,
+    msg: Message,
+  ) {
+    self.handle_message_inner(now, wal, sb, from, msg);
+    #[cfg(debug_assertions)]
+    self.assert_invariants();
+  }
+
+  /// The body of [`Self::handle_message`]; see it for the exit-time invariant check that wraps this.
+  fn handle_message_inner<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
     wal: &mut W,
@@ -1158,6 +1590,9 @@ impl<S: StateMachine> Endpoint<S> {
         .find(|&kind| self.serviceable_now(kind) && self.armed(kind).is_some_and(|d| d <= now))
         .map(TimerKind::as_str)
     );
+    // Re-check the (status × sub-state-flag) coupling at every timeout exit (see `assert_invariants`).
+    #[cfg(debug_assertions)]
+    self.assert_invariants();
   }
 
   /// Drain completed storage ops and react.
@@ -1168,12 +1603,25 @@ impl<S: StateMachine> Endpoint<S> {
     while let Some(done) = sb.poll() {
       self.on_sb_done(now, wal, sb, done);
     }
+    // Re-check the (status × sub-state-flag) coupling at every storage-drain exit (see
+    // `assert_invariants`) — the async superblock/WAL completions are where the flag transitions land.
+    #[cfg(debug_assertions)]
+    self.assert_invariants();
   }
 
   /// (Re)arms this replica's timers for its current role/status.
   fn arm_timers(&mut self, now: Instant) {
-    // clear all, then set the ones for this role
+    // clear all, then set the ones for this role. PRESERVE the forfeit grace timer across the reset:
+    // it is a Normal-primary heartbeat-path deadline that a stuck primary keeps ticking even as it
+    // appends new client ops (which call `arm_timers`), so re-zeroing it here would let a steady client
+    // load perpetually restart the grace window and the primary would never forfeit. The forfeit
+    // lifecycle owns its own arm/disarm (`maybe_forfeit`/`forfeit`, the `primary_timeouts` forfeit
+    // branch, and every view-change transition's `reset_for_view_transition`); `arm_timers` is a
+    // role-timer (re)arm and must leave it exactly as it found it (matching the pre-fold behavior, when
+    // `forfeit_armed` lived OUTSIDE `Timers` and `Timers::default()` could not touch it).
+    let forfeit_armed = self.timers.forfeit_armed;
     self.timers = Timers::default();
+    self.timers.forfeit_armed = forfeit_armed;
     match self.status {
       Status::Normal if self.is_primary() => {
         self.timers.commit = Some(now + COMMIT_HEARTBEAT);
@@ -1184,7 +1632,7 @@ impl<S: StateMachine> Endpoint<S> {
       Status::Normal => {
         self.timers.primary_idle = Some(now + PRIMARY_IDLE);
       }
-      Status::ViewChange if self.catching_up => {
+      Status::ViewChange if self.catching_up() => {
         self.timers.get_view_message = Some(now + VC_MESSAGE_RETRANSMIT);
         self.timers.view_change_status = Some(now + VIEW_CHANGE_STATUS);
       }
@@ -1278,7 +1726,7 @@ impl<S: StateMachine> Endpoint<S> {
       TimerKind::RecoverHead => self.timers.recover_head,
       TimerKind::RepairRetry => self.timers.repair_retry,
       TimerKind::SyncSolicit => self.timers.sync_solicit,
-      TimerKind::ForfeitArmed => self.forfeit_armed,
+      TimerKind::ForfeitArmed => self.timers.forfeit_armed,
     }
   }
 
@@ -1327,7 +1775,7 @@ impl<S: StateMachine> Endpoint<S> {
       TimerKind::SvcMessage => {
         (self.status.is_normal() && self.is_primary() && self.pending_forfeit)
           || (self.status.is_normal() && !self.is_primary())
-          || (self.status.is_view_change() && !self.catching_up)
+          || (self.status.is_view_change() && !self.catching_up())
       }
       // The DVC retransmit is a VOTE the new primary counts toward forming the view, so it is
       // serviceable only once this replica's view is DURABLE — durable-view-before-participate in the
@@ -1342,10 +1790,10 @@ impl<S: StateMachine> Endpoint<S> {
       // *request-to-change* (an SVC), not a vote, and `get_view_message` is a catch-up READ that (by the
       // `catching_up` discriminant) never coexists with the SendDoViewChange `pending_sb` window.
       TimerKind::DvcMessage => {
-        self.status.is_view_change() && !self.catching_up && self.pending_sb.is_none()
+        self.status.is_view_change() && !self.catching_up() && self.pending_sb.is_none()
       }
       TimerKind::ViewChangeStatus => self.status.is_view_change(),
-      TimerKind::GetViewMessage => self.status.is_view_change() && self.catching_up,
+      TimerKind::GetViewMessage => self.status.is_view_change() && self.catching_up(),
       TimerKind::RecoverRetry => self.status.is_recovering(),
       TimerKind::RecoverHead => self.status.is_recovering_head(),
       // `handle_timeout` runs `repair_timeouts`/`sync_timeouts` only while Normal.

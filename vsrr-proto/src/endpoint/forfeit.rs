@@ -38,8 +38,10 @@ impl<S: StateMachine> Endpoint<S> {
     // Only ever called from `primary_timeouts` (the Normal-primary tick); a backup behind on
     // checkpoint catches up via state-sync/force-sync and never forfeits.
     debug_assert!(self.status.is_normal() && self.is_primary());
-    // SOLO guard (mirrors the four sibling sites: `complete_recovery`, `maybe_force_sync`,
-    // `on_sync_checkpoint`, `on_recover_sync_checkpoint`). A SOLO replica (`replica_count == 1`) is its
+    // SOLO guard (mirrors the sibling step-down sites: the disk-recovered primary's
+    // `complete_recovery`, and the deferred-forfeit chokepoint `abdicate_if_primary` that
+    // `maybe_force_sync` / `on_sync_checkpoint` / `on_recover_sync_checkpoint` now share). A SOLO replica
+    // (`replica_count == 1`) is its
     // own primary and CANNOT view-change — `quorum_view_change() == 1`, so forfeiting would propose
     // `view + 1`, satisfy the VC quorum with its OWN SVC bit alone, transition to ViewChange, and then
     // livelock in `view_change_timeouts` (no peer ever sends a StartView) — dropping all client traffic
@@ -50,7 +52,7 @@ impl<S: StateMachine> Endpoint<S> {
     if self.config.replica_count() <= 1 {
       // Disarm any stale grace timer defensively (it can only have been set before this guard existed;
       // a solo replica never arms it now).
-      self.forfeit_armed = None;
+      self.timers.forfeit_armed = None;
       return;
     }
     let lag = self
@@ -61,11 +63,11 @@ impl<S: StateMachine> Endpoint<S> {
     // outstanding (a committed op `<= commit_max` the apply loop is held below — see the doc). The
     // grace timer disarms a hole that fills in time, so a fillable hole never forfeits.
     let stuck = lag >= self.config.forfeit_checkpoint_lag() || !self.repair.is_empty();
-    match (stuck, self.forfeit_armed) {
+    match (stuck, self.timers.forfeit_armed) {
       // Caught up (or never behind): disarm — a transient lag / in-flight repair does not forfeit.
-      (false, _) => self.forfeit_armed = None,
+      (false, _) => self.timers.forfeit_armed = None,
       // Newly stuck: arm the grace timer; do NOT step down yet.
-      (true, None) => self.forfeit_armed = Some(now + FORFEIT_GRACE),
+      (true, None) => self.timers.forfeit_armed = Some(now + FORFEIT_GRACE),
       // Stuck for the whole grace window: forfeit.
       (true, Some(deadline)) if deadline <= now => self.forfeit(now, sb),
       // Still within the grace window: wait.
@@ -94,7 +96,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// it), so the latch self-resolves exactly when the forfeit succeeds and never leaks across views.
   /// The grace timer is disarmed here (the persistent latch, not the grace timer, now drives retries).
   pub(crate) fn forfeit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
-    self.forfeit_armed = None;
+    self.timers.forfeit_armed = None;
     self.pending_forfeit = true;
     self.propose_next_view(now, sb);
   }
@@ -124,6 +126,37 @@ impl<S: StateMachine> Endpoint<S> {
   pub(crate) fn defer_forfeit(&mut self, now: Instant) {
     self.pending_forfeit = true;
     self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
+  }
+
+  /// The SINGLE chokepoint (audit D1) for the deferred-forfeit step-down a replica must take when it
+  /// CANNOT resume/continue as the primary with a torn-down pipeline — it applied a state-sync, fetched
+  /// its checkpoint from a peer, or hit an unservable checkpoint-subsumed hole. Each of those sites
+  /// (`maybe_force_sync`, `on_sync_checkpoint`, `on_recover_sync_checkpoint`) MUST NOT force-sync/apply
+  /// in place (that reuses op numbers in this view → committed-state divergence; see each site), so a
+  /// MULTI-REPLICA primary instead ABDICATES: flag the deferred forfeit (+ bootstrap the serviceable
+  /// `svc_message` wake) so the next `primary_timeouts` re-proposes `view + 1` and a caught-up replica
+  /// leads. Returns `true` iff it stepped down, so the caller can branch its own control flow (skip the
+  /// in-place apply / forced-sync arm). Folding the three byte-identical copies here closes the
+  /// "guard on some completion paths, missing on a new one" shape the original empty-body / seed-8
+  /// CRITICALs came from.
+  ///
+  /// SOLO (`replica_count == 1`): a solo replica cannot view-change (no quorum) — abdicating would
+  /// wedge it — so it never steps down here (it stays Normal and HOLDS commit below any unfillable
+  /// hole). The `replica_count() > 1` guard makes that explicit; the three call sites are all
+  /// solo-UNREACHABLE anyway (a solo replica has no peers, so it never arms a `sync`, never has a
+  /// peer-checkpoint floor, and never receives a `SyncCheckpoint`), so adding the guard is
+  /// behaviour-preserving — it only formalises what reachability already guaranteed. The DISK-recovered
+  /// primary takes a DIFFERENT abdication (`complete_recovery` → `enter_view_change_from_recovery`, an
+  /// IMMEDIATE view change rather than a deferred forfeit) because it runs BEFORE the replica is Normal
+  /// — `pending_forfeit` may only be set on a Normal primary (the `assert_invariants` clause) — so it is
+  /// intentionally NOT routed through here.
+  pub(crate) fn abdicate_if_primary(&mut self, now: Instant) -> bool {
+    if self.config.replica_count() > 1 && self.is_primary() {
+      self.defer_forfeit(now);
+      true
+    } else {
+      false
+    }
   }
 
   pub(crate) fn on_primary_idle<B: Superblock>(&mut self, now: Instant, sb: &mut B) {

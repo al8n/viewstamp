@@ -1,5 +1,80 @@
 use super::*;
 
+/// The committed-band recover verdict (audit D2): does a recovered, SELF-VERIFYING WAL slot count as
+/// the canonical body for its op, or is it a stale/superseded slot that must be peer-repaired?
+///
+/// Only ever computed for a slot that has ALREADY passed `Header::verify` + the placement check
+/// (`header.op() == op`) at the call site — so this classifies the SELF-CONSISTENT slots, splitting
+/// them into the ones we adopt and the ones we drop. Two outcomes; the `Fault` case (a torn/absent/
+/// misdirected read) never reaches here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotVerdict {
+  /// The slot IS the canonical body for `op` — adopt it.
+  Verified,
+  /// The slot is stale/unproven/superseded — drop it from the cache; `advance_commit` peer-repairs the
+  /// canonical body on demand (it is NEVER re-derived from this WAL).
+  StaleCommitted,
+}
+
+/// Classify a recovered, self-verifying WAL slot at `op` against the durable `vsr_headers` — the
+/// committed-band recover verdict (audit D2). EXTRACTED from `on_recover_wal_done` as a PURE + TOTAL
+/// function so its safety (a TOTAL partition of the committed-band staleness space — no stale-committed
+/// body can slip through a future reorder of the arms) is FROZEN by a unit test, not left to depend on a
+/// rare VOPR seed. Behaviour is byte-for-byte the prior in-line `match` (verified against the recover
+/// tests + VOPR).
+///
+/// Inputs (exactly what the call site holds):
+/// - `slot_identity` — the read slot's FULL committed-op identity `(client, request, body_checksum)`,
+///   NOT body bytes alone: two clients can submit identical payloads, so a body-only check would trust a
+///   stale slot bearing the same body under a different client/request (codex R9-F2).
+/// - `canonical` — the persisted SPARSE header's identity for `op` (`None` if the writer held no header
+///   for `op`: a gap / a not-held committed op; codex R12-F1).
+/// - `op`, `slot_view` — the slot's op and its ORIGINAL header view.
+/// - `durable_commit` — our durable known-committed frontier (`commit_max`).
+/// - `durable_log_view` — our durable `log_view`.
+///
+/// The four mutually-exclusive, EXHAUSTIVE arms (see the cross-product test
+/// `classify_committed_slot_is_total_over_the_staleness_space`):
+///   * header present + identity MISMATCH → `StaleCommitted` (R9-F2: the persisted `vsr_headers` say a
+///     different body, OR the same body under a different client/request — a superseded/stale slot).
+///   * header ABSENT + KNOWN-COMMITTED (`op <= durable_commit`) → `StaleCommitted` (R11-F1: the SPARSE
+///     set has one header per committed-band op the writer HELD, so no header ⇒ the writer did NOT hold
+///     this committed op — a genuine hole / stale leftover the headers do not vouch; the local
+///     self-verifying body is UNPROVEN and must be peer-repaired, never trusted).
+///   * header ABSENT + ABOVE-commit (`op > durable_commit`) + SUPERSEDED view (`slot_view <
+///     durable_log_view`) → `StaleCommitted` (vopr seed 335: an above-band tail op from a generation we
+///     have already superseded — we advanced `log_view` past its view, so its body is an abandoned
+///     earlier-view proposal).
+///   * everything else → `Verified` — i.e. (a) header present + identity MATCH (the R12-F1 fix: a
+///     locally-held canonical committed op above a LOWER header-less hole is KEPT — its own sparse header
+///     vouches it), or (b) header ABSENT + ABOVE-commit + CURRENT-generation view (`slot_view >=
+///     durable_log_view`) — a current uncommitted tail op, kept to be re-acked.
+fn classify_committed_slot(
+  slot_identity: (ClientId, RequestNumber, u128),
+  canonical: Option<(ClientId, RequestNumber, u128)>,
+  op: u64,
+  slot_view: u64,
+  durable_commit: u64,
+  durable_log_view: u64,
+) -> SlotVerdict {
+  match canonical {
+    // (1) HAS a sparse canonical header: its FULL identity must MATCH (a different body, OR the same body
+    // under a different client/request, is stale; R9-F2). A MATCH keeps a locally-held canonical
+    // committed op above a lower header-less hole (R12-F1).
+    Some(canonical) if canonical != slot_identity => SlotVerdict::StaleCommitted,
+    // (2) KNOWN-COMMITTED (`op <= durable_commit`) but NO sparse header (R11-F1): the writer did not hold
+    // this committed op — unproven, must be peer-repaired. A HELD committed op carries a sparse header and
+    // so takes the MATCH path above, not this arm (the R12-F1 fix).
+    None if op <= durable_commit => SlotVerdict::StaleCommitted,
+    // (3) ABOVE the durable committed frontier with a strictly-older view (seed 335): a superseded
+    // earlier-view proposal. A current-generation uncommitted tail op (`slot_view >= durable_log_view`) is
+    // NOT dropped — it is kept to be re-acked.
+    None if op > durable_commit && slot_view < durable_log_view => SlotVerdict::StaleCommitted,
+    // (4) header present + identity match, OR above-commit current-generation tail → canonical.
+    _ => SlotVerdict::Verified,
+  }
+}
+
 impl<S: StateMachine> Endpoint<S> {
   /// Reconstructs an endpoint from durable storage after a restart — a **metadata-only constructor**
   /// that enters [`Status::Recovering`] and defers all fallible reads to an async `handle_storage`
@@ -120,9 +195,9 @@ impl<S: StateMachine> Endpoint<S> {
       log_view: state.log_view(),
       svc_from: 0,
       svc_target: state.view(),
-      catching_up: false,
-      dvc_from: BTreeMap::new(),
-      dvc_quorum: false,
+      // ViewChange-only collection — `None` in `Status::Recovering` (this constructor's status). A
+      // recovery-driven view change (`enter_view_change_from_recovery` / `catch_up_to_view`) sets it.
+      view_change: None,
       nonce,
       // Dense headers-only cache; bodies filled by the Recovering loop (Phase 2).
       log: BTreeMap::new(),
@@ -144,10 +219,10 @@ impl<S: StateMachine> Endpoint<S> {
       recover: None,
       repair: std::collections::BTreeSet::new(),
       sync: None,
+      pending_install: None,
       sync_serving: BTreeMap::new(),
       state_syncs_applied: 0,
       forced_syncs_applied: 0,
-      forfeit_armed: None,
       pending_forfeit: false,
     };
 
@@ -307,24 +382,20 @@ impl<S: StateMachine> Endpoint<S> {
         // its body is abandoned. A current-generation uncommitted tail op has `view == log_view` and is
         // kept (to be re-acked); only a strictly-older-view slot is dropped.
         let h = r.header();
-        match rec.canonical.get(&op) {
-          Some(&canonical) if canonical != (h.client(), h.request(), h.body_checksum()) => {
-            Outcome::StaleCommitted
-          }
-          // (c) KNOWN-COMMITTED (`op <= durable_commit`, the persisted commit_max) but with NO sparse
-          // canonical header (codex R11-F1): the persisted set is SPARSE — one header per committed-band
-          // op the writer HELD (codex R12-F1) — so a missing header means the writer did NOT hold this op
-          // when it persisted the root (a genuine repair hole, or a stale leftover the headers do not
-          // vouch). Such a known-committed op is UNPROVEN — we must NOT trust the local self-verifying WAL
-          // body (it can be a stale earlier-view body that checksum-verifies); drop it so `advance_commit`
-          // peer-repairs the canonical value, never re-deriving it from the local WAL. Crucially, a HELD
-          // committed op DOES carry a sparse header and so takes the case-(1) `Verified` path above —
-          // this arm no longer drops a locally-held committed op above a lower hole (the R12-F1 fix).
-          None if op <= durable_commit => Outcome::StaleCommitted,
-          None if op > durable_commit && h.view().get() < durable_log_view => {
-            Outcome::StaleCommitted
-          }
-          _ => Outcome::Verified(h.client(), h.request(), r.body_bytes()),
+        // The verdict (Verified vs StaleCommitted) is the PURE, exhaustively-tested
+        // `classify_committed_slot` (audit D2); the adopt payload `(client, request, body)` is built
+        // here only for the Verified case (the body is not part of the verdict). See that function for
+        // the four-arm rationale (R9-F2 / R11-F1 / seed-335) — kept there so a reorder fails a unit test.
+        match classify_committed_slot(
+          (h.client(), h.request(), h.body_checksum()),
+          rec.canonical.get(&op).copied(),
+          op,
+          h.view().get(),
+          durable_commit,
+          durable_log_view,
+        ) {
+          SlotVerdict::StaleCommitted => Outcome::StaleCommitted,
+          SlotVerdict::Verified => Outcome::Verified(h.client(), h.request(), r.body_bytes()),
         }
       }
       _ => Outcome::Fault, // Absent, Fault, misdirected, OR a ReadOk that fails verify (torn/bit-rot).
@@ -559,7 +630,54 @@ impl<S: StateMachine> Endpoint<S> {
     };
     let faulty: std::vec::Vec<u64> = rec.faulty.iter().copied().collect();
     for op in faulty {
+      // Committed-survival backstop: a faulty committed slot is `> checkpoint_op` (only the offset tail
+      // is materialized), so it is NOT covered by the snapshot — survival relies on it being TRACKED for
+      // repair. It is in `rec.faulty` here, which `recover_progress` promotes to a `self.repair` hole on
+      // the `→ Normal` transition (or drives `RecoveringHead`), so the canonical body is re-fetched; the
+      // helper's tracked-for-repair clause witnesses that. Asserted per dropped op.
+      self.assert_committed_survives(op, self.checkpoint_op.get());
       self.log.remove(&op);
+    }
+  }
+
+  /// The SINGLE recovery-completion choke (audit D1) for the faulty-slot drop: run
+  /// [`Self::drop_faulty_committed_slots`] EXACTLY once, then DEBUG-ASSERT no permanently-faulty
+  /// committed-band slot survived as a populated `self.log` entry into the terminal status. Every
+  /// recovery-completion / continuation path (`recover_progress` once tail verification settles, and the
+  /// peer-checkpoint-fetch completion in `on_recover_sync_checkpoint`) funnels the drop through here, so
+  /// the "guard on some completion paths, missing on a new one" shape (the original empty-body CRITICAL)
+  /// fails a debug-assert instead of silently applying a committed op with `&[]`.
+  ///
+  /// The assert is the regression net: a faulty op left in `self.log` is `Some({body: EMPTY})` (NOT a
+  /// hole), which `advance_commit`/`adopt_log` would apply empty cluster-wide. After the drop EVERY op in
+  /// `rec.faulty` must be ABSENT from `self.log` (a genuine repair hole `advance_commit` peer-repairs on
+  /// demand). It runs while `rec` is still live (`recover` is cleared only AFTER, by the terminal
+  /// dispatch), so it can witness the final `rec.faulty` set. Idempotent (the drop is), so re-running on a
+  /// later continuation is a no-op + a re-assert.
+  fn finalize_recovery(&mut self) {
+    self.drop_faulty_committed_slots();
+    self.assert_no_faulty_committed_survives();
+  }
+
+  /// DEBUG-ASSERT no permanently-faulty committed-band slot survived into the terminal recovery status
+  /// as a POPULATED `self.log` entry (audit D1, the regression net). A faulty op left in `self.log` is
+  /// `Some({body: EMPTY})` — NOT a hole — which `advance_commit`/`adopt_log` would apply empty
+  /// cluster-wide (the original empty-body CRITICAL). After [`Self::finalize_recovery`]'s drop EVERY op
+  /// in `rec.faulty` MUST be ABSENT from `self.log` (a genuine repair hole `advance_commit` peer-repairs
+  /// on demand); this fires if a future edit makes the drop stop actually removing the slot, or routes a
+  /// completion through here with a faulty slot still populated. Body is a `debug_assert!`, a no-op in
+  /// release (zero cost, like `assert_committed_survives`). Runs while `rec` is still live (the terminal
+  /// dispatch clears `recover` only AFTER), so it can witness the final `rec.faulty` set.
+  pub(crate) fn assert_no_faulty_committed_survives(&self) {
+    #[cfg(debug_assertions)]
+    if let Some(rec) = self.recover.as_ref() {
+      for &op in &rec.faulty {
+        debug_assert!(
+          !self.log.contains_key(&op),
+          "faulty committed slot {op} survived into the terminal recovery status as a populated \
+           log entry (would be applied empty) — the drop choke was bypassed"
+        );
+      }
     }
   }
 
@@ -593,8 +711,9 @@ impl<S: StateMachine> Endpoint<S> {
     // finalize tail of this function) cannot leave an empty slot in `self.log` to be applied empty. The
     // drop is idempotent, so re-running it on the finalize paths below is harmless. (Codex audit
     // critical: previously the drop lived only at the finalize tail, BELOW this early-return, so the
-    // peer-fetch escalation skipped it.)
-    self.drop_faulty_committed_slots();
+    // peer-fetch escalation skipped it.) Routed through the `finalize_recovery` choke, which also
+    // debug-asserts no faulty slot survives into the terminal status.
+    self.finalize_recovery();
     let Some(rec) = self.recover.as_ref() else {
       return; // (defensive; the helper never clears `recover`)
     };
@@ -829,44 +948,54 @@ impl<S: StateMachine> Endpoint<S> {
       Some((bound_op, _, _)) if bound_op == m.checkpoint_op() => {}
       _ => return, // unparsable, or the bound op disagrees with the advertised op — reject, keep awaiting.
     }
-    // CENTRALIZED faulty-slot drop (codex audit critical): before we abandon local recovery (`recover =
-    // None` discards `rec.faulty`) and `apply_sync` (whose held-tail retain KEEPS `self.log` entries
-    // above the synced checkpoint), drop every permanently-faulty committed-band slot's EMPTY
-    // placeholder. Otherwise such a slot survives `apply_sync` as `Some({body: EMPTY})` and a later
-    // `advance_commit` applies the committed op with `&[]` — committed-state divergence. This is the SAME
-    // invariant `recover_progress` enforces; the peer-checkpoint-fetch path completes HERE (not through
-    // `recover_progress`'s finalize tail), so it must enforce it too. After the drop the faulty slot is a
-    // genuine repair hole `advance_commit` peer-repairs on demand. (`recover_progress` already dropped
-    // these once tail verification settled, so this is normally a no-op; it is belt-and-suspenders for
-    // any path that reaches here with a faulty slot still in `self.log`.)
-    self.drop_faulty_committed_slots();
+    // CENTRALIZED faulty-slot drop (codex audit critical), via the `finalize_recovery` choke: before we
+    // abandon local recovery (`recover = None` discards `rec.faulty`) and `apply_sync` (whose held-tail
+    // retain KEEPS `self.log` entries above the synced checkpoint), drop every permanently-faulty
+    // committed-band slot's EMPTY placeholder. Otherwise such a slot survives `apply_sync` as
+    // `Some({body: EMPTY})` and a later `advance_commit` applies the committed op with `&[]` —
+    // committed-state divergence. This is the SAME invariant `recover_progress` enforces; the
+    // peer-checkpoint-fetch path completes HERE (not through `recover_progress`'s finalize tail), so it
+    // routes the drop through the SAME choke (which also debug-asserts no faulty slot survives). After the
+    // drop the faulty slot is a genuine repair hole `advance_commit` peer-repairs on demand.
+    // (`recover_progress` already dropped these once tail verification settled, so this is normally a
+    // no-op; it is belt-and-suspenders for any path that reaches here with a faulty slot still in
+    // `self.log`.)
+    self.finalize_recovery();
     // Fully verified → abandon local recovery and apply via the shared state-sync core. Flip to Normal
-    // FIRST so the re-persist completions route through the ordinary `on_sb_done` (apply_sync leaves
-    // `sync` armed until the durable root lands, which then clears it and resumes as a Normal backup).
+    // FIRST so the re-persist completions route through the ordinary `on_sb_done` (which clears `sync` +
+    // counts a forced state-sync on the root write), then `apply_sync` STAGES the durable re-persist.
     self.recover = None;
     self.status = Status::Normal;
-    self.apply_sync(now, wal, sb, &m);
-    // STEP DOWN if we are the primary (codex vopr seed 8, async-superblock). This F1 peer-checkpoint
-    // fetch RESTORED our SM from a peer snapshot and KEPT our retained tail `(commit_min .. op]`, but —
-    // exactly like a state-sync on a Normal primary, and like a restarted primary in `complete_recovery`
-    // — it left `inflight` (the commit pipeline) CLEARED while we remain the primary of our view. A
-    // Normal primary with a torn-down pipeline wedges: `try_commit` cannot advance past `commit_min`
-    // (the missing inflight entry at `commit_min + 1` breaks the in-order loop; re-acked PrepareOks drop
-    // on the empty pipeline). A multi-replica primary therefore ABDICATES: flag the deferred forfeit so
-    // the next `primary_timeouts` re-proposes `view + 1` and a caught-up replica leads (every replica
-    // already holds the committed tail durably). The SM is restored (we needed the snapshot to recover
-    // at all), so we abdicate AFTER applying — unlike `on_sync_checkpoint`, where a Normal primary's SM
-    // is already valid and we step down without applying. SOLO (`replica_count == 1`) cannot view-change
-    // (no quorum), but a solo replica has no peers and so never reaches this peer-fetch path; the guard
-    // is belt-and-suspenders. (`complete_recovery` enforces the same abdication for a disk-recovered
-    // primary; this closes the parallel hole on the peer-fetch recovery path.)
-    if self.config.replica_count() > 1 && self.is_primary() {
-      // `defer_forfeit` sets the latch AND bootstraps a serviceable `svc_message` wake (codex R15) so a
-      // poll_timeout driver reaches the re-propose tick. (`apply_sync` above left `sync_solicit` armed —
-      // also serviceable while Normal — but arming `svc_message` keeps the step-down's wake uniform with
-      // the other two step-down sites and independent of the sync-persist lifetime.)
-      self.defer_forfeit(now);
+    self.apply_sync(now, sb, &m);
+    // EAGER INSTALL (codex R24-F1): the Normal state-sync path DEFERS the destructive install to the
+    // durable root (so a view change cannot strand a pruned-but-stale band), but the RECOVERY peer-fetch
+    // path must NOT reach Normal with an UNRESTORED SM — its own checkpoint snapshot is permanently
+    // unreadable, so until the restore lands the SM is indeterminate, and a Normal replica must hold a
+    // valid SM (the `escalate_checkpoint_to_peer_fetch` invariant: "never completes to Normal with an
+    // unrestored SM"). So install IMMEDIATELY here — restore the SM/sessions + advance/prune at flip
+    // time — while the staged re-persist still goes durable in the background. The `on_sb_done` root
+    // completion then finds `pending_install` already taken (no second install) and runs only the sync
+    // completion bookkeeping (clear `sync`, count the forced sync, re-arm). This path is not subject to
+    // the R24-F1 wedge: a `Recovering` replica is not a Normal replica advertising a checkpoint, and the
+    // restore-at-flip keeps the long-standing recovery safety contract intact.
+    if let Some(install) = self.pending_install.take() {
+      self.install_sync(wal, install);
     }
+    // STEP DOWN if we are the primary (codex vopr seed 8, async-superblock), via the single
+    // `abdicate_if_primary` chokepoint (audit D1). This F1 peer-checkpoint fetch RESTORED our SM from a
+    // peer snapshot and KEPT our retained tail `(commit_min .. op]`, but — exactly like a state-sync on a
+    // Normal primary, and like a restarted primary in `complete_recovery` — it left `inflight` (the
+    // commit pipeline) CLEARED while we remain the primary of our view. A Normal primary with a torn-down
+    // pipeline wedges: `try_commit` cannot advance past `commit_min` (the missing inflight entry at
+    // `commit_min + 1` breaks the in-order loop; re-acked PrepareOks drop on the empty pipeline). So a
+    // multi-replica primary ABDICATES (the chokepoint flags the deferred forfeit + bootstraps the
+    // serviceable `svc_message` wake so the next `primary_timeouts` re-proposes `view + 1` and a
+    // caught-up replica leads; every replica already holds the committed tail durably). The SM is
+    // restored (we needed the snapshot to recover at all), so we abdicate AFTER applying — unlike
+    // `on_sync_checkpoint`, where a Normal primary's SM is already valid and we step down without
+    // applying. SOLO is a no-op (no peers ⇒ this peer-fetch path is unreachable; `complete_recovery`
+    // enforces the same abdication for a disk-recovered primary).
+    self.abdicate_if_primary(now);
   }
 
   /// Higher-view rule: a newer primary already exists (we saw its Prepare/Commit/PrepareOk) and we
@@ -879,33 +1008,23 @@ impl<S: StateMachine> Endpoint<S> {
     );
     self.view = view;
     self.status = Status::ViewChange;
-    self.catching_up = true;
+    self.svc_target = view;
+    // Tear down ALL old-generation in-flight state in one place (audit D3): SVC bits, in-flight
+    // appends, peer-checkpoint reports, in-flight checkpoint, in-flight sync + its deferred install
+    // (cancelled together — durable-before-install leaves the old state intact, R24-F1), and the
+    // forfeit sub-state. See [`Self::reset_for_view_transition`] for the per-field rationale.
+    self.reset_for_view_transition();
+    // ViewChange ENTRY (the higher-view catch-up): install a fresh collection with `catching_up = true`
+    // — this entry sends GetView, not SVC/DVC. (`is_some() == is_view_change()` coupling.)
+    self.view_change = Some(ViewChangeCollection::entering(true));
+    // The primary pipeline + backup reorder buffer are dropped on this catch-up (kept OUT of the shared
+    // reset because `adopt_canonical_head` preserves a live primary pipeline).
     self.inflight.clear();
     self.buffer.clear();
-    // Drop stale per-replica checkpoint reports (see transition_to_view_change_status).
-    self.peer_checkpoint.clear();
-    // Abandon in-flight WAL appends from the old view (see transition_to_view_change_status).
-    self.pending.clear();
-    self.appending.clear(); // keep the R7-F1 in-flight set in lockstep with `pending`
     // GetView is a catch-up probe, not a vote; no superblock write needed. Clear any prior-view
-    // pending_sb (supersession): a stale completion from the prior view must not fire.
+    // pending_sb (supersession): a stale completion from the prior view must not fire. (This is the
+    // distinguishing `pending_sb` action — the two durable-view-writing entries overwrite it instead.)
     self.pending_sb = None;
-    // Likewise drop any in-flight checkpoint from the prior view; it re-triggers once Normal resumes.
-    self.pending_checkpoint = None;
-    // Abandon any in-flight state-sync (mutually exclusive with view change; see
-    // `transition_to_view_change_status`). A replica catching up to a newer view re-triggers
-    // state-sync from Normal if it is still behind the cluster checkpoint.
-    self.sync = None;
-    self.timers.sync_solicit = None;
-    // A primary catching up to a newer view ends its generation: clear any forfeit grace timer
-    // (M3.5 T3) AND any deferred-forfeit flag (the safety step-down — see `maybe_force_sync`) — the
-    // new generation re-evaluates from scratch.
-    self.forfeit_armed = None;
-    self.pending_forfeit = false;
-    self.svc_target = view;
-    self.svc_from = 0;
-    self.dvc_from.clear();
-    self.dvc_quorum = false;
     self.arm_timers(now);
     self.send_get_view(now);
   }
@@ -1028,5 +1147,126 @@ impl<S: StateMachine> Endpoint<S> {
     }
     self.adopt_canonical_head(now, sb, m.view(), m.op(), m.commit(), m.log_slice());
     self.truncate_wal_above_adopted_head(wal);
+  }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+  use super::{SlotVerdict, classify_committed_slot};
+  use crate::{ClientId, RequestNumber};
+
+  // The slot's own identity (what the read returned), and a DIFFERENT identity (a stale slot's, or a
+  // same-payload-different-client slot's). The third tuple field is the body_checksum (`u128`).
+  const SLOT: (ClientId, RequestNumber, u128) = (ClientId::new(7), RequestNumber::with(3), 0xABCD);
+  // Differs in EVERY field — a header-mismatch under any of client/request/body is StaleCommitted; one
+  // representative is enough since the verdict compares the tuples for equality as a whole.
+  const OTHER: (ClientId, RequestNumber, u128) = (ClientId::new(9), RequestNumber::with(4), 0x1234);
+
+  /// FREEZE the totality of `classify_committed_slot` (audit D2) as a test contract: enumerate the FULL
+  /// cross-product {header present / absent} × {identity matches / mismatches} × {op <= / > durable_commit}
+  /// × {slot_view < / >= durable_log_view} and assert the verdict for EVERY cell, documenting WHY. The
+  /// function is total ONLY by arm ordering; this test fails a future reorder that re-opens a
+  /// stale-committed-body hole (the worst class) — a unit failure, not a rare VOPR seed.
+  #[test]
+  fn classify_committed_slot_is_total_over_the_staleness_space() {
+    // Fixed reference frontiers; we move `op`/`slot_view` around them to flip the C and V dimensions.
+    const DURABLE_COMMIT: u64 = 100;
+    const DURABLE_LOG_VIEW: u64 = 5;
+    // op <= durable_commit (C = true, KNOWN-COMMITTED) vs op > durable_commit (C = false, above-band).
+    let op_committed = 100; // == durable_commit ⇒ known-committed
+    let op_above = 101; // > durable_commit ⇒ above the committed frontier
+    // slot_view < durable_log_view (V = true, SUPERSEDED) vs >= (V = false, current generation). The
+    // `>=` arm must hold at BOTH strictly-greater and EQUAL, so we test the `==` boundary explicitly.
+    let view_superseded = 4; // < 5 ⇒ an abandoned earlier-view proposal
+    let view_current_eq = 5; // == 5 ⇒ current generation (boundary of the `>=` predicate)
+    let view_current_gt = 6; // > 5 ⇒ current generation
+
+    let verdict = |canonical, op, slot_view| {
+      classify_committed_slot(
+        SLOT,
+        canonical,
+        op,
+        slot_view,
+        DURABLE_COMMIT,
+        DURABLE_LOG_VIEW,
+      )
+    };
+
+    // ── HEADER PRESENT + identity MATCHES (canonical == slot) ────────────────────────────────────────
+    // R12-F1: a locally-held canonical committed op is KEPT — its own sparse header vouches it, so this
+    // replica's only surviving copy is not destroyed. The match VERDICT is independent of op/view: a held
+    // committed op above a LOWER header-less hole is still Verified. All 4 (C × V) cells → Verified.
+    for &op in &[op_committed, op_above] {
+      for &v in &[view_superseded, view_current_gt] {
+        assert_eq!(
+          verdict(Some(SLOT), op, v),
+          SlotVerdict::Verified,
+          "header present + identity match is ALWAYS Verified (R12-F1): op={op}, view={v}"
+        );
+      }
+    }
+
+    // ── HEADER PRESENT + identity MISMATCHES (canonical != slot) ─────────────────────────────────────
+    // R9-F2: the persisted `vsr_headers` say a different body, OR the same body under a different
+    // client/request — a superseded/stale slot (seed 52). The mismatch VERDICT is independent of op/view:
+    // a header that disagrees is authoritative. All 4 (C × V) cells → StaleCommitted.
+    for &op in &[op_committed, op_above] {
+      for &v in &[view_superseded, view_current_gt] {
+        assert_eq!(
+          verdict(Some(OTHER), op, v),
+          SlotVerdict::StaleCommitted,
+          "header present + identity mismatch is ALWAYS StaleCommitted (R9-F2): op={op}, view={v}"
+        );
+      }
+    }
+
+    // ── HEADER ABSENT + KNOWN-COMMITTED (op <= durable_commit) ───────────────────────────────────────
+    // R11-F1: the sparse set has one header per committed-band op the writer HELD, so NO header ⇒ the
+    // writer did not hold this committed op (a genuine hole / stale leftover the headers do not vouch).
+    // The local self-verifying body is UNPROVEN and must be peer-repaired. The VERDICT is independent of
+    // the view (the committed-band arm wins before the view is even consulted). Both V cells →
+    // StaleCommitted.
+    for &v in &[view_superseded, view_current_gt] {
+      assert_eq!(
+        verdict(None, op_committed, v),
+        SlotVerdict::StaleCommitted,
+        "header absent + known-committed is StaleCommitted (R11-F1): view={v}"
+      );
+    }
+
+    // ── HEADER ABSENT + ABOVE-commit (op > durable_commit) + SUPERSEDED view (slot_view < log_view) ───
+    // seed-335: an above-band tail op from a generation we have already superseded — we advanced
+    // `log_view` past its view, so its body is an abandoned earlier-view proposal. → StaleCommitted.
+    assert_eq!(
+      verdict(None, op_above, view_superseded),
+      SlotVerdict::StaleCommitted,
+      "header absent + above-commit + superseded view is StaleCommitted (seed 335)"
+    );
+
+    // ── HEADER ABSENT + ABOVE-commit (op > durable_commit) + CURRENT-generation view (>= log_view) ────
+    // A current uncommitted tail op (no canonical header, not superseded): kept to be re-acked. → Verified.
+    // Tested at BOTH the `==` boundary and strictly-greater so the `>=` predicate is pinned.
+    for &v in &[view_current_eq, view_current_gt] {
+      assert_eq!(
+        verdict(None, op_above, v),
+        SlotVerdict::Verified,
+        "header absent + above-commit + current-generation view is Verified (current tail): view={v}"
+      );
+    }
+
+    // ── Boundary corollary: the KNOWN-COMMITTED predicate is `op <= durable_commit` (INCLUSIVE). An op
+    // EXACTLY AT durable_commit with no header is StaleCommitted (covered above via op_committed == 100);
+    // the very next op (durable_commit + 1) with no header + current view is Verified (op_above above).
+    // This pins the `<=` boundary so an off-by-one to `<` cannot silently trust a not-held committed op.
+    assert_eq!(
+      verdict(None, DURABLE_COMMIT, view_current_gt),
+      SlotVerdict::StaleCommitted,
+      "op == durable_commit (no header) is known-committed ⇒ StaleCommitted (the `<=` boundary)"
+    );
+    assert_eq!(
+      verdict(None, DURABLE_COMMIT + 1, view_current_gt),
+      SlotVerdict::Verified,
+      "op == durable_commit + 1 (no header, current view) is above-band ⇒ Verified"
+    );
   }
 }

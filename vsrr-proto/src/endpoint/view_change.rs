@@ -11,6 +11,39 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
+  /// Is this replica a CATCHING-UP view-changer (the higher-view rule: soliciting a `StartView` via
+  /// GetView rather than driving an SVC/DVC change)? `false` outside `Status::ViewChange` (the
+  /// `view_change` collection is `None` there), so this safely answers "no" in Normal/Recovering.
+  pub(crate) fn catching_up(&self) -> bool {
+    self.view_change.as_ref().is_some_and(|vc| vc.catching_up)
+  }
+
+  /// Has this view's canonical log already been formed (the DVC quorum was reached)? `false` outside
+  /// `Status::ViewChange` (collection `None`), so it safely answers "no" there — and the
+  /// `on_do_view_change` guard reads it only after the `is_view_change()` short-circuit anyway.
+  fn dvc_quorum(&self) -> bool {
+    self.view_change.as_ref().is_some_and(|vc| vc.dvc_quorum)
+  }
+
+  /// The prospective-primary DVC collection (read). Only ever called inside `Status::ViewChange` (where
+  /// the collection is `Some`); `expect` documents that invariant.
+  fn dvc_from(&self) -> &BTreeMap<u8, DoViewChange> {
+    &self
+      .view_change
+      .as_ref()
+      .expect("DVC collection read outside ViewChange")
+      .dvc_from
+  }
+
+  /// The prospective-primary DVC collection (mutable). Only ever called inside `Status::ViewChange`.
+  fn dvc_from_mut(&mut self) -> &mut BTreeMap<u8, DoViewChange> {
+    &mut self
+      .view_change
+      .as_mut()
+      .expect("DVC collection mutated outside ViewChange")
+      .dvc_from
+  }
+
   /// Set our own bit for `svc_target` and broadcast a `StartViewChange{svc_target}`.
   pub(crate) fn join_svc(&mut self, now: Instant) {
     self.svc_from |= 1u64 << self.config.replica().get();
@@ -52,8 +85,11 @@ impl<S: StateMachine> Endpoint<S> {
     if self.timers.view_change_status.is_some_and(|d| d <= now) {
       // The change did not complete (the next primary is also down, or our catch-up target is
       // unreachable): become an active SVC-driver for the next view and re-arm timers for that
-      // role (clears the now-stale get_view_message; arms svc/dvc/view_change_status).
-      self.catching_up = false;
+      // role (clears the now-stale get_view_message; arms svc/dvc/view_change_status). Still
+      // ViewChange here, so the collection is `Some`; flip the catch-up discriminant in place.
+      if let Some(vc) = self.view_change.as_mut() {
+        vc.catching_up = false;
+      }
       self.propose_next_view(now, sb);
       self.arm_timers(now);
     }
@@ -143,49 +179,102 @@ impl<S: StateMachine> Endpoint<S> {
     self.enter_view_change(now, sb, view_new);
   }
 
-  /// The shared `ViewChange`-entry body (no view-advance assert — the callers assert their own
-  /// contract). Resets the pipeline + quorums and defers the DoViewChange until the new view is durable.
-  fn enter_view_change<B: Superblock>(&mut self, now: Instant, sb: &mut B, view_new: View) {
-    self.view = view_new;
-    self.status = Status::ViewChange;
-    self.catching_up = false; // a real, self-driven change (not catch-up)
-    self.svc_target = view_new; // collect future escalations above this view
-    self.inflight.clear();
-    self.buffer.clear();
+  /// THE SINGLE CHOKEPOINT (audit D3) for tearing down the OLD-GENERATION in-flight state that EVERY
+  /// view transition must abandon. The three transition entries — [`Self::enter_view_change`]
+  /// (self-driven SVC-quorum change), [`Self::catch_up_to_view`] (higher-view catch-up), and
+  /// [`Self::adopt_canonical_head`] (adopt an authoritative StartView/RecoveryResponse) — all cross a
+  /// generation boundary and so MUST drop the same union of old-view sub-state; centralizing it here
+  /// means a NEW in-flight sub-state added next milestone is cleared on all three paths by editing ONE
+  /// place (the R24-F1-shaped seam bug — a half-completed durable transition leaking across the
+  /// boundary because one of three hand-written resets forgot a field — cannot recur).
+  ///
+  /// Clears, in one place: the SVC-collection bits (`svc_from` — these stay FLAT, being live in Normal
+  /// too; the DVC collection + `catching_up` discriminant instead live behind `self.view_change`, which
+  /// each call site sets/`take`s around this reset — see below), the in-flight STORAGE submissions
+  /// (`pending`/`appending` — abandoned old-view WAL appends whose late completion must not emit a
+  /// stale-view `PrepareOk`; kept in lockstep per R7-F1), the stale per-replica checkpoint reports
+  /// (`peer_checkpoint` — a fresh primary rebuilds the GC map from incoming `PrepareOk`/`Commit`), the
+  /// in-flight checkpoint
+  /// (`pending_checkpoint` — re-triggers once Normal resumes), the in-flight state-sync as the
+  /// LOAD-BEARING PAIR `sync` + `pending_install` cleared TOGETHER (clearing `sync` alone would let
+  /// `on_sb_done`'s install arm fire against a cancelled sync — the `assert_invariants` `pending_install
+  /// ⟹ sync` clause guards exactly this) along with its `sync_solicit` timer, and the forfeit sub-state
+  /// `forfeit_armed` + `pending_forfeit` (a fresh generation re-evaluates the step-down from scratch).
+  ///
+  /// With durable-before-install (codex R24-F1) cancelling `sync`/`pending_install` finds the OLD
+  /// (consistent, if stale) state intact — the STAGE never restored the SM, advanced
+  /// `commit_min`/`op`, nor pruned the WAL — so there is no pruned-but-stale window; a still-behind
+  /// replica re-triggers state-sync from Normal.
+  ///
+  /// NOT cleared here (the per-site DISTINGUISHING state each entry sets itself): the new
+  /// `view`/`status`/`svc_target`; the `view_change` collection (the DVC + catch-up state — each site
+  /// sets it `Some(ViewChangeCollection::entering(catching_up))` on the two ViewChange ENTRIES and
+  /// `take`s it to `None` on the two EXITS to Normal, the `is_some() == is_view_change()` coupling; this
+  /// reset is bidirectional — reached on both entries and the adopt EXIT — so it cannot own that
+  /// direction-dependent set/take); `inflight`/`buffer` (the primary pipeline + backup reorder buffer —
+  /// `adopt_canonical_head` deliberately does NOT clear them, since a Normal primary can reach it via a
+  /// higher-view `on_start_view` with a live pipeline, so they stay at the two ViewChange entries);
+  /// `pending_sb` (overwritten by `submit_durable_view` in the two entries that issue a durable-view
+  /// write, set `None` by `catch_up_to_view` which issues none); `recover` (only the adoption path
+  /// retires it); and the forward `arm_timers(now)` re-arm.
+  pub(crate) fn reset_for_view_transition(&mut self) {
+    // SVC-collection bits for the OLD view (these stay flat — live in Normal too, see the struct
+    // fields). The ViewChange-only DVC collection + catch-up discriminant are NOT touched here: they
+    // live behind `self.view_change`, which each transition site sets (the two ViewChange entries) or
+    // takes to `None` (the two exits) around this shared reset — the `view_change.is_some() ==
+    // is_view_change()` coupling cannot be expressed in this BIDIRECTIONAL chokepoint (it is reached on
+    // both entries AND the adopt EXIT), so the Option lifecycle stays at the call sites.
+    self.svc_from = 0;
+    // Abandon in-flight WAL appends from the old view: their bytes are already durable, but a late
+    // completion must not emit a stale-view PrepareOk or vote on a wrong-generation op. `appending` is
+    // kept in lockstep with `pending` (R7-F1): clearing it means a later adopt-append re-marks the op
+    // fresh, and the abandoned old completion (now absent from `pending`) does not retract that fresh
+    // mark in `on_wal_done`.
+    self.pending.clear();
+    self.appending.clear();
     // Drop stale per-replica checkpoint reports: the new generation re-establishes the pipeline, so
     // old-view reports must not gate the next primary's GC. A fresh primary rebuilds the map from
     // incoming PrepareOk/Commit, staying conservative (unheard peers count as 0) until then.
     self.peer_checkpoint.clear();
-    // Abandon in-flight WAL appends from the old view: their bytes are already durable, but a
-    // late completion must not emit a stale-view PrepareOk or vote on a wrong-generation op.
-    self.pending.clear();
-    // Keep the append-before-ack in-flight set in lockstep with `pending` (R7-F1): clearing it here
-    // means a later adopt-append re-marks the op fresh, and the abandoned old completion (now absent
-    // from `pending`) does not retract that fresh mark in `on_wal_done`.
-    self.appending.clear();
     // Supersede any in-flight checkpoint: a view change drops it (its stale superblock completion is
     // then ignored in on_sb_done). It re-triggers once Normal resumes — commit_min is preserved.
     self.pending_checkpoint = None;
     // Abandon any in-flight state-sync (M3.4a): a view change supersedes it (state-sync and view
-    // change are mutually exclusive by status — §2.6). If the sync was mid-persist its
-    // `pending_checkpoint` is dropped above; the synced checkpoint is NOT made durable, so the
-    // view-change root below names the prior durable `checkpoint_op` (the Superblock serialized
-    // root-write ordering makes that the winning root). The in-memory SM may already reflect the
-    // synced point (apply_sync restored it) with `commit_min == op == synced_op`, which is internally
-    // consistent; a later crash recovers either clean (empty WAL) or via RecoveringHead (pruned tail
-    // → re-fetch the canonical head from a peer) — both safe, no committed op lost cluster-wide. The
-    // replica re-triggers state-sync from Normal if it is still behind.
+    // change are mutually exclusive by status — §2.6). The `sync` handshake and its DEFERRED INSTALL
+    // (`pending_install`) are cancelled TOGETHER: with durable-before-install (codex R24-F1) the STAGE
+    // never restored the SM, advanced `commit_min`/`op`, nor pruned the WAL, so this finds the OLD
+    // (consistent, if stale) state intact — there is NO pruned-but-stale window. Dropping
+    // `pending_install` here also releases the staged snapshot bytes — and, gated by the
+    // `sync.is_some()` cleared alongside, the `on_sb_done` install arm can never fire against this
+    // cancelled sync (the `assert_invariants` `pending_install ⟹ sync` clause guards this pairing).
     self.sync = None;
+    self.pending_install = None;
     self.timers.sync_solicit = None;
     // A view change ends this primary generation: clear any forfeit grace timer (M3.5 T3) AND any
     // deferred-forfeit flag (the safety step-down — see `maybe_force_sync`). The new generation
     // re-evaluates from scratch once it resumes Normal as primary, so neither a stale grace deadline
     // nor a stale pending-forfeit must carry across (no same-view re-forfeit / cross-view leak).
-    self.forfeit_armed = None;
+    self.timers.forfeit_armed = None;
     self.pending_forfeit = false;
-    self.svc_from = 0;
-    self.dvc_from.clear();
-    self.dvc_quorum = false;
+  }
+
+  /// The shared `ViewChange`-entry body (no view-advance assert — the callers assert their own
+  /// contract). Resets the pipeline + quorums and defers the DoViewChange until the new view is durable.
+  fn enter_view_change<B: Superblock>(&mut self, now: Instant, sb: &mut B, view_new: View) {
+    self.view = view_new;
+    self.status = Status::ViewChange;
+    self.svc_target = view_new; // collect future escalations above this view
+    // Tear down ALL old-generation in-flight state in one place (audit D3): SVC bits, in-flight
+    // appends, peer-checkpoint reports, in-flight checkpoint, in-flight sync + its deferred install, and
+    // the forfeit sub-state.
+    self.reset_for_view_transition();
+    // ViewChange ENTRY: install a fresh ViewChange-only collection — `catching_up = false` (a real,
+    // self-driven change, not the higher-view catch-up). (`is_some() == is_view_change()` coupling.)
+    self.view_change = Some(ViewChangeCollection::entering(false));
+    // The primary pipeline + backup reorder buffer are dropped on this self-driven entry (kept OUT of
+    // the shared reset because `adopt_canonical_head` preserves a live primary pipeline).
+    self.inflight.clear();
+    self.buffer.clear();
     self.arm_timers(now);
     // DVC deferred to on_sb_done: persist the new view before voting in it.
     self.submit_durable_view(PendingSbAction::SendDoViewChange, sb);
@@ -244,10 +333,12 @@ impl<S: StateMachine> Endpoint<S> {
     // legitimately omits the prefix that lives in its SM snapshot). Safe under honest crash-stop
     // peers; matters once untrusted/real-driver inputs land. The cross-DVC commit* <= op_head
     // invariant is enforced (fail-stop) in `select_canonical_log`.
+    // `!is_view_change()` short-circuits BEFORE `dvc_quorum()` reads the (then-`None`) collection, so
+    // the collection is `Some` on every non-returning path below (ViewChange ⟹ `view_change.is_some()`).
     if m.view() != self.view
       || !self.config.is_primary(self.view)
       || !self.status.is_view_change()
-      || self.dvc_quorum
+      || self.dvc_quorum()
     {
       return;
     }
@@ -257,7 +348,7 @@ impl<S: StateMachine> Endpoint<S> {
     // Ensure our own DVC is represented (keyed by replica → a self-addressed DVC is idempotent).
     // Compute the own-DVC into a local FIRST to avoid a self borrow conflict, then insert.
     let own = self.config.replica().get();
-    if !self.dvc_from.contains_key(&own) {
+    if !self.dvc_from().contains_key(&own) {
       let own_dvc = crate::DoViewChange::new(
         self.view,
         self.log_view,
@@ -269,18 +360,18 @@ impl<S: StateMachine> Endpoint<S> {
         self.config.replica(),
         self.log_entries(),
       );
-      self.dvc_from.insert(own, own_dvc);
+      self.dvc_from_mut().insert(own, own_dvc);
     }
     // Keep the most-advanced DVC per replica.
     let replace = self
-      .dvc_from
+      .dvc_from()
       .get(&m.replica().get())
       .map(|cur| (m.log_view().get(), m.op().get()) > (cur.log_view().get(), cur.op().get()))
       .unwrap_or(true);
     if replace {
-      self.dvc_from.insert(m.replica().get(), m);
+      self.dvc_from_mut().insert(m.replica().get(), m);
     }
-    if self.dvc_from.len() >= self.config.quorum_view_change() {
+    if self.dvc_from().len() >= self.config.quorum_view_change() {
       self.start_view_as_new_primary(now, wal, sb);
     }
   }
@@ -338,7 +429,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// contiguous model (the head-holder is one of them); truncation activates only with a larger
   /// collected set. See the `no_truncation_at_minimal_quorum` test.
   pub(crate) fn select_canonical_log(&self) -> (std::vec::Vec<crate::PreparedEntry>, u64, u64) {
-    let dvcs: std::vec::Vec<&crate::DoViewChange> = self.dvc_from.values().collect();
+    let dvcs: std::vec::Vec<&crate::DoViewChange> = self.dvc_from().values().collect();
     debug_assert!(!dvcs.is_empty(), "selection requires at least one DVC");
 
     let log_view_star = dvcs.iter().map(|d| d.log_view().get()).max().unwrap_or(0);
@@ -481,6 +572,11 @@ impl<S: StateMachine> Endpoint<S> {
     // committed-or-truncated head). The subsequent `start_view_participate` broadcasts the now-dense
     // `self.log_entries()`, so backups adopt a gap-free log too.
     if let Some(gap) = ((commit_star + 1)..=self.op.get()).find(|op| !self.log.contains_key(op)) {
+      // Committed-survival backstop on the BOUNDARY dropped op `gap` (the smallest op truncated here):
+      // the quorum-intersection argument above proves everything from `gap` up is uncommitted (a gap
+      // above `commit_star` is held by no canonical donor, so it was never committed), so it satisfies
+      // the helper's uncommitted clause (`> commit_max`).
+      self.assert_committed_survives(gap, self.checkpoint_op.get());
       self.op = OpNumber::with(gap - 1);
       self.log.retain(|&op, _| op <= self.op.get());
       // Retire any repair holes now stranded above the truncated head (mirrors the `repair.retain`
@@ -497,6 +593,9 @@ impl<S: StateMachine> Endpoint<S> {
     // later `recover` and applied for a committed op the cluster assigns at that number with a DIFFERENT
     // value (a committed-divergence). Truncating drops only uncommitted ops, so no durability dip; the
     // `adopt_append` loop below re-writes the canonical `(commit_min .. op]` slots authoritatively.
+    // Committed-survival backstop on the BOUNDARY freed WAL slot `self.op + 1` (the lowest slot above
+    // the canonical head): nothing above the authoritative head is committed, so it is uncommitted.
+    self.assert_committed_survives(self.op.get() + 1, self.checkpoint_op.get());
     wal.truncate(self.op);
 
     // Backfill the client-session request high-water from the adopted in-memory log tail. This is a
@@ -526,7 +625,12 @@ impl<S: StateMachine> Endpoint<S> {
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = self.view;
     self.status = Status::Normal;
-    self.dvc_quorum = true;
+    // ViewChange EXIT: the canonical log has been formed and we are returning to Normal as the new
+    // primary, so retire the ViewChange-only collection (DVC quorum + catch-up discriminant) to `None`
+    // — the `view_change.is_some() == is_view_change()` coupling. (Previously a `dvc_quorum = true`
+    // marker set here then immediately went stale as the generation ended; the Option `take`-on-exit
+    // makes that lifecycle explicit and type-enforced.)
+    self.view_change = None;
     // Becoming primary FRESH: a deferred-forfeit flag (the M3.5 safety step-down) from a prior
     // generation must not carry in (it was cleared on entering ViewChange, but clear it defensively
     // here so a fresh primary never starts already-flagged to abdicate).
@@ -664,6 +768,9 @@ impl<S: StateMachine> Endpoint<S> {
   /// re-fetched from the primary as `Prepare`s. (`adopt_canonical_head` never lowers `self.op`, so this is
   /// exactly the adopted head; done in the caller because it owns the `wal` handle.)
   pub(crate) fn truncate_wal_above_adopted_head<W: Wal>(&self, wal: &mut W) {
+    // Committed-survival backstop on the BOUNDARY freed WAL slot `self.op + 1`: the adopted head is the
+    // view's authoritative head, so nothing strictly above it is committed (the uncommitted clause).
+    self.assert_committed_survives(self.op.get() + 1, self.checkpoint_op.get());
     wal.truncate(self.op);
   }
 
@@ -733,39 +840,31 @@ impl<S: StateMachine> Endpoint<S> {
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = view;
     self.status = Status::Normal;
-    self.catching_up = false;
-    self.svc_from = 0;
-    self.dvc_from.clear();
+    // Tear down ALL old-generation in-flight state in one place (audit D3): SVC bits (svc_from),
+    // in-flight appends (pending/appending), peer-checkpoint reports, in-flight checkpoint, in-flight
+    // state-sync + its deferred install (cancelled TOGETHER — adopting an authoritative canonical head
+    // supersedes the sync; the adopted canonical log + the adopter's preserved APPLIED prefix supply the
+    // committed prefix, with peer-repair as the backstop for the omitted unapplied committed band;
+    // durable-before-install R24-F1 leaves the old state intact), and the forfeit sub-state. See
+    // [`Self::reset_for_view_transition`]. NOTE this DELIBERATELY does NOT clear `inflight`/`buffer`:
+    // a Normal primary can reach here via a higher-view `on_start_view` holding a live pipeline, so —
+    // unlike the two ViewChange entries — adoption preserves it (this is the real per-site asymmetry
+    // the shared reset keeps out).
+    self.reset_for_view_transition();
+    // ViewChange EXIT (adoption → Normal): retire the ViewChange-only collection (DVC + catch-up). The
+    // shared reset above is bidirectional, so the `take`-to-`None` lives here. (`is_some() ==
+    // is_view_change()` coupling.)
+    self.view_change = None;
     // Adoption re-established a trustworthy head, so the recovery bookkeeping is retired: a
     // RecoveringHead replica that reaches here via this path leaves `recover` = None (the field is
     // structurally None in every non-recovering status). A non-recovering adopter already has None.
+    // (This is the distinguishing reset only the adoption path owns.)
     self.recover = None;
     // (The pending-repair set was reconciled above — holes the adopted log / applied-prefix held copies
     // now cover were retired; any committed op neither side carries — including the unapplied band
     // `adopt_log` dropped — stays solicited and was re-requested by `advance_commit`. We deliberately do
     // NOT blanket-clear `repair` here: that was the B3 stranding bug — clearing right after
     // `advance_commit` requested a hole silently forgot a committed op.)
-    // Abandon in-flight WAL appends from the old view (see transition_to_view_change_status).
-    self.pending.clear();
-    self.appending.clear(); // keep the R7-F1 in-flight set in lockstep with `pending`
-    // Drop stale per-replica checkpoint reports from the old generation (see
-    // transition_to_view_change_status); a backup-turned-... primary rebuilds from fresh PrepareOk.
-    self.peer_checkpoint.clear();
-    // Supersede any in-flight checkpoint from the old view (its stale superblock completion is then
-    // ignored). The view-change root below preserves the durable checkpoint_op via submit_durable_view.
-    self.pending_checkpoint = None;
-    // Abandon any in-flight state-sync: adopting an authoritative canonical head supersedes it (the
-    // adopted canonical log + the adopter's preserved APPLIED prefix supply the committed prefix, with
-    // peer-repair as the backstop for the omitted unapplied committed band). See the note in
-    // `transition_to_view_change_status` on the mid-persist case (safe; re-syncs from Normal if still behind).
-    self.sync = None;
-    self.timers.sync_solicit = None;
-    // Adopting a canonical head starts a fresh generation in `view`: clear any forfeit grace timer
-    // (M3.5 T3) AND any deferred-forfeit flag (the safety step-down — see `maybe_force_sync`) so
-    // neither a stale deadline nor a stale pending-forfeit carries into this view (re-evaluated fresh).
-    self.forfeit_armed = None;
-    self.pending_forfeit = false;
-    self.dvc_quorum = false;
     self.arm_timers(now);
     // Defer held-op re-acks to on_sb_done → `start_view_acks`: persist the new view first, and there
     // WAL-(re-)append each adopted uncommitted-tail op before its PrepareOk (codex R6-F1). The adopted
