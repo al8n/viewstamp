@@ -56,6 +56,7 @@ fn committed_ops_survive_crash_storage_fault_and_restart() {
       torn_write_per_mille: 0,
       bit_rot_per_mille: 0,
       misdirect_read_per_mille: 0,
+      corrupt_checkpoint_read_per_mille: 0,
     });
     let mut dur = DurabilityChecker::new(5);
 

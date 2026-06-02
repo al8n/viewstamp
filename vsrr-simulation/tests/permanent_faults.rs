@@ -68,6 +68,7 @@ fn committed_ops_survive_crash_permanent_fault_and_restart() {
       torn_write_per_mille: 200,
       bit_rot_per_mille: 200,
       misdirect_read_per_mille: 0,
+      corrupt_checkpoint_read_per_mille: 0,
     });
     let mut dur = DurabilityChecker::new(5);
 

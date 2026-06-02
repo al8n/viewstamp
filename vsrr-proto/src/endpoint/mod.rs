@@ -913,6 +913,111 @@ impl<S: StateMachine> Endpoint<S> {
     crate::OpId::new(id)
   }
 
+  /// Binds a message's SELF-CLAIMED sender to the authenticated transport peer `from` — the single
+  /// ingress backstop mirroring the [`Self::emit`] egress chokepoint (codex R19-F1).
+  ///
+  /// vsrr is a NON-Byzantine, crash-fault-tolerant VSR (like TigerBeetle) for a TRUSTED cluster:
+  /// authenticating a replica message's sender is the DRIVER's job (it sets `from` to the
+  /// authenticated transport peer, mirroring TigerBeetle's `message_bus.zig` `set_and_verify_peer`),
+  /// and the proto TRUSTS `from`. This check is the cheap defense-in-depth complement: it rejects any
+  /// message whose own claimed identity DISAGREES with `from`, so a BUGGY / misrouting driver (or a
+  /// trivially-mislabeled message) cannot make a forged/misrouted message spoof a quorum VOTE
+  /// (`PrepareOk`/`DoViewChange`/`StartViewChange` count the message BODY's claimed `replica()` toward
+  /// a commit / view-change quorum — see `on_prepare_ok`/`on_do_view_change`/`on_start_view_change`).
+  /// It is NOT cryptographic message authentication against a MALICIOUS sender (signatures, Byzantine
+  /// fault tolerance) — that is explicitly OUT OF SCOPE (a BFT/blockchain concern).
+  ///
+  /// The per-kind bindings (each accessor verified against `message.rs`):
+  /// - **Client-originated** — `Request` binds to `from == Peer::Client(r.client())`.
+  /// - **Self-identifying replica messages** (carry the sender's OWN `replica()` id) — bind to
+  ///   `from == Peer::Replica(msg.replica())`: the VOTES `PrepareOk`/`StartViewChange`/`DoViewChange`
+  ///   (the MUST-HAVE spoof guard), the solicitations `GetView`/`RequestPrepare`/`Recovery`/
+  ///   `RequestSync`, and the serves `RecoveryResponse`/`SyncCheckpoint`. The latter two carry BOTH a
+  ///   `view()` and a self `replica()`, but are legitimately sent by ANY `Normal` replica (a backup
+  ///   answers a `Recovery` with its view; any newer-checkpoint peer serves a `RequestSync`), so they
+  ///   bind to their self `replica()` — NOT `config.primary(view)`, which would drop an honest
+  ///   backup-originated serve.
+  /// - **Primary-authority broadcasts** (only the primary of the advertised view legitimately sends
+  ///   them, and they carry NO self `replica()` to bind to) — bind to
+  ///   `from == Peer::Replica(self.config.primary(msg.view()))`: `Commit` and `StartView`. This also
+  ///   closes a forged `Commit`/`StartView` from a non-primary.
+  /// - **`Reply`** — replicas ignore it (the dispatch is a no-op), so this is a no-op: returns `true`.
+  ///
+  /// PATH-SENSITIVE (reported, not guessed): **`Prepare`** carries NO self `replica()`, so its binding
+  /// is split by path (codex R20-F1 / R21-F1). The normal head-advancing / re-ack `Prepare` comes ONLY
+  /// from the primary of its view, so it binds to `config.primary(view)`. But a committed-op REPAIR
+  /// serve (`on_request_prepare`, codex R17-F1) is legitimately sent by ANY `Normal` holder — incl. a
+  /// BACKUP — carrying `self.view` (where `config.primary(view) != backup`), so binding it to
+  /// `config.primary(view)` would DROP an honest backup repair-serve. The escape therefore ALSO accepts
+  /// a `Prepare` whose op is one of our registered repair holes — but ONLY from a CONFIGURED replica
+  /// `from` (an in-range `Peer::Replica`): a repair-serve is always a peer replica that holds the op,
+  /// never a client / out-of-range id. The escape narrows the binding to the repair surface only;
+  /// `on_prepare` then runs `fill_repair` (which body-checksums + commit>=op-vouches the serve) FIRST,
+  /// and DROPS a hole-targeted `Prepare` that `fill_repair` declines BEFORE any view catch-up (the
+  /// R13-F2 / R21-F1 hole-ownership guard), so neither a bad body nor a spurious catch-up can ride the
+  /// escape. This leaves no spoof gap on the vote/quorum surface this check protects.
+  fn sender_matches(&self, from: Peer, msg: &Message) -> bool {
+    match msg {
+      // Client-originated: the authenticated peer must be the issuing client.
+      Message::Request(r) => from == Peer::Client(r.client()),
+      // Self-identifying replica messages: the authenticated peer must be the claimed sender AND a
+      // CONFIGURED cluster member (`replica < replica_count`). The membership range check is CENTRALIZED
+      // in `sender_is_member_replica` (codex R22-F1): without it, `from == Peer::Replica(m.replica())`
+      // accepts an out-of-range id (e.g. `Peer::Replica(5)` in a 3-replica cluster with `m.replica() == 5`)
+      // — a non-member — whose self-consistent message then reaches the quorum / apply path (some
+      // handlers, e.g. `on_prepare_ok`, range-check downstream, but `serve_sync_checkpoint`/`apply_sync`
+      // did not, extending checkpoint trust outside `Config`). Binding here closes it for ALL self-id
+      // messages at once, regardless of per-handler downstream checks.
+      Message::PrepareOk(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::StartViewChange(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::DoViewChange(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::GetView(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::RequestPrepare(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::Recovery(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::RequestSync(m) => self.sender_is_member_replica(from, m.replica()),
+      // Serves that carry a self `replica()` AND a `view()` but may come from ANY Normal replica
+      // (a backup, not only the primary) — bind to the self id, not `config.primary(view)`.
+      Message::RecoveryResponse(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::SyncCheckpoint(m) => self.sender_is_member_replica(from, m.replica()),
+      // Primary-authority broadcasts (no self id): only the primary of the advertised view sends them.
+      Message::Commit(m) => from == Peer::Replica(self.config.primary(m.view())),
+      Message::StartView(m) => from == Peer::Replica(self.config.primary(m.view())),
+      // `Prepare` is PATH-SENSITIVE (codex R20-F1 / R21-F1). A NORMAL head-advancing / re-ack Prepare
+      // comes ONLY from the primary of its advertised view — binding it to `config.primary(view)` closes
+      // the gap where a misrouted non-primary replica Prepare drives a backup's normal append + PrepareOk.
+      // But a committed-op REPAIR serve (answering our `RequestPrepare` for a hole in `self.repair`)
+      // legitimately comes from ANY Normal holder, so ALSO accept a Prepare whose op is one of our
+      // registered repair holes — but ONLY from a CONFIGURED replica `from` (R21-F1): a repair-serve is
+      // always a peer replica that holds the committed op, NEVER a client or an out-of-range id. Without
+      // the replica-peer guard, an authenticated `Peer::Client` (or an out-of-range `Peer::Replica`)
+      // whose forged/misrouted Prepare's op happened to be one of our holes passed ingress and reached
+      // `fill_repair` (which checks only commit>=op + `Header::verify` self-consistency, BEFORE any role
+      // check), so a buggy/misrouting driver could fill a committed hole from a non-replica peer.
+      // (`fill_repair` then verifies the body — checksum + the commit>=op committed-vouch — and a
+      // hole-targeted Prepare it DECLINES is dropped by the R13-F2 / R21-F1 hole-ownership guard in
+      // `on_prepare` before any view catch-up, so the `repair` escape cannot inject a bad body nor drive
+      // a spurious catch-up; a repair op is `<= self.op`, so it cannot advance the head.)
+      Message::Prepare(p) => {
+        from == Peer::Replica(self.config.primary(p.view()))
+          || (matches!(from, Peer::Replica(r) if r.get() < self.config.replica_count())
+            && self.repair.contains(&p.op().get()))
+      }
+      // `Reply` is ignored by replicas (dropped in the dispatch) — no-op.
+      Message::Reply(_) => true,
+    }
+  }
+
+  /// True iff `from` is the authenticated peer for the self-identifying `claimed` replica AND `claimed`
+  /// is a CONFIGURED cluster member (`< replica_count`). The membership range check is the load-bearing
+  /// half (codex R22-F1): a message whose body claims an OUT-OF-RANGE replica id (a non-member), with a
+  /// matching out-of-range `from` from a buggy/misrouting driver, must not reach the quorum / apply path
+  /// — it would extend trust outside `Config`. Centralized here so every self-id replica message
+  /// (`PrepareOk`/`StartViewChange`/`DoViewChange`/`SyncCheckpoint`/…) is membership-checked uniformly,
+  /// not relying on each handler's own (inconsistent) downstream range check.
+  fn sender_is_member_replica(&self, from: Peer, claimed: ReplicaId) -> bool {
+    claimed.get() < self.config.replica_count() && from == Peer::Replica(claimed)
+  }
+
   /// Feeds an incoming protocol message.
   pub fn handle_message<W: Wal, B: Superblock>(
     &mut self,
@@ -922,6 +1027,15 @@ impl<S: StateMachine> Endpoint<S> {
     from: Peer,
     msg: Message,
   ) {
+    // Sender-binding backstop (codex R19-F1): drop any message whose self-claimed identity disagrees
+    // with the authenticated `from`. Placed at the TOP — BEFORE the Recovering/RecoveringHead
+    // early-returns — so it ALSO guards those states' message exceptions (a RecoveringHead adopting a
+    // `StartView`/`RecoveryResponse`; a Recovering replica fetching a peer `SyncCheckpoint`), not only
+    // the normal dispatch. This is the ingress analogue of the `emit` egress chokepoint: one place,
+    // every path. See [`Self::sender_matches`] for the per-kind bindings + the `Prepare` exception.
+    if !self.sender_matches(from, &msg) {
+      return;
+    }
     // A Recovering replica does NOT process ANY consensus message: it is still draining its own
     // durable storage (the async `handle_storage` loop) and does not even know its true head yet, so
     // it casts no PrepareOk/vote/DVC and adopts no peer's view until it reaches Normal. This also

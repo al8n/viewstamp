@@ -100,7 +100,7 @@ impl<S: StateMachine> Endpoint<S> {
     let id = match done {
       SuperblockDone::Wrote(id) => id,
       SuperblockDone::CheckpointRead(cr) => {
-        self.serve_sync_checkpoint(cr);
+        self.serve_sync_checkpoint(sb, cr);
         return;
       }
       SuperblockDone::Fault(id) => {

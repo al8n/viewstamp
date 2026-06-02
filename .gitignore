@@ -19,3 +19,8 @@ Cargo.lock
 
 # Local-only working docs (design specs, notes) — never commit or push
 docs/
+
+# Local-only AI-agent instruction files (read from the working tree, never uploaded)
+AGENTS.md
+CLAUDE.md
+GEMINI.md

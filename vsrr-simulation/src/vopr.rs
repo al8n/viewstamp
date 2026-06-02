@@ -481,6 +481,13 @@ impl Vopr {
     // on a later read (it never permanently removes a correct copy, so it is inherently quorum-safe:
     // every replica's own disk still eventually reads each slot correctly).
     let misdirect = self.prng.below(40) as u32;
+    // TRANSIENT corrupt-but-PARSEABLE checkpoint reads (codex R23-F1): a checkpoint read returns the
+    // live snapshot with a flipped tail byte — it still DECODES and keeps its bound op, but hashes to a
+    // DIFFERENT id than the durable root. The donor's serve path (and recover) must verify against the
+    // durable id and DROP it rather than ship/restore corrupt state. Drawn UNCONDITIONALLY (so a
+    // `VOPR_NO_CKPT_CORRUPT` shrink stays on the same prng stream); low rate so a sync/recover read
+    // eventually returns clean bytes within budget.
+    let corrupt_ckpt = self.prng.below(40) as u32;
     let mask_perm = env_flag("VOPR_NO_PERM");
     StorageFaults {
       read_fault_per_mille: if env_flag("VOPR_NO_READFAULT") {
@@ -494,6 +501,11 @@ impl Vopr {
         0
       } else {
         misdirect
+      },
+      corrupt_checkpoint_read_per_mille: if env_flag("VOPR_NO_CKPT_CORRUPT") {
+        0
+      } else {
+        corrupt_ckpt
       },
     }
   }
