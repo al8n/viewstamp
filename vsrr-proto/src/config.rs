@@ -159,7 +159,7 @@ impl Config {
   }
 
   /// The checkpoint lag (in ops) at which a `Normal` primary FORFEITS primacy and steps down via a
-  /// view change (M3.5 T3): if a quorum has durably checkpointed at least this many ops beyond the
+  /// view change: if a quorum has durably checkpointed at least this many ops beyond the
   /// primary's own `checkpoint_op` — continuously for the grace window — the primary is genuinely
   /// stuck (it cannot checkpoint because it is repairing/syncing while the cluster raced ahead) and
   /// proposes a view change so a caught-up replica leads.

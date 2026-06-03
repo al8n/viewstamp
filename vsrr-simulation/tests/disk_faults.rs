@@ -1,4 +1,4 @@
-//! M3.3a gate: committed ops survive crash + STORAGE-FAULT + restart (TRANSIENT faults only).
+//! Transient-fault gate: committed ops survive crash + STORAGE-FAULT + restart (TRANSIENT faults only).
 //!
 //! Every replica's WAL runs under seeded TRANSIENT read-faults the whole time. We crash a caught-up
 //! backup, let the surviving quorum keep committing, then restart it so it recovers from its OWN
@@ -6,18 +6,18 @@
 //! proto's `RECOVER_READ_RETRIES` budget). The recovered replica must re-apply its committed prefix
 //! with NO divergence and NO lost committed op.
 //!
-//! ## Why the fault model is strictly transient (the M3.3a safety invariant)
+//! ## Why the fault model is strictly transient (the safety invariant for this gate)
 //!
 //! `bit_rot = 0`, `torn = 0`: a faulted read re-rolls and a retry succeeds, so a recovering replica
-//! always reaches `Normal` from its own disk — no peer fetch needed. This is exactly the M3.3a
+//! always reaches `Normal` from its own disk — no peer fetch needed. This is exactly the transient-fault
 //! guarantee. PERMANENT corruption of a committed op or the head would strand the replica in
-//! `RecoveringHead` (terminal until M3.3b's `StartView` adoption) or trip the proto's "committed op
-//! present in log" expectation in `advance_commit` (closed by M3.3b's peer fault-repair). Both are
+//! `RecoveringHead` (terminal until peer-repair via `StartView` adoption) or trip the proto's "committed
+//! op present in log" expectation in `advance_commit` (closed by peer fault-repair). Both are
 //! deliberately out of scope here, so the gate keeps `bit_rot = torn = 0`.
 //!
 //! ## Why the survivor is chosen dynamically
 //!
-//! There is no state-transfer / get-prepare path yet (that is M3.4): a backup that drops Prepares
+//! There is no state-transfer / get-prepare path yet (that is a later gate): a backup that drops Prepares
 //! under network faults and then sees the cluster go quiescent can stay permanently behind. Crashing
 //! such a laggard would be a degenerate (near-empty) recovery. So we crash the backup with the MOST
 //! applied ops at crash time — a backup that genuinely holds the committed prefix — making every
@@ -50,7 +50,7 @@ fn committed_ops_survive_crash_storage_fault_and_restart() {
       drop_per_mille: 10,
       duplicate_per_mille: 0,
     });
-    // TRANSIENT read-faults on every replica's WAL; NO torn writes, NO permanent bit-rot (M3.3b).
+    // TRANSIENT read-faults on every replica's WAL; NO torn writes, NO permanent bit-rot.
     c.set_storage_faults(StorageFaults {
       read_fault_per_mille: 80,
       torn_write_per_mille: 0,

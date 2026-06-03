@@ -1,4 +1,4 @@
-//! M3.1b gate: durable-view-before-participate + recover-restores-view.
+//! Durable-view gate: durable-view-before-participate + recover-restores-view.
 //!
 //! A replica that advanced its view via a view change, then crashed, must recover that view on
 //! restart — never regressing to an earlier view (which would risk a cross-view double-vote /

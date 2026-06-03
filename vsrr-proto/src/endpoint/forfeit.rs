@@ -1,14 +1,14 @@
 use super::*;
 
 impl<S: StateMachine> Endpoint<S> {
-  /// M3.5 T3 — the forfeit gate. A `Normal` primary that is genuinely STUCK steps down (via a view
+  /// The forfeit gate. A `Normal` primary that is genuinely STUCK steps down (via a view
   /// change) so a caught-up replica leads, rather than wedge the cluster (clients whose requests sit
   /// above its stalled commit never finish). Two independent stuck-conditions, both grace-timed:
   ///
   /// 1. **Checkpoint lag.** Its own durable `checkpoint_op` lags the quorum's by at least a full
   ///    checkpoint interval (`config.forfeit_checkpoint_lag()`) — it cannot checkpoint because it is
   ///    repairing/syncing while the cluster raced ahead.
-  /// 2. **Unfillable committed hole (liveness, VOPR seed 36).** It holds a `repair` hole — a COMMITTED
+  /// 2. **Unfillable committed hole.** It holds a `repair` hole — a COMMITTED
   ///    op below its head it cannot apply (registered only for `commit_min + 1 <= commit_max`). If that
   ///    op was CHECKPOINTED + PRUNED past on its holders (the residual case of `select_canonical_log`'s
   ///    offset-union: a committed op no canonical donor's LOG carries, so it lives only inside a peer's
@@ -101,14 +101,14 @@ impl<S: StateMachine> Endpoint<S> {
     self.propose_next_view(now, sb);
   }
 
-  /// Flag the DEFERRED-forfeit step-down a PRIMARY raises off the M3.5 force-sync / sync-checkpoint
+  /// Flag the DEFERRED-forfeit step-down a PRIMARY raises off the force-sync / sync-checkpoint
   /// strand (`maybe_force_sync` / `on_sync_checkpoint` / `on_recover_sync_checkpoint`) — it must NOT
   /// force-sync (that reuses op numbers; see those sites), so it steps down instead and the next
   /// `primary_timeouts` tick re-proposes `view + 1`. Unlike [`Self::forfeit`] this is raised OUTSIDE a
   /// primary tick (from a message handler), so it does NOT itself propose; but it MUST bootstrap a
   /// SERVICEABLE wake so a `poll_timeout`-driven driver actually reaches that next tick.
   ///
-  /// Bootstrapping `svc_message` (codex R15) is load-bearing: once `pending_forfeit` is set,
+  /// Bootstrapping `svc_message` is load-bearing: once `pending_forfeit` is set,
   /// `serviceable_now` makes `commit`/`prepare`/`forfeit_armed` NON-serviceable (the `pending_forfeit`
   /// branch of `primary_timeouts` retires them and never heartbeats), so the ONLY primary-side timer the
   /// filtered `poll_timeout` may return while forfeiting is `svc_message`. Were it left unarmed here, a
@@ -128,7 +128,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
   }
 
-  /// The SINGLE chokepoint (audit D1) for the deferred-forfeit step-down a replica must take when it
+  /// The SINGLE chokepoint for the deferred-forfeit step-down a replica must take when it
   /// CANNOT resume/continue as the primary with a torn-down pipeline — it applied a state-sync, fetched
   /// its checkpoint from a peer, or hit an unservable checkpoint-subsumed hole. Each of those sites
   /// (`maybe_force_sync`, `on_sync_checkpoint`, `on_recover_sync_checkpoint`) MUST NOT force-sync/apply

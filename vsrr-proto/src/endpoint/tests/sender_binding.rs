@@ -194,8 +194,8 @@ fn forged_commit_from_a_non_primary_is_dropped_by_the_sender_binding() {
   // commit would have an op to apply. A `Commit(view 0, commit 1)` whose authenticated `from` is a
   // NON-primary (replica 2; the view-0 primary is replica 0) is forged/misrouted and must be dropped
   // — the backup's commit does not advance. The honest Commit path (from the real primary) is
-  // unaffected. (`Prepare` binds to `config.primary(view)` OR a registered repair hole — codex R20-F1
-  // — so the normal head-advancing path is primary-bound while the non-primary repair-serve still
+  // unaffected. (`Prepare` binds to `config.primary(view)` OR a registered repair hole —
+  // so the normal head-advancing path is primary-bound while the non-primary repair-serve still
   // works; see `sender_matches` and the `forged_prepare_from_a_non_primary_replica_is_dropped` test.)
   let mut e = backup(); // replica 1 of 3
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
@@ -237,7 +237,7 @@ fn forged_commit_from_a_non_primary_is_dropped_by_the_sender_binding() {
 
 #[test]
 fn forged_prepare_from_a_client_is_dropped_by_the_sender_binding() {
-  // `Prepare` binds (codex R20-F1) to `config.primary(view)` OR a registered repair hole. A client
+  // `Prepare` binds to `config.primary(view)` OR a registered repair hole. A client
   // `from` is neither the primary nor a replica serving a hole, so a `Prepare` whose authenticated
   // `from` is a `Peer::Client` is forged/misrouted and must be dropped — the backup does not append it.
   // The honest primary-originated `Prepare` is unaffected.
@@ -270,7 +270,7 @@ fn forged_prepare_from_a_client_is_dropped_by_the_sender_binding() {
 
 #[test]
 fn forged_prepare_from_a_non_primary_replica_is_dropped() {
-  // codex R20-F1: the head-advancing / normal `Prepare` path must accept a Prepare ONLY from the
+  // the head-advancing / normal `Prepare` path must accept a Prepare ONLY from the
   // primary of its advertised view. A current-view `Prepare` from a NON-primary replica (replica 2;
   // the view-0 primary is replica 0) whose op is NOT one of our registered repair holes is
   // forged/misrouted — `sender_matches` drops it, so the backup does NOT append it and emits NO
@@ -311,7 +311,7 @@ fn forged_prepare_from_a_non_primary_replica_is_dropped() {
 
 #[test]
 fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
-  // codex R22-F1 (membership range check, vote surface): a PrepareOk whose self-claimed replica is NOT
+  // MEMBERSHIP RANGE CHECK (vote surface): a PrepareOk whose self-claimed replica is NOT
   // a configured cluster member (replica 5 in a 3-replica cluster) — delivered from a matching
   // out-of-range `from` by a buggy/misrouting driver — must NOT count toward the commit quorum. The
   // centralized `sender_is_member_replica` check drops it at ingress.
@@ -378,7 +378,7 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
 
 #[test]
 fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
-  // codex R22-F1 (membership range check, apply surface): a SyncCheckpoint whose self-claimed replica
+  // MEMBERSHIP RANGE CHECK (apply surface): a SyncCheckpoint whose self-claimed replica
   // is NOT a configured member (replica 5 in a 3-replica cluster), even with a matching nonce and a
   // self-consistent checkpoint hash, must NOT reach apply_sync — that would restore SM/session state
   // from a non-member. The centralized membership check drops it at ingress; the sync stays outstanding.
@@ -448,7 +448,7 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
 
 #[test]
 fn repair_hole_prepare_from_a_client_is_dropped() {
-  // codex R21-F1 (Part A): the `Prepare` ingress escape for a registered repair hole must require a
+  // REPAIR-HOLE INGRESS GUARD (Part A): the `Prepare` ingress escape for a registered repair hole must require a
   // CONFIGURED replica `from` — the committed-op repair-serve legitimately comes ONLY from a peer
   // replica that holds the op, never a client. Without that guard, an authenticated `Peer::Client`
   // whose (forged/misrouted) `Prepare`'s op happens to be one of our holes passed `sender_matches`
@@ -512,7 +512,7 @@ fn repair_hole_prepare_from_a_client_is_dropped() {
 
 #[test]
 fn repair_hole_prepare_from_an_out_of_range_replica_is_dropped() {
-  // codex R21-F1 (Part A): the `Prepare` repair-hole escape must require an IN-RANGE configured
+  // REPAIR-HOLE INGRESS GUARD (Part A): the `Prepare` repair-hole escape must require an IN-RANGE configured
   // replica `from` (`r < config.replica_count()`). An out-of-range replica id is not a member of the
   // cluster, so a `Prepare` it sends for one of our holes is misrouted/forged and must be dropped at
   // ingress, never reaching `fill_repair`. The hole stays open until a valid holder answers.
@@ -573,7 +573,7 @@ fn repair_hole_prepare_from_an_out_of_range_replica_is_dropped() {
 
 #[test]
 fn higher_view_non_canonical_hole_prepare_does_not_trigger_catch_up() {
-  // codex R21-F1 (Part B): a registered repair hole is owned EXCLUSIVELY by the repair path. A
+  // REPAIR-HOLE INGRESS GUARD (Part B): a registered repair hole is owned EXCLUSIVELY by the repair path. A
   // hole-targeted `Prepare` that `fill_repair` DECLINES (here `commit < op`, an uncommitted old-view
   // body) is NOT the canonical fill — it must be dropped IMMEDIATELY, before the higher-view
   // `catch_up_to_view`. Otherwise a higher-view non-canonical hole Prepare (which still passes the

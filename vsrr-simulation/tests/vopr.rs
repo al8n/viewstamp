@@ -6,9 +6,9 @@
 //! appends (modelling real fsync-loss-on-crash); network reorder/drop/duplicate/delay; storage
 //! read/torn/bit-rot faults + MISDIRECTED reads (a read returns a wrong-but-valid sibling slot,
 //! exercising the recovery/repair placement-integrity checks); small AND large `checkpoint_ops` (the
-//! latter recovers a non-trivial committed band — the R13-F1 read-window path); a redundant-copy
+//! latter recovers a non-trivial committed band — the large-checkpoint recover read-window path); a redundant-copy
 //! Superblock that retains the last-rooted checkpoint until a new one is durably rooted (finding B); and
-//! a seed-derived PHYSICAL BOUNDED-WAL RING (M3.2b Phase C) on ~1/3 of seeds (the rest unbounded), where
+//! a seed-derived PHYSICAL BOUNDED-WAL RING on ~1/3 of seeds (the rest unbounded), where
 //! each WAL is a fixed `N`-slot ring so the primary STALLS op-assignment before it would wrap an
 //! un-pruned slot — folding wrap (stall-before-wrap + recover off a wrapped ring + a below-ring-window
 //! backup overflow) into the full crash + partition + disk-fault schedule, with a per-tick RING-RESIDENCY
@@ -29,11 +29,11 @@
 //! The sweep runs a contiguous `0..SEEDS` range PLUS an explicit [`REGRESSION_SEEDS`] list of every
 //! seed that historically caught a real bug, so those stay pinned even above the contiguous range. A
 //! wide catch-panic scan `0..512` at [`DEFAULT_TICKS`] with the async-superblock mode ON is verified
-//! clean end to end (including seed 313, fixed by the final-quiesce phase — see below). The M3.2b Phase-C
+//! clean end to end (including the final-quiesce fix — see below). The
 //! bounded-WAL axis (a fixed-`N` ring on the ~1/3 of seeds it seed-derives) is verified clean over the
 //! committed `0..SEEDS` + regression range; it is drawn from a SEPARATE per-seed PRNG, so the ~2/3
-//! UNBOUNDED seeds (and every pinned regression seed that lands unbounded — including seed 313) keep
-//! their EXACT pre-Phase-C schedule, leaving that historical `0..512` unbounded-schedule scan valid. The
+//! UNBOUNDED seeds (and every pinned regression seed that lands unbounded) keep
+//! their EXACT pre-bounded-axis schedule, leaving that historical `0..512` unbounded-schedule scan valid. The
 //! committed `SEEDS` is kept smaller only to bound the gate's wall-clock (each seed runs a few thousand
 //! ticks of
 //! rich adversarial schedule).
@@ -46,14 +46,14 @@
 //! cache, NOT the durable WAL. On a later crash + `recover`, the loop re-loaded that STALE body from the
 //! WAL, and when the cluster committed the op (whose canonical value differs) `advance_commit` applied
 //! the stale local body → a single committed op number carried two values (op 227 = `…76` on r0 vs
-//! `…77` elsewhere, for seed 253). At-most-once held throughout (no second op minted, no request
+//! `…77` elsewhere, for an adversarial schedule). At-most-once held throughout (no second op minted, no request
 //! committed twice). FIXED in two places: (1) `adopt_canonical_head` / `start_view_as_new_primary` now
 //! `wal.truncate` above the adopted canonical head, dropping the uncommitted divergent suffix from the
 //! WAL at the source (no durability dip — only uncommitted ops are removed); (2) `recover` extends the
 //! `vsr_headers` cross-check — a self-verifying tail slot ABOVE the durable committed frontier whose
 //! original header `view` is below the durable `log_view` is a superseded earlier-view proposal, so it
-//! is dropped + peer-repaired instead of trusted (this catches the INTERIOR committed-band variant — seed
-//! 335 — that the head truncation cannot, where the stale slot sits below the adopted offset-log's floor).
+//! is dropped + peer-repaired instead of trusted (this catches the INTERIOR committed-band variant
+//! that the head truncation cannot, where the stale slot sits below the adopted offset-log's floor).
 //!
 //! Seed **313** was a FINAL-INSTANT durability-CHECKER artifact (verified real-vs-checker), now FIXED
 //! in the driver — NOT a proto loss. The end-of-run assertion fired `no operational replica retains the
@@ -74,55 +74,56 @@
 //! reports a liveness/non-convergence wedge instead of passing.
 //!
 //! Every bug this sweep found has been fixed:
-//! - **seed 17** — append-before-ack re-ack hole (the `appending` set is not a durability oracle; the
-//!   re-ack now consults the WAL's durable status directly);
-//! - **seed 24** (+ 29, 49, 84, 89, 90, 120, 131, 197) — adoption preserved a stale UNAPPLIED held copy
-//!   of a committed op the offset canonical log omits (a superseded earlier-view proposal), diverging
-//!   the committed log; fixed by preserving only the APPLIED prefix (`op <= commit_min`) and repairing
-//!   the omitted committed band from a peer;
-//! - **seed 36** — liveness wedge: a primary stuck on an unfillable committed hole now forfeits so a
-//!   healthy replica can take over;
-//! - **seed 52** — adoption WAL-staleness committed-divergence: `recover` blindly re-derived a committed
-//!   op from the WAL, resurrecting a STALE superseded body an adoption never re-wrote there. Fixed by
+//! - **append-before-ack re-ack hole** — the `appending` set is not a durability oracle; the
+//!   re-ack now consults the WAL's durable status directly;
+//! - **stale-unapplied-held-copy divergence** (multiple adversarial schedules) — adoption preserved a
+//!   stale UNAPPLIED held copy of a committed op the offset canonical log omits (a superseded
+//!   earlier-view proposal), diverging the committed log; fixed by preserving only the APPLIED prefix
+//!   (`op <= commit_min`) and repairing the omitted committed band from a peer;
+//! - **liveness wedge: unfillable committed hole** — a primary stuck on an unfillable committed hole
+//!   now forfeits so a healthy replica can take over;
+//! - **adoption WAL-staleness committed-divergence** — `recover` blindly re-derived a committed op
+//!   from the WAL, resurrecting a STALE superseded body an adoption never re-wrote there. Fixed by
 //!   persisting the canonical committed-band headers (TigerBeetle's `vsr_headers`) in the durable
 //!   `VsrState` and having `recover` cross-check each committed-band WAL slot against them, routing a
 //!   mismatch to peer-repair instead of trusting the stale body (NO wal.truncate, so NO durability dip);
-//! - **seeds 253 + 299 + 335** — recover re-loaded a SUPERSEDED earlier-view tail op from the WAL and
-//!   `advance_commit` applied its stale body for an op the new view committed with a different value
-//!   (committed-divergence across partition-heal + view-change + async-superblock + duplication). Fixed by
-//!   (1) truncating the WAL above the adopted canonical head on view adoption, and (2) extending the
-//!   `vsr_headers` recover cross-check to drop an above-durable-commit tail slot whose original header
-//!   `view` is below the durable `log_view` (a superseded proposal) → peer-repair the canonical body;
-//! - **seeds 164 + 103** — forced state-sync discarded an acked tail above the synced checkpoint;
-//! - **seed 151** — a view-monotonic CHECKER over-sensitivity, not a proto bug: it watched the volatile
+//! - **superseded-tail-op committed-divergence** (multiple adversarial schedules) — `recover` re-loaded
+//!   a SUPERSEDED earlier-view tail op from the WAL and `advance_commit` applied its stale body for an
+//!   op the new view committed with a different value (committed-divergence across partition-heal +
+//!   view-change + async-superblock + duplication). Fixed by (1) truncating the WAL above the adopted
+//!   canonical head on view adoption, and (2) extending the `vsr_headers` recover cross-check to drop an
+//!   above-durable-commit tail slot whose original header `view` is below the durable `log_view` (a
+//!   superseded proposal) → peer-repair the canonical body;
+//! - **force-sync discarded acked tail** (two adversarial schedules) — forced state-sync discarded an
+//!   acked tail above the synced checkpoint;
+//! - **view-monotonic CHECKER over-sensitivity** — not a proto bug: the checker watched the volatile
 //!   in-memory view across a restart, but a replica safely reverts to its DURABLE view on recovery (it
 //!   never participated in the un-durable view) and re-catches-up on the next higher-view message; the
 //!   checker now tracks the durable view;
-//! - **seed 313** — a final-INSTANT durability-CHECKER artifact, not a proto bug: the run ended on a tick
-//!   where a committed op the operational survivors held DURABLY on a quorum's WAL (the per-tick
+//! - **final-INSTANT durability-CHECKER artifact** — not a proto bug: an adversarial schedule ended on
+//!   a tick where a committed op the operational survivors held DURABLY on a quorum's WAL (the per-tick
 //!   structural quorum-durability check correctly never fired) had been APPLIED only by a since-crashed
 //!   replica, so the end-of-run "applied by an operational replica" assertion was stricter than VSR's
 //!   true durable-quorum-retention guarantee; `run_vopr` now runs a bounded final QUIESCE phase
 //!   (TigerBeetle's `transition_to_liveness_mode`) to converge the survivors before the end-of-run
 //!   assertions, kept strict (a committed op held by no quorum never converges and is reported).
-//! - **seeds 21 + 464** — an append-before-ack CHECKER over-sensitivity (surfaced by the misdirected-read
-//!   axis below), NOT a proto bug. A replica emits `PrepareOk(op, view = V)` legitimately in view V (op
-//!   IS durably appended); the sim drains `outgoing` only on the NEXT tick, and a view-change-to-`V+1`
-//!   that ran in between truncated the uncommitted tail above the new canonical head, emptying that WAL
-//!   slot. Re-checking the now-STALE `PrepareOk(view = V)` against the replica's post-truncation WAL is
-//!   stricter than VSR requires: the message carries `view = V`, and the proto's `on_prepare_ok` DROPS
-//!   any ack whose `view != self.view`, so a `view < current` ack can never count toward a commit quorum
-//!   — it is inert (seed 464 needs the misdirected recovery read to reach the shape; seed 21 reaches it
-//!   on the schedule alone). FIXED in the CHECKER (`Cluster::tick`): the append-before-ack proxy exempts
-//!   a `msg_view < cur_view` stale ack (same seed-151-class lesson — fix the checker, never the proto);
-//!   a `msg_view >= cur_view` non-durable ack still trips.
-//! - **seed 622** — a TRUE liveness wedge (forfeit StartViewChange STORM): a Normal primary stuck
-//!   `pending_forfeit` (it forfeited while the cluster ran on in a higher view) RE-BROADCAST a
-//!   `StartViewChange` on EVERY `handle_timeout` tick, because `primary_timeouts` called `forfeit()` →
-//!   `propose_next_view()` unconditionally. In the nanosecond-clock simulator that storm pins the virtual
-//!   clock to sub-millisecond steps, starving the LIVE view's primary's 50ms Commit heartbeat → the
-//!   stale-view holdout never hears the new view to catch up, livelocking the cluster. FIXED in the proto:
-//!   the forfeit re-propose is now gated on the `svc_message` retransmit timer (one SVC per
+//! - **append-before-ack CHECKER over-sensitivity** (two adversarial schedules, surfaced by the
+//!   misdirected-read axis below), NOT a proto bug. A replica emits `PrepareOk(op, view = V)` legitimately
+//!   in view V (op IS durably appended); the sim drains `outgoing` only on the NEXT tick, and a
+//!   view-change-to-`V+1` that ran in between truncated the uncommitted tail above the new canonical head,
+//!   emptying that WAL slot. Re-checking the now-STALE `PrepareOk(view = V)` against the replica's
+//!   post-truncation WAL is stricter than VSR requires: the message carries `view = V`, and the proto's
+//!   `on_prepare_ok` DROPS any ack whose `view != self.view`, so a `view < current` ack can never count
+//!   toward a commit quorum — it is inert. FIXED in the CHECKER (`Cluster::tick`): the
+//!   append-before-ack proxy exempts a `msg_view < cur_view` stale ack (same class of checker fix —
+//!   fix the checker, never the proto); a `msg_view >= cur_view` non-durable ack still trips.
+//! - **liveness wedge: forfeit StartViewChange STORM** — a Normal primary stuck `pending_forfeit` (it
+//!   forfeited while the cluster ran on in a higher view) RE-BROADCAST a `StartViewChange` on EVERY
+//!   `handle_timeout` tick, because `primary_timeouts` called `forfeit()` → `propose_next_view()`
+//!   unconditionally. In the nanosecond-clock simulator that storm pins the virtual clock to
+//!   sub-millisecond steps, starving the LIVE view's primary's 50ms Commit heartbeat → the stale-view
+//!   holdout never hears the new view to catch up, livelocking the cluster. FIXED in the proto: the
+//!   forfeit re-propose is now gated on the `svc_message` retransmit timer (one SVC per
 //!   `VC_MESSAGE_RETRANSMIT` window, like `view_change_timeouts`) — the persistent step-down + heartbeat
 //!   suppression are preserved, only the per-tick storm is removed.
 
@@ -130,15 +131,14 @@ use vsrr_simulation::{DEFAULT_TICKS, run_vopr, run_vopr_one};
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
 /// coverage over raw count: each seed runs a few thousand ticks of rich adversarial schedule. With the
-/// async-superblock mode ON in [`run_vopr`] (the pending-durable-view window, codex R8-F1), this whole
-/// `0..SEEDS` range is verified clean — including seed 52, fixed by the `vsr_headers` recovery
-/// cross-check (a wide `0..512` catch-panic re-scan with async-SB on is clean end to end, including
-/// seed 313, fixed by the final-quiesce phase in [`run_vopr`]).
+/// async-superblock mode ON in [`run_vopr`] (the pending-durable-view window), this whole
+/// `0..SEEDS` range is verified clean — including the `vsr_headers` recovery cross-check fix and
+/// the final-quiesce fix (a wide `0..512` catch-panic re-scan with async-SB on is clean end to end).
 const SEEDS: u64 = 64;
 
 /// Seeds that historically caught a real bug, pinned as regression protection even above the contiguous
 /// `0..SEEDS` range. All pass with the async-superblock mode on; these guard against any of those
-/// specific divergences/wedges ever returning. Seed 52 (the `vsr_headers` recovery fix) is also covered
+/// specific divergences/wedges ever returning. The `vsr_headers` recovery fix is also covered
 /// by the contiguous range, but stays pinned here as an explicit named guard against its return.
 const REGRESSION_SEEDS: &[u64] = &[
   21, 52, 84, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622,
@@ -155,7 +155,7 @@ fn vopr_sweep_no_violations() {
   let mut max_recovered_band = 0u64;
   let mut total_forced_syncs = 0u64;
   let mut total_misdirects = 0u64;
-  // M3.2b Phase C — the bounded-WAL (wrap) axis. Partition seeds into bounded/unbounded and tally the
+  // Bounded-WAL (wrap) axis. Partition seeds into bounded/unbounded and tally the
   // wrap-exercised witnesses: how many seeds ran a bounded ring, the cumulative WAL stalls across them
   // (the ring filled + the primary stalled — wrap engaged), the below-ring-window backup-overflow syncs
   // (rare under this schedule), the largest committed history on any bounded seed (its head climbed past
@@ -205,17 +205,17 @@ fn vopr_sweep_no_violations() {
     seeds_with_view_change > 0,
     "no seed drove a view change — failover is not being exercised"
   );
-  // R8-F1 non-vacuity: the async-superblock mode must actually OPEN the pending-durable-view window
-  // (a Normal primary whose view is not yet durable) somewhere across the sweep — otherwise the
-  // durable-view-before-participate gates (codex R8-F1) are being checked vacuously. `> 0` proves a
+  // Async-superblock non-vacuity: the async-superblock mode must actually OPEN the pending-durable-view
+  // window (a Normal primary whose view is not yet durable) somewhere across the sweep — otherwise the
+  // durable-view-before-participate gates are being checked vacuously. `> 0` proves a
   // seed drove a replica into that window while a view-change root write was in flight.
   assert!(
     total_pending_view_windows > 0,
-    "async-superblock never opened the pending-durable-view window — the R8-F1 gate is untested"
+    "async-superblock never opened the pending-durable-view window — the durable-view gate is untested"
   );
-  // Adversarial-coverage axes (audit hardening) must actually FIRE, or they are vacuous:
+  // Adversarial-coverage axes must actually FIRE, or they are vacuous:
   // - large `checkpoint_ops` materialized a NON-trivial recovered committed band (well above the small
-  //   interval's ~12 ceiling), so the R13-F1 recover read-window path (`commit_max` far above
+  //   interval's ~12 ceiling), so the large-checkpoint recover read-window path (`commit_max` far above
   //   `checkpoint_op`) is exercised over a real multi-hundred-op band, not always a tiny one;
   // - the misdirected-read axis fired, exercising the recovery/repair placement-integrity checks
   //   (`header.op() == op`) that the DST otherwise never reaches;
@@ -236,12 +236,12 @@ fn vopr_sweep_no_violations() {
     "no forced-sync/peer-fetch escalation occurred across the sweep — finding B may have silently \
      removed that coverage (forced_syncs={total_forced_syncs})"
   );
-  // M3.2b Phase C — the bounded-WAL (wrap) axis must genuinely fire, or the wrap coverage is vacuous:
+  // Bounded-WAL (wrap) axis must genuinely fire, or the wrap coverage is vacuous:
   // - SOME seeds ran the bounded ring (the ~1/3 seed-derived draw — sanity that the axis is wired and
   //   the env mask is off);
   // - across those bounded seeds the primary STALLED (`wal_stalls > 0`): the ring genuinely FILLED and
   //   the physical stall-before-wrap engaged under the full crash + partition + disk-fault schedule —
-  //   wrap was EXERCISED, not vacuously skipped by an under-filled ring (the headline M3.2b stress);
+  //   wrap was EXERCISED, not vacuously skipped by an under-filled ring (the headline bounded-WAL stress);
   // - SOME bounded seed genuinely WRAPPED (committed strictly more ops than its ring size `N`), so an op
   //   `K + N` physically reused op `K`'s slot — the strongest single witness the wrap path did real work.
   // The per-tick ring-residency checker (in `run_vopr`) proves no wrap ever dropped a needed op; these
@@ -270,21 +270,20 @@ fn vopr_sweep_no_violations() {
   let _ = total_below_ring_window_syncs;
 }
 
-/// Regression for VOPR seed 313: a FINAL-INSTANT durability-checker artifact, NOT a proto loss.
+/// Regression for the final-quiesce fix: a FINAL-INSTANT durability-checker artifact, NOT a proto loss.
 ///
-/// At the run's last tick the committed-history high-water op (1141) was APPLIED only by a replica
+/// Under an adversarial schedule the committed-history high-water op was APPLIED only by a replica
 /// that happened to be CRASHED at that instant, while two OPERATIONAL survivors held that op DURABLY
 /// on their WAL (so the committed op was retained by a quorum — the per-tick structural
 /// quorum-durability check never fired) but had not yet APPLIED it (commit catch-up still in flight,
-/// their `commit_max` had not yet learned op 1141 was committed). The end-of-run durability assertion
+/// their `commit_max` had not yet learned the op was committed). The end-of-run durability assertion
 /// asked for the committed history to be APPLIED by an operational replica AT THAT ARBITRARY INSTANT —
 /// strictly stronger than VSR's true guarantee (a committed op survives on a quorum's DURABLE storage;
 /// application is local catch-up that completes eventually). The fix gives [`run_vopr`] a final
 /// bounded QUIESCE phase (heal everything, restart all, no faults, tick to convergence) BEFORE the
 /// end-of-run assertions — exactly TigerBeetle's VOPR `transition_to_liveness_mode` discipline — so the
-/// survivors apply the durably-held committed tail before the check. (Verified: from that final instant
-/// a healed cluster converges all five replicas to applied=1141 in ~74 ticks.) This run is a pure
-/// function of the seed, so the artifact reproduces exactly and the drained run must now pass.
+/// survivors apply the durably-held committed tail before the check. This run is a pure function of
+/// the seed, so the artifact reproduces exactly and the drained run must now pass.
 #[test]
 fn seed_313_final_quiesce_converges_the_durably_held_committed_tail() {
   // Must NOT panic: the final quiesce phase drains the committed tail the (operational) survivors
@@ -295,12 +294,12 @@ fn seed_313_final_quiesce_converges_the_durably_held_committed_tail() {
   // not a quiet happy path that would trivially have converged already.
   assert!(
     r.max_committed() >= 1_000,
-    "seed 313 commits a long history (got {})",
+    "this schedule commits a long history (got {})",
     r.max_committed()
   );
   assert!(
     r.crashes() > 0 && r.restarts() > 0 && r.max_view() >= 1,
-    "seed 313 exercised crash/restart + failover before the final quiesce (crashes={}, restarts={}, \
+    "this schedule exercised crash/restart + failover before the final quiesce (crashes={}, restarts={}, \
      max_view={})",
     r.crashes(),
     r.restarts(),

@@ -42,7 +42,7 @@
 //!   durably retained — but it is not yet applied by an operational replica); VSR's guarantee is
 //!   durable-quorum retention, with application a local catch-up that the drain completes. The per-tick
 //!   checks stay live through the drain, so a committed op held by NO quorum never converges and the
-//!   phase panics with a non-convergence wedge rather than passing (VOPR seed 313).
+//!   phase panics with a non-convergence wedge rather than passing.
 //!
 //! On ANY violation the driver **panics** with `seed`, `tick`, and a one-line description, so the
 //! failure is reproducible by re-running that seed (see [`run_vopr_one`]).
@@ -86,7 +86,7 @@ pub struct VoprReport {
   max_view: u64,
   /// Whether every client completed all its requests by the end of the run.
   all_clients_done: bool,
-  /// Ticks on which at least one replica was observed in the R8-F1 pending-durable-view window (a
+  /// Ticks on which at least one replica was observed in the pending-durable-view window (a
   /// `Normal` primary whose volatile view is ahead of its durable view — a view-change root write in
   /// flight). `> 0` proves the async-superblock mode actually opened the window this run exercises,
   /// so the durable-view-before-participate gate was genuinely tested rather than vacuously skipped.
@@ -99,7 +99,7 @@ pub struct VoprReport {
   /// The high-water mark of the RECOVERED COMMITTED BAND width (`commit_max - checkpoint_op`) sampled
   /// on a replica IMMEDIATELY AFTER a `restart` (i.e. right after `recover` ran). `> ~12` proves the
   /// large-`checkpoint_ops` axis genuinely materialized a NON-trivial committed band on a recovering
-  /// replica — so the R13-F1 recover read-window logic (`commit_max` well above `checkpoint_op`) was
+  /// replica — so the recover read-window logic (`commit_max` well above `checkpoint_op`) was
   /// exercised over a real multi-hundred-op band, not always the tiny ≈4..=12 the small-interval seeds
   /// produce. Stays far below `RECOVER_TAIL_WINDOW = 8192` (the tick budget caps committed ops at
   /// ~1.1k), so the extreme window-clip case remains unit-tested in the proto.
@@ -108,14 +108,14 @@ pub struct VoprReport {
   /// accumulated across crash/restart (each `recover` resets the proto's per-replica counter, so this
   /// folds in the value before each reset). A forced sync is the proto's escalation when a replica
   /// cannot recover a committed checkpoint/op from its OWN disk and must FETCH it from a peer — both
-  /// the M3.5 pruned-committed-hole strand AND the F1 recover-checkpoint peer-fetch (a replica whose
+  /// the pruned-committed-hole escalation path AND the recover-checkpoint peer-fetch (a replica whose
   /// own durable checkpoint snapshot reads back unusable). It is the observability proxy for
   /// "peer-fetch escalation": the two-slot-superblock fix (finding B) removes the SPURIOUS escalations
   /// (an orphaned checkpoint a redundant-copy backend would still hold locally) while a GENUINELY
   /// far-behind replica (its own checkpoint truly subsumed/gone) still escalates — so this count must
   /// stay `> 0` after the fix, proving the path is still exercised.
   forced_syncs: u64,
-  /// The bounded WAL ring size `N` this run was seeded with (M3.2b Phase C), or `None` if this seed runs
+  /// The bounded WAL ring size `N` this run was seeded with, or `None` if this seed runs
   /// the UNBOUNDED default (≈2/3 of seeds). When `Some(n)`, every replica's WAL is a fixed `n`-slot ring
   /// (op `K` occupies slot `K mod n`), so the primary STALLS op-assignment before it would physically
   /// wrap an un-pruned slot. `n` is sized `checkpoint_ops * k + headroom` (`k` in 3..=6) — always well
@@ -208,7 +208,7 @@ impl VoprReport {
     self.all_clients_done
   }
 
-  /// The number of ticks on which at least one replica was in the R8-F1 pending-durable-view window
+  /// The number of ticks on which at least one replica was in the pending-durable-view window
   /// (a `Normal` primary whose view is not yet durable). `> 0` ⇒ the async-superblock mode genuinely
   /// opened the window this run, so the durable-view-before-participate gate was exercised.
   pub const fn pending_view_windows_seen(&self) -> u64 {
@@ -223,8 +223,8 @@ impl VoprReport {
 
   /// The high-water of the RECOVERED COMMITTED BAND width (`commit_max - checkpoint_op`) sampled right
   /// after a `restart`. A value well above the small-interval ceiling (≈12) ⇒ the large-`checkpoint_ops`
-  /// axis genuinely had a recovering replica reconstruct a non-trivial committed band (the R13-F1
-  /// recover read-window path), rather than always the trivially-tiny band the small interval yields.
+  /// axis genuinely had a recovering replica reconstruct a non-trivial committed band via the
+  /// recover read-window path, rather than always the trivially-tiny band the small interval yields.
   pub const fn recovered_band_max(&self) -> u64 {
     self.recovered_band_max
   }
@@ -237,7 +237,7 @@ impl VoprReport {
     self.forced_syncs
   }
 
-  /// The bounded WAL ring size `N` this run was seeded with (M3.2b Phase C), or `None` for an UNBOUNDED
+  /// The bounded WAL ring size `N` this run was seeded with, or `None` for an UNBOUNDED
   /// seed. `Some(n)` ⇒ every WAL is a fixed `n`-slot ring and the primary stalls before wrapping an
   /// un-pruned slot; the sweep uses this to partition seeds into bounded/unbounded for the non-vacuity
   /// assertions (only bounded seeds exercise wrap).
@@ -294,19 +294,19 @@ struct Vopr {
   /// microseconds per tick and 800 ticks can span ~2ms — far less than the proto's 100ms
   /// `PREPARE_RETRANSMIT` cadence. Convergence of the un-acked head op to a laggard backup is
   /// retransmit-gated, so a tick-only calm window can end before a single retransmit fires and spuriously
-  /// flag a "livelock" that is really just timer-gated catch-up (the seed-622 nanosecond-clock lesson:
-  /// liveness must be judged over a virtual-time-meaningful window, not a raw tick count).
+  /// flag a "livelock" that is really just timer-gated catch-up. Liveness must be judged over a
+  /// virtual-time-meaningful window, not a raw tick count.
   calm_start_virtual: Instant,
   /// Per-replica last-observed FORCED-state-sync count, for cumulative accumulation across crash/restart
   /// (a `recover` resets the proto's per-replica counter to 0, so we fold each positive delta into the
   /// report's running total and a reset's downward step contributes nothing). Indexed by replica.
   forced_sync_seen: Vec<u64>,
-  /// Per-replica last-observed WAL-STALL count (M3.2b Phase C), for the same reset-robust cumulative
+  /// Per-replica last-observed WAL-STALL count, for the same reset-robust cumulative
   /// accumulation as [`Self::forced_sync_seen`]: the proto's `wal_stalls` counter ALSO resets to 0 on
   /// `recover` (it lives on the `Endpoint`, rebuilt each restart — see `recovery.rs`), so a plain
   /// high-water would lose a pre-restart stall burst. Indexed by replica.
   wal_stalls_seen: Vec<u64>,
-  /// Per-replica last-observed BELOW-RING-WINDOW-sync count (M3.2b Phase C), accumulated reset-robustly
+  /// Per-replica last-observed BELOW-RING-WINDOW-sync count, accumulated reset-robustly
   /// like [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by
   /// replica.
   below_ring_window_syncs_seen: Vec<u64>,
@@ -314,7 +314,7 @@ struct Vopr {
   /// high-water and whether any client still had outstanding work. Used to assert progress at the end.
   calm_baseline_committed: usize,
   calm_had_outstanding: bool,
-  /// The bounded WAL ring size `N` seeded for this run (M3.2b Phase C), or `None` for the UNBOUNDED
+  /// The bounded WAL ring size `N` seeded for this run, or `None` for the UNBOUNDED
   /// default. Held here (not just in the report) because the per-tick RING-RESIDENCY checker
   /// ([`Vopr::check_ring_residency`]) is meaningful ONLY on a bounded seed — on an unbounded WAL every
   /// op is trivially resident, so the checker short-circuits when this is `None`.
@@ -337,14 +337,14 @@ pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
   let mut vm = ViewMonotonicChecker::new(v.n);
   // Generous structural bound: the per-op caches/WAL plateau near a few checkpoint intervals plus
   // pipeline headroom; a real unbounded-growth leak blows well past this. Clients are bounded by the
-  // active client set. (Mirrors the M3.4b gate's reasoning.)
+  // active client set.
   let bound = BoundednessChecker::new(4_096, v.n + v.report.clients + 8);
 
   for tick in 0..ticks {
     v.step_phase(&mut c, tick);
     v.apply_actions(&mut c, tick);
     c.tick();
-    // R8-F1: adversarially probe the pending-durable-view window THIS tick — deliver a GetView +
+    // adversarially probe the pending-durable-view window THIS tick — deliver a GetView +
     // Recovery and fire the primary timers to any replica that is a Normal primary whose view is not
     // yet durable (a `StartViewAsPrimary` root write in flight). The window is short, so this targeted
     // probe (rather than incidental coincidence) is what actually exercises the
@@ -356,7 +356,7 @@ pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
 
   // Final QUIESCE phase (TigerBeetle's VOPR `transition_to_liveness_mode`): heal everything, restart
   // every crashed replica, drop all faults, and tick to convergence BEFORE the end-of-run assertions.
-  // Rationale (VOPR seed 313): the chaos loop can end on an arbitrary instant where the
+  // Rationale: the chaos loop can end on an arbitrary instant where the
   // committed-history high-water op is APPLIED only by a since-crashed replica while the operational
   // survivors hold that op DURABLY on a quorum's WAL but have not yet APPLIED it (commit catch-up in
   // flight). That is NOT a lost op — VSR's guarantee is durable-quorum RETENTION, with application a
@@ -402,8 +402,8 @@ const CALM_TICKS: u64 = 800;
 /// retransmit/heartbeat-gated, so a tick-only window can end before a single retransmit fires and
 /// spuriously flag a "livelock" that is really timer-gated catch-up. 3000ms covers ≥30 prepare
 /// retransmits / 6 view-change-status periods — ample for a healed cluster to converge — while a
-/// cluster still wedged after that much virtual time is a genuine liveness bug. (The seed-622 lesson:
-/// liveness is a virtual-time property; never judge it on raw tick count under a nanosecond clock.)
+/// cluster still wedged after that much virtual time is a genuine liveness bug. Liveness is a
+/// virtual-time property; never judge it on raw tick count under a nanosecond clock.
 const CALM_MIN_VIRTUAL: Duration = Duration::from_millis(3_000);
 
 /// The bound (in ticks) on the final QUIESCE phase: a healed, all-up, fault-free cluster must apply
@@ -417,7 +417,7 @@ const FINAL_QUIESCE_TICKS: u64 = 6_000;
 impl Vopr {
   fn new(seed: u64) -> Self {
     let mut prng = Prng::new(seed);
-    // Cluster size from {2, 3, 4, 5, 6} — including EVEN N and the sharp N=2 case (audit coverage of
+    // Cluster size from {2, 3, 4, 5, 6} — including EVEN N and the sharp N=2 case (covering
     // the quorum/nack arithmetic). `Config::try_new` accepts any `1..=64`, and the derived quorums are
     // sane for every size: quorum = ⌊n/2⌋+1, quorum_view_change = quorum_nack_prepare = n − quorum + 1
     // (N=2 → quorum 2 = unanimous, vc/nack 1 = a single DVC/nack suffices; N=4 → 3 / 2; N=6 → 4 / 3),
@@ -467,17 +467,18 @@ impl Vopr {
     // Checkpoint interval. MOST seeds use a SMALL interval (4..=12) so a few-thousand-tick run crosses
     // several checkpoints (exercising checkpoint + GC + checkpoint-based recovery repeatedly). But a
     // small interval keeps the durable `checkpoint_op` always close behind `commit_max`, so the
-    // RECOVERED COMMITTED BAND (`(checkpoint_op .. commit_max]` — the span the R13-F1 recover
+    // RECOVERED COMMITTED BAND (`(checkpoint_op .. commit_max]` — the span the recover
     // read-window logic materializes + re-applies) is ALWAYS trivially tiny. So ~1/3 of seeds instead
     // pick a substantially LARGER interval (256..=768): such a run rarely (or never) reaches the first
     // checkpoint within the tick budget, so `checkpoint_op` stays low while `commit_max` climbs into
     // the hundreds — a restart then recovers a non-trivial committed band, genuinely exercising the
-    // R13-F1 path (`commit_max` far above `checkpoint_op`) rather than always the ≈4..=12 case. Both
+    // recover read-window path (`commit_max` far above `checkpoint_op`) rather than always the ≈4..=12
+    // case. Both
     // branches draw from the SAME prng position regardless (the `large_ckpt` roll is unconditional), so
     // the schedule stays a pure function of the seed. NOTE (honest limitation): the 4000-tick budget
-    // commits at most ~1.1k ops (the longest historical run, seed 313), so even the largest band stays
+    // commits at most ~1.1k ops in a typical run, so even the largest band stays
     // FAR below `RECOVER_TAIL_WINDOW = 8192` — this axis stops the band from being trivially small and
-    // exercises the read-window arithmetic over a real multi-hundred-op band, but the EXTREME R13-F1
+    // exercises the read-window arithmetic over a real multi-hundred-op band, but the EXTREME
     // case (`commit_max > 8192`, where the window cap actually clips a held committed op) remains
     // unit-tested in `vsrr-proto`, not reachable here.
     let large_ckpt = self.prng.chance(1, 3);
@@ -486,10 +487,10 @@ impl Vopr {
     } else {
       4 + self.prng.below(9)
     };
-    // M3.2b Phase C: seed-derive a PHYSICAL bounded-WAL ring for ~1/3 of seeds (the rest keep the
+    // seed-derive a PHYSICAL bounded-WAL ring for ~1/3 of seeds (the rest keep the
     // UNBOUNDED default), so the adversarial sweep finally EXERCISES wrap (stall-before-wrap + recover
     // off a wrapped ring + a below-ring-window backup overflow) UNDER the full fault schedule — crash +
-    // partition + disk faults together — closing the audit's biggest "VOPR-green overstates safety" gap.
+    // partition + disk faults together — covering the "VOPR-green overstates safety" gap.
     //
     // CRITICAL headroom constraint: the primary stalls op-assignment so the un-pruned window
     // `(prune_floor, op]` never exceeds `N` slots, and that stall RELEASES only as the quorum checkpoint
@@ -508,7 +509,7 @@ impl Vopr {
     //
     // The bounded decision is drawn from a SEPARATE per-seed PRNG (`seed ^ BOUNDED_WAL_SEED_MAGIC`), NOT
     // the action stream `self.prng`, for two reasons: (1) it leaves every seed's action schedule +
-    // checkpoint_ops + async delays BYTE-IDENTICAL to the pre-Phase-C sweep, so the ~2/3 unbounded seeds
+    // checkpoint_ops + async delays BYTE-IDENTICAL to the unbounded-only sweep, so the ~2/3 unbounded seeds
     // (and every pinned regression seed that lands unbounded) reproduce their EXACT historical scenario —
     // adding draws to `self.prng` here would shift the whole downstream schedule and silently change what
     // those seeds test; (2) it is still a pure deterministic function of `seed`, UNCONDITIONAL (the env
@@ -537,8 +538,8 @@ impl Vopr {
     let delay = 1 + self.prng.below(4) as u32;
     c.set_async_wal_delay(Some(delay));
     // Async SUPERBLOCK: a per-write in-flight window of 1..=4 polls (the pending durable-view window
-    // the durable-view-before-participate gate must survive, codex R8-F1). With the superblock
-    // completing synchronously the `pending_sb` window never opened, so the VOPR could not see R8-F1;
+    // the durable-view-before-participate gate must survive. With the superblock
+    // completing synchronously the `pending_sb` window never opened, so the VOPR could not probe it;
     // staging the view-change/checkpoint root writes opens it. Seeded per-run; a `crash` discards any
     // in-flight write so a not-yet-durable view is genuinely lost.
     // The `sb_delay` is drawn UNCONDITIONALLY (determinism); `VOPR_NO_ASYNC_SB` only suppresses
@@ -552,7 +553,7 @@ impl Vopr {
     // Baseline storage + network faults for the chaos phases (toggled around calm windows).
     c.set_storage_faults(self.chaos_storage_faults());
     c.set_faults(self.chaos_network_faults());
-    // M3.2b Phase C: install the seed-derived bounded ring LAST so its storage rebuild composes over the
+    // install the seed-derived bounded ring LAST so its storage rebuild composes over the
     // async-WAL/superblock modes + the storage-fault plan set above (each rebuild preserves the others'
     // settings; `set_wal_capacity` is just the final pass that also fixes `capacity()` to `N`). On an
     // unbounded seed `wal_capacity` is `None` and this is skipped (the WAL keeps its `u64::MAX` default).
@@ -607,7 +608,7 @@ impl Vopr {
     // on a later read (it never permanently removes a correct copy, so it is inherently quorum-safe:
     // every replica's own disk still eventually reads each slot correctly).
     let misdirect = self.prng.below(40) as u32;
-    // TRANSIENT corrupt-but-PARSEABLE checkpoint reads (codex R23-F1): a checkpoint read returns the
+    // TRANSIENT corrupt-but-PARSEABLE checkpoint reads: a checkpoint read returns the
     // live snapshot with a flipped tail byte — it still DECODES and keeps its bound op, but hashes to a
     // DIFFERENT id than the durable root. The donor's serve path (and recover) must verify against the
     // durable id and DROP it rather than ship/restore corrupt state. Drawn UNCONDITIONALLY (so a
@@ -649,7 +650,7 @@ impl Vopr {
       // axis) 800 ticks can be ~2ms, less than one `PREPARE_RETRANSMIT` (100ms), so a retransmit-gated
       // catch-up would not yet have had a chance to fire. Extend the calm window (keep faults off, all
       // up) by another tick budget and re-check; this loop terminates because each extension ticks the
-      // healthy cluster forward and the virtual clock is monotone. (The seed-622 lesson.)
+      // healthy cluster forward and the virtual clock is monotone.
       let spanned = c.now().saturating_duration_since(self.calm_start_virtual);
       if spanned < CALM_MIN_VIRTUAL {
         self.phase_until = tick + CALM_TICKS;
@@ -732,7 +733,7 @@ impl Vopr {
   /// committed op is durably RETAINED on a quorum (WAL/snapshot); APPLYING it is local catch-up that
   /// completes once the cluster is healthy. The chaos loop can stop on an instant where a committed op
   /// the operational replicas hold durably-but-unapplied was applied only by a now-crashed replica
-  /// (VOPR seed 313) — asserting applied-by-an-operational-replica THERE is stricter than the true
+  /// — asserting applied-by-an-operational-replica at that instant is stricter than the true
   /// guarantee. Draining first lets the survivors apply the durably-held tail, so the subsequent
   /// assertion tests the real invariant. It stays STRICT for a genuine loss: the per-tick checks run
   /// throughout the drain (a divergence is exposed, never hidden), and a committed op held by NO quorum
@@ -917,8 +918,8 @@ impl Vopr {
   /// Restart replica `i` and SAMPLE its recovered committed band (`commit_max - checkpoint_op`,
   /// reconstructed by `recover` and reflected immediately because `Cluster::restart` drains the
   /// Recovering loop synchronously). Folds the band into the report high-water so the
-  /// large-`checkpoint_ops` axis (TASK 3) can be asserted non-vacuous — a recovering replica really did
-  /// materialize a non-trivial committed band via the R13-F1 read-window path. Every restart site goes
+  /// large-`checkpoint_ops` axis can be asserted non-vacuous — a recovering replica really did
+  /// materialize a non-trivial committed band via the recover read-window path. Every restart site goes
   /// through here so the high-water captures the band wherever recovery fires (chaos action, calm
   /// window, or final quiesce). Bumps the restart counter too (one place).
   fn restart_and_track(&mut self, c: &mut Cluster, i: usize) {
@@ -954,7 +955,7 @@ impl Vopr {
     if let Some(why) = c.take_append_before_ack_violation() {
       panic!("vopr seed {} tick {tick}: {why}", self.seed);
     }
-    // Durable-view-before-participate (R8-F1): a StartView / head-bearing RecoveryResponse for a view
+    // Durable-view-before-participate: a StartView / head-bearing RecoveryResponse for a view
     // above the emitter's durable view, observed during the tick + the pending-view-window probe.
     if let Some(why) = c.take_durable_view_violation() {
       panic!("vopr seed {} tick {tick}: {why}", self.seed);
@@ -1040,7 +1041,7 @@ impl Vopr {
     }
   }
 
-  /// The M3.2b Phase-C RING-RESIDENCY safety invariant — the PHYSICAL analogue of "no committed op
+  /// The RING-RESIDENCY safety invariant — the PHYSICAL analogue of "no committed op
   /// lost", checked every tick on a BOUNDED seed (a no-op on an unbounded one, where the ring is
   /// `u64::MAX` slots so a wrap is impossible, hence the short-circuit). The invariant, faithful to the
   /// `bounded_wal.rs` `tail_is_ring_resident` intent ("a wrap must NEVER drop an op recover/repair still
@@ -1055,23 +1056,23 @@ impl Vopr {
   /// Why "slot reused by a later op", NOT merely "slot is `Empty`": a committed op's WAL slot can be
   /// legitimately `Empty` under the adversarial VOPR in ways that are NOT a wrap and that `recover`
   /// repairs/re-syncs cleanly — so flagging every `Empty` slot false-positives. The three benign `Empty`
-  /// cases observed (each verified real-vs-checker, fix-the-checker-not-the-proto, the seed-151 lesson):
+  /// cases observed (each verified by running the cluster, fix-the-checker-not-the-proto):
   /// (1) **async in-flight** — the freshest tail ops are transiently `Dirty`, not yet durable (the
   /// append-before-ack window); (2) **applied-from-cache** — a BACKUP advances `commit_min` by applying an
   /// op from its in-memory `log` cache once it learns the op is committed, WITHOUT that op being durable in
   /// its OWN WAL (its slot may be `Empty`/`Dirty`/abandoned); `recover` routes such a non-durable tail slot
-  /// through the peer-repair path, and durability is held on a quorum elsewhere (VOPR seed 28: a backup at
-  /// commit_min=1558 had op 1554 `Empty` with NO later occupant — applied-from-cache, not a wrap); (3)
-  /// **state-sync-pruned + R24-F1-deferred checkpoint** — a just-synced replica has already
+  /// through the peer-repair path, and durability is held on a quorum elsewhere (a backup at
+  /// commit_min=1558 may have op 1554 `Empty` with no later occupant — applied-from-cache, not a wrap); (3)
+  /// **state-sync-pruned + deferred-checkpoint** — a just-synced replica has already
   /// `wal.prune(synced_ckpt)`d and advanced `commit_min` to the synced point, while `self.checkpoint_op`
   /// still reads the OLD durable value until the synced ROOT is durable, so the band
-  /// `(checkpoint_op .. commit_min]` is full of snapshot-subsumed `Empty` slots (VOPR seed 22:
+  /// `(checkpoint_op .. commit_min]` is full of snapshot-subsumed `Empty` slots (e.g.
   /// commit_min=815, checkpoint_op=804, the 805..815 band snapshot-subsumed). A true WRAP differs from all
   /// three: the slot is occupied by a LATER op (the evicting generation), and the bounded ring keys its
   /// resident map by op number, so a later congruent op being resident is the exact, unambiguous physical
   /// signature of `op` having been overwritten. (Also bound by `commit_min`, not `head`: a backup can
   /// ADOPT a head far ahead of its resident tail with a legitimate un-repaired uncommitted `Empty` gap —
-  /// VOPR seed 19, head=1436 over commit_min=1401 — which is repair territory, not a wrap.)
+  /// a backup can adopt a head far ahead of its resident tail, e.g. head=1436 over commit_min=1401, which is repair territory, not a wrap.)
   ///
   /// This is the observable analogue of the proto's permanent `append_prepare` debug-assert (which panics
   /// at append time if any append would overwrite an un-pruned slot): both backstop the stall-before-wrap
@@ -1188,7 +1189,7 @@ impl Vopr {
     }
   }
 
-  /// Fold the cluster's current state into the running report (high-waters only). The R8-F1
+  /// Fold the cluster's current state into the running report (high-waters only). The
   /// pending-view-window counter is maintained by the per-tick probe in [`run_vopr`], not here.
   fn update_report(&mut self, c: &Cluster) {
     self.report.max_committed = self.report.max_committed.max(max_committed(c));
@@ -1213,7 +1214,7 @@ impl Vopr {
       }
       self.forced_sync_seen[i] = cur;
     }
-    // M3.2b Phase C non-vacuity counters. `wal_stalls` (the primary dropped a request rather than wrap
+    // Bounded-WAL non-vacuity counters. `wal_stalls` (the primary dropped a request rather than wrap
     // an un-pruned ring slot) and `below_ring_window_syncs` (a backup overflowed its ring window and
     // state-synced rather than overwrite an un-pruned slot) BOTH live on the `Endpoint` and reset to 0
     // on `recover`, so they use the SAME reset-robust positive-delta accumulation as `forced_syncs`

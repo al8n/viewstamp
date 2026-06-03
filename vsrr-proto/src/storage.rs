@@ -1,7 +1,7 @@
 //! Pluggable durable-storage contract: value types + the `Wal`/`Superblock` traits.
 //!
 //! The proto owns no log; it orchestrates consensus over a user-supplied `Wal` +
-//! `Superblock` (wired in M3.1). All faults surface as data (`SlotStatus::Faulty`,
+//! `Superblock`. All faults surface as data (`SlotStatus::Faulty`,
 //! `WalDone::Fault`) — never as panics; the proto verifies `Header` checksums itself.
 
 use std::vec::Vec;
@@ -186,7 +186,7 @@ impl Header {
 
   fn compute_checksum(&self) -> u128 {
     // Hash exactly the canonical body bytes — the same bytes [`Self::encode`] embeds — so the
-    // codec output and the checksum are derived from one definition (audit P3).
+    // codec output and the checksum are derived from one definition.
     let mut buf = Vec::with_capacity(HEADER_CANONICAL_LEN);
     self.write_canonical(&mut buf);
     fnv1a_128(&buf)
@@ -260,7 +260,7 @@ impl Header {
 /// struct, one root write) and let `recover` independently verify each committed-band WAL slot against
 /// the canonical body checksum — a slot whose own (self-consistent) header kept a STALE superseded
 /// body is then DETECTED and routed to peer-repair instead of blindly re-derived from the WAL. The set
-/// is SPARSE (codex R12-F1): one header per committed-band op the writer HELD, so a repair hole omits
+/// is SPARSE: one header per committed-band op the writer HELD, so a repair hole omits
 /// only that op while later held ops keep their headers (recovery verifies each held op individually
 /// rather than dropping a whole suffix below one hole). The band is bounded by `Config::checkpoint_ops`
 /// (post-checkpoint GC keeps `commit - checkpoint_op` within ~one checkpoint interval), so the list
@@ -271,14 +271,14 @@ pub struct VsrState {
   log_view: View,
   /// The KNOWN-committed frontier — VSR's commit-number `k`, the highest op the writer KNOWS is
   /// committed cluster-wide (the replica's `commit_max`), which `recover` reads back as `commit_max`
-  /// (codex R9-F1/R10-F2). It may exceed the writer's locally-APPLIED `commit_min`: a replica held at a
+  ///. It may exceed the writer's locally-APPLIED `commit_min`: a replica held at a
   /// stale/faulty repair hole knows op N is committed yet has not applied it, and the root must record N
   /// so a re-recovered replica's DoViewChange does not under-report the frontier.
   commit: OpNumber,
   checkpoint_op: OpNumber,
   checkpoint_id: u128,
   /// Canonical headers for the committed band `(checkpoint_op .. commit]` — a SPARSE, op-ascending set
-  /// holding ONE header per committed-band op the writer actually HELD (codex R12-F1). A repair hole —
+  /// holding ONE header per committed-band op the writer actually HELD. A repair hole —
   /// or a hole in `(commit_min, commit]` when the writer's applied frontier lags — simply OMITS that
   /// op's header; a held op above it keeps its own (so the list may be SHORTER than the full band AND
   /// may contain gaps; see [`Self::try_new`], which validates in-range strictly-ascending ops but allows
@@ -300,7 +300,7 @@ impl VsrState {
   ///
   /// `committed_headers` are the canonical headers of the committed band `(checkpoint_op .. commit]` —
   /// a SPARSE canonical-header set over the committed-band ops the writer actually HELD, ordered by op
-  /// (codex R12-F1). It is NOT required to be contiguous: a repair hole the writer had simply omits that
+  ///. It is NOT required to be contiguous: a repair hole the writer had simply omits that
   /// op's header, and a LATER held op keeps its own header (so recovery can verify each held op
   /// individually rather than dropping a whole suffix because of one lower hole). The set is VALIDATED,
   /// not silently truncated — every header's op must be in `(checkpoint_op .. commit]` and the ops must
@@ -321,7 +321,7 @@ impl VsrState {
     if commit.get() < checkpoint_op.get() {
       return Err(VsrStateError::CommitBelowCheckpoint);
     }
-    // Validate the SPARSE in-band header set (codex R12-F1): every op strictly in `(checkpoint_op ..
+    // Validate the SPARSE in-band header set: every op strictly in `(checkpoint_op ..
     // commit]`, in STRICTLY-INCREASING op order — GAPS ARE ALLOWED (a hole the writer held is simply
     // omitted; a held op above it keeps its header). Reject (never silently truncate) an out-of-range,
     // duplicate, or descending op, so the stored band remains a trustworthy per-op canonical-identity set
@@ -401,8 +401,8 @@ impl VsrState {
   }
 
   /// The canonical headers for the un-checkpointed committed band `(checkpoint_op .. commit]` — a SPARSE,
-  /// op-ascending set with ONE header per committed-band op the writer HELD (TigerBeetle's `vsr_headers`;
-  /// codex R12-F1). Recovery verifies each committed-band WAL slot against the matching header's
+  /// op-ascending set with ONE header per committed-band op the writer HELD (TigerBeetle's `vsr_headers`).
+  /// Recovery verifies each committed-band WAL slot against the matching header's
   /// [`Header::body_checksum`]: a held slot whose own self-consistent header kept a stale superseded body
   /// mismatches the canonical checksum and is routed to peer-repair rather than re-derived from the WAL,
   /// while a known-committed op with NO header (one the writer did not hold) is dropped + peer-repaired.
@@ -629,7 +629,7 @@ pub enum SuperblockDone {
 /// - A [`submit_read`](Wal::submit_read) of that slot MUST resolve to [`WalDone::Absent`] (or the
 ///   PRIOR durable bytes, if the slot held a completed entry) — NEVER the in-flight bytes.
 ///
-/// This is load-bearing for append-before-ack (codex R7-F1): the proto's head (`self.op`) advances
+/// This is load-bearing for append-before-ack: the proto's head (`self.op`) advances
 /// at SUBMIT, but the ack/vote it owes is deferred until the matching [`WalDone::Appended`]. A driver
 /// that advanced [`op_head`](Wal::op_head) (or flipped a slot to [`Clean`](SlotStatus::Clean)) on
 /// SUBMIT rather than on COMPLETION would silently let a `PrepareOk` be cast for a not-yet-durable op,
@@ -639,16 +639,16 @@ pub enum SuperblockDone {
 /// proto MUST NOT assume FIFO completion; the synchronous views above MUST stay consistent with
 /// "only-durable" regardless of the order completions are drained in.
 ///
-/// **Capacity / back-pressure contract (the M3.2b WAL-wrap shape).** [`capacity`](Wal::capacity) is
+/// **Capacity / back-pressure contract.** [`capacity`](Wal::capacity) is
 /// the total number of slots the log can hold (`u64::MAX` ⇒ effectively unbounded; the default).
 /// `submit_*` stay INFALLIBLE — they return `()` and never signal "queue full" — so the back-pressure
 /// model is **the proto's job, not the driver's** (TigerBeetle-faithful: the WAL is a fixed ring and
 /// the replica stalls op-assignment before it would wrap): the proto MUST NOT
 /// [`submit_append`](Wal::submit_append) an op that would require more than [`capacity`](Wal::capacity)
 /// un-pruned slots to be live at once (it stalls assigning the next op until a
-/// [`prune`](Wal::prune) frees room — the M3.2b wrap-stall). A conforming driver MAY
+/// [`prune`](Wal::prune) frees room). A conforming driver MAY
 /// `debug_assert`/panic if the proto violates this (submits past `capacity()` un-pruned slots); it is
-/// NOT required to grow, queue, or reject the append. The M3.2b PRIMARY stall is now implemented
+/// NOT required to grow, queue, or reject the append. The primary stall is implemented
 /// (`Endpoint::on_request` refuses to mint op `K+1` when `(K+1) - prune_floor > capacity()`), so a
 /// bounded backend physically wraps op `K`'s slot only after `K` is checkpoint-subsumed on a quorum.
 ///
@@ -658,8 +658,8 @@ pub enum SuperblockDone {
 /// pipeline_headroom`. With a ring smaller than (or equal to) a checkpoint interval the un-pruned
 /// window `(floor, op]` cannot reach the next checkpoint boundary before it would wrap, so the stall
 /// would never release and the primary would WEDGE. A backend that reports a fixed `capacity()` is
-/// responsible for honouring this (the sim's bounded mode picks `n` well above `checkpoint_ops`; an
-/// M4 disk driver must size its WAL ring the same way).
+/// responsible for honouring this (the sim's bounded mode picks `n` well above `checkpoint_ops`; a
+/// disk driver must size its WAL ring the same way).
 pub trait Wal {
   /// The highest op number held.
   fn op_head(&self) -> OpNumber;
@@ -669,7 +669,7 @@ pub trait Wal {
   fn status(&self, op: OpNumber) -> SlotStatus;
   /// The total WAL slot capacity — the maximum number of un-pruned slots that can be live at once
   /// (`u64::MAX` ⇒ effectively unbounded). The proto observes this to stall op-assignment before it
-  /// would wrap a fixed ring (the M3.2b back-pressure model); see the trait-level capacity contract.
+  /// would wrap a fixed ring; see the trait-level capacity contract.
   /// Defaults to `u64::MAX` (unbounded) so a backend with no fixed bound need not override it.
   fn capacity(&self) -> u64 {
     u64::MAX
@@ -704,7 +704,7 @@ pub trait Wal {
 /// slot satisfies this naturally (as TigerBeetle's does); one that completes root writes out of
 /// order would violate VSR safety.
 ///
-/// **Writes MUST NOT surface a [`SuperblockDone::Fault`] (audit finding C).** A `Fault` completion is
+/// **Writes MUST NOT surface a [`SuperblockDone::Fault`].** A `Fault` completion is
 /// reserved for a READ ([`submit_read_checkpoint`](Superblock::submit_read_checkpoint)) — recovery /
 /// state-sync treat a checkpoint-read fault as faults-as-data (retry within budget, then peer-fetch).
 /// An implementation MUST make a [`submit_write`](Superblock::submit_write) /
@@ -857,7 +857,7 @@ mod tests {
     assert_eq!(s.committed_headers_slice().len(), 3);
     assert_eq!(s.committed_headers_slice()[0].op(), OpNumber::with(3));
 
-    // A GAP after op 3 (3, then 5 — op 4 a hole) is now KEPT verbatim (codex R12-F1): the held op 5
+    // A GAP after op 3 (3, then 5 — op 4 a hole) is now KEPT verbatim: the held op 5
     // above the op-4 hole retains its canonical header so recovery can verify it individually.
     let holed = VsrState::try_new(
       View::with(1),
@@ -894,7 +894,7 @@ mod tests {
 
   #[test]
   fn vsr_state_accepts_a_sparse_in_band_header_set_but_rejects_a_malformed_one() {
-    // codex R12-F1: the committed-band header set is now a SPARSE canonical-header set over the held
+    // the committed-band header set is now a SPARSE canonical-header set over the held
     // committed ops, NOT a contiguous prefix. `try_new` ACCEPTS an in-range, strictly-increasing set
     // even with GAPS (a held op above a lower hole keeps its header), but REJECTS an out-of-range,
     // non-ascending, or duplicate set rather than silently truncating a valid sparse list.
@@ -1002,7 +1002,7 @@ mod tests {
     assert_eq!(d.unwrap_read_ok().op(), OpNumber::with(1));
   }
 
-  // ── disk codec (audit P0): Header + VsrState ──
+  // ── disk codec: Header + VsrState ──
 
   use crate::codec::CodecError;
 
@@ -1053,7 +1053,7 @@ mod tests {
     assert!(back.verify(b"payload"), "decoded header verifies");
     // The encoded buffer's canonical region (after the 16-byte checksum, before the reserved
     // padding) is EXACTLY the bytes compute_checksum hashes — i.e. the codec and the checksum
-    // share one definition (audit P3): hashing the embedded canonical region reproduces the
+    // share one definition: hashing the embedded canonical region reproduces the
     // checksum the writer stored.
     let canonical = &bytes[16..16 + HEADER_CANONICAL_LEN];
     assert_eq!(

@@ -17,11 +17,11 @@ impl<S: StateMachine> Endpoint<S> {
       return; // Normal op: only an append matters (reads/faults occur during recovery).
     };
     // Append-before-ack dispatch by the recorded kind. An OpId not in `self.pending` is a
-    // stale/superseded completion → ignore. (A peer-repair fill is now TRACKED as `Pending::RepairFill`
-    // — codex R13-F2 — so it is no longer an untracked bare write.)
+    // stale/superseded completion → ignore. (A peer-repair fill is tracked as `Pending::RepairFill`
+    // so it is no longer an untracked bare write.)
     let resolved = self.pending.remove(&id.get());
     // This op's WAL append is now durable: clear its in-flight mark BEFORE casting any ack/vote (or
-    // clearing a repair hole), so the choke point (`send_prepare_ok`) sees it as durable (R7-F1) and the
+    // clearing a repair hole), so the choke point (`send_prepare_ok`) sees it as durable and the
     // repair-fill apply runs off a no-longer-in-flight op. Done for every tracked kind — each variant
     // carries its op number — and never in the `None` arm (a stale/superseded completion must not
     // retract an op a FRESH adopt-/repair-append just re-marked under a new OpId).
@@ -38,7 +38,7 @@ impl<S: StateMachine> Endpoint<S> {
           self.send_prepare_ok(op);
         }
       }
-      // codex R6-F1: a new primary's adopted uncommitted-tail op is now durable → only NOW set its own
+      // a new primary's adopted uncommitted-tail op is now durable → only NOW set its own
       // inflight vote and try to commit. The own vote could not be cast before this append (it was
       // seeded `oks: 0` in `start_view_as_new_primary`), so the primary never counts a vote for an op
       // it has not durably appended (append-before-ack for the view-change adoption path).
@@ -46,10 +46,10 @@ impl<S: StateMachine> Endpoint<S> {
         self.record_own_vote(op.get());
         self.try_commit(now, sb);
       }
-      // codex R6-F1: a backup's adopted uncommitted-tail op is now durable → send the deferred
+      // a backup's adopted uncommitted-tail op is now durable → send the deferred
       // PrepareOk. No PrepareOk was sent for this op before its append completed (append-before-ack).
       Some(Pending::AdoptAck(op)) => self.send_prepare_ok(op),
-      // codex R13-F2: the peer-repair fill's WAL append is now durable. ONLY NOW expose + apply it: the
+      // the peer-repair fill's WAL append is now durable. ONLY NOW expose + apply it: the
       // staged canonical body lands in `self.log`, the repair hole clears, and the held commit resumes.
       // No PrepareOk/own-vote is ever sent for a repair fill (peer repair is not a vote) — this is a
       // pure durability barrier. The body was withheld from `self.log` until here, so it was never in a
@@ -124,15 +124,15 @@ impl<S: StateMachine> Endpoint<S> {
           // The committed band the NEW root names shrinks to `(target_op .. commit]` (the just-
           // checkpointed prefix `[1..=target_op]` now lives in the snapshot, not the band) — pass
           // `pc.target_op` as the floor so the persisted vsr_headers match this root's `checkpoint_op`.
-          // Persist the KNOWN-committed frontier `commit_max` as the commit (codex R10-F2): a root that
+          // Persist the KNOWN-committed frontier `commit_max` as the commit: a root that
           // persisted the lower `commit_min` would let `recover` (which reads `state.commit()` as
-          // `commit_max`, R9-F1) read back a LOWERED frontier when this replica is held at a repair hole
+          // `commit_max`) read back a LOWERED frontier when this replica is held at a repair hole
           // below `commit_max`. The band headers are the SPARSE canonical set — one per HELD op in
-          // `(target_op .. commit]`, skipping holes (codex R12-F1).
+          // `(target_op .. commit]`, skipping holes.
           //
           // commit = max(commit_max, target_op): for an ORDINARY checkpoint `commit_max >= commit_min >=
           // target_op` already (target_op was commit_min at trigger; both only grow), so the `.max` is a
-          // no-op — unchanged. For a STATE-SYNC re-persist (codex R24-F1, durable-before-install) the
+          // no-op — unchanged. For a STATE-SYNC re-persist the
           // destructive install is DEFERRED to `install_sync` (it has NOT advanced `commit_max` yet), so
           // `commit_max` here may sit BELOW `target_op`; the `.max` lifts the persisted commit to the
           // synced checkpoint op. This is correct — a synced checkpoint at `target_op` proves a quorum
@@ -165,7 +165,7 @@ impl<S: StateMachine> Endpoint<S> {
         CheckpointStep::AwaitRoot(rid) if rid == id => {
           // The root is durable → the checkpoint is COMPLETE. Route by the TYPED `pc.kind` — whether
           // THIS root is a state-sync re-persist or an ordinary checkpoint. Matching on the kind carried
-          // in the completion token (NOT `self.sync.is_some()`) makes the R24-F1 footgun structurally
+          // in the completion token (NOT `self.sync.is_some()`) makes the routing footgun structurally
           // impossible: a sync can be merely SOLICITED (armed, no staged install) while an ORDINARY
           // checkpoint completes, and routing on `self.sync` would misroute that ordinary completion to
           // the install branch — never advancing `checkpoint_op`, clearing the solicited sync, and
@@ -175,7 +175,7 @@ impl<S: StateMachine> Endpoint<S> {
           self.pending_checkpoint = None;
           match pc.kind {
             CheckpointKind::SyncRepersist => {
-              // SYNC re-persist (codex R24-F1, durable-before-install). The synced checkpoint root is now
+              // SYNC re-persist. The synced checkpoint root is now
               // durable → INSTALL the synced state ATOMICALLY (the destructive half of `apply_sync`):
               // restore the SM/sessions, advance `commit_min`/`commit_max`/`op` to the synced point, and
               // prune the WAL (`install_sync` does its own `wal.prune` + `wal.truncate`, so no separate
@@ -203,9 +203,9 @@ impl<S: StateMachine> Endpoint<S> {
               let forced = self.sync.is_some_and(|s| s.forced);
               self.sync = None;
               self.timers.sync_solicit = None;
-              // Non-vacuity signal (M3.4a): a state-sync just fully applied + became durable.
+              // Non-vacuity signal: a state-sync just fully applied + became durable.
               self.state_syncs_applied += 1;
-              // Non-vacuity signal (M3.5 T6): distinguish a FORCE-sync (the escalation that recovers a
+              // Non-vacuity signal: distinguish a FORCE-sync (the escalation that recovers a
               // pruned committed hole below the quorum checkpoint) from an ordinary `> self.op` sync.
               if forced {
                 self.forced_syncs_applied += 1;
@@ -214,7 +214,7 @@ impl<S: StateMachine> Endpoint<S> {
             }
             CheckpointKind::Ordinary => {
               // ORDINARY checkpoint: advance the in-memory checkpoint_op, then GC the WAL + per-op caches
-              // below the prune floor (M3.4b). GC runs AFTER the durable root so the recovery point is
+              // below the prune floor. GC runs AFTER the durable root so the recovery point is
               // the new checkpoint; a lost/failing prune is then safe (a later checkpoint re-prunes). A
               // sync may be concurrently SOLICITED (`self.sync` armed but not staged) — it is
               // deliberately left intact here (this root is NOT its re-persist), so it completes on its
@@ -278,9 +278,9 @@ impl<S: StateMachine> Endpoint<S> {
     });
   }
 
-  // M3.2b: physical bounded-WAL slot reuse + stall-before-wrap (the `Wal` exposes a capacity; the
-  // primary refuses to assign an op that would overwrite an un-pruned slot below `quorum_checkpoint_op`)
-  // is a SEPARATE milestone — see the M3.2b plan. `run_gc` below is the *logical* safety half (the
+  // Physical bounded-WAL slot reuse + stall-before-wrap (the `Wal` exposes a capacity; the
+  // primary refuses to assign an op that would overwrite an un-pruned slot below `quorum_checkpoint_op`).
+  // `run_gc` below is the *logical* safety half (the
   // prune floor a bounded-WAL backend would enforce as a physical stall): it tells the WAL what is
   // safe to free, never authorizing a free above what a quorum still needs.
   //
@@ -316,7 +316,7 @@ impl<S: StateMachine> Endpoint<S> {
   ///    Then `L`'s state-sync trigger fires on the next `Commit`/`Prepare`/`PrepareOk` it hears
   ///    (`maybe_request_sync`: `incoming.checkpoint_op() > self.op`), and `L` fetches a checkpoint at
   ///    op `>= N` (the snapshot subsumes every op `<= N`). `L` recovers `N` via the snapshot — it never
-  ///    needs the freed slot. This is exactly why GC is safe NOW (M3.4a state-sync) but was not before.
+  ///    needs the freed slot. This is exactly why GC is safe NOW but was not before.
   /// 2. **`N` is above every operational replica's checkpoint** (it is in the recent committed tail).
   ///    Then NO replica has freed `N` (freeing requires `N <= checkpoint_op`), so `N` is still held by
   ///    the quorum that committed it, and `L` obtains it by ordinary retransmit (`commit_min+1..=op`)
@@ -329,24 +329,24 @@ impl<S: StateMachine> Endpoint<S> {
   /// The only reads at/below the floor are *peer-serve* paths (`on_request_prepare`), which return
   /// silently on a freed op — and case (1)/(2) above show such a peer always has another route.
   ///
-  /// (Formerly-residual strand, now CLOSED by the M3.5 force-state-sync escalation
+  /// (Formerly-residual strand, now CLOSED by the force-state-sync escalation
   /// ([`Self::maybe_force_sync`]): a `Normal` replica holding a PERMANENTLY-faulty hole at `N` *below
   /// its own head but above its own checkpoint*, where every replica that ever held `N` has pruned it
   /// — a correlated multi-replica permanent fault on a single pruned op. Its head `>=` the cluster
   /// checkpoint, so the `> self.op` sync trigger does NOT fire, and no peer can serve the pruned op.
-  /// This is reachable under the M3 gate's envelope (GC + permanent disk-faults + partitions). The
+  /// This is reachable under the fault envelope (GC + permanent disk-faults + partitions). The
   /// escalation detects it via `quorum_checkpoint_op() >= N` (the op is now available ONLY as part of
   /// a checkpoint snapshot, every quorum member pruned the prepare), clears the doomed hole, and forces
   /// a `RequestSync` to the quorum checkpoint (`>= N`) — recovering `N` from the snapshot that subsumes
   /// it. Liveness-only (no committed op is ever lost or rewritten — `N` survives in every checkpoint
-  /// snapshot, swapping a `RequestPrepare`-for-a-pruned-op for a satisfiable `RequestSync`). See §2 of
-  /// the M3.5 plan and [`Self::maybe_force_sync`]'s safety proof.)
+  /// snapshot, swapping a `RequestPrepare`-for-a-pruned-op for a satisfiable `RequestSync`). See
+  /// [`Self::maybe_force_sync`]'s safety proof.)
   /// The PRIMARY prune floor: `min(self.checkpoint_op, quorum_checkpoint_op())` — the highest op a
   /// `quorum` has both committed AND folded into its durable checkpoint, so every op at/below it is
   /// recoverable from a snapshot cluster-wide and its WAL slot is safe to physically reuse. This is THE
   /// single definition shared by two readers:
   /// - [`run_gc`](Self::run_gc)'s PRIMARY branch — the LOGICAL free: it `prune`s WAL slots `<= floor`.
-  /// - the M3.2b PHYSICAL stall ([`Self::on_request`]) — op-assignment refuses to mint an op whose ring
+  /// - the PHYSICAL stall ([`Self::on_request`]) — op-assignment refuses to mint an op whose ring
   ///   slot still holds an UN-pruned op, i.e. it stalls when `next_op - floor > wal.capacity()`.
   ///
   /// Keeping ONE definition means the slot a bounded WAL physically reuses is exactly the slot `run_gc`
@@ -409,12 +409,12 @@ impl<S: StateMachine> Endpoint<S> {
   /// post-checkpoint GC ([`Self::run_gc`]) and the state-sync install ([`Self::install_sync`]) — the
   /// one piece those two sites provably perform IDENTICALLY (both `log.retain(|op| op > floor)` behind
   /// the same committed-survival witness), extracted so a future change to the log prune FLOOR can
-  /// never silently apply to one site but not the other (the audit's latent-drift concern).
+  /// never silently apply to one site but not the other (a latent-drift concern).
   ///
   /// `checkpoint_floor` is the durable/just-restored checkpoint the SITE relies on for the
   /// committed-survival witness (passed through to [`Self::assert_committed_survives`]): `run_gc` passes
   /// `self.checkpoint_op` (its durable snapshot); `install_sync` passes its LOCAL synced checkpoint
-  /// (the R24-F1 deferred-advance leaves `self.checkpoint_op` STALE until the caller records the new
+  /// (the deferred-advance leaves `self.checkpoint_op` STALE until the caller records the new
   /// root, so the install's own witness is the snapshot it just restored). Naming it per call keeps the
   /// witness exact and STRONG.
   ///
@@ -428,8 +428,8 @@ impl<S: StateMachine> Endpoint<S> {
   /// which has the state-sync/retransmit fallbacks the `run_gc` doc proves.
   pub(super) fn trim_log_to_checkpoint(&mut self, floor: u64, checkpoint_floor: u64) {
     // Committed-survival backstop on the BOUNDARY dropped op `floor`: it is `<= checkpoint_floor`, so
-    // every op dropped here (`<= floor`) is folded into the durable snapshot — the shared invariant of
-    // the destructive-site audit (Phase 1).
+    // every op dropped here (`<= floor`) is folded into the durable snapshot — the shared invariant
+    // of the destructive-site trim.
     self.assert_committed_survives(floor, checkpoint_floor);
     self.log.retain(|&op, _| op > floor);
   }
@@ -438,19 +438,19 @@ impl<S: StateMachine> Endpoint<S> {
   /// participation deferred until the write completes.
   /// Overwrites any prior `pending_sb` (supersession): an older-view completion is then ignored.
   ///
-  /// **Persists the KNOWN-committed frontier, not the applied one (codex R10-F2).** The `VsrState`
+  /// **Persists the KNOWN-committed frontier, not the applied one.** The `VsrState`
   /// commit is `self.commit_max` (the highest op KNOWN committed cluster-wide), NOT `self.commit_min`
-  /// (the locally-applied frontier). `recover` reads `state.commit()` back as `commit_max` (R9-F1), so
+  /// (the locally-applied frontier). `recover` reads `state.commit()` back as `commit_max`, so
   /// persisting the lower `commit_min` on a replica HELD at a repair hole below `commit_max` would lower
-  /// the recovered frontier and re-open the R9-F1 laggard-quorum truncation hazard. The committed-band
+  /// the recovered frontier and re-open the laggard-quorum truncation hazard. The committed-band
   /// headers below are the SPARSE canonical set over `(checkpoint_op .. commit_max]` — one header per
-  /// HELD op, skipping holes (codex R12-F1) — so they may be SHORTER than `commit` and contain gaps,
+  /// HELD op, skipping holes — so they may be SHORTER than `commit` and contain gaps,
   /// which `try_new` allows.
   ///
   /// **Preserves the durable checkpoint pointer.** This write must carry the CURRENT checkpoint
   /// (`self.checkpoint_op` + the durable `checkpoint_id`), NOT zeros — a view-change root that
   /// zeroed `checkpoint_op` would regress the durable checkpoint and, once the WAL below it is GC'd
-  /// (M3.2 Task 5), lose committed ops on recovery. The view transitions drop the LOGICAL
+  ///, lose committed ops on recovery. The view transitions drop the LOGICAL
   /// `pending_checkpoint`, so `self.checkpoint_op` equals the durable checkpoint op and
   /// `sb.state().checkpoint_id()` is its matching id. (A checkpoint's step-2 root write may still be
   /// PHYSICALLY in flight when a view change issues this durable-view root write; the `Superblock`
@@ -463,16 +463,16 @@ impl<S: StateMachine> Endpoint<S> {
   /// records — `self.checkpoint_op` for an ordinary durable-view write, but `pc.target_op` (the NEW
   /// checkpoint) for the checkpoint root write, whose band shrinks to `(target_op .. commit_max]`.
   ///
-  /// **SPARSE, one header per HELD op (codex R12-F1).** The list records a header for EVERY op the log
+  /// **SPARSE, one header per HELD op.** The list records a header for EVERY op the log
   /// holds in `(checkpoint_floor .. commit_max]`, in ascending op order, SKIPPING holes — it does NOT
-  /// stop at the first gap. This is the R12-F1 fix: the durable header set must vouch for the identity
+  /// stop at the first gap. The durable header set vouches for the identity
   /// of EVERY committed-band op this replica actually holds, so `recover` can verify each held op
   /// individually rather than DROPPING a whole suffix because of one lower hole. A contiguous-prefix
-  /// list left a held committed op above a lower hole HEADER-LESS, and the R11-F1 recover guard then
-  /// deleted that op's only surviving copy when this replica was the quorum intersection for it.
+  /// list would leave a held committed op above a lower hole HEADER-LESS, and the recover guard would
+  /// delete that op's only surviving copy when this replica was the quorum intersection for it.
   ///
-  /// The band reaches the KNOWN-committed frontier `commit_max` (the value the same root persists,
-  /// R10-F2), NOT `commit_min`: a replica HELD at `commit_min < commit_max` by a lower repair hole still
+  /// The band reaches the KNOWN-committed frontier `commit_max` (the value the same root persists),
+  /// NOT `commit_min`: a replica HELD at `commit_min < commit_max` by a lower repair hole still
   /// HOLDS the committed ops in `(commit_min, commit_max]` (it appended+acked them; they are above the
   /// checkpoint, un-GC'd), and each must keep its canonical header. The loop is bounded at `self.op` —
   /// `min(commit_max, self.op)` — because `self.log` holds NO op above the head: ops in `(self.op,
@@ -501,7 +501,7 @@ impl<S: StateMachine> Endpoint<S> {
     let mut headers = std::vec::Vec::new();
     for op in lo..=hi {
       // SPARSE: record a header for every HELD op, SKIPPING (not stopping at) a hole. A held committed
-      // op above a lower repair hole thus keeps its canonical header (the R12-F1 fix); an op the log is
+      // op above a lower repair hole thus keeps its canonical header; an op the log is
       // missing gets none and is the UNPROVEN/peer-repair case recover handles.
       let Some(entry) = self.log.get(&op) else {
         continue;
@@ -523,14 +523,14 @@ impl<S: StateMachine> Endpoint<S> {
       self.view,
       self.log_view,
       // Persist `commit_max` — the KNOWN-committed frontier — as the durable `VsrState` commit, NOT
-      // `commit_min` (codex R10-F2). The R9-F1 fix made `recover` read `state.commit()` as `commit_max`,
+      // `commit_min`. `recover` reads `state.commit()` as `commit_max`,
       // so a root write that persisted the LOWER `commit_min` would, on a replica HELD at
       // `commit_min < commit_max` by a stale/faulty repair hole, make `recover` read back a LOWERED
-      // frontier — the recovered DVC would then under-report the known commit and the R9-F1
+      // frontier — the recovered DVC would then under-report the known commit and the
       // laggard-quorum truncation hazard reappears. `commit_max >= commit_min >= checkpoint_op`, so
       // `try_new`'s `commit >= checkpoint_op` invariant still holds; the committed-band headers below
       // are the SPARSE canonical set from `self.log` — one header per HELD op in `(checkpoint_op ..
-      // commit_max]`, SKIPPING holes (codex R12-F1) — so a held committed op above a lower repair hole
+      // commit_max]`, SKIPPING holes — so a held committed op above a lower repair hole
       // keeps its header rather than being left header-less and dropped by recover.
       self.commit_max,
       self.checkpoint_op,

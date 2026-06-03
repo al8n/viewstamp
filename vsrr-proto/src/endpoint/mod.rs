@@ -19,26 +19,26 @@ mod view_change;
 /// What the endpoint does when a submitted WAL append completes. Append-before-ack: the vote/ack a
 /// completion owes is always deferred to `on_wal_done`, never cast before the op is durable. A
 /// peer-repair fill (see `fill_repair`) owes NO ack, but is still a DURABILITY BARRIER — its apply +
-/// hole-clear + exposure wait for the append via `Pending::RepairFill` (codex R13-F2).
+/// hole-clear + exposure wait for the append via `Pending::RepairFill`.
 ///
 /// Not `Copy`: [`Pending::RepairFill`] carries the repaired [`LogEntry`] (a `Bytes` body) so the
 /// staged op is inserted into `self.log` only once its append is durable — never staged into the
-/// in-memory log while non-durable (which would expose / apply it before the barrier; R13-F2).
+/// in-memory log while non-durable (which would expose / apply it before the barrier).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
   /// A normal-path prepare append (a backup's `on_prepare`, or the primary's own `on_request`); on
   /// completion, record the ack/own-vote for this op (`send_prepare_ok` on a backup; own inflight bit
   /// + `try_commit` on the primary).
   Ack(OpNumber),
-  /// A new primary's view-change ADOPTION append (codex R6-F1): an uncommitted-tail op it learned
+  /// A new primary's view-change ADOPTION append: an uncommitted-tail op it learned
   /// from the DVC quorum and must re-drive. On completion, set the OWN inflight vote for this op and
   /// `try_commit` — the own vote must never precede its WAL append (append-before-ack).
   AdoptVote(OpNumber),
-  /// A backup's view-change ADOPTION append (codex R6-F1): an uncommitted-tail op it learned from a
+  /// A backup's view-change ADOPTION append: an uncommitted-tail op it learned from a
   /// `StartView`/`RecoveryResponse`. On completion, send the deferred `PrepareOk` — no `PrepareOk` is
   /// sent for an adopted op before its WAL append is durable (append-before-ack).
   AdoptAck(OpNumber),
-  /// A peer-repair fill append (codex R13-F2): the canonical body for a committed repair hole, staged
+  /// A peer-repair fill append: the canonical body for a committed repair hole, staged
   /// to durability before it is applied or exposed. It owes NO ack/vote (peer repair is not a vote) —
   /// instead, on completion `on_wal_done` inserts the carried [`LogEntry`] into `self.log`, removes the
   /// repair hole, and only THEN `advance_commit`s. The body rides in the variant (not `self.log`) so a
@@ -47,7 +47,7 @@ enum Pending {
   RepairFill(RepairFill),
 }
 
-/// The `(op, body)` payload of a staged peer-repair fill awaiting durability (codex R13-F2),
+/// The `(op, body)` payload of a staged peer-repair fill awaiting durability,
 /// extracted from the `Pending::RepairFill` variant so its two fields are named + accessor-wrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RepairFill {
@@ -110,7 +110,7 @@ enum CheckpointStep {
 
 /// Why an in-flight checkpoint root is being written — the typed completion discriminator the
 /// `on_sb_done` root-completion arm `match`es on to route the now-durable checkpoint. Carried INSIDE
-/// the `PendingCheckpoint` completion token (codex R24-F1 follow-up) so the routing is a `match` over a
+/// the `PendingCheckpoint` completion token so the routing is a `match` over a
 /// sum, NOT a bool beside the struct: there is no ambient `sync` flag left to confuse with
 /// `self.sync.is_some()` (the footgun that bit once — a sync can be merely SOLICITED, with no staged
 /// install, while an ORDINARY checkpoint completes; routing on `self.sync` would then misroute that
@@ -123,7 +123,7 @@ enum CheckpointKind {
   /// An ordinary [`Endpoint::maybe_checkpoint`]: the root completion advances `checkpoint_op` + GCs,
   /// leaving any concurrently-SOLICITED sync intact (this root is not its re-persist).
   Ordinary,
-  /// A STATE-SYNC re-persist staged by [`Endpoint::apply_sync`] (codex R24-F1, durable-before-install):
+  /// A STATE-SYNC re-persist staged by [`Endpoint::apply_sync`]:
   /// the root completion INSTALLS the synced state (or, on the recovery eager-install path, finds it
   /// already installed) + runs the sync completion bookkeeping.
   SyncRepersist,
@@ -147,7 +147,7 @@ struct PendingCheckpoint {
   kind: CheckpointKind,
 }
 
-/// In-flight state-sync bookkeeping (M3.4a). `Some` while a lagging replica is awaiting (or
+/// In-flight state-sync bookkeeping. `Some` while a lagging replica is awaiting (or
 /// re-soliciting) a `SyncCheckpoint` for a `RequestSync` it broadcast — and continues to hold while
 /// the synced checkpoint's two superblock writes are being made durable. `None` otherwise. Holds the
 /// highest cluster `checkpoint_op` this replica has LEARNED it is behind (the target — a SyncCheckpoint
@@ -160,15 +160,15 @@ struct SyncState {
   target: OpNumber,
   /// Freshness nonce echoed in the SyncCheckpoint (a per-attempt bump of `self.nonce`).
   nonce: u64,
-  /// `true` when this sync was raised by the M3.5 force-sync escalation ([`Endpoint::maybe_force_sync`])
+  /// `true` when this sync was raised by the force-sync escalation ([`Endpoint::maybe_force_sync`])
   /// rather than the ordinary `> self.op` trigger. On the forced path the synced checkpoint may sit at
   /// or BELOW our head (we hold a tail above a pruned committed hole), so `apply_sync` relaxes its
   /// release-active assert from `checkpoint_op > self.op` to the true safety invariant
-  /// `checkpoint_op >= commit_min` (never rewind the applied frontier). See §2 of the M3.5 plan.
+  /// `checkpoint_op >= commit_min` (never rewind the applied frontier).
   forced: bool,
 }
 
-/// The DEFERRED INSTALL of a verified, staged `SyncCheckpoint` (codex R24-F1, durable-before-install).
+/// The DEFERRED INSTALL of a verified, staged `SyncCheckpoint`.
 /// [`Endpoint::apply_sync`] STAGES the durable re-persist (the two superblock writes) and records this
 /// payload; the DESTRUCTIVE install — restore the SM/sessions, advance `commit_min`/`commit_max`/`op`
 /// to the synced point, prune the WAL, advance `checkpoint_op` — runs ATOMICALLY in
@@ -186,7 +186,7 @@ pub(crate) struct PendingInstall {
   /// The decoded SM snapshot tail to `restore` (an owned zero-copy slice of the wire envelope).
   sm_tail: Bytes,
   /// The forced-sync held-tail decision captured at STAGE (`checkpoint_op < self.op`): the band
-  /// `(checkpoint_op .. self.op]` is PRESERVED on install rather than discarded (safety, VOPR seed 164).
+  /// `(checkpoint_op .. self.op]` is PRESERVED on install rather than discarded (safety, adversarial schedule).
   /// `self.op` is frozen across the window (`on_prepare` drops while `sync.is_some()`), so this decision
   /// is identical at install time.
   held_tail: bool,
@@ -194,7 +194,7 @@ pub(crate) struct PendingInstall {
 
 /// The ViewChange-only collection state — reified as `Endpoint::view_change: Option<ViewChangeCollection>`
 /// so the coupling "these are meaningless outside `Status::ViewChange`" is TYPE-enforced rather than
-/// prose (audit Q1/Q2): the field is `Some` for EXACTLY the lifetime of `Status::ViewChange` and `None`
+/// prose: the field is `Some` for EXACTLY the lifetime of `Status::ViewChange` and `None`
 /// in every other status, so a Normal/Recovering replica simply cannot hold (or read) garbage DVC /
 /// catch-up state. The two ViewChange entries ([`Endpoint::enter_view_change`], [`Endpoint::catch_up_to_view`])
 /// CONSTRUCT it (via [`ViewChangeCollection::entering`]); the four ViewChange exits — the two
@@ -202,7 +202,7 @@ pub(crate) struct PendingInstall {
 /// status returns to Normal. The `assert_invariants` clause `view_change.is_some() == is_view_change()`
 /// freezes the coupling at every handler exit.
 ///
-/// Scope NOTE (the deliberate split, audit Q1): the SVC-collection fields `svc_from`/`svc_target` are
+/// Scope NOTE (the deliberate split): the SVC-collection fields `svc_from`/`svc_target` are
 /// NOT folded in here — they are live in `Status::Normal` too (a backup that proposed a view change off
 /// its idle timer, or a primary forfeiting, accumulates `svc_from` toward the quorum and re-broadcasts
 /// `svc_target` while STILL Normal, only entering `ViewChange` once the SVC quorum forms — see
@@ -241,7 +241,7 @@ const COMMIT_HEARTBEAT: core::time::Duration = core::time::Duration::from_millis
 const PRIMARY_IDLE: core::time::Duration = core::time::Duration::from_millis(200);
 const VC_MESSAGE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
 const VIEW_CHANGE_STATUS: core::time::Duration = core::time::Duration::from_millis(500);
-/// Forfeit (M3.5 T3, `Status::Normal` primary): how long the checkpoint-lag forfeit condition must
+/// Forfeit: how long the checkpoint-lag forfeit condition must
 /// hold CONTINUOUSLY before a stuck primary actually steps down (the anti-storm grace timer). Sits
 /// above `PRIMARY_IDLE` (200ms) — so a *silent* primary is failed over first by a backup's idle VC,
 /// and forfeit handles only the *alive-but-stuck* case where the primary keeps heartbeating yet
@@ -283,7 +283,7 @@ const TAIL_GAP_WINDOW: u64 = 64;
 /// Recovery (`recover()`): the maximum number of WAL-tail slots ABOVE the durable committed frontier
 /// `recover()` will bookkeep + submit a read for in ONE pass — the size of the uncommitted-tail window
 /// it materializes above `commit_max` (the full committed band `(checkpoint_op .. commit_max]` is ALWAYS
-/// read; the cap bounds only the uncommitted tail above it — codex R13-F1). Bounds the synchronous work
+/// read; the cap bounds only the uncommitted tail above it). Bounds the synchronous work
 /// of constructing a `Recovering` replica: `recover()` inserts a dense-cache entry and submits one read
 /// per tail slot, so without a cap a corrupt/buggy `Wal` reporting a huge `op_head` (e.g. `u64::MAX` from
 /// bit-rot in the head slot) would force unbounded CPU / allocation / outgoing reads before the async
@@ -339,9 +339,9 @@ struct RecoverState {
   /// `VsrState`'s `committed_headers` (TigerBeetle's `vsr_headers`). A committed op's identity is the
   /// FULL `(op, client, request, body)` tuple — NOT body bytes alone: two clients can submit identical
   /// payload bytes, so a body-only check would trust a stale superseded slot that kept the same body
-  /// under a DIFFERENT `client`/`request` (codex R9-F2). When a committed-band tail read self-verifies,
+  /// under a DIFFERENT `client`/`request`. When a committed-band tail read self-verifies,
   /// `on_recover_wal_done` checks its `(client, request, body_checksum)` against the entry here: ANY
-  /// mismatch means the WAL slot is STALE/superseded (the seed-52 stale-body hazard, OR a same-body
+  /// mismatch means the WAL slot is STALE/superseded (a stale-body hazard, OR a same-body
   /// different-identity slot whose own header is internally consistent), so the slot is DROPPED and
   /// routed to peer-repair (the B4 path) instead of being re-derived from the WAL. The `view` is
   /// deliberately NOT part of the identity here: `committed_band_headers()` rewrites each entry's view to
@@ -411,7 +411,7 @@ struct Timers {
   /// `SyncCheckpoint` or persisting the adopted one). Armed only while `sync.is_some()`; cleared once
   /// the synced checkpoint is durable.
   sync_solicit: Option<Instant>,
-  /// Normal primary (M3.5 T3): the forfeit GRACE timer. `Some(deadline)` while a `Normal` primary has
+  /// Normal primary: the forfeit GRACE timer. `Some(deadline)` while a `Normal` primary has
   /// observed the checkpoint-lag / unfillable-committed-hole forfeit condition but has not yet stepped
   /// down — the condition must persist until `deadline` (armed `now + FORFEIT_GRACE`) before the
   /// primary forfeits, so a transient lag cannot trigger a view change (anti-storm). Disarmed (`None`)
@@ -427,7 +427,7 @@ struct Timers {
 /// single source of truth for "will the CURRENT (status, substate) actually SERVICE this timer if it
 /// fires?") so [`Endpoint::poll_timeout`] can filter to only-serviceable deadlines — making the
 /// timer-wedge spin (a `poll_timeout`-driven driver re-returning a stale, never-serviced deadline)
-/// impossible by construction (codex R15). `ALL` enumerates every kind for the filter + the
+/// impossible by construction. `ALL` enumerates every kind for the filter + the
 /// `handle_timeout` no-orphan assert; `as_str` names it for that assert's diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerKind {
@@ -492,19 +492,19 @@ impl TimerKind {
 ///
 /// # The durable-before-effect principle (the module invariant)
 ///
-/// THE invariant of this module — the through-line behind the codex R6/R7/R8/R16/R17/R18/R24 fixes and
-/// the frontier-mutation audit — is: **an irreversible or externally-observable effect happens ONLY
+/// THE invariant of this module — the through-line behind the durable-before-effect fixes and
+/// the frontier-mutation discipline — is: **an irreversible or externally-observable effect happens ONLY
 /// AFTER the durable record that justifies it has landed.** A crash must never roll back to a state the
 /// cluster already acted on. It is enforced STRUCTURALLY, each member at a single chokepoint, so a new
 /// call site cannot bypass it (the asserts are detection; the chokepoints are prevention):
 ///
 /// - **Authoritative emit** ⇐ durable view. A view-advertising participation message is pushed only
 ///   when `self.view` is durable (no `pending_sb` write in flight): `emit` is the sole egress point and
-///   asserts it (durable-view-before-participate, R8/R16/R17/R18).
+///   asserts it (durable-view-before-participate).
 /// - **State-machine restore + band prune** ⇐ durable synced root. A state-sync's destructive install
 ///   (SM restore, commit/op advance, WAL prune) is DEFERRED behind `pending_install` until the synced
 ///   checkpoint root is durable (`on_sb_done` → `install_sync`), so a view change in the window cancels
-///   cleanly with no pruned-but-stale band (durable-before-install, R24).
+///   cleanly with no pruned-but-stale band (durable-before-install).
 /// - **`checkpoint_op` advance** ⇐ durable checkpoint root. `advance_checkpoint_op` is the sole
 ///   non-constructor writer and is MONOTONE — it gates the irreversible `wal.prune` in `run_gc` /
 ///   `install_sync`, so a rewind would prune a band a durable root still claims to cover.
@@ -515,7 +515,7 @@ impl TimerKind {
 ///   checkpoint, tracked for peer-repair, or provably uncommitted — so no committed op is ever lost.
 /// - **Ack/vote** ⇐ durable append (append-before-ack). A `PrepareOk`/own-vote is cast only once the op's
 ///   WAL append is durable: the `appending` set is the single gate (`send_prepare_ok` checks it), and
-///   every completion's deferred ack is cast from `on_wal_done` via the `Pending` action (R6/R7/R13).
+///   every completion's deferred ack is cast from `on_wal_done` via the `Pending` action.
 ///
 /// The exit-time `assert_invariants` backstops the `(status × sub-state-flag)` coupling that these
 /// members assume, so any future drift trips deterministically across the suite + the VOPR sweep.
@@ -556,12 +556,12 @@ pub struct Endpoint<S> {
   nonce: u64,
   /// In-memory log, keyed by op number.
   ///
-  /// Trimmed by post-checkpoint GC ([`Self::run_gc`], M3.4b) to the un-checkpointed tail
+  /// Trimmed by post-checkpoint GC ([`Self::run_gc`]) to the un-checkpointed tail
   /// `(prune_floor .. head]`; bounded by `O(checkpoint_ops + pipeline)`.
   log: BTreeMap<u64, LogEntry>,
   /// Primary pipeline: op → ack tracking.
   ///
-  /// Trimmed by post-checkpoint GC ([`Self::run_gc`], M3.4b) to the un-checkpointed tail
+  /// Trimmed by post-checkpoint GC ([`Self::run_gc`]) to the un-checkpointed tail
   /// `(prune_floor .. head]`; bounded by `O(checkpoint_ops + pipeline)`.
   inflight: BTreeMap<u64, Inflight>,
   /// Backup reorder buffer: future prepares awaiting contiguity.
@@ -581,11 +581,11 @@ pub struct Endpoint<S> {
   /// Outstanding storage submissions awaiting completion.
   pending: BTreeMap<u64, Pending>,
   /// Op numbers with an in-flight WAL append — the single source of truth for "is op N durable yet?"
-  /// (codex R7-F1). An op is INSERTED here when a votable append is submitted (`on_request`,
+  ///. An op is INSERTED here when a votable append is submitted (`on_request`,
   /// `append_prepare`, `adopt_append`) and REMOVED in `on_wal_done` once that op's append completes.
   /// `send_prepare_ok` is the choke point: a `PrepareOk` for op N may be emitted ONLY if N is NOT in
   /// this set (it is durable). This makes append-before-ack a SINGLE enforced gate, so the violation
-  /// class cannot relocate again (R6-F1 was the adoption path; R7-F1 was the retransmit re-ack path).
+  /// class cannot relocate again.
   /// A repair-fill append (`fill_repair`) is deliberately NOT tracked here — it owes no ack. Cleared
   /// wholesale alongside `pending` on every view-change / state-sync reset (those abandon in-flight
   /// appends; a late completion finds no `pending` entry and is ignored, so its op must not linger).
@@ -611,7 +611,7 @@ pub struct Endpoint<S> {
   /// bookkeeping (see [`RecoverState`]). Cleared to `None` by the `→ Normal` recovery transition
   /// (`recover_progress`); structurally `None` in every other status, since a recovering replica does
   /// not participate in consensus (the `handle_message` guard) and so cannot enter a view change
-  /// while recovering. (M3.3b's `RecoveringHead → StartView` adoption will clear it on that path too.)
+  /// while recovering.
   recover: Option<RecoverState>,
   /// Peer fault-repair (B4): committed ops whose body read back PERMANENTLY faulty (bit-rot / torn)
   /// from this replica's own durable WAL and must be re-fetched from a peer (`RequestPrepare` →
@@ -624,29 +624,29 @@ pub struct Endpoint<S> {
   /// empty once every committed op below the head is present; cleared wholesale when an adopted
   /// canonical log (StartView / new-primary selection) supplies the full committed prefix.
   repair: std::collections::BTreeSet<u64>,
-  /// State-sync (M3.4a): `Some` while this replica is catching up a stale checkpoint via the
+  /// State-sync: `Some` while this replica is catching up a stale checkpoint via the
   /// `RequestSync` → `SyncCheckpoint` handshake — set when the trigger fires (it learned the cluster
   /// checkpointed past its WAL head), held through the durable re-persist of the adopted checkpoint,
   /// and cleared on the persist's root-write completion. While `Some`, ordinary tail-apply paths are
   /// not relied upon to catch up (the needed ops are below the cluster checkpoint and may be pruned);
   /// the `sync_solicit` timer re-broadcasts until a valid `SyncCheckpoint` is applied + made durable.
   sync: Option<SyncState>,
-  /// State-sync deferred install (codex R24-F1, durable-before-install): the staged-but-not-yet-installed
+  /// State-sync deferred install: the staged-but-not-yet-installed
   /// synced checkpoint. `Some` exactly between `apply_sync` STAGING the durable re-persist and the sync
   /// ROOT going durable (`on_sb_done` → `install_sync`); `None` otherwise. While `Some`, the replica
   /// keeps its OLD (consistent, if stale) in-memory + durable state — the SM is NOT yet restored and
   /// `commit_min`/`op`/`checkpoint_op` are NOT advanced, so a view change in this window finds the old
-  /// state intact and cleanly cancels the install (no pruned-but-stale window → no R24-F1 wedge). The
+  /// state intact and cleanly cancels the install (no pruned-but-stale window). The
   /// apply loop (`advance_commit`) is suppressed while this is `Some` so no op is applied over the
   /// soon-to-be-replaced SM (load-bearing for the recovery peer-fetch path, whose SM is unrestored here).
   pending_install: Option<PendingInstall>,
-  /// State-sync peer side (M3.4a): in-flight checkpoint reads this replica issued to SERVE peers'
+  /// State-sync peer side: in-flight checkpoint reads this replica issued to SERVE peers'
   /// `RequestSync`s, keyed by the read's `OpId` → `(requester, echoed nonce)`. When the read completes
   /// (`on_sb_done`), the durable snapshot is shipped as a `SyncCheckpoint` to the recorded requester.
   /// A `Fault` drops the entry silently (the requester re-solicits; another peer answers). Bounded by
   /// the number of distinct requesters (<= `replica_count`); cleared per entry on completion/fault.
   sync_serving: BTreeMap<u64, (ReplicaId, u64)>,
-  /// Test/observability counter (M3.4a): how many times a state-sync has fully applied on this
+  /// Test/observability counter: how many times a state-sync has fully applied on this
   /// replica — incremented when an `apply_sync`'s durable re-persist completes (the root write lands
   /// in `on_sb_done`, the synced checkpoint becomes durable, and the replica resumes as a Normal
   /// backup). Lets the state-sync sim gate assert NON-VACUITY (the laggard genuinely state-synced
@@ -654,30 +654,30 @@ pub struct Endpoint<S> {
   /// lifetime (a fresh `new`/`recover` after a crash starts it back at 0, which is correct — the
   /// gate counts syncs since the laggard's restart). Exposed only via `state_syncs_applied()`.
   state_syncs_applied: u64,
-  /// Test/observability counter (M3.5 T6): the subset of `state_syncs_applied` that were raised by the
+  /// Test/observability counter: the subset of `state_syncs_applied` that were raised by the
   /// FORCE-sync escalation ([`Self::maybe_force_sync`]) rather than the ordinary `> self.op` trigger —
   /// incremented in the same `on_sb_done` arm as `state_syncs_applied` when the completing sync carried
   /// `forced: true`. Lets the force-sync sim gate prove the FORCED path specifically fired (not just an
   /// ordinary state-sync), since both route through `apply_sync` and would otherwise be indistinguishable
   /// via `state_syncs_applied` alone. Same lifecycle as `state_syncs_applied` (reset to 0 on `new`/`recover`).
   forced_syncs_applied: u64,
-  /// Test/observability counter (M3.2b): how many client requests this replica DROPPED at op-assignment
+  /// Test/observability counter: how many client requests this replica DROPPED at op-assignment
   /// because minting the next op would overflow the bounded WAL ring — the physical stall-before-wrap
   /// ([`Self::on_request`]). `0` whenever the WAL is unbounded (`capacity() == u64::MAX`, the default),
-  /// so it is inert for every existing gate; the M3.2b bounded-WAL gate asserts it goes `> 0` to prove
+  /// so it is inert for every existing gate; the bounded-WAL sim gate asserts it goes `> 0` to prove
   /// the stall genuinely engaged (rather than the ring being vacuously under-filled). Same lifecycle as
   /// the other observability counters (reset to 0 on `new`/`recover`). Exposed only via `wal_stalls()`.
   wal_stalls: u64,
-  /// Test/observability counter (M3.2b Phase B): how many times this BACKUP fell BELOW its bounded-WAL
+  /// Test/observability counter: how many times this BACKUP fell BELOW its bounded-WAL
   /// ring window on a head-extending `Prepare` and STATE-SYNCED to the cluster checkpoint instead of
   /// overwriting an un-pruned slot ([`Self::maybe_sync_below_ring_window`] armed a forced sync). `0`
   /// whenever the WAL is unbounded (the default) or for an in-quorum backup (its checkpoint tracks the
-  /// quorum, so no overflow). The bounded-WAL Phase-B gate asserts it goes `> 0` to prove the connected
+  /// quorum, so no overflow). The bounded-WAL sim gate asserts it goes `> 0` to prove the connected
   /// below-ring-window path genuinely fired (vs the ordinary `> self.op` state-sync trigger). Same
   /// lifecycle as the other observability counters (reset to 0 on `new`/`recover`); exposed only via
   /// `below_ring_window_syncs()`.
   below_ring_window_syncs: u64,
-  /// Deferred-forfeit flag (M3.5, safety): set when [`Self::maybe_force_sync`] would have force-synced
+  /// Deferred-forfeit flag: set when [`Self::maybe_force_sync`] would have force-synced
   /// but we are the PRIMARY — a primary MUST NOT force-sync, as that resets `self.op` to the checkpoint
   /// (below its head) and lets it re-issue new client requests at REUSED op numbers in the same view,
   /// which backups re-ack from their old entries WITHOUT comparing bodies → committed-state divergence.
@@ -691,9 +691,6 @@ pub struct Endpoint<S> {
 
 impl<S> Endpoint<S> {
   /// Creates a fresh endpoint in `Status::Normal`, view 0.
-  ///
-  /// (M1 starts in `Normal`; the `Recovering`/`RecoveringHead` startup path is
-  /// added in M3.)
   pub fn new(config: Config, seed: u64, sm: S) -> Self {
     let nonce = Prng::new(seed).next_u64();
     Self {
@@ -772,7 +769,7 @@ impl<S> Endpoint<S> {
     self.checkpoint_op
   }
 
-  /// The sole non-constructor writer of `self.checkpoint_op` (codex/audit: it gates an irreversible
+  /// The sole non-constructor writer of `self.checkpoint_op`. It gates an irreversible
   /// `wal.prune` in [`Self::run_gc`] / [`Self::install_sync`], so it MUST be monotone — a rewind would
   /// prune a band a durable root still claims to cover, losing committed ops on a later recover). Both
   /// advance sites (the ordinary-checkpoint and the state-sync re-persist root completions in
@@ -807,15 +804,15 @@ impl<S> Endpoint<S> {
     self.commit_min = to;
   }
 
-  /// Cancel an outstanding FORCED sync once repair/commit has SATISFIED its target (codex R25-F1,
-  /// Part A — the root cause). A forced sync ([`Self::maybe_force_sync`]) is armed to recover a doomed
-  /// committed hole `N` that became servable only as part of a peer checkpoint snapshot, targeting that
-  /// snapshot's op (`>= N`). But the cheap ORDINARY repair path can still WIN the race: a peer's
-  /// `Prepare` fills the hole via `fill_repair`, its WAL append lands, and `advance_commit` applies past
-  /// the hole — moving `commit_min` to/PAST the forced-sync target. The hole the force-sync was working
-  /// around is then FILLED + APPLIED, so the forced sync is NO LONGER NEEDED: keeping it armed only waits
-  /// for a response we no longer want, and a DELAYED `SyncCheckpoint` for the now-stale target would
-  /// otherwise reach `apply_sync` below the applied frontier (the R25-F1 panic Part B also defends).
+  /// Cancel an outstanding FORCED sync once repair/commit has SATISFIED its target. A forced sync
+  /// ([`Self::maybe_force_sync`]) is armed to recover a doomed committed hole `N` that became servable
+  /// only as part of a peer checkpoint snapshot, targeting that snapshot's op (`>= N`). But the cheap
+  /// ORDINARY repair path can still WIN the race: a peer's `Prepare` fills the hole via `fill_repair`,
+  /// its WAL append lands, and `advance_commit` applies past the hole — moving `commit_min` to/PAST
+  /// the forced-sync target. The hole the force-sync was working around is then FILLED + APPLIED, so the
+  /// forced sync is NO LONGER NEEDED: keeping it armed only waits for a response we no longer want, and a
+  /// DELAYED `SyncCheckpoint` for the now-stale target would otherwise reach `apply_sync` below the
+  /// applied frontier (the `apply_sync` assert also defends).
   ///
   /// Called at the tail of the two apply loops ([`Self::advance_commit`] / [`Self::try_commit`]) — the
   /// only sites that advance `commit_min` by APPLYING ops. Gated on `pending_install.is_none()`: a forced
@@ -862,12 +859,12 @@ impl<S> Endpoint<S> {
   ///   `op` was ever committed, so there is no committed value to lose.
   ///
   /// `checkpoint_floor` is the durable/just-restored checkpoint the SITE relies on, almost always
-  /// `self.checkpoint_op`; the ONE exception is [`Self::install_sync`], where the R24-F1 deferred-advance
+  /// `self.checkpoint_op`; the ONE exception is [`Self::install_sync`], where the deferred-advance
   /// keeps `self.checkpoint_op` at the OLD value until the caller records the new root, so the install
   /// passes its LOCAL synced checkpoint (the snapshot it just restored into the SM). Naming the floor
   /// per site keeps the witness exact and STRONG (no fall back to the weaker applied frontier).
   ///
-  /// The historical committed-divergence seeds (24/253/335) all live at these sites. NOTE `commit_max`
+  /// The historical committed-divergence failures all live at these sites. NOTE `commit_max`
   /// is a re-learnable HINT, so the `> commit_max` clause is the *loosest* uncommitted witness; the
   /// per-site safety arguments (quorum-intersection nack-truncation, the offset-tail materialization)
   /// remain the real proofs — this is the shared backstop that fires if a NEW destructive site drops a
@@ -968,7 +965,7 @@ impl<S> Endpoint<S> {
   /// Record a peer's reported `checkpoint_op` MONOTONICALLY: a peer's durable checkpoint never
   /// regresses, so a reordered/older report (a delayed `Commit`/`PrepareOk`, or a stale message
   /// after a partition heals) must never lower the value we hold. Keeping this monotone keeps the GC
-  /// prune floor (`quorum_checkpoint_op`) and the M3.5 force-sync/forfeit triggers that read it from
+  /// prune floor (`quorum_checkpoint_op`) and the force-sync/forfeit triggers that read it from
   /// moving backward — a regressing floor could spuriously un-fire the force-sync escalation. (T1)
   fn record_peer_checkpoint(&mut self, replica: u8, reported: OpNumber) {
     let prev = self
@@ -1053,7 +1050,7 @@ impl<S> Endpoint<S> {
 
   /// True iff this replica may participate AS the primary right now: `Normal`, the primary of its
   /// view, AND its current view is already DURABLE (no pending superblock view write). The last
-  /// clause is durable-view-before-participate (codex R8-F1): [`Self::start_view_as_new_primary`]
+  /// clause is durable-view-before-participate: [`Self::start_view_as_new_primary`]
   /// sets `Normal` but DEFERS the StartView broadcast (and the rest of participation) to
   /// [`Self::start_view_participate`] on `on_sb_done`, so until that durable-view write lands the new
   /// view is not yet recoverable — a crash would regress out of it. Acting AS the primary in that
@@ -1106,7 +1103,7 @@ impl<S> Endpoint<S> {
 
   /// The number of entries in this replica's in-memory `log` cache (the per-op tail cache).
   ///
-  /// Exposed for the simulation boundedness checker: after M3.4b GC, this is bounded by
+  /// Exposed for the simulation boundedness checker: after post-checkpoint GC, this is bounded by
   /// `O(checkpoint_ops + pipeline)` — the un-checkpointed tail `(prune_floor .. head]` plus in-flight
   /// headroom. Not part of the stable API.
   #[doc(hidden)]
@@ -1170,13 +1167,13 @@ impl<S> Endpoint<S> {
     self.awaiting_peer_checkpoint()
   }
 
-  /// Test-only: is the forfeit grace timer currently armed (M3.5 T3)?
+  /// Test-only: is the forfeit grace timer currently armed?
   #[cfg(test)]
   fn forfeit_armed_for_test(&self) -> bool {
     self.timers.forfeit_armed.is_some()
   }
 
-  /// Test-only: is the deferred-forfeit flag set (the M3.5 safety step-down a primary raises instead of
+  /// Test-only: is the deferred-forfeit flag set (the safety step-down a primary raises instead of
   /// force-syncing — see `maybe_force_sync`)?
   #[cfg(test)]
   fn pending_forfeit_for_test(&self) -> bool {
@@ -1184,7 +1181,7 @@ impl<S> Endpoint<S> {
   }
 
   /// Test-only: is a view-change/adoption superblock write still pending (`pending_sb` armed)? True
-  /// exactly in the durable-view-before-participate window (codex R8-F1): after
+  /// exactly in the durable-view-before-participate window: after
   /// `start_view_as_new_primary` sets `Normal` but before `on_sb_done` lands the durable-view write.
   #[cfg(test)]
   fn pending_sb_for_test(&self) -> bool {
@@ -1206,7 +1203,7 @@ impl<S> Endpoint<S> {
 
   /// Test-only: the in-flight checkpoint's typed completion kind (the `on_sb_done` root-completion
   /// discriminator) — `Some(true)` for a [`CheckpointKind::SyncRepersist`], `Some(false)` for a
-  /// [`CheckpointKind::Ordinary`], `None` when no checkpoint is in flight. Lets the R24-F1 regression
+  /// [`CheckpointKind::Ordinary`], `None` when no checkpoint is in flight. Lets a regression test
   /// assert the STAGED kind directly (the typed discriminator that replaced the ambient `sync` bool),
   /// not just the downstream routing behavior.
   #[cfg(test)]
@@ -1280,7 +1277,7 @@ impl<S> Endpoint<S> {
     self.sync.map(|s| s.target.get())
   }
 
-  /// Test-only: is the outstanding sync a FORCED (M3.5) sync?
+  /// Test-only: is the outstanding sync a FORCED sync?
   #[cfg(test)]
   fn sync_is_forced_for_test(&self) -> bool {
     self.sync.is_some_and(|s| s.forced)
@@ -1304,7 +1301,7 @@ impl<S> Endpoint<S> {
     });
   }
 
-  /// Test/observability counter (M3.4a): how many state-syncs have fully applied + become durable on
+  /// Test/observability counter: how many state-syncs have fully applied + become durable on
   /// this replica since it was constructed. Incremented when an `apply_sync`'s durable re-persist
   /// completes (`on_sb_done` lands the synced checkpoint's root write). The state-sync sim gate uses
   /// this to assert NON-VACUITY — the laggard genuinely state-synced (>= 1) rather than catching up
@@ -1315,7 +1312,7 @@ impl<S> Endpoint<S> {
     self.state_syncs_applied
   }
 
-  /// Test/observability counter (M3.5 T6): the subset of [`Self::state_syncs_applied`] raised by the
+  /// Test/observability counter: the subset of [`Self::state_syncs_applied`] raised by the
   /// FORCE-sync escalation ([`Self::maybe_force_sync`]) — a `Normal` replica that cleared a pruned
   /// committed hole below the quorum checkpoint and fetched the snapshot, instead of looping
   /// `RequestPrepare`. The focused force-sync sim gate uses this to prove the FORCED path fired
@@ -1327,7 +1324,7 @@ impl<S> Endpoint<S> {
     self.forced_syncs_applied
   }
 
-  /// Test/observability counter (M3.2b): how many client requests this replica dropped at op-assignment
+  /// Test/observability counter: how many client requests this replica dropped at op-assignment
   /// because minting the next op would overflow the bounded WAL ring (the physical stall-before-wrap).
   /// `0` for an unbounded WAL (the default), so it is inert for existing gates; the bounded-WAL sim gate
   /// asserts it goes `> 0` to prove the stall genuinely engaged. Not part of the stable API.
@@ -1337,10 +1334,10 @@ impl<S> Endpoint<S> {
     self.wal_stalls
   }
 
-  /// Test/observability counter (M3.2b Phase B): how many times this backup fell below its bounded-WAL
+  /// Test/observability counter: how many times this backup fell below its bounded-WAL
   /// ring window on a head-extending `Prepare` and state-synced to the cluster checkpoint instead of
   /// overwriting an un-pruned slot ([`Self::maybe_sync_below_ring_window`]). `0` for an unbounded WAL (the
-  /// default) or an in-quorum backup; the bounded-WAL Phase-B gate asserts it goes `> 0` to prove the
+  /// default) or an in-quorum backup; the bounded-WAL sim gate asserts it goes `> 0` to prove the
   /// connected below-ring-window path fired (distinct from the ordinary `> self.op` sync trigger). Not
   /// part of the stable API.
   #[doc(hidden)]
@@ -1362,7 +1359,7 @@ impl<S> Endpoint<S> {
   }
 
   /// Test-only: populate the ENTIRE old-generation in-flight set that the view-transition sites tear
-  /// down (audit D3 + Q1/Q2), so a transition test can prove every field is replaced/cleared. Sets each
+  /// down, so a transition test can prove every field is replaced/cleared. Sets each
   /// member to a NON-empty / armed sentinel: the SVC bits (`svc_from`), the ViewChange-only collection
   /// (a `Some(ViewChangeCollection)` carrying a sentinel DVC + `dvc_quorum = true` + `catching_up =
   /// true`), the in-flight storage submissions (`pending`/`appending`), the per-replica checkpoint
@@ -1468,7 +1465,7 @@ impl<S> Endpoint<S> {
   }
 
   /// Binds a message's SELF-CLAIMED sender to the authenticated transport peer `from` — the single
-  /// ingress backstop mirroring the [`Self::emit`] egress chokepoint (codex R19-F1).
+  /// ingress backstop mirroring the [`Self::emit`] egress chokepoint.
   ///
   /// vsrr is a NON-Byzantine, crash-fault-tolerant VSR (like TigerBeetle) for a TRUSTED cluster:
   /// authenticating a replica message's sender is the DRIVER's job (it sets `from` to the
@@ -1498,9 +1495,9 @@ impl<S> Endpoint<S> {
   /// - **`Reply`** — replicas ignore it (the dispatch is a no-op), so this is a no-op: returns `true`.
   ///
   /// PATH-SENSITIVE (reported, not guessed): **`Prepare`** carries NO self `replica()`, so its binding
-  /// is split by path (codex R20-F1 / R21-F1). The normal head-advancing / re-ack `Prepare` comes ONLY
+  /// is split by path. The normal head-advancing / re-ack `Prepare` comes ONLY
   /// from the primary of its view, so it binds to `config.primary(view)`. But a committed-op REPAIR
-  /// serve (`on_request_prepare`, codex R17-F1) is legitimately sent by ANY `Normal` holder — incl. a
+  /// serve (`on_request_prepare`) is legitimately sent by ANY `Normal` holder — incl. a
   /// BACKUP — carrying `self.view` (where `config.primary(view) != backup`), so binding it to
   /// `config.primary(view)` would DROP an honest backup repair-serve. The escape therefore ALSO accepts
   /// a `Prepare` whose op is one of our registered repair holes — but ONLY from a CONFIGURED replica
@@ -1508,7 +1505,7 @@ impl<S> Endpoint<S> {
   /// never a client / out-of-range id. The escape narrows the binding to the repair surface only;
   /// `on_prepare` then runs `fill_repair` (which body-checksums + commit>=op-vouches the serve) FIRST,
   /// and DROPS a hole-targeted `Prepare` that `fill_repair` declines BEFORE any view catch-up (the
-  /// R13-F2 / R21-F1 hole-ownership guard), so neither a bad body nor a spurious catch-up can ride the
+  /// the hole-ownership guard), so neither a bad body nor a spurious catch-up can ride the
   /// escape. This leaves no spoof gap on the vote/quorum surface this check protects.
   fn sender_matches(&self, from: Peer, msg: &Message) -> bool {
     match msg {
@@ -1516,7 +1513,7 @@ impl<S> Endpoint<S> {
       Message::Request(r) => from == Peer::Client(r.client()),
       // Self-identifying replica messages: the authenticated peer must be the claimed sender AND a
       // CONFIGURED cluster member (`replica < replica_count`). The membership range check is CENTRALIZED
-      // in `sender_is_member_replica` (codex R22-F1): without it, `from == Peer::Replica(m.replica())`
+      // in `sender_is_member_replica`: without it, `from == Peer::Replica(m.replica())`
       // accepts an out-of-range id (e.g. `Peer::Replica(5)` in a 3-replica cluster with `m.replica() == 5`)
       // — a non-member — whose self-consistent message then reaches the quorum / apply path (some
       // handlers, e.g. `on_prepare_ok`, range-check downstream, but `serve_sync_checkpoint`/`apply_sync`
@@ -1536,19 +1533,19 @@ impl<S> Endpoint<S> {
       // Primary-authority broadcasts (no self id): only the primary of the advertised view sends them.
       Message::Commit(m) => from == Peer::Replica(self.config.primary(m.view())),
       Message::StartView(m) => from == Peer::Replica(self.config.primary(m.view())),
-      // `Prepare` is PATH-SENSITIVE (codex R20-F1 / R21-F1). A NORMAL head-advancing / re-ack Prepare
+      // `Prepare` is PATH-SENSITIVE. A NORMAL head-advancing / re-ack Prepare
       // comes ONLY from the primary of its advertised view — binding it to `config.primary(view)` closes
       // the gap where a misrouted non-primary replica Prepare drives a backup's normal append + PrepareOk.
       // But a committed-op REPAIR serve (answering our `RequestPrepare` for a hole in `self.repair`)
       // legitimately comes from ANY Normal holder, so ALSO accept a Prepare whose op is one of our
-      // registered repair holes — but ONLY from a CONFIGURED replica `from` (R21-F1): a repair-serve is
+      // registered repair holes — but ONLY from a CONFIGURED replica `from`: a repair-serve is
       // always a peer replica that holds the committed op, NEVER a client or an out-of-range id. Without
       // the replica-peer guard, an authenticated `Peer::Client` (or an out-of-range `Peer::Replica`)
       // whose forged/misrouted Prepare's op happened to be one of our holes passed ingress and reached
       // `fill_repair` (which checks only commit>=op + `Header::verify` self-consistency, BEFORE any role
       // check), so a buggy/misrouting driver could fill a committed hole from a non-replica peer.
       // (`fill_repair` then verifies the body — checksum + the commit>=op committed-vouch — and a
-      // hole-targeted Prepare it DECLINES is dropped by the R13-F2 / R21-F1 hole-ownership guard in
+      // hole-targeted Prepare it DECLINES is dropped by the hole-ownership guard in
       // `on_prepare` before any view catch-up, so the `repair` escape cannot inject a bad body nor drive
       // a spurious catch-up; a repair op is `<= self.op`, so it cannot advance the head.)
       Message::Prepare(p) => {
@@ -1563,7 +1560,7 @@ impl<S> Endpoint<S> {
 
   /// True iff `from` is the authenticated peer for the self-identifying `claimed` replica AND `claimed`
   /// is a CONFIGURED cluster member (`< replica_count`). The membership range check is the load-bearing
-  /// half (codex R22-F1): a message whose body claims an OUT-OF-RANGE replica id (a non-member), with a
+  /// half: a message whose body claims an OUT-OF-RANGE replica id (a non-member), with a
   /// matching out-of-range `from` from a buggy/misrouting driver, must not reach the quorum / apply path
   /// — it would extend trust outside `Config`. Centralized here so every self-id replica message
   /// (`PrepareOk`/`StartViewChange`/`DoViewChange`/`SyncCheckpoint`/…) is membership-checked uniformly,
@@ -1606,7 +1603,7 @@ where
     from: Peer,
     msg: Message,
   ) {
-    // Sender-binding backstop (codex R19-F1): drop any message whose self-claimed identity disagrees
+    // Sender-binding backstop: drop any message whose self-claimed identity disagrees
     // with the authenticated `from`. Placed at the TOP — BEFORE the Recovering/RecoveringHead
     // early-returns — so it ALSO guards those states' message exceptions (a RecoveringHead adopting a
     // `StartView`/`RecoveryResponse`; a Recovering replica fetching a peer `SyncCheckpoint`), not only
@@ -1661,7 +1658,7 @@ where
       Message::RequestPrepare(m) => self.on_request_prepare(now, m),
       Message::Recovery(m) => self.on_recovery(now, m),
       Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
-      // State-sync (M3.4a): a peer's sync solicitation is answered from our durable checkpoint
+      // State-sync: a peer's sync solicitation is answered from our durable checkpoint
       // (`on_request_sync`); a sync response is verified + applied (`on_sync_checkpoint`).
       Message::RequestSync(m) => self.on_request_sync(now, sb, m),
       Message::SyncCheckpoint(m) => self.on_sync_checkpoint(now, wal, sb, m),
@@ -1683,7 +1680,7 @@ where
           self.on_primary_idle(now, sb);
           self.timers.primary_idle = Some(now + PRIMARY_IDLE);
         }
-        // FIX 1 (codex R15-F1, the timer-wedge class): once this backup has PROPOSED a view change off
+        // FIX 1: once this backup has PROPOSED a view change off
         // its idle timeout (`on_primary_idle` -> `propose_next_view` -> `join_svc`), it ARMS `svc_message`
         // (the SVC retransmit) — but until a view-change quorum forms it stays Normal, and this branch
         // would otherwise service ONLY `primary_idle`, orphaning `svc_message` (`view_change_timeouts`,
@@ -1718,7 +1715,7 @@ where
       // sync is outstanding (awaiting a SyncCheckpoint or persisting the adopted one).
       self.sync_timeouts(now);
     }
-    // No-orphan-due invariant (codex R15): after dispatch, NO serviceable timer may remain armed-and-due
+    // No-orphan-due invariant: after dispatch, NO serviceable timer may remain armed-and-due
     // (`serviceable_now(kind) && armed(kind) <= now`). `poll_timeout` returns only serviceable timers, so
     // every such timer either was just serviced (re-armed strictly forward, or cleared) or was never
     // serviceable (filtered out). If one is left armed-and-due, a poll_timeout()-driven driver would
@@ -1808,7 +1805,7 @@ where
     // entering ViewChange/catch-up, so arming `repair_retry` in a non-Normal status would leave it
     // armed-but-never-serviced (`view_change_timeouts` ignores it), spinning a poll_timeout()-driven
     // driver on that stale deadline — the SAME timer-level wedge as the forfeit / pending-view cases
-    // (codex R14-F1 class audit). Gating the ARM on the same condition as the SERVICE keeps the two in
+    //. Gating the ARM on the same condition as the SERVICE keeps the two in
     // lockstep, so no orphaned hole-timer can wake a non-Normal handler. (`arm_timers` clears all timers
     // first, so an inherited Normal `repair_retry` is dropped on the transition into ViewChange.) The
     // hole itself survives — it is re-solicited once Normal resumes (adoption clears it, or
@@ -1825,14 +1822,14 @@ where
   }
 
   /// The single outbound-emission chokepoint. EVERY replica-originated message goes through here so the
-  /// durable-view-before-participate invariant (codex R8-F1) is enforced in ONE place: a view-advertising
+  /// durable-view-before-participate invariant is enforced in ONE place: a view-advertising
   /// AUTHORITY / participation message (the gated set — [`Message::advertises_authoritative_view`]) must
   /// never be emitted while a durable-view write is in flight (`pending_sb.is_some()`), because
   /// `self.view` is then not yet durable and a crash rolls it back. This is the proto-side analogue of
-  /// the VOPR durable-view checker, and the STRUCTURAL close of the class (codex R16-F1 / R17-F1 /
-  /// R18-F1): a NEW emission site cannot bypass the per-site gates because it routes here. The
-  /// `debug_assert!` is detection (it fails fast in every test/sim at the emission site, with zero
-  /// release cost) — the per-site gates (`participates_as_primary`, the R16-F1 dvc gate, the
+  /// the VOPR durable-view checker, and the STRUCTURAL close of the class: a NEW emission site cannot
+  /// bypass the per-site gates because it routes here. The `debug_assert!` is detection (it fails fast
+  /// in every test/sim at the emission site, with zero release cost) — the per-site gates
+  /// (`participates_as_primary`, the dvc gate, the
   /// `on_request_prepare` / `on_recovery` / `serve_sync_checkpoint` `pending_sb` drops) remain the
   /// PREVENTION; this assert proves they are COMPLETE.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -1879,8 +1876,8 @@ where
 
   /// The SINGLE SOURCE OF TRUTH for "will the CURRENT (status, substate) actually SERVICE `kind` if it
   /// fires?" — i.e. does some branch of [`Self::handle_timeout`] act on this timer in this exact state?
-  /// It MIRRORS `handle_timeout`'s status dispatch + the per-handler substate gates EXACTLY (codex
-  /// R15). [`Self::poll_timeout`] filters every armed timer through this so it can NEVER return a
+  /// It MIRRORS `handle_timeout`'s status dispatch + the per-handler substate gates EXACTLY.
+  /// [`Self::poll_timeout`] filters every armed timer through this so it can NEVER return a
   /// deadline the current state will not act on; the `debug_assert` at the end of `handle_timeout`
   /// enforces the converse (no serviceable timer is left armed-and-due) so any future arm/service drift
   /// trips deterministically (regardless of clock model — so the tick-driven VOPR catches it too). The
@@ -1898,7 +1895,7 @@ where
   ///   Normal-BACKUP idle-SVC retransmit (FIX 1), and by `view_change_timeouts` while not catching up.
   /// - `dvc_message`: `view_change_timeouts`, not catching up, AND the view is durable
   ///   (`pending_sb.is_none()`) — the DVC is a vote, so it must not be (re)cast before the view is
-  ///   recoverable (durable-view-before-participate in the retransmit path, codex R16-F1).
+  ///   recoverable (durable-view-before-participate in the retransmit path).
   /// - `view_change_status`: `view_change_timeouts` (armed + serviced in BOTH catch-up and not).
   /// - `get_view_message`: `view_change_timeouts`, catching up.
   /// - `recover_retry`: `recover_timeouts` (Recovering).
@@ -1926,7 +1923,7 @@ where
       }
       // The DVC retransmit is a VOTE the new primary counts toward forming the view, so it is
       // serviceable only once this replica's view is DURABLE — durable-view-before-participate in the
-      // retransmit path (codex R16-F1). `enter_view_change` arms `dvc_message` AND submits the
+      // retransmit path. `enter_view_change` arms `dvc_message` AND submits the
       // SendDoViewChange durable-view write (`pending_sb`), and the INITIAL DVC is sent by `on_sb_done`
       // when that write lands; gating the retransmit on `pending_sb.is_none()` keeps a slow async
       // superblock write from letting the retransmit cast the vote first (before the view is
@@ -1954,7 +1951,7 @@ where
   /// (the internal `serviceable_now` predicate) — NOT over every armed timer. A deadline this returns is therefore
   /// always one that the next `handle_timeout` acts on (services/re-arms forward or clears), so a
   /// deadline-driven driver that advances virtual time to it and fires it ALWAYS makes progress: it can
-  /// never re-return a stale, never-serviced deadline and spin (the timer-wedge class — codex R15).
+  /// never re-return a stale, never-serviced deadline and spin (the timer-wedge class).
   /// Deadlines stay STATEFUL: this only FILTERS what is considered; it never resets a timer (the
   /// handlers own arming/clearing).
   pub fn poll_timeout(&self) -> Option<Instant> {
@@ -2000,7 +1997,7 @@ where
   /// Decodes a checkpoint envelope produced by [`Self::encode_checkpoint`] into
   /// `(checkpoint_op, sessions, sm_snapshot_slice)`, or `None` if the bytes are malformed/truncated.
   ///
-  /// **Fallible (M3.3, safety).** A checkpoint read may return a corrupted / stale / torn snapshot
+  /// **Fallible.** A checkpoint read may return a corrupted / stale / torn snapshot
   /// (recover or state-sync over a faulty superblock), so EVERY field access is bounds-checked
   /// (`env.get(..)?`) and returns `None` rather than panicking on an out-of-range index or a
   /// reply-length that overruns the buffer. Callers treat `None` as a FAULT (recover re-reads within

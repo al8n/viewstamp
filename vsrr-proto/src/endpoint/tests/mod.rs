@@ -1,7 +1,7 @@
 //! Shared test harness for the endpoint unit tests: the mock `Wal`/`Superblock`/
 //! [`StateMachine`] impls and the `backup()`/`prepare()`/... helper constructors the
 //! per-subsystem submodules below build on. Split out of the former monolithic
-//! `endpoint/tests.rs` (audit B1) — the test bodies themselves are unchanged.
+//! `endpoint/tests.rs` — the test bodies themselves are unchanged.
 
 use super::*;
 use crate::{
@@ -508,7 +508,7 @@ fn wal_in_view(head: u64, view: u64) -> TestWal {
 
 /// Drive replica 1 to become the NEW PRIMARY of view 1 (via a DVC quorum) over an ASYNC superblock
 /// (`StepSb`), leaving it `Normal` with the durable-view write STILL inflight (`pending_sb` armed) —
-/// the exact durable-view-before-participate window codex R8-F1 is about. The adopted canonical log
+/// the exact durable-view-before-participate window. The adopted canonical log
 /// is op 1 (committed) + op 2 (uncommitted, commit* = 1), supplied by replica 2's DVC. The WAL
 /// completions (the AdoptVote append for op 2) are pumped so they do not muddy the window; the
 /// superblock write is left inflight (not flushed), so the view is NOT yet durable.
@@ -571,7 +571,7 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
   assert_eq!(e.view(), View::with(1));
   assert!(
     e.pending_sb_for_test(),
-    "the durable-view write must still be pending (the R8-F1 window is open)"
+    "the durable-view write must still be pending (the durable-view window is open)"
   );
   assert!(
     sb.has_inflight(),

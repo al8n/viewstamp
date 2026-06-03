@@ -86,7 +86,7 @@ fn three_replicas_commit_no_faults() {
 fn progress_under_message_loss() {
   // 20% drop. Liveness requires BOTH the primary's prepare retransmit AND the
   // client's request retransmit. Sweep seeds so no single lucky seed can mask a
-  // dead retransmit path (seed 0 deadlocks unless the primary actually retransmits).
+  // dead retransmit path.
   for seed in 0..32u64 {
     let mut c = Cluster::new(3, 2, 4, seed);
     c.set_faults(vsrr_simulation::Faults {

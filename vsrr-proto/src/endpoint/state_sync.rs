@@ -1,7 +1,7 @@
 use super::*;
 
 impl<S: StateMachine> Endpoint<S> {
-  // ── State-sync (M3.4a): the trigger + the lagging replica's solicitation ──
+  // ── State-sync: the trigger + the lagging replica's solicitation ──
 
   /// The state-sync TRIGGER. A replica enters state-sync iff it is `Normal` AND it learns of a cluster
   /// checkpoint strictly ABOVE its own head (`incoming_checkpoint > self.op`), via a `checkpoint_op`
@@ -51,7 +51,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.send_request_sync(now);
   }
 
-  /// M3.2b Phase B: a backup that has fallen BELOW its bounded-WAL RING WINDOW state-syncs instead of
+  /// a backup that has fallen BELOW its bounded-WAL RING WINDOW state-syncs instead of
   /// overwriting an un-pruned slot. Called from [`Self::on_prepare`]'s head-extend branch BEFORE the
   /// append, with the incoming `Prepare`. Returns `true` (caller DROPS the prepare, appending nothing)
   /// when this replica cannot durably hold the prepare without wrapping away an op it has NOT yet
@@ -101,7 +101,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// `commit_min >= checkpoint_op + checkpoint_ops`) and WILL land — advancing `checkpoint_op` and
   /// shrinking `head - checkpoint_op` below `capacity`. So the back-pressure self-releases with no wedge.
   ///
-  /// **Why STRICT, not `>=` (codex R26-F1 — the un-completable-sync wedge).** The `C == self.commit_min`
+  /// **Why STRICT, not `>=`.** The `C == self.commit_min`
   /// case is the bug. Arming there targets `C == commit_min`; the backup's OWN in-flight ordinary
   /// checkpoint for `commit_min` then lands, advancing `self.checkpoint_op` to `C`. But
   /// `cancel_forced_sync_if_satisfied` fires only on a COMMIT advance, never a CHECKPOINT advance, so the
@@ -136,13 +136,13 @@ impl<S: StateMachine> Endpoint<S> {
     // capacity`. DROP the prepare (do not overwrite a needed slot). Additionally, if the cluster
     // checkpoint the Prepare advertises is a VALID forward sync target, JUMP to it via a forced sync.
     //
-    // The discriminator is STRICT — `target > self.commit_min` (codex R26-F1), NOT `>=`. Arm a sync ONLY
+    // The discriminator is STRICT — `target > self.commit_min`, NOT `>=`. Arm a sync ONLY
     // when the cluster checkpoint is STRICTLY ABOVE our applied frontier: then the band `(commit_min ..
     // target]` is folded into the cluster snapshot AND may be wrapped away from every ring, so a sync is
     // the SOLE recovery. When `target <= self.commit_min` we have ALREADY APPLIED through the cluster
     // checkpoint — the ring is full ONLY because our OWN `checkpoint_op` lags (an ordinary checkpoint for
     // `commit_min` is in flight / pending), NOT because we are missing committed state — so do NOT arm a
-    // sync; just back-pressure (drop, below). The `==` case is the one R26-F1 fixes: arming there targets
+    // sync; just back-pressure (drop, below). The `==` case is the latent bug: arming there targets
     // `commit_min`, and a LOCAL checkpoint then advances `checkpoint_op` to `commit_min == target`,
     // leaving the sync un-completable (an equal `SyncCheckpoint` is rejected by `on_sync_checkpoint`'s
     // `checkpoint_op <= self.checkpoint_op` guard) — a liveness WEDGE (`on_prepare` drops retransmits
@@ -181,7 +181,7 @@ impl<S: StateMachine> Endpoint<S> {
     true
   }
 
-  /// The M3.5 force-state-sync escalation (the safety-critical core). A `Normal` replica holding a
+  /// The force-state-sync escalation (the safety-critical core). A `Normal` replica holding a
   /// peer-fault-`repair` hole at op `N` whose `RequestPrepare` has become FUTILE — because a peer has
   /// checkpointed past `N` (`max_peer_checkpoint_op() >= N`), so that peer captured `N` in a checkpoint
   /// snapshot and pruned the servable prepare — clears the doomed hole(s) and forces a `RequestSync` to
@@ -239,13 +239,13 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.repair.iter().any(|&op| op <= floor.get()) {
       return;
     }
-    // SAFETY (M3.5): a PRIMARY must NOT force-sync. The force-sync below resets `self.op` to `floor`
+    // SAFETY: a PRIMARY must NOT force-sync. The force-sync below resets `self.op` to `floor`
     // (BELOW the primary's head) and clears the log/inflight; the primary would then accept new client
     // requests at REUSED op numbers in the SAME view, and backups still holding the old entries would
     // re-ack them from `on_prepare`'s `pop <= self.op` branch WITHOUT comparing bodies — the primary
     // commits body B while backups applied body A for the same op = committed-state divergence. So a
     // primary that reaches this strand (an unservable, checkpoint-subsumed hole) steps DOWN instead, via
-    // the single `abdicate_if_primary` chokepoint (audit D1): it flags the deferred forfeit (+ the
+    // the single `abdicate_if_primary` chokepoint: it flags the deferred forfeit (+ the
     // serviceable `svc_message` wake) which the next primary tick (`primary_timeouts`) acts on, and we
     // RETURN here without arming the forced sync. A caught-up replica then leads and the subsumed hole is
     // recovered via that primary's ordinary checkpoint flow. (Gating force-sync off the primary WITHOUT
@@ -319,7 +319,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.send_request_sync(now);
   }
 
-  // ── State-sync (M3.4a): the peer side — answer a RequestSync from the durable checkpoint ──
+  // ── State-sync: the peer side — answer a RequestSync from the durable checkpoint ──
 
   /// Answer a peer's `RequestSync` by shipping our latest DURABLE checkpoint, iff we are `Normal` and
   /// hold a checkpoint strictly NEWER than the requester's (else stay silent — never ship a megabyte
@@ -362,7 +362,7 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Ship a `SyncCheckpoint` for a completed serve-read (the read `on_request_sync` issued). Binds the
   /// shipped `checkpoint_id` to the shipped bytes via `checkpoint_id(cr.snapshot())`, then VERIFIES that
-  /// id equals our DURABLE checkpoint id (`sb.state().checkpoint_id()`, codex R23-F1) — so a CORRUPT-but-
+  /// id equals our DURABLE checkpoint id (`sb.state().checkpoint_id()`) — so a CORRUPT-but-
   /// parseable read (an in-model disk fault) cannot make us ship a self-consistent-but-wrong (id, bytes)
   /// pair the requester would accept and restore (it only re-checks `checkpoint_id(snapshot) == advertised
   /// id`); a mismatch DROPS the read (the serve path is then as strict as `recover`'s `id_ok` gate). Also
@@ -372,7 +372,7 @@ impl<S: StateMachine> Endpoint<S> {
     let Some((to, nonce)) = self.sync_serving.remove(&cr.id().get()) else {
       return; // not a serve-read we issued (a stale/foreign completion) — ignore.
     };
-    // Durable-view-before-participate (codex R18-F1): the shipped `SyncCheckpoint` advertises
+    // Durable-view-before-participate: the shipped `SyncCheckpoint` advertises
     // `self.view` (see below). A replica in its `pending_sb` window (a new primary between
     // `start_view_as_new_primary` and the `on_sb_done` that makes its view durable — or any replica mid
     // `AdoptedStartView`/`SendDoViewChange` write) is `Normal` but its view is NOT yet recoverable;
@@ -381,7 +381,7 @@ impl<S: StateMachine> Endpoint<S> {
     // checkpoint is committed and its CONTENT is view-independent, so the requester loses nothing by
     // waiting: it re-solicits on its `sync_solicit` timer and a Normal+durable peer answers (and we
     // answer once our own view is durable). Negligible liveness cost; consistent with the class — the
-    // same shape as the `on_request_prepare` (R17-F1) drop. (The submit side, `on_request_sync`, also
+    // same shape as the `on_request_prepare` drop. (The submit side, `on_request_sync`, also
     // gates on status, but this SHIP-time gate is the load-bearing one: the view may have advanced
     // between the read submit and its completion.)
     if !self.status.is_normal() || self.pending_sb.is_some() {
@@ -400,7 +400,7 @@ impl<S: StateMachine> Endpoint<S> {
     }
     let snapshot = cr.snapshot_bytes();
     let id = crate::checkpoint_id(&snapshot);
-    // Integrity (codex R23-F1): a checkpoint READ may return CORRUPT-but-parseable bytes (an in-model
+    // Integrity: a checkpoint READ may return CORRUPT-but-parseable bytes (an in-model
     // DISK FAULT — bit-rot in the snapshot region that still decodes). Serving them would ship a
     // SELF-CONSISTENT (id, snapshot) pair the requester cannot distinguish from a good one: it only
     // re-checks `checkpoint_id(snapshot) == advertised id` (`on_sync_checkpoint`), which HOLDS because we
@@ -426,7 +426,7 @@ impl<S: StateMachine> Endpoint<S> {
     ));
   }
 
-  // ── State-sync (M3.4a): apply a verified SyncCheckpoint (the safety-critical core) ──
+  // ── State-sync: apply a verified SyncCheckpoint (the safety-critical core) ──
 
   /// Receive a `SyncCheckpoint`. Runs the §2.5 guard cascade (status; matching outstanding sync;
   /// nonce; advances past `target`, our head, and our checkpoint), then the LOAD-BEARING integrity
@@ -460,7 +460,7 @@ impl<S: StateMachine> Endpoint<S> {
       return; // does not advance us past what we know the cluster has committed — ignore.
     }
     // The `<= self.op` drop is ONLY for the ordinary trigger: there, an equal/lower checkpoint means a
-    // racing tail-apply already covered it (no sync needed). A FORCED sync (M3.5) deliberately targets
+    // racing tail-apply already covered it (no sync needed). A FORCED sync deliberately targets
     // a checkpoint AT/BELOW our head — we hold a tail above a pruned committed hole — so this guard
     // must NOT drop it; the forced sync MUST apply to subsume the hole. Forced safety is gated instead
     // on `>= self.checkpoint_op` below (advances our own checkpoint) + `apply_sync`'s `>= commit_min`
@@ -477,7 +477,7 @@ impl<S: StateMachine> Endpoint<S> {
     if crate::checkpoint_id(m.snapshot()) != m.checkpoint_id() {
       return;
     }
-    // SAFETY/LIVENESS (codex vopr seed 8, async-superblock): a PRIMARY must NOT APPLY a state-sync in
+    // A PRIMARY must NOT APPLY a state-sync in
     // place. `apply_sync` resets `commit_min` to the synced checkpoint and CLEARS `inflight` (the
     // commit pipeline) while KEEPING `self.op` (the held tail) and staying Normal primary — but it does
     // NOT rebuild the pipeline for the retained committed tail `(commit_min .. op]`, so the primary's
@@ -487,7 +487,7 @@ impl<S: StateMachine> Endpoint<S> {
     // sets `pending_forfeit` instead of force-syncing — see its safety note), but a forced/ordinary
     // sync ARMED while this replica was a BACKUP can still be DELIVERED after it (re)gained primacy, so
     // the guard must also hold at the APPLY site. Mirror the arm-site decision via the single
-    // `abdicate_if_primary` chokepoint (audit D1): a multi-replica primary that would apply a sync STEPS
+    // `abdicate_if_primary` chokepoint: a multi-replica primary that would apply a sync STEPS
     // DOWN — the chokepoint flags the deferred forfeit (+ the serviceable `svc_message` wake) which the
     // next `primary_timeouts` acts on (re-propose `view + 1`), and we DROP the rejected sync (its
     // `sync_solicit`, the only other timer this path armed) and skip the in-place apply. A caught-up
@@ -504,7 +504,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.apply_sync(now, sb, &m);
   }
 
-  /// STAGE a verified `SyncCheckpoint` (codex R24-F1, durable-before-install). Runs the up-front
+  /// STAGE a verified `SyncCheckpoint`. Runs the up-front
   /// VERIFICATION (the forced-vs-ordinary release-active assert, the fallible decode, the F3 BIND-CHECK)
   /// — these mutate nothing — then stages the durable re-persist (the two superblock writes, reusing the
   /// checkpoint sequence) and REMEMBERS the install in `pending_install`. The DESTRUCTIVE install
@@ -513,7 +513,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// once the sync ROOT (step 2) is durable. `sync` stays `Some` until then, so a crash mid-persist
   /// re-solicits (the durable root still names the OLD checkpoint until step 2 lands).
   ///
-  /// **Why defer the install (the R24-F1 root fix — durable-before-install).** The destructive effects
+  /// **Why defer the install (durable-before-install).** The destructive effects
   /// (pruning the WAL + advancing `commit_min`/`op`) are IRREVERSIBLE; the rest of vsrr only performs
   /// such effects AFTER the durable record justifying them has landed (the normal checkpoint path GCs
   /// only after its root is durable; durable-view gates participation on `pending_sb`). The old
@@ -537,10 +537,10 @@ impl<S: StateMachine> Endpoint<S> {
   /// prepared it, which would put it `<= self.op`); the only thing discarded is a stale/uncommitted tail
   /// at or below the synced checkpoint, which is safe.
   ///
-  /// On the M3.5 FORCED path ([`Self::maybe_force_sync`]) the synced `checkpoint_op` may instead be
+  /// On the FORCED path ([`Self::maybe_force_sync`]) the synced `checkpoint_op` may instead be
   /// `<= self.op` (the replica holds a tail ABOVE a pruned committed hole). The held tail
-  /// `(checkpoint_op .. self.op]` is then **PRESERVED, not discarded** by the install (safety, VOPR seed
-  /// 164) — the `held_tail` decision captured HERE is what `install_sync` honours. Those ops were
+  /// `(checkpoint_op .. self.op]` is then **PRESERVED, not discarded** by the install — the `held_tail`
+  /// decision captured HERE is what `install_sync` honours. Those ops were
   /// already durably APPENDED + ACKED by this replica (it voted for them), so the cluster may have
   /// COMMITTED them off its vote. The forced sync's *purpose* is only to recover the doomed hole(s) `N
   /// (<= checkpoint_op)` (subsumed by the restored snapshot); the acked tail above the floor must
@@ -550,9 +550,9 @@ impl<S: StateMachine> Endpoint<S> {
   /// `<= self.op` case is dropped upstream in `on_sync_checkpoint`, so reaching it here is a genuine
   /// trigger-loosening bug — fail loudly, matching `select_canonical_log`'s style); forced ⇒ the true
   /// invariant `checkpoint_op >= commit_min` (never rewind the applied frontier), where a VIOLATION is
-  /// a reordered STALE response (codex R25-F1), not a bug — DROP it gracefully (see below), never panic.
+  /// a reordered STALE response, not a bug — DROP it gracefully (see below), never panic.
   ///
-  /// **Drop a stale forced SyncCheckpoint below the applied frontier (codex R25-F1, Part B).** The
+  /// **Drop a stale forced SyncCheckpoint below the applied frontier.** The
   /// forced path relaxes the upstream stale-response guard to admit a checkpoint `<= self.op` (the
   /// held-tail case). That relaxation also lets a DELAYED forced `SyncCheckpoint` for a target the
   /// ordinary repair path has since SATISFIED (`commit_min` advanced PAST it) reach here below the
@@ -576,12 +576,12 @@ impl<S: StateMachine> Endpoint<S> {
     m: &crate::SyncCheckpoint,
   ) {
     let checkpoint_op = m.checkpoint_op();
-    // Release-active safety guard, branched on whether this is a FORCED sync (M3.5).
+    // Release-active safety guard, branched on whether this is a FORCED sync.
     if self.sync.is_some_and(|s| s.forced) {
       // FORCED path. The synced checkpoint may legitimately sit at/below our head (we hold a tail above
-      // a pruned committed hole — VOPR seed 164), so the ordinary `> self.op` requirement is relaxed.
+      // a pruned committed hole under an adversarial schedule), so the ordinary `> self.op` requirement is relaxed.
       // The TRUE invariant is `checkpoint_op >= commit_min` (never rewind the applied frontier). A
-      // VIOLATION here is a reordered STALE forced SyncCheckpoint (codex R25-F1): a forced sync whose
+      // VIOLATION here is a reordered STALE forced SyncCheckpoint: a forced sync whose
       // target the ordinary repair path already SATISFIED (`commit_min` advanced PAST it), arriving late.
       // DROP it gracefully — applying it would `set_commit_min` BACKWARD (a committed-op rewind). Part A
       // (`cancel_forced_sync_if_satisfied`) normally clears such a forced sync the moment commit catches
@@ -629,7 +629,7 @@ impl<S: StateMachine> Endpoint<S> {
     if bound_op != checkpoint_op {
       return;
     }
-    // PRESERVE-TAIL decision (safety, VOPR seed 164), captured for the deferred install: does this sync
+    // PRESERVE-TAIL decision, captured for the deferred install: does this sync
     // land BELOW our held head? Only the FORCED path can (the ordinary assert above guarantees
     // `checkpoint_op > self.op`). When it does, `install_sync` PRESERVES the band `(checkpoint_op ..
     // self.op]` rather than discarding it — those ops were already durably APPENDED + ACKED, so the
@@ -651,13 +651,13 @@ impl<S: StateMachine> Endpoint<S> {
       target_op: checkpoint_op,
       checkpoint_id: m.checkpoint_id(),
       step: CheckpointStep::AwaitSnapshot(id),
-      // a STATE-SYNC re-persist: the root completion routes to the install (codex R24-F1)
+      // a STATE-SYNC re-persist: the root completion routes to the install
       kind: CheckpointKind::SyncRepersist,
     });
     // REMEMBER the install — applied atomically by `install_sync` when the root is durable. Until then
     // the replica keeps its OLD (consistent, if stale) in-memory + durable state: NOTHING destructive
     // (no SM restore, no `commit_min`/`op` advance, no WAL prune) happens yet, so a view change in this
-    // window cancels cleanly with no pruned-but-stale band (the R24-F1 fix).
+    // window cancels cleanly with no pruned-but-stale band (the durable-before-install guarantee).
     self.pending_install = Some(PendingInstall {
       checkpoint_op,
       sessions,
@@ -668,7 +668,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
   }
 
-  /// INSTALL a staged `SyncCheckpoint` (codex R24-F1, durable-before-install) — the DESTRUCTIVE half of
+  /// INSTALL a staged `SyncCheckpoint` — the DESTRUCTIVE half of
   /// [`Self::apply_sync`]. Restores the SM + sessions, advances `commit_min`/`commit_max`/`op` to the
   /// synced point (preserving the forced-sync held tail), and prunes the WAL. (The caller advances
   /// `self.checkpoint_op` — see the note at the tail — so the durable checkpoint pointer moves only when
@@ -724,7 +724,7 @@ impl<S: StateMachine> Endpoint<S> {
     // The log cache trim is the SHARED post-checkpoint rule ([`Self::trim_log_to_checkpoint`], common
     // with `run_gc`): drop every op `<= checkpoint_op`, retaining the held tail `(checkpoint_op ..
     // head]`. The committed-survival witness floor is the LOCAL synced `checkpoint_op` (the snapshot
-    // restored above), NOT `self.checkpoint_op` — the R24-F1 deferred-advance leaves `self.checkpoint_op`
+    // restored above), NOT `self.checkpoint_op` — the deferred-advance leaves `self.checkpoint_op`
     // at the OLD value until the caller records the synced root.
     self.trim_log_to_checkpoint(checkpoint_op.get(), checkpoint_op.get());
     // The remaining teardown is site-specific (NOT the shared trim): a sync lands as a BACKUP and
@@ -762,7 +762,7 @@ impl<S: StateMachine> Endpoint<S> {
     // durable), and advancing `checkpoint_op` here would let a view change in the window persist a
     // durable-view root naming a `checkpoint_op` whose snapshot is not yet durable (a `checkpoint_op`↔
     // `checkpoint_id` mismatch); leaving it at the OLD value keeps any such root self-consistent (it
-    // names the prior durable checkpoint, exactly as the pre-R24-F1 recovery path did) until the
+    // names the prior durable checkpoint) until the
     // re-persist root lands and the caller advances it.
   }
 }

@@ -1,4 +1,4 @@
-//! Codex R7-F1 reproduction: a backup must never `PrepareOk` an op whose WAL append is still in
+//! Append-before-ack reproduction: a backup must never `PrepareOk` an op whose WAL append is still in
 //! flight, even when the primary RETRANSMITS the current-view `Prepare` during the in-flight window.
 //!
 //! The bug lives in `Endpoint::on_prepare`'s `pop <= self.op` re-ack branch, which re-acks INLINE on
@@ -37,8 +37,8 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   // Replica 2 of a 3-cluster: a BACKUP in view 0 (primary is replica 0), status Normal, head op 0.
   let cfg = Config::try_new(1, ReplicaId::new(2), 3).unwrap();
   let mut backup = Endpoint::new(cfg, 0, LogSm::default());
-  // ASYNC WAL: an append stays in flight for a few polls (the R7-F1 window). The superblock is the
-  // ordinary synchronous sim superblock — only the WAL append timing matters here.
+  // ASYNC WAL: an append stays in flight for a few polls (the append-before-ack window). The superblock
+  // is the ordinary synchronous sim superblock — only the WAL append timing matters here.
   let mut wal = InMemoryWal::with_async_appends(4);
   let mut sb = InMemorySuperblock::new();
   let now = Instant::ZERO;

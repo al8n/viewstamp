@@ -211,7 +211,7 @@ fn checkpoint_does_not_double_trigger_while_in_flight() {
     "the first checkpoint's snapshot write is inflight"
   );
 
-  // Send requests 3,4 WHILE the first checkpoint's snapshot write is still in flight. The M3.5
+  // Send requests 3,4 WHILE the first checkpoint's snapshot write is still in flight. The
   // op-reset DEFENSE (`on_request` short-circuits while `pending_checkpoint.is_some()`) DROPS them —
   // a primary must not assign new ops while a checkpoint-persist is in flight (an op-reuse hazard).
   // So commit stays at 2, and (a fortiori) no second checkpoint is armed.
@@ -318,7 +318,7 @@ fn checkpoint_completes_in_one_drain_with_synchronous_superblock() {
 
 #[test]
 fn checkpoint_gcs_wal_and_maps_below_the_quorum_checkpoint() {
-  // M3.4b GC: once a checkpoint is durable, the WAL slots + in-memory caches below the prune floor
+  // GC: once a checkpoint is durable, the WAL slots + in-memory caches below the prune floor
   // are freed. Single replica (quorum 1) → quorum_checkpoint_op == self.checkpoint_op, so the floor
   // is the checkpoint op (2): ops <= 2 are pruned from the WAL and the log/inflight caches, while a
   // NEW request still commits (apply reads from commit_min, not from a pruned op).
@@ -390,7 +390,7 @@ fn checkpoint_gcs_wal_and_maps_below_the_quorum_checkpoint() {
 fn backup_gcs_below_its_own_checkpoint_even_without_quorum_reports() {
   // A backup never collects PrepareOks, so its `quorum_checkpoint_op` would be 0 (peers default 0)
   // — if GC used the quorum floor on a backup, the backup would never prune and its WAL/log would
-  // grow unbounded. M3.4b's asymmetric floor lets a BACKUP prune below its OWN durable checkpoint
+  // grow unbounded. The asymmetric floor lets a BACKUP prune below its OWN durable checkpoint
   // (those ops are in its snapshot; a laggard below it state-syncs). This test drives a backup
   // (replica 1 of 3) to a durable checkpoint via Prepares + Commits and asserts it pruned.
   let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
@@ -616,7 +616,7 @@ fn quorum_checkpoint_op_single_replica_is_self() {
   );
 }
 
-// ── M3.5 T1: monotone peer_checkpoint ──
+// ── Monotone peer_checkpoint ──
 
 #[test]
 fn peer_checkpoint_is_monotone_under_reordering() {
@@ -699,4 +699,4 @@ fn on_commit_records_the_primary_checkpoint_monotonically() {
   );
 }
 
-// ── State-sync (M3.4a) ──
+// ── State-sync ──

@@ -9,10 +9,10 @@ use std::collections::VecDeque;
 
 #[test]
 fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated() {
-  // CONSENSUS-CRITICAL regression (codex R9-F1). `recover` set BOTH commit_min AND commit_max to
+  // CONSENSUS-CRITICAL regression. `recover` set BOTH commit_min AND commit_max to
   // checkpoint_op, DISCARDING the durable known-committed frontier `state.commit()` (which can exceed
   // checkpoint_op). A replica whose durable root says op N is committed — but whose WAL slot N read back
-  // stale/faulty (now DROPPED → repair hole by the R9-F2 / seed-52 vsr_headers cross-check) — recovered
+  // stale/faulty (now DROPPED → repair hole by the vsr_headers cross-check) — recovered
   // having FORGOTTEN that N is committed. Its DoViewChange then UNDER-reported its commit (commit_min ==
   // checkpoint_op), so if the DVC quorum is this recovered replica + a LAGGARD (the other old
   // commit-quorum holder crashed/partitioned), `commit*` never reached N, the offset-union treated the
@@ -158,7 +158,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
 
   // Pump the StartViewAsPrimary durable-view write, then a committed-vouching peer answers our
   // RequestPrepare for op 2 (commit 2 >= op 2) → fill the hole and resume the held commit to op 2. The
-  // fill is a durability barrier (R13-F2): complete the repaired append before the hole clears.
+  // fill is a durability barrier: complete the repaired append before the hole clears.
   r.handle_storage(now, &mut wal, &mut sb);
   while r.poll_message().is_some() {}
   r.handle_message(
@@ -187,14 +187,14 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
 
 #[test]
 fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repair_hole() {
-  // CONSENSUS-CRITICAL regression (codex R10-F2), the follow-on gap in the R9-F1 fix. R9-F1 made
+  // CONSENSUS-CRITICAL regression, the follow-on gap in the prior known-commit fix. That fix made
   // `recover` read `state.commit()` as the DURABLE known-committed frontier `commit_max`. But every
   // superblock ROOT write (`submit_durable_view`, the checkpoint root, a state-sync re-persist) still
   // persisted `self.commit_min` as the `VsrState` commit. So a replica HELD at `commit_min < commit_max`
-  // by a stale/faulty repair hole — exactly the R9-F1 shape — that completes a durable-view (or
+  // by a stale/faulty repair hole — exactly the held-at-repair-hole shape — that completes a durable-view (or
   // checkpoint) root write and then crashes BEFORE its DoViewChange is delivered would, on `recover`,
   // read `commit_max = state.commit() == commit_min` (LOWERED below the true known frontier). The
-  // recovered DVC then UNDER-reports the known commit and the R9-F1 truncation hazard reappears with a
+  // recovered DVC then UNDER-reports the known commit and the truncation hazard reappears with a
   // laggard quorum.
   //
   // Fix: persist `self.commit_max` (the known-committed frontier), NOT `commit_min`, in EVERY root
@@ -202,7 +202,7 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   // invariant still holds; the committed-band headers stay the CONTIGUOUS canonical prefix from the log
   // (possibly SHORTER than `commit` when there are holes — `try_new` already allows that).
   //
-  // Setup: replica 1 of 3, recovered into the R9-F1 held-at-repair-hole shape — durable root view 0,
+  // Setup: replica 1 of 3, recovered into the held-at-repair-hole shape — durable root view 0,
   // commit 2 (op 2 KNOWN committed), checkpoint_op 0, vsr_headers for ops 1 + 2; WAL head 3 with slot 2
   // permanently faulty → dropped → an interior committed repair hole. So commit_max == 2 while
   // commit_min == 0 (the SM is restored to the checkpoint; op 2 is a held hole).
@@ -292,11 +292,11 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
      (FAIL-BEFORE: it persisted commit_min == 0, lowering the durable frontier)"
   );
   // The committed band is now the SPARSE canonical set over `(checkpoint_op .. commit_max] == (0 .. 2]`
-  // (codex R12-F1): one header per HELD op, skipping the op-2 hole. This replica HOLDS op 1 (canonical)
+  //: one header per HELD op, skipping the op-2 hole. This replica HOLDS op 1 (canonical)
   // but op 2 read back faulty → dropped, so the band records ONLY op 1 — SHORTER than `commit == 2` and
-  // with a gap at op 2. This is the crux invariant R10-F2 relies on (the header list is legitimately
-  // shorter than `commit`), and the R12-F1 fix's whole point: op 1 (a held committed op) keeps its
-  // canonical header even though `commit_min == 0`, while the genuinely-not-held op 2 is left header-less
+  // with a gap at op 2. The header list is legitimately shorter than `commit`, and the key invariant
+  // is that op 1 (a held committed op) keeps its canonical header even though `commit_min == 0`,
+  // while the genuinely-not-held op 2 is left header-less
   // and peer-repaired on the next recover. (FAIL-BEFORE the sparse change ranged only up to commit_min,
   // so the band was empty.)
   assert_eq!(
@@ -458,7 +458,7 @@ fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
   // A permanently-faulty NON-head committed slot must NOT strand the replica (the old behaviour) and
   // must NOT panic: the replica returns to Normal, drops the unreadable slot from its cache, and
   // — once its commit reaches the slot — broadcasts a RequestPrepare for it (peer fault-repair),
-  // HOLDING its commit below the hole. (codex R6-F2) The slot is NOT pre-registered as a repair hole
+  // HOLDING its commit below the hole. The slot is NOT pre-registered as a repair hole
   // at recovery time: a faulty slot above the checkpoint may be UNCOMMITTED, and registering it then
   // would be an unfillable hole after the R5 repair restrictions; `advance_commit` requests it ON
   // DEMAND only when commit reaches it (which only happens once it is committed).
@@ -520,7 +520,7 @@ fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
 
 #[test]
 fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_applied() {
-  // REGRESSION (vopr seed 253 / 299 / 335), CONSENSUS-CRITICAL committed-divergence. A replica's WAL can
+  // REGRESSION, CONSENSUS-CRITICAL committed-divergence. A replica's WAL can
   // retain a STALE tail op from an EARLIER view that a later view never overwrote — a proposal it appended
   // as an old-view primary, which a view change SUPERSEDED (the new view assigns that op number a DIFFERENT
   // client request). Adoption only dropped it from the in-memory cache, not the WAL. On a later crash +
@@ -543,7 +543,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   // cluster's canonical op 3 is (client 7, request 3, body [3]). Recover must DROP slot 3 (not hold its stale
   // body) yet keep 4 + 5.
   //
-  // EXTENDED for codex R10-F1 (CONSENSUS-CRITICAL, the re-ack follow-on gap): after recover drops the stale
+  // EXTENDED (CONSENSUS-CRITICAL, the re-ack follow-on gap): after recover drops the stale
   // interior op 3, a RETRANSMITTED current-view `Prepare(op 3, CANONICAL body)` arriving BEFORE any Commit
   // must NOT be re-acked off the stale Clean WAL slot. The re-ack branch now proves IDENTITY against
   // `self.log`; a missing/mismatched current-view op is (re)appended CANONICALLY (interior overwrite at
@@ -628,7 +628,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   );
   while r.poll_message().is_some() {} // discard recovery chatter
   while r.poll_event().is_some() {}
-  // Precondition for the R10-F1 sub-scenario: the WAL slot 3 STILL holds the stale view-0 body [0xAA]
+  // Precondition for the re-ack sub-scenario: the WAL slot 3 STILL holds the stale view-0 body [0xAA]
   // (recover dropped it only from the in-memory cache, not the durable WAL), and its slot is Clean —
   // the exact false-ack bait below.
   assert_eq!(
@@ -642,7 +642,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
     "precondition: the stale slot 3 is Clean (durably appended) — the op_durably_appended bait"
   );
 
-  // ── R10-F1 (CONSENSUS-CRITICAL, the follow-on gap in the seed-335 drop): the primary RETRANSMITS the
+  // ── CONSENSUS-CRITICAL (the follow-on gap in the stale-slot drop): the primary RETRANSMITS the
   // current-view canonical `Prepare(op 3)` BEFORE any Commit registers op 3 as a repair hole. The
   // retransmit carries the primary's `commit_min` (= 2 here, < op 3), so it does NOT auto-register op 3
   // for repair. op 3 is NOT in `self.repair`, NOT in `self.log` (dropped), and `pop = 3 <= self.op = 5`,
@@ -746,10 +746,10 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
 
 #[test]
 fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hole() {
-  // codex R6-F2 (REGRESSION): a faulty slot ABOVE the checkpoint may be UNCOMMITTED. At recovery the
+  // REGRESSION: a faulty slot ABOVE the checkpoint may be UNCOMMITTED. At recovery the
   // replica only knows `commit_min == commit_max == checkpoint_op`, so it must NOT pre-register the
-  // slot in `self.repair`: post-R5 a peer serves only `op <= commit_min` and `fill_repair` rejects
-  // `commit < op`, so an uncommitted repair hole can NEVER be filled — and the R5-F2 `on_request`
+  // slot in `self.repair`: a peer serves only `op <= commit_min` and `fill_repair` rejects
+  // `commit < op`, so an uncommitted repair hole can NEVER be filled — and the `on_request`
   // guard (`!self.repair.is_empty()`) would then drop every client forever (a liveness deadlock).
   //
   // Recover with an uncommitted interior faulty slot (checkpoint 0, head 3, faulty op 2, and NO
@@ -763,14 +763,14 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
   );
   assert!(
     !r.has_repair_hole_for_test(2),
-    "an UNCOMMITTED faulty tail slot is NOT registered as a repair hole at recovery (R6-F2)"
+    "an UNCOMMITTED faulty tail slot is NOT registered as a repair hole at recovery"
   );
   assert!(
     r.repair.is_empty(),
-    "the repair set is empty after recovery — no unfillable hole, no on_request deadlock (R6-F2)"
+    "the repair set is empty after recovery — no unfillable hole, no on_request deadlock"
   );
 
-  // Liveness consequence: with an empty repair set the R5-F2 `on_request` guard does NOT drop
+  // Liveness consequence: with an empty repair set the `on_request` guard does NOT drop
   // clients. Demonstrate on a Normal PRIMARY (the role that serves requests): with the buggy
   // pre-registration (`repair = {uncommitted op}`) `on_request` returns early and the client hangs;
   // with the empty repair the recovery now produces, the primary accepts the request and prepares it.
@@ -800,7 +800,7 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
     );
     assert!(
       p.poll_message().is_none(),
-      "with a stranded uncommitted hole in `repair`, on_request drops the client (the deadlock R6-F2 removes)"
+      "with a stranded uncommitted hole in `repair`, on_request drops the client (the deadlock this removes)"
     );
   }
   // (b) fixed state: empty repair (what recovery now leaves) → the primary serves the request.
@@ -1172,7 +1172,7 @@ fn recovering_head_does_not_participate_on_non_head_learning_messages() {
   );
 }
 
-// ── R4-F1: a recovered replica must NOT resume as the established primary ──
+// ── a recovered replica must NOT resume as the established primary ──
 
 #[test]
 fn recovered_primary_abdicates_to_a_view_change_instead_of_resuming_normal() {
@@ -1483,7 +1483,7 @@ fn recover_read_ok_with_bad_checksum_does_not_adopt_the_corrupt_body() {
 
 #[test]
 fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_header() {
-  // CONSENSUS-CRITICAL regression (VOPR seed 52). `recover` blindly re-derived committed ops from
+  // CONSENSUS-CRITICAL regression. `recover` blindly re-derived committed ops from
   // the WAL bytes, so an ADOPTED committed slot whose WAL kept a STALE superseded body (a prior-view
   // proposal whose OWN header is internally consistent) was resurrected on crash+recover → the
   // recovered replica diverged. The fix: the durable `VsrState` carries the CANONICAL `vsr_headers`
@@ -1494,7 +1494,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   // Setup: replica 1 of 3. Durable root: view 0, commit 2, checkpoint_op 0, with canonical headers
   // recording op 1 = body [1] and op 2 = body [2] (bodyY). The WAL holds op 1 = [1] (canonical) but
   // op 2 = [0xBB] (bodyX — STALE), with a SELF-CONSISTENT header for [0xBB] (so plain `Header::verify`
-  // passes, exactly the seed-52 hazard). Op 3 = [3] sits above the committed band (uncommitted tail).
+  // passes — the stale-body hazard). Op 3 = [3] sits above the committed band (uncommitted tail).
   let canonical_op1 = Header::new(
     OpNumber::with(1),
     View::new(),
@@ -1602,7 +1602,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
 
   // A committed-vouching peer answers with the CANONICAL op 2 (body [2], commit=2 >= op 2). This fills
   // the hole and resumes the held commit: op 2 applies with [2] (bodyY), NEVER [0xBB] (bodyX). The fill
-  // is a durability barrier (R13-F2): complete the repaired append before the commit resumes.
+  // is a durability barrier: complete the repaired append before the commit resumes.
   r.handle_message(
     now,
     &mut wal,
@@ -1634,7 +1634,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
 
 #[test]
 fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
-  // CONSENSUS-CRITICAL regression (codex R11-F1). After R10-F2 the durable `VsrState` persists the
+  // CONSENSUS-CRITICAL regression. After the durable `VsrState` began persisting the
   // KNOWN-committed frontier `commit_max`, but `committed_band_headers` is only the CONTIGUOUS canonical
   // prefix above the checkpoint — so when a repair hole sits below `commit_max`, the committed-band ops
   // ABOVE the header prefix (but `<= commit_max`) carry NO canonical header. The recover cross-check must
@@ -1670,7 +1670,7 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
 
   let mut wal = ScriptedWal::with_entries(3);
   // op 1: canonical [1] (matches its header). op 3: canonical [3] (uncommitted tail). op 2: STALE [0xBB]
-  // with a self-consistent header — the false-ack/false-apply bait the R11-F1 fix must reject.
+  // with a self-consistent header — the false-ack/false-apply bait the recovery cross-check must reject.
   let stale_body = Bytes::copy_from_slice(&[0xBBu8]);
   let stale_header = Header::new(
     OpNumber::with(2),
@@ -1723,7 +1723,7 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
   );
 
   // A committed-vouching peer answers with the CANONICAL op 2 (body [2], commit=2 >= op 2). The fill is
-  // a durability barrier (R13-F2): complete the repaired append before the commit resumes.
+  // a durability barrier: complete the repaired append before the commit resumes.
   r.handle_message(
     now,
     &mut wal,
@@ -1747,13 +1747,13 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
 
 #[test]
 fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
-  // CONSENSUS-CRITICAL regression (codex R12-F1), the completion of the R9-F1→R10-F2→R11-F1 chain. The
-  // R11-F1 guard drops EVERY known-committed op (`op <= commit_max`) that lacks a persisted canonical
-  // header. While the persisted band was only the CONTIGUOUS prefix above the checkpoint, a SINGLE lower
-  // repair hole made all LATER committed ops header-less too — so recover deleted LOCALLY-HELD canonical
-  // copies of committed ops the R11-F1 rule was never meant to touch. When this replica was the quorum
-  // intersection for those ops (their only surviving copies), peer-repair could not vouch them → the
-  // committed tail WEDGES or is LOST.
+  // CONSENSUS-CRITICAL regression completing the known-commit / durable-frontier fix chain. The
+  // guard that drops every known-committed op (`op <= commit_max`) lacking a persisted canonical
+  // header was over-broad: while the persisted band was only the CONTIGUOUS prefix above the checkpoint,
+  // a SINGLE lower repair hole made all LATER committed ops header-less too — so recover deleted
+  // LOCALLY-HELD canonical copies of committed ops the rule was never meant to touch. When this replica
+  // was the quorum intersection for those ops (their only surviving copies), peer-repair could not vouch
+  // them → the committed tail WEDGES or is LOST.
   //
   // The fix persists a SPARSE canonical header for EVERY committed-band op this replica HOLDS (skipping
   // holes), so recover verifies each held committed op individually (keep canonical) and only
@@ -1816,9 +1816,9 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
     Status::Normal,
     "recovers to Normal (the faulty op 2 is below the head 4 → peer-repair, not RecoveringHead)"
   );
-  // THE CRUX (R12-F1): the locally-held canonical ops 3 + 4 above the lower header-less hole are KEPT —
+  // THE CRUX: the locally-held canonical ops 3 + 4 above the lower header-less hole are KEPT —
   // each verified individually against its SPARSE canonical header. (FAIL-BEFORE: the contiguous header
-  // prefix stopped at op 1, so ops 3 + 4 were header-less, `op <= commit_max` fired the R11-F1 rule, and
+  // prefix stopped at op 1, so ops 3 + 4 were header-less, `op <= commit_max` fired the over-broad drop rule, and
   // recover DROPPED them — destroying this replica's only surviving copies of the committed tail.)
   assert!(
     r.log.get(&3).is_some_and(|e| e.body.as_ref() == [3u8]),
@@ -1864,7 +1864,7 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
 
   // A committed-vouching peer supplies the CANONICAL op 2 (body [2], commit=4 >= op 2). This fills the
   // ONE hole and resumes the held commit straight through the LOCALLY-HELD ops 3 + 4 — the committed
-  // tail (op 3 / op 4) was never lost. The fill is a durability barrier (R13-F2): complete the repaired
+  // tail (op 3 / op 4) was never lost. The fill is a durability barrier: complete the repaired
   // append before the commit resumes.
   r.handle_message(
     now,
@@ -1895,7 +1895,7 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
 
 #[test]
 fn recover_reads_held_committed_ops_above_the_default_window() {
-  // CONSENSUS-CRITICAL regression (codex R13-F1). `recover`'s tail read window was capped at
+  // CONSENSUS-CRITICAL regression. `recover`'s tail read window was capped at
   // `checkpoint_op + RECOVER_TAIL_WINDOW`, which exists ONLY to bound reads against a BOGUS `op_head`
   // (bit-rot → huge), NOT to hide the legitimate committed band. With `Config::with_checkpoint_ops >
   // RECOVER_TAIL_WINDOW` a replica can durably commit FAR past its last checkpoint, persist a durable
@@ -2075,11 +2075,11 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
 
 #[test]
 fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
-  // R13-F1 COMPANION (keep the bogus-`op_head` bound green): when `commit_max == checkpoint_op` (a
+  // COMPANION test (keep the bogus-`op_head` bound green): when `commit_max == checkpoint_op` (a
   // synced/fresh root with NO committed band above the checkpoint) a HUGE `op_head` must STILL cap at
   // `checkpoint_op + RECOVER_TAIL_WINDOW` — the window bounds the uncommitted tail against bit-rot, and
   // a corrupt superblock cannot inflate `commit_max` to widen it. This is the bogus-head defense the
-  // R13-F1 fix must not weaken.
+  // recovery window bound must not weaken.
   let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
   let mut wal = ScriptedWal::with_entries(0);
   wal.head = u64::MAX; // a pathological / bit-rotted head
@@ -2109,7 +2109,7 @@ fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
 
 #[test]
 fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_request() {
-  // CONSENSUS-CRITICAL regression (codex R9-F2). A committed op's identity is `(op, client, request,
+  // CONSENSUS-CRITICAL regression. A committed op's identity is `(op, client, request,
   // body)`, NOT body bytes alone. Two clients can submit IDENTICAL payload bytes, so a STALE superseded
   // WAL slot that kept the SAME body but a DIFFERENT `client`/`request` would pass the body-only
   // cross-check, be adopted, and applied under the WRONG session — corrupting dedup/reply (duplicate
@@ -2236,7 +2236,7 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
     Bytes::copy_from_slice(&[2u8]),
   ));
   r.handle_message(now, &mut wal, &mut sb, primary_peer(), canonical_repair);
-  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes (R13-F2 barrier) → resume
+  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → resume
   assert_eq!(
     r.commit(),
     OpNumber::with(2),
@@ -2562,7 +2562,7 @@ fn recover_restores_a_nonzero_durable_view() {
   );
   // The durable root is `view 1 / log_view 0` — the replica crashed MID-VIEW-CHANGE (it had
   // escalated to ViewChange(1) and persisted the view, but never installed a view-1 log). Per the
-  // R4-F1 fix (TigerBeetle replica.zig open()), recovery RE-DRIVES the in-progress view change
+  // Per TigerBeetle replica.zig open(), recovery RE-DRIVES the in-progress view change
   // rather than resuming Normal: `log_view < view` → ViewChange at `view` (NOT Normal, which would
   // wrongly resume a never-completed view change). No op was appended (op_head == 0) and there is no
   // checkpoint, so the empty-WAL fast path settles the terminal status directly in recover().
@@ -2578,7 +2578,7 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   // A single-replica primary commits past a checkpoint (checkpoint_ops=2), so the checkpoint is
   // durable; then it "crashes". recover() MUST restore the SM from the checkpoint snapshot and set
   // commit_min == checkpoint_op (NOT 0) — re-applying [1..=checkpoint_op] would double-apply.
-  // (M3.2a never prunes the WAL — Task 5/GC is deferred — so the WAL still holds ops [1..=head];
+  // (The implementation never prunes the WAL at this stage — so the WAL still holds ops [1..=head];
   //  the log cache is rebuilt for the tail (checkpoint_op..=head] only, the snapshot owns the rest.)
   let cfg = || Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
@@ -2933,7 +2933,7 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
 
 #[test]
 fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
-  // audit D1 (the `abdicate_if_primary` chokepoint, site 3 — `on_recover_sync_checkpoint`). The F1
+  // The `abdicate_if_primary` chokepoint, site 3 — `on_recover_sync_checkpoint`. The
   // peer-checkpoint fetch RESTORES the SM from a peer snapshot but leaves `inflight` (the commit
   // pipeline) CLEARED while this replica remains the PRIMARY of its view — a wedge if it resumed as
   // primary (`try_commit` can never advance past commit_min). So a multi-replica primary that completes
@@ -3017,7 +3017,7 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   );
   assert!(
     e.pending_forfeit_for_test(),
-    "the recovered primary abdicated via the abdicate_if_primary chokepoint (audit D1) — it did not \
+    "the recovered primary abdicated via the abdicate_if_primary chokepoint — it did not \
      resume Normal as the established primary with a torn-down pipeline"
   );
 }
@@ -3025,7 +3025,7 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
 #[test]
 #[should_panic(expected = "survived into the terminal recovery status")]
 fn finalize_recovery_assert_catches_a_leaked_empty_faulty_slot() {
-  // audit D1 (the regression net): the `finalize_recovery` choke debug-asserts that no
+  // Regression net: the `finalize_recovery` choke debug-asserts that no
   // permanently-faulty committed-band slot survived as a POPULATED `self.log` entry (an empty-body
   // placeholder that `advance_commit`/`adopt_log` would apply empty cluster-wide — the original
   // empty-body CRITICAL). Here we LEAK one — op 5 is in `rec.faulty` AND still in `self.log` with an
@@ -3118,7 +3118,7 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
 
 #[test]
 fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empty() {
-  // AUDIT CRITICAL (committed-state divergence via the peer-checkpoint-fetch recovery path): Phase 1
+  // CRITICAL (committed-state divergence via the peer-checkpoint-fetch recovery path): Phase 1
   // of `recover` seeds an EMPTY-body placeholder for every tail op (headers readable, bodies pending).
   // Phase 2 verifies each; a permanently-faulty COMMITTED-band slot (op 2 here) exhausts its retry
   // budget and lands in `rec.faulty` — but its empty placeholder stays in `self.log`. The protective
@@ -3257,7 +3257,7 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
 
   // THE CORE SAFETY PROPERTY (post-recovery): op 2's EMPTY placeholder was DROPPED from `self.log`, so
   // the apply path treats it as a missing-body hole rather than a held empty entry that advance_commit
-  // would apply with `&[]`. (It is not yet REGISTERED in `self.repair` — codex R6-F2 defers that to the
+  // would apply with `&[]`. (It is not yet REGISTERED in `self.repair` — that is deferred to the
   // on-demand `advance_commit` once commit reaches it, asserted after the Commit below.) The SM reflects
   // only the restored op 1 — op 2 was never applied (empty or otherwise) on any recovery-completion path.
   assert!(
@@ -3347,7 +3347,7 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
 #[test]
 fn recover_with_no_checkpoint_is_unchanged() {
   // Backward-compat guard: with checkpoint_op == 0 (no checkpoint yet), recover() behaves EXACTLY
-  // as the M3.1b path — commit_min == commit_max == 0, a fresh SM (0 applied), log cache [1..=head].
+  // as the no-checkpoint path — commit_min == commit_max == 0, a fresh SM (0 applied), log cache [1..=head].
   let cfg = || Config::try_new(1, ReplicaId::new(1), 3).unwrap();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
@@ -3366,7 +3366,7 @@ fn recover_with_no_checkpoint_is_unchanged() {
   assert_eq!(
     recovered.commit(),
     OpNumber::with(0),
-    "no checkpoint → commit_min stays 0 (M3.1b behavior)"
+    "no checkpoint → commit_min stays 0"
   );
   assert_eq!(recovered.commit_max(), OpNumber::with(0));
   assert_eq!(recovered.checkpoint_op(), OpNumber::with(0));

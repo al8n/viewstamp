@@ -1,8 +1,8 @@
-//! M3.4b gate: post-checkpoint GC keeps the in-memory maps + WAL BOUNDED over a long run, and a
-//! restarted laggard below the prune floor STATE-SYNCS through the prune with no committed-op loss.
+//! Post-checkpoint GC gate: post-checkpoint GC keeps the in-memory maps + WAL BOUNDED over a long run,
+//! and a restarted laggard below the prune floor STATE-SYNCS through the prune with no committed-op loss.
 //!
-//! This is the "maps provably bounded" deliverable the M3.2 gate promised but deferred (GC was unsafe
-//! until state-sync, M3.4a, landed). With a small checkpoint interval and sustained client load the
+//! This is the "maps provably bounded" deliverable: GC was deferred until state-sync landed because it
+//! was unsafe to prune without a snapshot recovery path. With a small checkpoint interval and sustained client load the
 //! cluster checkpoints repeatedly; on each checkpoint a replica prunes its WAL + trims its per-op
 //! caches below the prune floor (primary: `min(checkpoint_op, quorum_checkpoint_op)`; backup: its own
 //! `checkpoint_op`). We assert, EVERY tick:

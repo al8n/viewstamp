@@ -20,7 +20,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.assert_committed_survives(op, self.checkpoint_op.get());
     self.send_request_prepare(op);
     self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
-    // Force-sync escalation (M3.5): if a quorum already checkpointed past this just-registered hole
+    // Force-sync escalation: if a quorum already checkpointed past this just-registered hole
     // (e.g. a replica recovered a rotted committed slot the cluster long since checkpointed+pruned),
     // its `RequestPrepare` is futile from the outset — escalate straight to a forced `RequestSync`.
     self.maybe_force_sync(now);
@@ -65,7 +65,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// op). The reply's `commit` field carries our commit so the requester can also learn fresh commit
   /// progress; the op's content is view-independent, so the requester accepts it regardless of our view.
   pub(crate) fn on_request_prepare(&mut self, _now: Instant, m: crate::RequestPrepare) {
-    // Durable-view-before-participate (codex R17-F1): the served `Prepare` advertises `self.view` (see
+    // Durable-view-before-participate: the served `Prepare` advertises `self.view` (see
     // below). A replica in its `pending_sb` window (a new primary between `start_view_as_new_primary`
     // and the `on_sb_done` that makes its view durable — or any replica mid `AdoptedStartView`/
     // `SendDoViewChange` write) is `Normal` but its view is NOT yet recoverable; serving a repair
@@ -84,7 +84,7 @@ impl<S: StateMachine> Endpoint<S> {
     let Some(entry) = self.log.get(&op) else {
       return; // we do not hold this op (or it is a hole for us too) — stay silent; another peer answers
     };
-    // codex R5-F1: never vouch for an uncommitted op as a repair source. Serve only ops we have
+    // never vouch for an uncommitted op as a repair source. Serve only ops we have
     // committed (op <= commit_min) so the answering Prepare carries commit (= commit_min) >= op; an op
     // above our applied frontier is not ours to certify — stay silent and let a caught-up peer answer.
     if op > self.commit_min.get() {
@@ -118,7 +118,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// The integrity of the repaired *content* rests on the VSR durability guarantee that a quorum holds
   /// every committed op's correct body (the honest-peer model) plus the placement guard above. On
   /// success the repaired body is persisted durably via a WAL append (so future reads / DVCs / a later
-  /// crash-restart serve the repaired op) as a DURABILITY BARRIER (codex R13-F2): the apply, the
+  /// crash-restart serve the repaired op) as a DURABILITY BARRIER: the apply, the
   /// hole-clear, and the exposure of the op all WAIT for that append to land. `fill_repair` stages the
   /// body in a [`Pending::RepairFill`] (NOT in `self.log`) + `submit_append`s + marks `op` `appending`,
   /// but keeps the hole OPEN and does NOT `advance_commit`; `on_wal_done` then inserts the body into
@@ -134,21 +134,21 @@ impl<S: StateMachine> Endpoint<S> {
     sb: &mut B,
     p: &Prepare,
   ) -> bool {
-    let _ = (now, &mut *sb); // the apply/advance is deferred to on_wal_done (R13-F2); no commit here
+    let _ = (now, &mut *sb); // the apply/advance is deferred to on_wal_done; no commit here
     let op = p.op().get();
     if !self.repair.contains(&op) {
       return false; // placement: not a hole we are repairing — let on_prepare handle it normally
     }
     // A RepairFill append for this op is already in flight (a duplicate/retransmitted repair Prepare):
     // the op is still a hole (kept open until durable) but staging a SECOND append would double-write.
-    // Swallow the duplicate — it is a repair answer we are already making durable (R13-F2). A repair
+    // Swallow the duplicate — it is a repair answer we are already making durable. A repair
     // hole's slot can ONLY be `appending` via a RepairFill: the normal `on_prepare` re-ack/re-append
     // branch now skips an op in `self.repair` (the repair-hole-ownership guard there), so this `appending`
     // membership unambiguously means our own in-flight RepairFill, never a normal-path append.
     if self.appending.contains(&op) {
       return true;
     }
-    // SAFETY (codex R5-F1): a committed repair hole may ONLY be filled with the committed value for
+    // SAFETY: a committed repair hole may ONLY be filled with the committed value for
     // this op. A repair answer from a peer that holds op N committed carries commit >= op (it set
     // prepare.commit = its own commit_min >= N in on_request_prepare). A STALE/reordered Prepare from an
     // old view, broadcast while its body was still UNCOMMITTED, carries commit < op — reject it (keep the
@@ -164,7 +164,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !header.verify(p.body()) {
       return false; // unverifiable body — never adopt it for a committed op; keep the hole + re-solicit
     }
-    // Persist the repaired op durably (append-after-verify) as a DURABILITY BARRIER (codex R13-F2). The
+    // Persist the repaired op durably (append-after-verify) as a DURABILITY BARRIER. The
     // body is staged in the `Pending::RepairFill` entry — NOT in `self.log` — so it is NOT exposed in a
     // DVC/StartView/checkpoint nor applied by a concurrently-triggered `advance_commit` while the append
     // is still in flight; `on_wal_done` inserts it into `self.log`, clears the hole, and advances the
