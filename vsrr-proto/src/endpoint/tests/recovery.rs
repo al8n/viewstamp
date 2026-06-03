@@ -101,7 +101,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
   // The recovered replica's OWN DVC must report its KNOWN committed frontier (commit_max == 2), not
   // commit_min == 0 — otherwise the laggard quorum loses op 2. Verify it on the wire.
-  let own_dvc_commit = std::iter::from_fn(|| r.poll_message())
+  let own_dvc_commit = core::iter::from_fn(|| r.poll_message())
     .filter_map(|out| match out.into_msg() {
       Message::DoViewChange(d) => Some(d.commit()),
       _ => None,
@@ -310,7 +310,7 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   );
 
   // The recovered DVC for view 1 reports the KNOWN committed frontier (commit_max == 2). Drain it.
-  let own_dvc_commit = std::iter::from_fn(|| r.poll_message())
+  let own_dvc_commit = core::iter::from_fn(|| r.poll_message())
     .filter_map(|out| match out.into_msg() {
       Message::DoViewChange(d) => Some(d.commit()),
       _ => None,
@@ -666,7 +666,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   // BEFORE the append completes (no handle_storage yet): NO PrepareOk(3) may have been emitted. The op was
   // missing/mismatched, so the fix (re)appends the canonical body and DEFERS the ack — it must NOT have
   // inline-acked off the stale slot. (FAIL-BEFORE: a PrepareOk(3) is emitted immediately here.)
-  let acks_before: std::vec::Vec<_> = std::iter::from_fn(|| r.poll_message())
+  let acks_before: std::vec::Vec<_> = core::iter::from_fn(|| r.poll_message())
     .filter_map(|out| match out.into_msg() {
       Message::PrepareOk(ok) if ok.op() == OpNumber::with(3) => Some(ok),
       _ => None,
@@ -697,7 +697,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
 
   // Now the append completes → on_wal_done clears `appending(3)` and sends EXACTLY ONE deferred PrepareOk(3).
   r.handle_storage(now, &mut wal, &mut sb);
-  let acks_after: std::vec::Vec<_> = std::iter::from_fn(|| r.poll_message())
+  let acks_after: std::vec::Vec<_> = core::iter::from_fn(|| r.poll_message())
     .filter_map(|out| match out.into_msg() {
       Message::PrepareOk(ok) if ok.op() == OpNumber::with(3) => Some(ok),
       _ => None,
@@ -819,7 +819,7 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
       Peer::Client(ClientId::new(7)),
       mk_request(),
     );
-    let prepared = std::iter::from_fn(|| p.poll_message())
+    let prepared = core::iter::from_fn(|| p.poll_message())
       .any(|out| matches!(out.into_msg(), Message::Prepare(_)));
     assert!(
       prepared,
@@ -2010,7 +2010,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
   // log_slice carrying the held band up to commit_max — so `commit* == commit_max <= op_head ==
   // commit_max` and the fail-stop does NOT trip. (FAIL-BEFORE: the DVC reported op == RECOVER_TAIL_WINDOW
   // with commit_max > op, so `commit* > op_head` → FAIL-STOP, or truncation destroyed the hidden ops.)
-  let own_dvc = std::iter::from_fn(|| r.poll_message())
+  let own_dvc = core::iter::from_fn(|| r.poll_message())
     .filter_map(|out| match out.into_msg() {
       Message::DoViewChange(d) => Some(d),
       _ => None,
@@ -2241,7 +2241,7 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
   );
   // The op 2 that COMMITTED carries the CANONICAL session `clientB / req 3`, NEVER the stale
   // `clientA / req 5` the WAL slot held. (FAIL-BEFORE: the body-only check adopted clientA/req5.)
-  let committed_op2 = std::iter::from_fn(|| r.poll_event())
+  let committed_op2 = core::iter::from_fn(|| r.poll_event())
     .map(|e| e.unwrap_committed())
     .find(|c| c.op() == OpNumber::with(2))
     .expect("op 2 committed event");

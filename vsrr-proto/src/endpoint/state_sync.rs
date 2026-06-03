@@ -309,7 +309,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// State-sync solicit timer: while a sync is outstanding, re-broadcast `RequestSync` and re-arm.
   /// Cleared when the synced checkpoint goes durable (`on_sb_done` clears `sync` + this timer).
   pub(crate) fn sync_timeouts(&mut self, now: Instant) {
-    if !self.timers.sync_solicit.is_some_and(|d| d <= now) {
+    if self.timers.sync_solicit.is_none_or(|d| d > now) {
       return;
     }
     if self.sync.is_none() {
