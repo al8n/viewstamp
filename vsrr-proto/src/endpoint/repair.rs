@@ -45,7 +45,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// unrepaired op and re-arm. Terminates when the last hole is filled (`fill_repair` clears the op
   /// and stops re-arming once `repair` is empty).
   pub(crate) fn repair_timeouts(&mut self, now: Instant) {
-    if !self.timers.repair_retry.is_some_and(|d| d <= now) {
+    if self.timers.repair_retry.is_none_or(|d| d > now) {
       return;
     }
     if self.repair.is_empty() {

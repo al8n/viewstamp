@@ -846,7 +846,7 @@ impl<S: StateMachine> Endpoint<S> {
     wal: &mut W,
     sb: &mut B,
   ) {
-    if !self.timers.recover_retry.is_some_and(|d| d <= now) {
+    if self.timers.recover_retry.is_none_or(|d| d > now) {
       return;
     }
     // Collect the ops needing a (re)read: those still pending OR classed faulty. (Snapshot the set
