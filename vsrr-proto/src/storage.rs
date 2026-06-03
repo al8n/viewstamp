@@ -282,10 +282,19 @@ pub struct VsrState {
   /// or a hole in `(commit_min, commit]` when the writer's applied frontier lags — simply OMITS that
   /// op's header; a held op above it keeps its own (so the list may be SHORTER than the full band AND
   /// may contain gaps; see [`Self::try_new`], which validates in-range strictly-ascending ops but allows
-  /// gaps). Private; read via [`Self::committed_headers`]. The per-entry `body_checksum` is the
+  /// gaps). Private; read via [`Self::committed_headers_slice`]. The per-entry `body_checksum` is the
   /// load-bearing field recovery checks the WAL against.
   committed_headers: Vec<Header>,
 }
+
+impl Default for VsrState {
+  /// The fresh-cluster root — delegates to [`VsrState::new`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl VsrState {
   /// Creates a durable root, validating `log_view <= view` and `commit >= checkpoint_op`.
   ///
@@ -346,7 +355,8 @@ impl VsrState {
   }
 
   /// The fresh-cluster root (all zero, no committed-band headers).
-  pub const fn initial() -> Self {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
     Self {
       view: View::new(),
       log_view: View::new(),
@@ -399,7 +409,7 @@ impl VsrState {
   /// May be SHORTER than the full band AND contain gaps when the caller had repair holes (each held op
   /// keeps its header regardless of a lower hole; [`Self::try_new`] allows gaps).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn committed_headers(&self) -> &[Header] {
+  pub fn committed_headers_slice(&self) -> &[Header] {
     &self.committed_headers
   }
 
@@ -818,7 +828,7 @@ mod tests {
     .unwrap();
     assert_eq!(s.commit(), OpNumber::with(5));
     assert_eq!(s.checkpoint_id(), 99);
-    assert!(s.committed_headers().is_empty());
+    assert!(s.committed_headers_slice().is_empty());
   }
 
   #[test]
@@ -843,8 +853,8 @@ mod tests {
       std::vec![mk(3), mk(4), mk(5)],
     )
     .unwrap();
-    assert_eq!(s.committed_headers().len(), 3);
-    assert_eq!(s.committed_headers()[0].op(), OpNumber::with(3));
+    assert_eq!(s.committed_headers_slice().len(), 3);
+    assert_eq!(s.committed_headers_slice()[0].op(), OpNumber::with(3));
 
     // A GAP after op 3 (3, then 5 — op 4 a hole) is now KEPT verbatim (codex R12-F1): the held op 5
     // above the op-4 hole retains its canonical header so recovery can verify it individually.
@@ -859,7 +869,7 @@ mod tests {
     .unwrap();
     assert_eq!(
       holed
-        .committed_headers()
+        .committed_headers_slice()
         .iter()
         .map(|h| h.op().get())
         .collect::<std::vec::Vec<_>>(),
@@ -909,7 +919,7 @@ mod tests {
     .unwrap();
     assert_eq!(
       sparse
-        .committed_headers()
+        .committed_headers_slice()
         .iter()
         .map(|h| h.op().get())
         .collect::<std::vec::Vec<_>>(),
@@ -1146,7 +1156,7 @@ mod tests {
   #[test]
   fn vsr_state_round_trips_empty_and_populated() {
     // Empty committed-band header set.
-    let empty = VsrState::initial();
+    let empty = VsrState::new();
     assert_eq!(
       VsrState::decode(&empty.encode()).expect("empty round-trips"),
       empty
@@ -1165,7 +1175,7 @@ mod tests {
     assert_eq!(back, populated, "decode(encode(state)) == state");
     assert_eq!(
       back
-        .committed_headers()
+        .committed_headers_slice()
         .iter()
         .map(|h| h.op().get())
         .collect::<std::vec::Vec<_>>(),

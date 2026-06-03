@@ -21,6 +21,7 @@ pub struct Request {
 
 impl Request {
   /// Creates a client request.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(client: ClientId, request: RequestNumber, body: Bytes) -> Self {
     Self {
       client,
@@ -71,6 +72,7 @@ pub struct Prepare {
 
 impl Prepare {
   /// Creates a prepare.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
     op: OpNumber,
@@ -151,6 +153,7 @@ pub struct PrepareOk {
 
 impl PrepareOk {
   /// Creates a prepare acknowledgement.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(view: View, op: OpNumber, replica: ReplicaId, checkpoint_op: OpNumber) -> Self {
     Self {
       view,
@@ -196,6 +199,7 @@ pub struct Reply {
 
 impl Reply {
   /// Creates a client reply.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(view: View, client: ClientId, request: RequestNumber, body: Bytes) -> Self {
     Self {
       view,
@@ -246,6 +250,7 @@ pub struct Commit {
 
 impl Commit {
   /// Creates a commit heartbeat.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(view: View, commit: OpNumber, checkpoint_op: OpNumber) -> Self {
     Self {
       view,
@@ -284,6 +289,7 @@ pub struct PreparedEntry {
 
 impl PreparedEntry {
   /// Creates a prepared-log entry.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(op: OpNumber, client: ClientId, request: RequestNumber, body: Bytes) -> Self {
     Self {
       op,
@@ -333,6 +339,7 @@ pub struct StartViewChange {
 
 impl StartViewChange {
   /// Creates a StartViewChange.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(view: View, replica: ReplicaId) -> Self {
     Self { view, replica }
   }
@@ -363,6 +370,7 @@ pub struct DoViewChange {
 
 impl DoViewChange {
   /// Creates a DoViewChange.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
     log_view: View,
@@ -439,6 +447,7 @@ pub struct StartView {
 
 impl StartView {
   /// Creates a StartView.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
     op: OpNumber,
@@ -504,6 +513,7 @@ pub struct GetView {
 
 impl GetView {
   /// Creates a GetView.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(view: View, replica: ReplicaId, nonce: u64) -> Self {
     Self {
       view,
@@ -547,6 +557,7 @@ pub struct RequestPrepare {
 
 impl RequestPrepare {
   /// Creates a RequestPrepare for the missing committed op `op`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(view: View, op: OpNumber, replica: ReplicaId) -> Self {
     Self { view, op, replica }
   }
@@ -582,6 +593,7 @@ pub struct Recovery {
 
 impl Recovery {
   /// Creates a Recovery solicitation.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(replica: ReplicaId, nonce: u64) -> Self {
     Self { replica, nonce }
   }
@@ -617,6 +629,7 @@ pub struct RecoveryResponse {
 impl RecoveryResponse {
   /// Creates a RecoveryResponse. The primary fills `op`/`commit`/`log` from its canonical state; a
   /// backup passes `op = commit = 0` and an empty `log` (view + nonce only).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
     op: OpNumber,
@@ -704,6 +717,7 @@ impl RequestSync {
   /// read back permanently corrupt) — there a peer at the SAME `checkpoint_op` must still serve, since
   /// the requester's local bytes are unusable; ordinary state-sync leaves it `false` (a peer answers
   /// only with something strictly newer).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     view: View,
     checkpoint_op: OpNumber,
@@ -773,6 +787,7 @@ pub struct SyncCheckpoint {
 
 impl SyncCheckpoint {
   /// Creates a SyncCheckpoint carrying the durable checkpoint snapshot envelope.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
     checkpoint_op: OpNumber,
@@ -1258,6 +1273,7 @@ pub struct Outgoing {
 
 impl Outgoing {
   /// Creates an outgoing message.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(to: Recipient, msg: Message) -> Self {
     Self { to, msg }
   }

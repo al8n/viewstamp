@@ -7,9 +7,17 @@ use core::time::Duration;
 /// The Sans-I/O core never reads a clock; the driver supplies `now` and converts
 /// to/from its real clock at the boundary. `u64` nanoseconds spans ~584 years —
 /// ample for monotonic elapsed time — and serializes compactly onto the wire.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct Instant(u64);
+
+impl Default for Instant {
+  /// The zero instant (epoch) — delegates to [`Instant::ZERO`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::ZERO
+  }
+}
 
 impl Instant {
   /// The zero instant (epoch).

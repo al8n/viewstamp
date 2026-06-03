@@ -253,7 +253,7 @@ impl<S: StateMachine> Endpoint<S> {
     // an op with NO canonical entry; a held committed op above a lower hole keeps its entry and is
     // verified individually (the R12-F1 fix). Only ops at/below the persisted `commit` are committed, so
     // we never cross-check (and thus never drop) an op the root did not record as committed.
-    for h in state.committed_headers() {
+    for h in state.committed_headers_slice() {
       rec
         .canonical
         .insert(h.op().get(), (h.client(), h.request(), h.body_checksum()));

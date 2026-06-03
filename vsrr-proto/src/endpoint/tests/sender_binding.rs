@@ -419,7 +419,7 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
     "an out-of-range (non-member) SyncCheckpoint is dropped: the sync is not applied",
   );
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     0,
     "the non-member snapshot was NOT restored into the SM",
   );

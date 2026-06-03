@@ -574,7 +574,7 @@ fn sync_checkpoint_restores_and_resumes_at_the_synced_point() {
   assert_eq!(e.op(), OpNumber::with(4));
   assert_eq!(e.status(), Status::Normal);
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     4,
     "SM restored from the snapshot, not replayed"
   );
@@ -631,7 +631,7 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
   let nonce = captured_sync_nonce(&mut e);
   // Baseline the OLD (pre-STAGE, post-trigger) frontier — the install must not move it before the root.
   let (base_commit, base_op, base_ckpt) = (e.commit(), e.op(), e.checkpoint_op());
-  let base_applied = e.state_machine().applied().len();
+  let base_applied = e.state_machine_ref().applied().len();
   assert_eq!(
     base_ckpt,
     OpNumber::with(0),
@@ -672,7 +672,7 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
     "commit_min did NOT jump to the synced point at STAGE"
   );
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     base_applied,
     "SM NOT restored at STAGE (still its old applied state, no snapshot installed yet)"
   );
@@ -715,7 +715,7 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
   assert_eq!(e.op(), OpNumber::with(4), "op advances on the durable root");
   assert_eq!(e.status(), Status::Normal);
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     4,
     "SM restored from the snapshot ONLY after the root is durable"
   );
@@ -1013,7 +1013,7 @@ fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
     "checkpoint unchanged (no apply)"
   );
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     4,
     "SM still reflects its own 4 applied ops — the peer snapshot was NOT restored"
   );
@@ -1070,7 +1070,7 @@ fn sync_checkpoint_with_mismatched_id_is_rejected_not_restored() {
     "rejected: checkpoint not advanced"
   );
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     0,
     "rejected: SM untouched"
   );
@@ -1152,7 +1152,7 @@ fn sync_checkpoint_with_op_not_bound_to_the_snapshot_is_rejected_not_restored() 
     "rejected: head not advanced to the overstated op"
   );
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     0,
     "rejected: SM untouched (the op-2 snapshot was NOT restored under op 4)",
   );
@@ -1201,7 +1201,7 @@ fn stale_nonce_sync_checkpoint_is_ignored() {
     OpNumber::with(0),
     "wrong nonce → ignored"
   );
-  assert_eq!(e.state_machine().applied().len(), 0);
+  assert_eq!(e.state_machine_ref().applied().len(), 0);
 }
 
 #[test]
@@ -1285,7 +1285,7 @@ fn sync_checkpoint_without_an_outstanding_sync_is_ignored() {
     OpNumber::with(0),
     "an unsolicited SyncCheckpoint (no outstanding sync) is ignored"
   );
-  assert_eq!(e.state_machine().applied().len(), 0);
+  assert_eq!(e.state_machine_ref().applied().len(), 0);
 }
 
 #[test]
@@ -2085,7 +2085,7 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
   recovered.handle_storage(now, &mut wal, &mut sb); // restore SM from the synced snapshot → Normal
   assert_eq!(recovered.status(), Status::Normal);
   assert_eq!(
-    recovered.state_machine().applied().len(),
+    recovered.state_machine_ref().applied().len(),
     4,
     "recovered SM reflects the synced checkpoint prefix"
   );

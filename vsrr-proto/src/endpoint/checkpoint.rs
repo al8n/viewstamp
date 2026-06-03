@@ -25,16 +25,8 @@ impl<S: StateMachine> Endpoint<S> {
     // repair-fill apply runs off a no-longer-in-flight op. Done for every tracked kind — each variant
     // carries its op number — and never in the `None` arm (a stale/superseded completion must not
     // retract an op a FRESH adopt-/repair-append just re-marked under a new OpId).
-    match &resolved {
-      Some(
-        Pending::Ack(op)
-        | Pending::AdoptVote(op)
-        | Pending::AdoptAck(op)
-        | Pending::RepairFill(op, _),
-      ) => {
-        self.appending.remove(&op.get());
-      }
-      None => {}
+    if let Some(p) = &resolved {
+      self.appending.remove(&p.op().get());
     }
     match resolved {
       Some(Pending::Ack(op)) => {
@@ -67,8 +59,9 @@ impl<S: StateMachine> Endpoint<S> {
       // op`), and a committed op's body is identical across all views (committed-op survival), so applying
       // it here is CONSISTENT with adoption — a `select_canonical_log`/`adopt_log` that supersedes the log
       // re-derives this exact canonical committed body, never a divergent one.
-      Some(Pending::RepairFill(op, entry)) => {
-        self.log.insert(op.get(), entry);
+      Some(Pending::RepairFill(rf)) => {
+        let op = rf.op();
+        self.log.insert(op.get(), rf.into_entry());
         self.repair.remove(&op.get());
         if self.repair.is_empty() {
           self.timers.repair_retry = None;
@@ -125,7 +118,7 @@ impl<S: StateMachine> Endpoint<S> {
     // Checkpoint write? Distinguish the two steps by their own minted OpIds.
     if let Some(pc) = self.pending_checkpoint {
       match pc.step {
-        CheckpointStep::AwaitSnapshot { id: sid } if sid == id => {
+        CheckpointStep::AwaitSnapshot(sid) if sid == id => {
           // The snapshot is durable → advance the durable root to name the new checkpoint.
           let root_id = self.mint_op_id();
           // The committed band the NEW root names shrinks to `(target_op .. commit]` (the just-
@@ -165,11 +158,11 @@ impl<S: StateMachine> Endpoint<S> {
           .expect("checkpoint root: commit_max >= target_op and log_view <= view");
           sb.submit_write(root_id, state);
           self.pending_checkpoint = Some(PendingCheckpoint {
-            step: CheckpointStep::AwaitRoot { id: root_id },
+            step: CheckpointStep::AwaitRoot(root_id),
             ..pc
           });
         }
-        CheckpointStep::AwaitRoot { id: rid } if rid == id => {
+        CheckpointStep::AwaitRoot(rid) if rid == id => {
           // The root is durable → the checkpoint is COMPLETE. Route by the TYPED `pc.kind` — whether
           // THIS root is a state-sync re-persist or an ordinary checkpoint. Matching on the kind carried
           // in the completion token (NOT `self.sync.is_some()`) makes the R24-F1 footgun structurally
@@ -280,7 +273,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op,
       checkpoint_id,
-      step: CheckpointStep::AwaitSnapshot { id },
+      step: CheckpointStep::AwaitSnapshot(id),
       kind: CheckpointKind::Ordinary, // not a state-sync re-persist
     });
   }

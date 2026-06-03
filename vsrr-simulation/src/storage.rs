@@ -647,7 +647,7 @@ impl Default for InMemorySuperblock {
 }
 
 impl InMemorySuperblock {
-  /// Creates a fresh-cluster superblock (`VsrState::initial`, no checkpoint, no faults).
+  /// Creates a fresh-cluster superblock (`VsrState::new`, no checkpoint, no faults).
   pub fn new() -> Self {
     Self::with_faults(StorageFaults::none(), 0)
   }
@@ -657,7 +657,7 @@ impl InMemorySuperblock {
   /// Synchronous writes (no async delay).
   pub fn with_faults(faults: StorageFaults, seed: u64) -> Self {
     Self {
-      state: VsrState::initial(),
+      state: VsrState::new(),
       snapshots: BTreeMap::new(),
       completions: VecDeque::new(),
       faults,
@@ -931,7 +931,7 @@ mod tests {
   #[test]
   fn superblock_write_reflects_in_state() {
     let mut sb = InMemorySuperblock::new();
-    assert_eq!(sb.state(), VsrState::initial());
+    assert_eq!(sb.state(), VsrState::new());
     // Include canonical committed-band headers (ops 1..=3) so the vsr_headers round-trip through
     // submit_write/state() too (the superblock stores VsrState by value).
     let headers: std::vec::Vec<Header> = (1..=3)
@@ -957,7 +957,7 @@ mod tests {
     sb.submit_write(OpId::new(1), next.clone());
     assert!(sb.poll().is_some());
     assert_eq!(sb.state(), next);
-    assert_eq!(sb.state().committed_headers().len(), 3);
+    assert_eq!(sb.state().committed_headers_slice().len(), 3);
   }
 
   /// Appends one entry `body` at `op` and drains the `Appended` completion.

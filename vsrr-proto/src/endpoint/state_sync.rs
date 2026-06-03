@@ -650,7 +650,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op: checkpoint_op,
       checkpoint_id: m.checkpoint_id(),
-      step: CheckpointStep::AwaitSnapshot { id },
+      step: CheckpointStep::AwaitSnapshot(id),
       // a STATE-SYNC re-persist: the root completion routes to the install (codex R24-F1)
       kind: CheckpointKind::SyncRepersist,
     });

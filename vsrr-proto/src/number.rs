@@ -3,9 +3,16 @@
 macro_rules! counter {
   ($(#[$meta:meta])* $name:ident) => {
     $(#[$meta])*
-    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     #[repr(transparent)]
     pub struct $name(u64);
+
+    impl Default for $name {
+      #[cfg_attr(not(tarpaulin), inline(always))]
+      fn default() -> Self {
+        Self::new()
+      }
+    }
 
     impl $name {
       #[doc = concat!("Creates a `", stringify!($name), "` with value 0.")]
