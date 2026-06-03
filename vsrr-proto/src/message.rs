@@ -1,6 +1,6 @@
 //! Wire message types for the Viewstamped Replication protocol.
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use std::vec::Vec;
 
 use crate::codec::{CodecError, Reader, write_bytes_u32};
@@ -988,100 +988,100 @@ impl Message {
   /// Nested [`crate::Header`]s (none appear in messages today) would reuse the fixed-size
   /// `Header::encode`. The `match` over every variant is EXHAUSTIVE (no wildcard), preserving the
   /// codebase's exhaustive-`Message`-match property.
-  pub fn encode(&self) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
-    out.push(self.tag());
+  pub fn encode(&self) -> Bytes {
+    let mut out = BytesMut::new();
+    out.put_u16(WIRE_VERSION);
+    out.put_u8(self.tag());
     match self {
       Self::Request(m) => {
-        out.extend_from_slice(&m.client.get().to_be_bytes());
-        out.extend_from_slice(&m.request.get().to_be_bytes());
+        out.put_u128(m.client.get());
+        out.put_u64(m.request.get());
         write_bytes_u32(&mut out, &m.body);
       }
       Self::Prepare(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.op.get().to_be_bytes());
-        out.extend_from_slice(&m.commit.get().to_be_bytes());
-        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
-        out.extend_from_slice(&m.client.get().to_be_bytes());
-        out.extend_from_slice(&m.request.get().to_be_bytes());
+        out.put_u64(m.view.get());
+        out.put_u64(m.op.get());
+        out.put_u64(m.commit.get());
+        out.put_u64(m.checkpoint_op.get());
+        out.put_u128(m.client.get());
+        out.put_u64(m.request.get());
         write_bytes_u32(&mut out, &m.body);
       }
       Self::PrepareOk(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.op.get().to_be_bytes());
-        out.push(m.replica.get());
-        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
+        out.put_u64(m.view.get());
+        out.put_u64(m.op.get());
+        out.put_u8(m.replica.get());
+        out.put_u64(m.checkpoint_op.get());
       }
       Self::Reply(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.client.get().to_be_bytes());
-        out.extend_from_slice(&m.request.get().to_be_bytes());
+        out.put_u64(m.view.get());
+        out.put_u128(m.client.get());
+        out.put_u64(m.request.get());
         write_bytes_u32(&mut out, &m.body);
       }
       Self::Commit(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.commit.get().to_be_bytes());
-        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
+        out.put_u64(m.view.get());
+        out.put_u64(m.commit.get());
+        out.put_u64(m.checkpoint_op.get());
       }
       Self::StartViewChange(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.push(m.replica.get());
+        out.put_u64(m.view.get());
+        out.put_u8(m.replica.get());
       }
       Self::DoViewChange(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.log_view.get().to_be_bytes());
-        out.extend_from_slice(&m.op.get().to_be_bytes());
-        out.extend_from_slice(&m.commit.get().to_be_bytes());
-        out.push(m.replica.get());
+        out.put_u64(m.view.get());
+        out.put_u64(m.log_view.get());
+        out.put_u64(m.op.get());
+        out.put_u64(m.commit.get());
+        out.put_u8(m.replica.get());
         write_log(&mut out, &m.log);
       }
       Self::StartView(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.op.get().to_be_bytes());
-        out.extend_from_slice(&m.commit.get().to_be_bytes());
-        out.push(m.replica.get());
+        out.put_u64(m.view.get());
+        out.put_u64(m.op.get());
+        out.put_u64(m.commit.get());
+        out.put_u8(m.replica.get());
         write_log(&mut out, &m.log);
       }
       Self::GetView(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.push(m.replica.get());
-        out.extend_from_slice(&m.nonce.to_be_bytes());
+        out.put_u64(m.view.get());
+        out.put_u8(m.replica.get());
+        out.put_u64(m.nonce);
       }
       Self::RequestPrepare(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.op.get().to_be_bytes());
-        out.push(m.replica.get());
+        out.put_u64(m.view.get());
+        out.put_u64(m.op.get());
+        out.put_u8(m.replica.get());
       }
       Self::Recovery(m) => {
-        out.push(m.replica.get());
-        out.extend_from_slice(&m.nonce.to_be_bytes());
+        out.put_u8(m.replica.get());
+        out.put_u64(m.nonce);
       }
       Self::RecoveryResponse(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.op.get().to_be_bytes());
-        out.extend_from_slice(&m.commit.get().to_be_bytes());
-        out.push(m.replica.get());
-        out.extend_from_slice(&m.nonce.to_be_bytes());
+        out.put_u64(m.view.get());
+        out.put_u64(m.op.get());
+        out.put_u64(m.commit.get());
+        out.put_u8(m.replica.get());
+        out.put_u64(m.nonce);
         write_log(&mut out, &m.log);
       }
       Self::RequestSync(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
-        out.push(m.replica.get());
-        out.extend_from_slice(&m.nonce.to_be_bytes());
-        out.push(m.recovery as u8);
+        out.put_u64(m.view.get());
+        out.put_u64(m.checkpoint_op.get());
+        out.put_u8(m.replica.get());
+        out.put_u64(m.nonce);
+        out.put_u8(m.recovery as u8);
       }
       Self::SyncCheckpoint(m) => {
-        out.extend_from_slice(&m.view.get().to_be_bytes());
-        out.extend_from_slice(&m.checkpoint_op.get().to_be_bytes());
-        out.extend_from_slice(&m.checkpoint_id.to_be_bytes());
-        out.push(m.replica.get());
-        out.extend_from_slice(&m.nonce.to_be_bytes());
+        out.put_u64(m.view.get());
+        out.put_u64(m.checkpoint_op.get());
+        out.put_u128(m.checkpoint_id);
+        out.put_u8(m.replica.get());
+        out.put_u64(m.nonce);
         write_bytes_u32(&mut out, &m.snapshot);
       }
     }
-    out
+    out.freeze()
   }
 
   /// Decodes a message produced by [`Self::encode`], bounds-checked and panic-free on any
@@ -1236,12 +1236,12 @@ fn read_body(r: &mut Reader<'_>) -> Result<Bytes, CodecError> {
 
 /// Writes a `Vec<PreparedEntry>` log slice: a `u32` element count, then each entry as
 /// `op`(u64) `client`(u128) `request`(u64) + a length-prefixed body.
-fn write_log(out: &mut Vec<u8>, log: &[PreparedEntry]) {
-  out.extend_from_slice(&(log.len() as u32).to_be_bytes());
+fn write_log(out: &mut impl BufMut, log: &[PreparedEntry]) {
+  out.put_u32(log.len() as u32);
   for e in log {
-    out.extend_from_slice(&e.op.get().to_be_bytes());
-    out.extend_from_slice(&e.client.get().to_be_bytes());
-    out.extend_from_slice(&e.request.get().to_be_bytes());
+    out.put_u64(e.op.get());
+    out.put_u128(e.client.get());
+    out.put_u64(e.request.get());
     write_bytes_u32(out, &e.body);
   }
 }
@@ -1793,14 +1793,14 @@ mod tests {
       Err(CodecError::Truncated { .. })
     ));
     // A bad leading version → UnknownVersion.
-    let mut badver = bytes.clone();
+    let mut badver = bytes.to_vec();
     badver[1] = 9;
     assert!(matches!(
       Message::decode(&badver),
       Err(CodecError::UnknownVersion(9))
     ));
     // An unknown variant tag (99) → UnknownTag.
-    let mut badtag = bytes.clone();
+    let mut badtag = bytes.to_vec();
     badtag[2] = 99;
     assert!(matches!(
       Message::decode(&badtag),
@@ -1812,7 +1812,7 @@ mod tests {
       Err(CodecError::Truncated { .. })
     ));
     // Trailing bytes after a fully-decoded variant → TrailingBytes.
-    let mut over = bytes;
+    let mut over = bytes.to_vec();
     over.push(0);
     assert!(matches!(
       Message::decode(&over),
@@ -1832,7 +1832,7 @@ mod tests {
       0,
       Bytes::from_static(b"abc"),
     ));
-    let mut bytes = sc.encode();
+    let mut bytes = sc.encode().to_vec();
     // The snapshot length prefix is the last 4 bytes before the 3 body bytes.
     let n = bytes.len();
     bytes[n - 7..n - 3].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
@@ -1850,7 +1850,7 @@ mod tests {
       ReplicaId::new(0),
       std::vec![entry(1, b"x")],
     ));
-    let mut d = dvc.encode();
+    let mut d = dvc.encode().to_vec();
     // Locate the log count: ver(2)+tag(1)+view(8)+log_view(8)+op(8)+commit(8)+replica(1) = 36.
     d[36..40].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
     assert!(matches!(

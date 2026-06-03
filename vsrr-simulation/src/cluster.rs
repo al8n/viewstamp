@@ -1,5 +1,7 @@
 use core::time::Duration;
 
+use smol_str::SmolStr;
+
 use vsrr_proto::{
   Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Instant, Message, OpNumber, Outgoing, Peer, Prng,
   Recipient, ReplicaId, Wal,
@@ -45,7 +47,7 @@ pub struct Cluster {
   /// structurally "via the sim's storage view". Stays `None` in the absence of a violation; a checker
   /// (the VOPR driver) drains it each tick via [`take_append_before_ack_violation`]. Existing gates
   /// never read it, so it is inert for them.
-  append_before_ack_violation: Option<String>,
+  append_before_ack_violation: Option<SmolStr>,
   /// Set by [`tick`](Self::tick) when a replica emitted ANY view-advertising / primary-authority
   /// participation message — a `StartView`/`RecoveryResponse`, a `DoViewChange` vote, a `Prepare`, a
   /// `PrepareOk` vote, or a `Commit` — for a view that is NOT yet DURABLE on its own superblock. This
@@ -59,7 +61,7 @@ pub struct Cluster {
   /// participated in a view a crash could regress it out of. Stays `None` absent a violation; the VOPR
   /// driver drains it each tick via [`take_durable_view_violation`]. Inert for existing gates (they
   /// never read it). See [`record_durable_view_violation`](Self::record_durable_view_violation).
-  durable_view_violation: Option<String>,
+  durable_view_violation: Option<SmolStr>,
   /// `None` (default) ⇒ every replica's WAL appends SYNCHRONOUSLY (existing-gate behaviour). `Some(d)`
   /// ⇒ async-append mode with per-append delay `d` polls — the Phase-A in-flight window the
   /// append-before-ack invariant must survive. Set via [`set_async_wal_delay`] before running;
@@ -336,7 +338,7 @@ impl Cluster {
   /// replica emitted a `PrepareOk` for an op whose WAL append had not completed — `Dirty`/`Empty`), if
   /// any. Returns `None` when no violation has occurred since the last drain. The violation is recorded
   /// structurally each tick by checking every emitted `PrepareOk` against the sender's own WAL view.
-  pub fn take_append_before_ack_violation(&mut self) -> Option<String> {
+  pub fn take_append_before_ack_violation(&mut self) -> Option<SmolStr> {
     self.append_before_ack_violation.take()
   }
 
@@ -346,7 +348,7 @@ impl Cluster {
   /// head-bearing `RecoveryResponse`, `DoViewChange`, `Prepare`, `PrepareOk`, or `Commit` — for a view
   /// above its own durable superblock view; the whole class, codex R8-F1 + R16-F1 + R17-F1), if any.
   /// `None` when none has occurred since the last drain.
-  pub fn take_durable_view_violation(&mut self) -> Option<String> {
+  pub fn take_durable_view_violation(&mut self) -> Option<SmolStr> {
     self.durable_view_violation.take()
   }
 
@@ -424,13 +426,16 @@ impl Cluster {
       _ => return,
     };
     if msg_view > durable_view {
-      self.durable_view_violation = Some(format!(
-        "replica {ri} emitted {kind}(view={msg_view}) while its DURABLE view is {durable_view} \
+      self.durable_view_violation = Some(
+        format!(
+          "replica {ri} emitted {kind}(view={msg_view}) while its DURABLE view is {durable_view} \
          (volatile view={}, status={}) — durable-view-before-participate (R8-F1) violated: it \
          advertised/participated in a view not yet persisted",
-        self.replicas[ri].view().get(),
-        self.replicas[ri].status().as_str(),
-      ));
+          self.replicas[ri].view().get(),
+          self.replicas[ri].status().as_str(),
+        )
+        .into(),
+      );
     }
   }
 
@@ -844,7 +849,7 @@ impl Cluster {
               r.commit().get(),
               r.commit_max().get(),
               r.checkpoint_op().get(),
-            ));
+            ).into());
           }
         }
         // Durable-view-before-participate (R8-F1 + R16-F1), checked at emission: a StartView /

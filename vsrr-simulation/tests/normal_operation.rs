@@ -18,7 +18,7 @@ fn backups_converge_via_commit_heartbeat() {
       break;
     }
   }
-  let r0: Vec<(u64, Vec<u8>)> = c.replica_sm(0).applied().to_vec();
+  let r0 = c.replica_sm(0).applied().to_vec();
   assert_eq!(r0.len(), 15, "primary applied 15 ops");
   for (i, (op, _)) in r0.iter().enumerate() {
     assert_eq!(*op, (i as u64) + 1, "contiguous, no duplicate apply");

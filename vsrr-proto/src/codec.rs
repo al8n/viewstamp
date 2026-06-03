@@ -16,7 +16,7 @@
 //!   corrupt, or adversarial buffer (the internal `Reader` below length-checks every read,
 //!   mirroring `Endpoint::decode_checkpoint`).
 
-use std::vec::Vec;
+use bytes::BufMut;
 
 /// The wire/disk format version every codec output in this crate leads with (or, for the
 /// fixed-size [`Header`](crate::Header) body, incorporates via
@@ -199,7 +199,7 @@ impl<'a> Reader<'a> {
 /// payload framing read back by [`Reader::bytes_u32`]: a big-endian `u32` byte count, then the
 /// bytes). Used to frame every `Bytes` payload + snapshot envelope in a message.
 #[cfg_attr(not(tarpaulin), inline)]
-pub(crate) fn write_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) {
-  out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-  out.extend_from_slice(bytes);
+pub(crate) fn write_bytes_u32(out: &mut impl BufMut, bytes: &[u8]) {
+  out.put_u32(bytes.len() as u32);
+  out.put_slice(bytes);
 }

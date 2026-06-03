@@ -8,6 +8,7 @@ description = "Deterministic simulation testing harness for vsrr-proto"
 
 [dependencies]
 bytes = { workspace = true }
+smol_str = { workspace = true }
 vsrr-proto = { workspace = true, features = ["std"] }
 
 [lints]

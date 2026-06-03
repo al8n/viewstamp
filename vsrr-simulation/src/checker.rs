@@ -1,5 +1,8 @@
 //! Safety / agreement checks over a cluster run.
 
+use bytes::Bytes;
+use smol_str::SmolStr;
+
 use crate::cluster::Cluster;
 
 /// Outcome of checking a cluster's invariants.
@@ -8,10 +11,16 @@ pub enum CheckResult {
   /// All checked invariants hold.
   Ok,
   /// An invariant was violated, with a human-readable reason.
-  Violation(String),
+  Violation(SmolStr),
 }
 
 impl CheckResult {
+  /// Constructs a [`Self::Violation`] from any string-ish reason (`&str` / `String` / `SmolStr`).
+  #[inline]
+  pub fn violation(reason: impl Into<SmolStr>) -> Self {
+    Self::Violation(reason.into())
+  }
+
   /// True iff all invariants held.
   pub const fn is_ok(&self) -> bool {
     matches!(self, Self::Ok)
@@ -29,12 +38,12 @@ impl CheckResult {
 ///    the longer (full content comparison, not just op numbers).
 /// 3. **Client safety** — each client's replies are for strictly increasing request numbers `1..=n`.
 pub fn check_safety(cluster: &Cluster) -> CheckResult {
-  let mut logs: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
+  let mut logs: Vec<Vec<(u64, Bytes)>> = Vec::new();
   for i in 0..cluster.replica_count() {
-    let applied: Vec<(u64, Vec<u8>)> = cluster.replica_sm(i).applied().to_vec();
+    let applied: Vec<(u64, Bytes)> = cluster.replica_sm(i).applied().to_vec();
     for (idx, (op, _)) in applied.iter().enumerate() {
       if *op != idx as u64 + 1 {
-        return CheckResult::Violation(format!(
+        return CheckResult::violation(format!(
           "replica {i}: applied op {op} at position {idx} (expected {})",
           idx + 1
         ));
@@ -45,7 +54,7 @@ pub fn check_safety(cluster: &Cluster) -> CheckResult {
   for i in 1..logs.len() {
     let n = logs[0].len().min(logs[i].len());
     if logs[0][..n] != logs[i][..n] {
-      return CheckResult::Violation(format!(
+      return CheckResult::violation(format!(
         "replica {i} diverges from replica 0 (content mismatch in applied prefix)"
       ));
     }
@@ -53,7 +62,7 @@ pub fn check_safety(cluster: &Cluster) -> CheckResult {
   for i in 0..cluster.client_count() {
     for (idx, (rn, _)) in cluster.client(i).replies().iter().enumerate() {
       if *rn != (idx as u64) + 1 {
-        return CheckResult::Violation(format!(
+        return CheckResult::violation(format!(
           "client {i}: reply for request {rn} at position {idx} (expected {})",
           idx + 1
         ));
@@ -84,7 +93,7 @@ pub fn check_safety(cluster: &Cluster) -> CheckResult {
 #[derive(Debug)]
 pub struct DurabilityChecker {
   /// The longest applied `(op, body)` prefix ever observed (the committed history high-water).
-  committed: Vec<(u64, Vec<u8>)>,
+  committed: Vec<(u64, Bytes)>,
   /// Per-replica high-water of `checkpoint_op` (monotonicity guard).
   checkpoint_hw: Vec<u64>,
 }
@@ -101,12 +110,12 @@ impl DurabilityChecker {
   /// Folds one set of per-replica applied logs + checkpoint-ops into the committed history, returning
   /// a violation on a rewritten committed op or a regressed checkpoint. Pure over its inputs so the
   /// monotonicity logic is unit-testable without a live `Cluster`.
-  fn fold(&mut self, applied: &[Vec<(u64, Vec<u8>)>], checkpoint_ops: &[u64]) -> CheckResult {
+  fn fold(&mut self, applied: &[Vec<(u64, Bytes)>], checkpoint_ops: &[u64]) -> CheckResult {
     for (i, a) in applied.iter().enumerate() {
       // (1) No committed op rewritten: agree with the committed history on the common prefix.
       let n = a.len().min(self.committed.len());
       if a[..n] != self.committed[..n] {
-        return CheckResult::Violation(format!(
+        return CheckResult::violation(format!(
           "replica {i}: applied prefix diverges from the committed history (a committed op was \
            rewritten/lost across time)"
         ));
@@ -118,7 +127,7 @@ impl DurabilityChecker {
     }
     for (i, &cp) in checkpoint_ops.iter().enumerate() {
       if cp < self.checkpoint_hw[i] {
-        return CheckResult::Violation(format!(
+        return CheckResult::violation(format!(
           "replica {i}: checkpoint_op regressed to {cp} (was {})",
           self.checkpoint_hw[i]
         ));
@@ -131,7 +140,7 @@ impl DurabilityChecker {
   /// Sample the cluster: update the committed history and return a violation if any replica rewrote a
   /// committed op or regressed its `checkpoint_op`. Call every tick.
   pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
-    let applied: Vec<Vec<(u64, Vec<u8>)>> = (0..cluster.replica_count())
+    let applied: Vec<Vec<(u64, Bytes)>> = (0..cluster.replica_count())
       .map(|i| cluster.replica_sm(i).applied().to_vec())
       .collect();
     let checkpoint_ops: Vec<u64> = (0..cluster.replica_count())
@@ -156,7 +165,7 @@ impl DurabilityChecker {
     if survived {
       CheckResult::Ok
     } else {
-      CheckResult::Violation(format!(
+      CheckResult::violation(format!(
         "no operational replica retains the committed history of {} ops — a committed op was lost \
          across crash + storage-fault + restart",
         self.committed.len()
@@ -201,7 +210,7 @@ impl ViewMonotonicChecker {
     for i in 0..cluster.replica_count() {
       let v = cluster.replica_durable_view(i).get();
       if v < self.max_view[i] {
-        return CheckResult::Violation(format!(
+        return CheckResult::violation(format!(
           "replica {i}: durable view regressed to {v} (was {})",
           self.max_view[i]
         ));
@@ -245,28 +254,28 @@ impl BoundednessChecker {
     for i in 0..cluster.replica_count() {
       let log = cluster.replica_log_len(i);
       if log > self.max_per_op {
-        return CheckResult::Violation(format!(
+        return CheckResult::violation(format!(
           "replica {i}: log cache {log} exceeds bound {} (GC not bounding the per-op cache)",
           self.max_per_op
         ));
       }
       let inflight = cluster.replica_inflight_len(i);
       if inflight > self.max_per_op {
-        return CheckResult::Violation(format!(
+        return CheckResult::violation(format!(
           "replica {i}: inflight {inflight} exceeds bound {}",
           self.max_per_op
         ));
       }
       let wal = cluster.wal_len(i);
       if wal > self.max_per_op {
-        return CheckResult::Violation(format!(
+        return CheckResult::violation(format!(
           "replica {i}: WAL {wal} exceeds bound {} (prune not freeing slots below the checkpoint)",
           self.max_per_op
         ));
       }
       let clients = cluster.replica_clients_len(i);
       if clients > self.max_clients {
-        return CheckResult::Violation(format!(
+        return CheckResult::violation(format!(
           "replica {i}: client sessions {clients} exceeds bound {}",
           self.max_clients
         ));
@@ -299,14 +308,30 @@ mod tests {
     let mut dur = DurabilityChecker::new(2);
     // Observation 1: both replicas agree on [1,2,3] → committed history is 3 ops.
     let o1 = vec![
-      vec![(1, b"a".to_vec()), (2, b"b".to_vec()), (3, b"c".to_vec())],
-      vec![(1, b"a".to_vec()), (2, b"b".to_vec()), (3, b"c".to_vec())],
+      vec![
+        (1, Bytes::from_static(b"a")),
+        (2, Bytes::from_static(b"b")),
+        (3, Bytes::from_static(b"c")),
+      ],
+      vec![
+        (1, Bytes::from_static(b"a")),
+        (2, Bytes::from_static(b"b")),
+        (3, Bytes::from_static(b"c")),
+      ],
     ];
     assert!(dur.fold(&o1, &[0, 0]).is_ok());
     // Observation 2: replica 1's op 2 now reads back a DIFFERENT body → a committed op was rewritten.
     let o2 = vec![
-      vec![(1, b"a".to_vec()), (2, b"b".to_vec()), (3, b"c".to_vec())],
-      vec![(1, b"a".to_vec()), (2, b"X".to_vec()), (3, b"c".to_vec())],
+      vec![
+        (1, Bytes::from_static(b"a")),
+        (2, Bytes::from_static(b"b")),
+        (3, Bytes::from_static(b"c")),
+      ],
+      vec![
+        (1, Bytes::from_static(b"a")),
+        (2, Bytes::from_static(b"X")),
+        (3, Bytes::from_static(b"c")),
+      ],
     ];
     assert!(
       dur.fold(&o2, &[0, 0]).is_violation(),
@@ -330,8 +355,12 @@ mod tests {
     // a violation — only a rewrite or cluster-wide loss is. observe must stay Ok.
     let mut dur = DurabilityChecker::new(2);
     let ahead = vec![
-      vec![(1, b"a".to_vec()), (2, b"b".to_vec()), (3, b"c".to_vec())],
-      vec![(1, b"a".to_vec())], // replica 1 is behind, agrees on its (short) prefix
+      vec![
+        (1, Bytes::from_static(b"a")),
+        (2, Bytes::from_static(b"b")),
+        (3, Bytes::from_static(b"c")),
+      ],
+      vec![(1, Bytes::from_static(b"a"))], // replica 1 is behind, agrees on its (short) prefix
     ];
     assert!(
       dur.fold(&ahead, &[0, 0]).is_ok(),
