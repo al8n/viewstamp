@@ -12,7 +12,7 @@ pub struct ClientModel {
   id: ClientId,
   total: u64,
   next_request: u64,
-  replies: Vec<(u64, Vec<u8>)>,
+  replies: Vec<(u64, Bytes)>,
   inflight: Option<Request>,
   /// Last instant at which the inflight request was transmitted; `None` means
   /// "not yet sent this cycle" so the next `pending` call must transmit.
@@ -38,7 +38,7 @@ impl ClientModel {
   }
 
   /// The replies received so far.
-  pub fn replies(&self) -> &[(u64, Vec<u8>)] {
+  pub fn replies(&self) -> &[(u64, Bytes)] {
     &self.replies
   }
 
@@ -77,7 +77,7 @@ impl ClientModel {
     if let Message::Reply(r) = msg {
       if let Some(req) = &self.inflight {
         if req.request() == r.request() {
-          self.replies.push((r.request().get(), r.body().to_vec()));
+          self.replies.push((r.request().get(), r.body_bytes()));
           self.inflight = None;
           self.last_sent = None;
           self.next_request += 1;

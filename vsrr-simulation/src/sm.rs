@@ -6,19 +6,19 @@ use vsrr_proto::{OpNumber, StateMachine};
 /// the linearizability checker to verify ordering and uniqueness.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LogSm {
-  applied: Vec<(u64, Vec<u8>)>,
+  applied: Vec<(u64, Bytes)>,
 }
 
 impl LogSm {
   /// The ordered list of applied `(op, body)` pairs.
-  pub fn applied(&self) -> &[(u64, Vec<u8>)] {
+  pub fn applied(&self) -> &[(u64, Bytes)] {
     &self.applied
   }
 }
 
 impl StateMachine for LogSm {
   fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
-    self.applied.push((op.get(), body.to_vec()));
+    self.applied.push((op.get(), Bytes::copy_from_slice(body)));
     Bytes::from((self.applied.len() as u64).to_be_bytes().to_vec())
   }
 
@@ -43,7 +43,7 @@ impl StateMachine for LogSm {
       i += 8;
       let len = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap()) as usize;
       i += 8;
-      applied.push((op, snapshot[i..i + len].to_vec()));
+      applied.push((op, Bytes::copy_from_slice(&snapshot[i..i + len])));
       i += len;
     }
     self.applied = applied;

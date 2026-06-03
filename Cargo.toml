@@ -12,6 +12,7 @@ vsrr-proto = { path = "vsrr-proto", version = "0.0.0" }
 bytes = { version = "1", default-features = false }
 derive_more = { version = "2", default-features = false }
 thiserror = { version = "2", default-features = false }
+smol_str = "0.3"
 
 [profile.bench]
 opt-level = 3

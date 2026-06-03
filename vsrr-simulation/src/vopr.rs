@@ -47,6 +47,7 @@
 //! On ANY violation the driver **panics** with `seed`, `tick`, and a one-line description, so the
 //! failure is reproducible by re-running that seed (see [`run_vopr_one`]).
 
+use bytes::Bytes;
 use core::time::Duration;
 
 use vsrr_proto::{Instant, Prng};
@@ -1136,14 +1137,14 @@ impl Vopr {
       "=== VOPR divergence dump seed {} tick {tick} ===",
       self.seed
     );
-    let logs: Vec<Vec<(u64, Vec<u8>)>> = (0..self.n)
+    let logs: Vec<Vec<(u64, Bytes)>> = (0..self.n)
       .map(|i| c.replica_sm(i).applied().to_vec())
       .collect();
     // First position where any two replicas disagree.
     let maxlen = logs.iter().map(Vec::len).max().unwrap_or(0);
     let mut diverge_at = maxlen;
     'outer: for pos in 0..maxlen {
-      let mut seen: Option<(u64, Vec<u8>)> = None;
+      let mut seen: Option<(u64, Bytes)> = None;
       for log in &logs {
         if let Some(e) = log.get(pos) {
           match &seen {

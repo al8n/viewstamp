@@ -6,7 +6,7 @@
 
 use std::vec::Vec;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::codec::{CodecError, Reader};
 use crate::{ClientId, OpNumber, RequestNumber, View};
@@ -171,7 +171,7 @@ impl Header {
   /// checksum), so the on-disk checksum can never disagree with the codec output. The order +
   /// `u128` widening match the original ad-hoc checksum loop verbatim, so the checksum VALUE is
   /// unchanged for already-persisted data. Exactly [`HEADER_CANONICAL_LEN`] bytes are appended.
-  fn write_canonical(&self, out: &mut Vec<u8>) {
+  fn write_canonical(&self, out: &mut impl BufMut) {
     for word in [
       self.version as u128,
       self.op.get() as u128,
@@ -180,7 +180,7 @@ impl Header {
       self.request.get() as u128,
       self.body_checksum,
     ] {
-      out.extend_from_slice(&word.to_be_bytes());
+      out.put_u128(word);
     }
   }
 
@@ -420,20 +420,21 @@ impl VsrState {
   /// fixed-size [`Header::encode`] blocks (one [`HEADER_ENCODED_LEN`]-byte block per header). The
   /// scalar field order matches the [`Self::try_new`] parameter order. Variable-length because the
   /// header set is sparse + bounded by one checkpoint interval.
-  pub fn encode(&self) -> Vec<u8> {
-    let mut out =
-      Vec::with_capacity(2 + 8 * 4 + 16 + 4 + self.committed_headers.len() * HEADER_ENCODED_LEN);
-    out.extend_from_slice(&crate::WIRE_VERSION.to_be_bytes());
-    out.extend_from_slice(&self.view.get().to_be_bytes());
-    out.extend_from_slice(&self.log_view.get().to_be_bytes());
-    out.extend_from_slice(&self.commit.get().to_be_bytes());
-    out.extend_from_slice(&self.checkpoint_op.get().to_be_bytes());
-    out.extend_from_slice(&self.checkpoint_id.to_be_bytes());
-    out.extend_from_slice(&(self.committed_headers.len() as u32).to_be_bytes());
+  pub fn encode(&self) -> Bytes {
+    let mut out = BytesMut::with_capacity(
+      2 + 8 * 4 + 16 + 4 + self.committed_headers.len() * HEADER_ENCODED_LEN,
+    );
+    out.put_u16(crate::WIRE_VERSION);
+    out.put_u64(self.view.get());
+    out.put_u64(self.log_view.get());
+    out.put_u64(self.commit.get());
+    out.put_u64(self.checkpoint_op.get());
+    out.put_u128(self.checkpoint_id);
+    out.put_u32(self.committed_headers.len() as u32);
     for h in &self.committed_headers {
-      out.extend_from_slice(&h.encode());
+      out.put_slice(&h.encode());
     }
-    out
+    out.freeze()
   }
 
   /// Decodes a durable root produced by [`Self::encode`], bounds-checked and panic-free on any
@@ -1237,7 +1238,7 @@ mod tests {
       Err(CodecError::LengthOverflow { .. })
     ));
     // Bad leading version → UnknownVersion.
-    let mut badver = good.clone();
+    let mut badver = good.to_vec();
     badver[1] = 7;
     assert!(matches!(
       VsrState::decode(&badver),
@@ -1245,14 +1246,14 @@ mod tests {
     ));
     // A header-count prefix that overruns the buffer → LengthOverflow (not an OOB slice). The
     // count u32 sits at offset 2+8+8+8+8+16 = 50.
-    let mut huge = good.clone();
+    let mut huge = good.to_vec();
     huge[50..54].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
     assert!(matches!(
       VsrState::decode(&huge),
       Err(CodecError::LengthOverflow { .. })
     ));
     // Trailing bytes after the last header → TrailingBytes.
-    let mut over = good.clone();
+    let mut over = good.to_vec();
     over.push(0);
     assert!(matches!(
       VsrState::decode(&over),
