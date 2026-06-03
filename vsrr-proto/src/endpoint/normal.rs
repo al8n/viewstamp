@@ -187,6 +187,19 @@ impl<S: StateMachine> Endpoint<S> {
     if self.commit_max.get() > self.commit_min.get() || !self.repair.is_empty() {
       return;
     }
+    // M3.2b physical bounded-WAL stall-before-wrap: never assign an op whose ring slot still holds an
+    // un-pruned op (one not yet checkpoint-subsumed on a quorum). The un-pruned window `(floor, op]`
+    // must fit in the WAL's `capacity()` slots; minting the next op would make it `next_op - floor`
+    // wide, so if THAT exceeds `capacity()` we STALL (drop this request — the client retransmits),
+    // applying back-pressure until the quorum checkpoints forward and `run_gc` frees slots. Computed
+    // BEFORE the session borrow below (which holds `&mut self.clients`, blocking `self.prune_floor()`);
+    // the decision is only ACTED ON in the accept branch, right before the op assignment, so a stale /
+    // duplicate request (which mints no op) still gets its cached-reply resend. The unbounded WAL
+    // (`capacity() == u64::MAX`) never overflows, so the default never stalls. Requires `capacity >
+    // checkpoint_ops + pipeline headroom` or the stall would never release (documented on
+    // [`Self::prune_floor`] / the `Wal` capacity contract); a sub-interval ring would wedge here.
+    let next_op = self.op.get().saturating_add(1);
+    let wal_would_overflow = next_op.saturating_sub(self.prune_floor().get()) > wal.capacity();
     let key = r.client().get();
     let session = self.clients.entry(key).or_default();
 
@@ -223,6 +236,15 @@ impl<S: StateMachine> Endpoint<S> {
     let client = r.client();
     let request = r.request();
     let body_bytes = r.body_bytes();
+    // M3.2b stall-before-wrap (decision computed above the session borrow): the next op would overflow
+    // the WAL ring — its slot still holds an op the quorum has not yet checkpoint-subsumed. STALL: drop
+    // this NEW request WITHOUT advancing `session.request` (so the client's retransmit is still the
+    // canonical next request, not seen as a gap) and WITHOUT minting the op. Back-pressure self-releases
+    // as `quorum_checkpoint_op` rises and `run_gc` frees ring slots. Unbounded WAL never reaches here.
+    if wal_would_overflow {
+      self.wal_stalls += 1; // observability: prove the stall genuinely engaged (M3.2b gate non-vacuity)
+      return;
+    }
     session.request = request;
     self.op = self.op.next();
     let header = Header::new(self.op, self.view, client, request, r.body());
@@ -300,6 +322,11 @@ impl<S: StateMachine> Endpoint<S> {
         Message::Commit(Commit::new(self.view, self.commit_min, self.checkpoint_op)),
       ));
     }
+    // codex R25-F1 (Part A): cancel an outstanding FORCED sync the commit just satisfied (its target is
+    // now `<= commit_min`). A primary normally forfeits rather than force-sync (`maybe_force_sync`), so
+    // this rarely fires here — but a forced sync ARMED while this replica was a backup, then satisfied by
+    // ordinary commit after it regained primacy, must not linger to admit a stale SyncCheckpoint.
+    self.cancel_forced_sync_if_satisfied();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(sb);
   }
@@ -463,9 +490,29 @@ impl<S: StateMachine> Endpoint<S> {
       return;
     }
     if pop == self.op.get() + 1 {
+      // M3.2b Phase B: a SUB-QUORUM laggard on a bounded ring may have fallen BELOW its ring window —
+      // appending this head-extending op would PHYSICALLY overwrite an op it has not yet
+      // checkpoint-subsumed (`pop - checkpoint_op > capacity`). It cannot hold the full live tail, so it
+      // state-syncs to the cluster checkpoint instead of wrapping away a needed slot (and DROPS this
+      // prepare). Inert for an unbounded WAL / an in-quorum backup (no overflow). Checked AFTER
+      // `advance_commit` above, so a commit that just advanced the checkpoint can avert a needless sync.
+      if self.maybe_sync_below_ring_window(now, wal, pop, p.checkpoint_op()) {
+        return;
+      }
       self.append_prepare(wal, p);
-      // Drain any buffered, now-contiguous prepares.
-      while let Some(next) = self.buffer.remove(&(self.op.get() + 1)) {
+      // Drain any buffered, now-contiguous prepares — each also extends the head, so it too could fall
+      // below the ring window. Stop draining at the first op that would overflow (it + every higher
+      // buffered op is unreachable until the sync just armed installs; the `sync.is_some()` guard then
+      // drops their retransmits).
+      while let Some(next) = self.buffer.get(&(self.op.get() + 1)) {
+        let (next_op, next_ckpt) = (next.op().get(), next.checkpoint_op());
+        if self.maybe_sync_below_ring_window(now, wal, next_op, next_ckpt) {
+          break;
+        }
+        let next = self
+          .buffer
+          .remove(&(self.op.get() + 1))
+          .expect("just peeked");
         self.append_prepare(wal, next);
       }
       // After appending, apply any ops now available up to the learned commit.
@@ -481,6 +528,22 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn append_prepare<W: Wal>(&mut self, wal: &mut W, p: Prepare) {
+    // M3.2b Phase B: the backup-overflow guard ([`Self::maybe_sync_below_ring_window`]) runs in
+    // `on_prepare` BEFORE every head-extend append (the new-op branch + each buffered-prepare drain), so
+    // a bounded-WAL append never overwrites an un-pruned ring slot. This debug-assert FREEZES that
+    // contract: a future caller that extends the head without the guard (re-opening the
+    // resident-tail-overflow class — `recover` would then read a wrapped-away op) trips it. Unbounded ⇒
+    // never fires (`capacity == u64::MAX`); and `pop == self.op + 1 > checkpoint_op` here, so the
+    // condition asserted is the exact negation of the guard's overflow test (`pop - checkpoint_op > cap`).
+    debug_assert!(
+      wal.capacity() == u64::MAX
+        || p.op().get().saturating_sub(self.checkpoint_op.get()) <= wal.capacity(),
+      "bounded-WAL backup-overflow: appending op {} would overwrite an un-pruned ring slot \
+       (checkpoint_op={}, capacity={}) — the maybe_sync_below_ring_window guard was bypassed",
+      p.op().get(),
+      self.checkpoint_op.get(),
+      wal.capacity(),
+    );
     self.op = p.op();
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
     let id = self.mint_op_id();
@@ -630,6 +693,11 @@ impl<S: StateMachine> Endpoint<S> {
           reply,
         )));
     }
+    // codex R25-F1 (Part A): if applying past a filled repair hole has carried `commit_min` to/past an
+    // outstanding FORCED sync's target, the hole the force-sync was working around is recovered the cheap
+    // way — cancel the now-unneeded forced sync (clears `sync` + its solicit timer) so a delayed, stale
+    // SyncCheckpoint for that target never reaches `apply_sync` below the advanced frontier.
+    self.cancel_forced_sync_if_satisfied();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(sb);
   }
@@ -678,6 +746,47 @@ impl<S: StateMachine> Endpoint<S> {
     for op in lo..=hi {
       self.send_request_prepare(op);
     }
+  }
+
+  /// Periodic checkpoint REPORT to the primary, piggybacked on the `Commit` heartbeat (M3.2b liveness).
+  /// A backup ordinarily reports its `checkpoint_op` to the primary ONLY inside a `PrepareOk` answering a
+  /// `Prepare`. That couples the primary's view of the quorum checkpoint to fresh op traffic — which the
+  /// M3.2b bounded-WAL stall can HALT: once op-assignment stalls (the un-pruned window hit the ring
+  /// bound), the primary broadcasts no new `Prepare`s, so backups send no fresh `PrepareOk`s, so the
+  /// primary's `peer_checkpoint` for them goes STALE. The prune floor `min(checkpoint_op,
+  /// quorum_checkpoint_op())` then under-counts the quorum's true checkpoint and the stall never releases
+  /// — a deadlock when the pipeline drains exactly at the ring bound (every head op committed+acked, no
+  /// in-flight `Prepare` whose `PrepareOk` would refresh the report). To keep the report fresh
+  /// independent of op flow, a caught-up Normal backup RE-ACKS its OWN durable `checkpoint_op` on each
+  /// heartbeat: the `PrepareOk` carries that `checkpoint_op`, so the primary's `quorum_checkpoint_op`
+  /// (and thus the prune floor + the stall release) tracks the real quorum checkpoint even while
+  /// op-assignment is stalled.
+  ///
+  /// Re-acking `checkpoint_op` (NOT `commit_min` / the head) is deliberately the SAFEST possible op to
+  /// vouch for: it is at/below the applied frontier, so it is durable + committed and the
+  /// `on_prepare_ok` side-effects are inert — it re-ORs an already-pruned `inflight` bit (a no-op,
+  /// `run_gc` freed it) and `try_commit` advances nothing; ONLY `record_peer_checkpoint` (the report)
+  /// takes effect. Gated like every other backup participation: skip while a durable-view write is
+  /// pending (`pending_sb` — the durable-view-before-participate rule, enforced at the `emit`
+  /// chokepoint), while syncing, or before anything is checkpointed (`checkpoint_op == 0` — the floor is
+  /// already 0, nothing to un-stall). The append-before-ack guard is EXPLICIT here (`!appending`): even
+  /// the checkpoint-boundary slot can be transiently IN FLIGHT — a state-sync install / recovery keeps
+  /// the WAL slot AT `checkpoint_op` and may re-append it (staged), marking it `appending` — and
+  /// `send_prepare_ok` MUST NOT vouch for an op whose append has not completed (it `debug_assert!`s this;
+  /// VOPR seed 313). No-op for the primary. None of these skips harm stall-release liveness: the stall
+  /// only needs fresh reports during STEADY operation (when `pending_sb`/`sync`/the boundary re-append
+  /// are all clear), which is exactly when this fires.
+  fn report_checkpoint_to_primary(&mut self) {
+    if !self.status.is_normal()
+      || self.is_primary()
+      || self.sync.is_some()
+      || self.pending_sb.is_some()
+      || self.checkpoint_op.get() == 0
+      || self.appending.contains(&self.checkpoint_op.get())
+    {
+      return;
+    }
+    self.send_prepare_ok(self.checkpoint_op);
   }
 
   pub(crate) fn on_prepare_ok<B: Superblock>(&mut self, now: Instant, sb: &mut B, ok: PrepareOk) {
@@ -737,5 +846,10 @@ impl<S: StateMachine> Endpoint<S> {
     // `commit_min+1..=op`) never re-sends a committed op below its own commit_min, so a backup that fell
     // behind would otherwise be stranded at its head. Self-retrying on each heartbeat until caught up.
     self.request_tail_gap();
+    // M3.2b liveness: re-report our checkpoint to the primary on the heartbeat (a `PrepareOk` for
+    // `commit_min` carrying `checkpoint_op`), so the primary's `quorum_checkpoint_op` — the bounded-WAL
+    // prune floor / stall-release signal — stays fresh even when op-assignment is stalled and no new
+    // `Prepare`/`PrepareOk` traffic flows. Without this the stall can deadlock at the ring bound.
+    self.report_checkpoint_to_primary();
   }
 }

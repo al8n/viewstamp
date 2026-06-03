@@ -114,6 +114,36 @@ pub struct VoprReport {
   /// far-behind replica (its own checkpoint truly subsumed/gone) still escalates — so this count must
   /// stay `> 0` after the fix, proving the path is still exercised.
   forced_syncs: u64,
+  /// The bounded WAL ring size `N` this run was seeded with (M3.2b Phase C), or `None` if this seed runs
+  /// the UNBOUNDED default (≈2/3 of seeds). When `Some(n)`, every replica's WAL is a fixed `n`-slot ring
+  /// (op `K` occupies slot `K mod n`), so the primary STALLS op-assignment before it would physically
+  /// wrap an un-pruned slot. `n` is sized `checkpoint_ops * k + headroom` (`k` in 3..=6) — always well
+  /// above one checkpoint interval plus pipeline headroom, so the stall ALWAYS releases (see
+  /// [`Vopr::build_cluster`]); a tighter ring would WEDGE the primary (a permanent stall → spurious
+  /// liveness failure), which is exactly the headroom constraint this sizing honours.
+  wal_capacity: Option<u64>,
+  /// Cumulative WAL STALLS across all replicas this run (the primary dropped a client request at
+  /// op-assignment because minting the next op would overflow its bounded ring — the physical
+  /// stall-before-wrap). `0` on an unbounded seed (the ring is `u64::MAX`, never overflows). `> 0` on a
+  /// bounded seed proves the ring genuinely FILLED and the stall engaged — wrap was EXERCISED, not
+  /// vacuously skipped by an under-filled ring. The committed sweep asserts the SUM across bounded seeds
+  /// is `> 0` (Item 3 non-vacuity). Read off the proto's per-replica `wal_stalls` (monotone, persists
+  /// across crash/restart since the WAL does), summed each tick and tracked as a high-water.
+  wal_stalls: u64,
+  /// Cumulative BELOW-RING-WINDOW state-syncs across all replicas this run (a backup received a
+  /// head-extending `Prepare` whose ring slot still held an un-pruned op and STATE-SYNCED to the cluster
+  /// checkpoint instead of overwriting it — the proto's `maybe_sync_below_ring_window` guard). `0` on an
+  /// unbounded seed. Distinct from an ordinary `> self.op` state-sync. This is a RARE confluence under
+  /// the VOPR schedule (it needs a sub-quorum laggard adopting a head over a held-commit hole while its
+  /// own checkpoint lags below the ring window); the deterministic `bounded_wal.rs` laggard gate covers
+  /// it directly, so the committed sweep only NOTES this count rather than forcing a flaky assert.
+  below_ring_window_syncs: u64,
+  /// `true` iff this is a BOUNDED seed (`wal_capacity.is_some()`) that committed STRICTLY MORE than `N`
+  /// ops — i.e. its ring genuinely WRAPPED at least once (an op `K + N` reused op `K`'s physical slot).
+  /// This is the strongest single witness that the bounded mode did real work: a seed whose committed
+  /// history never reached `N` would exercise the ring slots but never a wrap. The committed sweep
+  /// asserts SOME bounded seed wrapped (Item 3), proving the wrap path is non-vacuous.
+  bounded_seed_wrapped: bool,
 }
 
 impl VoprReport {
@@ -205,6 +235,36 @@ impl VoprReport {
   pub const fn forced_syncs(&self) -> u64 {
     self.forced_syncs
   }
+
+  /// The bounded WAL ring size `N` this run was seeded with (M3.2b Phase C), or `None` for an UNBOUNDED
+  /// seed. `Some(n)` ⇒ every WAL is a fixed `n`-slot ring and the primary stalls before wrapping an
+  /// un-pruned slot; the sweep uses this to partition seeds into bounded/unbounded for the non-vacuity
+  /// assertions (only bounded seeds exercise wrap).
+  pub const fn wal_capacity(&self) -> Option<u64> {
+    self.wal_capacity
+  }
+
+  /// The cumulative WAL-STALL count across the run (the primary dropped a request because minting the
+  /// next op would overflow its bounded ring). `0` on an unbounded seed. `> 0` ⇒ the bounded ring
+  /// genuinely FILLED and the stall-before-wrap engaged (wrap was exercised, not vacuously skipped).
+  pub const fn wal_stalls(&self) -> u64 {
+    self.wal_stalls
+  }
+
+  /// The cumulative BELOW-RING-WINDOW state-sync count across the run (a backup overflowed its ring
+  /// window on a head-extending `Prepare` and state-synced instead of overwriting an un-pruned slot —
+  /// the `maybe_sync_below_ring_window` guard). `0` on an unbounded seed; rare under the VOPR schedule
+  /// (the `bounded_wal.rs` laggard gate covers it deterministically).
+  pub const fn below_ring_window_syncs(&self) -> u64 {
+    self.below_ring_window_syncs
+  }
+
+  /// `true` iff this is a bounded seed whose ring genuinely WRAPPED — it committed strictly more than
+  /// `N` ops, so an op `K + N` physically reused op `K`'s ring slot. The strongest single witness that
+  /// the bounded mode did real work (the sweep asserts SOME bounded seed wrapped).
+  pub const fn bounded_seed_wrapped(&self) -> bool {
+    self.bounded_seed_wrapped
+  }
 }
 
 /// The driver's own seeded RNG + bookkeeping. Separate from the cluster's internal network/storage
@@ -240,10 +300,24 @@ struct Vopr {
   /// (a `recover` resets the proto's per-replica counter to 0, so we fold each positive delta into the
   /// report's running total and a reset's downward step contributes nothing). Indexed by replica.
   forced_sync_seen: Vec<u64>,
+  /// Per-replica last-observed WAL-STALL count (M3.2b Phase C), for the same reset-robust cumulative
+  /// accumulation as [`Self::forced_sync_seen`]: the proto's `wal_stalls` counter ALSO resets to 0 on
+  /// `recover` (it lives on the `Endpoint`, rebuilt each restart — see `recovery.rs`), so a plain
+  /// high-water would lose a pre-restart stall burst. Indexed by replica.
+  wal_stalls_seen: Vec<u64>,
+  /// Per-replica last-observed BELOW-RING-WINDOW-sync count (M3.2b Phase C), accumulated reset-robustly
+  /// like [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by
+  /// replica.
+  below_ring_window_syncs_seen: Vec<u64>,
   /// Liveness baseline captured at the START of the current calm window: the cluster's committed-op
   /// high-water and whether any client still had outstanding work. Used to assert progress at the end.
   calm_baseline_committed: usize,
   calm_had_outstanding: bool,
+  /// The bounded WAL ring size `N` seeded for this run (M3.2b Phase C), or `None` for the UNBOUNDED
+  /// default. Held here (not just in the report) because the per-tick RING-RESIDENCY checker
+  /// ([`Vopr::check_ring_residency`]) is meaningful ONLY on a bounded seed — on an unbounded WAL every
+  /// op is trivially resident, so the checker short-circuits when this is `None`.
+  wal_capacity: Option<u64>,
   report: VoprReport,
 }
 
@@ -365,8 +439,12 @@ impl Vopr {
       phase_until: 0,
       calm_start_virtual: Instant::ZERO,
       forced_sync_seen: vec![0; n],
+      wal_stalls_seen: vec![0; n],
+      below_ring_window_syncs_seen: vec![0; n],
       calm_baseline_committed: 0,
       calm_had_outstanding: false,
+      // Set by `build_cluster` (which draws the bounded-WAL decision off the prng); `None` until then.
+      wal_capacity: None,
       report: VoprReport {
         seed,
         replicas: n,
@@ -407,6 +485,46 @@ impl Vopr {
     } else {
       4 + self.prng.below(9)
     };
+    // M3.2b Phase C: seed-derive a PHYSICAL bounded-WAL ring for ~1/3 of seeds (the rest keep the
+    // UNBOUNDED default), so the adversarial sweep finally EXERCISES wrap (stall-before-wrap + recover
+    // off a wrapped ring + a below-ring-window backup overflow) UNDER the full fault schedule — crash +
+    // partition + disk faults together — closing the audit's biggest "VOPR-green overstates safety" gap.
+    //
+    // CRITICAL headroom constraint: the primary stalls op-assignment so the un-pruned window
+    // `(prune_floor, op]` never exceeds `N` slots, and that stall RELEASES only as the quorum checkpoint
+    // rises (lifting the prune floor `min(checkpoint_op, quorum_checkpoint_op)` and freeing slots). So
+    // `N` MUST exceed one checkpoint interval plus the in-flight pipeline depth, or the window can never
+    // reach the next checkpoint boundary before it would wrap and the primary WEDGES PERMANENTLY (a
+    // spurious liveness failure, not a real bug). We size `N = checkpoint_ops * k + HEADROOM` with `k`
+    // in 3..=6 — the prune floor lags `checkpoint_op` by at most one interval and the quorum's min
+    // checkpoint by at most one more, so `2 * checkpoint_ops + pipeline` bounds the window and `k >= 3`
+    // clears it with margin (the `bounded_wal.rs` gate proves checkpoint_ops=4 → N=12=4*3 RELEASES even
+    // under a deeper 8-client pipeline; the VOPR's 2..=4 clients are strictly shallower). HEADROOM (8)
+    // is a fixed pipeline cushion on top, so the tiniest case (checkpoint_ops=4, k=3) is N=20 — more
+    // generous than the gate's proven 12. NOTE: on a LARGE-`checkpoint_ops` seed `N` lands in the
+    // thousands while the 4000-tick budget commits at most ~1.1k ops, so the ring never fills — bounded
+    // mode is then safe-but-vacuous there; the genuine wrap-exercising seeds are the small-interval ones.
+    //
+    // The bounded decision is drawn from a SEPARATE per-seed PRNG (`seed ^ BOUNDED_WAL_SEED_MAGIC`), NOT
+    // the action stream `self.prng`, for two reasons: (1) it leaves every seed's action schedule +
+    // checkpoint_ops + async delays BYTE-IDENTICAL to the pre-Phase-C sweep, so the ~2/3 unbounded seeds
+    // (and every pinned regression seed that lands unbounded) reproduce their EXACT historical scenario —
+    // adding draws to `self.prng` here would shift the whole downstream schedule and silently change what
+    // those seeds test; (2) it is still a pure deterministic function of `seed`, UNCONDITIONAL (the env
+    // mask below only gates APPLYING the capacity, never the draw), so a `VOPR_NO_BOUNDED_WAL` shrink
+    // stays on the exact same schedule — the determinism guarantee the `VOPR_NO_*` masks rely on.
+    const BOUNDED_WAL_HEADROOM: u64 = 8;
+    const BOUNDED_WAL_SEED_MAGIC: u64 = 0xB0DE_D7A1_5EED_0C7A;
+    let mut bounded_prng = Prng::new(self.seed ^ BOUNDED_WAL_SEED_MAGIC);
+    let bounded_wal = bounded_prng.chance(1, 3);
+    let bounded_k = 3 + bounded_prng.below(4); // k in 3..=6
+    let wal_capacity = if bounded_wal && !env_flag("VOPR_NO_BOUNDED_WAL") {
+      Some(checkpoint_ops * bounded_k + BOUNDED_WAL_HEADROOM)
+    } else {
+      None
+    };
+    self.wal_capacity = wal_capacity;
+    self.report.wal_capacity = wal_capacity;
     let mut c = Cluster::with_checkpoint_ops(
       self.n as u8,
       clients,
@@ -433,6 +551,13 @@ impl Vopr {
     // Baseline storage + network faults for the chaos phases (toggled around calm windows).
     c.set_storage_faults(self.chaos_storage_faults());
     c.set_faults(self.chaos_network_faults());
+    // M3.2b Phase C: install the seed-derived bounded ring LAST so its storage rebuild composes over the
+    // async-WAL/superblock modes + the storage-fault plan set above (each rebuild preserves the others'
+    // settings; `set_wal_capacity` is just the final pass that also fixes `capacity()` to `N`). On an
+    // unbounded seed `wal_capacity` is `None` and this is skipped (the WAL keeps its `u64::MAX` default).
+    if let Some(n) = wal_capacity {
+      c.set_wal_capacity(Some(n));
+    }
     c
   }
 
@@ -849,6 +974,7 @@ impl Vopr {
       panic!("vopr seed {} tick {tick}: boundedness: {why}", self.seed);
     }
     self.check_structural(c, tick);
+    self.check_ring_residency(c, tick);
   }
 
   /// The structural per-replica invariants, read directly off the sim state each tick:
@@ -910,6 +1036,96 @@ impl Vopr {
          (< quorum {quorum}) — a committed op is not retained durably by a quorum",
         self.seed
       );
+    }
+  }
+
+  /// The M3.2b Phase-C RING-RESIDENCY safety invariant — the PHYSICAL analogue of "no committed op
+  /// lost", checked every tick on a BOUNDED seed (a no-op on an unbounded one, where the ring is
+  /// `u64::MAX` slots so a wrap is impossible, hence the short-circuit). The invariant, faithful to the
+  /// `bounded_wal.rs` `tail_is_ring_resident` intent ("a wrap must NEVER drop an op recover/repair still
+  /// needs") but SOUND under the VOPR's full adversarial state: NO committed op above the prune floor is
+  /// physically WRAPPED AWAY — i.e. no op `op` with `checkpoint_op < op <= commit_min` (committed +
+  /// applied, un-pruned) has its ring slot `op mod N` currently OCCUPIED BY A STRICTLY-LATER congruent op
+  /// `op + m·N` (`m >= 1`, `<= head`). That state is the ONLY genuine committed-op wrap: a later
+  /// generation evicted a still-needed committed op, so `recover` would read a DIFFERENT op's bytes for
+  /// `op` (committed-op-loss class). Combined with [`DurabilityChecker`] (no committed op rewritten/lost
+  /// ACROSS TIME) and [`check_safety`] (cross-replica agreement), it closes the wrap-corruption loop.
+  ///
+  /// Why "slot reused by a later op", NOT merely "slot is `Empty`": a committed op's WAL slot can be
+  /// legitimately `Empty` under the adversarial VOPR in ways that are NOT a wrap and that `recover`
+  /// repairs/re-syncs cleanly — so flagging every `Empty` slot false-positives. The three benign `Empty`
+  /// cases observed (each verified real-vs-checker, fix-the-checker-not-the-proto, the seed-151 lesson):
+  /// (1) **async in-flight** — the freshest tail ops are transiently `Dirty`, not yet durable (the
+  /// append-before-ack window); (2) **applied-from-cache** — a BACKUP advances `commit_min` by applying an
+  /// op from its in-memory `log` cache once it learns the op is committed, WITHOUT that op being durable in
+  /// its OWN WAL (its slot may be `Empty`/`Dirty`/abandoned); `recover` routes such a non-durable tail slot
+  /// through the peer-repair path, and durability is held on a quorum elsewhere (VOPR seed 28: a backup at
+  /// commit_min=1558 had op 1554 `Empty` with NO later occupant — applied-from-cache, not a wrap); (3)
+  /// **state-sync-pruned + R24-F1-deferred checkpoint** — a just-synced replica has already
+  /// `wal.prune(synced_ckpt)`d and advanced `commit_min` to the synced point, while `self.checkpoint_op`
+  /// still reads the OLD durable value until the synced ROOT is durable, so the band
+  /// `(checkpoint_op .. commit_min]` is full of snapshot-subsumed `Empty` slots (VOPR seed 22:
+  /// commit_min=815, checkpoint_op=804, the 805..815 band snapshot-subsumed). A true WRAP differs from all
+  /// three: the slot is occupied by a LATER op (the evicting generation), and the bounded ring keys its
+  /// resident map by op number, so a later congruent op being resident is the exact, unambiguous physical
+  /// signature of `op` having been overwritten. (Also bound by `commit_min`, not `head`: a backup can
+  /// ADOPT a head far ahead of its resident tail with a legitimate un-repaired uncommitted `Empty` gap —
+  /// VOPR seed 19, head=1436 over commit_min=1401 — which is repair territory, not a wrap.)
+  ///
+  /// This is the observable analogue of the proto's permanent `append_prepare` debug-assert (which panics
+  /// at append time if any append would overwrite an un-pruned slot): both backstop the stall-before-wrap
+  /// and `maybe_sync_below_ring_window` guards, this one as an independent per-tick cross-check over the
+  /// whole resident committed tail (not relying on debug-assertions being enabled).
+  fn check_ring_residency(&self, c: &Cluster, tick: u64) {
+    // Unbounded seed: the WAL is `u64::MAX` slots, so a wrap is impossible — nothing to check.
+    let Some(n) = self.wal_capacity else {
+      return;
+    };
+    for i in 0..self.n {
+      // A crashed replica is powered off — its volatile state is meaningless and its durable WAL is read
+      // only on the next `recover`; the residency invariant is checked on the OPERATIONAL replicas (and
+      // re-checked on a recovered one once it rejoins). Mirrors the `bounded_wal.rs` gate, which checks
+      // the tail before the crash and after the rejoin, never on the powered-off replica.
+      if c.is_crashed(i) {
+        continue;
+      }
+      let ckpt = c.replica_checkpoint_op(i).get();
+      let commit_min = c.replica_commit(i).get();
+      let head = c.replica_op(i).get();
+      // Scan the un-pruned COMMITTED band `(checkpoint_op .. commit_min]` for a physical wrap: an op whose
+      // ring slot is now held by a strictly-LATER congruent op. (Below `checkpoint_op` a wrap is benign —
+      // snapshot-subsumed; above `commit_min` an `Empty` slot is a legitimate repair gap, not a wrap.)
+      for op in (ckpt + 1)..=commit_min {
+        if c.replica_wal_slot_not_wrapped_away(i, vsrr_proto::OpNumber::with(op)) {
+          continue; // `op` itself is still resident (`Clean`/`Faulty`) or its own append is in flight.
+        }
+        // `op`'s slot is `Empty`. It is a WRAP only if a strictly-later congruent op `op + m·N` (<= head)
+        // is RESIDENT — that op physically occupies slot `op mod N`, having evicted the committed `op`. If
+        // no later congruent op is resident, the `Empty` is one of the benign cases (async in-flight /
+        // applied-from-cache / sync-pruned-deferred) the doc explains — `recover`/repair handles it.
+        let mut y = op + n;
+        let mut wrapped_by = None;
+        while y <= head {
+          if c.replica_wal_holds_op(i, vsrr_proto::OpNumber::with(y)) {
+            wrapped_by = Some(y);
+            break;
+          }
+          y += n;
+        }
+        if let Some(y) = wrapped_by {
+          if env_flag("VOPR_DUMP") {
+            self.dump_divergence(c, tick);
+          }
+          panic!(
+            "vopr seed {} tick {tick}: ring-residency: replica {i} COMMITTED op {op} (checkpoint_op={ckpt}, \
+             commit_min={commit_min}, head={head}, ring N={n}) was physically WRAPPED AWAY — its ring slot \
+             {} is now occupied by the strictly-later op {y} (a wrap evicted a committed op the cluster \
+             still needs; the stall-before-wrap / below-ring-window guard failed — committed-op-loss class)",
+            self.seed,
+            op % n,
+          );
+        }
+      }
     }
   }
 
@@ -995,6 +1211,33 @@ impl Vopr {
         self.report.forced_syncs += cur - self.forced_sync_seen[i];
       }
       self.forced_sync_seen[i] = cur;
+    }
+    // M3.2b Phase C non-vacuity counters. `wal_stalls` (the primary dropped a request rather than wrap
+    // an un-pruned ring slot) and `below_ring_window_syncs` (a backup overflowed its ring window and
+    // state-synced rather than overwrite an un-pruned slot) BOTH live on the `Endpoint` and reset to 0
+    // on `recover`, so they use the SAME reset-robust positive-delta accumulation as `forced_syncs`
+    // above (a plain per-tick-sum high-water would lose a pre-restart burst). Always `0` on an unbounded
+    // seed (the ring is `u64::MAX`, never overflows), so these stay 0 there and the sweep's
+    // bounded-seed-only assertions are sound.
+    for i in 0..self.n {
+      let stalls = c.replica_wal_stalls(i);
+      if stalls > self.wal_stalls_seen[i] {
+        self.report.wal_stalls += stalls - self.wal_stalls_seen[i];
+      }
+      self.wal_stalls_seen[i] = stalls;
+      let syncs = c.replica_below_ring_window_syncs(i);
+      if syncs > self.below_ring_window_syncs_seen[i] {
+        self.report.below_ring_window_syncs += syncs - self.below_ring_window_syncs_seen[i];
+      }
+      self.below_ring_window_syncs_seen[i] = syncs;
+    }
+    // Genuine-WRAP witness: a BOUNDED seed whose committed history exceeded its ring size `N` has had an
+    // op `K + N` physically reuse op `K`'s slot — the ring truly wrapped (not merely filled). Latches
+    // once true. Trivially false on an unbounded seed (`wal_capacity` is `None`).
+    if let Some(n) = self.wal_capacity {
+      if (self.report.max_committed as u64) > n {
+        self.report.bounded_seed_wrapped = true;
+      }
     }
   }
 }

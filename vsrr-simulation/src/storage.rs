@@ -19,6 +19,15 @@
 //! PLACEMENT check (recovery's `header.op() == op`) does, routing it to the retry path. It is the read
 //! analogue of the torn/bit-rot WRITE faults: faults-as-data the proto must defend against by op
 //! placement, not body checksum alone.
+//!
+//! M3.2b adds an OPT-IN **bounded ring** mode ([`InMemoryWal::with_capacity`]): the WAL is a fixed ring
+//! of `n` slots where op `K` occupies slot `K mod n`, so a durable append at `K` physically OVERWRITES
+//! whatever op last held that slot (op `K - n`). A read of a wrapped-over op then returns `Absent` (its
+//! bytes are gone — a clean wrap). [`Wal::capacity`] reports `n` (the unbounded default reports
+//! `u64::MAX`), which engages the proto's stall-before-wrap: the primary refuses to assign an op whose
+//! ring slot still holds an un-pruned op, so a committed-but-unpruned op is never the one overwritten.
+//! The default stays UNBOUNDED so existing gates are unaffected, and every fault/async mode composes
+//! with the ring (a bounded slot can still be torn / bit-rotted / misdirected / staged in flight).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -161,6 +170,13 @@ pub struct InMemoryWal {
   /// since construction. Lets the VOPR sweep assert the misdirected-read axis is NON-vacuous (it
   /// really fired, so the proto's placement check was genuinely exercised) rather than merely armed.
   misdirects_fired: u64,
+  /// `None` (default) ⇒ UNBOUNDED: `entries` grows without a physical cap and `capacity()` reports
+  /// `u64::MAX`. `Some(n)` ⇒ a fixed RING of `n` slots (M3.2b): op `K` occupies slot `K mod n`, and a
+  /// durable append at `K` physically OVERWRITES whatever op last held that slot (op `K - n`). A read of
+  /// a wrapped-over op then finds no resident entry and returns `Absent` (a clean wrap — its bytes are
+  /// gone). The proto's stall-before-wrap keeps the un-pruned window `(prune_floor, op]` within `n`, so a
+  /// committed-but-unpruned op is never the one overwritten; see [`InMemoryWal::with_capacity`].
+  capacity: Option<u64>,
 }
 
 impl Default for InMemoryWal {
@@ -188,7 +204,45 @@ impl InMemoryWal {
       async_delay: None,
       staged: VecDeque::new(),
       misdirects_fired: 0,
+      capacity: None,
     }
+  }
+
+  /// Creates an empty, reliable WAL as a **fixed RING of `n` slots** (M3.2b bounded mode). Op `K`
+  /// occupies slot `K mod n`; a durable append at `K` physically OVERWRITES whatever op last held that
+  /// slot (op `K - n`), and a read of that wrapped-over op then returns `Absent` (its bytes are gone — a
+  /// clean wrap, which the proto's placement check `header.op() == op` would reject as a torn/misdirect
+  /// anyway, so we model it as `Absent` outright). [`capacity`](InMemoryWal::capacity) reports `n`, so
+  /// the proto's bounded-WAL stall engages and refuses to assign an op whose ring slot still holds an
+  /// un-pruned op. OPT-IN; the default ([`new`](Self::new)/[`with_faults`](Self::with_faults)) stays
+  /// UNBOUNDED (`capacity() == u64::MAX`) so existing gates are unaffected. `n` must be non-zero. All
+  /// fault/async modes compose with the ring (a bounded slot can still be torn/bit-rotted/misdirected,
+  /// or staged in flight); use [`with_capacity_faults`](Self::with_capacity_faults) /
+  /// [`set_capacity`](Self::set_capacity) for those.
+  pub fn with_capacity(n: u64) -> Self {
+    Self::with_capacity_faults(n, StorageFaults::none(), 0)
+  }
+
+  /// Like [`with_capacity`](Self::with_capacity) but with a seeded fault plan, so the bounded ring
+  /// composes with torn/bit-rot/misdirected-read faults (a wrapped ring slot can still be corrupt).
+  pub fn with_capacity_faults(n: u64, faults: StorageFaults, seed: u64) -> Self {
+    assert!(n > 0, "a bounded WAL ring needs at least one slot");
+    let mut w = Self::with_faults(faults, seed);
+    w.capacity = Some(n);
+    w
+  }
+
+  /// Test/harness helper: switch an EMPTY WAL between unbounded (`None`) and a fixed ring of `n` slots
+  /// (`Some(n)`), preserving the existing fault plan / async mode. Mirrors how the cluster harness
+  /// rebuilds storage when toggling a mode. Panics if called on a non-empty WAL (the resident set would
+  /// not match the new ring geometry) or with `Some(0)`.
+  pub fn set_capacity(&mut self, n: Option<u64>) {
+    assert!(
+      self.entries.is_empty() && self.staged.is_empty() && self.rotted.is_empty(),
+      "set_capacity must be called on an empty WAL"
+    );
+    assert!(n != Some(0), "a bounded WAL ring needs at least one slot");
+    self.capacity = n;
   }
 
   /// Creates an empty, reliable WAL in **async-append mode**: every `submit_append` stages the entry
@@ -299,6 +353,24 @@ impl InMemoryWal {
   pub fn misdirects_fired(&self) -> u64 {
     self.misdirects_fired
   }
+
+  /// Bounded-ring (M3.2b) physical slot reuse: when a durable append at `op` lands in slot `op mod n`,
+  /// EVICT whatever DIFFERENT op last held that slot (op `op - n`) — its bytes are physically gone (a
+  /// clean wrap), so it leaves `entries`/`rotted`/`staged` and a subsequent read of it returns `Absent`.
+  /// A no-op in unbounded mode (`capacity == None`). Called at the moment a slot is PHYSICALLY written:
+  /// inline in `submit_append` (sync) or on release in `poll` (async). Removing the wrapped op from
+  /// `rotted` too is correct — overwriting a bit-rotted slot rewrites the media, clearing the verdict.
+  fn evict_wrapped_slot(&mut self, op: u64) {
+    let Some(n) = self.capacity else {
+      return;
+    };
+    let slot = op % n;
+    // The resident set keeps at most one op per slot, so this removes the single congruent occupant
+    // (`op - n`) if present, never `op` itself.
+    self.entries.retain(|&o, _| o == op || o % n != slot);
+    self.rotted.retain(|&o| o == op || o % n != slot);
+    self.staged.retain(|s| s.op == op || s.op % n != slot);
+  }
 }
 
 /// Flips one byte of a body so `Header::verify` fails on read-back (a torn write). An empty body
@@ -318,10 +390,11 @@ impl Wal for InMemoryWal {
   }
 
   fn capacity(&self) -> u64 {
-    // Uncapped until M3.2b (the WAL-wrap milestone) adds a fixed ring + the proto-side wrap-stall.
-    // `u64::MAX` (unbounded) ⇒ the proto's capacity back-pressure never engages, so today's behaviour
-    // is unchanged; M3.2b turns this into the real ring size and fills in the stall against it.
-    u64::MAX
+    // Unbounded by default (`u64::MAX` ⇒ the proto's capacity back-pressure never engages, so the
+    // existing gates are unaffected). In bounded mode ([`with_capacity`](InMemoryWal::with_capacity))
+    // this reports the fixed ring size `n`, engaging the proto's M3.2b stall-before-wrap so it refuses
+    // to assign an op whose ring slot still holds an un-pruned op.
+    self.capacity.unwrap_or(u64::MAX)
   }
 
   fn header(&self, op: OpNumber) -> Option<Header> {
@@ -367,6 +440,8 @@ impl Wal for InMemoryWal {
     match self.async_delay {
       // SYNCHRONOUS (default): durable immediately, completion queued in this call (M3.0/M3.1).
       None => {
+        // Bounded ring (M3.2b): writing slot `op mod n` physically evicts the op that last held it.
+        self.evict_wrapped_slot(op.get());
         if rot {
           self.rotted.insert(op.get());
         }
@@ -455,6 +530,9 @@ impl Wal for InMemoryWal {
     if let Some(front) = self.staged.front_mut() {
       if front.remaining == 0 {
         let done = self.staged.pop_front().expect("front exists");
+        // Bounded ring (M3.2b): the physical write happens HERE (on release), so the slot-`op mod n`
+        // eviction of the wrapped-over op happens here too, not at submit time.
+        self.evict_wrapped_slot(done.op);
         if done.rot {
           self.rotted.insert(done.op);
         }
@@ -1657,5 +1735,138 @@ mod tests {
     w.discard_inflight();
     assert_eq!(w.op_head(), OpNumber::with(1), "sync durable op untouched");
     assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Clean);
+  }
+
+  #[test]
+  fn bounded_capacity_reports_the_ring_size() {
+    // The unbounded default reports u64::MAX (the proto's stall never engages); a bounded ring reports
+    // its slot count n (the stall engages against it).
+    assert_eq!(InMemoryWal::new().capacity(), u64::MAX);
+    assert_eq!(InMemoryWal::with_capacity(3).capacity(), 3);
+    assert_eq!(InMemoryWal::with_capacity(12).capacity(), 12);
+  }
+
+  #[test]
+  fn bounded_ring_append_wraps_and_a_wrapped_over_op_reads_absent() {
+    // The core ring semantics: op K lands in slot K mod n, so an append at K physically OVERWRITES the
+    // op that last held that slot (op K-n). A read of the wrapped-over op then returns Absent (its
+    // bytes are gone — a clean wrap), while the op currently resident in the slot reads back.
+    let mut w = InMemoryWal::with_capacity(3); // slots {0,1,2}
+    for op in 1..=3u64 {
+      append(&mut w, op, b"v");
+    }
+    // All three residents are present; the head is the highest op.
+    assert_eq!(w.op_head(), OpNumber::with(3));
+    for op in 1..=3u64 {
+      assert_eq!(w.status(OpNumber::with(op)), SlotStatus::Clean);
+      assert!(w.header(OpNumber::with(op)).is_some());
+    }
+    // Append op 4 → slot 4 mod 3 == 1 == op 1's slot: op 1 is physically overwritten by op 4.
+    append(&mut w, 4, b"v");
+    assert_eq!(w.op_head(), OpNumber::with(4));
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Empty,
+      "op 1 was wrapped over by op 4 (same ring slot) — its slot no longer holds it"
+    );
+    assert!(
+      w.header(OpNumber::with(1)).is_none(),
+      "a wrapped-over op has no resident header"
+    );
+    w.submit_read(OpId::new(100), OpNumber::with(1));
+    assert!(
+      matches!(w.poll(), Some(WalDone::Absent(_))),
+      "a read of the wrapped-over op is Absent (a clean wrap; its bytes are gone)"
+    );
+    // op 4 (the new occupant of slot 1) and the untouched residents (ops 2, 3) read back intact.
+    for op in [2u64, 3, 4] {
+      assert_eq!(w.status(OpNumber::with(op)), SlotStatus::Clean);
+      w.submit_read(OpId::new(200 + op), OpNumber::with(op));
+      match w.poll() {
+        Some(WalDone::ReadOk(r)) => assert_eq!(r.op(), OpNumber::with(op)),
+        other => panic!("op {op} should read back ReadOk, got {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn bounded_ring_eviction_clears_a_wrapped_bit_rot_verdict() {
+    // Overwriting a bit-rotted ring slot physically rewrites the media, so the OLD op's permanent rot
+    // verdict is cleared from the WAL (it leaves `rotted`): op 1 is rotted, then op 4 (same slot in an
+    // n=3 ring) wraps over it. op 1 must read `Empty`, NOT `Faulty` — proving the eviction dropped its
+    // rot entry rather than leaving a ghost verdict under a wrapped-away op number.
+    let mut w = InMemoryWal::with_capacity_faults(
+      3,
+      StorageFaults {
+        bit_rot_per_mille: 1000, // every append here rots its slot (we only need op 1's, for the wrap)
+        ..StorageFaults::none()
+      },
+      1,
+    );
+    append(&mut w, 1, b"x");
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Faulty,
+      "op 1 rotted"
+    );
+    // Append ops 2, 3 (distinct slots), then op 4 wraps over op 1's slot (4 mod 3 == 1).
+    append(&mut w, 2, b"x");
+    append(&mut w, 3, b"x");
+    append(&mut w, 4, b"x");
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Empty,
+      "op 1 (rotted) was physically overwritten by op 4 → no longer resident, and its rot verdict cleared"
+    );
+    // op 4 is the new resident of the slot (its OWN append-time verdict applies, not op 1's stale one).
+    assert_ne!(
+      w.status(OpNumber::with(4)),
+      SlotStatus::Empty,
+      "op 4 is the new resident of the slot"
+    );
+  }
+
+  #[test]
+  fn bounded_ring_prune_and_truncate_work_on_the_resident_set() {
+    // GC/view-change ops operate on the currently-resident ring ops exactly as in unbounded mode.
+    let mut w = InMemoryWal::with_capacity(8);
+    for op in 1..=5u64 {
+      append(&mut w, op, b"v");
+    }
+    w.truncate(OpNumber::with(3));
+    assert_eq!(w.op_head(), OpNumber::with(3));
+    assert!(w.header(OpNumber::with(4)).is_none());
+    w.prune(OpNumber::with(2));
+    assert!(w.header(OpNumber::with(1)).is_none());
+    assert!(w.header(OpNumber::with(2)).is_some());
+    assert!(w.header(OpNumber::with(3)).is_some());
+  }
+
+  #[test]
+  fn bounded_ring_composes_with_async_appends() {
+    // A bounded ring in async-append mode: the physical write (and thus the wrap-eviction) happens on
+    // RELEASE, not at submit. An n=2 ring; op 1 then op 3 share slot 1. Stage + release op 1, then op 3
+    // overwrites it on release. `set_capacity` makes an EMPTY async WAL bounded (exercising the setter).
+    let mut w = InMemoryWal::with_async_appends(0);
+    w.set_capacity(Some(2));
+    let id1 = submit(&mut w, 1, 1, b"a");
+    assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Dirty, "staged");
+    assert_eq!(w.poll(), Some(WalDone::Appended(id1)), "op 1 durable");
+    assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Clean);
+    // op 3 shares op 1's slot (3 mod 2 == 1). Stage + release it → it overwrites op 1 on release.
+    let id3 = submit(&mut w, 3, 3, b"c");
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Clean,
+      "op 1 still resident while op 3 is only STAGED (physical write deferred to release)"
+    );
+    assert_eq!(w.poll(), Some(WalDone::Appended(id3)), "op 3 durable");
+    assert_eq!(
+      w.status(OpNumber::with(1)),
+      SlotStatus::Empty,
+      "op 3's release physically overwrote op 1's slot"
+    );
+    assert_eq!(w.status(OpNumber::with(3)), SlotStatus::Clean);
+    assert_eq!(w.op_head(), OpNumber::with(3));
   }
 }

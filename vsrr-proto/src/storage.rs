@@ -637,8 +637,18 @@ pub enum SuperblockDone {
 /// un-pruned slots to be live at once (it stalls assigning the next op until a
 /// [`prune`](Wal::prune) frees room — the M3.2b wrap-stall). A conforming driver MAY
 /// `debug_assert`/panic if the proto violates this (submits past `capacity()` un-pruned slots); it is
-/// NOT required to grow, queue, or reject the append. (M3.2b fills in the proto-side stall against
-/// this accessor; until then the sim reports `u64::MAX` and nothing stalls.)
+/// NOT required to grow, queue, or reject the append. The M3.2b PRIMARY stall is now implemented
+/// (`Endpoint::on_request` refuses to mint op `K+1` when `(K+1) - prune_floor > capacity()`), so a
+/// bounded backend physically wraps op `K`'s slot only after `K` is checkpoint-subsumed on a quorum.
+///
+/// **Liveness constraint on a bounded `capacity()`.** The stall self-RELEASES as the quorum checkpoint
+/// rises (which lifts the prune floor and frees slots), so `capacity()` MUST exceed one checkpoint
+/// interval plus the in-flight pipeline depth — concretely `capacity() > config.checkpoint_ops() +
+/// pipeline_headroom`. With a ring smaller than (or equal to) a checkpoint interval the un-pruned
+/// window `(floor, op]` cannot reach the next checkpoint boundary before it would wrap, so the stall
+/// would never release and the primary would WEDGE. A backend that reports a fixed `capacity()` is
+/// responsible for honouring this (the sim's bounded mode picks `n` well above `checkpoint_ops`; an
+/// M4 disk driver must size its WAL ring the same way).
 pub trait Wal {
   /// The highest op number held.
   fn op_head(&self) -> OpNumber;

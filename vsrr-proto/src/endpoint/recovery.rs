@@ -223,6 +223,8 @@ impl<S: StateMachine> Endpoint<S> {
       sync_serving: BTreeMap::new(),
       state_syncs_applied: 0,
       forced_syncs_applied: 0,
+      wal_stalls: 0,
+      below_ring_window_syncs: 0,
       pending_forfeit: false,
     };
 
