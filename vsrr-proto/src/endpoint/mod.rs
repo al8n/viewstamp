@@ -623,6 +623,22 @@ pub struct Endpoint<S> {
   /// ordinary state-sync), since both route through `apply_sync` and would otherwise be indistinguishable
   /// via `state_syncs_applied` alone. Same lifecycle as `state_syncs_applied` (reset to 0 on `new`/`recover`).
   forced_syncs_applied: u64,
+  /// Test/observability counter (M3.2b): how many client requests this replica DROPPED at op-assignment
+  /// because minting the next op would overflow the bounded WAL ring — the physical stall-before-wrap
+  /// ([`Self::on_request`]). `0` whenever the WAL is unbounded (`capacity() == u64::MAX`, the default),
+  /// so it is inert for every existing gate; the M3.2b bounded-WAL gate asserts it goes `> 0` to prove
+  /// the stall genuinely engaged (rather than the ring being vacuously under-filled). Same lifecycle as
+  /// the other observability counters (reset to 0 on `new`/`recover`). Exposed only via `wal_stalls()`.
+  wal_stalls: u64,
+  /// Test/observability counter (M3.2b Phase B): how many times this BACKUP fell BELOW its bounded-WAL
+  /// ring window on a head-extending `Prepare` and STATE-SYNCED to the cluster checkpoint instead of
+  /// overwriting an un-pruned slot ([`Self::maybe_sync_below_ring_window`] armed a forced sync). `0`
+  /// whenever the WAL is unbounded (the default) or for an in-quorum backup (its checkpoint tracks the
+  /// quorum, so no overflow). The bounded-WAL Phase-B gate asserts it goes `> 0` to prove the connected
+  /// below-ring-window path genuinely fired (vs the ordinary `> self.op` state-sync trigger). Same
+  /// lifecycle as the other observability counters (reset to 0 on `new`/`recover`); exposed only via
+  /// `below_ring_window_syncs()`.
+  below_ring_window_syncs: u64,
   /// Deferred-forfeit flag (M3.5, safety): set when [`Self::maybe_force_sync`] would have force-synced
   /// but we are the PRIMARY — a primary MUST NOT force-sync, as that resets `self.op` to the checkpoint
   /// (below its head) and lets it re-issue new client requests at REUSED op numbers in the same view,
@@ -676,6 +692,8 @@ impl<S: StateMachine> Endpoint<S> {
       sync_serving: BTreeMap::new(),
       state_syncs_applied: 0,
       forced_syncs_applied: 0,
+      wal_stalls: 0,
+      below_ring_window_syncs: 0,
       pending_forfeit: false,
     }
   }
@@ -749,6 +767,37 @@ impl<S: StateMachine> Endpoint<S> {
       self.commit_min.get(),
     );
     self.commit_min = to;
+  }
+
+  /// Cancel an outstanding FORCED sync once repair/commit has SATISFIED its target (codex R25-F1,
+  /// Part A — the root cause). A forced sync ([`Self::maybe_force_sync`]) is armed to recover a doomed
+  /// committed hole `N` that became servable only as part of a peer checkpoint snapshot, targeting that
+  /// snapshot's op (`>= N`). But the cheap ORDINARY repair path can still WIN the race: a peer's
+  /// `Prepare` fills the hole via `fill_repair`, its WAL append lands, and `advance_commit` applies past
+  /// the hole — moving `commit_min` to/PAST the forced-sync target. The hole the force-sync was working
+  /// around is then FILLED + APPLIED, so the forced sync is NO LONGER NEEDED: keeping it armed only waits
+  /// for a response we no longer want, and a DELAYED `SyncCheckpoint` for the now-stale target would
+  /// otherwise reach `apply_sync` below the applied frontier (the R25-F1 panic Part B also defends).
+  ///
+  /// Called at the tail of the two apply loops ([`Self::advance_commit`] / [`Self::try_commit`]) — the
+  /// only sites that advance `commit_min` by APPLYING ops. Gated on `pending_install.is_none()`: a forced
+  /// sync that has already STAGED ([`Self::apply_sync`]) carries a `pending_install` and is mid durable
+  /// re-persist (its `install_sync` advances `commit_min` to the synced point as it COMPLETES — that is
+  /// the legitimate forced sync landing, NOT a satisfied-by-repair cancel), so we only cancel a
+  /// PRE-stage forced sync, where cancelling is just clearing `sync` + its solicit timer (no staged
+  /// install to unwind). An ORDINARY sync is never cancelled here — its `> self.op` trigger means
+  /// `commit_min` (`<= self.op`) can never reach its target by ordinary apply.
+  fn cancel_forced_sync_if_satisfied(&mut self) {
+    if self.pending_install.is_some() {
+      return; // a STAGED forced sync is completing via install_sync — not a repair-satisfied cancel.
+    }
+    if self
+      .sync
+      .is_some_and(|s| s.forced && s.target.get() <= self.commit_min.get())
+    {
+      self.sync = None;
+      self.timers.sync_solicit = None;
+    }
   }
 
   /// Whether `op` is being re-fetched as a TRACKED repair hole — either an active peer-repair hole
@@ -1238,6 +1287,28 @@ impl<S: StateMachine> Endpoint<S> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn forced_syncs_applied(&self) -> u64 {
     self.forced_syncs_applied
+  }
+
+  /// Test/observability counter (M3.2b): how many client requests this replica dropped at op-assignment
+  /// because minting the next op would overflow the bounded WAL ring (the physical stall-before-wrap).
+  /// `0` for an unbounded WAL (the default), so it is inert for existing gates; the bounded-WAL sim gate
+  /// asserts it goes `> 0` to prove the stall genuinely engaged. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn wal_stalls(&self) -> u64 {
+    self.wal_stalls
+  }
+
+  /// Test/observability counter (M3.2b Phase B): how many times this backup fell below its bounded-WAL
+  /// ring window on a head-extending `Prepare` and state-synced to the cluster checkpoint instead of
+  /// overwriting an un-pruned slot ([`Self::maybe_sync_below_ring_window`]). `0` for an unbounded WAL (the
+  /// default) or an in-quorum backup; the bounded-WAL Phase-B gate asserts it goes `> 0` to prove the
+  /// connected below-ring-window path fired (distinct from the ordinary `> self.op` sync trigger). Not
+  /// part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn below_ring_window_syncs(&self) -> u64 {
+    self.below_ring_window_syncs
   }
 
   /// Test-only: the cached `(request_number, reply_body)` a client session holds (the at-most-once

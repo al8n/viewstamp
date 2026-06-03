@@ -1,10 +1,76 @@
 use super::super::*;
 use super::*;
 use crate::{
-  ClientId, Config, DoViewChange, OpNumber, PreparedEntry, ReplicaId, Request, RequestNumber,
-  StartViewChange, View, VsrState,
+  ClientId, Config, DoViewChange, Header, OpId, OpNumber, PreparedEntry, ReadOk, ReplicaId,
+  Request, RequestNumber, SlotStatus, StartViewChange, View, VsrState, Wal, WalDone,
 };
 use std::collections::VecDeque;
+
+/// A FIXED-RING WAL of `capacity` slots (the M3.2b bounded-WAL backend, modelled for the proto unit
+/// tests). Op `K` occupies ring slot `K mod capacity`; appending `K` EVICTS whatever op last held that
+/// slot (op `K - capacity`), so the resident set never exceeds `capacity` and a read of the
+/// wrapped-over op returns `Absent` — exactly the sim's `set_capacity` semantics
+/// (`vsrr_simulation::storage`). Used to drive the proto's `maybe_sync_below_ring_window` /
+/// `append_prepare`-overflow paths deterministically at the unit level (`TestWal` is unbounded).
+struct RingWal {
+  entries: BTreeMap<u64, (Header, Bytes)>,
+  head: u64,
+  capacity: u64,
+  done: VecDeque<WalDone>,
+}
+impl RingWal {
+  fn new(capacity: u64) -> Self {
+    Self {
+      entries: BTreeMap::new(),
+      head: 0,
+      capacity,
+      done: VecDeque::new(),
+    }
+  }
+}
+impl Wal for RingWal {
+  fn op_head(&self) -> OpNumber {
+    OpNumber::with(self.head)
+  }
+  fn capacity(&self) -> u64 {
+    self.capacity
+  }
+  fn header(&self, op: OpNumber) -> Option<Header> {
+    self.entries.get(&op.get()).map(|(h, _)| *h)
+  }
+  fn status(&self, op: OpNumber) -> SlotStatus {
+    if self.entries.contains_key(&op.get()) {
+      SlotStatus::Clean
+    } else {
+      SlotStatus::Empty
+    }
+  }
+  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+    // Evict the op that last held this ring slot (op `K - capacity`), modelling the physical wrap.
+    if op.get() > self.capacity {
+      self.entries.remove(&(op.get() - self.capacity));
+    }
+    self.entries.insert(op.get(), (header, body));
+    self.head = self.head.max(op.get());
+    self.done.push_back(WalDone::Appended(id));
+  }
+  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+    self.done.push_back(match self.entries.get(&op.get()) {
+      Some((h, b)) => WalDone::ReadOk(ReadOk::new(id, *h, b.clone())),
+      None => WalDone::Absent(id),
+    });
+  }
+  fn truncate(&mut self, above: OpNumber) {
+    self.entries.retain(|&op, _| op <= above.get());
+    self.head = self.head.min(above.get());
+  }
+  fn prune(&mut self, below: OpNumber) {
+    self.entries.retain(|&op, _| op >= below.get());
+  }
+  fn poll(&mut self) -> Option<WalDone> {
+    self.done.pop_front()
+  }
+}
 
 #[test]
 fn stale_checkpoint_commit_triggers_request_sync() {
@@ -1599,6 +1665,202 @@ fn forced_sync_preserves_a_held_tail_above_the_checkpoint_without_panic() {
 }
 
 #[test]
+fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_target() {
+  // codex R25-F1 REGRESSION (a stale forced SyncCheckpoint reaches apply_sync). A forced sync is armed
+  // for a doomed hole at target T=2, but the ORDINARY repair path completes FIRST: a peer's `Prepare`
+  // fills the hole via `fill_repair`, its WAL append lands, and `advance_commit` moves `commit_min` PAST
+  // T (to 4) while the forced `sync` is armed. Then a DELAYED `SyncCheckpoint(checkpoint_op = T = 2)` for
+  // the now-stale target arrives. The ordinary stale-response guard (`checkpoint_op <= self.op → drop`)
+  // is SKIPPED for the forced path (the M3.5/seed-164 relaxation), so the stale response would reach
+  // `apply_sync` — where the forced-branch `assert!(checkpoint_op >= commit_min)` PANICKED (commit_min 4
+  // > checkpoint_op 2). FAIL-BEFORE: that panic. PASS-AFTER: Part A CANCELS the satisfied forced sync the
+  // moment `advance_commit` carries `commit_min` past T, so the stale response is dropped upstream (no
+  // outstanding sync), the applied frontier is unchanged, and nothing is installed — no panic, no rewind.
+  //
+  // A real BACKUP (replica 1 of 3) over CountSm with a HUGE checkpoint interval, so applying its band
+  // does NOT auto-checkpoint (which would otherwise set `pending_checkpoint` and short-circuit the path).
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 1_000).unwrap();
+  let mut ep = Endpoint::new(cfg, 7, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Head op 4, commit HELD at 1, own checkpoint 0, a committed hole at op 2. The above-hole committed
+  // band (ops 3, 4) is held in the log cache so that — once the hole at 2 fills — `advance_commit` can
+  // apply 2, 3, 4 in order and move `commit_min` to 4.
+  ep.force_state_for_test(0, 4, 1, 0, &[2]);
+  ep.seed_log_entry_for_test(3);
+  ep.seed_log_entry_for_test(4);
+  // Learn the cluster has committed through op 4 (so `commit_max == 4`), with the commit HELD at the
+  // hole (op 2). The Commit carries checkpoint_op 0, so it triggers neither the ordinary sync nor the
+  // forced escalation (no peer-checkpoint floor crosses the hole yet) — it only raises `commit_max`.
+  ep.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(0),
+    )),
+  );
+  assert_eq!(
+    ep.commit(),
+    OpNumber::with(1),
+    "the commit is still held at the hole (op 2)"
+  );
+  assert_eq!(
+    ep.commit_max(),
+    OpNumber::with(4),
+    "but commit_max learned the cluster reached op 4"
+  );
+  assert!(
+    ep.has_repair_hole_for_test(2),
+    "the hole at op 2 is still registered"
+  );
+  // Arm a FORCED sync to target T=2 (as `maybe_force_sync` would for a hole pruned on the quorum).
+  ep.arm_forced_sync_for_test(2);
+  assert_eq!(ep.sync_target_for_test(), Some(2));
+  assert!(ep.sync_is_forced_for_test());
+  // The ORDINARY repair path completes: a peer `Prepare` for op 2 (commit >= op, verifiable body) fills
+  // the hole via `fill_repair` (staged as a durability-barrier RepairFill); its WAL append then lands.
+  ep.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    repair_prepare(0, 2, 4),
+  );
+  assert!(
+    ep.has_repair_hole_for_test(2),
+    "the hole stays OPEN until the repair-fill append is durable (R13-F2 barrier)"
+  );
+  ep.handle_storage(now, &mut wal, &mut sb); // on_wal_done: insert op 2, clear the hole, advance_commit
+  assert!(
+    !ep.has_repair_hole_for_test(2),
+    "the hole filled via ordinary repair"
+  );
+  assert_eq!(
+    ep.commit(),
+    OpNumber::with(4),
+    "advance_commit moved the applied frontier PAST the forced-sync target (commit_min 4 > T 2)"
+  );
+  // Part A (the root cause): the forced sync the commit just satisfied is CANCELLED — its target (2) is
+  // now `<= commit_min` (4), so the hole it was working around is recovered the cheap way. (Without
+  // this, the stale SyncCheckpoint below would reach `apply_sync` and panic at the forced assert.)
+  assert_eq!(
+    ep.sync_target_for_test(),
+    None,
+    "the satisfied forced sync is cancelled (Part A) — no longer awaiting a response we don't need",
+  );
+  assert!(
+    ep.poll_timeout().is_none() || ep.timers.sync_solicit.is_none(),
+    "the sync_solicit timer is cleared with the cancelled forced sync"
+  );
+  while ep.poll_message().is_some() {}
+  // A DELAYED SyncCheckpoint for the original (now-stale) target T=2 arrives. With the forced sync
+  // already cancelled it is dropped upstream (the `sync.is_none` guard in `on_sync_checkpoint`) and never
+  // reaches `apply_sync`. Build a valid envelope at op 2 (id matches its bytes); the OLD code (no Part A)
+  // would have carried it into `apply_sync` and panicked at `assert!(checkpoint_op >= commit_min)`.
+  let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(2);
+  let (env, _id) = donor_envelope(&dsb);
+  ep.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(2),
+      crate::checkpoint_id(&env),
+      ReplicaId::new(0),
+      // a nonce that would have matched the cancelled forced sync (it is gone, so this is moot)
+      7,
+      env,
+    )),
+  );
+  ep.handle_storage(now, &mut wal, &mut sb);
+  // The stale response was DROPPED: nothing rewound, no snapshot installed, no re-persist staged.
+  assert_eq!(
+    ep.commit(),
+    OpNumber::with(4),
+    "the applied frontier is UNCHANGED — the stale forced SyncCheckpoint did not rewind it"
+  );
+  assert_eq!(
+    ep.checkpoint_op(),
+    OpNumber::with(0),
+    "no stale checkpoint was installed (checkpoint_op unchanged)"
+  );
+  assert_eq!(ep.op(), OpNumber::with(4), "the head is unchanged");
+  assert_eq!(
+    ep.state_syncs_applied(),
+    0,
+    "no state-sync was applied from the stale response"
+  );
+}
+
+#[test]
+fn apply_sync_drops_a_stale_forced_sync_checkpoint_below_the_applied_frontier() {
+  // codex R25-F1 (Part B — the safety NET reaching `apply_sync` directly). Models the reordering where a
+  // forced `SyncCheckpoint` for a target the applied frontier has ALREADY passed reaches `apply_sync`
+  // (i.e. Part A's apply-loop cancel did not run between the arm and this delivery). The forced sync's
+  // target (2) is `<= self.op` (so the upstream `<= self.op → drop` guard is relaxed for the forced
+  // path) and `< commit_min` (4) — applying it would rewind the applied frontier. Part B DROPS it
+  // gracefully (no panic, no rewind) instead of asserting; the LEGITIMATE forced sync is unaffected.
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 1_000).unwrap();
+  let mut ep = Endpoint::new(cfg, 7, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Head op 4, applied frontier already at 4, own checkpoint 0 (no hole — the band is fully applied).
+  ep.force_state_for_test(0, 4, 4, 0, &[]);
+  ep.seed_log_entry_for_test(4);
+  // Arm a forced sync to a target (2) the applied frontier (4) is already past — exactly the reordered
+  // state where Part A's chokepoint never fired between the arm and the delivery below.
+  ep.arm_forced_sync_for_test(2);
+  let nonce = ep.sync_nonce_for_test();
+  let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(2);
+  let (env, id) = donor_envelope(&dsb);
+  // Deliver the stale forced SyncCheckpoint at op 2. It passes the upstream guards (target 2 reached,
+  // forced relaxes `<= self.op`, 2 > own checkpoint 0, integrity ok, not primary) and reaches
+  // `apply_sync` with `checkpoint_op 2 < commit_min 4`. FAIL-BEFORE: panic. PASS-AFTER: dropped.
+  ep.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(2),
+      id,
+      ReplicaId::new(0),
+      nonce,
+      env,
+    )),
+  );
+  ep.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    ep.commit(),
+    OpNumber::with(4),
+    "Part B: the stale forced SyncCheckpoint below the applied frontier was DROPPED — no rewind"
+  );
+  assert_eq!(
+    ep.checkpoint_op(),
+    OpNumber::with(0),
+    "no stale checkpoint installed"
+  );
+  assert_eq!(ep.op(), OpNumber::with(4), "head unchanged");
+  assert_eq!(
+    ep.state_syncs_applied(),
+    0,
+    "no sync applied from the stale response"
+  );
+  assert_eq!(
+    ep.sync_target_for_test(),
+    None,
+    "the stale forced sync was cancelled on the drop (its target is already satisfied)"
+  );
+}
+
+#[test]
 fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
   // SAFETY REGRESSION (op-number reuse → divergence): a PRIMARY that reaches the force-sync strand (a
   // committed-op repair hole at/below `max_peer_checkpoint_op`) must NOT force-sync. Force-sync resets
@@ -1924,4 +2186,179 @@ fn synced_replica_reports_its_checkpoint_in_view_change() {
     dvc.log_slice().iter().all(|e| e.op().get() > 4),
     "the DVC log is the tail above the synced checkpoint (no fabricated sub-checkpoint ops)"
   );
+}
+
+#[test]
+fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies_it() {
+  // codex R26-F1 (REGRESSION — the un-completable-sync WEDGE). The M3.2b backup-overflow path
+  // `maybe_sync_below_ring_window` armed a forced sync whenever the cluster checkpoint `C` the
+  // overflowing Prepare advertises satisfied `C >= self.commit_min`. The `==` case (`C == commit_min`)
+  // is the bug: a sub-quorum backup that has ALREADY APPLIED through `C` (commit_min == C) but whose own
+  // `checkpoint_op` still LAGS (an ordinary checkpoint for `C` merely IN FLIGHT) would arm a forced sync
+  // at `target = C`. Then the LOCAL ordinary checkpoint root LANDS, advancing `checkpoint_op` to `C` —
+  // but `cancel_forced_sync_if_satisfied` fires only on a COMMIT advance, never a CHECKPOINT advance, so
+  // the forced sync stays armed at `target == C == checkpoint_op`. An equal `SyncCheckpoint(C)` is then
+  // REJECTED by `on_sync_checkpoint`'s `checkpoint_op <= self.checkpoint_op` guard (a sync to a
+  // checkpoint we already hold is a no-op) → the forced sync can NEVER complete. And while
+  // `sync.is_some()`, `on_prepare` DROPS every retransmitted Prepare → the backup WEDGES: it already
+  // holds the checkpoint it needed, yet is stuck "syncing" forever, dropping the very prepares that
+  // would extend its head.
+  //
+  // FAIL-BEFORE: with the `>= commit_min` arm, the forced sync stays armed (target C == checkpoint_op),
+  // the equal SyncCheckpoint is rejected, and the retransmitted Prepare is dropped — `op` never extends,
+  // no PrepareOk, the cluster cannot converge through this replica. PASS-AFTER (Part A): the arm uses the
+  // STRICT `target > commit_min`, so the `C == commit_min` case arms NO sync — it just back-pressures
+  // (drops the overflowing Prepare). The in-flight local checkpoint then advances `checkpoint_op` to `C`,
+  // freeing the ring, and the retransmitted Prepare FITS + appends + acks. No wedge.
+  //
+  // Numbers: capacity N = 4; old checkpoint_op = 0; commit_min = C = 5; head = 5. The next op (6)
+  // overflows the ring (`6 - 0 = 6 > 4`), and the Prepare advertises checkpoint_op = C = 5 == commit_min
+  // (the `==` case) while `5 <= head` (so the ORDINARY `> self.op` sync trigger correctly does NOT fire —
+  // only the below-ring path can).
+  const N: u64 = 4;
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 5).unwrap(); // checkpoint_ops == C
+  let mut e = Endpoint::new(cfg, 7, CountSm::default());
+  let mut wal = RingWal::new(N);
+  let mut sb = StepSb::default(); // async: the ordinary checkpoint root lands on a later flush
+  let now = Instant::ZERO;
+
+  // Pre-overflow state: a sub-quorum laggard with head 5, applied frontier (commit_min) 5, own
+  // checkpoint still 0. Its head ran ahead of its checkpoint (the canonical-head-over-a-held-hole shape),
+  // so its ring is FULL relative to its stale checkpoint. Seed the live tail (1..=5) into the ring so the
+  // resident-tail invariant is realistic (the checkpoint snapshot content itself is irrelevant — the
+  // wedge is about the sync arming, and the sync is never applied).
+  e.force_state_for_test(0, 5, 5, 0, &[]);
+  for op in 1..=5u64 {
+    let body = Bytes::copy_from_slice(&[op as u8]);
+    let h = Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &body,
+    );
+    wal.entries.insert(op, (h, body));
+  }
+  wal.head = 5;
+
+  // Stage a REAL ordinary checkpoint for C = 5 (as `advance_commit` → `maybe_checkpoint` would once the
+  // backup applied through the checkpoint boundary): commit_min (5) >= checkpoint_op (0) + checkpoint_ops
+  // (5), so this snapshots at commit_min and submits the snapshot write to the async superblock. It is
+  // now IN FLIGHT (checkpoint_op is still 0 until the root lands).
+  e.maybe_checkpoint(&mut sb);
+  assert_eq!(
+    e.pending_checkpoint_is_sync_for_test(),
+    Some(false),
+    "an ORDINARY checkpoint for C is staged (in flight) — checkpoint_op is still old"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(0),
+    "the local checkpoint has NOT landed yet (checkpoint_op still 0)"
+  );
+
+  // A head-extending Prepare(op = 6, commit = 5, checkpoint_op = 5) arrives. It OVERFLOWS the ring
+  // (`6 - 0 > N`). checkpoint_op = 5 <= head 5, so the ordinary `> self.op` sync trigger does NOT fire;
+  // the below-ring-window guard handles it. The Prepare is dropped either way (back-pressure); the
+  // question is whether a forced sync is (wrongly) armed at C = commit_min.
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare_ck(6, 5, 5));
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.op(),
+    OpNumber::with(5),
+    "the overflowing Prepare was dropped (back-pressure) — head not extended past the ring"
+  );
+  // PART A — the discriminator. With `C == commit_min`, NO forced sync may be armed: the backup has
+  // ALREADY applied through the cluster checkpoint, so the ring is full only because its OWN checkpoint
+  // lags — a local checkpoint (in flight) will free it. (FAIL-BEFORE: a forced sync to target 5 is armed
+  // here, which the local checkpoint then makes un-completable.)
+  assert_eq!(
+    e.sync_target_for_test(),
+    None,
+    "Part A: a below-ring forced sync is NOT armed when applied through the cluster checkpoint \
+     (target C == commit_min) — it back-pressures instead, so the local checkpoint can release it"
+  );
+  assert_eq!(
+    e.below_ring_window_syncs(),
+    0,
+    "no below-ring-window sync was armed in the C == commit_min case"
+  );
+
+  // The in-flight LOCAL ordinary checkpoint root now lands → checkpoint_op advances to C = 5, freeing the
+  // ring (`head - checkpoint_op = 0`). (With the old code this is the exact moment a forced sync armed at
+  // C becomes un-completable — sync.target == checkpoint_op == 5.)
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb); // AwaitSnapshot → submit root
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb); // AwaitRoot → advance_checkpoint_op(5) + run_gc
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(5),
+    "the local ordinary checkpoint landed → checkpoint_op advanced to C"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    None,
+    "still no outstanding sync after the local checkpoint (nothing left un-completable)"
+  );
+
+  // THE WEDGE TEST. The donor crashes / a prior ack was lost, so the primary RETRANSMITS the
+  // head-extending Prepare(op = 6). The ring now has room (`6 - checkpoint_op(5) = 1 <= N`), so a healthy
+  // backup APPENDS it and acks. FAIL-BEFORE: `sync.is_some()` (the un-completable forced sync) makes
+  // `on_prepare` DROP this retransmit → op stays 5, no PrepareOk, the cluster wedges through this replica.
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare_ck(6, 5, 5));
+  e.handle_storage(now, &mut wal, &mut sb); // drive the append → its PrepareOk
+  let mut acked_op6 = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      acked_op6 |= ok.op() == OpNumber::with(6);
+    }
+  }
+  assert_eq!(
+    e.op(),
+    OpNumber::with(6),
+    "NO WEDGE: the retransmitted Prepare(6) was APPENDED (the ring freed; no un-completable sync \
+     dropped it) — the backup's head extended"
+  );
+  assert!(
+    acked_op6,
+    "NO WEDGE: the backup ACKED the retransmitted op 6 — it can make progress (it is not stuck \
+     dropping prepares behind a sync it can never complete)"
+  );
+  assert!(
+    wal.entries.contains_key(&6),
+    "op 6 is durably resident in the ring after the append"
+  );
+
+  // And the cluster converges through this replica: a Commit advancing the frontier to 6 applies cleanly
+  // (the backup is no longer wedged behind a phantom sync).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(6),
+      OpNumber::with(5),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(6),
+    "the backup applied op 6 — it converged (no wedge)"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    None,
+    "no phantom sync was ever left armed across the whole sequence"
+  );
+  // Part B (defense-in-depth) is SUBSUMED by Part A — no checkpoint-advance cancellation is added. Every
+  // forced/ordinary sync is armed with `target > commit_min` (below-ring: the strict R26-F1 discriminator;
+  // `maybe_force_sync`: `target = floor` over a hole held at `commit_min < floor`; ordinary: `target >
+  // self.op >= commit_min`). A LOCAL checkpoint advances `checkpoint_op` to at most `commit_min` (it
+  // checkpoints at `target_op = commit_min`), so `checkpoint_op <= commit_min < sync.target` always holds
+  // — a local checkpoint can NEVER make `sync.target <= checkpoint_op`. So a checkpoint-advance
+  // satisfied-sync cancel would be dead code; Part A closes the wedge at the root (the arm site).
 }

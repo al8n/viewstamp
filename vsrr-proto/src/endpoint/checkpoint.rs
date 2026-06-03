@@ -348,12 +348,33 @@ impl<S: StateMachine> Endpoint<S> {
   /// it. Liveness-only (no committed op is ever lost or rewritten — `N` survives in every checkpoint
   /// snapshot, swapping a `RequestPrepare`-for-a-pruned-op for a satisfiable `RequestSync`). See §2 of
   /// the M3.5 plan and [`Self::maybe_force_sync`]'s safety proof.)
-  fn run_gc<W: Wal>(&mut self, wal: &mut W) {
-    let floor = if self.is_primary() {
+  /// The PRIMARY prune floor: `min(self.checkpoint_op, quorum_checkpoint_op())` — the highest op a
+  /// `quorum` has both committed AND folded into its durable checkpoint, so every op at/below it is
+  /// recoverable from a snapshot cluster-wide and its WAL slot is safe to physically reuse. This is THE
+  /// single definition shared by two readers:
+  /// - [`run_gc`](Self::run_gc)'s PRIMARY branch — the LOGICAL free: it `prune`s WAL slots `<= floor`.
+  /// - the M3.2b PHYSICAL stall ([`Self::on_request`]) — op-assignment refuses to mint an op whose ring
+  ///   slot still holds an UN-pruned op, i.e. it stalls when `next_op - floor > wal.capacity()`.
+  ///
+  /// Keeping ONE definition means the slot a bounded WAL physically reuses is exactly the slot `run_gc`
+  /// has authorized freeing — the stall can never let op `K + N` overwrite op `K`'s slot before `K <=
+  /// floor` (checkpoint-subsumed on a quorum). Conservative: an unheard peer counts as 0 in
+  /// `quorum_checkpoint_op`, so a fresh primary's floor is low (it frees nothing / stalls earlier) until
+  /// fresh `PrepareOk`s raise it — never freeing or wrapping an op too early. (A backup's `run_gc` uses
+  /// its OWN `checkpoint_op`, NOT this quorum floor — see `run_gc`'s doc — and a backup never assigns
+  /// ops, so the stall is primary-only and reads this directly.)
+  pub(crate) fn prune_floor(&self) -> OpNumber {
+    OpNumber::with(
       self
         .checkpoint_op
         .get()
-        .min(self.quorum_checkpoint_op().get())
+        .min(self.quorum_checkpoint_op().get()),
+    )
+  }
+
+  fn run_gc<W: Wal>(&mut self, wal: &mut W) {
+    let floor = if self.is_primary() {
+      self.prune_floor().get()
     } else {
       // A backup prunes below its OWN checkpoint (it serves no peer WAL reads the cluster relies on);
       // gating it on the quorum floor would never prune → unbounded WAL/log. See the method doc.

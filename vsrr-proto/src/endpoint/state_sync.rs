@@ -51,6 +51,136 @@ impl<S: StateMachine> Endpoint<S> {
     self.send_request_sync(now);
   }
 
+  /// M3.2b Phase B: a backup that has fallen BELOW its bounded-WAL RING WINDOW state-syncs instead of
+  /// overwriting an un-pruned slot. Called from [`Self::on_prepare`]'s head-extend branch BEFORE the
+  /// append, with the incoming `Prepare`. Returns `true` (caller DROPS the prepare, appending nothing)
+  /// when this replica cannot durably hold the prepare without wrapping away an op it has NOT yet
+  /// checkpoint-subsumed; `false` (no overflow) ⇒ the append proceeds normally.
+  ///
+  /// # Why a backup can overflow (the bounded-WAL crux)
+  ///
+  /// A bounded WAL is a ring of `wal.capacity()` slots: appending op `K` PHYSICALLY overwrites slot
+  /// `K mod capacity`, whose last occupant was op `K - capacity`. That overwrite is safe ONLY if
+  /// `K - capacity` is below this replica's prune floor (checkpoint-subsumed) — i.e. `K -
+  /// self.checkpoint_op <= capacity`. The PRIMARY enforces this by stalling op-assignment on the QUORUM
+  /// floor ([`Self::on_request`]), so an IN-QUORUM backup never overflows (its checkpoint tracks the
+  /// quorum's). But a SUB-QUORUM laggard — one whose own `checkpoint_op` has fallen far below the cluster
+  /// checkpoint while its head kept extending (e.g. it adopted a canonical head over a held-commit hole
+  /// after a view change, so `commit_min`/`checkpoint_op` are pinned low while `op` ran ahead) — receives
+  /// fresh head-extending `Prepare`s whose op `K` satisfies `K - self.checkpoint_op > capacity`. Appending
+  /// `K` would overwrite the un-pruned slot `K - capacity`, breaking the resident-tail invariant `recover`
+  /// relies on (`(checkpoint_op .. head]` must fit the ring) — on a later crash, `recover` would request
+  /// the wrapped-away ops below the resident range and spuriously fault. The ORDINARY sync trigger
+  /// ([`Self::maybe_request_sync`]) does NOT catch this: it fires only on `incoming_checkpoint > self.op`,
+  /// but here the laggard's HEAD kept up (`p.checkpoint_op() <= self.op`) while only its CHECKPOINT lagged.
+  ///
+  /// # The fix — jump to the cluster checkpoint
+  ///
+  /// Such a laggard cannot hold the full live tail in its ring; it must JUMP its checkpoint forward via
+  /// state-sync. The target is the cluster checkpoint the `Prepare` advertises, `C = p.checkpoint_op()`:
+  /// the primary's stall guarantees `C >= K - capacity` (the primary kept `K - prune_floor(primary) <=
+  /// capacity` and `prune_floor(primary) <= C`), so syncing to `C` advances `self.checkpoint_op` past the
+  /// overflowing slot `K - capacity`, restoring `head - checkpoint_op <= capacity`. `C` may be AT or BELOW
+  /// our head (the head ran ahead of the cluster checkpoint), so this is the FORCED-style sync (it applies
+  /// a checkpoint `<= self.op`, preserving the resident held tail `(C .. head]` — those slots are the last
+  /// `<= capacity` ring writes, so they are present); the ordinary `> self.op` requirement does not hold.
+  ///
+  /// We arm the forced sync ONLY when `C` is a VALID forward target — `C > self.checkpoint_op` (advances
+  /// us) AND `C > self.commit_min` (STRICT — the cluster checkpoint is ABOVE our applied frontier, so the
+  /// band `(commit_min .. C]` is folded into the cluster snapshot and may be wrapped away from every ring
+  /// → a state-sync is the ONLY recovery; this strict form also keeps `apply_sync`'s `>= commit_min`
+  /// forced assert satisfied with room to spare).
+  ///
+  /// When `C <= self.commit_min` (the laggard has ALREADY APPLIED through the cluster checkpoint) we do
+  /// NOT sync — we still DROP the prepare (back-pressure, the primary-stall analogue), and let our OWN
+  /// pending/next checkpoint advance `checkpoint_op` (freeing the ring), after which the retransmitted
+  /// Prepare fits and is appended. This is GUARANTEED to release: the backup is applied through
+  /// `commit_min >= C > K - capacity > checkpoint_op`, so it sits at/past a checkpoint boundary (its
+  /// `commit_min` is a full interval above its stale `checkpoint_op`), meaning a local ordinary
+  /// checkpoint for `commit_min` is already triggered/in-flight (`maybe_checkpoint` fires the moment
+  /// `commit_min >= checkpoint_op + checkpoint_ops`) and WILL land — advancing `checkpoint_op` and
+  /// shrinking `head - checkpoint_op` below `capacity`. So the back-pressure self-releases with no wedge.
+  ///
+  /// **Why STRICT, not `>=` (codex R26-F1 — the un-completable-sync wedge).** The `C == self.commit_min`
+  /// case is the bug. Arming there targets `C == commit_min`; the backup's OWN in-flight ordinary
+  /// checkpoint for `commit_min` then lands, advancing `self.checkpoint_op` to `C`. But
+  /// `cancel_forced_sync_if_satisfied` fires only on a COMMIT advance, never a CHECKPOINT advance, so the
+  /// forced sync stays armed at `target == C == checkpoint_op`. An equal `SyncCheckpoint(C)` is then
+  /// REJECTED by `on_sync_checkpoint`'s `checkpoint_op <= self.checkpoint_op` guard (syncing to a
+  /// checkpoint we already hold is a no-op) → the forced sync can NEVER complete, and while
+  /// `sync.is_some()` `on_prepare` DROPS every retransmitted Prepare → the cluster WEDGES through this
+  /// replica (it already holds the checkpoint it needed, yet is stuck "syncing" forever). The strict
+  /// discriminator folds `C == commit_min` into the back-pressure path, where the local checkpoint
+  /// releases it cleanly. (A genuine below-ring laggard has `C > commit_min` and still force-syncs.)
+  ///
+  /// Anti-thrash + integration: a sync already outstanding is only RE-TARGETED upward (mirroring
+  /// `maybe_request_sync`/`maybe_force_sync`); the caller's existing `if self.sync.is_some() { return }`
+  /// guard then drops every subsequent overflowing prepare until the sync installs. Unbounded WAL
+  /// (`capacity == u64::MAX`) can never overflow, so this is inert for the default — and for an in-quorum
+  /// backup under a bounded ring (its checkpoint tracks the quorum, so `K - checkpoint_op <= capacity`).
+  pub(crate) fn maybe_sync_below_ring_window<W: Wal>(
+    &mut self,
+    now: Instant,
+    wal: &W,
+    pop: u64,
+    cluster_checkpoint: OpNumber,
+  ) -> bool {
+    // Only the head-extend append can overwrite a ring slot; the caller invokes this for `pop ==
+    // self.op + 1`. Appending `pop` reuses slot `pop mod capacity` (last held by `pop - capacity`); it is
+    // an UN-pruned overwrite iff `pop - self.checkpoint_op > capacity`. Unbounded ⇒ never.
+    let capacity = wal.capacity();
+    if pop.saturating_sub(self.checkpoint_op.get()) <= capacity {
+      return false; // fits the ring (or unbounded) — append normally.
+    }
+    // We have fallen below the ring window: appending `pop` would wrap away the un-pruned op `pop -
+    // capacity`. DROP the prepare (do not overwrite a needed slot). Additionally, if the cluster
+    // checkpoint the Prepare advertises is a VALID forward sync target, JUMP to it via a forced sync.
+    //
+    // The discriminator is STRICT — `target > self.commit_min` (codex R26-F1), NOT `>=`. Arm a sync ONLY
+    // when the cluster checkpoint is STRICTLY ABOVE our applied frontier: then the band `(commit_min ..
+    // target]` is folded into the cluster snapshot AND may be wrapped away from every ring, so a sync is
+    // the SOLE recovery. When `target <= self.commit_min` we have ALREADY APPLIED through the cluster
+    // checkpoint — the ring is full ONLY because our OWN `checkpoint_op` lags (an ordinary checkpoint for
+    // `commit_min` is in flight / pending), NOT because we are missing committed state — so do NOT arm a
+    // sync; just back-pressure (drop, below). The `==` case is the one R26-F1 fixes: arming there targets
+    // `commit_min`, and a LOCAL checkpoint then advances `checkpoint_op` to `commit_min == target`,
+    // leaving the sync un-completable (an equal `SyncCheckpoint` is rejected by `on_sync_checkpoint`'s
+    // `checkpoint_op <= self.checkpoint_op` guard) — a liveness WEDGE (`on_prepare` drops retransmits
+    // while `sync.is_some()`).
+    let target = cluster_checkpoint;
+    let valid_sync_target =
+      target.get() > self.checkpoint_op.get() && target.get() > self.commit_min.get();
+    if valid_sync_target {
+      match self.sync {
+        // Already syncing: only raise the target (keep it forced — applying a checkpoint `<= self.op`).
+        Some(s) if target.get() > s.target.get() => {
+          self.sync = Some(SyncState {
+            target,
+            nonce: s.nonce,
+            forced: true,
+          });
+        }
+        Some(_) => {} // a sync to >= target is already outstanding — let it run (anti-thrash).
+        None => {
+          self.nonce = self.nonce.wrapping_add(1);
+          self.sync = Some(SyncState {
+            target,
+            nonce: self.nonce,
+            forced: true,
+          });
+          // Observability (non-vacuity): count this FRESH below-ring-window sync, so the Phase-B gate can
+          // prove the connected backup-overflow path genuinely fired (vs the ordinary `> self.op` trigger).
+          self.below_ring_window_syncs += 1;
+          self.send_request_sync(now);
+        }
+      }
+    }
+    // Either way the overflowing prepare is dropped (the un-pruned slot is preserved); if no sync was
+    // armed (the `target <= commit_min` back-pressure case), the local checkpoint for `commit_min`
+    // (`>= target`) lands and advances `checkpoint_op`, restoring the window so the next retransmit fits.
+    true
+  }
+
   /// The M3.5 force-state-sync escalation (the safety-critical core). A `Normal` replica holding a
   /// peer-fault-`repair` hole at op `N` whose `RequestPrepare` has become FUTILE — because a peer has
   /// checkpointed past `N` (`max_peer_checkpoint_op() >= N`), so that peer captured `N` in a checkpoint
@@ -416,9 +546,24 @@ impl<S: StateMachine> Endpoint<S> {
   /// (<= checkpoint_op)` (subsumed by the restored snapshot); the acked tail above the floor must
   /// survive. `self.op` is FROZEN across the STAGE→install window (`on_prepare` drops while
   /// `sync.is_some()`), so the `held_tail` decision is identical at install time. The release-active
-  /// assert below branches: ordinary ⇒ `checkpoint_op > self.op`; forced ⇒ the true invariant
-  /// `checkpoint_op >= commit_min`. Either way it makes a trigger-loosening that violates safety fail
-  /// loudly rather than silently drop a committed op (matching `select_canonical_log`'s fail-stop style).
+  /// safety guard below branches: ordinary ⇒ the fail-stop assert `checkpoint_op > self.op` (its
+  /// `<= self.op` case is dropped upstream in `on_sync_checkpoint`, so reaching it here is a genuine
+  /// trigger-loosening bug — fail loudly, matching `select_canonical_log`'s style); forced ⇒ the true
+  /// invariant `checkpoint_op >= commit_min` (never rewind the applied frontier), where a VIOLATION is
+  /// a reordered STALE response (codex R25-F1), not a bug — DROP it gracefully (see below), never panic.
+  ///
+  /// **Drop a stale forced SyncCheckpoint below the applied frontier (codex R25-F1, Part B).** The
+  /// forced path relaxes the upstream stale-response guard to admit a checkpoint `<= self.op` (the
+  /// held-tail case). That relaxation also lets a DELAYED forced `SyncCheckpoint` for a target the
+  /// ordinary repair path has since SATISFIED (`commit_min` advanced PAST it) reach here below the
+  /// applied frontier (`checkpoint_op < commit_min`). Part A normally CANCELS such a forced sync the
+  /// moment commit catches up (so `on_sync_checkpoint` drops the late response at its `sync.is_none`
+  /// guard and never calls us), but this is the load-bearing SAFETY NET for any path that still arrives:
+  /// applying it would `set_commit_min` BACKWARD (a committed-op-survival violation the install's own
+  /// `>= commit_min` debug-assert + the `set_commit_min` monotone choke would trip). So DROP it (early
+  /// return, nothing staged) instead of asserting — a crash on a valid in-model reordering is itself a
+  /// liveness/DoS bug. The LEGITIMATE forced sync (`commit_min <= checkpoint_op <= self.op`, the
+  /// held-tail / seed-164 case) still STAGEs + INSTALLs unchanged.
   ///
   /// **Never sync past uncommitted state.** The synced `checkpoint_op` is, by definition, a checkpoint
   /// a peer made durable — a quorum committed+applied through it — and we additionally gate on
@@ -431,23 +576,35 @@ impl<S: StateMachine> Endpoint<S> {
     m: &crate::SyncCheckpoint,
   ) {
     let checkpoint_op = m.checkpoint_op();
-    // Release-active safety assert, branched on whether this is a FORCED sync (M3.5). On the ordinary
-    // path the synced checkpoint is strictly above our head, so discarding our held log `[..=op]`
-    // cannot drop a committed op. On the forced path it may be at/below our head (we hold a tail above
-    // a pruned committed hole); the TRUE invariant there is `checkpoint_op >= commit_min` — never
-    // rewind the applied frontier — and the trigger structurally guarantees `checkpoint_op >= N > N-1
-    // == commit_min`, so the held tail it discards is only uncommitted ops or committed ops the quorum
-    // holds and re-announces (see the method doc's case analysis). Both `commit_min` and `self.op` are
-    // FROZEN across the STAGE→install window (`advance_commit` is suppressed while `pending_install`,
-    // and `on_prepare` drops while `sync.is_some()`), so this assert holds identically at install time.
+    // Release-active safety guard, branched on whether this is a FORCED sync (M3.5).
     if self.sync.is_some_and(|s| s.forced) {
-      assert!(
-        checkpoint_op.get() >= self.commit_min.get(),
-        "force-sync must not rewind the applied frontier (checkpoint_op {} < commit_min {})",
-        checkpoint_op.get(),
-        self.commit_min.get()
-      );
+      // FORCED path. The synced checkpoint may legitimately sit at/below our head (we hold a tail above
+      // a pruned committed hole — VOPR seed 164), so the ordinary `> self.op` requirement is relaxed.
+      // The TRUE invariant is `checkpoint_op >= commit_min` (never rewind the applied frontier). A
+      // VIOLATION here is a reordered STALE forced SyncCheckpoint (codex R25-F1): a forced sync whose
+      // target the ordinary repair path already SATISFIED (`commit_min` advanced PAST it), arriving late.
+      // DROP it gracefully — applying it would `set_commit_min` BACKWARD (a committed-op rewind). Part A
+      // (`cancel_forced_sync_if_satisfied`) normally clears such a forced sync the moment commit catches
+      // up, so `on_sync_checkpoint` drops the late response upstream and never reaches us; this is the
+      // load-bearing safety net for any path that still arrives. We have mutated nothing, so an early
+      // return is clean. Cancel the stale sync + its solicit timer (the target is already satisfied — its
+      // own commit-frontier `> sync.target`, so there is nothing left to fetch); the install's own
+      // `>= commit_min` debug-assert + the monotone `set_commit_min` choke remain the backstop a genuine
+      // commit_min rewind would still trip. The LEGITIMATE forced sync (`commit_min <= checkpoint_op <=
+      // self.op`) falls through and STAGEs normally.
+      if checkpoint_op.get() < self.commit_min.get() {
+        self.sync = None;
+        self.timers.sync_solicit = None;
+        return;
+      }
     } else {
+      // ORDINARY path: the synced checkpoint is strictly above our head, so discarding our held log
+      // `[..=op]` cannot drop a committed op. The `<= self.op` case is dropped upstream in
+      // `on_sync_checkpoint` (the racing-tail-apply guard), so reaching here with `checkpoint_op <=
+      // self.op` is a genuine trigger-loosening bug — keep the FAIL-STOP assert (it makes such a
+      // regression fail loudly rather than silently drop a committed op, matching `select_canonical_log`).
+      // `self.op` is FROZEN across the STAGE→install window (`on_prepare` drops while `sync.is_some()`),
+      // so this holds identically at install time.
       assert!(
         checkpoint_op.get() > self.op.get(),
         "state-sync must not discard a held op above the synced checkpoint (checkpoint_op {} <= op {})",

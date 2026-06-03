@@ -72,6 +72,13 @@ pub struct Cluster {
   /// superblock struct does. A `crash` additionally DISCARDS any in-flight superblock write (a real
   /// crash loses an `fsync` mid-flight), so a not-yet-durable view write is genuinely lost.
   async_sb_delay: Option<u32>,
+  /// `None` (default) ⇒ every replica's WAL is UNBOUNDED (`capacity() == u64::MAX`, the proto's
+  /// stall-before-wrap never engages — existing-gate behaviour). `Some(n)` ⇒ a fixed RING of `n` slots
+  /// per replica (M3.2b): the proto stalls op-assignment before wrapping an un-pruned slot. Set via
+  /// [`set_wal_capacity`] before running; persists across `crash`/`restart` because the WAL struct does.
+  /// MUST be `> checkpoint_ops + pipeline headroom` or the stall never releases (see the `Wal` capacity
+  /// liveness contract).
+  wal_capacity: Option<u64>,
 }
 
 impl Cluster {
@@ -112,7 +119,7 @@ impl Cluster {
       .collect();
     let n = replicas as usize;
     let storage_faults = StorageFaults::none();
-    let (wals, sbs) = Self::seed_storage(replicas, seed, storage_faults, None, None);
+    let (wals, sbs) = Self::seed_storage(replicas, seed, storage_faults, None, None, None);
     Self {
       replicas: replica_set,
       wals,
@@ -132,6 +139,7 @@ impl Cluster {
       durable_view_violation: None,
       async_wal_delay: None,
       async_sb_delay: None,
+      wal_capacity: None,
     }
   }
 
@@ -140,21 +148,27 @@ impl Cluster {
   /// reproducible per (seed, replica) yet independent across replicas. When `async_wal_delay` is
   /// `Some`, every WAL is built in async-append mode (the in-flight window); when `async_sb_delay` is
   /// `Some`, every superblock is built in async-write mode (the pending durable-view window) — both
-  /// composed with the fault plan.
+  /// composed with the fault plan. When `wal_capacity` is `Some(n)`, every WAL is a fixed ring of `n`
+  /// slots (M3.2b bounded mode), composed with the fault/async modes.
   fn seed_storage(
     replicas: u8,
     seed: u64,
     faults: StorageFaults,
     async_wal_delay: Option<u32>,
     async_sb_delay: Option<u32>,
+    wal_capacity: Option<u64>,
   ) -> (Vec<InMemoryWal>, Vec<InMemorySuperblock>) {
     let wals = (0..replicas)
       .map(|i| {
         let s = Self::storage_seed(seed, i);
-        match async_wal_delay {
+        let mut w = match async_wal_delay {
           Some(d) => InMemoryWal::with_async_appends_and_faults(faults, s, d),
           None => InMemoryWal::with_faults(faults, s),
-        }
+        };
+        // Bounded ring (M3.2b): make this (empty) WAL a fixed ring of `n` slots, composed with the
+        // fault/async mode chosen above. `None` leaves it unbounded (existing-gate behaviour).
+        w.set_capacity(wal_capacity);
+        w
       })
       .collect();
     let sbs = (0..replicas)
@@ -191,6 +205,7 @@ impl Cluster {
       faults,
       self.async_wal_delay,
       self.async_sb_delay,
+      self.wal_capacity,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -210,6 +225,7 @@ impl Cluster {
       self.storage_faults,
       delay,
       self.async_sb_delay,
+      self.wal_capacity,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -233,6 +249,29 @@ impl Cluster {
       self.storage_faults,
       self.async_wal_delay,
       delay,
+      self.wal_capacity,
+    );
+    self.wals = wals;
+    self.sbs = sbs;
+  }
+
+  /// Enables (or, with `None`, disables) **bounded ring mode** on every replica's WAL: each WAL becomes
+  /// a fixed RING of `n` slots (M3.2b), so the proto STALLS op-assignment before it would physically
+  /// wrap an un-pruned slot (one not yet checkpoint-subsumed on a quorum). Composes with the current
+  /// fault/async modes. Call before running; the mode persists across `crash`/`restart` because the WAL
+  /// struct does. Rebuilds the (empty) WALs, like [`set_async_wal_delay`](Self::set_async_wal_delay).
+  ///
+  /// `n` MUST exceed `checkpoint_ops` plus pipeline headroom or the stall never releases and the
+  /// primary wedges (the `Wal` capacity liveness contract). `None` restores the unbounded default.
+  pub fn set_wal_capacity(&mut self, n: Option<u64>) {
+    self.wal_capacity = n;
+    let (wals, sbs) = Self::seed_storage(
+      self.replica_count,
+      self.seed,
+      self.storage_faults,
+      self.async_wal_delay,
+      self.async_sb_delay,
+      n,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -427,6 +466,35 @@ impl Cluster {
   /// bounded by the un-pruned tail.
   pub fn wal_len(&self, i: usize) -> usize {
     self.wals[i].len()
+  }
+
+  /// True iff replica `i`'s WAL PHYSICALLY holds op `op` right now — its slot is `Clean` or `Faulty`
+  /// (durably written, possibly later corrupt). UNLIKE [`Self::replica_appended_op`] this does NOT fold
+  /// in the `op <= checkpoint_op` snapshot-subsumption clause, so it distinguishes "still in the WAL
+  /// ring" from "subsumed by the checkpoint but physically wrapped away". The M3.2b bounded-WAL gate
+  /// uses it to assert a committed op is PRESENT before its ring slot wraps and ABSENT after the quorum
+  /// checkpoints past it and the slot is reused — at which point a laggard would state-sync (Phase B).
+  pub fn replica_wal_holds_op(&self, i: usize, op: OpNumber) -> bool {
+    matches!(
+      self.wals[i].status(op),
+      vsrr_proto::SlotStatus::Clean | vsrr_proto::SlotStatus::Faulty
+    )
+  }
+
+  /// True iff op `op`'s WAL slot has NOT been WRAPPED AWAY on replica `i` — i.e. its status is anything
+  /// but `Empty` (`Clean`/`Faulty` = durably resident, `Dirty` = its OWN append still in flight). The
+  /// async-robust form of [`Self::replica_wal_holds_op`] for the M3.2b Phase-C VOPR ring-residency
+  /// checker: under async-WAL the freshest tail ops are transiently `Dirty` (in flight, not yet durable)
+  /// — NOT wrapped away — so the wrap invariant must TOLERATE `Dirty` while still catching a true wrap.
+  /// The bounded ring keys its entry/staged maps by OP NUMBER, so a slot whose ring index `op mod N` was
+  /// REUSED by a later op `op + N` reports `Empty` for `op` (its entry evicted, and any staged entry
+  /// there carries the NEW op number, not `op`), whereas a legitimate in-flight append OF `op` itself
+  /// reports `Dirty` — so "status != Empty" precisely distinguishes "still this op's slot" from "the
+  /// physical slot was reused by a later op" (a wrap). The proto's stall + `append_prepare` debug-assert
+  /// guarantee a `Dirty` slot is never a wrap-in-progress over an un-pruned op, so tolerating `Dirty`
+  /// cannot mask a real wrap.
+  pub fn replica_wal_slot_not_wrapped_away(&self, i: usize, op: OpNumber) -> bool {
+    !matches!(self.wals[i].status(op), vsrr_proto::SlotStatus::Empty)
   }
 
   /// True iff replica `i` is participating in consensus (`Normal` or `ViewChange`) — i.e. it is NOT
@@ -629,6 +697,26 @@ impl Cluster {
   #[doc(hidden)]
   pub fn replica_forced_sync_count(&self, i: usize) -> u64 {
     self.replicas[i].forced_syncs_applied()
+  }
+
+  /// Test-only (M3.2b): how many client requests replica `i` DROPPED at op-assignment because the next
+  /// op would overflow its bounded WAL ring (the physical stall-before-wrap). `0` for an unbounded WAL.
+  /// The bounded-WAL gate asserts this goes `> 0` to prove the stall genuinely engaged (non-vacuity).
+  /// Mirrors the proto's `Endpoint::wal_stalls`.
+  #[doc(hidden)]
+  pub fn replica_wal_stalls(&self, i: usize) -> u64 {
+    self.replicas[i].wal_stalls()
+  }
+
+  /// Test-only (M3.2b Phase B): how many times replica `i` (a backup) fell BELOW its bounded-WAL ring
+  /// window on a head-extending `Prepare` and STATE-SYNCED to the cluster checkpoint instead of
+  /// overwriting an un-pruned slot. `0` for an unbounded WAL or an in-quorum backup. The bounded-WAL
+  /// Phase-B gate asserts the SUM across replicas goes `> 0` to prove the connected backup-overflow path
+  /// genuinely fired (distinct from the ordinary `> self.op` state-sync trigger). Mirrors the proto's
+  /// `Endpoint::below_ring_window_syncs`.
+  #[doc(hidden)]
+  pub fn replica_below_ring_window_syncs(&self, i: usize) -> u64 {
+    self.replicas[i].below_ring_window_syncs()
   }
 
   /// Test-only: how many of replica `i`'s WAL slots in `1..=op` are PERMANENTLY corrupt (bit-rot or

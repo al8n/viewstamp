@@ -6,10 +6,17 @@
 //! appends (modelling real fsync-loss-on-crash); network reorder/drop/duplicate/delay; storage
 //! read/torn/bit-rot faults + MISDIRECTED reads (a read returns a wrong-but-valid sibling slot,
 //! exercising the recovery/repair placement-integrity checks); small AND large `checkpoint_ops` (the
-//! latter recovers a non-trivial committed band — the R13-F1 read-window path); and a redundant-copy
-//! Superblock that retains the last-rooted checkpoint until a new one is durably rooted (finding B).
+//! latter recovers a non-trivial committed band — the R13-F1 read-window path); a redundant-copy
+//! Superblock that retains the last-rooted checkpoint until a new one is durably rooted (finding B); and
+//! a seed-derived PHYSICAL BOUNDED-WAL RING (M3.2b Phase C) on ~1/3 of seeds (the rest unbounded), where
+//! each WAL is a fixed `N`-slot ring so the primary STALLS op-assignment before it would wrap an
+//! un-pruned slot — folding wrap (stall-before-wrap + recover off a wrapped ring + a below-ring-window
+//! backup overflow) into the full crash + partition + disk-fault schedule, with a per-tick RING-RESIDENCY
+//! checker asserting no wrap ever drops an op `recover`/repair still needs. `N` is sized
+//! `checkpoint_ops * k + headroom` (`k` in 3..=6) so the stall always RELEASES (a tighter ring would
+//! wedge the primary — the headroom constraint, documented in `src/vopr.rs::build_cluster`).
 //! Liveness is judged over calm windows gated on VIRTUAL time, not raw ticks (the seed-622 lesson).
-//! Safety/durability/view-monotonicity/boundedness/append-before-ack/structural
+//! Safety/durability/view-monotonicity/boundedness/append-before-ack/structural/ring-residency
 //! invariants checked EVERY tick and liveness checked across calm windows. `run_vopr` panics on any
 //! violation with the seed + tick, so this test simply runs the sweep and lets a violation surface.
 //!
@@ -22,8 +29,13 @@
 //! The sweep runs a contiguous `0..SEEDS` range PLUS an explicit [`REGRESSION_SEEDS`] list of every
 //! seed that historically caught a real bug, so those stay pinned even above the contiguous range. A
 //! wide catch-panic scan `0..512` at [`DEFAULT_TICKS`] with the async-superblock mode ON is verified
-//! clean end to end (including seed 313, fixed by the final-quiesce phase — see below); the committed
-//! `SEEDS` is kept smaller only to bound the gate's wall-clock (each seed runs a few thousand ticks of
+//! clean end to end (including seed 313, fixed by the final-quiesce phase — see below). The M3.2b Phase-C
+//! bounded-WAL axis (a fixed-`N` ring on the ~1/3 of seeds it seed-derives) is verified clean over the
+//! committed `0..SEEDS` + regression range; it is drawn from a SEPARATE per-seed PRNG, so the ~2/3
+//! UNBOUNDED seeds (and every pinned regression seed that lands unbounded — including seed 313) keep
+//! their EXACT pre-Phase-C schedule, leaving that historical `0..512` unbounded-schedule scan valid. The
+//! committed `SEEDS` is kept smaller only to bound the gate's wall-clock (each seed runs a few thousand
+//! ticks of
 //! rich adversarial schedule).
 //!
 //! Seeds **253 / 299 / 335** were a committed-divergence (`replica diverges from replica` at one
@@ -143,6 +155,16 @@ fn vopr_sweep_no_violations() {
   let mut max_recovered_band = 0u64;
   let mut total_forced_syncs = 0u64;
   let mut total_misdirects = 0u64;
+  // M3.2b Phase C — the bounded-WAL (wrap) axis. Partition seeds into bounded/unbounded and tally the
+  // wrap-exercised witnesses: how many seeds ran a bounded ring, the cumulative WAL stalls across them
+  // (the ring filled + the primary stalled — wrap engaged), the below-ring-window backup-overflow syncs
+  // (rare under this schedule), the largest committed history on any bounded seed (its head climbed past
+  // the ring many times over), and whether ANY bounded seed genuinely WRAPPED (committed > its N).
+  let mut bounded_seeds = 0u64;
+  let mut total_wal_stalls = 0u64;
+  let mut total_below_ring_window_syncs = 0u64;
+  let mut max_bounded_committed = 0usize;
+  let mut any_bounded_wrapped = false;
   for seed in (0..SEEDS).chain(REGRESSION_SEEDS.iter().copied()) {
     let r = run_vopr(seed, DEFAULT_TICKS);
     total_committed += r.max_committed();
@@ -153,6 +175,13 @@ fn vopr_sweep_no_violations() {
     max_recovered_band = max_recovered_band.max(r.recovered_band_max());
     total_forced_syncs += r.forced_syncs();
     total_misdirects += r.misdirects_fired();
+    if r.wal_capacity().is_some() {
+      bounded_seeds += 1;
+      total_wal_stalls += r.wal_stalls();
+      total_below_ring_window_syncs += r.below_ring_window_syncs();
+      max_bounded_committed = max_bounded_committed.max(r.max_committed());
+      any_bounded_wrapped |= r.bounded_seed_wrapped();
+    }
     if r.max_view() >= 1 {
       seeds_with_view_change += 1;
     }
@@ -207,6 +236,38 @@ fn vopr_sweep_no_violations() {
     "no forced-sync/peer-fetch escalation occurred across the sweep — finding B may have silently \
      removed that coverage (forced_syncs={total_forced_syncs})"
   );
+  // M3.2b Phase C — the bounded-WAL (wrap) axis must genuinely fire, or the wrap coverage is vacuous:
+  // - SOME seeds ran the bounded ring (the ~1/3 seed-derived draw — sanity that the axis is wired and
+  //   the env mask is off);
+  // - across those bounded seeds the primary STALLED (`wal_stalls > 0`): the ring genuinely FILLED and
+  //   the physical stall-before-wrap engaged under the full crash + partition + disk-fault schedule —
+  //   wrap was EXERCISED, not vacuously skipped by an under-filled ring (the headline M3.2b stress);
+  // - SOME bounded seed genuinely WRAPPED (committed strictly more ops than its ring size `N`), so an op
+  //   `K + N` physically reused op `K`'s slot — the strongest single witness the wrap path did real work.
+  // The per-tick ring-residency checker (in `run_vopr`) proves no wrap ever dropped a needed op; these
+  // assert the wrap actually HAPPENED so that checker is non-vacuous on the committed range.
+  assert!(
+    bounded_seeds > 0,
+    "no seed ran the bounded-WAL ring — the seed-derived bounded mode is not firing (is \
+     VOPR_NO_BOUNDED_WAL set, or the 1/3 draw never hit on this range?)"
+  );
+  assert!(
+    total_wal_stalls > 0,
+    "the bounded seeds never STALLED (wal_stalls={total_wal_stalls}) — the bounded ring did not fill, \
+     so the physical stall-before-wrap was not exercised; the wrap axis is vacuous"
+  );
+  assert!(
+    any_bounded_wrapped,
+    "no bounded seed committed past its ring size N (max bounded committed={max_bounded_committed}) — \
+     the ring never WRAPPED, so wrap-under-adversity was not genuinely exercised"
+  );
+  // NOTE: `below_ring_window_syncs` (the CONNECTED backup-overflow path — a sub-quorum laggard adopting
+  // a head over a held-commit hole while its checkpoint lags below the ring window) is a RARE confluence
+  // under the VOPR's quorum-preserving schedule; the deterministic `bounded_wal.rs` laggard gate covers
+  // it directly with hand-picked provoking seeds. So we do NOT force a (flaky) `> 0` assert here — we
+  // only assert it when it IS reachable on this range, and otherwise leave it observed. (Currently it is
+  // not consistently hit by the committed range, so this stays a soft observation, never a hard gate.)
+  let _ = total_below_ring_window_syncs;
 }
 
 /// Regression for VOPR seed 313: a FINAL-INSTANT durability-checker artifact, NOT a proto loss.
@@ -260,7 +321,8 @@ fn replay_single_seed() {
   let r = run_vopr_one(SEED);
   println!(
     "vopr seed {} OK: ticks={} replicas={} clients={} max_committed={} crashes={} restarts={} \
-     partitions={} heals={} calm_windows={} max_view={} all_clients_done={}",
+     partitions={} heals={} calm_windows={} max_view={} all_clients_done={} \
+     wal_capacity={:?} wal_stalls={} below_ring_window_syncs={} bounded_seed_wrapped={}",
     r.seed(),
     r.ticks(),
     r.replicas(),
@@ -273,5 +335,9 @@ fn replay_single_seed() {
     r.calm_windows(),
     r.max_view(),
     r.all_clients_done(),
+    r.wal_capacity(),
+    r.wal_stalls(),
+    r.below_ring_window_syncs(),
+    r.bounded_seed_wrapped(),
   );
 }
