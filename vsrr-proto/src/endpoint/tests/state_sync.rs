@@ -6,7 +6,7 @@ use crate::{
 };
 use std::collections::VecDeque;
 
-/// A FIXED-RING WAL of `capacity` slots (the M3.2b bounded-WAL backend, modelled for the proto unit
+/// A FIXED-RING WAL of `capacity` slots (the bounded-WAL backend, modelled for the proto unit
 /// tests). Op `K` occupies ring slot `K mod capacity`; appending `K` EVICTS whatever op last held that
 /// slot (op `K - capacity`), so the resident set never exceeds `capacity` and a read of the
 /// wrapped-over op returns `Absent` — exactly the sim's `set_capacity` semantics
@@ -249,7 +249,7 @@ fn primary_answers_request_sync_with_sync_checkpoint() {
 
 #[test]
 fn serve_sync_checkpoint_drops_a_corrupt_checkpoint_read() {
-  // codex R23-F1 REGRESSION (serve path must be as strict as recover): a Normal donor at a durable
+  // REGRESSION (serve path must be as strict as recover): a Normal donor at a durable
   // checkpoint (op 2) answers a peer's RequestSync by reading its own checkpoint snapshot. A DISK FAULT
   // (in-model: bit-rot in the snapshot region that STILL DECODES) makes that read return CORRUPT bytes
   // bound to the right op — so the existing `cr.op() == checkpoint_op` gate passes — but whose hash no
@@ -588,7 +588,7 @@ fn sync_checkpoint_restores_and_resumes_at_the_synced_point() {
 
 #[test]
 fn state_sync_installs_atomically_only_after_the_root_is_durable() {
-  // codex R24-F1 (durable-before-install): a verified SyncCheckpoint STAGES the durable re-persist
+  // DURABLE-BEFORE-INSTALL: a verified SyncCheckpoint STAGES the durable re-persist
   // (the two superblock writes) but must NOT install the synced state — restore the SM, advance
   // commit_min/op/commit_max/checkpoint_op, or prune the WAL — until the SYNC ROOT (step 2) is
   // durable. The install is ATOMIC at the root completion: everything advances together, only then.
@@ -733,7 +733,7 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
 
 #[test]
 fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_band() {
-  // codex R24-F1 REGRESSION (the wedge). A laggard STAGES a SyncCheckpoint but a VIEW CHANGE fires
+  // REGRESSION (the wedge). A laggard STAGES a SyncCheckpoint but a VIEW CHANGE fires
   // before the sync ROOT completes, and the laggard becomes the new PRIMARY. It must NOT advertise the
   // synced commit while carrying a STALE `checkpoint_op` over a PRUNED committed band — that strands a
   // lower laggard (which can neither RequestPrepare the pruned band nor is triggered to RequestSync,
@@ -762,7 +762,7 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
   while e.poll_message().is_some() {}
   // Trigger + STAGE a sync to checkpoint 4 (> head 2). The trigger Commit carries commit=0, so the
   // laggard does NOT learn a commit above its head (a known-commit above op would, correctly, fail-stop
-  // canonical-log selection — that R9-F1 hazard is orthogonal to this test).
+  // canonical-log selection — that hazard is orthogonal to this test).
   e.handle_message(
     now,
     &mut wal,
@@ -850,7 +850,7 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
     )),
   );
   assert!(e.is_primary(), "replica 1 became the new primary of view 1");
-  // THE R24-F1 ASSERTION. The new primary did NOT install the synced state behind a stale checkpoint:
+  // THE CORE ASSERTION. The new primary did NOT install the synced state behind a stale checkpoint:
   // `commit_min` and `checkpoint_op` are CONSISTENT (both old, not commit==4/checkpoint==0), and the
   // committed band {1,2} is NOT pruned — so a lower laggard can still be served + caught up.
   assert_eq!(
@@ -875,7 +875,7 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
 
 #[test]
 fn an_ordinary_checkpoint_completing_during_a_solicited_sync_advances_without_clearing_it() {
-  // codex R24-F1 follow-up (REGRESSION). The `on_sb_done` root-completion arm must route by whether THIS
+  // REGRESSION. The `on_sb_done` root-completion arm must route by whether THIS
   // root is the sync's re-persist (`pc.sync`), NOT by `self.sync.is_some()`. A sync can be merely
   // SOLICITED (armed, awaiting a SyncCheckpoint — no staged install) while an ORDINARY checkpoint
   // completes. If that ordinary completion were misrouted to the sync-install branch it would (a) NOT
@@ -913,7 +913,7 @@ fn an_ordinary_checkpoint_completing_during_a_solicited_sync_advances_without_cl
   );
   // The in-flight checkpoint is TYPED `Ordinary`, even though a sync is concurrently solicited — the
   // discriminator the routing uses lives in the completion token (`pc.kind`), NOT in `self.sync`. This
-  // is the structural property that types the R24-F1 footgun away: there is no ambient bool to confuse.
+  // is the structural property that types the footgun away: there is no ambient bool to confuse.
   assert_eq!(
     e.pending_checkpoint_is_sync_for_test(),
     Some(false),
@@ -942,11 +942,11 @@ fn an_ordinary_checkpoint_completing_during_a_solicited_sync_advances_without_cl
 
 #[test]
 fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
-  // codex vopr seed 8 (REGRESSION). A `Normal` PRIMARY that receives a valid `SyncCheckpoint` for an
+  // REGRESSION (an adversarial schedule). A `Normal` PRIMARY that receives a valid `SyncCheckpoint` for an
   // outstanding sync must NOT apply it in place (that would reset commit_min to the checkpoint and
   // clear the commit pipeline while it stays primary → a wedge: `try_commit` can never advance past
-  // the checkpoint, and a recovered/op-reset primary can REUSE committed op numbers — the seed-52
-  // divergence). Instead it STEPS DOWN: flags the deferred forfeit and drops the sync, unchanged. A
+  // the checkpoint, and a recovered/op-reset primary can REUSE committed op numbers — divergence).
+  // Instead it STEPS DOWN: flags the deferred forfeit and drops the sync, unchanged. A
   // caught-up replica then leads.
   let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap(); // huge interval: no checkpoint
   let mut e = Endpoint::new(cfg, 0, CountSm::default());
@@ -1399,7 +1399,7 @@ fn sync_checkpoint_clears_a_pending_repair_hole_below_the_synced_point() {
   assert!(e.timers.repair_retry.is_none(), "repair timer stopped");
 }
 
-// ── M3.5 T2: force-state-sync escalation ───────────────────────────────────────────────────────
+// ── Force-state-sync escalation ────────────────────────────────────────────────────────────────
 
 #[test]
 fn a_pruned_committed_hole_forces_a_state_sync() {
@@ -1597,7 +1597,7 @@ fn force_sync_stays_dormant_until_a_quorum_floor_is_known() {
 
 #[test]
 fn forced_sync_preserves_a_held_tail_above_the_checkpoint_without_panic() {
-  // SAFETY (VOPR seed 164): a forced sync where checkpoint_op (3) <= self.op (5). The held tail
+  // SAFETY (an adversarial schedule): a forced sync where checkpoint_op (3) <= self.op (5). The held tail
   // (3..5] is ops this replica already durably appended + ACKED, so the cluster may have COMMITTED
   // them off its vote. The OLD code discarded the tail (rewound the head to 3 + truncated the WAL),
   // destroying its only durable copy while keeping `log_view` — a later view change then took its
@@ -1666,12 +1666,12 @@ fn forced_sync_preserves_a_held_tail_above_the_checkpoint_without_panic() {
 
 #[test]
 fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_target() {
-  // codex R25-F1 REGRESSION (a stale forced SyncCheckpoint reaches apply_sync). A forced sync is armed
+  // REGRESSION (a stale forced SyncCheckpoint reaches apply_sync). A forced sync is armed
   // for a doomed hole at target T=2, but the ORDINARY repair path completes FIRST: a peer's `Prepare`
   // fills the hole via `fill_repair`, its WAL append lands, and `advance_commit` moves `commit_min` PAST
   // T (to 4) while the forced `sync` is armed. Then a DELAYED `SyncCheckpoint(checkpoint_op = T = 2)` for
   // the now-stale target arrives. The ordinary stale-response guard (`checkpoint_op <= self.op → drop`)
-  // is SKIPPED for the forced path (the M3.5/seed-164 relaxation), so the stale response would reach
+  // is SKIPPED for the forced path (the forced-tail relaxation), so the stale response would reach
   // `apply_sync` — where the forced-branch `assert!(checkpoint_op >= commit_min)` PANICKED (commit_min 4
   // > checkpoint_op 2). FAIL-BEFORE: that panic. PASS-AFTER: Part A CANCELS the satisfied forced sync the
   // moment `advance_commit` carries `commit_min` past T, so the stale response is dropped upstream (no
@@ -1732,7 +1732,7 @@ fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_targ
   );
   assert!(
     ep.has_repair_hole_for_test(2),
-    "the hole stays OPEN until the repair-fill append is durable (R13-F2 barrier)"
+    "the hole stays OPEN until the repair-fill append is durable"
   );
   ep.handle_storage(now, &mut wal, &mut sb); // on_wal_done: insert op 2, clear the hole, advance_commit
   assert!(
@@ -1800,7 +1800,7 @@ fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_targ
 
 #[test]
 fn apply_sync_drops_a_stale_forced_sync_checkpoint_below_the_applied_frontier() {
-  // codex R25-F1 (Part B — the safety NET reaching `apply_sync` directly). Models the reordering where a
+  // SAFETY NET (Part B — reaching `apply_sync` directly). Models the reordering where a
   // forced `SyncCheckpoint` for a target the applied frontier has ALREADY passed reaches `apply_sync`
   // (i.e. Part A's apply-loop cancel did not run between the arm and this delivery). The forced sync's
   // target (2) is `<= self.op` (so the upstream `<= self.op → drop` guard is relaxed for the forced
@@ -1930,7 +1930,7 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
   // The next primary tick ACTS on the flag: it forfeits by proposing the next view (StartViewChange).
   // The flag PERSISTS (F2) — the lone SVC has not yet formed a quorum, so the view has not changed;
   // the latch keeps the primary re-proposing + not heartbeating until it does. The op is unchanged.
-  // (The step-down bootstraps `svc_message` at the retransmit cadence — codex R15 — so the re-propose
+  // (The step-down bootstraps `svc_message` at the retransmit cadence, so the re-propose
   // is serviced on the next svc_message window; tick at that 100ms boundary.)
   ep.handle_timeout(
     Instant::ZERO + core::time::Duration::from_millis(100),
@@ -2091,7 +2091,7 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
   );
 }
 
-// ── State-sync (M3.4a) — A6: view-change / B3-interaction safety (regression guards) ──
+// ── State-sync — A6: view-change / B3-interaction safety (regression guards) ──
 
 #[test]
 fn synced_replica_reports_its_checkpoint_in_view_change() {
@@ -2190,7 +2190,7 @@ fn synced_replica_reports_its_checkpoint_in_view_change() {
 
 #[test]
 fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies_it() {
-  // codex R26-F1 (REGRESSION — the un-completable-sync WEDGE). The M3.2b backup-overflow path
+  // REGRESSION (the un-completable-sync WEDGE). The bounded-WAL backup-overflow path
   // `maybe_sync_below_ring_window` armed a forced sync whenever the cluster checkpoint `C` the
   // overflowing Prepare advertises satisfied `C >= self.commit_min`. The `==` case (`C == commit_min`)
   // is the bug: a sub-quorum backup that has ALREADY APPLIED through `C` (commit_min == C) but whose own
@@ -2355,7 +2355,7 @@ fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies
     "no phantom sync was ever left armed across the whole sequence"
   );
   // Part B (defense-in-depth) is SUBSUMED by Part A — no checkpoint-advance cancellation is added. Every
-  // forced/ordinary sync is armed with `target > commit_min` (below-ring: the strict R26-F1 discriminator;
+  // forced/ordinary sync is armed with `target > commit_min` (below-ring: the strict discriminator;
   // `maybe_force_sync`: `target = floor` over a hole held at `commit_min < floor`; ordinary: `target >
   // self.op >= commit_min`). A LOCAL checkpoint advances `checkpoint_op` to at most `commit_min` (it
   // checkpoints at `target_op = commit_min`), so `checkpoint_op <= commit_min < sync.target` always holds

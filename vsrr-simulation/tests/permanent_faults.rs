@@ -1,7 +1,6 @@
-//! M3.3b gate: committed ops survive crash + PERMANENT storage-fault + restart (bit-rot / torn).
+//! Permanent-fault gate: committed ops survive crash + PERMANENT storage-fault + restart (bit-rot / torn).
 //!
-//! This is the M3.3 spec gate ("committed ops survive crash + STORAGE-FAULT + restart") with the
-//! PERMANENT fault model that M3.3b's peer fault-repair lifts (M3.3a kept `bit_rot = torn = 0`). A
+//! This gate covers the PERMANENT fault model that peer fault-repair handles. A
 //! caught-up backup runs under seeded PERMANENT WAL corruption — `bit_rot_per_mille` (every read of
 //! the slot faults forever) and `torn_write_per_mille` (the body fails `Header::verify` forever). We
 //! crash it, let the surviving quorum keep committing, then restart it so it rebuilds its cache from

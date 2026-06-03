@@ -1,12 +1,12 @@
-//! M3.4a / B3 gate: two DIFFERENT-FLOOR recover-from-checkpoint replicas survive a view change
-//! together with NO committed-op loss.
+//! Offset-floor view-change gate: two DIFFERENT-FLOOR recover-from-checkpoint replicas survive a view
+//! change together with NO committed-op loss.
 //!
-//! This is the end-to-end proof of B3 (offset-aware canonical-log selection) — the scenario the proto
+//! This is the end-to-end proof of offset-aware canonical-log selection (B3) — the scenario the proto
 //! unit tests cover (`canonical_selection_with_a_checkpoint_offset_log_is_safe`) but no sim gate did.
 //!
 //! ## The offset-log hazard B3 fixes
 //!
-//! Since M3.2a a recover-from-checkpoint (or state-synced) replica's in-memory log is the OFFSET TAIL
+//! A recover-from-checkpoint (or state-synced) replica's in-memory log is the OFFSET TAIL
 //! `(checkpoint_op .. head]` — the committed prefix `[1..=checkpoint_op]` lives in its SM snapshot, not
 //! the log. So a `DoViewChange` from such a replica carries only `(floor .. head]` with `commit ==
 //! checkpoint_op`. Two recovered replicas at DIFFERENT checkpoint floors therefore send DVCs with

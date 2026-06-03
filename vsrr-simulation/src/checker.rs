@@ -186,9 +186,9 @@ impl DurabilityChecker {
 /// **acted in no higher view than its durable view** — on restart `recover()` legitimately restores
 /// the durable view, regressing the in-memory view, and the replica is self-correcting (the next
 /// higher-view message re-catches it up). Asserting monotonicity on the in-memory view would flag this
-/// safe, expected behaviour (observed at VOPR seed 151: a replica entered a view change for view 1,
-/// crashed before the view-1 root was durable, and recovered to view 0 — having sent NOTHING in view
-/// 1). The DURABLE view is the right invariant: it only advances when a view-change/adoption root
+/// safe, expected behaviour (a replica enters a view change for view 1, crashes before the view-1
+/// root is durable, and recovers to view 0 — having sent NOTHING in view 1). The DURABLE view is
+/// the right invariant: it only advances when a view-change/adoption root
 /// write lands, so it is monotone AND it is exactly "the highest view the replica could have acted in".
 /// A regression THERE would be a real durable-state safety violation.
 #[derive(Debug)]
@@ -222,7 +222,7 @@ impl ViewMonotonicChecker {
 }
 
 /// Asserts the per-op in-memory maps (`log` cache, `inflight` pipeline) and each replica's durable
-/// WAL stay **bounded** over a run — the M3.4b promise that post-checkpoint GC bounds the structures
+/// WAL stay **bounded** over a run — the guarantee that post-checkpoint GC bounds the structures
 /// that previously grew without bound in op count.
 ///
 /// Without GC these grow with the total committed-op count (one `log`/WAL entry per op forever); with
@@ -442,12 +442,12 @@ mod tests {
 
   #[test]
   fn view_checker_tracks_the_durable_view_across_an_undurable_catch_up_regression() {
-    // Regression for VOPR seed 151: a replica that caught its IN-MEMORY view up to a higher view via
-    // the higher-view rule (`catch_up_to_view` — a non-binding GetView probe, NO durable write, NO
-    // participation), then crashed and recovered to its (lower) DURABLE view, legitimately regresses
-    // its in-memory view. That is SAFE (it acted in no higher view than it persisted), so the
-    // view-monotonic checker — which tracks the DURABLE view — must stay Ok, even though a naive
-    // in-memory-view checker WOULD have fired.
+    // A replica that caught its IN-MEMORY view up to a higher view via the higher-view rule
+    // (`catch_up_to_view` — a non-binding GetView probe, NO durable write, NO participation), then
+    // crashed and recovered to its (lower) DURABLE view, legitimately regresses its in-memory view.
+    // That is SAFE (it acted in no higher view than it persisted), so the view-monotonic checker —
+    // which tracks the DURABLE view — must stay Ok, even though a naive in-memory-view checker WOULD
+    // have fired.
     //
     // Construction: a 5-node cluster, crash the primary (r0) so the survivors fail over to view 1. A
     // lagging backup catches its in-memory view up to 1 BEFORE persisting it (the un-durable window:

@@ -1,11 +1,11 @@
 //! Deterministic in-memory `Wal`/`Superblock` impls for the DST harness.
 //!
-//! M3.0/M3.1: reliable + synchronous (each submit completes immediately into the
+//! Reliable + synchronous by default (each submit completes immediately into the
 //! completion queue). [`InMemoryWal::with_async_appends`] adds an OPT-IN async-append mode that
 //! STAGES each append as not-yet-durable for a seeded number of `poll`s — reopening the in-flight
 //! window a real `fsync`-between-ticks WAL has (and the synchronous default closes), which the
-//! append-before-ack invariant must survive (codex R7-F1). The default stays synchronous so existing
-//! gates are unaffected. M3.3a adds **seeded** fault injection ([`StorageFaults`]): TRANSIENT WAL read
+//! append-before-ack invariant must survive. The default stays synchronous so existing
+//! gates are unaffected. Seeded fault injection ([`StorageFaults`]) adds: TRANSIENT WAL read
 //! faults (each read independently rolls — a retry may succeed, exercising the proto's
 //! `Status::Recovering` retry loop), permanent torn writes (a flipped body byte ⇒ `Header::verify`
 //! fails on read-back), and permanent bit-rot (every read of the slot faults). All faults surface as
@@ -20,7 +20,7 @@
 //! analogue of the torn/bit-rot WRITE faults: faults-as-data the proto must defend against by op
 //! placement, not body checksum alone.
 //!
-//! M3.2b adds an OPT-IN **bounded ring** mode ([`InMemoryWal::with_capacity`]): the WAL is a fixed ring
+//! The OPT-IN **bounded ring** mode ([`InMemoryWal::with_capacity`]) makes the WAL a fixed ring
 //! of `n` slots where op `K` occupies slot `K mod n`, so a durable append at `K` physically OVERWRITES
 //! whatever op last held that slot (op `K - n`). A read of a wrapped-over op then returns `Absent` (its
 //! bytes are gone — a clean wrap). [`Wal::capacity`] reports `n` (the unbounded default reports
@@ -46,19 +46,18 @@ use vsrr_proto::{
 /// golden rule is enforced on `vsrr-proto` (the library), not on the simulation test harness, which
 /// already uses pub-field config structs for ergonomic test setup.
 ///
-/// # The transient-vs-permanent distinction (load-bearing for the M3.3a gate)
+/// # The transient-vs-permanent distinction
 ///
 /// - **`read_fault_per_mille`** — TRANSIENT. Each `submit_read` rolls independently, so a faulted
 ///   read may succeed on retry; the proto's recover loop (budget `RECOVER_READ_RETRIES`) clears it.
-///   The M3.3a "committed ops survive crash + storage-fault + restart" gate uses ONLY this, so a
+///   The "committed ops survive crash + storage-fault + restart" gate uses ONLY this, so a
 ///   restarted replica always recovers from its OWN disk and reaches `Normal` — no peer needed.
 /// - **`torn_write_per_mille` / `bit_rot_per_mille`** — PERMANENT (a slot is gone until rewritten /
 ///   for good on this replica). Recovering such a committed slot needs a PEER: a permanently-faulty
 ///   HEAD slot ⇒ `RecoveringHead` + `StartView`/`RecoveryResponse` adoption (B1); a permanently-faulty
 ///   NON-head committed slot ⇒ peer fault-repair via `RequestPrepare` → `Prepare`, with the commit
-///   HELD below the hole until the op arrives (B4). M3.3a gates set these to `0` because peer-repair
-///   did not yet exist (a permanent committed-op fault would have tripped the old "committed op
-///   present in log" expectation); the M3.3b permanent-fault gate turns them on and proves no
+///   HELD below the hole until the op arrives (B4). The transient-only gate sets these to `0` so a
+///   restarted replica recovers from its own disk; the permanent-fault gate turns them on and proves no
 ///   committed op is lost across crash + permanent fault + restart.
 #[derive(Debug, Clone, Copy)]
 pub struct StorageFaults {
@@ -69,7 +68,7 @@ pub struct StorageFaults {
   /// with the ORIGINAL header ⇒ `Header::verify` fails on read-back). Permanent until rewritten.
   pub torn_write_per_mille: u32,
   /// Per-append probability (out of 1000) that the slot is PERMANENTLY corrupt (bit-rot): every read
-  /// of it faults, modelling unrecoverable media damage. (Used by M3.3b; `0` in M3.3a gates.)
+  /// of it faults, modelling unrecoverable media damage. `0` in the transient-only gates.
   pub bit_rot_per_mille: u32,
   /// Per-read probability (out of 1000) that a WAL read for op X is MISDIRECTED: instead of X's bytes
   /// (or `Absent`), it returns a DIFFERENT present, valid, checksum-CORRECT slot's `ReadOk`
@@ -82,7 +81,7 @@ pub struct StorageFaults {
   /// fault stays a pure function of the per-replica seed.
   pub misdirect_read_per_mille: u32,
   /// Per-read probability (out of 1000) that a CHECKPOINT read returns CORRUPT-but-PARSEABLE bytes:
-  /// the live snapshot with one trailing SM-tail byte flipped (codex R23-F1). The bytes STILL DECODE
+  /// the live snapshot with one trailing SM-tail byte flipped. The bytes STILL DECODE
   /// (`Endpoint::decode_checkpoint` treats the SM snapshot as an opaque tail) and keep the right BOUND
   /// op (only the tail flips, never the leading op u64), so a donor's `cr.op() == checkpoint_op` gate
   /// passes — but they hash to a DIFFERENT id than the durable root. This is the in-model disk fault
@@ -134,17 +133,17 @@ struct PendingAppend {
 }
 
 /// A seeded in-memory write-ahead log. With [`StorageFaults::none`] it is reliable + synchronous
-/// (M3.0/M3.1 behaviour); with faults it injects transient read faults + permanent torn/bit-rot.
+///; with faults it injects transient read faults + permanent torn/bit-rot.
 ///
 /// # Async-append mode (opt-in, [`InMemoryWal::with_async_appends`])
 ///
 /// By DEFAULT every `submit_append` completes SYNCHRONOUSLY (the entry is durable and its `Appended`
-/// completion is queued in the same call) — the M3.0/M3.1 behaviour all existing gates rely on.
+/// completion is queued in the same call) — the synchronous behaviour all existing gates rely on.
 /// Async mode instead STAGES each append as not-yet-durable for a seeded number of `poll`s before it
 /// becomes durable, modelling a real WAL whose `fsync` lands between ticks rather than inline. This
 /// opens the window a real driver has — and the synchronous default closed — where the proto's head
 /// (`self.op`) has advanced past an op whose bytes are still in flight, which is exactly the state
-/// the append-before-ack invariant must hold across (codex R7-F1). It composes with the fault rolls:
+/// the append-before-ack invariant must hold across. It composes with the fault rolls:
 /// the torn/bit-rot verdict is still decided at submit time, just applied on completion.
 #[derive(Debug)]
 pub struct InMemoryWal {
@@ -171,7 +170,7 @@ pub struct InMemoryWal {
   /// really fired, so the proto's placement check was genuinely exercised) rather than merely armed.
   misdirects_fired: u64,
   /// `None` (default) ⇒ UNBOUNDED: `entries` grows without a physical cap and `capacity()` reports
-  /// `u64::MAX`. `Some(n)` ⇒ a fixed RING of `n` slots (M3.2b): op `K` occupies slot `K mod n`, and a
+  /// `u64::MAX`. `Some(n)` ⇒ a fixed RING of `n` slots: op `K` occupies slot `K mod n`, and a
   /// durable append at `K` physically OVERWRITES whatever op last held that slot (op `K - n`). A read of
   /// a wrapped-over op then finds no resident entry and returns `Absent` (a clean wrap — its bytes are
   /// gone). The proto's stall-before-wrap keeps the un-pruned window `(prune_floor, op]` within `n`, so a
@@ -208,7 +207,7 @@ impl InMemoryWal {
     }
   }
 
-  /// Creates an empty, reliable WAL as a **fixed RING of `n` slots** (M3.2b bounded mode). Op `K`
+  /// Creates an empty, reliable WAL as a **fixed RING of `n` slots**. Op `K`
   /// occupies slot `K mod n`; a durable append at `K` physically OVERWRITES whatever op last held that
   /// slot (op `K - n`), and a read of that wrapped-over op then returns `Absent` (its bytes are gone — a
   /// clean wrap, which the proto's placement check `header.op() == op` would reject as a torn/misdirect
@@ -251,7 +250,7 @@ impl InMemoryWal {
   /// synchronous so existing gates are unaffected. Until an append completes the slot is
   /// [`SlotStatus::Dirty`] (never `Clean`) and a read of it returns `Absent` — modelling the in-flight
   /// window a real async WAL has, where the proto's head has advanced past bytes not yet on disk
-  /// (codex R7-F1). `delay_ticks == 0` still defers to the next `poll` (never inline).
+  ///. `delay_ticks == 0` still defers to the next `poll` (never inline).
   pub fn with_async_appends(delay_ticks: u32) -> Self {
     let mut w = Self::with_faults(StorageFaults::none(), 0);
     w.async_delay = Some(delay_ticks);
@@ -276,7 +275,7 @@ impl InMemoryWal {
   }
 
   /// Test-only: the number of PERMANENTLY-corrupt slots in `1..=op` — bit-rotted (every read faults)
-  /// or torn (the stored body fails its header's `verify`). Used by the M3.3b permanent-fault gate to
+  /// or torn (the stored body fails its header's `verify`). Used by the permanent-fault gate to
   /// assert the crashed replica's recovery is non-vacuous (it really does read back faulty committed
   /// slots that must be peer-repaired).
   #[doc(hidden)]
@@ -288,7 +287,7 @@ impl InMemoryWal {
       .count()
   }
 
-  /// The number of durable slots currently held (after any prune/truncate). Used by the M3.4b
+  /// The number of durable slots currently held (after any prune/truncate). Used by the
   /// boundedness checker to assert the WAL stays bounded over a long run with checkpoint GC.
   pub fn len(&self) -> usize {
     self.entries.len()
@@ -354,7 +353,7 @@ impl InMemoryWal {
     self.misdirects_fired
   }
 
-  /// Bounded-ring (M3.2b) physical slot reuse: when a durable append at `op` lands in slot `op mod n`,
+  /// Bounded-ring physical slot reuse: when a durable append at `op` lands in slot `op mod n`,
   /// EVICT whatever DIFFERENT op last held that slot (op `op - n`) — its bytes are physically gone (a
   /// clean wrap), so it leaves `entries`/`rotted`/`staged` and a subsequent read of it returns `Absent`.
   /// A no-op in unbounded mode (`capacity == None`). Called at the moment a slot is PHYSICALLY written:
@@ -392,7 +391,7 @@ impl Wal for InMemoryWal {
   fn capacity(&self) -> u64 {
     // Unbounded by default (`u64::MAX` ⇒ the proto's capacity back-pressure never engages, so the
     // existing gates are unaffected). In bounded mode ([`with_capacity`](InMemoryWal::with_capacity))
-    // this reports the fixed ring size `n`, engaging the proto's M3.2b stall-before-wrap so it refuses
+    // this reports the fixed ring size `n`, engaging the proto's stall-before-wrap so it refuses
     // to assign an op whose ring slot still holds an un-pruned op.
     self.capacity.unwrap_or(u64::MAX)
   }
@@ -414,7 +413,7 @@ impl Wal for InMemoryWal {
       SlotStatus::Clean
     } else if self.staged.iter().any(|s| s.op == op.get()) {
       // Async mode: a submitted-but-not-yet-durable append is DIRTY, never Clean — the bytes are not
-      // on disk yet, so the proto must not treat this slot as a durable voter copy (R7-F1).
+      // on disk yet, so the proto must not treat this slot as a durable voter copy.
       SlotStatus::Dirty
     } else {
       SlotStatus::Empty
@@ -438,9 +437,9 @@ impl Wal for InMemoryWal {
       body
     };
     match self.async_delay {
-      // SYNCHRONOUS (default): durable immediately, completion queued in this call (M3.0/M3.1).
+      // SYNCHRONOUS (default): durable immediately, completion queued in this call.
       None => {
-        // Bounded ring (M3.2b): writing slot `op mod n` physically evicts the op that last held it.
+        // Bounded ring: writing slot `op mod n` physically evicts the op that last held it.
         self.evict_wrapped_slot(op.get());
         if rot {
           self.rotted.insert(op.get());
@@ -451,7 +450,7 @@ impl Wal for InMemoryWal {
       }
       // ASYNC: STAGE as not-yet-durable. `self.head`/`entries`/`rotted` are left untouched (so the
       // slot reads `Dirty`/`Absent` and `op_head` does not yet count it) until `poll` releases it
-      // after `delay` ticks — opening the in-flight window the synchronous path never had (R7-F1).
+      // after `delay` ticks — opening the in-flight window the synchronous path never had.
       Some(delay) => self.staged.push_back(PendingAppend {
         remaining: delay,
         id,
@@ -525,12 +524,12 @@ impl Wal for InMemoryWal {
     // submission order, so we count down the FRONT entry and make it durable when it reaches zero —
     // at which point its bytes land in `entries`/`rotted` (the fault verdict taken at submit) and its
     // `Appended` is queued. This is the ONLY place a staged append becomes durable: until then the
-    // slot is `Dirty`/`Absent` and the proto's head sits above not-yet-durable bytes (the R7-F1
-    // window). A no-op in synchronous mode (`staged` is always empty there).
+    // slot is `Dirty`/`Absent` and the proto's head sits above not-yet-durable bytes (the
+    // append-before-ack window). A no-op in synchronous mode (`staged` is always empty there).
     if let Some(front) = self.staged.front_mut() {
       if front.remaining == 0 {
         let done = self.staged.pop_front().expect("front exists");
-        // Bounded ring (M3.2b): the physical write happens HERE (on release), so the slot-`op mod n`
+        // Bounded ring: the physical write happens HERE (on release), so the slot-`op mod n`
         // eviction of the wrapped-over op happens here too, not at submit time.
         self.evict_wrapped_slot(done.op);
         if done.rot {
@@ -576,11 +575,11 @@ impl StagedSbWrite {
 
 /// A seeded in-memory superblock + checkpoint store. The only fault it injects is a TRANSIENT
 /// checkpoint-read fault (`read_fault_per_mille`): the recover loop retries it within budget. It
-/// NEVER permanently corrupts a checkpoint the durable root names (preserving the M3.2a invariant
-/// that the root only ever names a fully-written snapshot), so the M3.3a recover always eventually
+/// NEVER permanently corrupts a checkpoint the durable root names (preserving the invariant
+/// that the root only ever names a fully-written snapshot), so the recover path always eventually
 /// restores. Torn/bit-rot are WAL-only.
 ///
-/// # Redundant checkpoint copies — retain the last-ROOTED snapshot (audit finding B)
+/// # Redundant checkpoint copies — retain the last-ROOTED snapshot
 ///
 /// The checkpoint store keeps a SMALL set of recent snapshot generations (`snapshots`, op → bytes),
 /// not a single clobberable slot, modelling a faithful redundant-copy superblock backend. A
@@ -609,11 +608,11 @@ impl StagedSbWrite {
 /// # Async-write mode (opt-in, [`InMemorySuperblock::with_async_writes_and_faults`])
 ///
 /// By DEFAULT every `submit_write`/`submit_write_checkpoint` completes SYNCHRONOUSLY (the effect is
-/// applied and the `Wrote` completion queued in the same call) — the M3.0/M3.1 behaviour all existing
+/// applied and the `Wrote` completion queued in the same call) — the synchronous behaviour all existing
 /// gates rely on. Async mode instead STAGES each write as not-yet-durable for a seeded number of
 /// `poll`s before it becomes durable, modelling a real superblock whose `fsync` lands between ticks.
 /// This opens the **pending durable-view window** the proto's durable-view-before-participate gate
-/// must hold across (codex R8-F1): a replica that just became primary has set `Status::Normal` and
+/// must hold across: a replica that just became primary has set `Status::Normal` and
 /// minted the view-change root write, but that root is still in flight — so `pending_sb` is armed and
 /// `state()` still names the OLD view, exactly the window where a delayed `GetView`/`Recovery` or a
 /// primary timer must NOT make it act in the not-yet-durable view. The synchronous default never
@@ -626,7 +625,7 @@ pub struct InMemorySuperblock {
   /// called with). `submit_read_checkpoint` serves the entry the CURRENT durable root names
   /// (`state().checkpoint_op()`); newer staged generations whose root has not landed are retained but
   /// not served, and strictly-older-than-live generations are GC'd once no in-flight root could
-  /// re-name them. Modelling redundant copies, not a single clobberable slot (audit finding B).
+  /// re-name them. Modelling redundant copies, not a single clobberable slot.
   snapshots: BTreeMap<u64, Bytes>,
   completions: VecDeque<SuperblockDone>,
   faults: StorageFaults,
@@ -673,7 +672,7 @@ impl InMemorySuperblock {
   /// ([`new`](Self::new)/[`with_faults`](Self::with_faults)) stays synchronous so existing gates are
   /// unaffected. Until a write completes, `state()` returns the prior durable root and
   /// `submit_read_checkpoint` reads the prior snapshot — opening the pending-durable-view window the
-  /// proto's durable-view-before-participate gate must survive (codex R8-F1). `delay_ticks == 0` still
+  /// proto's durable-view-before-participate gate must survive. `delay_ticks == 0` still
   /// defers to the next `poll` (never inline).
   pub fn with_async_writes_and_faults(faults: StorageFaults, seed: u64, delay_ticks: u32) -> Self {
     let mut sb = Self::with_faults(faults, seed);
@@ -698,7 +697,7 @@ impl InMemorySuperblock {
   /// It ALSO discards any staged-but-unrooted checkpoint snapshot — a generation whose bytes landed
   /// but whose durable ROOT never did (the `state` still names an OLDER checkpoint). Such a snapshot
   /// was never the live checkpoint, so a faithful redundant-copy backend's crash leaves only the
-  /// last-rooted snapshot readable (audit finding B). Concretely: drop every `snapshots` entry whose op
+  /// last-rooted snapshot readable. Concretely: drop every `snapshots` entry whose op
   /// is NOT the live root's `checkpoint_op` (strictly newer unrooted generations; older ones are
   /// already GC'd in steady state). After this the only retained snapshot is exactly the one the
   /// durable root names, so a restart's recover restores from its OWN disk — not a spurious peer fetch.
@@ -738,7 +737,7 @@ impl Superblock for InMemorySuperblock {
 
   fn submit_write(&mut self, id: OpId, state: VsrState) {
     match self.async_delay {
-      // SYNCHRONOUS (default): durable immediately, completion queued in this call (M3.0/M3.1). The new
+      // SYNCHRONOUS (default): durable immediately, completion queued in this call. The new
       // durable root may NAME a just-written snapshot generation (a checkpoint's step-2 root) — which
       // becomes the live/readable checkpoint by virtue of `state.checkpoint_op()` now pointing at it;
       // GC then drops strictly-older generations (staged is empty in sync mode, so GC runs inline).
@@ -748,7 +747,7 @@ impl Superblock for InMemorySuperblock {
         self.completions.push_back(SuperblockDone::Wrote(id));
       }
       // ASYNC: STAGE as not-yet-durable. `self.state` is left at the prior durable root until `poll`
-      // releases this write after `delay` ticks — opening the pending durable-view window (R8-F1).
+      // releases this write after `delay` ticks — opening the pending durable-view window.
       Some(delay) => self
         .staged
         .push_back((delay, StagedSbWrite::Root { id, state })),
@@ -795,7 +794,7 @@ impl Superblock for InMemorySuperblock {
       self.completions.push_back(SuperblockDone::Fault(id));
       return;
     }
-    // TRANSIENT corrupt-but-PARSEABLE checkpoint read (codex R23-F1): flip one trailing SM-tail byte of
+    // TRANSIENT corrupt-but-PARSEABLE checkpoint read: flip one trailing SM-tail byte of
     // the live snapshot. The bytes still DECODE and keep the leading bound op (the envelope is >= 12
     // bytes: op u64 + sessions_len u32, so the last byte is never the op), so a donor's `cr.op() ==
     // checkpoint_op` gate passes — but they now hash to a DIFFERENT id than the durable root. The proto
@@ -832,7 +831,7 @@ impl Superblock for InMemorySuperblock {
     // the new durable root, or the now-readable checkpoint snapshot. FIFO completion satisfies the
     // trait's root-write ordering contract (the LAST-submitted root wins once all complete). This is
     // the ONLY place a staged write becomes durable: until then `state()`/the readable checkpoint sit
-    // at their prior values (the R8-F1 pending-durable-view window). A no-op in synchronous mode.
+    // at their prior values (the pending-durable-view window). A no-op in synchronous mode.
     if let Some((remaining, _)) = self.staged.front_mut() {
       if *remaining == 0 {
         let (_, write) = self.staged.pop_front().expect("front exists");
@@ -1014,7 +1013,7 @@ mod tests {
 
   #[test]
   fn read_faults_clear_within_the_proto_retry_budget() {
-    // The load-bearing property for the M3.3a gate: a TRANSIENT read fault must clear within the
+    // The load-bearing property for the transient-fault gate: a TRANSIENT read fault must clear within the
     // proto's RECOVER_READ_RETRIES (8) immediate retries — otherwise a recovering replica strands.
     // We model that exact budget (9 attempts per round) and assert a clean read is almost certain.
     let mut w = InMemoryWal::with_faults(
@@ -1204,7 +1203,7 @@ mod tests {
   #[test]
   fn permanent_verdicts_survive_a_restart_via_the_persisted_struct() {
     // A bit-rotted slot stays rotted across a crash/restart because the WAL struct persists in the
-    // Cluster (the `rotted` set lives in the struct). This is what makes the M3.3b permanent-fault
+    // Cluster (the `rotted` set lives in the struct). This is what makes the permanent-fault
     // gate meaningful; here we assert the struct-level persistence directly.
     let mut w = InMemoryWal::with_faults(
       StorageFaults {
@@ -1302,7 +1301,7 @@ mod tests {
   #[test]
   fn superblock_corrupt_checkpoint_read_returns_parseable_but_altered_bytes() {
     use vsrr_proto::SuperblockDone;
-    // codex R23-F1: the corrupt-checkpoint-read fault returns a `CheckpointRead` for the RIGHT op whose
+    // the corrupt-checkpoint-read fault returns a `CheckpointRead` for the RIGHT op whose
     // bytes are the live snapshot with one trailing byte flipped — still a `CheckpointRead` (parseable),
     // but NOT byte-identical to the written snapshot, so it hashes to a different checkpoint id. Proven
     // TRANSIENT: across many reads some return the GENUINE bytes (a re-read serves the clean snapshot).
@@ -1510,7 +1509,7 @@ mod tests {
 
   #[test]
   fn async_append_stays_dirty_until_the_delay_elapses_then_becomes_durable() {
-    // The core async-mode primitive (R7-F1 harness): a submitted append is NOT durable for `delay`
+    // The core async-mode primitive: a submitted append is NOT durable for `delay`
     // polls — `status` is Dirty (never Clean), `op_head` does not count it, a read returns Absent, and
     // `poll` yields no Appended — then exactly at the delay it becomes durable and `poll` yields it.
     let mut w = InMemoryWal::with_async_appends(3);

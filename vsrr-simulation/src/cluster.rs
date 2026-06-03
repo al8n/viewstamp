@@ -51,8 +51,8 @@ pub struct Cluster {
   /// Set by [`tick`](Self::tick) when a replica emitted ANY view-advertising / primary-authority
   /// participation message — a `StartView`/`RecoveryResponse`, a `DoViewChange` vote, a `Prepare`, a
   /// `PrepareOk` vote, or a `Commit` — for a view that is NOT yet DURABLE on its own superblock. This
-  /// is the ORACLE for the WHOLE durable-view-before-participate CLASS (codex R8-F1 for the primary
-  /// `StartView`/`RecoveryResponse` paths, R16-F1 for the `DoViewChange` retransmit, R17-F1 for the
+  /// is the ORACLE for the WHOLE durable-view-before-participate CLASS (the primary
+  /// `StartView`/`RecoveryResponse` paths, the `DoViewChange` retransmit, the
   /// `on_request_prepare` repair `Prepare`, plus the `PrepareOk`/`Commit` participation messages),
   /// checked structurally at emission time against the sim's MONOTONE superblock view. A
   /// `StartView`/`RecoveryResponse`/`Commit`/`Prepare` asserts authority in view V; a
@@ -69,14 +69,14 @@ pub struct Cluster {
   async_wal_delay: Option<u32>,
   /// `None` (default) ⇒ every replica's superblock writes complete SYNCHRONOUSLY (existing-gate
   /// behaviour). `Some(d)` ⇒ async-write mode with per-write delay `d` polls — the pending
-  /// durable-view window the durable-view-before-participate gate must survive (codex R8-F1). Set via
+  /// durable-view window the durable-view-before-participate gate must survive. Set via
   /// [`set_async_superblock_delay`] before running; persists across `crash`/`restart` because the
   /// superblock struct does. A `crash` additionally DISCARDS any in-flight superblock write (a real
   /// crash loses an `fsync` mid-flight), so a not-yet-durable view write is genuinely lost.
   async_sb_delay: Option<u32>,
   /// `None` (default) ⇒ every replica's WAL is UNBOUNDED (`capacity() == u64::MAX`, the proto's
   /// stall-before-wrap never engages — existing-gate behaviour). `Some(n)` ⇒ a fixed RING of `n` slots
-  /// per replica (M3.2b): the proto stalls op-assignment before wrapping an un-pruned slot. Set via
+  /// per replica: the proto stalls op-assignment before wrapping an un-pruned slot. Set via
   /// [`set_wal_capacity`] before running; persists across `crash`/`restart` because the WAL struct does.
   /// MUST be `> checkpoint_ops + pipeline headroom` or the stall never releases (see the `Wal` capacity
   /// liveness contract).
@@ -151,7 +151,7 @@ impl Cluster {
   /// `Some`, every WAL is built in async-append mode (the in-flight window); when `async_sb_delay` is
   /// `Some`, every superblock is built in async-write mode (the pending durable-view window) — both
   /// composed with the fault plan. When `wal_capacity` is `Some(n)`, every WAL is a fixed ring of `n`
-  /// slots (M3.2b bounded mode), composed with the fault/async modes.
+  /// slots, composed with the fault/async modes.
   fn seed_storage(
     replicas: u8,
     seed: u64,
@@ -167,7 +167,7 @@ impl Cluster {
           Some(d) => InMemoryWal::with_async_appends_and_faults(faults, s, d),
           None => InMemoryWal::with_faults(faults, s),
         };
-        // Bounded ring (M3.2b): make this (empty) WAL a fixed ring of `n` slots, composed with the
+        // Bounded ring: make this (empty) WAL a fixed ring of `n` slots, composed with the
         // fault/async mode chosen above. `None` leaves it unbounded (existing-gate behaviour).
         w.set_capacity(wal_capacity);
         w
@@ -236,7 +236,7 @@ impl Cluster {
   /// Enables (or, with `None`, disables) **async-write mode** on every replica's superblock, with
   /// per-write delay `delay` polls. In this mode a durable-root or checkpoint write stays
   /// not-yet-durable (`state()` still names the prior root) for `delay` polls — the pending
-  /// durable-view window the durable-view-before-participate gate must survive (codex R8-F1): a
+  /// durable-view window the durable-view-before-participate gate must survive: a
   /// replica that just became primary has `pending_sb` armed while its view-change root write is in
   /// flight, so a delayed `GetView`/`Recovery` or a primary timer in that window must not make it act
   /// in the not-yet-durable view. Composes with the current storage-fault plan. Call before running;
@@ -258,7 +258,7 @@ impl Cluster {
   }
 
   /// Enables (or, with `None`, disables) **bounded ring mode** on every replica's WAL: each WAL becomes
-  /// a fixed RING of `n` slots (M3.2b), so the proto STALLS op-assignment before it would physically
+  /// a fixed RING of `n` slots, so the proto STALLS op-assignment before it would physically
   /// wrap an un-pruned slot (one not yet checkpoint-subsumed on a quorum). Composes with the current
   /// fault/async modes. Call before running; the mode persists across `crash`/`restart` because the WAL
   /// struct does. Rebuilds the (empty) WALs, like [`set_async_wal_delay`](Self::set_async_wal_delay).
@@ -346,8 +346,8 @@ impl Cluster {
   /// [`tick`](Self::tick) or [`probe_pending_view_window`](Self::probe_pending_view_window) (a replica
   /// emitted ANY view-advertising / primary-authority participation message — `StartView`,
   /// head-bearing `RecoveryResponse`, `DoViewChange`, `Prepare`, `PrepareOk`, or `Commit` — for a view
-  /// above its own durable superblock view; the whole class, codex R8-F1 + R16-F1 + R17-F1), if any.
-  /// `None` when none has occurred since the last drain.
+  /// above its own durable superblock view; the whole class covering all view-advertising message
+  /// kinds), if any. `None` when none has occurred since the last drain.
   pub fn take_durable_view_violation(&mut self) -> Option<SmolStr> {
     self.durable_view_violation.take()
   }
@@ -355,27 +355,26 @@ impl Cluster {
   /// Record a durable-view-before-participate violation if `out` (emitted by replica `ri`) advertises
   /// a view STRICTLY ABOVE replica `ri`'s own DURABLE (superblock) view — i.e. it acts authoritatively
   /// for, or votes in, a view that is not yet recoverable and which a crash could regress it out of.
-  /// This is the ORACLE for the WHOLE durable-view-before-participate CLASS (codex R8-F1 + R16-F1 +
-  /// R17-F1 + R18-F1), flagging every VIEW-ADVERTISING / primary-authority PARTICIPATION message a
+  /// This is the ORACLE for the WHOLE durable-view-before-participate CLASS, flagging every
+  /// VIEW-ADVERTISING / primary-authority PARTICIPATION message a
   /// replica could emit while its view write is still pending. Its flagged set EXACTLY equals the
   /// proto's gated set ([`Message::advertises_authoritative_view`]):
   ///
-  /// - `StartView` — the primary's authoritative "I am the canonical primary of view V" head broadcast
-  ///   (R8-F1, the load-bearing primary path).
+  /// - `StartView` — the primary's authoritative "I am the canonical primary of view V" head broadcast.
   /// - head-bearing `RecoveryResponse` (non-empty log OR `op > 0`, the PRIMARY's recovery-handshake
-  ///   answer, not a backup's view-only echo) — the recovery equivalent of a `StartView` (R8-F1).
-  /// - `DoViewChange` — a VOTE the prospective primary counts toward FORMING view V (R16-F1): voting
+  ///   answer, not a backup's view-only echo) — the recovery equivalent of a `StartView`.
+  /// - `DoViewChange` — a VOTE the prospective primary counts toward FORMING view V: voting
   ///   in a view not yet persisted means a crash regresses it out of a view it helped a quorum form.
   /// - `Prepare` — advertises `self.view` as authoritative. A primary's `on_request`/retransmit
-  ///   `Prepare`, or a repair `Prepare` served from `on_request_prepare` (R17-F1), in the
+  ///   `Prepare`, or a repair `Prepare` served from `on_request_prepare`, in the
   ///   not-yet-durable view advertises a view a crash could roll back.
   /// - `PrepareOk` — a backup's VOTE the primary counts toward a COMMIT quorum (carries `self.view`):
   ///   acking in a not-yet-durable view helps commit an op under a view this replica might regress out of.
   /// - `Commit` — the primary's heartbeat/commit advance (carries `self.view`): a primary-authority
   ///   broadcast in the not-yet-durable view.
-  /// - `SyncCheckpoint` — the state-sync serve answering a `RequestSync` (R18-F1): it advertises
+  /// - `SyncCheckpoint` — the state-sync serve answering a `RequestSync`: it advertises
   ///   `self.view` as the server's authoritative view; shipping it from a not-yet-durable view
-  ///   advertises a view a crash could roll back (the blind spot that previously hid R18-F1).
+  ///   advertises a view a crash could roll back (previously an unchecked blind spot).
   ///
   /// The durable view is read off the same superblock the proto recovers from; it is MONOTONE (it only
   /// advances when a view-change/adoption write lands), so a message legitimately built while its view
@@ -393,33 +392,33 @@ impl Cluster {
       // A primary's RecoveryResponse carries the canonical head (non-empty log or op > 0); a Normal
       // backup answers with op == 0 + empty log (view-only echo), which reports its view but not a
       // head — still a participation signal, but the head-bearing primary answer is the load-bearing
-      // R8-F1 case the gate suppresses. Flag the head-bearing one (op > 0).
+      // case the gate suppresses. Flag the head-bearing one (op > 0).
       Message::RecoveryResponse(rr) if rr.op().get() > 0 => ("RecoveryResponse", rr.view().get()),
-      // A DoViewChange is a VOTE the prospective primary counts toward FORMING the new view (codex
-      // R16-F1) — the participation message in the retransmit path the original R8-F1 checker did not
-      // cover. After the durable-view gate, a replica sends its DVC only once its view is persisted
-      // (the initial one from `on_sb_done`, the retransmit gated on `pending_sb.is_none()`), so a DVC
-      // whose advertised view is STRICTLY ABOVE the sender's durable view means it voted in a view it
-      // has not yet persisted — a crash would regress it out of a view it helped a quorum form.
+      // A DoViewChange is a VOTE the prospective primary counts toward FORMING the new view — the
+      // participation message in the retransmit path. After the durable-view gate, a replica sends
+      // its DVC only once its view is persisted (the initial one from `on_sb_done`, the retransmit
+      // gated on `pending_sb.is_none()`), so a DVC whose advertised view is STRICTLY ABOVE the
+      // sender's durable view means it voted in a view it has not yet persisted — a crash would
+      // regress it out of a view it helped a quorum form.
       Message::DoViewChange(dvc) => ("DoViewChange", dvc.view().get()),
       // A Prepare advertises `self.view` as the authoritative view of the op (a new-op broadcast /
-      // retransmit from the primary, OR a committed-op repair served from `on_request_prepare`, codex
-      // R17-F1). Emitting it for a view above the sender's durable view advertises a view a crash could
+      // retransmit from the primary, OR a committed-op repair served from `on_request_prepare`).
+      // Emitting it for a view above the sender's durable view advertises a view a crash could
       // roll back — the same hazard as a StartView, on the prepare path.
       Message::Prepare(p) => ("Prepare", p.view().get()),
       // A PrepareOk is a backup's VOTE the primary counts toward a COMMIT quorum (it carries
       // `self.view`). Acking in a not-yet-durable view helps commit an op under a view this replica
       // could regress out of — a vote in a view it has not persisted, the backup-side analogue of the
-      // DoViewChange (R16-F1) vote.
+      // DoViewChange vote.
       Message::PrepareOk(ok) => ("PrepareOk", ok.view().get()),
       // A Commit is the primary's heartbeat / commit-advance (carries `self.view`) — a primary-
       // authority broadcast. In the not-yet-durable view it asserts this replica's primacy in a view a
-      // crash could regress out of, the same R8-F1 hazard as a StartView/Prepare on the heartbeat path.
+      // crash could regress out of, the same hazard as a StartView/Prepare on the heartbeat path.
       Message::Commit(commit) => ("Commit", commit.view().get()),
-      // A SyncCheckpoint is the state-sync serve answering a peer's RequestSync (codex R18-F1): it
-      // advertises `self.view` as the serving replica's authoritative view. Shipping it from a
-      // not-yet-durable view advertises a view a crash could roll back — the blind spot that hid R18-F1
-      // (the checker covered StartView/RecoveryResponse/DoViewChange/Prepare/PrepareOk/Commit but not
+      // A SyncCheckpoint is the state-sync serve answering a peer's RequestSync: it advertises
+      // `self.view` as the serving replica's authoritative view. Shipping it from a not-yet-durable
+      // view advertises a view a crash could roll back — previously an unchecked blind spot (the
+      // checker covered StartView/RecoveryResponse/DoViewChange/Prepare/PrepareOk/Commit but not
       // this serve). The checkpoint content is view-independent, so the requester re-solicits and a
       // Normal+durable peer answers; serving it during `pending_sb` is the same class as the others.
       Message::SyncCheckpoint(sc) => ("SyncCheckpoint", sc.view().get()),
@@ -429,7 +428,7 @@ impl Cluster {
       self.durable_view_violation = Some(
         format!(
           "replica {ri} emitted {kind}(view={msg_view}) while its DURABLE view is {durable_view} \
-         (volatile view={}, status={}) — durable-view-before-participate (R8-F1) violated: it \
+         (volatile view={}, status={}) — durable-view-before-participate violated: it \
          advertised/participated in a view not yet persisted",
           self.replicas[ri].view().get(),
           self.replicas[ri].status().as_str(),
@@ -445,29 +444,29 @@ impl Cluster {
   }
 
   /// True iff any non-crashed replica has advanced to a view strictly greater than `v` — i.e. a real
-  /// view change occurred (used by the M3 gate's liveness assertions, including forfeit-driven VCs).
+  /// view change occurred (used by the liveness assertions, including forfeit-driven VCs).
   pub fn any_replica_view_advanced_beyond(&self, v: u64) -> bool {
     (0..self.replicas.len()).any(|i| !self.crashed[i] && self.replicas[i].view().get() > v)
   }
 
-  /// Replica `i`'s in-memory `log` cache size (for the M3.4b boundedness checker). After GC this is
+  /// Replica `i`'s in-memory `log` cache size (for the boundedness checker). After GC this is
   /// bounded by the un-checkpointed tail + pipeline headroom.
   pub fn replica_log_len(&self, i: usize) -> usize {
     self.replicas[i].log_len()
   }
 
-  /// Replica `i`'s primary-pipeline (`inflight`) size (for the M3.4b boundedness checker).
+  /// Replica `i`'s primary-pipeline (`inflight`) size (for the boundedness checker).
   pub fn replica_inflight_len(&self, i: usize) -> usize {
     self.replicas[i].inflight_len()
   }
 
-  /// Replica `i`'s client-session table size (for the M3.4b boundedness checker). Bounded by the
+  /// Replica `i`'s client-session table size (for the boundedness checker). Bounded by the
   /// active client set, independent of op count.
   pub fn replica_clients_len(&self, i: usize) -> usize {
     self.replicas[i].clients_len()
   }
 
-  /// Replica `i`'s durable WAL entry count (for the M3.4b boundedness checker). After GC this is
+  /// Replica `i`'s durable WAL entry count (for the boundedness checker). After GC this is
   /// bounded by the un-pruned tail.
   pub fn wal_len(&self, i: usize) -> usize {
     self.wals[i].len()
@@ -476,9 +475,9 @@ impl Cluster {
   /// True iff replica `i`'s WAL PHYSICALLY holds op `op` right now — its slot is `Clean` or `Faulty`
   /// (durably written, possibly later corrupt). UNLIKE [`Self::replica_appended_op`] this does NOT fold
   /// in the `op <= checkpoint_op` snapshot-subsumption clause, so it distinguishes "still in the WAL
-  /// ring" from "subsumed by the checkpoint but physically wrapped away". The M3.2b bounded-WAL gate
+  /// ring" from "subsumed by the checkpoint but physically wrapped away". The bounded-WAL gate
   /// uses it to assert a committed op is PRESENT before its ring slot wraps and ABSENT after the quorum
-  /// checkpoints past it and the slot is reused — at which point a laggard would state-sync (Phase B).
+  /// checkpoints past it and the slot is reused — at which point a laggard would state-sync.
   pub fn replica_wal_holds_op(&self, i: usize, op: OpNumber) -> bool {
     matches!(
       self.wals[i].status(op),
@@ -488,8 +487,8 @@ impl Cluster {
 
   /// True iff op `op`'s WAL slot has NOT been WRAPPED AWAY on replica `i` — i.e. its status is anything
   /// but `Empty` (`Clean`/`Faulty` = durably resident, `Dirty` = its OWN append still in flight). The
-  /// async-robust form of [`Self::replica_wal_holds_op`] for the M3.2b Phase-C VOPR ring-residency
-  /// checker: under async-WAL the freshest tail ops are transiently `Dirty` (in flight, not yet durable)
+  /// async-robust form of [`Self::replica_wal_holds_op`] for the ring-residency checker: under
+  /// async-WAL the freshest tail ops are transiently `Dirty` (in flight, not yet durable)
   /// — NOT wrapped away — so the wrap invariant must TOLERATE `Dirty` while still catching a true wrap.
   /// The bounded ring keys its entry/staged maps by OP NUMBER, so a slot whose ring index `op mod N` was
   /// REUSED by a later op `op + N` reports `Empty` for `op` (its entry evicted, and any staged entry
@@ -549,7 +548,7 @@ impl Cluster {
   /// still in flight (async mode), which a real crash loses mid-`fsync`. We `discard_inflight` BOTH:
   ///
   /// - the superblock, so the durable root/checkpoint stay at their last-COMPLETED values. This is
-  ///   what makes the pending-durable-view window (R8-F1) a genuine crash hazard — a not-yet-durable
+  ///   what makes the pending-durable-view window a genuine crash hazard — a not-yet-durable
   ///   view write is actually lost, so the replica recovers to the OLD view (and the proto must never
   ///   have acted in the new one);
   /// - the WAL, so any STAGED (not-yet-durable) append is genuinely LOST — the faithful
@@ -620,7 +619,7 @@ impl Cluster {
 
   /// Test-only: the number of staged (not-yet-durable) superblock writes on replica `i` — `> 0` iff
   /// the async-write superblock has an in-flight write open RIGHT NOW (the pending durable-view /
-  /// checkpoint window). The async-superblock VOPR uses this to confirm the R8-F1 window is genuinely
+  /// checkpoint window). The async-superblock harness uses this to confirm the window is genuinely
   /// exercised (a primary sits with `pending_sb` armed while a view-change root write is in flight).
   #[doc(hidden)]
   pub fn sb_staged_len_for_test(&self, i: usize) -> usize {
@@ -629,9 +628,9 @@ impl Cluster {
 
   /// Test-only: whether replica `i` is a `Normal` primary whose current view is NOT yet durable —
   /// i.e. its volatile in-memory view is strictly ahead of its durable (superblock) view while it is
-  /// the primary of that volatile view. This is EXACTLY the R8-F1 pending-durable-view window from the
+  /// the primary of that volatile view. This is EXACTLY the pending-durable-view window from the
   /// proto's side (`pending_sb` armed for a `StartViewAsPrimary` write). Lets the async-superblock
-  /// VOPR confirm a seed actually opens the window (rather than merely staging unrelated writes).
+  /// harness confirm a seed actually opens the window (rather than merely staging unrelated writes).
   #[doc(hidden)]
   pub fn in_pending_primary_view_window_for_test(&self, i: usize) -> bool {
     use vsrr_proto::Superblock;
@@ -640,18 +639,17 @@ impl Cluster {
     r.status().is_normal() && r.is_primary() && r.view().get() > durable_view
   }
 
-  /// Adversarially PROBE the R8-F1 pending-durable-view window (codex R8-F1): for every non-crashed
+  /// Adversarially PROBE the pending-durable-view window: for every non-crashed
   /// replica that is a `Normal` primary whose view is NOT yet durable (a `StartViewAsPrimary` root
   /// write still in flight), deliver — RIGHT NOW, in this window — a `GetView` AND a `Recovery` from a
   /// peer, plus fire its timers. A correct primary must answer NEITHER (no `StartView` for the
   /// not-yet-durable view, no `RecoveryResponse` with its canonical head, no `Commit`/`Prepare`
   /// heartbeat) until the view is durable; the durability/view-monotonic checkers then catch any
   /// resulting cross-view double-participation. Returns the number of replicas probed in their window,
-  /// so the sweep can assert the window is genuinely EXERCISED (not merely opened). This is the
-  /// driver-side "deliver GetView/Recovery during the pending-superblock window" the R8-F1 closure
-  /// needs: the window is short, so relying on incidental message/timer coincidence misses it — this
-  /// makes the probe deterministic. Faithful: a delayed/duplicate `GetView`/`Recovery` and a primary
-  /// timer firing in that window are exactly the real events the gate must survive.
+  /// so the sweep can assert the window is genuinely EXERCISED (not merely opened). The window is
+  /// short, so relying on incidental message/timer coincidence misses it — this makes the probe
+  /// deterministic. Faithful: a delayed/duplicate `GetView`/`Recovery` and a primary timer firing in
+  /// that window are exactly the real events the gate must survive.
   pub fn probe_pending_view_window(&mut self) -> u64 {
     let now = self.clock.now();
     let mut probed = 0u64;
@@ -671,7 +669,7 @@ impl Cluster {
       // Fire the primary timers too (the `primary_timeouts` heartbeat/retransmit gate).
       self.replicas[i].handle_timeout(now, &mut self.wals[i], &mut self.sbs[i]);
       // Inspect EVERYTHING the probe made the replica emit: a correct (gated) primary emits no
-      // StartView/RecoveryResponse for its not-yet-durable view; an ungated one does → R8-F1
+      // StartView/RecoveryResponse for its not-yet-durable view; an ungated one does → durable-view
       // violation. Drain the queue (re-enqueuing for normal routing) and check each message.
       let mut drained = std::vec::Vec::new();
       while let Some(out) = self.replicas[i].poll_message() {
@@ -685,7 +683,7 @@ impl Cluster {
     probed
   }
 
-  /// Test-only (M3.4a): how many state-syncs have fully applied + become durable on replica `i` since
+  /// Test-only: how many state-syncs have fully applied + become durable on replica `i` since
   /// it was last constructed (`new`/`restart`). The state-sync gate asserts the restarted laggard's
   /// count goes from 0 to `>= 1` — proving it genuinely STATE-SYNCED (fetched + restored a checkpoint
   /// past its head) rather than merely catching up op-by-op via retransmit. Mirrors the proto's
@@ -695,7 +693,7 @@ impl Cluster {
     self.replicas[i].state_syncs_applied()
   }
 
-  /// Test-only (M3.5 T6): how many of replica `i`'s applied syncs were FORCED (the escalation that
+  /// Test-only: how many of replica `i`'s applied syncs were FORCED (the escalation that
   /// recovers a pruned committed hole below the quorum checkpoint), as opposed to ordinary `> self.op`
   /// state-syncs. The focused force-sync gate asserts this goes `> 0` to prove the FORCED path fired
   /// specifically. Mirrors the proto's `Endpoint::forced_syncs_applied`.
@@ -704,7 +702,7 @@ impl Cluster {
     self.replicas[i].forced_syncs_applied()
   }
 
-  /// Test-only (M3.2b): how many client requests replica `i` DROPPED at op-assignment because the next
+  /// Test-only: how many client requests replica `i` DROPPED at op-assignment because the next
   /// op would overflow its bounded WAL ring (the physical stall-before-wrap). `0` for an unbounded WAL.
   /// The bounded-WAL gate asserts this goes `> 0` to prove the stall genuinely engaged (non-vacuity).
   /// Mirrors the proto's `Endpoint::wal_stalls`.
@@ -713,7 +711,7 @@ impl Cluster {
     self.replicas[i].wal_stalls()
   }
 
-  /// Test-only (M3.2b Phase B): how many times replica `i` (a backup) fell BELOW its bounded-WAL ring
+  /// Test-only: how many times replica `i` (a backup) fell BELOW its bounded-WAL ring
   /// window on a head-extending `Prepare` and STATE-SYNCED to the cluster checkpoint instead of
   /// overwriting an un-pruned slot. `0` for an unbounded WAL or an in-quorum backup. The bounded-WAL
   /// Phase-B gate asserts the SUM across replicas goes `> 0` to prove the connected backup-overflow path
@@ -725,8 +723,8 @@ impl Cluster {
   }
 
   /// Test-only: how many of replica `i`'s WAL slots in `1..=op` are PERMANENTLY corrupt (bit-rot or
-  /// torn) — i.e. would read back faulty. The M3.3b permanent-fault gate uses this to assert recovery
-  /// is non-vacuous (the crashed replica genuinely must peer-repair some rotted committed slot).
+  /// torn) — i.e. would read back faulty. The permanent-fault gate uses this to assert recovery is
+  /// non-vacuous (the crashed replica genuinely must peer-repair some rotted committed slot).
   #[doc(hidden)]
   pub fn wal_corrupt_slots_at_or_below_for_test(&self, i: usize, op: u64) -> usize {
     self.wals[i].corrupt_slots_at_or_below_for_test(op)
@@ -742,10 +740,10 @@ impl Cluster {
 
   /// Replica `i`'s RECOVERED COMMITTED BAND width: `commit_max - checkpoint_op`, the count of
   /// known-committed ops the replica holds ABOVE its durable checkpoint. This is exactly the span the
-  /// R13-F1 recover read-window logic materializes (`recover` reads + re-applies `(checkpoint_op ..
+  /// recover read-window logic materializes (`recover` reads + re-applies `(checkpoint_op ..
   /// commit_max]` from the WAL, bounded by `RECOVER_TAIL_WINDOW`). Read right after a `restart`, it is
-  /// the band that recovery actually reconstructed; the VOPR tracks its high-water across the run so
-  /// the large-`checkpoint_ops` axis can be asserted NON-vacuous (a replica really recovered a
+  /// the band that recovery actually reconstructed; the simulator tracks its high-water across the run
+  /// so the large-`checkpoint_ops` axis can be asserted NON-vacuous (a replica really recovered a
   /// non-trivial band, not always the tiny ≈4..=12 the small-interval seeds produce). Saturating, since
   /// a re-learnable `commit_max` hint can momentarily exceed a freshly-recovered `checkpoint_op` only
   /// upward (the subtraction floors at 0 when `checkpoint_op > commit_max`, which recovery never sets).
@@ -813,7 +811,7 @@ impl Cluster {
         // flags an ack of a genuinely-incomplete append. Record-only — a checker drains it; existing
         // gates ignore it.
         //
-        // STALE-VIEW EXEMPTION (vopr seeds 21, 464): the invariant binds AT THE ACK'S VIEW. A
+        // STALE-VIEW EXEMPTION: the invariant binds AT THE ACK'S VIEW. A
         // `PrepareOk(op, view = V)` is built + queued by the proto in view V, where `op` IS durably
         // appended; the sim drains `outgoing` only on the NEXT tick, and a view-change-to-`V+1` that
         // ran in between (truncating the uncommitted tail above the new canonical head) can empty that
@@ -852,9 +850,9 @@ impl Cluster {
             ).into());
           }
         }
-        // Durable-view-before-participate (R8-F1 + R16-F1), checked at emission: a StartView /
+        // Durable-view-before-participate, checked at emission: a StartView /
         // head-bearing RecoveryResponse (the primary paths) OR a DoViewChange vote (the ViewChange
-        // retransmit path, R16-F1) for a view above the emitter's durable view is a participation in a
+        // retransmit path) for a view above the emitter's durable view is a participation in a
         // not-yet-recoverable view.
         self.record_durable_view_violation(ri, &out);
         outgoing.push((ReplicaId::new(ri as u8), out));
@@ -1168,11 +1166,11 @@ mod tests {
 
   #[test]
   fn durable_view_checker_flags_a_sync_checkpoint_above_the_durable_view() {
-    // codex R18-F1 (CHECKER NON-VACUITY): the durable-view oracle must flag a `SyncCheckpoint`
-    // advertising a view ABOVE the emitter's durable view — the state-sync serve was the blind spot
-    // that previously hid R18-F1 (the checker covered StartView/RecoveryResponse/DoViewChange/
-    // Prepare/PrepareOk/Commit but NOT this serve). A fresh cluster's durable view is 0; a
-    // SyncCheckpoint(view=1) is therefore a participation in a not-yet-durable view and MUST trip.
+    // CHECKER NON-VACUITY: the durable-view oracle must flag a `SyncCheckpoint` advertising a view
+    // ABOVE the emitter's durable view — the state-sync serve was previously an unchecked blind spot
+    // (the checker covered StartView/RecoveryResponse/DoViewChange/Prepare/PrepareOk/Commit but NOT
+    // this serve). A fresh cluster's durable view is 0; a SyncCheckpoint(view=1) is therefore a
+    // participation in a not-yet-durable view and MUST trip.
     let mut c = Cluster::new(3, 1, 1, 1);
     assert_eq!(
       c.replica_durable_view(0).get(),
@@ -1193,7 +1191,7 @@ mod tests {
     c.record_durable_view_violation(0, &serve);
     let why = c
       .take_durable_view_violation()
-      .expect("a SyncCheckpoint above the durable view must be flagged (the R18-F1 blind spot)");
+      .expect("a SyncCheckpoint above the durable view must be flagged");
     assert!(
       why.contains("SyncCheckpoint"),
       "the violation names the offending message kind: {why}"

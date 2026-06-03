@@ -2,7 +2,7 @@ use super::*;
 
 impl<S: StateMachine> Endpoint<S> {
   pub(crate) fn primary_timeouts<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
-    // Deferred forfeit (M3.5, safety + liveness): a primary that hit the force-sync strand
+    // Deferred forfeit: a primary that hit the force-sync strand
     // ([`Self::maybe_force_sync`]) flagged a step-down rather than reset its `op` (which would let it
     // reuse op numbers in this view). Act on it FIRST, on EVERY primary tick while the flag is set —
     // and crucially do NOT clear it one-shot (F2). A one-shot forfeit broadcasts a SINGLE
@@ -19,7 +19,7 @@ impl<S: StateMachine> Endpoint<S> {
     //      per-tick re-broadcast is an unbounded StartViewChange STORM that, in the nanosecond-clock
     //      simulator, floods the network and pins the virtual clock to sub-millisecond steps — starving
     //      the LIVE view's primary's 50ms Commit heartbeat so a stale-view holdout never learns the new
-    //      view to catch up, livelocking the cluster (VOPR seed 622). `propose_next_view` → `join_svc`
+    //      view to catch up, livelocking the cluster under an adversarial schedule. `propose_next_view` → `join_svc`
     //      re-arms `svc_message`, so this self-paces; the `is_none_or` also fires once if the timer is
     //      somehow unset (it never is while latched — the transition handlers clear both together), so a
     //      forfeit can never silently stop re-proposing.
@@ -27,7 +27,7 @@ impl<S: StateMachine> Endpoint<S> {
     //      skips the arming code below), so backups STOP hearing this primary; their `primary_idle` fires
     //      and they JOIN the SVC for `view+1` → an SVC quorum forms → the view changes (a caught-up replica
     //      leads). RETIRING — not merely skipping — `commit`/`prepare` is load-bearing for a deadline-driven
-    //      driver (codex R14): a real driver advances virtual time to `poll_timeout()` (the EARLIEST armed
+    //      driver: a real driver advances virtual time to `poll_timeout()` (the EARLIEST armed
     //      deadline) before each `handle_timeout`, so a still-armed-and-due `commit` (50ms, earlier than the
     //      SVC retransmit cadence) — which this branch never services — would be re-returned every step,
     //      pinning the clock at that instant and never reaching `svc_message`: the view change stalls (the
@@ -41,14 +41,14 @@ impl<S: StateMachine> Endpoint<S> {
       // RETIRE the normal-primary cadence timers: a forfeiting primary STOPS heartbeating/retransmitting,
       // so leaving `commit`/`prepare` armed-and-due wedges a poll_timeout()-driven driver (it advances only
       // to the next armed deadline) by spinning at the stale commit deadline, never reaching `svc_message`
-      // (codex R14 — a timer-level wedge replacing the seed-622 message storm). `svc_message` is the SOLE
+      //. `svc_message` is the SOLE
       // primary-side driver while forfeiting; `propose_next_view` -> `join_svc` keeps it armed. Clearing them
       // on every forfeit tick is intended (idempotent once None; nothing re-arms them while `pending_forfeit`,
       // since the heartbeat/retransmit arming below sits under this early return).
       self.timers.commit = None;
       self.timers.prepare = None;
-      // FIX 2 (codex R15-F2, the timer-wedge class): also RETIRE the forfeit grace timer. A primary can
-      // reach `pending_forfeit` via the M3.5 force-sync / sync-checkpoint STEP-DOWN
+      // FIX 2: also RETIRE the forfeit grace timer. A primary can
+      // reach `pending_forfeit` via the force-sync / sync-checkpoint STEP-DOWN
       // (`maybe_force_sync` / `on_sync_checkpoint` / `on_recover_sync_checkpoint`) rather than via
       // `forfeit()` — and that path does NOT disarm `forfeit_armed` (only `forfeit()` does). This branch
       // never calls `maybe_forfeit` (the early `return` below skips the heartbeat/forfeit tick), so a
@@ -64,7 +64,7 @@ impl<S: StateMachine> Endpoint<S> {
       }
       return;
     }
-    // Durable-view-before-participate (codex R8-F1): until the new-primary view-change superblock
+    // Durable-view-before-participate: until the new-primary view-change superblock
     // write is durable, status is Normal but the view is NOT yet recoverable. A primary must NOT
     // heartbeat (`Commit`) nor retransmit prepares (`Prepare`) in a view it could regress out of on
     // crash — those assert this replica's authority in the not-yet-durable view (the same hazard the
@@ -74,8 +74,8 @@ impl<S: StateMachine> Endpoint<S> {
     // ordinary ticks resume. The deferred forfeit above is exempt: it is a STEP-DOWN (it proposes a
     // higher view via `propose_next_view`), not participation as this view's primary.
     if self.pending_sb.is_some() {
-      // RETIRE every cadence timer for this window (codex R14-F1 class-audit sibling — the SAME
-      // timer-level wedge as the forfeit branch above). `start_view_as_new_primary` flips status to
+      // RETIRE every cadence timer for this window — the SAME
+      // timer-level wedge as the forfeit branch above. `start_view_as_new_primary` flips status to
       // Normal-primary but DEFERS `arm_timers` to `start_view_participate` (on `on_sb_done`), so the
       // STALE ViewChange timers (`svc_message`/`dvc_message`/`view_change_status`, armed by
       // `enter_view_change`) are still armed here AND are status-foreign: this branch never services
@@ -134,7 +134,7 @@ impl<S: StateMachine> Endpoint<S> {
         None
       };
     }
-    // M3.5 T3: a primary that has fallen a full checkpoint interval behind the quorum's durable
+    // A primary that has fallen a full checkpoint interval behind the quorum's durable
     // checkpoint — continuously for the grace window — forfeits primacy (steps down via a view
     // change). Checked each primary tick, AFTER the heartbeat/retransmit above (so an alive primary
     // still heartbeats while it is being given its grace window to catch up).
@@ -155,7 +155,7 @@ impl<S: StateMachine> Endpoint<S> {
     // but our view is not yet persisted. Serving a request now would create+commit an op in a view
     // we could regress out of on crash. Drop it — the client retries once the view is durable.
     //
-    // DEFENSE (M3.5, safety): also drop while a state-sync OR a checkpoint-persist is in flight. Both
+    // DEFENSE: also drop while a state-sync OR a checkpoint-persist is in flight. Both
     // can RESET `self.op` (a sync to the checkpoint via `apply_sync`; a checkpoint completion advances
     // `checkpoint_op` and GCs) — assigning a new client request an op now risks reusing an op number a
     // backup still holds under different bytes (the op-reuse divergence `maybe_force_sync`'s primary
@@ -164,21 +164,20 @@ impl<S: StateMachine> Endpoint<S> {
     if self.pending_sb.is_some() || self.sync.is_some() || self.pending_checkpoint.is_some() {
       return;
     }
-    // SAFETY (codex vopr seed 52, async-superblock): a primary that has FLAGGED a forfeit (it has
-    // decided to step down — `maybe_force_sync`'s primary guard, or the F1 recovery-peer-fetch /
+    // A primary that has FLAGGED a forfeit (it has
+    // decided to step down — `maybe_force_sync`'s primary guard, or the recovery-peer-fetch /
     // state-sync apply that reset this replica's `op` back to a checkpoint) must NOT assign new ops. It
     // has just RESET `self.op` to (a checkpoint at or below) a value the cluster has moved PAST — under
     // a NEWER view a fresh primary already committed ops at those numbers. Accepting a client request
-    // now reuses a committed op number with DIFFERENT bytes (the stale-primary op-reuse divergence:
-    // VOPR seed 52 had a recovered view-0 primary reuse a committed op a view-1 primary had already
-    // committed). The forfeit is latched and acted on by the next `primary_timeouts` tick, but a client
+    // now reuses a committed op number with DIFFERENT bytes (the stale-primary op-reuse divergence).
+    // The forfeit is latched and acted on by the next `primary_timeouts` tick, but a client
     // request can arrive (via `handle_message`) BEFORE that tick — so the op-assignment gate, not just
     // the timer, must honour the abdication. Drop the request; once the view change completes a
     // caught-up primary serves it.
     if self.pending_forfeit {
       return;
     }
-    // codex R5-F2: do not serve clients while our committed prefix is not yet applied. If commit_max >
+    // do not serve clients while our committed prefix is not yet applied. If commit_max >
     // commit_min (a committed op is known but not yet applied — e.g. held by a B4 repair hole), the client
     // session table is stale for the unapplied ops; assigning a fresh op to a retry of one of them would
     // double-execute it once the gap fills (the apply loop has no dedup). Make the primary catch up first;
@@ -187,7 +186,7 @@ impl<S: StateMachine> Endpoint<S> {
     if self.commit_max.get() > self.commit_min.get() || !self.repair.is_empty() {
       return;
     }
-    // M3.2b physical bounded-WAL stall-before-wrap: never assign an op whose ring slot still holds an
+    // Physical bounded-WAL stall-before-wrap: never assign an op whose ring slot still holds an
     // un-pruned op (one not yet checkpoint-subsumed on a quorum). The un-pruned window `(floor, op]`
     // must fit in the WAL's `capacity()` slots; minting the next op would make it `next_op - floor`
     // wide, so if THAT exceeds `capacity()` we STALL (drop this request — the client retransmits),
@@ -236,13 +235,13 @@ impl<S: StateMachine> Endpoint<S> {
     let client = r.client();
     let request = r.request();
     let body_bytes = r.body_bytes();
-    // M3.2b stall-before-wrap (decision computed above the session borrow): the next op would overflow
+    // Stall-before-wrap (decision computed above the session borrow): the next op would overflow
     // the WAL ring — its slot still holds an op the quorum has not yet checkpoint-subsumed. STALL: drop
     // this NEW request WITHOUT advancing `session.request` (so the client's retransmit is still the
     // canonical next request, not seen as a gap) and WITHOUT minting the op. Back-pressure self-releases
     // as `quorum_checkpoint_op` rises and `run_gc` frees ring slots. Unbounded WAL never reaches here.
     if wal_would_overflow {
-      self.wal_stalls += 1; // observability: prove the stall genuinely engaged (M3.2b gate non-vacuity)
+      self.wal_stalls += 1; // observability: prove the stall genuinely engaged
       return;
     }
     session.request = request;
@@ -266,7 +265,7 @@ impl<S: StateMachine> Endpoint<S> {
       },
     );
     self.pending.insert(id.get(), Pending::Ack(self.op));
-    // Append-before-ack: op is in flight until its `on_wal_done` (R7-F1). The primary's own vote is
+    // Append-before-ack: op is in flight until its `on_wal_done`. The primary's own vote is
     // likewise gated — `record_own_vote` fires only on completion — but tracking it here keeps the
     // "durable?" predicate uniform across every votable append (and the choke-point debug_assert).
     self.appending.insert(self.op.get());
@@ -322,7 +321,7 @@ impl<S: StateMachine> Endpoint<S> {
         Message::Commit(Commit::new(self.view, self.commit_min, self.checkpoint_op)),
       ));
     }
-    // codex R25-F1 (Part A): cancel an outstanding FORCED sync the commit just satisfied (its target is
+    // Cancel an outstanding FORCED sync the commit just satisfied (its target is
     // now `<= commit_min`). A primary normally forfeits rather than force-sync (`maybe_force_sync`), so
     // this rarely fires here — but a forced sync ARMED while this replica was a backup, then satisfied by
     // ordinary commit after it regained primacy, must not linger to admit a stale SyncCheckpoint.
@@ -337,7 +336,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// the commit at the hole until a peer supplies the op (B4).
   #[must_use]
   fn commit_op(&mut self, now: Instant, op: u64) -> bool {
-    // Faults-as-data (the M3.3b peer fault-repair conversion): a committed op whose body read back
+    // Faults-as-data (peer fault-repair): a committed op whose body read back
     // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
     // dropped it rather than adopt a wrong/empty body). Instead of panicking, hold the commit and
     // fetch the op from a peer (`RequestPrepare` → `Prepare`); a later try_commit resumes here.
@@ -389,7 +388,7 @@ impl<S: StateMachine> Endpoint<S> {
     if self.fill_repair(now, wal, sb, &p) {
       return;
     }
-    // A registered repair hole is owned EXCLUSIVELY by the repair path (codex R13-F2 / R21-F1):
+    // A registered repair hole is owned EXCLUSIVELY by the repair path:
     // `fill_repair` above already had its chance. If it DECLINED (a stale `commit < op`, an unverifiable
     // body, or — returning `true`, handled above — a RepairFill already in flight), this `Prepare` is
     // NOT the canonical fill for the hole, so drop it NOW — BEFORE the higher-view `catch_up_to_view`
@@ -431,7 +430,7 @@ impl<S: StateMachine> Endpoint<S> {
     let pop = p.op().get();
     if pop <= self.op.get() {
       // NOTE: a hole-targeted `Prepare` that `fill_repair` declined was ALREADY dropped at the top of
-      // `on_prepare` (the R13-F2 / R21-F1 hole-ownership guard, moved up to run before the higher-view
+      // `on_prepare` (the hole-ownership guard, moved up to run before the higher-view
       // catch-up), so `pop` here is NEVER one of our registered repair holes — the re-ack /
       // interior-re-append branch below can never write a declined hole `Prepare` into the committed
       // hole's WAL slot nor mark it `appending` (which would masquerade as an in-flight RepairFill).
@@ -439,13 +438,13 @@ impl<S: StateMachine> Endpoint<S> {
       // view, and the higher-view rule (top of this fn) + the `view != self.view` reject mean this
       // branch only fires for a current-view prepare.
       //
-      // RE-ACK MUST PROVE IDENTITY (codex R10-F1). A re-ack is only sound if this replica genuinely holds
+      // RE-ACK MUST PROVE IDENTITY. A re-ack is only sound if this replica genuinely holds
       // the CANONICAL body for `pop`. For an op ABOVE the checkpoint that is required: `self.log[pop]` must
       // EXIST and MATCH the incoming Prepare's identity `(client, request, body)`. Matching `self.log` ⇒
       // the WAL slot is the canonical body (the dense `log` cache mirrors the durable WAL except for a
       // dropped-stale slot). The OLD code consulted ONLY the WAL durability oracle (`op_durably_appended`),
       // which a `recover`-DROPPED stale slot still satisfies: recover drops a superseded interior op (its
-      // header `view` < durable `log_view`, seed 335) from `self.log` but the WAL slot still holds the
+      // header `view` < durable `log_view`) from `self.log` but the WAL slot still holds the
       // STALE view-0 body as `Clean`. So `op_durably_appended(pop)` was TRUE for a slot whose CANONICAL
       // body this replica does NOT hold → it false-acked the canonical Prepare off the stale body
       // (append-before-ack + committed-op-survival broken: a quorum could be this false ack + the primary,
@@ -463,12 +462,12 @@ impl<S: StateMachine> Endpoint<S> {
         });
       if canonical_held {
         // We hold the canonical body (in `self.log` above the checkpoint, or in the snapshot at/below it).
-        // Append-before-ack (codex R7-F1): re-ack INLINE only if `pop` is DURABLE and not still IN FLIGHT.
+        // Append-before-ack: re-ack INLINE only if `pop` is DURABLE and not still IN FLIGHT.
         // The durability oracle is the WAL itself (`op_durably_appended`), NOT just `appending`: a view
         // change / catch-up clears `appending` while an async append abandoned in an old generation is
         // STILL staged in the WAL — and once such an op commits, the re-append range `(commit_min+1 ..=
         // op]` never re-marks it, so `appending` alone would wrongly green-light a re-ack of a
-        // committed-but-still-in-flight op (vopr seed 17). We keep the `appending` guard too, so the
+        // committed-but-still-in-flight op. We keep the `appending` guard too, so the
         // in-flight-then-just-completed window defers its single ack to `on_wal_done` (whose
         // `Pending::Ack(pop)` owes exactly one PrepareOk) rather than emitting a redundant inline duplicate.
         if !self.appending.contains(&pop) && self.op_durably_appended(wal, pop) {
@@ -477,7 +476,7 @@ impl<S: StateMachine> Endpoint<S> {
         return;
       }
       // `self.log[pop]` is MISSING or MISMATCHED and `pop > checkpoint_op` — the dropped-stale interior
-      // case (seed 335). We must NOT re-ack (the stale/absent body is not the canonical one). The incoming
+      // case. We must NOT re-ack (the stale/absent body is not the canonical one). The incoming
       // current-view Prepare carries the CANONICAL body (the top-of-fn guards already proved
       // `p.view() == self.view`), so durably (re)APPEND it — an INTERIOR overwrite at `pop < self.op` that
       // overwrites the stale WAL slot — and DEFER the ack to `on_wal_done` (a `Pending::Ack(pop)`), WITHOUT
@@ -490,7 +489,7 @@ impl<S: StateMachine> Endpoint<S> {
       return;
     }
     if pop == self.op.get() + 1 {
-      // M3.2b Phase B: a SUB-QUORUM laggard on a bounded ring may have fallen BELOW its ring window —
+      // a SUB-QUORUM laggard on a bounded ring may have fallen BELOW its ring window —
       // appending this head-extending op would PHYSICALLY overwrite an op it has not yet
       // checkpoint-subsumed (`pop - checkpoint_op > capacity`). It cannot hold the full live tail, so it
       // state-syncs to the cluster checkpoint instead of wrapping away a needed slot (and DROPS this
@@ -528,7 +527,7 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   fn append_prepare<W: Wal>(&mut self, wal: &mut W, p: Prepare) {
-    // M3.2b Phase B: the backup-overflow guard ([`Self::maybe_sync_below_ring_window`]) runs in
+    // the backup-overflow guard ([`Self::maybe_sync_below_ring_window`]) runs in
     // `on_prepare` BEFORE every head-extend append (the new-op branch + each buffered-prepare drain), so
     // a bounded-WAL append never overwrites an un-pruned ring slot. This debug-assert FREEZES that
     // contract: a future caller that extends the head without the guard (re-opening the
@@ -557,14 +556,14 @@ impl<S: StateMachine> Endpoint<S> {
       },
     );
     self.pending.insert(id.get(), Pending::Ack(p.op()));
-    // Append-before-ack (R7-F1): mark op in-flight so neither this op's deferred ack NOR a
+    // Append-before-ack: mark op in-flight so neither this op's deferred ack NOR a
     // retransmit-driven re-ack (`on_prepare`'s `pop <= self.op` branch) can emit a PrepareOk before
     // `on_wal_done` clears it. PrepareOk is deferred to on_wal_done when the append is durable.
     self.appending.insert(p.op().get());
   }
 
   /// Durably (re)append an INTERIOR current-view `Prepare` at `pop < self.op` whose `self.log` entry is
-  /// MISSING or MISMATCHED, then DEFER the ack to `on_wal_done` (codex R10-F1). Unlike [`Self::append_prepare`]
+  /// MISSING or MISMATCHED, then DEFER the ack to `on_wal_done`. Unlike [`Self::append_prepare`]
   /// this does NOT advance (rewind) `self.op` — it is an interior overwrite of one stale/absent slot, not a
   /// head extension — and it does not drain the buffer (a head concern). It overwrites the canonical body
   /// into the `log` cache + the durable WAL slot (so a future read / DVC / crash-restart serves the canonical
@@ -609,7 +608,7 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// The single append-before-ack choke point: emits a `PrepareOk` for `op` to the primary. `op` MUST
   /// be durable — NOT in `self.appending` — at every call. The `debug_assert!` is the systematic guard
-  /// (codex R7-F1): any future caller that tries to ack an op whose WAL append is still in flight trips
+  ///: any future caller that tries to ack an op whose WAL append is still in flight trips
   /// in tests, so the violation class cannot silently relocate. Callers (`on_wal_done` after the append
   /// lands; `on_prepare`'s in-flight-gated re-ack branch) are responsible for not calling this for an
   /// in-flight op — this assert backstops that contract.
@@ -634,7 +633,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// Applies committed ops we hold, up to `min(target, op)`, strictly in order. Backups discard the
   /// reply but emit `Committed` so observers can verify agreement.
   pub(crate) fn advance_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B, target: u64) {
-    // Durable-before-install (codex R24-F1): while a state-sync install is STAGED but not yet durable,
+    // Durable-before-install: while a state-sync install is STAGED but not yet durable,
     // the SM is about to be wholesale-REPLACED at the synced point by `install_sync`, so do NOT apply
     // ops over the soon-to-be-replaced SM in the meantime. This is load-bearing for the recovery
     // peer-fetch path (`on_recover_sync_checkpoint`), whose SM is genuinely UNRESTORED during the window
@@ -650,7 +649,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.commit_max = OpNumber::with(self.commit_max.get().max(target));
     while self.commit_min.get() < target && self.commit_min.get() < self.op.get() {
       let op = self.commit_min.get() + 1;
-      // Faults-as-data (the M3.3b peer fault-repair conversion): a committed op whose body read back
+      // Faults-as-data (peer fault-repair): a committed op whose body read back
       // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
       // dropped it rather than adopt a wrong/empty body). Instead of panicking, HOLD the commit at the
       // hole — never skip op N to apply N+1 — and fetch op N from a peer (`RequestPrepare` →
@@ -664,7 +663,7 @@ impl<S: StateMachine> Endpoint<S> {
       // Maintain the client-session request high-water + CACHED REPLY as we apply (mirrors the
       // primary's `commit_op`). The request watermark is the at-most-once dedup watermark a
       // backup-turned-primary needs in `on_request`. It MUST be tracked here on every apply — NOT
-      // reconstructed from the `log` cache when becoming primary — because M3.4b GC prunes the `log`
+      // reconstructed from the `log` cache when becoming primary — because GC prunes the `log`
       // below the checkpoint, so a backup whose log is empty (everything checkpointed+pruned) would
       // otherwise carry a stale `session.request` of 0 and wedge every client on the gap check
       // (`r.request() != session.request + 1`). The snapshot also restores these on recover/state-sync,
@@ -693,7 +692,7 @@ impl<S: StateMachine> Endpoint<S> {
           reply,
         )));
     }
-    // codex R25-F1 (Part A): if applying past a filled repair hole has carried `commit_min` to/past an
+    // If applying past a filled repair hole has carried `commit_min` to/past an
     // outstanding FORCED sync's target, the hole the force-sync was working around is recovered the cheap
     // way — cancel the now-unneeded forced sync (clears `sync` + its solicit timer) so a delayed, stale
     // SyncCheckpoint for that target never reaches `apply_sync` below the advanced frontier.
@@ -713,7 +712,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// snapshot-only), and ABOVE its own head (so `advance_commit`'s apply loop can never reach them).
   /// Without this it stalls at its head forever — and if it is in the only surviving quorum (another
   /// replica crashed), the WHOLE cluster stalls (no caught-up quorum can form). Observed deterministically
-  /// under the M3 fault envelope (a laggard crashed while two backups were transiently behind).
+  /// under an adversarial fault schedule (a laggard crashed while two backups were transiently behind).
   ///
   /// Self-driven + self-retrying: called on every `Commit`/`Prepare` from the primary (heartbeats every
   /// `COMMIT_HEARTBEAT`), so it re-solicits until the head catches up — no dedicated timer, and it works
@@ -748,10 +747,10 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
-  /// Periodic checkpoint REPORT to the primary, piggybacked on the `Commit` heartbeat (M3.2b liveness).
+  /// Periodic checkpoint REPORT to the primary, piggybacked on the `Commit` heartbeat.
   /// A backup ordinarily reports its `checkpoint_op` to the primary ONLY inside a `PrepareOk` answering a
   /// `Prepare`. That couples the primary's view of the quorum checkpoint to fresh op traffic — which the
-  /// M3.2b bounded-WAL stall can HALT: once op-assignment stalls (the un-pruned window hit the ring
+  /// bounded-WAL stall can HALT: once op-assignment stalls (the un-pruned window hit the ring
   /// bound), the primary broadcasts no new `Prepare`s, so backups send no fresh `PrepareOk`s, so the
   /// primary's `peer_checkpoint` for them goes STALE. The prune floor `min(checkpoint_op,
   /// quorum_checkpoint_op())` then under-counts the quorum's true checkpoint and the stall never releases
@@ -772,8 +771,8 @@ impl<S: StateMachine> Endpoint<S> {
   /// already 0, nothing to un-stall). The append-before-ack guard is EXPLICIT here (`!appending`): even
   /// the checkpoint-boundary slot can be transiently IN FLIGHT — a state-sync install / recovery keeps
   /// the WAL slot AT `checkpoint_op` and may re-append it (staged), marking it `appending` — and
-  /// `send_prepare_ok` MUST NOT vouch for an op whose append has not completed (it `debug_assert!`s this;
-  /// VOPR seed 313). No-op for the primary. None of these skips harm stall-release liveness: the stall
+  /// `send_prepare_ok` MUST NOT vouch for an op whose append has not completed (it `debug_assert!`s this).
+  /// No-op for the primary. None of these skips harm stall-release liveness: the stall
   /// only needs fresh reports during STEADY operation (when `pending_sb`/`sync`/the boundary re-append
   /// are all clear), which is exactly when this fires.
   fn report_checkpoint_to_primary(&mut self) {
@@ -809,7 +808,7 @@ impl<S: StateMachine> Endpoint<S> {
     // State-sync trigger (symmetric): a backup reporting a checkpoint above our head means we are the
     // laggard (e.g. a partition-healed old primary). The `> self.op` gate keeps this a no-op normally.
     self.maybe_request_sync(now, ok.checkpoint_op());
-    // Force-sync escalation (M3.5): a fresh quorum-checkpoint report may have just crossed a `repair`
+    // Force-sync escalation: a fresh quorum-checkpoint report may have just crossed a `repair`
     // hole we hold, rendering its `RequestPrepare` futile (the op is pruned everywhere on the quorum).
     self.maybe_force_sync(now);
     if let Some(inflight) = self.inflight.get_mut(&ok.op().get()) {
@@ -837,7 +836,7 @@ impl<S: StateMachine> Endpoint<S> {
     // State-sync trigger: if the cluster has checkpointed past our WAL head, solicit a SyncCheckpoint
     // (the ops we'd need are below the cluster checkpoint and may be pruned — tail-apply can't reach).
     self.maybe_request_sync(now, c.checkpoint_op());
-    // Force-sync escalation (M3.5): the primary's just-recorded checkpoint may have crossed a `repair`
+    // Force-sync escalation: the primary's just-recorded checkpoint may have crossed a `repair`
     // hole we hold below it (pruned everywhere on the quorum) → escalate to a forced `RequestSync`.
     self.maybe_force_sync(now);
     self.advance_commit(now, sb, c.commit().get());
@@ -846,7 +845,7 @@ impl<S: StateMachine> Endpoint<S> {
     // `commit_min+1..=op`) never re-sends a committed op below its own commit_min, so a backup that fell
     // behind would otherwise be stranded at its head. Self-retrying on each heartbeat until caught up.
     self.request_tail_gap();
-    // M3.2b liveness: re-report our checkpoint to the primary on the heartbeat (a `PrepareOk` for
+    // Re-report our checkpoint to the primary on the heartbeat (a `PrepareOk` for
     // `commit_min` carrying `checkpoint_op`), so the primary's `quorum_checkpoint_op` — the bounded-WAL
     // prune floor / stall-release signal — stays fresh even when op-assignment is stalled and no new
     // `Prepare`/`PrepareOk` traffic flows. Without this the stall can deadlock at the ring bound.

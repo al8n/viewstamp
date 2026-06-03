@@ -1,6 +1,6 @@
-//! M3.5 force-sync gate: a replica STUCK on a permanently-rotted committed hole that the QUORUM has
+//! Force-sync gate: a replica STUCK on a permanently-rotted committed hole that the QUORUM has
 //! checkpointed + pruned past converges via the FORCE-state-sync escalation — NOT op-by-op repair (no
-//! peer can serve the pruned op). This is the deterministic, non-vacuous proof that the M3.5 escalation
+//! peer can serve the pruned op). This is the deterministic, non-vacuous proof that the escalation
 //! ([`Endpoint::maybe_force_sync`]) closes the GC + permanent-fault strand the `run_gc` doc-comment
 //! flagged.
 //!
@@ -208,8 +208,8 @@ fn a_stuck_pruned_committed_hole_converges_via_force_sync() {
   }
 
   // NON-VACUITY (aggregate): the FORCED escalation genuinely fired across the sweep. A gate where the
-  // forced path never fired would prove nothing about the M3.5 closure — these asserts fail loudly if
-  // the construction degrades into ordinary state-sync only. (`forced_syncs_applied` is the proto
+  // forced path never fired would prove nothing about the force-sync closure — these asserts fail loudly
+  // if the construction degrades into ordinary state-sync only. (`forced_syncs_applied` is the proto
   // counter that increments ONLY on the forced path, distinct from ordinary `> self.op` syncs.)
   assert!(
     seeds_rotted_committed >= 1,

@@ -6,9 +6,9 @@ use crate::{
 
 #[test]
 fn new_primary_in_pending_view_window_does_not_spin_a_poll_timeout_driver() {
-  // codex R14-F1 CLASS-AUDIT SIBLING (same timer-level wedge as the forfeit case). A replica that just
-  // became Normal primary of a new view but whose durable-view write is still in flight (`pending_sb`,
-  // the R8-F1 window) deferred `arm_timers` to `on_sb_done` — so the STALE ViewChange cadence timers
+  // A replica that just became Normal primary of a new view but whose durable-view write is still in
+  // flight (`pending_sb`, the durable-view-before-participate window) deferred `arm_timers` to
+  // `on_sb_done` — so the STALE ViewChange cadence timers
   // (`svc_message`/`dvc_message`/`view_change_status`, armed by `enter_view_change`) are STILL armed and
   // are status-foreign: `primary_timeouts`' `pending_sb` early-return does NOT service them, and
   // `view_change_timeouts` (which would) runs only in ViewChange status. A poll_timeout()-driven driver
@@ -77,7 +77,7 @@ fn new_primary_in_pending_view_window_does_not_spin_a_poll_timeout_driver() {
 
 #[test]
 fn view_changing_replica_with_a_repair_hole_does_not_spin_a_poll_timeout_driver() {
-  // codex R14-F1 CLASS-AUDIT SIBLING (same timer-level wedge). A replica holding a committed-op
+  // A replica holding a committed-op
   // `repair` hole that enters ViewChange keeps the hole (no transition clears `repair`), and
   // `arm_timers` re-arms `repair_retry` whenever `repair` is non-empty REGARDLESS of status. But
   // `handle_timeout` GATES `repair_timeouts` on `Status::Normal` (only a Normal replica solicits/serves
@@ -151,7 +151,7 @@ fn view_changing_replica_with_a_repair_hole_does_not_spin_a_poll_timeout_driver(
 
 #[test]
 fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
-  // codex R14-F1 (LIVENESS, follow-on of the seed-622 forfeit-storm fix). A forfeiting primary STOPS
+  // LIVENESS (follow-on of the forfeit-storm fix). A forfeiting primary STOPS
   // heartbeating, but a poll_timeout()-driven driver (a real async driver advances virtual time to the
   // EARLIEST armed deadline, then calls handle_timeout) WEDGES at the stale `commit` deadline if that
   // deadline is left armed-and-due: `primary_timeouts`' `pending_forfeit` branch returns early WITHOUT
@@ -300,7 +300,7 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
 
 #[test]
 fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
-  // codex R15-F1 (LIVENESS, the timer-wedge class). A Normal BACKUP whose primary went silent fires
+  // LIVENESS (the timer-wedge class). A Normal BACKUP whose primary went silent fires
   // its `primary_idle` timeout → `on_primary_idle` → `propose_next_view` → `join_svc`, which ARMS
   // `svc_message` (the SVC retransmit) at the VC_MESSAGE_RETRANSMIT (100ms) cadence — EARLIER than the
   // re-armed `primary_idle` (200ms). But the Normal-backup branch of `handle_timeout` services ONLY
@@ -401,9 +401,9 @@ fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
 
 #[test]
 fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
-  // codex R15-F2 (LIVENESS, the timer-wedge class). A `Normal` primary can ARM its `forfeit_armed`
+  // LIVENESS (the timer-wedge class). A `Normal` primary can ARM its `forfeit_armed`
   // grace timer (it holds a committed `repair` hole → `maybe_forfeit` arms the grace) and THEN be
-  // forced into `pending_forfeit` via the M3.5 force-sync / sync-checkpoint STEP-DOWN (a forced
+  // forced into `pending_forfeit` via the force-sync / sync-checkpoint STEP-DOWN (a forced
   // `SyncCheckpoint` on a primary sets `pending_forfeit` rather than applying the sync — the seed-8
   // op-reuse guard — and does NOT go through `forfeit()`, so it never disarms the grace). The
   // `pending_forfeit` branch of `primary_timeouts` retires `commit`/`prepare` and re-proposes on the
@@ -526,7 +526,7 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
 
 #[test]
 fn poll_timeout_only_returns_serviceable_timers() {
-  // The INVARIANT this whole refactor establishes (codex R15): `poll_timeout` returns ONLY timers the
+  // The INVARIANT this whole refactor establishes: `poll_timeout` returns ONLY timers the
   // current (status, substate) will actually SERVICE in `handle_timeout`. Equivalently, EVERY deadline
   // `poll_timeout()` returns is one `handle_timeout` then makes progress on — so firing it strictly
   // advances the clock (it is serviced/re-armed forward or cleared, never re-returned at the same
@@ -595,7 +595,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
     }
   }
 
-  // (2) Normal PRIMARY then forced into pending_forfeit (the R15-F2 substate): only svc_message drives.
+  // (2) Normal PRIMARY then forced into pending_forfeit (the force-forfeited substate): only svc_message drives.
   {
     let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
     let mut e = Endpoint::new(cfg, 0, CountSm::default());
@@ -628,7 +628,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
     }
   }
 
-  // (3) Normal BACKUP that proposed an idle SVC (the R15-F1 substate): primary_idle + svc_message.
+  // (3) Normal BACKUP that proposed an idle SVC (the idle-SVC substate): primary_idle + svc_message.
   {
     let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
     let mut e = Endpoint::new(cfg, 7, NoopSm);

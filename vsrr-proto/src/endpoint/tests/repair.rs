@@ -69,7 +69,7 @@ fn on_request_prepare_for_an_op_we_lack_is_silent() {
 
 #[test]
 fn on_request_prepare_serves_only_committed_ops_not_uncommitted_held_ops() {
-  // R5-F1 (mirror, server side): a replica must NEVER vouch for an UNCOMMITTED op as a repair source.
+  // SAFETY (mirror, server side): a replica must NEVER vouch for an UNCOMMITTED op as a repair source.
   // It serves a RequestPrepare only for ops it has COMMITTED (`op <= commit_min`); for an op it merely
   // HOLDS but has not yet applied/committed (`op > commit_min`) it stays SILENT — that op is not its
   // to certify, and the answering Prepare's `commit` (= commit_min) would otherwise be < op, i.e. a
@@ -153,7 +153,7 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
   );
   assert_eq!(r.commit(), OpNumber::with(1), "held at the hole");
 
-  // A peer answers our RequestPrepare with op 2's Prepare → stage the durable fill (R13-F2: the apply +
+  // A peer answers our RequestPrepare with op 2's Prepare → stage the durable fill (the apply +
   // hole-clear + commit-resume DEFER to the append's completion), then complete it.
   r.handle_message(
     now,
@@ -165,7 +165,7 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
   assert_eq!(
     r.commit(),
     OpNumber::with(1),
-    "commit still held until the repaired append is durable (R13-F2 barrier)"
+    "commit still held until the repaired append is durable"
   );
   r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + resume
   assert_eq!(
@@ -225,7 +225,7 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
     "no wrong body applied; the commit stays held until the CORRECT op 2 arrives"
   );
   // The correct op 2 still repairs it (liveness: a wrong reply did not poison the hole). Its fill is a
-  // durability barrier (R13-F2), so complete the append before the commit resumes.
+  // durability barrier, so complete the append before the commit resumes.
   r.handle_message(
     now,
     &mut wal,
@@ -243,7 +243,7 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
 
 #[test]
 fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
-  // R5-F1 (committed-op survival): a committed repair hole may ONLY be filled with the committed
+  // SAFETY (committed-op survival): a committed repair hole may ONLY be filled with the committed
   // value for the op. A STALE/reordered Prepare from an old view, broadcast while its body was still
   // UNCOMMITTED (`commit < op`), must be REJECTED — it does not vouch the op is committed, and the
   // committed value at that op could be a DIFFERENT body. Accepting it would diverge the replica from
@@ -289,7 +289,7 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
 
   // A Prepare that VOUCHES op 2 is committed (`commit = 2` >= op 2, from a peer that holds it
   // committed) fills the hole and resumes the held commit — liveness preserved. The fill is a
-  // durability barrier (R13-F2): complete the append before the hole clears + the commit resumes.
+  // durability barrier: complete the append before the hole clears + the commit resumes.
   r.handle_message(
     now,
     &mut wal,
@@ -348,7 +348,7 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
     );
   }
   // One repair → the entire held suffix (2,3,4) applies in order (once the repaired append is durable —
-  // the R13-F2 barrier).
+  // the durability barrier).
   r.handle_message(
     now,
     &mut wal,
@@ -372,7 +372,7 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
 
 #[test]
 fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
-  // CONSENSUS-CRITICAL regression (codex R13-F2). `fill_repair` inserted the repaired body into
+  // CONSENSUS-CRITICAL regression. `fill_repair` inserted the repaired body into
   // `self.log`, `submit_append`ed it, REMOVED the repair hole, and immediately `advance_commit`ed — but
   // the async `Wal`'s `submit_append` only STAGES the write. So with the async WAL the repaired op was
   // APPLIED (and exposable in a DVC/StartView/checkpoint) BEFORE `WalDone::Appended`: a crash in that
@@ -384,7 +384,7 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
   // hole OPEN and does NOT advance the commit; `on_wal_done` inserts the body, clears the hole, and
   // resumes the held commit ONLY once the append completes.
   //
-  // Setup (the R9-F1 held-committed-hole shape): replica 1 of 3, durable commit 2 (op 2 KNOWN
+  // Setup (the held-committed-hole shape): replica 1 of 3, durable commit 2 (op 2 KNOWN
   // committed), checkpoint_op 0, canonical headers for ops 1 + 2. WAL head 3, slot 2 reads back
   // PERMANENTLY FAULTY → recover drops it to a COMMITTED repair hole (op 1 held canonical, op 3 the
   // uncommitted tail). commit_max == 2, commit_min == 0.

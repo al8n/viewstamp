@@ -298,7 +298,7 @@ fn backup_acks_only_after_append_is_durable() {
 
 #[test]
 fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
-  // codex vopr seed 17 (append-before-ack): the `pop <= self.op` re-ack branch must consult the WAL
+  // REGRESSION (append-before-ack): the `pop <= self.op` re-ack branch must consult the WAL
   // for durability, NOT just the `appending` set. A view change / catch-up clears `appending` (to
   // keep it in lockstep with `pending`); with an ASYNC WAL an append abandoned in the old generation
   // is still in flight, and once that op is COMMITTED (commit_min advances past it) the view-change
@@ -324,7 +324,7 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
   // matching the `prepare(5, 5)` retransmit below. In real operation a committed op AT the head is
   // ALWAYS in the dense cache (`append_prepare` inserts it; `enter_view_change` clears `pending`/
   // `appending`/the WAL-in-flight mark but NOT `self.log`), even when its async WAL append was abandoned
-  // — `force_state_for_test` just omits it. The R10-F1 re-ack identity gate reads this entry to prove the
+  // — `force_state_for_test` just omits it. The re-ack identity gate reads this entry to prove the
   // replica holds the canonical body; the WAL-durability gate (this test's subject) then decides whether
   // to ack. (Without the entry the re-ack would mis-classify a durable committed op as a dropped hole.)
   e.log.insert(
@@ -392,7 +392,7 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
 
 #[test]
 fn on_request_is_dropped_while_a_sync_or_checkpoint_persist_is_in_flight() {
-  // DEFENSE (Codex): a primary must NOT serve a client while a state-sync OR a checkpoint-persist is
+  // DEFENSE: a primary must NOT serve a client while a state-sync OR a checkpoint-persist is
   // in flight — either can reset `self.op` (a sync via `apply_sync`; a checkpoint completion advances
   // checkpoint_op + GCs), so assigning a new request an op now risks op-number reuse. Both an
   // outstanding `sync` and an outstanding `pending_checkpoint` must short-circuit `on_request`.
@@ -436,7 +436,7 @@ fn on_request_is_dropped_while_a_sync_or_checkpoint_persist_is_in_flight() {
 
 #[test]
 fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
-  // R5-F2 (at-most-once / sessions-caught-up): a primary must NOT assign a fresh op to a client while
+  // SAFETY (at-most-once / sessions-caught-up): a primary must NOT assign a fresh op to a client while
   // its committed prefix is unapplied (`commit_max > commit_min` — a committed op is KNOWN but held by
   // a B4 repair hole). The session/dedup table (`self.clients`) is only updated as ops APPLY, so during
   // the gap a just-committed client request is ABSENT from the table → a retry would be mis-seen as NEW
@@ -493,7 +493,7 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   );
 
   // Close the gap: the hole at op 2 is filled (a vouching repair Prepare, commit >= op), so once the
-  // repaired append is DURABLE (the R13-F2 barrier) `advance_commit` applies ops 2,3,4 in order →
+  // repaired append is DURABLE (the durability barrier) `advance_commit` applies ops 2,3,4 in order →
   // commit_min catches up to commit_max == 4, and the repair set empties.
   ep.handle_message(
     Instant::ZERO,
@@ -546,4 +546,4 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   );
 }
 
-// ── M3.5 T3: forfeit — a lagging primary steps down via a view change ───────────────────────────
+// ── Forfeit — a lagging primary steps down via a view change ────────────────────────────────────

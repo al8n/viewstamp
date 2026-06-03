@@ -1,6 +1,6 @@
-//! M3.4a gate: a long-down replica converges via STATE-SYNC (not op-by-op retransmit).
+//! State-sync gate: a long-down replica converges via STATE-SYNC (not op-by-op retransmit).
 //!
-//! This is the spec's M3.4 deliverable-4 gate: a replica is crashed long enough that the cluster
+//! A replica is crashed long enough that the cluster
 //! checkpoints PAST its durable head, so on restart its head is below the cluster's checkpoint and it
 //! CANNOT catch its tail by ordinary retransmit (`commit_min+1..=op` can't reach ops that start
 //! at/under its own head) or single-op peer fault-repair — it MUST fetch the latest checkpoint via the

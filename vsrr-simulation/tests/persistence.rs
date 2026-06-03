@@ -1,4 +1,4 @@
-//! M3.1a gate: committed operations survive a clean crash + restart.
+//! Persistence gate: committed operations survive a clean crash + restart.
 //!
 //! Crash a backup, let the cluster keep committing on the surviving quorum, then restart the
 //! backup so it recovers from its durable WAL. The restarted replica must re-apply its committed
@@ -71,7 +71,7 @@ fn committed_ops_survive_clean_crash_and_restart() {
   );
 }
 
-/// R4-F1 liveness: a PRIMARY crash + restart must not freeze the cluster.
+/// Primary crash + restart liveness: a PRIMARY crash + restart must not freeze the cluster.
 ///
 /// Before the fix, a recovered primary resumed `Normal` with an EMPTY pipeline (`inflight`) and a
 /// session table only at `checkpoint_op`. It kept heartbeating `Commit(checkpoint_op)` (so backups

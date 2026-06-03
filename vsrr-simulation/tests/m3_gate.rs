@@ -1,12 +1,12 @@
-//! THE M3 GATE — the capstone sweep: committed ops survive EVERYTHING.
+//! The durability gate — the capstone sweep: committed ops survive EVERYTHING.
 //!
-//! Combines, simultaneously, every M3 fault mode:
+//! Combines, simultaneously, every fault mode:
 //!   - crash-stop + restart (the laggard, then the view-0 primary),
 //!   - PERMANENT storage-faults (bit-rot + torn) on every replica's WAL from t0,
 //!   - GC (`checkpoint_ops = 4`, so checkpoints fire frequently and prune the WAL + per-op maps),
 //!   - partitions (`partition` / `heal`),
 //!   - a far-behind laggard that must rejoin via state-sync — and, where a rotted committed slot is
-//!     pruned past on the quorum, via the M3.5 FORCE-sync escalation.
+//!     pruned past on the quorum, via the FORCE-sync escalation.
 //!
 //! It asserts:
 //!   - **SAFETY ALWAYS** — `check_safety` (agreement at an instant) + `DurabilityChecker` (no committed
@@ -42,7 +42,7 @@
 //! The gate would prove nothing if the schedule degraded into a no-op. So it asserts, in aggregate, that
 //! the run genuinely (a) GC'd — the cluster checkpoint advanced (`checkpoint_op` grew) every seed; (b)
 //! drove a real view change every seed (the primary crash → failover/forfeit); (c) rejoined the laggard
-//! via a snapshot sync every seed; and (d) exercised the M3.5 FORCE-sync escalation
+//! via a snapshot sync every seed; and (d) exercised the FORCE-sync escalation
 //! (`forced_syncs_applied` advanced) — proving the permanent-fault + GC + partition strand was hit, not
 //! bypassed. (`check_safety` + the durability/view checkers run every tick, so a single safety slip
 //! anywhere in any phase fails the gate immediately.)
@@ -235,7 +235,7 @@ fn the_m3_gate_committed_ops_survive_everything() {
   );
   assert!(
     seeds_force_synced >= 1,
-    "no seed exercised the M3.5 FORCE-sync escalation — the permanent-fault + GC + partition strand \
+    "no seed exercised the FORCE-sync escalation — the permanent-fault + GC + partition strand \
      (a rotted committed hole pruned past on the quorum) was never hit"
   );
 }

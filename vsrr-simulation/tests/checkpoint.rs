@@ -1,4 +1,4 @@
-//! M3.2a gate: checkpoints + recover-from-checkpoint + view change after checkpoint-recovery.
+//! Checkpoint gate: checkpoints + recover-from-checkpoint + view change after checkpoint-recovery.
 //!
 //! With a small checkpoint interval, replicas checkpoint repeatedly (snapshotting the SM + the
 //! client sessions to the superblock and advancing `checkpoint_op`). A replica that checkpointed,
@@ -7,7 +7,7 @@
 //! crashes) WITHOUT divergence — committed ops survive crash+restart THROUGH a checkpoint, and
 //! checkpoint-recovery does not strand the replica.
 //!
-//! (As of M3.4b, GC/prune is ENABLED: a replica frees its WAL + per-op caches below its prune floor
+//! (GC/prune is ENABLED: a replica frees its WAL + per-op caches below its prune floor
 //! once a checkpoint is durable, so the recovered log is the OFFSET tail `(floor .. head]`, not dense
 //! from op 1. This gate still validates the checkpoint mechanism + checkpoint-based recovery + the
 //! recovered replica's view-change participation; the dedicated boundedness + through-the-prune

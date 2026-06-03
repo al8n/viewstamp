@@ -111,7 +111,7 @@ fn new_primary_adopts_canonical_log_and_starts_view() {
 
 #[test]
 fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
-  // codex R6-F1 (REGRESSION, the cardinal append-before-ack invariant): a new primary that adopts an
+  // REGRESSION (the cardinal append-before-ack invariant): a new primary that adopts an
   // uncommitted-tail op it learned from a PEER's DVC (it did NOT hold the op before) must NOT count
   // its OWN vote for that op — and must NOT commit it — until the op's WAL append is durable. The
   // own vote could only be cast from memory before, so a crash+recover would lose the op it voted
@@ -177,7 +177,7 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
   assert_eq!(
     e.inflight.get(&2).map(|i| i.oks),
     Some(0),
-    "the new primary must NOT vote for the adopted op 2 before its WAL append is durable (R6-F1)"
+    "the new primary must NOT vote for the adopted op 2 before its WAL append is durable"
   );
 
   // Pump storage: the AdoptVote append for op 2 completes → on_wal_done sets the own vote; the
@@ -197,7 +197,7 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
   use crate::Wal as _;
   assert!(
     wal.header(OpNumber::with(2)).is_some(),
-    "op 2 was durably appended to the WAL before its own vote was counted (R6-F1)"
+    "op 2 was durably appended to the WAL before its own vote was counted"
   );
 
   // A backup PrepareOk for op 2 now reaches quorum (own + backup) → op 2 commits.
@@ -222,7 +222,7 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
 
 #[test]
 fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
-  // codex R6-F1 (REGRESSION): after the new primary records its OWN vote for an adopted peer-learned
+  // REGRESSION: after the new primary records its OWN vote for an adopted peer-learned
   // op, that op MUST be in its durable WAL — so a crash+recover BEFORE any checkpoint still produces
   // it. We drive the adoption, pump until the AdoptVote append lands (own vote recorded), then CRASH
   // (drop all in-memory state) and RECOVER from the durable WAL+Superblock; op 2 must be present.
@@ -303,7 +303,7 @@ fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
   use crate::Wal as _;
   assert!(
     wal.header(OpNumber::with(2)).is_some(),
-    "op 2 the new primary voted for is in the durable WAL after crash+recover (R6-F1)"
+    "op 2 the new primary voted for is in the durable WAL after crash+recover"
   );
   assert!(
     recovered.op().get() >= 2,
@@ -313,7 +313,7 @@ fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
 
 #[test]
 fn backup_adopted_ack_survives_crash_before_checkpoint() {
-  // codex R6-F1 (REGRESSION, backup side): after a backup sends its PrepareOk for an adopted
+  // REGRESSION (backup side): after a backup sends its PrepareOk for an adopted
   // StartView tail op, that op MUST be in its durable WAL — a crash+recover before any checkpoint
   // still produces it. Drive the adoption, pump until the PrepareOk is emitted (its AdoptAck append
   // landed), then CRASH + RECOVER; op 2 must be present. Fail-before: the ack was memory-only.
@@ -382,7 +382,7 @@ fn backup_adopted_ack_survives_crash_before_checkpoint() {
   use crate::Wal as _;
   assert!(
     wal.header(OpNumber::with(2)).is_some(),
-    "op 2 the backup acked is in the durable WAL after crash+recover (R6-F1 append-before-ack)"
+    "op 2 the backup acked is in the durable WAL after crash+recover"
   );
   assert!(
     recovered.op().get() >= 2,
@@ -392,7 +392,7 @@ fn backup_adopted_ack_survives_crash_before_checkpoint() {
 
 #[test]
 fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
-  // codex R7-F2 (CONSENSUS-CRITICAL): a replica that recovered with a faulty INTERIOR slot (here
+  // CONSENSUS-CRITICAL: a replica that recovered with a faulty INTERIOR slot (here
   // checkpoint 0, head 3, op 2 read back permanently faulty + still uncommitted) drops op 2 from its
   // cache, so its log is `{1, 3}` with an interior GAP at op 2. It then becomes the new primary via a
   // DVC quorum where no donor supplies op 2 (op 2 is uncommitted and unique — no quorum holds it). The
@@ -414,7 +414,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
   );
   assert!(
     !r.has_repair_hole_for_test(2),
-    "precondition: op 2 is uncommitted, so it is NOT a repair hole (R6-F2)"
+    "precondition: op 2 is uncommitted, so it is NOT a repair hole"
   );
   while r.poll_message().is_some() {} // discard the recovery-time chatter
   let now = Instant::ZERO;
@@ -538,7 +538,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
 
 #[test]
 fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
-  // codex R7-F2 (the COMPLEMENT — a COMMITTED gap must NOT be truncated). Same faulty-interior-slot
+  // COMPLEMENT — a COMMITTED gap must NOT be truncated. Same faulty-interior-slot
   // replica (checkpoint 0, head 3, op 2 absent), but this time the DVC quorum reports commit* == 3, so
   // op 2 is BELOW the committed frontier — a real B4 repair hole the offset-union could not carry, NOT
   // an uncommitted gap. The seeding-site truncation only scans `(commit* .. op]`, so op 2 (≤ commit*)
@@ -607,7 +607,7 @@ fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
 
   // Pump the StartViewAsPrimary durable-view write, then a peer answers our RequestPrepare with op 2's
   // committed-vouching Prepare (commit 3 >= op 2) → fill the hole and resume the held commit to op 3.
-  // The fill is a durability barrier (R13-F2): complete the repaired append before the hole clears.
+  // The fill is a durability barrier: complete the repaired append before the hole clears.
   r.handle_storage(now, &mut wal, &mut sb);
   while r.poll_message().is_some() {}
   r.handle_message(
@@ -864,7 +864,7 @@ fn backup_adopts_start_view() {
   assert_eq!(e.log_view(), View::with(1));
   assert_eq!(e.op(), OpNumber::with(2));
   assert_eq!(e.commit(), OpNumber::with(1)); // op 1 applied
-  // codex R6-F1: the PrepareOk for the held uncommitted op (op 2) is deferred until BOTH the new
+  // the PrepareOk for the held uncommitted op (op 2) is deferred until BOTH the new
   // view is durable AND op 2 is durably (re-)appended to the WAL (append-before-ack). Two sequential
   // storage steps: (1) the durable-view write completes → `start_view_acks` submits the WAL append;
   // (2) the append completes → `on_wal_done` sends the PrepareOk. Pump until it appears (bounded).
@@ -891,11 +891,11 @@ fn backup_adopts_start_view() {
   use crate::Wal as _;
   assert!(
     wal.header(OpNumber::with(2)).is_some(),
-    "the acked op 2 was durably (re-)appended to the WAL before the PrepareOk (R6-F1)"
+    "the acked op 2 was durably (re-)appended to the WAL before the PrepareOk"
   );
 }
 
-/// Audit D3: NO old-generation in-flight state survives a view transition. Each of the THREE
+/// NO old-generation in-flight state survives a view transition. Each of the THREE
 /// transition entries — `enter_view_change` (self-driven), `catch_up_to_view` (higher-view catch-up),
 /// and `adopt_canonical_head` (adopt an authoritative head) — must tear down the SAME union of
 /// old-view sub-state via the single `reset_for_view_transition` chokepoint. This seeds the FULL set
@@ -1129,7 +1129,7 @@ fn on_start_view_rewind_below_commit_panics() {
 
 #[test]
 fn adopting_a_canonical_head_truncates_the_wal_above_it() {
-  // REGRESSION (vopr seed 253 / 299), the source-side half of the committed-divergence fix. When a replica
+  // REGRESSION, the source-side half of the committed-divergence fix. When a replica
   // adopts a new view's canonical head, any WAL slot ABOVE that head is an UNCOMMITTED earlier-view proposal
   // (the canonical head is the new view's authoritative head — nothing above it is committed). Leaving such a
   // slot in the WAL lets a later `recover` re-load it and apply its stale body for a committed op the new view
@@ -1248,7 +1248,7 @@ fn dvc_is_deferred_until_view_is_durable() {
 
 #[test]
 fn dvc_retransmit_waits_for_the_durable_view_write() {
-  // codex R16-F1 (REGRESSION, durable-view-before-participate, CONSENSUS-CRITICAL). A ViewChange
+  // REGRESSION (durable-view-before-participate, CONSENSUS-CRITICAL). A ViewChange
   // replica arms `dvc_message` (the DVC retransmit) AND submits the SendDoViewChange durable-view
   // write in `enter_view_change`. The INITIAL DVC is deferred to `on_sb_done` (see
   // `dvc_is_deferred_until_view_is_durable`), BUT if the async superblock write is slower than
@@ -1431,7 +1431,7 @@ fn backup_does_not_prepare_ok_before_start_view_is_durable() {
     "backup must NOT PrepareOk before the view is durable"
   );
   assert_eq!(sb.state().view(), View::with(1));
-  // codex R6-F1: the re-ack now ALSO waits for op 2's WAL (re-)append (append-before-ack), so it
+  // the re-ack now ALSO waits for op 2's WAL (re-)append (append-before-ack), so it
   // arrives after two sequential storage steps (durable-view → submit append; append → PrepareOk).
   let mut acked_op2 = false;
   for _ in 0..4 {
@@ -1454,7 +1454,7 @@ fn backup_does_not_prepare_ok_before_start_view_is_durable() {
   use crate::Wal as _;
   assert!(
     wal.header(OpNumber::with(2)).is_some(),
-    "op 2 is durable in the WAL before its PrepareOk (R6-F1 append-before-ack)"
+    "op 2 is durable in the WAL before its PrepareOk"
   );
 }
 
@@ -1544,7 +1544,7 @@ fn new_prepare_not_acked_while_view_write_pending() {
 
 #[test]
 fn new_primary_does_not_answer_get_view_while_its_view_write_is_pending() {
-  // codex R8-F1 (REGRESSION, durable-view-before-participate, CONSENSUS-CRITICAL). A replica that
+  // REGRESSION (durable-view-before-participate, CONSENSUS-CRITICAL). A replica that
   // just became primary of a new view but has not yet PERSISTED that view (the StartView broadcast
   // is deferred to `on_sb_done`) must NOT answer a delayed/duplicate `GetView` with a `StartView`
   // for the not-yet-durable view: on crash it could regress out of a view it had already vouched
@@ -1611,7 +1611,7 @@ fn new_primary_does_not_answer_get_view_while_its_view_write_is_pending() {
 
 #[test]
 fn new_primary_does_not_answer_recovery_while_its_view_write_is_pending() {
-  // codex R8-F1 (REGRESSION): same window, the Recovery-solicitation path. A primary in the
+  // REGRESSION: same window, the Recovery-solicitation path. A primary in the
   // pending_sb window must NOT answer a peer's `Recovery` with its canonical `(op, commit, log)` in
   // the not-yet-durable view. FAIL-BEFORE: a `RecoveryResponse` appears in the window. PASS-AFTER:
   // silent in the window; once the view is durable a Recovery is answered normally.
@@ -1661,7 +1661,7 @@ fn new_primary_does_not_answer_recovery_while_its_view_write_is_pending() {
 
 #[test]
 fn new_primary_does_not_heartbeat_or_retransmit_while_its_view_write_is_pending() {
-  // codex R8-F1 (REGRESSION): the timer path. A primary in the pending_sb window must NOT emit a
+  // REGRESSION: the timer path. A primary in the pending_sb window must NOT emit a
   // `Commit` heartbeat nor retransmit `Prepare`s — those assert its authority in a view that is not
   // yet durable. FAIL-BEFORE: a `Commit`/`Prepare` appears when `primary_timeouts` fires in the
   // window. PASS-AFTER: silent in the window; heartbeats resume once the view is durable.
@@ -1712,7 +1712,7 @@ fn new_primary_does_not_heartbeat_or_retransmit_while_its_view_write_is_pending(
 
 #[test]
 fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
-  // codex R17-F1 (REGRESSION, durable-view-before-participate, CONSENSUS-CRITICAL). A replica in its
+  // REGRESSION (durable-view-before-participate, CONSENSUS-CRITICAL). A replica in its
   // `pending_sb` window — here a NEW PRIMARY that just adopted view 1 but has NOT yet persisted it (the
   // StartView broadcast is deferred to `on_sb_done`) — is `Normal` but its view is not yet recoverable.
   // The repair-server path `on_request_prepare` previously gated only on `status.is_normal()` and then
@@ -1798,14 +1798,14 @@ fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
 
 #[test]
 fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
-  // codex R18-F1 (REGRESSION, durable-view-before-participate, CONSENSUS-CRITICAL). A replica in its
+  // REGRESSION (durable-view-before-participate, CONSENSUS-CRITICAL). A replica in its
   // `pending_sb` window — here a NEW PRIMARY that just adopted view 1 but has NOT yet persisted it (the
   // StartView broadcast is deferred to `on_sb_done`) — is `Normal` but its view is not yet recoverable.
   // The state-sync serve path `serve_sync_checkpoint` previously gated only on `status.is_normal()` and
   // then shipped `SyncCheckpoint::new(self.view, ..)` for a held durable checkpoint, ADVERTISING the
   // not-yet-durable view: on crash it could regress out of a view it had already vouched for to a
   // soliciting peer (the same cross-view hazard the primary `Prepare`/`Commit`/`StartView` and the
-  // R17-F1 `on_request_prepare` paths gate on). FAIL-BEFORE: a `SyncCheckpoint` appears in the window.
+  // `on_request_prepare` paths gate on). FAIL-BEFORE: a `SyncCheckpoint` appears in the window.
   // PASS-AFTER: silent in the window; once the view is durable the same `RequestSync` IS answered with
   // a `SyncCheckpoint` carrying the now-durable view.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
@@ -1813,7 +1813,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   // Give this primed primary a DURABLE checkpoint to serve: a `checkpoint_op` of 1 (a committed op it
   // holds — its `commit_min` is 1) and a readable snapshot envelope in the StepSb at that op. The
   // serve's F3 ship-time gate requires `cr.op() == self.checkpoint_op`, so the injected op must match;
-  // the R23-F1 integrity gate additionally requires the read bytes to hash to the DURABLE checkpoint id,
+  // the integrity gate additionally requires the read bytes to hash to the DURABLE checkpoint id,
   // so the durable ROOT must NAME this snapshot — set `sb.state` to a root at checkpoint_op 1 whose
   // `checkpoint_id == checkpoint_id(snapshot)` (a genuinely durable checkpoint, not a half-faked one).
   // The view stays 0 (the prior, still-durable view): the view-1 write is the one held inflight, which
@@ -1877,7 +1877,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   // (when the durable root was `initial()`), so the StepSb published it with checkpoint_id 0 — a harness
   // artifact: the real `submit_durable_view` PRESERVES the durable checkpoint id (see its doc-comment).
   // Re-establish the proto-correct durable root (now at view 1, still naming the op-1 checkpoint) so the
-  // R23-F1 integrity gate sees the genuine durable id the post-flush serve must match.
+  // The integrity gate sees the genuine durable id the post-flush serve must match.
   sb.state = VsrState::try_new(
     View::with(1),
     View::with(1),
@@ -2141,15 +2141,16 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
   //     immutable (VSR committed-op survival ⇒ no other view committed a different value), so its local
   //     copy is canonical. It is PRESERVED directly from `self.log` (kept, never re-fetched).
   //   * UNAPPLIED & omitted (7,8, `op in (commit_min, commit]`): the held body is unapplied and may be a
-  //     STALE superseded proposal (VOPR seed 24) — `LogEntry` has no per-entry view to tell. It is
+  //     STALE superseded proposal from an earlier view — `LogEntry` has no per-entry view to tell. It is
   //     therefore DROPPED and REPAIRED: `advance_commit` HOLDS the commit at the first such op and
   //     `request_repair`s the CANONICAL value from a committed-vouching peer.
   //
   // Why this is a CORRECTION, not a weakening of the original B3 safety property: B3's invariant is "no
   // committed op an offset canonical log omits is ever LOST." That still holds end-to-end here — the
   // omitted committed band ends up correct (applied to the SM after repair), never silently skipped. The
-  // ONLY change is the SOURCE for the UNAPPLIED band: a possibly-stale local copy (which diverged the
-  // committed log under seed 24) is replaced by the quorum's canonical value fetched via peer-repair.
+  // ONLY change is the SOURCE for the UNAPPLIED band: a possibly-stale local copy (which, under an
+  // adversarial schedule, can diverge the committed log) is replaced by the quorum's canonical value
+  // fetched via peer-repair.
   // The original B3 bug (clearing the whole log + then `repair.clear()` stranding the op) stays fixed:
   // the omitted committed op is never forgotten — it is a held hole until its canonical value arrives.
   let mut e = Endpoint::new(
@@ -2226,7 +2227,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
     "the first unapplied omitted committed op (7) is a repair hole, its held body dropped"
   );
   // A committed-vouching peer (commit 8 >= op) supplies the canonical value for the repaired band. Each
-  // fill is a durability barrier (R13-F2): the repaired append must complete before the op applies and
+  // fill is a durability barrier: the repaired append must complete before the op applies and
   // the NEXT hole (op 8) is registered — so drive each fill to durability in turn.
   for op in [7u64, 8] {
     e.handle_message(
@@ -2259,7 +2260,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
 
 #[test]
 fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() {
-  // SAFETY REGRESSION (VOPR seed 24): the B3 "preserve the omitted committed op from the adopter's
+  // SAFETY REGRESSION: the B3 "preserve the omitted committed op from the adopter's
   // own log" rule is only sound for ops the adopter has APPLIED (`op <= commit_min`) — those are
   // committed+immutable. For a committed op in `(commit_min .. adopted_commit]` the adopter holds a
   // body it has NOT applied: it can be a STALE UNCOMMITTED proposal from an earlier view that a later
@@ -2269,7 +2270,7 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
   // committed band `(commit_min .. adopted_commit]` becomes repair holes whose CANONICAL value is
   // fetched from a committed-vouching peer (commit HELD until then) — never trusted from local.
   //
-  // Setup mirrors seed 24: the adopter holds the two committed ops 5,6 TRANSPOSED (op 5 -> body[6],
+  // Setup: the adopter holds the two committed ops 5,6 TRANSPOSED (op 5 -> body[6],
   // op 6 -> body[5] — stale superseded proposals), while the cluster committed op 5 -> body[5], op 6
   // -> body[6]. checkpoint == commit_min == 4 (those held bodies are UNAPPLIED), op == 8. The adopted
   // offset StartView (head 10, commit 8) OMITS 5,6 (its log starts at op 7).
@@ -2361,7 +2362,7 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
   );
   // A committed-vouching peer Prepare (commit 8 >= op) supplies the CANONICAL value for each hole in
   // order: op 5 -> body[5], op 6 -> body[6] (the un-transposed quorum values), then op 7,8. Each fill is
-  // a durability barrier (R13-F2): once the repaired append is durable the apply loop resumes, which
+  // a durability barrier: once the repaired append is durable the apply loop resumes, which
   // then registers the NEXT hole — so drive each fill to durability in turn.
   for op in [5u64, 6, 7, 8] {
     assert!(
@@ -2400,6 +2401,6 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
   );
 }
 
-// ── Sender-binding at ingress (codex R19-F1): a message's self-claimed sender must agree with the
+// ── Sender-binding at ingress: a message's self-claimed sender must agree with the
 // authenticated `from`, or it is dropped. A non-Byzantine, cheap defense-in-depth backstop against a
 // buggy/misrouting driver (or a trivially-mislabeled message) spoofing a quorum vote. ──

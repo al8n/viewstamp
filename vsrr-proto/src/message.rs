@@ -919,7 +919,7 @@ impl Message {
   /// head answer, a checkpoint serve) OR as a vote the recipient counts toward forming/committing in
   /// that view. Such a message must NEVER leave a replica whose current view is not yet DURABLE on its
   /// own superblock (`pending_sb.is_some()`), because `self.view` is then the not-yet-persisted view a
-  /// crash would roll back — the durable-view-before-participate invariant (codex R8-F1). This is the
+  /// crash would roll back — the durable-view-before-participate invariant. This is the
   /// GATED set the single emission chokepoint ([`Endpoint::emit`](crate::Endpoint)) asserts on; it
   /// equals the set the VOPR durable-view checker flags.
   ///
@@ -930,19 +930,19 @@ impl Message {
   pub const fn advertises_authoritative_view(&self) -> bool {
     match self {
       // Primary append broadcast / retransmit, AND the `on_request_prepare` repair serve — advertises
-      // `self.view` as the authoritative view of the op (R8-F1 / R17-F1).
+      // `self.view` as the authoritative view of the op.
       Self::Prepare(_)
       // A backup's VOTE the primary counts toward a COMMIT quorum (carries `self.view`).
       | Self::PrepareOk(_)
       // The primary's heartbeat / commit-advance authority broadcast (carries `self.view`).
       | Self::Commit(_)
-      // A VOTE the prospective primary counts toward FORMING the new view (R16-F1).
+      // A VOTE the prospective primary counts toward FORMING the new view.
       | Self::DoViewChange(_)
       // The new primary's "I am the canonical primary of view V" head broadcast.
       | Self::StartView(_)
       // The PRIMARY's recovery-handshake answer (the head-bearing equivalent of a StartView).
       | Self::RecoveryResponse(_)
-      // The state-sync serve advertises `self.view` (R18-F1).
+      // The state-sync serve advertises `self.view`.
       | Self::SyncCheckpoint(_) => true,
       // Solicitations / requests-to-change / client-facing — view-independent, never an authority claim.
       Self::Request(_)
@@ -1610,7 +1610,7 @@ mod tests {
     assert_eq!(rr.view(), View::with(3));
   }
 
-  // ── wire codec (audit P0): all 14 Message variants ──
+  // ── wire codec: all 14 Message variants ──
 
   use crate::codec::CodecError;
 

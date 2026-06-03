@@ -3,13 +3,13 @@ use crate::{ClientId, Config, OpNumber, ReplicaId, Request, RequestNumber, View}
 
 #[test]
 fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
-  // codex vopr seed 52 (REGRESSION). A primary that has FLAGGED a forfeit (decided to step down)
+  // REGRESSION (an adversarial schedule). A primary that has FLAGGED a forfeit (decided to step down)
   // must NOT assign new ops to client requests: a primary reaches this state after an op-resetting
   // recovery/state-sync left it primary of a view the cluster has moved PAST, so a fresh
   // op-assignment would REUSE a committed op number with DIFFERENT bytes (the stale-primary op-reuse
   // divergence). We reuse the sync-step-down path to arm the forfeit cleanly (NO repair hole and
   // commit_max == commit_min, so the only guard that can drop the request is the `pending_forfeit`
-  // one — not the R5-F2 unapplied-prefix guard).
+  // one — not the unapplied-prefix guard).
   let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
   let mut e = Endpoint::new(cfg, 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
@@ -227,7 +227,7 @@ fn a_backup_never_forfeits_even_when_behind() {
 
 #[test]
 fn solo_primary_with_a_permanent_repair_hole_stays_normal_and_does_not_view_change() {
-  // AUDIT (LOW) REGRESSION: `maybe_forfeit` computed `stuck = lag >= forfeit_checkpoint_lag() ||
+  // REGRESSION (low-severity): `maybe_forfeit` computed `stuck = lag >= forfeit_checkpoint_lag() ||
   // !self.repair.is_empty()` with NO `replica_count > 1` gate (unlike its four sibling sites). For a
   // SOLO cluster `quorum_view_change() == 1`, so a forfeit → `propose_next_view` →
   // `maybe_start_view_change` would satisfy the VC quorum with the replica's OWN SVC bit alone →
@@ -340,7 +340,7 @@ fn a_transiently_lagging_primary_recovers_and_disarms_without_forfeiting() {
 
 #[test]
 fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_period() {
-  // LIVENESS REGRESSION (VOPR seed 36): a new primary can adopt a canonical head with a COMMITTED
+  // LIVENESS REGRESSION: a new primary can adopt a canonical head with a COMMITTED
   // interior hole the offset-union could not carry (a committed op a holder checkpointed + pruned
   // past, so it lives only inside a peer's checkpoint snapshot — unservable via `RequestPrepare`).
   // Such a primary is stuck: its commit is HELD below the hole, it cannot serve clients, it cannot
@@ -408,7 +408,7 @@ fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
   );
   while ep.poll_message().is_some() {}
   // A peer answers our RequestPrepare with op 2's committed-vouching Prepare → fills the hole (once the
-  // repaired append is durable — the R13-F2 barrier).
+  // repaired append is durable — the durability barrier).
   ep.handle_message(
     Instant::ZERO,
     &mut wal,
@@ -546,7 +546,7 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
 
 #[test]
 fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_window() {
-  // LIVENESS REGRESSION (VOPR seed 622): a forfeiting primary RE-PROPOSES view+1 to keep stepping
+  // LIVENESS REGRESSION (an adversarial schedule): a forfeiting primary RE-PROPOSES view+1 to keep stepping
   // down under loss — but it must do so on the SVC-retransmit CADENCE, not on EVERY `handle_timeout`
   // tick. The old code called `forfeit()` → `propose_next_view()` → `join_svc()` → `push_svc()`
   // unconditionally each primary tick, so a primary stuck `pending_forfeit` while the cluster ran on
@@ -607,7 +607,7 @@ fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_wi
     svc_count <= 1,
     "a forfeiting primary rate-limits its SVC to the retransmit cadence (at most one per \
      VC_MESSAGE_RETRANSMIT window) — got {svc_count} (the per-tick STORM that pins the sim clock and \
-     starves the live primary's heartbeat → VOPR seed 622 livelock)"
+     starves the live primary's heartbeat → a re-broadcast livelock)"
   );
   assert!(
     ep.pending_forfeit_for_test(),

@@ -1,5 +1,5 @@
-//! M3.2b PHASE A gate: the PHYSICAL bounded-WAL stall-before-wrap, proven in the deterministic sim
-//! (M3's philosophy — prove it here before the real M4 disk driver).
+//! Bounded-WAL gate: the PHYSICAL bounded-WAL stall-before-wrap, proven in the deterministic sim
+//! (prove it in simulation before the real disk driver).
 //!
 //! With an OPT-IN bounded ring WAL ([`Cluster::set_wal_capacity`]) of `N` slots, op `K` occupies ring
 //! slot `K mod N`, so an append at `K + N` would PHYSICALLY overwrite op `K`'s slot. The safety
@@ -192,7 +192,7 @@ fn tail_is_ring_resident(c: &Cluster, r: usize) -> Result<(), String> {
   Ok(())
 }
 
-/// Item 1 (M3.2b Phase B): a bounded-WAL replica whose ring has WRAPPED MANY TIMES recovers correctly on
+/// Item 1: a bounded-WAL replica whose ring has WRAPPED MANY TIMES recovers correctly on
 /// crash + restart. `recover` reads the un-pruned tail `(checkpoint_op .. head]`; the primary stall keeps
 /// that band `<= N` slots, so it FITS the ring and every op it reads is RESIDENT — `recover` never
 /// requests a wrapped-away (snapshot-subsumed) op `<= prune_floor`, which the ring would return `Absent`
@@ -388,7 +388,7 @@ fn request_prepare_unservable_clusterwide(c: &Cluster, op: u64, except: usize) -
   })
 }
 
-/// Item 2 (M3.2b Phase B) — THE key Phase-B validation. A backup is PARTITIONED while the cluster keeps
+/// Item 2 — THE key Phase-B validation. A backup is PARTITIONED while the cluster keeps
 /// committing, checkpointing, and WRAPPING its ring past the backup's window, so the ops the backup is
 /// missing are pushed BELOW the quorum checkpoint and PHYSICALLY WRAPPED AWAY from every quorum member's
 /// ring (their bytes physically gone everywhere). Once an op is below
@@ -592,7 +592,7 @@ fn bounded_wal_laggard_with_wrapped_away_ops_recovers_via_state_sync() {
   }
 }
 
-/// Item 2 (M3.2b Phase B) — the CONNECTED backup-overflow case + its fix. A SUB-QUORUM laggard on a
+/// Item 2 — the CONNECTED backup-overflow case + its fix. A SUB-QUORUM laggard on a
 /// bounded ring can keep receiving HEAD-EXTENDING `Prepare`s while its OWN `checkpoint_op` lags far below
 /// the cluster checkpoint (e.g. it adopted a canonical head over a held-commit hole after a view change,
 /// so `commit_min`/`checkpoint_op` are pinned low while `op` ran ahead). Appending such an op `K` would
