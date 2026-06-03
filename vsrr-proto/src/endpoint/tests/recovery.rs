@@ -179,7 +179,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     "the held commit resumes — the known-committed op 2 is RETAINED, never lost"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[(1, std::vec![1u8]), (2, std::vec![2u8])],
     "the committed log retains op 2 end to end (FAIL-BEFORE: op 2 was truncated and lost)"
   );
@@ -301,7 +301,7 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   // so the band was empty.)
   assert_eq!(
     sb.state()
-      .committed_headers()
+      .committed_headers_slice()
       .iter()
       .map(|h| h.op().get())
       .collect::<std::vec::Vec<_>>(),
@@ -496,7 +496,7 @@ fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
     "commit is HELD below the hole — op 2's body is missing, so op 3 must not apply"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[(1, std::vec![1u8])],
     "only op 1 applied; the hole stops the apply strictly in order"
   );
@@ -734,7 +734,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
     "committed through op 3 off the re-appended canonical body"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[
       (1, std::vec![1u8]),
       (2, std::vec![2u8]),
@@ -994,7 +994,7 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
     "the commit is HELD below the first unfilled hole (op 1), never advanced over an empty/stale body"
   );
   // CRUCIAL: no op was ever applied with an empty body (the divergence signature).
-  for (op, body) in r.state_machine().applied() {
+  for (op, body) in r.state_machine_ref().applied() {
     assert!(
       !body.is_empty(),
       "op {op} was applied with an EMPTY body — the committed-op divergence this guards against"
@@ -1002,7 +1002,10 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
   }
   // And op 2 specifically is not applied at all yet (held — its faulty empty placeholder was dropped).
   assert!(
-    !r.state_machine().applied().iter().any(|(op, _)| *op == 2),
+    !r.state_machine_ref()
+      .applied()
+      .iter()
+      .any(|(op, _)| *op == 2),
     "op 2 is not applied until a verified body arrives"
   );
   assert!(
@@ -1562,7 +1565,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   // Recovery did not apply anything yet (commit_min == checkpoint_op == 0); the stale body [0xBB] was
   // never applied.
   assert!(
-    r.state_machine().applied().is_empty(),
+    r.state_machine_ref().applied().is_empty(),
     "nothing applied yet — the stale body [0xBB] is never re-derived from the WAL"
   );
 
@@ -1614,7 +1617,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
     "the canonical op 2 fills the hole → the held commit resumes"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[(1, std::vec![1u8]), (2, std::vec![2u8])],
     "the applied band is CANONICAL ([1],[2]) — the stale WAL body [0xBB] was never resurrected \
      (FAIL-BEFORE: the old recover trusted the WAL and applied [0xBB], diverging)"
@@ -1735,7 +1738,7 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
     "the canonical op 2 fills the hole"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[(1, std::vec![1u8]), (2, std::vec![2u8])],
     "the applied band is CANONICAL ([1],[2]) — the stale WAL body [0xBB] was never applied \
      (FAIL-BEFORE: recover trusted the header-less committed op 2 and applied [0xBB], diverging)"
@@ -1783,7 +1786,7 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   // truncated this to just [op 1], so ops 3 + 4 lost their canonical headers.
   assert_eq!(
     state
-      .committed_headers()
+      .committed_headers_slice()
       .iter()
       .map(|h| h.op().get())
       .collect::<std::vec::Vec<_>>(),
@@ -1877,7 +1880,7 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
     "the single repaired op 2 lets the held commit resume through the retained ops 3 + 4 to op 4"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[
       (1, std::vec![1u8]),
       (2, std::vec![2u8]),
@@ -2080,7 +2083,7 @@ fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
   let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
   let mut wal = ScriptedWal::with_entries(0);
   wal.head = u64::MAX; // a pathological / bit-rotted head
-  let mut sb = TestSb::default(); // VsrState::initial(): commit == checkpoint_op == 0
+  let mut sb = TestSb::default(); // VsrState::new(): commit == checkpoint_op == 0
   assert_eq!(
     sb.state().commit(),
     sb.state().checkpoint_op(),
@@ -2196,7 +2199,7 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
     "the wrong-identity slot is dropped from the in-memory log so it can never be applied as clientA/req5"
   );
   assert!(
-    r.state_machine().applied().is_empty(),
+    r.state_machine_ref().applied().is_empty(),
     "nothing applied yet — the wrong-identity body is never re-derived from the WAL"
   );
 
@@ -2341,7 +2344,7 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
     "still no repair hole after applying the trusted band"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[(1, std::vec![1u8]), (2, std::vec![2u8])],
     "the trusted WAL band applied verbatim"
   );
@@ -2604,7 +2607,7 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
     "checkpoint is durable"
   );
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     2,
     "the live SM applied ops 1,2 before the crash"
   );
@@ -2636,12 +2639,12 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   assert_eq!(recovered.status(), Status::Normal);
   // The SM was restored from the snapshot: it already reflects ops 1,2 (NOT re-applied → exactly 2).
   assert_eq!(
-    recovered.state_machine().applied().len(),
+    recovered.state_machine_ref().applied().len(),
     2,
     "SM restored from the checkpoint snapshot (no double-apply)"
   );
   assert_eq!(
-    recovered.state_machine().applied(),
+    recovered.state_machine_ref().applied(),
     &[(1u64, std::vec![1u8]), (2u64, std::vec![2u8])],
     "the restored SM reflects exactly the checkpointed applied prefix"
   );
@@ -2703,7 +2706,7 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   sb.flush(); // release the Phase-1 checkpoint read (the corrupt one)
   e.handle_storage(now, &mut wal, &mut sb);
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     0,
     "a hash-mismatched read must NOT restore the SM"
   );
@@ -2717,7 +2720,7 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   sb.flush(); // release the retry read submitted in drain #1 (the wrong-op one)
   e.handle_storage(now, &mut wal, &mut sb);
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     0,
     "a wrong-op read must NOT restore the SM"
   );
@@ -2787,7 +2790,7 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
     "a truncated snapshot is a fault (decode None), not a panic"
   );
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     0,
     "nothing restored from garbage bytes"
   );
@@ -2860,7 +2863,7 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
     "the forced sync targets our own checkpoint op (a peer >= it answers)"
   );
   assert_eq!(
-    e.state_machine().applied().len(),
+    e.state_machine_ref().applied().len(),
     0,
     "nothing restored from the unreadable snapshot"
   );
@@ -3262,7 +3265,7 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
     "op 2's empty placeholder was dropped from the log cache (NOT a held empty entry to apply with &[])"
   );
   assert_eq!(
-    e.state_machine().applied(),
+    e.state_machine_ref().applied(),
     &[(1u64, b"OP1-REAL-BODY".to_vec())],
     "only the restored op 1 is applied — op 2 was NEVER applied with an empty (or any) body yet"
   );
@@ -3331,7 +3334,7 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
   );
   // The decisive assertion: op 2 applied with its REAL body — the SM NEVER saw `&[]` for op 2.
   assert_eq!(
-    e.state_machine().applied(),
+    e.state_machine_ref().applied(),
     &[
       (1u64, b"OP1-REAL-BODY".to_vec()),
       (2u64, b"OP2-REAL-BODY".to_vec()),
@@ -3368,7 +3371,7 @@ fn recover_with_no_checkpoint_is_unchanged() {
   assert_eq!(recovered.commit_max(), OpNumber::with(0));
   assert_eq!(recovered.checkpoint_op(), OpNumber::with(0));
   assert_eq!(
-    recovered.state_machine().applied().len(),
+    recovered.state_machine_ref().applied().len(),
     0,
     "no checkpoint → fresh SM, nothing restored/applied"
   );

@@ -174,7 +174,7 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
     "the hole filled (durably) → the held commit resumes and applies ops 2 then 3 in order"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[
       (1, std::vec![1u8]),
       (2, std::vec![2u8]),
@@ -220,7 +220,7 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
     "a Prepare whose op is not the hole does not fill it (placement mismatch)"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[(1, std::vec![1u8])],
     "no wrong body applied; the commit stays held until the CORRECT op 2 arrives"
   );
@@ -282,7 +282,7 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
     "the hole stays OPEN (re-solicited) — the uncommitted old-view body is never adopted"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[(1, std::vec![1u8])],
     "no uncommitted body applied to the held slot"
   );
@@ -308,7 +308,7 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
     "the committed value fills the hole → the held commit resumes (ops 2 then 3 apply in order)"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[
       (1, std::vec![1u8]),
       (2, std::vec![2u8]),
@@ -359,7 +359,7 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
   r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply the held suffix
   assert_eq!(r.commit(), OpNumber::with(4));
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[
       (1, std::vec![1u8]),
       (2, std::vec![2u8]),
@@ -476,7 +476,10 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
      (FAIL-BEFORE: commit advanced to 2 on the staged append)"
   );
   assert!(
-    r.state_machine().applied().iter().all(|(op, _)| *op != 2),
+    r.state_machine_ref()
+      .applied()
+      .iter()
+      .all(|(op, _)| *op != 2),
     "op 2 is NOT applied to the SM before its append is durable \
      (FAIL-BEFORE: op 2 applied immediately on the staged append)"
   );
@@ -499,7 +502,7 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
     "the held commit resumes to op 2 ONLY after the repaired append is durable"
   );
   assert_eq!(
-    r.state_machine().applied(),
+    r.state_machine_ref().applied(),
     &[(1, std::vec![1u8]), (2, std::vec![2u8])],
     "ops 1 + 2 apply once op 2 is durable — the repaired body is never applied before its WAL append lands"
   );

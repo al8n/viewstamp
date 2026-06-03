@@ -139,21 +139,13 @@ impl Wal for TestWal {
   }
 }
 
+#[derive(Default)]
 struct TestSb {
   state: VsrState,
   done: VecDeque<SuperblockDone>,
   /// The last checkpoint snapshot written (op, bytes) — stored so a recover/read test can read it
   /// back, mirroring `InMemorySuperblock`.
   checkpoint: Option<(OpNumber, Bytes)>,
-}
-impl Default for TestSb {
-  fn default() -> Self {
-    Self {
-      state: VsrState::initial(),
-      done: VecDeque::new(),
-      checkpoint: None,
-    }
-  }
 }
 impl Superblock for TestSb {
   fn state(&self) -> VsrState {
@@ -187,6 +179,7 @@ impl Superblock for TestSb {
 /// (called by the test between `handle_storage` rounds) makes the currently-inflight writes
 /// durable (`ready`). This lets a test step the 3-step checkpoint sequence one superblock write at
 /// a time and observe the intermediate (not-yet-durable) states the synchronous `TestSb` hides.
+#[derive(Default)]
 struct StepSb {
   state: VsrState,
   inflight: VecDeque<SuperblockDone>,
@@ -194,17 +187,6 @@ struct StepSb {
   /// The state each inflight write will publish once flushed (paired by position with `inflight`).
   inflight_states: VecDeque<VsrState>,
   checkpoint: Option<(OpNumber, Bytes)>,
-}
-impl Default for StepSb {
-  fn default() -> Self {
-    Self {
-      state: VsrState::initial(),
-      inflight: VecDeque::new(),
-      ready: VecDeque::new(),
-      inflight_states: VecDeque::new(),
-      checkpoint: None,
-    }
-  }
 }
 impl StepSb {
   /// Make all currently-inflight writes durable: publish their states and move completions to

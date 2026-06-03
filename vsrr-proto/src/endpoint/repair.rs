@@ -180,9 +180,10 @@ impl<S: StateMachine> Endpoint<S> {
     wal.submit_append(id, p.op(), header, p.body_bytes());
     // This append owes NO PrepareOk/own-vote (peer repair is not a vote), but unlike the OLD bare write
     // it IS tracked — as a `RepairFill`, so `on_wal_done` defers the apply + hole-clear to durability.
-    self
-      .pending
-      .insert(id.get(), Pending::RepairFill(p.op(), entry));
+    self.pending.insert(
+      id.get(),
+      Pending::RepairFill(RepairFill::new(p.op(), entry)),
+    );
     self.appending.insert(op);
     true
   }

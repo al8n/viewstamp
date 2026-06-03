@@ -284,7 +284,7 @@ impl Cluster {
 
   /// Read access to replica `i`'s state machine (for invariant checking).
   pub fn replica_sm(&self, i: usize) -> &LogSm {
-    self.replicas[i].state_machine()
+    self.replicas[i].state_machine_ref()
   }
 
   /// Replica `i`'s current view (for invariant checking).

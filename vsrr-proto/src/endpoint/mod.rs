@@ -44,7 +44,45 @@ enum Pending {
   /// repair hole, and only THEN `advance_commit`s. The body rides in the variant (not `self.log`) so a
   /// non-durable repaired op is never exposed in a `DoViewChange`/`StartView`/checkpoint nor applied by
   /// a concurrently-triggered `advance_commit` before its WAL append lands.
-  RepairFill(OpNumber, LogEntry),
+  RepairFill(RepairFill),
+}
+
+/// The `(op, body)` payload of a staged peer-repair fill awaiting durability (codex R13-F2),
+/// extracted from the `Pending::RepairFill` variant so its two fields are named + accessor-wrapped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepairFill {
+  op: OpNumber,
+  entry: LogEntry,
+}
+
+impl RepairFill {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn new(op: OpNumber, entry: LogEntry) -> Self {
+    Self { op, entry }
+  }
+
+  /// The op number of the staged repair fill.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn op(&self) -> OpNumber {
+    self.op
+  }
+
+  /// Consumes the payload, yielding the canonical log entry to insert once the append is durable.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn into_entry(self) -> LogEntry {
+    self.entry
+  }
+}
+
+impl Pending {
+  /// The op number this pending append is for (every variant carries one).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn op(&self) -> OpNumber {
+    match self {
+      Pending::Ack(op) | Pending::AdoptVote(op) | Pending::AdoptAck(op) => *op,
+      Pending::RepairFill(rf) => rf.op(),
+    }
+  }
 }
 
 /// What the endpoint does once its pending durable-view (superblock) write completes.
@@ -65,9 +103,9 @@ pub(crate) enum PendingSbAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointStep {
   /// The snapshot write is in flight; on its completion, write the new `VsrState` root.
-  AwaitSnapshot { id: crate::OpId },
+  AwaitSnapshot(crate::OpId),
   /// The `VsrState` root write is in flight; on its completion, the checkpoint is durable.
-  AwaitRoot { id: crate::OpId },
+  AwaitRoot(crate::OpId),
 }
 
 /// Why an in-flight checkpoint root is being written — the typed completion discriminator the
@@ -651,7 +689,7 @@ pub struct Endpoint<S> {
   pending_forfeit: bool,
 }
 
-impl<S: StateMachine> Endpoint<S> {
+impl<S> Endpoint<S> {
   /// Creates a fresh endpoint in `Status::Normal`, view 0.
   ///
   /// (M1 starts in `Normal`; the `Recovering`/`RecoveringHead` startup path is
@@ -1031,7 +1069,7 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Read access to the state machine (for tests / observers).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn state_machine(&self) -> &S {
+  pub fn state_machine_ref(&self) -> &S {
     &self.sm
   }
 
@@ -1161,7 +1199,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op: self.commit_min,
       checkpoint_id: 0,
-      step: CheckpointStep::AwaitSnapshot { id },
+      step: CheckpointStep::AwaitSnapshot(id),
       kind: CheckpointKind::Ordinary, // models an ordinary checkpoint-persist in flight
     });
   }
@@ -1359,9 +1397,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op: self.commit_min,
       checkpoint_id: 0,
-      step: CheckpointStep::AwaitSnapshot {
-        id: crate::OpId::new(999),
-      },
+      step: CheckpointStep::AwaitSnapshot(crate::OpId::new(999)),
       kind: CheckpointKind::SyncRepersist,
     });
     self.sync = Some(SyncState {
@@ -1535,7 +1571,16 @@ impl<S: StateMachine> Endpoint<S> {
   fn sender_is_member_replica(&self, from: Peer, claimed: ReplicaId) -> bool {
     claimed.get() < self.config.replica_count() && from == Peer::Replica(claimed)
   }
+}
 
+/// The state-machine-driving operations: the `handle_*` ingress/timeout/storage entry points and the
+/// poll/timer machinery they reach. These transitively invoke `S::apply`/`snapshot`/`restore` (via the
+/// submodule consensus methods), so — per the method-local-bounds rule — they carry `S: StateMachine`
+/// here, while the pure accessors/observers above stay unconstrained (callable on any `Endpoint<S>`).
+impl<S> Endpoint<S>
+where
+  S: StateMachine,
+{
   /// Feeds an incoming protocol message. Runs `assert_invariants` at exit (TigerBeetle's `assert_main`)
   /// so the `(status × sub-state-flag)` coupling is re-checked after EVERY ingress, across all of
   /// `handle_message_inner`'s early-return paths.
