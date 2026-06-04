@@ -321,7 +321,8 @@ impl<S: StateMachine> Endpoint<S> {
           e.request,
           body.clone(),
         )),
-        // header-only entries are carried through the DVC in a later task; none exist yet.
+        // A body-`Repairing` header-only entry (a kept body-faulty op awaiting peer-repair) is OMITTED
+        // from the DVC log for now — carrying its existence through the view change is a later task.
         Body::Repairing(_) => None,
       })
       .collect()
@@ -904,8 +905,7 @@ impl<S: StateMachine> Endpoint<S> {
       return; // not held — `advance_commit`/`request_repair` recovers a committed gap; nothing to ack
     };
     // A body-`Repairing` entry has no bytes to (re-)append, so it is treated like a not-held op: skip
-    // it and owe no ack — `advance_commit`/`request_repair` recovers its body from a peer. (No path
-    // creates a `Repairing` entry yet.)
+    // it and owe no ack — `advance_commit`/`request_repair` recovers its body from a peer.
     let Body::Present(body) = entry.body else {
       return;
     };

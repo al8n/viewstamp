@@ -509,7 +509,7 @@ impl<S: StateMachine> Endpoint<S> {
       // Build from the entry's canonical `body_checksum` (the load-bearing field for the recovery
       // cross-check): for a `Present` body it is `fnv1a_128(bytes)` — identical to `Header::new(...,
       // &bytes)` — and for a body-`Repairing` slot it is the stored durable checksum, so the canonical
-      // header is recorded even when the bytes are absent. (No path creates a `Repairing` entry yet.)
+      // header is recorded even when the bytes are absent.
       headers.push(Header::from_parts(
         OpNumber::with(op),
         self.view,

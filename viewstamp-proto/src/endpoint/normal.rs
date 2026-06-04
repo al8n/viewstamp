@@ -114,8 +114,7 @@ impl<S: StateMachine> Endpoint<S> {
       for op in lo..=hi {
         // SKIP a body-`Repairing` hole: a `Prepare` carries the body bytes, which an absent-body op
         // does not hold, so it cannot be retransmitted (it is itself awaiting peer-repair). Treated like
-        // an op the log is missing — the outer `if let Some(..)` already skips those. (No path creates a
-        // `Repairing` entry yet.)
+        // an op the log is missing — the outer `if let Some(..)` already skips those.
         if let Some(LogEntry {
           client,
           request,
@@ -352,7 +351,7 @@ impl<S: StateMachine> Endpoint<S> {
     };
     let Some(body) = entry.body.as_present() else {
       // A body-absent (`Repairing`) hole: handled EXACTLY like a wholly-missing slot above — hold the
-      // commit and peer-repair the body. (No path creates a `Repairing` entry yet.)
+      // commit and peer-repair the body.
       self.request_repair(now, op);
       return false;
     };
@@ -470,8 +469,7 @@ impl<S: StateMachine> Endpoint<S> {
       // primary's `commit_min`), so this fall-through is for a stray/buffered Prepare.
       // A body-`Repairing` entry does NOT hold the canonical body (only its checksum), so
       // `as_present()` is `None` and the identity match fails — this op falls through to the re-append
-      // path (it is itself awaiting the canonical body), never re-acked off an absent body. (No path
-      // creates a `Repairing` entry yet.)
+      // path (it is itself awaiting the canonical body), never re-acked off an absent body.
       let canonical_held = pop <= self.checkpoint_op.get()
         || self.log.get(&pop).is_some_and(|entry| {
           entry.client == p.client()
@@ -671,7 +669,7 @@ impl<S: StateMachine> Endpoint<S> {
       };
       let Some(body) = entry.body.as_present() else {
         // A body-absent (`Repairing`) hole: handled EXACTLY like a wholly-missing slot above — hold the
-        // commit and peer-repair the body. (No path creates a `Repairing` entry yet.)
+        // commit and peer-repair the body.
         self.request_repair(now, op);
         break;
       };

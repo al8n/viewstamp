@@ -366,9 +366,9 @@ enum Body {
   /// The body is absent (torn / not-yet-repaired); only the durable canonical `body_checksum` is known.
   /// The bytes must be peer-repaired before the op can apply.
   ///
-  /// No production path CONSTRUCTS this yet — recover/view-change populate it in a later task; today it
-  /// is built only by tests. Every reader already handles it (the commit path holds + peer-repairs).
-  #[cfg_attr(not(test), allow(dead_code))]
+  /// Constructed in production by `recover` (`Outcome::KeepRepairing`): a committed/kept op whose WAL
+  /// read came back body-faulty (durable header, torn/rotted body) is retained header-only as this
+  /// hole, so its existence survives the fault and the commit path peer-repairs the body on demand.
   Repairing(u128),
 }
 

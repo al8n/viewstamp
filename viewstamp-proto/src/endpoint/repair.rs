@@ -86,7 +86,7 @@ impl<S: StateMachine> Endpoint<S> {
     };
     // A body-`Repairing` entry holds the op's identity but NOT its bytes (we are ourselves awaiting
     // peer-repair of this body), so we cannot serve it: stay silent and let a peer that holds the body
-    // answer. (No path creates a `Repairing` entry yet.)
+    // answer.
     let Body::Present(body) = &entry.body else {
       return;
     };

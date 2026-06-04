@@ -360,6 +360,13 @@ impl<S: StateMachine> Endpoint<S> {
       // was already DROPPED from `self.log` as faulty (a transient that cleared on a later timer-driven
       // read, after `drop_faulty_committed_slots` ran) can be RE-INSERTED in full, not lost.
       Verified(ClientId, RequestNumber, Bytes),
+      // A durable-header read whose BODY is faulty (torn/rotted/absent) but whose slot classifies
+      // Verified — the op EXISTS and its identity is known, only the body must be peer-repaired. The op
+      // is KEPT header-only as a `Body::Repairing` hole carrying its durable `(client, request,
+      // body_checksum)`, NOT dropped: its existence is preserved so a later view change can never
+      // re-mint its op number, and the commit path solicits the body on demand. (The body bytes are
+      // absent, hence only the identity + canonical checksum, unlike `Verified`.)
+      KeepRepairing(ClientId, RequestNumber, u128),
       StaleCommitted,
       Fault,
     }
@@ -400,6 +407,31 @@ impl<S: StateMachine> Endpoint<S> {
           SlotVerdict::Verified => Outcome::Verified(h.client(), h.request(), r.body_bytes()),
         }
       }
+      // A durable-header read whose BODY is faulty (torn/rotted/absent): we HAVE the self-verified
+      // header for `op`, so run the SAME `classify_committed_slot` verdict a clean read runs — only the
+      // body verdict differs (we lack the bytes). The placement check is the header's own op: a
+      // BodyFaulty whose `header().op()` is NOT `op` is a misdirected-read sibling — not a trustworthy
+      // read of THIS op — so it falls to `Fault` (the catch-all below) and retries.
+      //   * Verified → KEEP the op header-only as `Body::Repairing` (existence preserved, body
+      //     peer-repaired) rather than drop it — so a later view change can never re-mint its number.
+      //   * StaleCommitted → drop + peer-repair the canonical body (a superseded/stale slot must NOT be
+      //     resurrected as `Repairing`), exactly as a stale ReadOk is dropped.
+      WalDone::BodyFaulty(bf) if bf.header().op() == OpNumber::with(op) => {
+        let h = bf.header();
+        match classify_committed_slot(
+          (h.client(), h.request(), h.body_checksum()),
+          rec.canonical.get(&op).copied(),
+          op,
+          h.view().get(),
+          durable_commit,
+          durable_log_view,
+        ) {
+          SlotVerdict::StaleCommitted => Outcome::StaleCommitted,
+          SlotVerdict::Verified => {
+            Outcome::KeepRepairing(h.client(), h.request(), h.body_checksum())
+          }
+        }
+      }
       _ => Outcome::Fault, // Absent, Fault, misdirected, OR a ReadOk that fails verify (torn/bit-rot).
     };
     match outcome {
@@ -417,6 +449,33 @@ impl<S: StateMachine> Endpoint<S> {
             self
               .log
               .insert(op, LogEntry::present(client, request, body));
+          }
+        }
+      }
+      Outcome::KeepRepairing(client, request, body_checksum) => {
+        // KEEP the op header-only as a `Body::Repairing` hole, retiring this read. Its existence +
+        // canonical identity (client, request, body_checksum) survive the body fault, so a later view
+        // change cannot re-mint its op number; the bytes are absent and the commit path peer-repairs
+        // them ON DEMAND (`advance_commit`/`commit_op` hold at a `Repairing` entry and `request_repair`
+        // its body). It is NOT added to `rec.faulty`: the op is fully RESOLVED here (the durable header
+        // makes its existence certain), so it must NOT be dropped by `drop_faulty_committed_slots` nor
+        // re-read — unlike a no-durable-header `Fault`, which IS faulty. A `Repairing` entry already
+        // present (a re-read after a prior body fault) is left as-is; a Phase-1 `Present(empty)`
+        // placeholder is REPLACED with the `Repairing` hole (the empty body must never apply).
+        rec.reads.remove(&id.get());
+        rec.pending.remove(&op);
+        rec.faulty.remove(&op);
+        match self.log.get_mut(&op) {
+          Some(entry) => entry.body = Body::Repairing(body_checksum),
+          None => {
+            self.log.insert(
+              op,
+              LogEntry {
+                client,
+                request,
+                body: Body::Repairing(body_checksum),
+              },
+            );
           }
         }
       }
@@ -617,6 +676,16 @@ impl<S: StateMachine> Endpoint<S> {
   /// canonical header (`body_checksum == fnv1a_128(&[])`) for it — so no poisoned self-justifying header
   /// can make the empty body MATCH on a later recover.
   ///
+  /// A `Body::Repairing` slot is the ONE faulty-band entry this MUST NOT drop: a durable-header
+  /// body-faulty read kept the op header-only as a `Repairing` hole (`Outcome::KeepRepairing`), so its
+  /// EXISTENCE + canonical `body_checksum` are already preserved and the op must SURVIVE recovery (else
+  /// a later view change re-mints its number). It is already a hole (`as_present()` is `None`), so it
+  /// CANNOT apply empty — the empty-placeholder hazard above does not apply to it. `Outcome::KeepRepairing`
+  /// does not even add the op to `rec.faulty`, so it is normally never iterated here; the explicit
+  /// `Repairing` skip is a correct-by-construction backstop (a kept op is NEVER dropped even if a future
+  /// path tracks it as faulty). Only genuinely-absent / stale slots (an EMPTY `Present` placeholder, or
+  /// no entry) are dropped.
+  ///
   /// Idempotent (re-running drops nothing new). Call ONLY once tail verification is settled
   /// (`rec.pending.is_empty()`), so `rec.faulty` is final and a still-in-flight retry cannot resurrect a
   /// just-dropped slot; the `Outcome::Verified` arm re-inserts a body that arrives after a drop, so even
@@ -627,6 +696,14 @@ impl<S: StateMachine> Endpoint<S> {
     };
     let faulty: std::vec::Vec<u64> = rec.faulty.iter().copied().collect();
     for op in faulty {
+      // KEEP a durable-header body-faulty op held as a `Body::Repairing` hole — its existence is
+      // preserved + the body is peer-repaired on demand, so dropping it would LOSE the op. It is already
+      // a hole (no bytes to apply empty), so the empty-placeholder safety this fn enforces is moot for
+      // it. (Normally unreachable — `Outcome::KeepRepairing` does not add the op to `rec.faulty` — but a
+      // correct-by-construction guard so no kept op is ever dropped.)
+      if matches!(self.log.get(&op), Some(e) if e.body.is_repairing()) {
+        continue;
+      }
       // Committed-survival backstop: a faulty committed slot is `> checkpoint_op` (only the offset tail
       // is materialized), so it is NOT covered by the snapshot — survival relies on it being TRACKED for
       // repair. It is in `rec.faulty` here, which `recover_progress` promotes to a `self.repair` hole on
@@ -657,12 +734,13 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// DEBUG-ASSERT no permanently-faulty committed-band slot survived into the terminal recovery status
-  /// as a POPULATED `self.log` entry. A faulty op left in `self.log` is
-  /// `Some({body: EMPTY})` — NOT a hole — which `advance_commit`/`adopt_log` would apply empty
-  /// cluster-wide (the original empty-body CRITICAL). After [`Self::finalize_recovery`]'s drop EVERY op
-  /// in `rec.faulty` MUST be ABSENT from `self.log` (a genuine repair hole `advance_commit` peer-repairs
-  /// on demand); this fires if a future edit makes the drop stop actually removing the slot, or routes a
-  /// completion through here with a faulty slot still populated. Body is a `debug_assert!`, a no-op in
+  /// as a POPULATED-with-bytes `self.log` entry. A faulty op left as `Some({body: Present(EMPTY)})` is
+  /// NOT a hole — `advance_commit`/`adopt_log` would apply it empty cluster-wide (the original
+  /// empty-body CRITICAL). After [`Self::finalize_recovery`]'s drop EVERY op in `rec.faulty` MUST be
+  /// either ABSENT from `self.log` OR a `Body::Repairing` hole (a kept body-faulty op whose existence is
+  /// preserved and whose body is peer-repaired on demand — also not a bytes-bearing entry, so it cannot
+  /// apply empty). This fires only if a future edit leaves a faulty op as a `Present` entry, or routes a
+  /// completion through here with such a slot still populated. Body is a `debug_assert!`, a no-op in
   /// release (zero cost, like `assert_committed_survives`). Runs while `rec` is still live (the terminal
   /// dispatch clears `recover` only AFTER), so it can witness the final `rec.faulty` set.
   pub(crate) fn assert_no_faulty_committed_survives(&self) {
@@ -670,9 +748,9 @@ impl<S: StateMachine> Endpoint<S> {
     if let Some(rec) = self.recover.as_ref() {
       for &op in &rec.faulty {
         debug_assert!(
-          !self.log.contains_key(&op),
+          !matches!(self.log.get(&op), Some(e) if e.body.is_present()),
           "faulty committed slot {op} survived into the terminal recovery status as a populated \
-           log entry (would be applied empty) — the drop choke was bypassed"
+           Present log entry (would be applied empty) — the drop choke was bypassed"
         );
       }
     }

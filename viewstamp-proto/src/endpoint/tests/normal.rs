@@ -552,8 +552,8 @@ fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
   // torn-body fault) but its bytes are absent — must be treated by the commit path EXACTLY like a
   // wholly-missing slot: HOLD the commit at it (never apply over an absent body) and solicit the body
   // from a peer (`RequestPrepare`). This is the safety the otherwise-untested `Body::Repairing` apply
-  // arm rests on. (No production path creates a `Repairing` entry yet; this seeds one directly, the way
-  // a later recover/view-change task will.)
+  // arm rests on. (`recover` now produces such entries for body-faulty committed ops; this seeds one
+  // directly to isolate the commit-path apply arm.)
   let mut e = backup(); // replica 1 of 3, view 0 (primary is replica 0)
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;

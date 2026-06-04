@@ -250,6 +250,10 @@ struct ScriptedWal {
   head: u64,
   read_faults: BTreeMap<u64, u8>,
   corrupt: std::collections::BTreeSet<u64>,
+  /// Slots whose HEADER is durable (still served by `header()`) but whose BODY is permanently
+  /// unrecoverable (torn / bit-rot): every read yields `WalDone::BodyFaulty(header)`. Mirrors the sim
+  /// WAL's torn/rotted-body verdict — the op EXISTS, only the body needs peer-repair.
+  body_faulty: std::collections::BTreeSet<u64>,
   done: VecDeque<WalDone>,
 }
 impl ScriptedWal {
@@ -272,6 +276,7 @@ impl ScriptedWal {
       head: n,
       read_faults: BTreeMap::new(),
       corrupt: std::collections::BTreeSet::new(),
+      body_faulty: std::collections::BTreeSet::new(),
       done: VecDeque::new(),
     }
   }
@@ -282,6 +287,16 @@ impl ScriptedWal {
   /// Script every read of `op` to return a ReadOk whose body fails `Header::verify` (permanent).
   fn script_corrupt_body(&mut self, op: OpNumber) {
     self.corrupt.insert(op.get());
+  }
+  /// Script every read of `op` to return `WalDone::BodyFaulty` carrying `op`'s durable header (the
+  /// header survives, only the body is unrecoverable). Permanent: the verdict never clears on disk.
+  fn script_body_faulty(&mut self, op: OpNumber) {
+    self.body_faulty.insert(op.get());
+  }
+  /// Remove `op`'s slot entirely (no durable header, no body): `header()` returns `None` and a read of
+  /// `op` resolves to `WalDone::Absent`. Models a genuine hole the writer never held.
+  fn remove_entry_for_test(&mut self, op: OpNumber) {
+    self.entries.remove(&op.get());
   }
 }
 impl Wal for ScriptedWal {
@@ -315,6 +330,12 @@ impl Wal for ScriptedWal {
       }
     }
     let done = match self.entries.get(&op.get()) {
+      // A body-faulty slot: the HEADER is durable (still served), only the body is unrecoverable →
+      // BodyFaulty carrying that header (the sim WAL's torn/rotted-body verdict). Checked before the
+      // clean-read arm so it wins for a held slot.
+      Some((h, _)) if self.body_faulty.contains(&op.get()) => {
+        WalDone::BodyFaulty(crate::storage::BodyFaulty::new(id, *h))
+      }
       Some((h, b)) if self.corrupt.contains(&op.get()) => {
         // A corrupt slot returns the ORIGINAL header with a flipped body so verify fails.
         let mut torn = b.to_vec();
