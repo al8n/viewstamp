@@ -68,12 +68,17 @@ fn on_request_prepare_for_an_op_we_lack_is_silent() {
 }
 
 #[test]
-fn on_request_prepare_serves_only_committed_ops_not_uncommitted_held_ops() {
-  // SAFETY (mirror, server side): a replica must NEVER vouch for an UNCOMMITTED op as a repair source.
-  // It serves a RequestPrepare only for ops it has COMMITTED (`op <= commit_min`); for an op it merely
-  // HOLDS but has not yet applied/committed (`op > commit_min`) it stays SILENT — that op is not its
-  // to certify, and the answering Prepare's `commit` (= commit_min) would otherwise be < op, i.e. a
-  // stale uncommitted vouch the requester's `fill_repair` now rejects anyway. A caught-up peer answers.
+fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
+  // A replica serves a RequestPrepare for any op it HOLDS (`Present`) at or below its head
+  // (`op <= self.op`), with a TRUTHFUL `commit` field (= its `commit_min`). Safety rests on the
+  // REQUESTER's `fill_repair`, not on a restrictive serve gate:
+  //   * a COMMITTED op (`op <= commit_min`) is served with `commit >= op` — a committed vouch the
+  //     requester's ordinary committed-hole repair accepts;
+  //   * an UNCOMMITTED held op (`commit_min < op <= self.op`) is served with `commit < op` — NOT a
+  //     committed vouch; the requester adopts such a body ONLY against a locally-known canonical
+  //     `body_checksum` (a view-change-carried `Repairing` hole), so a peer-held uncommitted body is
+  //     never trusted blindly. This is what lets a new primary fetch a carried-through uncommitted-tail
+  //     op's body from a peer that holds it.
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
@@ -90,7 +95,8 @@ fn on_request_prepare_serves_only_committed_ops_not_uncommitted_held_ops() {
     "but holds op 2 (uncommitted) in its log"
   );
 
-  // Asking for op 2 (> commit_min == 1, held-but-uncommitted) → SILENT (not ours to certify).
+  // Asking for op 2 (held-but-uncommitted, op <= head) → served, but with a TRUTHFUL `commit` (= 1)
+  // that does NOT vouch op 2 committed (`commit < op`). The requester's `fill_repair` is the safety gate.
   e.handle_message(
     now,
     &mut wal,
@@ -102,12 +108,22 @@ fn on_request_prepare_serves_only_committed_ops_not_uncommitted_held_ops() {
       ReplicaId::new(2),
     )),
   );
-  assert!(
-    e.poll_message().is_none(),
-    "no Prepare for an uncommitted held op (op 2 > commit_min) — we never vouch for it"
-  );
+  match e
+    .poll_message()
+    .expect("a held op at/below head IS served")
+    .into_msg()
+  {
+    Message::Prepare(p) => {
+      assert_eq!(p.op(), OpNumber::with(2), "serves the held op 2");
+      assert!(
+        p.commit().get() < p.op().get(),
+        "but the commit field is truthful (= commit_min = 1 < op 2) — NOT a committed vouch"
+      );
+    }
+    other => panic!("expected a Prepare for the held op, got {other:?}"),
+  }
 
-  // Asking for op 1 (<= commit_min, committed) → answered (the answering Prepare carries commit >= op).
+  // Asking for op 1 (<= commit_min, committed) → answered with a committed vouch (commit >= op).
   e.handle_message(
     now,
     &mut wal,
@@ -133,6 +149,23 @@ fn on_request_prepare_serves_only_committed_ops_not_uncommitted_held_ops() {
     }
     other => panic!("expected a Prepare for the committed op, got {other:?}"),
   }
+
+  // Asking for op 3 (ABOVE our head) → SILENT (not ours to serve).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestPrepare(crate::RequestPrepare::new(
+      View::new(),
+      OpNumber::with(3),
+      ReplicaId::new(2),
+    )),
+  );
+  assert!(
+    e.poll_message().is_none(),
+    "no Prepare for an op above our head (op 3 > self.op == 2)"
+  );
 }
 
 #[test]

@@ -7,10 +7,15 @@ impl<S: StateMachine> Endpoint<S> {
   /// (they break at the first missing op) — this never advances `commit_min` past the hole. Idempotent
   /// per op (a re-request while already pending just re-solicits + re-arms).
   pub(crate) fn request_repair(&mut self, now: Instant, op: u64) {
-    // Drop the cache entry so the apply path keeps treating this slot as a hole until a VERIFIED
-    // Prepare fills it (never apply a wrong/empty body). A torn slot's header-only entry is removed;
-    // a bit-rotted slot was never inserted.
-    self.log.remove(&op);
+    // Drop a stale PRESENT cache entry so the apply path keeps treating this slot as a hole until a
+    // VERIFIED Prepare fills it (never apply a wrong/empty body). A header-only `Repairing` entry is
+    // KEPT, not removed: it carries the op's durable canonical `body_checksum`, which `fill_repair`
+    // uses to verify a peer-supplied body for an UNCOMMITTED-tail repair (a carried-through view-change
+    // op whose donors did not vouch it committed) — and it is already a hole the apply path holds at, so
+    // keeping it changes nothing about the commit hold. (A bit-rotted slot was never inserted.)
+    if !matches!(self.log.get(&op), Some(e) if e.body.is_repairing()) {
+      self.log.remove(&op);
+    }
     self.repair.insert(op);
     // Committed-survival backstop: this drop is a cache eviction, not a loss — `op` is now a TRACKED
     // repair hole, so the canonical committed body is re-solicited below (and the apply loop holds the
@@ -81,21 +86,25 @@ impl<S: StateMachine> Endpoint<S> {
       return; // ignore malformed/out-of-range replica id
     }
     let op = m.op().get();
+    // Serve an op we hold in our log at or below our head (`op <= self.op`). A body-`Repairing` entry
+    // holds the op's identity but NOT its bytes (we are ourselves awaiting peer-repair of this body), so
+    // we cannot serve it — stay silent and let a peer that holds the body answer.
     let Some(entry) = self.log.get(&op) else {
       return; // we do not hold this op (or it is a hole for us too) — stay silent; another peer answers
     };
-    // A body-`Repairing` entry holds the op's identity but NOT its bytes (we are ourselves awaiting
-    // peer-repair of this body), so we cannot serve it: stay silent and let a peer that holds the body
-    // answer.
     let Body::Present(body) = &entry.body else {
       return;
     };
-    // never vouch for an uncommitted op as a repair source. Serve only ops we have
-    // committed (op <= commit_min) so the answering Prepare carries commit (= commit_min) >= op; an op
-    // above our applied frontier is not ours to certify — stay silent and let a caught-up peer answer.
-    if op > self.commit_min.get() {
-      return;
+    if op > self.op.get() {
+      return; // above our head — not ours to serve
     }
+    // The reply's `commit` field is our TRUTHFUL `commit_min`. For a committed op (`op <= commit_min`)
+    // this vouches the body is committed (`commit >= op`), the requester's committed-hole path. For an
+    // UNCOMMITTED held op (`commit_min < op <= self.op`) the reply carries `commit < op`: we do NOT
+    // certify it committed — `fill_repair` accepts such a body ONLY against a locally-known canonical
+    // `body_checksum` (a carried-through view-change `Repairing` hole), so a peer-held uncommitted body
+    // is adopted only when it matches the canonical checksum, never trusted blindly. This lets a new
+    // primary fetch the body of a view-change-carried uncommitted-tail op from a peer that holds it.
     let prepare = Prepare::new(
       self.view,
       OpNumber::with(op),
@@ -154,21 +163,43 @@ impl<S: StateMachine> Endpoint<S> {
     if self.appending.contains(&op) {
       return true;
     }
-    // SAFETY: a committed repair hole may ONLY be filled with the committed value for
-    // this op. A repair answer from a peer that holds op N committed carries commit >= op (it set
-    // prepare.commit = its own commit_min >= N in on_request_prepare). A STALE/reordered Prepare from an
-    // old view, broadcast while its body was still UNCOMMITTED, carries commit < op — reject it (keep the
-    // hole open + re-solicit) so a committed slot is never overwritten with an uncommitted old-view body.
-    // Soundness: under the VSR (non-Byzantine) fault model commit >= op means the sender committed op,
-    // and a committed op's body is identical across all views (committed-op survival), so the body is
-    // canonical.
-    if p.commit().get() < p.op().get() {
-      return false;
-    }
-    // Reconstruct the header (also needed for the durable append below) and gate on its body checksum.
+    // Reconstruct the header (also needed for the durable append below) and gate on its body checksum
+    // (self-consistency: the body matches its own header's embedded checksum).
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
     if !header.verify(p.body()) {
-      return false; // unverifiable body — never adopt it for a committed op; keep the hole + re-solicit
+      return false; // unverifiable body — never adopt it; keep the hole + re-solicit
+    }
+    // SAFETY: a repair hole may ONLY be filled with the CANONICAL body for this op. Two trust sources,
+    // in priority order:
+    //   1. A KEPT header-only `Repairing` hole carries the op's durable canonical `(client, request,
+    //      body_checksum)` (recovered from a durable WAL header / carried through a view change). The
+    //      supplied body must match that FULL identity — same client+request AND
+    //      `body_checksum`. This certifies the body WITHOUT a committed-vouch, so a new primary can fetch
+    //      the body of a view-change-carried UNCOMMITTED-tail op from a peer that holds it (the peer's
+    //      reply carries `commit < op`, but the canonical checksum is what makes it safe).
+    //   2. Otherwise (a hole with no kept canonical header — the ordinary committed-band repair) the
+    //      answer must come from a peer that holds op N COMMITTED, i.e. `commit >= op`: a committed op's
+    //      body is identical across all views (committed-op survival), so it is canonical. A
+    //      stale/reordered old-view Prepare carrying `commit < op` is rejected (keep the hole open +
+    //      re-solicit) so a committed slot is never overwritten with an uncommitted old-view body.
+    match self.log.get(&op) {
+      Some(LogEntry {
+        client,
+        request,
+        body: Body::Repairing(canonical_checksum),
+      }) => {
+        if p.client() != *client
+          || p.request() != *request
+          || crate::storage::fnv1a_128(p.body()) != *canonical_checksum
+        {
+          return false; // does not match the kept canonical identity — never adopt; keep the hole
+        }
+      }
+      _ => {
+        if p.commit().get() < p.op().get() {
+          return false; // not committed-vouched and we hold no canonical header — reject
+        }
+      }
     }
     // Persist the repaired op durably (append-after-verify) as a DURABILITY BARRIER. The
     // body is staged in the `Pending::RepairFill` entry — NOT in `self.log` — so it is NOT exposed in a

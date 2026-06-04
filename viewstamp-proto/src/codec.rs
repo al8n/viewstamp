@@ -23,7 +23,7 @@ use bytes::BufMut;
 /// [`HEADER_VERSION`](crate::HEADER_VERSION)). A decode that reads a different version
 /// fails with [`CodecError::UnknownVersion`] rather than misinterpreting later bytes — this
 /// is what lets the format evolve without a silent reinterpretation of old/foreign data.
-pub const WIRE_VERSION: u16 = 1;
+pub const WIRE_VERSION: u16 = 2;
 
 /// A typed, structured error from decoding a [`Header`](crate::Header),
 /// [`VsrState`](crate::VsrState), or [`Message`](crate::Message) from bytes (or from a

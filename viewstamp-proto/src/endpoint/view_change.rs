@@ -314,16 +314,18 @@ impl<S: StateMachine> Endpoint<S> {
     self
       .log
       .iter()
-      .filter_map(|(&op, e)| match &e.body {
-        Body::Present(body) => Some(crate::PreparedEntry::new(
-          OpNumber::with(op),
-          e.client,
-          e.request,
-          body.clone(),
-        )),
-        // A body-`Repairing` header-only entry (a kept body-faulty op awaiting peer-repair) is OMITTED
-        // from the DVC log for now — carrying its existence through the view change is a later task.
-        Body::Repairing(_) => None,
+      .map(|(&op, e)| match &e.body {
+        Body::Present(body) => {
+          crate::PreparedEntry::new(OpNumber::with(op), e.client, e.request, body.clone())
+        }
+        // A body-`Repairing` header-only entry (a kept body-faulty committed op awaiting peer-repair)
+        // is carried through the view change as a header-only `PreparedEntry`: its EXISTENCE +
+        // canonical identity (client, request, body_checksum) travel in the DVC so the new primary
+        // sees the op as TAKEN (never re-mints its number) and adopts it repair-pending, fetching the
+        // body from a peer that holds it.
+        Body::Repairing(checksum) => {
+          crate::PreparedEntry::repairing(OpNumber::with(op), e.client, e.request, *checksum)
+        }
       })
       .collect()
   }
@@ -500,18 +502,30 @@ impl<S: StateMachine> Endpoint<S> {
     // Build the canonical log by UNIONING the canonical generation's entries up to op_head: for each
     // op, take its `PreparedEntry` from any canonical donor that holds it. A committed op present in a
     // low-floor donor's offset log but absent from a higher-floor donor is therefore STILL included.
-    // The BTreeMap keys by op so the result is ordered+gapless-where-present; `or_insert_with` keeps
-    // the FIRST canonical donor's copy of each op. The donor choice is immaterial: every donor of the
-    // canonical generation agrees on a committed op's content (same prior-view prepare), and an
-    // uncommitted tail op `(commit* .. op_head]` is identical across the canonical generation too (it
-    // is the same prepared op — the canonical `op_head` holder's value).
+    // The BTreeMap keys by op so the result is ordered+gapless-where-present. A `Repairing`
+    // (header-only) entry COUNTS as the op being present — its existence is what stops the op number
+    // being re-minted — but when BOTH a `Present` and a `Repairing` entry exist for the same op
+    // across canonical donors, `Present` WINS (prefer a real body over a repair-pending hole); a
+    // `Repairing`-only op stays repair-pending in the canonical log (its body is peer-repaired after
+    // adoption). Among two `Present` (or two `Repairing`) copies the choice is immaterial: every donor
+    // of the canonical generation agrees on a committed op's content (same prior-view prepare), and an
+    // uncommitted tail op `(commit* .. op_head]` is identical across the canonical generation too.
     let mut merged: BTreeMap<u64, crate::PreparedEntry> = BTreeMap::new();
     for d in &canonical {
       for entry in d.log_slice() {
         if entry.op().get() <= op_head {
-          merged
-            .entry(entry.op().get())
-            .or_insert_with(|| entry.clone());
+          match merged.entry(entry.op().get()) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+              v.insert(entry.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+              // A real body supersedes a held `Repairing` hole for the same op; otherwise keep the
+              // existing copy (Present stays Present, Repairing stays Repairing).
+              if o.get().is_repairing() && !entry.is_repairing() {
+                o.insert(entry.clone());
+              }
+            }
+          }
         }
       }
     }
@@ -643,6 +657,28 @@ impl<S: StateMachine> Endpoint<S> {
     // here so a fresh primary never starts already-flagged to abdicate).
     self.pending_forfeit = false;
 
+    // Solicit the body of any adopted UNCOMMITTED-tail op carried HEADER-ONLY (`Repairing`): a
+    // committed-but-not-widely-known op whose only canonical-generation donor read its body back faulty
+    // travels through the DVC as a `Repairing` entry (its existence kept so its number is never
+    // re-minted), but its bytes must be fetched from a peer that holds them before this primary can
+    // re-prepare + commit it. `request_repair` registers the hole + broadcasts a `RequestPrepare`,
+    // KEEPING the `Repairing` entry (its canonical `body_checksum` is what `fill_repair` verifies the
+    // peer-supplied body against). Once the body returns Present, the prepare-retransmit re-broadcasts it
+    // and `try_commit` drives it to commit (the inflight entry seeded below holds its place meanwhile —
+    // `try_commit` HOLDS in op order at the body-absent hole until the repair fills it). A `Repairing` op
+    // in the COMMITTED prefix `(.. =commit_star]` was already solicited by `advance_commit` above.
+    let repairing_tail: std::vec::Vec<u64> = self
+      .log
+      .iter()
+      .filter(|(op, e)| {
+        **op > self.commit_min.get() && **op <= self.op.get() && e.body.is_repairing()
+      })
+      .map(|(op, _)| *op)
+      .collect();
+    for op in repairing_tail {
+      self.request_repair(now, op);
+    }
+
     // Rebuild the pipeline for the uncommitted tail `(commit_min, op]`. The new primary
     // must NOT count its own vote for an op it adopted from a peer's DVC and holds ONLY in memory —
     // that would let it commit (and on crash+recover lose) an op it never durably appended. So seed
@@ -724,15 +760,50 @@ impl<S: StateMachine> Endpoint<S> {
     // This reads `self.commit_min` AT ADOPT TIME, BEFORE the caller advances the commit, so the
     // predicate uses the OLD (pre-adoption) applied frontier — both callers (`adopt_canonical_head`,
     // `start_view_as_new_primary`) run `adopt_log` strictly before their `advance_commit`.
+    // Before dropping the held log, capture the adopter's OWN body bytes for any op the canonical log
+    // carries only HEADER-ONLY (`Repairing`) but the adopter already holds `Present` with a body whose
+    // checksum MATCHES the canonical `body_checksum`. The adopter's body is then the CANONICAL body the
+    // new view still needs (the canonical donor read it back faulty and carried only the header), so it
+    // must NOT be destroyed by overwriting the slot with a body-less `Repairing` entry: a replica that
+    // holds the body is the source the new primary peer-repairs from. The checksum match makes this
+    // safe — only the canonical body is preserved, never a superseded one (a different body fails the
+    // match and is dropped). This makes "Present wins over a matching Repairing" hold on the ADOPT side
+    // too, mirroring the union in `select_canonical_log`.
+    let mut preserved_bodies: BTreeMap<u64, Bytes> = BTreeMap::new();
+    for e in entries {
+      if e.is_repairing() {
+        if let Some(LogEntry {
+          body: Body::Present(body),
+          ..
+        }) = self.log.get(&e.op().get())
+        {
+          if crate::storage::fnv1a_128(body) == e.body_checksum() {
+            preserved_bodies.insert(e.op().get(), body.clone());
+          }
+        }
+      }
+    }
     let applied_floor = self.commit_min.get();
     self
       .log
       .retain(|&op, _| op <= applied_floor && !supplied.contains(&op));
     for e in entries {
-      self.log.insert(
-        e.op().get(),
-        LogEntry::present(e.client(), e.request(), e.body_bytes()),
-      );
+      // A `Present` canonical entry is adopted with its body held. A header-only `Repairing` entry is
+      // adopted repair-pending (its `body_checksum` only) UNLESS the adopter already held the matching
+      // canonical body (captured above) — then keep that body so this replica can serve / commit it. The
+      // new primary's `start_view_as_new_primary` `request_repair`s any still-header-only tail op and the
+      // commit path HOLDS at it until the body returns. Either way the op exists in `self.log`, so its
+      // number is TAKEN and never re-minted.
+      let body = match preserved_bodies.remove(&e.op().get()) {
+        Some(bytes) => Body::Present(bytes),
+        None => e.body_state().clone(),
+      };
+      let entry = LogEntry {
+        client: e.client(),
+        request: e.request(),
+        body,
+      };
+      self.log.insert(e.op().get(), entry);
     }
   }
 

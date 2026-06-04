@@ -110,6 +110,145 @@ fn new_primary_adopts_canonical_log_and_starts_view() {
 }
 
 #[test]
+fn new_primary_carries_a_header_only_repairing_op_through_the_dvc_and_repairs_it() {
+  // The committed-op-loss closed: a DoViewChange carrying a body-faulty-but-header-durable COMMITTED
+  // op (a header-only `Repairing` PreparedEntry — its body did not survive a torn-body fault on the
+  // donor, but its canonical identity + body_checksum did) must let the new primary see op 2 as TAKEN.
+  // It adopts op 2 repair-pending (NEVER re-mints its number), HOLDS the commit at it, and
+  // `request_repair`s the canonical body from a peer. A follow-up peer `Prepare` then fills the body
+  // and op 2 commits the canonical value. Before this fix the DVC dropped header-only entries, so the
+  // new primary never saw op 2 and re-minted its number for a different request (committed divergence).
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Drive replica 1 into ViewChange(view 1) as the prospective primary (reuse the SVC path).
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  // Replica 2's DVC: log_view 0, head op 2, commit 2 (BOTH committed). Op 1 has a real body; op 2 is
+  // carried HEADER-ONLY as a `Repairing` entry — the donor read its body back faulty but kept its
+  // existence + canonical body_checksum.
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  // Quorum (own op-0 DVC + replica 2's op-2 DVC) → adopt. op_head includes the Repairing op: op 2 is
+  // TAKEN, the head is 2, NOT re-minted down to 1.
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "the header-only op 2 is counted — the head is 2, its number is taken (never re-minted)"
+  );
+  // The commit HOLDS at op 2 (its body is absent) and op 2 is registered for peer fault-repair: op 1
+  // applies, op 2 does not (no apply over an absent body). `advance_commit` reaches the adopted
+  // `Repairing` op 2, finds its body absent, and `request_repair`s it — which converts the held
+  // header-only slot into a TRACKED repair hole (`self.repair`), the canonical body to be fetched.
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the commit is HELD at the body-absent op 2 (op 1 applied, op 2 not applied over an absent body)"
+  );
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is a TRACKED repair hole — its canonical body is solicited, its number stays taken (op == 2)"
+  );
+  // A RequestPrepare(op 2) is emitted to fetch the canonical body from a peer (r3/r4 in seed 774). The
+  // StartView the new primary broadcasts carries head op 2 as a HEADER-ONLY (`Repairing`) entry — its
+  // existence + canonical body_checksum, but NO fabricated body (the body is peer-fetched).
+  e.handle_storage(now, &mut wal, &mut sb); // pump the deferred StartView / repair solicitation
+  let mut solicited = false;
+  while let Some(out) = e.poll_message() {
+    match out.msg_ref() {
+      Message::RequestPrepare(rp) if rp.op() == OpNumber::with(2) => solicited = true,
+      Message::StartView(sv) => {
+        assert_eq!(
+          sv.op(),
+          OpNumber::with(2),
+          "the StartView head is op 2 (its number is taken)"
+        );
+        let op2 = sv
+          .log_slice()
+          .iter()
+          .find(|e| e.op() == OpNumber::with(2))
+          .expect("op 2 IS carried in the StartView (its existence is taken)");
+        assert!(
+          op2.is_repairing() && op2.body().is_none(),
+          "op 2 is header-only in the StartView (Repairing, no fabricated body — body peer-fetched)"
+        );
+      }
+      _ => {}
+    }
+  }
+  assert!(
+    solicited,
+    "a RequestPrepare(op 2) fetches the missing canonical body — exactly the missing-slot behavior"
+  );
+  // The repair Prepare answers with op 2's REAL body (the canonical value a peer holds). Once its
+  // append is durable, the held commit resumes and op 2 applies the canonical body — proving the hold
+  // was a genuine pause, not a loss, and the op number was never re-minted for a different request.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    repair_prepare(1, 2, 2),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "once the canonical body is repaired + durable, the held commit applies op 2"
+  );
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "the repair hole clears once the canonical body fills it"
+  );
+  let filled = e.log.get(&2).expect("op 2 stays held after repair");
+  assert!(
+    filled.body.is_present(),
+    "op 2's body is now Present (the canonical body was fetched + applied)"
+  );
+}
+
+#[test]
 fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
   // REGRESSION (the cardinal append-before-ack invariant): a new primary that adopts an
   // uncommitted-tail op it learned from a PEER's DVC (it did NOT hold the op before) must NOT count
@@ -2057,7 +2196,7 @@ fn select_canonical_log_unions_committed_ops_across_different_floor_dvcs() {
   for entry in &log {
     assert_eq!(
       entry.body(),
-      &entry.op().get().to_be_bytes()[..],
+      Some(&entry.op().get().to_be_bytes()[..]),
       "each unioned entry carries the donor's real body"
     );
   }

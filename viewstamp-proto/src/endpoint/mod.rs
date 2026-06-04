@@ -352,46 +352,11 @@ struct RecoverState {
   canonical: BTreeMap<u64, (ClientId, RequestNumber, u128)>,
 }
 
-/// A log entry's body is either Present (the bytes) or Repairing (only the durable body_checksum is
-/// known; the bytes must be peer-repaired).
-///
-/// Body-independent durable headers let a committed op's EXISTENCE survive a torn-body storage fault:
-/// the op stays in the log as a `Repairing` slot carrying just its canonical `body_checksum`, and the
-/// commit path holds at it (soliciting the body from a peer) exactly as it does for a wholly-missing
-/// slot. Not `Copy` — `Present` carries a `Bytes`.
-#[derive(Debug, Clone, PartialEq, Eq, derive_more::IsVariant)]
-enum Body {
-  /// The body bytes are held.
-  Present(Bytes),
-  /// The body is absent (torn / not-yet-repaired); only the durable canonical `body_checksum` is known.
-  /// The bytes must be peer-repaired before the op can apply.
-  ///
-  /// Constructed in production by `recover` (`Outcome::KeepRepairing`): a committed/kept op whose WAL
-  /// read came back body-faulty (durable header, torn/rotted body) is retained header-only as this
-  /// hole, so its existence survives the fault and the commit path peer-repairs the body on demand.
-  Repairing(u128),
-}
-
-impl Body {
-  /// The body bytes when [`Present`](Body::Present), else `None` (a `Repairing` slot has no bytes yet).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  fn as_present(&self) -> Option<&[u8]> {
-    match self {
-      Body::Present(bytes) => Some(bytes),
-      Body::Repairing(_) => None,
-    }
-  }
-
-  /// The canonical `body_checksum` of this op — total: computed from the bytes when
-  /// [`Present`](Body::Present), or the stored durable checksum when [`Repairing`](Body::Repairing).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  fn body_checksum(&self) -> u128 {
-    match self {
-      Body::Present(bytes) => crate::storage::fnv1a_128(bytes),
-      Body::Repairing(checksum) => *checksum,
-    }
-  }
-}
+/// The body-state of a log entry — `Present` (bytes held) or `Repairing` (header-only, body
+/// peer-repaired). ONE type shared with the wire [`crate::PreparedEntry`], so a `Repairing` op
+/// carried through a `DoViewChange`/`StartView` keeps its op number (never re-minted). Defined in
+/// [`crate::message`]; re-used here as the in-memory `LogEntry`'s body.
+pub(crate) use crate::message::Body;
 
 /// One entry in the in-memory log (persistence arrives in a later milestone). Its [`Body`] is either
 /// `Present` (the bytes) or `Repairing` (only the durable `body_checksum`, awaiting peer-repair).

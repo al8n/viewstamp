@@ -55,10 +55,12 @@ impl<S: StateMachine> Endpoint<S> {
       // pure durability barrier. The body was withheld from `self.log` until here, so it was never in a
       // DVC/StartView/checkpoint nor applied by a concurrent `advance_commit` before its append landed.
       // Safe even if a view change has begun since the fill was staged (the prior comment covers only the
-      // PENDING window): the filled op is COMMITTED (`fill_repair` only accepts a Prepare with `commit >=
-      // op`), and a committed op's body is identical across all views (committed-op survival), so applying
-      // it here is CONSISTENT with adoption — a `select_canonical_log`/`adopt_log` that supersedes the log
-      // re-derives this exact canonical committed body, never a divergent one.
+      // PENDING window): `fill_repair` accepted this body only as the CANONICAL value for the op — either
+      // committed-vouched (`commit >= op`) OR matched against a kept `Repairing` hole's durable canonical
+      // `body_checksum` (a view-change-carried op). A canonical op's body is identical across all views
+      // (committed-op survival for the vouched case; the checksum pins the exact body for the carried
+      // case), so applying it here is CONSISTENT with adoption — a `select_canonical_log`/`adopt_log` that
+      // supersedes the log re-derives this exact canonical body, never a divergent one.
       Some(Pending::RepairFill(rf)) => {
         let op = rf.op();
         self.log.insert(op.get(), rf.into_entry());

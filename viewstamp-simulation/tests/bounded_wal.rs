@@ -626,7 +626,7 @@ fn bounded_wal_backup_below_ring_window_state_syncs_instead_of_overwriting() {
   // Seeds an offline sweep (32 seeds, this exact N=12 / drop=300 / flap-5000-2500 scenario) found to
   // drive a backup below its ring window — the connected overflow fires early on each (~ticks 2.5k–7.5k),
   // well within the budget below. Re-derive with the `zz_scan` harness if the scenario changes.
-  const PROVOKING_SEEDS: [u64; 3] = [1, 20, 27];
+  const PROVOKING_SEEDS: [u64; 3] = [13, 19, 29];
   let mut total_below_ring_window_syncs = 0u64;
   for seed in PROVOKING_SEEDS {
     // N=5 (a 4-of-5 quorum always commits + checkpoints), a SMALL checkpoint interval (4) and a SMALL ring
