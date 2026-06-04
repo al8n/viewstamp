@@ -63,8 +63,8 @@ pub use prng::Prng;
 pub use state_machine::StateMachine;
 pub use status::Status;
 pub use storage::{
-  CheckpointRead, HEADER_ENCODED_LEN, HEADER_VERSION, Header, OpId, ReadOk, SlotStatus, Superblock,
-  SuperblockDone, VsrState, VsrStateError, Wal, WalDone, checkpoint_id,
+  BodyFaulty, CheckpointRead, HEADER_ENCODED_LEN, HEADER_VERSION, Header, OpId, ReadOk, SlotStatus,
+  Superblock, SuperblockDone, VsrState, VsrStateError, Wal, WalDone, checkpoint_id,
 };
 pub use time::Instant;
 #[cfg(feature = "tcp")]

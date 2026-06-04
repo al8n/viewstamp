@@ -33,8 +33,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  CheckpointRead, Header, OpId, OpNumber, Prng, ReadOk, SlotStatus, Superblock, SuperblockDone,
-  VsrState, Wal, WalDone,
+  BodyFaulty, CheckpointRead, Header, OpId, OpNumber, Prng, ReadOk, SlotStatus, Superblock,
+  SuperblockDone, VsrState, Wal, WalDone,
 };
 
 /// Seeded storage-fault plan for one replica's WAL + superblock. Deterministic per (seed, replica):
@@ -397,12 +397,12 @@ impl Wal for InMemoryWal {
   }
 
   fn header(&self, op: OpNumber) -> Option<Header> {
-    // A known-permanently-faulty (bit-rotted) slot reports no header, per the trait contract
-    // ("None = absent OR known-faulty"). A torn slot still has its original header (the tear is
-    // latent — only the body fails verify on read), so it reports its header as usual.
-    if self.rotted.contains(&op.get()) {
-      return None;
-    }
+    // The header tuple lives in `entries` and is durable from the moment the append completed
+    // (it is always written intact — only the BODY can be torn or bit-rotted). Both fault
+    // classes therefore leave the header readable: a bit-rotted slot still has its `entries`
+    // tuple, and a torn slot's header was never touched by the tear. Return `Some` for any op
+    // present in `entries`, reserving `None` for ops that were never durably appended (or were
+    // subsequently truncated / pruned / ring-wrapped).
     self.entries.get(&op.get()).map(|(h, _)| *h)
   }
 
@@ -463,9 +463,20 @@ impl Wal for InMemoryWal {
   }
 
   fn submit_read(&mut self, id: OpId, op: OpNumber) {
-    // PERMANENT bit-rot: this slot always faults.
+    // PERMANENT bit-rot: the header is durable (it lives in `entries`) but the body is
+    // unrecoverable from this replica. Emit BodyFaulty so the caller knows the op exists and
+    // can identify it, without pretending the body is valid.
     if self.rotted.contains(&op.get()) {
-      self.completions.push_back(WalDone::Fault(id));
+      // The header must be present in `entries` whenever a rot verdict is held (rot is set
+      // only at append-completion time, so the entry was written before the rot fired).
+      let stored_header = self
+        .entries
+        .get(&op.get())
+        .map(|(h, _)| *h)
+        .expect("rot entry must be present in entries");
+      self
+        .completions
+        .push_back(WalDone::BodyFaulty(BodyFaulty::new(id, stored_header)));
       return;
     }
     // TRANSIENT read fault: rolled independently per read, so a retry may succeed — this is what the
@@ -493,9 +504,11 @@ impl Wal for InMemoryWal {
         return;
       }
     }
-    // Otherwise return the stored entry. A torn body is returned AS-IS (it fails the proto's
-    // `Header::verify`), never repaired.
+    // Otherwise return the stored entry. A torn body (header present but body fails verify) is
+    // promoted to BodyFaulty — the header is durable, only the body is corrupt. An op never
+    // durably appended (not in `entries`) yields Absent.
     let done = match self.entries.get(&op.get()) {
+      Some((h, b)) if !h.verify(b) => WalDone::BodyFaulty(BodyFaulty::new(id, *h)),
       Some((h, b)) => WalDone::ReadOk(ReadOk::new(id, *h, b.clone())),
       None => WalDone::Absent(id),
     };
@@ -1045,7 +1058,7 @@ mod tests {
   }
 
   #[test]
-  fn bit_rot_makes_a_slot_permanently_faulty() {
+  fn bit_rot_makes_a_slot_permanently_body_faulty() {
     let mut w = InMemoryWal::with_faults(
       StorageFaults {
         bit_rot_per_mille: 1000,
@@ -1059,21 +1072,35 @@ mod tests {
       SlotStatus::Faulty,
       "bit-rotted slot is Faulty"
     );
-    assert!(
-      w.header(OpNumber::with(1)).is_none(),
-      "a known-faulty slot reports no header"
+    // The header is durable even when the body is permanently corrupt — the append wrote the
+    // header successfully before the rot verdict fired.
+    let stored_header = w
+      .header(OpNumber::with(1))
+      .expect("bit-rotted slot still has a durable header");
+    assert_eq!(
+      stored_header.op(),
+      OpNumber::with(1),
+      "the durable header carries the correct op"
     );
+    // Every read of a bit-rotted slot yields BodyFaulty carrying the durable header, not a bare
+    // Fault — the op is identified, only the body is unrecoverable from this replica.
     for i in 0..5u64 {
       w.submit_read(OpId::new(i), OpNumber::with(1));
-      assert!(
-        w.poll().unwrap().is_fault(),
-        "permanent: every read of a bit-rotted slot faults"
-      );
+      match w.poll() {
+        Some(WalDone::BodyFaulty(bf)) => {
+          assert_eq!(
+            bf.header(),
+            stored_header,
+            "BodyFaulty carries the durable header"
+          );
+        }
+        other => panic!("permanent bit-rot must yield BodyFaulty, got {other:?}"),
+      }
     }
   }
 
   #[test]
-  fn torn_write_fails_proto_verify_on_read() {
+  fn torn_write_yields_body_faulty_on_read() {
     let mut w = InMemoryWal::with_faults(
       StorageFaults {
         torn_write_per_mille: 1000,
@@ -1082,17 +1109,26 @@ mod tests {
       1,
     );
     append(&mut w, 1, b"intact");
-    // A torn slot keeps its ORIGINAL header (the tear is latent) and reports Clean — only the body
-    // fails verify on read, exactly the corruption a dumb backend cannot hide from the proto.
+    // A torn slot keeps its ORIGINAL header (the tear is latent — only the stored body bytes are
+    // corrupt) and reports Clean. The header is fully durable and readable.
     assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Clean);
-    assert!(w.header(OpNumber::with(1)).is_some());
+    let stored_header = w
+      .header(OpNumber::with(1))
+      .expect("torn slot still has its original durable header");
+    assert_eq!(stored_header.op(), OpNumber::with(1));
+    // A read of a torn slot yields BodyFaulty (header durable, body unverifiable) — not a bare
+    // ReadOk with a corrupt body that the caller must re-check, and not a bare Fault that
+    // discards the known-durable header.
     w.submit_read(OpId::new(2), OpNumber::with(1));
     match w.poll() {
-      Some(WalDone::ReadOk(r)) => assert!(
-        !r.header().verify(r.body()),
-        "a torn body fails the proto's Header::verify"
-      ),
-      other => panic!("torn write should still yield a (corrupt) ReadOk, got {other:?}"),
+      Some(WalDone::BodyFaulty(bf)) => {
+        assert_eq!(
+          bf.header(),
+          stored_header,
+          "BodyFaulty carries the durable original header"
+        );
+      }
+      other => panic!("torn write must yield BodyFaulty, got {other:?}"),
     }
   }
 
@@ -1215,11 +1251,94 @@ mod tests {
     append(&mut w, 1, b"x");
     assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Faulty);
     // No "restart" resets the struct — the Cluster reuses the same `InMemoryWal`. Re-reading still
-    // faults, proving the verdict is stable for the lifetime of the durable medium.
+    // yields BodyFaulty (the rot verdict is permanent), proving the verdict is stable for the
+    // lifetime of the durable medium.
     for i in 0..3u64 {
       w.submit_read(OpId::new(i), OpNumber::with(1));
-      assert!(w.poll().unwrap().is_fault());
+      assert!(
+        w.poll().unwrap().is_body_faulty(),
+        "a permanently bit-rotted slot always yields BodyFaulty"
+      );
     }
+  }
+
+  // ── Task-2 durable-header tests ──
+
+  #[test]
+  fn rotted_op_header_survives_and_read_yields_body_faulty() {
+    // An appended-then-rotted op must keep its durable header (the header tuple in `entries` is
+    // intact; only the body is unrecoverable from this replica). A read must yield BodyFaulty
+    // carrying that header, not a bare Fault.
+    let mut w = InMemoryWal::with_faults(
+      StorageFaults {
+        bit_rot_per_mille: 1000,
+        ..StorageFaults::none()
+      },
+      42,
+    );
+    append(&mut w, 3, b"payload");
+    // header() returns Some even for a rotted slot.
+    let stored = w
+      .header(OpNumber::with(3))
+      .expect("rotted slot still has a durable header");
+    assert_eq!(stored.op(), OpNumber::with(3));
+    // A read yields BodyFaulty carrying the durable header.
+    w.submit_read(OpId::new(1), OpNumber::with(3));
+    match w.poll() {
+      Some(WalDone::BodyFaulty(bf)) => {
+        assert_eq!(bf.id(), OpId::new(1));
+        assert_eq!(bf.header(), stored, "carries the durable header");
+      }
+      other => panic!("rotted slot must yield BodyFaulty, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn torn_op_header_survives_and_read_yields_body_faulty() {
+    // An appended-then-torn op must keep its durable header (the tear only flips a body byte;
+    // the stored header tuple in `entries` is the original intact header). A read must yield
+    // BodyFaulty carrying that header.
+    let mut w = InMemoryWal::with_faults(
+      StorageFaults {
+        torn_write_per_mille: 1000,
+        ..StorageFaults::none()
+      },
+      42,
+    );
+    append(&mut w, 7, b"content");
+    // header() returns Some for a torn slot (the tear is latent — only the body is corrupt).
+    let stored = w
+      .header(OpNumber::with(7))
+      .expect("torn slot still has its original durable header");
+    assert_eq!(stored.op(), OpNumber::with(7));
+    // A read yields BodyFaulty carrying the durable header.
+    w.submit_read(OpId::new(1), OpNumber::with(7));
+    match w.poll() {
+      Some(WalDone::BodyFaulty(bf)) => {
+        assert_eq!(bf.id(), OpId::new(1));
+        assert_eq!(bf.header(), stored, "carries the original durable header");
+      }
+      other => panic!("torn slot must yield BodyFaulty, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn never_appended_op_yields_absent() {
+    // An op that was never durably appended (not in `entries`) must yield Absent on a read —
+    // not BodyFaulty (there is no durable header to carry) and not Fault.
+    let mut w = InMemoryWal::new();
+    // Append op 1 to keep the WAL non-empty; op 99 was never appended.
+    append(&mut w, 1, b"x");
+    assert!(
+      w.header(OpNumber::with(99)).is_none(),
+      "a never-appended op has no durable header"
+    );
+    w.submit_read(OpId::new(5), OpNumber::with(99));
+    assert_eq!(
+      w.poll(),
+      Some(WalDone::Absent(OpId::new(5))),
+      "a never-appended op yields Absent, not BodyFaulty"
+    );
   }
 
   /// A durable VSR root naming `checkpoint_op` (with a matching `commit >= checkpoint_op` and no
@@ -1649,11 +1768,14 @@ mod tests {
     );
     w.submit_read(OpId::new(9), OpNumber::with(1));
     match w.poll() {
-      Some(WalDone::ReadOk(r)) => assert!(
-        !r.header().verify(r.body()),
-        "the durable torn body fails the proto's Header::verify"
-      ),
-      other => panic!("expected a (corrupt) ReadOk, got {other:?}"),
+      Some(WalDone::BodyFaulty(bf)) => {
+        assert_eq!(
+          bf.header().op(),
+          OpNumber::with(1),
+          "BodyFaulty carries the durable header for the async torn write"
+        );
+      }
+      other => panic!("expected BodyFaulty for a durable torn slot, got {other:?}"),
     }
   }
 
