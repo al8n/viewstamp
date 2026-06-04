@@ -488,7 +488,7 @@ impl StartView {
     self.replica
   }
 
-  /// The canonical log as a slice — the new primary's UNIONed offset tail `(min_floor .. op]` (B3),
+  /// The canonical log as a slice — the new primary's UNIONed offset tail `(min_floor .. op]`,
   /// which an adopter merges with its own preserved committed ops (it is not necessarily dense
   /// `[1..=op]` if the primary itself checkpointed/state-synced).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -679,7 +679,7 @@ impl RecoveryResponse {
   }
 
   /// The canonical log as a slice (empty from a backup) — a primary's UNIONed offset tail
-  /// `(min_floor .. op]` (B3), merged by the adopter with its own preserved committed ops; not
+  /// `(min_floor .. op]`, merged by the adopter with its own preserved committed ops; not
   /// necessarily dense `[1..=op]`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn log_slice(&self) -> &[PreparedEntry] {
@@ -771,7 +771,7 @@ impl RequestSync {
 /// Peer → lagging replica (state-sync response): the latest durable checkpoint — its op, its content
 /// id, and the opaque snapshot envelope (the client-session table + `sm.snapshot()` produced by the
 /// proto's `encode_checkpoint`, modelled as one `Bytes`; the wire codec / chunking of a large snapshot
-/// is M4). The requester MUST verify `checkpoint_id == checkpoint_id(snapshot)` (a content hash) BEFORE
+/// is deferred to a later milestone). The requester MUST verify `checkpoint_id == checkpoint_id(snapshot)` (a content hash) BEFORE
 /// restoring — never restore a corrupt/mismatched checkpoint — then `sm.restore` + restore the session
 /// table + set `commit_min == commit_max == checkpoint_op`. `nonce` echoes the soliciting
 /// [`RequestSync`] (a stale reply is dropped). Not `Copy` (it carries owned `Bytes`).
@@ -1082,6 +1082,51 @@ impl Message {
       }
     }
     out.freeze()
+  }
+
+  /// The exact number of bytes [`Self::encode`] would produce for this message, computed WITHOUT
+  /// encoding (no allocation/copy). It sums the same fixed-width scalars, length-prefixed payloads,
+  /// and log slices that `encode` writes, so the transport can preflight a message against its
+  /// frame cap before paying for a full encode of an oversized one. The `#[cfg(test)]`
+  /// `encoded_len() == encode().len()` equivalence assertion below pins the two together so they
+  /// cannot drift; if a future field changes `encode`, update both.
+  pub fn encoded_len(&self) -> usize {
+    // Shared per-encoding prefix: WIRE_VERSION (u16) + the variant discriminant tag (u8).
+    const HEADER: usize = 2 + 1;
+    // Fixed-width scalar widths as `encode` writes them.
+    const U64: usize = 8;
+    const U128: usize = 16;
+    const U8: usize = 1;
+    // A `write_bytes_u32` payload is a u32 length prefix plus the bytes.
+    fn bytes_u32(len: usize) -> usize {
+      4 + len
+    }
+    // A `write_log` slice is a u32 count plus, per entry, op(u64) + client(u128) + request(u64) and
+    // a length-prefixed body.
+    fn log(log: &[PreparedEntry]) -> usize {
+      let mut n = 4;
+      for e in log {
+        n += U64 + U128 + U64 + bytes_u32(e.body.len());
+      }
+      n
+    }
+    let body = match self {
+      Self::Request(m) => U128 + U64 + bytes_u32(m.body.len()),
+      Self::Prepare(m) => U64 + U64 + U64 + U64 + U128 + U64 + bytes_u32(m.body.len()),
+      Self::PrepareOk(_) => U64 + U64 + U8 + U64,
+      Self::Reply(m) => U64 + U128 + U64 + bytes_u32(m.body.len()),
+      Self::Commit(_) => U64 + U64 + U64,
+      Self::StartViewChange(_) => U64 + U8,
+      Self::DoViewChange(m) => U64 + U64 + U64 + U64 + U8 + log(&m.log),
+      Self::StartView(m) => U64 + U64 + U64 + U8 + log(&m.log),
+      Self::GetView(_) => U64 + U8 + U64,
+      Self::RequestPrepare(_) => U64 + U64 + U8,
+      Self::Recovery(_) => U8 + U64,
+      Self::RecoveryResponse(m) => U64 + U64 + U64 + U8 + U64 + log(&m.log),
+      Self::RequestSync(_) => U64 + U64 + U8 + U64 + U8,
+      Self::SyncCheckpoint(m) => U64 + U64 + U128 + U8 + U64 + bytes_u32(m.snapshot.len()),
+    };
+    HEADER + body
   }
 
   /// Decodes a message produced by [`Self::encode`], bounds-checked and panic-free on any
@@ -1708,6 +1753,30 @@ mod tests {
         Bytes::from_static(b"snapshot-envelope"),
       )),
     ]
+  }
+
+  #[test]
+  fn encoded_len_matches_encode_len_for_every_variant() {
+    // The preflight size must exactly equal the encoded length for every variant (incl. empty and
+    // populated bodies/log slices), so the transport's pre-encode frame-cap check can never disagree
+    // with the bytes a subsequent encode would actually produce.
+    for m in one_of_each_variant() {
+      assert_eq!(
+        m.encoded_len(),
+        m.encode().len(),
+        "encoded_len() must equal encode().len() for {}",
+        m.kind_str()
+      );
+    }
+    // Also the recovery=false RequestSync, whose bool is the only field that differs by value.
+    let rq = Message::RequestSync(RequestSync::new(
+      View::with(4),
+      OpNumber::with(2),
+      ReplicaId::new(3),
+      0xBEEF,
+      false,
+    ));
+    assert_eq!(rq.encoded_len(), rq.encode().len());
   }
 
   #[test]
