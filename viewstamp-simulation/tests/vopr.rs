@@ -134,7 +134,19 @@ use viewstamp_simulation::{DEFAULT_TICKS, run_vopr, run_vopr_one};
 /// async-superblock mode ON in [`run_vopr`] (the pending-durable-view window), this whole
 /// `0..SEEDS` range is verified clean — including the `vsr_headers` recovery cross-check fix and
 /// the final-quiesce fix (a wide `0..512` catch-panic re-scan with async-SB on is clean end to end).
+///
+/// The `VOPR_SEEDS` env var overrides this contiguous count at runtime (default 64): a release-mode
+/// sweep — run locally or by the `vopr` CI workflow — sets `VOPR_SEEDS=1024` (or `2048`) to scan far
+/// wider without recompiling. The pinned [`REGRESSION_SEEDS`] are always appended regardless.
 const SEEDS: u64 = 64;
+
+/// The contiguous seed count to sweep this run: `VOPR_SEEDS` if set and parseable, else [`SEEDS`].
+fn sweep_seed_count() -> u64 {
+  std::env::var("VOPR_SEEDS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(SEEDS)
+}
 
 /// Seeds that historically caught a real bug, pinned as regression protection even above the contiguous
 /// `0..SEEDS` range. All pass with the async-superblock mode on; these guard against any of those
@@ -165,7 +177,12 @@ fn vopr_sweep_no_violations() {
   let mut total_below_ring_window_syncs = 0u64;
   let mut max_bounded_committed = 0usize;
   let mut any_bounded_wrapped = false;
-  for seed in (0..SEEDS).chain(REGRESSION_SEEDS.iter().copied()) {
+  let contiguous = sweep_seed_count();
+  println!(
+    "VOPR sweep: 0..{contiguous} contiguous + {} pinned regression seeds, {DEFAULT_TICKS} ticks each",
+    REGRESSION_SEEDS.len()
+  );
+  for seed in (0..contiguous).chain(REGRESSION_SEEDS.iter().copied()) {
     let r = run_vopr(seed, DEFAULT_TICKS);
     total_committed += r.max_committed();
     total_crashes += r.crashes();
@@ -268,6 +285,55 @@ fn vopr_sweep_no_violations() {
   // only assert it when it IS reachable on this range, and otherwise leave it observed. (Currently it is
   // not consistently hit by the committed range, so this stays a soft observation, never a hard gate.)
   let _ = total_below_ring_window_syncs;
+  println!(
+    "VOPR sweep OK: committed={total_committed} crashes={total_crashes} restarts={total_restarts} \
+     partitions={total_partitions} view_change_seeds={seeds_with_view_change} \
+     bounded_seeds={bounded_seeds} wal_stalls={total_wal_stalls} misdirects={total_misdirects} \
+     forced_syncs={total_forced_syncs} max_recovered_band={max_recovered_band}"
+  );
+}
+
+/// Diagnostic (NOT a gate): sweep `0..VOPR_SEEDS` (default 64) but CATCH each seed's violation with
+/// [`std::panic::catch_unwind`] instead of failing fast, so ONE run records EVERY failing seed + its
+/// message rather than aborting at the first. Use it to audit a wide range for failure CLASSES — the
+/// messages carry `seed S tick T: <class>: ...`, so they group by class: e.g.
+/// `VOPR_SEEDS=2048 cargo test --release -p viewstamp-simulation --test vopr vopr_collect_failures
+/// -- --ignored --nocapture`. Ignored so it never runs in the normal sweep.
+#[test]
+#[ignore = "failure-collecting sweep: set VOPR_SEEDS and run with --ignored --nocapture to record all failing seeds"]
+fn vopr_collect_failures() {
+  let count = sweep_seed_count();
+  // Silence the per-panic hook for the sweep so a failing seed does not spam stderr with a backtrace;
+  // the message is recovered from the caught panic payload instead.
+  let prev_hook = std::panic::take_hook();
+  std::panic::set_hook(Box::new(|_| {}));
+  let mut failures: Vec<(u64, String)> = Vec::new();
+  for seed in 0..count {
+    if seed % 256 == 0 {
+      eprintln!(
+        "  ... seed {seed}/{count}, {} failures so far",
+        failures.len()
+      );
+    }
+    if let Err(payload) = std::panic::catch_unwind(|| run_vopr(seed, DEFAULT_TICKS)) {
+      let msg = if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+      } else if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+      } else {
+        "<non-string panic payload>".to_string()
+      };
+      failures.push((seed, msg));
+    }
+  }
+  std::panic::set_hook(prev_hook);
+  println!(
+    "=== VOPR failure sweep 0..{count}: {} failing seeds ===",
+    failures.len()
+  );
+  for (seed, msg) in &failures {
+    println!("  seed {seed}: {msg}");
+  }
 }
 
 /// Regression for the final-quiesce fix: a FINAL-INSTANT durability-checker artifact, NOT a proto loss.
@@ -307,17 +373,20 @@ fn seed_313_final_quiesce_converges_the_durably_held_committed_tail() {
   );
 }
 
-/// Replay a SINGLE seed in isolation, with output captured, for debugging a sweep failure. Set `SEED`
-/// to the seed of interest and run with `--ignored --nocapture`. (Ignored so it does not run in the
-/// normal sweep; it is a debugging aid, not a gate.) Pair with the `VOPR_DUMP` / `VOPR_TRACE` /
-/// `VOPR_NO_*` env switches in `src/vopr.rs` to dump divergence state, trace actions, or shrink the
-/// fault set while staying on the exact same seeded schedule. (The sweep is currently clean to `0..256`;
-/// set `SEED` to any seed you want to inspect — e.g. a historical bug-finder like 24, 36, or 164.)
+/// Replay a SINGLE seed in isolation, with output captured, for debugging a sweep failure. Set
+/// `VOPR_SEED` to the seed of interest and run with `--ignored --nocapture`. (Ignored so it does not
+/// run in the normal sweep; it is a debugging aid, not a gate.) Pair with the `VOPR_DUMP` /
+/// `VOPR_TRACE` / `VOPR_NO_*` env switches in `src/vopr.rs` to dump divergence state, trace actions, or
+/// shrink the fault set while staying on the exact same seeded schedule. (Set `VOPR_SEED` to any seed
+/// you want to inspect — e.g. a historical bug-finder like 24, 36, or 164.)
 #[test]
-#[ignore = "single-seed replay: set SEED and run with --ignored --nocapture to debug a sweep failure"]
+#[ignore = "single-seed replay: set VOPR_SEED and run with --ignored --nocapture to debug a sweep failure"]
 fn replay_single_seed() {
-  const SEED: u64 = 36;
-  let r = run_vopr_one(SEED);
+  let seed = std::env::var("VOPR_SEED")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(36);
+  let r = run_vopr_one(seed);
   println!(
     "vopr seed {} OK: ticks={} replicas={} clients={} max_committed={} crashes={} restarts={} \
      partitions={} heals={} calm_windows={} max_view={} all_clients_done={} \
