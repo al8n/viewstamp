@@ -15,13 +15,25 @@ default = ["std"]
 # not compile — that is the intended signal).
 alloc = []
 std = ["bytes/std"]
+# Network transport, folded in as feature-gated modules (additive over the core).
+# `tcp` is no_std+alloc; no new REQUIRED deps. `tls` adds the rustls record layer,
+# implies `tcp` (reuses the framing/Conn/router) and `std` (rustls is std-only).
+tcp = ["alloc"]
+tls = ["tcp", "std", "dep:rustls"]
+tls-rustls-ring = ["tls", "rustls/ring"]
+tls-rustls-aws-lc-rs = ["tls", "rustls/aws_lc_rs"]
+tls-rustls-aws-lc-rs-fips = ["tls", "rustls/fips"]
 
 [dependencies]
 bytes = { workspace = true }
 derive_more = { workspace = true, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 thiserror = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
+rcgen = "0.14"
+ring = "0.17"
+rustls = { version = "0.23", features = ["ring"] }
 
 [lints]
 workspace = true

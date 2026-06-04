@@ -45,6 +45,9 @@ mod state_machine;
 mod status;
 mod storage;
 mod time;
+#[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
+mod transport;
 pub use codec::{CodecError, WIRE_VERSION};
 pub use config::{Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS};
 pub use endpoint::Endpoint;
@@ -64,3 +67,12 @@ pub use storage::{
   SuperblockDone, VsrState, VsrStateError, Wal, WalDone, checkpoint_id,
 };
 pub use time::Instant;
+#[cfg(feature = "tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
+pub use transport::{
+  Conn, ConnId, Intake, LabelOptions, Labeled, Passthrough, PeerRouter, StreamCoordinator,
+  StreamTransport, TransportError,
+};
+#[cfg(feature = "tls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
+pub use transport::{TlsOptions, TlsRecords};

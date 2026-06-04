@@ -49,7 +49,7 @@ impl ClientId {
 }
 
 /// The source or destination of a protocol message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Peer {
   /// A peer replica.
   Replica(ReplicaId),
