@@ -288,7 +288,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// (re)arm the solicit timer. An ordinary state-sync request is answered only by a `Normal` peer with
   /// a STRICTLY-newer durable checkpoint; a RECOVERY peer-fetch (`awaiting_peer_checkpoint()` — our own
   /// checkpoint snapshot is permanently unreadable) sets the `recovery` flag so a peer at the SAME
-  /// `checkpoint_op` also serves it (F2: without this, an idle cluster where every healthy peer holds
+  /// `checkpoint_op` also serves it (without this, an idle cluster where every healthy peer holds
   /// exactly our checkpoint_op ignores the request forever → recovery livelocks).
   pub(crate) fn send_request_sync(&mut self, now: Instant) {
     let nonce = self.sync.map_or(self.nonce, |s| s.nonce);
@@ -343,7 +343,7 @@ impl<S: StateMachine> Endpoint<S> {
     if self.checkpoint_op.get() == 0 {
       return; // nothing durable to serve — silent.
     }
-    // A RECOVERY peer-fetch (F2) is served at an EQUAL checkpoint too: the requester's OWN snapshot
+    // A RECOVERY peer-fetch is served at an EQUAL checkpoint too: the requester's OWN snapshot
     // bytes are corrupt, so it needs ours even at the same `checkpoint_op`. (We are `Normal` — checked
     // above — so our durable snapshot is trustworthy.) An ordinary state-sync request keeps the strict
     // `>`: never ship a megabyte snapshot for a no-op when the requester is already at our checkpoint.
@@ -390,7 +390,7 @@ impl<S: StateMachine> Endpoint<S> {
     if to.get() >= self.config.replica_count() {
       return; // defensive range re-check.
     }
-    // Only ship when the READ's op matches our CURRENT durable `checkpoint_op` (F3): we advertise
+    // Only ship when the READ's op matches our CURRENT durable `checkpoint_op`: we advertise
     // `cr.op()` and bind it into the snapshot, so the op we ship must be the one whose bytes these are.
     // If we checkpointed forward between submit and completion (a newer checkpoint write landed), the
     // returned bytes may be the OLD snapshot under a stale op — drop rather than ship a mismatched pair
@@ -505,7 +505,7 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// STAGE a verified `SyncCheckpoint`. Runs the up-front
-  /// VERIFICATION (the forced-vs-ordinary release-active assert, the fallible decode, the F3 BIND-CHECK)
+  /// VERIFICATION (the forced-vs-ordinary release-active assert, the fallible decode, the BIND-CHECK)
   /// — these mutate nothing — then stages the durable re-persist (the two superblock writes, reusing the
   /// checkpoint sequence) and REMEMBERS the install in `pending_install`. The DESTRUCTIVE install
   /// (restore the SM/sessions, advance `commit_min`/`commit_max`/`op`, prune the WAL, advance
@@ -563,7 +563,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// `>= commit_min` debug-assert + the `set_commit_min` monotone choke would trip). So DROP it (early
   /// return, nothing staged) instead of asserting — a crash on a valid in-model reordering is itself a
   /// liveness/DoS bug. The LEGITIMATE forced sync (`commit_min <= checkpoint_op <= self.op`, the
-  /// held-tail / seed-164 case) still STAGEs + INSTALLs unchanged.
+  /// held-tail case) still STAGEs + INSTALLs unchanged.
   ///
   /// **Never sync past uncommitted state.** The synced `checkpoint_op` is, by definition, a checkpoint
   /// a peer made durable — a quorum committed+applied through it — and we additionally gate on
@@ -620,7 +620,7 @@ impl<S: StateMachine> Endpoint<S> {
     let Some((bound_op, sessions, sm_tail)) = Self::decode_checkpoint(m.snapshot()) else {
       return;
     };
-    // BIND-CHECK (F3, safety): the op hashed INTO the snapshot must equal the advertised `checkpoint_op`
+    // BIND-CHECK (safety): the op hashed INTO the snapshot must equal the advertised `checkpoint_op`
     // the install will advance `commit_min`/`commit_max`/`op` to. A faulty peer can ship STALE snapshot
     // bytes (whose real frontier is op A) under an OVERSTATED `checkpoint_op = B > A` whose hash still
     // matches the old bytes; without this check the install would restore the OLDER SM yet advance the

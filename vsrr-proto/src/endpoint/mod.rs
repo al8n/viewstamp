@@ -179,7 +179,7 @@ struct SyncState {
 /// outlive the message) so the install reconstructs the synced state without re-decoding.
 #[derive(Debug)]
 pub(crate) struct PendingInstall {
-  /// The synced checkpoint op (== the op BOUND into the snapshot, F3) the install advances to.
+  /// The synced checkpoint op (== the op BOUND into the snapshot) the install advances to.
   checkpoint_op: OpNumber,
   /// The decoded client-session table to install (`self.clients`).
   sessions: BTreeMap<u128, Session>,
@@ -206,7 +206,7 @@ pub(crate) struct PendingInstall {
 /// NOT folded in here — they are live in `Status::Normal` too (a backup that proposed a view change off
 /// its idle timer, or a primary forfeiting, accumulates `svc_from` toward the quorum and re-broadcasts
 /// `svc_target` while STILL Normal, only entering `ViewChange` once the SVC quorum forms — see
-/// `propose_next_view`/`join_svc`/the FIX-1 Normal-backup `svc_message` retransmit). They span the
+/// `propose_next_view`/`join_svc`/the Normal-backup `svc_message` retransmit). They span the
 /// status boundary, so they stay flat; only the genuinely ViewChange-confined state is reified.
 #[derive(Debug)]
 struct ViewChangeCollection {
@@ -324,9 +324,9 @@ struct RecoverState {
   /// names a snapshot that is PERMANENTLY unreadable or permanently inconsistent with the root (wrong
   /// op/hash/unparsable on EVERY read) — the replica cannot restore its SM from its OWN disk and
   /// escalates to a peer fetch (see `awaiting_peer_checkpoint`), never panics on storage-controlled
-  /// bytes (F1).
+  /// bytes.
   checkpoint_retries: u8,
-  /// `true` once the local checkpoint read EXHAUSTED its budget (F1): the replica's own durable
+  /// `true` once the local checkpoint read EXHAUSTED its budget: the replica's own durable
   /// checkpoint snapshot is permanently unreadable/inconsistent, so it has escalated to FETCHING the
   /// checkpoint from a peer via state-sync (a forced `sync` is armed + a `RequestSync` solicited).
   /// While set, `recover_progress` will NOT complete recovery (the SM is not yet restored), and
@@ -343,7 +343,7 @@ struct RecoverState {
   /// `on_recover_wal_done` checks its `(client, request, body_checksum)` against the entry here: ANY
   /// mismatch means the WAL slot is STALE/superseded (a stale-body hazard, OR a same-body
   /// different-identity slot whose own header is internally consistent), so the slot is DROPPED and
-  /// routed to peer-repair (the B4 path) instead of being re-derived from the WAL. The `view` is
+  /// routed to peer-repair (the fault-repair path) instead of being re-derived from the WAL. The `view` is
   /// deliberately NOT part of the identity here: `committed_band_headers()` rewrites each entry's view to
   /// the current root view, so the persisted view is not the op's original view — comparing it would
   /// spuriously mismatch every band entry. Ops NOT present here (above the persisted band, or with no
@@ -352,7 +352,7 @@ struct RecoverState {
   canonical: BTreeMap<u64, (ClientId, RequestNumber, u128)>,
 }
 
-/// One entry in the in-memory log (M1; persistence arrives in M3).
+/// One entry in the in-memory log (persistence arrives in a later milestone).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogEntry {
   client: ClientId,
@@ -613,7 +613,7 @@ pub struct Endpoint<S> {
   /// not participate in consensus (the `handle_message` guard) and so cannot enter a view change
   /// while recovering.
   recover: Option<RecoverState>,
-  /// Peer fault-repair (B4): committed ops whose body read back PERMANENTLY faulty (bit-rot / torn)
+  /// Peer fault-repair: committed ops whose body read back PERMANENTLY faulty (bit-rot / torn)
   /// from this replica's own durable WAL and must be re-fetched from a peer (`RequestPrepare` →
   /// `Prepare`). An op lands here when the recover loop classes a non-head committed slot permanently
   /// faulty (it is dropped from the dense `log` cache so it cannot be applied with a wrong/empty body)
@@ -1022,7 +1022,7 @@ impl<S> Endpoint<S> {
   }
 
   /// Whether this `Recovering` replica's OWN checkpoint read exhausted and it is now fetching the
-  /// checkpoint from a peer (F1). `false` in every other state (incl. when `recover` is `None`).
+  /// checkpoint from a peer. `false` in every other state (incl. when `recover` is `None`).
   fn awaiting_peer_checkpoint(&self) -> bool {
     self
       .recover
@@ -1161,7 +1161,7 @@ impl<S> Endpoint<S> {
   }
 
   /// Test-only: is this `Recovering` replica awaiting a PEER checkpoint after its own checkpoint read
-  /// exhausted (the F1 escalation)?
+  /// exhausted (the peer-fetch escalation)?
   #[cfg(test)]
   fn awaiting_peer_checkpoint_for_test(&self) -> bool {
     self.awaiting_peer_checkpoint()
@@ -1618,7 +1618,7 @@ where
     // blocks the higher-view `catch_up_to_view` pre-checks inside the per-message handlers (which
     // would otherwise yank a recovering replica into ViewChange mid-recovery).
     //
-    // The ONE exception (F1): a replica whose OWN durable checkpoint read exhausted its budget cannot
+    // The ONE exception: a replica whose OWN durable checkpoint read exhausted its budget cannot
     // restore its SM from disk and is FETCHING the checkpoint from a peer (`awaiting_peer_checkpoint`).
     // It must accept the answering `SyncCheckpoint` — mirroring how a `RecoveringHead` replica accepts
     // a `StartView` to learn its head. Every other message is still dropped (it casts no ack/vote).
@@ -1680,7 +1680,7 @@ where
           self.on_primary_idle(now, sb);
           self.timers.primary_idle = Some(now + PRIMARY_IDLE);
         }
-        // FIX 1: once this backup has PROPOSED a view change off
+        // Once this backup has PROPOSED a view change off
         // its idle timeout (`on_primary_idle` -> `propose_next_view` -> `join_svc`), it ARMS `svc_message`
         // (the SVC retransmit) — but until a view-change quorum forms it stays Normal, and this branch
         // would otherwise service ONLY `primary_idle`, orphaning `svc_message` (`view_change_timeouts`,
@@ -1892,7 +1892,7 @@ where
   ///   !pending_forfeit`.
   /// - `primary_idle`: the Normal-BACKUP branch.
   /// - `svc_message`: re-broadcast by the Normal-primary forfeit re-propose (`pending_forfeit`), by the
-  ///   Normal-BACKUP idle-SVC retransmit (FIX 1), and by `view_change_timeouts` while not catching up.
+  ///   Normal-BACKUP idle-SVC retransmit, and by `view_change_timeouts` while not catching up.
   /// - `dvc_message`: `view_change_timeouts`, not catching up, AND the view is durable
   ///   (`pending_sb.is_none()`) — the DVC is a vote, so it must not be (re)cast before the view is
   ///   recoverable (durable-view-before-participate in the retransmit path).
@@ -1905,7 +1905,7 @@ where
   ///   re-solicit rides the `recover_retry` deadline (`recover_timeouts`), NOT `sync_solicit` — so the
   ///   `sync_solicit` deadline itself is NOT serviced there and must be filtered out of `poll_timeout`
   ///   (a corrected entry vs. the draft table: had it been left "Recovering too", a `sync_solicit`
-  ///   armed during the F1 peer-fetch would have been the very spin this refactor forbids).
+  ///   armed during the peer-fetch would have been the very spin this refactor forbids).
   fn serviceable_now(&self, kind: TimerKind) -> bool {
     match kind {
       // The Normal-primary heartbeat tick services these only when NOT forfeiting and the view is
@@ -1914,7 +1914,7 @@ where
         self.participates_as_primary() && !self.pending_forfeit
       }
       TimerKind::PrimaryIdle => self.status.is_normal() && !self.is_primary(),
-      // Three disjoint servicers (see the doc): forfeit re-propose, FIX-1 backup retransmit, or the
+      // Three disjoint servicers (see the doc): forfeit re-propose, backup retransmit, or the
       // active view-change driver.
       TimerKind::SvcMessage => {
         (self.status.is_normal() && self.is_primary() && self.pending_forfeit)
@@ -1968,7 +1968,7 @@ where
   /// | has_reply: u8 | (if has_reply) reply_request: u64 BE, reply_len: u32 BE, reply_bytes ] |
   /// sm_snapshot_bytes`.
   ///
-  /// **The leading `checkpoint_op` BINDS the op into the content hash (F3, safety).** `checkpoint_id`
+  /// **The leading `checkpoint_op` BINDS the op into the content hash (safety).** `checkpoint_id`
   /// is `hash(envelope)`, so a faulty/forged superblock cannot ship STALE snapshot bytes (whose real
   /// frontier is op A) under an OVERSTATED advertised `checkpoint_op = B > A`: the restore paths decode
   /// this leading op and reject the snapshot unless it equals the advertised op, closing the silent
@@ -2005,7 +2005,7 @@ where
   /// the snapshot *content* (that it is the RIGHT checkpoint) is established separately by the
   /// `checkpoint_id` hash check at each call site; this method only guarantees safe *parsing*.
   ///
-  /// The decoded `checkpoint_op` (the leading u64) is the op BOUND into the hash (F3): every restore
+  /// The decoded `checkpoint_op` (the leading u64) is the op BOUND into the hash: every restore
   /// path verifies it equals the advertised `cr.op()` / `m.checkpoint_op()` BEFORE restoring, so an
   /// overstated advertised op over stale-but-consistent bytes is rejected rather than silently dropping
   /// the committed ops above the snapshot's real frontier.
@@ -2027,7 +2027,7 @@ where
       Some(u128::from_be_bytes(bytes.try_into().ok()?))
     }
     let mut i = 0usize;
-    let checkpoint_op = OpNumber::with(take_u64(env, &mut i)?); // the BOUND op (F3)
+    let checkpoint_op = OpNumber::with(take_u64(env, &mut i)?); // the BOUND op
     let count = take_u32(env, &mut i)? as usize;
     let mut sessions = BTreeMap::new();
     for _ in 0..count {

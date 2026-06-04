@@ -58,7 +58,7 @@ fn backup_buffers_out_of_order_prepares() {
 
 #[test]
 fn backup_caches_the_reply_so_a_backup_turned_primary_can_resend_it() {
-  // REGRESSION (the lost-reply-across-failover hang the M3 sweep exposed): the primary caches each
+  // REGRESSION (the lost-reply-across-failover hang): the primary caches each
   // committed reply (`commit_op`), but a BACKUP used to discard it. So if a client's reply was LOST
   // in flight and the primary then failed over, the new primary (a former backup) saw the client's
   // resend as a duplicate (`request == session.request`) yet had NO cached reply to resend — staying
@@ -438,7 +438,7 @@ fn on_request_is_dropped_while_a_sync_or_checkpoint_persist_is_in_flight() {
 fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   // SAFETY (at-most-once / sessions-caught-up): a primary must NOT assign a fresh op to a client while
   // its committed prefix is unapplied (`commit_max > commit_min` — a committed op is KNOWN but held by
-  // a B4 repair hole). The session/dedup table (`self.clients`) is only updated as ops APPLY, so during
+  // a repair hole). The session/dedup table (`self.clients`) is only updated as ops APPLY, so during
   // the gap a just-committed client request is ABSENT from the table → a retry would be mis-seen as NEW
   // and assigned an op ABOVE the gap → when the hole fills, the apply loop (which has no dedup) would
   // execute BOTH the original AND the duplicate → divergence. The primary must catch up first; the

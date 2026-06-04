@@ -1,7 +1,7 @@
 use super::*;
 
 impl<S: StateMachine> Endpoint<S> {
-  /// Register op `op` for peer fault-repair (B4): its committed body read back permanently faulty, so
+  /// Register op `op` for peer fault-repair: its committed body read back permanently faulty, so
   /// we drop any stale (header-only / wrong) cache entry, record the hole, immediately solicit the op
   /// from peers, and arm the repair-retry timer. The COMMIT IS HELD below `op` by the apply loops
   /// (they break at the first missing op) — this never advances `commit_min` past the hole. Idempotent
@@ -105,7 +105,7 @@ impl<S: StateMachine> Endpoint<S> {
     ));
   }
 
-  /// Fill a peer-supplied `Prepare` for an op in our pending-repair set (B4), then resume the held
+  /// Fill a peer-supplied `Prepare` for an op in our pending-repair set, then resume the held
   /// commit. Two guards protect the committed slot:
   /// - **Placement** (`p.op()` equals a hole in `self.repair`): the load-bearing check — a misdirected
   ///   or mismatched reply for any other op is rejected, so a committed slot is never filled with a

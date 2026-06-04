@@ -2,7 +2,7 @@
 //! durable ([`Header`](crate::Header)/[`VsrState`](crate::VsrState)) and message
 //! ([`Message`](crate::Message)) encodings.
 //!
-//! The proto owns no I/O; M4 (TCP networking + async disk storage) serializes these
+//! The proto owns no I/O; a later I/O layer (TCP networking + async disk storage) serializes these
 //! value types over the wire and onto disk, so the encoding is **part of the protocol
 //! contract**, not a driver detail. The three requirements every encoding here meets:
 //!

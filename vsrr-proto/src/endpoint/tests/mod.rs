@@ -753,7 +753,7 @@ fn dvc_offset(replica: u8, log_view: u64, floor: u64, op: u64, commit: u64) -> D
 
 /// Build a MALFORMED DVC that CLAIMS head `claimed_op` but carries only `present` real entries
 /// (`1..=present`). Models a peer (or fuzzed wire input) advertising an enormous op far above its
-/// actual log — the F4 attack shape.
+/// actual log — the attack shape.
 fn dvc_claiming(
   replica: u8,
   log_view: u64,

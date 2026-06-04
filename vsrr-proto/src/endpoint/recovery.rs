@@ -20,7 +20,7 @@ enum SlotVerdict {
 /// committed-band recover verdict. EXTRACTED from `on_recover_wal_done` as a PURE + TOTAL
 /// function so its safety (a TOTAL partition of the committed-band staleness space — no stale-committed
 /// body can slip through a future reorder of the arms) is FROZEN by a unit test, not left to depend on a
-/// rare VOPR seed. Behaviour is byte-for-byte the prior in-line `match` (verified against the recover
+/// rare schedule. Behaviour is byte-for-byte the prior in-line `match` (verified against the recover
 /// tests + VOPR).
 ///
 /// Inputs (exactly what the call site holds):
@@ -97,7 +97,7 @@ impl<S: StateMachine> Endpoint<S> {
   ///   committed prefix `[1..=checkpoint_op]` lives in the restored SM snapshot (and a state-synced
   ///   replica has pruned its WAL there), so the cache holds only ops ABOVE the checkpoint;
   ///   `commit_min == checkpoint_op` means `[1..=checkpoint_op]` are never re-applied. View change is
-  ///   **offset-aware** (B3: `select_canonical_log` UNIONs the committed band across DVCs, so an
+  ///   **offset-aware** (`select_canonical_log` UNIONs the committed band across DVCs, so an
   ///   offset log carrying only `(checkpoint_op .. head]` is safe — no committed op a different-floor
   ///   participant needs is dropped). A slot whose `header()` is absent/faulty is still recorded as
   ///   pending (the read resolves it).
@@ -153,7 +153,7 @@ impl<S: StateMachine> Endpoint<S> {
     let committed_frontier = state.commit().get().max(checkpoint_op);
     let hi = head.min(committed_frontier.saturating_add(RECOVER_TAIL_WINDOW));
     // The recovered head is the VERIFIED read FRONTIER `hi`, never BELOW the durable checkpoint — NOT
-    // the RAW `head` (F1, safety). A STATE-SYNCED replica holds no WAL at or below the synced
+    // the RAW `head` (safety). A STATE-SYNCED replica holds no WAL at or below the synced
     // checkpoint (it pruned the WAL there and never appended the tail), so its `wal.op_head()` can be
     // below `checkpoint_op`; the SM snapshot owns `[1..=checkpoint_op]`, so the recovered head must be
     // at least `checkpoint_op` to preserve `op >= commit_max >= commit_min == checkpoint_op`. The cache
@@ -234,7 +234,7 @@ impl<S: StateMachine> Endpoint<S> {
     // `commit_min == checkpoint_op` — and a STATE-SYNCED replica has pruned its WAL there, so reading
     // them would spuriously class pruned slots faulty). A recover-from-checkpoint replica and a
     // state-synced one are thus identical: both hold only the tail above the checkpoint, and the DVC
-    // they later send carries that (offset) tail with `commit == checkpoint_op` (the B3-safe shape
+    // they later send carries that (offset) tail with `commit == checkpoint_op` (the offset-safe shape
     // asserted by the A6 tests). `head` may be below `checkpoint_op` for a synced replica → the range
     // is empty and recovery completes immediately at the synced point.
     let mut rec = RecoverState::default();
@@ -258,7 +258,7 @@ impl<S: StateMachine> Endpoint<S> {
         .canonical
         .insert(h.op().get(), (h.client(), h.request(), h.body_checksum()));
     }
-    // Bound the per-recover read-submission window (F3): a corrupt/buggy `Wal` reporting a huge
+    // Bound the per-recover read-submission window: a corrupt/buggy `Wal` reporting a huge
     // `op_head` must not force unbounded bookkeeping + reads here. SATURATING `checkpoint_op + 1`
     // (never overflow), with the high end `hi` (computed above) capped at `committed_frontier +
     // RECOVER_TAIL_WINDOW` and at `head` — at most `RECOVER_TAIL_WINDOW` slots ABOVE the durable
@@ -267,7 +267,7 @@ impl<S: StateMachine> Endpoint<S> {
     // uncommitted tail (the small un-checkpointed pipeline above the committed frontier) is far below the
     // cap; a pathological head is clipped (its deep tail is recovered incrementally / via the head-fault
     // path), never billions of reads. `self.op` was set to `hi.max(checkpoint_op)` above, so the window
-    // this loop reads and the held head agree EXACTLY (F1: no held op above the verified frontier).
+    // this loop reads and the held head agree EXACTLY (no held op above the verified frontier).
     let lo = checkpoint_op.saturating_add(1);
     for op in lo..=hi {
       if let Some(h) = wal.header(OpNumber::with(op)) {
@@ -428,7 +428,7 @@ impl<S: StateMachine> Endpoint<S> {
       Outcome::StaleCommitted => {
         // The persisted vsr_header says this committed slot's canonical body differs from the WAL's:
         // class it permanently faulty IMMEDIATELY (no retry — the mismatch is authoritative). The
-        // existing B4 path then drops it from the `log` cache (`recover_progress`) and `advance_commit`
+        // existing peer fault-repair path then drops it from the `log` cache (`recover_progress`) and `advance_commit`
         // peer-repairs it on demand; the canonical body is fetched, never re-derived from the stale WAL.
         rec.reads.remove(&id.get());
         rec.pending.remove(&op);
@@ -488,7 +488,7 @@ impl<S: StateMachine> Endpoint<S> {
         let id_ok = crate::checkpoint_id(cr.snapshot()) == state.checkpoint_id();
         let op_ok = cr.op() == state.checkpoint_op();
         let decoded = Self::decode_checkpoint(cr.snapshot());
-        // The op BOUND inside the envelope (F3) must equal the read's advertised op; a mismatch means
+        // The op BOUND inside the envelope must equal the read's advertised op; a mismatch means
         // the bytes are an older checkpoint shipped under a newer op (their hash would then disagree
         // with the durable id too, but we check the bound op explicitly so the binding is load-bearing).
         let bound_ok = decoded
@@ -528,7 +528,7 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// Re-submit the recover checkpoint read within the retry budget — or, on EXHAUSTION, escalate to a
-  /// PEER FETCH (F1). Shared by the `Fault` arm and the VERIFY-failure path (a `CheckpointRead` whose
+  /// PEER FETCH. Shared by the `Fault` arm and the VERIFY-failure path (a `CheckpointRead` whose
   /// op/hash mismatched or that failed to parse) of [`Self::on_recover_sb_done`], so a corrupt/torn/
   /// stale read is retried EXACTLY like a transient fault — never restored, never panicked on.
   ///
@@ -557,7 +557,7 @@ impl<S: StateMachine> Endpoint<S> {
       .map(|r| r.checkpoint_retries)
       .unwrap_or(0);
     if budget == 0 {
-      // Budget exhausted → escalate to a peer fetch instead of panicking (F1).
+      // Budget exhausted → escalate to a peer fetch instead of panicking.
       self.escalate_checkpoint_to_peer_fetch(now);
       let _ = &mut *wal;
       return;
@@ -573,7 +573,7 @@ impl<S: StateMachine> Endpoint<S> {
     let _ = &mut *wal;
   }
 
-  /// Escalate a permanently-unreadable own checkpoint to a PEER FETCH (F1). Stops local checkpoint
+  /// Escalate a permanently-unreadable own checkpoint to a PEER FETCH. Stops local checkpoint
   /// retries, arms a FORCED state-sync targeting our own `checkpoint_op` (so a peer holding a
   /// checkpoint `>= ours` answers), broadcasts the `RequestSync`, and marks `awaiting_peer_checkpoint`
   /// so the recovery stays open (never completes to Normal with an unrestored SM) and `handle_message`
@@ -605,7 +605,7 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// Drop every permanently-faulty committed-band slot's EMPTY placeholder from the dense `log` cache,
-  /// turning it into a genuine repair hole — the B4 durability invariant, CENTRALIZED here so EVERY
+  /// turning it into a genuine repair hole — the fault-repair durability invariant, CENTRALIZED here so EVERY
   /// recovery-completion / continuation path enforces it.
   ///
   /// Phase 1 of `recover` seeds each tail slot with an EMPTY body (`Bytes::new()`) and a verified read
@@ -689,7 +689,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// `RecoveringHead` (the HEAD slot is permanently faulty — it cannot trust its head and must learn
   /// the canonical head from a peer).
   ///
-  /// A non-head permanently-faulty committed slot is repaired peer-to-peer (B4): it is necessarily
+  /// A non-head permanently-faulty committed slot is repaired peer-to-peer: it is necessarily
   /// ABOVE the applied frontier (`commit_min == checkpoint_op`; the restored SM already holds
   /// `[1..=checkpoint_op]`, so a faulty `op <= checkpoint_op` is never re-applied and does not block
   /// the apply path), so the replica safely returns to `Normal` and re-fetches the op on demand via
@@ -720,7 +720,7 @@ impl<S: StateMachine> Endpoint<S> {
       return; // (defensive; the helper never clears `recover`)
     };
     // The checkpoint snapshot not yet restored, OR awaiting a PEER checkpoint after our own read
-    // exhausted (F1). Stay Recovering and re-arm: an owner re-submits any dropped/slow checkpoint read
+    // exhausted. Stay Recovering and re-arm: an owner re-submits any dropped/slow checkpoint read
     // AND re-solicits the peer checkpoint. Crucially, `awaiting_peer_checkpoint` blocks completion: we
     // must NEVER reach Normal with the SM unrestored (`commit_min == checkpoint_op` would then be a
     // silent committed-prefix loss) — recovery completes only once a verified `SyncCheckpoint` restores
@@ -861,7 +861,7 @@ impl<S: StateMachine> Endpoint<S> {
       }
       None => (std::vec::Vec::new(), None, false),
     };
-    // F1 peer-fetch: if our own checkpoint read exhausted and we are awaiting a PEER `SyncCheckpoint`,
+    // Peer-fetch: if our own checkpoint read exhausted and we are awaiting a PEER `SyncCheckpoint`,
     // re-broadcast the `RequestSync` on this cadence (the Normal-only `sync_timeouts` does not run
     // while Recovering). A peer holding a checkpoint `>= ours` answers; until then we stay here.
     if awaiting_peer && self.sync.is_some() {
@@ -900,7 +900,7 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
-  /// Receive a `SyncCheckpoint` while RECOVERING and AWAITING A PEER CHECKPOINT (F1) — the escalation
+  /// Receive a `SyncCheckpoint` while RECOVERING and AWAITING A PEER CHECKPOINT — the escalation
   /// path for a replica whose OWN durable checkpoint snapshot read back permanently unreadable/
   /// inconsistent ([`Self::retry_recover_checkpoint_read`] exhaustion). It cannot restore its SM from
   /// disk, so it solicited a peer; this verifies and applies the answer, completing recovery.
@@ -942,7 +942,7 @@ impl<S: StateMachine> Endpoint<S> {
     }
     // Decode must succeed before we commit to applying (apply_sync also decodes, but verifying here
     // keeps the irreversible status flip below from ever stranding us Normal with an unrestored SM).
-    // The op BOUND into the snapshot (F3) must equal the advertised `checkpoint_op` — a faulty peer
+    // The op BOUND into the snapshot must equal the advertised `checkpoint_op` — a faulty peer
     // shipping stale bytes under an overstated op would otherwise advance our frontier past the
     // snapshot's real content. Verified HERE too (not only in `apply_sync`) so the Normal flip below
     // never strands us with an unrestored SM on a bind mismatch.
@@ -984,7 +984,7 @@ impl<S: StateMachine> Endpoint<S> {
       self.install_sync(wal, install);
     }
     // STEP DOWN if we are the primary (async-superblock path), via the single
-    // `abdicate_if_primary` chokepoint. This F1 peer-checkpoint fetch RESTORED our SM from a
+    // `abdicate_if_primary` chokepoint. This peer-checkpoint fetch RESTORED our SM from a
     // peer snapshot and KEPT our retained tail `(commit_min .. op]`, but — exactly like a state-sync on a
     // Normal primary, and like a restarted primary in `complete_recovery` — it left `inflight` (the
     // commit pipeline) CLEARED while we remain the primary of our view. A Normal primary with a torn-down
@@ -1168,7 +1168,7 @@ mod verdict_tests {
   /// cross-product {header present / absent} × {identity matches / mismatches} × {op <= / > durable_commit}
   /// × {slot_view < / >= durable_log_view} and assert the verdict for EVERY cell, documenting WHY. The
   /// function is total ONLY by arm ordering; this test fails a future reorder that re-opens a
-  /// stale-committed-body hole (the worst class) — a unit failure, not a rare VOPR seed.
+  /// stale-committed-body hole (the worst class) — a unit failure, not a rare schedule.
   #[test]
   fn classify_committed_slot_is_total_over_the_staleness_space() {
     // Fixed reference frontiers; we move `op`/`slot_view` around them to flip the C and V dimensions.

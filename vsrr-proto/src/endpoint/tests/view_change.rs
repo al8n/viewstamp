@@ -540,7 +540,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
 fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
   // COMPLEMENT — a COMMITTED gap must NOT be truncated. Same faulty-interior-slot
   // replica (checkpoint 0, head 3, op 2 absent), but this time the DVC quorum reports commit* == 3, so
-  // op 2 is BELOW the committed frontier — a real B4 repair hole the offset-union could not carry, NOT
+  // op 2 is BELOW the committed frontier — a real repair hole the offset-union could not carry, NOT
   // an uncommitted gap. The seeding-site truncation only scans `(commit* .. op]`, so op 2 (≤ commit*)
   // is OUTSIDE it: the head is NOT truncated, op 2 stays a `repair` hole, the commit is HELD at op 1,
   // and a peer-supplied (committed-vouching) Prepare fills it and resumes the held commit. This guards
@@ -597,7 +597,7 @@ fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
   );
   assert!(
     r.has_repair_hole_for_test(2),
-    "the committed gap is a repair hole (on-demand B4 repair), not silently dropped"
+    "the committed gap is a repair hole (on-demand repair), not silently dropped"
   );
   assert_eq!(
     r.commit(),
@@ -1812,7 +1812,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   let now = Instant::ZERO;
   // Give this primed primary a DURABLE checkpoint to serve: a `checkpoint_op` of 1 (a committed op it
   // holds — its `commit_min` is 1) and a readable snapshot envelope in the StepSb at that op. The
-  // serve's F3 ship-time gate requires `cr.op() == self.checkpoint_op`, so the injected op must match;
+  // serve's ship-time gate requires `cr.op() == self.checkpoint_op`, so the injected op must match;
   // the integrity gate additionally requires the read bytes to hash to the DURABLE checkpoint id,
   // so the durable ROOT must NAME this snapshot — set `sb.state` to a root at checkpoint_op 1 whose
   // `checkpoint_id == checkpoint_id(snapshot)` (a genuinely durable checkpoint, not a half-faked one).
@@ -2021,11 +2021,11 @@ fn canonical_selection_with_a_fully_checkpoint_synced_participant_is_safe() {
   assert!(commit_star <= op_head);
 }
 
-// ── B3: offset-aware canonical-log selection (UNION committed entries across DVCs) ──
+// ── offset-aware canonical-log selection (UNION committed entries across DVCs) ──
 
 #[test]
 fn select_canonical_log_unions_committed_ops_across_different_floor_dvcs() {
-  // The reviewer's reproduction (the heart of B3): TWO different-floor offset DVCs in the SAME
+  // The reproduction (offset-aware canonical-log selection): TWO different-floor offset DVCs in the SAME
   // canonical generation, both head op 10 commit 8. r0 (floor 4) holds ops 5..=10; r1 (floor 8) holds
   // only 9,10. Both tie at op 10, so the OLD `max_by_key(op)` (ties → highest replica id) picks r1's
   // log [9,10] and SILENTLY DROPS committed ops 5,6,7 — which only r0 holds. The `commit* <= op_head`
@@ -2092,7 +2092,7 @@ fn select_canonical_log_stitches_the_band_across_three_offset_donors() {
 
 #[test]
 fn select_canonical_log_bounds_a_dvc_claiming_a_huge_op() {
-  // F4 REGRESSION (unbounded nack-scan + overflow): DoViewChanges whose CLAIMED `op` is enormous
+  // REGRESSION (unbounded nack-scan + overflow): DoViewChanges whose CLAIMED `op` is enormous
   // (here `u64::MAX`) but whose `log_slice()` carries only a few real entries must NOT make the
   // nack-truncation loop scan `commit*+1 ..= u64::MAX` op-by-op. The UNBOUNDED case is when a NACK
   // quorum's worth of donors claim a huge op: then the loop's nack count never reaches the threshold
@@ -2131,7 +2131,7 @@ fn select_canonical_log_bounds_a_dvc_claiming_a_huge_op() {
 
 #[test]
 fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
-  // B3 gate, CORRECTED to the safe semantics (this is a correctness CORRECTION, not a weakening — see
+  // offset-aware gate, CORRECTED to the safe semantics (this is a correctness CORRECTION, not a weakening — see
   // below). A backup holds committed ops 5..=8 in its OFFSET log; the lower band 5,6 it has APPLIED
   // (commit_min == 6), the upper band 7,8 it has NOT (committed by a prior-view quorum but unapplied;
   // op == 8). It adopts a StartView whose canonical log is itself OFFSET, starts at op 9 (does NOT
@@ -2145,13 +2145,13 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
   //     therefore DROPPED and REPAIRED: `advance_commit` HOLDS the commit at the first such op and
   //     `request_repair`s the CANONICAL value from a committed-vouching peer.
   //
-  // Why this is a CORRECTION, not a weakening of the original B3 safety property: B3's invariant is "no
+  // Why this is a CORRECTION, not a weakening of the original canonical-log safety property: its invariant is "no
   // committed op an offset canonical log omits is ever LOST." That still holds end-to-end here — the
   // omitted committed band ends up correct (applied to the SM after repair), never silently skipped. The
   // ONLY change is the SOURCE for the UNAPPLIED band: a possibly-stale local copy (which, under an
   // adversarial schedule, can diverge the committed log) is replaced by the quorum's canonical value
   // fetched via peer-repair.
-  // The original B3 bug (clearing the whole log + then `repair.clear()` stranding the op) stays fixed:
+  // The original stranding bug (clearing the whole log + then `repair.clear()` stranding the op) stays fixed:
   // the omitted committed op is never forgotten — it is a held hole until its canonical value arrives.
   let mut e = Endpoint::new(
     Config::try_new(1, ReplicaId::new(2), 3).unwrap(),
@@ -2242,7 +2242,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
   assert_eq!(
     e.commit(),
     OpNumber::with(8),
-    "commit reaches 8: the omitted committed band is repaired, not lost (the B3 safety property holds)"
+    "commit reaches 8: the omitted committed band is repaired, not lost (the canonical-log safety property holds)"
   );
   // The SM applied exactly the unapplied band 7,8 (5,6 lived below commit_min, never re-applied; 1..=4
   // in the checkpoint). SAFETY: no committed op the offset StartView omitted was lost.
@@ -2260,7 +2260,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
 
 #[test]
 fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() {
-  // SAFETY REGRESSION: the B3 "preserve the omitted committed op from the adopter's
+  // SAFETY REGRESSION: the "preserve the omitted committed op from the adopter's
   // own log" rule is only sound for ops the adopter has APPLIED (`op <= commit_min`) — those are
   // committed+immutable. For a committed op in `(commit_min .. adopted_commit]` the adopter holds a
   // body it has NOT applied: it can be a STALE UNCOMMITTED proposal from an earlier view that a later
