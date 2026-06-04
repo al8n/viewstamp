@@ -162,7 +162,7 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
   //
   // We arm the forfeit the REAL way on an EXISTING, heartbeating primary: a primary that has committed
   // a tail (so it would heartbeat) receives a valid forced `SyncCheckpoint` → it STEPS DOWN
-  // (`pending_forfeit`) rather than apply the sync in place (the seed-8 op-reuse guard). This arms the
+  // (`pending_forfeit`) rather than apply the sync in place (the op-reuse guard). This arms the
   // forfeit with NO repair hole and NO grace timer, so the ONLY armed cadence timer is the heartbeat
   // `commit` (50ms COMMIT_HEARTBEAT) — earlier than the post-forfeit `svc_message` (100ms
   // VC_MESSAGE_RETRANSMIT) — which is exactly the stale spinner.
@@ -214,7 +214,7 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
     "precondition: the only armed timer is the 50ms commit heartbeat"
   );
   // Now arm the forfeit the REAL way: a valid forced SyncCheckpoint on this (still-heartbeating)
-  // primary makes it STEP DOWN (the seed-8 op-reuse guard) — `pending_forfeit` is set while `commit`
+  // primary makes it STEP DOWN (the op-reuse guard) — `pending_forfeit` is set while `commit`
   // is already armed at 50ms. No grace timer / repair hole is involved (clean step-down path).
   let (_d, _dw, dsb) = donor_primary_at_checkpoint(6);
   let (env, id) = donor_envelope(&dsb);
@@ -243,7 +243,7 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
   // Drive the endpoint PURELY via poll_timeout() — exactly as a real deadline-driven driver does —
   // and assert the clock STRICTLY ADVANCES (never spins on the stale commit deadline) AND the primary
   // re-broadcasts the StartViewChange{view+1} across MULTIPLE svc_message windows (persistent
-  // step-down under loss — the F2 latch must keep re-proposing, not stop).
+  // step-down under loss — the latch must keep re-proposing, not stop).
   //
   // FAIL-BEFORE (fix reverted): the forfeit branch leaves `commit` armed-and-due, so poll_timeout()
   // returns 50ms every step → on the SECOND advance `due (50) > last (50)` is FALSE → the strict-advance
@@ -311,7 +311,7 @@ fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
   // re-returns the SAME instant → the clock SPINS at 100ms, never re-broadcasting the StartViewChange
   // and never advancing → the cluster cannot fail over (the SVC is never retransmitted under loss).
   //
-  // The fix (FIX 1) makes the Normal-backup branch SERVICE `svc_message` when armed+due (re-broadcast
+  // The fix makes the Normal-backup branch SERVICE `svc_message` when armed+due (re-broadcast
   // the StartViewChange{view+1} on its retransmit cadence) AND `poll_timeout`'s serviceable filter then
   // returns it only where it is acted on, so the clock strictly advances and the SVC is re-broadcast
   // across multiple windows.
@@ -404,7 +404,7 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
   // LIVENESS (the timer-wedge class). A `Normal` primary can ARM its `forfeit_armed`
   // grace timer (it holds a committed `repair` hole → `maybe_forfeit` arms the grace) and THEN be
   // forced into `pending_forfeit` via the force-sync / sync-checkpoint STEP-DOWN (a forced
-  // `SyncCheckpoint` on a primary sets `pending_forfeit` rather than applying the sync — the seed-8
+  // `SyncCheckpoint` on a primary sets `pending_forfeit` rather than applying the sync — the
   // op-reuse guard — and does NOT go through `forfeit()`, so it never disarms the grace). The
   // `pending_forfeit` branch of `primary_timeouts` retires `commit`/`prepare` and re-proposes on the
   // `svc_message` cadence, but it NEVER calls `maybe_forfeit` and (before the fix) NEVER cleared
@@ -413,7 +413,7 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
   // branch ignores it), and `poll_timeout()` re-returns it → the clock SPINS on the stale grace
   // deadline, never progressing the step-down → the cluster wedges below the unfillable hole.
   //
-  // The fix (FIX 2) retires `self.forfeit_armed = None` in the `pending_forfeit` branch (and the
+  // The fix retires `self.forfeit_armed = None` in the `pending_forfeit` branch (and the
   // serviceability filter no longer returns it once `pending_forfeit` holds), so `svc_message` is the
   // sole primary-side driver and the clock strictly advances to the step-down re-proposal.
   let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
@@ -441,7 +441,7 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
     "but it is not yet forfeiting (within the grace window)"
   );
   // Now force the step-down the REAL way (NOT via forfeit()): a valid FORCED SyncCheckpoint on this
-  // primary makes it set `pending_forfeit` (the seed-8 op-reuse guard) WITHOUT disarming the grace
+  // primary makes it set `pending_forfeit` (the op-reuse guard) WITHOUT disarming the grace
   // timer (`on_sync_checkpoint`'s primary branch only sets the flag + drops the sync). The grace timer
   // (armed at 300ms) is therefore left armed alongside `pending_forfeit` — exactly the stale spinner.
   let (_d, _dw, dsb) = donor_primary_at_checkpoint(6);
@@ -671,7 +671,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
     }
   }
 
-  // (5) Recovering: recover_retry drives (and any sync_solicit armed by the F1 peer-fetch must NOT spin).
+  // (5) Recovering: recover_retry drives (and any sync_solicit armed by the peer-fetch must NOT spin).
   {
     let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
     let mut sb = TestSb::default();

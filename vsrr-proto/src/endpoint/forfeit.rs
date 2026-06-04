@@ -22,7 +22,7 @@ impl<S: StateMachine> Endpoint<S> {
   ///    band leads cleanly; it does not re-forfeit), and THIS replica then recovers the band as a
   ///    BACKUP via the ordinary force-sync escalation. The grace timer makes this self-limiting: a
   ///    FILLABLE hole (a peer holds it un-pruned, in or out of the DVC quorum — the case the
-  ///    seeding-site B4 path covers) is repaired by the answering `Prepare` well within `FORFEIT_GRACE`,
+  ///    seeding-site peer fault-repair path covers) is repaired by the answering `Prepare` well within `FORFEIT_GRACE`,
   ///    emptying `repair` and DISARMING the forfeit; only a hole that persists the WHOLE window — i.e.
   ///    one no peer can serve — actually steps the primary down. No committed op is lost (it survives in
   ///    the holder's checkpoint throughout).
@@ -87,7 +87,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// `maybe_forfeit` (and the force-sync-strand gate in `maybe_force_sync`) ensure this only fires
   /// when genuinely stuck.
   ///
-  /// **Persistent until the view changes (F2).** A SINGLE proposed `StartViewChange` can be
+  /// **Persistent until the view changes.** A SINGLE proposed `StartViewChange` can be
   /// dropped/partitioned; were the primary to then resume heartbeating, every backup would keep
   /// resetting its `primary_idle` (never starting its own VC) and the cluster would wedge below the
   /// hole. So forfeiting LATCHES `pending_forfeit`: while set, `primary_timeouts` re-proposes `view+1`
@@ -137,7 +137,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// `svc_message` wake) so the next `primary_timeouts` re-proposes `view + 1` and a caught-up replica
   /// leads. Returns `true` iff it stepped down, so the caller can branch its own control flow (skip the
   /// in-place apply / forced-sync arm). Folding the three byte-identical copies here closes the
-  /// "guard on some completion paths, missing on a new one" shape the original empty-body / seed-8
+  /// "guard on some completion paths, missing on a new one" shape the original empty-body
   /// CRITICALs came from.
   ///
   /// SOLO (`replica_count == 1`): a solo replica cannot view-change (no quorum) — abdicating would

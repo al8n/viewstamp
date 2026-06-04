@@ -391,7 +391,7 @@ fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_peri
 fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
   // ANTI-STORM complement of the above: a committed repair hole that a peer CAN serve is filled by
   // the answering `Prepare` well within the grace window, emptying `repair` and DISARMING the
-  // forfeit — so a FILLABLE hole (the ordinary B4 repair case) never triggers a view change. Primary
+  // forfeit — so a FILLABLE hole (the ordinary repair case) never triggers a view change. Primary
   // (replica 0 of 3), commit held at 1 with a hole at op 2; a peer answers with op 2's
   // committed-vouching Prepare (commit 2 >= op 2) before the grace elapses.
   let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
@@ -444,7 +444,7 @@ fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
 
 #[test]
 fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_changes() {
-  // F2 REGRESSION (a one-shot forfeit can be LOST → the cluster wedges): when the FIRST forfeit
+  // REGRESSION (a one-shot forfeit can be LOST → the cluster wedges): when the FIRST forfeit
   // StartViewChange is dropped/partitioned, the OLD code cleared `pending_forfeit` one-shot and the
   // primary RESUMED heartbeating — so every backup kept resetting its `primary_idle` (none started
   // its own VC) and the SVC retransmit timer was never serviced while Normal, wedging the cluster

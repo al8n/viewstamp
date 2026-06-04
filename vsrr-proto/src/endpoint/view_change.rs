@@ -308,7 +308,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// The in-memory log as wire entries — the OFFSET tail `(checkpoint_op .. op]` for a
   /// recover-from-checkpoint / state-synced replica (the committed prefix `[1..=checkpoint_op]` lives
   /// in the SM snapshot, not the cache), or dense `[1..=op]` for a replica that never checkpointed.
-  /// `select_canonical_log` is offset-aware (B3) and UNIONs these across DVCs, so a DVC carrying only
+  /// `select_canonical_log` is offset-aware and UNIONs these across DVCs, so a DVC carrying only
   /// the offset tail loses no committed op at view change.
   pub(crate) fn log_entries(&self) -> std::vec::Vec<crate::PreparedEntry> {
     self
@@ -327,7 +327,7 @@ impl<S: StateMachine> Endpoint<S> {
     sb: &mut B,
     m: crate::DoViewChange,
   ) {
-    // NOTE (deferred to M3 message-hardening): we do not yet validate incoming DVC well-formedness
+    // NOTE (deferred to a later milestone): we do not yet validate incoming DVC well-formedness
     // (commit <= op; the log is the OFFSET tail `(checkpoint .. op]`, dense WITHIN that range — it is
     // NOT required to be dense from op 1, since a recover-from-checkpoint / state-synced sender
     // legitimately omits the prefix that lives in its SM snapshot). Safe under honest crash-stop
@@ -376,7 +376,7 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
-  /// VSR canonical-log selection + nack-prepare truncation — **offset-aware** (B3).
+  /// VSR canonical-log selection + nack-prepare truncation — **offset-aware**.
   ///
   /// Returns `(canonical log truncated to op_head, op_head, commit*)`:
   /// - the canonical generation is the DVCs with the greatest `log_view`;
@@ -417,7 +417,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// case where a committed op in `(min_floor .. commit*]` is held by NO canonical donor (the donor
   /// that committed+checkpointed it past, plus a low-floor donor that lagged the tail), the union
   /// omits it — but this is **never a silent loss**: the adopter's `advance_commit` HOLDS the commit
-  /// at the missing op and `request_repair`s it from a peer (the B4 `RequestPrepare` → `Prepare`
+  /// at the missing op and `request_repair`s it from a peer (the `RequestPrepare` → `Prepare`
   /// safety net, mirroring TigerBeetle's `repair_prepares_between`). The adopt path is fixed to NOT
   /// destroy a held copy and NOT clear that repair request (see `adopt_log` / `adopt_canonical_head`).
   /// So the SAFETY property — no committed op is ever dropped — holds: a committed op is present in
@@ -439,7 +439,7 @@ impl<S: StateMachine> Endpoint<S> {
       .filter(|d| d.log_view().get() == log_view_star)
       .collect();
 
-    // `op_head` is the canonical generation's head, but BOUNDED to the ACTUALLY-represented log (F4):
+    // `op_head` is the canonical generation's head, but BOUNDED to the ACTUALLY-represented log:
     // a malformed DVC may CLAIM `op` far above (up to `u64::MAX`) the entries it carries, which —
     // taken at face value — would (a) spin the nack-scan below `commit* ..= op_head` for billions of
     // iterations and (b) overflow `op += 1` at `u64::MAX`. We cap the claimed head at the max op
@@ -566,7 +566,7 @@ impl<S: StateMachine> Endpoint<S> {
     // never committed — and the whole suffix above `G` is uncommitted too (a committed op above an
     // uncommitted one would violate the commit prefix). Truncating it is thus safe: it mirrors
     // `select_canonical_log`'s nack-truncation of the uncommitted tail, but catches an INTERIOR gap the
-    // contiguous nack-scan steps over. A gap AT or BELOW `commit*` is a COMMITTED op (a real B4 repair
+    // contiguous nack-scan steps over. A gap AT or BELOW `commit*` is a COMMITTED op (a real repair
     // hole the union could not carry) — it is NOT truncated here; `advance_commit` above already HELD the
     // commit at it and `request_repair`d it from a peer (the seeding loop then only spans the gap-free
     // committed-or-truncated head). The subsequent `start_view_participate` broadcasts the now-dense
@@ -862,7 +862,7 @@ impl<S: StateMachine> Endpoint<S> {
     // (The pending-repair set was reconciled above — holes the adopted log / applied-prefix held copies
     // now cover were retired; any committed op neither side carries — including the unapplied band
     // `adopt_log` dropped — stays solicited and was re-requested by `advance_commit`. We deliberately do
-    // NOT blanket-clear `repair` here: that was the B3 stranding bug — clearing right after
+    // NOT blanket-clear `repair` here: that was the stranding bug — clearing right after
     // `advance_commit` requested a hole silently forgot a committed op.)
     self.arm_timers(now);
     // Defer held-op re-acks to on_sb_done → `start_view_acks`: persist the new view first, and there
