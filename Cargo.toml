@@ -1,14 +1,14 @@
 [workspace]
 members = [
-  "vsrr-proto",
-  "vsrr-compio",
-  "vsrr-reactor",
-  "vsrr-simulation",
+  "viewstamp-proto",
+  "viewstamp-compio",
+  "viewstamp-reactor",
+  "viewstamp-simulation",
 ]
 resolver = "3"
 
 [workspace.dependencies]
-vsrr-proto = { path = "vsrr-proto", version = "0.0.0" }
+viewstamp-proto = { path = "viewstamp-proto", version = "0.0.0" }
 bytes = { version = "1", default-features = false }
 derive_more = { version = "2", default-features = false }
 thiserror = { version = "2", default-features = false }

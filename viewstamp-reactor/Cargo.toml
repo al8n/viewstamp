@@ -1,0 +1,13 @@
+[package]
+name = "viewstamp-reactor"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Reactor (tokio/async-io) driver for viewstamp-proto (implemented in M6)"
+
+[dependencies]
+viewstamp-proto = { workspace = true }
+
+[lints]
+workspace = true
