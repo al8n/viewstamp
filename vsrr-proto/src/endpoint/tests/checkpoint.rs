@@ -26,7 +26,7 @@ fn checkpoint_envelope_round_trips_sessions_and_snapshot() {
   assert_eq!(
     decoded_op,
     OpNumber::with(42),
-    "the bound checkpoint op round-trips (F3)"
+    "the bound checkpoint op round-trips"
   );
   assert_eq!(decoded_snap, &b"SM-SNAPSHOT"[..]);
   assert_eq!(decoded_sessions.len(), 2);

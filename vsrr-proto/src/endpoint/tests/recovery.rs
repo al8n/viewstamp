@@ -451,7 +451,7 @@ fn recover_head_permanently_faulty_enters_recovering_head() {
   );
 }
 
-// ── B4: peer fault-repair (RequestPrepare → Prepare) ──
+// ── peer fault-repair (RequestPrepare → Prepare) ──
 
 #[test]
 fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
@@ -460,7 +460,7 @@ fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
   // — once its commit reaches the slot — broadcasts a RequestPrepare for it (peer fault-repair),
   // HOLDING its commit below the hole. The slot is NOT pre-registered as a repair hole
   // at recovery time: a faulty slot above the checkpoint may be UNCOMMITTED, and registering it then
-  // would be an unfillable hole after the R5 repair restrictions; `advance_commit` requests it ON
+  // would be an unfillable hole after the repair restrictions; `advance_commit` requests it ON
   // DEMAND only when commit reaches it (which only happens once it is committed).
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
   assert_eq!(
@@ -529,7 +529,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   // replica diverged from every other replica at that one committed op number (no second op number is minted
   // and no request is committed twice — at-most-once holds — but a single committed slot carried two values).
   //
-  // The seed-52 `vsr_headers` cross-check only guards the persisted committed band `(checkpoint .. commit]`;
+  // The `vsr_headers` cross-check only guards the persisted committed band `(checkpoint .. commit]`;
   // a slot ABOVE the durable known-committed frontier is not in that band, so it was trusted blindly. The fix
   // generalises the cross-check: on `recover`, a self-verifying tail slot above `commit_max` whose ORIGINAL
   // header `view` is BELOW the durable `log_view` is a SUPERSEDED earlier-view proposal (we advanced our
@@ -913,7 +913,7 @@ fn recovering_head_adopts_start_view_and_becomes_normal() {
 
 #[test]
 fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
-  // REGRESSION (the empty-body divergence the M3 sweep exposed): a replica that recovers with BOTH a
+  // REGRESSION (the empty-body divergence): a replica that recovers with BOTH a
   // faulty HEAD slot (→ RecoveringHead) AND a faulty NON-head committed slot must STILL drop the
   // non-head slot from its `log` cache (it holds only an EMPTY placeholder body from recover Phase 1).
   // Otherwise, when it later adopts a canonical head whose (offset) log OMITS that slot, `adopt_log`
@@ -980,7 +980,7 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
   // applied empty. This replica recovered from its WAL alone (no checkpoint, commit_min == 0), so it
   // had APPLIED nothing — ops 1 AND 2 are both committed-but-unapplied at adopt time. The offset
   // canonical log omits op 2 (and op 1), so BOTH become repair holes: the commit is HELD at 0 at the
-  // first hole (op 1), op 2 is registered once op 1 fills. (The seed-24 safety fix means an UNAPPLIED
+  // first hole (op 1), op 2 is registered once op 1 fills. (The safety fix means an UNAPPLIED
   // omitted committed op is never resurrected from the local cache — including op 1, whose clean-read
   // WAL body could itself be a superseded proposal — so it is fetched from a peer, not trusted local.
   // This only STRENGTHENS the original guard: still no empty/stale body is ever applied to op 2.)
@@ -1386,7 +1386,7 @@ fn normal_primary_answers_recovery_with_canonical_response() {
 
 #[test]
 fn has_inflight_storage_is_true_mid_append_and_false_when_quiesced() {
-  // The M4 driver-drain signal: `has_inflight_storage()` is true the moment a votable WAL append is
+  // The driver-drain signal: `has_inflight_storage()` is true the moment a votable WAL append is
   // submitted (its `pending`/`appending` entries are live, the completion still owed) and false once
   // `handle_storage` drains that completion (nothing left for the driver to deliver). (Replica 0 is
   // primary of view 0; a single own-vote is below the N=3 quorum of 2, so the drain commits nothing
@@ -1489,7 +1489,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   // recovered replica diverged. The fix: the durable `VsrState` carries the CANONICAL `vsr_headers`
   // for the committed band `(checkpoint_op .. commit]`, and `recover` cross-checks each committed-band
   // WAL slot's body against the persisted canonical `body_checksum`. A MISMATCH is routed to
-  // peer-repair (the B4 path) instead of being trusted — the canonical body is fetched from a peer.
+  // peer-repair (the peer fault-repair path) instead of being trusted — the canonical body is fetched from a peer.
   //
   // Setup: replica 1 of 3. Durable root: view 0, commit 2, checkpoint_op 0, with canonical headers
   // recording op 1 = body [1] and op 2 = body [2] (bodyY). The WAL holds op 1 = [1] (canonical) but
@@ -2115,7 +2115,7 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
   // cross-check, be adopted, and applied under the WRONG session — corrupting dedup/reply (duplicate
   // execution under the wrong client). The fix keys the canonical cross-check on FULL operation identity
   // `(client, request, body_checksum)`: a same-body-different-identity slot now MISMATCHES and is dropped
-  // → peer-repaired, exactly like the seed-52 stale-body case.
+  // → peer-repaired, exactly like the stale-body case.
   //
   // Setup: replica 1 of 3. Durable root: view 0, commit 2, checkpoint_op 0. The canonical header for op 2
   // records identity `(clientB = 9, req 3, body [2])` — what the cluster actually committed. The WAL slot
@@ -2275,7 +2275,7 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
 
 #[test]
 fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
-  // The complement of the seed-52 regression: a NORMAL-operation recover (no staleness) must NOT
+  // The complement of the stale-body regression: a NORMAL-operation recover (no staleness) must NOT
   // spuriously peer-repair. Every committed-band WAL slot matches its persisted canonical header, so
   // recovery trusts them all — no repair hole, no dropped slot, the SM re-applies the canonical band
   // directly from the WAL once commit is announced.
@@ -2806,7 +2806,7 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
 
 #[test]
 fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unreadable() {
-  // F1 REGRESSION (a permanently-corrupt own checkpoint must NOT panic recovery): when this replica's
+  // REGRESSION (a permanently-corrupt own checkpoint must NOT panic recovery): when this replica's
   // OWN durable checkpoint snapshot read back unreadable/mismatched on EVERY attempt, the OLD code hit
   // an `assert!` once the per-op retry budget exhausted — crashing the replica on storage-controlled
   // bytes (a faulty/malicious superblock could do this at will). The fix ESCALATES to fetching the
@@ -3049,7 +3049,7 @@ fn finalize_recovery_assert_catches_a_leaked_empty_faulty_slot() {
 
 #[test]
 fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a_peer_serves() {
-  // F1 REGRESSION (variant): the checkpoint read MATCHES our read id but its CONTENT is permanently
+  // REGRESSION (variant): the checkpoint read MATCHES our read id but its CONTENT is permanently
   // wrong (hash mismatch on every attempt) — the verify-failure path, not a raw Fault. It must route
   // to the SAME budget→peer-fetch escalation (no panic), then a peer's good SyncCheckpoint completes.
   let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
@@ -3379,7 +3379,7 @@ fn recover_with_no_checkpoint_is_unchanged() {
 
 #[test]
 fn recover_bounds_the_read_window_for_a_huge_op_head() {
-  // F3 REGRESSION (unbounded read submission): a corrupt/buggy `Wal` reporting an enormous
+  // REGRESSION (unbounded read submission): a corrupt/buggy `Wal` reporting an enormous
   // `op_head` must NOT make `recover()` bookkeep + submit a read per slot from `checkpoint_op+1`
   // up to that head (billions of inserts/reads/allocations before any async fault-handling runs).
   // With the fix, the per-recover window is capped at `RECOVER_TAIL_WINDOW`, so at most that many
@@ -3410,7 +3410,7 @@ fn recover_bounds_the_read_window_for_a_huge_op_head() {
 
 #[test]
 fn recover_does_not_overflow_with_a_checkpoint_op_near_u64_max() {
-  // F3 REGRESSION (overflow): `checkpoint_op + 1` and `checkpoint_op + RECOVER_TAIL_WINDOW` must use
+  // REGRESSION (overflow): `checkpoint_op + 1` and `checkpoint_op + RECOVER_TAIL_WINDOW` must use
   // SATURATING arithmetic so a `checkpoint_op` near `u64::MAX` (a corrupt durable root) cannot
   // overflow-panic while computing the tail window. Here the durable root claims a checkpoint at
   // `u64::MAX - 1` and the WAL head equals it, so the tail range is empty — recovery must construct
@@ -3449,7 +3449,7 @@ fn recover_does_not_overflow_with_a_checkpoint_op_near_u64_max() {
 
 #[test]
 fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
-  // F1 REGRESSION (a SAFETY regression introduced by the R2 read-window cap): the R2 fix capped the
+  // REGRESSION (a SAFETY regression introduced by the read-window cap): the fix capped the
   // recover READ window at `checkpoint_op + RECOVER_TAIL_WINDOW` but still set `self.op =
   // head.max(checkpoint_op)` (the RAW head). When `head` is far above the window, ops in `(frontier,
   // head]` are "held" per `self.op` yet were NEVER read/verified/cached — so `on_prepare`'s `pop <=

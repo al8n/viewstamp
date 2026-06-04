@@ -264,7 +264,7 @@ impl<S: StateMachine> Endpoint<S> {
     // `commit_min` (apply is forward-only) — so the snapshot reflects state through `commit_min`.
     let target_op = self.commit_min;
     let snapshot = self.sm.snapshot();
-    // Bind the checkpoint op into the envelope so `checkpoint_id` covers it (F3): the written op and
+    // Bind the checkpoint op into the envelope so `checkpoint_id` covers it: the written op and
     // the op hashed inside the snapshot are the SAME, so a later restore can prove they agree.
     let envelope = Self::encode_checkpoint(target_op, &self.clients, &snapshot);
     let checkpoint_id = crate::checkpoint_id(&envelope);

@@ -113,7 +113,7 @@ fn stale_checkpoint_commit_triggers_request_sync() {
 #[test]
 fn stale_checkpoint_prepare_triggers_request_sync() {
   // A `Prepare` (not just a Commit) carrying checkpoint_op > our head also triggers the sync — the
-  // A2 signal closes the last trigger gap for a backup that only ever hears Prepares.
+  // this commit signal closes the last trigger gap for a backup that only ever hears Prepares.
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
@@ -382,9 +382,9 @@ fn peer_without_newer_checkpoint_does_not_answer_request_sync() {
 
 #[test]
 fn recovery_request_sync_is_served_by_a_peer_at_the_same_checkpoint() {
-  // F2 REGRESSION (recovery peer-fetch livelock): a recovering replica whose OWN checkpoint snapshot
+  // REGRESSION (recovery peer-fetch livelock): a recovering replica whose OWN checkpoint snapshot
   // is permanently corrupt solicits a RECOVERY RequestSync advertising its (known) checkpoint_op. The
-  // R2 escalation only got served by a STRICTLY-newer peer (`>`), so on an idle cluster where every
+  // escalation only got served by a STRICTLY-newer peer (`>`), so on an idle cluster where every
   // healthy peer holds EXACTLY the same checkpoint_op, the request was ignored forever → the recovery
   // livelocked (the cluster could stay unavailable if that replica is needed for quorum). With the
   // fix, a `recovery` request is served by a peer at an EQUAL checkpoint_op; an ordinary one is not.
@@ -448,7 +448,7 @@ fn recovery_request_sync_is_served_by_a_peer_at_the_same_checkpoint() {
 
 #[test]
 fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
-  // F2 REGRESSION (end-to-end convergence): a replica whose OWN durable checkpoint snapshot is
+  // REGRESSION (end-to-end convergence): a replica whose OWN durable checkpoint snapshot is
   // permanently unreadable escalates to a recovery peer-fetch; a Normal peer at the SAME checkpoint
   // op serves it; delivering that SyncCheckpoint converges the recovering replica to Normal. (Before
   // the fix the equal-checkpoint peer ignored the request and the replica never left Recovering.)
@@ -511,7 +511,7 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
       answer = Some(s.clone());
     }
   }
-  let answer = answer.expect("the equal-checkpoint peer SERVES the recovery request (F2)");
+  let answer = answer.expect("the equal-checkpoint peer SERVES the recovery request");
 
   // Deliver the peer's SyncCheckpoint back to the recovering replica → it applies + re-persists +
   // converges to Normal at the synced point.
@@ -1083,7 +1083,7 @@ fn sync_checkpoint_with_mismatched_id_is_rejected_not_restored() {
 
 #[test]
 fn sync_checkpoint_with_op_not_bound_to_the_snapshot_is_rejected_not_restored() {
-  // F3 REGRESSION (overstated checkpoint op over stale-but-consistent bytes): a faulty peer ships a
+  // REGRESSION (overstated checkpoint op over stale-but-consistent bytes): a faulty peer ships a
   // snapshot whose REAL frontier is op A=2 but advertises `checkpoint_op = B=4`. The snapshot's bytes
   // hash to the advertised `checkpoint_id` (so the existing integrity gate PASSES — the id is
   // consistent with the OLD bytes), yet B > A. Before binding the op into the hash, the receiver
@@ -1928,7 +1928,7 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
     "a primary in the force-sync strand emits NO RequestSync (no self-reset)"
   );
   // The next primary tick ACTS on the flag: it forfeits by proposing the next view (StartViewChange).
-  // The flag PERSISTS (F2) — the lone SVC has not yet formed a quorum, so the view has not changed;
+  // The flag PERSISTS — the lone SVC has not yet formed a quorum, so the view has not changed;
   // the latch keeps the primary re-proposing + not heartbeating until it does. The op is unchanged.
   // (The step-down bootstraps `svc_message` at the retransmit cadence, so the re-propose
   // is serviced on the next svc_message window; tick at that 100ms boundary.)
@@ -2091,13 +2091,13 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
   );
 }
 
-// ── State-sync — A6: view-change / B3-interaction safety (regression guards) ──
+// ── State-sync — view-change / canonical-log-interaction safety (regression guards) ──
 
 #[test]
 fn synced_replica_reports_its_checkpoint_in_view_change() {
   // After syncing to checkpoint 4, force the replica into a view change and inspect its DVC: it must
   // report commit == 4 (the synced point) with log_view <= view and a tail that does NOT start at
-  // op 1 — exactly the recover-from-checkpoint shape (this is the B3 interaction; no B3 code here).
+  // op 1 — exactly the recover-from-checkpoint shape (this is the canonical-log interaction; no canonical-log-selection code here).
   // Use replica 2 of 3 as the laggard: in view 1 the primary is replica 1 (not itself), so it sends
   // a DoViewChange we can capture (a replica that is itself the next primary would form the
   // canonical log directly instead of sending a DVC).

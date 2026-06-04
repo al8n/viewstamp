@@ -5,7 +5,7 @@ impl<S: StateMachine> Endpoint<S> {
     // Deferred forfeit: a primary that hit the force-sync strand
     // ([`Self::maybe_force_sync`]) flagged a step-down rather than reset its `op` (which would let it
     // reuse op numbers in this view). Act on it FIRST, on EVERY primary tick while the flag is set —
-    // and crucially do NOT clear it one-shot (F2). A one-shot forfeit broadcasts a SINGLE
+    // and crucially do NOT clear it one-shot. A one-shot forfeit broadcasts a SINGLE
     // StartViewChange and then resumes heartbeating; if that lone SVC is dropped/partitioned the
     // primary keeps heartbeating, every backup keeps resetting its `primary_idle` (so none starts its
     // own view change), and the SVC retransmit timer is not serviced while Normal — the stuck primary
@@ -47,7 +47,7 @@ impl<S: StateMachine> Endpoint<S> {
       // since the heartbeat/retransmit arming below sits under this early return).
       self.timers.commit = None;
       self.timers.prepare = None;
-      // FIX 2: also RETIRE the forfeit grace timer. A primary can
+      // Also RETIRE the forfeit grace timer. A primary can
       // reach `pending_forfeit` via the force-sync / sync-checkpoint STEP-DOWN
       // (`maybe_force_sync` / `on_sync_checkpoint` / `on_recover_sync_checkpoint`) rather than via
       // `forfeit()` — and that path does NOT disarm `forfeit_armed` (only `forfeit()` does). This branch
@@ -178,7 +178,7 @@ impl<S: StateMachine> Endpoint<S> {
       return;
     }
     // do not serve clients while our committed prefix is not yet applied. If commit_max >
-    // commit_min (a committed op is known but not yet applied — e.g. held by a B4 repair hole), the client
+    // commit_min (a committed op is known but not yet applied — e.g. held by a repair hole), the client
     // session table is stale for the unapplied ops; assigning a fresh op to a retry of one of them would
     // double-execute it once the gap fills (the apply loop has no dedup). Make the primary catch up first;
     // the client retries. (A healthy steady-state primary has commit_max == commit_min, so this never fires
@@ -333,7 +333,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// Applies op `op` on the primary, caches + sends the reply, emits the event. Returns `true` if it
   /// applied; `false` if the body is missing (read back permanently faulty) — in which case it
   /// registers the op for peer fault-repair and does NOT advance `commit_min`, so the caller HOLDS
-  /// the commit at the hole until a peer supplies the op (B4).
+  /// the commit at the hole until a peer supplies the op.
   #[must_use]
   fn commit_op(&mut self, now: Instant, op: u64) -> bool {
     // Faults-as-data (peer fault-repair): a committed op whose body read back
@@ -379,7 +379,7 @@ impl<S: StateMachine> Endpoint<S> {
     sb: &mut B,
     p: Prepare,
   ) {
-    // Peer fault-repair (B4): a `Prepare` answering our `RequestPrepare` for a committed-op hole is
+    // Peer fault-repair: a `Prepare` answering our `RequestPrepare` for a committed-op hole is
     // handled BEFORE the view/role guards below — its op's content is view-independent (a committed op
     // is immutable), so a reply from a holder in any view fills the hole; we must NOT let the
     // higher-view rule yank us into a view change, nor the `is_primary`/same-view guards drop it (a
