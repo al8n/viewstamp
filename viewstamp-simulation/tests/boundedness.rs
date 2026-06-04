@@ -20,7 +20,9 @@
 //! (non-vacuously: its sync count goes 0 -> >= 1) and converge — proving a laggard below the prune
 //! floor recovers via snapshot, not the pruned ops. Multi-seed.
 
-use viewstamp_simulation::{BoundednessChecker, CheckResult, Cluster, DurabilityChecker, check_safety};
+use viewstamp_simulation::{
+  BoundednessChecker, CheckResult, Cluster, DurabilityChecker, check_safety,
+};
 
 #[test]
 fn long_run_with_gc_stays_bounded_and_survives_crash_through_the_prune() {
