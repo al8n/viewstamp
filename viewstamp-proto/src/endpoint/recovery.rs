@@ -320,6 +320,7 @@ impl<S: StateMachine> Endpoint<S> {
     let id = match &done {
       WalDone::ReadOk(r) => r.id(),
       WalDone::Absent(id) | WalDone::Fault(id) => *id,
+      WalDone::BodyFaulty(bf) => bf.id(),
       WalDone::Appended(_) => return,
     };
     // Capture the durable known-committed frontier + log_view BEFORE borrowing `rec` (the above-band

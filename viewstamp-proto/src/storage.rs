@@ -541,6 +541,33 @@ impl ReadOk {
   }
 }
 
+/// A durable read whose header self-checksum verifies but whose body failed verification
+/// (torn / bit-rot) or is absent — the op EXISTS and its identity is known; only the body
+/// needs peer-repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyFaulty {
+  id: OpId,
+  header: Header,
+}
+impl BodyFaulty {
+  /// Creates a body-faulty result.
+  pub const fn new(id: OpId, header: Header) -> Self {
+    Self { id, header }
+  }
+
+  /// The correlation id of the storage op that produced this result.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn id(&self) -> OpId {
+    self.id
+  }
+
+  /// The WAL entry header (durable and self-verified).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn header(&self) -> Header {
+    self.header
+  }
+}
+
 /// Completion of a submitted `Wal` op.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
@@ -557,6 +584,8 @@ pub enum WalDone {
   Absent(OpId),
   /// A storage-level fault (or proto-detected corruption).
   Fault(OpId),
+  /// A durable read whose header verifies but whose body failed verification or is absent.
+  BodyFaulty(BodyFaulty),
 }
 
 /// A successful checkpoint read.
@@ -1000,6 +1029,25 @@ mod tests {
     let d = WalDone::ReadOk(r);
     assert!(d.is_read_ok());
     assert_eq!(d.unwrap_read_ok().op(), OpNumber::with(1));
+  }
+
+  #[test]
+  fn body_faulty_round_trips_id_and_header() {
+    let id = OpId::new(42);
+    let header = Header::new(
+      OpNumber::with(7),
+      View::with(2),
+      ClientId::new(9),
+      RequestNumber::with(3),
+      b"payload",
+    );
+    let bf = BodyFaulty::new(id, header);
+    assert_eq!(bf.id(), id, "id round-trips");
+    assert_eq!(bf.header(), header, "header round-trips");
+    // Can be wrapped in WalDone::BodyFaulty.
+    let done = WalDone::BodyFaulty(bf);
+    assert!(done.is_body_faulty());
+    assert_eq!(done.unwrap_body_faulty().id(), id);
   }
 
   // ── disk codec: Header + VsrState ──
