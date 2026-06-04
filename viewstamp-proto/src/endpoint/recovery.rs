@@ -271,14 +271,13 @@ impl<S: StateMachine> Endpoint<S> {
     let lo = checkpoint_op.saturating_add(1);
     for op in lo..=hi {
       if let Some(h) = wal.header(OpNumber::with(op)) {
-        endpoint.log.insert(
-          op,
-          LogEntry {
-            client: h.client(),
-            request: h.request(),
-            body: Bytes::new(),
-          },
-        );
+        // A Phase-1 header-only PLACEHOLDER: the body is filled in by the WAL-tail read completion
+        // (`on_recover_wal_done`). Kept as a `Present(empty)` body — NOT a `Body::Repairing` hole — so
+        // behavior is exactly as before this task; a recovering replica does not apply ops, so the empty
+        // placeholder is never read by the commit path (it is filled, or dropped + peer-repaired, first).
+        endpoint
+          .log
+          .insert(op, LogEntry::present(h.client(), h.request(), Bytes::new()));
       }
       // Submit a read for EVERY tail op (even one whose header is absent/faulty now): the read is
       // the authoritative resolution, and a `Fault`/`Absent` completion routes through the retry
@@ -413,16 +412,11 @@ impl<S: StateMachine> Endpoint<S> {
         rec.pending.remove(&op);
         rec.faulty.remove(&op);
         match self.log.get_mut(&op) {
-          Some(entry) => entry.body = body,
+          Some(entry) => entry.body = Body::Present(body),
           None => {
-            self.log.insert(
-              op,
-              LogEntry {
-                client,
-                request,
-                body,
-              },
-            );
+            self
+              .log
+              .insert(op, LogEntry::present(client, request, body));
           }
         }
       }

@@ -314,8 +314,15 @@ impl<S: StateMachine> Endpoint<S> {
     self
       .log
       .iter()
-      .map(|(&op, e)| {
-        crate::PreparedEntry::new(OpNumber::with(op), e.client, e.request, e.body.clone())
+      .filter_map(|(&op, e)| match &e.body {
+        Body::Present(body) => Some(crate::PreparedEntry::new(
+          OpNumber::with(op),
+          e.client,
+          e.request,
+          body.clone(),
+        )),
+        // header-only entries are carried through the DVC in a later task; none exist yet.
+        Body::Repairing(_) => None,
       })
       .collect()
   }
@@ -723,11 +730,7 @@ impl<S: StateMachine> Endpoint<S> {
     for e in entries {
       self.log.insert(
         e.op().get(),
-        LogEntry {
-          client: e.client(),
-          request: e.request(),
-          body: e.body_bytes(),
-        },
+        LogEntry::present(e.client(), e.request(), e.body_bytes()),
       );
     }
   }
@@ -900,15 +903,21 @@ impl<S: StateMachine> Endpoint<S> {
     let Some(entry) = self.log.get(&op).cloned() else {
       return; // not held — `advance_commit`/`request_repair` recovers a committed gap; nothing to ack
     };
+    // A body-`Repairing` entry has no bytes to (re-)append, so it is treated like a not-held op: skip
+    // it and owe no ack — `advance_commit`/`request_repair` recovers its body from a peer. (No path
+    // creates a `Repairing` entry yet.)
+    let Body::Present(body) = entry.body else {
+      return;
+    };
     let header = Header::new(
       OpNumber::with(op),
       self.view,
       entry.client,
       entry.request,
-      &entry.body,
+      &body,
     );
     let id = self.mint_op_id();
-    wal.submit_append(id, OpNumber::with(op), header, entry.body);
+    wal.submit_append(id, OpNumber::with(op), header, body);
     self.pending.insert(id.get(), kind);
     // Append-before-ack: the adopted op is in flight until `on_wal_done`. Both adoption kinds
     // (AdoptVote → own vote, AdoptAck → PrepareOk) defer their cast to completion; tracking the op

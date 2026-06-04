@@ -329,11 +329,11 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
   // to ack. (Without the entry the re-ack would mis-classify a durable committed op as a dropped hole.)
   e.log.insert(
     5,
-    LogEntry {
-      client: ClientId::new(7),
-      request: RequestNumber::with(5),
-      body: Bytes::copy_from_slice(&[5u8]),
-    },
+    LogEntry::present(
+      ClientId::new(7),
+      RequestNumber::with(5),
+      Bytes::copy_from_slice(&[5u8]),
+    ),
   );
   assert_eq!(
     wal.status(OpNumber::with(5)),
@@ -455,11 +455,11 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   for op in [3u64, 4u64] {
     ep.log.insert(
       op,
-      LogEntry {
-        client: ClientId::new(7),
-        request: RequestNumber::with(op),
-        body: Bytes::copy_from_slice(&[op as u8]),
-      },
+      LogEntry::present(
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      ),
     );
   }
   assert!(ep.is_primary());
@@ -543,6 +543,86 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   assert!(
     saw_prepare,
     "the primary broadcasts a Prepare for the request once it has caught up"
+  );
+}
+
+#[test]
+fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
+  // A body-`Repairing` log entry — the op EXISTS (its identity + durable body_checksum survived a
+  // torn-body fault) but its bytes are absent — must be treated by the commit path EXACTLY like a
+  // wholly-missing slot: HOLD the commit at it (never apply over an absent body) and solicit the body
+  // from a peer (`RequestPrepare`). This is the safety the otherwise-untested `Body::Repairing` apply
+  // arm rests on. (No production path creates a `Repairing` entry yet; this seeds one directly, the way
+  // a later recover/view-change task will.)
+  let mut e = backup(); // replica 1 of 3, view 0 (primary is replica 0)
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Head op 1, nothing applied yet, op 1 present in the log as a body-ABSENT `Repairing` slot carrying
+  // only op 1's canonical body_checksum (the bytes did not survive).
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry {
+      client: ClientId::new(7),
+      request: RequestNumber::with(1),
+      body: Body::Repairing(crate::storage::fnv1a_128(&[1u8])),
+    },
+  );
+  assert!(
+    !e.has_repair_hole_for_test(1),
+    "precondition: op 1 is not yet a tracked repair hole"
+  );
+
+  // The primary announces commit=1. `on_commit` → `advance_commit(target=1)` reaches op 1, finds its
+  // body absent, and must HOLD: commit_min stays 0, op 1 is registered for peer fault-repair, and a
+  // RequestPrepare(op 1) is solicited.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(0),
+    "the commit is HELD at the body-Repairing entry (op 1 not applied over an absent body)"
+  );
+  assert!(
+    e.has_repair_hole_for_test(1),
+    "op 1 is registered for peer fault-repair (the absent body is solicited, not skipped)"
+  );
+  let mut solicited = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::RequestPrepare(rp) = out.msg_ref() {
+      if rp.op() == OpNumber::with(1) {
+        solicited = true;
+      }
+    }
+  }
+  assert!(
+    solicited,
+    "a RequestPrepare(op 1) is emitted to fetch the missing body — exactly the missing-slot behavior"
+  );
+
+  // The repair Prepare answers with op 1's real body: once its append is durable, the held commit
+  // resumes and op 1 applies (commit_min reaches 1), proving the hold was a genuine pause, not a loss.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    repair_prepare(0, 1, 1),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply op 1
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "once the body is repaired + durable, the held commit applies op 1"
+  );
+  assert!(
+    !e.has_repair_hole_for_test(1),
+    "the repair hole clears once the canonical body fills it"
   );
 }
 

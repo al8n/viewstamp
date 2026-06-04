@@ -1821,12 +1821,16 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   // prefix stopped at op 1, so ops 3 + 4 were header-less, `op <= commit_max` fired the over-broad drop rule, and
   // recover DROPPED them — destroying this replica's only surviving copies of the committed tail.)
   assert!(
-    r.log.get(&3).is_some_and(|e| e.body.as_ref() == [3u8]),
+    r.log
+      .get(&3)
+      .is_some_and(|e| e.body.as_present() == Some(&[3u8][..])),
     "op 3 (held canonical, sparse-header-matched) is KEPT with its canonical body \
      (FAIL-BEFORE: dropped as a header-less committed op above the lower hole)"
   );
   assert!(
-    r.log.get(&4).is_some_and(|e| e.body.as_ref() == [4u8]),
+    r.log
+      .get(&4)
+      .is_some_and(|e| e.body.as_present() == Some(&[4u8][..])),
     "op 4 (held canonical, sparse-header-matched) is KEPT with its canonical body \
      (FAIL-BEFORE: dropped as a header-less committed op above the lower hole)"
   );
@@ -1985,7 +1989,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
     assert!(
       r.log
         .get(&op)
-        .is_some_and(|e| e.body.as_ref() == [op as u8]),
+        .is_some_and(|e| e.body.as_present() == Some(&[op as u8][..])),
       "op {op} (held committed, above the old cap) is read + cached with its canonical body"
     );
     assert!(
@@ -2323,7 +2327,9 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
     "no spurious repair hole — every committed-band slot matched its persisted header"
   );
   assert!(
-    r.log.get(&2).is_some_and(|e| e.body.as_ref() == [2u8]),
+    r.log
+      .get(&2)
+      .is_some_and(|e| e.body.as_present() == Some(&[2u8][..])),
     "op 2 kept its canonical WAL body (trusted, not dropped)"
   );
   // Announce commit=2: both committed ops apply directly from the trusted WAL, no peer-repair needed.
@@ -3038,11 +3044,8 @@ fn finalize_recovery_assert_catches_a_leaked_empty_faulty_slot() {
   e.recover = Some(rec);
   e.log.insert(
     5,
-    LogEntry {
-      client: ClientId::new(7),
-      request: RequestNumber::with(5),
-      body: Bytes::new(), // … but its EMPTY placeholder was NOT dropped from the cache (the leak).
-    },
+    // … but its EMPTY `Present` placeholder was NOT dropped from the cache (the leak).
+    LogEntry::present(ClientId::new(7), RequestNumber::with(5), Bytes::new()),
   );
   e.assert_no_faulty_committed_survives(); // must panic in debug: the leaked slot would apply empty.
 }

@@ -103,7 +103,21 @@ impl Header {
     request: RequestNumber,
     body: &[u8],
   ) -> Self {
-    let body_checksum = fnv1a_128(body);
+    Self::from_parts(op, view, client, request, fnv1a_128(body))
+  }
+
+  /// Creates a header from a PRECOMPUTED `body_checksum`, without the body bytes. Used when the body
+  /// is absent but its canonical checksum is durably known (a body-`Repairing` log entry), so the
+  /// header still records the op's canonical identity. Computes only the header self-checksum; the
+  /// `body_checksum` is taken as given. Equivalent to [`Header::new`] when
+  /// `body_checksum == fnv1a_128(body)`.
+  pub fn from_parts(
+    op: OpNumber,
+    view: View,
+    client: ClientId,
+    request: RequestNumber,
+    body_checksum: u128,
+  ) -> Self {
     let mut h = Self {
       version: HEADER_VERSION,
       checksum: 0,
@@ -772,7 +786,7 @@ pub fn checkpoint_id(snapshot: &[u8]) -> u128 {
 const FNV_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
 const FNV_PRIME: u128 = 0x0000000001000000000000000000013B;
 
-fn fnv1a_128(bytes: &[u8]) -> u128 {
+pub(crate) fn fnv1a_128(bytes: &[u8]) -> u128 {
   fnv1a_128_mix(FNV_OFFSET, bytes)
 }
 

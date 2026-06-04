@@ -84,6 +84,12 @@ impl<S: StateMachine> Endpoint<S> {
     let Some(entry) = self.log.get(&op) else {
       return; // we do not hold this op (or it is a hole for us too) — stay silent; another peer answers
     };
+    // A body-`Repairing` entry holds the op's identity but NOT its bytes (we are ourselves awaiting
+    // peer-repair of this body), so we cannot serve it: stay silent and let a peer that holds the body
+    // answer. (No path creates a `Repairing` entry yet.)
+    let Body::Present(body) = &entry.body else {
+      return;
+    };
     // never vouch for an uncommitted op as a repair source. Serve only ops we have
     // committed (op <= commit_min) so the answering Prepare carries commit (= commit_min) >= op; an op
     // above our applied frontier is not ours to certify — stay silent and let a caught-up peer answer.
@@ -97,7 +103,7 @@ impl<S: StateMachine> Endpoint<S> {
       self.checkpoint_op,
       entry.client,
       entry.request,
-      entry.body.clone(),
+      body.clone(),
     );
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(m.replica())),
@@ -171,11 +177,7 @@ impl<S: StateMachine> Endpoint<S> {
     // commit only once `WalDone::Appended` lands. The hole stays OPEN here (commit held, op not exposed)
     // and `op` is marked `appending` so the durable-status oracle treats it as in-flight (and a
     // duplicate repair Prepare hits the early `appending` guard above instead of double-appending).
-    let entry = LogEntry {
-      client: p.client(),
-      request: p.request(),
-      body: p.body_bytes(),
-    };
+    let entry = LogEntry::present(p.client(), p.request(), p.body_bytes());
     let id = self.mint_op_id();
     wal.submit_append(id, p.op(), header, p.body_bytes());
     // This append owes NO PrepareOk/own-vote (peer repair is not a vote), but unlike the OLD bare write

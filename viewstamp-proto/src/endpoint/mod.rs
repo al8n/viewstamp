@@ -21,8 +21,8 @@ mod view_change;
 /// peer-repair fill (see `fill_repair`) owes NO ack, but is still a DURABILITY BARRIER — its apply +
 /// hole-clear + exposure wait for the append via `Pending::RepairFill`.
 ///
-/// Not `Copy`: [`Pending::RepairFill`] carries the repaired [`LogEntry`] (a `Bytes` body) so the
-/// staged op is inserted into `self.log` only once its append is durable — never staged into the
+/// Not `Copy`: [`Pending::RepairFill`] carries the repaired [`LogEntry`] (a [`Body::Present`] body) so
+/// the staged op is inserted into `self.log` only once its append is durable — never staged into the
 /// in-memory log while non-durable (which would expose / apply it before the barrier).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
@@ -352,12 +352,67 @@ struct RecoverState {
   canonical: BTreeMap<u64, (ClientId, RequestNumber, u128)>,
 }
 
-/// One entry in the in-memory log (persistence arrives in a later milestone).
+/// A log entry's body is either Present (the bytes) or Repairing (only the durable body_checksum is
+/// known; the bytes must be peer-repaired).
+///
+/// Body-independent durable headers let a committed op's EXISTENCE survive a torn-body storage fault:
+/// the op stays in the log as a `Repairing` slot carrying just its canonical `body_checksum`, and the
+/// commit path holds at it (soliciting the body from a peer) exactly as it does for a wholly-missing
+/// slot. Not `Copy` — `Present` carries a `Bytes`.
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::IsVariant)]
+enum Body {
+  /// The body bytes are held.
+  Present(Bytes),
+  /// The body is absent (torn / not-yet-repaired); only the durable canonical `body_checksum` is known.
+  /// The bytes must be peer-repaired before the op can apply.
+  ///
+  /// No production path CONSTRUCTS this yet — recover/view-change populate it in a later task; today it
+  /// is built only by tests. Every reader already handles it (the commit path holds + peer-repairs).
+  #[cfg_attr(not(test), allow(dead_code))]
+  Repairing(u128),
+}
+
+impl Body {
+  /// The body bytes when [`Present`](Body::Present), else `None` (a `Repairing` slot has no bytes yet).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn as_present(&self) -> Option<&[u8]> {
+    match self {
+      Body::Present(bytes) => Some(bytes),
+      Body::Repairing(_) => None,
+    }
+  }
+
+  /// The canonical `body_checksum` of this op — total: computed from the bytes when
+  /// [`Present`](Body::Present), or the stored durable checksum when [`Repairing`](Body::Repairing).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn body_checksum(&self) -> u128 {
+    match self {
+      Body::Present(bytes) => crate::storage::fnv1a_128(bytes),
+      Body::Repairing(checksum) => *checksum,
+    }
+  }
+}
+
+/// One entry in the in-memory log (persistence arrives in a later milestone). Its [`Body`] is either
+/// `Present` (the bytes) or `Repairing` (only the durable `body_checksum`, awaiting peer-repair).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogEntry {
   client: ClientId,
   request: RequestNumber,
-  body: Bytes,
+  body: Body,
+}
+
+impl LogEntry {
+  /// A log entry whose body bytes are held — the common case (every path that knows the body builds
+  /// one of these). Wraps `body` as [`Body::Present`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn present(client: ClientId, request: RequestNumber, body: Bytes) -> Self {
+    Self {
+      client,
+      request,
+      body: Body::Present(body),
+    }
+  }
 }
 
 /// Primary-side tracking of an in-flight prepare awaiting a prepare_ok quorum.
@@ -1257,11 +1312,7 @@ impl<S> Endpoint<S> {
   fn seed_log_entry_for_test(&mut self, op: u64) {
     self.log.insert(
       op,
-      LogEntry {
-        client: ClientId::new(1),
-        request: RequestNumber::with(op),
-        body: Bytes::new(),
-      },
+      LogEntry::present(ClientId::new(1), RequestNumber::with(op), Bytes::new()),
     );
   }
 

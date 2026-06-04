@@ -2167,11 +2167,11 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
   for op in 5..=8u64 {
     e.log.insert(
       op,
-      LogEntry {
-        client: ClientId::new(7),
-        request: RequestNumber::with(op),
-        body: Bytes::copy_from_slice(&op.to_be_bytes()),
-      },
+      LogEntry::present(
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&op.to_be_bytes()),
+      ),
     );
   }
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
@@ -2288,19 +2288,19 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
   // post-repair canonical value `[5]`/`[6]` is provably DIFFERENT from the preserved-stale `[6]`/`[5]`.)
   e.log.insert(
     5,
-    LogEntry {
-      client: ClientId::new(7),
-      request: RequestNumber::with(5),
-      body: Bytes::copy_from_slice(&[6u8]),
-    },
+    LogEntry::present(
+      ClientId::new(7),
+      RequestNumber::with(5),
+      Bytes::copy_from_slice(&[6u8]),
+    ),
   );
   e.log.insert(
     6,
-    LogEntry {
-      client: ClientId::new(7),
-      request: RequestNumber::with(6),
-      body: Bytes::copy_from_slice(&[5u8]),
-    },
+    LogEntry::present(
+      ClientId::new(7),
+      RequestNumber::with(6),
+      Bytes::copy_from_slice(&[5u8]),
+    ),
   );
   // op 7,8 are also in the (commit_min .. commit] band and OMITTED below; they ride the same repair
   // path. Give the adopter NO held copy for them, so they are pure holes filled only from the peer.
