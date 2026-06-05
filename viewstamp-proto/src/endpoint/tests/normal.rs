@@ -448,8 +448,8 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   // Primary holding a committed-op GAP: head op 4, commit HELD at 1 by a hole at op 2, but commit_max
   // = 4 (ops 2..=4 are known committed cluster-wide, merely unapplied here). Ops 3 + 4 are present in
-  // the log; only op 2 is the unreadable hole. (`force_state_for_test` keeps commit_max == commit_min,
-  // so raise it directly to model the known-but-unapplied committed suffix.)
+  // the log; only op 2 is the unreadable hole. (`force_state_for_test` raises commit_max to cover the
+  // op-2 hole; raise it further to 4 to model the full known-but-unapplied committed suffix.)
   ep.force_state_for_test(0, 4, 1, 0, &[2]);
   ep.commit_max = OpNumber::with(4);
   for op in [3u64, 4u64] {

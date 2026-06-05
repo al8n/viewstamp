@@ -241,6 +241,30 @@ const COMMIT_HEARTBEAT: core::time::Duration = core::time::Duration::from_millis
 const PRIMARY_IDLE: core::time::Duration = core::time::Duration::from_millis(200);
 const VC_MESSAGE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
 const VIEW_CHANGE_STATUS: core::time::Duration = core::time::Duration::from_millis(500);
+/// Body-aware nack-truncation: the VIRTUAL-TIME grace a new primary gives a *repair-or-truncate
+/// candidate* — a header-only `Repairing` op ABOVE `commit*` that NO canonical-quorum donor holds
+/// `Present` (so its body is absent on the collected quorum). The keep-vs-truncate decision is locally
+/// undecidable (a committed op whose body-holders are merely unreachable looks byte-identical to a
+/// genuinely-uncommitted no-body op), so the new primary repairs the candidate AND arms this deadline:
+/// if a `Present` body arrives first the op is KEPT (it was committed after all); only if the grace
+/// elapses with the body still absent is the uncommitted tail truncated.
+///
+/// **Why VIRTUAL time, not tick/view counts** (the seed-622 lesson): a liveness window must gate on the
+/// virtual clock, never on tick counts or view-change counts — under a churn schedule those advance at
+/// wildly varying virtual rates, so a count-gated window can truncate before a reachable holder ever had
+/// a virtual-time chance to answer.
+///
+/// **Why this length is safe** (it must be long enough that an eventually-connected `Present` holder
+/// answers a `RequestPrepare` first, robust to a view-change storm): a committed op's body is WAL-durable
+/// on a write-quorum, so within `f` faults ≥1 holder exists and — once reachable — answers on the
+/// `REPAIR_RETRANSMIT` (100ms) cadence. `10 × VIEW_CHANGE_STATUS` (5s) spans ~10 view-change escalation
+/// cycles and ~50 repair retransmits, far more than enough for a healed partition's holder to reply
+/// before the deadline — so a committed op is never truncated within `f`. It also comfortably exceeds the
+/// simulator's `CALM_MIN_VIRTUAL` (3s) calm-window span, so a body-faulty COMMITTED op (always carried
+/// `<= commit*`, hence never a candidate) and the rare genuinely-uncommitted candidate both heal/cancel
+/// inside a calm window before this fires. A genuinely body-absent uncommitted op (no holder anywhere)
+/// has no one to answer, so the deadline elapses and it is truncated — restoring liveness.
+const REPAIR_OR_TRUNCATE_GRACE: core::time::Duration = core::time::Duration::from_millis(5_000);
 /// Forfeit: how long the checkpoint-lag forfeit condition must
 /// hold CONTINUOUSLY before a stuck primary actually steps down (the anti-storm grace timer). Sits
 /// above `PRIMARY_IDLE` (200ms) — so a *silent* primary is failed over first by a backup's idle VC,
@@ -441,9 +465,23 @@ struct Timers {
   /// reset (it is a heartbeat-path deadline a Normal primary keeps ticking while it appends new ops),
   /// so a steady client load does not keep re-zeroing the grace window.
   forfeit_armed: Option<Instant>,
+  /// Normal primary: the body-aware nack-truncation GRACE timer. `Some(deadline)` while this new
+  /// primary holds a *repair-or-truncate candidate* — a header-only `Repairing` op ABOVE `commit*` that
+  /// no canonical-quorum donor held `Present` (its body absent on the collected DVC quorum). Armed by
+  /// [`Endpoint::start_view_as_new_primary`] (`now + REPAIR_OR_TRUNCATE_GRACE`); the candidate is
+  /// repaired meanwhile (`request_repair`). DISARMED the moment a `Present` body fills the last
+  /// candidate (the op was committed after all — see the `RepairFill` arm of `on_wal_done`), on the
+  /// deadline (the still-body-absent uncommitted tail is then truncated — see
+  /// [`Endpoint::repair_or_truncate_timeouts`]), and on every view-change transition (a fresh
+  /// generation re-evaluates from scratch — `reset_for_view_transition`). Only ever set on the
+  /// new-primary path; a backup never arms it. Like [`Timers::forfeit_armed`], `arm_timers` PRESERVES
+  /// it across its `Timers::default()` reset (it is a deadline that must survive the durable-view-write
+  /// / forfeit windows the role-timer re-arm passes through), so its lifecycle is owned solely by the
+  /// arm/disarm sites above, not by the role re-arm.
+  repair_or_truncate: Option<Instant>,
 }
 
-/// The twelve scheduled timers, as an enumerable kind. Used by [`Endpoint::serviceable_now`] (the
+/// The thirteen scheduled timers, as an enumerable kind. Used by [`Endpoint::serviceable_now`] (the
 /// single source of truth for "will the CURRENT (status, substate) actually SERVICE this timer if it
 /// fires?") so [`Endpoint::poll_timeout`] can filter to only-serviceable deadlines — making the
 /// timer-wedge spin (a `poll_timeout`-driven driver re-returning a stale, never-serviced deadline)
@@ -465,13 +503,18 @@ enum TimerKind {
   /// The forfeit grace timer ([`Timers::forfeit_armed`]), serviced (via `maybe_forfeit`) on the same
   /// Normal-primary heartbeat path as `commit`/`prepare`.
   ForfeitArmed,
+  /// The body-aware nack-truncation grace timer ([`Timers::repair_or_truncate`]), serviced (via
+  /// [`Endpoint::repair_or_truncate_timeouts`]) on the Normal-primary heartbeat path — gated, like
+  /// `commit`/`prepare`/`forfeit_armed`, on `participates_as_primary() && !pending_forfeit` (it must
+  /// not truncate while the view write is in flight or the primary is stepping down).
+  RepairOrTruncate,
 }
 
 impl TimerKind {
   /// Every timer kind, so `poll_timeout`'s filter and `handle_timeout`'s no-orphan assert iterate the
   /// complete set (a new timer added to [`Timers`] must be added here, to `arm`-edness, and to
   /// `serviceable_now`).
-  const ALL: [TimerKind; 12] = [
+  const ALL: [TimerKind; 13] = [
     TimerKind::Prepare,
     TimerKind::Commit,
     TimerKind::PrimaryIdle,
@@ -484,6 +527,7 @@ impl TimerKind {
     TimerKind::RepairRetry,
     TimerKind::SyncSolicit,
     TimerKind::ForfeitArmed,
+    TimerKind::RepairOrTruncate,
   ];
 
   /// A stable name for the no-orphan-due `debug_assert` diagnostic in `handle_timeout`.
@@ -501,6 +545,7 @@ impl TimerKind {
       TimerKind::RepairRetry => "repair_retry",
       TimerKind::SyncSolicit => "sync_solicit",
       TimerKind::ForfeitArmed => "forfeit_armed",
+      TimerKind::RepairOrTruncate => "repair_or_truncate",
     }
   }
 }
@@ -1200,6 +1245,18 @@ impl<S> Endpoint<S> {
     self.pending_forfeit
   }
 
+  /// Test-only: raise the deferred-forfeit step-down exactly as the production `defer_forfeit` does
+  /// (the step-down a primary takes off the force-sync / sync-checkpoint strand), so a regression can
+  /// prove the body-aware truncation is gated OUT of the `pending_forfeit` window without driving a
+  /// full force-sync. Inlined (not delegating to `defer_forfeit`) because this test-accessor impl block
+  /// carries no `S: StateMachine` bound; kept byte-identical to that method (latch `pending_forfeit` +
+  /// bootstrap the serviceable `svc_message` wake).
+  #[cfg(test)]
+  fn defer_forfeit_for_test(&mut self, now: Instant) {
+    self.pending_forfeit = true;
+    self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
+  }
+
   /// Test-only: is a view-change/adoption superblock write still pending (`pending_sb` armed)? True
   /// exactly in the durable-view-before-participate window: after
   /// `start_view_as_new_primary` sets `Normal` but before `on_sb_done` lands the durable-view write.
@@ -1238,6 +1295,13 @@ impl<S> Endpoint<S> {
   /// apply path would leave a replica holding a committed-op hole below its head. Does NOT touch the
   /// `log` cache (the holes are, by construction, ABSENT from it — the apply path treats them as
   /// missing bodies), so the commit is genuinely held below the first hole.
+  ///
+  /// The supplied `repair` holes are modelled as COMMITTED holes (the helper's documented contract: "a
+  /// committed-op hole below its head"), so `commit_max` is raised to cover the highest of them as well
+  /// as `commit_min`. This keeps a hole `<= commit_max` — the property the forfeit gate (and the
+  /// body-aware nack-truncation candidate test, which excludes `op <= commit_max`) read to tell a
+  /// COMMITTED hole apart from an above-`commit_max` repair-or-truncate candidate. Without it a hole
+  /// would read as `> commit_max` (an uncommitted candidate) and never gate the forfeit.
   #[cfg(test)]
   fn force_state_for_test(
     &mut self,
@@ -1256,7 +1320,14 @@ impl<S> Endpoint<S> {
     self.log_view = View::with(view);
     self.op = OpNumber::with(op);
     self.commit_min = OpNumber::with(commit_min);
-    self.commit_max = OpNumber::with(self.commit_max.get().max(commit_min));
+    let committed_frontier = repair
+      .iter()
+      .copied()
+      .max()
+      .unwrap_or(0)
+      .max(commit_min)
+      .max(self.commit_max.get());
+    self.commit_max = OpNumber::with(committed_frontier);
     self.checkpoint_op = OpNumber::with(checkpoint_op);
     self.repair = repair.iter().copied().collect();
     if !self.repair.is_empty() {
@@ -1360,6 +1431,14 @@ impl<S> Endpoint<S> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn below_ring_window_syncs(&self) -> u64 {
     self.below_ring_window_syncs
+  }
+
+  /// Test-only: the client session's request high-water (the at-most-once dedup watermark
+  /// `on_request` compares against), or `None` if the client has no session row. Proves the watermark
+  /// is NOT seeded for an uncommitted adopted tail op that is later truncated.
+  #[cfg(test)]
+  fn session_request_for_test(&self, client: u128) -> Option<u64> {
+    self.clients.get(&client).map(|s| s.request.get())
   }
 
   /// Test-only: the cached `(request_number, reply_body)` a client session holds (the at-most-once
@@ -1685,7 +1764,15 @@ where
   /// Fires any timers due at `now`, dispatching by status/role.
   pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     match self.status {
-      Status::Normal if self.is_primary() => self.primary_timeouts(now, sb),
+      Status::Normal if self.is_primary() => {
+        self.primary_timeouts(now, sb);
+        // Body-aware nack-truncation grace expiry: run AFTER the heartbeat, on the Normal-primary path.
+        // It self-gates on `participates_as_primary() && !pending_forfeit` (matching
+        // `serviceable_now(RepairOrTruncate)`), so it truncates only when the view is durable and the
+        // primary is not stepping down; in those windows the deadline is preserved (non-serviceable, so
+        // poll_timeout-filtered + ignored by the no-orphan assert — no spin).
+        self.repair_or_truncate_timeouts(now, wal);
+      }
       Status::Normal => {
         // backup: bootstrap + fire primary_idle, then re-arm THIS timer only so we
         // re-propose at the primary_idle cadence (not every tick).
@@ -1780,8 +1867,15 @@ where
     // role-timer (re)arm and must leave it exactly as it found it (matching the pre-fold behavior, when
     // `forfeit_armed` lived OUTSIDE `Timers` and `Timers::default()` could not touch it).
     let forfeit_armed = self.timers.forfeit_armed;
+    // PRESERVE the body-aware nack-truncation grace across the role-timer reset for the same reason as
+    // `forfeit_armed`: it is a deadline armed by `start_view_as_new_primary` that must survive the
+    // durable-view-write window (which routes through `start_view_participate` → `arm_timers`) and any
+    // client-append `arm_timers`, so re-zeroing it here would lose the candidate's truncation clock. Its
+    // lifecycle is owned by the arm/fill-cancel/expiry/view-transition sites, never by this role re-arm.
+    let repair_or_truncate = self.timers.repair_or_truncate;
     self.timers = Timers::default();
     self.timers.forfeit_armed = forfeit_armed;
+    self.timers.repair_or_truncate = repair_or_truncate;
     match self.status {
       Status::Normal if self.is_primary() => {
         self.timers.commit = Some(now + COMMIT_HEARTBEAT);
@@ -1887,6 +1981,7 @@ where
       TimerKind::RepairRetry => self.timers.repair_retry,
       TimerKind::SyncSolicit => self.timers.sync_solicit,
       TimerKind::ForfeitArmed => self.timers.forfeit_armed,
+      TimerKind::RepairOrTruncate => self.timers.repair_or_truncate,
     }
   }
 
@@ -1926,9 +2021,17 @@ where
     match kind {
       // The Normal-primary heartbeat tick services these only when NOT forfeiting and the view is
       // durable; the `pending_forfeit` and `pending_sb` branches of `primary_timeouts` retire them.
-      TimerKind::Commit | TimerKind::Prepare | TimerKind::ForfeitArmed => {
-        self.participates_as_primary() && !self.pending_forfeit
-      }
+      // `repair_or_truncate` (the body-aware truncation grace) rides the SAME gate: `handle_timeout`'s
+      // Normal-primary arm runs `repair_or_truncate_timeouts` AFTER `primary_timeouts`, but that method
+      // itself early-returns under `pending_forfeit`/`pending_sb` WITHOUT clearing the deadline (it must
+      // survive both windows — a forfeiting / not-yet-durable primary must not truncate, but the
+      // candidate is still pending). So it is serviceable exactly when `commit`/`prepare` are, and is
+      // (like them) non-serviceable — hence poll_timeout-filtered and ignored by the no-orphan assert —
+      // during those windows, where it is preserved for the post-window tick to act on.
+      TimerKind::Commit
+      | TimerKind::Prepare
+      | TimerKind::ForfeitArmed
+      | TimerKind::RepairOrTruncate => self.participates_as_primary() && !self.pending_forfeit,
       TimerKind::PrimaryIdle => self.status.is_normal() && !self.is_primary(),
       // Three disjoint servicers (see the doc): forfeit re-propose, backup retransmit, or the
       // active view-change driver.

@@ -46,6 +46,175 @@ impl<S: StateMachine> Endpoint<S> {
     ));
   }
 
+  /// Whether `(op, entry)` is a still-open *repair-or-truncate candidate*: a header-only `Repairing`
+  /// op ABOVE the known-committed frontier `commit_max` whose body is NOT already being made durable.
+  /// Three exclusions, each meaning "not a truncation candidate":
+  /// - `op <= commit_max` — genuinely COMMITTED (kept + repaired, never truncated).
+  /// - not `Repairing` — its body is already `Present` (filled, or never a hole).
+  /// - `op` in `self.appending` — a peer answered and `fill_repair` ACCEPTED the canonical body, which
+  ///   is now an in-flight `Pending::RepairFill` (the entry stays `Repairing` only until `on_wal_done`
+  ///   lands the durable append). A holder answering PROVES the op was committed, so it must NEVER be
+  ///   truncated — even by a grace that fires concurrently with the not-yet-durable fill. A repair
+  ///   hole's slot can only be `appending` via a `RepairFill` (the normal `on_prepare` re-append branch
+  ///   skips ops in `self.repair`; see `fill_repair`), so this membership unambiguously means an
+  ///   accepted-but-not-yet-durable fill — treat it as body-present.
+  fn is_repair_or_truncate_candidate(&self, op: u64, entry: &LogEntry) -> bool {
+    op > self.commit_max.get() && entry.body.is_repairing() && !self.appending.contains(&op)
+  }
+
+  /// Whether any *repair-or-truncate candidate* remains. The candidate set shrinks via a `Present` fill
+  /// (`on_wal_done`'s `RepairFill` arm turns the entry `Present`) OR the moment `fill_repair` ACCEPTS a
+  /// body (the op enters `self.appending`, so `is_repair_or_truncate_candidate` excludes it) —
+  /// `commit_max` cannot cross a candidate without first filling its body (the apply/`try_commit` loop
+  /// HOLDS at the body-absent hole) — so re-deriving from current state is exact.
+  fn has_repair_or_truncate_candidate(&self) -> bool {
+    self
+      .log
+      .iter()
+      .any(|(op, e)| self.is_repair_or_truncate_candidate(*op, e))
+  }
+
+  /// Clear the body-aware nack-truncation grace once the LAST candidate is gone (filled or
+  /// learned-committed). Called after a `Present` fill lands (`on_wal_done`'s `RepairFill` arm): a
+  /// holder answered, so the candidate was committed after all and must never be truncated — disarm the
+  /// deadline. Idempotent (a no-op if the timer is already `None` or candidates remain).
+  pub(crate) fn cancel_repair_or_truncate_if_no_candidate(&mut self) {
+    if self.timers.repair_or_truncate.is_some() && !self.has_repair_or_truncate_candidate() {
+      self.timers.repair_or_truncate = None;
+    }
+  }
+
+  /// Body-aware nack-truncation GRACE expiry (the f-fault-model liveness closure). Run on the
+  /// Normal-primary heartbeat path (after `primary_timeouts`); a no-op unless the grace deadline is due.
+  ///
+  /// On expiry, RE-CONFIRM the candidate from CURRENT state — any op still held `Repairing` AND still
+  /// ABOVE the known-committed frontier `commit_max` (so it was not, in the meantime, filled by a
+  /// `Present` body nor learned-committed). If such candidates remain, the body is provably absent
+  /// across the collected quorum and the grace has elapsed with no holder answering, so it is
+  /// uncommitted-or-lost-beyond-`f`: TRUNCATE from the LOWEST such candidate up — drop the whole suffix
+  /// `[gap ..= self.op]` from `self.log`, lower `self.op` to the op below `gap`, drop the stranded WAL
+  /// tail, and clear EVERY per-op side table for that suffix: `repair`/`inflight`, the in-flight WAL
+  /// appends `pending`/`appending` (a higher suffix op can have an accepted-out-of-order `RepairFill` or
+  /// an adopted-tail `AdoptVote`/`AdoptAck` in flight — its abandoned completion must not resurrect a
+  /// truncated op nor vote on a reused number), and the client-session request high-water (roll back any
+  /// watermark a truncated uncommitted request advanced, so the client's retry is processed fresh, not
+  /// deduped to a no-reply hang). Then `on_request`'s `!repair.is_empty()` / `commit_max > commit_min`
+  /// guard clears (for the no-other-hole case) and the primary serves clients again.
+  ///
+  /// SAFETY: every truncated op is `> commit_max` (the lowest candidate `gap` is, and the tail above it
+  /// is too), so each satisfies [`Self::assert_committed_survives`]'s uncommitted clause — no committed
+  /// op is ever dropped here. Within `f` faults a committed op's body is reachable on a write-quorum and
+  /// answers the `RequestPrepare` BEFORE this deadline (so a committed op is never a still-unfilled
+  /// candidate at expiry — it would have filled + cancelled the grace). Gated, like the heartbeat, on
+  /// `participates_as_primary() && !pending_forfeit`: a not-yet-durable-view or stepping-down primary
+  /// must not truncate — the deadline is PRESERVED for the post-window tick (it stays non-serviceable,
+  /// so `poll_timeout` filters it and the no-orphan-due assert ignores it; no spin).
+  pub(crate) fn repair_or_truncate_timeouts<W: Wal>(&mut self, now: Instant, wal: &mut W) {
+    // SERVICEABILITY GATE (the SAME `serviceable_now(RepairOrTruncate)` condition, enforced HERE so a
+    // DIRECT `handle_timeout` tick — the VOPR + tests call it directly, bypassing `poll_timeout`'s
+    // filter — never truncates in a non-serviceable window). A not-yet-durable-view (`pending_sb`) or
+    // stepping-down (`pending_forfeit`) primary must NOT mutate the tail: the deadline is PRESERVED
+    // (this returns WITHOUT clearing it), staying non-serviceable so `poll_timeout` filters it and the
+    // no-orphan-due assert ignores it — no spin — and the post-window tick re-confirms + truncates.
+    if !self.participates_as_primary() || self.pending_forfeit {
+      return;
+    }
+    // A no-op unless the grace is armed-and-due. (With the gate above this only fires on a serviceable
+    // tick, so guarding the due-ness here ensures a serviced grace is never left armed-and-due.)
+    if self.timers.repair_or_truncate.is_none_or(|d| d > now) {
+      return;
+    }
+    // RE-CONFIRM from CURRENT state: the LOWEST still-open candidate (held `Repairing`, above
+    // `commit_max`, and NOT an accepted-but-not-yet-durable repair fill — see
+    // `is_repair_or_truncate_candidate`). Everything from there to the head is the still-body-absent
+    // uncommitted tail. The `appending` exclusion is load-bearing: a grace firing CONCURRENTLY with a
+    // fill `fill_repair` already accepted (whose append has not yet landed) must not truncate that op —
+    // a holder answered, so it was committed.
+    let gap = self
+      .log
+      .iter()
+      .filter(|(op, e)| self.is_repair_or_truncate_candidate(**op, e))
+      .map(|(op, _)| *op)
+      .min();
+    let Some(gap) = gap else {
+      // The last candidate filled / was learned-committed between the arm and now — nothing to
+      // truncate; just disarm the grace.
+      self.timers.repair_or_truncate = None;
+      return;
+    };
+    // Truncate the uncommitted tail `[gap ..= self.op]`. SAFETY: `gap > commit_max`, so `gap` and every
+    // op above it is uncommitted — each satisfies `assert_committed_survives`'s `> commit_max` clause, so
+    // no committed op is ever dropped here.
+    let head = self.op.get();
+    let floor = self.checkpoint_op.get();
+    // Clients whose at-most-once request high-water was advanced by a now-truncated op: their watermark
+    // is rolled back below (a truncated UNCOMMITTED request must be processed fresh, not deduped). Captured
+    // HERE because the `(client, request)` is read off the entry before it is removed from `self.log`.
+    let mut truncated_clients: std::collections::BTreeSet<u128> = std::collections::BTreeSet::new();
+    for op in gap..=head {
+      self.assert_committed_survives(op, floor);
+      if let Some(entry) = self.log.remove(&op) {
+        truncated_clients.insert(entry.client.get());
+      }
+      self.repair.remove(&op);
+      self.inflight.remove(&op);
+    }
+    // Roll back the client-session request high-water for every client an op in the truncated suffix
+    // advanced. New-primary adoption (`start_view_as_new_primary`) seeds the watermark from the adopted
+    // in-memory tail INCLUDING an uncommitted op (needed so a client whose op committed on the OLD primary
+    // can have its NEXT request accepted — see that loop). But a truncated op never committed: leaving its
+    // seeded watermark would make the client's ORIGINAL retry of that exact request hit `on_request`'s
+    // dedup as a DUPLICATE with NO cached reply (a truncated op has none), so the primary would silently
+    // drop it and the client would HANG forever. Lower each affected client's watermark to the highest
+    // request still BACKED — its cached reply's request (its last COMMITTED request — a committed op is
+    // never truncated, so this floor never regresses an at-most-once guarantee) OR the highest request
+    // among its SURVIVING (un-truncated, `< gap`) log entries, whichever is greater — so a truncated
+    // request is re-minted fresh while a still-held lower request stays deduped. Never RAISES the watermark
+    // (the `>` guard), so it only undoes a stale advance.
+    for client in truncated_clients {
+      // The highest request this client still holds in a SURVIVING (un-truncated, `< gap`) log entry —
+      // computed first so the `&self.log` borrow ends before the `&mut self.clients` write below.
+      let surviving_request = self
+        .log
+        .values()
+        .filter(|e| e.client.get() == client)
+        .map(|e| e.request.get())
+        .max()
+        .unwrap_or(0);
+      let Some(session) = self.clients.get_mut(&client) else {
+        continue;
+      };
+      // Its cached reply's request is its last COMMITTED request (a committed op is never truncated, so
+      // this floor never regresses an at-most-once guarantee).
+      let reply_request = session.reply.as_ref().map_or(0, |(rn, _)| rn.get());
+      let backed = reply_request.max(surviving_request);
+      if session.request.get() > backed {
+        session.request = RequestNumber::with(backed);
+      }
+    }
+    // Abandon any in-flight WAL appends for the truncated suffix, kept in LOCKSTEP exactly as
+    // `reset_for_view_transition` clears `pending`/`appending` on a view change — but scoped to the
+    // suffix `>= gap` rather than wholesale (a LOWER op `< gap` keeps its legitimately-in-flight append).
+    // A HIGHER suffix op can hold a `Pending::RepairFill` (a peer answered its repair out of order, so
+    // the gap below excludes it via `appending`) or a `Pending::AdoptVote`/`AdoptAck` (an adopted
+    // `Present` tail op re-appending). After `wal.truncate(gap-1)` that append is abandoned; left in
+    // `pending`/`appending` its later completion would RESURRECT the truncated op back into `self.log`
+    // above the lowered `self.op` (the `RepairFill` arm), cast an own vote / `PrepareOk` for a now-reused
+    // op number (`AdoptVote`/`AdoptAck`), or simply linger as a permanently-stuck in-flight
+    // (`has_inflight_storage()` true forever, since `appending` never clears). `self.pending` is keyed by
+    // the minted `OpId`, NOT the op number, so filter by each pending's `Pending::op()`. Dropping the
+    // entry makes its WAL completion a no-op in `on_wal_done` (the `None` arm). The `appending` set IS
+    // keyed by op, so trim it directly to `< gap`.
+    self.pending.retain(|_, p| p.op().get() < gap);
+    self.appending.retain(|&op| op < gap);
+    self.op = OpNumber::with(gap - 1);
+    wal.truncate(OpNumber::with(gap - 1));
+    self.timers.repair_or_truncate = None;
+    if self.repair.is_empty() {
+      self.timers.repair_retry = None;
+    }
+  }
+
   /// Peer-fault-repair retransmit timer: while the repair set is non-empty, re-solicit every
   /// unrepaired op and re-arm. Terminates when the last hole is filled (`fill_repair` clears the op
   /// and stops re-arming once `repair` is empty).
@@ -218,6 +387,14 @@ impl<S: StateMachine> Endpoint<S> {
       Pending::RepairFill(RepairFill::new(p.op(), entry)),
     );
     self.appending.insert(op);
+    // STAGE-TIME CANCEL of the body-aware nack-truncation grace: a holder ANSWERED with the canonical
+    // body for this op, which PROVES the op was committed — it must NEVER be truncated. `op` is now in
+    // `self.appending`, so `is_repair_or_truncate_candidate` excludes it; if it was the LAST candidate
+    // the grace disarms HERE (the moment of acceptance), not only when the append lands durably in
+    // `on_wal_done`. This closes the async-fill race where a fill accepted before the deadline but made
+    // durable after it would otherwise let the grace fire on a still-`Repairing` (but already-answered)
+    // entry. Idempotent + safe with other still-open candidates outstanding (it keeps the grace then).
+    self.cancel_repair_or_truncate_if_no_candidate();
     true
   }
 }

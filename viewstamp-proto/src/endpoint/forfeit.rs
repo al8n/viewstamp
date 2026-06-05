@@ -59,10 +59,19 @@ impl<S: StateMachine> Endpoint<S> {
       .quorum_checkpoint_op()
       .get()
       .saturating_sub(self.checkpoint_op.get());
-    // Stuck iff EITHER the checkpoint lags a full interval OR an unfilled committed `repair` hole is
-    // outstanding (a committed op `<= commit_max` the apply loop is held below — see the doc). The
+    // Stuck iff EITHER the checkpoint lags a full interval OR an unfilled COMMITTED `repair` hole is
+    // outstanding — a committed op `<= commit_max` the apply loop is held below (see the doc). The
     // grace timer disarms a hole that fills in time, so a fillable hole never forfeits.
-    let stuck = lag >= self.config.forfeit_checkpoint_lag() || !self.repair.is_empty();
+    //
+    // ONLY committed holes (`op <= commit_max`) gate the forfeit. An ABOVE-`commit_max` repair hole is
+    // a body-aware nack-truncation CANDIDATE (`start_view_as_new_primary` `request_repair`s it too, so
+    // it also lands in `self.repair`): it is resolved by the 5s `repair_or_truncate` grace (filled if a
+    // holder answers, else truncated), NOT by a forfeit. Counting it here would latch `pending_forfeit`
+    // at the 300ms `FORFEIT_GRACE` — long before the 5s grace — and the truncation (gated OFF during
+    // `pending_forfeit`) would never fire, wedging the cluster. So the "stuck committed hole" signal is
+    // restricted to `op <= commit_max`; a legitimate unfillable committed hole still forfeits.
+    let committed_repair_hole = self.repair.iter().any(|&op| op <= self.commit_max.get());
+    let stuck = lag >= self.config.forfeit_checkpoint_lag() || committed_repair_hole;
     match (stuck, self.timers.forfeit_armed) {
       // Caught up (or never behind): disarm — a transient lag / in-flight repair does not forfeit.
       (false, _) => self.timers.forfeit_armed = None,

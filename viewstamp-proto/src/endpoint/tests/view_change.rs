@@ -2911,6 +2911,1198 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
   );
 }
 
+// ── Body-aware nack-truncation: a header-only `Repairing` op ABOVE commit* that no canonical donor
+// holds `Present` is a repair-OR-truncate candidate. The new primary repairs it but arms a virtual-time
+// grace; a `Present` fill within the grace KEEPS it (it was committed after all), and only if the grace
+// elapses with the body absent across the quorum is the uncommitted tail truncated — closing the
+// permanent-wedge a genuinely-uncommitted header-only op would cause, without ever truncating a
+// committed op (whose body is reachable within f faults). ──
+
+#[test]
+fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresses() {
+  // FALSIFIER B (liveness — the bug this closes). A new primary adopts an above-commit* header-only
+  // `Repairing` op whose body exists on NO reachable replica (no peer ever answers the RequestPrepare).
+  // BEFORE the fix the op is kept forever as an unfillable repair hole → `on_request`'s
+  // `!repair.is_empty()` guard drops every client → permanent wedge. AFTER the fix: the new primary
+  // repairs it AND arms a virtual-time grace; once the grace elapses with the body still absent, the
+  // uncommitted tail is truncated, the hole clears, and the primary commits a fresh client request.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  // Replica 2's DVC: head op 2, commit 1 — op 1 COMMITTED (real body), op 2 an UNCOMMITTED tail
+  // (commit* = 1 < 2) carried HEADER-ONLY as a `Repairing` entry. NO canonical donor holds op 2
+  // `Present` (the own DVC holds op 0; replica 2 holds it header-only), so op 2 is a truncation candidate.
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // durable-view write → start_view_participate; repair solicit
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(2), "op 2's number is taken (head 2)");
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "op 1 committed; the body-absent op 2 holds the commit"
+  );
+  // THE WEDGE (the bug): op 2 is a peer-repair hole, so `on_request` drops every client and the commit
+  // can never advance — even with a healthy quorum, because op 2's body exists nowhere.
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is an unfillable repair hole (its body is absent everywhere)"
+  );
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from_static(b"x"),
+    )),
+  );
+  assert!(
+    e.poll_message().is_none(),
+    "the wedge: the primary drops the client while the unfillable repair hole stands"
+  );
+  // THE GRACE: the new primary armed a virtual-time grace on the candidate; no peer answers the
+  // RequestPrepare, so it never fills. We fire timeouts repeatedly across virtual time; the grace MUST be
+  // virtual-time, not tick-gated, so only advancing the clock past the deadline truncates.
+  let before_grace = now + (REPAIR_OR_TRUNCATE_GRACE - core::time::Duration::from_millis(1));
+  e.handle_timeout(before_grace, &mut wal, &mut sb);
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "before the grace deadline the candidate is still held + repaired (never truncated early)"
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "head unchanged before the grace elapses"
+  );
+  // Now advance PAST the grace deadline → the candidate is truncated and the tail above it is dropped.
+  let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
+  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "the grace elapsed with the body absent → the uncommitted op 2 is truncated, the hole clears"
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the head drops to op 1 (the op below the truncated candidate)"
+  );
+  use crate::Wal as _;
+  assert!(
+    wal.header(OpNumber::with(2)).is_none(),
+    "the truncated op 2's WAL slot is dropped (no resurrection on a later recover)"
+  );
+  // The wedge is cleared: the primary serves clients again and commits a FRESH client request at the
+  // (now reusable) op number 2 — proving liveness was restored, not a committed op lost.
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    after_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from_static(b"x"),
+    )),
+  );
+  e.handle_storage(after_grace, &mut wal, &mut sb); // the own append lands → own vote
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "the primary serves the client again, minting a fresh op 2 (the wedge is gone)"
+  );
+  // One backup ack reaches quorum (own + backup) → the fresh op 2 commits.
+  e.handle_message(
+    after_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(0),
+      OpNumber::new(),
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "the fresh client request commits — the primary makes progress again after the truncation"
+  );
+}
+
+#[test]
+fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_grace() {
+  // FALSIFIER A (safety). A COMMITTED header-only `Repairing` op whose single `Present` donor is
+  // unreachable for a while but answers WITHIN the grace window must be filled + applied and NEVER
+  // truncated. Here op 2 is adopted as an UNCOMMITTED-tail candidate (commit* = 1, no Present donor on
+  // the collected quorum — the body holder was partitioned out of the DVC quorum), so the grace is armed;
+  // but the body holder becomes reachable BEFORE the grace elapses and answers the RequestPrepare. The
+  // `Present` fill cancels the truncation, and the op is kept (it was committed after all).
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(e.op(), OpNumber::with(2));
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is repaired (candidate) — grace armed"
+  );
+  while e.poll_message().is_some() {}
+  // The Present holder becomes reachable WITHIN the grace window and answers the RequestPrepare with op
+  // 2's real canonical body (matching the kept checksum). `commit 1 < op 2` is accepted via the kept
+  // canonical-checksum path. The fill lands durably → the truncation is cancelled.
+  let within_grace = now + (REPAIR_OR_TRUNCATE_GRACE - core::time::Duration::from_millis(1));
+  e.handle_message(
+    within_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    repair_prepare(1, 2, 1),
+  );
+  e.handle_storage(within_grace, &mut wal, &mut sb);
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "the canonical body filled the hole within the grace"
+  );
+  assert!(
+    e.log.get(&2).is_some_and(|x| x.body.is_present()),
+    "op 2's body is now Present (kept — it was committed after all)"
+  );
+  // Now fire timeouts PAST the grace deadline: the op must NOT be truncated — the Present fill cancelled it.
+  let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
+  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "op 2 is KEPT past the grace — a Present holder vouched its body, so it is never truncated"
+  );
+  assert!(
+    e.log.get(&2).is_some_and(|x| x.body.is_present()),
+    "op 2 stays Present past the grace deadline"
+  );
+  // It commits on a backup ack (own vote was cast on the durable fill) — proving it was applied, not lost.
+  e.handle_message(
+    after_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(2),
+      OpNumber::new(),
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "the kept op 2 commits its canonical value — it was never truncated"
+  );
+}
+
+#[test]
+fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_grace() {
+  // FALSIFIER C (safety). A committed `Repairing` op whose `Present` donor flaps must be KEPT (TAKEN —
+  // op_head >= it) across view changes and eventually repaired, NEVER truncated. Two halves:
+  //   1. ACROSS VIEW CHANGES: re-run the canonical-log selection for a SECOND view change while the
+  //      donor that vouches op 2 committed is collected with laggards — op 2 stays in the canonical log
+  //      (op_head >= it), never nack-truncated, exactly as the durable-header property requires.
+  //   2. WITHIN THE GRACE: a new primary that adopts op 2 as a header-only candidate (the donor was
+  //      partitioned out of THIS quorum, so commit* < op 2) arms the truncation grace; the `Present`
+  //      holder then answers within the grace, the fill cancels the truncation, and op 2 is kept past
+  //      the deadline — a committed op is never truncated because a holder answers first.
+  let now = Instant::ZERO;
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+
+  // ── Half 1: op 2 stays TAKEN across a SECOND view-change selection. A view-1 donor reports op 2
+  // COMMITTED (commit 2) header-only; two laggards (older generation, head op 1) nack op 2. With the
+  // committed-frontier DVC present, commit* >= 2, so the nack scan cannot cut op 2. ──
+  let committed_donor = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(2), // op 2 is COMMITTED on this donor — its DVC vouches commit >= 2
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+  let mut selector = Endpoint::new(Config::try_new(2, ReplicaId::new(2), 5).unwrap(), 0, NoopSm);
+  selector.dvc_from_mut_for_test().insert(2, committed_donor);
+  selector.dvc_from_mut_for_test().insert(3, dvc(3, 0, 1, 1)); // laggard, head op 1, nacks op 2
+  selector.dvc_from_mut_for_test().insert(4, dvc(4, 0, 1, 1)); // laggard, head op 1, nacks op 2
+  let (log, op_head, commit_star) = selector.select_canonical_log();
+  assert!(
+    commit_star >= 2 && op_head >= 2,
+    "across the second view change the committed op 2 stays in the band (commit* {commit_star}, op_head {op_head}) — never nack-truncated"
+  );
+  assert!(
+    log.iter().any(|e| e.op() == OpNumber::with(2)),
+    "op 2 is STILL in the canonical log after the second view change (TAKEN, never re-minted)"
+  );
+
+  // ── Half 2: a new primary adopts op 2 as a header-only candidate (commit* = 1 here — the Present
+  // donor was partitioned out of THIS quorum), arms the grace, and the holder answers within it. ──
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(2),
+      OpNumber::with(1), // commit* = 1 on this collected quorum → op 2 is a candidate, grace armed
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::repairing(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          op2_checksum,
+        ),
+      ],
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(e.op(), OpNumber::with(2), "op 2 is TAKEN (head 2)");
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is repaired + the grace is armed"
+  );
+  while e.poll_message().is_some() {}
+  // The `Present` holder answers within the grace with op 2's real canonical body (kept checksum
+  // matches). `commit 1 < op 2` is accepted via the canonical-checksum path. The fill cancels truncation.
+  let within_grace = now + (REPAIR_OR_TRUNCATE_GRACE - core::time::Duration::from_millis(1));
+  e.handle_message(
+    within_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    repair_prepare(1, 2, 1),
+  );
+  e.handle_storage(within_grace, &mut wal, &mut sb);
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "op 2 is filled within the grace (a Present holder answered)"
+  );
+  // Past the grace deadline: op 2 is KEPT — a Present holder vouched its body, so it is never truncated.
+  let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
+  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "op 2 survives view-change churn + the grace — a Present holder answered, so it is never truncated"
+  );
+  assert!(
+    e.log.get(&2).is_some_and(|x| x.body.is_present()),
+    "op 2's canonical body is held (repaired, not lost)"
+  );
+}
+
+#[test]
+fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
+  // FALSIFIER (safety — Finding 1). The repair path is ASYNC: a peer `Prepare` ACCEPTS the canonical
+  // body BEFORE the grace (`fill_repair` stages a `Pending::RepairFill` + marks the op `appending`),
+  // but its WAL append completes AFTER the deadline. The entry stays `Repairing` (the hole stays open)
+  // until `on_wal_done` lands the durable append, so a truncation that re-derives body-absence purely
+  // from `self.log` would drop op 2 — a COMMITTED op whose body was FOUND in time. The fix treats a
+  // staged/in-flight fill as body-present: `fill_repair`'s acceptance cancels the grace (a holder
+  // answered ⇒ committed) AND the expiry handler excludes an `appending` op from the gap, so even a
+  // grace firing concurrently with the not-yet-durable fill never truncates op 2.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  // Replica 2's DVC: head op 2, commit 1 — op 1 COMMITTED, op 2 an UNCOMMITTED tail (commit* = 1)
+  // carried HEADER-ONLY. No canonical donor holds op 2 `Present`, so op 2 is a truncation candidate.
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // durable-view write → repair solicit + grace armed
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(2), "op 2's number is TAKEN (head 2)");
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is a peer-repair hole (candidate) — the grace is armed"
+  );
+  while e.poll_message().is_some() {}
+  // A holder answers the RequestPrepare with op 2's REAL canonical body (matching the kept checksum)
+  // BEFORE the grace. `fill_repair` ACCEPTS it: it stages a `Pending::RepairFill`, marks op 2
+  // `appending`, and KEEPS the hole `Repairing` until the append is durable. We do NOT drain storage,
+  // so the fill is still in flight — the entry is still `Repairing` in `self.log`.
+  let before_grace = now + (REPAIR_OR_TRUNCATE_GRACE - core::time::Duration::from_millis(1));
+  e.handle_message(
+    before_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    repair_prepare(1, 2, 1), // commit 1 < op 2: accepted via the kept canonical-checksum path
+  );
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "the hole stays OPEN (Repairing) until the staged fill's append is durable"
+  );
+  assert!(
+    e.log.get(&2).is_some_and(|x| x.body.is_repairing()),
+    "op 2 is still header-only in the log while its repair fill is in flight"
+  );
+  // NOW advance PAST the grace deadline WITHOUT draining the in-flight append. Before the fix this
+  // truncates op 2 (still `Repairing` above commit_max) → drops a committed op whose body was found in
+  // time. After the fix the in-flight fill is treated as body-present → op 2 is KEPT.
+  let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
+  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "op 2 is KEPT past the grace — its repair fill was accepted in time (never truncated mid-flight)"
+  );
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2's hole is still open (the fill has not yet landed) — but it was NOT truncated"
+  );
+  // Drain the in-flight append: the staged canonical body lands durably → op 2 becomes Present, the
+  // hole clears, and the primary casts its own vote (append-before-ack). The op was applied, not lost.
+  e.handle_storage(after_grace, &mut wal, &mut sb);
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "the repair hole clears once the staged body lands durably (after the grace)"
+  );
+  assert!(
+    e.log.get(&2).is_some_and(|x| x.body.is_present()),
+    "op 2's canonical body is now Present — it was kept + applied, never truncated"
+  );
+  use crate::Wal as _;
+  assert!(
+    wal.header(OpNumber::with(2)).is_some(),
+    "op 2's durable WAL slot survives (no mid-flight truncation dropped it)"
+  );
+  // It commits on a backup ack (own vote was cast on the durable fill) — proving it was applied.
+  e.handle_message(
+    after_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(0),
+      OpNumber::new(),
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "the kept op 2 commits its canonical value — the in-flight fill was never truncated"
+  );
+}
+
+#[test]
+fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
+  // FALSIFIER (safety — Finding 2). A DIRECT `handle_timeout` tick (the VOPR + tests call it directly)
+  // bypasses `poll_timeout`'s serviceability filter. While the new-primary view write is still in
+  // flight (`pending_sb`), the view is NOT yet durable — the change's own doc says it must NOT mutate.
+  // Before the fix `repair_or_truncate_timeouts` only checked the deadline was due, so a direct tick
+  // past the grace truncated the candidate inside the non-serviceable window. After the fix the method
+  // self-gates on `participates_as_primary() && !pending_forfeit`, so the deadline is PRESERVED.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+  // Adopt the DVC but DO NOT drain storage: status is Normal-primary but the durable-view write is
+  // still in flight (`pending_sb` armed), and the grace was armed by `start_view_as_new_primary`.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert!(
+    e.pending_sb_for_test(),
+    "the new-primary view write is still in flight (non-serviceable window)"
+  );
+  assert_eq!(e.op(), OpNumber::with(2), "op 2's number is TAKEN (head 2)");
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is a candidate (the grace is armed) before the window tick"
+  );
+  // A direct `handle_timeout` PAST the grace must NOT truncate while `pending_sb` holds.
+  let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
+  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "no truncation in the pending_sb window — the head is unchanged"
+  );
+  assert!(
+    e.log.get(&2).is_some_and(|x| x.body.is_repairing()),
+    "op 2 is still held (Repairing) — the non-durable-view window must not mutate the tail"
+  );
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2's repair hole is untouched in the pending_sb window"
+  );
+  // The deadline is PRESERVED for the post-window tick: drain the durable-view write (the view becomes
+  // durable, `pending_sb` clears), then a tick past the grace truncates the still-absent candidate —
+  // proving the gate suspended (not dropped) the grace.
+  e.handle_storage(after_grace, &mut wal, &mut sb);
+  assert!(!e.pending_sb_for_test(), "the view is now durable");
+  while e.poll_message().is_some() {}
+  e.handle_timeout(
+    after_grace + core::time::Duration::from_millis(1),
+    &mut wal,
+    &mut sb,
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "once the view is durable the preserved grace fires — the candidate is truncated, the head lowers"
+  );
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "the candidate is truncated on the first serviceable tick after the pending_sb window"
+  );
+}
+
+#[test]
+fn repair_or_truncate_does_not_fire_in_pending_forfeit_window() {
+  // FALSIFIER (safety — Finding 2). A direct `handle_timeout` past the grace must NOT truncate while
+  // the primary is stepping down (`pending_forfeit`). Before the fix the callee ignored the forfeit
+  // flag; after the fix it self-gates on `!pending_forfeit`, preserving the deadline.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  while e.poll_message().is_some() {}
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  // Make the view durable (clears `pending_sb`), so the ONLY non-serviceable cause under test is the
+  // forfeit latch — the candidate + its armed grace persist.
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert!(!e.pending_sb_for_test(), "the view is durable");
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is a candidate (the grace is armed)"
+  );
+  // Latch a deferred forfeit (the step-down a primary raises off the force-sync/sync-checkpoint strand).
+  e.defer_forfeit_for_test(now);
+  assert!(
+    e.pending_forfeit_for_test(),
+    "the primary is stepping down (pending_forfeit latched)"
+  );
+  // A direct `handle_timeout` PAST the grace must NOT truncate while stepping down.
+  let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
+  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "no truncation in the pending_forfeit window — the head is unchanged"
+  );
+  assert!(
+    e.log.get(&2).is_some_and(|x| x.body.is_repairing()),
+    "op 2 is still held (Repairing) — a stepping-down primary must not mutate the tail"
+  );
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2's repair hole is untouched in the pending_forfeit window (the deadline is preserved): a \
+     truncation would have removed op 2 from the log and lowered the head"
+  );
+}
+
+#[test]
+fn uncommitted_candidate_does_not_forfeit_and_truncation_fires_at_the_grace_poll_driven() {
+  // FALSIFIER (liveness — Finding 3). A new primary `request_repair`s the above-commit* repair-or-
+  // truncate candidate, putting it in `self.repair`. The forfeit path treats a non-empty `repair` as a
+  // stuck COMMITTED hole and latches `pending_forfeit` after the FORFEIT_GRACE (300ms) — long before
+  // the 5s truncation grace. With Finding 2's gate in place, the primary would then forfeit FIRST and
+  // the truncation would never fire — the wedge persists. The fix filters the forfeit "stuck committed
+  // hole" condition to `repair` ops `<= commit_max`, so an above-commit* candidate never latches
+  // `pending_forfeit`; driven via the poll-timeout path, virtual time reaches the 5s grace and the
+  // truncation fires (progress restored) WITHOUT the primary ever forfeiting on the candidate.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  while e.poll_message().is_some() {}
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // make the view durable + arm the grace
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(2), "op 2's number is TAKEN (head 2)");
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is an uncommitted candidate (above commit_max) in self.repair"
+  );
+  // No peer ever answers the RequestPrepare; op 2's body is absent everywhere. Drive virtual time
+  // through the POLL-TIMEOUT path (advance the clock to each serviceable deadline). The candidate is
+  // `> commit_max`, so it must NOT latch `pending_forfeit` even after the 300ms FORFEIT_GRACE; virtual
+  // time keeps advancing (commit/prepare/repair_retry cadence) until the 5s truncation grace fires.
+  let mut clock = now;
+  let deadline = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
+  let mut steps = 0u32;
+  while e.has_repair_hole_for_test(2) {
+    while e.poll_message().is_some() {}
+    let next = e
+      .poll_timeout()
+      .expect("a serviceable timer must drive virtual time toward the grace");
+    assert!(
+      next > clock,
+      "poll_timeout must return a strictly-future serviceable deadline (no spin)"
+    );
+    clock = next;
+    e.handle_timeout(clock, &mut wal, &mut sb);
+    e.handle_storage(clock, &mut wal, &mut sb);
+    assert!(
+      !e.pending_forfeit_for_test(),
+      "the above-commit* candidate must NEVER latch pending_forfeit (it is resolved by truncation)"
+    );
+    assert!(
+      !e.forfeit_armed_for_test(),
+      "the forfeit grace must NEVER arm on an above-commit* candidate"
+    );
+    steps += 1;
+    assert!(
+      clock <= deadline && steps < 10_000,
+      "the truncation must fire by the 5s grace (poll-driven), not wedge on a forfeit"
+    );
+  }
+  // The truncation fired at the 5s grace: op 2 is dropped, the head lowers, progress is restored —
+  // and `pending_forfeit` was NEVER latched on the candidate (the loop asserted it each step).
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the head drops to op 1 — the uncommitted candidate was truncated at the grace"
+  );
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "the repair hole clears (truncated, not forfeited)"
+  );
+  assert!(
+    clock >= now + REPAIR_OR_TRUNCATE_GRACE,
+    "the truncation fired at/after the 5s grace, not at the 300ms forfeit grace"
+  );
+  use crate::Wal as _;
+  assert!(
+    wal.header(OpNumber::with(2)).is_none(),
+    "the truncated op 2's WAL slot is dropped"
+  );
+}
+
+#[test]
+fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
+  // FALSIFIER (safety — repair-tail truncation leaves stale per-op side state). The grace truncates
+  // the WHOLE suffix `[gap ..= head]`, but a HIGHER op in that suffix can legitimately have an
+  // in-flight `Pending::RepairFill` (a peer answered its repair OUT OF ORDER) while the LOWER `gap`
+  // candidate is still body-absent. Before the fix the truncation dropped `log`/`repair`/`inflight`
+  // for the suffix but NOT `pending`/`appending`, so the higher op's stale append lingered: the WAL
+  // completion was still queued, and on delivery `on_wal_done`'s `RepairFill` arm RESURRECTED the
+  // truncated op back into `self.log` ABOVE the lowered `self.op` — and meanwhile `appending` stayed
+  // set, so `has_inflight_storage()` was permanently true (a stuck in-flight that never drains).
+  //
+  // Shape: a new primary of view 1 adopts op 1 COMMITTED (commit* = 1) + ops 2 AND 3 header-only
+  // (`Repairing`), neither held `Present` by any canonical donor. Both become above-commit* candidates
+  // and are solicited; the grace is armed. A holder then answers op 3's RequestPrepare OUT OF ORDER
+  // (op 2 stays absent), so `fill_repair` stages a `Pending::RepairFill` for op 3 and marks it
+  // `appending` — but op 2 is still a candidate, so the grace stays armed. The grace then fires: the
+  // gap is op 2 (op 3 is excluded by `appending`), so the suffix `[2 ..= 3]` truncates while op 3's
+  // RepairFill append is STILL IN FLIGHT.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let op3_checksum = crate::storage::fnv1a_128(&[3u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(3),
+    OpNumber::with(1), // commit* = 1 → ops 2 + 3 are above-commit* candidates
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(3),
+        ClientId::new(7),
+        RequestNumber::with(3),
+        op3_checksum,
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // durable-view write → solicit ops 2 + 3, arm the grace
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(3), "head 3 (ops 2 + 3 taken)");
+  assert!(e.has_repair_hole_for_test(2) && e.has_repair_hole_for_test(3));
+  while e.poll_message().is_some() {}
+  // Drain the storage queue so the ONLY outstanding WAL completion is op 3's RepairFill append. (The
+  // adoption staged no AdoptVote append for the header-only ops 2 + 3 — there is no body to write.)
+  while wal.poll().is_some() {}
+
+  // A holder answers op 3's RequestPrepare OUT OF ORDER (op 2 stays absent). `fill_repair` ACCEPTS it
+  // (kept canonical checksum matches), stages a `Pending::RepairFill` for op 3, and marks op 3
+  // `appending` — the hole stays open until the append is durable. We do NOT drain storage, so the fill
+  // is in flight. op 2 is still a candidate, so the grace stays armed.
+  let before_grace = now + (REPAIR_OR_TRUNCATE_GRACE - core::time::Duration::from_millis(1));
+  e.handle_message(
+    before_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    repair_prepare(1, 3, 1), // commit 1 < op 3: accepted via the kept canonical-checksum path
+  );
+  assert!(
+    e.has_inflight_storage(),
+    "op 3's RepairFill append is genuinely in flight before the grace fires"
+  );
+  assert!(
+    e.log.get(&3).is_some_and(|x| x.body.is_repairing()),
+    "op 3 stays header-only while its repair fill is in flight"
+  );
+
+  // The grace fires past the deadline: the gap is op 2 (op 3 is `appending`, excluded), so the suffix
+  // `[2 ..= 3]` truncates — INCLUDING op 3, whose RepairFill append is still in flight.
+  let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
+  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the head drops to op 1 — the whole body-absent suffix [2..=3] is truncated"
+  );
+  assert!(
+    !e.has_repair_hole_for_test(2) && !e.has_repair_hole_for_test(3),
+    "both suffix repair holes are cleared by the truncation"
+  );
+  // FAIL-BEFORE: the truncation left op 3's `Pending::RepairFill` + `appending` membership behind, so a
+  // permanently-stuck in-flight append remained. AFTER the fix the suffix `pending`/`appending` is
+  // cleared too, so no in-flight storage lingers.
+  assert!(
+    !e.has_inflight_storage(),
+    "no stuck in-flight append survives the truncation \
+     (FAIL-BEFORE: op 3's RepairFill/appending lingered → has_inflight_storage stayed true forever)"
+  );
+
+  // The WAL completion for op 3's now-abandoned append is STILL queued (it was staged before the
+  // truncation). Delivering it must NOT resurrect op 3 into `self.log` above the lowered `self.op`, nor
+  // cast any vote/commit — the abandoned completion finds no `pending` entry and is a no-op.
+  e.handle_storage(after_grace, &mut wal, &mut sb);
+  assert!(
+    !e.has_log_entry_for_test(3),
+    "the abandoned RepairFill completion does NOT resurrect op 3 into self.log above self.op \
+     (FAIL-BEFORE: on_wal_done's RepairFill arm re-inserted the truncated op 3 above the head)"
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the head stays at op 1 — no resurrection raised it"
+  );
+  assert!(
+    !e.has_inflight_storage(),
+    "still no in-flight storage after the stale completion is drained"
+  );
+
+  // Liveness restored: the primary serves a FRESH client request, minting the now-reusable op 2, and
+  // commits it on a backup ack — proving the truncation cleaned up fully (no phantom vote, no stuck op).
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    after_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from_static(b"x"),
+    )),
+  );
+  e.handle_storage(after_grace, &mut wal, &mut sb); // the own append lands → own vote
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "the primary mints a fresh op 2 (the wedge is gone, the slot is reusable)"
+  );
+  e.handle_message(
+    after_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(0),
+      OpNumber::new(),
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "the fresh request commits — progress is fully restored after the suffix truncation"
+  );
+}
+
+#[test]
+fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
+  // FALSIFIER (liveness — repair-tail truncation leaves a stale client session watermark). New-primary
+  // adoption backfilled the client-session request high-water from the adopted in-memory log tail,
+  // INCLUDING an UNCOMMITTED header-only (`Repairing`) tail op. After the grace truncates that op the
+  // op is gone, but the seeded watermark remained with NO cached reply — so the client's ORIGINAL retry
+  // of that request hit `on_request`'s dedup as a duplicate, found no cached reply, and was silently
+  // dropped → the client hangs forever. The fix only seeds the watermark on APPLY of a committed op
+  // (the backfill loop is bounded to the applied frontier), so a truncated uncommitted request leaves
+  // no phantom watermark and the client's retry is processed fresh.
+  //
+  // Shape: op 1 COMMITTED for client 7 (request 1); op 2 an UNCOMMITTED header-only `Repairing` tail
+  // op whose ONLY client is client 9 (request 1) — it exists nowhere `Present`, so no peer answers and
+  // the grace truncates it. Client 9's request 1 lived ONLY in the truncated op 2.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  // op 2's canonical body is client 9 / request 1 / body [2]; carried header-only as `Repairing`.
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1), // commit* = 1 → op 2 is an above-commit* candidate
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(9), // op 2's only client is client 9
+        RequestNumber::with(1),
+        op2_checksum,
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // make the view durable + arm the grace
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(2), "op 2's number is TAKEN (head 2)");
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is an above-commit* candidate (the grace is armed)"
+  );
+  // Adoption seeds client 9's watermark from the adopted in-memory tail (op 2 is `Present`-or-header in
+  // `self.log`, so the backfill loop advances `clients[9].request` to 1). That seeding is correct for an
+  // op that will commit, but op 2's body is absent and the grace will truncate it — so the watermark MUST
+  // be rolled back when the op is dropped (asserted after the truncation below).
+  assert_eq!(
+    e.session_request_for_test(9),
+    Some(1),
+    "adoption seeded client 9's watermark from the adopted tail op 2 (it is rolled back on truncation)"
+  );
+
+  // No peer answers op 2's RequestPrepare; the grace truncates the body-absent op 2.
+  while e.poll_message().is_some() {}
+  let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
+  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the body-absent op 2 is truncated (head drops to op 1)"
+  );
+  assert!(!e.has_repair_hole_for_test(2), "the repair hole clears");
+  // The truncation ROLLED BACK client 9's stale watermark (its only request lived in the truncated op 2,
+  // and no reply was cached for it). FAIL-BEFORE: the watermark stayed at 1, so the retry below deduped.
+  assert!(
+    e.session_request_for_test(9).is_none_or(|r| r == 0),
+    "client 9's watermark is rolled back to 0 after its only op (op 2) is truncated \
+     (FAIL-BEFORE: it stayed at request 1, so the client's retry was deduped to a no-reply hang)"
+  );
+
+  // Client 9's ORIGINAL request 1 (the one that lived only in the truncated op 2) is RETRIED. It must
+  // be processed FRESH — minted as a new op and broadcast as a Prepare — NOT silently dropped as a
+  // duplicate of a phantom watermark with no cached reply.
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    after_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from_static(b"x"),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "client 9's retry is processed fresh — a new op 2 is minted \
+     (FAIL-BEFORE: the phantom watermark made it a duplicate, so no op was minted and the client hung)"
+  );
+  let prepared = e.poll_message().expect(
+    "the retried request is broadcast as a Prepare (processed fresh, not dropped as a duplicate)",
+  );
+  match prepared.into_msg() {
+    Message::Prepare(p) => {
+      assert_eq!(
+        p.op(),
+        OpNumber::with(2),
+        "the fresh op 2 carries client 9's request"
+      );
+      assert_eq!(p.client(), ClientId::new(9));
+      assert_eq!(p.request(), RequestNumber::with(1));
+    }
+    other => panic!("expected a Prepare for the re-minted request, got {other:?}"),
+  }
+  // And it commits on a backup ack — the client gets a reply, proving the hang is gone.
+  e.handle_storage(after_grace, &mut wal, &mut sb); // the own append lands → own vote
+  e.handle_message(
+    after_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(0),
+      OpNumber::new(),
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "client 9's retried request commits — it was processed fresh, never hung"
+  );
+}
+
 // ── Sender-binding at ingress: a message's self-claimed sender must agree with the
 // authenticated `from`, or it is dropped. A non-Byzantine, cheap defense-in-depth backstop against a
 // buggy/misrouting driver (or a trivially-mislabeled message) spoofing a quorum vote. ──

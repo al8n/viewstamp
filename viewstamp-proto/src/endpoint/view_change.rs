@@ -256,6 +256,15 @@ impl<S: StateMachine> Endpoint<S> {
     // nor a stale pending-forfeit must carry across (no same-view re-forfeit / cross-view leak).
     self.timers.forfeit_armed = None;
     self.pending_forfeit = false;
+    // A view change ends this primary generation: drop any body-aware nack-truncation grace deadline.
+    // The candidate (a header-only `Repairing` op above `commit*` with no `Present` donor) is
+    // re-evaluated from scratch by the NEXT primary's `select_canonical_log` (it may again be a
+    // candidate, may now be `Present` on a donor, or may be nack-truncated) — so a stale grace deadline
+    // must not carry across (no cross-generation truncation, no same-view re-arm leak), exactly as the
+    // forfeit sub-state above. (`arm_timers` preserves this across its reset, so this is the one place
+    // that clears it on a transition; the timer is otherwise owned by `start_view_as_new_primary` /
+    // the fill-cancel / the expiry truncation.)
+    self.timers.repair_or_truncate = None;
   }
 
   /// The shared `ViewChange`-entry body (no view-advance assert — the callers assert their own
@@ -631,6 +640,15 @@ impl<S: StateMachine> Endpoint<S> {
     // backup-turned-primary with a GC'd log would carry `session.request == 0` and wedge every client
     // on `on_request`'s gap check.
     //
+    // This seeds the watermark for an UNCOMMITTED `Present` adopted tail op too (an op that committed on
+    // the OLD primary — the client may already hold its reply and send its NEXT request — but which this
+    // quorum adopted as uncommitted because the committing replicas were partitioned out): that op will
+    // re-commit here, so its watermark is needed so the client's next request is not seen as a gap. The
+    // one uncommitted op whose watermark must NOT outlive a rollback is a header-only `Repairing`
+    // truncation candidate whose body never arrives — `repair_or_truncate_timeouts` ROLLS the watermark
+    // back when it truncates such an op (a truncated request must be processed fresh, never deduped to a
+    // no-reply hang), so seeding it here is safe.
+    //
     // NOTE: we do NOT reconstruct the cached *reply* body here, so a client whose prior-view reply
     // was LOST relies on the in-flight op re-committing; the lost-reply resend is liveness under loss.
     for op in 1..=self.op.get() {
@@ -677,6 +695,34 @@ impl<S: StateMachine> Endpoint<S> {
       .collect();
     for op in repairing_tail {
       self.request_repair(now, op);
+    }
+
+    // Body-aware nack-truncation (the f-fault-model liveness closure). A header-only `Repairing` op
+    // ABOVE `commit*` is a *repair-or-truncate candidate*: NO canonical-quorum donor held it `Present`
+    // (the offset-UNION in `select_canonical_log` prefers `Present`, so an op that adoption left
+    // `Repairing` is one no canonical donor — and no local matching body — could supply), AND it is
+    // above the known-committed frontier, so the cluster never observed it committed on the collected
+    // quorum. The keep-vs-truncate decision is locally UNDECIDABLE: this could be a committed op whose
+    // body-holders were merely partitioned out of the DVC quorum (World A — must keep + repair, the
+    // seed-774 case), or a genuinely-uncommitted no-body op (World B — must truncate, else its
+    // perpetual repair hole drops every client at `on_request` forever). So we do BOTH: `request_repair`
+    // above keeps repairing it, and here we arm a VIRTUAL-TIME grace. If a `Present` body arrives before
+    // the deadline (a holder became reachable + answered the `RequestPrepare`) the op is KEPT — it was
+    // committed after all (the fill cancels the timer, see `on_wal_done`'s `RepairFill` arm). If the
+    // grace elapses with the body still absent, the uncommitted tail is truncated
+    // (`repair_or_truncate_timeouts`). SAFETY within `f`: a committed op's body is WAL-durable on a
+    // write-quorum, so ≥1 of its ≤f-down holders is eventually reachable and supplies the body BEFORE
+    // the grace — a committed op is never truncated. (`commit*` == `commit_max` here, just raised by
+    // `advance_commit(commit_star)`.) A `Repairing` op `<= commit*` is genuinely committed — NEVER a
+    // candidate (it is solicited but its grace is never armed). The timer is re-armed on a single
+    // earliest-due deadline for the whole candidate set; the expiry handler truncates from the LOWEST
+    // still-unfilled candidate up.
+    let has_candidate = self
+      .log
+      .iter()
+      .any(|(op, e)| *op > self.commit_max.get() && e.body.is_repairing());
+    if has_candidate {
+      self.timers.repair_or_truncate = Some(now + REPAIR_OR_TRUNCATE_GRACE);
     }
 
     // Rebuild the pipeline for the uncommitted tail `(commit_min, op]`. The new primary
