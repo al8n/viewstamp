@@ -14,6 +14,22 @@ use crate::{ClientId, OpNumber, RequestNumber, View};
 /// On-disk header format version (bumped on any wire/disk layout change).
 pub const HEADER_VERSION: u16 = 1;
 
+/// On-disk superblock-root ([`VsrState`]) format version — the version NEW roots are written with, and
+/// the high end of the layout-compatible range [`VsrState::decode`] accepts. The superblock root carries
+/// its OWN version, like the disk [`Header`]'s [`HEADER_VERSION`], INDEPENDENT of the message
+/// [`WIRE_VERSION`](crate::WIRE_VERSION): a version names a disk LAYOUT, and it moves ONLY when the
+/// `VsrState` layout itself changes — never as collateral from a message-format change.
+///
+/// The committed-band-header root layout has been byte-identical since the first release, but the
+/// pre-decoupling code led the root with the shared `WIRE_VERSION`, which bumped `1 → 2 → 3` for
+/// MESSAGE-only changes (the `DoViewChange`/`PreparedEntry` Repairing wire, then the `PrepareOk` field).
+/// So that ONE root layout exists tagged `1`, `2`, AND `3`. [`VsrState::decode`] accepts the whole
+/// `1..=SUPERBLOCK_VERSION` range as that single layout, so NO persisted root is stranded and a
+/// message-only `WIRE_VERSION` bump can never invalidate a root. A future `VsrState` LAYOUT change bumps
+/// this and MUST add explicit per-version dispatch in `decode` — the contiguous-range shortcut holds only
+/// while there is one layout.
+pub const SUPERBLOCK_VERSION: u16 = 3;
+
 /// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
 /// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are
 /// the bytes shared between [`Header::encode`] and the checksum, so the on-disk checksum can
@@ -428,7 +444,7 @@ impl VsrState {
   }
 
   /// Encodes this durable root to a length-prefixed, versioned byte vector (the superblock
-  /// on-disk form). Layout (all scalars big-endian): [`WIRE_VERSION`](crate::WIRE_VERSION) `u16`,
+  /// on-disk form). Layout (all scalars big-endian): [`SUPERBLOCK_VERSION`] `u16`,
   /// then `view`/`log_view` (`u64` each), `commit`/`checkpoint_op` (`u64` each), `checkpoint_id`
   /// (`u128`), then the committed-band header set as a `u32` count followed by that many
   /// fixed-size [`Header::encode`] blocks (one [`HEADER_ENCODED_LEN`]-byte block per header). The
@@ -438,7 +454,7 @@ impl VsrState {
     let mut out = BytesMut::with_capacity(
       2 + 8 * 4 + 16 + 4 + self.committed_headers.len() * HEADER_ENCODED_LEN,
     );
-    out.put_u16(crate::WIRE_VERSION);
+    out.put_u16(SUPERBLOCK_VERSION);
     out.put_u64(self.view.get());
     out.put_u64(self.log_view.get());
     out.put_u64(self.commit.get());
@@ -464,7 +480,12 @@ impl VsrState {
   pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
     let mut r = Reader::new(buf);
     let version = r.u16()?;
-    if version != crate::WIRE_VERSION {
+    // Accept the whole layout-compatible range, not just the latest: the committed-band-header root
+    // layout is byte-identical across versions `1..=SUPERBLOCK_VERSION` (the pre-decoupling coupling
+    // stamped this ONE layout with 1, 2, 3), so a persisted root carrying ANY of them parses with this
+    // layout and is never stranded. A FUTURE layout change bumps `SUPERBLOCK_VERSION` and MUST replace
+    // this range with explicit per-version dispatch — the shortcut is sound only while there is one layout.
+    if version == 0 || version > SUPERBLOCK_VERSION {
       return Err(CodecError::UnknownVersion(version));
     }
     let view = View::with(r.u64()?);
@@ -1286,6 +1307,60 @@ mod tests {
       157, 189, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
     assert_eq!(st.encode(), expected, "VsrState wire layout is pinned");
+    // The pinned bytes — a `0x0002`-prefixed durable root, byte-identical to one persisted at the
+    // d6c649c baseline — must DECODE under the decoupled SUPERBLOCK_VERSION, so an existing on-disk root
+    // survives the upgrade (the version was pinned to the on-disk value, not reset below it).
+    assert_eq!(
+      VsrState::decode(&expected).unwrap(),
+      st,
+      "a persisted SUPERBLOCK_VERSION root decodes unchanged across the message-wire decoupling"
+    );
+  }
+
+  #[test]
+  fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
+    // GOLDEN: a version names a disk LAYOUT, and decode accepts EVERY version of a layout it can parse,
+    // not the latest only. The committed-band-header root layout is byte-identical across versions
+    // 1..=SUPERBLOCK_VERSION (the pre-decoupling message/disk coupling stamped this ONE layout with 1, 2,
+    // 3), so a root carrying ANY of them decodes to the same state and none is stranded. That tolerance —
+    // together with the root carrying its OWN version, independent of the message WIRE_VERSION — is what
+    // makes the decoupling correct-by-construction: a message-only WIRE_VERSION bump can never invalidate
+    // a persisted root (it neither touches this constant nor changes the accepted set).
+    let st = VsrState::try_new(
+      View::with(2),
+      View::with(1),
+      OpNumber::with(5),
+      OpNumber::with(4),
+      0xAABB,
+      std::vec![],
+    )
+    .unwrap();
+    // NEW roots are written with SUPERBLOCK_VERSION (the current layout version).
+    let bytes = st.encode();
+    assert_eq!(
+      &bytes[0..2],
+      &SUPERBLOCK_VERSION.to_be_bytes(),
+      "a new durable root leads with SUPERBLOCK_VERSION"
+    );
+    // EVERY legacy version of this one layout decodes to the SAME state — no persisted root is stranded.
+    for v in 1..=SUPERBLOCK_VERSION {
+      let mut legacy = bytes.to_vec();
+      legacy[0..2].copy_from_slice(&v.to_be_bytes());
+      assert_eq!(
+        VsrState::decode(&legacy).unwrap(),
+        st,
+        "a root tagged with layout-compatible version {v} decodes unchanged"
+      );
+    }
+    // Versions OUTSIDE the layout-compatible range fail CLEAN (never misparse): 0 and one past the high end.
+    for bad in [0u16, SUPERBLOCK_VERSION + 1] {
+      let mut wrong = bytes.to_vec();
+      wrong[0..2].copy_from_slice(&bad.to_be_bytes());
+      assert!(
+        matches!(VsrState::decode(&wrong), Err(CodecError::UnknownVersion(v)) if v == bad),
+        "version {bad} is outside the layout-compatible range and is rejected as unknown"
+      );
+    }
   }
 
   #[test]
@@ -1342,7 +1417,7 @@ mod tests {
     // rejected as InvalidVsrState rather than constructing an illegal root. Build it by hand: an
     // empty-header root with log_view = 5 > view = 4.
     let mut bad = std::vec::Vec::new();
-    bad.extend_from_slice(&crate::WIRE_VERSION.to_be_bytes());
+    bad.extend_from_slice(&SUPERBLOCK_VERSION.to_be_bytes());
     bad.extend_from_slice(&4u64.to_be_bytes()); // view
     bad.extend_from_slice(&5u64.to_be_bytes()); // log_view > view
     bad.extend_from_slice(&0u64.to_be_bytes()); // commit
