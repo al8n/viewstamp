@@ -943,9 +943,16 @@ impl<S> Endpoint<S> {
   /// per-site safety arguments (quorum-intersection nack-truncation, the offset-tail materialization)
   /// remain the real proofs — this is the shared backstop that fires if a NEW destructive site drops a
   /// committed op that is neither checkpointed nor tracked-for-repair nor above the known-committed frontier.
-  /// Body is a `debug_assert!`, so the call is a no-op in release (zero cost, like the `emit` choke).
+  /// RELEASE-ACTIVE (`assert!`, not `debug_assert!`): the wide release VOPR sweep and every release build
+  /// run this backstop, so no build can SILENTLY drop a committed op via a buggy destructive site (the
+  /// debug-only form left the release wide sweep — the very net that found the storage-fault loss — blind
+  /// to it). The `commit_max` frontier is a re-learnable hint a forced sync may regress, but that is sound
+  /// HERE: content-addressed votes (`PrepareOk` carries the body checksum) make a truncate-and-reuse of an
+  /// op above a regressed frontier non-divergent regardless, and every LEGITIMATE drop is checkpointed,
+  /// tracked-for-repair, or above the CURRENT `commit_max` — each destructive site's own gate — so the
+  /// witness is false-positive free while now guarding release builds too.
   fn assert_committed_survives(&self, op: u64, checkpoint_floor: u64) {
-    debug_assert!(
+    assert!(
       op <= checkpoint_floor || self.is_tracked_for_repair(op) || op > self.commit_max.get(),
       "destructive op on committed op {} (checkpoint_floor {}, commit_max {}, not tracked-for-repair)",
       op,
