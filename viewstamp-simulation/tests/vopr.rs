@@ -126,14 +126,23 @@
 //!   forfeit re-propose is now gated on the `svc_message` retransmit timer (one SVC per
 //!   `VC_MESSAGE_RETRANSMIT` window, like `view_change_timeouts`) — the persistent step-down + heartbeat
 //!   suppression are preserved, only the per-tick storm is removed.
+//! - **storage-fault committed-op loss + op-number reuse** (seed 774, found by a release-mode
+//!   `0..2048` wide sweep) — a committed op (on a durable quorum) was LOST and its op number RE-MINTED
+//!   across a view change when a recover-time disk fault (torn/bit-rot) dropped that op's WAL slot on the
+//!   SOLE commit/view quorum-intersection replica, which then neither held the op nor knew it was
+//!   committed. FIXED structurally (TigerBeetle's body-independent header durability): an op's HEADER now
+//!   survives a body-only fault, so `recover` keeps the op header-only as a `Body::Repairing` hole rather
+//!   than dropping it; that hole flows through the DoViewChange so `select_canonical_log` counts the op as
+//!   TAKEN (never re-minted) and the new primary peer-repairs the canonical body. `0..2048` is now clean.
 
 use viewstamp_simulation::{DEFAULT_TICKS, run_vopr, run_vopr_one};
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
 /// coverage over raw count: each seed runs a few thousand ticks of rich adversarial schedule. With the
 /// async-superblock mode ON in [`run_vopr`] (the pending-durable-view window), this whole
-/// `0..SEEDS` range is verified clean — including the `vsr_headers` recovery cross-check fix and
-/// the final-quiesce fix (a wide `0..512` catch-panic re-scan with async-SB on is clean end to end).
+/// `0..SEEDS` range is verified clean — including the `vsr_headers` recovery cross-check fix, the
+/// final-quiesce fix, and the durable-header storage-fault fix (a wide `0..2048` catch-panic re-scan
+/// with async-SB on is clean end to end).
 ///
 /// The `VOPR_SEEDS` env var overrides this contiguous count at runtime (default 64): a release-mode
 /// sweep — run locally or by the `vopr` CI workflow — sets `VOPR_SEEDS=1024` (or `2048`) to scan far
@@ -153,7 +162,7 @@ fn sweep_seed_count() -> u64 {
 /// specific divergences/wedges ever returning. The `vsr_headers` recovery fix is also covered
 /// by the contiguous range, but stays pinned here as an explicit named guard against its return.
 const REGRESSION_SEEDS: &[u64] = &[
-  21, 52, 84, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622,
+  21, 52, 84, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622, 774,
 ];
 
 #[test]

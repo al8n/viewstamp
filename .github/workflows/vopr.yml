@@ -1,0 +1,43 @@
+name: vopr
+
+# Deep VOPR sweep: the seeded adversarial simulator (viewstamp-simulation/tests/vopr.rs) run in
+# RELEASE over a wide seed range. Release is far faster per seed than the debug `test` job in ci.yml,
+# so this scans many more adversarial schedules than the committed 0..64 gate. It is heavier than the
+# per-PR CI, so it lives in its own workflow: nightly, and on demand with a configurable seed count.
+# The contiguous count is VOPR_SEEDS (default 1024); the pinned REGRESSION_SEEDS are always appended.
+on:
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Contiguous seed count to sweep (VOPR_SEEDS, default 1024)"
+        required: false
+        default: "1024"
+  schedule:
+    - cron: "0 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  vopr:
+    name: vopr (release, wide seed sweep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-vopr-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-vopr-
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Run VOPR sweep (release)
+        env:
+          VOPR_SEEDS: ${{ github.event.inputs.seeds || '1024' }}
+        run: cargo test --release -p viewstamp-simulation --test vopr vopr_sweep_no_violations -- --nocapture --exact
