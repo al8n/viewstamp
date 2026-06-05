@@ -44,6 +44,7 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
       OpNumber::with(1),
       ReplicaId::new(2), // self-claimed sender — DISAGREES with `from`
       OpNumber::new(),
+      crate::storage::fnv1a_128(b"a"), // correct body checksum — the drop is purely sender-auth
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -64,6 +65,7 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
       OpNumber::with(1),
       ReplicaId::new(1), // matches `from`
       OpNumber::new(),
+      crate::storage::fnv1a_128(b"a"), // matches the body op 1 is driving → counted
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -347,6 +349,7 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
       OpNumber::with(1),
       ReplicaId::new(5), // non-member self-claim
       OpNumber::new(),
+      crate::storage::fnv1a_128(b"a"), // correct body checksum — the drop is purely the range guard
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -366,6 +369,7 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
       OpNumber::with(1),
       ReplicaId::new(1),
       OpNumber::new(),
+      crate::storage::fnv1a_128(b"a"), // matches the body op 1 is driving → counted
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);

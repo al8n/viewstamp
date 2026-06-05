@@ -377,6 +377,7 @@ fn new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_
       OpNumber::with(2),
       ReplicaId::new(2),
       OpNumber::new(),
+      op2_checksum,
     )),
   );
   assert_eq!(
@@ -721,6 +722,7 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
       OpNumber::with(2),
       ReplicaId::new(2),
       OpNumber::new(),
+      crate::storage::fnv1a_128(b"b"),
     )),
   );
   assert_eq!(
@@ -1024,6 +1026,13 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
   }
   // Both backups ack the surviving tail op 1 AND the fresh op 2 → each reaches the quorum of 2.
   for ack_op in [1u64, 2] {
+    // Content-address each ack to that op's body: op 1's surviving tail carries the canonical [1u8]
+    // body; the fresh op 2 carries client 9's b"fresh" request.
+    let ack_body_checksum = if ack_op == 1 {
+      crate::storage::fnv1a_128(&[1u8])
+    } else {
+      crate::storage::fnv1a_128(b"fresh")
+    };
     for backup in [0u8, 2] {
       r.handle_message(
         now,
@@ -1035,6 +1044,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
           OpNumber::with(ack_op),
           ReplicaId::new(backup),
           OpNumber::new(),
+          ack_body_checksum,
         )),
       );
     }
@@ -3068,6 +3078,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
       OpNumber::with(2),
       ReplicaId::new(0),
       OpNumber::new(),
+      crate::storage::fnv1a_128(b"x"),
     )),
   );
   assert_eq!(
@@ -3181,6 +3192,7 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
       OpNumber::with(2),
       ReplicaId::new(2),
       OpNumber::new(),
+      op2_checksum,
     )),
   );
   assert_eq!(
@@ -3450,6 +3462,7 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
       OpNumber::with(2),
       ReplicaId::new(0),
       OpNumber::new(),
+      op2_checksum,
     )),
   );
   assert_eq!(
@@ -3940,6 +3953,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
       OpNumber::with(2),
       ReplicaId::new(0),
       OpNumber::new(),
+      crate::storage::fnv1a_128(b"x"),
     )),
   );
   assert_eq!(
@@ -4094,6 +4108,7 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
       OpNumber::with(2),
       ReplicaId::new(0),
       OpNumber::new(),
+      crate::storage::fnv1a_128(b"x"),
     )),
   );
   assert_eq!(

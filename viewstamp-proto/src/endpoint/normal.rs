@@ -266,6 +266,10 @@ impl<S: StateMachine> Endpoint<S> {
       Inflight {
         oks: 0, // own bit set on append-done in on_wal_done
         committed: false,
+        // Content-address this op's votes by the body being driven: only a PrepareOk carrying this
+        // same body_checksum is counted, so a stale/different-body ack for a reused op number cannot
+        // forge a quorum (mirrors TigerBeetle's (op, prepare_checksum) namespace).
+        body_checksum: crate::storage::fnv1a_128(&body_bytes),
       },
     );
     self.pending.insert(id.get(), Pending::Ack(self.op));
@@ -626,6 +630,19 @@ impl<S: StateMachine> Endpoint<S> {
       "append-before-ack: PrepareOk for op {} whose WAL append is still in flight",
       op.get()
     );
+    // Content-address the vote: stamp the canonical `body_checksum` of the body THIS replica actually
+    // holds at `op`, so the primary counts it only against the body it is itself driving (a stale or
+    // different-body ack carries a different checksum and is dropped). The body is `Present` in
+    // `self.log` for every real ack/re-ack of an above-checkpoint op (it was just appended). The lone
+    // exception is `report_checkpoint_to_primary`'s re-ack of `checkpoint_op` (a pure checkpoint
+    // REPORT, not a commit vote): that op is folded into the snapshot and GC-pruned from `self.log`,
+    // so it has no entry and stamps `0` — harmless, since the primary holds no live `inflight` entry
+    // at `checkpoint_op` to match the vote against (it re-ORs an already-pruned bit, a no-op).
+    let body_checksum = self
+      .log
+      .get(&op.get())
+      .map(|e| e.body.body_checksum())
+      .unwrap_or(0);
     let primary = self.config.primary(self.view);
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
@@ -634,6 +651,7 @@ impl<S: StateMachine> Endpoint<S> {
         op,
         self.config.replica(),
         self.checkpoint_op,
+        body_checksum,
       )),
     ));
   }
@@ -826,8 +844,16 @@ impl<S: StateMachine> Endpoint<S> {
     // Force-sync escalation: a fresh quorum-checkpoint report may have just crossed a `repair`
     // hole we hold, rendering its `RequestPrepare` futile (the op is pruned everywhere on the quorum).
     self.maybe_force_sync(now);
+    // Content-addressed vote gate (TigerBeetle's (op, prepare_checksum) namespace): count this ack
+    // toward the commit quorum ONLY if its body_checksum matches the body the primary is driving at
+    // this op. A mismatch means the ack is for a DIFFERENT or STALE body — e.g. a delayed PrepareOk
+    // for an OLD body at op N that the liveness truncation re-minted, or a backup that holds a
+    // different body for the same op — so DROP it (do not OR the vote). Without this, such a stale ack
+    // could complete a forged quorum for a value the primary never drove → committed-log divergence.
     if let Some(inflight) = self.inflight.get_mut(&ok.op().get()) {
-      inflight.oks |= 1u64 << ok.replica().get();
+      if ok.body_checksum() == inflight.body_checksum {
+        inflight.oks |= 1u64 << ok.replica().get();
+      }
     }
     self.try_commit(now, sb);
   }

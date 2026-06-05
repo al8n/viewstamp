@@ -152,23 +152,40 @@ impl Prepare {
 }
 
 /// Backup → primary: acknowledge a prepared op.
+///
+/// The vote is CONTENT-ADDRESSED: it carries the `body_checksum` of the prepare body this replica
+/// actually appended at `op`, so the primary counts it toward a commit quorum only if it matches the
+/// body the primary is itself driving at that op (`on_prepare_ok`). This mirrors TigerBeetle's
+/// `(op, prepare_checksum)` vote namespace: a stale or different-body ack for a reused/differently-
+/// bodied op number has a different checksum and is dropped, never counted — closing the same-view
+/// op-reuse vote-forging class by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrepareOk {
   view: View,
   op: OpNumber,
   replica: ReplicaId,
   checkpoint_op: OpNumber,
+  body_checksum: u128,
 }
 
 impl PrepareOk {
-  /// Creates a prepare acknowledgement.
+  /// Creates a prepare acknowledgement. `body_checksum` is the canonical
+  /// [`body_checksum`](Body::body_checksum) of the prepare body the acking replica holds at `op` —
+  /// the content address the primary's `on_prepare_ok` matches the vote against before counting it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(view: View, op: OpNumber, replica: ReplicaId, checkpoint_op: OpNumber) -> Self {
+  pub const fn new(
+    view: View,
+    op: OpNumber,
+    replica: ReplicaId,
+    checkpoint_op: OpNumber,
+    body_checksum: u128,
+  ) -> Self {
     Self {
       view,
       op,
       replica,
       checkpoint_op,
+      body_checksum,
     }
   }
 
@@ -194,6 +211,13 @@ impl PrepareOk {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checkpoint_op(&self) -> OpNumber {
     self.checkpoint_op
+  }
+
+  /// The canonical `body_checksum` of the prepare body this replica appended at `op` — the content
+  /// address the primary matches against the body it is driving at that op before counting the vote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn body_checksum(&self) -> u128 {
+    self.body_checksum
   }
 }
 
@@ -1108,6 +1132,7 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u8(m.replica.get());
         out.put_u64(m.checkpoint_op.get());
+        out.put_u128(m.body_checksum);
       }
       Self::Reply(m) => {
         out.put_u64(m.view.get());
@@ -1214,7 +1239,7 @@ impl Message {
     let body = match self {
       Self::Request(m) => U128 + U64 + bytes_u32(m.body.len()),
       Self::Prepare(m) => U64 + U64 + U64 + U64 + U128 + U64 + bytes_u32(m.body.len()),
-      Self::PrepareOk(_) => U64 + U64 + U8 + U64,
+      Self::PrepareOk(_) => U64 + U64 + U8 + U64 + U128,
       Self::Reply(m) => U64 + U128 + U64 + bytes_u32(m.body.len()),
       Self::Commit(_) => U64 + U64 + U64,
       Self::StartViewChange(_) => U64 + U8,
@@ -1268,6 +1293,7 @@ impl Message {
         op: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+        body_checksum: r.u128()?,
       }),
       3 => Self::Reply(Reply {
         view: read_view(&mut r)?,
@@ -1479,8 +1505,32 @@ mod tests {
       OpNumber::with(5),
       ReplicaId::new(2),
       OpNumber::with(4),
+      0x1234_5678_9abc_def0_1122_3344_5566_7788,
     );
     assert_eq!(ok.checkpoint_op(), OpNumber::with(4));
+    // The vote is content-addressed: it carries the acked body's checksum verbatim.
+    assert_eq!(
+      ok.body_checksum(),
+      0x1234_5678_9abc_def0_1122_3344_5566_7788
+    );
+  }
+
+  #[test]
+  fn prepare_ok_body_checksum_round_trips_through_the_wire_codec() {
+    // The content-addressed vote field must survive encode→decode unchanged (a u128 edge value),
+    // since the primary's `on_prepare_ok` matches it against the body it is driving at that op.
+    let ok = Message::PrepareOk(PrepareOk::new(
+      View::with(7),
+      OpNumber::with(9),
+      ReplicaId::new(3),
+      OpNumber::with(4),
+      u128::MAX,
+    ));
+    let back = Message::decode(&ok.encode()).expect("round-trips");
+    assert_eq!(back, ok);
+    let p = back.unwrap_prepare_ok();
+    assert_eq!(p.body_checksum(), u128::MAX);
+    assert_eq!(p.op(), OpNumber::with(9));
   }
 
   #[test]
@@ -1662,7 +1712,8 @@ mod tests {
         View::with(1),
         OpNumber::with(1),
         ReplicaId::new(2),
-        OpNumber::with(0)
+        OpNumber::with(0),
+        0
       )),
       Message::Commit(Commit::new(
         View::with(1),
@@ -1817,6 +1868,7 @@ mod tests {
         OpNumber::with(5),
         ReplicaId::new(255),
         OpNumber::with(6),
+        0xCAFE_F00D_DEAD_BEEF_0102_0304_0506_0708,
       )),
       Message::Reply(Reply::new(
         View::with(2),
@@ -1948,14 +2000,14 @@ mod tests {
       OpNumber::with(7),
     ));
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 2, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7,
+      0, 3, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7,
     ];
     assert_eq!(c.encode(), expected, "Commit wire layout is pinned");
   }
 
   #[test]
   fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
-    // A nested variant pinned exactly: header (ver 2 + tag 6), scalars, then a 1-entry log slice
+    // A nested variant pinned exactly: header (ver 3 + tag 6), scalars, then a 1-entry log slice
     // (count=1, op, client, request, body-state tag 0 = Present, length-prefixed body "hi").
     let dvc = Message::DoViewChange(DoViewChange::new(
       View::with(3),
@@ -1971,7 +2023,7 @@ mod tests {
       )],
     ));
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 2, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+      0, 3, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
       0, 0, 0, 4, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
       14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 2, 104, 105,
     ];
@@ -1996,7 +2048,7 @@ mod tests {
       )],
     ));
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 2, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+      0, 3, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
       0, 0, 0, 4, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
       14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 1, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
       30, 31, 32,

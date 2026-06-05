@@ -6,6 +6,22 @@ impl<S: StateMachine> Endpoint<S> {
   /// (`Pending::AdoptVote`) — both record the own vote ONLY once the op's WAL append is durable.
   pub(crate) fn record_own_vote(&mut self, op: u64) {
     let own = 1u64 << self.config.replica().get();
+    // The primary's own vote is for the body IT is driving at `op`, which is exactly the body whose
+    // checksum seeded this inflight entry (the `on_request` mint, the view-change adopt loop, or — for
+    // an adopted `Repairing` tail — the now-`Present` peer-repaired body `fill_repair` verified
+    // against the seeded canonical checksum). So it is content-addressed by construction; this assert
+    // freezes that invariant so a future own-vote site casting against a divergent body trips in tests.
+    debug_assert!(
+      self.inflight.get(&op).is_none_or(|inf| {
+        self
+          .log
+          .get(&op)
+          .map(|e| e.body.body_checksum())
+          .unwrap_or(inf.body_checksum)
+          == inf.body_checksum
+      }),
+      "own vote for op {op} disagrees with the body the inflight entry is driving"
+    );
     if let Some(inf) = self.inflight.get_mut(&op) {
       inf.oks |= own;
     }
@@ -736,11 +752,24 @@ impl<S: StateMachine> Endpoint<S> {
     // uncommitted tail must be re-driven through the WAL.
     self.inflight.clear();
     for op in (self.commit_min.get() + 1)..=self.op.get() {
+      // Content-address this adopted op's votes by the canonical body the primary is driving. The op
+      // is present in `self.log` here (the gap-truncation above dropped any op the union could not
+      // carry), so `body.body_checksum()` is total: the computed checksum of a `Present` body, or the
+      // stored canonical checksum of a `Repairing` entry — which the peer-repaired `Present` body that
+      // eventually fills the hole matches by construction (`fill_repair` accepts only a body whose
+      // `fnv1a_128` equals that canonical checksum). So a backup's `send_prepare_ok` (from its own
+      // `body.body_checksum()`) stamps the SAME value, and legitimate adopted-tail votes are counted.
+      let body_checksum = self
+        .log
+        .get(&op)
+        .map(|e| e.body.body_checksum())
+        .unwrap_or(0);
       self.inflight.insert(
         op,
         Inflight {
           oks: 0, // own vote set in on_wal_done when the AdoptVote append is durable
           committed: false,
+          body_checksum,
         },
       );
       self.adopt_append(wal, op, Pending::AdoptVote(OpNumber::with(op)));

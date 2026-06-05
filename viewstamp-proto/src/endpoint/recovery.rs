@@ -893,11 +893,21 @@ impl<S: StateMachine> Endpoint<S> {
         self.inflight.clear();
         let own = 1u64 << self.config.replica().get();
         for op in (self.commit_min.get() + 1)..=self.op.get() {
+          // Content-address the rebuilt entry by the recovered body it holds, keeping the
+          // `inflight.body_checksum == body driven at op` invariant uniform across every seeding site.
+          // (A solo replica has no peers, so no PrepareOk is ever matched against it; the own-vote
+          // quorum-of-1 commits via `oks` directly — but the checksum is stamped consistently.)
+          let body_checksum = self
+            .log
+            .get(&op)
+            .map(|e| e.body.body_checksum())
+            .unwrap_or(0);
           self.inflight.insert(
             op,
             Inflight {
               oks: own,
               committed: false,
+              body_checksum,
             },
           );
         }

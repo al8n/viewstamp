@@ -626,4 +626,99 @@ fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
   );
 }
 
+#[test]
+fn on_prepare_ok_counts_a_vote_only_when_the_body_checksum_matches() {
+  // CONSENSUS-CRITICAL: votes are content-addressed by (op, body_checksum). A PrepareOk for op N counts
+  // toward op N's quorum ONLY if it carries the checksum of the body the primary is driving at op N. A
+  // stale or different-body ack (same op number, a DIFFERENT body) is dropped — exactly what makes
+  // truncate-and-reuse of an op number safe: a delayed ack for the OLD body cannot commit a re-minted op.
+  let cfg = Config::try_new(1, ReplicaId::new(0), 3).expect("valid cluster config");
+  let mut e = Endpoint::new(cfg, 7, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  assert!(e.is_primary(), "replica 0 is primary of view 0");
+  let now = Instant::ZERO;
+
+  // The primary serves client 9's request (body [1]) → mints op 1, seeding inflight[1] with that body's
+  // checksum. Pump storage so the durable own append records the primary's own vote.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from(std::vec![1u8]),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the clean primary serves the request — op 1 is minted"
+  );
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb); // the own append lands → the primary's own vote
+  }
+  let own_bit = 1u64 << 0; // replica 0
+  assert_eq!(
+    e.inflight.get(&1).map(|i| i.oks),
+    Some(own_bit),
+    "after the durable append op 1 carries only the primary's own vote"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(0),
+    "the own vote alone is below quorum (2)"
+  );
+
+  let driven = crate::storage::fnv1a_128(&[1u8]); // the body the primary is driving at op 1
+  let stale = crate::storage::fnv1a_128(&[99u8]); // a DIFFERENT body (a stale / cross-body ack)
+  assert_ne!(driven, stale, "the two bodies must hash differently");
+
+  // A backup ack for op 1 carrying the WRONG body checksum is REJECTED — the vote is not counted.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      OpNumber::new(),
+      stale,
+    )),
+  );
+  assert_eq!(
+    e.inflight.get(&1).map(|i| i.oks),
+    Some(own_bit),
+    "the cross-body ack (wrong checksum) left the vote bitset unchanged — dropped, not counted"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(0),
+    "a stale/different-body ack does not commit op 1 (content-addressed votes reject it)"
+  );
+
+  // The SAME backup acking op 1 with the MATCHING body checksum counts → own + backup = quorum → commit.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      OpNumber::new(),
+      driven,
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the matching-body ack counts — op 1 commits on the content-addressed quorum"
+  );
+}
+
 // ── Forfeit — a lagging primary steps down via a view change ────────────────────────────────────
