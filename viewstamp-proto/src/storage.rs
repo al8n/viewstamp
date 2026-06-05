@@ -798,6 +798,23 @@ fn fnv1a_128_mix(mut acc: u128, bytes: &[u8]) -> u128 {
   acc
 }
 
+/// The content address of an operation's full IDENTITY — the namespace a `PrepareOk` vote is counted
+/// in. It is `(client, request, body_checksum)`: EXACTLY the committed identity `recover` compares
+/// (`classify_committed_slot`), with the op number supplied by the `inflight`/log map key and the view
+/// deliberately excluded (a committed op's identity is view-independent). Two DISTINCT operations that
+/// share body bytes — the same `body_checksum` under a different `(client, request)` — therefore have
+/// DIFFERENT identities, so a stale vote for an op number truncated and re-minted for a different
+/// request cannot be miscounted. `body_checksum` ALONE left that same-body op-reuse hole open.
+pub(crate) fn prepare_identity(
+  client: ClientId,
+  request: RequestNumber,
+  body_checksum: u128,
+) -> u128 {
+  let acc = fnv1a_128_mix(FNV_OFFSET, &client.get().to_be_bytes());
+  let acc = fnv1a_128_mix(acc, &request.get().to_be_bytes());
+  fnv1a_128_mix(acc, &body_checksum.to_be_bytes())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

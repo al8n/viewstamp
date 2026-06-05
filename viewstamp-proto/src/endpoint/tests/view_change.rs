@@ -377,7 +377,7 @@ fn new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_
       OpNumber::with(2),
       ReplicaId::new(2),
       OpNumber::new(),
-      op2_checksum,
+      crate::storage::prepare_identity(ClientId::new(7), RequestNumber::with(2), op2_checksum),
     )),
   );
   assert_eq!(
@@ -722,7 +722,11 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
       OpNumber::with(2),
       ReplicaId::new(2),
       OpNumber::new(),
-      crate::storage::fnv1a_128(b"b"),
+      crate::storage::prepare_identity(
+        ClientId::new(7),
+        RequestNumber::with(2),
+        crate::storage::fnv1a_128(b"b"),
+      ),
     )),
   );
   assert_eq!(
@@ -1026,12 +1030,20 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
   }
   // Both backups ack the surviving tail op 1 AND the fresh op 2 → each reaches the quorum of 2.
   for ack_op in [1u64, 2] {
-    // Content-address each ack to that op's body: op 1's surviving tail carries the canonical [1u8]
-    // body; the fresh op 2 carries client 9's b"fresh" request.
-    let ack_body_checksum = if ack_op == 1 {
-      crate::storage::fnv1a_128(&[1u8])
+    // Content-address each ack to that op's full identity: op 1's surviving tail carries client 7's
+    // canonical [1u8] body (request 1); the fresh op 2 carries client 9's b"fresh" request (request 1).
+    let ack_identity = if ack_op == 1 {
+      crate::storage::prepare_identity(
+        ClientId::new(7),
+        RequestNumber::with(1),
+        crate::storage::fnv1a_128(&[1u8]),
+      )
     } else {
-      crate::storage::fnv1a_128(b"fresh")
+      crate::storage::prepare_identity(
+        ClientId::new(9),
+        RequestNumber::with(1),
+        crate::storage::fnv1a_128(b"fresh"),
+      )
     };
     for backup in [0u8, 2] {
       r.handle_message(
@@ -1044,7 +1056,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
           OpNumber::with(ack_op),
           ReplicaId::new(backup),
           OpNumber::new(),
-          ack_body_checksum,
+          ack_identity,
         )),
       );
     }
@@ -3067,12 +3079,13 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     OpNumber::with(2),
     "the primary serves the client again, minting a fresh op 2 (the wedge is gone)"
   );
-  // CROSS-BODY SAFETY (content-addressed votes): a DELAYED PrepareOk for the OLD truncated op 2 (its
-  // body_checksum is op2_checksum) arrives now from a THIRD replica, after op 2 was re-minted for b"x".
-  // Counted by op number alone it would form a phantom quorum (own + this) and commit the fresh op 2 on
-  // a vote for a body the primary is NOT driving. It MUST be dropped — its checksum is the old body's,
-  // not b"x"'s. (This is the op-reuse vote-confusion class the bounded sim network cannot otherwise
-  // reach: a vote outliving its op's truncation + reuse.)
+  // CROSS-OPERATION SAFETY (content-addressed votes): a DELAYED PrepareOk for the OLD truncated op 2 —
+  // its FULL identity (client 7, request 2, op2_checksum) — arrives now from a THIRD replica, after op 2
+  // was re-minted for client 9's b"x". Counted by op number alone it would form a phantom quorum (own +
+  // this) and commit the fresh op 2 on a vote for an operation the primary is NOT driving. It MUST be
+  // dropped: its identity is the OLD operation's, not the re-minted one's. (This is the op-reuse
+  // vote-confusion class the bounded sim network cannot otherwise reach: a vote outliving its op's
+  // truncation + reuse.)
   e.handle_message(
     after_grace,
     &mut wal,
@@ -3083,14 +3096,15 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
       OpNumber::with(2),
       ReplicaId::new(2),
       OpNumber::new(),
-      op2_checksum, // the OLD (truncated) body — NOT b"x"
+      // the OLD operation's full identity — NOT the re-minted (client 9, request 1, b"x")
+      crate::storage::prepare_identity(ClientId::new(7), RequestNumber::with(2), op2_checksum),
     )),
   );
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
-    "the delayed vote for the OLD truncated body is dropped — commit stays at op 1, the fresh op 2 does \
-     NOT phantom-commit on an (own + stale-body) quorum"
+    "the delayed vote for the OLD operation is dropped — commit stays at op 1, the fresh op 2 does \
+     NOT phantom-commit on an (own + stale) quorum"
   );
   // One backup ack reaches quorum (own + backup) → the fresh op 2 commits.
   e.handle_message(
@@ -3103,7 +3117,11 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
       OpNumber::with(2),
       ReplicaId::new(0),
       OpNumber::new(),
-      crate::storage::fnv1a_128(b"x"),
+      crate::storage::prepare_identity(
+        ClientId::new(9),
+        RequestNumber::with(1),
+        crate::storage::fnv1a_128(b"x"),
+      ),
     )),
   );
   assert_eq!(
@@ -3217,7 +3235,7 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
       OpNumber::with(2),
       ReplicaId::new(2),
       OpNumber::new(),
-      op2_checksum,
+      crate::storage::prepare_identity(ClientId::new(7), RequestNumber::with(2), op2_checksum),
     )),
   );
   assert_eq!(
@@ -3487,7 +3505,7 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
       OpNumber::with(2),
       ReplicaId::new(0),
       OpNumber::new(),
-      op2_checksum,
+      crate::storage::prepare_identity(ClientId::new(7), RequestNumber::with(2), op2_checksum),
     )),
   );
   assert_eq!(
@@ -3978,7 +3996,11 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
       OpNumber::with(2),
       ReplicaId::new(0),
       OpNumber::new(),
-      crate::storage::fnv1a_128(b"x"),
+      crate::storage::prepare_identity(
+        ClientId::new(9),
+        RequestNumber::with(1),
+        crate::storage::fnv1a_128(b"x"),
+      ),
     )),
   );
   assert_eq!(
@@ -4133,7 +4155,11 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
       OpNumber::with(2),
       ReplicaId::new(0),
       OpNumber::new(),
-      crate::storage::fnv1a_128(b"x"),
+      crate::storage::prepare_identity(
+        ClientId::new(9),
+        RequestNumber::with(1),
+        crate::storage::fnv1a_128(b"x"),
+      ),
     )),
   );
   assert_eq!(

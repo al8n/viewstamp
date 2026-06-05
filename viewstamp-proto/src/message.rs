@@ -153,39 +153,40 @@ impl Prepare {
 
 /// Backup → primary: acknowledge a prepared op.
 ///
-/// The vote is CONTENT-ADDRESSED: it carries the `body_checksum` of the prepare body this replica
-/// actually appended at `op`, so the primary counts it toward a commit quorum only if it matches the
-/// body the primary is itself driving at that op (`on_prepare_ok`). This mirrors TigerBeetle's
-/// `(op, prepare_checksum)` vote namespace: a stale or different-body ack for a reused/differently-
-/// bodied op number has a different checksum and is dropped, never counted — closing the same-view
-/// op-reuse vote-forging class by construction.
+/// The vote is CONTENT-ADDRESSED by the prepare's full IDENTITY: it carries the `prepare_checksum` over
+/// `(client, request, body_checksum)` of the operation this replica holds at `op`, so the primary counts
+/// it toward a commit quorum only if it matches the operation the primary is itself driving at that op
+/// (`on_prepare_ok`). This mirrors TigerBeetle's `(op, prepare_checksum)` vote namespace: a stale ack for
+/// an op number that was truncated and re-minted for a DIFFERENT operation — even one with the same body
+/// bytes — has a different identity and is dropped, never counted, closing the op-reuse vote-forging
+/// class by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrepareOk {
   view: View,
   op: OpNumber,
   replica: ReplicaId,
   checkpoint_op: OpNumber,
-  body_checksum: u128,
+  prepare_checksum: u128,
 }
 
 impl PrepareOk {
-  /// Creates a prepare acknowledgement. `body_checksum` is the canonical
-  /// [`body_checksum`](Body::body_checksum) of the prepare body the acking replica holds at `op` —
-  /// the content address the primary's `on_prepare_ok` matches the vote against before counting it.
+  /// Creates a prepare acknowledgement. `prepare_checksum` is the operation IDENTITY content address
+  /// (`prepare_identity` over `(client, request, body_checksum)`) of the operation the acking replica
+  /// holds at `op` — the address the primary's `on_prepare_ok` matches the vote against before counting it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     view: View,
     op: OpNumber,
     replica: ReplicaId,
     checkpoint_op: OpNumber,
-    body_checksum: u128,
+    prepare_checksum: u128,
   ) -> Self {
     Self {
       view,
       op,
       replica,
       checkpoint_op,
-      body_checksum,
+      prepare_checksum,
     }
   }
 
@@ -213,11 +214,12 @@ impl PrepareOk {
     self.checkpoint_op
   }
 
-  /// The canonical `body_checksum` of the prepare body this replica appended at `op` — the content
-  /// address the primary matches against the body it is driving at that op before counting the vote.
+  /// The operation IDENTITY content address (`prepare_identity` over `(client, request, body_checksum)`)
+  /// of the op this replica holds at `op` — the address the primary matches against the operation it is
+  /// driving at that op before counting the vote.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn body_checksum(&self) -> u128 {
-    self.body_checksum
+  pub const fn prepare_checksum(&self) -> u128 {
+    self.prepare_checksum
   }
 }
 
@@ -1132,7 +1134,7 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u8(m.replica.get());
         out.put_u64(m.checkpoint_op.get());
-        out.put_u128(m.body_checksum);
+        out.put_u128(m.prepare_checksum);
       }
       Self::Reply(m) => {
         out.put_u64(m.view.get());
@@ -1293,7 +1295,7 @@ impl Message {
         op: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
-        body_checksum: r.u128()?,
+        prepare_checksum: r.u128()?,
       }),
       3 => Self::Reply(Reply {
         view: read_view(&mut r)?,
@@ -1508,17 +1510,17 @@ mod tests {
       0x1234_5678_9abc_def0_1122_3344_5566_7788,
     );
     assert_eq!(ok.checkpoint_op(), OpNumber::with(4));
-    // The vote is content-addressed: it carries the acked body's checksum verbatim.
+    // The vote is content-addressed: it carries the operation-identity checksum verbatim.
     assert_eq!(
-      ok.body_checksum(),
+      ok.prepare_checksum(),
       0x1234_5678_9abc_def0_1122_3344_5566_7788
     );
   }
 
   #[test]
-  fn prepare_ok_body_checksum_round_trips_through_the_wire_codec() {
+  fn prepare_ok_prepare_checksum_round_trips_through_the_wire_codec() {
     // The content-addressed vote field must survive encode→decode unchanged (a u128 edge value),
-    // since the primary's `on_prepare_ok` matches it against the body it is driving at that op.
+    // since the primary's `on_prepare_ok` matches it against the operation it is driving at that op.
     let ok = Message::PrepareOk(PrepareOk::new(
       View::with(7),
       OpNumber::with(9),
@@ -1529,7 +1531,7 @@ mod tests {
     let back = Message::decode(&ok.encode()).expect("round-trips");
     assert_eq!(back, ok);
     let p = back.unwrap_prepare_ok();
-    assert_eq!(p.body_checksum(), u128::MAX);
+    assert_eq!(p.prepare_checksum(), u128::MAX);
     assert_eq!(p.op(), OpNumber::with(9));
   }
 

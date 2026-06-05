@@ -627,19 +627,21 @@ fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
 }
 
 #[test]
-fn on_prepare_ok_counts_a_vote_only_when_the_body_checksum_matches() {
-  // CONSENSUS-CRITICAL: votes are content-addressed by (op, body_checksum). A PrepareOk for op N counts
-  // toward op N's quorum ONLY if it carries the checksum of the body the primary is driving at op N. A
-  // stale or different-body ack (same op number, a DIFFERENT body) is dropped — exactly what makes
-  // truncate-and-reuse of an op number safe: a delayed ack for the OLD body cannot commit a re-minted op.
+fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
+  // CONSENSUS-CRITICAL: votes are content-addressed by the FULL operation identity (op, client, request,
+  // body_checksum), NOT the body alone. A PrepareOk for op N counts toward op N's quorum ONLY if it
+  // carries the identity of the operation the primary is driving at op N. This closes the SAME-BODY
+  // op-reuse hole that body_checksum alone left open: two DISTINCT operations can share body bytes (same
+  // body_checksum) yet differ in (client, request), so a stale ack for an op number that was truncated
+  // and re-minted for a DIFFERENT request — even one with identical body bytes — must NOT be counted.
   let cfg = Config::try_new(1, ReplicaId::new(0), 3).expect("valid cluster config");
   let mut e = Endpoint::new(cfg, 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   assert!(e.is_primary(), "replica 0 is primary of view 0");
   let now = Instant::ZERO;
 
-  // The primary serves client 9's request (body [1]) → mints op 1, seeding inflight[1] with that body's
-  // checksum. Pump storage so the durable own append records the primary's own vote.
+  // The primary serves client 9's request 1 (body [1]) → mints op 1, seeding inflight[1] with that
+  // OPERATION's identity. Pump storage so the durable own append records the primary's own vote.
   e.handle_message(
     now,
     &mut wal,
@@ -671,11 +673,20 @@ fn on_prepare_ok_counts_a_vote_only_when_the_body_checksum_matches() {
     "the own vote alone is below quorum (2)"
   );
 
-  let driven = crate::storage::fnv1a_128(&[1u8]); // the body the primary is driving at op 1
-  let stale = crate::storage::fnv1a_128(&[99u8]); // a DIFFERENT body (a stale / cross-body ack)
-  assert_ne!(driven, stale, "the two bodies must hash differently");
+  // The identity the primary is driving at op 1 (client 9, request 1, body [1]). A DIFFERENT operation —
+  // client 7's request 1 — that happens to carry the SAME body bytes [1] has the SAME body_checksum but
+  // a DIFFERENT identity: exactly the collision body_checksum-only voting could not tell apart.
+  let body = crate::storage::fnv1a_128(&[1u8]);
+  let driven = crate::storage::prepare_identity(ClientId::new(9), RequestNumber::with(1), body);
+  let same_body_other_op =
+    crate::storage::prepare_identity(ClientId::new(7), RequestNumber::with(1), body);
+  assert_ne!(
+    driven, same_body_other_op,
+    "same body bytes, different client → DIFFERENT operation identity (the hole body_checksum left open)"
+  );
 
-  // A backup ack for op 1 carrying the WRONG body checksum is REJECTED — the vote is not counted.
+  // A backup ack for op 1 carrying a DIFFERENT operation's identity — even with the SAME body bytes — is
+  // REJECTED. (With body_checksum-only voting its checksum would have MATCHED and forged a quorum.)
   e.handle_message(
     now,
     &mut wal,
@@ -686,21 +697,21 @@ fn on_prepare_ok_counts_a_vote_only_when_the_body_checksum_matches() {
       OpNumber::with(1),
       ReplicaId::new(1),
       OpNumber::new(),
-      stale,
+      same_body_other_op,
     )),
   );
   assert_eq!(
     e.inflight.get(&1).map(|i| i.oks),
     Some(own_bit),
-    "the cross-body ack (wrong checksum) left the vote bitset unchanged — dropped, not counted"
+    "the same-body different-operation ack left the vote bitset unchanged — dropped, not counted"
   );
   assert_eq!(
     e.commit(),
     OpNumber::with(0),
-    "a stale/different-body ack does not commit op 1 (content-addressed votes reject it)"
+    "a same-body ack for a DIFFERENT operation does not commit op 1 (full-identity votes reject it)"
   );
 
-  // The SAME backup acking op 1 with the MATCHING body checksum counts → own + backup = quorum → commit.
+  // The SAME backup acking op 1 with the MATCHING operation identity counts → own + backup = quorum.
   e.handle_message(
     now,
     &mut wal,
@@ -717,7 +728,7 @@ fn on_prepare_ok_counts_a_vote_only_when_the_body_checksum_matches() {
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
-    "the matching-body ack counts — op 1 commits on the content-addressed quorum"
+    "the matching-identity ack counts — op 1 commits on the content-addressed quorum"
   );
 }
 

@@ -410,15 +410,15 @@ struct Inflight {
   /// Bitset of replica indices that have acked (the primary sets its own bit).
   oks: u64,
   committed: bool,
-  /// The canonical [`body_checksum`](crate::message::Body::body_checksum) of the body the primary is
-  /// currently driving at this op. A `PrepareOk` is counted into `oks` ONLY if its
-  /// [`body_checksum`](crate::PrepareOk::body_checksum) matches this — the content address that makes
-  /// the op-number-keyed commit rule sound across truncate-and-reuse (a stale/different-body vote for
-  /// a reused op number has a different checksum and is dropped). Seeded at every inflight-creation
-  /// site from the body being driven (the minted body on `on_request`; the adopted entry's
-  /// `body_checksum` on view-change adoption — for a `Repairing` entry its stored canonical checksum,
-  /// which the eventual peer-repaired `Present` body matches by construction).
-  body_checksum: u128,
+  /// The operation IDENTITY content address — `prepare_identity(client, request, body_checksum)` — of
+  /// the operation the primary is currently driving at this op. A `PrepareOk` is counted into `oks`
+  /// ONLY if its `prepare_checksum` matches this, the content address that makes the op-number-keyed
+  /// commit rule sound across truncate-and-reuse: a stale vote for a reused op number — even one whose
+  /// body bytes happen to match — carries a different `(client, request)`, so a different identity, and
+  /// is dropped. Seeded at every inflight-creation site from the operation being driven (the minted
+  /// request on `on_request`; the adopted entry on view-change adoption — for a `Repairing` entry from
+  /// its stored canonical checksum, which the eventual peer-repaired `Present` body matches).
+  prepare_checksum: u128,
 }
 
 /// Per-client session for at-most-once semantics.

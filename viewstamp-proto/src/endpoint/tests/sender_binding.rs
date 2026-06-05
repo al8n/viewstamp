@@ -65,7 +65,11 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
       OpNumber::with(1),
       ReplicaId::new(1), // matches `from`
       OpNumber::new(),
-      crate::storage::fnv1a_128(b"a"), // matches the body op 1 is driving → counted
+      crate::storage::prepare_identity(
+        ClientId::new(7),
+        RequestNumber::with(1),
+        crate::storage::fnv1a_128(b"a"),
+      ), // matches the op-1 identity the primary is driving → counted
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -369,7 +373,11 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
       OpNumber::with(1),
       ReplicaId::new(1),
       OpNumber::new(),
-      crate::storage::fnv1a_128(b"a"), // matches the body op 1 is driving → counted
+      crate::storage::prepare_identity(
+        ClientId::new(7),
+        RequestNumber::with(1),
+        crate::storage::fnv1a_128(b"a"),
+      ), // matches the op-1 identity the primary is driving → counted
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);

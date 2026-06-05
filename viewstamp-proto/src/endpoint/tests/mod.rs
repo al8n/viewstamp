@@ -691,7 +691,12 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
         OpNumber::with(rn),
         ReplicaId::new(1),
         OpNumber::new(),
-        crate::storage::fnv1a_128(&[rn as u8]), // content-address the vote to op rn's body
+        // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
+        crate::storage::prepare_identity(
+          ClientId::new(7),
+          RequestNumber::with(rn),
+          crate::storage::fnv1a_128(&[rn as u8]),
+        ),
       )),
     );
     e.handle_storage(now, &mut wal, &mut sb); // drain checkpoint writes
