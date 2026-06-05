@@ -976,6 +976,12 @@ fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
         OpNumber::with(rn),
         ReplicaId::new(1),
         OpNumber::new(),
+        // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
+        crate::storage::prepare_identity(
+          ClientId::new(7),
+          RequestNumber::with(rn),
+          crate::storage::fnv1a_128(&[rn as u8]),
+        ),
       )),
     );
   }
@@ -1890,6 +1896,7 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
       OpNumber::with(2),
       ReplicaId::new(1),
       OpNumber::with(8),
+      0, // no inflight at op 2 (force_state_for_test seeds none) — only checkpoint_op drives the strand
     )),
   );
   assert_eq!(
@@ -1987,6 +1994,7 @@ fn a_primary_in_the_force_sync_strand_never_reuses_an_op_number() {
       OpNumber::with(2),
       ReplicaId::new(1),
       OpNumber::with(8),
+      0, // no inflight at op 2 (force_state_for_test seeds none) — only checkpoint_op drives the strand
     )),
   );
   assert!(ep.pending_forfeit_for_test());

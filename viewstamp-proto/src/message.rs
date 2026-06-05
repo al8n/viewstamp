@@ -7,9 +7,18 @@ use crate::codec::{CodecError, Reader, write_bytes_u32};
 use crate::{ClientId, OpNumber, Recipient, ReplicaId, RequestNumber, View, WIRE_VERSION};
 
 /// The minimum encoded length of one [`PreparedEntry`] in a log slice: `op` (`u64`) + `client`
-/// (`u128`) + `request` (`u64`) + an empty body's `u32` length prefix = `8 + 16 + 8 + 4`. Used to
-/// reject a hostile log-slice element count before parsing (see [`Reader::seq_len`]).
-const PREPARED_ENTRY_MIN_LEN: usize = 8 + 16 + 8 + 4;
+/// (`u128`) + `request` (`u64`) + a body-state tag (`u8`) + the cheapest body-state payload. The
+/// cheapest is a `Present` empty body (a `u32` length prefix = `4`, total `8 + 16 + 8 + 1 + 4`),
+/// which is smaller than a `Repairing` 16-byte checksum, so this is the floor used to reject a hostile
+/// log-slice element count before parsing (see [`Reader::seq_len`]).
+const PREPARED_ENTRY_MIN_LEN: usize = 8 + 16 + 8 + 1 + 4;
+
+/// Wire body-state discriminant for a [`PreparedEntry`] in a log slice: `0` = [`Body::Present`] (a
+/// `u32`-length-prefixed body follows), `1` = [`Body::Repairing`] (a 16-byte `u128` `body_checksum`
+/// follows, no bytes). One source of truth shared by [`write_log`] (writes it) and [`read_log`]
+/// (dispatches on it).
+const BODY_TAG_PRESENT: u8 = 0;
+const BODY_TAG_REPAIRING: u8 = 1;
 
 /// A client request to the primary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,23 +152,41 @@ impl Prepare {
 }
 
 /// Backup → primary: acknowledge a prepared op.
+///
+/// The vote is CONTENT-ADDRESSED by the prepare's full IDENTITY: it carries the `prepare_checksum` over
+/// `(client, request, body_checksum)` of the operation this replica holds at `op`, so the primary counts
+/// it toward a commit quorum only if it matches the operation the primary is itself driving at that op
+/// (`on_prepare_ok`). This mirrors TigerBeetle's `(op, prepare_checksum)` vote namespace: a stale ack for
+/// an op number that was truncated and re-minted for a DIFFERENT operation — even one with the same body
+/// bytes — has a different identity and is dropped, never counted, closing the op-reuse vote-forging
+/// class by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrepareOk {
   view: View,
   op: OpNumber,
   replica: ReplicaId,
   checkpoint_op: OpNumber,
+  prepare_checksum: u128,
 }
 
 impl PrepareOk {
-  /// Creates a prepare acknowledgement.
+  /// Creates a prepare acknowledgement. `prepare_checksum` is the operation IDENTITY content address
+  /// (`prepare_identity` over `(client, request, body_checksum)`) of the operation the acking replica
+  /// holds at `op` — the address the primary's `on_prepare_ok` matches the vote against before counting it.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(view: View, op: OpNumber, replica: ReplicaId, checkpoint_op: OpNumber) -> Self {
+  pub const fn new(
+    view: View,
+    op: OpNumber,
+    replica: ReplicaId,
+    checkpoint_op: OpNumber,
+    prepare_checksum: u128,
+  ) -> Self {
     Self {
       view,
       op,
       replica,
       checkpoint_op,
+      prepare_checksum,
     }
   }
 
@@ -185,6 +212,14 @@ impl PrepareOk {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checkpoint_op(&self) -> OpNumber {
     self.checkpoint_op
+  }
+
+  /// The operation IDENTITY content address (`prepare_identity` over `(client, request, body_checksum)`)
+  /// of the op this replica holds at `op` — the address the primary matches against the operation it is
+  /// driving at that op before counting the vote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn prepare_checksum(&self) -> u128 {
+    self.prepare_checksum
   }
 }
 
@@ -278,24 +313,95 @@ impl Commit {
   }
 }
 
-/// One log entry carried in a `DoViewChange`/`StartView` (the full prepared op).
+/// A log entry's body is either `Present` (the bytes are held) or `Repairing` (only the durable
+/// canonical `body_checksum` is known; the bytes must be peer-repaired).
+///
+/// Body-independent durable headers let a committed op's EXISTENCE survive a torn-body storage
+/// fault: the op stays in the log as a `Repairing` slot carrying just its canonical `body_checksum`,
+/// and the commit path holds at it (soliciting the body from a peer) exactly as it does for a
+/// wholly-missing slot. This ONE type is shared by the endpoint's in-memory `LogEntry` and the wire
+/// [`PreparedEntry`], so a `Repairing` op carried through a `DoViewChange`/`StartView` is adopted
+/// repair-pending — its op number is taken (never re-minted) and its body is fetched from a peer. Not
+/// `Copy` — `Present` carries a [`Bytes`].
+#[derive(
+  Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+)]
+#[unwrap(ref)]
+#[try_unwrap(ref)]
+pub enum Body {
+  /// The body bytes are held.
+  Present(Bytes),
+  /// The body is absent (torn / not-yet-repaired); only the durable canonical `body_checksum` is
+  /// known. The bytes must be peer-repaired before the op can apply.
+  ///
+  /// Constructed in production by `recover` (a committed/kept op whose WAL read came back body-faulty
+  /// — durable header, torn/rotted body — is retained header-only as this hole, so its existence
+  /// survives the fault and the commit path peer-repairs the body on demand).
+  Repairing(u128),
+}
+
+impl Body {
+  /// The body bytes when [`Present`](Body::Present), else `None` (a `Repairing` slot has no bytes
+  /// yet).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn as_present(&self) -> Option<&[u8]> {
+    match self {
+      Body::Present(bytes) => Some(bytes),
+      Body::Repairing(_) => None,
+    }
+  }
+
+  /// The canonical `body_checksum` of this op — total: computed from the bytes when
+  /// [`Present`](Body::Present), or the stored durable checksum when [`Repairing`](Body::Repairing).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn body_checksum(&self) -> u128 {
+    match self {
+      Body::Present(bytes) => crate::storage::fnv1a_128(bytes),
+      Body::Repairing(checksum) => *checksum,
+    }
+  }
+}
+
+/// One log entry carried in a `DoViewChange`/`StartView` (the prepared op). Its [`Body`] is either
+/// `Present` (the bytes) or `Repairing` (only the durable `body_checksum`; the body is fetched from a
+/// peer after adoption). A `Repairing` entry exists ONLY to carry a body-faulty-but-header-durable
+/// committed op through a view change so its op number is never re-minted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedEntry {
   op: OpNumber,
   client: ClientId,
   request: RequestNumber,
-  body: Bytes,
+  body: Body,
 }
 
 impl PreparedEntry {
-  /// Creates a prepared-log entry.
+  /// Creates a prepared-log entry whose body bytes are held (a [`Body::Present`] entry) — the common
+  /// case (every path that knows the body builds one of these).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(op: OpNumber, client: ClientId, request: RequestNumber, body: Bytes) -> Self {
     Self {
       op,
       client,
       request,
-      body,
+      body: Body::Present(body),
+    }
+  }
+
+  /// Creates a header-only ([`Body::Repairing`]) prepared-log entry carrying only the op's durable
+  /// `body_checksum` — a body-faulty committed op whose existence is carried through the view change
+  /// so its op number is taken (never re-minted); the body is peer-repaired after adoption.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn repairing(
+    op: OpNumber,
+    client: ClientId,
+    request: RequestNumber,
+    body_checksum: u128,
+  ) -> Self {
+    Self {
+      op,
+      client,
+      request,
+      body: Body::Repairing(body_checksum),
     }
   }
 
@@ -317,16 +423,31 @@ impl PreparedEntry {
     self.request
   }
 
-  /// The opaque application payload as a slice.
+  /// The entry's body-state — [`Present`](Body::Present) (bytes held) or [`Repairing`](Body::Repairing)
+  /// (header-only, body peer-repaired after adoption).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn body(&self) -> &[u8] {
+  pub const fn body_state(&self) -> &Body {
     &self.body
   }
 
-  /// The opaque application payload as owned `Bytes`.
+  /// `true` iff this entry is header-only ([`Body::Repairing`]) — its body must be peer-repaired.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn body_bytes(&self) -> Bytes {
-    self.body.clone()
+  pub const fn is_repairing(&self) -> bool {
+    self.body.is_repairing()
+  }
+
+  /// The opaque application payload as a slice when the body is [`Present`](Body::Present), else
+  /// `None` (a [`Repairing`](Body::Repairing) entry carries no bytes — only its `body_checksum`).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn body(&self) -> Option<&[u8]> {
+    self.body.as_present()
+  }
+
+  /// The canonical `body_checksum` of this op — total: from the bytes when
+  /// [`Present`](Body::Present), or the stored durable checksum when [`Repairing`](Body::Repairing).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn body_checksum(&self) -> u128 {
+    self.body.body_checksum()
   }
 }
 
@@ -984,7 +1105,8 @@ impl Message {
   /// Layout: [`WIRE_VERSION`](crate::WIRE_VERSION) (`u16` BE), then the variant's discriminant tag
   /// (`u8`), then the variant's fields in canonical order — all scalars big-endian, every `Bytes`
   /// payload + snapshot envelope `u32`-length-prefixed, every `Vec<PreparedEntry>` log slice a
-  /// `u32` count followed by each entry (`op`/`client`/`request` then a length-prefixed body).
+  /// `u32` count followed by each entry (`op`/`client`/`request`, a body-state tag, then a
+  /// length-prefixed body for `Present` or a 16-byte `body_checksum` for `Repairing`).
   /// Nested [`crate::Header`]s (none appear in messages today) would reuse the fixed-size
   /// `Header::encode`. The `match` over every variant is EXHAUSTIVE (no wildcard), preserving the
   /// codebase's exhaustive-`Message`-match property.
@@ -1012,6 +1134,7 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u8(m.replica.get());
         out.put_u64(m.checkpoint_op.get());
+        out.put_u128(m.prepare_checksum);
       }
       Self::Reply(m) => {
         out.put_u64(m.view.get());
@@ -1101,19 +1224,24 @@ impl Message {
     fn bytes_u32(len: usize) -> usize {
       4 + len
     }
-    // A `write_log` slice is a u32 count plus, per entry, op(u64) + client(u128) + request(u64) and
-    // a length-prefixed body.
+    // A `write_log` slice is a u32 count plus, per entry, op(u64) + client(u128) + request(u64), a
+    // body-state tag (u8), and its payload — a length-prefixed body (Present) or a u128 checksum
+    // (Repairing).
     fn log(log: &[PreparedEntry]) -> usize {
       let mut n = 4;
       for e in log {
-        n += U64 + U128 + U64 + bytes_u32(e.body.len());
+        let body = match &e.body {
+          Body::Present(body) => bytes_u32(body.len()),
+          Body::Repairing(_) => U128,
+        };
+        n += U64 + U128 + U64 + U8 + body;
       }
       n
     }
     let body = match self {
       Self::Request(m) => U128 + U64 + bytes_u32(m.body.len()),
       Self::Prepare(m) => U64 + U64 + U64 + U64 + U128 + U64 + bytes_u32(m.body.len()),
-      Self::PrepareOk(_) => U64 + U64 + U8 + U64,
+      Self::PrepareOk(_) => U64 + U64 + U8 + U64 + U128,
       Self::Reply(m) => U64 + U128 + U64 + bytes_u32(m.body.len()),
       Self::Commit(_) => U64 + U64 + U64,
       Self::StartViewChange(_) => U64 + U8,
@@ -1167,6 +1295,7 @@ impl Message {
         op: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+        prepare_checksum: r.u128()?,
       }),
       3 => Self::Reply(Reply {
         view: read_view(&mut r)?,
@@ -1280,30 +1409,52 @@ fn read_body(r: &mut Reader<'_>) -> Result<Bytes, CodecError> {
 }
 
 /// Writes a `Vec<PreparedEntry>` log slice: a `u32` element count, then each entry as
-/// `op`(u64) `client`(u128) `request`(u64) + a length-prefixed body.
+/// `op`(u64) `client`(u128) `request`(u64) + a body-state tag (u8) + its payload — a
+/// length-prefixed body for [`Body::Present`], or a 16-byte `body_checksum` for [`Body::Repairing`]
+/// (no bytes). A `Repairing` entry carries a body-faulty committed op's existence through a view
+/// change so its op number is never re-minted.
 fn write_log(out: &mut impl BufMut, log: &[PreparedEntry]) {
   out.put_u32(log.len() as u32);
   for e in log {
     out.put_u64(e.op.get());
     out.put_u128(e.client.get());
     out.put_u64(e.request.get());
-    write_bytes_u32(out, &e.body);
+    match &e.body {
+      Body::Present(body) => {
+        out.put_u8(BODY_TAG_PRESENT);
+        write_bytes_u32(out, body);
+      }
+      Body::Repairing(checksum) => {
+        out.put_u8(BODY_TAG_REPAIRING);
+        out.put_u128(*checksum);
+      }
+    }
   }
 }
 
 /// Reads a `Vec<PreparedEntry>` log slice written by [`write_log`]. The element count is validated
 /// against the remaining bytes ([`Reader::seq_len`] with [`PREPARED_ENTRY_MIN_LEN`]) before any
-/// allocation, so a hostile count cannot drive an unbounded pre-allocation; each entry's body is
-/// length-checked individually.
+/// allocation, so a hostile count cannot drive an unbounded pre-allocation; each entry's body-state
+/// tag selects a `u32`-length-prefixed body ([`Body::Present`], length-checked individually) or a
+/// 16-byte checksum ([`Body::Repairing`]). An unknown body-state tag is rejected as
+/// [`CodecError::UnknownTag`].
 fn read_log(r: &mut Reader<'_>) -> Result<Vec<PreparedEntry>, CodecError> {
   let count = r.seq_len(PREPARED_ENTRY_MIN_LEN)?;
   let mut log = Vec::with_capacity(count);
   for _ in 0..count {
+    let op = read_op(r)?;
+    let client = read_client(r)?;
+    let request = read_request(r)?;
+    let body = match r.u8()? {
+      BODY_TAG_PRESENT => Body::Present(read_body(r)?),
+      BODY_TAG_REPAIRING => Body::Repairing(r.u128()?),
+      other => return Err(CodecError::UnknownTag(other)),
+    };
     log.push(PreparedEntry {
-      op: read_op(r)?,
-      client: read_client(r)?,
-      request: read_request(r)?,
-      body: read_body(r)?,
+      op,
+      client,
+      request,
+      body,
     });
   }
   Ok(log)
@@ -1356,8 +1507,32 @@ mod tests {
       OpNumber::with(5),
       ReplicaId::new(2),
       OpNumber::with(4),
+      0x1234_5678_9abc_def0_1122_3344_5566_7788,
     );
     assert_eq!(ok.checkpoint_op(), OpNumber::with(4));
+    // The vote is content-addressed: it carries the operation-identity checksum verbatim.
+    assert_eq!(
+      ok.prepare_checksum(),
+      0x1234_5678_9abc_def0_1122_3344_5566_7788
+    );
+  }
+
+  #[test]
+  fn prepare_ok_prepare_checksum_round_trips_through_the_wire_codec() {
+    // The content-addressed vote field must survive encode→decode unchanged (a u128 edge value),
+    // since the primary's `on_prepare_ok` matches it against the operation it is driving at that op.
+    let ok = Message::PrepareOk(PrepareOk::new(
+      View::with(7),
+      OpNumber::with(9),
+      ReplicaId::new(3),
+      OpNumber::with(4),
+      u128::MAX,
+    ));
+    let back = Message::decode(&ok.encode()).expect("round-trips");
+    assert_eq!(back, ok);
+    let p = back.unwrap_prepare_ok();
+    assert_eq!(p.prepare_checksum(), u128::MAX);
+    assert_eq!(p.op(), OpNumber::with(9));
   }
 
   #[test]
@@ -1539,7 +1714,8 @@ mod tests {
         View::with(1),
         OpNumber::with(1),
         ReplicaId::new(2),
-        OpNumber::with(0)
+        OpNumber::with(0),
+        0
       )),
       Message::Commit(Commit::new(
         View::with(1),
@@ -1694,6 +1870,7 @@ mod tests {
         OpNumber::with(5),
         ReplicaId::new(255),
         OpNumber::with(6),
+        0xCAFE_F00D_DEAD_BEEF_0102_0304_0506_0708,
       )),
       Message::Reply(Reply::new(
         View::with(2),
@@ -1710,10 +1887,21 @@ mod tests {
       Message::DoViewChange(DoViewChange::new(
         View::with(3),
         View::with(2),
-        OpNumber::with(5),
+        OpNumber::with(6),
         OpNumber::with(4),
         ReplicaId::new(6),
-        std::vec![entry(4, b""), entry(5, b"hi")], // populated, incl. an empty-body entry
+        // Populated: an empty-body Present entry, a populated Present entry, AND a header-only
+        // Repairing entry (op 6, body_checksum only) — exercises both body-state wire tags.
+        std::vec![
+          entry(4, b""),
+          entry(5, b"hi"),
+          PreparedEntry::repairing(
+            OpNumber::with(6),
+            ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+            RequestNumber::with(6),
+            0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
+          ),
+        ],
       )),
       Message::StartView(StartView::new(
         View::with(7),
@@ -1814,15 +2002,15 @@ mod tests {
       OpNumber::with(7),
     ));
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 1, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7,
+      0, 3, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7,
     ];
     assert_eq!(c.encode(), expected, "Commit wire layout is pinned");
   }
 
   #[test]
   fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
-    // A nested variant pinned exactly: header (ver+tag 6), scalars, then a 1-entry log slice
-    // (count=1, op, client, request, length-prefixed body "hi").
+    // A nested variant pinned exactly: header (ver 3 + tag 6), scalars, then a 1-entry log slice
+    // (count=1, op, client, request, body-state tag 0 = Present, length-prefixed body "hi").
     let dvc = Message::DoViewChange(DoViewChange::new(
       View::with(3),
       View::with(2),
@@ -1837,11 +2025,53 @@ mod tests {
       )],
     ));
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 1, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+      0, 3, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
       0, 0, 0, 4, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-      14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 2, 104, 105,
+      14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 2, 104, 105,
     ];
     assert_eq!(dvc.encode(), expected, "DoViewChange wire layout is pinned");
+  }
+
+  #[test]
+  fn do_view_change_golden_bytes_pin_a_repairing_entry() {
+    // The header-only (Repairing) entry layout pinned exactly: same scalars, then body-state tag
+    // 1 = Repairing, followed by the 16-byte body_checksum (NO length-prefixed body).
+    let dvc = Message::DoViewChange(DoViewChange::new(
+      View::with(3),
+      View::with(2),
+      OpNumber::with(5),
+      OpNumber::with(4),
+      ReplicaId::new(6),
+      std::vec![PreparedEntry::repairing(
+        OpNumber::with(5),
+        ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+        RequestNumber::with(9),
+        0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
+      )],
+    ));
+    let expected: std::vec::Vec<u8> = std::vec![
+      0, 3, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+      0, 0, 0, 4, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+      14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 1, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+      30, 31, 32,
+    ];
+    assert_eq!(
+      dvc.encode(),
+      expected,
+      "DoViewChange Repairing-entry wire layout is pinned"
+    );
+    // And it round-trips, preserving the op/client/request/checksum with no body bytes.
+    let back = Message::decode(&dvc.encode()).expect("round-trips");
+    let e = &back.unwrap_do_view_change().into_log()[0];
+    assert!(e.is_repairing(), "decoded back as a Repairing entry");
+    assert_eq!(e.op(), OpNumber::with(5));
+    assert_eq!(
+      e.client(),
+      ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10)
+    );
+    assert_eq!(e.request(), RequestNumber::with(9));
+    assert_eq!(e.body(), None, "a Repairing entry carries no bytes");
+    assert_eq!(e.body_checksum(), 0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20);
   }
 
   #[test]

@@ -112,7 +112,15 @@ impl<S: StateMachine> Endpoint<S> {
       let lo = self.commit_min.get() + 1;
       let hi = self.op.get();
       for op in lo..=hi {
-        if let Some(entry) = self.log.get(&op).cloned() {
+        // SKIP a body-`Repairing` hole: a `Prepare` carries the body bytes, which an absent-body op
+        // does not hold, so it cannot be retransmitted (it is itself awaiting peer-repair). Treated like
+        // an op the log is missing — the outer `if let Some(..)` already skips those.
+        if let Some(LogEntry {
+          client,
+          request,
+          body: Body::Present(body),
+        }) = self.log.get(&op).cloned()
+        {
           self.emit(Outgoing::new(
             Recipient::Backups,
             Message::Prepare(Prepare::new(
@@ -120,9 +128,9 @@ impl<S: StateMachine> Endpoint<S> {
               OpNumber::with(op),
               self.commit_min,
               self.checkpoint_op,
-              entry.client,
-              entry.request,
-              entry.body,
+              client,
+              request,
+              body,
             )),
           ));
         }
@@ -251,17 +259,22 @@ impl<S: StateMachine> Endpoint<S> {
     wal.submit_append(id, self.op, header, body_bytes.clone());
     self.log.insert(
       self.op.get(),
-      LogEntry {
-        client,
-        request,
-        body: body_bytes.clone(),
-      },
+      LogEntry::present(client, request, body_bytes.clone()),
     );
     self.inflight.insert(
       self.op.get(),
       Inflight {
         oks: 0, // own bit set on append-done in on_wal_done
         committed: false,
+        // Content-address this op's votes by the OPERATION IDENTITY being driven (client, request,
+        // body): only a PrepareOk carrying this same prepare_checksum is counted, so a stale ack for a
+        // reused op number — even one whose body bytes match — cannot forge a quorum (mirrors
+        // TigerBeetle's (op, prepare_checksum) namespace).
+        prepare_checksum: crate::storage::prepare_identity(
+          client,
+          request,
+          crate::storage::fnv1a_128(&body_bytes),
+        ),
       },
     );
     self.pending.insert(id.get(), Pending::Ack(self.op));
@@ -338,13 +351,20 @@ impl<S: StateMachine> Endpoint<S> {
   fn commit_op(&mut self, now: Instant, op: u64) -> bool {
     // Faults-as-data (peer fault-repair): a committed op whose body read back
     // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
-    // dropped it rather than adopt a wrong/empty body). Instead of panicking, hold the commit and
-    // fetch the op from a peer (`RequestPrepare` → `Prepare`); a later try_commit resumes here.
+    // dropped it rather than adopt a wrong/empty body), OR is present as a body-`Repairing` HOLE (the
+    // op's existence survived but its bytes did not). Either way, instead of panicking, hold the commit
+    // and fetch the op from a peer (`RequestPrepare` → `Prepare`); a later try_commit resumes here.
     let Some(entry) = self.log.get(&op).cloned() else {
       self.request_repair(now, op);
       return false;
     };
-    let reply_body = self.sm.apply(OpNumber::with(op), &entry.body);
+    let Some(body) = entry.body.as_present() else {
+      // A body-absent (`Repairing`) hole: handled EXACTLY like a wholly-missing slot above — hold the
+      // commit and peer-repair the body.
+      self.request_repair(now, op);
+      return false;
+    };
+    let reply_body = self.sm.apply(OpNumber::with(op), body);
     self.set_commit_min(OpNumber::with(op));
     if let Some(inflight) = self.inflight.get_mut(&op) {
       inflight.committed = true;
@@ -456,9 +476,14 @@ impl<S: StateMachine> Endpoint<S> {
       // is NOT a dropped-stale slot, so it keeps the durability-gated re-ack (re-appending below the prune
       // floor would be wrong). In practice a primary never retransmits such an op (it is below the
       // primary's `commit_min`), so this fall-through is for a stray/buffered Prepare.
+      // A body-`Repairing` entry does NOT hold the canonical body (only its checksum), so
+      // `as_present()` is `None` and the identity match fails — this op falls through to the re-append
+      // path (it is itself awaiting the canonical body), never re-acked off an absent body.
       let canonical_held = pop <= self.checkpoint_op.get()
         || self.log.get(&pop).is_some_and(|entry| {
-          entry.client == p.client() && entry.request == p.request() && entry.body == p.body_bytes()
+          entry.client == p.client()
+            && entry.request == p.request()
+            && entry.body.as_present() == Some(p.body())
         });
       if canonical_held {
         // We hold the canonical body (in `self.log` above the checkpoint, or in the snapshot at/below it).
@@ -549,11 +574,7 @@ impl<S: StateMachine> Endpoint<S> {
     wal.submit_append(id, p.op(), header, p.body_bytes());
     self.log.insert(
       p.op().get(),
-      LogEntry {
-        client: p.client(),
-        request: p.request(),
-        body: p.body_bytes(),
-      },
+      LogEntry::present(p.client(), p.request(), p.body_bytes()),
     );
     self.pending.insert(id.get(), Pending::Ack(p.op()));
     // Append-before-ack: mark op in-flight so neither this op's deferred ack NOR a
@@ -577,11 +598,7 @@ impl<S: StateMachine> Endpoint<S> {
     wal.submit_append(id, p.op(), header, p.body_bytes());
     self.log.insert(
       p.op().get(),
-      LogEntry {
-        client: p.client(),
-        request: p.request(),
-        body: p.body_bytes(),
-      },
+      LogEntry::present(p.client(), p.request(), p.body_bytes()),
     );
     self.pending.insert(id.get(), Pending::Ack(p.op()));
     // Mark in-flight so a further retransmit-driven re-ack defers to `on_wal_done` (which clears it +
@@ -618,6 +635,20 @@ impl<S: StateMachine> Endpoint<S> {
       "append-before-ack: PrepareOk for op {} whose WAL append is still in flight",
       op.get()
     );
+    // Content-address the vote: stamp the OPERATION IDENTITY (client, request, body_checksum) of the op
+    // THIS replica actually holds at `op`, so the primary counts it only against the operation it is
+    // itself driving (a stale or different-operation ack — even a same-body one for a re-minted op
+    // number — carries a different identity and is dropped). The op is `Present` in `self.log` for every
+    // real ack/re-ack of an above-checkpoint op (it was just appended). The lone exception is
+    // `report_checkpoint_to_primary`'s re-ack of `checkpoint_op` (a pure checkpoint REPORT, not a commit
+    // vote): that op is folded into the snapshot and GC-pruned from `self.log`, so it has no entry and
+    // stamps `0` — harmless, since the primary holds no live `inflight` entry at `checkpoint_op` to
+    // match the vote against (it re-ORs an already-pruned bit, a no-op).
+    let prepare_checksum = self
+      .log
+      .get(&op.get())
+      .map(|e| crate::storage::prepare_identity(e.client, e.request, e.body.body_checksum()))
+      .unwrap_or(0);
     let primary = self.config.primary(self.view);
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
@@ -626,6 +657,7 @@ impl<S: StateMachine> Endpoint<S> {
         op,
         self.config.replica(),
         self.checkpoint_op,
+        prepare_checksum,
       )),
     ));
   }
@@ -651,14 +683,21 @@ impl<S: StateMachine> Endpoint<S> {
       let op = self.commit_min.get() + 1;
       // Faults-as-data (peer fault-repair): a committed op whose body read back
       // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
-      // dropped it rather than adopt a wrong/empty body). Instead of panicking, HOLD the commit at the
+      // dropped it rather than adopt a wrong/empty body), OR is present as a body-`Repairing` HOLE (the
+      // op's existence survived but its bytes did not). Instead of panicking, HOLD the commit at the
       // hole — never skip op N to apply N+1 — and fetch op N from a peer (`RequestPrepare` →
       // `Prepare`); a later advance_commit (after the op arrives) resumes from exactly here.
       let Some(entry) = self.log.get(&op).cloned() else {
         self.request_repair(now, op);
         break;
       };
-      let reply = self.sm.apply(OpNumber::with(op), &entry.body);
+      let Some(body) = entry.body.as_present() else {
+        // A body-absent (`Repairing`) hole: handled EXACTLY like a wholly-missing slot above — hold the
+        // commit and peer-repair the body.
+        self.request_repair(now, op);
+        break;
+      };
+      let reply = self.sm.apply(OpNumber::with(op), body);
       self.set_commit_min(OpNumber::with(op));
       // Maintain the client-session request high-water + CACHED REPLY as we apply (mirrors the
       // primary's `commit_op`). The request watermark is the at-most-once dedup watermark a
@@ -811,8 +850,17 @@ impl<S: StateMachine> Endpoint<S> {
     // Force-sync escalation: a fresh quorum-checkpoint report may have just crossed a `repair`
     // hole we hold, rendering its `RequestPrepare` futile (the op is pruned everywhere on the quorum).
     self.maybe_force_sync(now);
+    // Content-addressed vote gate (TigerBeetle's (op, prepare_checksum) namespace): count this ack
+    // toward the commit quorum ONLY if its prepare_checksum matches the OPERATION IDENTITY (client,
+    // request, body) the primary is driving at this op. A mismatch means the ack is for a DIFFERENT or
+    // STALE operation — e.g. a delayed PrepareOk for the OLD op at op number N that the liveness
+    // truncation re-minted for a different request (even one whose body bytes match), or a backup
+    // holding a different operation at the same op number — so DROP it (do not OR the vote). Without
+    // this, such a stale ack could forge a quorum for an operation the primary never drove → divergence.
     if let Some(inflight) = self.inflight.get_mut(&ok.op().get()) {
-      inflight.oks |= 1u64 << ok.replica().get();
+      if ok.prepare_checksum() == inflight.prepare_checksum {
+        inflight.oks |= 1u64 << ok.replica().get();
+      }
     }
     self.try_commit(now, sb);
   }

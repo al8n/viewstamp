@@ -329,11 +329,11 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
   // to ack. (Without the entry the re-ack would mis-classify a durable committed op as a dropped hole.)
   e.log.insert(
     5,
-    LogEntry {
-      client: ClientId::new(7),
-      request: RequestNumber::with(5),
-      body: Bytes::copy_from_slice(&[5u8]),
-    },
+    LogEntry::present(
+      ClientId::new(7),
+      RequestNumber::with(5),
+      Bytes::copy_from_slice(&[5u8]),
+    ),
   );
   assert_eq!(
     wal.status(OpNumber::with(5)),
@@ -448,18 +448,18 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   // Primary holding a committed-op GAP: head op 4, commit HELD at 1 by a hole at op 2, but commit_max
   // = 4 (ops 2..=4 are known committed cluster-wide, merely unapplied here). Ops 3 + 4 are present in
-  // the log; only op 2 is the unreadable hole. (`force_state_for_test` keeps commit_max == commit_min,
-  // so raise it directly to model the known-but-unapplied committed suffix.)
+  // the log; only op 2 is the unreadable hole. (`force_state_for_test` raises commit_max to cover the
+  // op-2 hole; raise it further to 4 to model the full known-but-unapplied committed suffix.)
   ep.force_state_for_test(0, 4, 1, 0, &[2]);
   ep.commit_max = OpNumber::with(4);
   for op in [3u64, 4u64] {
     ep.log.insert(
       op,
-      LogEntry {
-        client: ClientId::new(7),
-        request: RequestNumber::with(op),
-        body: Bytes::copy_from_slice(&[op as u8]),
-      },
+      LogEntry::present(
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      ),
     );
   }
   assert!(ep.is_primary());
@@ -543,6 +543,192 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   assert!(
     saw_prepare,
     "the primary broadcasts a Prepare for the request once it has caught up"
+  );
+}
+
+#[test]
+fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
+  // A body-`Repairing` log entry — the op EXISTS (its identity + durable body_checksum survived a
+  // torn-body fault) but its bytes are absent — must be treated by the commit path EXACTLY like a
+  // wholly-missing slot: HOLD the commit at it (never apply over an absent body) and solicit the body
+  // from a peer (`RequestPrepare`). This is the safety the otherwise-untested `Body::Repairing` apply
+  // arm rests on. (`recover` now produces such entries for body-faulty committed ops; this seeds one
+  // directly to isolate the commit-path apply arm.)
+  let mut e = backup(); // replica 1 of 3, view 0 (primary is replica 0)
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Head op 1, nothing applied yet, op 1 present in the log as a body-ABSENT `Repairing` slot carrying
+  // only op 1's canonical body_checksum (the bytes did not survive).
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry {
+      client: ClientId::new(7),
+      request: RequestNumber::with(1),
+      body: Body::Repairing(crate::storage::fnv1a_128(&[1u8])),
+    },
+  );
+  assert!(
+    !e.has_repair_hole_for_test(1),
+    "precondition: op 1 is not yet a tracked repair hole"
+  );
+
+  // The primary announces commit=1. `on_commit` → `advance_commit(target=1)` reaches op 1, finds its
+  // body absent, and must HOLD: commit_min stays 0, op 1 is registered for peer fault-repair, and a
+  // RequestPrepare(op 1) is solicited.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(0),
+    "the commit is HELD at the body-Repairing entry (op 1 not applied over an absent body)"
+  );
+  assert!(
+    e.has_repair_hole_for_test(1),
+    "op 1 is registered for peer fault-repair (the absent body is solicited, not skipped)"
+  );
+  let mut solicited = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::RequestPrepare(rp) = out.msg_ref() {
+      if rp.op() == OpNumber::with(1) {
+        solicited = true;
+      }
+    }
+  }
+  assert!(
+    solicited,
+    "a RequestPrepare(op 1) is emitted to fetch the missing body — exactly the missing-slot behavior"
+  );
+
+  // The repair Prepare answers with op 1's real body: once its append is durable, the held commit
+  // resumes and op 1 applies (commit_min reaches 1), proving the hold was a genuine pause, not a loss.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    repair_prepare(0, 1, 1),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply op 1
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "once the body is repaired + durable, the held commit applies op 1"
+  );
+  assert!(
+    !e.has_repair_hole_for_test(1),
+    "the repair hole clears once the canonical body fills it"
+  );
+}
+
+#[test]
+fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
+  // CONSENSUS-CRITICAL: votes are content-addressed by the FULL operation identity (op, client, request,
+  // body_checksum), NOT the body alone. A PrepareOk for op N counts toward op N's quorum ONLY if it
+  // carries the identity of the operation the primary is driving at op N. This closes the SAME-BODY
+  // op-reuse hole that body_checksum alone left open: two DISTINCT operations can share body bytes (same
+  // body_checksum) yet differ in (client, request), so a stale ack for an op number that was truncated
+  // and re-minted for a DIFFERENT request — even one with identical body bytes — must NOT be counted.
+  let cfg = Config::try_new(1, ReplicaId::new(0), 3).expect("valid cluster config");
+  let mut e = Endpoint::new(cfg, 7, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  assert!(e.is_primary(), "replica 0 is primary of view 0");
+  let now = Instant::ZERO;
+
+  // The primary serves client 9's request 1 (body [1]) → mints op 1, seeding inflight[1] with that
+  // OPERATION's identity. Pump storage so the durable own append records the primary's own vote.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from(std::vec![1u8]),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the clean primary serves the request — op 1 is minted"
+  );
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb); // the own append lands → the primary's own vote
+  }
+  let own_bit = 1u64 << 0; // replica 0
+  assert_eq!(
+    e.inflight.get(&1).map(|i| i.oks),
+    Some(own_bit),
+    "after the durable append op 1 carries only the primary's own vote"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(0),
+    "the own vote alone is below quorum (2)"
+  );
+
+  // The identity the primary is driving at op 1 (client 9, request 1, body [1]). A DIFFERENT operation —
+  // client 7's request 1 — that happens to carry the SAME body bytes [1] has the SAME body_checksum but
+  // a DIFFERENT identity: exactly the collision body_checksum-only voting could not tell apart.
+  let body = crate::storage::fnv1a_128(&[1u8]);
+  let driven = crate::storage::prepare_identity(ClientId::new(9), RequestNumber::with(1), body);
+  let same_body_other_op =
+    crate::storage::prepare_identity(ClientId::new(7), RequestNumber::with(1), body);
+  assert_ne!(
+    driven, same_body_other_op,
+    "same body bytes, different client → DIFFERENT operation identity (the hole body_checksum left open)"
+  );
+
+  // A backup ack for op 1 carrying a DIFFERENT operation's identity — even with the SAME body bytes — is
+  // REJECTED. (With body_checksum-only voting its checksum would have MATCHED and forged a quorum.)
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      OpNumber::new(),
+      same_body_other_op,
+    )),
+  );
+  assert_eq!(
+    e.inflight.get(&1).map(|i| i.oks),
+    Some(own_bit),
+    "the same-body different-operation ack left the vote bitset unchanged — dropped, not counted"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(0),
+    "a same-body ack for a DIFFERENT operation does not commit op 1 (full-identity votes reject it)"
+  );
+
+  // The SAME backup acking op 1 with the MATCHING operation identity counts → own + backup = quorum.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      OpNumber::new(),
+      driven,
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the matching-identity ack counts — op 1 commits on the content-addressed quorum"
   );
 }
 

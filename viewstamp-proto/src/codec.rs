@@ -6,9 +6,11 @@
 //! value types over the wire and onto disk, so the encoding is **part of the protocol
 //! contract**, not a driver detail. The three requirements every encoding here meets:
 //!
-//! - **Versioned** — every encoding leads with [`WIRE_VERSION`] (the disk [`Header`] reuses
-//!   [`HEADER_VERSION`](crate::HEADER_VERSION) in its canonical body); decode REJECTS an
-//!   unknown version with [`CodecError::UnknownVersion`] so the format can evolve.
+//! - **Versioned** — every MESSAGE encoding leads with [`WIRE_VERSION`]; the DURABLE on-disk forms
+//!   version INDEPENDENTLY (the [`Header`] via [`HEADER_VERSION`](crate::HEADER_VERSION), the superblock
+//!   root [`VsrState`](crate::VsrState) via [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION)), so a
+//!   message-format change never invalidates a persisted root. Decode REJECTS an unknown version with
+//!   [`CodecError::UnknownVersion`] so each format can evolve.
 //! - **Canonical** — a fixed field order, big-endian scalars (matching the existing
 //!   `Header::compute_checksum` `to_be_bytes` order), length-prefixed variable parts.
 //! - **Bounds-checked, panic-free decode** — decode takes `&[u8]` and returns
@@ -18,12 +20,14 @@
 
 use bytes::BufMut;
 
-/// The wire/disk format version every codec output in this crate leads with (or, for the
-/// fixed-size [`Header`](crate::Header) body, incorporates via
-/// [`HEADER_VERSION`](crate::HEADER_VERSION)). A decode that reads a different version
-/// fails with [`CodecError::UnknownVersion`] rather than misinterpreting later bytes — this
-/// is what lets the format evolve without a silent reinterpretation of old/foreign data.
-pub const WIRE_VERSION: u16 = 1;
+/// The MESSAGE wire format version every [`Message`](crate::Message) encoding leads with. The DURABLE
+/// on-disk forms version INDEPENDENTLY — the [`Header`](crate::Header) via
+/// [`HEADER_VERSION`](crate::HEADER_VERSION), the superblock root [`VsrState`](crate::VsrState) via
+/// [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION) — so a message-only bump here never invalidates a
+/// persisted root or blocks a rolling upgrade. A decode that reads a different version fails with
+/// [`CodecError::UnknownVersion`] rather than misinterpreting later bytes, letting each format evolve
+/// without silently reinterpreting old/foreign data.
+pub const WIRE_VERSION: u16 = 3;
 
 /// A typed, structured error from decoding a [`Header`](crate::Header),
 /// [`VsrState`](crate::VsrState), or [`Message`](crate::Message) from bytes (or from a

@@ -493,6 +493,12 @@ fn view_change_preserves_the_durable_checkpoint_pointer() {
         OpNumber::with(rn),
         ReplicaId::new(1),
         OpNumber::new(),
+        // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
+        crate::storage::prepare_identity(
+          ClientId::new(7),
+          RequestNumber::with(rn),
+          crate::storage::fnv1a_128(&[rn as u8]),
+        ),
       )),
     );
     e.handle_storage(now, &mut wal, &mut sb); // drain any checkpoint writes
@@ -560,6 +566,7 @@ fn primary_tracks_quorum_checkpoint_op() {
       OpNumber::with(1),
       ReplicaId::new(1),
       OpNumber::with(5),
+      0, // no inflight at op 1 — this exercises only the checkpoint REPORT, not vote-counting
     )),
   );
   // Only one backup heard from: self(0)=0, r1=5, r2=unheard(0) → desc [5,0,0] → index 1 = 0.
@@ -578,6 +585,7 @@ fn primary_tracks_quorum_checkpoint_op() {
       OpNumber::with(1),
       ReplicaId::new(2),
       OpNumber::with(3),
+      0, // no inflight at op 1 — this exercises only the checkpoint REPORT, not vote-counting
     )),
   );
   assert_eq!(e.quorum_checkpoint_op(), OpNumber::with(3));
@@ -638,6 +646,7 @@ fn peer_checkpoint_is_monotone_under_reordering() {
       OpNumber::with(1),
       ReplicaId::new(1),
       OpNumber::with(8),
+      0, // no inflight at op 1 — this exercises only the checkpoint REPORT, not vote-counting
     )),
   );
   assert_eq!(ep.peer_checkpoint_for_test(1), 8);
@@ -652,6 +661,7 @@ fn peer_checkpoint_is_monotone_under_reordering() {
       OpNumber::with(1),
       ReplicaId::new(1),
       OpNumber::with(4),
+      0, // no inflight at op 1 — this exercises only the checkpoint REPORT, not vote-counting
     )),
   );
   assert_eq!(

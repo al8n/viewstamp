@@ -195,6 +195,12 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
         OpNumber::with(rn),
         ReplicaId::new(1),
         OpNumber::new(),
+        // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
+        crate::storage::prepare_identity(
+          ClientId::new(7),
+          RequestNumber::with(rn),
+          crate::storage::fnv1a_128(&[rn as u8]),
+        ),
       )),
     );
   }
@@ -586,6 +592,12 @@ fn poll_timeout_only_returns_serviceable_timers() {
           OpNumber::with(rn),
           ReplicaId::new(1),
           OpNumber::new(),
+          // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
+          crate::storage::prepare_identity(
+            ClientId::new(7),
+            RequestNumber::with(rn),
+            crate::storage::fnv1a_128(&[rn as u8]),
+          ),
         )),
       );
     }

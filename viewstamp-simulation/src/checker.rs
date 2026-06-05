@@ -115,9 +115,13 @@ impl DurabilityChecker {
       // (1) No committed op rewritten: agree with the committed history on the common prefix.
       let n = a.len().min(self.committed.len());
       if a[..n] != self.committed[..n] {
+        // Pinpoint the first diverging op for the audit: which committed op, and the two bodies.
+        let pos = (0..n).find(|&p| a[p] != self.committed[p]).unwrap_or(0);
+        let (cop, cbody) = &self.committed[pos];
+        let (aop, abody) = &a[pos];
         return CheckResult::violation(format!(
-          "replica {i}: applied prefix diverges from the committed history (a committed op was \
-           rewritten/lost across time)"
+          "replica {i}: applied prefix diverges from the committed history at op {cop} (a committed \
+           op was rewritten/lost across time): committed=({cop},{cbody:?}) replica=({aop},{abody:?})"
         ));
       }
       // Extend the committed history if this replica is strictly ahead (and agrees on the prefix).
@@ -391,7 +395,7 @@ mod tests {
     // The end-of-run durability assertion (which the VOPR driver's final QUIESCE phase runs AFTER
     // draining) must stay STRICT: if NO operational replica retains the committed history, it is a
     // Violation. This is the "a committed op held by no operational holder still FAILS" direction — it
-    // pins that the seed-313 quiesce fix (drain THEN assert) did not weaken the no-loss guarantee.
+    // pins that the quiesce fix (drain THEN assert) did not weaken the no-loss guarantee.
     let mut c = Cluster::new(3, 2, 3, 9);
     let mut dur = DurabilityChecker::new(c.replica_count());
     for _ in 0..50_000 {
@@ -467,6 +471,7 @@ mod tests {
       jitter: Duration::from_millis(2),
       drop_per_mille: 200,
       duplicate_per_mille: 0,
+      hold_per_mille: 0,
     });
     let mut vm = ViewMonotonicChecker::new(c.replica_count());
     // Warm up.

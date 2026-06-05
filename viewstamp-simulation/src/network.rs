@@ -36,6 +36,14 @@ pub struct Faults {
   /// apply; a re-delivered `PrepareOk` must not double-count the quorum). Default 0 (existing tests
   /// unaffected).
   pub duplicate_per_mille: u32,
+  /// Per-message UNBOUNDED-HOLD probability, out of 1000. When it fires, delivery is pushed FAR into
+  /// the virtual future (`HOLD_DELAY`, well past the repair-or-truncate grace) instead of
+  /// `latency + jitter` — modelling an adversarially-delayed message that OUTLIVES its op's truncation
+  /// and re-mint. This is the axis that lets the simulator reach the op-reuse / vote-confusion class: a
+  /// `PrepareOk` whose op number was truncated and re-used by the time the held vote arrives, which the
+  /// content-addressed vote gate must reject by body checksum. Default 0 (existing schedules unaffected —
+  /// no PRNG draw is taken when 0, so the per-seed stream is byte-identical).
+  pub hold_per_mille: u32,
 }
 
 impl Faults {
@@ -46,6 +54,7 @@ impl Faults {
       jitter: core::time::Duration::ZERO,
       drop_per_mille: 0,
       duplicate_per_mille: 0,
+      hold_per_mille: 0,
     }
   }
 }

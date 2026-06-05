@@ -14,6 +14,22 @@ use crate::{ClientId, OpNumber, RequestNumber, View};
 /// On-disk header format version (bumped on any wire/disk layout change).
 pub const HEADER_VERSION: u16 = 1;
 
+/// On-disk superblock-root ([`VsrState`]) format version — the version NEW roots are written with, and
+/// the high end of the layout-compatible range [`VsrState::decode`] accepts. The superblock root carries
+/// its OWN version, like the disk [`Header`]'s [`HEADER_VERSION`], INDEPENDENT of the message
+/// [`WIRE_VERSION`](crate::WIRE_VERSION): a version names a disk LAYOUT, and it moves ONLY when the
+/// `VsrState` layout itself changes — never as collateral from a message-format change.
+///
+/// The committed-band-header root layout has been byte-identical since the first release, but the
+/// pre-decoupling code led the root with the shared `WIRE_VERSION`, which bumped `1 → 2 → 3` for
+/// MESSAGE-only changes (the `DoViewChange`/`PreparedEntry` Repairing wire, then the `PrepareOk` field).
+/// So that ONE root layout exists tagged `1`, `2`, AND `3`. [`VsrState::decode`] accepts the whole
+/// `1..=SUPERBLOCK_VERSION` range as that single layout, so NO persisted root is stranded and a
+/// message-only `WIRE_VERSION` bump can never invalidate a root. A future `VsrState` LAYOUT change bumps
+/// this and MUST add explicit per-version dispatch in `decode` — the contiguous-range shortcut holds only
+/// while there is one layout.
+pub const SUPERBLOCK_VERSION: u16 = 3;
+
 /// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
 /// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are
 /// the bytes shared between [`Header::encode`] and the checksum, so the on-disk checksum can
@@ -103,7 +119,21 @@ impl Header {
     request: RequestNumber,
     body: &[u8],
   ) -> Self {
-    let body_checksum = fnv1a_128(body);
+    Self::from_parts(op, view, client, request, fnv1a_128(body))
+  }
+
+  /// Creates a header from a PRECOMPUTED `body_checksum`, without the body bytes. Used when the body
+  /// is absent but its canonical checksum is durably known (a body-`Repairing` log entry), so the
+  /// header still records the op's canonical identity. Computes only the header self-checksum; the
+  /// `body_checksum` is taken as given. Equivalent to [`Header::new`] when
+  /// `body_checksum == fnv1a_128(body)`.
+  pub fn from_parts(
+    op: OpNumber,
+    view: View,
+    client: ClientId,
+    request: RequestNumber,
+    body_checksum: u128,
+  ) -> Self {
     let mut h = Self {
       version: HEADER_VERSION,
       checksum: 0,
@@ -414,7 +444,7 @@ impl VsrState {
   }
 
   /// Encodes this durable root to a length-prefixed, versioned byte vector (the superblock
-  /// on-disk form). Layout (all scalars big-endian): [`WIRE_VERSION`](crate::WIRE_VERSION) `u16`,
+  /// on-disk form). Layout (all scalars big-endian): [`SUPERBLOCK_VERSION`] `u16`,
   /// then `view`/`log_view` (`u64` each), `commit`/`checkpoint_op` (`u64` each), `checkpoint_id`
   /// (`u128`), then the committed-band header set as a `u32` count followed by that many
   /// fixed-size [`Header::encode`] blocks (one [`HEADER_ENCODED_LEN`]-byte block per header). The
@@ -424,7 +454,7 @@ impl VsrState {
     let mut out = BytesMut::with_capacity(
       2 + 8 * 4 + 16 + 4 + self.committed_headers.len() * HEADER_ENCODED_LEN,
     );
-    out.put_u16(crate::WIRE_VERSION);
+    out.put_u16(SUPERBLOCK_VERSION);
     out.put_u64(self.view.get());
     out.put_u64(self.log_view.get());
     out.put_u64(self.commit.get());
@@ -450,7 +480,12 @@ impl VsrState {
   pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
     let mut r = Reader::new(buf);
     let version = r.u16()?;
-    if version != crate::WIRE_VERSION {
+    // Accept the whole layout-compatible range, not just the latest: the committed-band-header root
+    // layout is byte-identical across versions `1..=SUPERBLOCK_VERSION` (the pre-decoupling coupling
+    // stamped this ONE layout with 1, 2, 3), so a persisted root carrying ANY of them parses with this
+    // layout and is never stranded. A FUTURE layout change bumps `SUPERBLOCK_VERSION` and MUST replace
+    // this range with explicit per-version dispatch — the shortcut is sound only while there is one layout.
+    if version == 0 || version > SUPERBLOCK_VERSION {
       return Err(CodecError::UnknownVersion(version));
     }
     let view = View::with(r.u64()?);
@@ -541,6 +576,33 @@ impl ReadOk {
   }
 }
 
+/// A durable read whose header self-checksum verifies but whose body failed verification
+/// (torn / bit-rot) or is absent — the op EXISTS and its identity is known; only the body
+/// needs peer-repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyFaulty {
+  id: OpId,
+  header: Header,
+}
+impl BodyFaulty {
+  /// Creates a body-faulty result.
+  pub const fn new(id: OpId, header: Header) -> Self {
+    Self { id, header }
+  }
+
+  /// The correlation id of the storage op that produced this result.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn id(&self) -> OpId {
+    self.id
+  }
+
+  /// The WAL entry header (durable and self-verified).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn header(&self) -> Header {
+    self.header
+  }
+}
+
 /// Completion of a submitted `Wal` op.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
@@ -557,6 +619,8 @@ pub enum WalDone {
   Absent(OpId),
   /// A storage-level fault (or proto-detected corruption).
   Fault(OpId),
+  /// A durable read whose header verifies but whose body failed verification or is absent.
+  BodyFaulty(BodyFaulty),
 }
 
 /// A successful checkpoint read.
@@ -743,7 +807,7 @@ pub fn checkpoint_id(snapshot: &[u8]) -> u128 {
 const FNV_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
 const FNV_PRIME: u128 = 0x0000000001000000000000000000013B;
 
-fn fnv1a_128(bytes: &[u8]) -> u128 {
+pub(crate) fn fnv1a_128(bytes: &[u8]) -> u128 {
   fnv1a_128_mix(FNV_OFFSET, bytes)
 }
 
@@ -753,6 +817,23 @@ fn fnv1a_128_mix(mut acc: u128, bytes: &[u8]) -> u128 {
     acc = acc.wrapping_mul(FNV_PRIME);
   }
   acc
+}
+
+/// The content address of an operation's full IDENTITY — the namespace a `PrepareOk` vote is counted
+/// in. It is `(client, request, body_checksum)`: EXACTLY the committed identity `recover` compares
+/// (`classify_committed_slot`), with the op number supplied by the `inflight`/log map key and the view
+/// deliberately excluded (a committed op's identity is view-independent). Two DISTINCT operations that
+/// share body bytes — the same `body_checksum` under a different `(client, request)` — therefore have
+/// DIFFERENT identities, so a stale vote for an op number truncated and re-minted for a different
+/// request cannot be miscounted. `body_checksum` ALONE left that same-body op-reuse hole open.
+pub(crate) fn prepare_identity(
+  client: ClientId,
+  request: RequestNumber,
+  body_checksum: u128,
+) -> u128 {
+  let acc = fnv1a_128_mix(FNV_OFFSET, &client.get().to_be_bytes());
+  let acc = fnv1a_128_mix(acc, &request.get().to_be_bytes());
+  fnv1a_128_mix(acc, &body_checksum.to_be_bytes())
 }
 
 #[cfg(test)]
@@ -1002,6 +1083,25 @@ mod tests {
     assert_eq!(d.unwrap_read_ok().op(), OpNumber::with(1));
   }
 
+  #[test]
+  fn body_faulty_round_trips_id_and_header() {
+    let id = OpId::new(42);
+    let header = Header::new(
+      OpNumber::with(7),
+      View::with(2),
+      ClientId::new(9),
+      RequestNumber::with(3),
+      b"payload",
+    );
+    let bf = BodyFaulty::new(id, header);
+    assert_eq!(bf.id(), id, "id round-trips");
+    assert_eq!(bf.header(), header, "header round-trips");
+    // Can be wrapped in WalDone::BodyFaulty.
+    let done = WalDone::BodyFaulty(bf);
+    assert!(done.is_body_faulty());
+    assert_eq!(done.unwrap_body_faulty().id(), id);
+  }
+
   // ── disk codec: Header + VsrState ──
 
   use crate::codec::CodecError;
@@ -1198,7 +1298,7 @@ mod tests {
     )
     .unwrap();
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0,
+      0, 3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0,
       0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 187, 204, 221, 0, 0, 0, 1, 231, 44, 98, 75,
       124, 48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
       0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1207,6 +1307,58 @@ mod tests {
       157, 189, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
     assert_eq!(st.encode(), expected, "VsrState wire layout is pinned");
+    // The pinned golden bytes are a valid decode input too: they round-trip back to the same root.
+    assert_eq!(
+      VsrState::decode(&expected).unwrap(),
+      st,
+      "the pinned golden root round-trips through decode"
+    );
+  }
+
+  #[test]
+  fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
+    // A version names a disk LAYOUT, and decode accepts EVERY version of a layout it can parse,
+    // not the latest only. The committed-band-header root layout is byte-identical across versions
+    // 1..=SUPERBLOCK_VERSION (the pre-decoupling message/disk coupling stamped this ONE layout with 1, 2,
+    // 3), so a root carrying ANY of them decodes to the same state and none is stranded. That tolerance —
+    // together with the root carrying its OWN version, independent of the message WIRE_VERSION — is what
+    // makes the decoupling correct-by-construction: a message-only WIRE_VERSION bump can never invalidate
+    // a persisted root (it neither touches this constant nor changes the accepted set).
+    let st = VsrState::try_new(
+      View::with(2),
+      View::with(1),
+      OpNumber::with(5),
+      OpNumber::with(4),
+      0xAABB,
+      std::vec![],
+    )
+    .unwrap();
+    // NEW roots are written with SUPERBLOCK_VERSION (the current layout version).
+    let bytes = st.encode();
+    assert_eq!(
+      &bytes[0..2],
+      &SUPERBLOCK_VERSION.to_be_bytes(),
+      "a new durable root leads with SUPERBLOCK_VERSION"
+    );
+    // EVERY legacy version of this one layout decodes to the SAME state — no persisted root is stranded.
+    for v in 1..=SUPERBLOCK_VERSION {
+      let mut legacy = bytes.to_vec();
+      legacy[0..2].copy_from_slice(&v.to_be_bytes());
+      assert_eq!(
+        VsrState::decode(&legacy).unwrap(),
+        st,
+        "a root tagged with layout-compatible version {v} decodes unchanged"
+      );
+    }
+    // Versions OUTSIDE the layout-compatible range fail CLEAN (never misparse): 0 and one past the high end.
+    for bad in [0u16, SUPERBLOCK_VERSION + 1] {
+      let mut wrong = bytes.to_vec();
+      wrong[0..2].copy_from_slice(&bad.to_be_bytes());
+      assert!(
+        matches!(VsrState::decode(&wrong), Err(CodecError::UnknownVersion(v)) if v == bad),
+        "version {bad} is outside the layout-compatible range and is rejected as unknown"
+      );
+    }
   }
 
   #[test]
@@ -1263,7 +1415,7 @@ mod tests {
     // rejected as InvalidVsrState rather than constructing an illegal root. Build it by hand: an
     // empty-header root with log_view = 5 > view = 4.
     let mut bad = std::vec::Vec::new();
-    bad.extend_from_slice(&crate::WIRE_VERSION.to_be_bytes());
+    bad.extend_from_slice(&SUPERBLOCK_VERSION.to_be_bytes());
     bad.extend_from_slice(&4u64.to_be_bytes()); // view
     bad.extend_from_slice(&5u64.to_be_bytes()); // log_view > view
     bad.extend_from_slice(&0u64.to_be_bytes()); // commit

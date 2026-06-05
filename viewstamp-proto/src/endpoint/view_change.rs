@@ -6,6 +6,22 @@ impl<S: StateMachine> Endpoint<S> {
   /// (`Pending::AdoptVote`) — both record the own vote ONLY once the op's WAL append is durable.
   pub(crate) fn record_own_vote(&mut self, op: u64) {
     let own = 1u64 << self.config.replica().get();
+    // The primary's own vote is for the operation IT is driving at `op`, which is exactly the operation
+    // whose identity seeded this inflight entry (the `on_request` mint, the view-change adopt loop, or —
+    // for an adopted `Repairing` tail — the now-`Present` peer-repaired body `fill_repair` verified
+    // against the seeded canonical checksum). So it is content-addressed by construction; this assert
+    // freezes that invariant so a future own-vote site casting against a divergent operation trips in tests.
+    debug_assert!(
+      self.inflight.get(&op).is_none_or(|inf| {
+        self
+          .log
+          .get(&op)
+          .map(|e| crate::storage::prepare_identity(e.client, e.request, e.body.body_checksum()))
+          .unwrap_or(inf.prepare_checksum)
+          == inf.prepare_checksum
+      }),
+      "own vote for op {op} disagrees with the operation the inflight entry is driving"
+    );
     if let Some(inf) = self.inflight.get_mut(&op) {
       inf.oks |= own;
     }
@@ -256,6 +272,15 @@ impl<S: StateMachine> Endpoint<S> {
     // nor a stale pending-forfeit must carry across (no same-view re-forfeit / cross-view leak).
     self.timers.forfeit_armed = None;
     self.pending_forfeit = false;
+    // A view change ends this primary generation: drop any body-aware nack-truncation grace deadline.
+    // The candidate (a header-only `Repairing` op above `commit*` with no `Present` donor) is
+    // re-evaluated from scratch by the NEXT primary's `select_canonical_log` (it may again be a
+    // candidate, may now be `Present` on a donor, or may be nack-truncated) — so a stale grace deadline
+    // must not carry across (no cross-generation truncation, no same-view re-arm leak), exactly as the
+    // forfeit sub-state above. (`arm_timers` preserves this across its reset, so this is the one place
+    // that clears it on a transition; the timer is otherwise owned by `start_view_as_new_primary` /
+    // the fill-cancel / the expiry truncation.)
+    self.timers.repair_or_truncate = None;
   }
 
   /// The shared `ViewChange`-entry body (no view-advance assert — the callers assert their own
@@ -314,8 +339,18 @@ impl<S: StateMachine> Endpoint<S> {
     self
       .log
       .iter()
-      .map(|(&op, e)| {
-        crate::PreparedEntry::new(OpNumber::with(op), e.client, e.request, e.body.clone())
+      .map(|(&op, e)| match &e.body {
+        Body::Present(body) => {
+          crate::PreparedEntry::new(OpNumber::with(op), e.client, e.request, body.clone())
+        }
+        // A body-`Repairing` header-only entry (a kept body-faulty committed op awaiting peer-repair)
+        // is carried through the view change as a header-only `PreparedEntry`: its EXISTENCE +
+        // canonical identity (client, request, body_checksum) travel in the DVC so the new primary
+        // sees the op as TAKEN (never re-mints its number) and adopts it repair-pending, fetching the
+        // body from a peer that holds it.
+        Body::Repairing(checksum) => {
+          crate::PreparedEntry::repairing(OpNumber::with(op), e.client, e.request, *checksum)
+        }
       })
       .collect()
   }
@@ -492,18 +527,30 @@ impl<S: StateMachine> Endpoint<S> {
     // Build the canonical log by UNIONING the canonical generation's entries up to op_head: for each
     // op, take its `PreparedEntry` from any canonical donor that holds it. A committed op present in a
     // low-floor donor's offset log but absent from a higher-floor donor is therefore STILL included.
-    // The BTreeMap keys by op so the result is ordered+gapless-where-present; `or_insert_with` keeps
-    // the FIRST canonical donor's copy of each op. The donor choice is immaterial: every donor of the
-    // canonical generation agrees on a committed op's content (same prior-view prepare), and an
-    // uncommitted tail op `(commit* .. op_head]` is identical across the canonical generation too (it
-    // is the same prepared op — the canonical `op_head` holder's value).
+    // The BTreeMap keys by op so the result is ordered+gapless-where-present. A `Repairing`
+    // (header-only) entry COUNTS as the op being present — its existence is what stops the op number
+    // being re-minted — but when BOTH a `Present` and a `Repairing` entry exist for the same op
+    // across canonical donors, `Present` WINS (prefer a real body over a repair-pending hole); a
+    // `Repairing`-only op stays repair-pending in the canonical log (its body is peer-repaired after
+    // adoption). Among two `Present` (or two `Repairing`) copies the choice is immaterial: every donor
+    // of the canonical generation agrees on a committed op's content (same prior-view prepare), and an
+    // uncommitted tail op `(commit* .. op_head]` is identical across the canonical generation too.
     let mut merged: BTreeMap<u64, crate::PreparedEntry> = BTreeMap::new();
     for d in &canonical {
       for entry in d.log_slice() {
         if entry.op().get() <= op_head {
-          merged
-            .entry(entry.op().get())
-            .or_insert_with(|| entry.clone());
+          match merged.entry(entry.op().get()) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+              v.insert(entry.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+              // A real body supersedes a held `Repairing` hole for the same op; otherwise keep the
+              // existing copy (Present stays Present, Repairing stays Repairing).
+              if o.get().is_repairing() && !entry.is_repairing() {
+                o.insert(entry.clone());
+              }
+            }
+          }
         }
       }
     }
@@ -609,6 +656,15 @@ impl<S: StateMachine> Endpoint<S> {
     // backup-turned-primary with a GC'd log would carry `session.request == 0` and wedge every client
     // on `on_request`'s gap check.
     //
+    // This seeds the watermark for an UNCOMMITTED `Present` adopted tail op too (an op that committed on
+    // the OLD primary — the client may already hold its reply and send its NEXT request — but which this
+    // quorum adopted as uncommitted because the committing replicas were partitioned out): that op will
+    // re-commit here, so its watermark is needed so the client's next request is not seen as a gap. The
+    // one uncommitted op whose watermark must NOT outlive a rollback is a header-only `Repairing`
+    // truncation candidate whose body never arrives — `repair_or_truncate_timeouts` ROLLS the watermark
+    // back when it truncates such an op (a truncated request must be processed fresh, never deduped to a
+    // no-reply hang), so seeding it here is safe.
+    //
     // NOTE: we do NOT reconstruct the cached *reply* body here, so a client whose prior-view reply
     // was LOST relies on the in-flight op re-committing; the lost-reply resend is liveness under loss.
     for op in 1..=self.op.get() {
@@ -635,6 +691,56 @@ impl<S: StateMachine> Endpoint<S> {
     // here so a fresh primary never starts already-flagged to abdicate).
     self.pending_forfeit = false;
 
+    // Solicit the body of any adopted UNCOMMITTED-tail op carried HEADER-ONLY (`Repairing`): a
+    // committed-but-not-widely-known op whose only canonical-generation donor read its body back faulty
+    // travels through the DVC as a `Repairing` entry (its existence kept so its number is never
+    // re-minted), but its bytes must be fetched from a peer that holds them before this primary can
+    // re-prepare + commit it. `request_repair` registers the hole + broadcasts a `RequestPrepare`,
+    // KEEPING the `Repairing` entry (its canonical `body_checksum` is what `fill_repair` verifies the
+    // peer-supplied body against). Once the body returns Present, the prepare-retransmit re-broadcasts it
+    // and `try_commit` drives it to commit (the inflight entry seeded below holds its place meanwhile —
+    // `try_commit` HOLDS in op order at the body-absent hole until the repair fills it). A `Repairing` op
+    // in the COMMITTED prefix `(.. =commit_star]` was already solicited by `advance_commit` above.
+    let repairing_tail: std::vec::Vec<u64> = self
+      .log
+      .iter()
+      .filter(|(op, e)| {
+        **op > self.commit_min.get() && **op <= self.op.get() && e.body.is_repairing()
+      })
+      .map(|(op, _)| *op)
+      .collect();
+    for op in repairing_tail {
+      self.request_repair(now, op);
+    }
+
+    // Body-aware nack-truncation (the f-fault-model liveness closure). A header-only `Repairing` op
+    // ABOVE `commit*` is a *repair-or-truncate candidate*: NO canonical-quorum donor held it `Present`
+    // (the offset-UNION in `select_canonical_log` prefers `Present`, so an op that adoption left
+    // `Repairing` is one no canonical donor — and no local matching body — could supply), AND it is
+    // above the known-committed frontier, so the cluster never observed it committed on the collected
+    // quorum. The keep-vs-truncate decision is locally UNDECIDABLE: this could be a committed op whose
+    // body-holders were merely partitioned out of the DVC quorum (World A — must keep + repair),
+    // or a genuinely-uncommitted no-body op (World B — must truncate, else its
+    // perpetual repair hole drops every client at `on_request` forever). So we do BOTH: `request_repair`
+    // above keeps repairing it, and here we arm a VIRTUAL-TIME grace. If a `Present` body arrives before
+    // the deadline (a holder became reachable + answered the `RequestPrepare`) the op is KEPT — it was
+    // committed after all (the fill cancels the timer, see `on_wal_done`'s `RepairFill` arm). If the
+    // grace elapses with the body still absent, the uncommitted tail is truncated
+    // (`repair_or_truncate_timeouts`). SAFETY within `f`: a committed op's body is WAL-durable on a
+    // write-quorum, so ≥1 of its ≤f-down holders is eventually reachable and supplies the body BEFORE
+    // the grace — a committed op is never truncated. (`commit*` == `commit_max` here, just raised by
+    // `advance_commit(commit_star)`.) A `Repairing` op `<= commit*` is genuinely committed — NEVER a
+    // candidate (it is solicited but its grace is never armed). The timer is re-armed on a single
+    // earliest-due deadline for the whole candidate set; the expiry handler truncates from the LOWEST
+    // still-unfilled candidate up.
+    let has_candidate = self
+      .log
+      .iter()
+      .any(|(op, e)| *op > self.commit_max.get() && e.body.is_repairing());
+    if has_candidate {
+      self.timers.repair_or_truncate = Some(now + REPAIR_OR_TRUNCATE_GRACE);
+    }
+
     // Rebuild the pipeline for the uncommitted tail `(commit_min, op]`. The new primary
     // must NOT count its own vote for an op it adopted from a peer's DVC and holds ONLY in memory —
     // that would let it commit (and on crash+recover lose) an op it never durably appended. So seed
@@ -646,11 +752,24 @@ impl<S: StateMachine> Endpoint<S> {
     // uncommitted tail must be re-driven through the WAL.
     self.inflight.clear();
     for op in (self.commit_min.get() + 1)..=self.op.get() {
+      // Content-address this adopted op's votes by the OPERATION IDENTITY (client, request, body) the
+      // primary is driving. The op is present in `self.log` here (the gap-truncation above dropped any
+      // op the union could not carry), so its `(client, request, body_checksum)` is total: a `Present`
+      // body's computed checksum, or a `Repairing` entry's stored canonical checksum — which the
+      // peer-repaired `Present` body that fills the hole matches by construction (`fill_repair` accepts
+      // only a body whose `fnv1a_128` equals that canonical checksum). So a backup's `send_prepare_ok`
+      // stamps the SAME identity and legitimate adopted-tail votes are counted.
+      let prepare_checksum = self
+        .log
+        .get(&op)
+        .map(|e| crate::storage::prepare_identity(e.client, e.request, e.body.body_checksum()))
+        .unwrap_or(0);
       self.inflight.insert(
         op,
         Inflight {
           oks: 0, // own vote set in on_wal_done when the AdoptVote append is durable
           committed: false,
+          prepare_checksum,
         },
       );
       self.adopt_append(wal, op, Pending::AdoptVote(OpNumber::with(op)));
@@ -665,13 +784,24 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Runs once the new-primary superblock write is durable: broadcast StartView + begin committing.
   pub(crate) fn start_view_participate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
-    // Broadcast the canonical log to all backups.
+    // Broadcast the canonical log to all backups, advertising the KNOWN-committed frontier
+    // `commit_max` — NOT the APPLIED frontier `commit_min`. The two diverge when this new primary
+    // adopted a committed header-only (`Repairing`) op: `advance_commit(commit_star)` raised
+    // `commit_max` to the cross-DVC commit*, but `commit_min` STALLS below the unrepaired hole (the
+    // apply loop holds there). Advertising `commit_min` would tell a backup that adopts that committed
+    // op (op <= commit_max) it is merely an uncommitted tail; if repair is delayed and a SECOND view
+    // change then collects that backup, its DVC would report `commit` below the op, `commit*` would
+    // fall below it, and the nack scan could truncate it — re-opening the committed-op loss one view
+    // change later. Advertising `commit_max` makes the backup learn the true committed point; it then
+    // HOLDS at the `Repairing`/missing hole (the apply loop never applies an op it does not hold) and
+    // peer-repairs it. `commit_max <= self.op` here (`commit_max == commit_star <= op_head == self.op`
+    // by `select_canonical_log`'s fail-stop), so a receiver's `commit <= op` adopt guard holds.
     self.emit(Outgoing::new(
       Recipient::Backups,
       Message::StartView(crate::StartView::new(
         self.view,
         self.op,
-        self.commit_min,
+        self.commit_max,
         self.config.replica(),
         self.log_entries(),
       )),
@@ -716,19 +846,50 @@ impl<S: StateMachine> Endpoint<S> {
     // This reads `self.commit_min` AT ADOPT TIME, BEFORE the caller advances the commit, so the
     // predicate uses the OLD (pre-adoption) applied frontier — both callers (`adopt_canonical_head`,
     // `start_view_as_new_primary`) run `adopt_log` strictly before their `advance_commit`.
+    // Before dropping the held log, capture the adopter's OWN body bytes for any op the canonical log
+    // carries only HEADER-ONLY (`Repairing`) but the adopter already holds `Present` with a body whose
+    // checksum MATCHES the canonical `body_checksum`. The adopter's body is then the CANONICAL body the
+    // new view still needs (the canonical donor read it back faulty and carried only the header), so it
+    // must NOT be destroyed by overwriting the slot with a body-less `Repairing` entry: a replica that
+    // holds the body is the source the new primary peer-repairs from. The checksum match makes this
+    // safe — only the canonical body is preserved, never a superseded one (a different body fails the
+    // match and is dropped). This makes "Present wins over a matching Repairing" hold on the ADOPT side
+    // too, mirroring the union in `select_canonical_log`.
+    let mut preserved_bodies: BTreeMap<u64, Bytes> = BTreeMap::new();
+    for e in entries {
+      if e.is_repairing() {
+        if let Some(LogEntry {
+          body: Body::Present(body),
+          ..
+        }) = self.log.get(&e.op().get())
+        {
+          if crate::storage::fnv1a_128(body) == e.body_checksum() {
+            preserved_bodies.insert(e.op().get(), body.clone());
+          }
+        }
+      }
+    }
     let applied_floor = self.commit_min.get();
     self
       .log
       .retain(|&op, _| op <= applied_floor && !supplied.contains(&op));
     for e in entries {
-      self.log.insert(
-        e.op().get(),
-        LogEntry {
-          client: e.client(),
-          request: e.request(),
-          body: e.body_bytes(),
-        },
-      );
+      // A `Present` canonical entry is adopted with its body held. A header-only `Repairing` entry is
+      // adopted repair-pending (its `body_checksum` only) UNLESS the adopter already held the matching
+      // canonical body (captured above) — then keep that body so this replica can serve / commit it. The
+      // new primary's `start_view_as_new_primary` `request_repair`s any still-header-only tail op and the
+      // commit path HOLDS at it until the body returns. Either way the op exists in `self.log`, so its
+      // number is TAKEN and never re-minted.
+      let body = match preserved_bodies.remove(&e.op().get()) {
+        Some(bytes) => Body::Present(bytes),
+        None => e.body_state().clone(),
+      };
+      let entry = LogEntry {
+        client: e.client(),
+        request: e.request(),
+        body,
+      };
+      self.log.insert(e.op().get(), entry);
     }
   }
 
@@ -900,15 +1061,20 @@ impl<S: StateMachine> Endpoint<S> {
     let Some(entry) = self.log.get(&op).cloned() else {
       return; // not held — `advance_commit`/`request_repair` recovers a committed gap; nothing to ack
     };
+    // A body-`Repairing` entry has no bytes to (re-)append, so it is treated like a not-held op: skip
+    // it and owe no ack — `advance_commit`/`request_repair` recovers its body from a peer.
+    let Body::Present(body) = entry.body else {
+      return;
+    };
     let header = Header::new(
       OpNumber::with(op),
       self.view,
       entry.client,
       entry.request,
-      &entry.body,
+      &body,
     );
     let id = self.mint_op_id();
-    wal.submit_append(id, OpNumber::with(op), header, entry.body);
+    wal.submit_append(id, OpNumber::with(op), header, body);
     self.pending.insert(id.get(), kind);
     // Append-before-ack: the adopted op is in flight until `on_wal_done`. Both adoption kinds
     // (AdoptVote → own vote, AdoptAck → PrepareOk) defer their cast to completion; tracking the op

@@ -37,6 +37,12 @@ fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
         OpNumber::with(rn),
         ReplicaId::new(1),
         OpNumber::new(),
+        // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
+        crate::storage::prepare_identity(
+          ClientId::new(7),
+          RequestNumber::with(rn),
+          crate::storage::fnv1a_128(&[rn as u8]),
+        ),
       )),
     );
   }
@@ -472,6 +478,7 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
       OpNumber::with(2),
       ReplicaId::new(1),
       OpNumber::with(8),
+      0, // no inflight entry at op 2 (force_state_for_test seeds none) — only checkpoint_op matters
     )),
   );
   assert!(
@@ -578,6 +585,7 @@ fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_wi
       OpNumber::with(2),
       ReplicaId::new(1),
       OpNumber::with(8),
+      0, // no inflight entry at op 2 (force_state_for_test seeds none) — only checkpoint_op matters
     )),
   );
   assert!(

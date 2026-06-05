@@ -55,10 +55,12 @@ impl<S: StateMachine> Endpoint<S> {
       // pure durability barrier. The body was withheld from `self.log` until here, so it was never in a
       // DVC/StartView/checkpoint nor applied by a concurrent `advance_commit` before its append landed.
       // Safe even if a view change has begun since the fill was staged (the prior comment covers only the
-      // PENDING window): the filled op is COMMITTED (`fill_repair` only accepts a Prepare with `commit >=
-      // op`), and a committed op's body is identical across all views (committed-op survival), so applying
-      // it here is CONSISTENT with adoption — a `select_canonical_log`/`adopt_log` that supersedes the log
-      // re-derives this exact canonical committed body, never a divergent one.
+      // PENDING window): `fill_repair` accepted this body only as the CANONICAL value for the op — either
+      // committed-vouched (`commit >= op`) OR matched against a kept `Repairing` hole's durable canonical
+      // `body_checksum` (a view-change-carried op). A canonical op's body is identical across all views
+      // (committed-op survival for the vouched case; the checksum pins the exact body for the carried
+      // case), so applying it here is CONSISTENT with adoption — a `select_canonical_log`/`adopt_log` that
+      // supersedes the log re-derives this exact canonical body, never a divergent one.
       Some(Pending::RepairFill(rf)) => {
         let op = rf.op();
         self.log.insert(op.get(), rf.into_entry());
@@ -66,9 +68,41 @@ impl<S: StateMachine> Endpoint<S> {
         if self.repair.is_empty() {
           self.timers.repair_retry = None;
         }
-        // The hole is filled + durable → resume applying the held committed prefix from where it stalled.
-        let target = self.commit_max.get();
-        self.advance_commit(now, sb, target);
+        // Body-aware nack-truncation: a `Present` body just landed for this op (now `Present` in
+        // `self.log`). If it was the LAST repair-or-truncate candidate (a header-only op above
+        // `commit_max`), CANCEL the truncation grace — a holder answered, so the op was committed after
+        // all and must NEVER be truncated. (No-op when no grace is armed, or other candidates remain.)
+        self.cancel_repair_or_truncate_if_no_candidate();
+        // Two disjoint cases for the now-durable repaired op, by whether it is committed:
+        //
+        //   * COMMITTED (`op <= commit_max`): peer-repair is NOT a vote — committed-op survival means
+        //     the cluster already decided this op, so casting a vote is meaningless (and would be wrong:
+        //     a committed op needs no fresh quorum). Just resume applying the held committed prefix from
+        //     where it stalled at this hole. This is the ordinary committed-band repair invariant.
+        //
+        //   * UNCOMMITTED TAIL (`op > commit_max`, with an inflight entry): a new primary adopted this
+        //     op header-only (`Repairing`) from the DVC, so `start_view_as_new_primary` SKIPPED its
+        //     `AdoptVote` WAL re-append (`adopt_append` has no body to write for a `Repairing` entry) and
+        //     instead made it a peer-repair hole — leaving its seeded inflight entry at `oks: 0`. Now
+        //     that `fill_repair` has landed the canonical body durably, the primary holds a durable copy
+        //     and MUST cast its own vote (append-before-ack: the vote follows the durable append, exactly
+        //     as the `AdoptVote` path does for a body-carrying adopted tail). Without it, with one backup
+        //     unavailable the primary collects only one backup `PrepareOk` and can never reach a 2-of-3
+        //     quorum — wedging the view despite holding the op durably. The `is_primary()` +
+        //     inflight-entry guard scopes this to exactly the adopted-uncommitted-tail case (a backup, or
+        //     a primary repairing a committed op, has no such inflight entry to vote on).
+        if op.get() > self.commit_max.get()
+          && self.is_primary()
+          && self.inflight.contains_key(&op.get())
+        {
+          self.record_own_vote(op.get());
+          self.try_commit(now, sb);
+        } else {
+          // The hole is filled + durable → resume applying the held committed prefix from where it
+          // stalled (committed-repair case, or a backup that owes no vote).
+          let target = self.commit_max.get();
+          self.advance_commit(now, sb, target);
+        }
       }
       None => {}
     }
@@ -506,12 +540,16 @@ impl<S: StateMachine> Endpoint<S> {
       let Some(entry) = self.log.get(&op) else {
         continue;
       };
-      headers.push(Header::new(
+      // Build from the entry's canonical `body_checksum` (the load-bearing field for the recovery
+      // cross-check): for a `Present` body it is `fnv1a_128(bytes)` — identical to `Header::new(...,
+      // &bytes)` — and for a body-`Repairing` slot it is the stored durable checksum, so the canonical
+      // header is recorded even when the bytes are absent.
+      headers.push(Header::from_parts(
         OpNumber::with(op),
         self.view,
         entry.client,
         entry.request,
-        &entry.body,
+        entry.body.body_checksum(),
       ));
     }
     headers

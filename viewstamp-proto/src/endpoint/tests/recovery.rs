@@ -350,6 +350,248 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
 }
 
 #[test]
+fn recover_keeps_a_body_faulty_committed_op_as_repairing_then_peer_repairs_its_body() {
+  // CONSENSUS-CRITICAL. A committed/kept op whose WAL read comes back BodyFaulty — the HEADER is
+  // durable, only the BODY is torn/rotted — must be KEPT in `self.log` as a `Body::Repairing` hole
+  // (its existence + canonical identity preserved), NOT dropped. Dropping it forgets the op entirely,
+  // so a later view-change quorum reaching only this replica for that op would LOSE the committed op
+  // and re-mint its number. The fix classifies the slot exactly as a clean read does (the SAME
+  // `classify_committed_slot` verdict) and, on Verified, retains it header-only as `Repairing`; the
+  // body is peer-repaired on demand by the commit path.
+  //
+  // Setup: replica 1 of 3. Durable root: view 0, commit 1 (op 1 KNOWN committed), checkpoint_op 0,
+  // canonical vsr_header for op 1. WAL head 1; op 1's slot reads back BODY-FAULTY (header durable).
+  let mk_header = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(1), // durable commit — op 1 is KNOWN committed
+    OpNumber::new(),   // checkpoint_op 0
+    0,
+    std::vec![mk_header(1)],
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(1);
+  wal.script_body_faulty(OpNumber::with(1)); // header durable, body unrecoverable → BodyFaulty
+  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, 0, EchoSm, &mut wal, &mut sb);
+  for _ in 0..32 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "a durable-header body-faulty op does not block recovery — the op is kept, body repaired on demand"
+  );
+  // The op is KEPT in the cache as a `Body::Repairing` hole carrying its durable body_checksum — NOT
+  // dropped (FAIL-BEFORE: the body fault dropped the whole op from `self.log`).
+  let entry = r
+    .log
+    .get(&1)
+    .expect("the body-faulty committed op is KEPT in the log (existence preserved), not dropped");
+  assert_eq!(
+    entry.body,
+    Body::Repairing(mk_header(1).body_checksum()),
+    "kept header-only as Body::Repairing with the durable canonical body_checksum"
+  );
+  assert_eq!(
+    entry.client,
+    ClientId::new(7),
+    "the durable client identity is preserved"
+  );
+  assert_eq!(
+    entry.request,
+    RequestNumber::with(1),
+    "the durable request identity is preserved"
+  );
+  assert_eq!(
+    r.commit_max(),
+    OpNumber::with(1),
+    "the durable known-committed frontier (op 1) is carried"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(0),
+    "commit_min stays at checkpoint_op — op 1's body must arrive before it applies"
+  );
+
+  // A follow-up repaired body fills the Repairing hole to Present and recovery's tail commits. The
+  // commit path holds at the `Repairing` entry and solicits `RequestPrepare`; a peer's `Prepare`
+  // carrying the canonical body (the exact bytes `with_entries` stored) fills it via `fill_repair`.
+  while r.poll_message().is_some() {}
+  while r.poll_event().is_some() {}
+  // Drive commit toward op 1 so the commit path requests the body (advance_commit holds at the hole
+  // and registers a repair request).
+  r.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 1));
+  r.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    r.has_repair_hole_for_test(1),
+    "the commit path holds at the Repairing op and arms peer-repair for its body"
+  );
+  // The peer answers with the canonical body for op 1.
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    repair_prepare(0, 1, 1),
+  );
+  r.handle_storage(now, &mut wal, &mut sb); // the RepairFill append lands → body Present, hole clears
+  assert!(
+    !r.has_repair_hole_for_test(1),
+    "the repaired body fills the hole — the op is no longer repair-pending"
+  );
+  let filled = r.log.get(&1).expect("op 1 stays held after repair");
+  assert!(
+    filled.body.is_present(),
+    "the repaired body fills the Repairing hole to Present"
+  );
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(1),
+    "with the body repaired, the held commit resumes and op 1 applies"
+  );
+}
+
+#[test]
+fn recover_drops_a_stale_committed_op_read_back_body_faulty_not_resurrected_as_repairing() {
+  // GUARDS the superseded-proposal fix: a STALE/superseded committed slot must NOT be resurrected as
+  // a `Repairing` hole when its read comes back BodyFaulty — it is still DROPPED (classified
+  // StaleCommitted), exactly as a stale ReadOk is, so the canonical body is peer-repaired, never the
+  // local stale one. Here op 2's durable WAL header identity MISMATCHES the canonical vsr_header for
+  // op 2 (a different client/request/body), so `classify_committed_slot` returns StaleCommitted even
+  // though the read is BodyFaulty.
+  //
+  // Setup: replica 1 of 3. Durable root: view 0, commit 2 (ops 1+2 KNOWN committed), checkpoint_op 0.
+  // The canonical vsr_header for op 2 names a DIFFERENT identity than the WAL slot's durable header.
+  let canon_header = |op: u64, client: u128| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(client),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  // The canonical (root) identity for op 2 is client 99; the WAL slot below holds client 7 → mismatch.
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![canon_header(1, 7), canon_header(2, 99)],
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  // `with_entries` seeds op 2 under client 7 (the STALE local identity); its read is BodyFaulty.
+  let mut wal = ScriptedWal::with_entries(3);
+  wal.script_body_faulty(OpNumber::with(2));
+  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, 0, EchoSm, &mut wal, &mut sb);
+  for _ in 0..32 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal, "recovers to Normal");
+  assert!(
+    !r.log.contains_key(&2),
+    "a stale (identity-mismatched) committed slot read back BodyFaulty is DROPPED, NOT kept as Repairing"
+  );
+  assert_eq!(
+    r.commit_max(),
+    OpNumber::with(2),
+    "the durable known-committed frontier is still carried (op 2 is a peer-repaired hole)"
+  );
+}
+
+#[test]
+fn recover_drops_a_genuinely_absent_committed_op_as_today() {
+  // A genuinely-absent committed op (no durable header — the read is Absent, not BodyFaulty) is still
+  // DROPPED as today: there is no durable header to keep, so the op cannot be retained as `Repairing`;
+  // it becomes a repair hole peer-repaired on demand. Confirms the keep-as-Repairing path is gated on
+  // a DURABLE header and does not change the absent-op behaviour.
+  //
+  // Setup: replica 1 of 3, durable commit 2 (ops 1+2 KNOWN committed). The WAL holds op 1 + the head
+  // op 3, but op 2's slot is ABSENT entirely (no header, no body) — a genuine hole.
+  let mk_header = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![mk_header(1)], // sparse: op 2 was a hole the writer did not hold
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  // Build a WAL with ops 1 + 3 only (op 2 absent): start from a 3-entry WAL, then truncate-rebuild by
+  // removing op 2's slot via a permanent read fault that also has no header — simulate absence by
+  // pruning op 2 out of `entries`. `with_entries(3)` then op 2 removed leaves op 2 a genuine hole.
+  let mut wal = ScriptedWal::with_entries(3);
+  wal.remove_entry_for_test(OpNumber::with(2)); // op 2 has NO durable header → read is Absent
+  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, 0, EchoSm, &mut wal, &mut sb);
+  for _ in 0..32 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovers to Normal (op 2 a below-head hole)"
+  );
+  assert!(
+    !r.log.contains_key(&2),
+    "a genuinely-absent committed op (no durable header) is DROPPED — it cannot be kept as Repairing"
+  );
+  assert_eq!(
+    r.commit_max(),
+    OpNumber::with(2),
+    "the durable known-committed frontier is carried (op 2 peer-repaired on demand)"
+  );
+}
+
+#[test]
 fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
   // recover() is now a metadata-only constructor: it returns in Recovering and only reaches
   // Normal after handle_storage drains the tail reads. (Was: synchronous → Normal immediately.)
@@ -1821,12 +2063,16 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   // prefix stopped at op 1, so ops 3 + 4 were header-less, `op <= commit_max` fired the over-broad drop rule, and
   // recover DROPPED them — destroying this replica's only surviving copies of the committed tail.)
   assert!(
-    r.log.get(&3).is_some_and(|e| e.body.as_ref() == [3u8]),
+    r.log
+      .get(&3)
+      .is_some_and(|e| e.body.as_present() == Some(&[3u8][..])),
     "op 3 (held canonical, sparse-header-matched) is KEPT with its canonical body \
      (FAIL-BEFORE: dropped as a header-less committed op above the lower hole)"
   );
   assert!(
-    r.log.get(&4).is_some_and(|e| e.body.as_ref() == [4u8]),
+    r.log
+      .get(&4)
+      .is_some_and(|e| e.body.as_present() == Some(&[4u8][..])),
     "op 4 (held canonical, sparse-header-matched) is KEPT with its canonical body \
      (FAIL-BEFORE: dropped as a header-less committed op above the lower hole)"
   );
@@ -1985,7 +2231,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
     assert!(
       r.log
         .get(&op)
-        .is_some_and(|e| e.body.as_ref() == [op as u8]),
+        .is_some_and(|e| e.body.as_present() == Some(&[op as u8][..])),
       "op {op} (held committed, above the old cap) is read + cached with its canonical body"
     );
     assert!(
@@ -2323,7 +2569,9 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
     "no spurious repair hole — every committed-band slot matched its persisted header"
   );
   assert!(
-    r.log.get(&2).is_some_and(|e| e.body.as_ref() == [2u8]),
+    r.log
+      .get(&2)
+      .is_some_and(|e| e.body.as_present() == Some(&[2u8][..])),
     "op 2 kept its canonical WAL body (trusted, not dropped)"
   );
   // Announce commit=2: both committed ops apply directly from the trusted WAL, no peer-repair needed.
@@ -3038,11 +3286,8 @@ fn finalize_recovery_assert_catches_a_leaked_empty_faulty_slot() {
   e.recover = Some(rec);
   e.log.insert(
     5,
-    LogEntry {
-      client: ClientId::new(7),
-      request: RequestNumber::with(5),
-      body: Bytes::new(), // … but its EMPTY placeholder was NOT dropped from the cache (the leak).
-    },
+    // … but its EMPTY `Present` placeholder was NOT dropped from the cache (the leak).
+    LogEntry::present(ClientId::new(7), RequestNumber::with(5), Bytes::new()),
   );
   e.assert_no_faulty_committed_survives(); // must panic in debug: the leaked slot would apply empty.
 }
@@ -3183,6 +3428,7 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
     head: 3,
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
+    body_faulty: std::collections::BTreeSet::new(),
     done: VecDeque::new(),
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // never clears within any finite budget
