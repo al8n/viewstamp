@@ -471,6 +471,7 @@ mod tests {
       jitter: Duration::from_millis(2),
       drop_per_mille: 200,
       duplicate_per_mille: 0,
+      hold_per_mille: 0,
     });
     let mut vm = ViewMonotonicChecker::new(c.replica_count());
     // Warm up.

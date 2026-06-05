@@ -17,6 +17,13 @@ use crate::storage::{InMemorySuperblock, InMemoryWal, StorageFaults};
 /// its protocol PRNG (which uses a different mixer in `with_checkpoint_ops`).
 const STORAGE_SEED_MAGIC: u64 = 0x5151_DEAD_BEEF_0F0F;
 
+/// The virtual delay applied to a message the network elects to HOLD ([`Faults::hold_per_mille`]).
+/// Far past the proto's repair-or-truncate grace (5 s) so a held `PrepareOk` can outlive its op's
+/// truncation + re-mint and arrive at the new primary as a STALE-body vote — the op-reuse class the
+/// content-addressed vote gate defends. The event-driven clock jumps to it: a held message keeps the
+/// network non-empty, so it is always eventually delivered within the tick budget.
+const HOLD_DELAY: Duration = Duration::from_millis(15_000);
+
 /// A deterministic single-thread cluster of `Endpoint<LogSm>` replicas + clients.
 pub struct Cluster {
   replicas: Vec<Endpoint<LogSm>>,
@@ -977,7 +984,13 @@ impl Cluster {
     // (independent) jitter draws below — keeping the run a pure function of the seed.
     let duplicate = self.faults.duplicate_per_mille > 0
       && self.prng.chance(self.faults.duplicate_per_mille, 1000);
-    let deliver_at = now + self.faults.latency + Duration::from_nanos(self.jitter_ns());
+    // Roll the UNBOUNDED-HOLD decision in the same fixed slot (after the duplicate roll, before the
+    // jitter draw) so the draw order stays a pure function of the seed. The jitter draw below always
+    // happens, so a held message's deliver_at is overridden without perturbing the stream. When
+    // `hold_per_mille` is 0 the `&&` short-circuits — no draw — so default schedules are byte-identical.
+    let hold = self.faults.hold_per_mille > 0 && self.prng.chance(self.faults.hold_per_mille, 1000);
+    let base_at = now + self.faults.latency + Duration::from_nanos(self.jitter_ns());
+    let deliver_at = if hold { now + HOLD_DELAY } else { base_at };
     self.net.enqueue(InFlight {
       deliver_at,
       from,
@@ -1034,6 +1047,7 @@ mod tests {
       jitter: Duration::from_millis(2),
       drop_per_mille: 0,
       duplicate_per_mille: 1000,
+      hold_per_mille: 0,
     });
     let mut done = false;
     for _ in 0..20_000 {
@@ -1064,6 +1078,7 @@ mod tests {
         jitter: Duration::from_millis(2),
         drop_per_mille: 0,
         duplicate_per_mille: 1000,
+        hold_per_mille: 0,
       });
       for _ in 0..20_000 {
         c.tick();

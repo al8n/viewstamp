@@ -11,6 +11,7 @@ fn backups_converge_via_commit_heartbeat() {
     jitter: core::time::Duration::from_millis(8),
     drop_per_mille: 0,
     duplicate_per_mille: 0,
+    hold_per_mille: 0,
   });
   for _ in 0..5000 {
     c.tick();
@@ -94,6 +95,7 @@ fn progress_under_message_loss() {
       jitter: core::time::Duration::from_millis(4),
       drop_per_mille: 200,
       duplicate_per_mille: 0,
+      hold_per_mille: 0,
     });
     let mut done = false;
     for _ in 0..200_000 {
@@ -123,6 +125,7 @@ fn fault_sweep_safety_and_liveness() {
       jitter: core::time::Duration::from_millis(10),
       drop_per_mille: 150,
       duplicate_per_mille: 0,
+      hold_per_mille: 0,
     });
     for _ in 0..10_000 {
       c.tick();

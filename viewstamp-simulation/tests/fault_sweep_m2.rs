@@ -12,6 +12,7 @@ fn m2_sweep_crash_stop_safety_and_liveness() {
       jitter: Duration::from_millis(5),
       drop_per_mille: 30,
       duplicate_per_mille: 0,
+      hold_per_mille: 0,
     });
     let mut vm = ViewMonotonicChecker::new(5);
 
@@ -55,6 +56,7 @@ fn m2_sweep_partition_heal_safety_and_liveness() {
       jitter: Duration::from_millis(3),
       drop_per_mille: 10,
       duplicate_per_mille: 0,
+      hold_per_mille: 0,
     });
     let mut vm = ViewMonotonicChecker::new(5);
 

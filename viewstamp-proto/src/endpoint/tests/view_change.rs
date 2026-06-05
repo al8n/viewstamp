@@ -3067,6 +3067,31 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     OpNumber::with(2),
     "the primary serves the client again, minting a fresh op 2 (the wedge is gone)"
   );
+  // CROSS-BODY SAFETY (content-addressed votes): a DELAYED PrepareOk for the OLD truncated op 2 (its
+  // body_checksum is op2_checksum) arrives now from a THIRD replica, after op 2 was re-minted for b"x".
+  // Counted by op number alone it would form a phantom quorum (own + this) and commit the fresh op 2 on
+  // a vote for a body the primary is NOT driving. It MUST be dropped — its checksum is the old body's,
+  // not b"x"'s. (This is the op-reuse vote-confusion class the bounded sim network cannot otherwise
+  // reach: a vote outliving its op's truncation + reuse.)
+  e.handle_message(
+    after_grace,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(2),
+      OpNumber::new(),
+      op2_checksum, // the OLD (truncated) body — NOT b"x"
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the delayed vote for the OLD truncated body is dropped — commit stays at op 1, the fresh op 2 does \
+     NOT phantom-commit on an (own + stale-body) quorum"
+  );
   // One backup ack reaches quorum (own + backup) → the fresh op 2 commits.
   e.handle_message(
     after_grace,

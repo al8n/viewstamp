@@ -641,6 +641,7 @@ fn bounded_wal_backup_below_ring_window_state_syncs_instead_of_overwriting() {
       jitter: Duration::from_millis(3),
       drop_per_mille: 300,
       duplicate_per_mille: 100,
+      hold_per_mille: 0,
     });
     let mut dur = DurabilityChecker::new(c.replica_count());
 

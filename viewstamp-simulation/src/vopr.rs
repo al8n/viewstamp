@@ -572,6 +572,17 @@ impl Vopr {
     let jitter = 1 + self.prng.below(5);
     let drop = self.prng.below(60) as u32;
     let dup = self.prng.below(60) as u32;
+    // The UNBOUNDED-HOLD axis is OPT-IN (VOPR_HOLD). Its draw is CONDITIONAL: with the flag OFF no PRNG
+    // value is consumed, so the per-seed schedule is byte-identical to the committed baseline (the
+    // pinned regression seeds + the 0..N sweep reproduce exactly). A VOPR_HOLD run is its OWN baseline
+    // (a shrink keeps the flag on), so the conditional draw does not break shrink determinism. Enabling
+    // it lets a `PrepareOk` outlive its op's truncation + re-mint and arrive as a stale-body vote — the
+    // op-reuse class the content-addressed vote gate must reject.
+    let hold = if env_flag("VOPR_HOLD") {
+      1 + self.prng.below(30) as u32
+    } else {
+      0
+    };
     Faults {
       latency: Duration::from_millis(1),
       jitter: Duration::from_millis(if env_flag("VOPR_NO_JITTER") {
@@ -581,6 +592,7 @@ impl Vopr {
       }),
       drop_per_mille: if env_flag("VOPR_NO_DROP") { 0 } else { drop },
       duplicate_per_mille: if env_flag("VOPR_NO_DUP") { 0 } else { dup },
+      hold_per_mille: hold,
     }
   }
 

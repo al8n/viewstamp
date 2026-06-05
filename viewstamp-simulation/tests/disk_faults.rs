@@ -49,6 +49,7 @@ fn committed_ops_survive_crash_storage_fault_and_restart() {
       jitter: Duration::from_millis(3),
       drop_per_mille: 10,
       duplicate_per_mille: 0,
+      hold_per_mille: 0,
     });
     // TRANSIENT read-faults on every replica's WAL; NO torn writes, NO permanent bit-rot.
     c.set_storage_faults(StorageFaults {
