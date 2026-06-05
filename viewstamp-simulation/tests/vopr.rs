@@ -15,7 +15,7 @@
 //! checker asserting no wrap ever drops an op `recover`/repair still needs. `N` is sized
 //! `checkpoint_ops * k + headroom` (`k` in 3..=6) so the stall always RELEASES (a tighter ring would
 //! wedge the primary — the headroom constraint, documented in `src/vopr.rs::build_cluster`).
-//! Liveness is judged over calm windows gated on VIRTUAL time, not raw ticks (the seed-622 lesson).
+//! Liveness is judged over calm windows gated on VIRTUAL time, not raw ticks.
 //! Safety/durability/view-monotonicity/boundedness/append-before-ack/structural/ring-residency
 //! invariants checked EVERY tick and liveness checked across calm windows. `run_vopr` panics on any
 //! violation with the seed + tick, so this test simply runs the sweep and lets a violation surface.
@@ -126,8 +126,8 @@
 //!   forfeit re-propose is now gated on the `svc_message` retransmit timer (one SVC per
 //!   `VC_MESSAGE_RETRANSMIT` window, like `view_change_timeouts`) — the persistent step-down + heartbeat
 //!   suppression are preserved, only the per-tick storm is removed.
-//! - **storage-fault committed-op loss + op-number reuse** (seed 774, found by a release-mode
-//!   `0..2048` wide sweep) — a committed op (on a durable quorum) was LOST and its op number RE-MINTED
+//! - **storage-fault committed-op loss + op-number reuse** (found by a release-mode `0..2048` wide
+//!   sweep) — a committed op (on a durable quorum) was LOST and its op number RE-MINTED
 //!   across a view change when a recover-time disk fault (torn/bit-rot) dropped that op's WAL slot on the
 //!   SOLE commit/view quorum-intersection replica, which then neither held the op nor knew it was
 //!   committed. FIXED structurally (TigerBeetle's body-independent header durability): an op's HEADER now

@@ -827,7 +827,7 @@ impl Cluster {
         // and the proto's `on_prepare_ok` DROPS any ack whose `view != self.view` (and routes a
         // higher-view ack to catch-up, never a vote), so a `PrepareOk(view < current)` can never be
         // counted toward a commit quorum — it is inert. Skip it when `msg_view < cur_view` (a
-        // legitimately-superseded prior-view ack), exactly the seed-151-class lesson: a per-tick proxy
+        // legitimately-superseded prior-view ack), exactly the recurring checker lesson: a per-tick proxy
         // can over-fire on a message the proto itself neutralizes — fix the checker, never the proto. A
         // `msg_view >= cur_view` non-durable ack (current view, or the impossible-but-flagged future)
         // is still a real append-before-ack violation and trips.

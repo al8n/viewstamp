@@ -1307,19 +1307,17 @@ mod tests {
       157, 189, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
     assert_eq!(st.encode(), expected, "VsrState wire layout is pinned");
-    // The pinned bytes — a `0x0002`-prefixed durable root, byte-identical to one persisted at the
-    // d6c649c baseline — must DECODE under the decoupled SUPERBLOCK_VERSION, so an existing on-disk root
-    // survives the upgrade (the version was pinned to the on-disk value, not reset below it).
+    // The pinned golden bytes are a valid decode input too: they round-trip back to the same root.
     assert_eq!(
       VsrState::decode(&expected).unwrap(),
       st,
-      "a persisted SUPERBLOCK_VERSION root decodes unchanged across the message-wire decoupling"
+      "the pinned golden root round-trips through decode"
     );
   }
 
   #[test]
   fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
-    // GOLDEN: a version names a disk LAYOUT, and decode accepts EVERY version of a layout it can parse,
+    // A version names a disk LAYOUT, and decode accepts EVERY version of a layout it can parse,
     // not the latest only. The committed-band-header root layout is byte-identical across versions
     // 1..=SUPERBLOCK_VERSION (the pre-decoupling message/disk coupling stamped this ONE layout with 1, 2,
     // 3), so a root carrying ANY of them decodes to the same state and none is stranded. That tolerance —

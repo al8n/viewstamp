@@ -719,8 +719,8 @@ impl<S: StateMachine> Endpoint<S> {
     // `Repairing` is one no canonical donor — and no local matching body — could supply), AND it is
     // above the known-committed frontier, so the cluster never observed it committed on the collected
     // quorum. The keep-vs-truncate decision is locally UNDECIDABLE: this could be a committed op whose
-    // body-holders were merely partitioned out of the DVC quorum (World A — must keep + repair, the
-    // seed-774 case), or a genuinely-uncommitted no-body op (World B — must truncate, else its
+    // body-holders were merely partitioned out of the DVC quorum (World A — must keep + repair),
+    // or a genuinely-uncommitted no-body op (World B — must truncate, else its
     // perpetual repair hole drops every client at `on_request` forever). So we do BOTH: `request_repair`
     // above keeps repairing it, and here we arm a VIRTUAL-TIME grace. If a `Present` body arrives before
     // the deadline (a holder became reachable + answered the `RequestPrepare`) the op is KEPT — it was

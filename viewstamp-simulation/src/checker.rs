@@ -395,7 +395,7 @@ mod tests {
     // The end-of-run durability assertion (which the VOPR driver's final QUIESCE phase runs AFTER
     // draining) must stay STRICT: if NO operational replica retains the committed history, it is a
     // Violation. This is the "a committed op held by no operational holder still FAILS" direction — it
-    // pins that the seed-313 quiesce fix (drain THEN assert) did not weaken the no-loss guarantee.
+    // pins that the quiesce fix (drain THEN assert) did not weaken the no-loss guarantee.
     let mut c = Cluster::new(3, 2, 3, 9);
     let mut dur = DurabilityChecker::new(c.replica_count());
     for _ in 0..50_000 {

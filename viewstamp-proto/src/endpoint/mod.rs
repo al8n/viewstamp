@@ -249,7 +249,7 @@ const VIEW_CHANGE_STATUS: core::time::Duration = core::time::Duration::from_mill
 /// if a `Present` body arrives first the op is KEPT (it was committed after all); only if the grace
 /// elapses with the body still absent is the uncommitted tail truncated.
 ///
-/// **Why VIRTUAL time, not tick/view counts** (the seed-622 lesson): a liveness window must gate on the
+/// **Why VIRTUAL time, not tick/view counts**: a liveness window must gate on the
 /// virtual clock, never on tick counts or view-change counts — under a churn schedule those advance at
 /// wildly varying virtual rates, so a count-gated window can truncate before a reachable holder ever had
 /// a virtual-time chance to answer.

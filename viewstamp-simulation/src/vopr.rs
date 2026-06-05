@@ -573,7 +573,7 @@ impl Vopr {
     let drop = self.prng.below(60) as u32;
     let dup = self.prng.below(60) as u32;
     // The UNBOUNDED-HOLD axis is OPT-IN (VOPR_HOLD). Its draw is CONDITIONAL: with the flag OFF no PRNG
-    // value is consumed, so the per-seed schedule is byte-identical to the committed baseline (the
+    // value is consumed, so the per-seed schedule is byte-identical to the default schedule (the
     // pinned regression seeds + the 0..N sweep reproduce exactly). A VOPR_HOLD run is its OWN baseline
     // (a shrink keeps the flag on), so the conditional draw does not break shrink determinism. Enabling
     // it lets a `PrepareOk` outlive its op's truncation + re-mint and arrive as a stale-body vote — the

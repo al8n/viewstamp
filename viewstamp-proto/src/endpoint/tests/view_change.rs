@@ -190,7 +190,7 @@ fn new_primary_carries_a_header_only_repairing_op_through_the_dvc_and_repairs_it
     e.has_repair_hole_for_test(2),
     "op 2 is a TRACKED repair hole — its canonical body is solicited, its number stays taken (op == 2)"
   );
-  // A RequestPrepare(op 2) is emitted to fetch the canonical body from a peer (r3/r4 in seed 774). The
+  // A RequestPrepare(op 2) is emitted to fetch the canonical body from a peer that holds it. The
   // StartView the new primary broadcasts carries head op 2 as a HEADER-ONLY (`Repairing`) entry — its
   // existence + canonical body_checksum, but NO fabricated body (the body is peer-fetched).
   e.handle_storage(now, &mut wal, &mut sb); // pump the deferred StartView / repair solicitation
