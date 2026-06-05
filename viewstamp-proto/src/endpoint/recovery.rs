@@ -1136,12 +1136,18 @@ impl<S: StateMachine> Endpoint<S> {
     // already vouched for to a soliciting peer). The deferred `start_view_participate` broadcasts the
     // StartView once the view is durable, and a later `GetView` is then answered normally.
     if self.participates_as_primary() && self.view.get() >= m.view().get() {
+      // Advertise the KNOWN-committed frontier `commit_max`, not the APPLIED frontier `commit_min`
+      // (which stalls below an unrepaired committed `Repairing` hole) — see `start_view_participate`.
+      // A catching-up peer that adopts a committed op (op <= commit_max) thereby learns it is committed
+      // and HOLDS at the hole until peer-repair fills the body, instead of treating it as a truncatable
+      // uncommitted tail. `commit_max <= self.op` on a Normal primary, so the receiver's `commit <= op`
+      // adopt guard holds.
       self.emit(Outgoing::new(
         Recipient::To(Peer::Replica(m.replica())),
         Message::StartView(crate::StartView::new(
           self.view,
           self.op,
-          self.commit_min,
+          self.commit_max,
           self.config.replica(),
           self.log_entries(),
         )),
@@ -1174,7 +1180,13 @@ impl<S: StateMachine> Endpoint<S> {
       return; // ignore malformed/out-of-range replica id
     }
     let (op, commit, log) = if self.is_primary() {
-      (self.op, self.commit_min, self.log_entries())
+      // Advertise the KNOWN-committed frontier `commit_max`, not the APPLIED frontier `commit_min`
+      // (which stalls below an unrepaired committed `Repairing` hole) — the recovery-handshake
+      // equivalent of `start_view_participate`'s StartView. A recovering peer that adopts a committed
+      // op (op <= commit_max) thereby learns it is committed and HOLDS at the hole until peer-repair
+      // fills the body, never re-classifying it as a truncatable uncommitted tail. `commit_max <=
+      // self.op` on a Normal primary, so the receiver's `commit <= op` adopt guard holds.
+      (self.op, self.commit_max, self.log_entries())
     } else {
       // A backup cannot hand out a canonical head; it reports only its view (+ echoed nonce).
       (OpNumber::new(), OpNumber::new(), std::vec::Vec::new())

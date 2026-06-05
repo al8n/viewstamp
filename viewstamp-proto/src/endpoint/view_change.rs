@@ -709,13 +709,24 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Runs once the new-primary superblock write is durable: broadcast StartView + begin committing.
   pub(crate) fn start_view_participate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
-    // Broadcast the canonical log to all backups.
+    // Broadcast the canonical log to all backups, advertising the KNOWN-committed frontier
+    // `commit_max` — NOT the APPLIED frontier `commit_min`. The two diverge when this new primary
+    // adopted a committed header-only (`Repairing`) op: `advance_commit(commit_star)` raised
+    // `commit_max` to the cross-DVC commit*, but `commit_min` STALLS below the unrepaired hole (the
+    // apply loop holds there). Advertising `commit_min` would tell a backup that adopts that committed
+    // op (op <= commit_max) it is merely an uncommitted tail; if repair is delayed and a SECOND view
+    // change then collects that backup, its DVC would report `commit` below the op, `commit*` would
+    // fall below it, and the nack scan could truncate it — re-opening the committed-op loss one view
+    // change later. Advertising `commit_max` makes the backup learn the true committed point; it then
+    // HOLDS at the `Repairing`/missing hole (the apply loop never applies an op it does not hold) and
+    // peer-repairs it. `commit_max <= self.op` here (`commit_max == commit_star <= op_head == self.op`
+    // by `select_canonical_log`'s fail-stop), so a receiver's `commit <= op` adopt guard holds.
     self.emit(Outgoing::new(
       Recipient::Backups,
       Message::StartView(crate::StartView::new(
         self.view,
         self.op,
-        self.commit_min,
+        self.commit_max,
         self.config.replica(),
         self.log_entries(),
       )),

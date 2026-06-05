@@ -68,9 +68,36 @@ impl<S: StateMachine> Endpoint<S> {
         if self.repair.is_empty() {
           self.timers.repair_retry = None;
         }
-        // The hole is filled + durable → resume applying the held committed prefix from where it stalled.
-        let target = self.commit_max.get();
-        self.advance_commit(now, sb, target);
+        // Two disjoint cases for the now-durable repaired op, by whether it is committed:
+        //
+        //   * COMMITTED (`op <= commit_max`): peer-repair is NOT a vote — committed-op survival means
+        //     the cluster already decided this op, so casting a vote is meaningless (and would be wrong:
+        //     a committed op needs no fresh quorum). Just resume applying the held committed prefix from
+        //     where it stalled at this hole. This is the ordinary committed-band repair invariant.
+        //
+        //   * UNCOMMITTED TAIL (`op > commit_max`, with an inflight entry): a new primary adopted this
+        //     op header-only (`Repairing`) from the DVC, so `start_view_as_new_primary` SKIPPED its
+        //     `AdoptVote` WAL re-append (`adopt_append` has no body to write for a `Repairing` entry) and
+        //     instead made it a peer-repair hole — leaving its seeded inflight entry at `oks: 0`. Now
+        //     that `fill_repair` has landed the canonical body durably, the primary holds a durable copy
+        //     and MUST cast its own vote (append-before-ack: the vote follows the durable append, exactly
+        //     as the `AdoptVote` path does for a body-carrying adopted tail). Without it, with one backup
+        //     unavailable the primary collects only one backup `PrepareOk` and can never reach a 2-of-3
+        //     quorum — wedging the view despite holding the op durably. The `is_primary()` +
+        //     inflight-entry guard scopes this to exactly the adopted-uncommitted-tail case (a backup, or
+        //     a primary repairing a committed op, has no such inflight entry to vote on).
+        if op.get() > self.commit_max.get()
+          && self.is_primary()
+          && self.inflight.contains_key(&op.get())
+        {
+          self.record_own_vote(op.get());
+          self.try_commit(now, sb);
+        } else {
+          // The hole is filled + durable → resume applying the held committed prefix from where it
+          // stalled (committed-repair case, or a backup that owes no vote).
+          let target = self.commit_max.get();
+          self.advance_commit(now, sb, target);
+        }
       }
       None => {}
     }

@@ -249,6 +249,377 @@ fn new_primary_carries_a_header_only_repairing_op_through_the_dvc_and_repairs_it
 }
 
 #[test]
+fn new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_backup_down() {
+  // REGRESSION (liveness wedge): a new primary adopts an UNCOMMITTED-tail op carried HEADER-ONLY
+  // (`Repairing`) through the DVC. Because it has no body, `adopt_append` cannot re-append it as an
+  // `AdoptVote` — it becomes a peer-repair hole with its inflight entry seeded `oks: 0`. After
+  // `fill_repair` lands the canonical body durably, the primary holds a durable copy but — before the
+  // fix — never cast its OWN vote (the `RepairFill` arm only `advance_commit`s; peer-repair is not a
+  // vote). With one backup unavailable it would then collect only ONE backup `PrepareOk` and never
+  // reach the 2-of-3 quorum, wedging the view despite holding the op. The fix casts the primary's own
+  // vote on the durable fill (append-before-ack), so own vote + one backup ack = quorum and op commits.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  // Replica 2's DVC: log_view 0, head op 2, commit 1 — op 1 COMMITTED (real body), op 2 an UNCOMMITTED
+  // tail (commit* = 1 < 2) carried HEADER-ONLY as a `Repairing` entry (the donor read its body back
+  // faulty but kept its existence + canonical body_checksum). `[2]` is the body `repair_prepare(_,2,_)`
+  // supplies, so the canonical checksum matches the eventual repair fill.
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  // Adopted: head op 2 (its number is TAKEN), commit* = 1 (op 1 applied, op 2 an uncommitted tail).
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(2));
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "op 1 committed; op 2 is the uncommitted Repairing tail"
+  );
+  // op 2 has an inflight entry seeded with NO own vote (header-only → no AdoptVote append re-stages it).
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some(0),
+    "the adopted uncommitted Repairing tail op 2 starts with no own vote (no body to re-append)"
+  );
+  // Pump the durable-view write + repair solicitation. op 2's body is absent, so it is a peer-repair
+  // hole and a RequestPrepare(op 2) is emitted; the own vote is STILL absent (the body has not landed).
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is a peer-repair hole until its canonical body is fetched"
+  );
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some(0),
+    "still no own vote before the repaired body is durable (append-before-ack)"
+  );
+  // A peer answers our RequestPrepare with op 2's REAL canonical body (matching the kept checksum).
+  // `fill_repair` stages a durable `RepairFill`; once it lands, the fix casts the primary's OWN vote.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    repair_prepare(1, 2, 1), // commit 1 < op 2: accepted via the kept canonical-checksum path, not a vouch
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  let own_bit = 1u64 << 1; // replica 1
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "the repair hole clears once the canonical body lands durably"
+  );
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some(own_bit),
+    "the primary casts its OWN vote on the durable repaired fill (append-before-ack)"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the lone own vote is below quorum (2) — op 2 not yet committed"
+  );
+  use crate::Wal as _;
+  assert!(
+    wal.header(OpNumber::with(2)).is_some(),
+    "op 2's canonical body was durably appended before its own vote counted"
+  );
+  // ONE backup (replica 2) acks op 2; the OTHER backup (replica 0) is DOWN and never acks. Own vote +
+  // the single backup ack = quorum (2 of 3) → op 2 commits. No wedge despite a backup being down.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(2),
+      OpNumber::new(),
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "op 2 commits on the durable own vote + ONE backup ack — the view does not wedge with a backup down"
+  );
+}
+
+#[test]
+fn committed_repairing_op_survives_a_second_view_change_before_repair() {
+  // REGRESSION (committed-op loss one view change later): a primary's StartView must advertise the
+  // KNOWN-committed frontier `commit_max`, not the APPLIED frontier `commit_min` (which STALLS below an
+  // unrepaired committed `Repairing` hole). A backup that adopts a committed header-only op (op <=
+  // commit_max) must LEARN it is committed, so when a SECOND view change collects that backup + laggards
+  // BEFORE the body is repaired, the op stays in the committed band (`commit* >= it`) and the nack scan
+  // never truncates it. With the OLD `commit_min` advertisement the backup would under-learn the commit,
+  // its DVC would report `commit` below the op, `commit*` would fall below it, and the laggard-quorum
+  // nack scan would CUT the committed op — re-opening the loss the durable-header work closed.
+  //
+  // n=5: view 1 primary = replica 1, view 2 primary = replica 2. Op 3 is committed at view 1 but held
+  // HEADER-ONLY (`Repairing`) — its body read back faulty on every donor — and the two laggards (replicas
+  // 3, 4) never saw op 3 (head op 2). `quorum_nack_prepare = 3`, so three donors with `op < 3` form a
+  // nack quorum on op 3 — which would truncate it IF `commit*` sat below 3.
+  let now = Instant::ZERO;
+  let op3_checksum = crate::storage::fnv1a_128(&[3u8]);
+  // A DVC for view 1 carrying ops 1,2 (real bodies) + op 3 HEADER-ONLY (`Repairing`, committed: commit 3).
+  let donor_dvc = |replica: u8| {
+    DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(3),
+      OpNumber::with(3), // commit 3: op 3 is committed
+      ReplicaId::new(replica),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b"),
+        ),
+        PreparedEntry::repairing(
+          OpNumber::with(3),
+          ClientId::new(7),
+          RequestNumber::with(3),
+          op3_checksum,
+        ),
+      ],
+    )
+  };
+
+  // ── Stage 1: a REAL view-1 new primary (replica 1) adopts op 3 as a committed Repairing op and
+  // BROADCASTS a StartView. Its `commit()` field must be commit_max (= 3), the SENDER half of the fix. ──
+  let mut r1 = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 5).unwrap(), 0, NoopSm);
+  let (mut wal1, mut sb1) = (TestWal::default(), TestSb::default());
+  r1.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal1,
+    &mut sb1,
+  );
+  // Drive replica 1 into ViewChange(view 1). SVC quorum for n=5 is 3: own bit (from primary_idle above)
+  // + two peer SVCs.
+  r1.handle_message(
+    now,
+    &mut wal1,
+    &mut sb1,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  r1.handle_message(
+    now,
+    &mut wal1,
+    &mut sb1,
+    Peer::Replica(ReplicaId::new(3)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(3))),
+  );
+  assert_eq!(r1.status(), Status::ViewChange);
+  while r1.poll_message().is_some() {}
+  // Feed a DVC quorum (quorum_view_change = 3): own (op 0, auto-inserted) + replicas 3 and 4 each
+  // carrying op 3 committed-Repairing.
+  r1.handle_message(
+    now,
+    &mut wal1,
+    &mut sb1,
+    Peer::Replica(ReplicaId::new(3)),
+    Message::DoViewChange(donor_dvc(3)),
+  );
+  r1.handle_message(
+    now,
+    &mut wal1,
+    &mut sb1,
+    Peer::Replica(ReplicaId::new(4)),
+    Message::DoViewChange(donor_dvc(4)),
+  );
+  assert_eq!(
+    r1.status(),
+    Status::Normal,
+    "replica 1 becomes the view-1 primary"
+  );
+  assert_eq!(
+    r1.op(),
+    OpNumber::with(3),
+    "op 3's number is taken (head 3)"
+  );
+  assert_eq!(r1.commit_max, OpNumber::with(3), "op 3 is known committed");
+  assert_eq!(
+    r1.commit(),
+    OpNumber::with(2),
+    "the commit is HELD at the body-absent Repairing op 3"
+  );
+  // Pump the durable-view write → `start_view_participate` broadcasts the StartView. Capture it.
+  r1.handle_storage(now, &mut wal1, &mut sb1);
+  let sv = {
+    let mut found = None;
+    while let Some(out) = r1.poll_message() {
+      if let Message::StartView(s) = out.into_msg() {
+        found = Some(s);
+      }
+    }
+    found.expect("the view-1 primary broadcasts a StartView")
+  };
+  // THE SENDER FIX: the StartView advertises the COMMITTED frontier commit_max (3), NOT commit_min (2).
+  assert_eq!(
+    sv.commit(),
+    OpNumber::with(3),
+    "the new primary's StartView advertises commit_max (3), not the applied commit_min (2)"
+  );
+  assert_eq!(sv.op(), OpNumber::with(3));
+  assert_eq!(sv.replica(), ReplicaId::new(1), "from the view-1 primary");
+
+  // ── Stage 2: replica 2 adopts that REAL StartView and LEARNS op 3 is committed. ──
+  let mut r2 = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 5).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  r2.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(sv),
+  );
+  assert_eq!(
+    r2.status(),
+    Status::Normal,
+    "replica 2 adopts the view-1 head"
+  );
+  // THE FIX'S EFFECT: replica 2 LEARNS op 3 is committed — `commit_max == 3` — even though it cannot
+  // APPLY it yet (the body is absent, so the commit is HELD at op 3 and it is a peer-repair hole). Before
+  // the fix the StartView advertised `commit_min` and replica 2's `commit_max` would stay at 2.
+  assert_eq!(
+    r2.commit_max,
+    OpNumber::with(3),
+    "replica 2 learns op 3 is committed (commit_max raised to the advertised committed frontier)"
+  );
+  assert_eq!(
+    r2.commit(),
+    OpNumber::with(2),
+    "but the commit is HELD at the body-absent op 3 (applied frontier stalls at the Repairing hole)"
+  );
+  assert!(
+    r2.has_repair_hole_for_test(3),
+    "op 3 is a peer-repair hole on replica 2 — its body is solicited, not yet repaired"
+  );
+  // Drain replica 2's outgoing so far (StartView-adopt acks, repair solicitations).
+  while r2.poll_message().is_some() {}
+
+  // Now a SECOND view change to view 2 (primary = replica 2) begins BEFORE op 3 is repaired. Drive
+  // replica 2 into ViewChange(view 2) and capture the DoViewChange it emits: it must report
+  // `commit = commit_max = 3` and carry op 3 as a header-only `Repairing` entry (its existence taken).
+  r2.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    Message::StartViewChange(StartViewChange::new(View::with(2), ReplicaId::new(3))),
+  );
+  r2.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(4)),
+    Message::StartViewChange(StartViewChange::new(View::with(2), ReplicaId::new(4))),
+  );
+  assert_eq!(r2.status(), Status::ViewChange);
+  assert_eq!(r2.view(), View::with(2));
+  // Pump the durable-view write so the deferred DoViewChange is emitted.
+  r2.handle_storage(now, &mut wal, &mut sb);
+  let r2_dvc = {
+    let mut found = None;
+    while let Some(out) = r2.poll_message() {
+      if let Message::DoViewChange(d) = out.into_msg() {
+        found = Some(d);
+      }
+    }
+    found.expect("replica 2 emits a DoViewChange for view 2")
+  };
+  assert_eq!(
+    r2_dvc.commit(),
+    OpNumber::with(3),
+    "replica 2's DVC reports op 3 COMMITTED (commit_max), so commit* cannot fall below it"
+  );
+  let carries_op3_repairing = r2_dvc
+    .log_slice()
+    .iter()
+    .any(|e| e.op() == OpNumber::with(3) && e.is_repairing());
+  assert!(
+    carries_op3_repairing,
+    "replica 2's DVC carries op 3 header-only (its existence is taken — never re-minted)"
+  );
+
+  // Feed replica 2's REAL DVC + two laggard DVCs (replicas 3,4: head op 2, never saw op 3) into the
+  // view-2 prospective primary's canonical-log selection. Three donors with `op < 3` (the laggards plus
+  // r2 is the ONLY donor at op 3) form a nack quorum on op 3 — so a `commit*` below 3 WOULD truncate it.
+  let mut selector = Endpoint::new(Config::try_new(2, ReplicaId::new(2), 5).unwrap(), 0, NoopSm);
+  selector.dvc_from_mut_for_test().insert(2, r2_dvc);
+  // Two laggards in an OLDER generation (log_view 0) at head op 2, commit 2: they nack op 3.
+  selector.dvc_from_mut_for_test().insert(3, dvc(3, 0, 2, 2));
+  selector.dvc_from_mut_for_test().insert(4, dvc(4, 0, 2, 2));
+  let (log, op_head, commit_star) = selector.select_canonical_log();
+  // THE SAFETY PROPERTY: op 3 survives. `commit* >= 3` (replica 2 reported it committed), so op 3 is in
+  // the committed band and the nack scan (which only truncates the UNCOMMITTED tail `> commit*`) cannot
+  // cut it. Before the fix `commit*` would be 2 and op 3 — a COMMITTED op — would be truncated to op 2.
+  assert!(
+    commit_star >= 3,
+    "commit* is at least 3 — replica 2's committed-frontier DVC keeps op 3 in the committed band, got {commit_star}"
+  );
+  assert!(
+    op_head >= 3,
+    "op_head is not truncated below the committed op 3, got {op_head}"
+  );
+  let present: std::collections::BTreeSet<u64> = log.iter().map(|e| e.op().get()).collect();
+  assert!(
+    present.contains(&3),
+    "the committed op 3 is STILL in the canonical log after the second view change — never truncated or re-minted"
+  );
+}
+
+#[test]
 fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
   // REGRESSION (the cardinal append-before-ack invariant): a new primary that adopts an
   // uncommitted-tail op it learned from a PEER's DVC (it did NOT hold the op before) must NOT count
