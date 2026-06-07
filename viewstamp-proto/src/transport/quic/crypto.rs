@@ -1,0 +1,686 @@
+//! Crypto-provider plumbing for the QUIC transport (backed by the same rustls provider as TLS).
+//!
+//! `QuicOptions` holds the caller-supplied quinn-proto configs and a tuned
+//! `TransportConfig` with pinned values:
+//!
+//! - `max_idle_timeout` = 1 000 ms (> the 200 ms consensus primary-idle).
+//! - `initial_rtt` = 50 ms (PTO ~150 ms < the 200 ms consensus primary-idle) so a dropped handshake
+//!   datagram retransmits before a backup view-changes off a not-yet-connected primary.
+//! - `max_concurrent_bidi_streams` = 8 (each side opens up to 2 send streams under
+//!   `ControlBulk`; 8 gives per-side pair headroom across the cluster mesh).
+//! - `receive_window` (connection-level) = 17 MiB (16 MiB max frame + 1 MiB headroom)
+//!   so a maximum-sized bulk frame on one stream cannot exhaust the connection window
+//!   and stall the control stream.
+//! - `stream_receive_window` = 8 MiB: a checkpoint can flow in one shot but a single
+//!   stream cannot itself consume the full connection window.
+//!
+//! Use [`ClusterTls`] to build a `QuicOptions` with mandatory mutual TLS over
+//! cluster-private roots: the stock WebPki verifiers perform chain-only
+//! validation against the cluster CA, so a peer without a valid cert is
+//! rejected at the TLS handshake before any stream opens.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use quinn_proto::{
+  ClientConfig, EndpointConfig, IdleTimeout, ServerConfig, TransportConfig, VarInt,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+use super::layout::StreamLayout;
+
+/// The rustls [`CryptoProvider`](rustls::crypto::CryptoProvider) the QUIC TLS configs are built from,
+/// selected by the SAME `tls-rustls-*` features `Cargo.toml` wires (so the provider matches the one
+/// the byte-stream `tls` layer links and the one `quinn-proto` is compiled against). `ring` takes
+/// precedence when present; otherwise the FIPS `aws-lc-rs` provider, else the standard `aws-lc-rs`
+/// provider. The `quic` feature requires at least one provider (a `compile_error!` in
+/// [`transport`](crate::transport) enforces it), so exactly one of these arms is always live.
+///
+/// `tls-rustls-aws-lc-rs-fips` uses rustls's dedicated [`default_fips_provider`](rustls::crypto::default_fips_provider),
+/// which selects only FIPS-approved cipher suites and asserts the process is in a FIPS-capable build —
+/// stronger than the plain `aws_lc_rs::default_provider`, which merely prefers FIPS suites when the
+/// `fips` feature is on.
+#[cfg(feature = "quic")]
+fn active_provider() -> Arc<rustls::crypto::CryptoProvider> {
+  #[cfg(feature = "tls-rustls-ring")]
+  {
+    Arc::new(rustls::crypto::ring::default_provider())
+  }
+  #[cfg(all(
+    feature = "tls-rustls-aws-lc-rs-fips",
+    not(feature = "tls-rustls-ring")
+  ))]
+  {
+    Arc::new(rustls::crypto::default_fips_provider())
+  }
+  #[cfg(all(
+    feature = "tls-rustls-aws-lc-rs",
+    not(feature = "tls-rustls-ring"),
+    not(feature = "tls-rustls-aws-lc-rs-fips")
+  ))]
+  {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+  }
+}
+
+/// Pinned idle timeout.  Must exceed the 200 ms consensus primary-idle.
+#[cfg_attr(not(test), allow(dead_code))]
+const IDLE_TIMEOUT_MILLIS: u64 = 1_000;
+
+/// Initial RTT estimate for loss recovery BEFORE the first RTT sample.  quinn derives the initial
+/// Probe Timeout (PTO) — the delay before a lost handshake packet is first retransmitted — from this
+/// value, so it governs how fast a connection recovers from a dropped Initial/Handshake datagram on a
+/// link that has not yet measured an RTT.
+///
+/// quinn's default is 333 ms (a WAN-tuned estimate), which yields an initial PTO of ~1 s.  On a
+/// cluster-internal link that is far too slow: a single dropped handshake datagram would stall the
+/// handshake for ~1 s, which EXCEEDS the 200 ms consensus primary-idle — so a backup would start a
+/// view change before its link to the primary is even up, and a 2-replica cluster cannot reconcile a
+/// lone-replica view-change escalation (the higher-view anti-amplification rule), leaving it to
+/// escalate views indefinitely instead of converging.  Pinned at 50 ms (PTO ~150 ms, comfortably
+/// under the 200 ms primary-idle, and still ~50× a real datacenter RTT so it does not provoke
+/// spurious early retransmits) so a dropped handshake datagram retransmits well before the consensus
+/// layer reacts.  The seeded datagram sim (`datagram_sim`) is the regression net for this.
+const INITIAL_RTT_MILLIS: u64 = 50;
+
+/// Pinned max concurrent bidi streams.  Each side opens up to 2 send streams
+/// under `ControlBulk` (Control + Bulk); 8 gives cluster-mesh headroom for the
+/// mutual-dial doubling where both peers open streams concurrently.
+pub(crate) const MAX_BIDI_STREAMS: u32 = 8;
+
+/// Connection-level receive window: max frame (16 MiB) plus control headroom
+/// (1 MiB) so a single max-sized bulk frame on the Bulk stream cannot exhaust
+/// the connection window and block the Control stream.
+const CONNECTION_RECEIVE_WINDOW: u64 = 17 * 1024 * 1024;
+
+/// Per-stream receive window: a checkpoint snapshot can arrive in one shot but
+/// a single stream is bounded below the connection window so it cannot itself
+/// exhaust connection-level flow control.
+const STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+
+/// Default cap on the number of LIVE connections the bridge holds at once (dialed + accepted). The
+/// network is untrusted: an inbound flood of foreign-CA / no-cert Initials would otherwise each
+/// allocate a `Connection` before identity validation could reject it. At the cap the bridge
+/// statelessly refuses further inbound attempts ([`quinn_proto::Endpoint::refuse`]) instead of
+/// allocating. Sized generously for a small voting cluster (≤64 replicas) plus mutual-dial doubling
+/// and reconnect headroom; raise it via [`QuicOptions::with_max_connections`] for a larger mesh.
+///
+/// This is only the cap when no `replica_count`-derived sizing applies: the QUIC coordinator RAISES
+/// the effective cap to [`mesh_connection_floor`] at construction, so a default-cap node on a large
+/// cluster still admits its whole steady-state mesh (see that fn).
+const DEFAULT_MAX_CONNECTIONS: usize = 64;
+
+/// A small constant floor on the connection cap, so even a 1- or 2-replica cluster (whose mutual-dial
+/// mesh is tiny) keeps a little accept/reconnect headroom.
+const MIN_CONNECTION_FLOOR: usize = 4;
+
+/// The minimum live-connection cap that admits an `replica_count`-replica node's full steady-state
+/// mutual-dial mesh, plus reconnect headroom.
+///
+/// **Formula:** `max(MIN_CONNECTION_FLOOR, 3 * (replica_count - 1))`.
+///
+/// **Rationale.** The mutual-dial design keeps TWO physical connections per peer pair (each side dials
+/// the other and both are kept; see `Bridge::bind_validated`), so an `N`-replica node holds `2*(N-1)`
+/// steady-state connections. A reconnecting peer can briefly hold a THIRD connection (the new dial /
+/// accept overlapping the old one before it idle-times-out or is reaped), so we add one reconnect slot
+/// per peer — `(N-1)` — for a total of `3*(N-1)`. For the supported 64-replica maximum that is 189,
+/// comfortably above the `2*63 = 126` bare-mesh requirement; for `N <= 1` it is the floor.
+///
+/// The coordinator RAISES `max_connections` to this when the caller-configured cap is lower, so the cap
+/// can never refuse a legitimate steady-state mesh connection (a liveness failure at scale — the
+/// 64-default refuses mesh dials past ~33 replicas). It still bounds an untrusted-network flood; it is
+/// just sized to the configured membership rather than a fixed constant.
+pub(crate) const fn mesh_connection_floor(replica_count: u8) -> usize {
+  let peers = (replica_count as usize).saturating_sub(1);
+  let mesh_with_reconnect = peers * 3;
+  if mesh_with_reconnect > MIN_CONNECTION_FLOOR {
+    mesh_with_reconnect
+  } else {
+    MIN_CONNECTION_FLOOR
+  }
+}
+
+/// Immutable QUIC config bundle handed to the endpoint builder. Accessor-only;
+/// all fields are private and cannot be mutated after construction.
+pub struct QuicOptions {
+  endpoint: Arc<EndpointConfig>,
+  client: Option<ClientConfig>,
+  server: Option<Arc<ServerConfig>>,
+  idle_timeout_millis: u64,
+  /// Set to `true` by [`ClusterTls::build`]; `false` for the accept-any test
+  /// path.
+  requires_client_auth: bool,
+  /// Stream-layout selector stored for the coordinator and tests.
+  layout: StreamLayout,
+  /// Connection-level receive window baked into the `TransportConfig` (bytes).
+  connection_receive_window: u64,
+  /// Cap on the number of live connections the bridge holds at once. Inbound attempts past this are
+  /// refused (stateless close) instead of allocating, bounding an untrusted-network accept flood.
+  max_connections: usize,
+}
+
+impl QuicOptions {
+  /// Build from caller-supplied configs and an idle timeout (milliseconds).
+  ///
+  /// The tuned `TransportConfig` (idle timeout + bidi-stream cap + flow-control
+  /// windows) is constructed internally and installed on both the server and
+  /// client.  The layout defaults to `StreamLayout::ControlBulk`.
+  pub fn new(
+    endpoint: EndpointConfig,
+    client: Option<ClientConfig>,
+    server: Option<ServerConfig>,
+    idle_timeout_millis: u64,
+  ) -> Self {
+    Self::new_inner(
+      endpoint,
+      client,
+      server,
+      idle_timeout_millis,
+      false,
+      StreamLayout::default(),
+    )
+  }
+
+  fn new_inner(
+    endpoint: EndpointConfig,
+    client: Option<ClientConfig>,
+    server: Option<ServerConfig>,
+    idle_timeout_millis: u64,
+    requires_client_auth: bool,
+    layout: StreamLayout,
+  ) -> Self {
+    let transport = Self::build_transport(idle_timeout_millis);
+    let server = server.map(|mut s| {
+      s.transport_config(transport.clone());
+      Arc::new(s)
+    });
+    let mut client = client;
+    if let Some(ref mut c) = client {
+      c.transport_config(transport);
+    }
+    Self {
+      endpoint: Arc::new(endpoint),
+      client,
+      server,
+      idle_timeout_millis,
+      requires_client_auth,
+      layout,
+      connection_receive_window: CONNECTION_RECEIVE_WINDOW,
+      max_connections: DEFAULT_MAX_CONNECTIONS,
+    }
+  }
+
+  /// Cheap clone of the endpoint config arc.
+  #[inline(always)]
+  pub fn endpoint_config(&self) -> Arc<EndpointConfig> {
+    self.endpoint.clone()
+  }
+
+  /// Cheap clone of the client config used for outbound dials, if any.
+  #[inline(always)]
+  pub fn client_config(&self) -> Option<ClientConfig> {
+    self.client.clone()
+  }
+
+  /// Cheap clone of the server config arc, if any.
+  #[inline(always)]
+  pub fn server_config(&self) -> Option<Arc<ServerConfig>> {
+    self.server.clone()
+  }
+
+  /// Idle timeout in milliseconds (the value baked into the transport config).
+  #[inline(always)]
+  pub const fn idle_timeout_millis(&self) -> u64 {
+    self.idle_timeout_millis
+  }
+
+  /// Whether a client config is present.
+  #[inline(always)]
+  pub const fn has_client_config(&self) -> bool {
+    self.client.is_some()
+  }
+
+  /// Whether a server config is present.
+  #[inline(always)]
+  pub const fn has_server_config(&self) -> bool {
+    self.server.is_some()
+  }
+
+  /// Whether the server config was built with mandatory client-certificate
+  /// authentication.  `true` only when constructed via [`ClusterTls::build`];
+  /// the accept-any test path leaves this `false`.
+  #[inline(always)]
+  pub const fn requires_client_auth(&self) -> bool {
+    self.requires_client_auth
+  }
+
+  /// The stream-layout selector for this options bundle.
+  #[inline(always)]
+  pub const fn layout(&self) -> StreamLayout {
+    self.layout
+  }
+
+  /// The connection-level receive window baked into the `TransportConfig`
+  /// (bytes).  At least `MAX_FRAME_LEN` (16 MiB) so a maximum-sized bulk frame
+  /// cannot exhaust the connection window and stall the control stream.
+  #[inline(always)]
+  pub const fn connection_receive_window(&self) -> u64 {
+    self.connection_receive_window
+  }
+
+  /// The cap on live connections (dialed + accepted). The bridge refuses inbound attempts once the
+  /// table holds this many, bounding an untrusted-network accept flood. Defaults to
+  /// [`DEFAULT_MAX_CONNECTIONS`]; override with [`Self::with_max_connections`].
+  #[inline(always)]
+  pub const fn max_connections(&self) -> usize {
+    self.max_connections
+  }
+
+  /// Override the live-connection cap (see [`Self::max_connections`]). Sized for the cluster's
+  /// replica count plus mutual-dial doubling and reconnect headroom; a value of 0 is clamped to 1 so
+  /// at least one connection is always admissible.
+  ///
+  /// The QUIC coordinator RAISES the effective cap to the membership-sized
+  /// [`mesh_connection_floor`](mesh_connection_floor) at construction whenever the value set here is
+  /// lower, so the cap can never refuse a legitimate steady-state mutual-dial mesh connection. Setting
+  /// a value ABOVE that floor still takes effect (a larger flood budget); a lower one is floored.
+  #[must_use]
+  pub const fn with_max_connections(mut self, max: usize) -> Self {
+    self.max_connections = if max == 0 { 1 } else { max };
+    self
+  }
+
+  /// Build the tuned `TransportConfig` shared between server and client.
+  fn build_transport(idle_timeout_millis: u64) -> Arc<TransportConfig> {
+    let mut tc = TransportConfig::default();
+    let idle = IdleTimeout::try_from(Duration::from_millis(idle_timeout_millis))
+      .expect("idle timeout within VarInt range");
+    tc.max_idle_timeout(Some(idle));
+    tc.initial_rtt(Duration::from_millis(INITIAL_RTT_MILLIS));
+    tc.max_concurrent_bidi_streams(VarInt::from_u32(MAX_BIDI_STREAMS));
+    // Close the protocol surfaces this transport does NOT use, so a buggy / version-skew but
+    // fully validated peer cannot pin connection-level receive credit or memory on them and stall
+    // the Control/Bulk streams that share the connection window. Both quinn defaults are
+    // peer-usable (uni-stream limit 100, datagram-receive buffer Some(...)); consensus rides framed
+    // BIDI streams only and never QUIC DATAGRAM frames, so neither is needed.
+    //
+    // - Incoming UNIDIRECTIONAL streams: advertise a limit of 0, so a peer's `open(Dir::Uni)` is
+    //   refused by construction (it cannot mint the stream against a 0 limit) and a peer that forces
+    //   one anyway trips `STREAM_LIMIT_ERROR`, which quinn turns into a connection close.
+    // - DATAGRAM RECEIVE: `None` stops advertising `max_datagram_size`, so the peer's `datagrams()`
+    //   send is `UnsupportedByPeer` and an unsolicited DATAGRAM frame is a protocol violation quinn
+    //   rejects — nothing is buffered. (SEND stays at the quinn default but is never exercised: the
+    //   bridge issues no `datagrams().send`, and `poll_transmit`'s `max_datagrams` is the UDP-packet
+    //   coalescing count, not QUIC DATAGRAM frames.)
+    //
+    // After this the ignored `Stream(Opened { dir: Dir::Uni })` / `DatagramReceived` /
+    // `DatagramsUnblocked` arms in `on_app_event` are unreachable on a conformant path; they remain a
+    // defensive ignore.
+    tc.max_concurrent_uni_streams(VarInt::from_u32(0));
+    tc.datagram_receive_buffer_size(None);
+    // Connection-level window: must accommodate a max bulk frame (16 MiB) without
+    // blocking the control stream.  A Bulk stream exhausts stream_receive_window
+    // before it can exhaust this larger connection window.
+    tc.receive_window(
+      VarInt::from_u64(CONNECTION_RECEIVE_WINDOW).expect("connection window within VarInt range"),
+    );
+    // Per-stream window: large enough for a checkpoint snapshot in one shot but
+    // bounded below the connection window so a single stream cannot monopolise it.
+    tc.stream_receive_window(
+      VarInt::from_u64(STREAM_RECEIVE_WINDOW).expect("stream window within VarInt range"),
+    );
+    Arc::new(tc)
+  }
+}
+
+/// Builds a [`QuicOptions`] bundle with mandatory mutual TLS over a
+/// cluster-private root CA.
+///
+/// Both directions are fully authenticated:
+///
+/// - **Server side** uses [`rustls::server::WebPkiClientVerifier`] rooted at
+///   the cluster CA, which makes client certificates mandatory by default.
+///   A peer without a cert (or whose cert does not chain to the cluster CA) is
+///   rejected at the TLS handshake before any QUIC stream opens.
+///
+/// - **Client side** uses [`rustls::client::WebPkiServerVerifier`] with the
+///   same cluster CA, and presents this node's cert chain for mutual
+///   authentication (`with_client_auth_cert`).
+///
+/// Both configs are TLS 1.3-only with ALPN set to `b"viewstamp"`.
+///
+/// ## SNI server name
+///
+/// The stock `WebPkiServerVerifier` validates the SNI `server_name` the dialer
+/// supplies against the server cert's Subject Alternative Names.  Mint each
+/// replica's cert with a DNS SAN of the form
+/// `replica-<n>.<cluster-hex>.viewstamp` and have the coordinator pass that
+/// derived name on `connect` so the verifier can match it.
+pub struct ClusterTls {
+  roots: rustls::RootCertStore,
+  chain: Vec<CertificateDer<'static>>,
+  key: PrivateKeyDer<'static>,
+  layout: StreamLayout,
+}
+
+impl ClusterTls {
+  /// Create a new `ClusterTls` builder.
+  ///
+  /// - `roots` — the cluster-private CA(s); only peers whose cert chains to
+  ///   one of these roots will complete the handshake.
+  /// - `chain` — this node's certificate chain (leaf first).
+  /// - `key` — the private key for the leaf certificate.
+  pub fn new(
+    roots: rustls::RootCertStore,
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+  ) -> Self {
+    Self {
+      roots,
+      chain,
+      key,
+      layout: StreamLayout::default(),
+    }
+  }
+
+  /// Set the stream-layout selector for the built [`QuicOptions`].  The default
+  /// is `StreamLayout::ControlBulk`.
+  pub fn layout(mut self, layout: StreamLayout) -> Self {
+    self.layout = layout;
+    self
+  }
+
+  /// Consume the builder and produce a [`QuicOptions`] with both a server
+  /// config (mandatory client auth) and a client config (mTLS).
+  pub fn build(self) -> QuicOptions {
+    use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+    use rustls::client::WebPkiServerVerifier;
+    use rustls::server::WebPkiClientVerifier;
+
+    // The crypto provider is selected by the `tls-rustls-*` feature, NOT hard-coded — so an
+    // aws-lc-rs / FIPS-only build links the matching provider (see `active_provider`).
+    let provider = active_provider();
+    let roots = Arc::new(self.roots);
+
+    // Server: mandatory client-cert auth via cluster CA.
+    let client_verifier =
+      WebPkiClientVerifier::builder_with_provider(roots.clone(), provider.clone())
+        .build()
+        .expect("WebPkiClientVerifier with valid cluster roots");
+    let mut rustls_server = rustls::ServerConfig::builder_with_provider(provider.clone())
+      .with_protocol_versions(&[&rustls::version::TLS13])
+      .expect("TLS 1.3 is supported by the active provider")
+      .with_client_cert_verifier(client_verifier)
+      .with_single_cert(self.chain.clone(), self.key.clone_key())
+      .expect("valid cluster cert and key");
+    rustls_server.alpn_protocols = vec![b"viewstamp".to_vec()];
+    let qsc = QuicServerConfig::try_from(Arc::new(rustls_server))
+      .expect("QuicServerConfig from cluster-CA rustls ServerConfig");
+    let server = ServerConfig::with_crypto(Arc::new(qsc));
+
+    // Client: verify server against cluster CA; present this node's cert.
+    let server_verifier = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
+      .build()
+      .expect("WebPkiServerVerifier with valid cluster roots");
+    let mut rustls_client = rustls::ClientConfig::builder_with_provider(provider)
+      .with_protocol_versions(&[&rustls::version::TLS13])
+      .expect("TLS 1.3 is supported by the active provider")
+      .dangerous()
+      .with_custom_certificate_verifier(server_verifier)
+      .with_client_auth_cert(self.chain, self.key)
+      .expect("valid cluster cert and key for client auth");
+    rustls_client.alpn_protocols = vec![b"viewstamp".to_vec()];
+    let qcc = QuicClientConfig::try_from(Arc::new(rustls_client))
+      .expect("QuicClientConfig from cluster-CA rustls ClientConfig");
+    let client = ClientConfig::new(Arc::new(qcc));
+
+    QuicOptions::new_inner(
+      EndpointConfig::default(),
+      Some(client),
+      Some(server),
+      IDLE_TIMEOUT_MILLIS,
+      true,
+      self.layout,
+    )
+  }
+}
+
+#[cfg(test)]
+impl QuicOptions {
+  /// Test-only builder: self-signed cert, accept-any verifier, TLS 1.3 + ALPN
+  /// `viewstamp`, default (`ControlBulk`) stream layout.
+  ///
+  /// The `EndpointConfig` is `default()` — the deterministic rng seed is applied
+  /// when the actual `Endpoint` is built.
+  pub fn accept_any_for_test() -> Self {
+    Self::accept_any_with_layout(StreamLayout::default())
+  }
+
+  /// As [`accept_any_for_test`](Self::accept_any_for_test) but with an explicit
+  /// stream layout, so a bridge test can drive either `Single` or `ControlBulk`.
+  pub fn accept_any_with_layout(layout: StreamLayout) -> Self {
+    use crate::transport::tls::test_verifier::AcceptAny;
+    use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+
+    // Self-signed cert via rcgen 0.14.
+    let ck = rcgen::generate_simple_self_signed(vec!["viewstamp.local".into()]).unwrap();
+    let cert = CertificateDer::from(ck.cert.der().to_vec());
+    let key = PrivateKeyDer::try_from(ck.signing_key.serialize_der()).unwrap();
+
+    // Rustls provider: the SAME feature-selected provider the production `build` uses (not hard-coded
+    // ring), installed process-wide for any rustls path that consults the default.
+    let provider = active_provider();
+    let _ = (*provider).clone().install_default();
+
+    // Server config: no client auth; ALPN viewstamp.
+    let mut rustls_server = rustls::ServerConfig::builder_with_provider(provider.clone())
+      .with_protocol_versions(&[&rustls::version::TLS13])
+      .unwrap()
+      .with_no_client_auth()
+      .with_single_cert(vec![cert], key)
+      .unwrap();
+    rustls_server.alpn_protocols = vec![b"viewstamp".to_vec()];
+    let qsc =
+      QuicServerConfig::try_from(Arc::new(rustls_server)).expect("QuicServerConfig from rustls");
+    let server = ServerConfig::with_crypto(Arc::new(qsc));
+
+    // Client config: accept-any verifier (test only); ALPN viewstamp.
+    let mut rustls_client = rustls::ClientConfig::builder_with_provider(provider)
+      .with_protocol_versions(&[&rustls::version::TLS13])
+      .unwrap()
+      .dangerous()
+      .with_custom_certificate_verifier(Arc::new(AcceptAny))
+      .with_no_client_auth();
+    rustls_client.alpn_protocols = vec![b"viewstamp".to_vec()];
+    let qcc =
+      QuicClientConfig::try_from(Arc::new(rustls_client)).expect("QuicClientConfig from rustls");
+    let client = ClientConfig::new(Arc::new(qcc));
+
+    Self::new_inner(
+      EndpointConfig::default(),
+      Some(client),
+      Some(server),
+      IDLE_TIMEOUT_MILLIS,
+      false,
+      layout,
+    )
+  }
+}
+
+/// A test-only cluster CA + per-replica certificate issuer (rcgen 0.14).
+///
+/// `test_ca()` generates a fresh self-signed CA. `issue_replica` issues leaf
+/// certs signed by that CA with a DNS SAN of the form
+/// `replica-<n>.<cluster-hex>.viewstamp`.  The `cluster-hex` portion is a
+/// 32-character zero-padded hex string derived from the cluster id passed to
+/// `issue_replica`.
+#[cfg(test)]
+pub(crate) struct TestClusterCa {
+  ca_cert: rcgen::Certificate,
+  issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+#[cfg(test)]
+impl TestClusterCa {
+  /// Build a `RootCertStore` containing the CA certificate.
+  pub(crate) fn roots(&self) -> rustls::RootCertStore {
+    let mut store = rustls::RootCertStore::empty();
+    store
+      .add(CertificateDer::from(self.ca_cert.der().to_vec()))
+      .expect("CA cert parses as a trust anchor");
+    store
+  }
+
+  /// Issue a leaf certificate signed by this CA with the SAN
+  /// `replica-<n>.<cluster_id_hex>.viewstamp`.
+  pub(crate) fn issue_replica(&self, n: u8, cluster: u128) -> TestReplicaCert {
+    let san = format!("replica-{n}.{cluster:032x}.viewstamp");
+    let mut params =
+      rcgen::CertificateParams::new(vec![san]).expect("valid DNS SAN for replica cert");
+    params
+      .key_usages
+      .push(rcgen::KeyUsagePurpose::DigitalSignature);
+    params
+      .extended_key_usages
+      .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    params
+      .extended_key_usages
+      .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let leaf_key = rcgen::KeyPair::generate().expect("key pair generation succeeds");
+    let cert = params
+      .signed_by(&leaf_key, &self.issuer)
+      .expect("leaf cert signed by cluster CA");
+    TestReplicaCert { cert, leaf_key }
+  }
+
+  /// Issue a leaf certificate (as [`issue_replica`](Self::issue_replica)) that also carries the
+  /// viewstamp identity extension attesting `Peer::Replica(n)` for `cluster` — the input a
+  /// [`CertOid`](super::CertOid) verifier parses. The extension is added NON-critical so the stock
+  /// cluster-CA WebPki verifier does not reject the chain over it (see [`CertOid`](super::CertOid)).
+  pub(crate) fn issue_replica_with_oid(&self, n: u8, cluster: u128) -> TestReplicaCert {
+    use super::identity::{IDENTITY_OID, encode_identity_ext};
+
+    let san = format!("replica-{n}.{cluster:032x}.viewstamp");
+    let mut params =
+      rcgen::CertificateParams::new(vec![san]).expect("valid DNS SAN for replica cert");
+    params
+      .key_usages
+      .push(rcgen::KeyUsagePurpose::DigitalSignature);
+    params
+      .extended_key_usages
+      .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    params
+      .extended_key_usages
+      .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let content = encode_identity_ext(cluster, crate::Peer::Replica(crate::ReplicaId::new(n)));
+    let ext = rcgen::CustomExtension::from_oid_content(IDENTITY_OID, content);
+    params.custom_extensions.push(ext);
+    let leaf_key = rcgen::KeyPair::generate().expect("key pair generation succeeds");
+    let cert = params
+      .signed_by(&leaf_key, &self.issuer)
+      .expect("leaf cert signed by cluster CA");
+    TestReplicaCert { cert, leaf_key }
+  }
+}
+
+/// A leaf certificate + private key issued by a [`TestClusterCa`].
+#[cfg(test)]
+pub(crate) struct TestReplicaCert {
+  cert: rcgen::Certificate,
+  leaf_key: rcgen::KeyPair,
+}
+
+#[cfg(test)]
+impl TestReplicaCert {
+  /// The certificate chain (leaf only; CA is in the trust store).
+  pub(crate) fn chain(&self) -> Vec<CertificateDer<'static>> {
+    vec![CertificateDer::from(self.cert.der().to_vec())]
+  }
+
+  /// The end-entity (leaf) certificate as a single owned DER — the form
+  /// [`CertOid`](super::CertOid) parses out of the validated peer chain.
+  pub(crate) fn end_entity_der(&self) -> CertificateDer<'static> {
+    CertificateDer::from(self.cert.der().to_vec())
+  }
+
+  /// The private key for the leaf certificate.
+  pub(crate) fn key(&self) -> PrivateKeyDer<'static> {
+    PrivateKeyDer::try_from(self.leaf_key.serialize_der())
+      .expect("leaf key serialises as a valid private key DER")
+  }
+}
+
+/// Construct a fresh self-signed cluster CA for tests.
+#[cfg(test)]
+pub(crate) fn test_ca() -> TestClusterCa {
+  let mut params = rcgen::CertificateParams::new(vec![]).expect("empty SAN for CA is valid");
+  params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+  params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+  params
+    .key_usages
+    .push(rcgen::KeyUsagePurpose::DigitalSignature);
+  let ca_key = rcgen::KeyPair::generate().expect("CA key pair generation succeeds");
+  let ca_cert = params
+    .self_signed(&ca_key)
+    .expect("self-signed CA cert generation succeeds");
+  let issuer = rcgen::Issuer::new(params, ca_key);
+  TestClusterCa { ca_cert, issuer }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn accept_any_options_build_tls13_configs() {
+    let opts = QuicOptions::accept_any_for_test();
+    assert!(opts.idle_timeout_millis() >= 1000);
+    assert!(opts.has_client_config() && opts.has_server_config());
+  }
+
+  #[test]
+  fn cluster_tls_builds_mtls_configs_and_carries_mandatory_client_auth() {
+    let ca = test_ca();
+    let cert0 = ca.issue_replica(0, 0x5151);
+    let opts = ClusterTls::new(ca.roots(), cert0.chain(), cert0.key()).build();
+    assert!(opts.has_client_config() && opts.has_server_config());
+    assert!(opts.requires_client_auth());
+  }
+
+  #[test]
+  fn quic_options_carry_layout_and_size_the_connection_window() {
+    let ca = test_ca();
+    let cert0 = ca.issue_replica(0, 0x5151);
+    // The builder accepts a layout override and threads it through to QuicOptions.
+    let opts = ClusterTls::new(ca.roots(), cert0.chain(), cert0.key())
+      .layout(StreamLayout::ControlBulk)
+      .build();
+    assert_eq!(opts.layout(), StreamLayout::ControlBulk);
+    // Connection window must be at least MAX_FRAME_LEN (16 MiB) so a bulk frame
+    // cannot exhaust it and block the control stream.
+    assert!(opts.connection_receive_window() >= 16 * 1024 * 1024);
+  }
+
+  #[test]
+  fn max_connections_defaults_and_overrides_and_clamps_zero() {
+    // The default cap bounds an untrusted-network accept flood without an explicit override.
+    assert_eq!(
+      QuicOptions::accept_any_for_test().max_connections(),
+      DEFAULT_MAX_CONNECTIONS
+    );
+    // An override threads through.
+    assert_eq!(
+      QuicOptions::accept_any_for_test()
+        .with_max_connections(8)
+        .max_connections(),
+      8
+    );
+    // Zero is clamped to 1 so at least one connection is always admissible.
+    assert_eq!(
+      QuicOptions::accept_any_for_test()
+        .with_max_connections(0)
+        .max_connections(),
+      1
+    );
+  }
+}
