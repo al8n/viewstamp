@@ -1123,6 +1123,22 @@ impl<S> Endpoint<S> {
     self.config.replica()
   }
 
+  /// The cluster id this replica was configured for. The QUIC coordinator reads it to single-source
+  /// the cluster used by its identity-binding cross-check (rather than carrying a duplicate field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn cluster(&self) -> u128 {
+    self.config.cluster()
+  }
+
+  /// The number of replicas in the configured cluster. The QUIC coordinator reads it to single-source
+  /// the configured membership: it rejects binding a peer whose attested replica index is outside
+  /// `0..replica_count` (a retired / misconfigured cert from a since-shrunk cluster), and it sizes the
+  /// connection cap to the mutual-dial mesh — both without duplicating the count.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica_count(&self) -> u8 {
+    self.config.replica_count()
+  }
+
   /// Whether this replica is the primary of the current view.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn is_primary(&self) -> bool {
