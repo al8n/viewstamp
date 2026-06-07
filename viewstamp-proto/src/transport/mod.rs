@@ -5,6 +5,19 @@
 //! top, a per-socket byte-record layer, a cluster+identity handshake, a per-socket pipe, a
 //! per-peer router, and the composing coordinator. Modeled on `memberlist-proto`.
 
+#[cfg(all(
+  feature = "quic",
+  not(any(
+    feature = "tls-rustls-ring",
+    feature = "tls-rustls-aws-lc-rs",
+    feature = "tls-rustls-aws-lc-rs-fips"
+  ))
+))]
+compile_error!(
+  "feature `quic` requires a crypto provider: enable one of \
+  `tls-rustls-ring`, `tls-rustls-aws-lc-rs`, or `tls-rustls-aws-lc-rs-fips`"
+);
+
 mod conn;
 mod coordinator;
 mod frame;
@@ -12,6 +25,8 @@ mod labeled;
 #[cfg(test)]
 mod loopback;
 mod passthrough;
+#[cfg(feature = "quic")]
+mod quic;
 mod router;
 mod stream;
 #[cfg(test)]
@@ -22,6 +37,11 @@ pub use conn::Conn;
 pub use coordinator::StreamCoordinator;
 pub use labeled::{LabelOptions, Labeled};
 pub use passthrough::Passthrough;
+#[cfg(feature = "quic")]
+pub use quic::{
+  CertOid, ClusterTls, DialError, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome,
+  IdentitySource, ProvidedIdentity, QuicCoordinator, QuicOptions, StreamLayout,
+};
 pub use router::{ConnId, PeerRouter};
 pub use stream::{Intake, StreamTransport};
 #[cfg(feature = "tls")]

@@ -68,6 +68,12 @@ pub use storage::{
   WalDone, checkpoint_id,
 };
 pub use time::Instant;
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+pub use transport::{
+  CertOid, ClusterTls, DialError, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome,
+  IdentitySource, ProvidedIdentity, QuicCoordinator, QuicOptions, StreamLayout,
+};
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 pub use transport::{
