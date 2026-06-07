@@ -298,7 +298,7 @@ impl FrameDecoder {
   /// Count of complete-but-undrained frames currently queued — the observable a bounded-read
   /// regression asserts stays proportional to the per-pass read budget, not to the total frames a
   /// peer crammed into one receive window.
-  #[cfg(test)]
+  #[cfg(all(test, feature = "quic"))]
   pub fn ready_len(&self) -> usize {
     self.ready.len()
   }
