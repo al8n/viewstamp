@@ -9,6 +9,7 @@ use bytes::Bytes;
 use crate::{Endpoint, Event, Instant, Message, Outgoing, Peer, StateMachine, Superblock, Wal};
 
 use super::conn::Conn;
+use super::frame::STAGE_CHUNK;
 use super::router::{ConnId, PeerRouter};
 use super::stream::StreamTransport;
 
@@ -72,7 +73,6 @@ where
     // Feed the driver read in bounded chunks, decoding and draining between each, so the transport's
     // per-conn intake memory (record staging, the frame decoder's complete-frame queue) stays
     // bounded regardless of how much the driver hands in at once.
-    const STAGE_CHUNK: usize = 64 * 1024;
     let mut rest = bytes;
     loop {
       let take = rest.len().min(STAGE_CHUNK);

@@ -11,9 +11,13 @@ const HELLO_TAG: u8 = 0x0C;
 const HELLO_VERSION: u8 = 1;
 const PEER_REPLICA: u8 = 0;
 const PEER_CLIENT: u8 = 1;
-/// tag+ver+cluster(16)+peer_tag = 19, then up to a 16-byte client id = 35. Bounds the
-/// reassembly buffer: an unparsed prefix longer than this is a malformed stream → reject.
-const MAX_HELLO_LEN: usize = 1 + 1 + 16 + 1 + 16;
+/// The maximum encoded length of a hello: tag+ver+cluster(16)+peer_tag = 19, then up to a 16-byte
+/// client id = 35 (a replica hello is 20). This is the EXACT upper bound of [`encode_hello`], so no
+/// valid hello ever exceeds it. Two callers rely on it: the TCP byte-stream path bounds its reassembly
+/// buffer (an unparsed prefix longer than this is a malformed stream → reject), and the QUIC transport
+/// sizes its pre-authentication Control frame decoder to this cap (a peer cannot pin a larger first
+/// Control frame before its identity validates).
+pub(crate) const MAX_HELLO_LEN: usize = 1 + 1 + 16 + 1 + 16;
 
 /// Immutable handshake options: this node's cluster id and its own claimed identity. The inner
 /// record layer is built by the driver and passed straight to [`Labeled::dialer`]/[`Labeled::acceptor`],
@@ -42,7 +46,7 @@ impl LabelOptions {
   }
 }
 
-fn encode_hello(cluster: u128, who: Peer, out: &mut Vec<u8>) {
+pub(crate) fn encode_hello(cluster: u128, who: Peer, out: &mut Vec<u8>) {
   out.push(HELLO_TAG);
   out.push(HELLO_VERSION);
   out.extend_from_slice(&cluster.to_be_bytes());
@@ -58,7 +62,7 @@ fn encode_hello(cluster: u128, who: Peer, out: &mut Vec<u8>) {
   }
 }
 
-enum HelloOutcome {
+pub(crate) enum HelloOutcome {
   /// Validated; carries (claimed peer, bytes consumed from the buffer head).
   Accepted(Peer, usize),
   /// The prefix is not yet fully buffered.
@@ -68,7 +72,7 @@ enum HelloOutcome {
 }
 
 /// Validates the prefix at the head of `buf` against `expected_cluster`.
-fn classify_hello(buf: &[u8], expected_cluster: u128) -> HelloOutcome {
+pub(crate) fn classify_hello(buf: &[u8], expected_cluster: u128) -> HelloOutcome {
   if buf.len() < 18 {
     if !buf.is_empty() && buf[0] != HELLO_TAG {
       return HelloOutcome::Rejected;
