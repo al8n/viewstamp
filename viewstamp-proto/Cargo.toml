@@ -20,15 +20,20 @@ std = ["bytes/std"]
 # implies `tcp` (reuses the framing/Conn/router) and `std` (rustls is std-only).
 tcp = ["alloc"]
 tls = ["tcp", "std", "dep:rustls"]
-tls-rustls-ring = ["tls", "rustls/ring"]
-tls-rustls-aws-lc-rs = ["tls", "rustls/aws_lc_rs"]
-tls-rustls-aws-lc-rs-fips = ["tls", "rustls/fips"]
+tls-rustls-ring = ["tls", "rustls/ring", "quinn-proto?/rustls-ring"]
+tls-rustls-aws-lc-rs = ["tls", "rustls/aws_lc_rs", "quinn-proto?/rustls-aws-lc-rs"]
+tls-rustls-aws-lc-rs-fips = ["tls", "rustls/fips", "quinn-proto?/rustls-aws-lc-rs-fips"]
+# QUIC transport (std-only, like `tls`). The crypto provider is the SINGLE
+# source of truth shared with `tls-*`: selecting a provider drives BOTH layers.
+quic = ["tcp", "std", "dep:quinn-proto", "dep:x509-parser"]
 
 [dependencies]
 bytes = { workspace = true }
 derive_more = { workspace = true, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 thiserror = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
+quinn-proto = { version = "0.11", default-features = false, optional = true }
+x509-parser = { version = "0.18", default-features = false, optional = true }
 
 [dev-dependencies]
 rcgen = "0.14"
