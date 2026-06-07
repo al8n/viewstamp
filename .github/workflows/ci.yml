@@ -30,7 +30,10 @@ env:
 # The aws-lc-rs and aws-lc-rs-fips rustls providers need a C/CMake/NASM (and, for FIPS, Go)
 # toolchain that the macOS/Windows runners do not have; tls-rustls-ring is pure-Rust+asm and
 # builds on every platform, so it is the provider exercised in CI. The cargo-hack feature sweeps
-# below exclude the two aws-lc-rs features for that reason.
+# below exclude the two aws-lc-rs features for that reason. The `quic` feature is also excluded
+# from the sweeps because it mandates a crypto provider (a `compile_error!` rejects `quic` with no
+# provider, by design), so it cannot build standalone; each sweep job builds, lints, and tests it
+# explicitly via `quic,tls-rustls-ring`.
 jobs:
   # Check formatting
   rustfmt:
@@ -69,7 +72,9 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Apply clippy lints
-      run: cargo hack clippy --each-feature --exclude-no-default-features --exclude-features tls-rustls-aws-lc-rs,tls-rustls-aws-lc-rs-fips
+      run: cargo hack clippy --each-feature --exclude-no-default-features --exclude-features quic,tls-rustls-aws-lc-rs,tls-rustls-aws-lc-rs-fips
+    - name: Clippy the quic transport with an explicit crypto provider
+      run: cargo clippy -p viewstamp-proto --no-default-features --features quic,tls-rustls-ring
 
   # Run tests on some extra platforms
   cross:
@@ -161,7 +166,9 @@ jobs:
         path: ~/.cargo
         key: ${{ runner.os }}-coverage-dotcargo
     - name: Run build
-      run: cargo hack build --feature-powerset --exclude-no-default-features --exclude-features tls-rustls-aws-lc-rs,tls-rustls-aws-lc-rs-fips
+      run: cargo hack build --feature-powerset --exclude-no-default-features --exclude-features quic,tls-rustls-aws-lc-rs,tls-rustls-aws-lc-rs-fips
+    - name: Build the quic transport with an explicit crypto provider
+      run: cargo build -p viewstamp-proto --no-default-features --features quic,tls-rustls-ring
 
   test:
     name: test
@@ -195,7 +202,9 @@ jobs:
         path: ~/.cargo
         key: ${{ runner.os }}-coverage-dotcargo
     - name: Run test
-      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features tls-rustls-aws-lc-rs,tls-rustls-aws-lc-rs-fips
+      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features quic,tls-rustls-aws-lc-rs,tls-rustls-aws-lc-rs-fips
+    - name: Test the quic transport with an explicit crypto provider
+      run: cargo test -p viewstamp-proto --no-default-features --features quic,tls-rustls-ring
 
   coverage:
     name: coverage
