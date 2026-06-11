@@ -9,16 +9,23 @@ ignore:
 
 coverage:
   status:
+    # Coverage is measured for viewstamp-proto only (the CI coverage job runs tarpaulin -p
+    # viewstamp-proto: instrumenting the whole workspace's VOPR sweep times out), so the statuses
+    # are scoped to the measured crate — a diff outside it has no coverage signal to gate on.
     project: # Overall project status
       default:
         target: auto
         if_not_found: success
         only_pulls: false
+        paths:
+          - "viewstamp-proto/"
     patch: # Status for the patch in pull requests
       default:
         target: auto
         if_not_found: success
         only_pulls: true
+        paths:
+          - "viewstamp-proto/"
     changes: false # Whether to comment on the coverage changes in pull requests
 
 comment:
