@@ -149,7 +149,12 @@ pub struct CompioStreamDriver<S, R, W, B> {
   /// liveness) — so a redial while accepted conns hold the cap can exceed it transiently, by at
   /// most the missing-mesh count. The constructor refuses a max_conns below TWICE the peer count (the
   /// mutual-dial mesh needs a dialed and an accepted conn per peer), so the full mesh — both
-  /// directions — fits the cap with the startup dials in place.
+  /// directions — fits the cap with the startup dials in place, and at the cap a fresh accept
+  /// EVICTS the oldest unvalidated accepted conn (validated and dialed conns never evict), so
+  /// unvalidated sockets cannot durably deny a mesh socket admission. Outside the guarantee: a
+  /// sustained accept flood arriving faster than handshakes complete can thrash the in-flight
+  /// handshakes themselves — on the cluster-private network this transport requires, that is the
+  /// operator's flood to stop, not an admission-policy problem.
   conns: HashMap<ConnId, Conn>,
   /// Closes counted by [`CloseCause`] (indexed by [`CloseCause::index`]): the coordinator's
   /// internal closes as drained by [`Self::reconcile_closed_conns`], plus the driver's own
@@ -565,21 +570,41 @@ where
       }
 
       if let Some((stream, _addr)) = accepted {
-        // Admission control: at the live-connection cap, DROP the accepted socket (let `stream` fall
-        // out of scope → the socket closes) without registering, so an accept flood cannot grow
-        // `conns` + the coordinator router without bound. Below the cap, register + bridge it: the
-        // Labeled handshake authenticates the real peer, so the registration `peer` is only a
-        // placeholder hint (the router rebinds it on validation), and the `auth_deadline` reaps it if
-        // it never validates.
+        // Admission control: at the live-connection cap, EVICT the oldest unvalidated ACCEPTED
+        // conn in favor of the fresh socket. An inbound mesh socket arrives unvalidated by
+        // construction (the Labeled handshake is what authenticates a cluster peer), so dropping
+        // fresh accepts while earlier junk squats the table would make mesh formation depend on
+        // the auth-deadline reap's timing; eviction is that same reap, demand-driven. Validated
+        // (cluster-authenticated) and dialed conns are never evicted — junk displaces only other
+        // junk or a not-yet-validated handshake (the oldest in flight) — and the constructor's twice-the-peers floor
+        // sizes the cap so the mesh's own conns always fit. Only when every slot holds a
+        // validated-or-dialed conn is the fresh accept dropped instead (let `stream` fall out of
+        // scope → the socket closes), so an accept flood still cannot grow `conns` + the
+        // coordinator router without bound.
         if self.conns.len() >= self.cfg.max_conns() {
           self.close_counts[CloseCause::AcceptCapacity.index()] += 1;
-          drop(stream);
-        } else {
+          // Disjoint-fields borrow (as in `reconcile_auth_deadlines`): `is_conn_validated`
+          // borrows `&self.coord` while iterating `&self.conns`; the pick is closed after.
+          let evict = self
+            .conns
+            .iter()
+            .filter(|(id, c)| {
+              c.auth_deadline.is_some() && c.redial.is_none() && !self.coord.is_conn_validated(**id)
+            })
+            .min_by_key(|(_, c)| c.auth_deadline)
+            .map(|(&id, _)| id);
+          if let Some(id) = evict {
+            self.close_conn(id, now);
+          }
+        }
+        if self.conns.len() < self.cfg.max_conns() {
           let conn = (self.acceptor)();
           let id = self
             .coord
             .register_accepted(Peer::Replica(ReplicaId::new(0)), conn);
           self.spawn_bridge_accepted(now, id, stream);
+        } else {
+          drop(stream);
         }
       }
       // Any outbound bytes the just-handled command/inbound/dial/accept queued (a submitted request,
