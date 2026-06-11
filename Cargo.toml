@@ -5,6 +5,9 @@ members = [
   "viewstamp-reactor",
   "viewstamp-simulation",
 ]
+# The fuzz harness is its own nested workspace (nightly + libFuzzer instrumentation); keep it out
+# of the stable workspace and its feature-powerset sweeps.
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -13,6 +16,13 @@ bytes = { version = "1", default-features = false }
 derive_more = { version = "2", default-features = false }
 thiserror = { version = "2", default-features = false }
 smol_str = "0.3"
+compio = { version = "0.19", default-features = false }
+flume = { version = "0.12", default-features = false, features = ["async"] }
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+viewstamp-simulation = { path = "viewstamp-simulation", version = "0.0.0" }
 
 [profile.bench]
 opt-level = 3

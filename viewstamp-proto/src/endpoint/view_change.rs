@@ -125,7 +125,9 @@ impl<S: StateMachine> Endpoint<S> {
     m: crate::StartViewChange,
   ) {
     let target = m.view();
-    if target.get() <= self.view.get() || target.get() > self.view.get() + 1 {
+    // `View::next()` saturates, so this comparison cannot overflow even at `view == u64::MAX`
+    // (where the first clause already rejects every possible target).
+    if target.get() <= self.view.get() || target.get() > self.view.next().get() {
       // stale (≤ our view), OR a jump beyond our immediate next view — do not drive an
       // unverified inflated target from a lone SVC; we catch up to a genuinely-higher view
       // via a real Prepare/Commit from its primary (the higher-view rule), not via SVCs.
@@ -232,7 +234,9 @@ impl<S: StateMachine> Endpoint<S> {
   /// higher-view `on_start_view` with a live pipeline, so they stay at the two ViewChange entries);
   /// `pending_sb` (overwritten by `submit_durable_view` in the two entries that issue a durable-view
   /// write, set `None` by `catch_up_to_view` which issues none); `recover` (only the adoption path
-  /// retires it); and the forward `arm_timers(now)` re-arm.
+  /// retires it); the forward `arm_timers(now)` re-arm; and `log_floor` (a MONOTONE vouched fact
+  /// about durable cluster checkpoints, not per-generation in-flight state — clearing it would
+  /// un-learn the floor the force-sync escalation needs after `peer_checkpoint` is dropped here).
   pub(crate) fn reset_for_view_transition(&mut self) {
     // SVC-collection bits for the OLD view (these stay flat — live in Normal too, see the struct
     // fields). The ViewChange-only DVC collection + catch-up discriminant are NOT touched here: they
@@ -250,21 +254,36 @@ impl<S: StateMachine> Endpoint<S> {
     self.appending.clear();
     // Drop stale per-replica checkpoint reports: the new generation re-establishes the pipeline, so
     // old-view reports must not gate the next primary's GC. A fresh primary rebuilds the map from
-    // incoming PrepareOk/Commit, staying conservative (unheard peers count as 0) until then.
+    // incoming PrepareOk/Commit, staying conservative (unheard peers count as 0) until then. The
+    // cleared reports are an input of the cached quorum-checkpoint statistic — recompute it.
     self.peer_checkpoint.clear();
+    self.recompute_quorum_checkpoint();
+    // Drop PROVISIONAL client-session rows (`last_op == 0`): accept-time / watermark-backfill rows are
+    // GENERATION-LOCAL — they exist only on the replica that minted them and are invisible to the
+    // deterministic eviction. An op they covered either SURVIVED into the new generation (its row is
+    // re-seeded by the new primary's backfill and becomes applied when the op applies, identically on
+    // every replica) or was truncated (the row must be forgotten, or a deposed primary that later
+    // leads again would dedup the client's re-mint of that request against a watermark for an op that
+    // never committed — a silent permanent drop). APPLIED rows (and restored snapshot rows) persist:
+    // they are the consensus table.
+    self.clients.retain(|_, s| s.last_op.get() > 0);
     // Supersede any in-flight checkpoint: a view change drops it (its stale superblock completion is
     // then ignored in on_sb_done). It re-triggers once Normal resumes — commit_min is preserved.
     self.pending_checkpoint = None;
     // Abandon any in-flight state-sync: a view change supersedes it (state-sync and view
-    // change are mutually exclusive by status — §2.6). The `sync` handshake and its DEFERRED INSTALL
-    // (`pending_install`) are cancelled TOGETHER: with durable-before-install the STAGE
+    // change are mutually exclusive by status — §2.6). The `sync` handshake, its DEFERRED INSTALL
+    // (`pending_install`), and any in-progress chunked transfer (`sync_transfer`) are cancelled
+    // TOGETHER: with durable-before-install the STAGE
     // never restored the SM, advanced `commit_min`/`op`, nor pruned the WAL, so this finds the OLD
     // (consistent, if stale) state intact — there is NO pruned-but-stale window. Dropping
-    // `pending_install` here also releases the staged snapshot bytes — and, gated by the
+    // `pending_install` here also releases the staged snapshot bytes (and the transfer drop its
+    // partially-assembled ones) — and, gated by the
     // `sync.is_some()` cleared alongside, the `on_sb_done` install arm can never fire against this
-    // cancelled sync (the `assert_invariants` `pending_install ⟹ sync` clause guards this pairing).
+    // cancelled sync (the `assert_invariants` `pending_install ⟹ sync` + `sync_transfer ⟹ sync`
+    // clauses guard this pairing).
     self.sync = None;
     self.pending_install = None;
+    self.sync_transfer = None;
     self.timers.sync_solicit = None;
     // A view change ends this primary generation: clear any forfeit grace timer AND any
     // deferred-forfeit flag (the safety step-down — see `maybe_force_sync`). The new generation
@@ -287,7 +306,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// contract). Resets the pipeline + quorums and defers the DoViewChange until the new view is durable.
   fn enter_view_change<B: Superblock>(&mut self, now: Instant, sb: &mut B, view_new: View) {
     self.view = view_new;
-    self.status = Status::ViewChange;
+    self.set_status(Status::ViewChange);
     self.svc_target = view_new; // collect future escalations above this view
     // Tear down ALL old-generation in-flight state in one place: SVC bits, in-flight
     // appends, peer-checkpoint reports, in-flight checkpoint, in-flight sync + its deferred install, and
@@ -308,51 +327,85 @@ impl<S: StateMachine> Endpoint<S> {
   /// Send our full log + position to the prospective primary of the current view.
   pub(crate) fn send_do_view_change(&mut self, _now: Instant) {
     let primary = self.config.primary(self.view);
+    let entries = self.log_entries();
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
-      Message::DoViewChange(crate::DoViewChange::new(
-        self.view,
-        self.log_view,
-        self.op,
-        // The DVC reports the KNOWN committed frontier `commit_max` — VSR's commit-number `k` (the
-        // highest op this replica KNOWS is committed), NOT the locally-applied `commit_min`.
-        // `select_canonical_log` takes `commit* = max(d.commit())`, so under-reporting
-        // commit_min would let a known-committed op (whose slot is a dropped repair hole on this
-        // replica) fall ABOVE `commit*` and be truncated as an uncommitted gap when the DVC quorum is
-        // this replica + a laggard. Reporting commit_max keeps `commit*` at/above it, so it is a
-        // COMMITTED hole the new primary HOLDS + peer-repairs (never silently dropped). Fail-stop-safe:
-        // a committed op N is held by a write-quorum, which intersects the DVC quorum, so some donor
-        // claims `op >= N` → `commit* (<= max commit_max == N) <= op_head` holds.
-        self.commit_max,
-        self.config.replica(),
-        self.log_entries(),
-      )),
+      Message::DoViewChange(
+        crate::DoViewChange::new(
+          self.view,
+          self.log_view,
+          self.op,
+          // The DVC reports the KNOWN committed frontier `commit_max` — VSR's commit-number `k` (the
+          // highest op this replica KNOWS is committed), NOT the locally-applied `commit_min`.
+          // `select_canonical_log` takes `commit* = max(d.commit())`, so under-reporting
+          // commit_min would let a known-committed op (whose slot is a dropped repair hole on this
+          // replica) fall ABOVE `commit*` and be truncated as an uncommitted gap when the DVC quorum is
+          // this replica + a laggard. Reporting commit_max keeps `commit*` at/above it, so it is a
+          // COMMITTED hole the new primary HOLDS + peer-repairs (never silently dropped). Fail-stop-safe:
+          // a committed op N is held by a write-quorum, which intersects the DVC quorum, so some donor
+          // claims `op >= N` → `commit* (<= max commit_max == N) <= op_head` holds.
+          self.commit_max,
+          self.config.replica(),
+          entries,
+        )
+        // The vouched floor of the carried log: every op this DVC omits at/below it is folded into a
+        // durable cluster checkpoint. `select_canonical_log` floors its union at the canonical
+        // generation's max of these, so a checkpoint-subsumed prefix never rides the view change.
+        .with_checkpoint_op(self.log_floor),
+      ),
     ));
   }
 
-  /// The in-memory log as wire entries — the OFFSET tail `(checkpoint_op .. op]` for a
+  /// The in-memory log as HEADER-ONLY wire entries — the OFFSET tail `(checkpoint_op .. op]` for a
   /// recover-from-checkpoint / state-synced replica (the committed prefix `[1..=checkpoint_op]` lives
   /// in the SM snapshot, not the cache), or dense `[1..=op]` for a replica that never checkpointed.
   /// `select_canonical_log` is offset-aware and UNIONs these across DVCs, so a DVC carrying only
   /// the offset tail loses no committed op at view change.
-  pub(crate) fn log_entries(&self) -> std::vec::Vec<crate::PreparedEntry> {
-    self
+  ///
+  /// **Every entry is emitted HEADER-ONLY (`Repairing`), carrying only the op's canonical
+  /// `(client, request, body_checksum)`, NOT its body bytes** — even an op this replica holds
+  /// `Present`. This is what keeps the three carriers that delegate here (`DoViewChange` /
+  /// `StartView` / `RecoveryResponse`) UNDER the transport frame cap regardless of the body sizes
+  /// of the uncheckpointed band: a header-only entry is a fixed 49 bytes, so the carrier size is
+  /// independent of the ops' bodies (a full-body carrier would overflow `MAX_FRAME_LEN` for large
+  /// ops — see [`crate::message::MAX_REQUEST_BODY_OVERHEAD`]). The adopter
+  /// installs each as a `Repairing` hole (its number TAKEN, never re-minted) and fetches the body via
+  /// the WINDOWED bulk-repair channel (`RequestPrepareRange` → `RepairBatch`) — which is what makes
+  /// header-only liveness-viable even for a deep band (the per-op repair path would need one round
+  /// trip per op and never converge in a calm window). `body_checksum()` is total — `fnv1a_128(bytes)`
+  /// for a `Present` body, the stored durable checksum for a `Repairing` slot — and is exactly what
+  /// `fill_repair` verifies the peer-supplied body against, so the canonical identity travels intact.
+  pub(crate) fn log_entries(&mut self) -> std::vec::Vec<crate::PreparedEntry> {
+    // Observability (non-vacuity): every DVC/StartView/RecoveryResponse log payload is built HERE,
+    // so counting at this chokepoint witnesses the header-only carrier path across all three.
+    self.header_only_carriers_emitted += 1;
+    let entries: std::vec::Vec<crate::PreparedEntry> = self
       .log
       .iter()
-      .map(|(&op, e)| match &e.body {
-        Body::Present(body) => {
-          crate::PreparedEntry::new(OpNumber::with(op), e.client, e.request, body.clone())
-        }
-        // A body-`Repairing` header-only entry (a kept body-faulty committed op awaiting peer-repair)
-        // is carried through the view change as a header-only `PreparedEntry`: its EXISTENCE +
-        // canonical identity (client, request, body_checksum) travel in the DVC so the new primary
-        // sees the op as TAKEN (never re-mints its number) and adopts it repair-pending, fetching the
-        // body from a peer that holds it.
-        Body::Repairing(checksum) => {
-          crate::PreparedEntry::repairing(OpNumber::with(op), e.client, e.request, *checksum)
-        }
+      .map(|(&op, e)| {
+        crate::PreparedEntry::repairing(
+          OpNumber::with(op),
+          e.client,
+          e.request,
+          e.body.body_checksum(),
+        )
       })
-      .collect()
+      .collect();
+    // Correct-by-construction backstop: a header-only band must fit the transport frame cap. The
+    // `(checkpoint_op .. op]` band depth is bounded by the WAL/checkpoint geometry (`~6 * checkpoint_ops
+    // + headroom`), and `MAX_CHECKPOINT_OPS` is capped so that worst case stays at/below
+    // `MAX_HEADER_ONLY_BAND_DEPTH` (see `crate::config::MAX_CHECKPOINT_OPS`). This asserts the realized
+    // count against that bound, catching a bounded-WAL embedder that sized `capacity()` beyond the `~6 *`
+    // geometry the cap assumes (so an over-cap carrier trips here in tests + the VOPR, rather than being
+    // silently dropped by the transport's frame guard on the send path).
+    debug_assert!(
+      entries.len() <= crate::message::MAX_HEADER_ONLY_BAND_DEPTH,
+      "header-only view-change band of {} entries exceeds the frame-fitting bound {} — checkpoint_ops \
+       and/or the WAL capacity are sized beyond the geometry MAX_CHECKPOINT_OPS assumes",
+      entries.len(),
+      crate::message::MAX_HEADER_ONLY_BAND_DEPTH,
+    );
+    entries
   }
 
   pub(crate) fn on_do_view_change<W: Wal, B: Superblock>(
@@ -380,6 +433,12 @@ impl<S: StateMachine> Endpoint<S> {
     if m.replica().get() >= self.config.replica_count() {
       return; // ignore malformed/out-of-range replica id
     }
+    // Record the donor's vouched checkpoint floor, mirroring the `PrepareOk`/`Commit` recording
+    // sites (monotone, range-checked above). This is what keeps the new primary's force-sync /
+    // GC-quorum floors fresh across the view transition that cleared `peer_checkpoint`: a sub-floor
+    // committed hole the floored union cannot carry must still cross `max_peer_checkpoint_op()` so
+    // the escalation fires (the donor's checkpoint proves a servable snapshot at/above it exists).
+    self.record_peer_checkpoint(m.replica().get(), m.checkpoint_op());
     // Ensure our own DVC is represented (keyed by replica → a self-addressed DVC is idempotent).
     // Compute the own-DVC into a local FIRST to avoid a self borrow conflict, then insert.
     let own = self.config.replica().get();
@@ -394,7 +453,9 @@ impl<S: StateMachine> Endpoint<S> {
         self.commit_max,
         self.config.replica(),
         self.log_entries(),
-      );
+      )
+      // The same vouched floor the wire DVC carries (`send_do_view_change`).
+      .with_checkpoint_op(self.log_floor);
       self.dvc_from_mut().insert(own, own_dvc);
     }
     // Keep the most-advanced DVC per replica.
@@ -413,14 +474,31 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// VSR canonical-log selection + nack-prepare truncation — **offset-aware**.
   ///
-  /// Returns `(canonical log truncated to op_head, op_head, commit*)`:
+  /// Returns `(canonical log spanning (floor* .. op_head], op_head, commit*, floor*)`:
   /// - the canonical generation is the DVCs with the greatest `log_view`;
   /// - `op_head` is that generation's head, less any provably-uncommitted tail truncated by a
   ///   `quorum_nack_prepare` of nacks (contiguous ⟹ replica `r` nacks op `X` iff `r.op < X`);
   /// - `commit*` is the greatest commit across all DVCs (commit never rewinds);
-  /// - the canonical log is the **UNION** of the canonical generation's entries up to `op_head` —
-  ///   each op is sourced from ANY canonical-generation DVC that holds it — NOT a copy of one DVC's
-  ///   `log_slice()`.
+  /// - `floor*` is the canonical generation's greatest vouched checkpoint floor
+  ///   (`max(d.checkpoint_op())`, capped at `commit*`): every op `<= floor*` is folded into a
+  ///   canonical donor's durable checkpoint, so it is committed AND snapshot-recoverable;
+  /// - the canonical log is the **UNION** of the canonical generation's entries in
+  ///   `(floor* .. op_head]` — each op is sourced from ANY canonical-generation DVC that holds it —
+  ///   NOT a copy of one DVC's `log_slice()`.
+  ///
+  /// **Why the floor.** Each donor's band is individually frame-gated (`band_at_capacity`), but the
+  /// UNION of two individually-valid OFFSET bands is not: a partitioned laggard (which never
+  /// state-syncs — every sync trigger requires RECEIVING a higher-checkpoint message) can be a
+  /// canonical donor with an ANCIENT band, and unioning it with the current donor's band yields a
+  /// canonical log near TWO band caps — whose re-emitted carrier (`log_entries()` →
+  /// `StartView`/`DoViewChange`/`RecoveryResponse`) exceeds `MAX_FRAME_LEN`, is dropped by the
+  /// transport, and wedges the view change. Dropping the checkpoint-subsumed prefix `<= floor*`
+  /// bounds the union: the donor holding `op_head` keeps `op - log_floor <= MAX_HEADER_ONLY_BAND_DEPTH`
+  /// (the carrier SPAN gate) and its advertised floor is `<= floor*`, so the union spans at most
+  /// `(floor* .. op_head]` ⊆ one gated span → every carrier fits the frame (the `debug_assert` below
+  /// freezes this). Every dropped op is `<= floor* <= commit*` — committed and durably APPLIED inside
+  /// a canonical donor's checkpoint snapshot — so the omission is the same never-a-silent-loss case
+  /// the coverage proof below covers, systematic for the sub-floor prefix.
   ///
   /// **Why the union.** A DVC log is the *offset tail*
   /// `(checkpoint_op .. op]` — a recover-from-checkpoint or state-synced donor holds only ops above
@@ -445,25 +523,36 @@ impl<S: StateMachine> Endpoint<S> {
   /// **Coverage / no-committed-op-dropped proof.** Let `floor_d = (min op in d.log) - 1` (or `d.op`
   /// if d's log is empty) be donor `d`'s present-floor, and `min_floor` the minimum over the
   /// canonical generation. The committed band the canonical log must cover for the worst (lowest-
-  /// floor) adopter is `(min_floor .. commit*]`. For each such op the union includes it iff SOME
-  /// canonical donor holds it. By quorum intersection a committed op was held by some current-DVC
-  /// sender, and the lowest-floor canonical donor `L` (with `floor_L == min_floor`) covers
-  /// `(min_floor .. op_L]`. If `op_L >= commit*`, `L` alone covers the whole band. In the residual
-  /// case where a committed op in `(min_floor .. commit*]` is held by NO canonical donor (the donor
-  /// that committed+checkpointed it past, plus a low-floor donor that lagged the tail), the union
-  /// omits it — but this is **never a silent loss**: the adopter's `advance_commit` HOLDS the commit
-  /// at the missing op and `request_repair`s it from a peer (the `RequestPrepare` → `Prepare`
-  /// safety net, mirroring TigerBeetle's `repair_prepares_between`). The adopt path is fixed to NOT
-  /// destroy a held copy and NOT clear that repair request (see `adopt_log` / `adopt_canonical_head`).
+  /// floor) adopter is `(min_floor .. commit*]`. For each such op ABOVE `floor*` the union includes
+  /// it iff SOME canonical donor holds it. By quorum intersection a committed op was held by some
+  /// current-DVC sender, and the lowest-floor canonical donor `L` (with `floor_L == min_floor`)
+  /// covers `(min_floor .. op_L]`. If `op_L >= commit*`, `L` alone covers the whole band above
+  /// `floor*`. An op the union omits is one of two cases, NEITHER a silent loss:
+  /// - **`op <= floor*` (the systematic, floored omission):** the op is folded into a canonical
+  ///   donor's durable checkpoint — committed AND applied inside a servable snapshot. The adopter's
+  ///   `advance_commit` HOLDS at the sub-floor hole and registers it for repair; `maybe_force_sync`
+  ///   then escalates to state-sync, because the hole is at/below a KNOWN peer checkpoint — the
+  ///   floor is learned from the DVCs themselves (`on_do_view_change` records each donor's
+  ///   `checkpoint_op`) and from the adopted carrier (`adopt_canonical_head` records + raises
+  ///   `log_floor` to the carried floor, which `max_peer_checkpoint_op` includes). After the sync
+  ///   the adopter's state reaches `floor*` and commit resumes.
+  /// - **`op > floor*` held by NO canonical donor** (the donor that committed+checkpointed it past,
+  ///   plus a low-floor donor that lagged the tail): the adopter's `advance_commit` HOLDS the commit
+  ///   at the missing op and `request_repair`s it from a peer (the `RequestPrepare` → `Prepare`
+  ///   safety net, mirroring TigerBeetle's `repair_prepares_between`). The adopt path is fixed to NOT
+  ///   destroy a held copy and NOT clear that repair request (see `adopt_log` / `adopt_canonical_head`).
+  ///
   /// So the SAFETY property — no committed op is ever dropped — holds: a committed op is present in
-  /// the union when any canonical donor holds it, and otherwise is repaired (commit blocks until
-  /// then), never skipped.
+  /// the union when any canonical donor holds it above `floor*`, and otherwise is repaired or
+  /// state-synced (commit blocks until then), never skipped.
   ///
   /// Run by the prospective primary once it holds `>= quorum_view_change` DoViewChange messages.
   /// NOTE: with exactly `quorum_view_change` DVCs the truncation loop provably never fires in the
   /// contiguous model (the head-holder is one of them); truncation activates only with a larger
   /// collected set. See the `no_truncation_at_minimal_quorum` test.
-  pub(crate) fn select_canonical_log(&self) -> (std::vec::Vec<crate::PreparedEntry>, u64, u64) {
+  pub(crate) fn select_canonical_log(
+    &mut self,
+  ) -> (std::vec::Vec<crate::PreparedEntry>, u64, u64, u64) {
     let dvcs: std::vec::Vec<&crate::DoViewChange> = self.dvc_from().values().collect();
     debug_assert!(!dvcs.is_empty(), "selection requires at least one DVC");
 
@@ -524,9 +613,33 @@ impl<S: StateMachine> Endpoint<S> {
       }
     }
 
-    // Build the canonical log by UNIONING the canonical generation's entries up to op_head: for each
-    // op, take its `PreparedEntry` from any canonical donor that holds it. A committed op present in a
-    // low-floor donor's offset log but absent from a higher-floor donor is therefore STILL included.
+    // The union FLOOR: the canonical generation's greatest vouched checkpoint floor. Every op
+    // `<= floor*` is folded into a canonical donor's durable checkpoint, so it is committed AND
+    // recoverable from a servable snapshot — it must NOT ride the view change (the union of two
+    // individually-frame-valid offset bands can otherwise exceed the frame — see the doc). Capped at
+    // `commit*` so a malformed DVC advertising a floor above its own commit can never floor away an
+    // op not vouched committed (for an honest donor `checkpoint_op <= commit_max`, so the cap is a
+    // no-op).
+    let floor_star = canonical
+      .iter()
+      .map(|d| d.checkpoint_op().get())
+      .max()
+      .unwrap_or(0)
+      .min(commit_star);
+    // Observability (non-vacuity): does this selection's floor actually DROP a carried entry — some
+    // canonical donor holds an op `<= floor*` that the union below excludes (op numbers start at 1,
+    // so a floor of 0 never matches)? A selection whose floor sits below every carried op is not
+    // counted (the floor did no work there). The counter increment is deferred below the merge loop,
+    // past the last use of the `dvc_from()` borrows.
+    let floored_union = canonical
+      .iter()
+      .flat_map(|d| d.log_slice())
+      .any(|e| e.op().get() <= floor_star);
+
+    // Build the canonical log by UNIONING the canonical generation's entries in (floor* .. op_head]:
+    // for each op, take its `PreparedEntry` from any canonical donor that holds it. A committed op
+    // present in a low-floor donor's offset log but absent from a higher-floor donor is therefore
+    // STILL included (the floor drops only the checkpoint-subsumed prefix `<= floor*`).
     // The BTreeMap keys by op so the result is ordered+gapless-where-present. A `Repairing`
     // (header-only) entry COUNTS as the op being present — its existence is what stops the op number
     // being re-minted — but when BOTH a `Present` and a `Repairing` entry exist for the same op
@@ -538,7 +651,7 @@ impl<S: StateMachine> Endpoint<S> {
     let mut merged: BTreeMap<u64, crate::PreparedEntry> = BTreeMap::new();
     for d in &canonical {
       for entry in d.log_slice() {
-        if entry.op().get() <= op_head {
+        if entry.op().get() > floor_star && entry.op().get() <= op_head {
           match merged.entry(entry.op().get()) {
             std::collections::btree_map::Entry::Vacant(v) => {
               v.insert(entry.clone());
@@ -555,7 +668,24 @@ impl<S: StateMachine> Endpoint<S> {
       }
     }
     let log: std::vec::Vec<crate::PreparedEntry> = merged.into_values().collect();
-    (log, op_head, commit_star)
+    if floored_union {
+      self.unions_floored += 1;
+    }
+    // THE BOUND the floor exists for: the floored union fits ONE header-only carrier. The donor
+    // holding `op_head` kept `op - log_floor <= MAX_HEADER_ONLY_BAND_DEPTH` (the carrier SPAN gate on
+    // every head-growth path) and advertised `checkpoint_op == its log_floor <= floor*`, so the union
+    // — distinct ops in `(floor* .. op_head]` — has at most `op_head - floor*` entries, within one
+    // gated span. (Holds for honest donors; a recovered replica whose pre-crash adoption floor was
+    // not yet made durable can transiently exceed its span until it re-learns the floor + syncs, so
+    // this stays a debug assert, not a release fail-stop.)
+    debug_assert!(
+      log.len() <= crate::message::MAX_HEADER_ONLY_BAND_DEPTH,
+      "floored canonical union of {} entries exceeds the frame-fitting bound {} — a donor's carrier \
+       span outran its advertised checkpoint floor",
+      log.len(),
+      crate::message::MAX_HEADER_ONLY_BAND_DEPTH,
+    );
+    (log, op_head, commit_star, floor_star)
   }
 
   /// Adopt the canonical log from the DVC quorum and become the active primary.
@@ -576,11 +706,16 @@ impl<S: StateMachine> Endpoint<S> {
       self.pending_checkpoint.is_none(),
       "no checkpoint may be logically in flight when forming a new primary's view"
     );
-    // Offset-aware canonical-log selection (UNION) + nack-prepare truncation (see
-    // `select_canonical_log`). The canonical log is the offset tail `(min_floor .. op_head]`, NOT
-    // necessarily dense `[1..=op_head]`.
-    let (canonical_log, op_head, commit_star) = self.select_canonical_log();
-    self.adopt_log(&canonical_log);
+    // Offset-aware canonical-log selection (UNION, floored at the canonical generation's vouched
+    // checkpoint floor) + nack-prepare truncation (see `select_canonical_log`). The canonical log is
+    // the offset tail `(floor* .. op_head]`, NOT necessarily dense `[1..=op_head]`.
+    let (canonical_log, op_head, commit_star, floor_star) = self.select_canonical_log();
+    // The union floor is now this primary's vouched log floor: a canonical donor's durable
+    // checkpoint covers every op `<= floor*` the floored log omits. Raised BEFORE `advance_commit`
+    // below, so the force-sync floor (`max_peer_checkpoint_op` includes `log_floor`) already crosses
+    // any sub-floor hole the moment it is registered.
+    self.raise_log_floor(OpNumber::with(floor_star));
+    self.adopt_log(&canonical_log, floor_star);
     self.op = OpNumber::with(op_head);
     // Retire any pending-repair holes the adopted canonical log NOW supplies; leave the rest (a
     // committed op held by no canonical donor) for `advance_commit` below to re-`request_repair` from
@@ -667,10 +802,15 @@ impl<S: StateMachine> Endpoint<S> {
     //
     // NOTE: we do NOT reconstruct the cached *reply* body here, so a client whose prior-view reply
     // was LOST relies on the in-flight op re-committing; the lost-reply resend is liveness under loss.
-    for op in 1..=self.op.get() {
-      let Some((client, request)) = self.log.get(&op).map(|e| (e.client.get(), e.request)) else {
-        continue;
-      };
+    // Only HELD entries contribute (an absent op adds nothing), so iterate the retained log —
+    // bounded by the band — rather than probing every op number since genesis: at a high floor a
+    // dense `1..=op` probe burns minutes inside new-primary formation while peers' view-change
+    // escalation cadence turns the stall into a livelock.
+    for (client, request) in self
+      .log
+      .range(..=self.op.get())
+      .map(|(_, e)| (e.client.get(), e.request))
+    {
       let session = self.clients.entry(client).or_default();
       if request.get() > session.request.get() {
         session.request = request;
@@ -679,7 +819,12 @@ impl<S: StateMachine> Endpoint<S> {
 
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = self.view;
-    self.status = Status::Normal;
+    self.set_status(Status::Normal);
+    // Observability: the new view is FORMED on this replica (the canonical log is selected and it is
+    // resuming Normal as the view's primary). Scalar copy only.
+    self
+      .events
+      .push_back(Event::ViewChanged(crate::ViewChanged::new(self.view, true)));
     // ViewChange EXIT: the canonical log has been formed and we are returning to Normal as the new
     // primary, so retire the ViewChange-only collection (DVC quorum + catch-up discriminant) to `None`
     // — the `view_change.is_some() == is_view_change()` coupling. (Previously a `dvc_quorum = true`
@@ -741,17 +886,25 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.repair_or_truncate = Some(now + REPAIR_OR_TRUNCATE_GRACE);
     }
 
-    // Rebuild the pipeline for the uncommitted tail `(commit_min, op]`. The new primary
+    // Rebuild the pipeline for the genuinely-uncommitted tail `(commit_max .. op]`. The new primary
     // must NOT count its own vote for an op it adopted from a peer's DVC and holds ONLY in memory —
     // that would let it commit (and on crash+recover lose) an op it never durably appended. So seed
     // each inflight entry with `oks: 0` and durably (re-)append the adopted op tagged `AdoptVote`; the
     // own vote is set in `on_wal_done` ONLY once that append lands (append-before-ack — the same
     // discipline `on_request`/`on_prepare` use). `try_commit` (deferred to `start_view_participate`
-    // after the durable-view write) then counts only votes whose appends are durable. Committed ops
-    // `<= commit_star` are NOT re-appended: the cluster already guarantees them; only the voted-on
-    // uncommitted tail must be re-driven through the WAL.
+    // after the durable-view write) then counts only votes whose appends are durable.
+    //
+    // Committed ops `<= commit_max` (== `commit_star` here, just raised by `advance_commit`) are NOT
+    // re-appended: the cluster already guarantees them, they owe no vote, and where this primary is HELD
+    // at a committed repair hole below `commit_max` (the header-only adoption case), that committed band
+    // is repaired via the windowed bulk-repair channel (a filled `RepairFill` casts the own vote in
+    // `on_wal_done` only for the UNCOMMITTED-tail case, `op > commit_max`). Starting the loop at
+    // `commit_max + 1` rather than `commit_min + 1` is load-bearing for a deep-laggard new primary: a
+    // `commit_min` lower bound would re-append the ENTIRE committed band it already holds `Present` as
+    // redundant `AdoptVote` appends — hundreds of them — flooding the WAL and starving the repair fills
+    // that actually advance the commit (the liveness wedge a deep header-only adoption otherwise hits).
     self.inflight.clear();
-    for op in (self.commit_min.get() + 1)..=self.op.get() {
+    for op in (self.commit_max.get() + 1)..=self.op.get() {
       // Content-address this adopted op's votes by the OPERATION IDENTITY (client, request, body) the
       // primary is driving. The op is present in `self.log` here (the gap-truncation above dropped any
       // op the union could not carry), so its `(client, request, body_checksum)` is total: a `Present`
@@ -796,34 +949,56 @@ impl<S: StateMachine> Endpoint<S> {
     // HOLDS at the `Repairing`/missing hole (the apply loop never applies an op it does not hold) and
     // peer-repairs it. `commit_max <= self.op` here (`commit_max == commit_star <= op_head == self.op`
     // by `select_canonical_log`'s fail-stop), so a receiver's `commit <= op` adopt guard holds.
+    let entries = self.log_entries();
     self.emit(Outgoing::new(
       Recipient::Backups,
-      Message::StartView(crate::StartView::new(
-        self.view,
-        self.op,
-        self.commit_max,
-        self.config.replica(),
-        self.log_entries(),
-      )),
+      Message::StartView(
+        crate::StartView::new(
+          self.view,
+          self.op,
+          self.commit_max,
+          self.config.replica(),
+          entries,
+        )
+        // The vouched floor of the broadcast canonical log (raised to the union's floor* during
+        // `start_view_as_new_primary`): a backup below it trims its own sub-floor band and records
+        // the floor, so its force-sync escalation can recover the sub-floor gap from a snapshot.
+        .with_checkpoint_op(self.log_floor),
+      ),
     ));
 
     self.arm_timers(now);
     self.try_commit(now, sb);
   }
 
-  /// Adopt the canonical (`entries`) log for a view whose committed frontier is `commit`.
+  /// Adopt the canonical (`entries`) log for a view whose committed frontier is `commit`, floored at
+  /// the vouched checkpoint floor `floor`.
   ///
-  /// The canonical log is now built by UNIONING the canonical generation (see
-  /// `select_canonical_log`) and is the offset tail `(min_floor .. op_head]` — it is NOT necessarily
+  /// The canonical log is built by UNIONING the canonical generation (see
+  /// `select_canonical_log`) and is the offset tail `(floor .. op_head]` — it is NOT necessarily
   /// dense `[1..=op]`, and it may even OMIT a committed op held by NO canonical donor. So adoption
   /// must be **defensive**: it preserves any *committed* op the adopter already holds (in
-  /// `(.. =commit]`) that `entries` does not supply, rather than blindly clearing the log and
+  /// `(floor .. commit]`) that `entries` does not supply, rather than blindly clearing the log and
   /// destroying the adopter's own durable copy of a committed op. Held *uncommitted* ops (above
   /// `commit`) are governed solely by the canonical tail (a nack-truncated / lower-generation tail
   /// must not be resurrected from a stale local copy), so they are dropped; the canonical entries
-  /// then overwrite/insert authoritatively. A committed op that neither side supplies is left for
-  /// `advance_commit` to `request_repair` from a peer (it is never silently skipped).
-  fn adopt_log(&mut self, entries: &[crate::PreparedEntry]) {
+  /// then overwrite/insert authoritatively.
+  ///
+  /// **The floor trim.** Retained own entries `<= floor` are dropped too — the same in-memory trim
+  /// `run_gc`/`trim_log_to_checkpoint` performs at the OWN `checkpoint_op`, applied at adoption time
+  /// with the CANONICAL floor: every such op is folded into a durable cluster checkpoint (the
+  /// caller's floor is donor-vouched), so the drop is a cache eviction with a servable snapshot
+  /// behind it, never a loss. Without it a laggard adopter would keep its ancient band ALONGSIDE the
+  /// adopted one, and its own next re-emitted carrier (`log_entries()` → DVC/StartView/
+  /// RecoveryResponse) would span two bands — over the frame. The trim touches ONLY the adopter's
+  /// retained entries, never a supplied one (`entries` are inserted unconditionally below), and only
+  /// the in-memory cache — the WAL keeps its slots (a crash re-reads them; the post-adoption
+  /// force-sync's `install_sync` prunes them once the snapshot lands). A committed op that neither
+  /// side supplies is left for
+  /// `advance_commit` to `request_repair` from a peer (it is never silently skipped) — or, below the
+  /// floor, to the force-sync escalation (`maybe_force_sync`, whose floor the caller raises
+  /// `log_floor` to cover).
+  fn adopt_log(&mut self, entries: &[crate::PreparedEntry], floor: u64) {
     let supplied: std::collections::BTreeSet<u64> = entries.iter().map(|e| e.op().get()).collect();
     // Preserve ONLY the adopter's APPLIED prefix (`op <= self.commit_min`) that the canonical log
     // omits — those are committed ops the adopter has itself applied, so by VSR committed-op survival
@@ -870,9 +1045,13 @@ impl<S: StateMachine> Endpoint<S> {
       }
     }
     let applied_floor = self.commit_min.get();
+    // Committed-survival witness for the floor trim's boundary op: everything dropped by the
+    // `op > floor` clause is `<= floor`, folded into the donor-vouched durable checkpoint the caller
+    // floors at (the first clause of the shared proof, with the CANONICAL floor as the witness).
+    self.assert_committed_survives(floor, floor);
     self
       .log
-      .retain(|&op, _| op <= applied_floor && !supplied.contains(&op));
+      .retain(|&op, _| op > floor && op <= applied_floor && !supplied.contains(&op));
     for e in entries {
       // A `Present` canonical entry is adopted with its body held. A header-only `Repairing` entry is
       // adopted repair-pending (its `body_checksum` only) UNLESS the adopter already held the matching
@@ -912,7 +1091,15 @@ impl<S: StateMachine> Endpoint<S> {
     if m.replica() != self.config.primary(m.view()) {
       return; // must come from the view's primary
     }
-    self.adopt_canonical_head(now, sb, m.view(), m.op(), m.commit(), m.log_slice());
+    self.adopt_canonical_head(
+      now,
+      sb,
+      m.view(),
+      m.op(),
+      m.commit(),
+      m.checkpoint_op(),
+      m.log_slice(),
+    );
     self.truncate_wal_above_adopted_head(wal);
   }
 
@@ -959,6 +1146,10 @@ impl<S: StateMachine> Endpoint<S> {
   /// prefix lives in the SM, the committed tail in the (applied-preserved + adopted + repaired) log —
   /// the committed prefix is reconstructed end to end, with peer-repair as the backstop for any omitted
   /// committed op the adopter has not applied (never silently skipped, never filled from a stale local).
+  // The parameters are the carried head fields of ONE message (`view`/`op`/`commit`/`checkpoint_op`/
+  // `log` — both callers unpack the same accessors of a `StartView`/`RecoveryResponse`), so the arity
+  // mirrors the wire shape rather than an over-wide ad-hoc surface.
+  #[allow(clippy::too_many_arguments)]
   pub(crate) fn adopt_canonical_head<B: Superblock>(
     &mut self,
     now: Instant,
@@ -966,6 +1157,7 @@ impl<S: StateMachine> Endpoint<S> {
     view: View,
     op: OpNumber,
     commit: OpNumber,
+    checkpoint_op: OpNumber,
     log: &[crate::PreparedEntry],
   ) {
     assert!(
@@ -977,7 +1169,16 @@ impl<S: StateMachine> Endpoint<S> {
       "must not rewind below our committed op"
     );
     self.view = view;
-    self.adopt_log(log);
+    // The carried checkpoint floor, capped at the carried commit: only an op vouched COMMITTED (and
+    // checkpoint-subsumed) may be floored away (for an honest primary `checkpoint_op <= commit_max`,
+    // so the cap is a no-op — it only defangs a malformed floor above the commit).
+    let floor = checkpoint_op.get().min(commit.get());
+    // The carried floor is now this adopter's vouched log floor (a durable cluster checkpoint covers
+    // every op `<= floor` the carried log omits). Raised BEFORE `advance_commit` below, so the
+    // force-sync floor (`max_peer_checkpoint_op` includes `log_floor`) already crosses any sub-floor
+    // hole the moment the held commit registers it.
+    self.raise_log_floor(OpNumber::with(floor));
+    self.adopt_log(log, floor);
     self.op = op;
     // (The WAL is truncated to this adopted head by the caller — `on_start_view` /
     // `on_recovery_response` — via `truncate_wal_above_adopted_head`, dropping the uncommitted divergent
@@ -999,7 +1200,15 @@ impl<S: StateMachine> Endpoint<S> {
     self.advance_commit(now, sb, commit.get());
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = view;
-    self.status = Status::Normal;
+    self.set_status(Status::Normal);
+    // Observability: this replica ADOPTED the view's canonical head (a backup — the sender is the
+    // view's primary; `is_primary` is computed for totality). Scalar copy only.
+    self
+      .events
+      .push_back(Event::ViewChanged(crate::ViewChanged::new(
+        view,
+        self.config.is_primary(view),
+      )));
     // Tear down ALL old-generation in-flight state in one place: SVC bits (svc_from),
     // in-flight appends (pending/appending), peer-checkpoint reports, in-flight checkpoint, in-flight
     // state-sync + its deferred install (cancelled TOGETHER — adopting an authoritative canonical head
@@ -1011,6 +1220,16 @@ impl<S: StateMachine> Endpoint<S> {
     // unlike the two ViewChange entries — adoption preserves it (this is the real per-site asymmetry
     // the shared reset keeps out).
     self.reset_for_view_transition();
+    // Record a NON-ZERO carried floor as the sending primary's checkpoint report, mirroring
+    // `on_commit`'s recording of the primary's `Commit.checkpoint_op` (monotone; the caller verified
+    // the sender IS `config.primary(view)`). AFTER the shared reset — which just cleared
+    // `peer_checkpoint` — so the report survives into the new generation and a sub-floor adopter's
+    // `maybe_force_sync` floor (belt to `log_floor`'s braces) crosses its sub-floor holes from the
+    // first trigger. A zero floor carries no information and is skipped, keeping the freshly-reset
+    // map genuinely empty for a floor-less adoption.
+    if floor > 0 {
+      self.record_peer_checkpoint(self.config.primary(view).get(), OpNumber::with(floor));
+    }
     // ViewChange EXIT (adoption → Normal): retire the ViewChange-only collection (DVC + catch-up). The
     // shared reset above is bidirectional, so the `take`-to-`None` lives here. (`is_some() ==
     // is_view_change()` coupling.)
@@ -1033,8 +1252,8 @@ impl<S: StateMachine> Endpoint<S> {
     self.submit_durable_view(PendingSbAction::AdoptedStartView, sb);
   }
 
-  /// Runs once the adopted-StartView superblock write is durable: re-ack held uncommitted ops — but
-  /// only AFTER each is durably (re-)appended to the WAL.
+  /// Runs once the adopted-StartView superblock write is durable: re-ack held uncommitted-tail ops —
+  /// but only AFTER each is durably (re-)appended to the WAL.
   ///
   /// The adopted canonical entries lived only in the in-memory `self.log` (a `StartView` /
   /// `RecoveryResponse` installs them without a WAL write). Sending a `PrepareOk` for one before it is
@@ -1045,8 +1264,20 @@ impl<S: StateMachine> Endpoint<S> {
   /// AdoptAck append completes the new view is already persisted, so the `PrepareOk` never precedes
   /// EITHER its WAL append or the view write (no cross-view vote, no memory-only vote). A tail op the
   /// canonical log did not actually supply is not held, so `adopt_append` skips it and no ack is owed.
+  ///
+  /// **Re-appends ONLY the genuinely-uncommitted tail `(commit_max .. op]`, NOT the committed band
+  /// `(commit_min .. commit_max]`.** A committed op (`<= commit_max`) is already decided cluster-wide —
+  /// it owes NO `PrepareOk` (committed ops are not voted), and where this replica is HELD at a committed
+  /// repair hole below `commit_max` (the header-only adoption case), its committed band is repaired via
+  /// the windowed bulk-repair channel (`RequestPrepareRange` → `RepairBatch` → per-op `RepairFill`), NOT
+  /// re-appended here. Re-appending the whole `(commit_min .. op]` would, for a laggard held deep at the
+  /// first hole, re-append the ENTIRE committed band it already holds `Present` — flooding the WAL with
+  /// hundreds of redundant AdoptAck appends per view change and starving the repair fills that actually
+  /// advance the commit. Bounding the re-append to `(commit_max .. op]` keeps it at the pipeline-depth
+  /// tail it is meant to cover.
   pub(crate) fn start_view_acks<W: Wal>(&mut self, wal: &mut W) {
-    for op in (self.commit_min.get() + 1)..=self.op.get() {
+    let lo = self.commit_min.get().max(self.commit_max.get());
+    for op in (lo + 1)..=self.op.get() {
       self.adopt_append(wal, op, Pending::AdoptAck(OpNumber::with(op)));
     }
   }

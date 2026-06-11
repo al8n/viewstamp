@@ -5,7 +5,7 @@ use std::vec::Vec;
 
 use crate::{Instant, Peer};
 
-/// The outcome of feeding one transport read to a [`RecordIo`].
+/// The outcome of feeding one transport read to a `RecordIo`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant)]
 pub enum Intake {
   /// The input was fully consumed; the record layer made progress.
@@ -86,7 +86,7 @@ pub(crate) trait RecordIo: Sized {
 /// A pluggable per-socket record layer: raw passthrough, the cluster+identity handshake decorator,
 /// or the TLS record layer. A driver names `Conn<R: StreamTransport>` and constructs record layers
 /// through their public inherent constructors, but the byte-level I/O contract lives on the
-/// crate-internal [`RecordIo`] supertrait.
+/// crate-internal `RecordIo` supertrait.
 ///
 /// The trait is **sealed**: its supertrait `RecordIo` is `pub(crate)` and cannot be named outside
 /// this crate, so no out-of-crate type can implement `StreamTransport` (and none can call the

@@ -5,6 +5,14 @@ name: vopr
 # so this scans many more adversarial schedules than the committed 0..64 gate. It is heavier than the
 # per-PR CI, so it lives in its own workflow: nightly, and on demand with a configurable seed count.
 # The contiguous count is VOPR_SEEDS (default 1024); the pinned REGRESSION_SEEDS are always appended.
+#
+# Two lanes over the same range: the default schedule, and the same sweep with the unbounded-HOLD
+# network axis enabled (VOPR_HOLD=1 — messages held far past the repair-or-truncate grace, so a stale
+# vote can outlive its op's truncation + re-mint; the op-reuse class the content-addressed vote gate
+# rejects). Hold-enabled runs are their own deterministic baselines, so the hold lane scans a second
+# schedule family without disturbing the default lane's pinned schedules. (The committed per-PR gate
+# already runs a 16-seed hold sweep — vopr_hold_sweep_no_violations — with the axis force-enabled
+# programmatically; this lane is its wide nightly counterpart.)
 on:
   workflow_dispatch:
     inputs:
@@ -40,4 +48,53 @@ jobs:
       - name: Run VOPR sweep (release)
         env:
           VOPR_SEEDS: ${{ github.event.inputs.seeds || '1024' }}
+        run: cargo test --release -p viewstamp-simulation --test vopr vopr_sweep_no_violations -- --nocapture --exact
+
+  # The FULL deterministic simulation suite in RELEASE — every viewstamp-simulation test (the
+  # scenario gates, fault sweeps, checkpoint/state-sync/view-change suites, …), not just the vopr
+  # sweep. Release disables the debug-only checks (debug_assert!, overflow checks) the per-PR debug
+  # `test` job relies on, so this lane is what catches a release-only divergence: codegen-dependent
+  # behavior, an invariant enforced only by a debug_assert, timing thresholds. Nightly + on-demand,
+  # like the sweeps, because the full suite in release is too heavy for the per-PR path.
+  sim-release:
+    name: simulation suite (release, full)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-vopr-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-vopr-
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Run the full simulation suite (release)
+        run: cargo test --release -p viewstamp-simulation
+
+  vopr-hold:
+    name: vopr (release, wide seed sweep, hold axis on)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-vopr-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-vopr-
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Run VOPR sweep (release, hold axis enabled)
+        env:
+          VOPR_SEEDS: ${{ github.event.inputs.seeds || '1024' }}
+          VOPR_HOLD: "1"
         run: cargo test --release -p viewstamp-simulation --test vopr vopr_sweep_no_violations -- --nocapture --exact

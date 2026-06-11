@@ -364,6 +364,7 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
   // suffix applies at once.
   let (mut r, mut wal, mut sb) = recovering_with_hole(4, 2);
   while r.poll_message().is_some() {}
+  while r.poll_event().is_some() {}
   let now = Instant::ZERO;
   // Repeatedly learn commit up to the head; the hole at op 2 pins the applied frontier at op 1.
   for _ in 0..5 {
@@ -380,6 +381,16 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
       "commit pinned at the hole regardless of how far the primary's commit advances"
     );
   }
+  // The windowed solicit surfaced as an observability event: the hole band starts (and here ends —
+  // ops 3,4 are held Present, terminating the run) at op 2.
+  assert!(
+    core::iter::from_fn(|| r.poll_event()).any(|e| e
+      == Event::RepairStarted(crate::RepairStarted::new(
+        OpNumber::with(2),
+        OpNumber::with(2)
+      ))),
+    "the held commit's windowed repair solicit emits RepairStarted for the hole band"
+  );
   // One repair → the entire held suffix (2,3,4) applies in order (once the repaired append is durable —
   // the durability barrier).
   r.handle_message(

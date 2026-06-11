@@ -59,6 +59,25 @@ impl Faults {
   }
 }
 
+/// A GRAY-FAILURE delivery profile for one replica: its inter-replica messages still ARRIVE (this is
+/// NOT a partition), but each affected message picks up an extra seeded delay drawn uniformly from
+/// `[min_extra, max_extra]` on top of the base `latency + jitter`. `inbound`/`outbound` select which
+/// legs are degraded (a slow NIC/disk-stalled box can be slow to hear, slow to be heard, or both).
+/// The band is sized to sit BELOW the proto's liveness cadences (50 ms commit heartbeat, 200 ms
+/// idle view-change), so a slow replica is degraded-but-alive — late acks and late heartbeats, not a
+/// legitimate knockout — which is exactly the gray zone the timers/forfeit machinery must tolerate.
+#[derive(Debug, Clone, Copy)]
+pub struct SlowProfile {
+  /// Degrade messages DELIVERED TO this replica (it is slow to hear).
+  pub inbound: bool,
+  /// Degrade messages SENT BY this replica (it is slow to be heard).
+  pub outbound: bool,
+  /// The lower edge of the per-message extra-delay band.
+  pub min_extra: core::time::Duration,
+  /// The upper edge of the per-message extra-delay band (inclusive).
+  pub max_extra: core::time::Duration,
+}
+
 /// The virtual network: a queue of in-flight messages ordered by delivery time.
 #[derive(Debug, Default)]
 pub struct Network {

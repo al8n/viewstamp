@@ -530,17 +530,22 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     "replica 2 adopts the view-1 head"
   );
   // THE FIX'S EFFECT: replica 2 LEARNS op 3 is committed — `commit_max == 3` — even though it cannot
-  // APPLY it yet (the body is absent, so the commit is HELD at op 3 and it is a peer-repair hole). Before
+  // APPLY it yet (the body is absent, so the commit is HELD and op 3 is a peer-repair hole). Before
   // the fix the StartView advertised `commit_min` and replica 2's `commit_max` would stay at 2.
   assert_eq!(
     r2.commit_max,
     OpNumber::with(3),
     "replica 2 learns op 3 is committed (commit_max raised to the advertised committed frontier)"
   );
+  // The StartView log carrier is HEADER-ONLY: replica 2 adopts ALL of ops 1, 2, 3 as `Repairing`
+  // holes (their bytes peer-repaired after adoption), so the applied frontier HOLDS at the FIRST hole
+  // (op 1) — `commit() == 0` — and every band op is solicited via the windowed bulk-repair channel. The
+  // load-bearing safety fact this test pins: replica 2 LEARNS `commit_max == 3` (so op 3 stays in the
+  // committed band on the next view change), regardless of how far the apply frontier got.
   assert_eq!(
     r2.commit(),
-    OpNumber::with(2),
-    "but the commit is HELD at the body-absent op 3 (applied frontier stalls at the Repairing hole)"
+    OpNumber::with(0),
+    "the commit is HELD at the first body-absent op (header-only adoption — every band op is a hole)"
   );
   assert!(
     r2.has_repair_hole_for_test(3),
@@ -601,7 +606,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
   // Two laggards in an OLDER generation (log_view 0) at head op 2, commit 2: they nack op 3.
   selector.dvc_from_mut_for_test().insert(3, dvc(3, 0, 2, 2));
   selector.dvc_from_mut_for_test().insert(4, dvc(4, 0, 2, 2));
-  let (log, op_head, commit_star) = selector.select_canonical_log();
+  let (log, op_head, commit_star, _) = selector.select_canonical_log();
   // THE SAFETY PROPERTY: op 3 survives. `commit* >= 3` (replica 2 reported it committed), so op 3 is in
   // the committed band and the nack scan (which only truncates the UNCOMMITTED tail `> commit*`) cannot
   // cut it. Before the fix `commit*` would be 2 and op 3 — a COMMITTED op — would be truncated to op 2.
@@ -1259,7 +1264,7 @@ fn canonical_selection_prefers_highest_log_view_over_longer_log() {
   e.dvc_from_mut_for_test().insert(0, dvc(0, 2, 3, 1));
   e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 5, 1));
   e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 5, 1));
-  let (log, op_head, commit_star) = e.select_canonical_log();
+  let (log, op_head, commit_star, _) = e.select_canonical_log();
   assert_eq!(op_head, 3, "newest log_view wins, not the longer stale log");
   assert_eq!(log.len(), 3);
   assert_eq!(commit_star, 1);
@@ -1274,7 +1279,7 @@ fn nack_prepare_truncates_provably_uncommitted_tail() {
   e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 2, 2));
   e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 2, 2));
   e.dvc_from_mut_for_test().insert(3, dvc(3, 1, 2, 2));
-  let (log, op_head, _) = e.select_canonical_log();
+  let (log, op_head, _, _) = e.select_canonical_log();
   assert_eq!(op_head, 2, "ops 3..=5 had a nack quorum → truncated");
   assert_eq!(log.len(), 2);
 }
@@ -1287,7 +1292,7 @@ fn committed_ops_are_never_truncated() {
   e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 4, 4));
   e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 4, 4));
   e.dvc_from_mut_for_test().insert(3, dvc(3, 1, 4, 4));
-  let (log, op_head, commit_star) = e.select_canonical_log();
+  let (log, op_head, commit_star, _) = e.select_canonical_log();
   assert_eq!(commit_star, 4);
   assert_eq!(
     op_head, 4,
@@ -1304,7 +1309,7 @@ fn no_truncation_at_minimal_quorum() {
   e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 2));
   e.dvc_from_mut_for_test().insert(1, dvc(1, 1, 2, 2));
   e.dvc_from_mut_for_test().insert(2, dvc(2, 1, 2, 2));
-  let (_, op_head, _) = e.select_canonical_log();
+  let (_, op_head, _, _) = e.select_canonical_log();
   assert_eq!(
     op_head, 5,
     "no nack quorum possible at minimal quorum → no truncation"
@@ -1396,6 +1401,13 @@ fn backup_adopts_start_view() {
   assert_eq!(e.log_view(), View::with(1));
   assert_eq!(e.op(), OpNumber::with(2));
   assert_eq!(e.commit(), OpNumber::with(1)); // op 1 applied
+  // The adoption surfaced as an observability event: view 1, adopted as a BACKUP. (Status stayed
+  // Normal→Normal across the direct adoption, so no StatusChanged accompanies it here.)
+  assert!(
+    core::iter::from_fn(|| e.poll_event())
+      .any(|ev| ev == Event::ViewChanged(crate::ViewChanged::new(View::with(1), false))),
+    "adopting a StartView emits ViewChanged for the new view"
+  );
   // the PrepareOk for the held uncommitted op (op 2) is deferred until BOTH the new
   // view is durable AND op 2 is durably (re-)appended to the WAL (append-before-ack). Two sequential
   // storage steps: (1) the durable-view write completes → `start_view_acks` submits the WAL append;
@@ -1488,6 +1500,7 @@ fn no_old_generation_state_survives_a_view_transition() {
     View::with(1),
     OpNumber::with(1),
     OpNumber::with(0),
+    OpNumber::with(0),
     &[PreparedEntry::new(
       OpNumber::with(1),
       ClientId::new(7),
@@ -1560,12 +1573,29 @@ fn higher_view_prepare_triggers_get_view_catch_up() {
   );
   assert_eq!(e.status(), Status::Normal);
   assert_eq!(e.view(), View::with(1));
+  // The full transition arc surfaced as observability events, in order: the catch-up flipped status
+  // to ViewChange, the adoption flipped it back to Normal and reported the adopted view.
+  let events: std::vec::Vec<Event> = core::iter::from_fn(|| e.poll_event()).collect();
+  let transitions: std::vec::Vec<&Event> = events
+    .iter()
+    .filter(|ev| matches!(ev, Event::StatusChanged(_) | Event::ViewChanged(_)))
+    .collect();
+  assert_eq!(
+    transitions,
+    std::vec![
+      &Event::StatusChanged(Status::ViewChange),
+      &Event::StatusChanged(Status::Normal),
+      &Event::ViewChanged(crate::ViewChanged::new(View::with(1), false)),
+    ],
+    "the catch-up + adoption emit the status/view transition events in order"
+  );
 }
 
 #[test]
 fn normal_primary_answers_get_view_with_start_view() {
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  assert_eq!(e.header_only_carriers_emitted(), 0, "no carrier built yet");
   e.handle_message(
     Instant::ZERO,
     &mut wal,
@@ -1582,6 +1612,11 @@ fn normal_primary_answers_get_view_with_start_view() {
     }
   }
   assert!(saw_sv, "a Normal primary answers GetView with a StartView");
+  assert_eq!(
+    e.header_only_carriers_emitted(),
+    1,
+    "the StartView answer's log payload was built via the log_entries chokepoint (counted once)"
+  );
 }
 
 #[test]
@@ -2473,7 +2508,7 @@ fn canonical_selection_with_a_checkpoint_offset_log_is_safe() {
   e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 4));
   e.dvc_from_mut_for_test()
     .insert(1, dvc_offset(1, 1, 4, 5, 4));
-  let (log, op_head, commit_star) = e.select_canonical_log();
+  let (log, op_head, commit_star, _) = e.select_canonical_log();
   assert_eq!(
     op_head, 5,
     "the offset log does not shorten the canonical head"
@@ -2547,7 +2582,7 @@ fn canonical_selection_with_a_fully_checkpoint_synced_participant_is_safe() {
   e.dvc_from_mut_for_test().insert(0, dvc(0, 1, 5, 4));
   e.dvc_from_mut_for_test()
     .insert(1, dvc_offset(1, 1, 4, 4, 4)); // tail-empty synced participant
-  let (_log, op_head, commit_star) = e.select_canonical_log();
+  let (_log, op_head, commit_star, _) = e.select_canonical_log();
   assert_eq!(op_head, 5);
   assert_eq!(commit_star, 4);
   assert!(commit_star <= op_head);
@@ -2568,7 +2603,7 @@ fn select_canonical_log_unions_committed_ops_across_different_floor_dvcs() {
     .insert(0, dvc_offset(0, 1, 4, 10, 8)); // floor 4: holds 5,6,7,8,9,10
   e.dvc_from_mut_for_test()
     .insert(1, dvc_offset(1, 1, 8, 10, 8)); // floor 8: holds 9,10 only
-  let (log, op_head, commit_star) = e.select_canonical_log();
+  let (log, op_head, commit_star, _) = e.select_canonical_log();
   assert_eq!(op_head, 10, "canonical head is the generation's head");
   assert_eq!(commit_star, 8, "commit* is the greatest commit");
   // The committed band the union MUST cover: ops 5..=8 (above the lowest floor 4, up to commit*).
@@ -2611,7 +2646,7 @@ fn select_canonical_log_stitches_the_band_across_three_offset_donors() {
     .insert(1, dvc_offset(1, 1, 3, 6, 6));
   e.dvc_from_mut_for_test()
     .insert(2, dvc_offset(2, 1, 6, 8, 8));
-  let (log, op_head, commit_star) = e.select_canonical_log();
+  let (log, op_head, commit_star, _) = e.select_canonical_log();
   assert_eq!(op_head, 8);
   assert_eq!(commit_star, 8);
   let present: std::collections::BTreeSet<u64> = log.iter().map(|e| e.op().get()).collect();
@@ -2642,7 +2677,7 @@ fn select_canonical_log_bounds_a_dvc_claiming_a_huge_op() {
     .insert(2, dvc_claiming(2, 1, u64::MAX, 2, 3));
   // Must return PROMPTLY (no unbounded scan, no overflow panic) and bound op_head to the represented
   // log: the max op actually present across the canonical donors is 3, so op_head <= 3.
-  let (log, op_head, commit_star) = e.select_canonical_log();
+  let (log, op_head, commit_star, _) = e.select_canonical_log();
   assert!(
     op_head <= 3,
     "op_head must be bounded to the represented log (<= 3), not the claimed u64::MAX, got {op_head}"
@@ -2659,6 +2694,278 @@ fn select_canonical_log_bounds_a_dvc_claiming_a_huge_op() {
       "no fabricated entry above the represented log"
     );
   }
+}
+
+#[test]
+fn floored_union_of_two_frame_valid_offset_bands_fits_one_carrier() {
+  // THE UNION-OVERFLOW SCENARIO: two INDIVIDUALLY frame-valid header-only offset DVCs (disjoint deep
+  // bands, SAME log_view — the staggered case). Donor A is a partitioned laggard whose ancient band
+  // `(0 .. cap]` never state-synced (every sync trigger requires RECEIVING a higher-checkpoint
+  // message); donor B is the current replica, checkpointed at `x` with band `(x .. x+cap]`. Each
+  // band alone is at the gated maximum (`MAX_HEADER_ONLY_BAND_DEPTH` entries — its carrier fits the
+  // frame); their UNFLOORED union is ~2 bands ≈ twice the frame cap, which the new primary would
+  // adopt into `self.log` and re-emit as an UNSENDABLE StartView/DVC (the transport drops it → a
+  // wedged view change). The union floor `floor* = max(canonical checkpoint_op) = x` drops the
+  // checkpoint-subsumed prefix — A's entire ancient band is at/below B's durable checkpoint — so the
+  // floored union is B's band alone: one gated span, one frame.
+  use crate::message::{MAX_FRAME_LEN, MAX_HEADER_ONLY_BAND_DEPTH};
+  let cap = MAX_HEADER_ONLY_BAND_DEPTH as u64;
+  let x = cap + 1_000; // B's durable checkpoint; the bands are disjoint (A's head < x)
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+  let a = dvc_header_band(0, 1, 0, 0, cap, cap); // laggard: floor 0, ops 1..=cap
+  let b = dvc_header_band(1, 1, x, x, x + cap, x + cap); // current: floor x, ops x+1..=x+cap
+  // The PREMISE: each donor's carrier fits the frame, but a carrier of the unfloored union does not.
+  assert!(
+    Message::DoViewChange(a.clone()).encoded_len() <= MAX_FRAME_LEN as usize,
+    "donor A's band is individually frame-valid"
+  );
+  assert!(
+    Message::DoViewChange(b.clone()).encoded_len() <= MAX_FRAME_LEN as usize,
+    "donor B's band is individually frame-valid"
+  );
+  let unfloored: std::vec::Vec<PreparedEntry> = a
+    .log_slice()
+    .iter()
+    .chain(b.log_slice().iter())
+    .cloned()
+    .collect();
+  assert!(
+    Message::DoViewChange(DoViewChange::new(
+      View::with(11),
+      View::with(1),
+      OpNumber::with(x + cap),
+      OpNumber::with(x + cap),
+      ReplicaId::new(0),
+      unfloored,
+    ))
+    .encoded_len()
+      > MAX_FRAME_LEN as usize,
+    "the UNFLOORED union of the two bands exceeds the frame cap (the wedge being prevented)"
+  );
+  e.dvc_from_mut_for_test().insert(0, a);
+  e.dvc_from_mut_for_test().insert(1, b);
+  let (log, op_head, commit_star, floor_star) = e.select_canonical_log();
+  assert_eq!(op_head, x + cap);
+  assert_eq!(commit_star, x + cap);
+  assert_eq!(
+    floor_star, x,
+    "the union floor is the canonical generation's max vouched checkpoint"
+  );
+  assert!(
+    log.len() <= MAX_HEADER_ONLY_BAND_DEPTH,
+    "the floored union is within one band cap, got {} entries",
+    log.len()
+  );
+  assert!(
+    log.iter().all(|entry| entry.op().get() > x),
+    "every checkpoint-subsumed op (<= floor*) was dropped from the union"
+  );
+  assert_eq!(
+    log.len() as u64,
+    cap,
+    "the floored union is exactly B's band (nothing above the floor was lost)"
+  );
+  // The adopted carrier — the same header-only entries a real `log_entries()` re-emission ships
+  // (a `DoViewChange` here; it ties `RecoveryResponse` for the LARGEST carrier framing, so the
+  // `StartView` fits a fortiori). `encoded_len()` is pinned to `encode().len()` by the codec tests.
+  let carrier = Message::DoViewChange(
+    DoViewChange::new(
+      View::with(11),
+      View::with(1),
+      OpNumber::with(op_head),
+      OpNumber::with(commit_star),
+      ReplicaId::new(0),
+      log,
+    )
+    .with_checkpoint_op(OpNumber::with(floor_star)),
+  );
+  assert!(
+    carrier.encoded_len() <= MAX_FRAME_LEN as usize,
+    "the floored canonical carrier fits the frame: {} > {}",
+    carrier.encoded_len(),
+    MAX_FRAME_LEN
+  );
+}
+
+#[test]
+fn floored_union_keeps_a_committed_op_held_only_by_the_low_floor_donor() {
+  // SAFETY of the floor: the union drops ONLY ops `<= floor*` (checkpoint-subsumed at a canonical
+  // donor). An op in `(floor* .. commit*]` held by the LOW-floor donor but ABSENT from the
+  // high-floor donor (whose copy was, say, recovery-dropped — its log starts above its own durable
+  // checkpoint) MUST still ride the union. Donors (same log_view, head 10, commit 8):
+  //   r0: vouched floor 4, holds 5..=10  — the low-floor donor;
+  //   r1: vouched floor 6, holds 9,10    — its 7,8 are interior recovery losses (a log floor above
+  //       its advertised checkpoint — the span-exceeds-len shape).
+  // floor* = 6: ops 5,6 are dropped (subsumed by r1's checkpoint); ops 7,8 — committed, held ONLY
+  // by r0 — survive via the union.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
+  e.dvc_from_mut_for_test().insert(
+    0,
+    dvc_offset(0, 1, 4, 10, 8).with_checkpoint_op(OpNumber::with(4)),
+  );
+  e.dvc_from_mut_for_test().insert(
+    1,
+    dvc_offset(1, 1, 8, 10, 8).with_checkpoint_op(OpNumber::with(6)),
+  );
+  assert_eq!(
+    e.unions_floored(),
+    0,
+    "no selection has floored a union yet"
+  );
+  let (log, op_head, commit_star, floor_star) = e.select_canonical_log();
+  assert_eq!(op_head, 10);
+  assert_eq!(commit_star, 8);
+  assert_eq!(floor_star, 6);
+  assert_eq!(
+    e.unions_floored(),
+    1,
+    "this selection's floor dropped carried entries (ops 5,6) — the floored-union witness counts it"
+  );
+  let present: std::collections::BTreeSet<u64> = log.iter().map(|e| e.op().get()).collect();
+  for op in 7..=8u64 {
+    assert!(
+      present.contains(&op),
+      "committed op {op} in (floor* .. commit*], held only by the low-floor donor, must survive the floor"
+    );
+  }
+  assert!(
+    !present.contains(&5) && !present.contains(&6),
+    "ops at/below floor* are checkpoint-subsumed and do not ride the view change"
+  );
+  assert!(
+    present.contains(&9) && present.contains(&10),
+    "the head ops are present"
+  );
+}
+
+#[test]
+fn laggard_adopter_of_a_floored_start_view_trims_its_ancient_band_and_state_syncs_the_gap() {
+  // THE LAGGARD-ADOPTER LEG: a low-floor backup adopts a FLOORED canonical log (a StartView whose
+  // `checkpoint_op` floor is far above the adopter's applied frontier). Three properties:
+  //  (1) BOUNDED LOG: its own ancient applied band is trimmed at the carried floor (it is
+  //      checkpoint-subsumed at a canonical donor), so its own next re-emitted carrier is the
+  //      adopted band alone — never two bands;
+  //  (2) NOT SILENTLY LOST: the sub-floor gap holds the commit, and the next heartbeat-driven
+  //      `advance_commit` re-registers the hole and ESCALATES to a forced state-sync targeting the
+  //      carried floor (`log_floor`, raised at adoption, feeds `max_peer_checkpoint_op`);
+  //  (3) the re-emitted DVC carries exactly the adopted band — the adopter's own carrier stays
+  //      frame-bounded.
+  let mut e = Endpoint::new(
+    Config::try_new(1, ReplicaId::new(0), 3).unwrap(),
+    0,
+    CountSm::default(),
+  );
+  // The laggard's own ancient state: applied 1..=6 (commit_min == commit_max == 6), head 6, the
+  // band 1..=6 held Present, nothing checkpointed.
+  e.commit_min = OpNumber::with(6);
+  e.commit_max = OpNumber::with(6);
+  e.op = OpNumber::with(6);
+  for op in 1..=6u64 {
+    e.log.insert(
+      op,
+      LogEntry::present(
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&op.to_be_bytes()),
+      ),
+    );
+  }
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // The floored canonical StartView from view 1's primary: floor 600, band 601..=605 (head 605,
+  // commit 605). The adopter's whole world (1..=6) is below the floor.
+  let entries: std::vec::Vec<PreparedEntry> = (601..=605u64)
+    .map(|op| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&op.to_be_bytes()),
+      )
+    })
+    .collect();
+  let sv = StartView::new(
+    View::with(1),
+    OpNumber::with(605),
+    OpNumber::with(605),
+    ReplicaId::new(1),
+    entries,
+  )
+  .with_checkpoint_op(OpNumber::with(600));
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(sv),
+  );
+  assert_eq!(e.status(), Status::Normal, "adoption completes");
+  // (1) BOUNDED: the ancient band 1..=6 (<= floor 600) is trimmed; only the adopted band remains.
+  assert_eq!(
+    e.min_log_op(),
+    Some(601),
+    "the adopter's sub-floor ancient band is trimmed at the carried floor"
+  );
+  assert_eq!(e.log_len(), 5, "the log is exactly the adopted band");
+  // (2a) The gap is HELD, not skipped: nothing above the adopter's applied frontier has applied.
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(6),
+    "the commit holds below the sub-floor gap"
+  );
+  assert_eq!(
+    e.commit_max(),
+    OpNumber::with(605),
+    "the known-committed frontier is learned from the canonical head"
+  );
+  // Pump the durable-view write (start_view_acks has no uncommitted tail to re-ack here).
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  // (2b) The ESCAPE engages: a Commit heartbeat re-registers the sub-floor hole and the force-sync
+  // escalation fires — its floor includes the adoption-raised `log_floor`, so the hole at op 7
+  // (<= 600) escalates to a FORCED sync targeting the carried floor (a snapshot at/above it is
+  // vouched to exist at a canonical donor), instead of soliciting an unservable prepare forever.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Commit(crate::Commit::new(
+      View::with(1),
+      OpNumber::with(605),
+      OpNumber::new(),
+    )),
+  );
+  assert!(
+    e.sync_is_forced_for_test(),
+    "the sub-floor gap escalates to a FORCED state-sync (not an eternal futile RequestPrepare)"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(600),
+    "the forced sync targets the carried floor"
+  );
+  let mut solicited = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.into_msg(), Message::RequestSync(_)) {
+      solicited = true;
+    }
+  }
+  assert!(
+    solicited,
+    "the escalation broadcast a RequestSync for the vouched snapshot"
+  );
+  // (3) The re-emitted DVC carrier is the adopted band alone — the ancient band does not ride.
+  let dvc_entries = e.log_entries();
+  assert_eq!(
+    dvc_entries.len(),
+    5,
+    "the re-emitted carrier holds exactly the adopted band (no two-band union)"
+  );
+  assert!(
+    dvc_entries.iter().all(|en| en.op().get() > 600),
+    "no sub-floor entry rides the adopter's own carrier"
+  );
 }
 
 #[test]
@@ -2693,6 +3000,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
   // Hand-build the offset-backup state: checkpoint 4, applied through 6 (commit_min == commit_max == 6;
   // the [1..=6] prefix lives in the checkpoint, not the empty CountSm), head 8, offset tail 5..=8 held.
   e.checkpoint_op = OpNumber::with(4);
+  e.log_floor = OpNumber::with(4); // the coupling a real checkpoint advance maintains
   e.commit_min = OpNumber::with(6);
   e.commit_max = OpNumber::with(6);
   e.op = OpNumber::with(8);
@@ -2812,6 +3120,7 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
     CountSm::default(),
   );
   e.checkpoint_op = OpNumber::with(4);
+  e.log_floor = OpNumber::with(4); // the coupling a real checkpoint advance maintains
   e.commit_min = OpNumber::with(4);
   e.commit_max = OpNumber::with(4);
   e.op = OpNumber::with(8);
@@ -3287,7 +3596,7 @@ fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_gra
   selector.dvc_from_mut_for_test().insert(2, committed_donor);
   selector.dvc_from_mut_for_test().insert(3, dvc(3, 0, 1, 1)); // laggard, head op 1, nacks op 2
   selector.dvc_from_mut_for_test().insert(4, dvc(4, 0, 1, 1)); // laggard, head op 1, nacks op 2
-  let (log, op_head, commit_star) = selector.select_canonical_log();
+  let (log, op_head, commit_star, _) = selector.select_canonical_log();
   assert!(
     commit_star >= 2 && op_head >= 2,
     "across the second view change the committed op 2 stays in the band (commit* {commit_star}, op_head {op_head}) — never nack-truncated"
@@ -4169,6 +4478,562 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
   );
 }
 
+// ── Frame-fit: the header-only view-change carriers + the byte-bounded RepairBatch serve stay
+// under the transport frame cap regardless of body size (the symptom oracle for the header-only
+// carriers — a full-body carrier of the same band would overflow the frame by many MiB). ──
+
+#[test]
+fn large_bodied_view_change_carriers_and_repair_serve_fit_the_frame() {
+  use crate::message::{MAX_FRAME_LEN, PER_HEADER_ENTRY_BYTES, present_entry_encoded_len};
+
+  let cap = MAX_FRAME_LEN as usize;
+  // A fixture log of several ops, EACH with a body near half the frame cap. A full-body carrier of
+  // this band would be ~8 * 8 MiB = ~64 MiB — many times the 16 MiB frame — so the header-only
+  // carriers are the only thing that keeps it deliverable.
+  const ENTRIES: u64 = 8;
+  let big = cap / 2;
+  let body = bytes::Bytes::from(std::vec![0xABu8; big]);
+
+  // A Normal primary (replica 0 of 3) holding the band Present in its in-memory log, applied through
+  // its head — exactly the state a primary serves a DoViewChange / StartView / RepairBatch from.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  e.view = View::with(1);
+  e.log_view = View::with(1);
+  e.op = OpNumber::with(ENTRIES);
+  e.commit_min = OpNumber::with(ENTRIES);
+  e.commit_max = OpNumber::with(ENTRIES);
+  for op in 1..=ENTRIES {
+    e.log.insert(
+      op,
+      LogEntry::present(ClientId::new(7), RequestNumber::with(op), body.clone()),
+    );
+  }
+
+  // The REAL header-only carriers built through the production `log_entries()` (every entry emitted
+  // `Repairing`, body bytes dropped). Each entry is a fixed `PER_HEADER_ENTRY_BYTES` regardless of
+  // the op's body, so the whole band is ~`ENTRIES * 49 + carrier framing` — a few hundred bytes.
+  let entries = e.log_entries();
+  assert_eq!(entries.len() as u64, ENTRIES);
+  assert!(
+    entries.iter().all(|x| x.is_repairing()),
+    "log_entries() must carry every op header-only"
+  );
+  let dvc = Message::DoViewChange(crate::DoViewChange::new(
+    View::with(1),
+    View::with(1),
+    OpNumber::with(ENTRIES),
+    OpNumber::with(ENTRIES),
+    ReplicaId::new(0),
+    e.log_entries(),
+  ));
+  let sv = Message::StartView(StartView::new(
+    View::with(1),
+    OpNumber::with(ENTRIES),
+    OpNumber::with(ENTRIES),
+    ReplicaId::new(0),
+    e.log_entries(),
+  ));
+  let rr = Message::RecoveryResponse(crate::RecoveryResponse::new(
+    View::with(1),
+    OpNumber::with(ENTRIES),
+    OpNumber::with(ENTRIES),
+    ReplicaId::new(0),
+    0xC0FFEE,
+    e.log_entries(),
+  ));
+
+  // Each header-only carrier encodes far under the frame cap — and at a SIZE INDEPENDENT of body
+  // size: it is bounded by the fixed per-header-entry geometry, NOT the (~8 MiB each) bodies.
+  let header_band = ENTRIES as usize * PER_HEADER_ENTRY_BYTES;
+  for m in [&dvc, &sv, &rr] {
+    let n = m.encode().len();
+    assert!(
+      n <= cap,
+      "header-only {} must fit the frame cap: {n} > {cap}",
+      m.kind_str()
+    );
+    // ~fixed carrier framing + header_band, NOT the multi-MiB bodies. A generous bound that a
+    // full-body re-encoding (which would be > the cap) could never satisfy.
+    assert!(
+      n < header_band + 1024,
+      "{} is body-size-insensitive (header-only): {n} should be ~{header_band} + framing",
+      m.kind_str()
+    );
+  }
+  // The converse, in-line: a FULL-body carrier of the SAME band would overflow the frame by many
+  // MiB — exactly the overflow the header-only carriers exist to prevent. Build the same
+  // DoViewChange but with `Present` bodies and show it exceeds the cap.
+  let full_body_dvc = Message::DoViewChange(crate::DoViewChange::new(
+    View::with(1),
+    View::with(1),
+    OpNumber::with(ENTRIES),
+    OpNumber::with(ENTRIES),
+    ReplicaId::new(0),
+    (1..=ENTRIES)
+      .map(|op| {
+        PreparedEntry::new(
+          OpNumber::with(op),
+          ClientId::new(7),
+          RequestNumber::with(op),
+          body.clone(),
+        )
+      })
+      .collect(),
+  ));
+  assert!(
+    full_body_dvc.encode().len() > cap,
+    "a full-body DoViewChange of the same band MUST exceed the frame cap (the old, fixed bug)"
+  );
+
+  // The RepairBatch serve path: the windowed peer-repair answer is THE body carrier. Drive the
+  // real `on_request_prepare_range` over the whole large-bodied run and assert the produced batch is
+  // a BYTE-BOUNDED PREFIX under the frame cap that still makes forward progress (serves >= the first
+  // op). The serve self-gates on `Normal` + a durable view (`pending_sb.is_none()`); this endpoint is
+  // `Normal` with no view write in flight.
+  let now = Instant::ZERO;
+  e.on_request_prepare_range(
+    now,
+    crate::RequestPrepareRange::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(ENTRIES),
+      ReplicaId::new(1),
+    ),
+  );
+  let out = e
+    .poll_message()
+    .expect("the holder serves a RepairBatch for the solicited run");
+  let batch = match out.into_msg() {
+    Message::RepairBatch(b) => b,
+    other => panic!("expected a RepairBatch serve, got {other:?}"),
+  };
+  assert_eq!(
+    e.repair_batches_served(),
+    1,
+    "the non-empty serve is counted (the bulk-repair non-vacuity witness)"
+  );
+  let served = batch.log_slice().len();
+  assert!(
+    served >= 1,
+    "the byte-bounded serve must make forward progress — serve at least the first op"
+  );
+  // With each body ~half the frame, only the first op fits the per-frame budget (a second would
+  // push the running size past the cap), so the served prefix is strictly shorter than the run.
+  assert!(
+    (served as u64) < ENTRIES,
+    "a large-bodied run is served as a strict PREFIX, not the whole run (served={served})"
+  );
+  let encoded = Message::RepairBatch(batch.clone()).encode().len();
+  assert!(
+    encoded <= cap,
+    "the served RepairBatch must fit the frame cap: {encoded} > {cap}"
+  );
+  // The served prefix sits within a frame of the first served op's body — the byte-bounded budget at
+  // work (a single max-ish body plus framing, never the unbounded multi-op run).
+  assert!(
+    encoded <= present_entry_encoded_len(big) + 1024,
+    "the serve is byte-bounded to ~one body + framing, not the whole run: {encoded}"
+  );
+}
+
+// ── Serve-side window bound: `on_request_prepare_range` clamps the (untrusted) decoded `hi` to the
+// SAME window the requester solicits, so a buggy authenticated peer sending `hi:u64::MAX` against a
+// high-`self.op` sparse log forces only a `REPAIR_WINDOW`-bounded, frame-bounded answer — never
+// O(self.op) work nor an over-cap batch. ──
+
+#[test]
+fn repair_range_serve_clamps_a_huge_hi_to_the_window_against_a_sparse_high_op_log() {
+  use crate::message::MAX_FRAME_LEN;
+
+  let cap = MAX_FRAME_LEN as usize;
+  // A Normal primary (replica 0 of 3) with a HIGH head but a SPARSE log: it holds only a handful of
+  // Present ops at the low end of a `RequestPrepareRange`, then nothing for the (vast) remainder of a
+  // `u64::MAX` claimed run. A numeric `lo..=hi` walk would iterate billions of absent ops; the
+  // window clamp + `self.log.range` make the cost the present entries within one window only.
+  let head: u64 = 1_000_000;
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  e.view = View::with(1);
+  e.log_view = View::with(1);
+  e.op = OpNumber::with(head);
+  e.commit_min = OpNumber::with(head);
+  e.commit_max = OpNumber::with(head);
+  // Present ops only at `[lo, lo+SPARSE)` — a sparse low-end prefix of the solicited run; every other
+  // slot (including the whole window's tail and the billions above it) is a hole we do not hold.
+  let lo: u64 = 100;
+  const SPARSE: u64 = 5;
+  let body = bytes::Bytes::from(std::vec![0x33u8; 4096]);
+  for op in lo..lo + SPARSE {
+    e.log.insert(
+      op,
+      LogEntry::present(ClientId::new(7), RequestNumber::with(op), body.clone()),
+    );
+  }
+  // Also seed a Present op just ABOVE the window top: if the serve walked the requester's claimed
+  // `hi` (or even `self.op`) instead of the window, it could pull this op into the batch — it must NOT
+  // (a request for `[lo, lo+REPAIR_WINDOW)` is answered only within that window).
+  let above_window = lo + REPAIR_WINDOW + 10;
+  e.log.insert(
+    above_window,
+    LogEntry::present(
+      ClientId::new(7),
+      RequestNumber::with(above_window),
+      body.clone(),
+    ),
+  );
+
+  // Solicit with a MALICIOUSLY-HUGE `hi` (`u64::MAX`) — the untrusted decoded top.
+  let now = Instant::ZERO;
+  e.on_request_prepare_range(
+    now,
+    crate::RequestPrepareRange::new(
+      View::with(1),
+      OpNumber::with(lo),
+      OpNumber::with(u64::MAX),
+      ReplicaId::new(1),
+    ),
+  );
+  let out = e
+    .poll_message()
+    .expect("the holder serves a RepairBatch for the solicited low-end prefix");
+  let batch = match out.into_msg() {
+    Message::RepairBatch(b) => b,
+    other => panic!("expected a RepairBatch serve, got {other:?}"),
+  };
+  // Only the sparse low-end ops are served: the window-clamped scan never reached the op above the
+  // window (nor the billions of phantom ops up to the claimed `u64::MAX` head).
+  let served_ops: std::vec::Vec<u64> = batch.log_slice().iter().map(|e| e.op().get()).collect();
+  assert_eq!(
+    served_ops,
+    (lo..lo + SPARSE).collect::<std::vec::Vec<_>>(),
+    "the serve is bounded to the present ops WITHIN the window, not the claimed huge run"
+  );
+  assert!(
+    served_ops.iter().all(|&op| op < lo + REPAIR_WINDOW),
+    "no served op may lie at/above the window top {} (the op above the window must be excluded)",
+    lo + REPAIR_WINDOW
+  );
+  // And the produced batch is frame-bounded regardless of the huge claimed `hi`.
+  let encoded = Message::RepairBatch(batch).encode().len();
+  assert!(
+    encoded <= cap,
+    "the window-bounded serve must fit the frame cap even for a u64::MAX hi: {encoded} > {cap}"
+  );
+}
+
 // ── Sender-binding at ingress: a message's self-claimed sender must agree with the
 // authenticated `from`, or it is dropped. A non-Byzantine, cheap defense-in-depth backstop against a
 // buggy/misrouting driver (or a trivially-mislabeled message) spoofing a quorum vote. ──
+
+#[test]
+fn new_primary_session_backfill_over_a_floored_log_matches_the_dense_scan() {
+  // The new primary's session-watermark backfill iterates the RETAINED log (only held entries
+  // contribute — an absent op adds nothing), so over a high-floor canonical log it must produce
+  // exactly the table a dense `1..=op` probe of the same log would: the held band's per-client
+  // request maxima, and nothing else.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Into ViewChange for view 1 (replica 1 is its primary): the idle timeout proposes, r0's SVC
+  // completes the quorum.
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  // r2's DVC: a FLOORED canonical log — vouched checkpoint floor 10_000, holding ONLY ops
+  // 10_001..=10_005 (two clients alternating, request == op), commit 10_002. Everything below the
+  // floor is checkpoint-subsumed at the donor and rides no carrier.
+  let log: std::vec::Vec<PreparedEntry> = (10_001..=10_005u64)
+    .map(|op| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(1 + (op as u128 % 2)),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&op.to_be_bytes()),
+      )
+    })
+    .collect();
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(10_005),
+    OpNumber::with(10_002),
+    ReplicaId::new(2),
+    log,
+  )
+  .with_checkpoint_op(OpNumber::with(10_000));
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the new primary formed the view"
+  );
+  assert!(e.is_primary());
+  assert_eq!(
+    e.op(),
+    OpNumber::with(10_005),
+    "the floored head is adopted"
+  );
+  assert_eq!(
+    e.min_log_op(),
+    Some(10_001),
+    "nothing below the floor is held"
+  );
+  // The ORACLE: the dense numeric probe over `1..=op` of the SAME post-adoption log (`get` is
+  // `None` for every op below the floor, so only the held band contributes).
+  let mut expected: BTreeMap<u128, u64> = BTreeMap::new();
+  for op in 1..=e.op().get() {
+    if let Some(entry) = e.log.get(&op) {
+      let w = expected.entry(entry.client.get()).or_default();
+      *w = (*w).max(entry.request.get());
+    }
+  }
+  assert_eq!(
+    expected,
+    [(1u128, 10_004u64), (2u128, 10_005u64)]
+      .into_iter()
+      .collect(),
+    "sanity: the dense scan yields each client's held-band request maximum"
+  );
+  assert_eq!(
+    e.clients_len(),
+    expected.len(),
+    "the rebuilt session table has exactly the dense scan's clients"
+  );
+  for (client, request) in expected {
+    assert_eq!(
+      e.clients.get(&client).map(|s| s.request.get()),
+      Some(request),
+      "client {client}'s rebuilt watermark equals the dense scan's"
+    );
+  }
+}
+
+// ── View-scalar plausibility: an absurd advertised view (a buggy in-threat-model peer's corrupted
+// scalar, up to u64::MAX) must neither be adopted by the bare-scalar catch-up nor panic/wrap the
+// view+1 escalation arithmetic — while every legitimately-earnable jump still catches up. ──
+
+#[test]
+fn implausible_view_claims_are_ignored_and_the_replica_stays_serviceable() {
+  // Replica 1 of 3 at view 0 receives view = u64::MAX on each bare-scalar catch-up carrier
+  // (Commit / Prepare / PrepareOk). Without the clamp it would adopt the claim wholesale: stranded
+  // in ViewChange at the top of the view space, where no real primary answers the GetView, every
+  // genuine cluster message is "stale" (< u64::MAX), and the view+1 escalation could only
+  // overflow (debug) or saturate-and-spin — one corrupt scalar would permanently eject the replica
+  // from every quorum. The clamp drops the claim at ingress; the replica stays Normal in its
+  // real view. (In n=3 replica 0 leads view u64::MAX — (2^64 - 1) % 3 == 0 — so the
+  // primary-authority sender bindings pass and the claims genuinely reach the handlers.)
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let absurd = View::with(u64::MAX);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Commit(Commit::new(absurd, OpNumber::with(0), OpNumber::with(0))),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Prepare(Prepare::new(
+      absurd,
+      OpNumber::with(1),
+      OpNumber::with(0),
+      OpNumber::with(0),
+      ClientId::new(7),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"x"),
+    )),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::PrepareOk(PrepareOk::new(
+      absurd,
+      OpNumber::with(1),
+      ReplicaId::new(2),
+      OpNumber::with(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.view(),
+    View::new(),
+    "an implausible advertised view is never adopted"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the replica stays serviceable in its real view (not wedged in ViewChange)"
+  );
+  while e.poll_message().is_some() {}
+  // Not wedged: a legitimate higher view still catches up afterwards (the clamp gates only the
+  // absurd; primary(2) == replica 2 in n=3, so the sender binding passes).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Commit(Commit::new(
+      View::with(2),
+      OpNumber::with(0),
+      OpNumber::with(0),
+    )),
+  );
+  assert_eq!(e.view(), View::with(2));
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "a legitimate jump still drives the GetView catch-up"
+  );
+}
+
+#[test]
+fn view_jump_clamp_accepts_the_bound_and_rejects_just_above_it() {
+  // The clamp predicate is `claimed > local + MAX_VIEW_JUMP`: a claim exactly AT the bound is the
+  // most generous accepted jump (catch-up proceeds), one view past it is dropped. Replica 0 of 3 at
+  // view 0; primary(2^32) = replica 1 and primary(2^32 + 1) = replica 2 (2^32 ≡ 1 mod 3), so both
+  // claims pass the Commit sender binding and the difference below is the clamp alone.
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+
+  // One past the bound: rejected (stays Normal at view 0).
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Commit(Commit::new(
+      View::with(MAX_VIEW_JUMP + 1),
+      OpNumber::with(0),
+      OpNumber::with(0),
+    )),
+  );
+  assert_eq!(
+    e.view(),
+    View::new(),
+    "local + MAX_VIEW_JUMP + 1 is rejected"
+  );
+  assert_eq!(e.status(), Status::Normal);
+
+  // Exactly the bound: accepted (the catch-up adopts it and solicits the view's primary).
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Commit(Commit::new(
+      View::with(MAX_VIEW_JUMP),
+      OpNumber::with(0),
+      OpNumber::with(0),
+    )),
+  );
+  assert_eq!(
+    e.view(),
+    View::with(MAX_VIEW_JUMP),
+    "a jump AT the bound is still accepted"
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+}
+
+#[test]
+fn svc_and_get_view_at_view_max_neither_panic_nor_wrap() {
+  // A replica pinned at the very top of the view space (view == u64::MAX, Normal): an incoming
+  // StartViewChange{u64::MAX} crosses `on_start_view_change`'s next-view comparison — a raw
+  // `view + 1` there would overflow in debug builds; the saturating `View::next()` makes the target
+  // simply stale (`<= our view`) and ignored. A GetView{u64::MAX} performs no view arithmetic and
+  // a backup stays silent on it. Neither message may panic, wrap the view to 0, or move status.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  e.view = View::with(u64::MAX);
+  e.log_view = View::with(u64::MAX);
+  e.svc_target = View::with(u64::MAX);
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(u64::MAX),
+      ReplicaId::new(0),
+    )),
+  );
+  assert_eq!(e.view(), View::with(u64::MAX), "the view never moves");
+  assert_eq!(e.status(), Status::Normal);
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::GetView(GetView::new(View::with(u64::MAX), ReplicaId::new(2), 9)),
+  );
+  assert_eq!(e.status(), Status::Normal);
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::StartView(_)),
+      "a backup never answers a GetView with a StartView"
+    );
+  }
+}
+
+#[test]
+fn escalation_at_view_max_saturates_instead_of_wrapping() {
+  // The escalation target is the SATURATING `View::next()`: proposing off view u64::MAX pins the
+  // target at u64::MAX rather than computing `u64::MAX + 1` (debug panic; release wrap to view 0,
+  // which would un-fence every monotone-view guard behind a "view 0" the cluster believes is
+  // ancient). The proposal degrades to a no-quorum SVC{u64::MAX} broadcast — inert, not corrupt.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let mut sb = TestSb::default();
+  e.view = View::with(u64::MAX);
+  e.log_view = View::with(u64::MAX);
+  e.svc_target = View::with(u64::MAX);
+  e.propose_next_view(Instant::ZERO, &mut sb);
+  assert_eq!(
+    e.view(),
+    View::with(u64::MAX),
+    "the view itself never moves"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "no self-transition without an SVC quorum"
+  );
+  let mut saw_svc = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::StartViewChange(svc) = out.into_msg() {
+      assert_eq!(
+        svc.view(),
+        View::with(u64::MAX),
+        "the proposed target saturates at u64::MAX, never wraps to 0"
+      );
+      saw_svc = true;
+    }
+  }
+  assert!(
+    saw_svc,
+    "the proposal is still broadcast (liveness intent kept)"
+  );
+}

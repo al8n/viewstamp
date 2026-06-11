@@ -139,12 +139,103 @@ pub struct VoprReport {
   /// own checkpoint lags below the ring window); the deterministic `bounded_wal.rs` laggard gate covers
   /// it directly, so the committed sweep only NOTES this count rather than forcing a flaky assert.
   below_ring_window_syncs: u64,
+  /// Cumulative CHUNKED state-sync transfers completed across the run (an announced over-frame
+  /// checkpoint pulled chunk-by-chunk, assembled, and verified — the chunked path genuinely carrying
+  /// a sync), summed over replicas and accumulated across crash/restart like [`Self::forced_syncs`]
+  /// (the `Endpoint` counter resets on `recover`). `0` under the sweep's default load (its envelopes
+  /// stay under one frame); the focused `large_state_sync.rs` gate drives and asserts the chunked
+  /// path deterministically, so the sweep only REPORTS this count.
+  sync_chunk_transfers: u64,
   /// `true` iff this is a BOUNDED seed (`wal_capacity.is_some()`) that committed STRICTLY MORE than `N`
   /// ops — i.e. its ring genuinely WRAPPED at least once (an op `K + N` reused op `K`'s physical slot).
   /// This is the strongest single witness that the bounded mode did real work: a seed whose committed
   /// history never reached `N` would exercise the ring slots but never a wrap. The committed sweep
   /// asserts SOME bounded seed wrapped (Item 3), proving the wrap path is non-vacuous.
   bounded_seed_wrapped: bool,
+  /// How many LARGE-bodied client requests were minted this run (summed across clients, high-water).
+  /// `> 0` proves the frame-cap axis is NON-VACUOUS: the client genuinely produced large bodies that
+  /// built a large-bodied uncheckpointed band riding the (header-only) view-change carriers + the
+  /// byte-bounded `RepairBatch` repair serve. The sweep asserts the total across seeds is `> 0`.
+  large_bodies_sent: u64,
+  /// How many INTER-REPLICA messages this run dropped for exceeding the transport frame cap
+  /// [`MAX_FRAME_LEN`] (the modelled send-path frame guard). For the protocol's own traffic this MUST
+  /// stay `0`: header-only carriers + the byte-bounded `RepairBatch` keep every legitimate peer message
+  /// at/below the cap regardless of body size. A non-zero value is a REAL bug (a carrier overflowed
+  /// the frame — the old full-body view-change defect, or an incomplete bound); `run_vopr` asserts it
+  /// stays `0` every tick, so such a regression fails fast with its seed + tick.
+  oversized_dropped: u64,
+  /// How many messages the virtual network HELD this run ([`Faults::hold_per_mille`] fired — delivery
+  /// pushed far into the virtual future, past the proto's repair-or-truncate grace). `0` unless the
+  /// hold axis is enabled (`VOPR_HOLD`, or [`run_vopr_with_hold`]). `> 0` proves the axis genuinely
+  /// fired: a held message can outlive its op's truncation + re-mint and arrive as a stale-body vote —
+  /// the op-reuse class the content-addressed vote gate must reject. The committed hold sweep asserts
+  /// the sum across its seeds is `> 0`, so that lane can never silently become a no-op.
+  holds_fired: u64,
+  /// Cumulative count of canonical-log selections that actually FLOORED the union
+  /// (`select_canonical_log` dropped at least one canonical-donor entry at/below the vouched
+  /// checkpoint floor), summed over replicas and accumulated across crash/restart (the `Endpoint`
+  /// counter resets on `recover`, so positive deltas are folded like [`Self::forced_syncs`]). `> 0`
+  /// proves the floored-union path did real work this run — it needs donors carrying entries at or
+  /// below another donor's vouched checkpoint inside one view change, a rare confluence only a few
+  /// seeds per contiguous block reach (the base sweep asserts the cross-seed sum is `> 0`).
+  unions_floored: u64,
+  /// Cumulative count of NON-EMPTY `RepairBatch`es served (`on_request_prepare_range` genuinely
+  /// shipping bodies on the windowed bulk-repair channel), summed over replicas and accumulated
+  /// across crash/restart like [`Self::forced_syncs`]. `> 0` proves the byte-bounded repair serve
+  /// fired (vs every repair flowing through the per-op `RequestPrepare`); the base sweep asserts the
+  /// cross-seed sum is `> 0`.
+  repair_batches_served: u64,
+  prepare_batches_sent: u64,
+  /// Cumulative count of header-only carrier slices built (`log_entries` — the chokepoint every
+  /// `DoViewChange`/`StartView`/`RecoveryResponse` log payload flows through), summed over replicas
+  /// and accumulated across crash/restart like [`Self::forced_syncs`]. `> 0` proves the header-only
+  /// carrier path fired (view changes emit carriers in most seeds); the base sweep asserts the
+  /// cross-seed sum is `> 0`.
+  header_only_carriers_emitted: u64,
+  /// How many WIPE-and-restart actions fired this run (a crashed replica came back with FRESH,
+  /// empty durable storage — the amnesia axis). `0` unless the wipe axis is enabled (`VOPR_WIPE`, or
+  /// [`run_vopr_with_wipe`]); bounded by the per-run wipe budget. `> 0` proves the axis genuinely
+  /// forfeited a replica's durable state; the committed wipe sweep asserts the cross-seed sum is
+  /// `> 0`, so that lane can never silently become a no-op.
+  wipes_fired: u64,
+  /// The high-water of completed WAL appends that LOST their header (the torn-header
+  /// contract-violation verdict), summed over replicas. `0` unless the torn-header axis is enabled
+  /// (`VOPR_TORN_HEADER`, or [`run_vopr_with_torn_headers`] — the probe lane). `> 0` proves the
+  /// probe genuinely made completed appends vanish header-and-all, the exact shape the `Wal`
+  /// header-durability contract forbids.
+  torn_headers_fired: u64,
+  /// How many CLIENT-CHURN actions fired this run (an active client RETIRED + a fresh `ClientId`
+  /// spawned in its place). `0` unless the churn axis is enabled (`VOPR_CHURN`, or
+  /// [`run_vopr_with_churn`]); bounded by the per-run churn budget. The churn sweep asserts the
+  /// cross-seed sum is `> 0` so the lane cannot silently decay into the fixed-client default.
+  churns_fired: u64,
+  /// Cumulative client-session EVICTIONS across the run (the proto's deterministic apply-time
+  /// session-cap eviction engaging), summed over replicas and accumulated reset-robustly across
+  /// crash/restart like [`Self::forced_syncs`] (the `Endpoint` counter zeroes on `recover`). `0`
+  /// under the default fixed-client schedule (the table never outgrows the cap); the churn sweep —
+  /// which pairs client churn with a SMALL seeded `max_client_sessions` — asserts the cross-seed sum
+  /// is `> 0`, the non-vacuity witness that the eviction genuinely ran under the full adversarial
+  /// schedule while the safety/liveness checkers judged the outcome.
+  sessions_evicted: u64,
+  /// How many ONE-WAY (asymmetric) partition episodes were installed this run: a directed
+  /// `blocked[from][to]` cut a victim's link in ONE direction while the reverse kept flowing — the
+  /// shape the symmetric groups cannot express (a primary whose heartbeats flow OUT while the acks
+  /// never arrive). `0` unless the asym axis is enabled (`VOPR_ASYM`, or [`run_vopr_with_asym`]).
+  /// The committed asym sweep asserts the cross-seed sum is `> 0`.
+  asym_episodes: u64,
+  /// The high-water of inter-replica messages a directed one-way block DROPPED across the run (the
+  /// cluster's monotone counter). `> 0` proves an episode genuinely cut live traffic one-way — the
+  /// asym sweep's deep non-vacuity witness.
+  one_way_dropped: u64,
+  /// How many SLOW-REPLICA (gray failure) episodes were installed this run: one replica's
+  /// inter-replica delivery degraded by a seeded extra-delay band over a bounded window — messages
+  /// arrive LATE, never dropped (NOT a partition). `0` unless the slow axis is enabled (`VOPR_SLOW`,
+  /// or [`run_vopr_with_slow`]). The committed slow sweep asserts the cross-seed sum is `> 0`.
+  slow_episodes: u64,
+  /// The high-water of inter-replica messages that picked up a slow-replica extra delay across the
+  /// run (the cluster's monotone counter). `> 0` proves an episode genuinely delayed live traffic —
+  /// the slow sweep's deep non-vacuity witness.
+  slow_delays: u64,
 }
 
 impl VoprReport {
@@ -260,11 +351,119 @@ impl VoprReport {
     self.below_ring_window_syncs
   }
 
+  /// The cumulative CHUNKED state-sync transfer count across the run (an over-frame checkpoint
+  /// pulled, assembled, and verified chunk-by-chunk). `0` under the sweep's default load (its
+  /// envelopes fit one frame); the focused `large_state_sync.rs` gate drives + asserts the chunked
+  /// path deterministically.
+  pub const fn sync_chunk_transfers(&self) -> u64 {
+    self.sync_chunk_transfers
+  }
+
   /// `true` iff this is a bounded seed whose ring genuinely WRAPPED — it committed strictly more than
   /// `N` ops, so an op `K + N` physically reused op `K`'s ring slot. The strongest single witness that
   /// the bounded mode did real work (the sweep asserts SOME bounded seed wrapped).
   pub const fn bounded_seed_wrapped(&self) -> bool {
     self.bounded_seed_wrapped
+  }
+
+  /// How many LARGE-bodied client requests were minted this run (across clients). `> 0` ⇒ the
+  /// frame-cap axis genuinely fired — large bodies flowed through view-change/recovery, so the
+  /// [`Self::oversized_dropped`]`== 0` guarantee is non-vacuous.
+  pub const fn large_bodies_sent(&self) -> u64 {
+    self.large_bodies_sent
+  }
+
+  /// How many inter-replica messages were dropped for exceeding the transport frame cap this run. For
+  /// the protocol's own traffic this is `0` (header-only carriers + the byte-bounded `RepairBatch` keep
+  /// every legitimate peer message at/below the cap); a non-zero value is a REAL bug the per-tick
+  /// check in [`run_vopr`] already failed on.
+  pub const fn oversized_dropped(&self) -> u64 {
+    self.oversized_dropped
+  }
+
+  /// How many messages the virtual network HELD this run (the unbounded-hold axis fired). `0` with
+  /// the axis disabled; `> 0` proves a hold-enabled run genuinely delayed messages past the
+  /// repair-or-truncate grace — the non-vacuity witness the committed hold sweep asserts on.
+  pub const fn holds_fired(&self) -> u64 {
+    self.holds_fired
+  }
+
+  /// The run-cumulative count of canonical-log selections that FLOORED the union (dropped a
+  /// canonical-donor entry at/below the vouched checkpoint floor). `> 0` ⇒ the floored-union path
+  /// genuinely fired this run.
+  pub const fn unions_floored(&self) -> u64 {
+    self.unions_floored
+  }
+
+  /// The run-cumulative count of NON-EMPTY `RepairBatch`es served. `> 0` ⇒ the byte-bounded
+  /// bulk-repair serve genuinely fired this run.
+  pub const fn repair_batches_served(&self) -> u64 {
+    self.repair_batches_served
+  }
+
+  /// Total prepare-batch retransmit emissions observed across the run (reset-robust accumulation).
+  #[doc(hidden)]
+  pub const fn prepare_batches_sent(&self) -> u64 {
+    self.prepare_batches_sent
+  }
+
+  /// The run-cumulative count of header-only carrier slices built. `> 0` ⇒ the header-only
+  /// view-change/recovery carrier path genuinely fired this run.
+  pub const fn header_only_carriers_emitted(&self) -> u64 {
+    self.header_only_carriers_emitted
+  }
+
+  /// How many wipe-and-restart actions fired (a replica's durable state forfeited to a fresh disk).
+  /// `0` with the axis disabled; the committed wipe sweep asserts the cross-seed sum is `> 0`.
+  pub const fn wipes_fired(&self) -> u64 {
+    self.wipes_fired
+  }
+
+  /// The high-water of completed WAL appends that lost their header (the torn-header
+  /// contract-violation probe). `0` with the axis disabled; the probe lane reads this as its
+  /// non-vacuity witness.
+  pub const fn torn_headers_fired(&self) -> u64 {
+    self.torn_headers_fired
+  }
+
+  /// How many client-churn actions fired (a client retired + a fresh `ClientId` spawned). `0` with
+  /// the axis disabled; the churn sweep asserts the cross-seed sum is `> 0`.
+  pub const fn churns_fired(&self) -> u64 {
+    self.churns_fired
+  }
+
+  /// The run-cumulative client-session eviction count (the deterministic session-cap eviction
+  /// engaging, summed reset-robustly over replicas). The churn sweep's non-vacuity witness.
+  pub const fn sessions_evicted(&self) -> u64 {
+    self.sessions_evicted
+  }
+
+  /// How many ONE-WAY (asymmetric) partition episodes were installed (a directed block cut a
+  /// victim's link in one direction while the reverse flowed). `0` with the axis disabled; the
+  /// committed asym sweep asserts the cross-seed sum is `> 0`.
+  pub const fn asym_episodes(&self) -> u64 {
+    self.asym_episodes
+  }
+
+  /// How many inter-replica messages a directed one-way block dropped (the cluster's monotone
+  /// counter, high-water). `> 0` ⇒ an episode genuinely CUT live traffic one-way (the deep
+  /// non-vacuity witness — episodes that never intersected a message would be vacuous).
+  pub const fn one_way_dropped(&self) -> u64 {
+    self.one_way_dropped
+  }
+
+  /// How many SLOW-REPLICA (gray failure) episodes were installed (one replica's inter-replica
+  /// delivery degraded by a seeded extra-delay band — late, never dropped). `0` with the axis
+  /// disabled; the committed slow sweep asserts the cross-seed sum is `> 0`.
+  pub const fn slow_episodes(&self) -> u64 {
+    self.slow_episodes
+  }
+
+  /// How many inter-replica messages picked up a slow-replica extra delay (the cluster's monotone
+  /// counter, high-water). `> 0` ⇒ an episode genuinely DELAYED live traffic (the deep non-vacuity
+  /// witness for the slow lane).
+  pub const fn slow_delays(&self) -> u64 {
+    self.slow_delays
   }
 }
 
@@ -310,6 +509,22 @@ struct Vopr {
   /// like [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by
   /// replica.
   below_ring_window_syncs_seen: Vec<u64>,
+  /// Per-replica last-observed CHUNKED-transfer-completed count, accumulated reset-robustly like
+  /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by
+  /// replica.
+  sync_chunk_transfers_seen: Vec<u64>,
+  /// Per-replica last-observed floored-union count, accumulated reset-robustly like
+  /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
+  unions_floored_seen: Vec<u64>,
+  /// Per-replica last-observed served-`RepairBatch` count, accumulated reset-robustly like
+  /// [`Self::forced_sync_seen`]. Indexed by replica.
+  repair_batches_served_seen: Vec<u64>,
+  /// Per-replica last-observed prepare-batch-emission count, accumulated reset-robustly like
+  /// [`Self::forced_sync_seen`]. Indexed by replica.
+  prepare_batches_sent_seen: Vec<u64>,
+  /// Per-replica last-observed header-only-carrier count, accumulated reset-robustly like
+  /// [`Self::forced_sync_seen`]. Indexed by replica.
+  header_only_carriers_seen: Vec<u64>,
   /// Liveness baseline captured at the START of the current calm window: the cluster's committed-op
   /// high-water and whether any client still had outstanding work. Used to assert progress at the end.
   calm_baseline_committed: usize,
@@ -319,6 +534,69 @@ struct Vopr {
   /// ([`Vopr::check_ring_residency`]) is meaningful ONLY on a bounded seed — on an unbounded WAL every
   /// op is trivially resident, so the checker short-circuits when this is `None`.
   wal_capacity: Option<u64>,
+  /// Whether the UNBOUNDED-HOLD network axis is enabled for this run: the `VOPR_HOLD` env var
+  /// (captured once at construction, so every `chaos_network_faults` re-roll across the run agrees),
+  /// or force-enabled via [`run_vopr_with_hold`] (the committed hold sweep's programmatic override —
+  /// no env mutation, so parallel tests in one process cannot race). With the axis OFF the hold draw
+  /// is skipped entirely (no PRNG value consumed), keeping the default per-seed schedule
+  /// byte-identical; a hold-enabled run is its OWN deterministic baseline.
+  hold_axis: bool,
+  /// Whether the WIPE-and-restart (amnesia) axis is enabled for this run: the `VOPR_WIPE` env var, or
+  /// force-enabled via [`run_vopr_with_wipe`] (the committed wipe sweep). Same discipline as
+  /// [`Self::hold_axis`]: with the axis OFF its per-tick chance draw is skipped entirely (no PRNG
+  /// value consumed — the default schedule stays byte-identical); a wipe-enabled run is its OWN
+  /// deterministic baseline, with the `VOPR_NO_WIPE` shrink mask staying on the same stream (the
+  /// draws still happen; only the wipe effect is downgraded to a plain restart).
+  wipe_axis: bool,
+  /// Whether the TORN-HEADER contract-violation probe axis is enabled: the `VOPR_TORN_HEADER` env
+  /// var, or force-enabled via [`run_vopr_with_torn_headers`] (the probe lane). Same discipline as
+  /// [`Self::hold_axis`]: with the axis OFF the rate draw is skipped (default schedules
+  /// byte-identical); an enabled run is its own baseline, with `VOPR_NO_TORN_HEADER` only zeroing the
+  /// applied rate.
+  torn_header_axis: bool,
+  /// How many wipe ACTIONS this run has taken (counted against [`WIPE_BUDGET`]). Advances whether or
+  /// not the `VOPR_NO_WIPE` mask downgraded the effect, so a masked shrink run keeps the exact same
+  /// action schedule + PRNG stream as the unmasked run it is diagnosing.
+  wipe_actions: u64,
+  /// Whether the CLIENT-CHURN axis is enabled for this run: the `VOPR_CHURN` env var, or
+  /// force-enabled via [`run_vopr_with_churn`] (the committed churn sweep). Same discipline as
+  /// [`Self::hold_axis`]: with the axis OFF its per-tick chance draw (and the build-time session-cap
+  /// draw) is skipped entirely — no PRNG value consumed, the default schedule stays byte-identical;
+  /// a churn-enabled run is its OWN deterministic baseline.
+  churn_axis: bool,
+  /// How many churn ACTIONS this run has taken (counted against [`CHURN_BUDGET`]).
+  churn_actions: u64,
+  /// Whether the ASYMMETRIC (one-way) partition axis is enabled for this run: the `VOPR_ASYM` env
+  /// var, or force-enabled via [`run_vopr_with_asym`] (the committed asym sweep). Same discipline as
+  /// [`Self::hold_axis`]: with the axis OFF its draws are skipped entirely (no PRNG value consumed —
+  /// the default schedule stays byte-identical); an asym-enabled run is its OWN deterministic
+  /// baseline, with the `VOPR_NO_ASYM` shrink mask staying on the same stream (the draws and the
+  /// budget bookkeeping still happen; only the directed blocks are not installed).
+  asym_axis: bool,
+  /// Which replicas are currently the VICTIM of a one-way episode. A victim counts against the same
+  /// minority budget as crashed/isolated (a one-way-impaired replica cannot complete a round-trip
+  /// exchange, so it is budgeted as knocked out — conservative for the single-edge shape), and the
+  /// crash/isolate pickers exclude victims so the knocked-out sets stay disjoint. Cleared wherever
+  /// partitions heal (the heal actions, calm windows, final quiesce).
+  asym_victims: Vec<bool>,
+  /// Whether the SLOW-REPLICA (gray failure) axis is enabled for this run: the `VOPR_SLOW` env var,
+  /// or force-enabled via [`run_vopr_with_slow`] (the committed slow sweep). Same discipline as
+  /// [`Self::hold_axis`]; the `VOPR_NO_SLOW` shrink mask keeps the draws + episode bookkeeping and
+  /// only skips installing the delivery profile.
+  slow_axis: bool,
+  /// The replica currently under a slow episode, if any (one at a time — a single gray box, not a
+  /// uniformly slow cluster). NOT counted against the minority budget: a slow replica still
+  /// participates (messages arrive, late), which is the point of the axis.
+  slow_active: Option<usize>,
+  /// The tick at which the active slow episode expires (the bounded episode window; calm windows
+  /// and the final quiesce end it early).
+  slow_until: u64,
+  /// Per-replica last-observed session-eviction count, accumulated reset-robustly like
+  /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
+  sessions_evicted_seen: Vec<u64>,
+  /// Replicas wiped since the last invariant check, queued so [`Self::check_invariants`] can tell the
+  /// stateful checkers their per-replica baselines are forfeit BEFORE they next observe the cluster.
+  wiped_pending: Vec<usize>,
   report: VoprReport,
 }
 
@@ -330,15 +608,141 @@ struct Vopr {
 /// view-monotonicity, boundedness, append-before-ack, structural-ordering, or liveness (including
 /// final-quiesce non-convergence) violation — so a failing seed is reproducible via [`run_vopr_one`].
 pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
+  run_seeded(Vopr::new(seed), ticks)
+}
+
+/// Like [`run_vopr`] but with the unbounded-HOLD network axis FORCE-ENABLED, independent of the
+/// `VOPR_HOLD` env var (a programmatic override — no env mutation, so concurrently-running tests in
+/// one process cannot race each other's schedules). A hold-enabled run is still a pure function of
+/// `(seed, ticks)` and is byte-identical to a `VOPR_HOLD=1` run of the same seed; it is its OWN
+/// deterministic baseline, distinct from the default schedule (the hold axis consumes extra PRNG
+/// draws). This is the entry point for the committed hold sweep, so the axis that reaches the
+/// op-reuse / stale-vote class (a held message outliving its op's truncation + re-mint) runs in every
+/// gate rather than only when the env var is set by hand.
+pub fn run_vopr_with_hold(seed: u64, ticks: u64) -> VoprReport {
   let mut v = Vopr::new(seed);
+  v.hold_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the WIPE-and-restart (amnesia) axis FORCE-ENABLED, independent of the
+/// `VOPR_WIPE` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]). At most
+/// `WIPE_BUDGET` crashed replicas per run come back with FRESH, EMPTY durable storage (a replaced
+/// disk) instead of recovering their persisted WAL/superblock — the classic VSR amnesia hazard: the
+/// wiped replica re-joins at genesis with no memory of the views it voted in or the committed ops it
+/// durably held. Its OWN pre-wipe state is forfeit (within the crash-fault model's `<= f` lost-state
+/// budget; the stateful checkers' per-replica baselines are reset accordingly), but every
+/// CLUSTER-level invariant stays at full strength: agreement, no committed op rewritten/lost across
+/// time, quorum-durable retention (relaxed by exactly the wiped count — see the driver's
+/// per-tick structural check), and the end-of-run survival of the whole committed history. A
+/// violation here is a REAL protocol finding (amnesia breaking quorum intersection), not a checker
+/// artifact. A wipe-enabled run is a pure function of `(seed, ticks)` and its own deterministic
+/// baseline (the axis consumes extra PRNG draws); this is the entry point for the committed wipe
+/// sweep.
+pub fn run_vopr_with_wipe(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed);
+  v.wipe_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the TORN-HEADER contract-violation PROBE axis FORCE-ENABLED,
+/// independent of the `VOPR_TORN_HEADER` env var (the same programmatic-override pattern as
+/// [`run_vopr_with_hold`]). A seed-chosen per-mille of completed WAL appends LOSE THEIR HEADER: the
+/// slot reads back `Absent`/`Empty` with `header() == None`, as if the append had never happened —
+/// the exact failure shape the `Wal` header-durability contract FORBIDS an embedder from producing
+/// (headers must survive body-level faults; the `Body::Repairing` keep-header-only committed-op
+/// survival design leans on it). This lane therefore probes what happens when that documented
+/// contract is VIOLATED: a violation surfacing here is EXPECTED EVIDENCE the contract is
+/// load-bearing, not a proto bug to fix; a clean sweep would show the proto tolerates even
+/// headerless faults. NOT part of the committed gates — see the `#[ignore]`d probe lane in
+/// `tests/vopr.rs`.
+pub fn run_vopr_with_torn_headers(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed);
+  v.torn_header_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the ASYMMETRIC (one-way) partition axis FORCE-ENABLED, independent of
+/// the `VOPR_ASYM` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]). The
+/// default schedule's partitions are SYMMETRIC (group membership: either side sees the other, or
+/// neither does); this axis installs DIRECTED blocks — `blocked[from][to]` drops `from → to` while
+/// `to → from` flows — the one-way reachability real networks produce (a half-dead NIC, an
+/// asymmetric route/firewall) and the shape the forfeit/idle machinery has otherwise never faced.
+/// The liveness-killer instance is a DEAF primary: its heartbeats flow OUT (suppressing the backups'
+/// idle view-change timers) while the acks never ARRIVE (nothing commits) — so the victim draw
+/// biases toward a current primary half the time. Victims count against the same minority budget as
+/// crash/isolate, episodes heal exactly like symmetric partitions (a heal branch + every calm
+/// window/final quiesce restores full bidirectional connectivity), and progress is NOT owed during
+/// an episode — a calm window requires full bidirectional connectivity, so the liveness oracle
+/// judges recovery-after-heal. Safety/durability are judged as-is, every tick. A violation here is
+/// a REAL finding (one-way reachability wedging recovery or splitting commit accounting) — report
+/// it with its seed; never mask it. An asym-enabled run is a pure function of `(seed, ticks)` and
+/// its own deterministic baseline (the axis consumes extra PRNG draws); this is the entry point for
+/// the committed asym sweep.
+pub fn run_vopr_with_asym(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed);
+  v.asym_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the SLOW-REPLICA (gray failure) axis FORCE-ENABLED, independent of
+/// the `VOPR_SLOW` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]). On a
+/// seeded cadence one replica becomes SLOW for a bounded episode window: its inter-replica messages
+/// (inbound, outbound, or both — seeded) each pick up an extra delay drawn from a seeded band a few
+/// milliseconds wide, on top of the base latency + jitter. This is NOT a partition — every message
+/// still ARRIVES, late — and the band sits deliberately BELOW the proto's liveness cadences (50 ms
+/// commit heartbeat, 200 ms idle view-change), so the replica is degraded-but-alive: the classic
+/// gray failure that neither the crash detector (it never stops) nor the partition model (nothing
+/// is dropped) can express. The slow replica still participates and is NOT budgeted as knocked out;
+/// episodes are bounded (a seeded tick window) and healed like partitions (calm windows and the
+/// final quiesce end them early), so the liveness oracle judges a fully-prompt cluster. A violation
+/// here is a REAL finding (consistently-late delivery wedging a timer interaction or splitting
+/// agreement) — report it with its seed; never mask it. A slow-enabled run is a pure function of
+/// `(seed, ticks)` and its own deterministic baseline; this is the entry point for the committed
+/// slow sweep.
+pub fn run_vopr_with_slow(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed);
+  v.slow_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the CLIENT-CHURN axis FORCE-ENABLED, independent of the `VOPR_CHURN`
+/// env var (the same programmatic-override pattern as [`run_vopr_with_hold`]). The default sweep's
+/// client set is FIXED for a whole run, so the session table converges to one row per client and the
+/// session-cap eviction can never engage. This lane churns the population: on a seeded cadence
+/// (within `CHURN_BUDGET`) an ACTIVE client RETIRES (it stops issuing; its session row goes idle
+/// and ages) and a FRESH `ClientId` spawns in its place — so distinct client ids accumulate over the
+/// run while the concurrent load stays level. Paired with a SMALL seeded `max_client_sessions`
+/// (drawn at build time only on churn-enabled runs), the deterministic apply-time eviction genuinely
+/// engages under the full crash + partition + disk-fault schedule; the existing safety / durability /
+/// liveness checkers judge the outcome (divergent eviction would diverge the session tables that ride
+/// every checkpoint envelope — the class this lane exists to catch). A churn-enabled run is a pure
+/// function of `(seed, ticks)` and its own deterministic baseline (the axis consumes extra PRNG
+/// draws); this is the entry point for the committed churn sweep.
+pub fn run_vopr_with_churn(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed);
+  v.churn_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// The shared run loop behind [`run_vopr`] / [`run_vopr_with_hold`]: the driver `v` already carries
+/// the seed and the axis configuration.
+fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
   let mut c = v.build_cluster();
 
   let mut dur = DurabilityChecker::new(v.n);
   let mut vm = ViewMonotonicChecker::new(v.n);
   // Generous structural bound: the per-op caches/WAL plateau near a few checkpoint intervals plus
   // pipeline headroom; a real unbounded-growth leak blows well past this. Clients are bounded by the
-  // active client set.
-  let bound = BoundednessChecker::new(4_096, v.n + v.report.clients + 8);
+  // active client set — which the churn axis GROWS by up to CHURN_BUDGET distinct ids over the run
+  // (each spawn is a fresh id; the proto's own session cap holds the per-replica table far below
+  // this, so the headroom only keeps the checker's bound honest about the population).
+  let churn_headroom = if v.churn_axis {
+    CHURN_BUDGET as usize
+  } else {
+    0
+  };
+  let bound = BoundednessChecker::new(4_096, v.n + v.report.clients + churn_headroom + 8);
 
   for tick in 0..ticks {
     v.step_phase(&mut c, tick);
@@ -370,7 +774,10 @@ pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
   // Final durability assertion: after convergence, the whole committed history survives, applied, on
   // at least one operational replica — proving no committed op was lost across the run.
   if let crate::checker::CheckResult::Violation(why) = dur.check(&c) {
-    panic!("vopr seed {seed} tick {ticks} (final, post-quiesce): {why}");
+    panic!(
+      "vopr seed {} tick {ticks} (final, post-quiesce): {why}",
+      v.seed
+    );
   }
   v.report.ticks = ticks;
   v.report.all_clients_done = (0..c.client_count()).all(|i| c.client(i).is_done());
@@ -414,6 +821,22 @@ const CALM_MIN_VIRTUAL: Duration = Duration::from_millis(3_000);
 /// (or a genuine loss the quorum cannot repair), which the phase then reports.
 const FINAL_QUIESCE_TICKS: u64 = 6_000;
 
+/// The per-run WIPE budget: at most this many wipe-and-restart actions per run (wipe-axis runs only).
+/// A wipe PERMANENTLY forfeits one replica's durable state, and the cluster-level "committed ops
+/// survive" guarantee holds only while at most `f = ⌊(N-1)/2⌋` replicas' durable states are lost
+/// within a window the protocol cannot re-replicate across. `1` is `<= f` for every cluster size that
+/// can crash at all (N >= 3 ⇒ f >= 1; N = 2 has f = 0, never crashes a replica, and so never wipes —
+/// `pick_crashed` finds no candidate). No replica is special-cased: ANY crashed replica may be the
+/// one wiped — including the sole quorum-intersection holder — and the checkers judge the outcome;
+/// that is the point of the oracle.
+const WIPE_BUDGET: u64 = 1;
+
+/// The per-run CLIENT-CHURN budget (churn-axis runs only): at most this many retire+spawn actions
+/// per run. Bounds the distinct-`ClientId` population (the boundedness checker's client headroom)
+/// while leaving far more churn than the small seeded session cap needs to engage eviction many
+/// times over within a run's tick budget.
+const CHURN_BUDGET: u64 = 48;
+
 impl Vopr {
   fn new(seed: u64) -> Self {
     let mut prng = Prng::new(seed);
@@ -442,10 +865,28 @@ impl Vopr {
       forced_sync_seen: vec![0; n],
       wal_stalls_seen: vec![0; n],
       below_ring_window_syncs_seen: vec![0; n],
+      sync_chunk_transfers_seen: vec![0; n],
+      unions_floored_seen: vec![0; n],
+      repair_batches_served_seen: vec![0; n],
+      prepare_batches_sent_seen: vec![0; n],
+      header_only_carriers_seen: vec![0; n],
       calm_baseline_committed: 0,
       calm_had_outstanding: false,
       // Set by `build_cluster` (which draws the bounded-WAL decision off the prng); `None` until then.
       wal_capacity: None,
+      hold_axis: env_flag("VOPR_HOLD"),
+      wipe_axis: env_flag("VOPR_WIPE"),
+      torn_header_axis: env_flag("VOPR_TORN_HEADER"),
+      wipe_actions: 0,
+      churn_axis: env_flag("VOPR_CHURN"),
+      churn_actions: 0,
+      asym_axis: env_flag("VOPR_ASYM"),
+      asym_victims: vec![false; n],
+      slow_axis: env_flag("VOPR_SLOW"),
+      slow_active: None,
+      slow_until: 0,
+      sessions_evicted_seen: vec![0; n],
+      wiped_pending: Vec::new(),
       report: VoprReport {
         seed,
         replicas: n,
@@ -560,6 +1001,20 @@ impl Vopr {
     if let Some(n) = wal_capacity {
       c.set_wal_capacity(Some(n));
     }
+    // CHURN axis: pair the churning client population with a SMALL seeded session cap so the
+    // deterministic apply-time eviction genuinely engages within the tick budget (the proto default
+    // of 4096 needs more distinct committing clients than a run can mint). The cap is drawn with
+    // comfortable headroom ABOVE the concurrent active client count (`clients + 4 ..= clients + 7`),
+    // so eviction victims are overwhelmingly the RETIRED clients' idle rows — the oldest-activity
+    // ordering the rule targets — rather than a live client mid-conversation. The draw is
+    // CONDITIONAL on the axis (no PRNG value consumed otherwise — the default per-seed schedule
+    // stays byte-identical; a churn-enabled run is its own deterministic baseline, like the hold
+    // axis). Set AFTER the other build steps: it rebuilds the (still-fresh) endpoints with the
+    // capped config, leaving the storage/fault/ring composition above intact.
+    if self.churn_axis {
+      let cap = clients + 4 + self.prng.below(4) as u32;
+      c.set_max_client_sessions(Some(cap));
+    }
     c
   }
 
@@ -572,13 +1027,14 @@ impl Vopr {
     let jitter = 1 + self.prng.below(5);
     let drop = self.prng.below(60) as u32;
     let dup = self.prng.below(60) as u32;
-    // The UNBOUNDED-HOLD axis is OPT-IN (VOPR_HOLD). Its draw is CONDITIONAL: with the flag OFF no PRNG
-    // value is consumed, so the per-seed schedule is byte-identical to the default schedule (the
-    // pinned regression seeds + the 0..N sweep reproduce exactly). A VOPR_HOLD run is its OWN baseline
-    // (a shrink keeps the flag on), so the conditional draw does not break shrink determinism. Enabling
-    // it lets a `PrepareOk` outlive its op's truncation + re-mint and arrive as a stale-body vote — the
-    // op-reuse class the content-addressed vote gate must reject.
-    let hold = if env_flag("VOPR_HOLD") {
+    // The UNBOUNDED-HOLD axis is OPT-IN per run (`VOPR_HOLD`, or force-enabled by
+    // `run_vopr_with_hold` — the committed hold sweep). Its draw is CONDITIONAL: with the axis OFF no
+    // PRNG value is consumed, so the per-seed schedule is byte-identical to the default schedule (the
+    // pinned regression seeds + the 0..N sweep reproduce exactly). A hold-enabled run is its OWN
+    // baseline (a shrink keeps the axis on), so the conditional draw does not break shrink
+    // determinism. Enabling it lets a `PrepareOk` outlive its op's truncation + re-mint and arrive as
+    // a stale-body vote — the op-reuse class the content-addressed vote gate must reject.
+    let hold = if self.hold_axis {
       1 + self.prng.below(30) as u32
     } else {
       0
@@ -627,6 +1083,18 @@ impl Vopr {
     // `VOPR_NO_CKPT_CORRUPT` shrink stays on the same prng stream); low rate so a sync/recover read
     // eventually returns clean bytes within budget.
     let corrupt_ckpt = self.prng.below(40) as u32;
+    // The TORN-HEADER contract-violation probe rate is OPT-IN per run (`VOPR_TORN_HEADER`, or
+    // force-enabled by `run_vopr_with_torn_headers` — the probe lane). Like the hold axis, its draw
+    // is CONDITIONAL: with the axis OFF no PRNG value is consumed, so every default/hold/wipe
+    // schedule stays byte-identical. An enabled run is its own baseline; the `VOPR_NO_TORN_HEADER`
+    // shrink mask below only ZEROES the applied rate, keeping the stream. Low rate (1..=12 per
+    // mille): each hit erases a completed append header-and-all, so a high rate would simply raze the
+    // cluster rather than probe the contract's blast radius.
+    let torn_header = if self.torn_header_axis {
+      1 + self.prng.below(12) as u32
+    } else {
+      0
+    };
     let mask_perm = env_flag("VOPR_NO_PERM");
     StorageFaults {
       read_fault_per_mille: if env_flag("VOPR_NO_READFAULT") {
@@ -636,6 +1104,11 @@ impl Vopr {
       },
       torn_write_per_mille: if mask_perm { 0 } else { torn },
       bit_rot_per_mille: if mask_perm { 0 } else { rot },
+      torn_header_per_mille: if env_flag("VOPR_NO_TORN_HEADER") {
+        0
+      } else {
+        torn_header
+      },
       misdirect_read_per_mille: if env_flag("VOPR_NO_MISDIRECT") {
         0
       } else {
@@ -685,14 +1158,14 @@ impl Vopr {
     }
   }
 
-  /// Open a calm window: heal every partition, restart every crashed replica, drop all network +
+  /// Open a calm window: heal every partition (symmetric AND one-way — a calm window requires full
+  /// bidirectional connectivity, so an asymmetric episode is never live inside one), end any slow
+  /// episode (calm also requires PROMPT delivery), restart every crashed replica, drop all network +
   /// storage faults, and snapshot the liveness baseline. Runs for a stretch long enough for the
   /// cluster to converge.
   fn enter_calm(&mut self, c: &mut Cluster, tick: u64) {
-    for i in 0..self.n {
-      self.isolated[i] = false;
-    }
-    c.heal();
+    self.heal_all_partitions(c);
+    self.end_slow_episode(c);
     for i in 0..self.n {
       if c.is_crashed(i) {
         self.restart_and_track(c, i);
@@ -760,11 +1233,10 @@ impl Vopr {
     vm: &mut ViewMonotonicChecker,
     bound: &BoundednessChecker,
   ) {
-    // Heal: all partitions cleared, every crashed replica restarted, no network/storage chaos.
-    for i in 0..self.n {
-      self.isolated[i] = false;
-    }
-    c.heal();
+    // Heal: all partitions (symmetric and one-way) cleared, any slow episode ended, every crashed
+    // replica restarted, no network/storage chaos.
+    self.heal_all_partitions(c);
+    self.end_slow_episode(c);
     for i in 0..self.n {
       if c.is_crashed(i) {
         self.restart_and_track(c, i);
@@ -858,6 +1330,60 @@ impl Vopr {
       }
     }
 
+    // (c') WIPE-and-restart a crashed replica (the amnesia axis): it comes back with FRESH, EMPTY
+    // durable storage — a replaced disk — so every promise its pre-wipe durable state made (view
+    // participation, durable quorum copies) is forfeit. Only with the axis enabled (a wipe-enabled
+    // run is its own deterministic baseline; with the axis OFF no draw is consumed, mirroring the
+    // hold axis), and only within [`WIPE_BUDGET`]. The candidate is any crashed replica — never
+    // special-cased away from the dangerous one (the sole quorum-intersection holder); the checkers
+    // judge the outcome. The chance draw fires UNCONDITIONALLY on a wipe-enabled run (budget checked
+    // after), and `wipe_actions` advances whether or not `VOPR_NO_WIPE` downgrades the effect to a
+    // plain restart, so a masked shrink run keeps the exact same schedule + stream.
+    if self.wipe_axis && self.prng.chance(1, 40) && self.wipe_actions < WIPE_BUDGET {
+      if let Some(i) = self.pick_crashed(c) {
+        self.wipe_actions += 1;
+        if env_flag("VOPR_NO_WIPE") {
+          if trace {
+            eprintln!("tick {tick}: WIPE replica {i} (masked: plain restart)");
+          }
+          self.restart_and_track(c, i);
+        } else {
+          if trace {
+            eprintln!("tick {tick}: WIPE replica {i} (fresh storage)");
+          }
+          c.wipe_and_restart(i);
+          self.report.restarts += 1;
+          self.report.wipes_fired += 1;
+          // The stateful checkers' per-replica baselines (durable view, checkpoint high-water) are
+          // forfeit with the disk; queue the notice so `check_invariants` resets them BEFORE the
+          // next observation. Cluster-level invariants are NOT relaxed there.
+          self.wiped_pending.push(i);
+        }
+      }
+    }
+
+    // (c'') CLIENT CHURN (the session-population axis): retire a random ACTIVE client (it stops
+    // issuing; its session rows go idle and age toward the cap eviction) and spawn a FRESH ClientId
+    // issuing the same load in its place — distinct ids accumulate while concurrency stays level.
+    // Only with the axis enabled (a churn-enabled run is its own deterministic baseline; with the
+    // axis OFF no draw is consumed, mirroring the hold axis), and only within [`CHURN_BUDGET`] (the
+    // chance draw fires unconditionally on a churn-enabled run, budget checked after, so an
+    // exhausted budget keeps the same PRNG stream).
+    if self.churn_axis && self.prng.chance(1, 48) && self.churn_actions < CHURN_BUDGET {
+      let actives: Vec<usize> = (0..c.client_count())
+        .filter(|&i| !c.client(i).is_done())
+        .collect();
+      if let Some(i) = self.pick(&actives) {
+        self.churn_actions += 1;
+        if trace {
+          eprintln!("tick {tick}: CHURN retire client {i}, spawn a fresh ClientId");
+        }
+        c.retire_client(i);
+        c.spawn_client(1_000);
+        self.report.churns_fired += 1;
+      }
+    }
+
     // (d) Partition: isolate a replica into the minority (budget permitting), or heal.
     if self.prng.chance(1, 90) {
       if self.prng.chance(1, 2) {
@@ -873,11 +1399,127 @@ impl Vopr {
         if trace {
           eprintln!("tick {tick}: HEAL partition");
         }
-        for b in &mut self.isolated {
+        // `Cluster::heal` restores FULL connectivity (groups + one-way blocks), so the driver-side
+        // victim bookkeeping must clear with it — the helper keeps both sides in sync. (With the
+        // asym axis off the victim set is always empty and this is exactly the old groups-only heal.)
+        self.heal_all_partitions(c);
+        self.report.heals += 1;
+      }
+    }
+
+    // (d') ONE-WAY (asymmetric) partition: install a DIRECTED episode against a victim (budget
+    // permitting), or heal all one-way blocks — the install/heal coin mirrors the symmetric action
+    // (d). Only with the axis enabled (an asym-enabled run is its own deterministic baseline; with
+    // the axis OFF no draw is consumed, mirroring the hold axis). The episode shape is seeded:
+    // DEAF (every inbound leg to the victim cut — it sends, it never hears: the liveness-killer
+    // when the victim is a primary, whose outgoing heartbeats keep suppressing the backups' idle
+    // view-change timers while no ack ever arrives), MUTE (every outbound leg cut — it hears, it is
+    // never heard: a silently-ignored voter), or a SINGLE directed edge (the mildest one-way fault).
+    // The `VOPR_NO_ASYM` shrink mask keeps every draw + the victim/budget bookkeeping and only skips
+    // installing the blocks, so a masked run stays on the exact same action schedule.
+    if self.asym_axis && self.prng.chance(1, 90) {
+      if self.prng.chance(1, 2) {
+        if let Some(v) = self.pick_asym_victim(c) {
+          let shape = self.prng.below(3);
+          // The single-edge peer + direction draws happen for EVERY install (not just shape 2) so
+          // the stream never depends on which shape was drawn.
+          let mut w = self.prng.below((self.n - 1) as u64) as usize;
+          if w >= v {
+            w += 1;
+          }
+          let to_victim = self.prng.chance(1, 2);
+          self.asym_victims[v] = true;
+          if !env_flag("VOPR_NO_ASYM") {
+            match shape {
+              // DEAF: every peer's messages TO the victim are dropped; the victim's own flow out.
+              0 => {
+                for x in 0..self.n {
+                  if x != v {
+                    c.block_one_way(x as u8, v as u8);
+                  }
+                }
+              }
+              // MUTE: the victim's messages to every peer are dropped; everyone still reaches it.
+              1 => {
+                for x in 0..self.n {
+                  if x != v {
+                    c.block_one_way(v as u8, x as u8);
+                  }
+                }
+              }
+              // SINGLE EDGE: one directed leg between the victim and a seeded peer.
+              _ => {
+                let (f, t) = if to_victim { (w, v) } else { (v, w) };
+                c.block_one_way(f as u8, t as u8);
+              }
+            }
+            self.report.asym_episodes += 1;
+          }
+          if trace {
+            let kind = ["DEAF", "MUTE", "EDGE"][shape as usize];
+            eprintln!("tick {tick}: ASYM {kind} victim {v} (peer {w}, to_victim={to_victim})");
+          }
+        }
+      } else if self.asym_victims.iter().any(|&b| b) {
+        if trace {
+          eprintln!("tick {tick}: HEAL one-way blocks");
+        }
+        for b in &mut self.asym_victims {
           *b = false;
         }
-        c.heal();
+        c.heal_one_way();
         self.report.heals += 1;
+      }
+    }
+
+    // (e) SLOW REPLICA (gray failure): degrade ONE replica's delivery for a bounded episode window —
+    // every inter-replica message touching its seeded legs (inbound/outbound/both) arrives a few
+    // seeded milliseconds LATE, never dropped. NOT a partition and NOT budgeted as knocked out: the
+    // replica keeps participating, just consistently behind — the gray zone between healthy and
+    // failed that neither the crash nor the partition model expresses. Only with the axis enabled
+    // (no draw consumed otherwise, mirroring the hold axis); one episode at a time, expiring at its
+    // seeded window end (calm windows and the final quiesce end it early). The `VOPR_NO_SLOW`
+    // shrink mask keeps the draws + episode bookkeeping and only skips installing the profile.
+    if self.slow_axis {
+      if self.slow_active.is_some() && tick >= self.slow_until {
+        if trace {
+          eprintln!("tick {tick}: SLOW episode expired");
+        }
+        self.end_slow_episode(c);
+      }
+      if self.prng.chance(1, 90) && self.slow_active.is_none() {
+        let candidates: Vec<usize> = (0..self.n).filter(|&i| !c.is_crashed(i)).collect();
+        if let Some(v) = self.pick(&candidates) {
+          // Legs: 0 ⇒ inbound only (slow to hear), 1 ⇒ outbound only (slow to be heard), 2 ⇒ both.
+          let legs = self.prng.below(3);
+          // The extra-delay band, in milliseconds: lo in 3..=10, hi = lo + 2..=12 (max 22 ms) —
+          // several times the 1 ms base latency yet well under the proto's 50 ms commit-heartbeat /
+          // 200 ms idle cadences, so the victim is degraded-but-alive (late acks and heartbeats,
+          // never a legitimate knockout the failover machinery OWES a view change for).
+          let lo_ms = 3 + self.prng.below(8);
+          let hi_ms = lo_ms + 2 + self.prng.below(11);
+          // The episode window, in ticks (the chaos-phase length band).
+          let window = 60 + self.prng.below(200);
+          self.slow_active = Some(v);
+          self.slow_until = tick + window;
+          if !env_flag("VOPR_NO_SLOW") {
+            c.set_slow_replica(
+              v,
+              Some(crate::network::SlowProfile {
+                inbound: legs != 1,
+                outbound: legs != 0,
+                min_extra: Duration::from_millis(lo_ms),
+                max_extra: Duration::from_millis(hi_ms),
+              }),
+            );
+            self.report.slow_episodes += 1;
+          }
+          if trace {
+            eprintln!(
+              "tick {tick}: SLOW replica {v} legs={legs} band={lo_ms}..={hi_ms}ms window={window}"
+            );
+          }
+        }
       }
     }
   }
@@ -889,36 +1531,91 @@ impl Vopr {
     c.partition(groups);
   }
 
-  /// The number of replicas currently knocked out: crashed plus isolated (disjoint sets).
+  /// The number of replicas currently knocked out: crashed plus isolated plus one-way victims
+  /// (disjoint sets — the pickers exclude each other's members). A one-way victim is budgeted as
+  /// knocked out because it cannot complete any round-trip exchange while its episode lasts, so the
+  /// connected, fully-bidirectional majority component must survive WITHOUT it.
   fn knocked_out(&self, c: &Cluster) -> usize {
     (0..self.n)
-      .filter(|&i| c.is_crashed(i) || self.isolated[i])
+      .filter(|&i| c.is_crashed(i) || self.isolated[i] || self.asym_victims[i])
       .count()
   }
 
-  /// Pick a replica we may crash without breaking the fault budget: not already crashed, not isolated
-  /// (isolating then crashing the same node would be redundant), and only if one more knocked-out
-  /// replica still leaves a majority. Returns `None` if the budget is exhausted.
+  /// Pick a replica we may crash without breaking the fault budget: not already crashed, not isolated,
+  /// not a one-way victim (impairing the same node twice would be redundant and would double-count
+  /// the budget), and only if one more knocked-out replica still leaves a majority. Returns `None`
+  /// if the budget is exhausted.
   fn pick_crashable(&mut self, c: &Cluster) -> Option<usize> {
     if self.knocked_out(c) >= self.minority_budget {
       return None;
     }
     let candidates: Vec<usize> = (0..self.n)
-      .filter(|&i| !c.is_crashed(i) && !self.isolated[i])
+      .filter(|&i| !c.is_crashed(i) && !self.isolated[i] && !self.asym_victims[i])
       .collect();
     self.pick(&candidates)
   }
 
   /// Pick a replica we may isolate into the minority without breaking the budget. Same constraints as
-  /// [`Self::pick_crashable`] (crashed + isolated must stay ≤ the minority budget).
+  /// [`Self::pick_crashable`] (crashed + isolated + victims must stay ≤ the minority budget).
   fn pick_isolatable(&mut self, c: &Cluster) -> Option<usize> {
     if self.knocked_out(c) >= self.minority_budget {
       return None;
     }
     let candidates: Vec<usize> = (0..self.n)
-      .filter(|&i| !c.is_crashed(i) && !self.isolated[i])
+      .filter(|&i| !c.is_crashed(i) && !self.isolated[i] && !self.asym_victims[i])
       .collect();
     self.pick(&candidates)
+  }
+
+  /// Pick the victim of a new one-way episode, within the same minority budget as
+  /// [`Self::pick_crashable`]. Half the installs PREFER a current primary among the candidates (the
+  /// deaf/mute-primary liveness-killer shapes — a deaf primary's heartbeats keep flowing out while
+  /// the acks never arrive, so nothing forces a view change AND nothing commits); the rest draw
+  /// uniformly, so backups' one-way shapes (e.g. a deaf backup spamming ever-higher
+  /// StartViewChanges the cluster must absorb) stay covered. The bias coin is drawn whenever an
+  /// install is attempted, so the stream stays a pure function of the seed.
+  fn pick_asym_victim(&mut self, c: &Cluster) -> Option<usize> {
+    if self.knocked_out(c) >= self.minority_budget {
+      return None;
+    }
+    let candidates: Vec<usize> = (0..self.n)
+      .filter(|&i| !c.is_crashed(i) && !self.isolated[i] && !self.asym_victims[i])
+      .collect();
+    if candidates.is_empty() {
+      return None;
+    }
+    if self.prng.chance(1, 2) {
+      let primaries: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|&i| c.replica_is_primary(i))
+        .collect();
+      if let Some(p) = self.pick(&primaries) {
+        return Some(p);
+      }
+    }
+    self.pick(&candidates)
+  }
+
+  /// Clear every partition, symmetric AND one-way, on both sides of the bookkeeping: the driver's
+  /// `isolated`/`asym_victims` sets and the cluster's groups + directed matrix. Every full-heal site
+  /// (the heal actions, calm windows, the final quiesce) goes through here so the driver's budget
+  /// view can never desync from the cluster's connectivity.
+  fn heal_all_partitions(&mut self, c: &mut Cluster) {
+    for i in 0..self.n {
+      self.isolated[i] = false;
+      self.asym_victims[i] = false;
+    }
+    c.heal();
+  }
+
+  /// End the active slow episode, if any: drop the cluster-side delivery profile and the driver-side
+  /// bookkeeping. Called at the episode's seeded window end, on calm-window entry, and by the final
+  /// quiesce (calm requires prompt delivery).
+  fn end_slow_episode(&mut self, c: &mut Cluster) {
+    if self.slow_active.take().is_some() {
+      c.clear_slow_replicas();
+    }
   }
 
   /// Pick a currently-crashed replica to restart, if any.
@@ -963,9 +1660,34 @@ impl Vopr {
   ) {
     use crate::checker::CheckResult::Violation;
 
+    // Tell the stateful checkers about any wipe since the last check, BEFORE they observe: the wiped
+    // replica's per-replica monotonicity baselines (durable view, checkpoint high-water) are forfeit
+    // with its disk — its fresh superblock honestly reads view 0 / checkpoint 0, which is the amnesia
+    // itself, not a checker artifact. Every CLUSTER-level invariant below stays at full strength.
+    for i in self.wiped_pending.drain(..) {
+      dur.note_wipe(i);
+      vm.note_wipe(i);
+    }
+
     // Append-before-ack, observed during the tick we just ran (PrepareOk for a non-durable op).
     if let Some(why) = c.take_append_before_ack_violation() {
       panic!("vopr seed {} tick {tick}: {why}", self.seed);
+    }
+    // Frame cap: NO legitimate inter-replica message may exceed the transport frame cap. The
+    // header-only view-change carriers + the byte-bounded `RepairBatch` keep every peer message
+    // at/below `MAX_FRAME_LEN` regardless of body size, so the modelled send-path drop must NEVER fire
+    // for the protocol's own traffic — even while large client bodies build a deep uncheckpointed band.
+    // A drop here is a REAL bug (a carrier overflowed the frame — the old full-body view-change
+    // defect, or an incomplete bound), located by seed + tick. (Loosening the cap to pass would mask it.)
+    if c.oversized_dropped() > 0 {
+      panic!(
+        "vopr seed {} tick {tick}: frame-cap: a legitimate inter-replica message exceeded \
+         MAX_FRAME_LEN and was oversized-dropped ({} so far) — a view-change/recovery carrier or \
+         repair batch overflowed the frame (header-only carriers + windowed repair should keep every \
+         peer message sub-cap regardless of body size)",
+        self.seed,
+        c.oversized_dropped(),
+      );
     }
     // Durable-view-before-participate: a StartView / head-bearing RecoveryResponse for a view
     // above the emitter's durable view, observed during the tick + the pending-view-window probe.
@@ -1044,11 +1766,24 @@ impl Vopr {
     // The committed-history high-water means at least one replica APPLIED op `top`, which the
     // protocol only does after a quorum durably appended it — so a quorum of occupied holders must
     // persist. A shortfall means a committed op vanished from a quorum's durable medium.
-    if holders < quorum {
+    //
+    // WIPES weaken this bound HONESTLY, by exactly the wiped count: a wipe permanently forfeits one
+    // replica's durable copies, so a committed op held by a bare quorum can legitimately drop to
+    // `quorum - wipes` holders until repair/state-sync re-replicates it (the checker cannot cheaply
+    // know when that completes, so the relaxed envelope holds for the rest of the run). The floor is
+    // 1: a committed op held durably NOWHERE is an outright loss no fault budget excuses. With the
+    // wipe axis off (`wipes_fired == 0` always) this is exactly the strict quorum bound — the base
+    // gates are untouched. The end-of-run check (post-quiesce, full committed history applied on an
+    // operational replica) stays fully strict on every lane.
+    let required = quorum
+      .saturating_sub(self.report.wipes_fired as usize)
+      .max(1);
+    if holders < required {
       panic!(
         "vopr seed {} tick {tick}: committed op {top} is durably held on only {holders} replicas \
-         (< quorum {quorum}) — a committed op is not retained durably by a quorum",
-        self.seed
+         (< required {required} = quorum {quorum} - wipes {}) — a committed op is not retained \
+         durably by the surviving quorum",
+        self.seed, self.report.wipes_fired
       );
     }
   }
@@ -1244,7 +1979,52 @@ impl Vopr {
         self.report.below_ring_window_syncs += syncs - self.below_ring_window_syncs_seen[i];
       }
       self.below_ring_window_syncs_seen[i] = syncs;
+      // Chunked-transfer completions, same reset-robust positive-delta accumulation (the counter
+      // zeroes on `recover`; the focused large_state_sync gate is the asserting oracle — the sweep
+      // only reports).
+      let transfers = c.replica_sync_chunk_transfers_completed(i);
+      if transfers > self.sync_chunk_transfers_seen[i] {
+        self.report.sync_chunk_transfers += transfers - self.sync_chunk_transfers_seen[i];
+      }
+      self.sync_chunk_transfers_seen[i] = transfers;
     }
+    // New-path witnesses: floored canonical unions, served `RepairBatch`es, header-only carriers.
+    // All three live on the `Endpoint` and reset to 0 on `recover`, so they use the SAME reset-robust
+    // positive-delta accumulation as `forced_syncs` above (a plain high-water would lose a
+    // pre-restart burst). The sweeps assert their cross-seed sums are `> 0` (non-vacuity).
+    for i in 0..self.n {
+      let floored = c.replica_unions_floored(i);
+      if floored > self.unions_floored_seen[i] {
+        self.report.unions_floored += floored - self.unions_floored_seen[i];
+      }
+      self.unions_floored_seen[i] = floored;
+      let served = c.replica_repair_batches_served(i);
+      if served > self.repair_batches_served_seen[i] {
+        self.report.repair_batches_served += served - self.repair_batches_served_seen[i];
+      }
+      self.repair_batches_served_seen[i] = served;
+      let pbatches = c.replica_prepare_batches_sent(i);
+      if pbatches > self.prepare_batches_sent_seen[i] {
+        self.report.prepare_batches_sent += pbatches - self.prepare_batches_sent_seen[i];
+      }
+      self.prepare_batches_sent_seen[i] = pbatches;
+      let carriers = c.replica_header_only_carriers_emitted(i);
+      if carriers > self.header_only_carriers_seen[i] {
+        self.report.header_only_carriers_emitted += carriers - self.header_only_carriers_seen[i];
+      }
+      self.header_only_carriers_seen[i] = carriers;
+      // Session-cap evictions (the churn lane's non-vacuity witness), same reset-robust
+      // positive-delta accumulation (the counter zeroes on `recover`).
+      let evicted = c.replica_sessions_evicted(i);
+      if evicted > self.sessions_evicted_seen[i] {
+        self.report.sessions_evicted += evicted - self.sessions_evicted_seen[i];
+      }
+      self.sessions_evicted_seen[i] = evicted;
+    }
+    // Torn-header probe witness (summed over the persistent WALs, high-water like `misdirects_fired`
+    // so a storage rebuild can never lower it). Stays 0 with the axis off.
+    let th: u64 = (0..self.n).map(|i| c.wal_torn_headers_fired(i)).sum();
+    self.report.torn_headers_fired = self.report.torn_headers_fired.max(th);
     // Genuine-WRAP witness: a BOUNDED seed whose committed history exceeded its ring size `N` has had an
     // op `K + N` physically reuse op `K`'s slot — the ring truly wrapped (not merely filled). Latches
     // once true. Trivially false on an unbounded seed (`wal_capacity` is `None`).
@@ -1253,6 +2033,25 @@ impl Vopr {
         self.report.bounded_seed_wrapped = true;
       }
     }
+    // Frame-cap axis high-waters: how many LARGE bodies the clients have minted (non-vacuity — the cap
+    // must be exercised), and how many inter-replica messages the network has oversized-dropped (which
+    // must stay 0 for legitimate traffic — the per-tick check in `run_vopr` already asserts this; the
+    // report carries the cumulative count for the sweep summary). Both are monotone, so `max` is exact.
+    let large: u64 = (0..c.client_count())
+      .map(|i| c.client(i).large_bodies_sent())
+      .sum();
+    self.report.large_bodies_sent = self.report.large_bodies_sent.max(large);
+    self.report.oversized_dropped = self.report.oversized_dropped.max(c.oversized_dropped());
+    // Hold-axis witness: how many messages the network has HELD so far. Monotone on the cluster (the
+    // cluster struct persists across replica crash/restart and nothing resets it), so `max` is exact.
+    // Stays 0 with the axis disabled; the hold sweep asserts the cross-seed sum is `> 0`.
+    self.report.holds_fired = self.report.holds_fired.max(c.holds_fired());
+    // Asym/slow-axis deep witnesses: the cluster's monotone one-way-drop and slow-delay counters
+    // (same discipline as `holds_fired` — nothing resets them, so `max` is exact). Both stay 0 with
+    // their axes disabled; the asym/slow sweeps assert their cross-seed sums are `> 0`, proving an
+    // episode genuinely intersected live traffic rather than merely being installed.
+    self.report.one_way_dropped = self.report.one_way_dropped.max(c.one_way_dropped());
+    self.report.slow_delays = self.report.slow_delays.max(c.slow_delays_applied());
   }
 }
 

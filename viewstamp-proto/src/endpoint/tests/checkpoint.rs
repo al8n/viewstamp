@@ -10,6 +10,7 @@ fn checkpoint_envelope_round_trips_sessions_and_snapshot() {
     Session {
       request: RequestNumber::with(3),
       reply: Some((RequestNumber::with(3), Bytes::from_static(b"r3"))),
+      last_op: OpNumber::with(5),
     },
   );
   sessions.insert(
@@ -17,6 +18,7 @@ fn checkpoint_envelope_round_trips_sessions_and_snapshot() {
     Session {
       request: RequestNumber::with(1),
       reply: None,
+      last_op: OpNumber::new(), // a provisional accept-time row rides the envelope verbatim
     },
   );
   let snap = Bytes::from_static(b"SM-SNAPSHOT");
@@ -36,6 +38,9 @@ fn checkpoint_envelope_round_trips_sessions_and_snapshot() {
     Bytes::from_static(b"r3")
   );
   assert_eq!(decoded_sessions[&9].reply, None);
+  // The eviction-ordering stamp round-trips symmetrically — an applied stamp and a provisional zero.
+  assert_eq!(decoded_sessions[&7].last_op, OpNumber::with(5));
+  assert_eq!(decoded_sessions[&9].last_op, OpNumber::new());
   // The bound op is part of the content hash: encoding the SAME sessions+snapshot under a DIFFERENT
   // op yields a DIFFERENT checkpoint_id (so an overstated advertised op cannot reuse stale bytes' id).
   let env_other_op = Endpoint::<NoopSm>::encode_checkpoint(OpNumber::with(43), &sessions, &snap);
@@ -80,6 +85,7 @@ fn checkpoint_envelope_round_trips_sessions_and_snapshot() {
   overrun.extend_from_slice(&1u32.to_be_bytes()); // 1 session
   overrun.extend_from_slice(&7u128.to_be_bytes()); // client
   overrun.extend_from_slice(&3u64.to_be_bytes()); // request
+  overrun.extend_from_slice(&5u64.to_be_bytes()); // last_op
   overrun.push(1); // has_reply
   overrun.extend_from_slice(&3u64.to_be_bytes()); // reply request number
   overrun.extend_from_slice(&999u32.to_be_bytes()); // reply len 999 (but no body follows)
@@ -173,6 +179,12 @@ fn primary_checkpoints_after_interval_ops_via_two_superblock_writes() {
   // The durable root now names the new checkpoint, with a non-zero content id (hash of envelope).
   assert_eq!(sb.state().checkpoint_op(), OpNumber::with(2));
   assert_ne!(sb.state().checkpoint_id(), 0);
+  // The root-durable arm surfaced as an observability event for exactly the checkpointed op.
+  assert!(
+    core::iter::from_fn(|| e.poll_event())
+      .any(|ev| ev == Event::CheckpointDurable(OpNumber::with(2))),
+    "the durable checkpoint root emits CheckpointDurable"
+  );
 }
 
 #[test]

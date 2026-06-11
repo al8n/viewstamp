@@ -609,8 +609,10 @@ fn bounded_wal_laggard_with_wrapped_away_ops_recovers_via_state_sync() {
 /// flapping partition that isolates a backup, plus the view changes the drops induce, so a reconnecting
 /// laggard adopts a head over a held-commit hole while its checkpoint is stale) and asserts: SOME backup
 /// actually fell below its ring window and recovered via state-sync — the dedicated
-/// `below_ring_window_syncs` counter goes above 0 (non-vacuity — the ring-window sync path genuinely
-/// fired, distinct from an ordinary above-`self.op` state-sync); and the cluster stays SAFE + durable
+/// `below_ring_window_syncs` counter goes above 0 (non-vacuity — the ring-window guard genuinely
+/// ENGAGED: it refused an overflowing head-extend append with state-sync as the recovery, whether the
+/// guard armed the sync itself or the same delivery's carried commit/floor armed it a moment earlier —
+/// distinct from an ordinary above-`self.op` state-sync alone); and the cluster stays SAFE + durable
 /// EVERY tick and every client finishes.
 ///
 /// The proto's PERMANENT `append_prepare` debug-assert is the load-bearing backstop running THROUGHOUT:
@@ -624,9 +626,14 @@ fn bounded_wal_laggard_with_wrapped_away_ops_recovers_via_state_sync() {
 #[test]
 fn bounded_wal_backup_below_ring_window_state_syncs_instead_of_overwriting() {
   // Seeds an offline sweep (32 seeds, this exact N=12 / drop=300 / flap-5000-2500 scenario) found to
-  // drive a backup below its ring window — the connected overflow fires early on each (~ticks 2.5k–7.5k),
+  // drive a backup below its ring window — the connected overflow fires early on each (~ticks 2.5k–7.7k),
   // well within the budget below. Re-derive with the `zz_scan` harness if the scenario changes.
-  const PROVOKING_SEEDS: [u64; 3] = [13, 19, 29];
+  // (Re-derived after the windowed bulk-repair channel + the floored/carried checkpoint floors landed:
+  // those heal a reconnecting laggard's checkpoint much sooner — the held hole repairs in ~one round
+  // trip and the carried floor force-syncs sub-floor holes at adoption — so the overflow confluence
+  // shifted to different seeds, and the sync the overflow rides is typically armed by the SAME
+  // delivery's carried floor a moment before the ring guard runs.)
+  const PROVOKING_SEEDS: [u64; 3] = [15, 20, 51];
   let mut total_below_ring_window_syncs = 0u64;
   for seed in PROVOKING_SEEDS {
     // N=5 (a 4-of-5 quorum always commits + checkpoints), a SMALL checkpoint interval (4) and a SMALL ring

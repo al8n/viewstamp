@@ -17,6 +17,9 @@ pub use checker::{
   BoundednessChecker, CheckResult, DurabilityChecker, ViewMonotonicChecker, check_safety,
 };
 pub use cluster::Cluster;
-pub use network::Faults;
+pub use network::{Faults, SlowProfile};
 pub use storage::{InMemorySuperblock, InMemoryWal, StorageFaults};
-pub use vopr::{DEFAULT_TICKS, VoprReport, run_vopr, run_vopr_one};
+pub use vopr::{
+  DEFAULT_TICKS, VoprReport, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_churn,
+  run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_torn_headers, run_vopr_with_wipe,
+};

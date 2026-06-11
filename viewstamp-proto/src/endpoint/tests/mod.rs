@@ -254,6 +254,13 @@ struct ScriptedWal {
   /// unrecoverable (torn / bit-rot): every read yields `WalDone::BodyFaulty(header)`. Mirrors the sim
   /// WAL's torn/rotted-body verdict — the op EXISTS, only the body needs peer-repair.
   body_faulty: std::collections::BTreeSet<u64>,
+  /// `op → n`: the next `n` APPENDS of `op` complete as `WalDone::Fault` without landing (a
+  /// contract-violating backend; the `n+1`-th append succeeds). Drives the endpoint's defensive
+  /// faulted-append retry.
+  append_faults: BTreeMap<u64, u8>,
+  /// `op → count` of `submit_append` calls observed, so a test can prove a faulted append was
+  /// re-submitted.
+  append_submits: BTreeMap<u64, u32>,
   done: VecDeque<WalDone>,
 }
 impl ScriptedWal {
@@ -277,8 +284,19 @@ impl ScriptedWal {
       read_faults: BTreeMap::new(),
       corrupt: std::collections::BTreeSet::new(),
       body_faulty: std::collections::BTreeSet::new(),
+      append_faults: BTreeMap::new(),
+      append_submits: BTreeMap::new(),
       done: VecDeque::new(),
     }
+  }
+  /// Script the next `times` APPENDS of `op` to fault without landing (a contract-violating
+  /// backend; the following append succeeds).
+  fn script_append_fault(&mut self, op: OpNumber, times: u8) {
+    self.append_faults.insert(op.get(), times);
+  }
+  /// How many `submit_append` calls this WAL has seen for `op`.
+  fn append_submits(&self, op: OpNumber) -> u32 {
+    self.append_submits.get(&op.get()).copied().unwrap_or(0)
   }
   /// Script the next `times` reads of `op` to fault (transient). `u8::MAX` ⇒ never clears.
   fn script_read_fault(&mut self, op: OpNumber, times: u8) {
@@ -314,6 +332,16 @@ impl Wal for ScriptedWal {
     }
   }
   fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+    *self.append_submits.entry(op.get()).or_default() += 1;
+    // A scripted append fault completes as `Fault` WITHOUT landing the entry (the
+    // contract-violating backend shape the endpoint's defensive retry degrades gracefully).
+    if let Some(remaining) = self.append_faults.get_mut(&op.get()) {
+      if *remaining > 0 {
+        *remaining -= 1;
+        self.done.push_back(WalDone::Fault(id));
+        return;
+      }
+    }
     self.entries.insert(op.get(), (header, body));
     self.head = self.head.max(op.get());
     self.done.push_back(WalDone::Appended(id));
@@ -776,6 +804,38 @@ fn dvc_offset(replica: u8, log_view: u64, floor: u64, op: u64, commit: u64) -> D
     ReplicaId::new(replica),
     log,
   )
+}
+
+/// A DVC whose log is the HEADER-ONLY (`Repairing`) band `(floor .. op]`, advertising `checkpoint`
+/// as its vouched floor — the exact wire shape `log_entries()` emits for a deep band (fixed 49
+/// bytes per entry), so frame-cap arithmetic on it matches a real carrier.
+fn dvc_header_band(
+  replica: u8,
+  log_view: u64,
+  checkpoint: u64,
+  floor: u64,
+  op: u64,
+  commit: u64,
+) -> DoViewChange {
+  let log = ((floor + 1)..=op)
+    .map(|i| {
+      PreparedEntry::repairing(
+        OpNumber::with(i),
+        ClientId::new(1),
+        RequestNumber::with(i),
+        0,
+      )
+    })
+    .collect();
+  DoViewChange::new(
+    View::with(log_view + 10),
+    View::with(log_view),
+    OpNumber::with(op),
+    OpNumber::with(commit),
+    ReplicaId::new(replica),
+    log,
+  )
+  .with_checkpoint_op(OpNumber::with(checkpoint))
 }
 
 /// Build a MALFORMED DVC that CLAIMS head `claimed_op` but carries only `present` real entries

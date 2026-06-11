@@ -4,12 +4,13 @@
 #[cfg(not(feature = "std"))]
 use std::vec::Vec;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
 
 use crate::{Message, Peer, Recipient, ReplicaId};
 
+use super::CloseCause;
 use super::conn::Conn;
 use super::frame::{MAX_FRAME_LEN, encode_frame};
 use super::stream::StreamTransport;
@@ -19,6 +20,14 @@ use super::stream::StreamTransport;
 pub struct ConnId(u64);
 
 impl ConnId {
+  /// Wraps a raw handle value. The router is the sole authority that ALLOCATES live handles (monotonic,
+  /// never reused), so a value built here is only ever a tag / lookup key: an unknown id simply misses
+  /// (`conn`/`conn_mut` return `None`) and never aliases a live conn.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub const fn new(raw: u64) -> Self {
+    Self(raw)
+  }
+
   /// The raw handle.
   #[cfg_attr(not(tarpaulin), inline)]
   pub const fn get(self) -> u64 {
@@ -52,6 +61,12 @@ pub struct PeerRouter<R> {
   /// Surfaced (not silently swallowed) so a driver/operator can observe that a protocol message
   /// outgrew the transport frame limit and was never sent.
   oversized_dropped: u64,
+  /// ConnIds the router has internally removed, each with WHY it closed (a record-layer reject, a
+  /// malformed frame, a failed identity validation, or an outbound-cap overflow). Drained via
+  /// `poll_closed` so a driver can tear down the still-open socket and redial a dialed peer —
+  /// otherwise a conn the proto closed internally is a silent partition until the socket happens to
+  /// fail.
+  closed: VecDeque<(ConnId, CloseCause)>,
 }
 
 impl<R> Default for PeerRouter<R> {
@@ -71,10 +86,19 @@ impl<R> PeerRouter<R> {
       cursor: ConnId(0),
       outbound_cap: DEFAULT_OUTBOUND_CAP,
       oversized_dropped: 0,
+      closed: VecDeque::new(),
     }
   }
 
-  /// Creates an empty table with an explicit per-conn outbound byte cap.
+  /// Creates an empty table with an explicit per-conn outbound PLAINTEXT staging cap.
+  ///
+  /// Test/internal support, NOT a stable embedder API (hence `#[doc(hidden)]`): `cap` tunes only the
+  /// per-conn plaintext staging cap and the backlog accumulation threshold ([`Self::max_outbound_backlog`]).
+  /// It does NOT reduce the record layer's single-chunk bound (`2 * SEND_LIMIT` for `TlsRecords`),
+  /// so the advertised `≤ 4x` peak holds only at the DEFAULT cap (where `SEND_LIMIT` equals the
+  /// staging cap); a smaller `cap` is dominated by that fixed record-layer chunk. Exists so
+  /// cross-crate tests can drive the backlog logic with a tiny cap.
+  #[doc(hidden)]
   #[cfg_attr(not(tarpaulin), inline)]
   pub const fn with_outbound_cap(cap: usize) -> Self {
     Self {
@@ -84,6 +108,7 @@ impl<R> PeerRouter<R> {
       cursor: ConnId(0),
       outbound_cap: cap,
       oversized_dropped: 0,
+      closed: VecDeque::new(),
     }
   }
 
@@ -93,6 +118,16 @@ impl<R> PeerRouter<R> {
   #[cfg_attr(not(tarpaulin), inline)]
   pub const fn oversized_dropped(&self) -> u64 {
     self.oversized_dropped
+  }
+
+  /// Drains the next ConnId the router has internally removed, with the [`CloseCause`] the conn
+  /// recorded when it closed (a record-layer reject, a malformed frame, a failed identity
+  /// validation, or an outbound-cap overflow). The driver reconciles each: tear down the still-open
+  /// socket and redial a dialed peer, else the proto-closed conn is a silent partition until the
+  /// socket happens to fail.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn poll_closed(&mut self) -> Option<(ConnId, CloseCause)> {
+    self.closed.pop_front()
   }
 
   fn alloc(&mut self) -> ConnId {
@@ -122,6 +157,34 @@ impl<R> PeerRouter<R> {
   /// All live handles (snapshot, for the pump's split-borrow iteration).
   pub fn ids(&self) -> Vec<ConnId> {
     self.conns.keys().copied().collect()
+  }
+}
+
+impl<R> PeerRouter<R> {
+  /// The per-conn wire-byte ACCUMULATION threshold the driver tolerates before declaring a stalled
+  /// socket: 2x the per-conn `outbound_cap` staging size. This is NOT the peak out-queue size and NOT a
+  /// single-chunk size bound. The driver's always-admit-one rule admits one chunk whenever the queue is
+  /// at/under this threshold and closes a conn only when its already-queued backlog is strictly OVER it,
+  /// so a single legitimately produced wire chunk of any size is never refused — and exactly ONE chunk
+  /// is admitted past the threshold.
+  ///
+  /// The real per-conn out-queue peak is therefore `backlog_cap + max_single_wire_chunk`, where the
+  /// max single wire chunk is bounded by the RECORD LAYER's send buffer (NOT by this router cap). The
+  /// router's `poll_transmit` makes exactly one `poll_transport_transmit` call per chunk and returns
+  /// that one drain as the `Bytes` (it does NOT aggregate multiple record-layer drains into one larger
+  /// chunk). For `TlsRecords` that one encrypted chunk is bounded by `set_buffer_limit(Some(2 *
+  /// SEND_LIMIT))` — a FIXED `2 * SEND_LIMIT`, independent of a tuned `outbound_cap`; for a passthrough
+  /// (`tcp`) layer the chunk is the staging cap (1x). Because the TLS chunk term is fixed, only at the
+  /// DEFAULT cap (where `SEND_LIMIT` equals `outbound_cap`, so `backlog_cap = 2 * SEND_LIMIT`) does the
+  /// TLS peak reduce to `2 * SEND_LIMIT + 2 * SEND_LIMIT = 4x` the cap. A custom cap BELOW `SEND_LIMIT`
+  /// does NOT shrink the TLS chunk, so the fixed record-layer term then dominates the peak.
+  ///
+  /// 2x is the minimum that still admits a concurrent chunk WHILE one maximal chunk (≤2x) drains: a
+  /// heartbeat / retransmit / request produced during a large drain finds the queue at ≤2x and is
+  /// admitted rather than false-closed. A 1x threshold would close as soon as that second chunk arrived
+  /// while the maximal chunk was still in flight.
+  pub(crate) fn max_outbound_backlog(&self) -> usize {
+    self.outbound_cap.saturating_mul(2)
   }
 }
 
@@ -193,7 +256,7 @@ impl<R: StreamTransport> PeerRouter<R> {
       (Some(a), true) => {
         if a != expected {
           if let Some(e) = self.conns.get_mut(&id) {
-            e.conn.abort();
+            e.conn.abort(CloseCause::IdentityRejected);
           }
           return;
         }
@@ -229,14 +292,15 @@ impl<R: StreamTransport> PeerRouter<R> {
   /// call site by construction, not only in the coordinator's pump.
   pub fn route(&mut self, to: Recipient, msg: &Message, self_id: ReplicaId) -> usize {
     // Symmetric frame cap, preflighted BEFORE encoding: the transport never emits a frame larger
-    // than it would accept inbound, so a message whose frame would exceed MAX_FRAME_LEN (e.g. a
-    // large checkpoint awaiting the deferred snapshot/message chunking) is refused here WITHOUT
-    // paying for a full encode + copy of an oversized buffer the peer would only reject as
-    // FrameTooLong. Until chunking lands the transport refuses such a message visibly — bumping the
-    // oversized-dropped counter so a driver/operator sees a protocol message outgrew the frame
-    // limit — rather than emitting a doomed frame or silently swallowing the send and wedging
-    // liveness. The endpoint's ordinary messages all fit well under the cap; VSR retransmission
-    // covers a refused send. `encoded_len()` is the exact length `encode()` would produce.
+    // than it would accept inbound, so a message whose frame would exceed MAX_FRAME_LEN is refused
+    // here WITHOUT paying for a full encode + copy of an oversized buffer the peer would only
+    // reject as FrameTooLong. EVERY protocol message is bounded under the cap by construction —
+    // header-only view-change carriers, the byte-bounded RepairBatch serve, and chunked state-sync
+    // (an over-frame checkpoint travels as SyncCheckpointMeta + SyncChunk pulls, never one frame) —
+    // so a refusal here is a REAL bug; it is counted visibly (the oversized-dropped counter) rather
+    // than emitting a doomed frame or silently swallowing the send and wedging liveness. VSR
+    // retransmission covers a refused send. `encoded_len()` is the exact length `encode()` would
+    // produce.
     if msg.encoded_len() > MAX_FRAME_LEN as usize {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
       return 0;
@@ -251,7 +315,7 @@ impl<R: StreamTransport> PeerRouter<R> {
           continue;
         }
         if e.conn.queued_outbound().saturating_add(framed.len()) > self.outbound_cap {
-          e.conn.abort();
+          e.conn.abort(CloseCause::OutboundOverflow);
           dropped += 1;
           continue;
         }
@@ -326,15 +390,22 @@ impl<R: StreamTransport> PeerRouter<R> {
   /// replacement and black-holes the peer. The `peers` drop is equality-guarded so a dying conn
   /// cannot clobber a fresh mapping. Returns whether a slot was removed.
   pub fn reap(&mut self, id: ConnId) -> bool {
-    let (closed, peer) = match self.conns.get(&id) {
-      Some(e) => (e.conn.is_closed(), e.peer),
+    let (cause, peer) = match self.conns.get(&id) {
+      Some(e) => (e.conn.close_cause(), e.peer),
       None => return false,
     };
-    if !closed {
+    // `close_cause` is `Some` iff the conn is terminal, so this is the is-closed gate AND the
+    // cause read in one: a conn cannot be reaped without the cause its close transition recorded.
+    let Some(cause) = cause else {
       return false;
-    }
+    };
     let was_authoritative = self.peers.get(&peer).copied() == Some(id);
     self.conns.remove(&id);
+    // Record every removal so a driver can reconcile: tear down the matching socket and redial a
+    // dialed peer. `reap` is the single removal site (`reap_closed` and `route` both funnel through
+    // it), so recording here covers every internal-close path — overflow, short write, and inbound
+    // reject — exactly once per removed conn.
+    self.closed.push_back((id, cause));
     if was_authoritative {
       self.peers.remove(&peer);
       let replacement = self
@@ -409,6 +480,23 @@ mod tests {
     assert!(ids.contains(&a) && ids.contains(&b) && ids.len() == 2);
   }
 
+  #[test]
+  fn max_outbound_backlog_is_twice_the_outbound_cap() {
+    // The accumulation threshold the driver reads is 2x the router's ACTUAL per-conn outbound_cap
+    // staging size (the minimum that still admits a concurrent chunk while one maximal ~2x-expanded
+    // wire chunk drains), so it tracks a configured cap, not just the default. It is the threshold, not
+    // the peak: the always-admit-one rule admits one chunk past it, so the real peak is `backlog_cap +
+    // one max wire chunk`.
+    let default = PeerRouter::<crate::Passthrough>::new();
+    assert_eq!(default.max_outbound_backlog(), DEFAULT_OUTBOUND_CAP * 2);
+    let custom = PeerRouter::<crate::Passthrough>::with_outbound_cap(4096);
+    assert_eq!(
+      custom.max_outbound_backlog(),
+      4096 * 2,
+      "max_outbound_backlog is 2x a custom cap set via with_outbound_cap"
+    );
+  }
+
   fn commit_msg() -> Message {
     Message::Commit(Commit::new(
       View::with(1),
@@ -445,6 +533,30 @@ mod tests {
       r.authoritative(p),
       None,
       "no standby exists, so the peer has no authoritative conn after the overflow close"
+    );
+  }
+
+  #[test]
+  fn a_reaped_conn_surfaces_through_poll_closed_exactly_once() {
+    // The outbound-cap overflow path is the easiest reaping to trigger deterministically: a conn
+    // whose queued outbound exceeds the cap is aborted + reaped inside route(). Its id must surface
+    // through poll_closed — WITH the overflow cause the abort recorded — exactly once, then None.
+    let mut r = PeerRouter::<crate::Passthrough>::with_outbound_cap(8);
+    let p = Peer::Replica(ReplicaId::new(0));
+    assert_eq!(r.poll_closed(), None, "no closed conn before any reap");
+    let c = established(&mut r, p);
+    // A single framed message larger than the 8-byte cap aborts + reaps the conn on the first route.
+    r.route(Recipient::To(p), &commit_msg(), ReplicaId::new(1));
+    assert!(r.conn(c).is_none(), "the over-cap conn is reaped");
+    assert_eq!(
+      r.poll_closed(),
+      Some((c, CloseCause::OutboundOverflow)),
+      "the reaped conn's id and overflow cause are drained for driver reconciliation"
+    );
+    assert_eq!(
+      r.poll_closed(),
+      None,
+      "drained exactly once, no duplicate id"
     );
   }
 

@@ -36,18 +36,34 @@ impl<S: StateMachine> Endpoint<S> {
           // higher checkpoint does not downgrade an outstanding forced sync's assert-relaxation).
           forced: s.forced,
         });
+        // A FORCED target raised past a pinned chunked transfer invalidates it (the strict
+        // `>= target` gate is load-bearing there); an ordinary raise keeps the pin (it completes
+        // below the raised freshness floor).
+        self.drop_transfer_below_forced_target();
       }
       return;
     }
-    // Fresh trigger: bump the nonce deterministically (the sim seeds `self.nonce` from the prng;
-    // a simple increment keeps it deterministic + distinct from the prior recovery/get-view nonce),
-    // record the target, and broadcast the solicitation.
+    // Fresh trigger: arm + solicit through the single fresh-arm chokepoint.
+    self.arm_sync(now, incoming_checkpoint, false);
+  }
+
+  /// The SINGLE fresh-arm chokepoint for a state-sync handshake: bump the freshness nonce
+  /// deterministically (the sim seeds `self.nonce` from the prng; a simple increment keeps it
+  /// deterministic + distinct from the prior recovery/get-view nonce), record the target (and whether
+  /// the sync is FORCED — the relaxed `apply_sync` invariant), emit the
+  /// [`Event::StateSyncStarted`] observability event, and broadcast the solicitation. Every site that
+  /// arms a sync from `None` routes here (`maybe_request_sync`, `maybe_force_sync`,
+  /// `maybe_sync_below_ring_window`, the recovery peer-fetch escalation); target RAISES on an
+  /// outstanding sync stay at their sites (they re-target the same handshake, not a fresh arm).
+  pub(crate) fn arm_sync(&mut self, now: Instant, target: OpNumber, forced: bool) {
+    debug_assert!(self.sync.is_none(), "arm_sync is the FRESH-arm path only");
     self.nonce = self.nonce.wrapping_add(1);
     self.sync = Some(SyncState {
-      target: incoming_checkpoint,
+      target,
       nonce: self.nonce,
-      forced: false,
+      forced,
     });
+    self.events.push_back(Event::StateSyncStarted(target));
     self.send_request_sync(now);
   }
 
@@ -151,6 +167,18 @@ impl<S: StateMachine> Endpoint<S> {
     let valid_sync_target =
       target.get() > self.checkpoint_op.get() && target.get() > self.commit_min.get();
     if valid_sync_target {
+      // Observability (non-vacuity): count this below-ring-window overflow — a head-extending Prepare
+      // was DROPPED because appending it would overwrite an un-pruned ring slot, and state-sync is the
+      // recovery (the cluster checkpoint is a valid forward target). Counted for BOTH the fresh-arm and
+      // the already-outstanding arms below: the SAME delivery that brings the overflowing head-extend
+      // usually carries the commit/floor information whose `advance_commit` → `maybe_force_sync` ran a
+      // moment earlier in `on_prepare` and already armed the sync — so by the time this guard runs, the
+      // sync is typically outstanding. The counter witnesses the guard ENGAGING on a genuine overflow
+      // (drop + sync-recovery, vs wedging or overwriting), not which trigger within the same delivery
+      // armed the sync first. The `valid_sync_target == false` back-pressure case
+      // (already applied through the cluster checkpoint; a local checkpoint releases the ring) stays
+      // UNCOUNTED — no sync is the recovery there.
+      self.below_ring_window_syncs += 1;
       match self.sync {
         // Already syncing: only raise the target (keep it forced — applying a checkpoint `<= self.op`).
         Some(s) if target.get() > s.target.get() => {
@@ -159,20 +187,11 @@ impl<S: StateMachine> Endpoint<S> {
             nonce: s.nonce,
             forced: true,
           });
+          // The now-forced raised target invalidates a chunked transfer pinned below it.
+          self.drop_transfer_below_forced_target();
         }
         Some(_) => {} // a sync to >= target is already outstanding — let it run (anti-thrash).
-        None => {
-          self.nonce = self.nonce.wrapping_add(1);
-          self.sync = Some(SyncState {
-            target,
-            nonce: self.nonce,
-            forced: true,
-          });
-          // Observability (non-vacuity): count this FRESH below-ring-window sync, so the Phase-B gate can
-          // prove the connected backup-overflow path genuinely fired (vs the ordinary `> self.op` trigger).
-          self.below_ring_window_syncs += 1;
-          self.send_request_sync(now);
-        }
+        None => self.arm_sync(now, target, true),
       }
     }
     // Either way the overflowing prepare is dropped (the un-pruned slot is preserved); if no sync was
@@ -270,17 +289,11 @@ impl<S: StateMachine> Endpoint<S> {
           nonce: s.nonce,
           forced: true,
         });
+        // The now-forced raised target invalidates a chunked transfer pinned below it.
+        self.drop_transfer_below_forced_target();
       }
       Some(_) => {} // a sync to >= floor is already outstanding — let it run (anti-thrash).
-      None => {
-        self.nonce = self.nonce.wrapping_add(1);
-        self.sync = Some(SyncState {
-          target: floor,
-          nonce: self.nonce,
-          forced: true,
-        });
-        self.send_request_sync(now);
-      }
+      None => self.arm_sync(now, floor, true),
     }
   }
 
@@ -307,7 +320,12 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// State-sync solicit timer: while a sync is outstanding, re-broadcast `RequestSync` and re-arm.
-  /// Cleared when the synced checkpoint goes durable (`on_sb_done` clears `sync` + this timer).
+  /// Doubles as the chunked transfer's ARQ: with a transfer pinned, FIRST re-send the one
+  /// outstanding stop-and-wait chunk pull (the request or its answer may have been lost — the
+  /// staged frontier is exactly the next offset, so the re-send is idempotent), THEN re-broadcast
+  /// `RequestSync` (dead-donor replacement: a fresh announce from any live holder of the pinned
+  /// content re-pins the transfer and resumes at the same frontier). Cleared when the synced
+  /// checkpoint goes durable (`on_sb_done` clears `sync` + this timer).
   pub(crate) fn sync_timeouts(&mut self, now: Instant) {
     if self.timers.sync_solicit.is_none_or(|d| d > now) {
       return;
@@ -316,7 +334,63 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.sync_solicit = None;
       return;
     }
+    if let Some(offset) = self.sync_transfer.as_ref().map(|t| t.staged.len() as u64) {
+      self.send_request_sync_chunk(now, offset);
+    }
     self.send_request_sync(now);
+  }
+
+  /// Send the chunked transfer's one outstanding pull: a `RequestSyncChunk` for the pinned
+  /// `(checkpoint_op, checkpoint_id)` at `offset` (always the staged frontier), addressed to the
+  /// pinned donor, echoing the live sync nonce. Re-arms the solicit deadline while Normal (the
+  /// stop-and-wait ARQ rides it); while Recovering the `recover_retry` cadence re-drives the pull
+  /// instead (`sync_solicit` is not serviced there). No-op without a pinned transfer + live sync.
+  pub(super) fn send_request_sync_chunk(&mut self, now: Instant, offset: u64) {
+    let Some(t) = &self.sync_transfer else {
+      return;
+    };
+    let Some(s) = self.sync else {
+      return;
+    };
+    let (checkpoint_op, checkpoint_id, donor) = (t.checkpoint_op, t.checkpoint_id, t.donor);
+    self.emit(Outgoing::new(
+      Recipient::To(Peer::Replica(donor)),
+      Message::RequestSyncChunk(crate::RequestSyncChunk::new(
+        self.view,
+        checkpoint_op,
+        checkpoint_id,
+        offset,
+        self.config.replica(),
+        s.nonce,
+      )),
+    ));
+    if self.status.is_normal() {
+      self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+    }
+  }
+
+  /// Abort a pinned chunked transfer a FORCED-sync target raise has invalidated: a forced target is
+  /// LOAD-BEARING (`maybe_force_sync` cleared repair holes at/below it against a snapshot at/above
+  /// it), so the strict `>= target` install gate stays — a transfer pinned BELOW the raised target
+  /// can never install and would only burn round trips. Dropping it frees the staged bytes; `sync`
+  /// stays armed, so the solicit timer re-announces and a fresh pin at/above the new target starts
+  /// over. An ORDINARY sync's raise deliberately does NOT abort: its target is a freshness floor and
+  /// the pinned transfer still installs below it (strict progress — see the assembled carve-out in
+  /// `handle_sync_checkpoint`); the next trigger then chases the newer checkpoint.
+  fn drop_transfer_below_forced_target(&mut self) {
+    let Some(s) = self.sync else {
+      return;
+    };
+    if !s.forced {
+      return;
+    }
+    if self
+      .sync_transfer
+      .as_ref()
+      .is_some_and(|t| t.checkpoint_op.get() < s.target.get())
+    {
+      self.sync_transfer = None;
+    }
   }
 
   // ── State-sync: the peer side — answer a RequestSync from the durable checkpoint ──
@@ -355,23 +429,70 @@ impl<S: StateMachine> Endpoint<S> {
     if !in_reach {
       return; // nothing the requester needs from us — silent.
     }
-    let id = self.mint_op_id();
-    sb.submit_read_checkpoint(id);
-    self.sync_serving.insert(id.get(), (m.replica(), m.nonce()));
+    // ONE outstanding serve per requester (the structural bound on `sync_serving`): while this
+    // requester's serve-read is still in flight, a repeat `RequestSync` only REFRESHES the echoed
+    // nonce + serve kind — the completion then answers the LATEST solicitation — and issues NO
+    // second checkpoint read. Without the dedupe, a buggy peer's solicit burst would stack N concurrent
+    // reads, each completion shipping a full snapshot. (A same-nonce burst — the timer-retransmit
+    // common case — is answered identically; a re-armed sync's newer nonce is shipped without an
+    // extra round trip.)
+    self.submit_or_refresh_serve(sb, m.replica(), m.nonce(), ServeKind::Offer);
   }
 
-  /// Ship a `SyncCheckpoint` for a completed serve-read (the read `on_request_sync` issued). Binds the
-  /// shipped `checkpoint_id` to the shipped bytes via `checkpoint_id(cr.snapshot())`, then VERIFIES that
+  /// Record (or refresh) the single in-flight serve for `requester`. If a serve-read is already
+  /// outstanding, only the echoed nonce + serve kind are refreshed in place (the completion answers
+  /// the LATEST solicitation) — no second checkpoint read is issued; otherwise submit one read and
+  /// insert the entry. The structural one-read-per-requester bound on `sync_serving`.
+  fn submit_or_refresh_serve<B: Superblock>(
+    &mut self,
+    sb: &mut B,
+    requester: ReplicaId,
+    nonce: u64,
+    kind: ServeKind,
+  ) {
+    if let Some(serving) = self.sync_serving.get_mut(&requester.get()) {
+      serving.nonce = nonce;
+      serving.kind = kind;
+      return;
+    }
+    let id = self.mint_op_id();
+    sb.submit_read_checkpoint(id);
+    self.sync_serving.insert(
+      requester.get(),
+      SyncServe {
+        read: id.get(),
+        nonce,
+        kind,
+      },
+    );
+  }
+
+  /// Ship the answer for a completed serve-read (the read `on_request_sync` /
+  /// `on_request_sync_chunk` issued), per the recorded [`ServeKind`]: the whole `SyncCheckpoint`
+  /// when the envelope fits one frame, a `SyncCheckpointMeta` announce when it does not (the
+  /// requester then pulls chunks), or one `SyncChunk` for a cold-cache pull. Binds the shipped
+  /// `checkpoint_id` to the shipped bytes via `checkpoint_id(cr.snapshot())`, then VERIFIES that
   /// id equals our DURABLE checkpoint id (`sb.state().checkpoint_id()`) — so a CORRUPT-but-
   /// parseable read (an in-model disk fault) cannot make us ship a self-consistent-but-wrong (id, bytes)
   /// pair the requester would accept and restore (it only re-checks `checkpoint_id(snapshot) == advertised
-  /// id`); a mismatch DROPS the read (the serve path is then as strict as `recover`'s `id_ok` gate). Also
-  /// re-checks status + view-durability + replica range at SHIP time (all may have changed between submit
-  /// and completion): if we are no longer Normal, or our view is no longer durable, we drop the reply.
+  /// id`); a mismatch DROPS the read (the serve path is then as strict as `recover`'s `id_ok` gate). The
+  /// verified bytes also fill the donor serve cache (`sync_donating`), so subsequent chunk pulls are
+  /// zero-copy slices with no further superblock read. Also re-checks status + view-durability +
+  /// replica range at SHIP time (all may have changed between submit and completion): if we are no
+  /// longer Normal, or our view is no longer durable, we drop the reply.
   pub(crate) fn serve_sync_checkpoint<B: Superblock>(&mut self, sb: &B, cr: crate::CheckpointRead) {
-    let Some((to, nonce)) = self.sync_serving.remove(&cr.id().get()) else {
-      return; // not a serve-read we issued (a stale/foreign completion) — ignore.
+    // Serve entries are keyed by REQUESTER (one outstanding serve each); match this completion
+    // against the recorded read `OpId`. No match ⇒ not a serve-read we issued (a stale/foreign
+    // completion) — ignore. The scan is bounded by `replica_count` (<= 64).
+    let Some((to, nonce, kind)) = self
+      .sync_serving
+      .iter()
+      .find(|(_, s)| s.read == cr.id().get())
+      .map(|(&to, s)| (ReplicaId::new(to), s.nonce, s.kind))
+    else {
+      return;
     };
+    self.sync_serving.remove(&to.get());
     // Durable-view-before-participate: the shipped `SyncCheckpoint` advertises
     // `self.view` (see below). A replica in its `pending_sb` window (a new primary between
     // `start_view_as_new_primary` and the `on_sb_done` that makes its view durable — or any replica mid
@@ -413,17 +534,147 @@ impl<S: StateMachine> Endpoint<S> {
     if id != sb.state().checkpoint_id() {
       return;
     }
+    // The read is VERIFIED (op-matched + durable-id-matched) — fill the donor serve cache so this
+    // requester's (and any other pinned receiver's) chunk pulls are zero-copy slices of these bytes,
+    // with no superblock re-read + re-hash per chunk.
+    self.sync_donating = Some(SyncDonating {
+      checkpoint_op: cr.op(),
+      checkpoint_id: id,
+      snapshot: snapshot.clone(),
+    });
+    match kind {
+      ServeKind::Offer => {
+        if snapshot.len() <= crate::message::max_unchunked_snapshot_len() {
+          // The unchunked fast path: the whole envelope fits one frame — ship it whole.
+          self.emit(Outgoing::new(
+            Recipient::To(Peer::Replica(to)),
+            Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+              self.view,
+              cr.op(),
+              id,
+              self.config.replica(),
+              nonce,
+              snapshot,
+            )),
+          ));
+        } else {
+          // Too large for one frame: announce it (op, content id, total length) and let the
+          // requester pull chunks. `total_len` descends from this VERIFIED read, so the receiver can
+          // size its reassembly buffer to exactly the envelope it will verify.
+          self.emit(Outgoing::new(
+            Recipient::To(Peer::Replica(to)),
+            Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
+              self.view,
+              cr.op(),
+              id,
+              snapshot.len() as u64,
+              self.config.replica(),
+              nonce,
+            )),
+          ));
+        }
+      }
+      // A cold-cache chunk pull: the cache is now warm — ship the requested chunk (a malformed
+      // offset at/past the end is dropped; the requester's transfer state never asks for one).
+      ServeKind::Chunk { offset } => self.ship_sync_chunk(to, nonce, offset),
+    }
+  }
+
+  /// Ship one `SyncChunk` of the cached (`sync_donating`) envelope at `offset`, zero-copy. Drops a
+  /// malformed `offset` at/past the envelope end (nothing to serve there — a correct receiver's
+  /// next-offset never reaches it, so this only rejects a corrupt/buggy pull). The caller has
+  /// already gated status/durable-view/range and verified the cache covers the pinned checkpoint.
+  fn ship_sync_chunk(&mut self, to: ReplicaId, nonce: u64, offset: u64) {
+    let Some(d) = &self.sync_donating else {
+      return;
+    };
+    let total_len = d.snapshot.len() as u64;
+    if offset >= total_len {
+      return;
+    }
+    let end = offset
+      .saturating_add(crate::message::SYNC_CHUNK_LEN as u64)
+      .min(total_len);
+    let chunk = d.snapshot.slice(offset as usize..end as usize);
+    let (checkpoint_op, checkpoint_id) = (d.checkpoint_op, d.checkpoint_id);
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(to)),
-      Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      Message::SyncChunk(crate::SyncChunk::new(
         self.view,
-        cr.op(),
-        id,
+        checkpoint_op,
+        checkpoint_id,
+        total_len,
+        offset,
         self.config.replica(),
         nonce,
-        snapshot,
+        chunk,
       )),
     ));
+  }
+
+  /// Answer a peer's `RequestSyncChunk` — one chunk of the checkpoint envelope it has pinned
+  /// `(checkpoint_op, checkpoint_id)`. Gates like the serve completion (Normal + durable view +
+  /// replica range: a `SyncChunk` advertises `self.view`), then in order:
+  ///
+  /// - **Cache hit** — the pinned checkpoint is exactly the cached `sync_donating` content: ship the
+  ///   chunk as a zero-copy slice. This serves BOTH the common warm case and the donor-advanced case
+  ///   (the cache deliberately outlives the donor's own checkpoint advance — committed content is
+  ///   immutable — so a pinned mid-transfer receiver finishes pulling the OLD checkpoint).
+  /// - **Cold cache, current checkpoint** — the pin matches our durable root `(checkpoint_op, id)`
+  ///   but the cache is cold (e.g. we restarted mid-transfer): re-read the snapshot
+  ///   ([`ServeKind::Chunk`]); the verified completion warms the cache and ships the chunk.
+  /// - **Stale pin** — the pinned op is BELOW our durable checkpoint and not cached (we pruned past
+  ///   it / restarted): treat it as a fresh `RequestSync` ([`ServeKind::Offer`]) — the completion
+  ///   offers our CURRENT checkpoint (whole or chunked), and the requester re-pins to it. This is
+  ///   the donor-pruned-mid-transfer recovery.
+  /// - Otherwise stay silent (a pin we cannot serve — the requester's solicit timer re-broadcasts
+  ///   `RequestSync` and another peer answers).
+  pub(crate) fn on_request_sync_chunk<B: Superblock>(
+    &mut self,
+    _now: Instant,
+    sb: &mut B,
+    m: crate::RequestSyncChunk,
+  ) {
+    if !self.status.is_normal() {
+      return; // only a Normal replica has a trustworthy durable checkpoint to serve
+    }
+    if m.replica().get() >= self.config.replica_count() {
+      return; // ignore malformed/out-of-range replica id
+    }
+    // Durable-view-before-participate at the DIRECT-ship gate: a cache-hit chunk is emitted from
+    // this handler (no read completion re-gates it), and a `SyncChunk` advertises `self.view` — so
+    // drop while a durable-view write is in flight, exactly as `serve_sync_checkpoint` does at ship
+    // time. The requester re-solicits; we answer once the view is durable.
+    if self.pending_sb.is_some() {
+      return;
+    }
+    if let Some(d) = &self.sync_donating {
+      if d.checkpoint_op == m.checkpoint_op() && d.checkpoint_id == m.checkpoint_id() {
+        self.ship_sync_chunk(m.replica(), m.nonce(), m.offset());
+        return;
+      }
+    }
+    if self.checkpoint_op.get() == 0 {
+      return; // nothing durable to serve — silent.
+    }
+    if m.checkpoint_op() == self.checkpoint_op && m.checkpoint_id() == sb.state().checkpoint_id() {
+      // Cold cache, current durable checkpoint: re-read, then ship the chunk from the verified
+      // completion (which also warms the cache for the rest of the transfer).
+      self.submit_or_refresh_serve(
+        sb,
+        m.replica(),
+        m.nonce(),
+        ServeKind::Chunk { offset: m.offset() },
+      );
+      return;
+    }
+    if m.checkpoint_op().get() < self.checkpoint_op.get() {
+      // The pinned checkpoint is gone here (pruned / never ours) but we hold something STRICTLY
+      // newer: offer it fresh — the receiver aborts its stale pin and re-pins to the new announce.
+      self.submit_or_refresh_serve(sb, m.replica(), m.nonce(), ServeKind::Offer);
+    }
+    // Anything else (a pin at/above our checkpoint that is not our content) is unanswerable here —
+    // stay silent; the requester's re-broadcast finds a peer that holds it.
   }
 
   // ── State-sync: apply a verified SyncCheckpoint (the safety-critical core) ──
@@ -436,9 +687,34 @@ impl<S: StateMachine> Endpoint<S> {
   pub(crate) fn on_sync_checkpoint<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    m: crate::SyncCheckpoint,
+  ) {
+    self.handle_sync_checkpoint(now, wal, sb, m, false);
+  }
+
+  /// The body of [`Self::on_sync_checkpoint`], shared with the chunked-transfer completion.
+  /// `assembled` marks an envelope REASSEMBLED from a chunked transfer (vs one that arrived whole):
+  /// it relaxes exactly ONE guard — the `>= target` freshness gate for an ORDINARY sync — because
+  /// an ordinary target is a freshness FLOOR, not a safety bound: a target raised mid-transfer
+  /// (the cluster checkpointed again while chunks were in flight) must not discard a fully-pulled,
+  /// verified envelope that still passes every SAFETY gate (`> self.op` for ordinary, monotone over
+  /// our own checkpoint, the content hash, the decode bind-check). Installing it is strict progress;
+  /// the very next `Commit` re-fires the trigger and a follow-up sync chases the newer checkpoint.
+  /// Without the carve-out a sustained checkpoint cadence could raise the target faster than any
+  /// transfer completes and the laggard would restart forever. A FORCED sync keeps the strict gate
+  /// even when assembled — its target is LOAD-BEARING (`maybe_force_sync` cleared repair holes
+  /// at/below it against a snapshot at/above it), so a below-target install could strand a cleared
+  /// hole; the raise sites instead abort the pinned transfer outright
+  /// ([`Self::drop_transfer_below_forced_target`]).
+  fn handle_sync_checkpoint<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
     _wal: &mut W,
     sb: &mut B,
     m: crate::SyncCheckpoint,
+    assembled: bool,
   ) {
     // Freshness + relevance: we must be a Normal replica with an outstanding sync whose nonce matches.
     if !self.status.is_normal() {
@@ -456,8 +732,11 @@ impl<S: StateMachine> Endpoint<S> {
     if self.pending_checkpoint.is_some() {
       return;
     }
-    if m.checkpoint_op().get() < s.target.get() {
-      return; // does not advance us past what we know the cluster has committed — ignore.
+    if m.checkpoint_op().get() < s.target.get() && !(assembled && !s.forced) {
+      // Does not advance us past what we know the cluster has committed — ignore. The ONE carve-out
+      // (see the method doc): an ASSEMBLED ORDINARY transfer completes below a target raised
+      // mid-transfer — the target is a freshness floor there, and the safety gates below still run.
+      return;
     }
     // The `<= self.op` drop is ONLY for the ordinary trigger: there, an equal/lower checkpoint means a
     // racing tail-apply already covered it (no sync needed). A FORCED sync deliberately targets
@@ -498,10 +777,224 @@ impl<S: StateMachine> Endpoint<S> {
     // for a restarted primary (abdicate rather than resume with a torn-down pipeline).
     if self.abdicate_if_primary(now) {
       self.sync = None;
+      self.sync_transfer = None;
       self.timers.sync_solicit = None;
       return;
     }
     self.apply_sync(now, sb, &m);
+  }
+
+  /// Receive a `SyncCheckpointMeta` — a donor announcing a checkpoint too large for one frame. Runs
+  /// the BYTE-FREE PREFIX of the install cascade (so a transfer is never pinned for an envelope its
+  /// assembly would fail), then pins/extends the chunked transfer and sends the first/next pull.
+  ///
+  /// The announced `total_len` is ADMISSION-GATED before anything is sized from it (it is a wire
+  /// claim, not yet evidence): a length over the configured cap
+  /// ([`Config::max_sync_envelope_len`](crate::Config::max_sync_envelope_len)) or beyond this
+  /// target's address width is ignored outright, and the staging reservation itself is fallible —
+  /// each refusal leaves any live pin and the armed `sync` untouched, so a buggy donor's announce
+  /// costs nothing and a sane donor's next announce proceeds.
+  ///
+  /// Status dispatch mirrors the `SyncCheckpoint` ingress: `Normal` runs the ordinary cascade
+  /// (`>= target` unless forced; ordinary `> self.op`; monotone over our own checkpoint; a primary
+  /// ABDICATES at transfer START — it must never burn a whole transfer pulling an envelope its
+  /// apply-site step-down would discard); the `Recovering` peer-fetch runs
+  /// `on_recover_sync_checkpoint`'s prefix (the announced checkpoint must reach our own corrupt
+  /// one). Pin transitions:
+  /// - **No transfer** → pin `(op, id, total_len, donor)` and pull from offset 0.
+  /// - **Same content pinned** (`(op, id)` equal — non-Byzantine id-match ⇒ content-match) → re-pin
+  ///   the DONOR only (failover to a live holder), KEEP the staged prefix (chunks are
+  ///   interchangeable across donors), and re-pull at the staged frontier. A same-id announce whose
+  ///   `total_len` disagrees is a faulty donor — ignored.
+  /// - **Strictly newer checkpoint** (passed the gates) → the pin is superseded: drop the staged
+  ///   bytes and re-pin fresh.
+  /// - Anything older/different → ignore (the live pin keeps pulling).
+  pub(crate) fn on_sync_checkpoint_meta(&mut self, now: Instant, m: crate::SyncCheckpointMeta) {
+    let recovering = self.status.is_recovering() && self.awaiting_peer_checkpoint();
+    if !self.status.is_normal() && !recovering {
+      return;
+    }
+    let Some(s) = self.sync else {
+      return; // no sync outstanding — ignore.
+    };
+    if m.nonce() != s.nonce {
+      return; // a reply to a prior solicitation / forged — not fresh.
+    }
+    if self.pending_checkpoint.is_some() {
+      return; // already persisting a chosen snapshot — no new transfer.
+    }
+    if m.total_len() == 0 {
+      return; // malformed: no checkpoint envelope is empty (op u64 + session count u32 at least).
+    }
+    // The announced length is a wire-supplied CLAIM, admitted only under the configured envelope cap
+    // and this target's address width (see the admission doc above) — a buggy peer's one small frame
+    // can never drive an unbounded reservation, and an inadmissible announce is IGNORED (no pin
+    // displaced, no abdication, sync stays armed). Runs for BOTH the Normal and the Recovering
+    // peer-fetch ingress (both dispatch here), keeping the two paths' admission identical.
+    if m.total_len() > self.config.max_sync_envelope_len() {
+      return;
+    }
+    let Ok(announced_len) = usize::try_from(m.total_len()) else {
+      return; // not representable on this target (32-bit) — the same ignore as over-cap.
+    };
+    if recovering {
+      // The peer-fetch prefix (`on_recover_sync_checkpoint`): the announced checkpoint must at
+      // least reach our own (corrupt) one, else its snapshot cannot subsume it.
+      if m.checkpoint_op().get() < self.checkpoint_op.get() {
+        return;
+      }
+    } else {
+      // The byte-free prefix of `handle_sync_checkpoint`'s cascade. No assembled carve-out here:
+      // a FRESH pin below the current target would assemble an envelope the forced gate rejects,
+      // and an ordinary in-progress transfer re-pins through the same-content arm below (which
+      // does not re-run this prefix — by then the floor is the pinned content's to keep).
+      let same_pin = self.sync_transfer.as_ref().is_some_and(|t| {
+        t.checkpoint_op == m.checkpoint_op() && t.checkpoint_id == m.checkpoint_id()
+      });
+      if !same_pin {
+        if m.checkpoint_op().get() < s.target.get() {
+          return;
+        }
+        if !s.forced && m.checkpoint_op().get() <= self.op.get() {
+          return;
+        }
+        if m.checkpoint_op().get() <= self.checkpoint_op.get() {
+          return;
+        }
+        // A PRIMARY must not pull a transfer it could never apply (`handle_sync_checkpoint` steps
+        // down at the APPLY site): abdicate at transfer START instead, before any chunk flows.
+        if self.abdicate_if_primary(now) {
+          self.sync = None;
+          self.sync_transfer = None;
+          self.timers.sync_solicit = None;
+          return;
+        }
+      }
+    }
+    if let Some(t) = self.sync_transfer.as_mut() {
+      if t.checkpoint_op == m.checkpoint_op() && t.checkpoint_id == m.checkpoint_id() {
+        if t.total_len != m.total_len() {
+          return; // a same-id announce with a different length is a faulty donor — ignore.
+        }
+        // Donor failover: same pinned content from a (possibly different) live holder — keep the
+        // staged prefix and resume pulling from the frontier, now addressed to this announcer.
+        t.donor = m.replica();
+        let offset = t.staged.len() as u64;
+        self.send_request_sync_chunk(now, offset);
+        return;
+      }
+      if m.checkpoint_op().get() <= t.checkpoint_op.get() {
+        return; // an older (or same-op different-content) announce never displaces the live pin.
+      }
+      // A strictly newer checkpoint passed the gates: the pinned transfer is superseded.
+    }
+    // Reserve the staging buffer FALLIBLY before adopting the pin: the announce passed the
+    // admission cap, but the cap is an operator choice the allocator can still refuse. On refusal
+    // nothing is adopted — a live pinned transfer survives untouched and `sync` stays armed (the
+    // same keep-armed outcome as the inadmissible-announce ignore above; the solicit timer
+    // re-announces). The exact reservation is the transfer's full extent, so `on_sync_chunk`'s
+    // appends stay within capacity through the append-only growth to exactly `total_len`.
+    let mut staged = std::vec::Vec::new();
+    if staged.try_reserve_exact(announced_len).is_err() {
+      return;
+    }
+    self.sync_transfer = Some(SyncTransfer {
+      checkpoint_op: m.checkpoint_op(),
+      checkpoint_id: m.checkpoint_id(),
+      total_len: m.total_len(),
+      donor: m.replica(),
+      staged,
+    });
+    self.send_request_sync_chunk(now, 0);
+  }
+
+  /// Receive a `SyncChunk` — one pulled piece of the pinned envelope. Guard cascade: status dispatch
+  /// (Normal, or the Recovering peer-fetch); live sync + nonce; not mid-persist; the chunk's
+  /// `(checkpoint_op, checkpoint_id, total_len)` all equal the pin; `offset` is EXACTLY the staged
+  /// frontier (dups and reorders are inert — the ARQ re-pulls the frontier). A chunk that makes no
+  /// progress (empty) or would overflow the announced total aborts the transfer — staged bytes
+  /// freed, `sync` KEPT armed so the solicit timer re-announces and a fresh pin starts over.
+  ///
+  /// On the last chunk the WHOLE assembly is verified against the pinned content id BEFORE anything
+  /// reaches the install path (a mismatched assembly is dropped the same abort-keep-sync way); the
+  /// verified envelope then re-enters the EXISTING whole-message entry point —
+  /// [`Self::on_sync_checkpoint`]'s body for a Normal receiver, `on_recover_sync_checkpoint` for the
+  /// recovery peer-fetch — so the cascade, fallible decode, op bind-check, staged persist, and
+  /// durable-root-before-destructive install barrier are bit-identical to a single-frame
+  /// `SyncCheckpoint`.
+  pub(crate) fn on_sync_chunk<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    m: crate::SyncChunk,
+  ) {
+    let recovering = self.status.is_recovering() && self.awaiting_peer_checkpoint();
+    if !self.status.is_normal() && !recovering {
+      return;
+    }
+    let Some(s) = self.sync else {
+      return; // no sync outstanding — ignore.
+    };
+    if m.nonce() != s.nonce {
+      return; // a reply to a prior solicitation / forged — not fresh.
+    }
+    if self.pending_checkpoint.is_some() {
+      return; // already persisting a chosen snapshot — late chunks are moot.
+    }
+    let Some(t) = self.sync_transfer.as_mut() else {
+      return; // no transfer pinned (never announced / already completed) — ignore.
+    };
+    if t.checkpoint_op != m.checkpoint_op()
+      || t.checkpoint_id != m.checkpoint_id()
+      || t.total_len != m.total_len()
+    {
+      return; // a chunk of some other content — inert against the pin.
+    }
+    if m.offset() != t.staged.len() as u64 {
+      return; // out-of-order / duplicate — inert (the ARQ re-pulls the exact frontier).
+    }
+    let new_len = t.staged.len() as u64 + m.bytes().len() as u64;
+    if m.bytes().is_empty() || new_len > t.total_len {
+      // No progress, or past the announced end: a faulty donor. Abort the transfer (free the
+      // staged bytes) but KEEP the sync armed — the solicit timer re-announces and re-pins fresh.
+      self.sync_transfer = None;
+      return;
+    }
+    t.staged.extend_from_slice(m.bytes());
+    // The freshest live server answers the next pull (it just proved it holds the content).
+    t.donor = m.replica();
+    if new_len < t.total_len {
+      self.send_request_sync_chunk(now, new_len);
+      return;
+    }
+    // Assembly complete. Verify the WHOLE envelope against the pinned content id BEFORE anything
+    // reaches the install path: the pinned id descends from the donor's durable root, so a torn /
+    // corrupt assembly (or garbage chunks) cannot hash to it. A mismatch drops the transfer
+    // (abort-keep-sync: the timer re-announces; chunks re-pull from scratch).
+    let Some(t) = self.sync_transfer.take() else {
+      return;
+    };
+    if crate::checkpoint_id(&t.staged) != t.checkpoint_id {
+      return;
+    }
+    self.sync_chunk_transfers_completed += 1;
+    // Re-enter the EXISTING whole-message path bit-identically: every gate, the decode, the op
+    // bind-check, the staged two-write persist, and the durable-root install barrier run exactly
+    // as they would for a `SyncCheckpoint` that arrived in one frame.
+    let assembled = crate::SyncCheckpoint::new(
+      m.view(),
+      t.checkpoint_op,
+      t.checkpoint_id,
+      m.replica(),
+      s.nonce,
+      Bytes::from(t.staged),
+    );
+    if recovering {
+      self.on_recover_sync_checkpoint(now, wal, sb, assembled);
+    } else {
+      self.handle_sync_checkpoint(now, wal, sb, assembled, true);
+    }
   }
 
   /// STAGE a verified `SyncCheckpoint`. Runs the up-front
@@ -594,6 +1087,7 @@ impl<S: StateMachine> Endpoint<S> {
       // self.op`) falls through and STAGEs normally.
       if checkpoint_op.get() < self.commit_min.get() {
         self.sync = None;
+        self.sync_transfer = None;
         self.timers.sync_solicit = None;
         return;
       }
@@ -664,6 +1158,10 @@ impl<S: StateMachine> Endpoint<S> {
       sm_tail,
       held_tail,
     });
+    // A snapshot is chosen and persisting: any in-progress chunked transfer is superseded (a
+    // single-frame `SyncCheckpoint` racing a pinned transfer landed first — its staged bytes are
+    // moot, and `pending_checkpoint` blocks new chunk activity until the persist resolves).
+    self.sync_transfer = None;
     // Keep re-soliciting until the persist's root write completes (defends a fault mid-persist).
     self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
   }

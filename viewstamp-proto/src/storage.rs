@@ -3,6 +3,98 @@
 //! The proto owns no log; it orchestrates consensus over a user-supplied `Wal` +
 //! `Superblock`. All faults surface as data (`SlotStatus::Faulty`,
 //! `WalDone::Fault`) — never as panics; the proto verifies `Header` checksums itself.
+//!
+//! # Embedder contract
+//!
+//! This section consolidates the safety requirements a durable backend must honor. Each clause is
+//! documented in full on the trait item it binds (linked per clause); every one is load-bearing —
+//! the adversarial simulator demonstrates committed-op losses under backends that violate them.
+//! The in-memory fixtures in `viewstamp-simulation` are the reference implementations.
+//!
+//! ## Completion means durable
+//!
+//! A [`WalDone::Appended`] or [`SuperblockDone::Wrote`] completion asserts the write has reached
+//! STABLE storage — the `fsync`/`fdatasync` (or `O_DSYNC`-equivalent) covering it has returned —
+//! not merely a kernel page cache or a device's volatile write cache. The proto acks, votes, and
+//! reports durable views on the strength of these completions (append-before-ack,
+//! durable-view-before-participate), so a completion delivered before true durability lets a
+//! client-acked committed op vanish in a crash. Conversely the SYNCHRONOUS views must lag the
+//! completions: [`Wal::op_head`], [`Wal::header`], and a [`SlotStatus::Clean`] from
+//! [`Wal::status`] reflect only durably-COMPLETED appends, never an in-flight one (the
+//! poll-ordering contract on [`Wal`]). Append completions may be drained in any order; root-write
+//! completions must not be (see below).
+//!
+//! ## Writes never `Fault`
+//!
+//! `Fault` is a READ verdict. [`Wal::submit_append`] MUST complete only as [`WalDone::Appended`];
+//! [`Superblock::submit_write`] / [`Superblock::submit_write_checkpoint`] MUST complete only as
+//! [`SuperblockDone::Wrote`]. A backend retries internally — or fail-stops the process — until the
+//! write is durable; it never reports a write as faulted. The proto has no owner for a "failed"
+//! durable write: an append-`Fault` is degraded defensively to a resubmit (costing a retry, with
+//! no liveness promise under a backend that keeps faulting), and a root-write `Fault` would be
+//! silently dropped — i.e. that durable write would be LOST. A checkpoint READ
+//! ([`Superblock::submit_read_checkpoint`]) is the one superblock op that may fault:
+//! recovery/state-sync treat it as faults-as-data (retry within budget, then peer-fetch).
+//!
+//! ## Headers survive their bodies
+//!
+//! WAL slot headers MUST be durable INDEPENDENTLY of their bodies (redundant or
+//! atomically-replaced header storage, TigerBeetle-style), so a body-level fault — a torn write,
+//! bit-rot — on a completed append can never lose the header. A body-damaged slot still reports
+//! its header via [`Wal::header`] and surfaces the damage as a body-level verdict
+//! ([`SlotStatus::Faulty`]; a [`WalDone::BodyFaulty`] carrying the durable header), never as a
+//! vanished append. The surviving header is what proves a committed op EXISTS at its op number
+//! (pinning its canonical identity via [`Header::body_checksum`]) so the body can be peer-repaired;
+//! a backend whose body fault also loses the header re-opens a committed-op-LOSS class: the op's
+//! existence is forgotten, its number can be re-minted across a view change, and a client-acked op
+//! silently disappears. Full statement: the header-durability contract on [`Wal`].
+//!
+//! ## Root writes are serialized and crash-atomic
+//!
+//! The durable root is a single serialized writer: [`Superblock::submit_write`] completions are
+//! delivered in submission order, and once all outstanding writes complete, the durable
+//! [`Superblock::state`] equals the LAST-submitted root (full statement: the root-write ordering
+//! contract on [`Superblock`]). Each individual root write must also be crash-ATOMIC: a crash
+//! mid-write leaves either the old root or the new root readable — never a torn hybrid, never
+//! nothing. The canonical shape (two copies suffice for a single serialized writer):
+//!
+//! 1. Keep TWO fixed root slots, A and B. The durable root is, at every instant, the newest slot
+//!    that verifies.
+//! 2. Wrap the encoded root ([`VsrState::encode`]) in a backend envelope carrying a CHECKSUM over
+//!    the encoded bytes and a monotonically increasing sequence number. (The encoded root does not
+//!    checksum itself; the envelope is the backend's.)
+//! 3. Write each new root over the OLDER slot — never in place over the slot holding the current
+//!    root — then fsync that slot (data plus metadata, if allocation changed) BEFORE delivering
+//!    [`SuperblockDone::Wrote`].
+//! 4. On open, read both slots, discard any whose checksum fails to verify, and adopt the
+//!    survivor with the higher sequence number.
+//!
+//! A torn in-progress write then corrupts only the older slot's copy and the checksum routes the
+//! next open to the intact root. The shape to avoid is a SINGLE in-place-overwritten root slot: a
+//! torn write there destroys the old root and the new one together. With one serialized writer the
+//! A/B alternation needs no further coordination; a backend that overlaps root writes or completes
+//! them out of order violates VSR safety (a stale checkpoint root could roll back the durable
+//! view/commit a later view-change root recorded).
+//!
+//! ## Checkpoint snapshots read back content-identical
+//!
+//! [`Superblock::submit_read_checkpoint`] must return, byte-identically, the envelope of the last
+//! durably completed [`Superblock::submit_write_checkpoint`]. The snapshot is content-addressed:
+//! the root stores [`checkpoint_id`] (an FNV-1a-128 of the envelope bytes) and recovery +
+//! state-sync verify the read-back bytes against it, so a checkpoint that reads back altered is
+//! detected and treated as faulty (retry, then peer-fetch) rather than restored. The proto itself
+//! sequences checkpoint durability before visibility — the snapshot write completes durably
+//! BEFORE the root write naming it is submitted — so a backend honoring completion-means-durable
+//! can never expose a root that points at a checkpoint a crash erased.
+//!
+//! ## Drain in-flight ops before re-creating an endpoint
+//!
+//! [`OpId`]s are unique only within one `Endpoint` incarnation: `Endpoint::new` and
+//! `Endpoint::recover` RESTART the sequence. A driver that rebuilds the endpoint over the same
+//! live storage handles (a restart-in-place) MUST first drain or cancel every in-flight storage
+//! op, so no pre-restart completion is delivered against a post-restart `OpId` it would alias. A
+//! real crash satisfies this by construction — in-flight ops die with the process. Full
+//! statement: the lifetime contract on [`OpId`].
 
 use std::vec::Vec;
 
@@ -703,6 +795,19 @@ pub enum SuperblockDone {
 /// proto MUST NOT assume FIFO completion; the synchronous views above MUST stay consistent with
 /// "only-durable" regardless of the order completions are drained in.
 ///
+/// **Header-durability contract (load-bearing for committed-op survival).** Slot HEADERS MUST be
+/// durable INDEPENDENTLY of their bodies — redundant or atomically-replaced header storage,
+/// TigerBeetle-style — such that a body-level fault (a torn write, bit-rot) on a completed append
+/// can never lose the header. A slot whose body is torn/rotted MUST still report its header via
+/// [`header`](Wal::header) and surface the damage as a body-level verdict ([`SlotStatus::Faulty`]
+/// from [`status`](Wal::status); a [`WalDone::BodyFaulty`] carrying the durable header from a read)
+/// — never vanish as if the append had not happened. The keep-header-only recovery shape
+/// (`Body::Repairing`) depends on this: the surviving header is what proves a committed op EXISTS
+/// at its op number (and pins its canonical identity) so the body can be peer-repaired. A backend
+/// whose body fault also loses the header reintroduces a committed-op-LOSS class: the op's
+/// existence is forgotten, its number can be re-minted across a view change, and a client-acked
+/// committed op silently disappears.
+///
 /// **Capacity / back-pressure contract.** [`capacity`](Wal::capacity) is
 /// the total number of slots the log can hold (`u64::MAX` ⇒ effectively unbounded; the default).
 /// `submit_*` stay INFALLIBLE — they return `()` and never signal "queue full" — so the back-pressure
@@ -727,7 +832,10 @@ pub enum SuperblockDone {
 pub trait Wal {
   /// The highest op number held.
   fn op_head(&self) -> OpNumber;
-  /// The header at `op`, or `None` if absent or known-faulty.
+  /// The durable header at `op`, or `None` ONLY if the slot holds no completed append (never
+  /// written, or truncated / pruned / ring-wrapped away). A body-faulty slot MUST still report its
+  /// header — headers are durable independently of bodies (the trait-level header-durability
+  /// contract); only [`status`](Wal::status)/reads convey the body fault.
   fn header(&self, op: OpNumber) -> Option<Header>;
   /// The slot status for `op` (the present/nack signal).
   fn status(&self, op: OpNumber) -> SlotStatus;
@@ -741,6 +849,13 @@ pub trait Wal {
   /// Submit a durable append of `(header, body)` at `op`. Completion via [`Wal::poll`]. INFALLIBLE
   /// (returns `()`): the proto guarantees it never submits past [`capacity`](Wal::capacity) un-pruned
   /// slots (see the trait-level capacity contract), so a backend MAY assume room exists.
+  ///
+  /// **MUST complete as [`WalDone::Appended`] — never [`WalDone::Fault`].** Mirrors the
+  /// [`Superblock`] write contract: the implementation retries (or fail-stops) internally until the
+  /// append is durable; `Fault` is a READ verdict. A `Fault` completion for an append is an embedder
+  /// contract violation — the endpoint degrades it defensively to a re-submit of the same append
+  /// (so a transiently-faulting backend costs a retry, not a leaked in-flight ack), but no liveness
+  /// is promised under a backend that keeps faulting its appends.
   fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes);
   /// Submit a read of `op`'s entry. Completion via [`Wal::poll`].
   fn submit_read(&mut self, id: OpId, op: OpNumber);

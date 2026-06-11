@@ -121,6 +121,20 @@ impl<S: StateMachine> Endpoint<S> {
   ///
   /// **Durable-view.** The view is persisted before any view-change participation, so `state.view()`
   /// is trustworthy: a recovered replica resumes the view it was in when it last participated.
+  ///
+  /// **`seed` must carry fresh entropy per incarnation.** The freshness nonce that tags this
+  /// incarnation's solicitations (`Recovery`/`GetView`/`RequestSync`) is derived deterministically
+  /// from `seed` alone (`Prng::new(seed)`), and nothing else the endpoint holds is guaranteed to
+  /// differ across a crash + re-`recover` at the same durable state — so re-recovering with the SAME
+  /// seed re-mints the SAME nonce, and a DELAYED `RecoveryResponse`/`SyncCheckpoint` addressed to the
+  /// PREVIOUS incarnation then passes this incarnation's nonce check
+  /// (`Self::on_recovery_response`) and can adopt a stale head. That is never a committed-op loss
+  /// (the adopted head is validated against the responding primary, and the ordinary repair /
+  /// view-change machinery re-converges) — but it opens a needless divergence window the nonce
+  /// exists to close. The embedder/driver MUST therefore supply per-incarnation entropy here: OS
+  /// randomness, a persisted boot counter, or any value that cannot repeat across restarts of the
+  /// same replica. (The deterministic simulation does this with its seeded PRNG, drawing a distinct
+  /// value per replica incarnation.)
   pub fn recover<W: Wal, B: Superblock>(
     config: Config,
     seed: u64,
@@ -215,16 +229,38 @@ impl<S: StateMachine> Endpoint<S> {
       pending_sb: None,
       pending_checkpoint: None,
       checkpoint_op: OpNumber::with(checkpoint_op),
+      // The vouched log floor restarts at the DURABLE checkpoint: an adoption-learned (in-memory)
+      // floor does not survive a crash, so a pre-crash floored adoption re-learns the cluster floor
+      // from the next carrier / Commit it hears. Until then this replica's own carrier may exceed
+      // the frame if its WAL still spans the pre-adoption band (the un-synced crash window); the
+      // force-sync escalation re-narrows it as soon as a peer checkpoint is heard.
+      log_floor: OpNumber::with(checkpoint_op),
       peer_checkpoint: BTreeMap::new(),
+      // The quorum-th order statistic over {own durable checkpoint, no peer reports} — coherent with
+      // `recompute_quorum_checkpoint` over the fields above (own checkpoint counts only when
+      // `quorum == 1`, i.e. a solo cluster; otherwise the unheard peers pin it to 0).
+      quorum_checkpoint: if config.quorum() == 1 {
+        OpNumber::with(checkpoint_op)
+      } else {
+        OpNumber::new()
+      },
       recover: None,
       repair: std::collections::BTreeSet::new(),
       sync: None,
       pending_install: None,
       sync_serving: BTreeMap::new(),
+      sync_donating: None,
+      sync_transfer: None,
       state_syncs_applied: 0,
       forced_syncs_applied: 0,
+      sync_chunk_transfers_completed: 0,
       wal_stalls: 0,
       below_ring_window_syncs: 0,
+      unions_floored: 0,
+      repair_batches_served: 0,
+      prepare_batches_sent: 0,
+      header_only_carriers_emitted: 0,
+      sessions_evicted: 0,
       pending_forfeit: false,
     };
 
@@ -641,20 +677,16 @@ impl<S: StateMachine> Endpoint<S> {
     // Arm a FORCED sync to our own (corrupt) checkpoint_op: any peer whose durable checkpoint is at or
     // above it can serve a snapshot that subsumes ours. `forced` selects `apply_sync`'s relaxed
     // (never-rewind-the-applied-frontier) assert — correct here, where the synced op `>= checkpoint_op
-    // == commit_min`. Only arm if not already syncing (anti-thrash); otherwise the existing solicit
-    // stands and we just re-broadcast below.
+    // == commit_min`. Only arm if not already syncing (anti-thrash; the fresh-arm chokepoint
+    // `arm_sync` broadcasts the solicitation itself); an already-armed sync just re-broadcasts.
+    // Either way the recover-retry timer (`recover_timeouts`) keeps re-broadcasting on a cadence
+    // while `awaiting_peer_checkpoint` holds (the Normal-only `sync_timeouts` does not run during
+    // recovery).
     if self.sync.is_none() {
-      self.nonce = self.nonce.wrapping_add(1);
-      self.sync = Some(SyncState {
-        target: self.checkpoint_op,
-        nonce: self.nonce,
-        forced: true,
-      });
+      self.arm_sync(now, self.checkpoint_op, true);
+    } else {
+      self.send_request_sync(now);
     }
-    // Broadcast the solicitation now; the recover-retry timer (`recover_timeouts`) re-broadcasts on a
-    // cadence while `awaiting_peer_checkpoint` holds (the Normal-only `sync_timeouts` does not run
-    // during recovery).
-    self.send_request_sync(now);
     self.arm_timers(now);
   }
 
@@ -828,7 +860,7 @@ impl<S: StateMachine> Endpoint<S> {
       // `on_request` guard into a client-serving deadlock. A COMMITTED faulty slot is instead requested
       // ON DEMAND by `advance_commit` once commit reaches it (which only happens once it is committed);
       // an UNCOMMITTED one is simply truncated away if a later view change rewinds the tail.
-      self.status = Status::RecoveringHead;
+      self.set_status(Status::RecoveringHead);
       self.arm_timers(now);
       self.send_recovery(now);
       return;
@@ -885,7 +917,7 @@ impl<S: StateMachine> Endpoint<S> {
       self.enter_view_change_from_recovery(now, sb, self.view.next());
     } else {
       // Backup, or a SOLO replica (its own primary, no quorum to view-change) → resume Normal.
-      self.status = Status::Normal;
+      self.set_status(Status::Normal);
       if self.config.replica_count() == 1 {
         // Solo: rebuild the pipeline for the recovered tail so `try_commit` can re-commit ops the
         // solo primary had already committed pre-crash (an empty `inflight` would stall them — solo
@@ -948,7 +980,13 @@ impl<S: StateMachine> Endpoint<S> {
     // Peer-fetch: if our own checkpoint read exhausted and we are awaiting a PEER `SyncCheckpoint`,
     // re-broadcast the `RequestSync` on this cadence (the Normal-only `sync_timeouts` does not run
     // while Recovering). A peer holding a checkpoint `>= ours` answers; until then we stay here.
+    // With a chunked transfer pinned (an over-frame answer is being pulled), this cadence is also
+    // its ARQ: re-send the one outstanding chunk pull at the staged frontier first, exactly as
+    // `sync_timeouts` does for a Normal receiver.
     if awaiting_peer && self.sync.is_some() {
+      if let Some(offset) = self.sync_transfer.as_ref().map(|t| t.staged.len() as u64) {
+        self.send_request_sync_chunk(now, offset);
+      }
       self.send_request_sync(now);
     }
     for op in ops {
@@ -1051,7 +1089,7 @@ impl<S: StateMachine> Endpoint<S> {
     // FIRST so the re-persist completions route through the ordinary `on_sb_done` (which clears `sync` +
     // counts a forced state-sync on the root write), then `apply_sync` STAGES the durable re-persist.
     self.recover = None;
-    self.status = Status::Normal;
+    self.set_status(Status::Normal);
     self.apply_sync(now, sb, &m);
     // EAGER INSTALL: the Normal state-sync path DEFERS the destructive install to the
     // durable root (so a view change cannot strand a pruned-but-stale band), but the RECOVERY peer-fetch
@@ -1087,13 +1125,25 @@ impl<S: StateMachine> Endpoint<S> {
   /// Higher-view rule: a newer primary already exists (we saw its Prepare/Commit/PrepareOk) and we
   /// are merely stale. Fetch its log via GetView; do NOT broadcast a StartViewChange. If catch-up
   /// stalls, `view_change_status` escalates us to a real, self-driven change.
+  ///
+  /// **Plausibility-clamped at ingress.** This is the one place an UNVALIDATED view scalar (a
+  /// `Prepare`/`PrepareOk`/`Commit` view field, carrying no adoptable payload to cross-check) is
+  /// adopted wholesale, so an implausible claim — more than [`MAX_VIEW_JUMP`] ahead of the local
+  /// view — is dropped here as a no-op (the message it rode in on is ignored) rather than stranding
+  /// this replica in a `ViewChange` no real primary can answer. Every earnable lag is far below the
+  /// bound (see the constant's rationale), so a legitimate catch-up is never rejected; the validated
+  /// adoption vehicles (`on_start_view`/`on_recovery_response`, sender-bound to the claimed view's
+  /// primary) remain unclamped.
   pub(crate) fn catch_up_to_view(&mut self, now: Instant, view: View) {
+    if view.get() > self.view.get().saturating_add(MAX_VIEW_JUMP) {
+      return; // implausible advertised view (see MAX_VIEW_JUMP) — ignore the claim, stay put.
+    }
     assert!(
       view.get() > self.view.get(),
       "catch-up target must be strictly newer than our view"
     );
     self.view = view;
-    self.status = Status::ViewChange;
+    self.set_status(Status::ViewChange);
     self.svc_target = view;
     // Tear down ALL old-generation in-flight state in one place: SVC bits, in-flight
     // appends, peer-checkpoint reports, in-flight checkpoint, in-flight sync + its deferred install
@@ -1153,15 +1203,22 @@ impl<S: StateMachine> Endpoint<S> {
       // and HOLDS at the hole until peer-repair fills the body, instead of treating it as a truncatable
       // uncommitted tail. `commit_max <= self.op` on a Normal primary, so the receiver's `commit <= op`
       // adopt guard holds.
+      let entries = self.log_entries();
       self.emit(Outgoing::new(
         Recipient::To(Peer::Replica(m.replica())),
-        Message::StartView(crate::StartView::new(
-          self.view,
-          self.op,
-          self.commit_max,
-          self.config.replica(),
-          self.log_entries(),
-        )),
+        Message::StartView(
+          crate::StartView::new(
+            self.view,
+            self.op,
+            self.commit_max,
+            self.config.replica(),
+            entries,
+          )
+          // The vouched floor of the carried log: an op it omits at/below this is
+          // checkpoint-subsumed (the catching-up adopter trims its own sub-floor band + records the
+          // floor for its force-sync escalation).
+          .with_checkpoint_op(self.log_floor),
+        ),
       ));
     }
   }
@@ -1190,28 +1247,31 @@ impl<S: StateMachine> Endpoint<S> {
     if m.replica().get() >= self.config.replica_count() {
       return; // ignore malformed/out-of-range replica id
     }
-    let (op, commit, log) = if self.is_primary() {
+    let (op, commit, floor, log) = if self.is_primary() {
       // Advertise the KNOWN-committed frontier `commit_max`, not the APPLIED frontier `commit_min`
       // (which stalls below an unrepaired committed `Repairing` hole) — the recovery-handshake
       // equivalent of `start_view_participate`'s StartView. A recovering peer that adopts a committed
       // op (op <= commit_max) thereby learns it is committed and HOLDS at the hole until peer-repair
       // fills the body, never re-classifying it as a truncatable uncommitted tail. `commit_max <=
-      // self.op` on a Normal primary, so the receiver's `commit <= op` adopt guard holds.
-      (self.op, self.commit_max, self.log_entries())
+      // self.op` on a Normal primary, so the receiver's `commit <= op` adopt guard holds. The
+      // vouched log floor rides along so the adopter trims its own sub-floor band + records the
+      // floor for its force-sync escalation (same as a StartView).
+      (self.op, self.commit_max, self.log_floor, self.log_entries())
     } else {
       // A backup cannot hand out a canonical head; it reports only its view (+ echoed nonce).
-      (OpNumber::new(), OpNumber::new(), std::vec::Vec::new())
+      (
+        OpNumber::new(),
+        OpNumber::new(),
+        OpNumber::new(),
+        std::vec::Vec::new(),
+      )
     };
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(m.replica())),
-      Message::RecoveryResponse(crate::RecoveryResponse::new(
-        self.view,
-        op,
-        commit,
-        self.config.replica(),
-        m.nonce(),
-        log,
-      )),
+      Message::RecoveryResponse(
+        crate::RecoveryResponse::new(self.view, op, commit, self.config.replica(), m.nonce(), log)
+          .with_checkpoint_op(floor),
+      ),
     ));
   }
 
@@ -1231,6 +1291,10 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_recovering_head() {
       return; // not awaiting a head (already Normal, or never solicited) — ignore the stale reply
     }
+    // Freshness is only as strong as the nonce: it is seed-derived, so distinguishing THIS
+    // incarnation's solicitation from a previous incarnation's relies on the embedder feeding
+    // `recover()` per-incarnation entropy (see the `seed` contract there). With a reused seed a
+    // delayed prior-incarnation response passes this check.
     if m.nonce() != self.nonce {
       return; // a response to a prior solicitation (or forged) — not fresh, ignore
     }
@@ -1243,7 +1307,15 @@ impl<S: StateMachine> Endpoint<S> {
       // primary answers (or a StartView arrives).
       return;
     }
-    self.adopt_canonical_head(now, sb, m.view(), m.op(), m.commit(), m.log_slice());
+    self.adopt_canonical_head(
+      now,
+      sb,
+      m.view(),
+      m.op(),
+      m.commit(),
+      m.checkpoint_op(),
+      m.log_slice(),
+    );
     self.truncate_wal_above_adopted_head(wal);
   }
 }

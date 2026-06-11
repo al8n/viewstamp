@@ -168,6 +168,86 @@ struct SyncState {
   forced: bool,
 }
 
+/// What a completed state-sync serve-read ships to its requester. Recorded per requester in
+/// `sync_serving` at submit time; the completion ([`Endpoint::serve_sync_checkpoint`]) dispatches on
+/// it after the read passes the donor integrity gates (op-match + durable-id match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeKind {
+  /// Answer a `RequestSync`: ship the whole `SyncCheckpoint` when the envelope fits one frame, else
+  /// announce it with a `SyncCheckpointMeta` and let the requester pull chunks.
+  Offer,
+  /// Answer a `RequestSyncChunk` whose pinned checkpoint matched the durable root but the donor's
+  /// serve cache was cold (e.g. the donor restarted mid-transfer): re-read the snapshot, then ship
+  /// the chunk at this byte offset.
+  Chunk {
+    /// The byte offset the requester asked for.
+    offset: u64,
+  },
+}
+
+/// One in-flight checkpoint serve-read — the value of `sync_serving`, keyed by REQUESTER replica
+/// index. Carries the read's correlation id, the latest echoed nonce (a repeat solicitation only
+/// refreshes this in place), and what the completion ships ([`ServeKind`], likewise refreshed in
+/// place so the single completion answers the LATEST solicitation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncServe {
+  /// The serve-read's `OpId` (matches the completion back to this entry).
+  read: u64,
+  /// The latest nonce the requester solicited with (echoed in the answer).
+  nonce: u64,
+  /// What the completion ships.
+  kind: ServeKind,
+}
+
+/// The donor-side cache of the last VERIFIED checkpoint serve-read: the snapshot bytes a completed
+/// `submit_read_checkpoint` returned AFTER they passed the donor integrity gate (hash equals the
+/// durable root id at that op), kept so a chunked transfer's pulls are served by zero-copy slicing
+/// instead of one superblock re-read + re-hash per chunk. Deliberately NOT invalidated when the
+/// donor's own checkpoint advances: the cached content is a committed checkpoint — immutable
+/// cluster-wide — so a mid-transfer receiver pinned to it can finish pulling the OLD checkpoint
+/// while the donor moves on (the keep-serving property that closes the transfer-restart livelock on
+/// the donor side). Replaced lazily by the next verified serve-read; volatile, so a crash clears it
+/// (a cold-cache chunk request then re-reads via [`ServeKind::Chunk`]).
+#[derive(Debug)]
+struct SyncDonating {
+  /// The op of the cached checkpoint (the transfer pin's first half).
+  checkpoint_op: OpNumber,
+  /// The content id of the cached envelope (the transfer pin's second half).
+  checkpoint_id: u128,
+  /// The verified envelope bytes (chunks are zero-copy slices of this).
+  snapshot: Bytes,
+}
+
+/// The receiver side of ONE chunked checkpoint transfer: the pinned content identity
+/// `(checkpoint_op, checkpoint_id, total_len)` a `SyncCheckpointMeta` announced, the donor the next
+/// pull is addressed to, and the staged in-order prefix assembled so far. `Some` exactly while a
+/// chunked pull is in progress — always under an outstanding `sync` (the invariant
+/// `sync_transfer ⟹ sync`, asserted beside `pending_install ⟹ sync`): every path that clears
+/// `sync` clears this with it, and an abort (overflow / hash mismatch / superseding announce /
+/// forced-target raise past the pin) drops ONLY this, keeping `sync` armed so the solicit timer
+/// re-announces. The pin is by CONTENT, not by donor: chunks of the pinned `(op, id)` from ANY
+/// member are interchangeable (non-Byzantine id-match ⇒ content-match), so a donor crash
+/// mid-transfer costs a re-announce, not the staged prefix. Memory is bounded by one `Option` of
+/// exactly `total_len` bytes — the same allocation the install itself requires — where `total_len`
+/// is a wire claim admitted only under [`Config::max_sync_envelope_len`](crate::Config) and a
+/// fallible reservation (an honest donor derives it from a verified checkpoint read, but the
+/// receiver does not trust that). Volatile: a crash clears it for free.
+#[derive(Debug)]
+struct SyncTransfer {
+  /// The pinned checkpoint op (first half of the content pin).
+  checkpoint_op: OpNumber,
+  /// The pinned envelope content id (second half of the content pin); the assembled bytes must
+  /// hash to it before anything reaches the install path.
+  checkpoint_id: u128,
+  /// The announced envelope length; `staged` grows append-only to exactly this.
+  total_len: u64,
+  /// The peer the next chunk pull is addressed to (re-pinned on announce/chunk — the freshest
+  /// live server).
+  donor: ReplicaId,
+  /// The in-order assembled prefix (`staged.len()` is the next offset to pull).
+  staged: std::vec::Vec<u8>,
+}
+
 /// The DEFERRED INSTALL of a verified, staged `SyncCheckpoint`.
 /// [`Endpoint::apply_sync`] STAGES the durable re-persist (the two superblock writes) and records this
 /// payload; the DESTRUCTIVE install — restore the SM/sessions, advance `commit_min`/`commit_max`/`op`
@@ -237,6 +317,24 @@ impl ViewChangeCollection {
 }
 
 const PREPARE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
+/// The primary PIPELINE cap: the maximum number of accepted-but-uncommitted ops (`(commit_min, op]`)
+/// the primary holds in flight. `on_request` STALLS a new client request that would exceed it
+/// (sibling of the WAL-ring / carrier-band stalls — the client retransmits; admission releases as
+/// commits advance), and the prepare retransmit re-broadcasts at most the FIRST
+/// [`PREPARE_RETRANSMIT_WINDOW`] of these per tick. Without the cap the window can legally grow to
+/// the carrier-band bound (~342k ops), and the 100ms retransmit would re-broadcast the WHOLE window
+/// with full bodies every tick — unbounded CPU/bandwidth on a slow quorum. TigerBeetle pipelines 8
+/// prepares; ours is far larger because requests are not yet batched (one client request = one op),
+/// so a deep pipeline is the only way many clients keep the primary busy — 1024 bounds the
+/// retransmit working set while leaving room for over a thousand concurrent clients.
+const MAX_PIPELINE: u64 = 1024;
+/// How many un-committed ops the primary's prepare-retransmit timer re-broadcasts per tick: the
+/// FIRST `K` ops of `(commit_min, op]` (the lowest — the ones the commit is waiting on). Ops above
+/// the window are not starved: commits advance `commit_min` (sliding the window up), and a backup
+/// missing a HIGHER op it knows committed pulls it itself via the tail-gap solicitation
+/// ([`TAIL_GAP_WINDOW`], driven on every Commit/Prepare heartbeat) — the retransmit only has to keep
+/// the quorum fed at the commit frontier, not re-ship the whole pipeline every 100ms.
+const PREPARE_RETRANSMIT_WINDOW: u64 = 64;
 const COMMIT_HEARTBEAT: core::time::Duration = core::time::Duration::from_millis(50);
 const PRIMARY_IDLE: core::time::Duration = core::time::Duration::from_millis(200);
 const VC_MESSAGE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
@@ -321,6 +419,52 @@ const TAIL_GAP_WINDOW: u64 = 64;
 /// as the primary re-announces them, or — if the head slot itself is unreadable — via the
 /// `RecoveringHead`/peer head-fault path), never billions of reads.
 const RECOVER_TAIL_WINDOW: u64 = 8192;
+/// Peer fault-repair BELOW-head window ([`Endpoint::request_repair_run`]): the maximum number of ops a
+/// single `RequestPrepareRange` solicits — the size of the contiguous below-head `Repairing`/missing
+/// band it requests per call. The sibling of [`TAIL_GAP_WINDOW`] for the below-head path: where
+/// `request_tail_gap` windows ABOVE-head gaps, this windows the below-head committed band a deep
+/// header-only adoption (a view-change carrier carrying the whole uncheckpointed log as `Repairing`
+/// holes) installs — so it is repaired PIPELINED (one range request → one byte-bounded `RepairBatch`
+/// serving up to a frame's worth of ops) rather than one op per round trip. The server independently
+/// caps the served PREFIX by the frame byte budget ([`Endpoint::on_request_prepare_range`]), so this op
+/// count is only the solicitation breadth; a genuinely deep band is closed across a few passes (each
+/// answered batch fills a run and the next pass re-solicits from the new lowest hole). Sized like
+/// `TAIL_GAP_WINDOW` (a few pipeline depths) — large enough that the calm-window convergence the
+/// header-only carriers depend on needs only a handful of passes, small enough to bound the work per
+/// `advance_commit` hole-arm call in the Sans-I/O core.
+const REPAIR_WINDOW: u64 = 64;
+/// Higher-view catch-up plausibility bound ([`Endpoint::catch_up_to_view`]): the maximum number of
+/// views an advertised `Prepare`/`PrepareOk`/`Commit` view may sit AHEAD of the local view and still
+/// drive the bare-scalar catch-up; a claim further ahead is dropped as implausible.
+///
+/// **Why a bound exists.** The higher-view rule adopts the CLAIMED view scalar wholesale (then
+/// validates it by soliciting that view's primary via GetView), so a single buggy in-threat-model
+/// peer whose view field is corrupted to `u64::MAX` would drive every receiver through
+/// `catch_up_to_view(u64::MAX)` — stranding it in `ViewChange` at the top of the view space, where
+/// no genuine primary exists, every real cluster message is "stale" (`< self.view`), and the
+/// `view+1` escalation can only saturate. One corrupt scalar permanently ejects the replica from
+/// every future quorum. Rejecting the absurd claim at ingress keeps the replica Normal in its real
+/// view, where it continues to serve — degradation equivalent to ignoring a garbage message.
+///
+/// **Why `2^32` rejects only the absurd, never a legitimate jump.** A legitimate view advance is a
+/// completed view change: an SVC/DVC quorum round in which `quorum_view_change` replicas each
+/// persist the new view durably before participating. Views therefore advance at
+/// message-round-trip + storage-write cadence, never per-CPU-cycle: the fastest sustained
+/// escalation a replica drives is one view per `VC_MESSAGE_RETRANSMIT`/`VIEW_CHANGE_STATUS` period
+/// (100–500 ms), putting `2^32` consecutive view changes at ~13–68 YEARS of view-changing with zero
+/// normal operation — and even a fantastical 1 ms-per-view-change cluster would need ~50 days. No
+/// deployment earns a `2^32` view gap; a corrupted scalar claims one in a single message. The
+/// margin to the forgery (`u64::MAX` is ~`2^31` bounds above any reachable view) is ~9 decimal
+/// orders of magnitude, so the constant needs no tuning.
+///
+/// **A genuinely-lagging replica still converges.** Any earnable lag is below the bound, so its
+/// catch-up is untouched. The clamp gates ONLY the bare-scalar trigger sites; the validated
+/// adoption vehicles — `on_start_view` / `on_recovery_response`, which require the sender to BE
+/// `config.primary(m.view())` and carry the canonical log — stay unclamped and adopt any higher
+/// view, and a `StartView` is broadcast to ALL backups at every view formation, so even a replica
+/// that somehow sat out an above-bound stretch re-joins at the cluster's next view change rather
+/// than wedging.
+const MAX_VIEW_JUMP: u64 = 1 << 32;
 
 /// In-flight recovery read-bookkeeping for a `Status::Recovering`/`RecoveringHead` replica.
 ///
@@ -428,6 +572,15 @@ struct Session {
   request: RequestNumber,
   /// Cached `(request_number, reply_body)` of the latest committed request.
   reply: Option<(RequestNumber, Bytes)>,
+  /// The op number of this client's last APPLIED request — the deterministic last-activity stamp the
+  /// session-cap eviction orders victims by ([`crate::MAX_CLIENT_SESSIONS`]). `0` means PROVISIONAL:
+  /// the row was minted off the consensus path (a primary's accept-time insert, a new primary's
+  /// view-change watermark backfill) and no applied op has touched it yet. Provisional rows exist
+  /// only on the replica that minted them, so the eviction logic treats them as INVISIBLE — never a
+  /// victim, never counted toward the cap — which is what keeps the apply-time eviction decisions
+  /// identical across primary and backups despite the primary's accept-ahead rows; they become
+  /// applied (and visible) the moment their client's op applies, identically everywhere.
+  last_op: OpNumber,
 }
 
 /// Absolute timer deadlines, armed per role by `arm_timers`.
@@ -461,8 +614,9 @@ struct Timers {
   /// hole is filled. Active in BOTH primary and backup roles — either may hold a hole after recovery.
   repair_retry: Option<Instant>,
   /// Normal (state-sync): re-broadcast `RequestSync` while a sync is outstanding (awaiting a
-  /// `SyncCheckpoint` or persisting the adopted one). Armed only while `sync.is_some()`; cleared once
-  /// the synced checkpoint is durable.
+  /// `SyncCheckpoint` or persisting the adopted one); with a chunked transfer pinned it doubles as
+  /// the stop-and-wait ARQ (re-send the one outstanding chunk pull first, then re-broadcast). Armed
+  /// only while `sync.is_some()`; cleared once the synced checkpoint is durable.
   sync_solicit: Option<Instant>,
   /// Normal primary: the forfeit GRACE timer. `Some(deadline)` while a `Normal` primary has
   /// observed the checkpoint-lag / unfillable-committed-hole forfeit condition but has not yet stepped
@@ -626,7 +780,11 @@ pub struct Endpoint<S> {
   /// (the `assert_invariants` `view_change.is_some() == is_view_change()` coupling). See
   /// [`ViewChangeCollection`] for why the SVC fields above are deliberately NOT folded in.
   view_change: Option<ViewChangeCollection>,
-  /// Freshness nonce for GetView, drawn once from the prng.
+  /// Freshness nonce tagging this incarnation's solicitations (`GetView`/`Recovery`/`RequestSync`),
+  /// drawn once from the seed-keyed prng (then bumped per fresh sync handshake). Only as fresh as
+  /// the constructor `seed`: a reused seed re-mints the same nonce, letting a delayed
+  /// previous-incarnation response pass the freshness checks — hence the per-incarnation-entropy
+  /// contract on [`Self::new`]/[`Self::recover`]'s `seed` parameter.
   nonce: u64,
   /// In-memory log, keyed by op number.
   ///
@@ -639,10 +797,17 @@ pub struct Endpoint<S> {
   /// `(prune_floor .. head]`; bounded by `O(checkpoint_ops + pipeline)`.
   inflight: BTreeMap<u64, Inflight>,
   /// Backup reorder buffer: future prepares awaiting contiguity.
+  ///
+  /// Bounded on insert: `on_prepare` buffers only an op within [`TAIL_GAP_WINDOW`] of the head
+  /// (anything further is dropped — the primary's retransmit redelivers it once the head catches
+  /// up), so at most one tail-gap window of frame-sized bodies is ever held. Trimmed below the
+  /// prune floor by post-checkpoint GC ([`Self::run_gc`]); cleared on view transitions.
   buffer: BTreeMap<u64, Prepare>,
   /// Client session table.
   ///
-  /// Bounded by the active client set (one session per client), independent of op count;
+  /// Bounded by [`Config::max_client_sessions`] APPLIED sessions (deterministic apply-time eviction
+  /// past the cap — see [`crate::MAX_CLIENT_SESSIONS`] for the contract) plus at most a pipeline of
+  /// PROVISIONAL accept-time rows (`last_op == 0`, primary-local, dropped at view transitions);
   /// intentionally NOT trimmed by GC (dropping a live session risks an at-most-once dedup miss) —
   /// captured in each checkpoint envelope instead so a recover/state-sync restores it.
   clients: BTreeMap<u128, Session>,
@@ -674,6 +839,25 @@ pub struct Endpoint<S> {
   /// The op number of this replica's latest durable checkpoint (0 until the first checkpoint
   /// goes durable). Carried on `Commit` and `PrepareOk` as the checkpoint-quorum signal.
   checkpoint_op: OpNumber,
+  /// The durable-checkpoint-vouched floor of this replica's carried log: every op at/below it that
+  /// `self.log` omits is folded into SOME durable cluster checkpoint — this replica's own
+  /// (`raise_log_floor` tracks `advance_checkpoint_op`), or a canonical donor's learned when a
+  /// FLOORED canonical log was adopted (`select_canonical_log`'s union floor / the
+  /// `StartView`/`RecoveryResponse`-carried floor). MONOTONE (each source is), and `>= checkpoint_op`
+  /// always. Three readers:
+  /// - the view-change carriers advertise it (`DoViewChange`/`StartView`/`RecoveryResponse`
+  ///   `checkpoint_op`), so a receiver can treat an omitted sub-floor op as checkpoint-subsumed;
+  /// - the carrier SPAN gate ([`Self::band_at_capacity`]) bounds `op - log_floor`, which is what
+  ///   makes the next view change's floored union fit one frame (its span is at most the head
+  ///   donor's gated span);
+  /// - the force-sync floor ([`Self::max_peer_checkpoint_op`]) includes it, so a sub-floor repair
+  ///   hole escalates to state-sync even after a view transition cleared `peer_checkpoint`.
+  ///
+  /// NOT persisted: a crash in the adopt→state-sync window recovers with `log_floor =` the durable
+  /// `checkpoint_op` (the adoption-learned floor is re-learned from the next carrier / Commit).
+  /// Deliberately NOT cleared by `reset_for_view_transition` — it is a vouched durable fact about
+  /// the cluster, not per-generation in-flight state.
+  log_floor: OpNumber,
   /// Per-replica last-reported `checkpoint_op` (keyed by replica index), filled by the primary from
   /// incoming `PrepareOk` (and recorded on backups from `Commit`, harmlessly). The primary derives
   /// [`quorum_checkpoint_op`](Self::quorum_checkpoint_op) from this to gate WAL/session GC: it never
@@ -681,6 +865,13 @@ pub struct Endpoint<S> {
   /// cleared on every view-change transition (a new generation re-establishes the pipeline, so old
   /// reports are stale — clearing keeps the primary conservative until fresh `PrepareOk`s arrive).
   peer_checkpoint: BTreeMap<u8, OpNumber>,
+  /// CACHED [`Self::quorum_checkpoint_op`] (the quorum-th order statistic over
+  /// `self.checkpoint_op` + the `peer_checkpoint` reports). The uncached computation allocates +
+  /// sorts per call, and `prune_floor()` reads it on EVERY client request (the WAL-stall check), so
+  /// it is recomputed only at the mutation sites — [`Self::record_peer_checkpoint`],
+  /// [`Self::advance_checkpoint_op`], and the view-transition `peer_checkpoint` clear — via
+  /// [`Self::recompute_quorum_checkpoint`], and read O(1) everywhere else.
+  quorum_checkpoint: OpNumber,
   /// Active only while `status` is `Recovering`/`RecoveringHead`: the in-flight recovery-read
   /// bookkeeping (see [`RecoverState`]). Cleared to `None` by the `→ Normal` recovery transition
   /// (`recover_progress`); structurally `None` in every other status, since a recovering replica does
@@ -715,11 +906,29 @@ pub struct Endpoint<S> {
   /// soon-to-be-replaced SM (load-bearing for the recovery peer-fetch path, whose SM is unrestored here).
   pending_install: Option<PendingInstall>,
   /// State-sync peer side: in-flight checkpoint reads this replica issued to SERVE peers'
-  /// `RequestSync`s, keyed by the read's `OpId` → `(requester, echoed nonce)`. When the read completes
-  /// (`on_sb_done`), the durable snapshot is shipped as a `SyncCheckpoint` to the recorded requester.
-  /// A `Fault` drops the entry silently (the requester re-solicits; another peer answers). Bounded by
-  /// the number of distinct requesters (<= `replica_count`); cleared per entry on completion/fault.
-  sync_serving: BTreeMap<u64, (ReplicaId, u64)>,
+  /// `RequestSync`s / cold-cache `RequestSyncChunk`s, keyed by REQUESTER replica index →
+  /// [`SyncServe`] (the serve-read `OpId`, the latest echoed nonce, and what the completion ships).
+  /// Keying by requester makes the bound STRUCTURAL — at most one serve-read in flight per distinct
+  /// requester (<= `replica_count` entries), so a buggy peer's solicit burst cannot stack N
+  /// concurrent checkpoint reads each shipping a full snapshot. A repeat solicitation while that
+  /// requester's serve is outstanding only REFRESHES the echoed nonce + serve kind in place (the
+  /// completion then answers the LATEST solicitation), issuing no second read. When the read
+  /// completes (`on_sb_done` → `serve_sync_checkpoint`, matched by the recorded `OpId`), the durable
+  /// snapshot is shipped per its [`ServeKind`] — the whole `SyncCheckpoint` when it fits one frame, a
+  /// `SyncCheckpointMeta` announce when it does not, or one `SyncChunk` for a cold-cache pull; a
+  /// `Fault` drops the entry silently (the requester re-solicits; another peer answers). Cleared per
+  /// entry on completion/fault.
+  sync_serving: BTreeMap<u8, SyncServe>,
+  /// The donor-side serve cache ([`SyncDonating`]): the last VERIFIED checkpoint serve-read, kept so
+  /// chunk pulls slice it zero-copy instead of re-reading + re-hashing the superblock per chunk.
+  /// `None` until the first verified serve-read (or after a crash — volatile); survives the donor's
+  /// own checkpoint advance (committed content is immutable, so a pinned mid-transfer receiver can
+  /// finish pulling the old checkpoint).
+  sync_donating: Option<SyncDonating>,
+  /// The receiver side of an in-progress chunked checkpoint transfer ([`SyncTransfer`]). `Some`
+  /// exactly while pulling an announced over-frame checkpoint; always paired under `sync`
+  /// (`sync_transfer ⟹ sync`, see `assert_invariants`) and cleared wherever `sync` is.
+  sync_transfer: Option<SyncTransfer>,
   /// Test/observability counter: how many times a state-sync has fully applied on this
   /// replica — incremented when an `apply_sync`'s durable re-persist completes (the root write lands
   /// in `on_sb_done`, the synced checkpoint becomes durable, and the replica resumes as a Normal
@@ -735,6 +944,14 @@ pub struct Endpoint<S> {
   /// ordinary state-sync), since both route through `apply_sync` and would otherwise be indistinguishable
   /// via `state_syncs_applied` alone. Same lifecycle as `state_syncs_applied` (reset to 0 on `new`/`recover`).
   forced_syncs_applied: u64,
+  /// Test/observability counter: how many CHUNKED checkpoint transfers this replica completed —
+  /// incremented when an assembled transfer's bytes hash to the pinned `checkpoint_id` (the whole
+  /// envelope arrived intact over `SyncCheckpointMeta`/`SyncChunk` and re-enters the ordinary
+  /// `SyncCheckpoint` path). Lets the large-snapshot sim gate assert NON-VACUITY (the CHUNKED path
+  /// genuinely carried the sync, not the single-frame fast path). Same lifecycle as the other
+  /// observability counters (reset to 0 on `new`/`recover`); exposed only via
+  /// `sync_chunk_transfers_completed()`.
+  sync_chunk_transfers_completed: u64,
   /// Test/observability counter: how many client requests this replica DROPPED at op-assignment
   /// because minting the next op would overflow the bounded WAL ring — the physical stall-before-wrap
   /// ([`Self::on_request`]). `0` whenever the WAL is unbounded (`capacity() == u64::MAX`, the default),
@@ -743,14 +960,54 @@ pub struct Endpoint<S> {
   /// the other observability counters (reset to 0 on `new`/`recover`). Exposed only via `wal_stalls()`.
   wal_stalls: u64,
   /// Test/observability counter: how many times this BACKUP fell BELOW its bounded-WAL
-  /// ring window on a head-extending `Prepare` and STATE-SYNCED to the cluster checkpoint instead of
-  /// overwriting an un-pruned slot ([`Self::maybe_sync_below_ring_window`] armed a forced sync). `0`
-  /// whenever the WAL is unbounded (the default) or for an in-quorum backup (its checkpoint tracks the
-  /// quorum, so no overflow). The bounded-WAL sim gate asserts it goes `> 0` to prove the connected
-  /// below-ring-window path genuinely fired (vs the ordinary `> self.op` state-sync trigger). Same
-  /// lifecycle as the other observability counters (reset to 0 on `new`/`recover`); exposed only via
-  /// `below_ring_window_syncs()`.
+  /// ring window on a head-extending `Prepare` — the append was REFUSED (it would overwrite an
+  /// un-pruned slot) with state-sync to the cluster checkpoint as the recovery
+  /// ([`Self::maybe_sync_below_ring_window`] armed a forced sync, or one was already outstanding —
+  /// typically armed moments earlier in the SAME delivery by `advance_commit`'s force-sync off the
+  /// carried commit/floor). `0` whenever the WAL is unbounded (the default) or for an in-quorum backup
+  /// (its checkpoint tracks the quorum, so no overflow). The bounded-WAL sim gate asserts it goes `> 0`
+  /// to prove the connected below-ring-window guard genuinely engaged (vs the ordinary `> self.op`
+  /// state-sync trigger alone). Same lifecycle as the other observability counters (reset to 0 on
+  /// `new`/`recover`); exposed only via `below_ring_window_syncs()`.
   below_ring_window_syncs: u64,
+  /// Test/observability counter: how many canonical-log selections actually FLOORED the union —
+  /// [`Self::select_canonical_log`] dropped at least one canonical-donor entry at/below the vouched
+  /// checkpoint floor `floor*` (the floored-union path doing real work). `0` while every selection's
+  /// floor sits below all carried entries (the floor vacuously inert); the sim gate asserts it goes
+  /// `> 0` across a sweep to prove the floored-union path genuinely fired. Same lifecycle as the
+  /// other observability counters (reset to 0 on `new`/`recover`); exposed only via `unions_floored()`.
+  unions_floored: u64,
+  /// Test/observability counter: how many NON-EMPTY [`RepairBatch`](crate::RepairBatch)es this
+  /// replica served answering peers' `RequestPrepareRange`s ([`Self::on_request_prepare_range`]) —
+  /// the windowed bulk-repair channel genuinely shipping bodies (a solicit that falls silent or is
+  /// gated off does not count). The sim gate asserts it goes `> 0` to prove the bulk-repair serve
+  /// path fired (vs every repair flowing through the per-op `RequestPrepare`). Same lifecycle as the
+  /// other observability counters (reset to 0 on `new`/`recover`); exposed only via
+  /// `repair_batches_served()`.
+  repair_batches_served: u64,
+  /// Test/observability counter: how many NON-EMPTY [`PrepareBatch`](crate::PrepareBatch)es this
+  /// PRIMARY sent re-broadcasting its first un-acked window ([`Self::primary_timeouts`]'s prepare
+  /// retransmit) — the batched retransmit channel genuinely shipping bodies (a tick whose window is
+  /// empty, or whose every windowed op is a skipped hole, does not count). The sim gate asserts it
+  /// goes `> 0` to prove the retransmit path fired batched (vs every retransmit flowing as per-op
+  /// `Prepare`s). Same lifecycle as the other observability counters (reset to 0 on
+  /// `new`/`recover`); exposed only via `prepare_batches_sent()`.
+  prepare_batches_sent: u64,
+  /// Test/observability counter: how many header-only carrier slices this replica built via
+  /// [`Self::log_entries`] — the single chokepoint every `DoViewChange`/`StartView`/
+  /// `RecoveryResponse` emission's log payload flows through. The sim gate asserts it goes `> 0` to
+  /// prove the header-only carrier path genuinely fired across a sweep. Same lifecycle as the other
+  /// observability counters (reset to 0 on `new`/`recover`); exposed only via
+  /// `header_only_carriers_emitted()`.
+  header_only_carriers_emitted: u64,
+  /// Test/observability counter: how many client sessions this replica EVICTED at apply time —
+  /// inserting a newly-applied client past the [`Config::max_client_sessions`] cap deterministically
+  /// removed the session with the oldest `last_op` (see [`crate::MAX_CLIENT_SESSIONS`] for the
+  /// contract). Replica-deterministic by construction (eviction runs in the applied op stream), so
+  /// it advances identically on every replica across the same applied prefix. Lets the client-churn
+  /// sim lane assert NON-VACUITY (the cap genuinely engaged). Same lifecycle as the other
+  /// observability counters (reset to 0 on `new`/`recover`); exposed only via `sessions_evicted()`.
+  sessions_evicted: u64,
   /// Deferred-forfeit flag: set when [`Self::maybe_force_sync`] would have force-synced
   /// but we are the PRIMARY — a primary MUST NOT force-sync, as that resets `self.op` to the checkpoint
   /// (below its head) and lets it re-issue new client requests at REUSED op numbers in the same view,
@@ -765,6 +1022,11 @@ pub struct Endpoint<S> {
 
 impl<S> Endpoint<S> {
   /// Creates a fresh endpoint in `Status::Normal`, view 0.
+  ///
+  /// **`seed` must carry fresh entropy per incarnation**: the solicitation-freshness nonce is
+  /// derived deterministically from it, so a process restarted with a reused seed re-mints the same
+  /// nonce and a delayed response to the previous incarnation passes the freshness checks. See
+  /// [`Self::recover`] (where the hazard is concrete) for the full contract.
   pub fn new(config: Config, seed: u64, sm: S) -> Self {
     let nonce = Prng::new(seed).next_u64();
     Self {
@@ -793,16 +1055,28 @@ impl<S> Endpoint<S> {
       pending_sb: None,
       pending_checkpoint: None,
       checkpoint_op: OpNumber::new(),
+      log_floor: OpNumber::new(),
       peer_checkpoint: BTreeMap::new(),
+      // Genesis: own checkpoint 0, no peer reports — the quorum-th order statistic is 0 (matches
+      // `recompute_quorum_checkpoint` over this state, so the cache starts coherent).
+      quorum_checkpoint: OpNumber::new(),
       recover: None,
       repair: std::collections::BTreeSet::new(),
       sync: None,
       pending_install: None,
       sync_serving: BTreeMap::new(),
+      sync_donating: None,
+      sync_transfer: None,
       state_syncs_applied: 0,
       forced_syncs_applied: 0,
+      sync_chunk_transfers_completed: 0,
       wal_stalls: 0,
       below_ring_window_syncs: 0,
+      unions_floored: 0,
+      repair_batches_served: 0,
+      prepare_batches_sent: 0,
+      header_only_carriers_emitted: 0,
+      sessions_evicted: 0,
       pending_forfeit: false,
     }
   }
@@ -858,6 +1132,20 @@ impl<S> Endpoint<S> {
       self.checkpoint_op.get(),
     );
     self.checkpoint_op = to;
+    // The own durable snapshot vouches every op `<= to` the log may omit, so the carried-log floor
+    // keeps pace (it never falls below `checkpoint_op`).
+    self.raise_log_floor(to);
+    // The own checkpoint is an input of the cached quorum-th order statistic.
+    self.recompute_quorum_checkpoint();
+  }
+
+  /// The sole writer of `self.log_floor` — MONOTONE by construction (`max`), so neither a stale
+  /// adoption floor nor a lagging own checkpoint can lower a higher vouched floor. Raised by
+  /// [`Self::advance_checkpoint_op`] (the own-snapshot source) and by the floored-adoption sites
+  /// (`start_view_as_new_primary` with the union floor; `adopt_canonical_head` with the
+  /// `StartView`/`RecoveryResponse`-carried floor).
+  fn raise_log_floor(&mut self, to: OpNumber) {
+    self.log_floor = self.log_floor.max(to);
   }
 
   /// The sole non-constructor writer of `self.commit_min` (the applied frontier). It NEVER rewinds —
@@ -905,6 +1193,7 @@ impl<S> Endpoint<S> {
       .is_some_and(|s| s.forced && s.target.get() <= self.commit_min.get())
     {
       self.sync = None;
+      self.sync_transfer = None;
       self.timers.sync_solicit = None;
     }
   }
@@ -985,6 +1274,13 @@ impl<S> Endpoint<S> {
       self.pending_install.is_none() || self.pending_checkpoint.is_some(),
       "pending_install without its in-flight re-persist checkpoint"
     );
+    // (1b) A chunked transfer likewise belongs to an OUTSTANDING sync: `on_sync_checkpoint_meta`
+    // pins it only under a live nonce-matched `sync`, and every clear path drops it no later than
+    // `sync` (aborts drop only the transfer, keeping `sync` armed to re-announce).
+    debug_assert!(
+      self.sync_transfer.is_none() || self.sync.is_some(),
+      "sync_transfer without an outstanding sync"
+    );
     // (2) The ViewChange-only collection (DVC + catch-up discriminant) exists for EXACTLY the lifetime
     // of `Status::ViewChange`: the two ViewChange entries (`enter_view_change` / `catch_up_to_view`)
     // construct it, and every exit to Normal (`adopt_canonical_head` / `start_view_as_new_primary`)
@@ -1034,6 +1330,23 @@ impl<S> Endpoint<S> {
       self.op.get(),
       self.commit_min.get()
     );
+    // (5b) The vouched log floor keeps pace with the own checkpoint (`advance_checkpoint_op` raises
+    // it) and never exceeds the head: every adoption sets `op` to a head at/above the floor it
+    // raises the floor to, and a state-sync install lands `op` at/above its (floor-raising) synced
+    // checkpoint. `op >= log_floor` is what makes the carrier SPAN gate (`band_at_capacity`)
+    // well-formed and the floored-union span bound inductive across view changes.
+    debug_assert!(
+      self.log_floor.get() >= self.checkpoint_op.get(),
+      "log_floor {} < checkpoint_op {}",
+      self.log_floor.get(),
+      self.checkpoint_op.get()
+    );
+    debug_assert!(
+      self.op.get() >= self.log_floor.get(),
+      "op {} < log_floor {}",
+      self.op.get(),
+      self.log_floor.get()
+    );
     // (6) The peer-checkpoint fetch is a Recovering sub-state: `escalate_checkpoint_to_peer_fetch` sets
     // it only on the Recovering checkpoint-read-exhausted path, and `recover` is structurally `None`
     // (hence `awaiting_peer_checkpoint()` false) in every non-recovering status.
@@ -1055,17 +1368,42 @@ impl<S> Endpoint<S> {
       .copied()
       .unwrap_or_else(OpNumber::new);
     self.peer_checkpoint.insert(replica, prev.max(reported));
+    // A peer report is an input of the cached quorum-th order statistic.
+    self.recompute_quorum_checkpoint();
   }
 
   /// The highest op a `quorum` of replicas (including self) has reported checkpointing.
   ///
-  /// Computed from `self.checkpoint_op` plus the per-replica `peer_checkpoint` reports (defaulting an
-  /// unheard peer to 0): sort all replicas' reported checkpoints descending and take the `quorum`-th
-  /// highest — the largest op `v` such that at least `quorum` replicas report a checkpoint `>= v`.
-  /// The primary uses this as the floor below which WAL/session GC is safe (no op a quorum still
-  /// needs is freed). Conservative by construction: an unheard peer counts as 0, so a fresh primary
-  /// prunes nothing until enough fresh `PrepareOk`s arrive — it never frees an op too early.
+  /// Returns the CACHED quorum-th order statistic (`Self::recompute_quorum_checkpoint` maintains it
+  /// at the mutation sites — `record_peer_checkpoint`, `advance_checkpoint_op`, and the
+  /// view-transition `peer_checkpoint` clear): the largest op `v` such that at least `quorum`
+  /// replicas report a checkpoint `>= v`. The primary uses this as the floor below which WAL/session
+  /// GC is safe (no op a quorum still needs is freed) — and `Self::prune_floor` reads it on EVERY
+  /// client request (the WAL-stall check), which is why it is cached rather than allocated + sorted
+  /// per call. Conservative by construction: an unheard peer counts as 0, so a fresh primary prunes
+  /// nothing until enough fresh `PrepareOk`s arrive — it never frees an op too early.
   pub fn quorum_checkpoint_op(&self) -> OpNumber {
+    // Cache-coherence drift guard: any future writer of `checkpoint_op`/`peer_checkpoint` that skips
+    // the recompute trips deterministically across the suite.
+    debug_assert!(
+      self.quorum_checkpoint == self.compute_quorum_checkpoint_op(),
+      "quorum_checkpoint cache is stale (cached {}, actual {}) — a checkpoint-report mutation site \
+       skipped recompute_quorum_checkpoint",
+      self.quorum_checkpoint.get(),
+      self.compute_quorum_checkpoint_op().get(),
+    );
+    self.quorum_checkpoint
+  }
+
+  /// Recompute the cached [`Self::quorum_checkpoint_op`] from `self.checkpoint_op` + the
+  /// `peer_checkpoint` reports. Called at every mutation site of those inputs (the only writers).
+  fn recompute_quorum_checkpoint(&mut self) {
+    self.quorum_checkpoint = self.compute_quorum_checkpoint_op();
+  }
+
+  /// The uncached quorum-th order statistic: sort all replicas' reported checkpoints (self's own
+  /// durable checkpoint; unheard peers as 0) descending and take the `quorum`-th highest.
+  fn compute_quorum_checkpoint_op(&self) -> OpNumber {
     let count = self.config.replica_count();
     let mut cps: std::vec::Vec<u64> = std::vec::Vec::with_capacity(count as usize);
     let me = self.config.replica().get();
@@ -1094,8 +1432,14 @@ impl<S> Endpoint<S> {
   /// ordinary sync trusts, [`Self::maybe_request_sync`], which targets a *single* peer's reported
   /// checkpoint, integrity-gated by `on_sync_checkpoint`). Monotone (each `peer_checkpoint` entry is,
   /// via [`Self::record_peer_checkpoint`]), so the floor never regresses under reordering/partitions.
+  ///
+  /// Seeded from `log_floor` (`>= checkpoint_op`), not the own checkpoint alone: a FLOORED adoption
+  /// proved a durable cluster checkpoint at the adopted floor exists (a canonical donor's), and that
+  /// knowledge must survive the view transitions that clear `peer_checkpoint` — without it, a
+  /// sub-floor adopter's force-sync floor could fall back below its own holes and the escalation
+  /// would never fire (the hole is pruned everywhere, so `RequestPrepare` stays futile forever).
   fn max_peer_checkpoint_op(&self) -> OpNumber {
-    let mut hi = self.checkpoint_op;
+    let mut hi = self.checkpoint_op.max(self.log_floor);
     for cp in self.peer_checkpoint.values() {
       hi = hi.max(*cp);
     }
@@ -1145,6 +1489,16 @@ impl<S> Endpoint<S> {
     self.config.is_primary(self.view)
   }
 
+  /// The HARD bound on the raw session-table size at accept-time admission: the applied-session cap
+  /// ([`Config::max_client_sessions`], enforced by deterministic apply-time eviction) plus one
+  /// pipeline of PROVISIONAL accept-time rows (`last_op == 0`, bounded by the [`MAX_PIPELINE`]
+  /// admission — each provisional row corresponds to an accepted in-flight op). `on_request` refuses
+  /// to mint a NEW client row past this, so the table cannot grow without bound even before the
+  /// apply-time eviction sees the new clients.
+  fn session_table_hard_bound(&self) -> usize {
+    self.config.max_client_sessions() as usize + MAX_PIPELINE as usize
+  }
+
   /// True iff this replica may participate AS the primary right now: `Normal`, the primary of its
   /// view, AND its current view is already DURABLE (no pending superblock view write). The last
   /// clause is durable-view-before-participate: [`Self::start_view_as_new_primary`]
@@ -1175,7 +1529,8 @@ impl<S> Endpoint<S> {
   /// explicitness), the in-flight durable-view superblock write (`pending_sb`), the in-flight
   /// checkpoint write sequence (`pending_checkpoint`, and its deferred-install staging
   /// `pending_install` — which structurally implies `pending_checkpoint`), and the in-flight
-  /// checkpoint READS this replica issued to serve peers' `RequestSync`s (`sync_serving` — a
+  /// checkpoint READS this replica issued to serve peers' `RequestSync`s / cold-cache
+  /// `RequestSyncChunk`s (`sync_serving` — a
   /// `submit_read_checkpoint` whose completion is still owed). It deliberately covers BOTH writes we
   /// owe durability for AND the serve-reads we issued, since both are storage completions the driver is
   /// still holding for this endpoint.
@@ -1236,6 +1591,12 @@ impl<S> Endpoint<S> {
     self.log.keys().next().copied()
   }
 
+  /// Test-only: the number of buffered out-of-order prepares (proves the reorder-buffer bound).
+  #[cfg(test)]
+  fn buffer_len_for_test(&self) -> usize {
+    self.buffer.len()
+  }
+
   /// Test-only: the per-peer recorded checkpoint (0 if unheard). Proves T1 monotonicity directly.
   #[cfg(test)]
   fn peer_checkpoint_for_test(&self, replica: u8) -> u64 {
@@ -1252,9 +1613,12 @@ impl<S> Endpoint<S> {
 
   /// Test-only: set this replica's own durable `checkpoint_op` (the value the forfeit gate compares
   /// against `quorum_checkpoint_op()`), so a test can model a primary that is/ isn't keeping pace.
+  /// Keeps the `log_floor >= checkpoint_op` coupling a real checkpoint advance maintains.
   #[cfg(test)]
   fn set_own_checkpoint_for_test(&mut self, op: u64) {
     self.checkpoint_op = OpNumber::with(op);
+    self.raise_log_floor(OpNumber::with(op));
+    self.recompute_quorum_checkpoint();
   }
 
   /// Test-only: is this `Recovering` replica awaiting a PEER checkpoint after its own checkpoint read
@@ -1361,6 +1725,10 @@ impl<S> Endpoint<S> {
       .max(self.commit_max.get());
     self.commit_max = OpNumber::with(committed_frontier);
     self.checkpoint_op = OpNumber::with(checkpoint_op);
+    self.recompute_quorum_checkpoint();
+    // Arbitrary-construction helper: keep the `log_floor >= checkpoint_op` coupling a real
+    // checkpoint advance maintains (no adoption floor is being modelled here).
+    self.log_floor = OpNumber::with(checkpoint_op);
     self.repair = repair.iter().copied().collect();
     if !self.repair.is_empty() {
       self.timers.repair_retry = Some(Instant::ZERO);
@@ -1443,6 +1811,26 @@ impl<S> Endpoint<S> {
     self.forced_syncs_applied
   }
 
+  /// Test/observability counter: how many CHUNKED checkpoint transfers this replica completed — an
+  /// announced over-frame checkpoint was pulled chunk-by-chunk, assembled, and verified against the
+  /// pinned content id (it then re-enters the ordinary `SyncCheckpoint` install path). The
+  /// large-snapshot sim gate asserts it goes `>= 1` to prove the CHUNKED path genuinely carried the
+  /// sync (vs the single-frame fast path). Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sync_chunk_transfers_completed(&self) -> u64 {
+    self.sync_chunk_transfers_completed
+  }
+
+  /// Test/observability: the donor a chunked transfer is currently pinned to, or `None` when no
+  /// chunked pull is in progress. Lets the donor-crash sim variant target the live donor
+  /// deterministically. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn sync_transfer_donor(&self) -> Option<u8> {
+    self.sync_transfer.as_ref().map(|t| t.donor.get())
+  }
+
   /// Test/observability counter: how many client requests this replica dropped at op-assignment
   /// because minting the next op would overflow the bounded WAL ring (the physical stall-before-wrap).
   /// `0` for an unbounded WAL (the default), so it is inert for existing gates; the bounded-WAL sim gate
@@ -1454,15 +1842,67 @@ impl<S> Endpoint<S> {
   }
 
   /// Test/observability counter: how many times this backup fell below its bounded-WAL
-  /// ring window on a head-extending `Prepare` and state-synced to the cluster checkpoint instead of
-  /// overwriting an un-pruned slot ([`Self::maybe_sync_below_ring_window`]). `0` for an unbounded WAL (the
+  /// ring window on a head-extending `Prepare` — the append refused (it would overwrite an un-pruned
+  /// slot) with state-sync as the recovery, whether the guard armed the sync itself or one was already
+  /// outstanding ([`Self::maybe_sync_below_ring_window`]). `0` for an unbounded WAL (the
   /// default) or an in-quorum backup; the bounded-WAL sim gate asserts it goes `> 0` to prove the
-  /// connected below-ring-window path fired (distinct from the ordinary `> self.op` sync trigger). Not
-  /// part of the stable API.
+  /// connected below-ring-window guard engaged (distinct from the ordinary `> self.op` sync trigger
+  /// alone). Not part of the stable API.
   #[doc(hidden)]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn below_ring_window_syncs(&self) -> u64 {
     self.below_ring_window_syncs
+  }
+
+  /// Test/observability counter: how many canonical-log selections actually FLOORED the union —
+  /// [`Self::select_canonical_log`] dropped at least one canonical-donor entry at/below the vouched
+  /// checkpoint floor `floor*`. The sim gate asserts it goes `> 0` across a sweep to prove the
+  /// floored-union path did real work (not vacuously inert at floor 0). Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn unions_floored(&self) -> u64 {
+    self.unions_floored
+  }
+
+  /// Test/observability counter: how many NON-EMPTY [`RepairBatch`](crate::RepairBatch)es this
+  /// replica served answering peers' `RequestPrepareRange`s ([`Self::on_request_prepare_range`]).
+  /// The sim gate asserts it goes `> 0` to prove the windowed bulk-repair serve path genuinely
+  /// shipped bodies (vs every repair flowing per-op). Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn repair_batches_served(&self) -> u64 {
+    self.repair_batches_served
+  }
+
+  /// Test/observability counter: how many NON-EMPTY [`PrepareBatch`](crate::PrepareBatch)es this
+  /// primary sent re-broadcasting its first un-acked window ([`Self::primary_timeouts`]'s prepare
+  /// retransmit). The sim gate asserts it goes `> 0` to prove the batched retransmit path genuinely
+  /// shipped bodies (vs every retransmit flowing per-op). Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn prepare_batches_sent(&self) -> u64 {
+    self.prepare_batches_sent
+  }
+
+  /// Test/observability counter: how many header-only carrier slices this replica built via
+  /// [`Self::log_entries`] — the chokepoint every `DoViewChange`/`StartView`/`RecoveryResponse`
+  /// emission's log payload flows through. The sim gate asserts it goes `> 0` to prove the
+  /// header-only carrier path genuinely fired. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn header_only_carriers_emitted(&self) -> u64 {
+    self.header_only_carriers_emitted
+  }
+
+  /// Test/observability counter: how many client sessions this replica EVICTED at apply time (the
+  /// deterministic [`crate::MAX_CLIENT_SESSIONS`]-cap eviction — see that constant for the
+  /// contract). Advances identically on every replica across the same applied prefix; the
+  /// client-churn sim lane asserts it goes `> 0` to prove the cap genuinely engaged. Not part of the
+  /// stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sessions_evicted(&self) -> u64 {
+    self.sessions_evicted
   }
 
   /// Test-only: the client session's request high-water (the at-most-once dedup watermark
@@ -1483,6 +1923,18 @@ impl<S> Endpoint<S> {
       .get(&client)
       .and_then(|s| s.reply.as_ref())
       .map(|(rn, body)| (rn.get(), body.to_vec()))
+  }
+
+  /// Test-only: the full session table as ordered `(client, watermark, last_op)` rows — the
+  /// determinism witness the two-endpoint eviction test compares across a primary-path and a
+  /// backup-path endpoint (identical applied prefixes must yield identical tables).
+  #[cfg(test)]
+  fn sessions_snapshot_for_test(&self) -> std::vec::Vec<(u128, u64, u64)> {
+    self
+      .clients
+      .iter()
+      .map(|(&c, s)| (c, s.request.get(), s.last_op.get()))
+      .collect()
   }
 
   /// Test-only: populate the ENTIRE old-generation in-flight set that the view-transition sites tear
@@ -1517,7 +1969,8 @@ impl<S> Endpoint<S> {
     });
     self.pending.insert(7, Pending::Ack(OpNumber::with(1)));
     self.appending.insert(1);
-    self.peer_checkpoint.insert(2, OpNumber::with(3));
+    // Through the production recorder so the cached quorum statistic stays coherent.
+    self.record_peer_checkpoint(2, OpNumber::with(3));
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op: self.commit_min,
       checkpoint_id: 0,
@@ -1534,6 +1987,13 @@ impl<S> Endpoint<S> {
       sessions: BTreeMap::new(),
       sm_tail: Bytes::new(),
       held_tail: false,
+    });
+    self.sync_transfer = Some(SyncTransfer {
+      checkpoint_op: self.checkpoint_op,
+      checkpoint_id: 0,
+      total_len: 1,
+      donor: ReplicaId::new(0),
+      staged: std::vec::Vec::new(),
     });
     self.timers.sync_solicit = Some(Instant::ZERO);
     self.timers.forfeit_armed = Some(Instant::ZERO);
@@ -1559,6 +2019,7 @@ impl<S> Endpoint<S> {
       && self.pending_checkpoint.is_none()
       && self.sync.is_none()
       && self.pending_install.is_none()
+      && self.sync_transfer.is_none()
       && self.timers.sync_solicit.is_none()
       && self.timers.forfeit_armed.is_none()
       && !self.pending_forfeit
@@ -1589,6 +2050,18 @@ impl<S> Endpoint<S> {
     let id = self.next_op_id;
     self.next_op_id += 1;
     crate::OpId::new(id)
+  }
+
+  /// The status-transition chokepoint: assigns `self.status` and emits
+  /// [`Event::StatusChanged`] on an ACTUAL change (a same-status re-entry — e.g. a ViewChange
+  /// escalating to the next view — emits nothing). Every production status write routes here so the
+  /// observability event cannot be forgotten at a new transition site; the constructors set the
+  /// initial status directly (construction is not a transition).
+  fn set_status(&mut self, status: Status) {
+    if self.status != status {
+      self.status = status;
+      self.events.push_back(Event::StatusChanged(status));
+    }
   }
 
   /// Binds a message's SELF-CLAIMED sender to the authenticated transport peer `from` — the single
@@ -1636,8 +2109,20 @@ impl<S> Endpoint<S> {
   /// escape. This leaves no spoof gap on the vote/quorum surface this check protects.
   fn sender_matches(&self, from: Peer, msg: &Message) -> bool {
     match msg {
-      // Client-originated: the authenticated peer must be the issuing client.
-      Message::Request(r) => from == Peer::Client(r.client()),
+      // Client-originated: accept from the issuing client OR relayed by a configured cluster replica.
+      // A local-application client co-located with a backup reaches the primary only by forwarding its
+      // request over the replica mesh, where the transport tags the frame with the RELAYING replica's id
+      // (not the client's). Accepting that relay is safe in the non-Byzantine model: the sender is an
+      // authenticated cluster member (mTLS over cluster-private roots), `on_request` serves a request ONLY
+      // at the primary and dedups by client session (a relayed copy executes at most once), and a Request
+      // carries no view/quorum authority to forge — it is strictly weaker than the replica's existing
+      // consensus role. Out-of-range / non-member peers are still rejected by the membership bound.
+      Message::Request(r) => {
+        from == Peer::Client(r.client())
+          || from
+            .as_replica()
+            .is_some_and(|id| id.get() < self.config.replica_count())
+      }
       // Self-identifying replica messages: the authenticated peer must be the claimed sender AND a
       // CONFIGURED cluster member (`replica < replica_count`). The membership range check is CENTRALIZED
       // in `sender_is_member_replica`: without it, `from == Peer::Replica(m.replica())`
@@ -1651,15 +2136,28 @@ impl<S> Endpoint<S> {
       Message::DoViewChange(m) => self.sender_is_member_replica(from, m.replica()),
       Message::GetView(m) => self.sender_is_member_replica(from, m.replica()),
       Message::RequestPrepare(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::RequestPrepareRange(m) => self.sender_is_member_replica(from, m.replica()),
       Message::Recovery(m) => self.sender_is_member_replica(from, m.replica()),
       Message::RequestSync(m) => self.sender_is_member_replica(from, m.replica()),
       // Serves that carry a self `replica()` AND a `view()` but may come from ANY Normal replica
       // (a backup, not only the primary) — bind to the self id, not `config.primary(view)`.
       Message::RecoveryResponse(m) => self.sender_is_member_replica(from, m.replica()),
       Message::SyncCheckpoint(m) => self.sender_is_member_replica(from, m.replica()),
+      // The chunked state-sync trio all carry a self `replica()`: the announce + chunk are serves
+      // from ANY Normal holder (like `SyncCheckpoint`); the chunk pull is a solicitation (like
+      // `RequestSync`). All bind to the claimed self id + the membership range.
+      Message::SyncCheckpointMeta(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::RequestSyncChunk(m) => self.sender_is_member_replica(from, m.replica()),
+      Message::SyncChunk(m) => self.sender_is_member_replica(from, m.replica()),
       // Primary-authority broadcasts (no self id): only the primary of the advertised view sends them.
       Message::Commit(m) => from == Peer::Replica(self.config.primary(m.view())),
       Message::StartView(m) => from == Peer::Replica(self.config.primary(m.view())),
+      // `PrepareBatch` is the primary's BATCHED retransmit of its un-acked window — unlike the
+      // path-sensitive `Prepare` it has NO repair-serve role (the windowed repair answer is
+      // `RepairBatch`), so it binds strictly to `config.primary(view)` like `Commit`/`StartView`. A
+      // batch from any other peer is forged/misrouted: each entry would otherwise reconstruct a
+      // head-advancing `Prepare` that drives a backup's append + PrepareOk vote.
+      Message::PrepareBatch(m) => from == Peer::Replica(self.config.primary(m.view())),
       // `Prepare` is PATH-SENSITIVE. A NORMAL head-advancing / re-ack Prepare
       // comes ONLY from the primary of its advertised view — binding it to `config.primary(view)` closes
       // the gap where a misrouted non-primary replica Prepare drives a backup's normal append + PrepareOk.
@@ -1679,6 +2177,18 @@ impl<S> Endpoint<S> {
         from == Peer::Replica(self.config.primary(p.view()))
           || (matches!(from, Peer::Replica(r) if r.get() < self.config.replica_count())
             && self.repair.contains(&p.op().get()))
+      }
+      // `RepairBatch` is the windowed analogue of a repair-serve `Prepare`: it carries NO self
+      // `replica()` (only a `view()`) and is legitimately sent by ANY Normal holder — incl. a BACKUP —
+      // so it binds to "any CONFIGURED replica `from`" (an in-range `Peer::Replica`), never a client /
+      // out-of-range id. The serve is committed, view-independent content; binding it to
+      // `config.primary(view)` would drop an honest backup-originated batch. The narrowing to a peer
+      // replica is the same guard the `Prepare` repair escape uses; `fill_repair_batch` then runs the
+      // per-entry `fill_repair` (placement `repair.contains(op)` + checksum + committed-vouch) on EACH
+      // entry, so an unsolicited / forged batch is rejected entry-by-entry exactly like a forged repair
+      // `Prepare` — no committed slot is filled from a non-replica peer or an unverified body.
+      Message::RepairBatch(_) => {
+        matches!(from, Peer::Replica(r) if r.get() < self.config.replica_count())
       }
       // `Reply` is ignored by replicas (dropped in the dispatch) — no-op.
       Message::Reply(_) => true,
@@ -1748,11 +2258,16 @@ where
     // The ONE exception: a replica whose OWN durable checkpoint read exhausted its budget cannot
     // restore its SM from disk and is FETCHING the checkpoint from a peer (`awaiting_peer_checkpoint`).
     // It must accept the answering `SyncCheckpoint` — mirroring how a `RecoveringHead` replica accepts
-    // a `StartView` to learn its head. Every other message is still dropped (it casts no ack/vote).
+    // a `StartView` to learn its head — and, when the answer is too large for one frame, the chunked
+    // form of the SAME answer (`SyncCheckpointMeta` + `SyncChunk`; the assembled envelope re-enters
+    // `on_recover_sync_checkpoint`). Every other message is still dropped (it casts no ack/vote).
     if self.status.is_recovering() {
       if self.awaiting_peer_checkpoint() {
-        if let Message::SyncCheckpoint(m) = msg {
-          self.on_recover_sync_checkpoint(now, wal, sb, m);
+        match msg {
+          Message::SyncCheckpoint(m) => self.on_recover_sync_checkpoint(now, wal, sb, m),
+          Message::SyncCheckpointMeta(m) => self.on_sync_checkpoint_meta(now, m),
+          Message::SyncChunk(m) => self.on_sync_chunk(now, wal, sb, m),
+          _ => {}
         }
       }
       return;
@@ -1776,6 +2291,7 @@ where
     match msg {
       Message::Request(r) => self.on_request(now, wal, from, r),
       Message::Prepare(p) => self.on_prepare(now, wal, sb, p),
+      Message::PrepareBatch(m) => self.on_prepare_batch(now, wal, sb, m),
       Message::PrepareOk(ok) => self.on_prepare_ok(now, sb, ok),
       Message::Commit(c) => self.on_commit(now, sb, c),
       Message::StartViewChange(m) => self.on_start_view_change(now, sb, m),
@@ -1783,12 +2299,20 @@ where
       Message::StartView(m) => self.on_start_view(now, wal, sb, m),
       Message::GetView(m) => self.on_get_view(now, m),
       Message::RequestPrepare(m) => self.on_request_prepare(now, m),
+      Message::RequestPrepareRange(m) => self.on_request_prepare_range(now, m),
       Message::Recovery(m) => self.on_recovery(now, m),
       Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
       // State-sync: a peer's sync solicitation is answered from our durable checkpoint
       // (`on_request_sync`); a sync response is verified + applied (`on_sync_checkpoint`).
       Message::RequestSync(m) => self.on_request_sync(now, sb, m),
       Message::SyncCheckpoint(m) => self.on_sync_checkpoint(now, wal, sb, m),
+      Message::RepairBatch(m) => self.on_repair_batch(now, wal, sb, m),
+      // Chunked state-sync: a peer's chunk pull is served from the donor cache / a cold-cache read;
+      // an announce pins (or re-pins) this replica's own transfer; a chunk extends it (the assembled
+      // envelope re-enters the `SyncCheckpoint` path above).
+      Message::RequestSyncChunk(m) => self.on_request_sync_chunk(now, sb, m),
+      Message::SyncCheckpointMeta(m) => self.on_sync_checkpoint_meta(now, m),
+      Message::SyncChunk(m) => self.on_sync_chunk(now, wal, sb, m),
       Message::Reply(_) => {}
     }
   }
@@ -1905,14 +2429,28 @@ where
     // client-append `arm_timers`, so re-zeroing it here would lose the candidate's truncation clock. Its
     // lifecycle is owned by the arm/fill-cancel/expiry/view-transition sites, never by this role re-arm.
     let repair_or_truncate = self.timers.repair_or_truncate;
+    // PRESERVE an already-armed EARLIER `commit`/`prepare` deadline (the Normal-primary arm below
+    // re-arms with `min(existing, now + interval)`): every accepted client request ends in
+    // `arm_timers`, so re-arming to `now + interval` unconditionally lets a steady sub-interval
+    // request cadence slide the prepare-retransmit deadline forever — one lost Prepare broadcast
+    // under sustained load then never retransmits (the backups buffer the tail above the loss and
+    // their commit wedges below it until the load pauses a full interval). The deadline may only
+    // move EARLIER here; the forward re-arm after servicing belongs to `primary_timeouts` alone. No
+    // stale deadline can leak across generations: every transition out of Normal-primary clears both
+    // (this reset on the non-primary arms, plus the forfeit/pending-view retire branches), so a
+    // preserved deadline always originates in the current Normal-primary stint.
+    let prior_commit = self.timers.commit;
+    let prior_prepare = self.timers.prepare;
     self.timers = Timers::default();
     self.timers.forfeit_armed = forfeit_armed;
     self.timers.repair_or_truncate = repair_or_truncate;
     match self.status {
       Status::Normal if self.is_primary() => {
-        self.timers.commit = Some(now + COMMIT_HEARTBEAT);
+        let commit = now + COMMIT_HEARTBEAT;
+        self.timers.commit = Some(prior_commit.map_or(commit, |d| d.min(commit)));
         if self.commit_min.get() < self.op.get() {
-          self.timers.prepare = Some(now + PREPARE_RETRANSMIT);
+          let prepare = now + PREPARE_RETRANSMIT;
+          self.timers.prepare = Some(prior_prepare.map_or(prepare, |d| d.min(prepare)));
         }
       }
       Status::Normal => {
@@ -2116,8 +2654,11 @@ where
   /// Encodes the checkpoint op + client-session table + an SM snapshot into one checkpoint envelope.
   ///
   /// Layout: `checkpoint_op: u64 BE | sessions_len: u32 BE | repeat[ client: u128 BE | request: u64 BE
-  /// | has_reply: u8 | (if has_reply) reply_request: u64 BE, reply_len: u32 BE, reply_bytes ] |
-  /// sm_snapshot_bytes`.
+  /// | last_op: u64 BE | has_reply: u8 | (if has_reply) reply_request: u64 BE, reply_len: u32 BE,
+  /// reply_bytes ] | sm_snapshot_bytes`. (The per-session `last_op` is the eviction-ordering stamp —
+  /// see [`Session::last_op`]. The envelope has NO cross-version compatibility requirement pre-0.1:
+  /// it is consumed only by peers running the same build, so extending the per-session record is a
+  /// plain format change, not a migration.)
   ///
   /// **The leading `checkpoint_op` BINDS the op into the content hash (safety).** `checkpoint_id`
   /// is `hash(envelope)`, so a faulty/forged superblock cannot ship STALE snapshot bytes (whose real
@@ -2131,6 +2672,7 @@ where
     for (client, s) in sessions {
       out.extend_from_slice(&client.to_be_bytes());
       out.extend_from_slice(&s.request.get().to_be_bytes());
+      out.extend_from_slice(&s.last_op.get().to_be_bytes());
       match &s.reply {
         Some((rn, body)) => {
           out.push(1);
@@ -2184,6 +2726,7 @@ where
     for _ in 0..count {
       let client = take_u128(env, &mut i)?;
       let request = crate::RequestNumber::with(take_u64(env, &mut i)?);
+      let last_op = OpNumber::with(take_u64(env, &mut i)?);
       let has_reply = *env.get(i)?;
       i += 1;
       let reply = if has_reply == 1 {
@@ -2195,11 +2738,26 @@ where
       } else {
         None
       };
-      sessions.insert(client, Session { request, reply });
+      sessions.insert(
+        client,
+        Session {
+          request,
+          reply,
+          last_op,
+        },
+      );
     }
     // The remaining bytes are the SM snapshot tail (`i <= env.len()` is guaranteed by the checked
     // reads above, so this slice never panics).
     Some((checkpoint_op, sessions, &env[i..]))
+  }
+
+  /// Test-only: the checkpoint envelope this endpoint would encode for its CURRENT session table at
+  /// `op` (empty SM snapshot) — the byte-level determinism witness (identical tables ⇒ identical
+  /// envelope bytes ⇒ identical checkpoint ids).
+  #[cfg(test)]
+  fn encode_sessions_envelope_for_test(&self, op: u64) -> Bytes {
+    Self::encode_checkpoint(OpNumber::with(op), &self.clients, &[])
   }
 }
 

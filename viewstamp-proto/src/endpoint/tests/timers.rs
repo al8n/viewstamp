@@ -729,3 +729,78 @@ fn poll_timeout_only_returns_serviceable_timers() {
     }
   }
 }
+
+#[test]
+fn sustained_client_load_does_not_starve_the_prepare_retransmit() {
+  // A primary with an UNCOMMITTED op (its lone own vote is below the 2-of-3 quorum) arms the
+  // prepare retransmit at T. Every accepted client request ends in `arm_timers`, so re-arming to
+  // `now + PREPARE_RETRANSMIT` on each accept would let a steady sub-interval request cadence
+  // slide the deadline forever: one lost Prepare broadcast under sustained load then never
+  // retransmits — backups buffer the tail above the loss as future ops (their arrival still
+  // resets `primary_idle`, so no failover) and the commit wedges below it until the load pauses a
+  // full interval. The deadline must be PRESERVED across accepts (it may only move earlier), so
+  // the retransmit fires at T despite continuous accepts.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let t0 = Instant::ZERO;
+
+  // T0: accept request 1 → op 1, own append durable (own vote only — no quorum, stays uncommitted);
+  // the prepare retransmit is armed at T = t0 + PREPARE_RETRANSMIT.
+  e.handle_message(
+    t0,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    client_request(1),
+  );
+  e.handle_storage(t0, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  let deadline = t0 + PREPARE_RETRANSMIT;
+  assert_eq!(
+    e.timers.prepare,
+    Some(deadline),
+    "an uncommitted op arms the prepare retransmit"
+  );
+
+  // Continuous accepts at a sub-interval cadence (each < PREPARE_RETRANSMIT after the last): the
+  // armed deadline must NOT move past T — neither the prepare timer itself nor the earliest
+  // serviceable deadline a poll_timeout()-driven driver would wake on.
+  for (i, ms) in [40u64, 80].into_iter().enumerate() {
+    let now = t0 + core::time::Duration::from_millis(ms);
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      client_request(2 + i as u64),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    while e.poll_message().is_some() {}
+    assert_eq!(
+      e.timers.prepare,
+      Some(deadline),
+      "accepting a request at T-ε must not move the prepare deadline past T"
+    );
+    let due = e.poll_timeout().expect("primary timers armed");
+    assert!(
+      due <= deadline,
+      "poll_timeout must stay at/before the armed retransmit deadline ({due:?} > {deadline:?})"
+    );
+  }
+
+  // At T the retransmit FIRES: the whole uncommitted tail is re-broadcast (as the byte-bounded
+  // `PrepareBatch`), so op 1 — whose accept-time Prepare may have been lost — reaches the backups
+  // despite the continuous accepts.
+  e.handle_timeout(deadline, &mut wal, &mut sb);
+  let mut resent = std::collections::BTreeSet::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareBatch(b) = out.msg_ref() {
+      resent.extend(b.log_slice().iter().map(|entry| entry.op().get()));
+    }
+  }
+  assert_eq!(
+    resent,
+    (1..=3u64).collect::<std::collections::BTreeSet<u64>>(),
+    "the retransmit at T re-broadcasts every uncommitted op"
+  );
+}

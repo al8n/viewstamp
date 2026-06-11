@@ -70,6 +70,16 @@ pub struct StorageFaults {
   /// Per-append probability (out of 1000) that the slot is PERMANENTLY corrupt (bit-rot): every read
   /// of it faults, modelling unrecoverable media damage. `0` in the transient-only gates.
   pub bit_rot_per_mille: u32,
+  /// Per-append probability (out of 1000) that the slot loses its HEADER too: the append completes
+  /// (`WalDone::Appended` fires) but the slot retains NO recoverable header — [`Wal::header`] returns
+  /// `None`, [`Wal::status`] reports `Empty`, and a read resolves `Absent`, as if the append had
+  /// never happened. This DELIBERATELY VIOLATES the `Wal` header-durability contract (slot headers
+  /// MUST survive body-level faults — see the trait docs in `viewstamp-proto/src/storage.rs`), which
+  /// the committed-op-survival design (`Body::Repairing` keep-header-only) leans on. It exists ONLY
+  /// for the torn-header contract-violation probe lane, which measures the blast radius when an
+  /// embedder breaks that contract. PERMANENT until the slot is rewritten/truncated/pruned.
+  /// `0` everywhere except the probe lane.
+  pub torn_header_per_mille: u32,
   /// Per-read probability (out of 1000) that a WAL read for op X is MISDIRECTED: instead of X's bytes
   /// (or `Absent`), it returns a DIFFERENT present, valid, checksum-CORRECT slot's `ReadOk`
   /// (`header.op() != X`) — TigerBeetle's misdirected-IO hazard, where a read lands on the wrong
@@ -95,12 +105,13 @@ pub struct StorageFaults {
 }
 
 impl StorageFaults {
-  /// No faults: every read succeeds, no torn writes, no bit-rot, no misdirection.
+  /// No faults: every read succeeds, no torn writes, no bit-rot, no torn headers, no misdirection.
   pub const fn none() -> Self {
     Self {
       read_fault_per_mille: 0,
       torn_write_per_mille: 0,
       bit_rot_per_mille: 0,
+      torn_header_per_mille: 0,
       misdirect_read_per_mille: 0,
       corrupt_checkpoint_read_per_mille: 0,
     }
@@ -130,6 +141,9 @@ struct PendingAppend {
   body: Bytes,
   /// Whether to mark `op` permanently bit-rotted on completion (the bit-rot roll fired at submit).
   rot: bool,
+  /// Whether to mark `op` torn-HEADER on completion (the contract-violation probe roll fired at
+  /// submit): the slot then reports no header at all.
+  torn_header: bool,
 }
 
 /// A seeded in-memory write-ahead log. With [`StorageFaults::none`] it is reliable + synchronous
@@ -158,6 +172,12 @@ pub struct InMemoryWal {
   /// Slots marked PERMANENTLY corrupt (bit-rot) at append time: every read faults, `status` reports
   /// `Faulty`, `header` reports `None`. Persists across restart (the struct survives crash/restart).
   rotted: BTreeSet<u64>,
+  /// Slots whose HEADER was lost at append time (the torn-header contract-violation probe): the
+  /// completed append left NO recoverable header, so `header()` is `None`, `status()` is `Empty`, and
+  /// a read is `Absent` — the slot vanished as if never written. Deliberately violates the `Wal`
+  /// header-durability contract (the probe lane measures the blast radius). Persists across restart;
+  /// cleared when the slot is rewritten/truncated/pruned/ring-evicted, like `rotted`.
+  torn_headers: BTreeSet<u64>,
   /// `None` (default) ⇒ synchronous appends. `Some(d)` ⇒ async mode: each `submit_append` stages for
   /// `d` `poll`s before becoming durable. `d == 0` releases on the very next `poll` (still NOT inline,
   /// so the in-flight window still exists for at least one tick).
@@ -169,6 +189,10 @@ pub struct InMemoryWal {
   /// since construction. Lets the VOPR sweep assert the misdirected-read axis is NON-vacuous (it
   /// really fired, so the proto's placement check was genuinely exercised) rather than merely armed.
   misdirects_fired: u64,
+  /// Observability: how many completed appends LOST their header (the torn-header verdict fired)
+  /// since construction. Lets the torn-header probe lane assert it is NON-vacuous (committed slots
+  /// genuinely vanished header-and-all) rather than merely armed.
+  torn_headers_fired: u64,
   /// `None` (default) ⇒ UNBOUNDED: `entries` grows without a physical cap and `capacity()` reports
   /// `u64::MAX`. `Some(n)` ⇒ a fixed RING of `n` slots: op `K` occupies slot `K mod n`, and a
   /// durable append at `K` physically OVERWRITES whatever op last held that slot (op `K - n`). A read of
@@ -200,9 +224,11 @@ impl InMemoryWal {
       faults,
       prng: Prng::new(seed),
       rotted: BTreeSet::new(),
+      torn_headers: BTreeSet::new(),
       async_delay: None,
       staged: VecDeque::new(),
       misdirects_fired: 0,
+      torn_headers_fired: 0,
       capacity: None,
     }
   }
@@ -237,7 +263,10 @@ impl InMemoryWal {
   /// not match the new ring geometry) or with `Some(0)`.
   pub fn set_capacity(&mut self, n: Option<u64>) {
     assert!(
-      self.entries.is_empty() && self.staged.is_empty() && self.rotted.is_empty(),
+      self.entries.is_empty()
+        && self.staged.is_empty()
+        && self.rotted.is_empty()
+        && self.torn_headers.is_empty(),
       "set_capacity must be called on an empty WAL"
     );
     assert!(n != Some(0), "a bounded WAL ring needs at least one slot");
@@ -324,13 +353,16 @@ impl InMemoryWal {
   /// `&mut self`), AFTER the misdirect probability roll, keeping a masked (`VOPR_NO_MISDIRECT`) run on
   /// the same stream as far as the probability gate.
   fn misdirect_sibling(&mut self, op: u64) -> Option<(Header, Bytes)> {
-    // Candidate VALID sibling slots: present, op != requested, self-verifying, not bit-rotted. A torn
+    // Candidate VALID sibling slots: present, op != requested, self-verifying, not bit-rotted, not
+    // torn-header (a vanished slot has no readable bytes to land on). A torn
     // slot (body fails verify) is excluded — a misdirected read returns a CHECKSUM-CORRECT entry, so
     // the only thing the proto can use to reject it is the op/placement mismatch, not the checksum.
     let candidates: VecDeque<u64> = self
       .entries
       .iter()
-      .filter(|&(&o, (h, b))| o != op && !self.rotted.contains(&o) && h.verify(b))
+      .filter(|&(&o, (h, b))| {
+        o != op && !self.rotted.contains(&o) && !self.torn_headers.contains(&o) && h.verify(b)
+      })
       .map(|(&o, _)| o)
       .collect();
     if candidates.is_empty() {
@@ -353,6 +385,14 @@ impl InMemoryWal {
     self.misdirects_fired
   }
 
+  /// Test-only: how many completed appends LOST their header (the torn-header contract-violation
+  /// verdict fired) since construction. `> 0` proves the probe lane genuinely made slots vanish
+  /// header-and-all. Persists across `restart` because the WAL struct does.
+  #[doc(hidden)]
+  pub fn torn_headers_fired(&self) -> u64 {
+    self.torn_headers_fired
+  }
+
   /// Bounded-ring physical slot reuse: when a durable append at `op` lands in slot `op mod n`,
   /// EVICT whatever DIFFERENT op last held that slot (op `op - n`) — its bytes are physically gone (a
   /// clean wrap), so it leaves `entries`/`rotted`/`staged` and a subsequent read of it returns `Absent`.
@@ -368,6 +408,7 @@ impl InMemoryWal {
     // (`op - n`) if present, never `op` itself.
     self.entries.retain(|&o, _| o == op || o % n != slot);
     self.rotted.retain(|&o| o == op || o % n != slot);
+    self.torn_headers.retain(|&o| o == op || o % n != slot);
     self.staged.retain(|s| s.op == op || s.op % n != slot);
   }
 }
@@ -397,6 +438,12 @@ impl Wal for InMemoryWal {
   }
 
   fn header(&self, op: OpNumber) -> Option<Header> {
+    // TORN-HEADER probe verdict: the completed append left NO recoverable header, so the slot reports
+    // none at all — the deliberate violation of the trait's header-durability contract that the probe
+    // lane measures. Checked first: it overrides the in-model durability below.
+    if self.torn_headers.contains(&op.get()) {
+      return None;
+    }
     // The header tuple lives in `entries` and is durable from the moment the append completed
     // (it is always written intact — only the BODY can be torn or bit-rotted). Both fault
     // classes therefore leave the header readable: a bit-rotted slot still has its `entries`
@@ -407,7 +454,12 @@ impl Wal for InMemoryWal {
   }
 
   fn status(&self, op: OpNumber) -> SlotStatus {
-    if self.rotted.contains(&op.get()) {
+    // TORN-HEADER probe verdict first: the slot vanished as if the append had never happened, so it
+    // reports `Empty` — not `Faulty`, which would still admit "this op exists here" (the very
+    // knowledge the lost header was carrying).
+    if self.torn_headers.contains(&op.get()) {
+      SlotStatus::Empty
+    } else if self.rotted.contains(&op.get()) {
       SlotStatus::Faulty
     } else if self.entries.contains_key(&op.get()) {
       SlotStatus::Clean
@@ -436,6 +488,12 @@ impl Wal for InMemoryWal {
     } else {
       body
     };
+    // TORN-HEADER probe verdict (contract violation, probe lane only): the slot completes its append
+    // but loses the header too — it will read back as if never written. Rolled AFTER the existing
+    // verdicts and only when armed (`per_mille > 0` short-circuits the draw), so every zero-rate run
+    // keeps its exact historical fault-PRNG stream.
+    let torn_header = self.faults.torn_header_per_mille > 0
+      && self.prng.chance(self.faults.torn_header_per_mille, 1000);
     match self.async_delay {
       // SYNCHRONOUS (default): durable immediately, completion queued in this call.
       None => {
@@ -443,6 +501,14 @@ impl Wal for InMemoryWal {
         self.evict_wrapped_slot(op.get());
         if rot {
           self.rotted.insert(op.get());
+        }
+        if torn_header {
+          self.torn_headers.insert(op.get());
+          self.torn_headers_fired += 1;
+        } else {
+          // Rewriting a slot whose previous occupant (same op, e.g. a repair re-append) lost its
+          // header clears the verdict — the media was rewritten whole.
+          self.torn_headers.remove(&op.get());
         }
         self.entries.insert(op.get(), (header, stored));
         self.head = self.head.max(op.get());
@@ -458,11 +524,19 @@ impl Wal for InMemoryWal {
         header,
         body: stored,
         rot,
+        torn_header,
       }),
     }
   }
 
   fn submit_read(&mut self, id: OpId, op: OpNumber) {
+    // TORN-HEADER probe verdict: the slot retains NOTHING recoverable — not even the header — so the
+    // read resolves `Absent`, exactly as if the append had never happened. (The contract violation
+    // the probe lane measures: a real backend must never lose a completed append's header.)
+    if self.torn_headers.contains(&op.get()) {
+      self.completions.push_back(WalDone::Absent(id));
+      return;
+    }
     // PERMANENT bit-rot: the header is durable (it lives in `entries`) but the body is
     // unrecoverable from this replica. Emit BodyFaulty so the caller knows the op exists and
     // can identify it, without pretending the body is valid.
@@ -519,6 +593,7 @@ impl Wal for InMemoryWal {
     self.entries.retain(|&op, _| op <= above.get());
     // A truncated-away slot is no longer corrupt (it will be rewritten by a later append).
     self.rotted.retain(|&op| op <= above.get());
+    self.torn_headers.retain(|&op| op <= above.get());
     // Drop any staged (in-flight) append above the truncation point: those bytes are abandoned and
     // must never later become durable above the new head (async mode only; a no-op otherwise).
     self.staged.retain(|s| s.op <= above.get());
@@ -528,6 +603,7 @@ impl Wal for InMemoryWal {
   fn prune(&mut self, below: OpNumber) {
     self.entries.retain(|&op, _| op >= below.get());
     self.rotted.retain(|&op| op >= below.get());
+    self.torn_headers.retain(|&op| op >= below.get());
     // A staged append below the GC floor is moot; drop it (async mode only).
     self.staged.retain(|s| s.op >= below.get());
   }
@@ -547,6 +623,12 @@ impl Wal for InMemoryWal {
         self.evict_wrapped_slot(done.op);
         if done.rot {
           self.rotted.insert(done.op);
+        }
+        if done.torn_header {
+          self.torn_headers.insert(done.op);
+          self.torn_headers_fired += 1;
+        } else {
+          self.torn_headers.remove(&done.op);
         }
         self.entries.insert(done.op, (done.header, done.body));
         self.head = self.head.max(done.op);
@@ -724,6 +806,19 @@ impl InMemorySuperblock {
   /// must serve so recover's `cr.op() == state.checkpoint_op()` placement check always holds.
   fn live_checkpoint_op(&self) -> u64 {
     self.state.checkpoint_op().get()
+  }
+
+  /// Test-only: the byte length of the LIVE ROOTED checkpoint envelope (the bytes a serve-read
+  /// returns — exactly what a `SyncCheckpoint`/chunked transfer would carry), or `None` when no
+  /// checkpoint has been rooted. The large-snapshot gate reads this to assert the envelope genuinely
+  /// exceeded the one-frame threshold (the would-have-wedged precondition).
+  #[doc(hidden)]
+  pub fn live_checkpoint_len(&self) -> Option<usize> {
+    let live = self.live_checkpoint_op();
+    if live == 0 {
+      return None;
+    }
+    self.snapshots.get(&live).map(Bytes::len)
   }
 
   /// GC checkpoint snapshot generations no longer reachable: drop every entry STRICTLY OLDER than the
@@ -1320,6 +1415,46 @@ mod tests {
       }
       other => panic!("torn slot must yield BodyFaulty, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn torn_header_slot_vanishes_entirely() {
+    // The torn-header contract-violation probe: a completed append whose verdict fired retains NO
+    // recoverable header — `header()` is None, `status()` is Empty, a read is Absent — exactly the
+    // shape the `Wal` header-durability contract forbids a real backend from producing. The append
+    // COMPLETED normally (`Appended` fired), so the proto acked it believing it durable.
+    let mut w = InMemoryWal::with_faults(
+      StorageFaults {
+        torn_header_per_mille: 1000,
+        ..StorageFaults::none()
+      },
+      42,
+    );
+    append(&mut w, 5, b"gone");
+    assert_eq!(w.torn_headers_fired(), 1, "the verdict fired");
+    assert!(
+      w.header(OpNumber::with(5)).is_none(),
+      "a torn-header slot has NO recoverable header"
+    );
+    assert_eq!(
+      w.status(OpNumber::with(5)),
+      SlotStatus::Empty,
+      "a torn-header slot reports Empty — as if never written"
+    );
+    w.submit_read(OpId::new(1), OpNumber::with(5));
+    assert_eq!(
+      w.poll(),
+      Some(WalDone::Absent(OpId::new(1))),
+      "a read of a torn-header slot is Absent"
+    );
+    // Truncating the slot away clears the verdict with it (no ghost entry under a gone op).
+    w.truncate(OpNumber::with(0));
+    assert_eq!(w.status(OpNumber::with(5)), SlotStatus::Empty);
+    assert_eq!(
+      w.torn_headers_fired(),
+      1,
+      "the witness counter is cumulative"
+    );
   }
 
   #[test]

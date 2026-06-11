@@ -1,0 +1,63 @@
+name: fuzz
+
+# Short scheduled fuzz runs over the byte-decode surfaces (fuzz/fuzz_targets/): Message::decode,
+# the stream-transport ingress (the frame decoder fed arbitrary chunkings through the public
+# coordinator API), and the superblock/WAL disk codec. Each target runs briefly from the committed
+# seed corpus — a smoke lane that catches a decode panic/regression, not a deep campaign; run
+# longer sessions locally with `cargo +nightly fuzz run <target>`. Weekly + on demand, vopr-style:
+# heavier than the per-PR path and not tied to any one PR.
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Per-target run time in seconds (default 300)"
+        required: false
+        default: "300"
+  schedule:
+    - cron: "0 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: fuzz (libFuzzer, all targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('fuzz/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-
+      - name: Install nightly
+        run: rustup update nightly --no-self-update && rustup default nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz message_decode
+        env:
+          SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
+        run: cargo fuzz run message_decode -- -max_total_time=$SECONDS_PER_TARGET
+      - name: Fuzz stream_ingress
+        env:
+          SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
+        run: cargo fuzz run stream_ingress -- -max_total_time=$SECONDS_PER_TARGET
+      - name: Fuzz superblock_decode
+        env:
+          SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
+        run: cargo fuzz run superblock_decode -- -max_total_time=$SECONDS_PER_TARGET
+      - name: Upload crash artifacts (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

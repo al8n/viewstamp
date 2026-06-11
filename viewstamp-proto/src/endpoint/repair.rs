@@ -46,6 +46,79 @@ impl<S: StateMachine> Endpoint<S> {
     ));
   }
 
+  /// Register the CONTIGUOUS run of below-head `Repairing`/missing holes starting at `lo` for windowed
+  /// peer fault-repair and solicit it as ONE [`RequestPrepareRange`]. The windowed analogue of
+  /// [`Self::request_repair`]: where that solicits a single committed-op hole, this registers the whole
+  /// contiguous band `[lo, hi]` and asks for it in one message, so a deep header-only adoption (a
+  /// view-change carrier that installed the whole uncheckpointed log as `Repairing` holes) is repaired
+  /// PIPELINED — a holder answers with a byte-bounded [`RepairBatch`] serving up to a frame's worth of
+  /// ops — rather than one op per round trip (which never converges for a ~hundreds-deep band in a calm
+  /// window). The commit is HELD below `lo` by the apply loops exactly as for the single-op path.
+  ///
+  /// `hi` is the top of the contiguous hole band, capped two ways: it never exceeds the known-committed
+  /// frontier `commit_max` (ops above it are the ABOVE-head tail-gap path's job, not below-head repair)
+  /// nor `lo + REPAIR_WINDOW - 1` (bounding the solicitation breadth + the per-op work this call does in
+  /// the Sans-I/O core). The band stops at the first `Present` op — a filled op is not a hole, so the
+  /// run is holes-only. Each hole in `[lo, hi]` is registered identically to `request_repair`'s single
+  /// op, then the retry timer is armed and the force-sync escalation evaluated ONCE for the whole run.
+  pub(crate) fn request_repair_run(&mut self, now: Instant, lo: u64) {
+    // Walk the contiguous hole band up from `lo`, bounded by the repair window and the known-committed
+    // frontier. An op is a HOLE iff it is missing from `self.log` OR held header-only (`Repairing`); a
+    // `Present` op terminates the band (it is filled, not a hole). Capped at `commit_max` — a slot above
+    // it is uncommitted-tail (the `request_tail_gap` ABOVE-head path), never a below-head committed hole.
+    let window_top = lo.saturating_add(REPAIR_WINDOW).saturating_sub(1);
+    let ceiling = self.commit_max.get().min(window_top).min(self.op.get());
+    let mut hi = lo;
+    while hi < ceiling {
+      let next = hi + 1;
+      let is_hole = !matches!(self.log.get(&next), Some(e) if e.body.is_present());
+      if !is_hole {
+        break;
+      }
+      hi = next;
+    }
+    // Register every hole in `[lo, hi]` exactly as `request_repair` registers a single op: drop a stale
+    // `Present` cache entry so the apply path keeps treating the slot as a hole (a `Repairing` entry is
+    // KEPT — it carries the durable canonical `body_checksum` `fill_repair` verifies against), insert
+    // the hole, and assert the committed-survival backstop AFTER the insert (so the tracked-for-repair
+    // clause holds for a committed hole in `(checkpoint_op .. commit_max]`).
+    for op in lo..=hi {
+      if !matches!(self.log.get(&op), Some(e) if e.body.is_repairing()) {
+        self.log.remove(&op);
+      }
+      self.repair.insert(op);
+      self.assert_committed_survives(op, self.checkpoint_op.get());
+    }
+    // Observability: a windowed repair solicitation is going out for the hole band. Scalar copy only.
+    self
+      .events
+      .push_back(Event::RepairStarted(crate::RepairStarted::new(
+        OpNumber::with(lo),
+        OpNumber::with(hi),
+      )));
+    self.send_request_prepare_range(lo, hi);
+    self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
+    // Force-sync escalation: if a quorum already checkpointed past these just-registered holes, the
+    // range solicitation is futile from the outset — escalate straight to a forced `RequestSync`.
+    self.maybe_force_sync(now);
+  }
+
+  /// Broadcast a `RequestPrepareRange` for the contiguous missing committed run `[lo, hi]` to all peers.
+  /// Any peer holding (a prefix of) the run answers with a byte-bounded [`RepairBatch`]
+  /// (`on_request_prepare_range`). Broadcast (not primary-only), like `send_request_prepare`, so the
+  /// repair completes even mid-view-change / when the primary itself holds the holes.
+  pub(crate) fn send_request_prepare_range(&mut self, lo: u64, hi: u64) {
+    self.emit(Outgoing::new(
+      Recipient::Backups,
+      Message::RequestPrepareRange(crate::RequestPrepareRange::new(
+        self.view,
+        OpNumber::with(lo),
+        OpNumber::with(hi),
+        self.config.replica(),
+      )),
+    ));
+  }
+
   /// Whether `(op, entry)` is a still-open *repair-or-truncate candidate*: a header-only `Repairing`
   /// op ABOVE the known-committed frontier `commit_max` whose body is NOT already being made durable.
   /// Three exclusions, each meaning "not a truncation candidate":
@@ -218,6 +291,13 @@ impl<S: StateMachine> Endpoint<S> {
   /// Peer-fault-repair retransmit timer: while the repair set is non-empty, re-solicit every
   /// unrepaired op and re-arm. Terminates when the last hole is filled (`fill_repair` clears the op
   /// and stops re-arming once `repair` is empty).
+  ///
+  /// CONTIGUOUS runs of `self.repair` are COALESCED into windowed [`RequestPrepareRange`] re-solicits
+  /// (each chunk capped at [`REPAIR_WINDOW`] ops) rather than one [`RequestPrepare`] per op — so a deep
+  /// header-only band (a ~hundreds-deep `Repairing` adoption) re-solicits in a handful of range messages
+  /// a holder answers with byte-bounded [`RepairBatch`]es, instead of one round trip per op. `self.repair`
+  /// is a `BTreeSet` (ascending), so a maximal consecutive sub-sequence is one run; a non-consecutive gap
+  /// (two separate holes with a filled op between) starts a new range request.
   pub(crate) fn repair_timeouts(&mut self, now: Instant) {
     if self.timers.repair_retry.is_none_or(|d| d > now) {
       return;
@@ -227,9 +307,23 @@ impl<S: StateMachine> Endpoint<S> {
       return;
     }
     let ops: std::vec::Vec<u64> = self.repair.iter().copied().collect();
-    for op in ops {
-      self.send_request_prepare(op);
+    // Coalesce ascending ops into maximal contiguous runs, emitting one `RequestPrepareRange` per run
+    // (chunked at `REPAIR_WINDOW` ops so a single re-solicit never spans an unbounded range). `lo`/`hi`
+    // track the current open run; a break in contiguity OR a full window flushes it.
+    let mut lo = ops[0];
+    let mut hi = ops[0];
+    for &op in &ops[1..] {
+      let contiguous = op == hi + 1;
+      let within_window = op < lo + REPAIR_WINDOW;
+      if contiguous && within_window {
+        hi = op;
+      } else {
+        self.send_request_prepare_range(lo, hi);
+        lo = op;
+        hi = op;
+      }
     }
+    self.send_request_prepare_range(lo, hi);
     self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
   }
 
@@ -287,6 +381,136 @@ impl<S: StateMachine> Endpoint<S> {
       Recipient::To(Peer::Replica(m.replica())),
       Message::Prepare(prepare),
     ));
+  }
+
+  /// Answer a peer's [`RequestPrepareRange`] for a contiguous committed run `[lo, hi]` with a
+  /// BYTE-BOUNDED PREFIX of the ops we hold `Present`, as one [`RepairBatch`]. The windowed analogue of
+  /// [`Self::on_request_prepare`]: same serve gate (only a `Normal` replica whose view is DURABLE serves
+  /// — a `pending_sb` replica's `self.view` could roll back; the served ops are committed +
+  /// view-independent, so the requester loses nothing by waiting for another holder), but it walks the
+  /// run and accumulates a PREFIX rather than serving one op.
+  ///
+  /// **The window bound (the work cap).** The decoded `hi` is untrusted — a buggy authenticated peer
+  /// could send `hi:u64::MAX` against a high `self.op`. We clamp the served interval to the SAME window
+  /// the requester solicits (`lo + REPAIR_WINDOW - 1`, then our head), and iterate the `Present` entries
+  /// we actually HOLD in `[lo, hi]` via `self.log.range` — never the numeric `lo..=hi` — so the scan
+  /// costs only our present entries within a fixed-width window, not the requester-claimed span. This
+  /// bounds the WORK; the byte cap below bounds the answer SIZE.
+  ///
+  /// **The byte cap (the load-bearing bound).** We accumulate `Present` entries at/below our head into a
+  /// `Vec` UNTIL the running encoded size would exceed the frame budget
+  /// `MAX_FRAME_LEN - REPAIR_BATCH_CARRIER_OVERHEAD`, then STOP — serving a PREFIX of the run, never an
+  /// unbounded batch (the requester re-solicits the unserved tail on its next pass). This is what keeps
+  /// the produced `RepairBatch` under the transport frame cap by construction, regardless of how deep the
+  /// solicited run is. A `Repairing`/missing op is SKIPPED (we do not hold its body), exactly as
+  /// `on_request_prepare` stays silent on a hole — the requester's `fill_repair_batch` then fills only
+  /// the ops we actually served and re-solicits the rest. Always serves at least the FIRST eligible
+  /// entry even if its body alone meets the budget edge (a single committed op's body fits a frame by the
+  /// `max_request_body_len` bound — see [`crate::message::MAX_REQUEST_BODY_OVERHEAD`], which accounts for
+  /// the single-entry `RepairBatch` carrier), so the run always makes forward progress.
+  pub(crate) fn on_request_prepare_range(&mut self, _now: Instant, m: crate::RequestPrepareRange) {
+    // Durable-view-before-participate (identical to `on_request_prepare`): only a Normal replica whose
+    // view is durable may serve a (view-advertising) repair answer.
+    if !self.status.is_normal() || self.pending_sb.is_some() {
+      return;
+    }
+    if m.replica().get() >= self.config.replica_count() {
+      return; // ignore malformed/out-of-range replica id
+    }
+    let lo = m.lo().get();
+    // Clamp the served interval to the requester's own solicitation window (`request_repair_run` caps
+    // its `hi` the same way), then to our head: the decoded `hi` is untrusted (see the doc's work cap),
+    // and the clamp caps the SCAN while the byte budget below caps the answer SIZE.
+    let window_top = lo.saturating_add(REPAIR_WINDOW).saturating_sub(1);
+    let hi = m.hi().get().min(window_top).min(self.op.get());
+    if lo > hi {
+      return;
+    }
+    // Accumulate a byte-bounded PREFIX of the run we hold `Present`. The budget is the frame cap less
+    // the `RepairBatch` carrier framing; each `Present` entry costs `present_entry_encoded_len(body)`.
+    let budget =
+      crate::message::MAX_FRAME_LEN as usize - crate::message::REPAIR_BATCH_CARRIER_OVERHEAD;
+    let mut running = 0usize;
+    let mut entries: std::vec::Vec<crate::PreparedEntry> = std::vec::Vec::new();
+    // `self.log.range(lo..=hi)`, not the numeric `lo..=hi`: the scan costs only the entries we hold.
+    // A `Repairing` (header-only) entry is SKIPPED — we have its identity, not its bytes — exactly as
+    // `on_request_prepare` stays silent on a hole; the requester re-solicits any gap.
+    for (&op, entry) in self.log.range(lo..=hi) {
+      let Body::Present(body) = &entry.body else {
+        continue;
+      };
+      let (client, request) = (entry.client, entry.request);
+      let cost = crate::message::present_entry_encoded_len(body.len());
+      // Stop once adding this entry would exceed the frame budget — BUT always include the first eligible
+      // entry (an empty `entries` here) so a run whose lowest held op is itself near the budget still
+      // makes progress (a single op's body fits a frame by the request-body bound).
+      if !entries.is_empty() && running + cost > budget {
+        break;
+      }
+      running += cost;
+      entries.push(crate::PreparedEntry::new(
+        OpNumber::with(op),
+        client,
+        request,
+        body.clone(),
+      ));
+    }
+    if entries.is_empty() {
+      return; // we hold no `Present` op in the run — stay silent; another holder answers
+    }
+    // Observability (non-vacuity): a non-empty batch is genuinely served (every silent/empty/gated
+    // path returned above), witnessing the windowed bulk-repair serve.
+    self.repair_batches_served += 1;
+    self.emit(Outgoing::new(
+      Recipient::To(Peer::Replica(m.replica())),
+      Message::RepairBatch(crate::RepairBatch::new(
+        self.view,
+        self.commit_min,
+        self.checkpoint_op,
+        entries,
+      )),
+    ));
+  }
+
+  /// Apply a peer-supplied [`RepairBatch`] answering our [`RequestPrepareRange`]: run the EXISTING
+  /// per-entry [`Self::fill_repair`] core on EACH served entry, then let the deferred per-entry durable
+  /// completions resume the held commit. This is purely a PIPELINING of the single-op repair fill — NOT
+  /// a relaxation of it: each entry is reconstructed into a [`Prepare`] carrying the batch's `commit`
+  /// (the committed-vouch the per-op serve's `Prepare` rides) and passed through `fill_repair`, which
+  /// applies its OWN placement check (`self.repair.contains(&op)`), `appending` dedup, `Header::verify`
+  /// checksum, and canonical-identity-or-committed-vouch gate before staging a `Pending::RepairFill` +
+  /// `submit_append` + marking `op` `appending`. So EACH entry keeps its OWN durability barrier — N
+  /// served entries → N independent `RepairFill` pendings, each applied only in its own `on_wal_done`
+  /// after `WalDone::Appended` — and the safety surface is IDENTICAL to the per-op path, N times: no op
+  /// is applied or replied from an unverified body, and an entry whose placement/checksum/vouch fails is
+  /// silently skipped (re-solicited) exactly as a single declined repair `Prepare` is. A served entry
+  /// whose op is not (or no longer) one of our holes is a no-op via `fill_repair`'s placement reject.
+  pub(crate) fn on_repair_batch<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    m: crate::RepairBatch,
+  ) {
+    let commit = m.commit();
+    let checkpoint_op = m.checkpoint_op();
+    for e in m.into_log() {
+      // Reconstruct the per-entry `Prepare` the per-op repair path expects, carrying the batch's
+      // `commit` as the committed-vouch (so `fill_repair`'s `commit >= op` gate sees the same signal a
+      // single repair-serve `Prepare` carries). The decoded `Body::Present` bytes are MOVED out of the
+      // owned entry (`into_parts`) — the decode boundary already paid the wire→owned copy, so a second
+      // per-entry copy here would be pure waste on the bulk-repair path. A header-only (`Repairing`)
+      // served entry has no body to fill — skip it (we cannot adopt bytes we were not given); the
+      // requester re-solicits.
+      let (op, client, request, body) = e.into_parts();
+      let Body::Present(body) = body else {
+        continue;
+      };
+      let prepare = Prepare::new(self.view, op, commit, checkpoint_op, client, request, body);
+      // The SAME verify + durability core as the single-op path: `fill_repair` rejects this entry
+      // (silently; re-solicited) or stages its own `Pending::RepairFill` — see the doc above.
+      self.fill_repair(now, wal, sb, &prepare);
+    }
   }
 
   /// Fill a peer-supplied `Prepare` for an op in our pending-repair set, then resume the held

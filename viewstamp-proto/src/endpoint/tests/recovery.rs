@@ -749,8 +749,10 @@ fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
   );
   let mut asked_for_2 = false;
   while let Some(out) = r.poll_message() {
-    if let Message::RequestPrepare(rp) = out.into_msg() {
-      assert_eq!(rp.op(), OpNumber::with(2));
+    // The hole arm solicits the contiguous run via the windowed `RequestPrepareRange` (a single-op
+    // range `[2,2]` here) rather than a per-op `RequestPrepare`.
+    if let Message::RequestPrepareRange(rp) = out.into_msg() {
+      assert!(rp.lo() <= OpNumber::with(2) && rp.hi() >= OpNumber::with(2));
       asked_for_2 = true;
     }
   }
@@ -1566,13 +1568,31 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
     OpNumber::with(2),
     "the solo primary re-commits its recovered tail (no stall on an empty inflight)"
   );
-  // And it still serves a fresh request end-to-end (op 3 commits).
+  // A RETRY of an already-re-committed request is DEDUPED, not re-executed: the apply-time session
+  // update advanced the watermark to the recovered tail's request 2, so request 1 is stale (the
+  // at-most-once guarantee holds across the crash — no duplicate op is minted).
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
     Peer::Client(ClientId::new(7)),
     client_request(1),
+  );
+  for _ in 0..4 {
+    r.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    r.commit(),
+    OpNumber::with(2),
+    "a duplicate of a recovered-and-re-committed request mints no new op"
+  );
+  // And it still serves the genuinely-NEXT request end-to-end (op 3 commits).
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    client_request(3),
   );
   for _ in 0..4 {
     r.handle_storage(now, &mut wal, &mut sb);
@@ -1831,8 +1851,10 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   );
   let mut asked_for_2 = false;
   while let Some(out) = r.poll_message() {
-    if let Message::RequestPrepare(rp) = out.into_msg() {
-      if rp.op() == OpNumber::with(2) {
+    // The hole arm solicits the contiguous run via the windowed `RequestPrepareRange` (a single-op
+    // range `[2,2]` here) rather than a per-op `RequestPrepare`.
+    if let Message::RequestPrepareRange(rp) = out.into_msg() {
+      if rp.lo() <= OpNumber::with(2) && rp.hi() >= OpNumber::with(2) {
         asked_for_2 = true;
       }
     }
@@ -3429,6 +3451,8 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
+    append_faults: BTreeMap::new(),
+    append_submits: BTreeMap::new(),
     done: VecDeque::new(),
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // never clears within any finite budget
@@ -3540,8 +3564,10 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
   );
   let mut solicited_op2 = false;
   while let Some(out) = e.poll_message() {
-    if let Message::RequestPrepare(r) = out.msg_ref() {
-      if r.op() == OpNumber::with(2) {
+    // The hole arm solicits the contiguous run via the windowed `RequestPrepareRange` (a single-op
+    // range `[2,2]` here) rather than a per-op `RequestPrepare`.
+    if let Message::RequestPrepareRange(r) = out.msg_ref() {
+      if r.lo() <= OpNumber::with(2) && r.hi() >= OpNumber::with(2) {
         solicited_op2 = true;
       }
     }

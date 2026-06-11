@@ -54,10 +54,7 @@ fn committed_ops_survive_crash_storage_fault_and_restart() {
     // TRANSIENT read-faults on every replica's WAL; NO torn writes, NO permanent bit-rot.
     c.set_storage_faults(StorageFaults {
       read_fault_per_mille: 80,
-      torn_write_per_mille: 0,
-      bit_rot_per_mille: 0,
-      misdirect_read_per_mille: 0,
-      corrupt_checkpoint_read_per_mille: 0,
+      ..StorageFaults::none()
     });
     let mut dur = DurabilityChecker::new(5);
 
