@@ -12,8 +12,9 @@ Nothing has been released yet; everything below is the current state of the tree
 - **Deterministic simulation + VOPR (`viewstamp-simulation`)** — a seeded
   single-threaded cluster simulator with per-tick safety/durability/liveness checkers,
   adversarial fault axes (crash + fsync loss, network reorder/drop/duplicate/delay/hold,
-  storage torn/bit-rot/misdirected-read faults, wipe-and-restart), a committed sweep
-  gate with pinned regression seeds, and nightly wide-seed CI lanes.
+  one-way partitions, slow-replica delays, storage torn/bit-rot/misdirected-read
+  faults, wipe-and-restart, client churn), a committed sweep gate with pinned
+  regression seeds, and nightly wide-seed CI lanes.
 - **TCP + TLS transport (`viewstamp-proto`, features `tcp`/`tls`)** — Sans-I/O stream
   transport: length-prefixed framing with a bounded incremental decoder, a typed
   per-connection lifecycle, the `Labeled` cluster/identity handshake, an optional rustls
