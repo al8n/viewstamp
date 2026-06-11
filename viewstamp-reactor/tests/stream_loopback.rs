@@ -932,3 +932,103 @@ mod tls {
     }
   }
 }
+
+/// Unvalidated accepted sockets cannot durably deny admission: at the cap, a fresh accept EVICTS
+/// the oldest unvalidated accepted conn instead of being dropped, so an inbound mesh socket is
+/// never refused merely because earlier junk squats the table (the refusal would otherwise last
+/// until the auth-deadline reap). Witness: with the cap full of stalled never-validating sockets,
+/// a third raw connect is admitted — the OLDEST squatter reads EOF promptly (the eviction aborts
+/// its bridges, dropping its socket halves) while the newcomer stays open well past the eviction
+/// window (it lives on toward its own auth deadline, far beyond this test's bound).
+#[tokio::test]
+async fn a_full_cap_evicts_the_oldest_unvalidated_accept_for_a_fresh_one() {
+  use tokio::io::AsyncReadExt;
+
+  let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
+    Arc::new(move |_peer| {
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+    })
+  };
+  let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
+    Arc::new(move || {
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+    })
+  };
+
+  let bind: SocketAddr = "127.0.0.1:45800".parse().unwrap();
+  let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+  let (ready_tx, ready_rx) = flume::unbounded();
+  let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
+  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let (driver, handle) = GateDriver::with_config(
+    config,
+    viewstamp_simulation::sm::LogSm::default(),
+    wal,
+    sb,
+    viewstamp_proto::ClientId::new(1),
+    0,
+    bind,
+    Vec::new(), // no peers: every slot below is an accepted raw socket
+    mk_dialer(0),
+    mk_acceptor(0),
+    ready_rx,
+    viewstamp_reactor::DriverConfig::new().with_max_conns(2),
+  )
+  .await
+  .expect("driver builds");
+  // The dropped JoinHandle DETACHES the task (a tokio drop never cancels), so the run loop keeps
+  // driving on its own.
+  drop(tokio::spawn(driver.run()));
+
+  // Fill the cap with two stalled raw sockets (no Labeled hello: never validating). The sleeps
+  // land them in distinct loop iterations, so the first holds the strictly oldest auth deadline.
+  let mut s1 = tokio::net::TcpStream::connect(bind)
+    .await
+    .expect("first squatter connects");
+  tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+  let s2 = tokio::net::TcpStream::connect(bind)
+    .await
+    .expect("second squatter connects");
+  tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+  // The cap is full: this accept must EVICT the oldest squatter rather than be dropped.
+  let mut s3 = tokio::net::TcpStream::connect(bind)
+    .await
+    .expect("fresh socket connects");
+
+  // The evicted squatter's bridges die, dropping its socket halves: s1 drains to EOF within the
+  // bound (any bytes first are the acceptor-side handshake output; EOF is the witness).
+  let mut buf = [0u8; 256];
+  let eof = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    loop {
+      match s1.read(&mut buf).await {
+        Ok(0) => break true,
+        Ok(_) => continue,
+        Err(_) => break true, // a reset is the same witness: the conn was torn down
+      }
+    }
+  })
+  .await
+  .expect("the oldest squatter is evicted within the bound");
+  assert!(eof, "the evicted socket reached EOF/reset");
+
+  // The newcomer was ADMITTED: a refused accept is closed on the spot (the at-cap drop path),
+  // so staying open through this window — far short of its own auth deadline — is the
+  // admission witness.
+  let newcomer_alive = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+    match s3.read(&mut buf).await {
+      Ok(0) | Err(_) => false, // closed: the fresh socket was the one refused
+      Ok(_) => true,           // handshake bytes from the acceptor: definitely admitted
+    }
+  })
+  .await
+  // The timeout ELAPSING is the pass: nothing closed the newcomer within the window.
+  .unwrap_or(true);
+  assert!(newcomer_alive, "the fresh accept was admitted, not dropped");
+
+  // The middle squatter is untouched by this test's assertions; shut the driver down.
+  drop(s2);
+  handle.shutdown().await.expect("driver acks shutdown");
+}
