@@ -443,8 +443,8 @@ where
       }
       // Any outbound bytes the just-handled command/inbound/dial/accept queued (a submitted request,
       // a peer reply, a new conn's handshake) flush at the TOP of the next iteration: the loop
-      // re-enters iter-top immediately (no `await` between here and the next `pump_outputs`), so this
-      // is not a wait-for-wake — there's no reason to duplicate the pump here.
+      // re-enters iter-top immediately (no `await` between here and the next `pump_outputs`), so
+      // this is not a wait-for-wake.
     }
 
     // One teardown for every connection: dropping each `Conn` drops its task `JoinHandle`(s) (compio
@@ -861,13 +861,10 @@ where
         if let Some(conn) = self.conns.get(&id) {
           let len = bytes.len();
           let queued = conn.queued_bytes.load(Ordering::Relaxed);
-          // Always-admit-one: refuse a chunk ONLY when the queue is ALREADY over the backlog cap (a
-          // prior chunk pushed it over and it has not drained = a stalled/slow socket), then close +
-          // redial; consensus retransmits the whole message. The condition does NOT reference `len`,
-          // so a chunk is never refused for its own size — a healthy conn at/under the cap always
-          // admits the next wire chunk, of any size. This is strictly correct: we never predict the
-          // chunk's ciphertext size (rustls record expansion is config-dependent and unbounded by the
-          // plaintext cap), we only bound multi-chunk accumulation.
+          // Always-admit-one (see the method doc): refuse a chunk ONLY when the queue is ALREADY
+          // over the backlog cap (a stalled/slow socket), then close + redial; consensus retransmits
+          // the whole message. The condition does NOT reference `len`, so a chunk is never refused
+          // for its own size.
           if queued > backlog_cap {
             to_close.push((id, CloseCause::OutboundOverflow));
           } else {
@@ -1428,13 +1425,10 @@ mod tests {
   /// queue was ALREADY over the ceiling. The staging cap is 8 bytes (via `with_outbound_cap`, so the
   /// ceiling is `8 * 2 = 16`); the dialed conn's queued identity hello (20 bytes) already exceeds the
   /// 8-byte staging cap, so no large allocation is needed to prove size is not what gates admission.
-  /// With the old `queued + len > cap` strict-on-len rule this same chunk (`0 + 20 > 8`) would close
-  /// the conn from an empty queue; the always-admit-one rule keeps it alive.
   ///
-  /// NEUTER CHECK: reverting `pump_outputs` to `if queued + len > backlog_cap` makes this test FAIL —
-  /// the hello chunk (`0 + 20 > 16`... and even at the old 1x ceiling `0 + 20 > 8`) would close the
-  /// conn from the empty queue, so `contains_key` is false and the `out_rx` is empty. The
-  /// admit-from-empty-regardless-of-size behavior is exactly what the rule guarantees.
+  /// NEUTER CHECK: changing `pump_outputs` to `if queued + len > backlog_cap` makes this test FAIL —
+  /// the hello chunk (`0 + 20 > 16`) would close the conn from the empty queue, so `contains_key` is
+  /// false and the `out_rx` is empty.
   #[compio::test]
   async fn a_single_chunk_larger_than_the_backlog_cap_is_admitted_from_an_empty_queue() {
     let mut driver = test_driver_small_cap(8).await;
@@ -1839,9 +1833,9 @@ mod tests {
 
   /// OVER-FRAME REJECTION (stream driver): a submit whose body exceeds `max_request_body_len()` is
   /// rejected up front with `RequestTooLarge` and has NO side effects — no budget reserved (count and
-  /// bytes stay 0) and no command enqueued. This closes the hang where an over-frame body would enter
-  /// `pending`, pin the budget, and wait forever for a commit the transport can never produce (its
-  /// relayed `Request`/`Prepare` would exceed `MAX_FRAME_LEN` and be dropped).
+  /// bytes stay 0) and no command enqueued. Without the up-front rejection an over-frame body would
+  /// enter `pending`, pin the budget, and wait forever for a commit the transport can never produce
+  /// (its relayed `Request`/`Prepare` would exceed `MAX_FRAME_LEN` and be dropped).
   #[compio::test]
   async fn over_frame_submit_is_rejected_without_side_effects_stream() {
     let (driver, handle) = test_driver_with_handle().await;
