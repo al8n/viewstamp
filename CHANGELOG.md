@@ -28,3 +28,11 @@ Nothing has been released yet; everything below is the current state of the tree
   runtime: a QUIC driver and a TCP/TLS stream driver, both generic over storage and
   state machine, with durable-state boot/recovery, client-session submit/reply handles,
   bounded in-flight budgets, and reconnect/redial management.
+- **Shared driver core (`viewstamp-driver`)** — the runtime-agnostic embedder surface
+  shared by both driver crates: the `Handle`/`Command`
+  submit-and-reply protocol, bounded in-flight submit budgets, the `DriverConfig` tuning
+  surface, the `Clock` anchoring proto instants to std time, and the `DriverError` type.
+- **Reactor drivers (`viewstamp-reactor`)** — readiness-model real-I/O drivers generic
+  over any `agnostic` runtime (tokio/smol via features): a QUIC driver and a TCP/TLS
+  stream driver with abort-on-drop ownership of every spawned task, passing the same
+  loopback/restart/shutdown gate suite as the compio drivers.

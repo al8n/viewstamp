@@ -153,6 +153,10 @@ jobs:
       run: cargo doc --no-deps -p viewstamp-proto --features quic,tcp,tls,tls-rustls-ring
     - name: cargo doc viewstamp-compio
       run: cargo doc --no-deps -p viewstamp-compio
+    - name: cargo doc viewstamp-driver
+      run: cargo doc --no-deps -p viewstamp-driver
+    - name: cargo doc viewstamp-reactor
+      run: cargo doc --no-deps -p viewstamp-reactor
     - name: cargo doc viewstamp-simulation
       run: cargo doc --no-deps -p viewstamp-simulation
 
