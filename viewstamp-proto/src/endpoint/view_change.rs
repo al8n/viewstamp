@@ -1032,16 +1032,14 @@ impl<S: StateMachine> Endpoint<S> {
     // too, mirroring the union in `select_canonical_log`.
     let mut preserved_bodies: BTreeMap<u64, Bytes> = BTreeMap::new();
     for e in entries {
-      if e.is_repairing() {
-        if let Some(LogEntry {
+      if e.is_repairing()
+        && let Some(LogEntry {
           body: Body::Present(body),
           ..
         }) = self.log.get(&e.op().get())
-        {
-          if crate::storage::fnv1a_128(body) == e.body_checksum() {
-            preserved_bodies.insert(e.op().get(), body.clone());
-          }
-        }
+        && crate::storage::fnv1a_128(body) == e.body_checksum()
+      {
+        preserved_bodies.insert(e.op().get(), body.clone());
       }
     }
     let applied_floor = self.commit_min.get();

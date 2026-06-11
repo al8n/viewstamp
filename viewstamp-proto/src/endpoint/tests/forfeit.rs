@@ -137,10 +137,10 @@ fn a_lagging_primary_forfeits_after_the_grace_period() {
   );
   let mut saw_svc_before_grace = false;
   while let Some(out) = ep.poll_message() {
-    if let Message::StartViewChange(svc) = out.into_msg() {
-      if svc.view().get() == 1 {
-        saw_svc_before_grace = true;
-      }
+    if let Message::StartViewChange(svc) = out.into_msg()
+      && svc.view().get() == 1
+    {
+      saw_svc_before_grace = true;
     }
   }
   assert!(
@@ -152,10 +152,10 @@ fn a_lagging_primary_forfeits_after_the_grace_period() {
   ep.handle_timeout(later, &mut wal, &mut sb);
   let mut saw_svc_view1 = false;
   while let Some(out) = ep.poll_message() {
-    if let Message::StartViewChange(svc) = out.into_msg() {
-      if svc.view().get() == 1 {
-        saw_svc_view1 = true;
-      }
+    if let Message::StartViewChange(svc) = out.into_msg()
+      && svc.view().get() == 1
+    {
+      saw_svc_view1 = true;
     }
   }
   assert!(
@@ -381,10 +381,10 @@ fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_peri
   ep.handle_timeout(later, &mut wal, &mut sb);
   let mut saw_svc_view1 = false;
   while let Some(out) = ep.poll_message() {
-    if let Message::StartViewChange(svc) = out.into_msg() {
-      if svc.view().get() == 1 {
-        saw_svc_view1 = true;
-      }
+    if let Message::StartViewChange(svc) = out.into_msg()
+      && svc.view().get() == 1
+    {
+      saw_svc_view1 = true;
     }
   }
   assert!(
@@ -604,10 +604,10 @@ fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_wi
     let now = Instant::ZERO + core::time::Duration::from_millis(10 * (i + 1));
     ep.handle_timeout(now, &mut wal, &mut sb);
     while let Some(out) = ep.poll_message() {
-      if let Message::StartViewChange(svc) = out.into_msg() {
-        if svc.view().get() == 1 {
-          svc_count += 1;
-        }
+      if let Message::StartViewChange(svc) = out.into_msg()
+        && svc.view().get() == 1
+      {
+        svc_count += 1;
       }
     }
   }
@@ -627,10 +627,10 @@ fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_wi
   ep.handle_timeout(past_window, &mut wal, &mut sb);
   let mut saw_svc_after_window = false;
   while let Some(out) = ep.poll_message() {
-    if let Message::StartViewChange(svc) = out.into_msg() {
-      if svc.view().get() == 1 {
-        saw_svc_after_window = true;
-      }
+    if let Message::StartViewChange(svc) = out.into_msg()
+      && svc.view().get() == 1
+    {
+      saw_svc_after_window = true;
     }
   }
   assert!(

@@ -23,10 +23,10 @@ use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 fn drain_prepare_oks<S: StateMachine>(e: &mut Endpoint<S>, want_op: OpNumber) -> usize {
   let mut n = 0;
   while let Some(out) = e.poll_message() {
-    if let Message::PrepareOk(ok) = out.into_msg() {
-      if ok.op() == want_op {
-        n += 1;
-      }
+    if let Message::PrepareOk(ok) = out.into_msg()
+      && ok.op() == want_op
+    {
+      n += 1;
     }
   }
   n

@@ -235,12 +235,11 @@ impl ConnTable {
   /// the slot still points at `h`. A race where `bind_peer` already re-bound the peer to a
   /// newer handle leaves the peer index intact.
   pub(crate) fn remove(&mut self, h: ConnectionHandle) {
-    if let Some(entry) = self.conns.remove(&h) {
-      if let Some(p) = entry.peer {
-        if self.by_peer.get(&p).copied() == Some(h) {
-          self.by_peer.remove(&p);
-        }
-      }
+    if let Some(entry) = self.conns.remove(&h)
+      && let Some(p) = entry.peer
+      && self.by_peer.get(&p).copied() == Some(h)
+    {
+      self.by_peer.remove(&p);
     }
   }
 
@@ -251,12 +250,11 @@ impl ConnTable {
   /// instead would discard the `Connection` before it ever emits `Drained`, permanently leaking the
   /// endpoint-owned slab + CID/reset-token state.
   pub(crate) fn unbind(&mut self, h: ConnectionHandle) {
-    if let Some(entry) = self.conns.get(&h) {
-      if let Some(p) = entry.peer {
-        if self.by_peer.get(&p).copied() == Some(h) {
-          self.by_peer.remove(&p);
-        }
-      }
+    if let Some(entry) = self.conns.get(&h)
+      && let Some(p) = entry.peer
+      && self.by_peer.get(&p).copied() == Some(h)
+    {
+      self.by_peer.remove(&p);
     }
   }
 

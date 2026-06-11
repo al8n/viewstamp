@@ -570,13 +570,12 @@ impl Wal for InMemoryWal {
     // (`!= op`, present, self-verifying, not bit-rotted) exists — else fall through to the honest read.
     if self.faults.misdirect_read_per_mille > 0
       && self.prng.chance(self.faults.misdirect_read_per_mille, 1000)
+      && let Some((h, b)) = self.misdirect_sibling(op.get())
     {
-      if let Some((h, b)) = self.misdirect_sibling(op.get()) {
-        self
-          .completions
-          .push_back(WalDone::ReadOk(ReadOk::new(id, h, b)));
-        return;
-      }
+      self
+        .completions
+        .push_back(WalDone::ReadOk(ReadOk::new(id, h, b)));
+      return;
     }
     // Otherwise return the stored entry. A torn body (header present but body fails verify) is
     // promoted to BodyFaulty — the header is durable, only the body is corrupt. An op never

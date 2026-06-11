@@ -347,10 +347,10 @@ where
       if fire_timeout {
         self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
       }
-      if let Some(cmd) = command {
-        if self.handle_command(now, cmd, &mut shutdown_ack) {
-          break;
-        }
+      if let Some(cmd) = command
+        && self.handle_command(now, cmd, &mut shutdown_ack)
+      {
+        break;
       }
       self.retransmit_stale(now);
       self.pump_outputs(now).await;

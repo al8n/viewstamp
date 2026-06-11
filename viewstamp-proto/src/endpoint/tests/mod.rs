@@ -335,12 +335,12 @@ impl Wal for ScriptedWal {
     *self.append_submits.entry(op.get()).or_default() += 1;
     // A scripted append fault completes as `Fault` WITHOUT landing the entry (the
     // contract-violating backend shape the endpoint's defensive retry degrades gracefully).
-    if let Some(remaining) = self.append_faults.get_mut(&op.get()) {
-      if *remaining > 0 {
-        *remaining -= 1;
-        self.done.push_back(WalDone::Fault(id));
-        return;
-      }
+    if let Some(remaining) = self.append_faults.get_mut(&op.get())
+      && *remaining > 0
+    {
+      *remaining -= 1;
+      self.done.push_back(WalDone::Fault(id));
+      return;
     }
     self.entries.insert(op.get(), (header, body));
     self.head = self.head.max(op.get());
@@ -348,14 +348,14 @@ impl Wal for ScriptedWal {
   }
   fn submit_read(&mut self, id: OpId, op: OpNumber) {
     // A scripted transient fault takes precedence and decrements its remaining count.
-    if let Some(remaining) = self.read_faults.get_mut(&op.get()) {
-      if *remaining > 0 {
-        if *remaining != u8::MAX {
-          *remaining -= 1;
-        }
-        self.done.push_back(WalDone::Fault(id));
-        return;
+    if let Some(remaining) = self.read_faults.get_mut(&op.get())
+      && *remaining > 0
+    {
+      if *remaining != u8::MAX {
+        *remaining -= 1;
       }
+      self.done.push_back(WalDone::Fault(id));
+      return;
     }
     let done = match self.entries.get(&op.get()) {
       // A body-faulty slot: the HEADER is durable (still served), only the body is unrecoverable →

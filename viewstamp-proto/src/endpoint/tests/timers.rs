@@ -271,10 +271,10 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
     e.handle_timeout(due, &mut wal, &mut sb);
     let mut proposed_this_step = false;
     while let Some(out) = e.poll_message() {
-      if let Message::StartViewChange(svc) = out.into_msg() {
-        if svc.view().get() == 1 {
-          proposed_this_step = true;
-        }
+      if let Message::StartViewChange(svc) = out.into_msg()
+        && svc.view().get() == 1
+      {
+        proposed_this_step = true;
       }
     }
     if proposed_this_step && last_proposal_instant != Some(due) {
@@ -342,10 +342,10 @@ fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
   // ever forms; the backup must keep re-broadcasting its own on the retransmit cadence.)
   let mut proposed_initial = false;
   while let Some(out) = e.poll_message() {
-    if let Message::StartViewChange(svc) = out.msg_ref() {
-      if svc.view().get() == 1 {
-        proposed_initial = true;
-      }
+    if let Message::StartViewChange(svc) = out.msg_ref()
+      && svc.view().get() == 1
+    {
+      proposed_initial = true;
     }
   }
   assert!(
@@ -377,10 +377,10 @@ fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
     e.handle_timeout(due, &mut wal, &mut sb);
     let mut rebroadcast_this_step = false;
     while let Some(out) = e.poll_message() {
-      if let Message::StartViewChange(svc) = out.msg_ref() {
-        if svc.view().get() == 1 {
-          rebroadcast_this_step = true;
-        }
+      if let Message::StartViewChange(svc) = out.msg_ref()
+        && svc.view().get() == 1
+      {
+        rebroadcast_this_step = true;
       }
     }
     if rebroadcast_this_step && last_rebroadcast_instant != Some(due) {
@@ -502,10 +502,10 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
     e.handle_timeout(due, &mut wal, &mut sb);
     let mut proposed_this_step = false;
     while let Some(out) = e.poll_message() {
-      if let Message::StartViewChange(svc) = out.msg_ref() {
-        if svc.view().get() == 1 {
-          proposed_this_step = true;
-        }
+      if let Message::StartViewChange(svc) = out.msg_ref()
+        && svc.view().get() == 1
+      {
+        proposed_this_step = true;
       }
     }
     if proposed_this_step && last_proposal_instant != Some(due) {

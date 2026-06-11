@@ -1339,15 +1339,15 @@ impl Cluster {
       return Duration::ZERO;
     }
     let mut extra = Duration::ZERO;
-    if let Some(p) = self.slow[f] {
-      if p.outbound {
-        extra += self.slow_draw(p);
-      }
+    if let Some(p) = self.slow[f]
+      && p.outbound
+    {
+      extra += self.slow_draw(p);
     }
-    if let Some(p) = self.slow[t] {
-      if p.inbound {
-        extra += self.slow_draw(p);
-      }
+    if let Some(p) = self.slow[t]
+      && p.inbound
+    {
+      extra += self.slow_draw(p);
     }
     if !extra.is_zero() {
       self.slow_delays_applied += 1;

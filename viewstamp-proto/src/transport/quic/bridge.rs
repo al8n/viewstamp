@@ -614,10 +614,10 @@ impl Bridge {
         self.pending_endpoint_events.retain(|(qh, _)| *qh != h);
         continue;
       }
-      if let Some(conn_ev) = self.endpoint.handle_event(h, ev) {
-        if let Some(e) = self.table.entry(h) {
-          e.conn.handle_event(conn_ev);
-        }
+      if let Some(conn_ev) = self.endpoint.handle_event(h, ev)
+        && let Some(e) = self.table.entry(h)
+      {
+        e.conn.handle_event(conn_ev);
       }
       self.endpoint_events_processed = self.endpoint_events_processed.saturating_add(1);
     }
@@ -1290,11 +1290,11 @@ impl Bridge {
       // Bulk second (index 1) under ControlBulk; no preface rides Bulk.
       if e.layout.is_control_bulk() {
         let bulk = StreamClass::Bulk;
-        if e.class_mut(bulk).send.is_none() {
-          if let Some(sid) = e.conn.streams().open(Dir::Bi) {
-            e.class_mut(bulk).send = Some(sid);
-            let _ = e.conn.send_stream(sid).set_priority(class_priority(bulk));
-          }
+        if e.class_mut(bulk).send.is_none()
+          && let Some(sid) = e.conn.streams().open(Dir::Bi)
+        {
+          e.class_mut(bulk).send = Some(sid);
+          let _ = e.conn.send_stream(sid).set_priority(class_priority(bulk));
         }
       }
       // The Control stream is empty at this point (consensus frames are gated until `Validated`, and
@@ -1812,28 +1812,28 @@ impl Bridge {
         continue;
       }
       let st = e.class_mut(class);
-      if let Some(old) = st.recv {
-        if old != sid {
-          // Fully retire the OLD peer-opened stream — close BOTH halves via `retire_peer_recv`: `stop`
-          // the recv half (discards its unread bytes, returns its flow-control window as a `STOP_SENDING`
-          // + `MAX_DATA`) AND `finish` our UNUSED send half (an empty FIN) so the accepted stream leaves
-          // quinn's remote-stream accounting and the peer re-grants `MAX_STREAMS` — closing only the recv
-          // half would leave our send half open, the stream never retires, and the peer's bidi credit
-          // never returns. Those frames only reach the wire via `poll_transmit`, so set `should_service`
-          // to run one `service(now)` after the loop when the retire queued anything — otherwise a Bulk
-          // replacement with little/no new readable data would `finalize` nothing, return without
-          // servicing, and strand the stop/FIN/credit frames in quinn (invisible to both `out` and
-          // `has_pending_work`).
-          should_service |= retire_peer_recv(e, old);
-          // Re-cap the fresh decoder by class AND phase: Control while not `Validated` stays bounded to
-          // `MAX_HELLO_LEN` (a replaced pre-auth Control stream may still only carry a hello), Bulk and a
-          // post-validation Control to `MAX_FRAME_LEN`.
-          let max = decoder_max(class, e.phase);
-          let st = e.class_mut(class);
-          st.decoder = FrameDecoder::new(max);
-          st.recv = Some(sid);
-          continue;
-        }
+      if let Some(old) = st.recv
+        && old != sid
+      {
+        // Fully retire the OLD peer-opened stream — close BOTH halves via `retire_peer_recv`: `stop`
+        // the recv half (discards its unread bytes, returns its flow-control window as a `STOP_SENDING`
+        // + `MAX_DATA`) AND `finish` our UNUSED send half (an empty FIN) so the accepted stream leaves
+        // quinn's remote-stream accounting and the peer re-grants `MAX_STREAMS` — closing only the recv
+        // half would leave our send half open, the stream never retires, and the peer's bidi credit
+        // never returns. Those frames only reach the wire via `poll_transmit`, so set `should_service`
+        // to run one `service(now)` after the loop when the retire queued anything — otherwise a Bulk
+        // replacement with little/no new readable data would `finalize` nothing, return without
+        // servicing, and strand the stop/FIN/credit frames in quinn (invisible to both `out` and
+        // `has_pending_work`).
+        should_service |= retire_peer_recv(e, old);
+        // Re-cap the fresh decoder by class AND phase: Control while not `Validated` stays bounded to
+        // `MAX_HELLO_LEN` (a replaced pre-auth Control stream may still only carry a hello), Bulk and a
+        // post-validation Control to `MAX_FRAME_LEN`.
+        let max = decoder_max(class, e.phase);
+        let st = e.class_mut(class);
+        st.decoder = FrameDecoder::new(max);
+        st.recv = Some(sid);
+        continue;
       }
       e.class_mut(class).recv = Some(sid);
     }
@@ -2649,12 +2649,12 @@ mod tests {
         // Flush A's stream bytes out immediately so they reach B this loop.
         a.handle_timeout(now);
       }
-      if wrote_ping && delivered.is_none() {
-        if let Some(got) = b.test_read_first_stream() {
-          if !got.is_empty() {
-            delivered = Some(got);
-          }
-        }
+      if wrote_ping
+        && delivered.is_none()
+        && let Some(got) = b.test_read_first_stream()
+        && !got.is_empty()
+      {
+        delivered = Some(got);
       }
       if delivered.is_some() {
         break;
@@ -3044,15 +3044,15 @@ mod tests {
         tick,
       );
       b.ingest_recv(tick, hb);
-      if got_ctrl.is_none() {
-        if let Some(f) = b.next_frame(hb, StreamClass::Control) {
-          got_ctrl = Message::decode(&f).ok();
-        }
+      if got_ctrl.is_none()
+        && let Some(f) = b.next_frame(hb, StreamClass::Control)
+      {
+        got_ctrl = Message::decode(&f).ok();
       }
-      if got_bulk.is_none() {
-        if let Some(f) = b.next_frame(hb, StreamClass::Bulk) {
-          got_bulk = Message::decode(&f).ok();
-        }
+      if got_bulk.is_none()
+        && let Some(f) = b.next_frame(hb, StreamClass::Bulk)
+      {
+        got_bulk = Message::decode(&f).ok();
       }
       if got_ctrl.is_some() && got_bulk.is_some() {
         break;
@@ -3463,10 +3463,10 @@ mod tests {
         tick,
       );
       b.ingest_recv(tick, hb);
-      if got_ctrl.is_none() {
-        if let Some(f) = b.next_frame(hb, StreamClass::Control) {
-          got_ctrl = Message::decode(&f).ok();
-        }
+      if got_ctrl.is_none()
+        && let Some(f) = b.next_frame(hb, StreamClass::Control)
+      {
+        got_ctrl = Message::decode(&f).ok();
       }
       // The Bulk decoder must stay empty for the whole run: the refused stream is never read into it.
       if b.next_frame(hb, StreamClass::Bulk).is_some() {
@@ -3943,12 +3943,12 @@ mod tests {
       // Production reopen + write: stages a Bulk frame and opens a fresh Bulk send stream if credit
       // allows. If A is out of bidi credit this opens nothing and the frame just stays staged.
       a.write_framed(now, ha, StreamClass::Bulk, &commit(0x50 + k));
-      if let Some(e) = a.table.entry(ha) {
-        if let Some(sid) = e.class_mut(StreamClass::Bulk).send {
-          let idx = sid.index();
-          if !distinct_bulk_indices.contains(&idx) {
-            distinct_bulk_indices.push(idx);
-          }
+      if let Some(e) = a.table.entry(ha)
+        && let Some(sid) = e.class_mut(StreamClass::Bulk).send
+      {
+        let idx = sid.index();
+        if !distinct_bulk_indices.contains(&idx) {
+          distinct_bulk_indices.push(idx);
         }
       }
       // Ferry both ways so the reopened stream reaches B (its accept loop retires the prior one and
@@ -4003,11 +4003,11 @@ mod tests {
         a.flush_stream(now, h);
       }
       let _ = b.ingest_recv(now, hb);
-      if let Some(f) = b.next_frame(hb, StreamClass::Bulk) {
-        if Message::decode(&f).ok() == Some(final_frame.clone()) {
-          delivered = Some(final_frame.clone());
-          break;
-        }
+      if let Some(f) = b.next_frame(hb, StreamClass::Bulk)
+        && Message::decode(&f).ok() == Some(final_frame.clone())
+      {
+        delivered = Some(final_frame.clone());
+        break;
       }
     }
     assert_eq!(
@@ -4090,12 +4090,11 @@ mod tests {
     for k in 0..cycles {
       a.reset_send_class(ha, StreamClass::Bulk);
       a.write_framed(now, ha, StreamClass::Bulk, &commit(0x50 + k));
-      if let Some(e) = a.table.entry(ha) {
-        if let Some(sid) = e.class_mut(StreamClass::Bulk).send {
-          if !churned_send_ids.contains(&sid) {
-            churned_send_ids.push(sid);
-          }
-        }
+      if let Some(e) = a.table.entry(ha)
+        && let Some(sid) = e.class_mut(StreamClass::Bulk).send
+        && !churned_send_ids.contains(&sid)
+      {
+        churned_send_ids.push(sid);
       }
       now = start + Duration::from_millis(35 + k * 5);
       ferry_once(
@@ -7216,11 +7215,11 @@ mod tests {
       );
       while a.take_stream_ready().is_some() {}
       a.ingest_recv(tick, ha);
-      if let Some(id) = a.test_recv_id(ha, StreamClass::Bulk) {
-        if id != first_id {
-          second_id = Some(id);
-          break;
-        }
+      if let Some(id) = a.test_recv_id(ha, StreamClass::Bulk)
+        && id != first_id
+      {
+        second_id = Some(id);
+        break;
       }
     }
     let second_id = second_id.expect("A adopts B's second extra bidi stream, replacing the first");
