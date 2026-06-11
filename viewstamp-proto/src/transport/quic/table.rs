@@ -316,14 +316,15 @@ impl ConnTable {
 
 #[cfg(test)]
 mod tests {
-  use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-  use std::time::Instant;
+  use std::{
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    time::Instant,
+  };
 
   use quinn_proto::Endpoint;
 
   use super::*;
-  use crate::transport::quic::crypto::QuicOptions;
-  use crate::{Peer, ReplicaId};
+  use crate::{Peer, ReplicaId, transport::quic::crypto::QuicOptions};
 
   /// Builds a quinn-proto `Endpoint` from `QuicOptions::accept_any_for_test()` and returns it
   /// together with the client config so tests can dial two connections on the same endpoint

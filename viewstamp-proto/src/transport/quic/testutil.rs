@@ -1,8 +1,10 @@
 //! In-memory datagram pipe for QUIC bridge tests: a virtual UDP link with no
 //! loss or reordering, used to ferry `(from, bytes)` between two `Bridge`s.
 
-use std::collections::VecDeque;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+  collections::VecDeque,
+  net::{Ipv4Addr, SocketAddr},
+};
 
 /// A loopback `SocketAddr` on `port`, used to give each test bridge a stable
 /// "local" address to tag its outbound datagrams with.

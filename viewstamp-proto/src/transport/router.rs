@@ -10,10 +10,12 @@ use bytes::Bytes;
 
 use crate::{Message, Peer, Recipient, ReplicaId};
 
-use super::CloseCause;
-use super::conn::Conn;
-use super::frame::{MAX_FRAME_LEN, encode_frame};
-use super::stream::StreamTransport;
+use super::{
+  CloseCause,
+  conn::Conn,
+  frame::{MAX_FRAME_LEN, encode_frame},
+  stream::StreamTransport,
+};
 
 /// A monotonic connection handle (never reused, so a stale handle can't alias a fresh conn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -424,9 +426,10 @@ impl<R: StreamTransport> PeerRouter<R> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::message::Commit;
-  use crate::transport::stream::RecordIo;
-  use crate::{LabelOptions, Labeled, Message, OpNumber, Peer, Recipient, ReplicaId, View};
+  use crate::{
+    LabelOptions, Labeled, Message, OpNumber, Peer, Recipient, ReplicaId, View, message::Commit,
+    transport::stream::RecordIo,
+  };
 
   fn conn() -> Conn<crate::Passthrough> {
     Conn::from_parts(crate::Passthrough::new())
@@ -951,8 +954,7 @@ mod tests {
 
   #[test]
   fn an_oversized_outbound_frame_is_dropped_and_the_conn_stays_open() {
-    use crate::transport::frame::MAX_FRAME_LEN;
-    use crate::{ClientId, Request, RequestNumber};
+    use crate::{ClientId, Request, RequestNumber, transport::frame::MAX_FRAME_LEN};
     // A locally produced message whose encoded frame exceeds MAX_FRAME_LEN (the inbound cap) is
     // refused rather than queued — the peer would reject it as FrameTooLong, so emitting it would
     // needlessly close an otherwise healthy conn. The conn must stay open with nothing queued, and

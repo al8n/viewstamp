@@ -52,16 +52,18 @@
 
 use core::time::Duration;
 
-use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::{collections::VecDeque, net::SocketAddr};
 
 use bytes::Bytes;
 
-use super::StreamLayout;
-use super::loopback::{Replica, Scheme, applied_one, dial_and_seed, replica};
-use crate::Instant;
-use crate::transport::quic::crypto::test_ca;
-use crate::transport::quic::testutil::addr;
+use super::{
+  StreamLayout,
+  loopback::{Replica, Scheme, applied_one, dial_and_seed, replica},
+};
+use crate::{
+  Instant,
+  transport::quic::{crypto::test_ca, testutil::addr},
+};
 
 /// A minimal SplitMix64 PRNG. Deterministic given the seed — the source of the reproducible fault
 /// SCHEDULE (the handshake ciphertext is independent OS entropy; see the module docs).

@@ -3,8 +3,10 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use std::vec::Vec;
 
-use crate::codec::{CodecError, Reader, write_bytes_u32};
-use crate::{ClientId, OpNumber, Recipient, ReplicaId, RequestNumber, View, WIRE_VERSION};
+use crate::{
+  ClientId, OpNumber, Recipient, ReplicaId, RequestNumber, View, WIRE_VERSION,
+  codec::{CodecError, Reader, write_bytes_u32},
+};
 
 /// The minimum encoded length of one [`PreparedEntry`] in a log slice: `op` (`u64`) + `client`
 /// (`u128`) + `request` (`u64`) + a body-state tag (`u8`) + the cheapest body-state payload. The

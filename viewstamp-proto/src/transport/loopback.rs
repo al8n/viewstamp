@@ -5,11 +5,11 @@
 
 use core::time::Duration;
 
-use crate::message::Request;
-use crate::transport::testutil::{CountSm, TestSb, TestWal};
 use crate::{
   ClientId, Config, Conn, ConnId, Endpoint, Instant, LabelOptions, Labeled, Message, Passthrough,
   Peer, ReplicaId, RequestNumber, StreamCoordinator, StreamTransport,
+  message::Request,
+  transport::testutil::{CountSm, TestSb, TestWal},
 };
 
 const CLUSTER: u128 = 0x5151;

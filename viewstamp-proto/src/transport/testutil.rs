@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
 
-use crate::transport::stream::{Intake, RecordIo};
 use crate::{
   CheckpointRead, Header, Instant, OpId, OpNumber, Peer, ReadOk, SlotStatus, StateMachine,
   Superblock, SuperblockDone, VsrState, Wal, WalDone,
+  transport::stream::{Intake, RecordIo},
 };
 
 /// A record layer with a settable authenticated identity and handshake flag, for router/conn tests.

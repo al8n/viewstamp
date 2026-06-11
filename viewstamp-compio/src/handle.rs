@@ -1,8 +1,10 @@
 use bytes::Bytes;
 use viewstamp_proto::Event;
 
-use crate::DriverError;
-use crate::session::{InflightBudget, ReservationGuard};
+use crate::{
+  DriverError,
+  session::{InflightBudget, ReservationGuard},
+};
 
 /// A committed reply body returned by [`Handle::submit`].
 pub type Reply = Bytes;
@@ -140,8 +142,10 @@ impl Handle {
 #[cfg(test)]
 mod tests {
   use super::{Command, Handle};
-  use crate::DriverError;
-  use crate::session::{InflightBudget, MAX_INFLIGHT, MAX_PENDING_BYTES};
+  use crate::{
+    DriverError,
+    session::{InflightBudget, MAX_INFLIGHT, MAX_PENDING_BYTES},
+  };
   use bytes::Bytes;
 
   #[test]

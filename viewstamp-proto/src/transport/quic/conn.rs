@@ -1,14 +1,17 @@
 //! Per-connection state for the QUIC transport.
 
-use std::collections::VecDeque;
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 use quinn_proto::{Connection, StreamId};
 
 use super::layout::{StreamClass, StreamLayout};
-use crate::Peer;
-use crate::transport::frame::{FrameDecoder, MAX_FRAME_LEN};
-use crate::transport::labeled::MAX_HELLO_LEN;
+use crate::{
+  Peer,
+  transport::{
+    frame::{FrameDecoder, MAX_FRAME_LEN},
+    labeled::MAX_HELLO_LEN,
+  },
+};
 
 /// The per-frame length cap for a recv decoder, as a function of the stream class AND the connection
 /// phase. The Control class is held at a SMALL pre-authentication cap ([`MAX_HELLO_LEN`]) until the

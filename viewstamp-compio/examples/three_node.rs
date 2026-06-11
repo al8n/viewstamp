@@ -30,8 +30,7 @@
 //! - **A state machine** — deterministic `apply`/`snapshot`/`restore` (here: the simulation
 //!   crate's `LogSm`, which replies with the post-apply op count).
 
-use std::net::SocketAddr;
-use std::rc::Rc;
+use std::{net::SocketAddr, rc::Rc};
 
 use bytes::Bytes;
 use viewstamp_proto::{

@@ -1,5 +1,4 @@
-use super::super::*;
-use super::*;
+use super::{super::*, *};
 use crate::{
   ClientId, Config, DoViewChange, Header, OpId, OpNumber, PreparedEntry, ReadOk, ReplicaId,
   Request, RequestNumber, SlotStatus, StartViewChange, View, VsrState, Wal, WalDone,

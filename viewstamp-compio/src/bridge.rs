@@ -1,10 +1,14 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+  Arc,
+  atomic::{AtomicUsize, Ordering},
+};
 
 use bytes::Bytes;
-use compio::buf::{BufResult, IntoInner, IoBuf};
-use compio::io::{AsyncRead, AsyncWrite};
-use compio::net::TcpStream;
+use compio::{
+  buf::{BufResult, IntoInner, IoBuf},
+  io::{AsyncRead, AsyncWrite},
+  net::TcpStream,
+};
 use viewstamp_proto::ConnId;
 
 const RECV_BUF_LEN: usize = 64 * 1024;
@@ -209,9 +213,10 @@ pub(crate) async fn bridge_write(
 
 #[cfg(test)]
 mod tests {
-  use std::sync::Arc;
-  use std::sync::atomic::AtomicUsize;
-  use std::time::Duration;
+  use std::{
+    sync::{Arc, atomic::AtomicUsize},
+    time::Duration,
+  };
 
   use bytes::Bytes;
   use compio::net::{TcpListener, TcpStream};

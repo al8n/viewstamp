@@ -100,8 +100,10 @@ use std::vec::Vec;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::codec::{CodecError, Reader};
-use crate::{ClientId, OpNumber, RequestNumber, View};
+use crate::{
+  ClientId, OpNumber, RequestNumber, View,
+  codec::{CodecError, Reader},
+};
 
 /// On-disk header format version (bumped on any wire/disk layout change).
 pub const HEADER_VERSION: u16 = 1;

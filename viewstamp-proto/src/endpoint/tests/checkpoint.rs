@@ -1,5 +1,4 @@
-use super::super::*;
-use super::*;
+use super::{super::*, *};
 use crate::{ClientId, Config, OpNumber, Prepare, ReplicaId, Request, RequestNumber, View};
 
 #[test]

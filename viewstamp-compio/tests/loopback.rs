@@ -3,10 +3,11 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use viewstamp_proto::{ClusterTls, IdentityConfig, QuicOptions};
-use viewstamp_proto::{Superblock, Wal};
+use rustls::{
+  RootCertStore,
+  pki_types::{CertificateDer, PrivateKeyDer},
+};
+use viewstamp_proto::{ClusterTls, IdentityConfig, QuicOptions, Superblock, Wal};
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 const CLUSTER: u128 = 0x5151;

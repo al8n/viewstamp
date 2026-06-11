@@ -7,11 +7,13 @@ use viewstamp_proto::{
   Recipient, ReplicaId, Wal,
 };
 
-use crate::client::ClientModel;
-use crate::clock::Clock;
-use crate::network::{Faults, InFlight, Network, SlowProfile, Target};
-use crate::sm::LogSm;
-use crate::storage::{InMemorySuperblock, InMemoryWal, StorageFaults};
+use crate::{
+  client::ClientModel,
+  clock::Clock,
+  network::{Faults, InFlight, Network, SlowProfile, Target},
+  sm::LogSm,
+  storage::{InMemorySuperblock, InMemoryWal, StorageFaults},
+};
 
 /// Mixed into the per-replica storage-fault seed so a replica's WAL/SB fault PRNG is independent of
 /// its protocol PRNG (which uses a different mixer in `with_checkpoint_ops`).

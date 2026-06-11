@@ -1,8 +1,7 @@
 //! The rustls record layer (`tls` feature). The caller supplies the `rustls` configs (with the
 //! operator's cluster-CA verifier); this wraps them Sans-I/O.
 
-use std::io::Read;
-use std::sync::Arc;
+use std::{io::Read, sync::Arc};
 
 use rustls::{
   ClientConfig, ClientConnection, ServerConfig, ServerConnection, pki_types::ServerName,
@@ -354,8 +353,7 @@ pub(crate) mod test_verifier {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::Instant;
-  use crate::transport::stream::RecordIo;
+  use crate::{Instant, transport::stream::RecordIo};
   use std::sync::Arc;
 
   fn test_configs() -> (

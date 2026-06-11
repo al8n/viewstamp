@@ -6,16 +6,18 @@ use std::vec::Vec;
 
 use bytes::Bytes;
 
-use crate::message::Request;
 use crate::{
   Endpoint, Event, Instant, Message, Outgoing, Peer, Recipient, StateMachine, Superblock, Wal,
+  message::Request,
 };
 
-use super::CloseCause;
-use super::conn::Conn;
-use super::frame::STAGE_CHUNK;
-use super::router::{ConnId, PeerRouter};
-use super::stream::StreamTransport;
+use super::{
+  CloseCause,
+  conn::Conn,
+  frame::STAGE_CHUNK,
+  router::{ConnId, PeerRouter},
+  stream::StreamTransport,
+};
 
 /// Owns the consensus endpoint, the per-peer conns, and the router; pumps inbound transport data
 /// through the endpoint and routes the endpoint's outgoing messages back out. Transport (`R`) and
@@ -315,11 +317,15 @@ mod tests {
   use std::vec;
 
   use super::*;
-  use crate::message::Request;
-  use crate::transport::Passthrough;
-  use crate::transport::stream::RecordIo;
-  use crate::transport::testutil::{CountSm, TestSb, TestWal};
-  use crate::{ClientId, Config, LabelOptions, Labeled, ReplicaId, RequestNumber};
+  use crate::{
+    ClientId, Config, LabelOptions, Labeled, ReplicaId, RequestNumber,
+    message::Request,
+    transport::{
+      Passthrough,
+      stream::RecordIo,
+      testutil::{CountSm, TestSb, TestWal},
+    },
+  };
 
   fn req() -> Message {
     Message::Request(Request::new(
@@ -700,8 +706,7 @@ mod tests {
   // requesting replica; that response is the one whose routing must survive the EOF.
   #[test]
   fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
-    use crate::transport::frame::encode_frame;
-    use crate::{GetView, View};
+    use crate::{GetView, View, transport::frame::encode_frame};
     // Replica 0 is the primary of view 0, so it answers a GetView(view 0) synchronously.
     let cfg = Config::try_new(0xABCD, ReplicaId::new(0), 3).unwrap();
     let mut wal = TestWal::default();

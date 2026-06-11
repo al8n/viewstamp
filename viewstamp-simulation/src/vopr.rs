@@ -52,10 +52,12 @@ use core::time::Duration;
 
 use viewstamp_proto::{Instant, Prng};
 
-use crate::checker::{BoundednessChecker, DurabilityChecker, ViewMonotonicChecker, check_safety};
-use crate::cluster::Cluster;
-use crate::network::Faults;
-use crate::storage::StorageFaults;
+use crate::{
+  checker::{BoundednessChecker, DurabilityChecker, ViewMonotonicChecker, check_safety},
+  cluster::Cluster,
+  network::Faults,
+  storage::StorageFaults,
+};
 
 /// A summary of one [`run_vopr`] run — the schedule it actually explored, for observability and to
 /// let the sweep assert the run was non-vacuous (it really exercised faults + recovery, not a quiet

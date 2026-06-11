@@ -1,10 +1,14 @@
-use std::collections::HashMap;
-use std::io;
-use std::net::SocketAddr;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+  collections::HashMap,
+  io,
+  net::SocketAddr,
+  rc::Rc,
+  sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  },
+  time::Duration,
+};
 
 use compio::net::{TcpListener, TcpStream};
 use futures_channel::oneshot;
@@ -16,16 +20,18 @@ use viewstamp_proto::{
   RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock, Wal,
 };
 
-use crate::DriverError;
-use crate::bridge::{
-  BridgeInbound, BridgeOut, Conn, ConnTask, DialReady, Redial, bridge_read, bridge_write,
-};
-use crate::clock::{Clock, jittered};
-use crate::config::DriverConfig;
-use crate::handle::{Command, Handle};
-use crate::session::{
-  InflightBudget, Pending, PendingMap, build_endpoint, deliver_event, drain_pending,
-  reap_and_collect_retransmits,
+use crate::{
+  DriverError,
+  bridge::{
+    BridgeInbound, BridgeOut, Conn, ConnTask, DialReady, Redial, bridge_read, bridge_write,
+  },
+  clock::{Clock, jittered},
+  config::DriverConfig,
+  handle::{Command, Handle},
+  session::{
+    InflightBudget, Pending, PendingMap, build_endpoint, deliver_event, drain_pending,
+    reap_and_collect_retransmits,
+  },
 };
 
 /// Shared inbound-channel capacity (bridge tasks -> driver). Bounds the bytes in flight to
@@ -899,17 +905,23 @@ where
 
 #[cfg(test)]
 mod tests {
-  use std::rc::Rc;
-  use std::sync::Arc;
-  use std::sync::atomic::{AtomicUsize, Ordering};
-  use std::time::Duration;
+  use std::{
+    rc::Rc,
+    sync::{
+      Arc,
+      atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+  };
 
   use bytes::Bytes;
 
   use super::CompioStreamDriver;
-  use crate::DriverError;
-  use crate::bridge::{BridgeOut, Conn as BridgeConn, ConnTask};
-  use crate::session::REQUEST_TIMEOUT;
+  use crate::{
+    DriverError,
+    bridge::{BridgeOut, Conn as BridgeConn, ConnTask},
+    session::REQUEST_TIMEOUT,
+  };
   use viewstamp_proto::{
     ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled, OpNumber, Passthrough, Peer,
     ReplicaId, StreamCoordinator, View,

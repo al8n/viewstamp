@@ -26,10 +26,14 @@
 //! `Default`, and an embedder overrides them through the drivers' `with_config` constructors. Every
 //! bound stays a bound at any setting — only its size is tunable.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+  collections::HashMap,
+  sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  },
+  time::Duration,
+};
 
 use bytes::Bytes;
 use viewstamp_proto::{

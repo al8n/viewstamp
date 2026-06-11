@@ -16,8 +16,7 @@ use viewstamp_proto::{
   ClientId, Config, Endpoint, Instant, Message, OpNumber, Peer, Prepare, ReplicaId, RequestNumber,
   StateMachine, View, Wal,
 };
-use viewstamp_simulation::sm::LogSm;
-use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
+use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
 
 /// Drains the backup's outgoing queue, returning how many `PrepareOk(op)` it emitted for `want_op`.
 fn drain_prepare_oks<S: StateMachine>(e: &mut Endpoint<S>, want_op: OpNumber) -> usize {

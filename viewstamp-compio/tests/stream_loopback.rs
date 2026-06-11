@@ -3,13 +3,12 @@
 //! part — connection management (listen/accept/dial, the redial-on-fail recovery, the `Labeled`
 //! cleartext handshake); TLS is the same loop with a record-layer swap.
 
-use std::cell::RefCell;
-use std::net::SocketAddr;
-use std::rc::Rc;
+use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
 use bytes::Bytes;
-use viewstamp_proto::{Conn, LabelOptions, Labeled, Passthrough, Peer, ReplicaId, StreamTransport};
-use viewstamp_proto::{Superblock, Wal};
+use viewstamp_proto::{
+  Conn, LabelOptions, Labeled, Passthrough, Peer, ReplicaId, StreamTransport, Superblock, Wal,
+};
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 const CLUSTER: u128 = 0x5151;

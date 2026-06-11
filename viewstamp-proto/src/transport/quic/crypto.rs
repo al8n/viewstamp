@@ -25,8 +25,7 @@
 //! [`ClusterTls::tuning`]; the security-relevant construction (roots, mTLS,
 //! TLS 1.3, ALPN) is not tunable.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use quinn_proto::{
   ClientConfig, EndpointConfig, IdleTimeout, ServerConfig, TransportConfig, VarInt,
@@ -622,8 +621,7 @@ impl ClusterTls {
   /// config (mandatory client auth) and a client config (mTLS).
   pub fn build(self) -> QuicOptions {
     use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-    use rustls::client::WebPkiServerVerifier;
-    use rustls::server::WebPkiClientVerifier;
+    use rustls::{client::WebPkiServerVerifier, server::WebPkiClientVerifier};
 
     // The crypto provider is selected by the `tls-rustls-*` feature, NOT hard-coded — so an
     // aws-lc-rs / FIPS-only build links the matching provider (see `active_provider`).

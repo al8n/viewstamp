@@ -22,18 +22,16 @@ pub use identity::{
 };
 pub use layout::StreamLayout;
 
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use quinn_proto::{ConnectionHandle, EcnCodepoint};
 
 use bridge::Bridge;
 use layout::StreamClass;
 
-use crate::Endpoint;
 use crate::{
-  Event, Instant, Message, Outgoing, Peer, Recipient, ReplicaId, Request, StateMachine, Superblock,
-  Wal,
+  Endpoint, Event, Instant, Message, Outgoing, Peer, Recipient, ReplicaId, Request, StateMachine,
+  Superblock, Wal,
 };
 
 /// Derive the SNI server-name a dial presents for `expected` in `cluster`, matching the per-replica
@@ -831,10 +829,13 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::transport::quic::crypto::test_ca;
-  use crate::transport::quic::testutil::addr;
-  use crate::transport::testutil::CountSm;
-  use crate::{Config, Endpoint, Instant, Peer, ReplicaId};
+  use crate::{
+    Config, Endpoint, Instant, Peer, ReplicaId,
+    transport::{
+      quic::{crypto::test_ca, testutil::addr},
+      testutil::CountSm,
+    },
+  };
 
   /// A mandatory-mTLS [`QuicOptions`] for `cluster` (a fresh `ClusterTls` bundle), so `with_identity`'s
   /// `requires_client_auth()` invariant holds. These coordinator tests exercise dial-cap / clock-anchor
@@ -1176,9 +1177,13 @@ mod tests {
   /// transport-agnostic.
   #[test]
   fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() {
-    use crate::transport::frame::{MAX_FRAME_LEN, max_request_body_len};
-    use crate::transport::testutil::{TestSb, TestWal};
-    use crate::{ClientId, Message, Request, RequestNumber};
+    use crate::{
+      ClientId, Message, Request, RequestNumber,
+      transport::{
+        frame::{MAX_FRAME_LEN, max_request_body_len},
+        testutil::{TestSb, TestWal},
+      },
+    };
     use bytes::Bytes;
 
     let cluster = 0x5151;

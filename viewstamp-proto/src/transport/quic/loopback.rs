@@ -25,17 +25,19 @@ use core::time::Duration;
 
 use bytes::Bytes;
 
-use crate::message::Request;
-use crate::transport::frame::{LEN_PREFIX, STAGE_CHUNK, encode_frame};
-use crate::transport::quic::crypto::{ClusterTls, TestClusterCa, test_ca};
-use crate::transport::quic::testutil::{PacketPipe, addr};
-use crate::transport::quic::{
-  IdentityConfig, ProvidedIdentity, QuicCoordinator, QuicOptions, StreamLayout,
-};
-use crate::transport::testutil::{CountSm, TestSb, TestWal};
 use crate::{
   ClientId, Commit, Config, Endpoint, Event, Instant, Message, OpNumber, Peer, ReplicaId,
   RequestNumber, View,
+  message::Request,
+  transport::{
+    frame::{LEN_PREFIX, STAGE_CHUNK, encode_frame},
+    quic::{
+      IdentityConfig, ProvidedIdentity, QuicCoordinator, QuicOptions, StreamLayout,
+      crypto::{ClusterTls, TestClusterCa, test_ca},
+      testutil::{PacketPipe, addr},
+    },
+    testutil::{CountSm, TestSb, TestWal},
+  },
 };
 
 const CLUSTER: u128 = 0x5151;
@@ -404,8 +406,7 @@ fn large_op_commits_over_bulk() {
 /// the forwarder restores.
 #[test]
 fn an_oversized_outbound_message_is_surfaced_through_the_public_coordinator_counter() {
-  use crate::transport::frame::MAX_FRAME_LEN;
-  use crate::{Recipient, SyncCheckpoint};
+  use crate::{Recipient, SyncCheckpoint, transport::frame::MAX_FRAME_LEN};
 
   let ca = test_ca();
   let addr0 = addr(1);

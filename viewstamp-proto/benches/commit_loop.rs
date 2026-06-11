@@ -23,9 +23,11 @@
 //! |----------------------------------|------------------|---------------|
 //! | `commit_loop/3_replicas_256_ops` | ~554 µs          | ~462 Kelem/s  |
 
-use std::collections::{BTreeMap, VecDeque};
-use std::hint::black_box;
-use std::time::Duration;
+use std::{
+  collections::{BTreeMap, VecDeque},
+  hint::black_box,
+  time::Duration,
+};
 
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};

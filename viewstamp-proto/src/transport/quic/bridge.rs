@@ -46,9 +46,11 @@
 //! The `Bridge` works natively in [`std::time::Instant`] — quinn's time
 //! currency. The viewstamp-time adapter lives one layer up (the coordinator).
 
-use std::collections::VecDeque;
-use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::{
+  collections::VecDeque,
+  net::SocketAddr,
+  time::{Duration, Instant},
+};
 
 use quinn_proto::{
   ClientConfig, ConnectError, ConnectionHandle, DatagramEvent, Dir, EcnCodepoint, Endpoint,
@@ -56,12 +58,16 @@ use quinn_proto::{
 };
 use rustls::pki_types::CertificateDer;
 
-use super::conn::{ConnEntry, Phase, decoder_max};
-use super::crypto::QuicOptions;
-use super::layout::{StreamClass, StreamLayout};
-use super::table::ConnTable;
-use crate::transport::frame::{FrameDecoder, MAX_FRAME_LEN, STAGE_CHUNK, encode_frame};
-use crate::{Message, Peer};
+use super::{
+  conn::{ConnEntry, Phase, decoder_max},
+  crypto::QuicOptions,
+  layout::{StreamClass, StreamLayout},
+  table::ConnTable,
+};
+use crate::{
+  Message, Peer,
+  transport::frame::{FrameDecoder, MAX_FRAME_LEN, STAGE_CHUNK, encode_frame},
+};
 
 /// Per-class outbound staging cap. When a class's `outbound` would exceed this, the bridge RESETs
 /// just that class's send stream (clearing its buffer + reopening on the next write) rather than
@@ -2313,10 +2319,16 @@ fn class_of_index(sid: StreamId) -> StreamClass {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::transport::frame::LEN_PREFIX;
-  use crate::transport::quic::crypto::MAX_BIDI_STREAMS;
-  use crate::transport::quic::testutil::{PacketPipe, addr};
-  use crate::{Commit, OpNumber, ReplicaId, View};
+  use crate::{
+    Commit, OpNumber, ReplicaId, View,
+    transport::{
+      frame::LEN_PREFIX,
+      quic::{
+        crypto::MAX_BIDI_STREAMS,
+        testutil::{PacketPipe, addr},
+      },
+    },
+  };
   use quinn_proto::{Dir, StreamId};
   use std::time::Duration;
 
@@ -4967,8 +4979,7 @@ mod tests {
   /// and this test fails.
   #[test]
   fn a_large_post_validation_control_frame_is_accepted_after_the_cap_is_raised() {
-    use crate::transport::labeled::MAX_HELLO_LEN;
-    use crate::{ClientId, Prepare, RequestNumber};
+    use crate::{ClientId, Prepare, RequestNumber, transport::labeled::MAX_HELLO_LEN};
 
     let Linked {
       mut a,
@@ -5070,8 +5081,7 @@ mod tests {
   /// rejected, so the fix does not weaken the oversized-hello pin defense.
   #[test]
   fn a_control_frame_pipelined_after_the_hello_is_buffered_then_delivered_post_validation() {
-    use crate::transport::labeled::MAX_HELLO_LEN;
-    use crate::{ClientId, Prepare, RequestNumber};
+    use crate::{ClientId, Prepare, RequestNumber, transport::labeled::MAX_HELLO_LEN};
 
     let Linked {
       mut a,
@@ -8659,8 +8669,7 @@ mod tests {
   /// `true` and reaps on the buffered (COMPLETE) tail — the first defer assert fires (the connection is
   /// already Closed and the hello + pipelined frame are gone), the dropped-valid-frame regression.
   fn preauth_control_fin_with_complete_tail_validates_then_reaps(layout: StreamLayout) {
-    use crate::transport::labeled::MAX_HELLO_LEN;
-    use crate::{ClientId, Prepare, RequestNumber};
+    use crate::{ClientId, Prepare, RequestNumber, transport::labeled::MAX_HELLO_LEN};
 
     let Linked {
       mut a,
@@ -8830,8 +8839,7 @@ mod tests {
   /// tail was truncated, so the truncation distinction does not change the outcome here — only that the
   /// torn trailing bytes are dropped, which they are.)
   fn preauth_control_fin_with_partial_tail_validates_then_reaps(layout: StreamLayout) {
-    use crate::transport::labeled::MAX_HELLO_LEN;
-    use crate::{ClientId, Prepare, RequestNumber};
+    use crate::{ClientId, Prepare, RequestNumber, transport::labeled::MAX_HELLO_LEN};
 
     let Linked {
       mut a,

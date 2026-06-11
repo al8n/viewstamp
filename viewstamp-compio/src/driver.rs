@@ -1,5 +1,4 @@
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use compio::net::UdpSocket;
 use viewstamp_proto::{
@@ -7,13 +6,15 @@ use viewstamp_proto::{
   QuicOptions, ReplicaId, Request, RequestNumber, StateMachine, Superblock, Wal,
 };
 
-use crate::DriverError;
-use crate::clock::{Clock, jittered};
-use crate::config::DriverConfig;
-use crate::handle::{Command, Handle};
-use crate::session::{
-  InflightBudget, Pending, PendingMap, build_endpoint, deliver_event, drain_pending,
-  reap_and_collect_retransmits,
+use crate::{
+  DriverError,
+  clock::{Clock, jittered},
+  config::DriverConfig,
+  handle::{Command, Handle},
+  session::{
+    InflightBudget, Pending, PendingMap, build_endpoint, deliver_event, drain_pending,
+    reap_and_collect_retransmits,
+  },
 };
 
 const RECV_BUF_LEN: usize = 65_507; // IP-layer max UDP payload
@@ -528,15 +529,18 @@ where
 #[cfg(test)]
 mod tests {
   use bytes::Bytes;
-  use rustls::RootCertStore;
-  use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+  use rustls::{
+    RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer},
+  };
   use viewstamp_proto::{ClusterTls, Config, IdentityConfig, QuicOptions, ReplicaId};
-  use viewstamp_simulation::sm::LogSm;
-  use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
+  use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
 
   use super::CompioQuicDriver;
-  use crate::DriverError;
-  use crate::session::{MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT};
+  use crate::{
+    DriverError,
+    session::{MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT},
+  };
 
   const CLUSTER: u128 = 0x5151;
 

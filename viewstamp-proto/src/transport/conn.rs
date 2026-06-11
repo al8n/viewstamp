@@ -8,9 +8,11 @@ use std::vec::Vec;
 
 use crate::{Instant, Message, Peer};
 
-use super::frame::{FrameDecoder, MAX_FRAME_LEN};
-use super::stream::{Intake, StreamTransport};
-use super::{CloseCause, TransportError};
+use super::{
+  CloseCause, TransportError,
+  frame::{FrameDecoder, MAX_FRAME_LEN},
+  stream::{Intake, StreamTransport},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -272,10 +274,11 @@ impl<R: StreamTransport> Conn<R> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::message::Request;
-  use crate::transport::frame::encode_frame;
-  use crate::transport::stream::RecordIo;
-  use crate::{ClientId, Instant, Message, Peer, ReplicaId, RequestNumber};
+  use crate::{
+    ClientId, Instant, Message, Peer, ReplicaId, RequestNumber,
+    message::Request,
+    transport::{frame::encode_frame, stream::RecordIo},
+  };
 
   fn req_msg() -> Message {
     Message::Request(Request::new(

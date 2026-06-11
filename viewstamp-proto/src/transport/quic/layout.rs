@@ -100,10 +100,10 @@ mod tests {
   use bytes::Bytes;
 
   use super::*;
-  use crate::message::{
-    Commit, DoViewChange, PrepareOk, RecoveryResponse, StartView, SyncCheckpoint,
+  use crate::{
+    ClientId, Message, OpNumber, ReplicaId, RequestNumber, View,
+    message::{Commit, DoViewChange, PrepareOk, RecoveryResponse, StartView, SyncCheckpoint},
   };
-  use crate::{ClientId, Message, OpNumber, ReplicaId, RequestNumber, View};
 
   fn view(v: u64) -> View {
     View::with(v)
@@ -143,8 +143,7 @@ mod tests {
   }
 
   fn prepare_batch_msg(body: Bytes) -> Message {
-    use crate::PreparedEntry;
-    use crate::message::PrepareBatch;
+    use crate::{PreparedEntry, message::PrepareBatch};
     Message::PrepareBatch(PrepareBatch::new(
       view(1),
       op(0),
