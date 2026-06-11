@@ -1,5 +1,5 @@
 //! The stream-driver gate: a real 3-node cluster over real TCP sockets converges and replies, both
-//! plain (`Labeled<Passthrough>`) and over TLS (`Labeled<TlsRecords>`). Plain proves the new/hard
+//! plain (`Labeled<Passthrough>`) and over TLS (`Labeled<TlsRecords>`). Plain proves the hard
 //! part — connection management (listen/accept/dial, the redial-on-fail recovery, the `Labeled`
 //! cleartext handshake); TLS is the same loop with a record-layer swap.
 

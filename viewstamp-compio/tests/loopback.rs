@@ -318,10 +318,9 @@ async fn quic_driver_exits_when_all_handles_dropped() {
 /// backstop `sender_matches` accepts a `Request` relayed from a configured cluster replica (safe in the
 /// non-Byzantine model: the relay is an authenticated cluster member, `on_request` serves only at the
 /// primary and dedups by session, and a `Request` carries no view/quorum authority — see
-/// `endpoint/mod.rs`). The primary serves it, mints the op, and the cluster commits. This resolves the
-/// design's §10 client-routing item by relaxing `sender_matches` for a replica-relayed `Request`, rather
-/// than the clients-as-QUIC-peers fallback. With the primary-submit gate above, both the client→primary
-/// and the backup→relay→primary paths are proven end-to-end over real QUIC.
+/// `endpoint/mod.rs`). The primary serves it, mints the op, and the cluster commits — client routing
+/// works through any node without admitting clients as QUIC peers. With the primary-submit gate above,
+/// both the client→primary and the backup→relay→primary paths are proven end-to-end over real QUIC.
 #[compio::test]
 async fn backup_submit_relays_to_the_primary() {
   let ca = TestCa::new();

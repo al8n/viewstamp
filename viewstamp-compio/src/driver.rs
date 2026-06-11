@@ -499,10 +499,10 @@ where
       let mut produced = false;
       // Drain the pass's datagrams, then submit them as ONE batch of concurrent `send_to`s: compio
       // is a proactor, so N in-flight submissions overlap in the kernel instead of serializing N
-      // awaited round-trips (one-await-per-datagram made every pump O(datagrams) syscall latencies —
-      // a state-transfer burst is thousands of datagrams). QUIC datagrams are independent (quinn
-      // imposes no inter-datagram ordering; loss and reorder are its job), so completion order is
-      // free to vary. Each future owns its buffer; `join_all` keeps them all alive to completion.
+      // awaited round-trips (a state-transfer burst is thousands of datagrams). QUIC datagrams are
+      // independent (quinn imposes no inter-datagram ordering; loss and reorder are its job), so
+      // completion order is free to vary. Each future owns its buffer; `join_all` keeps them all
+      // alive to completion.
       let batch: Vec<(SocketAddr, Vec<u8>)> =
         std::iter::from_fn(|| self.coord.poll_transmit()).collect();
       if !batch.is_empty() {
@@ -874,9 +874,9 @@ mod tests {
 
   /// OVER-FRAME REJECTION (QUIC driver): a submit whose body exceeds `max_request_body_len()` is
   /// rejected up front with `RequestTooLarge` and has NO side effects — it reserves no budget (count and
-  /// bytes stay 0) and enqueues no command. This closes the hang where an over-frame body would enter
-  /// `pending`, pin the budget, and wait forever for a commit the transport can never produce (its
-  /// relayed `Request`/`Prepare` would exceed `MAX_FRAME_LEN` and be dropped).
+  /// bytes stay 0) and enqueues no command. Without the up-front rejection an over-frame body would
+  /// enter `pending`, pin the budget, and wait forever for a commit the transport can never produce
+  /// (its relayed `Request`/`Prepare` would exceed `MAX_FRAME_LEN` and be dropped).
   #[compio::test]
   async fn over_frame_submit_is_rejected_without_side_effects_quic() {
     let (driver, handle) = test_quic_driver_with_handle().await;

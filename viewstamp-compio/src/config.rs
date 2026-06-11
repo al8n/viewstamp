@@ -36,9 +36,9 @@ pub(crate) const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) const MAX_CONNS: usize = 1024;
 
 /// Tunable operational parameters for both drivers ([`crate::CompioQuicDriver`] and
-/// [`crate::CompioStreamDriver`]), with `Default` = the constants the drivers have always pinned
-/// (each default constant carries the sizing rationale). Pass a non-default config through the
-/// drivers' `with_config` constructors; the plain `new` constructors use the defaults.
+/// [`crate::CompioStreamDriver`]), with `Default` = the constants the drivers pin without an
+/// override (each default constant carries the sizing rationale). Pass a non-default config through
+/// the drivers' `with_config` constructors; the plain `new` constructors use the defaults.
 ///
 /// Three knobs apply to the STREAM driver only — [`Self::dial_timeout`], [`Self::auth_deadline`],
 /// and [`Self::max_conns`]: the QUIC transport owns the equivalent bounds inside
@@ -237,7 +237,7 @@ impl Default for DriverConfig {
 mod tests {
   use super::*;
 
-  /// The default config IS the historical constants — every knob pinned, so the tunable surface
+  /// The default config IS the pinned constants — every knob pinned, so the tunable surface
   /// cannot silently drift the production defaults.
   #[test]
   fn defaults_equal_the_pinned_constants() {
