@@ -733,7 +733,7 @@ impl<S: StateMachine> Endpoint<S> {
     if self.pending_checkpoint.is_some() {
       return;
     }
-    if m.checkpoint_op().get() < s.target.get() && !(assembled && !s.forced) {
+    if m.checkpoint_op().get() < s.target.get() && (!assembled || s.forced) {
       // Does not advance us past what we know the cluster has committed — ignore. The ONE carve-out
       // (see the method doc): an ASSEMBLED ORDINARY transfer completes below a target raised
       // mid-transfer — the target is a freshness floor there, and the safety gates below still run.

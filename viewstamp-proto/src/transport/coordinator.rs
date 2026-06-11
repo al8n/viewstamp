@@ -312,6 +312,8 @@ where
 
 #[cfg(test)]
 mod tests {
+  use std::vec;
+
   use super::*;
   use crate::message::Request;
   use crate::transport::Passthrough;
