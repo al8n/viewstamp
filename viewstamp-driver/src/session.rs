@@ -1,18 +1,16 @@
 //! Shared session state for both drivers, and the driver MEMORY MODEL.
 //!
-//! Both the QUIC ([`crate::CompioQuicDriver`]) and stream ([`crate::CompioStreamDriver`]) drivers
-//! retain a small fixed set of channels and maps. Each is EXPLICITLY bounded so a partitioned/slow
-//! cluster, a flooding peer, or a caller that submits faster than the cluster commits cannot grow
-//! the driver's memory without bound. The complete inventory:
+//! Both the QUIC and stream drivers retain a small fixed set of channels and maps. Each is
+//! EXPLICITLY bounded so a partitioned/slow cluster, a flooding peer, or a caller that submits
+//! faster than the cluster commits cannot grow the driver's memory without bound. The shared
+//! inventory (a driver crate documents any channels of its own beside their cap constants):
 //!
 //! | retained state            | bound                                                              |
 //! |---------------------------|--------------------------------------------------------------------|
 //! | `pending` submit map      | [`MAX_INFLIGHT`] entries AND [`MAX_PENDING_BYTES`] of request body  |
 //! | command channel           | `max_inflight + 1` buffered [`crate::Command`]s, + one in-flight per live sender (bounded; `try_send`) |
 //! | events channel            | [`EVENTS_CAP`] (bounded best-effort; dropped-on-full)              |
-//! | QUIC recv channel         | `RECV_CAP` datagrams (bounded; recv-task `send_async` backpressure) |
 //! | stream inbound channel    | `INBOUND_CAP` frames (bounded; bridge `send_async` backpressure)    |
-//! | stream accept channel     | `ACCEPT_CAP` sockets (bounded; accept task parks, kernel backlog)   |
 //! | per-conn out-queue        | `max_outbound_backlog` + one wire chunk (byte-bounded on enqueue)   |
 //! | `conns` connection table  | `max_conns` live connections (accept admission control)            |
 //! | dial-ready channel        | live dial count, itself bounded by `max_conns`                     |
@@ -68,7 +66,7 @@ use viewstamp_proto::{
 /// completion this driver polls can predate its endpoint, PROVIDED the handles carry no in-flight
 /// ops from a previous incarnation (the drivers' constructor-level storage contract; a real crash
 /// satisfies it by construction because in-flight ops die with the process).
-pub(crate) fn build_endpoint<S, W, B>(config: Config, sm: S, wal: &mut W, sb: &mut B) -> Endpoint<S>
+pub fn build_endpoint<S, W, B>(config: Config, sm: S, wal: &mut W, sb: &mut B) -> Endpoint<S>
 where
   S: StateMachine,
   W: Wal,
@@ -93,7 +91,7 @@ where
 /// it (the proto session table dedups). Shared by both the QUIC and stream drivers; tunable via
 /// `DriverConfig::with_request_timeout` (a geo-replicated cluster whose commit latency nears 250 ms
 /// raises it so steady-state submits are not re-broadcast spuriously).
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Ceiling on the interval between in-flight `pending` scans ([`reap_and_collect_retransmits`]).
 /// The scan is O(in-flight) — a cancelled-check plus duration math per entry — and the drivers'
@@ -107,12 +105,12 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) const PENDING_SCAN_MAX_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The re-arm interval of the drivers' deadline-gated `pending` scan, for a driver configured
-/// with `request_timeout`: an eighth of the timeout, capped at [`PENDING_SCAN_MAX_INTERVAL`].
+/// with `request_timeout`: an eighth of the timeout, capped at `PENDING_SCAN_MAX_INTERVAL`.
 /// The `/ 8` keeps the gate proportional when an embedder configures a far smaller timeout (each
 /// entry's staleness is still sampled ~8x per timeout window, so a due retransmit fires within
 /// ~12.5% of its cadence); the cap keeps a LARGER configured timeout from slowing cancellation
 /// reclaim below the default cadence.
-pub(crate) fn pending_scan_interval(request_timeout: Duration) -> Duration {
+pub fn pending_scan_interval(request_timeout: Duration) -> Duration {
   // Floored at 1ms: a zero or near-zero configured timeout must not produce a zero interval,
   // which — folded into the wake deadline while work is pending — would wake-scan-rearm without
   // ever parking the shared thread.
@@ -131,7 +129,7 @@ pub(crate) fn pending_scan_interval(request_timeout: Duration) -> Duration {
 /// enough that the entry overhead (a key, a `Bytes` handle, a oneshot) is negligible. Past the cap a
 /// submit returns [`crate::DriverError::Busy`] rather than enqueueing unboundedly. Tunable via
 /// `DriverConfig::with_max_inflight`.
-pub(crate) const MAX_INFLIGHT: usize = 4096;
+pub const MAX_INFLIGHT: usize = 4096;
 
 /// Default maximum total request-body bytes across all in-flight submits, shared by both drivers.
 /// Bounds the retained request payloads independently of the count cap so a smaller number of LARGE
@@ -142,16 +140,15 @@ pub(crate) const MAX_INFLIGHT: usize = 4096;
 /// in-flight working set, yet a hard bound an adversarial or buggy caller cannot exceed. Past the
 /// cap a submit returns [`crate::DriverError::Busy`]. Tunable via
 /// `DriverConfig::with_max_pending_bytes` (keep the >=-one-max-frame property when lowering it).
-pub(crate) const MAX_PENDING_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_PENDING_BYTES: usize = 128 * 1024 * 1024;
 
 /// Default best-effort capacity of the event observation channel (driver ->
 /// [`crate::Handle`]), shared by both drivers. Bounds the retained events to `EVENTS_CAP`
 /// so an application that submits but never drains `Handle::events()` cannot grow the channel
 /// without bound — the observation stream is dropped-on-full, not buffered forever. 1024 is a
 /// generous default: a consumer that keeps up never sees a drop, and the RELIABLE delivery path
-/// (the per-`submit` oneshot, answered in [`deliver_event`]) is unaffected by this cap. Mirrors
-/// `INBOUND_CAP`. Tunable via `DriverConfig::with_events_cap`.
-pub(crate) const EVENTS_CAP: usize = 1024;
+/// (the per-`submit` oneshot, answered in [`deliver_event`]) is unaffected by this cap. Tunable via `DriverConfig::with_events_cap`.
+pub const EVENTS_CAP: usize = 1024;
 
 /// The shared in-flight submit budget: a cheaply-cloneable handle bounding the submitted-but-not-yet-
 /// resolved requests by BOTH a count and a byte total (the configured `max_inflight` /
@@ -169,7 +166,7 @@ pub(crate) const EVENTS_CAP: usize = 1024;
 /// reserve uses fetch-add-then-check-then-rollback so concurrent `Handle` clones can momentarily
 /// observe an over-cap total but never COMMIT one (each rolls its own add back).
 #[derive(Clone, Debug)]
-pub(crate) struct InflightBudget {
+pub struct InflightBudget {
   count: Arc<AtomicUsize>,
   bytes: Arc<AtomicUsize>,
   /// The count cap this budget enforces (immutable after construction, copied into every clone).
@@ -181,7 +178,7 @@ pub(crate) struct InflightBudget {
 impl InflightBudget {
   /// A fresh budget with nothing reserved, enforcing the given count/byte caps (the driver passes
   /// its `DriverConfig`'s `max_inflight` / `max_pending_bytes`).
-  pub(crate) fn new(max_count: usize, max_bytes: usize) -> Self {
+  pub fn new(max_count: usize, max_bytes: usize) -> Self {
     Self {
       count: Arc::new(AtomicUsize::new(0)),
       bytes: Arc::new(AtomicUsize::new(0)),
@@ -221,14 +218,12 @@ impl InflightBudget {
   }
 
   /// The current count of reserved in-flight slots (test/observability).
-  #[cfg(test)]
-  pub(crate) fn count(&self) -> usize {
+  pub fn count(&self) -> usize {
     self.count.load(Ordering::Relaxed)
   }
 
   /// The current reserved byte total (test/observability).
-  #[cfg(test)]
-  pub(crate) fn bytes(&self) -> usize {
+  pub fn bytes(&self) -> usize {
     self.bytes.load(Ordering::Relaxed)
   }
 }
@@ -254,7 +249,7 @@ impl InflightBudget {
 /// reservations exactly and can neither leak nor double-release.
 ///
 /// `pub` (with no public constructor or accessor — it is minted only by the crate-private
-/// [`InflightBudget::try_acquire`]) solely because it rides the public [`crate::Command::Submit`]: an
+/// `InflightBudget::try_acquire`) solely because it rides the public [`crate::Command::Submit`]: an
 /// opaque token the driver moves into a [`Pending`] entry, never inspected by an embedder.
 #[derive(Debug)]
 pub struct ReservationGuard {
@@ -273,30 +268,30 @@ impl Drop for ReservationGuard {
 /// [`InflightBudget`] slot. The guard lives HERE for the entry's whole life, so dropping the entry —
 /// on commit, on cancellation reclaim, or on shutdown drain — releases its budget exactly once with no
 /// explicit release call at any of those sites.
-pub(crate) struct Pending {
-  pub(crate) reply: futures_channel::oneshot::Sender<Bytes>,
-  pub(crate) request: Request,
-  pub(crate) last_sent: Instant,
+pub struct Pending {
+  pub reply: futures_channel::oneshot::Sender<Bytes>,
+  pub request: Request,
+  pub last_sent: Instant,
   /// Owns this entry's budget reservation; its `Drop` releases the slot when the entry is removed.
-  pub(crate) reservation: ReservationGuard,
+  pub reservation: ReservationGuard,
 }
 
 /// The node-local client session map: `(client, request) -> Pending`.
-pub(crate) type PendingMap = HashMap<(ClientId, RequestNumber), Pending>;
+pub type PendingMap = HashMap<(ClientId, RequestNumber), Pending>;
 
 /// Drop every entry remaining in `pending`, then clear the map. The driver's shutdown/teardown site:
 /// any submit still in flight at shutdown (its commit never arrived) frees its reservation as its
 /// [`Pending`] is dropped here (the guard's `Drop`), so the budget returns to zero and never leaks
 /// across a driver's lifetime. The dropped reply oneshots surface [`crate::DriverError::ReplyDropped`]
 /// to any still-waiting `submit`.
-pub(crate) fn drain_pending(pending: &mut PendingMap) {
+pub fn drain_pending(pending: &mut PendingMap) {
   pending.clear();
 }
 
 /// Reap cancelled submits, then collect the requests due for retransmission. Shared by both drivers'
 /// `retransmit_stale`, which deadline-gates this walk to the [`pending_scan_interval`] cadence (the
 /// walk is O(in-flight); the gate's staleness budget is documented on
-/// [`PENDING_SCAN_MAX_INTERVAL`]). Two responsibilities, in one pass over `pending`:
+/// `PENDING_SCAN_MAX_INTERVAL`). Two responsibilities, in one pass over `pending`:
 ///
 /// 1. CANCELLATION RECLAIM. A submit whose returned reply future (the `oneshot::Receiver`) has been
 ///    dropped is cancelled: its `p.reply` sender reports [`futures_channel::oneshot::Sender::is_canceled`].
@@ -311,7 +306,7 @@ pub(crate) fn drain_pending(pending: &mut PendingMap) {
 ///
 /// Returns the requests to re-broadcast; the caller feeds each to its coordinator's
 /// `submit_client_request` (kept out of here so this stays storage/coordinator-agnostic).
-pub(crate) fn reap_and_collect_retransmits(
+pub fn reap_and_collect_retransmits(
   pending: &mut PendingMap,
   now: Instant,
   request_timeout: Duration,
@@ -357,7 +352,7 @@ pub(crate) fn reap_and_collect_retransmits(
 ///   change / sync / checkpoint, not per op), so the cap's sizing is unchanged. Nothing internal
 ///   consumes this stream — only the external application does — so dropping an observation event is
 ///   safe; consensus progress and submit replies do not depend on the events stream being complete.
-pub(crate) fn deliver_event(pending: &mut PendingMap, events: &flume::Sender<Event>, event: Event) {
+pub fn deliver_event(pending: &mut PendingMap, events: &flume::Sender<Event>, event: Event) {
   let forward = match event {
     Event::Committed(committed) => {
       if let Some(p) = pending.remove(&(committed.client(), committed.request())) {
@@ -640,8 +635,8 @@ mod tests {
   /// The committed-events channel is bounded best-effort: an application that never drains
   /// `Handle::events()` must not grow the channel without bound. Pushing far more than `EVENTS_CAP`
   /// committed events through `deliver_event` into the real `flume::bounded(EVENTS_CAP)` channel —
-  /// WITHOUT ever receiving — leaves the channel length capped at `EVENTS_CAP` (old events are
-  /// dropped on full), instead of accumulating every commit forever.
+  /// WITHOUT ever receiving — leaves the channel length capped at `EVENTS_CAP` (an event sent
+  /// once full is dropped at the failed try_send), instead of accumulating every commit forever.
   #[test]
   fn undrained_events_channel_stays_bounded_at_capacity() {
     let (events_tx, events_rx) = flume::bounded(super::EVENTS_CAP);

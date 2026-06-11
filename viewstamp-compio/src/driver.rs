@@ -6,15 +6,10 @@ use viewstamp_proto::{
   QuicOptions, ReplicaId, Request, RequestNumber, StateMachine, Superblock, Wal,
 };
 
-use crate::{
-  DriverError,
-  clock::{Clock, jittered},
-  config::DriverConfig,
-  handle::{Command, Handle},
-  session::{
-    InflightBudget, Pending, PendingMap, build_endpoint, deliver_event, drain_pending,
-    pending_scan_interval, reap_and_collect_retransmits,
-  },
+use viewstamp_driver::{
+  Clock, Command, DriverConfig, DriverError, Handle, InflightBudget, Pending, PendingMap,
+  build_endpoint, deliver_event, drain_pending, jittered, pending_scan_interval,
+  reap_and_collect_retransmits,
 };
 
 const RECV_BUF_LEN: usize = 65_507; // IP-layer max UDP payload
@@ -25,6 +20,10 @@ const RECV_BUF_LEN: usize = 65_507; // IP-layer max UDP payload
 /// then overflow — the kernel socket buffer. That is exactly UDP socket backpressure, whose drops
 /// QUIC's own loss recovery already absorbs. The run loop receives one datagram per iteration
 /// (the select's highest-priority arm), so the channel only fills under genuine overload.
+///
+/// A bounded retained-state row beside the shared inventory (the memory-model table in
+/// `viewstamp-driver`'s session module): the QUIC recv channel holds at most `RECV_CAP`
+/// datagrams, the recv task's `send_async` providing the backpressure.
 const RECV_CAP: usize = 256;
 /// Backoff before retrying a failed `recv_from`, bounding the retry rate under a persistent
 /// synchronously-resolving error so the shared thread always makes progress.
@@ -671,10 +670,7 @@ mod tests {
   use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
 
   use super::CompioQuicDriver;
-  use crate::{
-    DriverError,
-    session::{MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT},
-  };
+  use viewstamp_driver::{DriverError, MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT};
 
   const CLUSTER: u128 = 0x5151;
 
@@ -930,7 +926,7 @@ mod tests {
 
     // Deliver the matching commits: each releases one slot via `deliver_event`.
     let keys: Vec<_> = driver.pending.keys().copied().collect();
-    let (events_tx, _events_rx) = flume::bounded(crate::session::EVENTS_CAP);
+    let (events_tx, _events_rx) = flume::bounded(viewstamp_driver::EVENTS_CAP);
     for (client, request) in keys {
       let event = viewstamp_proto::Event::Committed(viewstamp_proto::Committed::new(
         viewstamp_proto::OpNumber::with(request.get()),
@@ -938,7 +934,7 @@ mod tests {
         request,
         Bytes::from_static(b"R"),
       ));
-      crate::session::deliver_event(&mut driver.pending, &events_tx, event);
+      viewstamp_driver::deliver_event(&mut driver.pending, &events_tx, event);
     }
     assert_eq!(driver.budget.count(), 0, "every commit released its slot");
     assert!(driver.pending.is_empty(), "pending drained by the commits");
@@ -1146,7 +1142,7 @@ mod tests {
   #[compio::test]
   async fn the_pending_scan_is_deadline_gated_quic() {
     let (mut driver, handle) = test_quic_driver_with_handle().await;
-    let interval = crate::session::pending_scan_interval(driver.cfg.request_timeout());
+    let interval = viewstamp_driver::pending_scan_interval(driver.cfg.request_timeout());
 
     let mut first: std::pin::Pin<Box<SubmitFut<'_>>> =
       Box::pin(handle.submit(Bytes::from_static(b"a")));

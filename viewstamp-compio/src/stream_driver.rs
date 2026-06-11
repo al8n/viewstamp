@@ -20,18 +20,14 @@ use viewstamp_proto::{
   RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock, Wal,
 };
 
-use crate::{
-  DriverError,
-  bridge::{
-    BridgeInbound, BridgeOut, Conn, ConnTask, DialReady, Redial, bridge_read, bridge_write,
-  },
-  clock::{Clock, jittered},
-  config::DriverConfig,
-  handle::{Command, Handle},
-  session::{
-    InflightBudget, Pending, PendingMap, build_endpoint, deliver_event, drain_pending,
-    pending_scan_interval, reap_and_collect_retransmits,
-  },
+use viewstamp_driver::{
+  Clock, Command, DriverConfig, DriverError, Handle, InflightBudget, Pending, PendingMap,
+  build_endpoint, deliver_event, drain_pending, jittered, pending_scan_interval,
+  reap_and_collect_retransmits,
+};
+
+use crate::bridge::{
+  BridgeInbound, BridgeOut, Conn, ConnTask, DialReady, Redial, bridge_read, bridge_write,
 };
 
 /// Shared inbound-channel capacity (bridge tasks -> driver). Bounds the bytes in flight to
@@ -47,6 +43,11 @@ const INBOUND_CAP: usize = 256;
 /// without parking the task. Once full the accept task's `send_async` parks, no `accept()` is in
 /// flight, and further peers queue in the kernel's listen backlog — exactly listener
 /// backpressure. The driver admits (or at-capacity drops) one accepted socket per loop iteration.
+///
+/// A bounded retained-state row beside the shared inventory (the memory-model table in
+/// `viewstamp-driver`'s session module): the stream accept channel holds at most `ACCEPT_CAP`
+/// sockets, the parked accept task — and behind it the kernel listen backlog — providing the
+/// backpressure.
 const ACCEPT_CAP: usize = 16;
 /// Backoff before retrying a failed `accept()`: long enough to yield the shared thread and let a
 /// transient condition (fd exhaustion) clear, short enough that real accepts resume promptly.
@@ -1077,11 +1078,9 @@ mod tests {
   use bytes::Bytes;
 
   use super::CompioStreamDriver;
-  use crate::{
-    DriverError,
-    bridge::{BridgeOut, Conn as BridgeConn, ConnTask},
-    session::REQUEST_TIMEOUT,
-  };
+  use viewstamp_driver::{DriverError, REQUEST_TIMEOUT};
+
+  use crate::bridge::{BridgeOut, Conn as BridgeConn, ConnTask};
   use viewstamp_proto::{
     ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled, OpNumber, Passthrough, Peer,
     ReplicaId, StreamCoordinator, View,
@@ -1286,7 +1285,7 @@ mod tests {
       ReplicaId::new(1),
       addr,
       Duration::ZERO,
-      crate::config::REDIAL_BACKOFF_BASE,
+      viewstamp_driver::REDIAL_BACKOFF_BASE,
     );
     let id = *driver
       .conns
@@ -1301,7 +1300,11 @@ mod tests {
         .get(&id)
         .and_then(|c| c.redial)
         .map(|r| (r.peer, r.addr, r.backoff)),
-      Some((ReplicaId::new(1), addr, crate::config::REDIAL_BACKOFF_BASE)),
+      Some((
+        ReplicaId::new(1),
+        addr,
+        viewstamp_driver::REDIAL_BACKOFF_BASE
+      )),
       "a dialed Conn records (peer, addr) for redial-on-loss, carrying the base backoff"
     );
     assert!(
@@ -1322,8 +1325,8 @@ mod tests {
   /// is issued at `jittered(backoff)` of the conn just lost, and the replacement conn carries the
   /// doubled (capped) value — so a failure chain schedules 200ms, 400ms, …, 5s, 5s, … and every
   /// delay is strictly above the previous one (`jittered(b) <= 1.25b < 2b`; the jitter bound is
-  /// pinned in `clock.rs`). The test drives the REAL loss path (`close_conn`) repeatedly and asserts
-  /// the carried backoff doubles to [`crate::config::REDIAL_BACKOFF_CAP`] then holds — deterministic: no
+  /// pinned in `viewstamp-driver`'s clock module). The test drives the REAL loss path (`close_conn`) repeatedly and asserts
+  /// the carried backoff doubles to [`viewstamp_driver::REDIAL_BACKOFF_CAP`] then holds — deterministic: no
   /// clock is consulted, the carried backoff IS the next schedule step.
   ///
   /// NEUTER CHECK: reverting `close_conn` to a fixed-delay redial leaves every carried backoff at
@@ -1336,10 +1339,10 @@ mod tests {
       ReplicaId::new(1),
       addr,
       Duration::ZERO,
-      crate::config::REDIAL_BACKOFF_BASE,
+      viewstamp_driver::REDIAL_BACKOFF_BASE,
     );
 
-    let mut expected = crate::config::REDIAL_BACKOFF_BASE;
+    let mut expected = viewstamp_driver::REDIAL_BACKOFF_BASE;
     // 200ms → 400ms → 800ms → 1.6s → 3.2s → 5s (capped) → 5s: the cap is reached and then held.
     for _ in 0..7 {
       let id = *driver
@@ -1362,11 +1365,11 @@ mod tests {
       // Lose the conn: `close_conn` redials at jittered(backoff) and the replacement carries the
       // doubled (capped) value.
       driver.close_conn(id, Instant::ZERO);
-      expected = (expected * 2).min(crate::config::REDIAL_BACKOFF_CAP);
+      expected = (expected * 2).min(viewstamp_driver::REDIAL_BACKOFF_CAP);
     }
     assert_eq!(
       expected,
-      crate::config::REDIAL_BACKOFF_CAP,
+      viewstamp_driver::REDIAL_BACKOFF_CAP,
       "the chain reached the cap"
     );
   }
@@ -1411,7 +1414,7 @@ mod tests {
       ReplicaId::new(1),
       addr,
       Duration::ZERO,
-      crate::config::REDIAL_BACKOFF_BASE,
+      viewstamp_driver::REDIAL_BACKOFF_BASE,
     );
     let id = *driver.conns.keys().next().expect("one dialed conn");
 
@@ -1454,8 +1457,8 @@ mod tests {
     // (the bridge handoff would have stamped it).
     {
       let conn = driver.conns.get_mut(&id).expect("the conn is live");
-      conn.redial.as_mut().expect("a dialed conn").backoff = crate::config::REDIAL_BACKOFF_CAP;
-      conn.auth_deadline = Some(now + crate::config::AUTH_DEADLINE);
+      conn.redial.as_mut().expect("a dialed conn").backoff = viewstamp_driver::REDIAL_BACKOFF_CAP;
+      conn.auth_deadline = Some(now + viewstamp_driver::AUTH_DEADLINE);
     }
 
     driver.reconcile_auth_deadlines(now);
@@ -1470,7 +1473,7 @@ mod tests {
     );
     assert_eq!(
       conn.redial.expect("a dialed conn").backoff,
-      crate::config::REDIAL_BACKOFF_BASE,
+      viewstamp_driver::REDIAL_BACKOFF_BASE,
       "validation resets the redial backoff, so the next loss starts the schedule over at the base"
     );
   }
@@ -1811,7 +1814,7 @@ mod tests {
   async fn a_custom_auth_deadline_changes_the_reap_timing() {
     let custom = Duration::from_millis(500);
     assert!(
-      custom < crate::config::AUTH_DEADLINE,
+      custom < viewstamp_driver::AUTH_DEADLINE,
       "the override must be far below the default for the timing contrast to mean anything"
     );
     let mut driver =
@@ -1927,7 +1930,7 @@ mod tests {
   /// body so the byte cap is nowhere near binding; the byte cap itself is covered in `handle.rs`.
   #[compio::test]
   async fn submit_budget_bounds_pending_and_releases_on_commit_stream() {
-    use crate::session::{MAX_INFLIGHT, MAX_PENDING_BYTES};
+    use viewstamp_driver::{MAX_INFLIGHT, MAX_PENDING_BYTES};
     let (mut driver, handle) = test_driver_with_handle().await;
 
     // Fill exactly to the count cap: each submit reserves (Handle) then is drained into `pending`
@@ -1976,7 +1979,7 @@ mod tests {
     // Deliver the matching commits: each releases one budget slot via `deliver_event`. Drain the
     // pending keys so we commit exactly the requests in flight.
     let keys: Vec<_> = driver.pending.keys().copied().collect();
-    let (events_tx, _events_rx) = flume::bounded(crate::session::EVENTS_CAP);
+    let (events_tx, _events_rx) = flume::bounded(viewstamp_driver::EVENTS_CAP);
     for (client, request) in keys {
       let event = viewstamp_proto::Event::Committed(viewstamp_proto::Committed::new(
         viewstamp_proto::OpNumber::with(request.get()),
@@ -1984,7 +1987,7 @@ mod tests {
         request,
         Bytes::from_static(b"R"),
       ));
-      crate::session::deliver_event(&mut driver.pending, &events_tx, event);
+      viewstamp_driver::deliver_event(&mut driver.pending, &events_tx, event);
     }
     assert_eq!(driver.budget.count(), 0, "every commit released its slot");
     assert!(driver.pending.is_empty(), "pending drained by the commits");
@@ -2077,7 +2080,7 @@ mod tests {
   /// in-flight submit is cancelled, and after `retransmit_stale` the next submit is accepted.
   #[compio::test]
   async fn cancelled_submit_is_reclaimed_within_a_retransmit_tick_stream() {
-    use crate::session::MAX_INFLIGHT;
+    use viewstamp_driver::MAX_INFLIGHT;
     let (mut driver, handle) = test_driver_with_handle().await;
 
     // The FIRST submit is the one we cancel: keep its future so dropping it cancels the reply.
@@ -2147,7 +2150,7 @@ mod tests {
   #[compio::test]
   async fn the_pending_scan_is_deadline_gated_stream() {
     let (mut driver, handle) = test_driver_with_handle().await;
-    let interval = crate::session::pending_scan_interval(driver.cfg.request_timeout());
+    let interval = viewstamp_driver::pending_scan_interval(driver.cfg.request_timeout());
 
     let mut first: std::pin::Pin<Box<SubmitFut<'_>>> =
       Box::pin(handle.submit(Bytes::from_static(b"a")));
