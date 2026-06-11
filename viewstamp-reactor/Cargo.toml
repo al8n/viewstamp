@@ -32,10 +32,14 @@ viewstamp-simulation = { workspace = true }
 agnostic = { workspace = true, features = ["net", "tokio"] }
 rcgen = { workspace = true }
 rustls = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 [[test]]
 name = "loopback"
+required-features = ["tokio"]
+
+[[test]]
+name = "stream_loopback"
 required-features = ["tokio"]
 
 [lints]
