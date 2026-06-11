@@ -12,16 +12,7 @@ features = ["std", "alloc", "tcp", "tls", "tls-rustls-ring", "quic"]
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-  # `time` < 0.3.47: DoS via stack exhaustion in `time`'s parsing (RUSTSEC-2026-0009).
-  # The fixed release (0.3.47) requires Rust 1.88, above this workspace's MSRV (1.85),
-  # and the MSRV-aware resolver therefore pins 0.3.45. Exposure here is marginal:
-  # `time` is reached only through x509-parser (certificate validity times on
-  # cluster-private mTLS certs issued by the operator's own CA) and rcgen/dev-deps —
-  # viewstamp never parses untrusted time strings. Drop this ignore when the
-  # workspace MSRV reaches 1.88.
-  "RUSTSEC-2026-0009",
-]
+ignore = []
 
 [licenses]
 version = 2

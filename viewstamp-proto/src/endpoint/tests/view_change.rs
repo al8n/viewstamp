@@ -873,10 +873,10 @@ fn backup_adopted_ack_survives_crash_before_checkpoint() {
   for _ in 0..4 {
     e.handle_storage(now, &mut wal, &mut sb);
     while let Some(out) = e.poll_message() {
-      if let Message::PrepareOk(ok) = out.into_msg() {
-        if ok.op() == OpNumber::with(2) {
-          acked = true;
-        }
+      if let Message::PrepareOk(ok) = out.into_msg()
+        && ok.op() == OpNumber::with(2)
+      {
+        acked = true;
       }
     }
     if acked {
@@ -1416,10 +1416,10 @@ fn backup_adopts_start_view() {
   for _ in 0..4 {
     e.handle_storage(now, &mut wal, &mut sb);
     while let Some(out) = e.poll_message() {
-      if let Message::PrepareOk(ok) = out.into_msg() {
-        if ok.op() == OpNumber::with(2) {
-          acked_op2 = true;
-        }
+      if let Message::PrepareOk(ok) = out.into_msg()
+        && ok.op() == OpNumber::with(2)
+      {
+        acked_op2 = true;
       }
     }
     if acked_op2 {
@@ -2004,10 +2004,10 @@ fn backup_does_not_prepare_ok_before_start_view_is_durable() {
   for _ in 0..4 {
     e.handle_storage(now, &mut wal, &mut sb);
     while let Some(out) = e.poll_message() {
-      if let Message::PrepareOk(ok) = out.into_msg() {
-        if ok.op() == OpNumber::with(2) {
-          acked_op2 = true;
-        }
+      if let Message::PrepareOk(ok) = out.into_msg()
+        && ok.op() == OpNumber::with(2)
+      {
+        acked_op2 = true;
       }
     }
     if acked_op2 {
@@ -2076,10 +2076,10 @@ fn new_prepare_not_acked_while_view_write_pending() {
   e.handle_storage(now, &mut wal, &mut sb); // drains the StartView write; would pump op 2 if accepted
   let mut acked_op2 = false;
   while let Some(out) = e.poll_message() {
-    if let Message::PrepareOk(ok) = out.into_msg() {
-      if ok.op() == OpNumber::with(2) {
-        acked_op2 = true;
-      }
+    if let Message::PrepareOk(ok) = out.into_msg()
+      && ok.op() == OpNumber::with(2)
+    {
+      acked_op2 = true;
     }
   }
   assert!(
@@ -2097,10 +2097,10 @@ fn new_prepare_not_acked_while_view_write_pending() {
   e.handle_storage(now, &mut wal, &mut sb); // append-before-ack: pump the WAL append
   let mut acked_after = false;
   while let Some(out) = e.poll_message() {
-    if let Message::PrepareOk(ok) = out.into_msg() {
-      if ok.op() == OpNumber::with(2) {
-        acked_after = true;
-      }
+    if let Message::PrepareOk(ok) = out.into_msg()
+      && ok.op() == OpNumber::with(2)
+    {
+      acked_after = true;
     }
   }
   assert!(

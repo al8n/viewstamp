@@ -648,11 +648,12 @@ impl<S: StateMachine> Endpoint<S> {
     if self.pending_sb.is_some() {
       return;
     }
-    if let Some(d) = &self.sync_donating {
-      if d.checkpoint_op == m.checkpoint_op() && d.checkpoint_id == m.checkpoint_id() {
-        self.ship_sync_chunk(m.replica(), m.nonce(), m.offset());
-        return;
-      }
+    if let Some(d) = &self.sync_donating
+      && d.checkpoint_op == m.checkpoint_op()
+      && d.checkpoint_id == m.checkpoint_id()
+    {
+      self.ship_sync_chunk(m.replica(), m.nonce(), m.offset());
+      return;
     }
     if self.checkpoint_op.get() == 0 {
       return; // nothing durable to serve — silent.

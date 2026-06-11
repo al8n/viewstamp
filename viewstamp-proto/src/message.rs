@@ -35,12 +35,14 @@ const ENCODE_HEADER_LEN: usize = 2 + 1;
 /// The `u32` length prefix [`crate::codec::write_bytes_u32`] writes before a `Bytes` payload.
 const BYTES_LEN_PREFIX: usize = 4;
 
+#[cfg(feature = "tcp")]
 /// Fixed bytes a [`Request`] encoding wraps around its body: the [`ENCODE_HEADER_LEN`] message header,
 /// then `client` (`u128`) + `request` (`u64`), then the body's [`BYTES_LEN_PREFIX`]. So a body of `b`
 /// bytes encodes to `REQUEST_ENCODE_OVERHEAD + b`. Derived from the exact widths
 /// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::Request`] arm.
 pub const REQUEST_ENCODE_OVERHEAD: usize = ENCODE_HEADER_LEN + 16 + 8 + BYTES_LEN_PREFIX;
 
+#[cfg(feature = "tcp")]
 /// Fixed bytes a [`Prepare`] encoding wraps around the SAME client body once the primary replicates it
 /// to backups: the [`ENCODE_HEADER_LEN`] message header, then `view` + `op` + `commit` + `checkpoint_op`
 /// (four `u64`s) + `client` (`u128`) + `request` (`u64`), then the body's [`BYTES_LEN_PREFIX`]. So the
@@ -96,6 +98,7 @@ const LOG_COUNT_PREFIX: usize = 4;
 pub(crate) const REPAIR_BATCH_CARRIER_OVERHEAD: usize =
   ENCODE_HEADER_LEN + 8 + 8 + 8 + LOG_COUNT_PREFIX;
 
+#[cfg(feature = "tcp")]
 /// Fixed bytes a [`RepairBatch`] encoding wraps around ONE client body when that body is the sole
 /// [`Body::Present`] entry served: the [`REPAIR_BATCH_CARRIER_OVERHEAD`] carrier framing plus one
 /// [`LOG_ENTRY_BODY_OVERHEAD`] per-entry framing. Since the view-change log carriers are
@@ -117,6 +120,7 @@ const REPAIR_BATCH_BODY_OVERHEAD: usize = REPAIR_BATCH_CARRIER_OVERHEAD + LOG_EN
 pub(crate) const PREPARE_BATCH_CARRIER_OVERHEAD: usize =
   ENCODE_HEADER_LEN + 8 + 8 + 8 + LOG_COUNT_PREFIX;
 
+#[cfg(feature = "tcp")]
 /// Fixed bytes a [`PrepareBatch`] encoding wraps around ONE client body when that body is the sole
 /// [`Body::Present`] entry retransmitted: the [`PREPARE_BATCH_CARRIER_OVERHEAD`] carrier framing
 /// plus one [`LOG_ENTRY_BODY_OVERHEAD`] per-entry framing — byte-identical to
@@ -194,11 +198,13 @@ pub(crate) const PER_HEADER_ENTRY_BYTES: usize = 8 + 16 + 8 + 1 + 16;
 pub(crate) const MAX_HEADER_ONLY_BAND_DEPTH: usize =
   (MAX_FRAME_LEN as usize - 64) / PER_HEADER_ENTRY_BYTES;
 
+#[cfg(feature = "tcp")]
 /// `const` max of two `usize`s ([`usize::max`] is not yet `const` in this MSRV).
 const fn max_usize(a: usize, b: usize) -> usize {
   if a > b { a } else { b }
 }
 
+#[cfg(feature = "tcp")]
 /// The WORST-CASE encoding overhead a single client request body incurs over EVERY message that carries
 /// it on its way through the cluster, so a body bounded by `MAX_FRAME_LEN - MAX_REQUEST_BODY_OVERHEAD`
 /// encodes to at most the frame cap on its tightest carrier and is therefore deliverable on every hop it

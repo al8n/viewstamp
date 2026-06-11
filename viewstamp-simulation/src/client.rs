@@ -186,15 +186,14 @@ impl ClientModel {
 
   /// Handles a reply: if it matches the in-flight request, record it and advance.
   pub fn handle(&mut self, msg: Message) {
-    if let Message::Reply(r) = msg {
-      if let Some(req) = &self.inflight {
-        if req.request() == r.request() {
-          self.replies.push((r.request().get(), r.body_bytes()));
-          self.inflight = None;
-          self.last_sent = None;
-          self.next_request += 1;
-        }
-      }
+    if let Message::Reply(r) = msg
+      && let Some(req) = &self.inflight
+      && req.request() == r.request()
+    {
+      self.replies.push((r.request().get(), r.body_bytes()));
+      self.inflight = None;
+      self.last_sent = None;
+      self.next_request += 1;
     }
   }
 }

@@ -119,17 +119,17 @@ jobs:
           cargo build --target ${{ matrix.target }}
 
   # Prove the declared MSRV (rust-version in every crate's Cargo.toml) actually compiles the
-  # feature set CI ships. The MSRV-aware resolver (workspace resolver = "3") picks 1.85-compatible
+  # feature set CI ships. The MSRV-aware resolver (workspace resolver = "3") picks 1.95-compatible
   # dependency versions on its own, so this is a plain check on the old toolchain: the workspace on
   # default features, plus viewstamp-proto with the full portable feature union (the powerset is
   # stable-toolchain territory in `build`/`test`; MSRV needs the additive union, exercised once).
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.95)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
-    - name: Install Rust 1.85
-      run: rustup toolchain install 1.85 --profile minimal && rustup default 1.85
+    - name: Install Rust 1.95
+      run: rustup toolchain install 1.95 --profile minimal && rustup default 1.95
     - name: Check the workspace on the MSRV
       run: cargo check --workspace
     - name: Check viewstamp-proto's portable feature union on the MSRV

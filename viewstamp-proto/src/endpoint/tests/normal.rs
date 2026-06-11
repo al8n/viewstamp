@@ -390,10 +390,10 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
   e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(5, 5));
   let mut premature = 0;
   while let Some(out) = e.poll_message() {
-    if let Message::PrepareOk(ok) = out.into_msg() {
-      if ok.op() == OpNumber::with(5) {
-        premature += 1;
-      }
+    if let Message::PrepareOk(ok) = out.into_msg()
+      && ok.op() == OpNumber::with(5)
+    {
+      premature += 1;
     }
   }
   assert_eq!(
@@ -422,10 +422,10 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
   e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(5, 5));
   let mut reacked = false;
   while let Some(out) = e.poll_message() {
-    if let Message::PrepareOk(ok) = out.into_msg() {
-      if ok.op() == OpNumber::with(5) {
-        reacked = true;
-      }
+    if let Message::PrepareOk(ok) = out.into_msg()
+      && ok.op() == OpNumber::with(5)
+    {
+      reacked = true;
     }
   }
   assert!(
@@ -961,10 +961,11 @@ fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
   while let Some(out) = e.poll_message() {
     // The hole arm solicits the contiguous run via the windowed `RequestPrepareRange` (here a
     // single-op range `[1,1]`, since `commit_max == 1` caps the band) rather than a per-op `RequestPrepare`.
-    if let Message::RequestPrepareRange(rp) = out.msg_ref() {
-      if rp.lo() <= OpNumber::with(1) && rp.hi() >= OpNumber::with(1) {
-        solicited = true;
-      }
+    if let Message::RequestPrepareRange(rp) = out.msg_ref()
+      && rp.lo() <= OpNumber::with(1)
+      && rp.hi() >= OpNumber::with(1)
+    {
+      solicited = true;
     }
   }
   assert!(

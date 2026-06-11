@@ -1308,24 +1308,24 @@ impl Vopr {
     }
 
     // (b) Crash a replica — only if the budget allows another knocked-out replica.
-    if self.prng.chance(1, 80) {
-      if let Some(i) = self.pick_crashable(c) {
-        if trace {
-          eprintln!("tick {tick}: CRASH replica {i}");
-        }
-        c.crash(i);
-        self.report.crashes += 1;
+    if self.prng.chance(1, 80)
+      && let Some(i) = self.pick_crashable(c)
+    {
+      if trace {
+        eprintln!("tick {tick}: CRASH replica {i}");
       }
+      c.crash(i);
+      self.report.crashes += 1;
     }
 
     // (c) Restart a previously-crashed replica (random timing, independent of calm windows).
-    if self.prng.chance(1, 60) {
-      if let Some(i) = self.pick_crashed(c) {
-        if trace {
-          eprintln!("tick {tick}: RESTART replica {i}");
-        }
-        self.restart_and_track(c, i);
+    if self.prng.chance(1, 60)
+      && let Some(i) = self.pick_crashed(c)
+    {
+      if trace {
+        eprintln!("tick {tick}: RESTART replica {i}");
       }
+      self.restart_and_track(c, i);
     }
 
     // (c') WIPE-and-restart a crashed replica (the amnesia axis): it comes back with FRESH, EMPTY
@@ -1337,26 +1337,28 @@ impl Vopr {
     // judge the outcome. The chance draw fires UNCONDITIONALLY on a wipe-enabled run (budget checked
     // after), and `wipe_actions` advances whether or not `VOPR_NO_WIPE` downgrades the effect to a
     // plain restart, so a masked shrink run keeps the exact same schedule + stream.
-    if self.wipe_axis && self.prng.chance(1, 40) && self.wipe_actions < WIPE_BUDGET {
-      if let Some(i) = self.pick_crashed(c) {
-        self.wipe_actions += 1;
-        if env_flag("VOPR_NO_WIPE") {
-          if trace {
-            eprintln!("tick {tick}: WIPE replica {i} (masked: plain restart)");
-          }
-          self.restart_and_track(c, i);
-        } else {
-          if trace {
-            eprintln!("tick {tick}: WIPE replica {i} (fresh storage)");
-          }
-          c.wipe_and_restart(i);
-          self.report.restarts += 1;
-          self.report.wipes_fired += 1;
-          // The stateful checkers' per-replica baselines (durable view, checkpoint high-water) are
-          // forfeit with the disk; queue the notice so `check_invariants` resets them BEFORE the
-          // next observation. Cluster-level invariants are NOT relaxed there.
-          self.wiped_pending.push(i);
+    if self.wipe_axis
+      && self.prng.chance(1, 40)
+      && self.wipe_actions < WIPE_BUDGET
+      && let Some(i) = self.pick_crashed(c)
+    {
+      self.wipe_actions += 1;
+      if env_flag("VOPR_NO_WIPE") {
+        if trace {
+          eprintln!("tick {tick}: WIPE replica {i} (masked: plain restart)");
         }
+        self.restart_and_track(c, i);
+      } else {
+        if trace {
+          eprintln!("tick {tick}: WIPE replica {i} (fresh storage)");
+        }
+        c.wipe_and_restart(i);
+        self.report.restarts += 1;
+        self.report.wipes_fired += 1;
+        // The stateful checkers' per-replica baselines (durable view, checkpoint high-water) are
+        // forfeit with the disk; queue the notice so `check_invariants` resets them BEFORE the
+        // next observation. Cluster-level invariants are NOT relaxed there.
+        self.wiped_pending.push(i);
       }
     }
 
@@ -2025,10 +2027,10 @@ impl Vopr {
     // Genuine-WRAP witness: a BOUNDED seed whose committed history exceeded its ring size `N` has had an
     // op `K + N` physically reuse op `K`'s slot — the ring truly wrapped (not merely filled). Latches
     // once true. Trivially false on an unbounded seed (`wal_capacity` is `None`).
-    if let Some(n) = self.wal_capacity {
-      if (self.report.max_committed as u64) > n {
-        self.report.bounded_seed_wrapped = true;
-      }
+    if let Some(n) = self.wal_capacity
+      && (self.report.max_committed as u64) > n
+    {
+      self.report.bounded_seed_wrapped = true;
     }
     // Frame-cap axis high-waters: how many LARGE bodies the clients have minted (non-vacuity — the cap
     // must be exercised), and how many inter-replica messages the network has oversized-dropped (which

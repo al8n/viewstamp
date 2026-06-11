@@ -2,7 +2,7 @@
 name = "viewstamp-simulation"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 repository = "https://github.com/al8n/viewstamp"
 license = "MIT OR Apache-2.0"
 description = "Deterministic simulation testing harness for viewstamp-proto"

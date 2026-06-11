@@ -1853,10 +1853,11 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   while let Some(out) = r.poll_message() {
     // The hole arm solicits the contiguous run via the windowed `RequestPrepareRange` (a single-op
     // range `[2,2]` here) rather than a per-op `RequestPrepare`.
-    if let Message::RequestPrepareRange(rp) = out.into_msg() {
-      if rp.lo() <= OpNumber::with(2) && rp.hi() >= OpNumber::with(2) {
-        asked_for_2 = true;
-      }
+    if let Message::RequestPrepareRange(rp) = out.into_msg()
+      && rp.lo() <= OpNumber::with(2)
+      && rp.hi() >= OpNumber::with(2)
+    {
+      asked_for_2 = true;
     }
   }
   assert!(
@@ -3566,10 +3567,11 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
   while let Some(out) = e.poll_message() {
     // The hole arm solicits the contiguous run via the windowed `RequestPrepareRange` (a single-op
     // range `[2,2]` here) rather than a per-op `RequestPrepare`.
-    if let Message::RequestPrepareRange(r) = out.msg_ref() {
-      if r.lo() <= OpNumber::with(2) && r.hi() >= OpNumber::with(2) {
-        solicited_op2 = true;
-      }
+    if let Message::RequestPrepareRange(r) = out.msg_ref()
+      && r.lo() <= OpNumber::with(2)
+      && r.hi() >= OpNumber::with(2)
+    {
+      solicited_op2 = true;
     }
   }
   assert!(
@@ -3825,10 +3827,10 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
   let premature_ack = {
     let mut found = false;
     while let Some(out) = e.poll_message() {
-      if let Message::PrepareOk(ok) = out.msg_ref() {
-        if ok.op() == OpNumber::with(danger) {
-          found = true;
-        }
+      if let Message::PrepareOk(ok) = out.msg_ref()
+        && ok.op() == OpNumber::with(danger)
+      {
+        found = true;
       }
     }
     found

@@ -197,16 +197,16 @@ impl<S: StateMachine> Endpoint<S> {
       }
     };
     // Durable-view write? (matched first; its OpId never aliases a checkpoint write's.)
-    if let Some((pending_id, action)) = self.pending_sb {
-      if pending_id == id {
-        self.pending_sb = None;
-        match action {
-          PendingSbAction::SendDoViewChange => self.send_do_view_change(now),
-          PendingSbAction::StartViewAsPrimary => self.start_view_participate(now, sb),
-          PendingSbAction::AdoptedStartView => self.start_view_acks(wal),
-        }
-        return;
+    if let Some((pending_id, action)) = self.pending_sb
+      && pending_id == id
+    {
+      self.pending_sb = None;
+      match action {
+        PendingSbAction::SendDoViewChange => self.send_do_view_change(now),
+        PendingSbAction::StartViewAsPrimary => self.start_view_participate(now, sb),
+        PendingSbAction::AdoptedStartView => self.start_view_acks(wal),
       }
+      return;
     }
     // Checkpoint write? Distinguish the two steps by their own minted OpIds.
     if let Some(pc) = self.pending_checkpoint {

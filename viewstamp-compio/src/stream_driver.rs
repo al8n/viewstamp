@@ -625,10 +625,10 @@ where
           if let Some(redial) = conn.redial.as_mut() {
             redial.backoff = self.cfg.redial_backoff_base(); // validated: the next loss starts the schedule over
           }
-        } else if let Some(d) = conn.auth_deadline {
-          if now >= d {
-            expired.push(id);
-          }
+        } else if let Some(d) = conn.auth_deadline
+          && now >= d
+        {
+          expired.push(id);
         }
       }
     }

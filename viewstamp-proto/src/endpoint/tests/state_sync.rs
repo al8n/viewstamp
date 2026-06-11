@@ -2057,10 +2057,10 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
   );
   let mut saw_svc_view1 = false;
   while let Some(out) = ep.poll_message() {
-    if let Message::StartViewChange(svc) = out.into_msg() {
-      if svc.view().get() == 1 {
-        saw_svc_view1 = true;
-      }
+    if let Message::StartViewChange(svc) = out.into_msg()
+      && svc.view().get() == 1
+    {
+      saw_svc_view1 = true;
     }
   }
   assert!(

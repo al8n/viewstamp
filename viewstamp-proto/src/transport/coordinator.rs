@@ -123,10 +123,8 @@ where
       // queueing it on a conn that is immediately closed and discarded (black-holing the response
       // until a later pump). A conn with no standby still closes and the response is dropped, which
       // is correct: the peer is gone.
-      if peer_finished {
-        if let Some(conn) = self.router.conn_mut(id) {
-          let _ = conn.finalize();
-        }
+      if peer_finished && let Some(conn) = self.router.conn_mut(id) {
+        let _ = conn.finalize();
       }
       // Pump after each chunk so the endpoint's outgoing backlog, drained into a transient Vec by
       // pump, is bounded to one chunk's responses rather than the whole read.
@@ -196,10 +194,10 @@ where
     from: Peer,
     msg: Message,
   ) {
-    if let Message::Request(r) = &msg {
-      if r.body().len() > super::frame::max_request_body_len() {
-        return;
-      }
+    if let Message::Request(r) = &msg
+      && r.body().len() > super::frame::max_request_body_len()
+    {
+      return;
     }
     self.endpoint.handle_message(now, wal, sb, from, msg);
   }

@@ -548,10 +548,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     from: Peer,
     msg: Message,
   ) {
-    if let Message::Request(r) = &msg {
-      if r.body().len() > crate::transport::frame::max_request_body_len() {
-        return;
-      }
+    if let Message::Request(r) = &msg
+      && r.body().len() > crate::transport::frame::max_request_body_len()
+    {
+      return;
     }
     self.endpoint.handle_message(now, wal, sb, from, msg);
     #[cfg(test)]

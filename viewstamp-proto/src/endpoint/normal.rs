@@ -1130,10 +1130,10 @@ impl<S: StateMachine> Endpoint<S> {
     // truncation re-minted for a different request (even one whose body bytes match), or a backup
     // holding a different operation at the same op number — so DROP it (do not OR the vote). Without
     // this, such a stale ack could forge a quorum for an operation the primary never drove → divergence.
-    if let Some(inflight) = self.inflight.get_mut(&ok.op().get()) {
-      if ok.prepare_checksum() == inflight.prepare_checksum {
-        inflight.oks |= 1u64 << ok.replica().get();
-      }
+    if let Some(inflight) = self.inflight.get_mut(&ok.op().get())
+      && ok.prepare_checksum() == inflight.prepare_checksum
+    {
+      inflight.oks |= 1u64 << ok.replica().get();
     }
     self.try_commit(now, sb);
   }
