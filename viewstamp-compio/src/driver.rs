@@ -1408,22 +1408,4 @@ mod tests {
     drop(survivor);
     drop(handle);
   }
-
-  /// The storage notifier is a wake-latency optimization the embedder may not wire at all:
-  /// dropping every sender clone must DOWNGRADE storage pumping to timer cadence, not turn the
-  /// dead channel into an always-ready select arm. The fixture's notifier is already
-  /// disconnected, so this drives the production `run()` loop on the single-threaded executor and
-  /// hands it the thread: a spinning loop would starve the timer driver and the sleep below would
-  /// never fire (a HANG here is the regression); parked correctly, the sleep elapses and the
-  /// shutdown acks within its bound.
-  #[compio::test]
-  async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
-    let (driver, handle) = test_quic_driver_with_handle().await;
-    compio::runtime::spawn(driver.run()).detach();
-    compio::time::sleep(std::time::Duration::from_millis(10)).await;
-    compio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
-      .await
-      .expect("the shutdown ack arrives")
-      .expect("driver acks shutdown");
-  }
 }

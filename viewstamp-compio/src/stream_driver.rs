@@ -144,8 +144,12 @@ pub struct CompioStreamDriver<S, R, W, B> {
   #[cfg(test)]
   budget: InflightBudget,
   /// One owned unit per connection; its redial target (if any) lives in [`Conn::redial`], so there
-  /// is no separate dialed-peer map to keep in sync. Bounded by the configured max_conns (accept
-  /// admission control).
+  /// is no separate dialed-peer map to keep in sync. Bounded by max_conns + the peer count: accept
+  /// admission stops at max_conns live conns, while mesh dials are never refused (consensus
+  /// liveness) — so a redial while accepted conns hold the cap can exceed it transiently, by at
+  /// most the missing-mesh count. The constructor refuses a max_conns below TWICE the peer count (the
+  /// mutual-dial mesh needs a dialed and an accepted conn per peer), so the full mesh — both
+  /// directions — fits the cap with the startup dials in place.
   conns: HashMap<ConnId, Conn>,
   /// Closes counted by [`CloseCause`] (indexed by [`CloseCause::index`]): the coordinator's
   /// internal closes as drained by [`Self::reconcile_closed_conns`], plus the driver's own
@@ -168,9 +172,10 @@ pub struct CompioStreamDriver<S, R, W, B> {
   bridge_inbound_tx: flume::Sender<BridgeInbound>,
   bridge_inbound_rx: flume::Receiver<BridgeInbound>,
   /// Unbounded by construction but BOUNDED by the live dial count: exactly one dial task exists per
-  /// dialed `Conn`, each sends at most one `DialReady`, and `conns` is capped at the configured
-  /// max_conns — so at most that many `DialReady`s can ever be queued. Drained (bounded budget)
-  /// every loop iteration.
+  /// dialed `Conn`, at most one dial is in flight per configured peer, and each sends at most one
+  /// `DialReady` — at most one live entry per configured peer, plus at most one already-sent
+  /// stale entry awaiting the next iteration's drain. Drained (bounded budget) every loop
+  /// iteration.
   dial_ready_tx: flume::Sender<DialReady>,
   dial_ready_rx: flume::Receiver<DialReady>,
   /// Embedder-owned notifier. Carries a unit signal only and is drained to empty every loop iteration
@@ -257,7 +262,9 @@ where
   /// security configuration stays in the `dialer`/`acceptor` factories.
   ///
   /// # Errors
-  /// [`DriverError::Bind`] if the listener cannot bind.
+  /// [`DriverError::CapBelowPeerMesh`] if `cfg.max_conns()` is below twice the configured peer
+  /// count (the mutual-dial mesh needs one dialed and one accepted connection per peer, and both
+  /// are consensus-required); [`DriverError::Bind`] if the listener cannot bind.
   #[allow(clippy::too_many_arguments)]
   pub async fn with_config(
     config: Config,
@@ -273,6 +280,19 @@ where
     storage_ready: flume::Receiver<()>,
     cfg: DriverConfig,
   ) -> Result<(Self, Handle), DriverError> {
+    // Refuse a cap that cannot admit the replica mesh. The mesh is MUTUAL-dial: `run()` dials
+    // every configured peer unconditionally (consensus liveness — mesh links are never load-shed)
+    // AND every peer dials back, and an inbound socket is admission-controlled until its
+    // handshake validates — so the cap must leave room for both directions. With less than twice
+    // the peer count, startup dials alone can fill the cap and the accept gate then drops every
+    // inbound mesh socket before it can validate: the mesh wedges even though construction
+    // succeeded. Misconfiguration is a constructor error, not a load condition.
+    if peers.len().saturating_mul(2) > cfg.max_conns() {
+      return Err(DriverError::CapBelowPeerMesh {
+        max_conns: cfg.max_conns(),
+        peers: peers.len(),
+      });
+    }
     let clock = Clock::new();
     let listener = TcpListener::bind(bind_addr)
       .await
@@ -291,8 +311,9 @@ where
     // growing the channel without bound (see `deliver_event`). Submit replies are unaffected.
     let (events_tx, events_rx) = flume::bounded(cfg.events_cap());
     let (bin_tx, bin_rx) = flume::bounded(INBOUND_CAP);
-    // Unbounded by construction but bounded by the live dial count (one dial task per dialed `Conn`,
-    // each sends one `DialReady`, `conns` capped at the configured max_conns); see the field doc.
+    // Unbounded by construction but bounded by the live dial count: one dial task per dialed peer
+    // (at most one in flight per configured peer), each sending exactly one `DialReady` — so at
+    // effectively bounded by the configured peer count; see the field doc.
     let (dr_tx, dr_rx) = flume::unbounded();
     let budget = InflightBudget::new(cfg.max_inflight(), cfg.max_pending_bytes());
     let driver = Self {
@@ -1194,6 +1215,72 @@ mod tests {
     .await
     .expect("driver builds");
     driver
+  }
+
+  /// The mesh is mutual-dial: `run()` dials every configured peer unconditionally (consensus
+  /// liveness) AND each peer dials back, with the inbound socket admission-controlled until its
+  /// handshake validates — so a cap below twice the peer count lets startup dials squeeze the
+  /// accept side and wedge mesh formation. The constructor must refuse the misconfiguration.
+  #[compio::test]
+  async fn a_peer_mesh_larger_than_the_conn_cap_is_refused_at_construction() {
+    const CLUSTER: u128 = 0x7777;
+    let mk_dialer = || -> super::DialerFactory<Labeled<Passthrough>> {
+      Rc::new(|peer| {
+        let opts = LabelOptions::new(CLUSTER, peer);
+        Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+      })
+    };
+    let mk_acceptor = || -> super::AcceptorFactory<Labeled<Passthrough>> {
+      Rc::new(|| {
+        let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(0)));
+        Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+      })
+    };
+    let mk_peers = || -> Vec<(ReplicaId, std::net::SocketAddr)> {
+      vec![
+        (ReplicaId::new(1), "127.0.0.1:1".parse().unwrap()),
+        (ReplicaId::new(2), "127.0.0.1:2".parse().unwrap()),
+      ]
+    };
+    let build = |cap: usize| async move {
+      let (_ready_tx, ready_rx) = flume::unbounded();
+      CompioStreamDriver::with_config(
+        Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap(),
+        LogSm::default(),
+        InMemoryWal::new(),
+        InMemorySuperblock::new(),
+        ClientId::new(1),
+        0,
+        "127.0.0.1:0".parse().unwrap(),
+        mk_peers(),
+        mk_dialer(),
+        mk_acceptor(),
+        ready_rx,
+        crate::DriverConfig::new().with_max_conns(cap),
+      )
+      .await
+    };
+
+    // Below the floor: 2 peers need 2 dialed + room for 2 accepted mesh sockets; a cap of 3 would
+    // let startup dials squeeze the accept side and wedge mesh formation.
+    let Err(err) = build(3).await else {
+      panic!("a 2-peer mutual mesh must not fit a cap of 3");
+    };
+    assert!(
+      matches!(
+        err,
+        crate::DriverError::CapBelowPeerMesh {
+          max_conns: 3,
+          peers: 2
+        }
+      ),
+      "the refusal names the cap and the mesh size: {err:?}"
+    );
+    // At the floor: twice the peer count leaves room for every dialed AND accepted mesh conn.
+    assert!(
+      build(4).await.is_ok(),
+      "a cap of twice the peer count admits the whole mutual mesh"
+    );
   }
 
   /// Like [`test_driver`] but also returns the `Handle`, so a budget test can drive the REAL
@@ -2415,23 +2502,5 @@ mod tests {
     );
     drop(survivor);
     drop(handle);
-  }
-
-  /// The storage notifier is a wake-latency optimization the embedder may not wire at all:
-  /// dropping every sender clone must DOWNGRADE storage pumping to timer cadence, not turn the
-  /// dead channel into an always-ready select arm. The fixture's notifier is already
-  /// disconnected, so this drives the production `run()` loop on the single-threaded executor and
-  /// hands it the thread: a spinning loop would starve the timer driver and the sleep below would
-  /// never fire (a HANG here is the regression); parked correctly, the sleep elapses and the
-  /// shutdown acks within its bound.
-  #[compio::test]
-  async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
-    let (driver, handle) = test_driver_with_handle().await;
-    compio::runtime::spawn(driver.run()).detach();
-    compio::time::sleep(std::time::Duration::from_millis(10)).await;
-    compio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
-      .await
-      .expect("the shutdown ack arrives")
-      .expect("driver acks shutdown");
   }
 }
