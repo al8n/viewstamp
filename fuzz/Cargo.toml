@@ -1,0 +1,57 @@
+[package]
+name = "viewstamp-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace, deliberately OUTSIDE the root one (the root Cargo.toml also excludes it):
+# the fuzz binaries need nightly + libFuzzer instrumentation and must not join the stable
+# feature-powerset sweeps.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.viewstamp-proto]
+path = "../viewstamp-proto"
+features = ["std", "tcp"]
+
+# Supplies the in-memory Wal/Superblock fixtures + LogSm the stream_ingress harness drives the
+# coordinator with — the same fixtures the simulator and the driver tests use.
+[dependencies.viewstamp-simulation]
+path = "../viewstamp-simulation"
+
+[[bin]]
+name = "message_decode"
+path = "fuzz_targets/message_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_ingress"
+path = "fuzz_targets/stream_ingress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "superblock_decode"
+path = "fuzz_targets/superblock_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Not a fuzz target: regenerates the seed corpus from the crate's own encoders.
+# Run from this directory: cargo run --bin corpus_gen
+[[bin]]
+name = "corpus_gen"
+path = "src/bin/corpus_gen.rs"
+test = false
+doc = false
+bench = false

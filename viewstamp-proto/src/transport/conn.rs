@@ -8,9 +8,9 @@ use std::vec::Vec;
 
 use crate::{Instant, Message, Peer};
 
-use super::TransportError;
 use super::frame::{FrameDecoder, MAX_FRAME_LEN};
 use super::stream::{Intake, StreamTransport};
+use super::{CloseCause, TransportError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -19,8 +19,10 @@ enum State {
   Handshaking,
   /// Identity validated and bound; application frames flow.
   Validated,
-  /// Terminal: no I/O of any kind, awaiting reap.
-  Closed,
+  /// Terminal: no I/O of any kind, awaiting reap. Carries WHY the conn closed, recorded at the
+  /// transition itself so every close has a cause by construction — the router's reap reads it out
+  /// for the driver without any close path having to thread an error value through.
+  Closed(CloseCause),
 }
 
 /// A long-lived per-peer connection: drives the record layer, frames `Message`s, and gates all
@@ -52,7 +54,16 @@ impl<R: StreamTransport> Conn<R> {
   /// True once this conn is terminal.
   #[cfg_attr(not(tarpaulin), inline)]
   pub(crate) const fn is_closed(&self) -> bool {
-    matches!(self.state, State::Closed)
+    matches!(self.state, State::Closed(_))
+  }
+
+  /// Why this conn closed — `Some` iff it is terminal (the cause rides the `Closed` state).
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub(crate) const fn close_cause(&self) -> Option<CloseCause> {
+    match self.state {
+      State::Closed(cause) => Some(cause),
+      _ => None,
+    }
   }
 
   /// True once the conn's identity has been validated and bound (application frames flow).
@@ -84,16 +95,16 @@ impl<R: StreamTransport> Conn<R> {
     }
   }
 
-  /// Aborts the conn: discards queued outbound and makes it terminal.
-  pub(crate) fn abort(&mut self) {
+  /// Aborts the conn for `cause`: discards queued outbound and makes it terminal.
+  pub(crate) fn abort(&mut self, cause: CloseCause) {
     self.r.clear_outbound();
-    self.state = State::Closed;
+    self.state = State::Closed(cause);
   }
 
   /// Forces the closed state, for tests of the router's canonical-conn discipline.
   #[cfg(test)]
   pub(crate) fn mark_closed_for_test(&mut self) {
-    self.state = State::Closed;
+    self.state = State::Closed(CloseCause::PeerClosed);
   }
 
   /// Feeds one inbound transport read: advances the record layer and buffers decrypted plaintext.
@@ -107,19 +118,19 @@ impl<R: StreamTransport> Conn<R> {
     eof: bool,
     now: Instant,
   ) -> Result<bool, TransportError> {
-    if matches!(self.state, State::Closed) {
+    if self.is_closed() {
       return Ok(true);
     }
     let mut off = 0;
     loop {
       match self.r.handle_transport_data(&bytes[off..], now) {
         Intake::Failed => {
-          self.state = State::Closed;
+          self.state = State::Closed(CloseCause::RecordRejected);
           return Err(TransportError::RecordRejected);
         }
         Intake::Done => {
           if let Err(e) = self.buffer_plaintext() {
-            self.state = State::Closed;
+            self.state = State::Closed(CloseCause::from(&e));
             return Err(e);
           }
           break;
@@ -129,13 +140,13 @@ impl<R: StreamTransport> Conn<R> {
           let drained = match self.buffer_plaintext() {
             Ok(d) => d,
             Err(e) => {
-              self.state = State::Closed;
+              self.state = State::Closed(CloseCause::from(&e));
               return Err(e);
             }
           };
           if n == 0 && !drained {
             if self.r.is_handshaking() {
-              self.state = State::Closed;
+              self.state = State::Closed(CloseCause::RecordRejected);
               return Err(TransportError::RecordRejected);
             }
             break;
@@ -169,14 +180,15 @@ impl<R: StreamTransport> Conn<R> {
   /// Finalizes a peer-finished conn AFTER its complete buffered frames have been drained: closes it,
   /// reporting truncation only if a partial frame remains.
   pub(crate) fn finalize(&mut self) -> Result<(), TransportError> {
-    if matches!(self.state, State::Closed) {
+    if self.is_closed() {
       return Ok(());
     }
     let remaining = self.decoder.partial_len();
-    self.state = State::Closed;
     if remaining > 0 {
+      self.state = State::Closed(CloseCause::TruncatedFrame);
       Err(TransportError::TruncatedFrame { remaining })
     } else {
+      self.state = State::Closed(CloseCause::PeerClosed);
       Ok(())
     }
   }
@@ -199,8 +211,9 @@ impl<R: StreamTransport> Conn<R> {
       match Message::decode(&frame) {
         Ok(msg) => out.push((from, msg)),
         Err(e) => {
-          self.state = State::Closed;
-          return Err(TransportError::from(e));
+          let e = TransportError::from(e);
+          self.state = State::Closed(CloseCause::from(&e));
+          return Err(e);
         }
       }
     }
@@ -223,7 +236,7 @@ impl<R: StreamTransport> Conn<R> {
     }
     let accepted = self.r.write_plaintext(framed);
     if accepted < framed.len() {
-      self.state = State::Closed;
+      self.state = State::Closed(CloseCause::OutboundOverflow);
       return true;
     }
     false
@@ -249,7 +262,7 @@ impl<R: StreamTransport> Conn<R> {
   /// Drains queued outbound wire bytes (handshake bytes flow while `Handshaking`; nothing once
   /// `Closed`). The record layer drains everything to the driver.
   pub(crate) fn poll_transmit(&mut self, out: &mut Vec<u8>) -> usize {
-    if matches!(self.state, State::Closed) {
+    if self.is_closed() {
       return 0;
     }
     self.r.poll_transport_transmit(out)

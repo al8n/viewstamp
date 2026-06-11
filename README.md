@@ -3,31 +3,134 @@
 </div>
 <div align="center">
 
-A template for creating Rust open-source GitHub repo.
+Pure-Rust Viewstamped Replication: a Sans-I/O consensus state machine, QUIC and TCP+TLS transports, real-I/O drivers, and a deterministic adversarial simulator.
 
 [<img alt="github" src="https://img.shields.io/badge/github-al8n/viewstamp-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fviewstamp" height="22">
 [<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/al8n/viewstamp/ci.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
 [<img alt="codecov" src="https://img.shields.io/codecov/c/gh/al8n/viewstamp?style=for-the-badge&token=6R3QFWRWHL&logo=codecov" height="22">][codecov-url]
-
-[<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-viewstamp-66c2a5?style=for-the-badge&labelColor=555555&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDUxMiA1MTIiPjxwYXRoIGZpbGw9IiNmNWY1ZjUiIGQ9Ik00ODguNiAyNTAuMkwzOTIgMjE0VjEwNS41YzAtMTUtOS4zLTI4LjQtMjMuNC0zMy43bC0xMDAtMzcuNWMtOC4xLTMuMS0xNy4xLTMuMS0yNS4zIDBsLTEwMCAzNy41Yy0xNC4xIDUuMy0yMy40IDE4LjctMjMuNCAzMy43VjIxNGwtOTYuNiAzNi4yQzkuMyAyNTUuNSAwIDI2OC45IDAgMjgzLjlWMzk0YzAgMTMuNiA3LjcgMjYuMSAxOS45IDMyLjJsMTAwIDUwYzEwLjEgNS4xIDIyLjEgNS4xIDMyLjIgMGwxMDMuOS01MiAxMDMuOSA1MmMxMC4xIDUuMSAyMi4xIDUuMSAzMi4yIDBsMTAwLTUwYzEyLjItNi4xIDE5LjktMTguNiAxOS45LTMyLjJWMjgzLjljMC0xNS05LjMtMjguNC0yMy40LTMzLjd6TTM1OCAyMTQuOGwtODUgMzEuOXYtNjguMmw4NS0zN3Y3My4zek0xNTQgMTA0LjFsMTAyLTM4LjIgMTAyIDM4LjJ2LjZsLTEwMiA0MS40LTEwMi00MS40di0uNnptODQgMjkxLjFsLTg1IDQyLjV2LTc5LjFsODUtMzguOHY3NS40em0wLTExMmwtMTAyIDQxLjQtMTAyLTQxLjR2LS42bDEwMi0zOC4yIDEwMiAzOC4ydi42em0yNDAgMTEybC04NSA0Mi41di03OS4xbDg1LTM4Ljh2NzUuNHptMC0xMTJsLTEwMiA0MS40LTEwMi00MS40di0uNmwxMDItMzguMiAxMDIgMzguMnYuNnoiPjwvcGF0aD48L3N2Zz4K" height="20">][doc-url]
-[<img alt="crates.io" src="https://img.shields.io/crates/v/viewstamp?style=for-the-badge&logo=data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pg0KPCEtLSBHZW5lcmF0b3I6IEFkb2JlIElsbHVzdHJhdG9yIDE5LjAuMCwgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246IDYuMDAgQnVpbGQgMCkgIC0tPg0KPHN2ZyB2ZXJzaW9uPSIxLjEiIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB4PSIwcHgiIHk9IjBweCINCgkgdmlld0JveD0iMCAwIDUxMiA1MTIiIHhtbDpzcGFjZT0icHJlc2VydmUiPg0KPGc+DQoJPGc+DQoJCTxwYXRoIGQ9Ik0yNTYsMEwzMS41MjgsMTEyLjIzNnYyODcuNTI4TDI1Niw1MTJsMjI0LjQ3Mi0xMTIuMjM2VjExMi4yMzZMMjU2LDB6IE0yMzQuMjc3LDQ1Mi41NjRMNzQuOTc0LDM3Mi45MTNWMTYwLjgxDQoJCQlsMTU5LjMwMyw3OS42NTFWNDUyLjU2NHogTTEwMS44MjYsMTI1LjY2MkwyNTYsNDguNTc2bDE1NC4xNzQsNzcuMDg3TDI1NiwyMDIuNzQ5TDEwMS44MjYsMTI1LjY2MnogTTQzNy4wMjYsMzcyLjkxMw0KCQkJbC0xNTkuMzAzLDc5LjY1MVYyNDAuNDYxbDE1OS4zMDMtNzkuNjUxVjM3Mi45MTN6IiBmaWxsPSIjRkZGIi8+DQoJPC9nPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPC9zdmc+DQo=" height="22">][crates-url]
-[<img alt="crates.io" src="https://img.shields.io/crates/d/viewstamp?color=critical&logo=data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBzdGFuZGFsb25lPSJubyI/PjwhRE9DVFlQRSBzdmcgUFVCTElDICItLy9XM0MvL0RURCBTVkcgMS4xLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL0dyYXBoaWNzL1NWRy8xLjEvRFREL3N2ZzExLmR0ZCI+PHN2ZyB0PSIxNjQ1MTE3MzMyOTU5IiBjbGFzcz0iaWNvbiIgdmlld0JveD0iMCAwIDEwMjQgMTAyNCIgdmVyc2lvbj0iMS4xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHAtaWQ9IjM0MjEiIGRhdGEtc3BtLWFuY2hvci1pZD0iYTMxM3guNzc4MTA2OS4wLmkzIiB3aWR0aD0iNDgiIGhlaWdodD0iNDgiIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIj48ZGVmcz48c3R5bGUgdHlwZT0idGV4dC9jc3MiPjwvc3R5bGU+PC9kZWZzPjxwYXRoIGQ9Ik00NjkuMzEyIDU3MC4yNHYtMjU2aDg1LjM3NnYyNTZoMTI4TDUxMiA3NTYuMjg4IDM0MS4zMTIgNTcwLjI0aDEyOHpNMTAyNCA2NDAuMTI4QzEwMjQgNzgyLjkxMiA5MTkuODcyIDg5NiA3ODcuNjQ4IDg5NmgtNTEyQzEyMy45MDQgODk2IDAgNzYxLjYgMCA1OTcuNTA0IDAgNDUxLjk2OCA5NC42NTYgMzMxLjUyIDIyNi40MzIgMzAyLjk3NiAyODQuMTYgMTk1LjQ1NiAzOTEuODA4IDEyOCA1MTIgMTI4YzE1Mi4zMiAwIDI4Mi4xMTIgMTA4LjQxNiAzMjMuMzkyIDI2MS4xMkM5NDEuODg4IDQxMy40NCAxMDI0IDUxOS4wNCAxMDI0IDY0MC4xOTJ6IG0tMjU5LjItMjA1LjMxMmMtMjQuNDQ4LTEyOS4wMjQtMTI4Ljg5Ni0yMjIuNzItMjUyLjgtMjIyLjcyLTk3LjI4IDAtMTgzLjA0IDU3LjM0NC0yMjQuNjQgMTQ3LjQ1NmwtOS4yOCAyMC4yMjQtMjAuOTI4IDIuOTQ0Yy0xMDMuMzYgMTQuNC0xNzguMzY4IDEwNC4zMi0xNzguMzY4IDIxNC43MiAwIDExNy45NTIgODguODMyIDIxNC40IDE5Ni45MjggMjE0LjRoNTEyYzg4LjMyIDAgMTU3LjUwNC03NS4xMzYgMTU3LjUwNC0xNzEuNzEyIDAtODguMDY0LTY1LjkyLTE2NC45MjgtMTQ0Ljk2LTE3MS43NzZsLTI5LjUwNC0yLjU2LTUuODg4LTMwLjk3NnoiIGZpbGw9IiNmZmZmZmYiIHAtaWQ9IjM0MjIiIGRhdGEtc3BtLWFuY2hvci1pZD0iYTMxM3guNzc4MTA2OS4wLmkwIiBjbGFzcz0iIj48L3BhdGg+PC9zdmc+&style=for-the-badge" height="22">][crates-url]
-<img alt="license" src="https://img.shields.io/badge/License-Apache%202.0/MIT-blue.svg?style=for-the-badge&fontColor=white&logoColor=f5c076&logo=data:image/svg+xml;base64,PCFET0NUWVBFIHN2ZyBQVUJMSUMgIi0vL1czQy8vRFREIFNWRyAxLjEvL0VOIiAiaHR0cDovL3d3dy53My5vcmcvR3JhcGhpY3MvU1ZHLzEuMS9EVEQvc3ZnMTEuZHRkIj4KDTwhLS0gVXBsb2FkZWQgdG86IFNWRyBSZXBvLCB3d3cuc3ZncmVwby5jb20sIFRyYW5zZm9ybWVkIGJ5OiBTVkcgUmVwbyBNaXhlciBUb29scyAtLT4KPHN2ZyBmaWxsPSIjZmZmZmZmIiBoZWlnaHQ9IjgwMHB4IiB3aWR0aD0iODAwcHgiIHZlcnNpb249IjEuMSIgaWQ9IkNhcGFfMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmlld0JveD0iMCAwIDI3Ni43MTUgMjc2LjcxNSIgeG1sOnNwYWNlPSJwcmVzZXJ2ZSIgc3Ryb2tlPSIjZmZmZmZmIj4KDTxnIGlkPSJTVkdSZXBvX2JnQ2FycmllciIgc3Ryb2tlLXdpZHRoPSIwIi8+Cg08ZyBpZD0iU1ZHUmVwb190cmFjZXJDYXJyaWVyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KDTxnIGlkPSJTVkdSZXBvX2ljb25DYXJyaWVyIj4gPGc+IDxwYXRoIGQ9Ik0xMzguMzU3LDBDNjIuMDY2LDAsMCw2Mi4wNjYsMCwxMzguMzU3czYyLjA2NiwxMzguMzU3LDEzOC4zNTcsMTM4LjM1N3MxMzguMzU3LTYyLjA2NiwxMzguMzU3LTEzOC4zNTcgUzIxNC42NDgsMCwxMzguMzU3LDB6IE0xMzguMzU3LDI1OC43MTVDNzEuOTkyLDI1OC43MTUsMTgsMjA0LjcyMywxOCwxMzguMzU3UzcxLjk5MiwxOCwxMzguMzU3LDE4IHMxMjAuMzU3LDUzLjk5MiwxMjAuMzU3LDEyMC4zNTdTMjA0LjcyMywyNTguNzE1LDEzOC4zNTcsMjU4LjcxNXoiLz4gPHBhdGggZD0iTTE5NC43OTgsMTYwLjkwM2MtNC4xODgtMi42NzctOS43NTMtMS40NTQtMTIuNDMyLDIuNzMyYy04LjY5NCwxMy41OTMtMjMuNTAzLDIxLjcwOC0zOS42MTQsMjEuNzA4IGMtMjUuOTA4LDAtNDYuOTg1LTIxLjA3OC00Ni45ODUtNDYuOTg2czIxLjA3Ny00Ni45ODYsNDYuOTg1LTQ2Ljk4NmMxNS42MzMsMCwzMC4yLDcuNzQ3LDM4Ljk2OCwyMC43MjMgYzIuNzgyLDQuMTE3LDguMzc1LDUuMjAxLDEyLjQ5NiwyLjQxOGM0LjExOC0yLjc4Miw1LjIwMS04LjM3NywyLjQxOC0xMi40OTZjLTEyLjExOC0xNy45MzctMzIuMjYyLTI4LjY0NS01My44ODItMjguNjQ1IGMtMzUuODMzLDAtNjQuOTg1LDI5LjE1Mi02NC45ODUsNjQuOTg2czI5LjE1Miw2NC45ODYsNjQuOTg1LDY0Ljk4NmMyMi4yODEsMCw0Mi43NTktMTEuMjE4LDU0Ljc3OC0zMC4wMDkgQzIwMC4yMDgsMTY5LjE0NywxOTguOTg1LDE2My41ODIsMTk0Ljc5OCwxNjAuOTAzeiIvPiA8L2c+IDwvZz4KDTwvc3ZnPg==" height="22">
-
-English | [简体中文][zh-cn-url]
+<img alt="license" src="https://img.shields.io/badge/License-Apache%202.0/MIT-blue.svg?style=for-the-badge&fontColor=white&logoColor=f5c076" height="22">
 
 </div>
 
-## Installation
+`viewstamp` is a [Viewstamped Replication] consensus library in pure Rust. The protocol
+logic lives in a single Sans-I/O "super state machine" — modeled on `quinn-proto`: it
+takes events as inputs (`handle_*`) and emits actions as outputs (`poll_*`), owning no
+I/O, no clock, and no randomness source. [TigerBeetle]'s `src/vsr/replica.zig` is the
+correctness reference for the protocol logic, including its storage-fault model: WAL
+corruption (torn writes, bit-rot, misdirected reads) is part of the fault model, not an
+afterthought, and faults surface as data the protocol repairs from peers — never as
+panics.
 
-```toml
-[dependencies]
-template_rs = "0.1"
+## Threat model — non-Byzantine, crash-fault-tolerant
+
+viewstamp is **crash-fault-tolerant** for a **trusted** cluster, exactly like
+TigerBeetle — explicitly **not** Byzantine-fault-tolerant. It tolerates crash-stop
+failures, storage faults, and network partitions, assuming honest, authenticated
+participants. Authenticating a message's sender is the **driver's** job (the QUIC
+transport mandates cluster-private mTLS; the proto keeps a cheap sender-binding ingress
+backstop against a buggy or misrouting driver). Cryptographic message authentication
+against a genuinely malicious replica — signatures, BFT voting — is out of scope.
+
+## Workspace
+
+| Crate | What it is |
+|---|---|
+| [`viewstamp-proto`](viewstamp-proto) | The Sans-I/O consensus core (`no_std` + `alloc` capable), plus feature-gated Sans-I/O transports: `tcp` (length-prefixed framing + connection lifecycle + peer routing), `tls` (rustls record layer), `quic` (quinn-proto with mandatory cluster-private mTLS). |
+| [`viewstamp-compio`](viewstamp-compio) | Real-I/O drivers on the [compio] proactor runtime: a QUIC driver and a TCP/TLS stream driver. Generic over storage, state machine, and identity — they bundle no backend. |
+| [`viewstamp-simulation`](viewstamp-simulation) | The deterministic simulation harness + the VOPR adversarial sweep (see below). Also home of the in-memory `Wal`/`Superblock` fixtures. |
+| [`viewstamp-reactor`](viewstamp-reactor) | Placeholder for a reactor-style (tokio/async-io) driver. Empty today. |
+
+## Quickstart
+
+A runnable three-node cluster over real loopback TCP lives in
+[`viewstamp-compio/examples/three_node.rs`](viewstamp-compio/examples/three_node.rs):
+
+```sh
+cargo run -p viewstamp-compio --example three_node
 ```
 
-## Features
-- [x] Create a Rust open-source repo fast 
+It boots three in-process replicas, submits a few operations through a backup (which
+relays to the primary), prints the committed replies, and shuts down. The comments
+narrate each embedder obligation — storage, client identity, the driver handle — and the
+example uses the simulation crate's in-memory storage, which you replace with your
+durable implementation in production.
+
+## The embedder contract
+
+The proto owns no log and no disk: you supply a `Wal` (the operation log) and a
+`Superblock` (the durable root + checkpoints), and the consensus core orchestrates over
+them. The contracts those implementations must honor — completion-means-durable,
+writes-never-fault, header durability independent of bodies, crash-atomic serialized
+root writes, drain-in-flight-before-recover — are consolidated in the
+[`storage` module documentation](viewstamp-proto/src/storage.rs). Read that before
+writing a backend; each clause is load-bearing for committed-op survival.
+
+The state machine side is three methods (`apply` / `snapshot` / `restore`), required to
+be deterministic across replicas.
+
+## Validation: the VOPR
+
+The flagship test rig is a [VOPR-style] deterministic simulator
+(`viewstamp-simulation`): N endpoints + client models in one thread over a virtual
+network with a virtual clock and one seeded PRNG, so **a whole cluster run is a pure
+function of its seed** — any failure replays exactly.
+
+Each seed builds a fresh cluster (size 2–6) and explores a randomized adversarial
+schedule within the crash-stop fault model (a quorum always survives):
+
+- **Process faults** — crash + restart, with in-flight (un-fsynced) WAL appends
+  discarded at the crash boundary; a wipe lane where a crashed replica rejoins with an
+  empty disk.
+- **Network faults** — reorder, drop, duplicate, delay; a hold lane where messages are
+  held arbitrarily long and released late.
+- **Storage faults** — read faults, torn writes, bit-rot, misdirected reads (a read
+  returning a wrong-but-valid sibling slot), recover-time fault injection.
+- **Structural axes** — async WAL + async superblock completion windows, small and
+  large checkpoint intervals, and a physical bounded-WAL ring on a third of seeds
+  (stall-before-wrap, recovery off a wrapped ring).
+
+Safety, durability, view-monotonicity, boundedness, append-before-ack, and
+ring-residency invariants are checked every tick; liveness is judged over calm windows
+on virtual time. The committed CI gate sweeps seeds `0..64` plus a pinned list of every
+seed that ever caught a real bug; a nightly release-mode workflow sweeps `0..1024` (plus
+the hold lane) and is verified clean out to `0..2048`. To replay one seed:
+
+```sh
+VOPR_SEED=<seed> cargo test -p viewstamp-simulation --test vopr replay_single_seed -- --ignored --nocapture
+```
+
+Byte-decode surfaces (`Message`, the superblock root, the WAL header codec, the stream
+transport ingress) are additionally fuzzed under `cargo fuzz` (see [`fuzz/`](fuzz)).
+
+## Status
+
+Pre-0.1 and unpublished. The wire format and the on-disk formats are **unstable**:
+versions are checked and mismatches rejected, but there is no cross-version
+compatibility story yet — upgrades are flag-day. APIs will move.
+
+### Versioning and upgrades
+
+The wire protocol and the durable formats version **independently**, so a
+message-format change can never invalidate data already on disk:
+
+- **Messages** lead with `WIRE_VERSION`
+  ([`viewstamp-proto/src/codec.rs`](viewstamp-proto/src/codec.rs)) and decode by
+  **strict equality**: any other version is rejected as
+  `CodecError::UnknownVersion`, never reinterpreted.
+- **Durable formats** carry their own versions
+  ([`viewstamp-proto/src/storage.rs`](viewstamp-proto/src/storage.rs)): the
+  superblock root leads with `SUPERBLOCK_VERSION` and decodes by
+  **compatibility range** — the whole layout-compatible range
+  `1..=SUPERBLOCK_VERSION` is accepted, so a wire-only bump never strands a
+  persisted root — and each WAL slot header leads with its own `HEADER_VERSION`.
+
+Pre-1.0 the cluster upgrade story is **flag-day**: stop all replicas, upgrade all
+of them, restart. Mixed-version clusters are rejected at connect time — the
+transport handshake hello carries its own version byte, and a peer speaking a
+different `WIRE_VERSION` has its first frame fail to decode and its connection
+dropped. Rolling upgrades require wire-version negotiation (accept a range,
+speak the lowest common version), which is future work.
 
 #### License
 
@@ -40,7 +143,8 @@ Copyright (c) 2021 Al Liu.
 
 [Github-url]: https://github.com/al8n/viewstamp/
 [CI-url]: https://github.com/al8n/viewstamp/actions/workflows/ci.yml
-[doc-url]: https://docs.rs/viewstamp
-[crates-url]: https://crates.io/crates/viewstamp
 [codecov-url]: https://app.codecov.io/gh/al8n/viewstamp/
-[zh-cn-url]: https://github.com/al8n/viewstamp/tree/main/README-zh_CN.md
+[Viewstamped Replication]: https://pmg.csail.mit.edu/papers/vr-revisited.pdf
+[TigerBeetle]: https://github.com/tigerbeetle/tigerbeetle
+[VOPR-style]: https://docs.tigerbeetle.com/concepts/safety/
+[compio]: https://github.com/compio-rs/compio

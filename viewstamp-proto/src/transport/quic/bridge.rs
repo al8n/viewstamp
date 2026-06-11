@@ -121,6 +121,24 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 /// adds headroom above this; it never narrows the per-peer guarantee.
 const PER_PEER_CONN_LIMIT: usize = 3;
 
+/// `max_datagrams` per [`quinn_proto::Connection::poll_transmit`] call: quinn packs up to this many
+/// equal-`segment_size` datagrams into ONE `Transmit` (the last may be shorter), so a
+/// congestion-window's worth of consensus/state-transfer traffic drains in a handful of poll calls
+/// instead of one call per datagram. 10 matches the cap the quinn runtime itself uses
+/// (`MAX_TRANSMIT_SEGMENTS`): past that the per-call buffer grows for no measured gain. The bridge
+/// splits a multi-segment `Transmit` back into per-datagram payloads for `out`
+/// ([`transmit_segments`]), so drivers keep sending one UDP datagram per popped entry — GSO is not
+/// required of them.
+const MAX_TRANSMIT_DATAGRAMS: usize = 10;
+
+/// Split one `Transmit`'s contents into its on-the-wire UDP datagrams: every chunk is exactly
+/// `segment_size` bytes except the last, which may be shorter (quinn's GSO segment layout). A
+/// `segment_size` of 0 cannot come out of quinn (it is `t.size / num_datagrams`-derived and quinn
+/// never emits empty datagrams); the `max(1)` keeps `chunks` panic-free anyway.
+fn transmit_segments(contents: &[u8], segment_size: usize) -> std::slice::Chunks<'_, u8> {
+  contents.chunks(segment_size.max(1))
+}
+
 // The per-peer reap keeps `keep` + the `PER_PEER_CONN_LIMIT - 1` newest others; a limit of 0 would
 // underflow that "others budget" (the `saturating_sub(1)` guards it, but a 0 limit would also mean "keep
 // no connection per peer", which is nonsensical for a mesh). At least one is mandatory.
@@ -323,6 +341,15 @@ pub(crate) struct Bridge {
   /// abandoned): those reap inline. The disposition is recorded at fault time so the deferred close
   /// matches the framing decision made then, rather than being re-derived from the class alone.
   pending_fin_close: VecDeque<(ConnectionHandle, StreamClass, FinDisposition)>,
+  /// Deferred-service marker for the per-MESSAGE write path: [`Self::write_framed`] sets this
+  /// instead of running a full `service` pass per message — the coordinator's `pump` routes every
+  /// outgoing message through `write_framed` before its single unconditional pump-end `service`
+  /// (the module-doc wakeup invariant), so a per-message pass would be O(messages × connections)
+  /// of redundant quinn polling per pump. That pump-end `service` consumes the flag (clears it on
+  /// entry) and collects everything the writes staged, including a Bulk-overflow `RESET_STREAM`.
+  /// White-box tests that drive `write_framed` directly (no coordinator pump follows) flush via
+  /// [`Self::service_if_deferred`], which runs a pass exactly when this is set.
+  needs_service: bool,
   /// Test-only: when set, [`Self::service`] skips the `poll_endpoint_events`
   /// drain (step 2). The negative control sets this to prove the flag gates the
   /// drain — with it set, `endpoint_events_processed` stays zero.
@@ -339,12 +366,21 @@ pub(crate) struct Bridge {
 
 impl Bridge {
   /// Build a bridge from `opts`. `rng_seed` seeds the endpoint's connection-ID
-  /// / token RNG (`None` = OS entropy). MTU discovery is disabled.
+  /// / token RNG (`None` = OS entropy).
+  ///
+  /// MTU discovery is ENABLED (`allow_mtud` + the `TransportConfig` default discovery config).
+  /// Consensus traffic routinely exceeds the 1200-byte initial MTU — a `Prepare` carries the client
+  /// request body, and a 16 MiB state-transfer frame is ~14k datagrams at 1200 — so staying at the
+  /// un-probed floor costs real packet count and per-packet overhead on every bulk path. Cluster
+  /// links are not the public internet: replica↔replica paths are datacenter/VPC-grade (path MTU at
+  /// or above the standard 1500), so the default probe schedule (up to 1452 bytes) converges
+  /// immediately and a black-holed probe merely keeps the connection at the floor — probing is
+  /// lossless to correctness either way.
   pub(crate) fn new(opts: &QuicOptions, rng_seed: Option<[u8; 32]>) -> Self {
     let endpoint = Endpoint::new(
       opts.endpoint_config(),
       opts.server_config(),
-      /*allow_mtud=*/ false,
+      /*allow_mtud=*/ true,
       rng_seed,
     );
     Self {
@@ -362,6 +398,7 @@ impl Bridge {
       deferred_ready: VecDeque::new(),
       lost: VecDeque::new(),
       pending_fin_close: VecDeque::new(),
+      needs_service: false,
       #[cfg(test)]
       skip_endpoint_drain: false,
       #[cfg(test)]
@@ -457,7 +494,8 @@ impl Bridge {
             t.size,
             rbuf.len()
           );
-          self.out.push_back((t.destination, rbuf[..t.size].to_vec()));
+          rbuf.truncate(t.size);
+          self.out.push_back((t.destination, rbuf));
           self.service(now);
           return;
         }
@@ -484,7 +522,8 @@ impl Bridge {
                 t.size,
                 abuf.len()
               );
-              self.out.push_back((t.destination, abuf[..t.size].to_vec()));
+              abuf.truncate(t.size);
+              self.out.push_back((t.destination, abuf));
             }
           }
         }
@@ -496,9 +535,8 @@ impl Bridge {
           t.size,
           scratch.len()
         );
-        self
-          .out
-          .push_back((t.destination, scratch[..t.size].to_vec()));
+        scratch.truncate(t.size);
+        self.out.push_back((t.destination, scratch));
       }
       None => {}
     }
@@ -537,8 +575,10 @@ impl Bridge {
   /// AFTER `drain_bridge` (all its `ingest_recv` / `flush_stream` / `write_framed` / `bind_validated` /
   /// `close_local` / accept-loop `stop` mutations) AND after its own routing `write_framed`s. So no
   /// mutation a pump performs can strand a queued frame, and a new connection-mutating path needs no
-  /// per-operation `service` plumbing to be wakeup-safe. (The bridge entry-points still `service` inline
-  /// so the bridge is correct when driven directly by its own white-box unit tests.)
+  /// per-operation `service` plumbing to be wakeup-safe. (The per-EVENT bridge entry-points still
+  /// `service` inline so the bridge is correct when driven directly by its own white-box unit tests;
+  /// the per-MESSAGE `write_framed` instead defers via [`Self::needs_service`] — see that field — and
+  /// tests flush it with [`Self::service_if_deferred`].)
   pub(crate) fn service(&mut self, now: Instant) {
     // Re-entrancy guard (test-only): `service` must never run within `service`. Every `close_local`
     // (the auth-reap loop below, the Control-class fatals) is a non-recursive state mutation, so this
@@ -552,6 +592,9 @@ impl Bridge {
       );
       self.service_depth += 1;
     }
+    // Consume the per-message write deferral: this pass collects everything `write_framed` staged
+    // since the last one (the coordinator's pump-end `service` is the production consumer).
+    self.needs_service = false;
     // Step 1: apply the previous iteration's deferred endpoint-event feedback
     // BEFORE any poll, mirroring quinn-proto's reference driver ordering. Drain
     // the whole queue (events for any connection) IN FIFO ORDER; materialise
@@ -620,15 +663,18 @@ impl Bridge {
         }
       }
 
-      // Step 4: collect outbound transmits. `poll_transmit` writes into `tbuf`
-      // and reports `t.size` bytes; one datagram per call (`max_datagrams = 1`,
-      // segmentation offload is off). quinn-proto grows `tbuf` to
-      // hold the written bytes, so `t.size <= tbuf.len()` is invariantly true.
-      // The `self.table` entry borrow and the `self.out` push touch disjoint
-      // fields, so both live together.
+      // Step 4: collect outbound transmits. `poll_transmit` writes into `tbuf` and reports `t.size`
+      // bytes, packing up to `MAX_TRANSMIT_DATAGRAMS` equal-size datagrams per call (`segment_size`
+      // is `Some` exactly when more than one was packed) — so a full congestion window drains in a
+      // few calls instead of one per datagram. quinn-proto grows `tbuf` to hold the written bytes,
+      // so `t.size <= tbuf.len()` is invariantly true. `out` stays one-UDP-datagram-per-entry (what
+      // the drivers and the loopback network expect): a single-datagram transmit hands its buffer
+      // through OWNED (truncate + take, no copy — quinn regrows the fresh buffer next call); a
+      // multi-segment transmit is split into per-segment payloads. The `self.table` entry borrow and
+      // the `self.out` push touch disjoint fields, so both live together.
       let mut tbuf = Vec::new();
       while let Some(e) = self.table.entry(h) {
-        let Some(t) = e.conn.poll_transmit(now, /*max_datagrams=*/ 1, &mut tbuf) else {
+        let Some(t) = e.conn.poll_transmit(now, MAX_TRANSMIT_DATAGRAMS, &mut tbuf) else {
           break;
         };
         debug_assert!(
@@ -637,8 +683,20 @@ impl Bridge {
           t.size,
           tbuf.len()
         );
-        self.out.push_back((t.destination, tbuf[..t.size].to_vec()));
-        tbuf.clear();
+        match t.segment_size {
+          None => {
+            tbuf.truncate(t.size);
+            self
+              .out
+              .push_back((t.destination, std::mem::take(&mut tbuf)));
+          }
+          Some(seg) => {
+            for datagram in transmit_segments(&tbuf[..t.size], seg) {
+              self.out.push_back((t.destination, datagram.to_vec()));
+            }
+            tbuf.clear();
+          }
+        }
       }
     }
 
@@ -823,7 +881,7 @@ impl Bridge {
   /// - [`Self::connected`] / [`Self::stream_ready`] / [`Self::lost`] — IMMEDIATE. These coordinator-
   ///   facing queues are drained by `QuicCoordinator::drain_bridge`, but `service` (run AFTER
   ///   `drain_bridge` by `pump`, and re-entered mid-`drain_bridge` by `open_send_and_preface` /
-  ///   `bind_validated` / `flush_stream` / `write_framed`) can enqueue a fresh `Connected` /
+  ///   `bind_validated` / `flush_stream`) can enqueue a fresh `Connected` /
   ///   `Stream(_)` / `ConnectionLost` via `on_app_event` AFTER this pass's `drain_bridge` already ran.
   ///   That leftover is connection auth / read / reap work that progresses with NO inbound datagram,
   ///   so a sleep-until-`poll_timeout` driver must be woken now to drain it.
@@ -1537,8 +1595,10 @@ impl Bridge {
   /// equal to call order: when nothing is staged the new frame is the whole buffer and is written
   /// immediately; when an earlier frame is still staged (a prior `Blocked` / partial write) the new
   /// frame queues behind it. Whatever the stream cannot accept (no send stream yet, or `Blocked`)
-  /// stays at the front for the next `Writable` retry. A flush that makes progress runs a service
-  /// pass at `now` so the resulting STREAM datagrams are queued.
+  /// stays at the front for the next `Writable` retry. The service pass that turns the written
+  /// stream bytes into datagrams is DEFERRED ([`Self::needs_service`]): the coordinator routes
+  /// per-message through here and runs ONE pump-end `service`, which collects every message this
+  /// pump wrote in a single whole-table pass.
   ///
   /// The COORDINATOR picks `class` via [`partition`](super::layout::partition); the bridge only
   /// routes to the right per-class buffer. Per-stream backpressure and fatals are CLASS-AWARE:
@@ -1610,12 +1670,28 @@ impl Bridge {
       };
       e.class_mut(class).outbound.extend(framed);
     }
-    // Flush the staged frame, then `service` UNCONDITIONALLY (not gated on the flush's progress): a Bulk
-    // overflow above queued a `RESET_STREAM` that reaches `out` only when `service` polls the connection,
-    // and the follow-on flush's reopen can make no write progress (it can fail or block), so gating the
-    // service on its return would strand that reset. An idle connection's `service` produces nothing.
+    // Flush the staged frame, then DEFER the service pass UNCONDITIONALLY (not gated on the flush's
+    // progress): a Bulk overflow above queued a `RESET_STREAM` that reaches `out` only when a
+    // `service` polls the connection, and the follow-on flush's reopen can make no write progress
+    // (it can fail or block), so gating on its return would strand that reset. The pass itself is
+    // deferred to the coordinator's single pump-end `service` (which always follows the per-message
+    // routing this is called from) rather than run inline per message — an inline pass would be
+    // O(messages × connections) of redundant whole-table quinn polling per pump. Within-pump
+    // visibility holds: everything staged here reaches `out` before the pump returns.
     self.flush_outbound(now, h, class);
-    self.service(now);
+    self.needs_service = true;
+  }
+
+  /// Run a `service` pass at `now` iff the per-message write path deferred one
+  /// ([`Self::needs_service`]) — the white-box stand-in for the coordinator's pump-end `service`,
+  /// for tests that drive [`Self::write_framed`] directly and then inspect `out`. Using this (rather
+  /// than an unconditional `service`) keeps the flag load-bearing under test: a `write_framed` that
+  /// failed to set it would leave its datagrams stranded and fail the test.
+  #[cfg(test)]
+  pub(crate) fn service_if_deferred(&mut self, now: Instant) {
+    if self.needs_service {
+      self.service(now);
+    }
   }
 
   /// The CLASS-AWARE teardown for a fatal recv close on connection `h`'s `class` (peer recv `sid`),
@@ -2243,6 +2319,31 @@ mod tests {
   use crate::{Commit, OpNumber, ReplicaId, View};
   use quinn_proto::{Dir, StreamId};
   use std::time::Duration;
+
+  /// `transmit_segments` reproduces quinn's GSO segment layout exactly: full `segment_size` chunks
+  /// with one possibly-shorter tail, a single chunk when `segment_size >= len`, no chunks for empty
+  /// contents, and no panic on a (never-emitted) zero segment size.
+  #[test]
+  fn transmit_segments_splits_per_quinn_gso_layout() {
+    let contents: Vec<u8> = (0u8..=9).collect();
+    // Even split: 10 bytes at segment 5 → two full datagrams.
+    let segs: Vec<&[u8]> = transmit_segments(&contents, 5).collect();
+    assert_eq!(segs, vec![&contents[..5], &contents[5..]]);
+    // Short tail: 10 bytes at segment 4 → 4, 4, 2.
+    let segs: Vec<&[u8]> = transmit_segments(&contents, 4).collect();
+    assert_eq!(segs, vec![&contents[..4], &contents[4..8], &contents[8..]]);
+    // Segment at/above the whole length → exactly one datagram.
+    assert_eq!(
+      transmit_segments(&contents, contents.len()).count(),
+      1,
+      "a segment size equal to the contents is one datagram"
+    );
+    assert_eq!(transmit_segments(&contents, 1024).count(), 1);
+    // Empty contents → nothing to send.
+    assert_eq!(transmit_segments(&[], 5).count(), 0);
+    // A zero segment size cannot come out of quinn; the clamp keeps it panic-free regardless.
+    assert_eq!(transmit_segments(&contents, 0).count(), contents.len());
+  }
 
   impl Bridge {
     /// Whether any connection has finished the QUIC handshake (`Authenticating` or `Validated`).
@@ -3462,16 +3563,18 @@ mod tests {
   }
 
   /// A Bulk-overflow reset whose FOLLOW-ON reopen makes NO write progress must STILL drain its
-  /// `RESET_STREAM` into `out` THIS pump — the exact gap the per-operation service trigger left open.
+  /// `RESET_STREAM` into `out` THIS pump — the gap a progress-gated service trigger leaves open.
   ///
   /// `write_framed`'s Bulk-overflow path resets the Bulk send stream (queuing a `RESET_STREAM` in
   /// quinn) and then flushes the re-staged frame onto a fresh stream. The reset frame reaches the wire
-  /// ONLY via a `poll_transmit`, which only `service` runs. The OLD code gated that `service` on the
-  /// follow-on `flush_outbound` reporting WRITE progress — but the reopen can make none: here every
+  /// ONLY via a `poll_transmit`, which only `service` runs. A service trigger gated on the follow-on
+  /// `flush_outbound` reporting WRITE progress misses this case — the reopen can make none: here every
   /// bidi stream slot is exhausted, so the post-reset `open` returns `None` and `flush_outbound`
-  /// reports `false`. Under the gated service the `RESET_STREAM` would sit stranded in quinn (in
-  /// neither `out` nor `has_pending_work`) until unrelated traffic woke a `poll_timeout`-driven driver.
-  /// The fix services UNCONDITIONALLY after the flush, so the reset drains this pump regardless.
+  /// reports `false`. Under such a gate the `RESET_STREAM` would sit stranded in quinn (in neither
+  /// `out` nor `has_pending_work`) until unrelated traffic woke a `poll_timeout`-driven driver.
+  /// `write_framed` therefore arms the trigger UNCONDITIONALLY after the flush: it sets the deferred
+  /// `needs_service` flag regardless of flush progress, and the pump-end `service` that consumes it
+  /// (stood in for here by `service_if_deferred`) collects the reset this same pump.
   ///
   /// The construction is deterministic and uses NO peer/ferry: A opens its class streams, then opens
   /// raw bidi streams until the concurrency limit is exhausted (so the post-reset reopen necessarily
@@ -3479,9 +3582,9 @@ mod tests {
   /// `write_framed`s a Bulk frame that crosses the per-class cap. The test asserts a datagram IS
   /// emitted; with the Bulk stream's id dropped and reopen blocked, that datagram is the `RESET_STREAM`.
   ///
-  /// NEUTER CHECK: revert `write_framed`'s tail to the gated `if self.flush_outbound(now, h, class) {
-  /// self.service(now); }` (and revert the coordinator pump-end `service`) and this `poll_transmit`
-  /// returns `None` — the reset is stranded, exactly the wakeup gap this closes.
+  /// NEUTER CHECK: gate the deferral on flush progress (`if self.flush_outbound(now, h, class) {
+  /// self.needs_service = true; }` in `write_framed`'s tail) and `service_if_deferred` runs nothing —
+  /// this `poll_transmit` returns `None`, the reset stranded, exactly the wakeup gap this closes.
   #[test]
   fn a_bulk_overflow_reset_with_a_blocked_reopen_drains_its_reset_this_pump() {
     let Linked {
@@ -3525,15 +3628,17 @@ mod tests {
     while a.poll_transmit().is_some() {}
 
     // The over-cap Bulk write resets the Bulk stream (queuing a RESET_STREAM) and then fails to reopen
-    // (slots exhausted) — the follow-on flush makes NO progress. The unconditional post-flush `service`
-    // must still collect the RESET_STREAM into `out` THIS call.
+    // (slots exhausted) — the follow-on flush makes NO progress. `write_framed` must still arm the
+    // deferred-service flag UNCONDITIONALLY, so the pump-end pass (`service_if_deferred` here) collects
+    // the RESET_STREAM into `out` THIS pump.
     a.write_framed(now, ha, StreamClass::Bulk, &commit(0x44));
+    a.service_if_deferred(now);
 
     assert!(
       a.poll_transmit().is_some(),
       "a Bulk-overflow reset whose reopen made no progress must still drain its RESET_STREAM into `out` \
-       THIS pump (the unconditional post-flush service) — with A's outbound drained first and no peer \
-       traffic, the emitted datagram is that reset; the pre-fix gated service stranded it"
+       THIS pump (the unconditionally-armed deferred service) — with A's outbound drained first and no \
+       peer traffic, the emitted datagram is that reset; a progress-gated trigger strands it"
     );
     // The connection survives the per-stream reset (a Bulk overflow never tears down the connection).
     assert!(

@@ -174,8 +174,14 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Propose moving to `self.view + 1`: adopt it as the SVC target (if higher than the current
   /// target), set our own bit, broadcast `StartViewChange{target}`, and transition on quorum.
+  ///
+  /// The successor is SATURATING (`View::next`): at the unreachable top of the view space the
+  /// proposal pins at `u64::MAX` instead of wrapping to view 0, which would un-fence every
+  /// monotone-view guarantee (durable-view, stale-message rejection) behind a "view 0" the whole
+  /// cluster believes is ancient. A replica that somehow holds `view == u64::MAX` keeps proposing
+  /// `u64::MAX` — its peers ignore the stale target and no quorum forms — which is inert, not corrupt.
   pub(crate) fn propose_next_view<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
-    let target = View::with(self.view.get() + 1);
+    let target = self.view.next();
     if target.get() > self.svc_target.get() {
       self.svc_target = target;
       self.svc_from = 0;

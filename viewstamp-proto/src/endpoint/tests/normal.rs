@@ -95,6 +95,50 @@ fn backup_caches_the_reply_so_a_backup_turned_primary_can_resend_it() {
 }
 
 #[test]
+fn apply_caches_the_reply_even_when_the_watermark_was_pre_seeded_without_it() {
+  // REGRESSION (the seeded-watermark reply black hole): the session watermark can legitimately sit AT
+  // an op's request BEFORE that op is applied, with NO cached reply — a primary's `on_request` seeds it
+  // at ACCEPT time and a checkpoint snapshot captures that row (restored by recovery / state-sync), and
+  // `start_view_as_new_primary` backfills it from a held-but-unapplied adopted entry. When the op's
+  // apply is DEFERRED past such a seeding (a floored view-change union holds the commit at a sub-floor
+  // hole until repair / state-sync), gating the reply cache on the watermark ADVANCING would skip it
+  // permanently: the client's retry of exactly that request would dedup against the seeded watermark
+  // with no cached reply and be dropped forever (a liveness freeze — the op committed, so the request
+  // can never be re-minted). The apply must cache the reply for the applied request regardless of
+  // whether the watermark moved.
+  let mut e = backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Pre-seed client 7's watermark at request 1 with NO reply — the snapshot-restored / backfilled row.
+  e.clients.insert(
+    7,
+    Session {
+      request: RequestNumber::with(1),
+      reply: None,
+      last_op: OpNumber::new(),
+    },
+  );
+  // Apply op 1 (client 7, request 1) via the normal Prepare + Commit flow.
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+  );
+  assert_eq!(e.commit(), OpNumber::with(1), "the backup applied op 1");
+  let cached = e.session_reply_for_test(7);
+  assert_eq!(
+    cached.map(|(rn, _)| rn),
+    Some(1),
+    "the apply caches request 1's reply even though the watermark already sat at 1 (seeded without a \
+     reply) — otherwise the client's retry dedups to a silent drop forever"
+  );
+}
+
+#[test]
 fn backup_below_primary_commit_solicits_the_committed_tail_gap() {
   // REGRESSION (the backup tail-gap liveness bug): a backup whose head fell BELOW the primary's
   // commit_min is missing committed ops that are ABOVE the cluster checkpoint (so the `> self.op`
@@ -547,6 +591,327 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
 }
 
 #[test]
+fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_fit_depth() {
+  // Release-build frame-fit floor for the header-only view-change carriers. The carriers
+  // (`DoViewChange`/`StartView`/`RecoveryResponse`) emit `log_entries()` — EVERY retained `self.log`
+  // op, header-only, with NO range filter — as one HEADER-ONLY band. A band past
+  // `MAX_HEADER_ONLY_BAND_DEPTH` encodes a carrier OVER the transport frame cap, which the transport
+  // drops on the send path, wedging the view change. `MAX_CHECKPOINT_OPS` + the `log_entries()`
+  // `debug_assert` already bound this for a ring-sized WAL, but an UNBOUNDED WAL (`capacity() ==
+  // u64::MAX`, so the wal-wrap stall never fires) with a deep uncommitted tail could grow the band past
+  // the bound in a release build. So op-admission must REFUSE to mint a new op the instant its carrier
+  // band would exceed the depth — the same backpressure as the wal-wrap stall, gating the carrier
+  // instead of the ring.
+  //
+  // The gate bounds the ACTUAL carrier (`self.log.len()`), NOT a `next_op - prune_floor` proxy: the
+  // carrier is the retained log, and `prune_floor` can advance ahead of an actual `self.log` trim (a
+  // quorum checkpoint REPORT raises it without a local `run_gc`), so the proxy can under-count. Here we
+  // SEED `self.log` to the band depth so the realized carrier is exactly what the gate reads.
+  //
+  // `TestWal::capacity()` is the default `u64::MAX`, so the wal-wrap stall is OUT of the picture here:
+  // any refusal is the band bound alone.
+  let depth = crate::message::MAX_HEADER_ONLY_BAND_DEPTH as u64;
+  let body = bytes::Bytes::from(std::vec![1u8]);
+
+  // (a) JUST BELOW the bound: head at `depth - 1` with `self.log` holding `[1..=depth-1]` (so the
+  // carrier is `depth - 1` entries). Minting `next_op == depth` grows the retained band to exactly
+  // `depth` entries — at/below `MAX_HEADER_ONLY_BAND_DEPTH`, so admission SUCCEEDS. Proves the bound
+  // does not perturb normal admission right up to the edge (the band is huge — ~342k — so a real
+  // in-flight band never reaches it; this is a release-build floor, not a normal-path limit).
+  {
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 8).unwrap();
+    let mut ep = Endpoint::new(cfg, 7, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let head = depth - 1;
+    ep.force_state_for_test(0, head, head, 0, &[]); // commit_min == op (caught up), no holes
+    for op in 1..=head {
+      ep.log.insert(
+        op,
+        LogEntry::present(ClientId::new(7), RequestNumber::with(op), body.clone()),
+      );
+    }
+    assert_eq!(
+      ep.log.len() as u64,
+      head,
+      "the retained carrier is `depth - 1` entries"
+    );
+    assert!(ep.is_primary());
+    // A fresh client (no prior session) — `on_request`'s `entry(key).or_default()` seeds request 0, so
+    // request 1 is the canonical next request and is admitted (subject only to the band bound).
+    ep.handle_message(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(9)),
+      Message::Request(Request::new(
+        ClientId::new(9),
+        RequestNumber::with(1),
+        body.clone(),
+      )),
+    );
+    assert_eq!(
+      ep.op().get(),
+      depth,
+      "a band of exactly MAX_HEADER_ONLY_BAND_DEPTH entries is admitted (the bound is the ceiling, \
+       not below it) — op advances to {depth}"
+    );
+    assert_eq!(
+      ep.log.len() as u64,
+      depth,
+      "the realized carrier is now exactly at the frame-fit ceiling"
+    );
+    assert_eq!(ep.wal_stalls(), 0, "no admission stall at the bound");
+    assert!(
+      ep.poll_message()
+        .map(|o| matches!(o.into_msg(), Message::Prepare(_)))
+        .unwrap_or(false),
+      "the admitted op is broadcast as a Prepare"
+    );
+  }
+
+  // (b) AT the bound: head at `depth` with `self.log` holding `[1..=depth]` (the carrier is exactly
+  // `depth` entries). Minting `next_op == depth + 1` would grow the retained band to `depth + 1`
+  // entries — OVER `MAX_HEADER_ONLY_BAND_DEPTH`, whose carrier would exceed the frame cap. Admission
+  // must STALL: the op does NOT advance, no Prepare is emitted, and the stall counter ticks —
+  // backpressure before an oversized header-only carrier could ever be minted.
+  {
+    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 8).unwrap();
+    let mut ep = Endpoint::new(cfg, 7, NoopSm);
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    ep.force_state_for_test(0, depth, depth, 0, &[]); // head exactly at the bound, caught up, no holes
+    for op in 1..=depth {
+      ep.log.insert(
+        op,
+        LogEntry::present(ClientId::new(7), RequestNumber::with(op), body.clone()),
+      );
+    }
+    assert_eq!(
+      ep.log.len() as u64,
+      depth,
+      "the retained carrier sits exactly at the frame-fit ceiling"
+    );
+    assert!(ep.is_primary());
+    let head_before = ep.op();
+    ep.handle_message(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(9)),
+      Message::Request(Request::new(
+        ClientId::new(9),
+        RequestNumber::with(1),
+        body.clone(),
+      )),
+    );
+    assert_eq!(
+      ep.op(),
+      head_before,
+      "no op is minted when its header-only carrier band would exceed the frame-fit depth"
+    );
+    assert_eq!(
+      ep.wal_stalls(),
+      1,
+      "the admission stall engaged (the carrier-band backpressure, not a wal wrap — capacity is u64::MAX)"
+    );
+    assert!(
+      ep.poll_message().is_none(),
+      "no Prepare is emitted for the refused op (the band would overflow the frame)"
+    );
+  }
+}
+
+#[test]
+fn a_quorum_checkpoint_report_advances_prune_floor_without_a_gc_trim_yet_the_carrier_fits_the_frame()
+ {
+  // The RELEASE gap the actual-carrier gate closes. The view-change carriers
+  // (`DoViewChange`/`StartView`/`RecoveryResponse`) encode `log_entries()` — EVERY retained `self.log`
+  // op, header-only, with NO range filter — so the real carrier-entry count is `self.log.len()`. A
+  // release gate on the `next_op - prune_floor()` PROXY would miss it: `prune_floor()` advances the
+  // instant a quorum checkpoint REPORT raises `quorum_checkpoint_op()`, while `self.log` is trimmed
+  // only by a LOCAL checkpoint's `run_gc`. So a peer report can shrink the proxy BELOW the true
+  // retained span (GC lag) — leaving the proxy within bound while the ACTUAL carrier exceeds
+  // `MAX_FRAME_LEN`, which the transport then drops on the send path → a wedged view change in a
+  // release build.
+  use crate::message::{MAX_FRAME_LEN, MAX_HEADER_ONLY_BAND_DEPTH};
+  let cap = MAX_FRAME_LEN as usize;
+  let depth = MAX_HEADER_ONLY_BAND_DEPTH;
+
+  // A Normal primary (replica 0 of 3, view 0 — replica 0 leads it) whose in-memory log holds the FULL
+  // band `[1..=depth]` — exactly at the frame-fit ceiling. This is the state a primary reaches by
+  // appending a deep tail before any local checkpoint lands.
+  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  e.op = OpNumber::with(depth as u64);
+  e.commit_min = OpNumber::with(depth as u64);
+  e.commit_max = OpNumber::with(depth as u64);
+  let body = bytes::Bytes::from(std::vec![0x5Au8; 8]);
+  for op in 1..=depth as u64 {
+    e.log.insert(
+      op,
+      LogEntry::present(ClientId::new(7), RequestNumber::with(op), body.clone()),
+    );
+  }
+  assert_eq!(
+    e.log.len(),
+    depth,
+    "the band sits exactly at the frame-fit ceiling"
+  );
+
+  // A QUORUM checkpoint REPORT advances the prune floor WITHOUT trimming `self.log` (no local
+  // checkpoint ran, so no `run_gc`). Model the report via the exact mechanism a `Commit`/`PrepareOk`
+  // uses — `record_peer_checkpoint` — for a quorum (self + one peer) at a HIGH checkpoint op.
+  let high = depth as u64 - 1;
+  e.record_peer_checkpoint(1, OpNumber::with(high));
+  // self's own report (quorum of 2-of-3 now at `high`); the helper keeps the log_floor coupling AND
+  // the cached quorum statistic coherent, as a real checkpoint advance would.
+  e.set_own_checkpoint_for_test(high);
+  // The `next_op - prune_floor()` PROXY is now WAY below the bound …
+  let proxy = e
+    .op()
+    .get()
+    .saturating_add(1)
+    .saturating_sub(e.prune_floor().get());
+  assert!(
+    proxy < depth as u64,
+    "the quorum report shrank the next_op - prune_floor proxy below the bound (proxy={proxy}), \
+     yet `self.log` is untrimmed — the GC-lag gap the proxy missed"
+  );
+  // … while the ACTUAL retained carrier is still the whole `depth`-entry band.
+  assert_eq!(
+    e.log.len(),
+    depth,
+    "self.log is NOT trimmed by a mere peer report (GC lag)"
+  );
+
+  // The real DVC carrier the primary would build encodes UNDER the frame cap — the actual-carrier
+  // gate held the band at the ceiling, so even with the proxy fooled the carrier fits.
+  let dvc = Message::DoViewChange(crate::DoViewChange::new(
+    e.view,
+    e.log_view,
+    e.op,
+    e.commit_max,
+    ReplicaId::new(0),
+    e.log_entries(),
+  ));
+  let n = dvc.encode().len();
+  assert!(
+    n <= cap,
+    "the header-only DoViewChange carrier must fit the frame cap: {n} > {cap}"
+  );
+
+  // And the gate FIRES on the actual count: a fresh client request is REFUSED (no op minted, the stall
+  // counter ticks), because admitting it would push the carrier to `depth + 1` entries — over the
+  // frame. The unbounded `TestWal` (`capacity() == u64::MAX`) rules out the WAL-wrap stall, so this is
+  // the carrier-band backpressure alone.
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let head_before = e.op();
+  let stalls_before = e.wal_stalls();
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from(std::vec![1u8]),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    head_before,
+    "op-admission stalls on the ACTUAL carrier count even though the prune-floor proxy is within bound"
+  );
+  assert_eq!(
+    e.wal_stalls(),
+    stalls_before + 1,
+    "the carrier-band backpressure engaged (not a WAL wrap — capacity is u64::MAX)"
+  );
+}
+
+#[test]
+fn a_backup_whose_checkpoint_lags_while_it_accepts_prepares_keeps_its_carrier_under_the_frame() {
+  // The BACKUP side of the band gate: a backup extends its head via `on_prepare`, so it needs the
+  // same carrier bound as the primary's `on_request`. Without one, a backup on an UNBOUNDED WAL (so
+  // the ring-window stall never fires) that keeps accepting head-extending prepares while its
+  // checkpoint/GC lags grows `self.log` without bound, and its DVC / RecoveryResponse carrier
+  // (`log_entries()`) with it — past `MAX_FRAME_LEN`, then dropped on the send path → a wedge if a
+  // view change collects this backup.
+  use crate::message::{MAX_FRAME_LEN, MAX_HEADER_ONLY_BAND_DEPTH};
+  let cap = MAX_FRAME_LEN as usize;
+  let depth = MAX_HEADER_ONLY_BAND_DEPTH;
+
+  // A Normal backup (replica 1 of 3, view 0, primary is replica 0) sitting exactly at the frame-fit
+  // ceiling: head at `depth`, checkpoint lagging at 0 (no local checkpoint yet), the whole band held.
+  // This is the state reached by accepting a deep prepare tail before any checkpoint lands.
+  let mut e = backup();
+  e.op = OpNumber::with(depth as u64);
+  e.commit_min = OpNumber::with(depth as u64);
+  e.commit_max = OpNumber::with(depth as u64);
+  let body = bytes::Bytes::from(std::vec![0x5Au8; 8]);
+  for op in 1..=depth as u64 {
+    e.log.insert(
+      op,
+      LogEntry::present(ClientId::new(7), RequestNumber::with(op), body.clone()),
+    );
+  }
+  assert_eq!(e.log.len(), depth);
+  assert!(!e.is_primary());
+
+  // The next head-extending Prepare (`pop == self.op + 1`) is REFUSED by the carrier-band gate: the
+  // head does NOT advance and nothing is appended, because growing to `depth + 1` retained entries
+  // would push the DVC carrier over the frame. `TestWal` is unbounded, so the ring-window stall is out
+  // of the picture — this is the band backpressure alone.
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let head_before = e.op();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    prepare(depth as u64 + 1, 0),
+  );
+  assert_eq!(
+    e.op(),
+    head_before,
+    "the backup refuses to extend its head past the carrier-band frame-fit depth"
+  );
+  assert!(
+    !e.log.contains_key(&(depth as u64 + 1)),
+    "no over-cap op was appended to the backup's log"
+  );
+
+  // The DVC carrier this lagging backup would answer a view change with still fits the frame.
+  let dvc = Message::DoViewChange(crate::DoViewChange::new(
+    e.view,
+    e.log_view,
+    e.op,
+    e.commit_max,
+    ReplicaId::new(1),
+    e.log_entries(),
+  ));
+  let n = dvc.encode().len();
+  assert!(
+    n <= cap,
+    "the lagging backup's header-only DoViewChange carrier must fit the frame cap: {n} > {cap}"
+  );
+  // The recovery-answer carrier is the same `log_entries()` band — also frame-bounded.
+  let rr = Message::RecoveryResponse(crate::RecoveryResponse::new(
+    e.view,
+    e.op,
+    e.commit_max,
+    ReplicaId::new(1),
+    0xC0FFEE,
+    e.log_entries(),
+  ));
+  let nr = rr.encode().len();
+  assert!(
+    nr <= cap,
+    "the lagging backup's RecoveryResponse carrier must fit the frame cap: {nr} > {cap}"
+  );
+}
+
+#[test]
 fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
   // A body-`Repairing` log entry — the op EXISTS (its identity + durable body_checksum survived a
   // torn-body fault) but its bytes are absent — must be treated by the commit path EXACTLY like a
@@ -594,15 +959,17 @@ fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
   );
   let mut solicited = false;
   while let Some(out) = e.poll_message() {
-    if let Message::RequestPrepare(rp) = out.msg_ref() {
-      if rp.op() == OpNumber::with(1) {
+    // The hole arm solicits the contiguous run via the windowed `RequestPrepareRange` (here a
+    // single-op range `[1,1]`, since `commit_max == 1` caps the band) rather than a per-op `RequestPrepare`.
+    if let Message::RequestPrepareRange(rp) = out.msg_ref() {
+      if rp.lo() <= OpNumber::with(1) && rp.hi() >= OpNumber::with(1) {
         solicited = true;
       }
     }
   }
   assert!(
     solicited,
-    "a RequestPrepare(op 1) is emitted to fetch the missing body — exactly the missing-slot behavior"
+    "a RequestPrepareRange covering op 1 is emitted to fetch the missing body — the windowed missing-slot behavior"
   );
 
   // The repair Prepare answers with op 1's real body: once its append is durable, the held commit
@@ -733,3 +1100,709 @@ fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
 }
 
 // ── Forfeit — a lagging primary steps down via a view change ────────────────────────────────────
+
+#[test]
+fn backup_reorder_buffer_is_bounded_to_the_tail_gap_window() {
+  // The reorder buffer holds frame-sized bodies, so it must not grow on arbitrary far-future
+  // Prepares: only an op within TAIL_GAP_WINDOW of the head is buffered; anything further is
+  // DROPPED (the primary's retransmit redelivers it once the head closes the gap — the same
+  // backpressure shape as the ring stall), so a buggy primary emitting sparse high-op Prepares
+  // cannot grow the buffer without bound.
+  let mut e = backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Head is 0. An op just past the window is NOT retained...
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    prepare(TAIL_GAP_WINDOW + 1, 0),
+  );
+  assert_eq!(
+    e.buffer_len_for_test(),
+    0,
+    "a beyond-window Prepare is dropped, not buffered"
+  );
+  // ...while one at the window edge (and an interior one) is.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    prepare(TAIL_GAP_WINDOW, 0),
+  );
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 0));
+  assert_eq!(
+    e.buffer_len_for_test(),
+    2,
+    "within-window Prepares are buffered"
+  );
+  assert_eq!(e.op(), OpNumber::with(0), "the head has not moved");
+}
+
+#[test]
+fn a_faulted_append_completion_retries_and_the_op_still_acks() {
+  // The `Wal` contract requires an append to complete as `Appended` — but a backend that surfaces
+  // a `Fault` for one anyway must not LEAK the op's in-flight bookkeeping (the `Pending` entry +
+  // `appending` mark would otherwise linger until the next view transition: the op could never be
+  // re-acked and `has_inflight_storage()` would read true forever). The endpoint degrades the
+  // violation to a RETRY: the fault re-submits the same append from the held entry, and the
+  // deferred ack follows the retried append's completion.
+  let mut wal = ScriptedWal::with_entries(0);
+  wal.script_append_fault(OpNumber::with(1), 1); // the first append of op 1 faults; the retry lands
+  let mut sb = TestSb::default();
+  let mut e = backup();
+  let now = Instant::ZERO;
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  assert_eq!(
+    wal.append_submits(OpNumber::with(1)),
+    1,
+    "the prepare submitted its append"
+  );
+  // Drain: the Fault completion re-submits the append; its Appended completion then acks.
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    wal.append_submits(OpNumber::with(1)),
+    2,
+    "the faulted append was re-submitted"
+  );
+  let mut acked = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      assert_eq!(ok.op(), OpNumber::with(1));
+      acked = true;
+    }
+  }
+  assert!(acked, "the op still acks once the retried append lands");
+  assert!(
+    !e.has_inflight_storage(),
+    "no in-flight bookkeeping leaks after the retry resolves"
+  );
+}
+
+/// Drive `n` distinct clients (ids `1..=n`, each submitting its request 1 with body `[id]`) through
+/// COMMIT on a SOLO PRIMARY (quorum 1: each op commits via `commit_op` the moment its append lands) —
+/// the primary-path half of the session-eviction determinism proof. Returns the endpoint with every
+/// op applied.
+fn solo_primary_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) {
+  let cfg = Config::try_new(1, ReplicaId::new(0), 1)
+    .unwrap()
+    .with_max_client_sessions(cap)
+    .unwrap();
+  let mut e = Endpoint::new(cfg, 0, EchoSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  for c in 1..=n {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(c as u128)),
+      Message::Request(Request::new(
+        ClientId::new(c as u128),
+        RequestNumber::with(1),
+        Bytes::from(std::vec![c as u8]),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // append lands → own vote → commit_op applies op c
+    assert_eq!(e.commit().get(), c, "the solo primary committed op {c}");
+  }
+  (e, wal, sb)
+}
+
+/// Drive the SAME op stream (op `c` = client `c`, request 1, body `[c]`) through a BACKUP's
+/// `on_prepare` + `advance_commit` apply path — the backup-path half of the determinism proof.
+fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) {
+  let cfg = Config::try_new(1, ReplicaId::new(1), 2)
+    .unwrap()
+    .with_max_client_sessions(cap)
+    .unwrap();
+  let mut e = Endpoint::new(cfg, 0, EchoSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let from = Peer::Replica(ReplicaId::new(0)); // the view-0 primary of the 2-replica cluster
+  for c in 1..=n {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      from,
+      Message::Prepare(Prepare::new(
+        View::new(),
+        OpNumber::with(c),
+        OpNumber::with(c - 1), // the primary's commit so far — applies op c-1 on delivery
+        OpNumber::new(),
+        ClientId::new(c as u128),
+        RequestNumber::with(1),
+        Bytes::from(std::vec![c as u8]),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb); // append lands → PrepareOk
+  }
+  // The final commit advance applies op n.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    from,
+    Message::Commit(Commit::new(View::new(), OpNumber::with(n), OpNumber::new())),
+  );
+  assert_eq!(e.commit().get(), n, "the backup applied through op {n}");
+  (e, wal, sb)
+}
+
+#[test]
+fn session_eviction_is_replica_deterministic_across_primary_and_backup_paths() {
+  // THE determinism proof for the apply-time session-cap eviction: the SAME applied op stream — 7
+  // distinct clients through a cap of 4 — driven through the PRIMARY apply path (`commit_op`, on a
+  // solo primary) and the BACKUP apply path (`advance_commit`) must yield IDENTICAL session tables,
+  // IDENTICAL eviction counts, and byte-IDENTICAL checkpoint envelopes (the table rides every
+  // envelope, so divergent eviction would diverge checkpoint ids — state-sync chaos).
+  let (cap, n) = (4u32, 7u64);
+  let (p, _, _) = solo_primary_with_clients(cap, n);
+  let (b, _, _) = backup_with_clients(cap, n);
+
+  // Both evicted the same number of sessions (7 clients into 4 slots → 3 evictions)…
+  assert_eq!(p.sessions_evicted(), 3, "primary path evicted 7 - 4 = 3");
+  assert_eq!(b.sessions_evicted(), 3, "backup path evicted 7 - 4 = 3");
+  // …the surviving tables are identical, with the OLDEST-activity sessions (clients 1..=3, applied
+  // at ops 1..=3) evicted and the 4 freshest retained, each stamped with its applied op…
+  let expect: std::vec::Vec<(u128, u64, u64)> =
+    (4..=7).map(|c| (c as u128, 1u64, c as u64)).collect();
+  assert_eq!(p.sessions_snapshot_for_test(), expect);
+  assert_eq!(b.sessions_snapshot_for_test(), expect);
+  // …and the checkpoint envelopes both replicas would encode are byte-identical (identical
+  // checkpoint ids for the same checkpoint op).
+  let pe = p.encode_sessions_envelope_for_test(n);
+  let be = b.encode_sessions_envelope_for_test(n);
+  assert_eq!(pe, be, "identical tables encode byte-identical envelopes");
+  assert_eq!(crate::checkpoint_id(&pe), crate::checkpoint_id(&be));
+}
+
+#[test]
+fn session_table_never_exceeds_the_cap_and_victims_are_oldest_first() {
+  // Drive 3× the cap through the backup apply path, asserting after EVERY apply that the APPLIED
+  // session count never exceeds the cap (the eviction is immediate, not amortized).
+  let cap = 4u32;
+  let cfg = Config::try_new(1, ReplicaId::new(1), 2)
+    .unwrap()
+    .with_max_client_sessions(cap)
+    .unwrap();
+  let mut e = Endpoint::new(cfg, 0, EchoSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let from = Peer::Replica(ReplicaId::new(0));
+  for c in 1..=(3 * cap as u64) {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      from,
+      Message::Prepare(Prepare::new(
+        View::new(),
+        OpNumber::with(c),
+        OpNumber::with(c.saturating_sub(1)),
+        OpNumber::new(),
+        ClientId::new(c as u128),
+        RequestNumber::with(1),
+        Bytes::from_static(b"x"),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    let applied = e
+      .sessions_snapshot_for_test()
+      .iter()
+      .filter(|(_, _, last_op)| *last_op > 0)
+      .count();
+    assert!(
+      applied <= cap as usize,
+      "applied sessions ({applied}) exceeded the cap ({cap}) after op {c}"
+    );
+  }
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    from,
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3 * cap as u64),
+      OpNumber::new(),
+    )),
+  );
+  // The survivors are exactly the `cap` most-recently-applied clients.
+  let survivors: std::vec::Vec<u128> = e
+    .sessions_snapshot_for_test()
+    .iter()
+    .map(|(c, _, _)| *c)
+    .collect();
+  let expect: std::vec::Vec<u128> = ((2 * cap as u128 + 1)..=(3 * cap as u128)).collect();
+  assert_eq!(
+    survivors, expect,
+    "the oldest-activity sessions were evicted first"
+  );
+  assert_eq!(e.sessions_evicted(), 2 * cap as u64);
+}
+
+#[test]
+fn an_evicted_client_returns_as_a_fresh_session_only_from_request_one() {
+  // The evicted-client contract on MAX_CLIENT_SESSIONS: an evicted client's dedup history is gone —
+  // a resume of its old numbering is silently dropped (no session, request != 1), while a
+  // RE-REGISTRATION from request 1 opens a fresh session (which is also what un-wedges a client
+  // that restarted with a lost request counter once its stale row ages out).
+  let (mut e, mut wal, mut sb) = solo_primary_with_clients(2, 3); // cap 2: client 1 was evicted
+  let now = Instant::ZERO;
+  assert_eq!(e.session_request_for_test(1), None, "client 1 was evicted");
+
+  // Client 1 resumes its OLD numbering (request 2) → unknown client + request != 1 → silent drop.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(1)),
+    Message::Request(Request::new(
+      ClientId::new(1),
+      RequestNumber::with(2),
+      Bytes::from_static(b"resume"),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(e.op().get(), 3, "a resumed evicted numbering mints no op");
+  assert_eq!(
+    e.session_request_for_test(1),
+    None,
+    "and mints no session row"
+  );
+
+  // Client 1 re-registers from request 1 → a FRESH session is opened and the op commits.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(1)),
+    Message::Request(Request::new(
+      ClientId::new(1),
+      RequestNumber::with(1),
+      Bytes::from_static(b"fresh"),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(e.commit().get(), 4, "the re-registered request commits");
+  assert_eq!(
+    e.session_request_for_test(1),
+    Some(1),
+    "client 1 holds a fresh session at watermark 1"
+  );
+}
+
+#[test]
+fn pipeline_admission_stalls_at_the_cap_and_releases_as_commits_advance() {
+  // A 2-replica primary (quorum 2) accepts client requests WITHOUT committing (no backup acks), so
+  // the pipeline `(commit_min, op]` grows to MAX_PIPELINE — at which point admission STALLS (no op
+  // minted, no watermark advanced, so the client's retransmit is still canonical). Acking the first
+  // op then advances the commit and admission RELEASES.
+  let cfg = Config::try_new(1, ReplicaId::new(0), 2).unwrap();
+  let mut e = Endpoint::new(cfg, 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let submit = |e: &mut Endpoint<NoopSm>, wal: &mut TestWal, sb: &mut TestSb, rn: u64| {
+    e.handle_message(
+      now,
+      wal,
+      sb,
+      Peer::Client(ClientId::new(7)),
+      client_request(rn),
+    );
+    e.handle_storage(now, wal, sb); // land the append (own vote only — quorum 2 never commits)
+  };
+  for rn in 1..=MAX_PIPELINE {
+    submit(&mut e, &mut wal, &mut sb, rn);
+  }
+  assert_eq!(e.op().get(), MAX_PIPELINE, "the pipeline filled to the cap");
+  assert_eq!(e.commit().get(), 0, "nothing committed (no backup acks)");
+
+  // The next request is REFUSED at admission: no op minted, watermark unchanged.
+  submit(&mut e, &mut wal, &mut sb, MAX_PIPELINE + 1);
+  assert_eq!(
+    e.op().get(),
+    MAX_PIPELINE,
+    "admission stalled at MAX_PIPELINE"
+  );
+  assert_eq!(
+    e.session_request_for_test(7),
+    Some(MAX_PIPELINE),
+    "the stalled request did not advance the watermark"
+  );
+
+  // The backup acks op 1 (content-addressed vote) → commit advances → admission releases.
+  let identity = crate::storage::prepare_identity(
+    ClientId::new(7),
+    RequestNumber::with(1),
+    crate::storage::fnv1a_128(&[1u8]),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      OpNumber::new(),
+      identity,
+    )),
+  );
+  assert_eq!(e.commit().get(), 1, "op 1 committed off the backup ack");
+  submit(&mut e, &mut wal, &mut sb, MAX_PIPELINE + 1);
+  assert_eq!(
+    e.op().get(),
+    MAX_PIPELINE + 1,
+    "admission released once the commit advanced"
+  );
+}
+
+#[test]
+fn prepare_retransmit_is_windowed_to_the_first_unacked_ops() {
+  // A primary with a deep un-acked pipeline re-broadcasts at most PREPARE_RETRANSMIT_WINDOW prepares
+  // per retransmit tick — the LOWEST ops (the ones the commit is waiting on) — not the whole window.
+  // The window ships as a byte-bounded `PrepareBatch` (small bodies: ONE batch carrying the whole
+  // window), never as per-op `Prepare` frames.
+  let cfg = Config::try_new(1, ReplicaId::new(0), 2).unwrap();
+  let mut e = Endpoint::new(cfg, 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let deep = PREPARE_RETRANSMIT_WINDOW + 16;
+  for rn in 1..=deep {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      client_request(rn),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  while e.poll_message().is_some() {} // drop the initial broadcasts
+  // Fire the prepare-retransmit timer.
+  let later = now + PREPARE_RETRANSMIT;
+  e.handle_timeout(later, &mut wal, &mut sb);
+  let mut retransmitted = std::vec::Vec::new();
+  let mut batches = 0u64;
+  while let Some(out) = e.poll_message() {
+    match out.msg_ref() {
+      Message::PrepareBatch(b) => {
+        batches += 1;
+        assert_eq!(
+          b.view(),
+          View::new(),
+          "the batch carries the primary's view"
+        );
+        assert_eq!(
+          b.commit(),
+          OpNumber::new(),
+          "the batch carries the primary's commit (nothing committed — quorum 2, no backup acks)"
+        );
+        for entry in b.log_slice() {
+          assert!(
+            entry.body().is_some(),
+            "a retransmitted entry always carries its body (the primary skips its own holes)"
+          );
+          retransmitted.push(entry.op().get());
+        }
+      }
+      Message::Prepare(_) => panic!("the retransmit path is batched: no per-op Prepare frames"),
+      _ => {}
+    }
+  }
+  let expect: std::vec::Vec<u64> = (1..=PREPARE_RETRANSMIT_WINDOW).collect();
+  assert_eq!(
+    retransmitted, expect,
+    "exactly the first PREPARE_RETRANSMIT_WINDOW un-acked ops are re-broadcast"
+  );
+  assert_eq!(
+    batches, 1,
+    "small bodies fit the frame budget: the whole window ships as ONE batch"
+  );
+  assert_eq!(
+    e.prepare_batches_sent(),
+    1,
+    "the observability counter witnesses the batched retransmit"
+  );
+}
+
+#[test]
+fn prepare_retransmit_splits_batches_at_the_frame_budget() {
+  // The retransmit accumulator is byte-bounded: ops whose bodies cannot share one frame split into
+  // multiple batches, each under MAX_FRAME_LEN, together still covering the whole window. Three
+  // 6 MiB ops: two fit one frame (12 MiB + framing < 16 MiB), the third would exceed the budget —
+  // so the tick emits [1,2] then [3].
+  let cfg = Config::try_new(1, ReplicaId::new(0), 2).unwrap();
+  let mut e = Endpoint::new(cfg, 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let big = 6 * 1024 * 1024usize;
+  for rn in 1..=3u64 {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8; big]),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.op(),
+    OpNumber::with(3),
+    "three large ops minted, un-acked"
+  );
+  while e.poll_message().is_some() {} // drop the initial per-op broadcasts
+  e.handle_timeout(now + PREPARE_RETRANSMIT, &mut wal, &mut sb);
+  let mut batches: std::vec::Vec<std::vec::Vec<u64>> = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareBatch(b) = out.msg_ref() {
+      assert!(
+        Message::PrepareBatch(b.clone()).encoded_len() <= crate::message::MAX_FRAME_LEN as usize,
+        "every emitted batch fits the frame cap"
+      );
+      batches.push(b.log_slice().iter().map(|e| e.op().get()).collect());
+    }
+  }
+  assert_eq!(
+    batches,
+    std::vec![std::vec![1, 2], std::vec![3]],
+    "the window splits at the byte budget into successive sub-cap batches, in op order"
+  );
+  assert_eq!(
+    e.prepare_batches_sent(),
+    2,
+    "the counter advances once per emitted batch"
+  );
+}
+
+#[test]
+fn prepare_retransmit_skips_a_repairing_hole_in_the_window() {
+  // A post-adoption primary can hold a header-only (`Repairing`) entry inside its un-acked window —
+  // it has the op's identity but not its bytes (the windowed repair channel is fetching them). The
+  // retransmit must SKIP it (there is no body to ship) while still batching the `Present` ops on
+  // either side.
+  let cfg = Config::try_new(1, ReplicaId::new(0), 2).unwrap();
+  let mut e = Endpoint::new(cfg, 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  for rn in 1..=3u64 {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      client_request(rn),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  // Replace op 2's body with a `Repairing` hole (the in-memory shape a view-change adoption leaves
+  // for an op whose body no donor shipped).
+  e.log.insert(
+    2,
+    LogEntry {
+      client: ClientId::new(7),
+      request: RequestNumber::with(2),
+      body: Body::Repairing(0xABCD),
+    },
+  );
+  while e.poll_message().is_some() {}
+  e.handle_timeout(now + PREPARE_RETRANSMIT, &mut wal, &mut sb);
+  let mut retransmitted = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareBatch(b) = out.msg_ref() {
+      for entry in b.log_slice() {
+        retransmitted.push(entry.op().get());
+      }
+    }
+  }
+  assert_eq!(
+    retransmitted,
+    std::vec![1, 3],
+    "the Repairing hole is skipped; its Present neighbours still ship in one batch"
+  );
+}
+
+#[test]
+fn prepare_batch_delivery_is_equivalent_to_the_separate_prepares() {
+  // The semantics-identical-by-construction proof: a backup fed ONE `PrepareBatch` ends in EXACTLY
+  // the state of a backup fed the equivalent per-op `Prepare`s (same envelope
+  // view/commit/checkpoint_op, same entries, same order) — `on_prepare_batch` reconstructs each
+  // per-op `Prepare` and routes it through `on_prepare`, so every gate re-evaluates per entry. The
+  // entry set deliberately exercises DIFFERENT `on_prepare` branches: ops 1-2 head-extend (with the
+  // piggybacked commit applying op 1), op 4 is a future op (op 3 missing) that lands in the
+  // tail-gap buffer and solicits the gap.
+  let now = Instant::ZERO;
+  let body_of = |op: u64| Bytes::copy_from_slice(&[op as u8]);
+  let (commit, ck) = (OpNumber::with(1), OpNumber::new());
+  let ops = [1u64, 2, 4];
+
+  // Path A: the separate per-op Prepares, delivered back-to-back.
+  let mut a = backup();
+  let (mut wal_a, mut sb_a) = (TestWal::default(), TestSb::default());
+  for op in ops {
+    a.handle_message(
+      now,
+      &mut wal_a,
+      &mut sb_a,
+      primary_peer(),
+      Message::Prepare(Prepare::new(
+        View::new(),
+        OpNumber::with(op),
+        commit,
+        ck,
+        ClientId::new(7),
+        RequestNumber::with(op),
+        body_of(op),
+      )),
+    );
+  }
+
+  // Path B: ONE PrepareBatch carrying the same envelope + entries.
+  let mut b = backup();
+  let (mut wal_b, mut sb_b) = (TestWal::default(), TestSb::default());
+  let entries = ops
+    .iter()
+    .map(|&op| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        body_of(op),
+      )
+    })
+    .collect();
+  b.handle_message(
+    now,
+    &mut wal_b,
+    &mut sb_b,
+    primary_peer(),
+    Message::PrepareBatch(crate::PrepareBatch::new(View::new(), commit, ck, entries)),
+  );
+
+  // Land the in-flight appends on both, so the deferred acks are emitted too.
+  a.handle_storage(now, &mut wal_a, &mut sb_a);
+  b.handle_storage(now, &mut wal_b, &mut sb_b);
+
+  // The full observable state converges — position, retained log, buffer, repair set, sessions…
+  assert_eq!(a.op(), b.op());
+  assert_eq!(
+    a.op(),
+    OpNumber::with(2),
+    "ops 1-2 extended the head; op 4 is buffered (op 3 missing)"
+  );
+  assert_eq!(a.commit(), b.commit());
+  assert_eq!(
+    a.commit(),
+    OpNumber::with(1),
+    "the piggybacked commit applied op 1"
+  );
+  assert_eq!(a.commit_max, b.commit_max);
+  assert_eq!(a.log, b.log, "identical retained logs");
+  assert_eq!(a.buffer, b.buffer, "identical tail-gap buffers");
+  assert!(a.buffer.contains_key(&4), "the future op buffered on both");
+  assert_eq!(a.repair, b.repair);
+  assert_eq!(
+    a.sessions_snapshot_for_test(),
+    b.sessions_snapshot_for_test()
+  );
+  // …the emitted message sequences (acks + the tail-gap solicitation, in order)…
+  let drain_msgs = |e: &mut Endpoint<NoopSm>| {
+    let mut out = std::vec::Vec::new();
+    while let Some(m) = e.poll_message() {
+      out.push(m);
+    }
+    out
+  };
+  let (out_a, out_b) = (drain_msgs(&mut a), drain_msgs(&mut b));
+  assert_eq!(out_a, out_b, "identical emitted message sequences");
+  assert!(
+    out_a
+      .iter()
+      .any(|o| matches!(o.msg_ref(), Message::PrepareOk(ok) if ok.op() == OpNumber::with(2))),
+    "non-vacuous: the durable appends acked on both paths"
+  );
+  // …and the application events.
+  let drain_events = |e: &mut Endpoint<NoopSm>| {
+    let mut out = std::vec::Vec::new();
+    while let Some(ev) = e.poll_event() {
+      out.push(ev);
+    }
+    out
+  };
+  assert_eq!(
+    drain_events(&mut a),
+    drain_events(&mut b),
+    "identical event sequences"
+  );
+}
+
+#[test]
+fn prepare_batch_skips_a_repairing_entry_and_processes_the_rest() {
+  // A header-only (`Repairing`) entry carries no bytes to prepare, so the receive side SKIPS it and
+  // processes the remaining entries. The sender never emits one (its retransmit loop skips its own
+  // holes), so this is the defensive posture against a buggy-but-authenticated primary: op 1
+  // (Present) appends + acks, the Repairing op 2 neither extends the head nor buffers, and op 3 —
+  // now a future op relative to head 1 — still flows through `on_prepare` into the tail-gap buffer
+  // (hole-filling stays owned by the windowed repair channel, never the retransmit).
+  let mut e = backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let entry = |op: u64| {
+    PreparedEntry::new(
+      OpNumber::with(op),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      Bytes::copy_from_slice(&[op as u8]),
+    )
+  };
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::PrepareBatch(crate::PrepareBatch::new(
+      View::new(),
+      OpNumber::new(),
+      OpNumber::new(),
+      std::vec![
+        entry(1),
+        PreparedEntry::repairing(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          0xABCD,
+        ),
+        entry(3),
+      ],
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the Present op extended the head; the Repairing entry did not"
+  );
+  assert!(
+    e.buffer.contains_key(&3) && !e.buffer.contains_key(&2),
+    "the entry after the skipped one still processed (buffered as a future op); nothing buffered \
+     for the skipped op"
+  );
+  let mut acked = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      acked.push(ok.op().get());
+    }
+  }
+  assert_eq!(acked, std::vec![1], "exactly the Present head-extend acked");
+}

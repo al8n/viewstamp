@@ -58,7 +58,7 @@ enum Conn {
   Server(ServerConnection),
 }
 
-/// The rustls record layer as a [`StreamTransport`].
+/// The rustls record layer as a [`StreamTransport`](super::StreamTransport).
 pub struct TlsRecords {
   conn: Conn,
   /// Outbound plaintext staged for the next transmit, bounded by `SEND_LIMIT`. This is the real
@@ -203,6 +203,10 @@ impl RecordIo for TlsRecords {
       .unwrap_or(0);
       self.pending.drain(..accepted);
     }
+    // `write_tls` drains ALL of rustls's queued output — handshake records included, not just the
+    // encrypted application plaintext above. So handshake bytes flow through this same transmit path
+    // and are counted in the driver's per-conn `queued_bytes` (bounded by its always-admit-one rule),
+    // not bypassed. The handshake is small and bounded, so no extra accounting is needed.
     loop {
       let n = match &mut self.conn {
         Conn::Client(c) => c.write_tls(out),

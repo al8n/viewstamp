@@ -1038,7 +1038,9 @@ fn commits_are_drained_through_the_public_poll_event() {
     let event = coord
       .poll_event()
       .unwrap_or_else(|| panic!("{who} must surface its commit through the public poll_event"));
-    let Event::Committed(committed) = event;
+    let Event::Committed(committed) = event else {
+      panic!("{who}'s drained event must be the Committed for op 1, got {event:?}");
+    };
     assert_eq!(
       committed.op(),
       OpNumber::with(1),
@@ -1055,6 +1057,71 @@ fn commits_are_drained_through_the_public_poll_event() {
        accumulate unbounded"
     );
   }
+}
+
+/// The PUBLIC node-local request path: [`QuicCoordinator::submit_client_request`] injects a client
+/// request at this replica AND broadcasts it to the backups, so whichever replica holds the primary
+/// role for the current view serves it. Two replicas converge over real mTLS; the request is submitted
+/// at replica 0 (primary for view 0 of a 2-node cluster) through the PUBLIC api — NOT the
+/// `inject_message_for_test` seam — and the committed reply is drained through the public
+/// `poll_event` as [`Event::Committed`].
+///
+/// This is the driver's submit surface: a real QUIC driver has only `submit_client_request` to feed a
+/// node-local app request into consensus (the inject seam is `#[cfg(test)]`), so this proves that
+/// public path drives a request to commit and surfaces the reply.
+#[test]
+fn public_submit_client_request_converges() {
+  let ca = test_ca();
+  let addr0 = addr(1);
+  let addr1 = addr(2);
+  let mut r0 = replica(&ca, 0, [7u8; 32], Scheme::Hello, StreamLayout::ControlBulk);
+  let mut r1 = replica(&ca, 1, [9u8; 32], Scheme::Hello, StreamLayout::ControlBulk);
+
+  // Mutual dial so each side records the dialed expectation its binding policy match-or-aborts on.
+  r0.0
+    .connect(Instant::ZERO, addr1, Peer::Replica(ReplicaId::new(1)))
+    .expect("a fresh coordinator dials under the connection cap");
+  r1.0
+    .connect(Instant::ZERO, addr0, Peer::Replica(ReplicaId::new(0)))
+    .expect("a fresh coordinator dials under the connection cap");
+
+  // Submit at replica 0 (the view-0 primary) via the PUBLIC api: it injects locally AND broadcasts to
+  // backups. The Prepare is staged immediately; the consensus layer retransmits it until the per-peer
+  // send stream is up, so submitting before the ferry loop needs no handshake-complete barrier.
+  r0.0.submit_client_request(
+    Instant::ZERO,
+    &mut r0.1,
+    &mut r0.2,
+    Request::new(
+      ClientId::new(1),
+      RequestNumber::with(1),
+      Bytes::from_static(b"x"),
+    ),
+  );
+
+  assert!(
+    run_until_converged(&mut r0, addr0, &mut r1, addr1),
+    "the publicly-submitted client request must commit on both replicas"
+  );
+
+  // The committed reply reaches the app through the PUBLIC poll_event on the submitting replica.
+  let event = r0
+    .0
+    .poll_event()
+    .expect("the submitting replica surfaces its commit through the public poll_event");
+  let Event::Committed(committed) = event else {
+    panic!("the drained event must be the Committed for the submitted op, got {event:?}");
+  };
+  assert_eq!(
+    committed.op(),
+    OpNumber::with(1),
+    "the drained event is the commit of the submitted op 1"
+  );
+  assert_eq!(
+    committed.reply(),
+    b"x",
+    "the committed reply carries the submitted op body"
+  );
 }
 
 /// End-to-end coverage of a frame that CROSSES the per-stream receive window: a single consensus op

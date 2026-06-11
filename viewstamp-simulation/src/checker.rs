@@ -141,6 +141,18 @@ impl DurabilityChecker {
     CheckResult::Ok
   }
 
+  /// Record that replica `i`'s durable storage was WIPED ([`Cluster::wipe_and_restart`]): its
+  /// per-replica `checkpoint_op` monotonicity baseline is forfeit with the disk (the replica
+  /// legitimately restarts at checkpoint 0 — its OWN pre-wipe durable state is gone, which is not by
+  /// itself a violation under the `<= f` lost-state budget). The CLUSTER-level guarantees are
+  /// deliberately NOT relaxed: the committed history is kept as-is, so the wiped replica's re-applied
+  /// prefix must still agree with it (a divergent re-application — the amnesia hazard breaking quorum
+  /// intersection — still trips [`observe`](Self::observe)), and [`check`](Self::check) still demands
+  /// the full history survive on an operational replica.
+  pub fn note_wipe(&mut self, i: usize) {
+    self.checkpoint_hw[i] = 0;
+  }
+
   /// Sample the cluster: update the committed history and return a violation if any replica rewrote a
   /// committed op or regressed its `checkpoint_op`. Call every tick.
   pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
@@ -206,6 +218,15 @@ impl ViewMonotonicChecker {
     Self {
       max_view: vec![0; replica_count],
     }
+  }
+
+  /// Record that replica `i`'s durable storage was WIPED ([`Cluster::wipe_and_restart`]): its
+  /// durable-view monotonicity baseline is forfeit with the disk — the fresh superblock honestly
+  /// reads view 0, and that REGRESSION IS the amnesia hazard, not a checker artifact (the replica may
+  /// have voted in views its new disk has no memory of). Whether that ever lets it double-participate
+  /// and break agreement is judged by the safety/durability checkers, which are NOT relaxed.
+  pub fn note_wipe(&mut self, i: usize) {
+    self.max_view[i] = 0;
   }
 
   /// Sample the cluster: returns a violation if any replica's DURABLE view dropped below a prior

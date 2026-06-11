@@ -75,11 +75,8 @@ fn a_stuck_pruned_committed_hole_converges_via_force_sync() {
     // retry; no torn — keep the fault model a single, crisp permanent class). High enough that a
     // committed slot in the laggard's tail rots across the sweep.
     c.set_storage_faults(StorageFaults {
-      read_fault_per_mille: 0,
-      torn_write_per_mille: 0,
       bit_rot_per_mille: 250,
-      misdirect_read_per_mille: 0,
-      corrupt_checkpoint_read_per_mille: 0,
+      ..StorageFaults::none()
     });
     let laggard = 2usize;
 

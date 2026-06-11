@@ -20,6 +20,212 @@ const PREPARED_ENTRY_MIN_LEN: usize = 8 + 16 + 8 + 1 + 4;
 const BODY_TAG_PRESENT: u8 = 0;
 const BODY_TAG_REPAIRING: u8 = 1;
 
+/// The maximum encoded message length the transport framing admits (16 MiB). The single source of
+/// truth for the frame cap: the (feature-gated) transport re-exports this as
+/// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN), and the always-available byte-bounded
+/// repair serve ([`Endpoint::on_request_prepare_range`](crate::Endpoint)) reads it directly — so the
+/// serve's budget and the transport's cap can never drift. Lives in the base crate (not behind a
+/// feature) so the proto core (and the VOPR, which runs without the transport) can size repair batches
+/// against the very cap the wire enforces.
+pub(crate) const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+
+/// Bytes [`Message::encode`] prepends before any variant body: [`WIRE_VERSION`](crate::WIRE_VERSION)
+/// (`u16`) then the variant discriminant tag (`u8`).
+const ENCODE_HEADER_LEN: usize = 2 + 1;
+/// The `u32` length prefix [`crate::codec::write_bytes_u32`] writes before a `Bytes` payload.
+const BYTES_LEN_PREFIX: usize = 4;
+
+/// Fixed bytes a [`Request`] encoding wraps around its body: the [`ENCODE_HEADER_LEN`] message header,
+/// then `client` (`u128`) + `request` (`u64`), then the body's [`BYTES_LEN_PREFIX`]. So a body of `b`
+/// bytes encodes to `REQUEST_ENCODE_OVERHEAD + b`. Derived from the exact widths
+/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::Request`] arm.
+pub const REQUEST_ENCODE_OVERHEAD: usize = ENCODE_HEADER_LEN + 16 + 8 + BYTES_LEN_PREFIX;
+
+/// Fixed bytes a [`Prepare`] encoding wraps around the SAME client body once the primary replicates it
+/// to backups: the [`ENCODE_HEADER_LEN`] message header, then `view` + `op` + `commit` + `checkpoint_op`
+/// (four `u64`s) + `client` (`u128`) + `request` (`u64`), then the body's [`BYTES_LEN_PREFIX`]. So the
+/// same `b`-byte client body that arrived as a `Request` leaves as a `Prepare` of
+/// `PREPARE_ENCODE_OVERHEAD + b` bytes. Derived from the exact widths
+/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::Prepare`] arm. This is strictly
+/// larger than [`REQUEST_ENCODE_OVERHEAD`] (a `Prepare` carries the extra consensus header fields), but
+/// it is NOT the worst hop the body sees — the log-slice carriers below wrap it in more — so it is only
+/// one input to [`MAX_REQUEST_BODY_OVERHEAD`].
+pub const PREPARE_ENCODE_OVERHEAD: usize =
+  ENCODE_HEADER_LEN + 8 + 8 + 8 + 8 + 16 + 8 + BYTES_LEN_PREFIX;
+
+/// Fixed bytes a [`Reply`] encoding wraps around its body: the `ENCODE_HEADER_LEN` message header,
+/// then `view` (`u64`) + `client` (`u128`) + `request` (`u64`), then the body's `BYTES_LEN_PREFIX`.
+/// So a reply body of `b` bytes encodes to `REPLY_ENCODE_OVERHEAD + b`. Derived from the exact widths
+/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::Reply`] arm. The `Reply` is
+/// the ONLY carrier of a reply body on the wire (the checkpoint envelope also embeds cached reply
+/// bodies, but that envelope is chunk-transferable and so unbounded by any single frame), so this is
+/// the binding overhead behind [`max_reply_body_len`].
+pub const REPLY_ENCODE_OVERHEAD: usize = ENCODE_HEADER_LEN + 8 + 16 + 8 + BYTES_LEN_PREFIX;
+
+/// The largest reply body a [`crate::StateMachine::apply`] may return: a reply of this many bytes
+/// encodes as a [`Reply`] of exactly `MAX_FRAME_LEN`, the largest frame the transport will send or
+/// accept. One byte more and the encoded `Reply` exceeds the frame cap — the transport refuses the
+/// send, the client never hears the result, and since the op is ALREADY COMMITTED there is no
+/// in-protocol recovery (the request cannot be re-executed; the cached over-bound reply re-fails on
+/// every resend). The bound is therefore an EMBEDDER OBLIGATION documented on
+/// [`crate::StateMachine::apply`] and debug-asserted at both apply sites, mirroring how
+/// `max_request_body_len()` bounds the request body at driver submit.
+pub const fn max_reply_body_len() -> usize {
+  MAX_FRAME_LEN as usize - REPLY_ENCODE_OVERHEAD
+}
+
+/// Fixed bytes that wrap ONE client body inside a single [`Body::Present`] [`PreparedEntry`] within a
+/// log slice (the per-element framing [`write_log`] emits around the body): `op` (`u64`) + `client`
+/// (`u128`) + `request` (`u64`) + the body-state tag (`u8`, [`BODY_TAG_PRESENT`]), then the body's
+/// [`BYTES_LEN_PREFIX`]. The same client body that arrived as a `Request` and replicated as a `Prepare`
+/// is re-encoded as one of these entries when it rides a `DoViewChange` / `StartView` /
+/// `RecoveryResponse` log at view change or recovery. Derived from the exact widths [`write_log`] /
+/// [`Message::encoded_len`]'s `log(..)` write per `Present` entry.
+const LOG_ENTRY_BODY_OVERHEAD: usize = 8 + 16 + 8 + 1 + BYTES_LEN_PREFIX;
+
+/// The `u32` element-count prefix [`write_log`] writes before the entries of a log slice.
+const LOG_COUNT_PREFIX: usize = 4;
+
+/// Fixed bytes a [`RepairBatch`] encoding wraps around its served log slice, BEFORE the per-entry
+/// framing: the [`ENCODE_HEADER_LEN`] message header, then `view` + `commit` + `checkpoint_op` (three
+/// `u64`s), then the log slice's [`LOG_COUNT_PREFIX`]. The byte-bounded serve
+/// ([`Endpoint::on_request_prepare_range`](crate::Endpoint)) subtracts this from
+/// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN) to get the budget for the per-entry payloads
+/// it accumulates, so the produced `RepairBatch` never exceeds the frame cap. Derived from the exact
+/// widths [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::RepairBatch`] arm.
+pub(crate) const REPAIR_BATCH_CARRIER_OVERHEAD: usize =
+  ENCODE_HEADER_LEN + 8 + 8 + 8 + LOG_COUNT_PREFIX;
+
+/// Fixed bytes a [`RepairBatch`] encoding wraps around ONE client body when that body is the sole
+/// [`Body::Present`] entry served: the [`REPAIR_BATCH_CARRIER_OVERHEAD`] carrier framing plus one
+/// [`LOG_ENTRY_BODY_OVERHEAD`] per-entry framing. Since the view-change log carriers are
+/// header-only (see [`Endpoint::log_entries`](crate::Endpoint)), the `RepairBatch` repair serve is THE
+/// binding BODY carrier — a committed op's full body travels the wire as a single-entry
+/// `RepairBatch` (the windowed peer-repair answer), so a max-size body must fit one of these. This is
+/// the largest of the three body carriers (a one-entry `RepairBatch` carries more framing than a bare
+/// `Prepare`), so it sets [`MAX_REQUEST_BODY_OVERHEAD`].
+const REPAIR_BATCH_BODY_OVERHEAD: usize = REPAIR_BATCH_CARRIER_OVERHEAD + LOG_ENTRY_BODY_OVERHEAD;
+
+/// Fixed bytes a [`PrepareBatch`] encoding wraps around its retransmitted log slice, BEFORE the
+/// per-entry framing: the [`ENCODE_HEADER_LEN`] message header, then `view` + `commit` +
+/// `checkpoint_op` (three `u64`s), then the log slice's [`LOG_COUNT_PREFIX`]. The primary's
+/// byte-bounded prepare retransmit ([`Endpoint::primary_timeouts`](crate::Endpoint) via its
+/// `prepare` timer) subtracts this from [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN)
+/// to get the budget for the per-entry payloads each batch accumulates, so a produced
+/// `PrepareBatch` never exceeds the frame cap. Derived from the exact widths
+/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::PrepareBatch`] arm.
+pub(crate) const PREPARE_BATCH_CARRIER_OVERHEAD: usize =
+  ENCODE_HEADER_LEN + 8 + 8 + 8 + LOG_COUNT_PREFIX;
+
+/// Fixed bytes a [`PrepareBatch`] encoding wraps around ONE client body when that body is the sole
+/// [`Body::Present`] entry retransmitted: the [`PREPARE_BATCH_CARRIER_OVERHEAD`] carrier framing
+/// plus one [`LOG_ENTRY_BODY_OVERHEAD`] per-entry framing — byte-identical to
+/// [`REPAIR_BATCH_BODY_OVERHEAD`] (the two batch carriers share the envelope + per-entry layout).
+/// A committed-band op's full body also rides the retransmit as a one-entry `PrepareBatch`, so a
+/// max-size body must fit one of these; it TIES the `RepairBatch` carrier as the binding input to
+/// [`MAX_REQUEST_BODY_OVERHEAD`], leaving the bound unchanged.
+const PREPARE_BATCH_BODY_OVERHEAD: usize = PREPARE_BATCH_CARRIER_OVERHEAD + LOG_ENTRY_BODY_OVERHEAD;
+
+/// Fixed bytes a [`SyncCheckpoint`] encoding wraps around its checkpoint envelope: the
+/// [`ENCODE_HEADER_LEN`] message header, then `view` + `checkpoint_op` (two `u64`s) + `checkpoint_id`
+/// (`u128`) + `replica` (`u8`) + `nonce` (`u64`), then the envelope's [`BYTES_LEN_PREFIX`]. Derived
+/// from the exact widths [`Message::encode`]/[`Message::encoded_len`] write for the
+/// [`Message::SyncCheckpoint`] arm. The state-sync serve branches on
+/// `MAX_FRAME_LEN - SYNC_CHECKPOINT_CARRIER_OVERHEAD` ([`max_unchunked_snapshot_len`]): an envelope
+/// at/under it ships as ONE `SyncCheckpoint` (the unchunked fast path, byte-tight against the frame
+/// cap), a larger one ships chunked ([`SyncCheckpointMeta`] → [`RequestSyncChunk`] → [`SyncChunk`]) so
+/// no serve can ever exceed the frame cap.
+pub(crate) const SYNC_CHECKPOINT_CARRIER_OVERHEAD: usize =
+  ENCODE_HEADER_LEN + 8 + 8 + 16 + 1 + 8 + BYTES_LEN_PREFIX;
+
+/// The largest checkpoint envelope that ships UNCHUNKED — as one [`SyncCheckpoint`] of exactly
+/// `MAX_FRAME_LEN` at this size. The state-sync donor branches here: an envelope at/under this
+/// length is served whole (the existing single-message fast path); a larger one is announced with a
+/// [`SyncCheckpointMeta`] and pulled chunk-by-chunk ([`RequestSyncChunk`] → [`SyncChunk`]), so a
+/// snapshot of any size remains state-sync-servable. Not a tunable: derived entirely from the frame
+/// cap and the `SyncCheckpoint` carrier framing.
+pub const fn max_unchunked_snapshot_len() -> usize {
+  MAX_FRAME_LEN as usize - SYNC_CHECKPOINT_CARRIER_OVERHEAD
+}
+
+/// Fixed bytes a [`SyncChunk`] encoding wraps around its chunk payload: the [`ENCODE_HEADER_LEN`]
+/// message header, then `view` + `checkpoint_op` (two `u64`s) + `checkpoint_id` (`u128`) +
+/// `total_len` + `offset` (two `u64`s) + `replica` (`u8`) + `nonce` (`u64`), then the payload's
+/// [`BYTES_LEN_PREFIX`] — 64 bytes. Derived from the exact widths
+/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::SyncChunk`] arm.
+pub(crate) const SYNC_CHUNK_CARRIER_OVERHEAD: usize =
+  ENCODE_HEADER_LEN + 8 + 8 + 16 + 8 + 8 + 1 + 8 + BYTES_LEN_PREFIX;
+
+/// The chunk size of the chunked state-sync transfer: the largest payload a [`SyncChunk`] can carry
+/// with its encoding landing exactly on `MAX_FRAME_LEN` (max-fill, pinned exact by test). Every
+/// chunk but the last carries exactly this many bytes, so a transfer of `total_len` bytes completes
+/// in `ceil(total_len / SYNC_CHUNK_LEN)` stop-and-wait round trips. Not a tunable: derived entirely
+/// from the frame cap and the `SyncChunk` carrier framing.
+pub const SYNC_CHUNK_LEN: usize = MAX_FRAME_LEN as usize - SYNC_CHUNK_CARRIER_OVERHEAD;
+
+/// The exact number of bytes one [`Body::Present`] [`PreparedEntry`] of `body_len` body bytes
+/// contributes to a `write_log` slice: the per-entry framing [`LOG_ENTRY_BODY_OVERHEAD`] plus the body
+/// bytes themselves. Used by the byte-bounded repair serve to accumulate a served prefix without
+/// exceeding the frame budget (one source of truth with [`write_log`]'s `Present` arm).
+#[cfg_attr(not(tarpaulin), inline(always))]
+pub(crate) const fn present_entry_encoded_len(body_len: usize) -> usize {
+  LOG_ENTRY_BODY_OVERHEAD + body_len
+}
+
+/// The exact encoded size of one HEADER-ONLY ([`Body::Repairing`]) [`PreparedEntry`] in a log slice:
+/// `op` (`u64`) + `client` (`u128`) + `request` (`u64`) + the body-state tag (`u8`,
+/// [`BODY_TAG_REPAIRING`]) + the 16-byte `body_checksum` (`u128`), NO body bytes. The view-change log
+/// carriers (`DoViewChange` / `StartView` / `RecoveryResponse`) emit EVERY entry header-only (see
+/// [`Endpoint::log_entries`](crate::Endpoint)), so a whole uncheckpointed band of `d` ops encodes to a
+/// fixed `d * PER_HEADER_ENTRY_BYTES + carrier framing` regardless of body sizes — the property
+/// [`crate::config::MAX_CHECKPOINT_OPS`] is capped against so even the deepest band fits the frame.
+pub(crate) const PER_HEADER_ENTRY_BYTES: usize = 8 + 16 + 8 + 1 + 16;
+
+/// The MAXIMUM header-only band depth (op count) that fits one view-change log carrier under the frame
+/// cap, by construction: the frame budget less the largest carrier framing, divided by the fixed
+/// per-header-entry size. The carrier framing is the largest of the three log carriers — a
+/// `DoViewChange` (header + `view`/`log_view`/`op`/`commit`/`checkpoint_op` five `u64`s + `replica`
+/// `u8` + [`LOG_COUNT_PREFIX`]) and a `RecoveryResponse` (header + four `u64`s + `replica` `u8` +
+/// `nonce` `u64` + [`LOG_COUNT_PREFIX`]) tie at the larger framing; we use a generous fixed `64`-byte
+/// allowance that exceeds either (each is `48`). [`crate::config::MAX_CHECKPOINT_OPS`] is capped so the
+/// deepest achievable band `(checkpoint_op .. op]` stays at/below this, making a header-only carrier
+/// sub-cap by construction; [`Endpoint::log_entries`](crate::Endpoint) also `debug_assert`s the band
+/// against it.
+pub(crate) const MAX_HEADER_ONLY_BAND_DEPTH: usize =
+  (MAX_FRAME_LEN as usize - 64) / PER_HEADER_ENTRY_BYTES;
+
+/// `const` max of two `usize`s ([`usize::max`] is not yet `const` in this MSRV).
+const fn max_usize(a: usize, b: usize) -> usize {
+  if a > b { a } else { b }
+}
+
+/// The WORST-CASE encoding overhead a single client request body incurs over EVERY message that carries
+/// it on its way through the cluster, so a body bounded by `MAX_FRAME_LEN - MAX_REQUEST_BODY_OVERHEAD`
+/// encodes to at most the frame cap on its tightest carrier and is therefore deliverable on every hop it
+/// causes. The same body bytes are wrapped, in turn, by:
+///
+/// - the [`Request`] the client sends ([`REQUEST_ENCODE_OVERHEAD`] = 31),
+/// - the [`Prepare`] the primary replicates ([`PREPARE_ENCODE_OVERHEAD`] = 63),
+/// - and — once the op is logged — a single [`Body::Present`] [`PreparedEntry`] inside a
+///   [`RepairBatch`] ([`REPAIR_BATCH_BODY_OVERHEAD`] = 68), the windowed peer-repair answer that ships
+///   a committed op's full body, or inside a [`PrepareBatch`] ([`PREPARE_BATCH_BODY_OVERHEAD`],
+///   byte-identical at 68), the primary's batched retransmit of the un-acked window.
+///
+/// The view-change log carriers (`DoViewChange` / `StartView` / `RecoveryResponse`) are NOT in
+/// this list: they carry every entry HEADER-ONLY (see [`Endpoint::log_entries`](crate::Endpoint)),
+/// so they ship NO client body — the binding BODY carriers are the batch slices. The BINDING max
+/// is therefore the tied `RepairBatch`/`PrepareBatch` pair (68), which exceeds the `Prepare` hop (63)
+/// by the single-entry log framing they wrap the body in. Bounding by `Prepare` alone (63) would let a
+/// max-size body served as a one-entry batch encode to `MAX_FRAME_LEN + 5` and be dropped on the
+/// repair/retransmit path, leaving a single max-body committed op unrepairable. The transport's
+/// `max_request_body_len()` subtracts exactly this from
+/// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN); each batch's per-entry byte cap then
+/// guarantees a single served entry (a max body) lands exactly on the cap.
+pub const MAX_REQUEST_BODY_OVERHEAD: usize = max_usize(
+  max_usize(REQUEST_ENCODE_OVERHEAD, PREPARE_ENCODE_OVERHEAD),
+  max_usize(REPAIR_BATCH_BODY_OVERHEAD, PREPARE_BATCH_BODY_OVERHEAD),
+);
+
 /// A client request to the primary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -362,7 +568,7 @@ impl Body {
   }
 }
 
-/// One log entry carried in a `DoViewChange`/`StartView` (the prepared op). Its [`Body`] is either
+/// One log entry carried in a `DoViewChange`/`StartView` (the prepared op). Its `Body` is either
 /// `Present` (the bytes) or `Repairing` (only the durable `body_checksum`; the body is fetched from a
 /// peer after adoption). A `Repairing` entry exists ONLY to carry a body-faulty-but-header-durable
 /// committed op through a view change so its op number is never re-minted.
@@ -375,7 +581,7 @@ pub struct PreparedEntry {
 }
 
 impl PreparedEntry {
-  /// Creates a prepared-log entry whose body bytes are held (a [`Body::Present`] entry) — the common
+  /// Creates a prepared-log entry whose body bytes are held (a `Body::Present` entry) — the common
   /// case (every path that knows the body builds one of these).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(op: OpNumber, client: ClientId, request: RequestNumber, body: Bytes) -> Self {
@@ -387,7 +593,7 @@ impl PreparedEntry {
     }
   }
 
-  /// Creates a header-only ([`Body::Repairing`]) prepared-log entry carrying only the op's durable
+  /// Creates a header-only (`Body::Repairing`) prepared-log entry carrying only the op's durable
   /// `body_checksum` — a body-faulty committed op whose existence is carried through the view change
   /// so its op number is taken (never re-minted); the body is peer-repaired after adoption.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -423,31 +629,40 @@ impl PreparedEntry {
     self.request
   }
 
-  /// The entry's body-state — [`Present`](Body::Present) (bytes held) or [`Repairing`](Body::Repairing)
+  /// The entry's body-state — `Present` (bytes held) or `Repairing`
   /// (header-only, body peer-repaired after adoption).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn body_state(&self) -> &Body {
     &self.body
   }
 
-  /// `true` iff this entry is header-only ([`Body::Repairing`]) — its body must be peer-repaired.
+  /// `true` iff this entry is header-only (`Body::Repairing`) — its body must be peer-repaired.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_repairing(&self) -> bool {
     self.body.is_repairing()
   }
 
-  /// The opaque application payload as a slice when the body is [`Present`](Body::Present), else
-  /// `None` (a [`Repairing`](Body::Repairing) entry carries no bytes — only its `body_checksum`).
+  /// The opaque application payload as a slice when the body is `Present`, else
+  /// `None` (a `Repairing` entry carries no bytes — only its `body_checksum`).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn body(&self) -> Option<&[u8]> {
     self.body.as_present()
   }
 
   /// The canonical `body_checksum` of this op — total: from the bytes when
-  /// [`Present`](Body::Present), or the stored durable checksum when [`Repairing`](Body::Repairing).
+  /// `Present`, or the stored durable checksum when `Repairing`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn body_checksum(&self) -> u128 {
     self.body.body_checksum()
+  }
+
+  /// Consumes the entry into its `(op, client, request, body)` parts, MOVING the decoded
+  /// `Body::Present` bytes out rather than copying them — the consuming counterpart of the borrow
+  /// accessors, for callers (e.g. the `RepairBatch` fill path) that own the entry and would otherwise
+  /// re-copy a body the decode boundary already owns.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_parts(self) -> (OpNumber, ClientId, RequestNumber, Body) {
+    (self.op, self.client, self.request, self.body)
   }
 }
 
@@ -485,12 +700,15 @@ pub struct DoViewChange {
   log_view: View,
   op: OpNumber,
   commit: OpNumber,
+  checkpoint_op: OpNumber,
   replica: ReplicaId,
   log: Vec<PreparedEntry>,
 }
 
 impl DoViewChange {
-  /// Creates a DoViewChange.
+  /// Creates a DoViewChange with no checkpoint floor advertised (`checkpoint_op` 0 — the
+  /// never-checkpointed sender's form). A sender with a durable-checkpoint-vouched log floor chains
+  /// [`Self::with_checkpoint_op`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
@@ -505,9 +723,17 @@ impl DoViewChange {
       log_view,
       op,
       commit,
+      checkpoint_op: OpNumber::new(),
       replica,
       log,
     }
+  }
+
+  /// Sets the advertised checkpoint floor (see [`Self::checkpoint_op`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_checkpoint_op(mut self, checkpoint_op: OpNumber) -> Self {
+    self.checkpoint_op = checkpoint_op;
+    self
   }
 
   /// The view being entered.
@@ -532,6 +758,17 @@ impl DoViewChange {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn commit(&self) -> OpNumber {
     self.commit
+  }
+
+  /// The durable-checkpoint-vouched floor of the carried log: every op at/below it that `log_slice`
+  /// omits is folded into SOME durable cluster checkpoint (the sender's own, or a canonical donor's
+  /// it learned at a prior floored adoption), so an omitted op `<= checkpoint_op` is checkpoint-
+  /// subsumed — state-sync territory, never a repairable-by-prepare hole. `select_canonical_log`
+  /// takes the canonical generation's MAX as the union floor: checkpoint-subsumed ops do not ride
+  /// the view change, which is what keeps the floored union's carrier under the frame cap.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
   }
 
   /// The sending replica.
@@ -562,12 +799,14 @@ pub struct StartView {
   view: View,
   op: OpNumber,
   commit: OpNumber,
+  checkpoint_op: OpNumber,
   replica: ReplicaId,
   log: Vec<PreparedEntry>,
 }
 
 impl StartView {
-  /// Creates a StartView.
+  /// Creates a StartView with no checkpoint floor advertised (`checkpoint_op` 0). A primary with a
+  /// durable-checkpoint-vouched log floor chains [`Self::with_checkpoint_op`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
@@ -580,9 +819,17 @@ impl StartView {
       view,
       op,
       commit,
+      checkpoint_op: OpNumber::new(),
       replica,
       log,
     }
+  }
+
+  /// Sets the advertised checkpoint floor (see [`Self::checkpoint_op`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_checkpoint_op(mut self, checkpoint_op: OpNumber) -> Self {
+    self.checkpoint_op = checkpoint_op;
+    self
   }
 
   /// The new view.
@@ -601,6 +848,16 @@ impl StartView {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn commit(&self) -> OpNumber {
     self.commit
+  }
+
+  /// The durable-checkpoint-vouched floor of the carried canonical log: every op at/below it that
+  /// `log_slice` omits is folded into a durable cluster checkpoint (the new primary's own, or a
+  /// canonical DVC donor's — the union floor `select_canonical_log` applied). An adopter below this
+  /// floor trims its own retained sub-floor band (checkpoint-subsumed — must not be re-carried) and
+  /// records the floor so its force-sync escalation can recover the sub-floor gap from a snapshot.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
   }
 
   /// The new primary.
@@ -702,6 +959,59 @@ impl RequestPrepare {
   }
 }
 
+/// Replica → peers (the windowed analogue of [`RequestPrepare`]): solicit a CONTIGUOUS RUN of
+/// committed ops `[lo, hi]` this replica is missing/repairing below its head, in ONE message. A
+/// far-behind replica that adopted a deep header-only band (e.g. a view-change carrier carried the
+/// whole uncheckpointed log as header-only `Repairing` holes) would, with the per-op [`RequestPrepare`]
+/// path, need one round trip per op — never converging in a calm window. This range request lets a
+/// holder serve a BYTE-BOUNDED PREFIX of the run as one [`RepairBatch`]; the requester re-solicits the
+/// unserved tail on the next pass. Broadcast like [`RequestPrepare`]; the view is carried for
+/// routing/freshness only — a committed op's content is view-independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestPrepareRange {
+  view: View,
+  lo: OpNumber,
+  hi: OpNumber,
+  replica: ReplicaId,
+}
+
+impl RequestPrepareRange {
+  /// Creates a RequestPrepareRange for the contiguous missing committed run `[lo, hi]`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(view: View, lo: OpNumber, hi: OpNumber, replica: ReplicaId) -> Self {
+    Self {
+      view,
+      lo,
+      hi,
+      replica,
+    }
+  }
+
+  /// The requester's current view.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The low (inclusive) op of the requested run.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn lo(&self) -> OpNumber {
+    self.lo
+  }
+
+  /// The high (inclusive) op of the requested run.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn hi(&self) -> OpNumber {
+    self.hi
+  }
+
+  /// The requesting replica (the [`RepairBatch`] reply is addressed back to it).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+}
+
 /// Recovering replica → all (TB recovery): solicit the canonical head when the local head slot is
 /// permanently faulty. A `RecoveringHead` replica that cannot trust its own durable head broadcasts
 /// this; peers answer with a [`RecoveryResponse`]. The `nonce` is a freshness token echoed back so a
@@ -742,14 +1052,16 @@ pub struct RecoveryResponse {
   view: View,
   op: OpNumber,
   commit: OpNumber,
+  checkpoint_op: OpNumber,
   replica: ReplicaId,
   nonce: u64,
   log: Vec<PreparedEntry>,
 }
 
 impl RecoveryResponse {
-  /// Creates a RecoveryResponse. The primary fills `op`/`commit`/`log` from its canonical state; a
-  /// backup passes `op = commit = 0` and an empty `log` (view + nonce only).
+  /// Creates a RecoveryResponse. The primary fills `op`/`commit`/`log` from its canonical state and
+  /// chains [`Self::with_checkpoint_op`] for its vouched log floor; a backup passes `op = commit = 0`
+  /// and an empty `log` (view + nonce only, no floor).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
@@ -763,10 +1075,18 @@ impl RecoveryResponse {
       view,
       op,
       commit,
+      checkpoint_op: OpNumber::new(),
       replica,
       nonce,
       log,
     }
+  }
+
+  /// Sets the advertised checkpoint floor (see [`Self::checkpoint_op`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn with_checkpoint_op(mut self, checkpoint_op: OpNumber) -> Self {
+    self.checkpoint_op = checkpoint_op;
+    self
   }
 
   /// The responder's current view.
@@ -785,6 +1105,15 @@ impl RecoveryResponse {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn commit(&self) -> OpNumber {
     self.commit
+  }
+
+  /// The durable-checkpoint-vouched floor of the carried canonical log (`0` from a backup) — the
+  /// same semantics as [`StartView::checkpoint_op`]: an omitted op at/below it is checkpoint-
+  /// subsumed, so the recovering adopter trims its own retained sub-floor band and records the
+  /// floor for its force-sync escalation.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
   }
 
   /// The responding replica.
@@ -808,6 +1137,142 @@ impl RecoveryResponse {
   }
 
   /// Consumes the message and returns the log vector.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_log(self) -> Vec<PreparedEntry> {
+    self.log
+  }
+}
+
+/// Holder → requester (the windowed analogue of a repair-serve [`Prepare`]): a BYTE-BOUNDED PREFIX of
+/// the contiguous committed run a [`RequestPrepareRange`] solicited. Structurally a [`StartView`]
+/// WITHOUT a head `op` — it carries the holder's `commit` and `checkpoint_op` (so the requester learns
+/// fresh commit/checkpoint progress) plus a `log` of `Body::Present` [`PreparedEntry`]s, one per
+/// served op. The server walks the requested run and accumulates entries it holds `Present` UNTIL the
+/// running encoded size would exceed the frame cap (it serves a PREFIX, never an unbounded batch); the
+/// requester re-solicits the unserved tail. Each entry is verified + made durable INDIVIDUALLY by the
+/// requester (one `fill_repair` per entry — identical safety to the per-op path), so a batch is purely
+/// a pipelining of the per-op fill, never a relaxation of its verification or durability barrier. Not
+/// `Copy` (it carries owned entry bodies).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairBatch {
+  view: View,
+  commit: OpNumber,
+  checkpoint_op: OpNumber,
+  log: Vec<PreparedEntry>,
+}
+
+impl RepairBatch {
+  /// Creates a RepairBatch carrying the served prefix `log` of a solicited committed run.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn new(
+    view: View,
+    commit: OpNumber,
+    checkpoint_op: OpNumber,
+    log: Vec<PreparedEntry>,
+  ) -> Self {
+    Self {
+      view,
+      commit,
+      checkpoint_op,
+      log,
+    }
+  }
+
+  /// The responder's current view (routing/freshness; a committed op's content is view-independent).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The responder's commit number (so the requester also learns fresh commit progress — the
+  /// committed-vouch each served entry rides on, exactly as a repair-serve `Prepare`'s `commit` does).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn commit(&self) -> OpNumber {
+    self.commit
+  }
+
+  /// The op number of the responder's latest durable checkpoint (the state-sync trigger signal).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
+  }
+
+  /// The served prefix as a slice — the `Body::Present` entries the holder fit under the frame cap,
+  /// in ascending op order (a sub-run of the solicited `[lo, hi]`).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn log_slice(&self) -> &[PreparedEntry] {
+    &self.log
+  }
+
+  /// Consumes the message and returns the served-entry vector.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_log(self) -> Vec<PreparedEntry> {
+    self.log
+  }
+}
+
+/// Primary → all backups (the BATCHED retransmit form of [`Prepare`]): a byte-bounded run of the
+/// FIRST un-acked ops `(commit, ...]` the primary's prepare-retransmit timer re-broadcasts as ONE
+/// frame instead of one `Prepare` per op. Structurally a [`RepairBatch`] with head-append semantics:
+/// it carries the primary's `view`, `commit`, and `checkpoint_op` (the envelope every per-op
+/// `Prepare` would have carried) plus a `log` of `Body::Present` [`PreparedEntry`]s in ascending op
+/// order. The sender accumulates entries until the running encoded size would exceed the frame cap
+/// and then starts another batch, so the whole retransmit window always ships, in one or more
+/// sub-cap frames. The receiver reconstructs the per-op [`Prepare`] from the envelope + each entry
+/// and feeds it through the ordinary `on_prepare` ingress, so every per-op gate (view/role, sync
+/// drop, ring window, band cap, buffer window, re-ack identity) re-evaluates per entry — batching
+/// changes the framing, never the semantics. Not `Copy` (it carries owned entry bodies).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareBatch {
+  view: View,
+  commit: OpNumber,
+  checkpoint_op: OpNumber,
+  log: Vec<PreparedEntry>,
+}
+
+impl PrepareBatch {
+  /// Creates a PrepareBatch carrying the retransmitted run `log` of un-acked ops.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn new(
+    view: View,
+    commit: OpNumber,
+    checkpoint_op: OpNumber,
+    log: Vec<PreparedEntry>,
+  ) -> Self {
+    Self {
+      view,
+      commit,
+      checkpoint_op,
+      log,
+    }
+  }
+
+  /// The view in which these prepares were created (the view each reconstructed [`Prepare`] carries).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The primary's commit number at send time (each reconstructed [`Prepare`]'s piggybacked commit).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn commit(&self) -> OpNumber {
+    self.commit
+  }
+
+  /// The op number of the sender's latest durable checkpoint (the state-sync trigger signal).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
+  }
+
+  /// The retransmitted run as a slice — the `Body::Present` entries the primary fit under the
+  /// frame cap, in ascending op order.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn log_slice(&self) -> &[PreparedEntry] {
+    &self.log
+  }
+
+  /// Consumes the message and returns the retransmitted-entry vector.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn into_log(self) -> Vec<PreparedEntry> {
     self.log
@@ -891,8 +1356,11 @@ impl RequestSync {
 
 /// Peer → lagging replica (state-sync response): the latest durable checkpoint — its op, its content
 /// id, and the opaque snapshot envelope (the client-session table + `sm.snapshot()` produced by the
-/// proto's `encode_checkpoint`, modelled as one `Bytes`; the wire codec / chunking of a large snapshot
-/// is deferred to a later milestone). The requester MUST verify `checkpoint_id == checkpoint_id(snapshot)` (a content hash) BEFORE
+/// proto's `encode_checkpoint`, modelled as one `Bytes`). Ships whole only when the envelope fits one
+/// frame (at most [`max_unchunked_snapshot_len`] bytes); a larger envelope travels chunked
+/// ([`SyncCheckpointMeta`] → [`RequestSyncChunk`] → [`SyncChunk`]) and the verified reassembly
+/// re-enters the receive path as exactly this message. The requester MUST verify
+/// `checkpoint_id == checkpoint_id(snapshot)` (a content hash) BEFORE
 /// restoring — never restore a corrupt/mismatched checkpoint — then `sm.restore` + restore the session
 /// table + set `commit_min == commit_max == checkpoint_op`. `nonce` echoes the soliciting
 /// [`RequestSync`] (a stale reply is dropped). Not `Copy` (it carries owned `Bytes`).
@@ -971,6 +1439,260 @@ impl SyncCheckpoint {
   }
 }
 
+/// Donor → lagging replica (the chunked state-sync announce): the donor's latest durable checkpoint
+/// is TOO LARGE to ship as one [`SyncCheckpoint`] (its envelope exceeds
+/// [`max_unchunked_snapshot_len`]), so the donor announces it — op, content id, and the envelope's
+/// `total_len` — and the requester PULLS it chunk-by-chunk ([`RequestSyncChunk`] → [`SyncChunk`]).
+/// `total_len` descends from a VERIFIED checkpoint read (the donor hashes the read bytes against its
+/// durable root before announcing), so the receiver can size its reassembly buffer to exactly the
+/// envelope it will verify. `nonce` echoes the soliciting `RequestSync` (a stale announce is
+/// dropped); `view` is routing/freshness only — committed checkpoint content is view-independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncCheckpointMeta {
+  view: View,
+  checkpoint_op: OpNumber,
+  checkpoint_id: u128,
+  total_len: u64,
+  replica: ReplicaId,
+  nonce: u64,
+}
+
+impl SyncCheckpointMeta {
+  /// Creates a chunked-transfer announce for the checkpoint `(checkpoint_op, checkpoint_id)` whose
+  /// envelope is `total_len` bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    view: View,
+    checkpoint_op: OpNumber,
+    checkpoint_id: u128,
+    total_len: u64,
+    replica: ReplicaId,
+    nonce: u64,
+  ) -> Self {
+    Self {
+      view,
+      checkpoint_op,
+      checkpoint_id,
+      total_len,
+      replica,
+      nonce,
+    }
+  }
+
+  /// The donor's current view (routing/freshness; the checkpoint content is view-independent).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The op number at which the announced checkpoint was taken.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
+  }
+
+  /// The content id of the announced envelope — the transfer is PINNED by `(checkpoint_op, this)`,
+  /// and the assembled bytes must hash to it before anything reaches the install path.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_id(&self) -> u128 {
+    self.checkpoint_id
+  }
+
+  /// The announced envelope's total length in bytes (from a VERIFIED donor read).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn total_len(&self) -> u64 {
+    self.total_len
+  }
+
+  /// The announcing replica (chunk requests are addressed to it).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// The freshness nonce echoed from the soliciting `RequestSync`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+}
+
+/// Lagging replica → donor (the chunked state-sync pull): request the chunk of the pinned checkpoint
+/// envelope starting at `offset`. One outstanding request at a time (stop-and-wait, self-clocked:
+/// the next request is sent on chunk accept); the `sync_solicit` timer re-sends the current request
+/// as the ARQ. `(checkpoint_op, checkpoint_id)` pin the exact content being pulled, so a donor whose
+/// checkpoint has since advanced can keep serving the pinned (immutable, committed) envelope from
+/// its cache, and chunks from DIFFERENT donors of the same pinned content are interchangeable.
+/// `nonce` is the requester's live sync nonce, echoed in the [`SyncChunk`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestSyncChunk {
+  view: View,
+  checkpoint_op: OpNumber,
+  checkpoint_id: u128,
+  offset: u64,
+  replica: ReplicaId,
+  nonce: u64,
+}
+
+impl RequestSyncChunk {
+  /// Creates a chunk request for the pinned checkpoint `(checkpoint_op, checkpoint_id)` at `offset`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    view: View,
+    checkpoint_op: OpNumber,
+    checkpoint_id: u128,
+    offset: u64,
+    replica: ReplicaId,
+    nonce: u64,
+  ) -> Self {
+    Self {
+      view,
+      checkpoint_op,
+      checkpoint_id,
+      offset,
+      replica,
+      nonce,
+    }
+  }
+
+  /// The requester's current view.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The pinned checkpoint op being pulled.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
+  }
+
+  /// The pinned envelope content id being pulled.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_id(&self) -> u128 {
+    self.checkpoint_id
+  }
+
+  /// The byte offset into the envelope this request asks the donor to serve from.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn offset(&self) -> u64 {
+    self.offset
+  }
+
+  /// The requesting replica (the [`SyncChunk`] reply is addressed back to it).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// The requester's live sync nonce, echoed in the [`SyncChunk`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+}
+
+/// Donor → lagging replica (the chunked state-sync payload): one chunk of the pinned checkpoint
+/// envelope, answering a [`RequestSyncChunk`]. Every chunk repeats `(checkpoint_op, checkpoint_id,
+/// total_len)` so it is statelessly self-describing — the receiver rejects any chunk that does not
+/// match its pinned transfer, and a dup/reordered chunk (its `offset` is not the staged frontier) is
+/// inert. The payload is at most [`SYNC_CHUNK_LEN`] bytes by construction (a max-fill chunk encodes
+/// to exactly the frame cap), so the chunked path can never produce an oversized frame. Not `Copy`
+/// (it carries owned `Bytes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncChunk {
+  view: View,
+  checkpoint_op: OpNumber,
+  checkpoint_id: u128,
+  total_len: u64,
+  offset: u64,
+  replica: ReplicaId,
+  nonce: u64,
+  bytes: Bytes,
+}
+
+impl SyncChunk {
+  /// Creates a chunk of the pinned checkpoint `(checkpoint_op, checkpoint_id)`: the envelope bytes
+  /// at `offset .. offset + bytes.len()` of a `total_len`-byte envelope.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[allow(clippy::too_many_arguments)] // the wire layout, in canonical field order
+  pub const fn new(
+    view: View,
+    checkpoint_op: OpNumber,
+    checkpoint_id: u128,
+    total_len: u64,
+    offset: u64,
+    replica: ReplicaId,
+    nonce: u64,
+    bytes: Bytes,
+  ) -> Self {
+    Self {
+      view,
+      checkpoint_op,
+      checkpoint_id,
+      total_len,
+      offset,
+      replica,
+      nonce,
+      bytes,
+    }
+  }
+
+  /// The donor's current view (routing/freshness; the chunk content is view-independent).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The pinned checkpoint op this chunk belongs to.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_op(&self) -> OpNumber {
+    self.checkpoint_op
+  }
+
+  /// The pinned envelope content id this chunk belongs to.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_id(&self) -> u128 {
+    self.checkpoint_id
+  }
+
+  /// The envelope's total length (repeated on every chunk — statelessly self-describing).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn total_len(&self) -> u64 {
+    self.total_len
+  }
+
+  /// The byte offset of this chunk within the envelope.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn offset(&self) -> u64 {
+    self.offset
+  }
+
+  /// The serving replica.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// The freshness nonce echoed from the soliciting [`RequestSyncChunk`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+
+  /// The chunk payload as a slice.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn bytes(&self) -> &[u8] {
+    &self.bytes
+  }
+
+  /// The chunk payload as a cloned [`Bytes`] handle.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn bytes_owned(&self) -> Bytes {
+    self.bytes.clone()
+  }
+}
+
 /// A Viewstamped Replication protocol message.
 ///
 /// Client traffic is not a separate API: a request arrives as `Message::Request`
@@ -1010,6 +1732,19 @@ pub enum Message {
   RequestSync(RequestSync),
   /// Answer a `RequestSync` with the latest durable checkpoint (snapshot + op + content id).
   SyncCheckpoint(SyncCheckpoint),
+  /// Solicit a contiguous run of missing committed ops `[lo, hi]` (windowed peer fault-repair).
+  RequestPrepareRange(RequestPrepareRange),
+  /// Answer a `RequestPrepareRange` with a byte-bounded prefix of the solicited run.
+  RepairBatch(RepairBatch),
+  /// Announce an over-frame checkpoint for chunked transfer (op, content id, total length).
+  SyncCheckpointMeta(SyncCheckpointMeta),
+  /// Solicit one chunk of an announced checkpoint envelope at a byte offset.
+  RequestSyncChunk(RequestSyncChunk),
+  /// Answer a `RequestSyncChunk` with one chunk of the pinned checkpoint envelope.
+  SyncChunk(SyncChunk),
+  /// Retransmit a byte-bounded batch of the primary's first un-acked prepares (one frame, not one
+  /// `Prepare` per op).
+  PrepareBatch(PrepareBatch),
 }
 
 impl Message {
@@ -1032,6 +1767,12 @@ impl Message {
       Self::RecoveryResponse(_) => "RecoveryResponse",
       Self::RequestSync(_) => "RequestSync",
       Self::SyncCheckpoint(_) => "SyncCheckpoint",
+      Self::RequestPrepareRange(_) => "RequestPrepareRange",
+      Self::RepairBatch(_) => "RepairBatch",
+      Self::SyncCheckpointMeta(_) => "SyncCheckpointMeta",
+      Self::RequestSyncChunk(_) => "RequestSyncChunk",
+      Self::SyncChunk(_) => "SyncChunk",
+      Self::PrepareBatch(_) => "PrepareBatch",
     }
   }
 
@@ -1064,21 +1805,39 @@ impl Message {
       // The PRIMARY's recovery-handshake answer (the head-bearing equivalent of a StartView).
       | Self::RecoveryResponse(_)
       // The state-sync serve advertises `self.view`.
-      | Self::SyncCheckpoint(_) => true,
+      | Self::SyncCheckpoint(_)
+      // The chunked-transfer serves are the SAME state-sync answer split across messages — the
+      // announce and each chunk advertise `self.view` exactly as the whole `SyncCheckpoint` does, so
+      // they ride the same emit gate (a donor never serves while its view write is in flight).
+      | Self::SyncCheckpointMeta(_)
+      | Self::SyncChunk(_)
+      // The windowed repair serve advertises `self.view` exactly as the per-op repair-serve `Prepare`
+      // does (it is the batched form of the same answer): the server emits it only when Normal +
+      // durable-view (`on_request_prepare_range` self-gates like `on_request_prepare`), so gating it at
+      // the `emit` chokepoint keeps it in lockstep with `Prepare` rather than carving an exception.
+      | Self::RepairBatch(_)
+      // The primary's batched prepare retransmit advertises `self.view` exactly as each per-op
+      // retransmit `Prepare` it replaces does (`primary_timeouts` skips the retransmit tick while
+      // `pending_sb` holds, the same gate the per-op form rode).
+      | Self::PrepareBatch(_) => true,
       // Solicitations / requests-to-change / client-facing — view-independent, never an authority claim.
       Self::Request(_)
       | Self::Reply(_)
       | Self::StartViewChange(_)
       | Self::GetView(_)
       | Self::RequestPrepare(_)
+      // The windowed solicitation is a request-for-repair, not an authority claim (like `RequestPrepare`).
+      | Self::RequestPrepareRange(_)
       | Self::Recovery(_)
-      | Self::RequestSync(_) => false,
+      | Self::RequestSync(_)
+      // The chunk pull is a solicitation, exactly like the `RequestSync` it follows.
+      | Self::RequestSyncChunk(_) => false,
     }
   }
 
   /// The stable wire discriminant tag for each variant, matching declaration order. One source of
   /// truth shared by [`Self::encode`] (writes it) and [`Self::decode`] (dispatches on it); the
-  /// `match` is EXHAUSTIVE (no wildcard) so a future 15th variant fails to compile until it is
+  /// `match` is EXHAUSTIVE (no wildcard) so a future 21st variant fails to compile until it is
   /// assigned a tag here.
   #[cfg_attr(not(tarpaulin), inline)]
   const fn tag(&self) -> u8 {
@@ -1097,6 +1856,12 @@ impl Message {
       Self::RecoveryResponse(_) => 11,
       Self::RequestSync(_) => 12,
       Self::SyncCheckpoint(_) => 13,
+      Self::RequestPrepareRange(_) => 14,
+      Self::RepairBatch(_) => 15,
+      Self::SyncCheckpointMeta(_) => 16,
+      Self::RequestSyncChunk(_) => 17,
+      Self::SyncChunk(_) => 18,
+      Self::PrepareBatch(_) => 19,
     }
   }
 
@@ -1111,7 +1876,10 @@ impl Message {
   /// `Header::encode`. The `match` over every variant is EXHAUSTIVE (no wildcard), preserving the
   /// codebase's exhaustive-`Message`-match property.
   pub fn encode(&self) -> Bytes {
-    let mut out = BytesMut::new();
+    // Pre-size to the exact encoded length ([`Self::encoded_len`], pinned to `encode().len()` by
+    // test) so an MB-scale Prepare/SyncCheckpoint encodes into one allocation instead of paying
+    // doubling-realloc copies.
+    let mut out = BytesMut::with_capacity(self.encoded_len());
     out.put_u16(WIRE_VERSION);
     out.put_u8(self.tag());
     match self {
@@ -1156,6 +1924,7 @@ impl Message {
         out.put_u64(m.log_view.get());
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
+        out.put_u64(m.checkpoint_op.get());
         out.put_u8(m.replica.get());
         write_log(&mut out, &m.log);
       }
@@ -1163,6 +1932,7 @@ impl Message {
         out.put_u64(m.view.get());
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
+        out.put_u64(m.checkpoint_op.get());
         out.put_u8(m.replica.get());
         write_log(&mut out, &m.log);
       }
@@ -1184,6 +1954,7 @@ impl Message {
         out.put_u64(m.view.get());
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
+        out.put_u64(m.checkpoint_op.get());
         out.put_u8(m.replica.get());
         out.put_u64(m.nonce);
         write_log(&mut out, &m.log);
@@ -1202,6 +1973,50 @@ impl Message {
         out.put_u8(m.replica.get());
         out.put_u64(m.nonce);
         write_bytes_u32(&mut out, &m.snapshot);
+      }
+      Self::RequestPrepareRange(m) => {
+        out.put_u64(m.view.get());
+        out.put_u64(m.lo.get());
+        out.put_u64(m.hi.get());
+        out.put_u8(m.replica.get());
+      }
+      Self::RepairBatch(m) => {
+        out.put_u64(m.view.get());
+        out.put_u64(m.commit.get());
+        out.put_u64(m.checkpoint_op.get());
+        write_log(&mut out, &m.log);
+      }
+      Self::SyncCheckpointMeta(m) => {
+        out.put_u64(m.view.get());
+        out.put_u64(m.checkpoint_op.get());
+        out.put_u128(m.checkpoint_id);
+        out.put_u64(m.total_len);
+        out.put_u8(m.replica.get());
+        out.put_u64(m.nonce);
+      }
+      Self::RequestSyncChunk(m) => {
+        out.put_u64(m.view.get());
+        out.put_u64(m.checkpoint_op.get());
+        out.put_u128(m.checkpoint_id);
+        out.put_u64(m.offset);
+        out.put_u8(m.replica.get());
+        out.put_u64(m.nonce);
+      }
+      Self::SyncChunk(m) => {
+        out.put_u64(m.view.get());
+        out.put_u64(m.checkpoint_op.get());
+        out.put_u128(m.checkpoint_id);
+        out.put_u64(m.total_len);
+        out.put_u64(m.offset);
+        out.put_u8(m.replica.get());
+        out.put_u64(m.nonce);
+        write_bytes_u32(&mut out, &m.bytes);
+      }
+      Self::PrepareBatch(m) => {
+        out.put_u64(m.view.get());
+        out.put_u64(m.commit.get());
+        out.put_u64(m.checkpoint_op.get());
+        write_log(&mut out, &m.log);
       }
     }
     out.freeze()
@@ -1245,14 +2060,20 @@ impl Message {
       Self::Reply(m) => U64 + U128 + U64 + bytes_u32(m.body.len()),
       Self::Commit(_) => U64 + U64 + U64,
       Self::StartViewChange(_) => U64 + U8,
-      Self::DoViewChange(m) => U64 + U64 + U64 + U64 + U8 + log(&m.log),
-      Self::StartView(m) => U64 + U64 + U64 + U8 + log(&m.log),
+      Self::DoViewChange(m) => U64 + U64 + U64 + U64 + U64 + U8 + log(&m.log),
+      Self::StartView(m) => U64 + U64 + U64 + U64 + U8 + log(&m.log),
       Self::GetView(_) => U64 + U8 + U64,
       Self::RequestPrepare(_) => U64 + U64 + U8,
       Self::Recovery(_) => U8 + U64,
-      Self::RecoveryResponse(m) => U64 + U64 + U64 + U8 + U64 + log(&m.log),
+      Self::RecoveryResponse(m) => U64 + U64 + U64 + U64 + U8 + U64 + log(&m.log),
       Self::RequestSync(_) => U64 + U64 + U8 + U64 + U8,
       Self::SyncCheckpoint(m) => U64 + U64 + U128 + U8 + U64 + bytes_u32(m.snapshot.len()),
+      Self::RequestPrepareRange(_) => U64 + U64 + U64 + U8,
+      Self::RepairBatch(m) => U64 + U64 + U64 + log(&m.log),
+      Self::SyncCheckpointMeta(_) => U64 + U64 + U128 + U64 + U8 + U64,
+      Self::RequestSyncChunk(_) => U64 + U64 + U128 + U64 + U8 + U64,
+      Self::SyncChunk(m) => U64 + U64 + U128 + U64 + U64 + U8 + U64 + bytes_u32(m.bytes.len()),
+      Self::PrepareBatch(m) => U64 + U64 + U64 + log(&m.log),
     };
     HEADER + body
   }
@@ -1264,8 +2085,8 @@ impl Message {
   /// unknown variant tag ([`CodecError::UnknownTag`]), a buffer that ends mid-field
   /// ([`CodecError::Truncated`]), a body/log length prefix exceeding the remaining bytes
   /// ([`CodecError::LengthOverflow`]), or trailing bytes after the variant
-  /// ([`CodecError::TrailingBytes`]). The tag dispatch covers the 14 known tags, with any other
-  /// byte falling through to [`CodecError::UnknownTag`] — adding a 15th variant means adding its
+  /// ([`CodecError::TrailingBytes`]). The tag dispatch covers the 20 known tags, with any other
+  /// byte falling through to [`CodecError::UnknownTag`] — adding a 21st variant means adding its
   /// discriminant tag + a decode arm here (the encode `match` will not compile until the variant
   /// is handled, preserving the exhaustive-`Message`-match property).
   pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
@@ -1317,6 +2138,7 @@ impl Message {
         log_view: read_view(&mut r)?,
         op: read_op(&mut r)?,
         commit: read_op(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
         log: read_log(&mut r)?,
       }),
@@ -1324,6 +2146,7 @@ impl Message {
         view: read_view(&mut r)?,
         op: read_op(&mut r)?,
         commit: read_op(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
         log: read_log(&mut r)?,
       }),
@@ -1345,6 +2168,7 @@ impl Message {
         view: read_view(&mut r)?,
         op: read_op(&mut r)?,
         commit: read_op(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
         nonce: r.u64()?,
         log: read_log(&mut r)?,
@@ -1363,6 +2187,50 @@ impl Message {
         replica: read_replica(&mut r)?,
         nonce: r.u64()?,
         snapshot: read_body(&mut r)?,
+      }),
+      14 => Self::RequestPrepareRange(RequestPrepareRange {
+        view: read_view(&mut r)?,
+        lo: read_op(&mut r)?,
+        hi: read_op(&mut r)?,
+        replica: read_replica(&mut r)?,
+      }),
+      15 => Self::RepairBatch(RepairBatch {
+        view: read_view(&mut r)?,
+        commit: read_op(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+        log: read_log(&mut r)?,
+      }),
+      16 => Self::SyncCheckpointMeta(SyncCheckpointMeta {
+        view: read_view(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+        checkpoint_id: r.u128()?,
+        total_len: r.u64()?,
+        replica: read_replica(&mut r)?,
+        nonce: r.u64()?,
+      }),
+      17 => Self::RequestSyncChunk(RequestSyncChunk {
+        view: read_view(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+        checkpoint_id: r.u128()?,
+        offset: r.u64()?,
+        replica: read_replica(&mut r)?,
+        nonce: r.u64()?,
+      }),
+      18 => Self::SyncChunk(SyncChunk {
+        view: read_view(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+        checkpoint_id: r.u128()?,
+        total_len: r.u64()?,
+        offset: r.u64()?,
+        replica: read_replica(&mut r)?,
+        nonce: r.u64()?,
+        bytes: read_body(&mut r)?,
+      }),
+      19 => Self::PrepareBatch(PrepareBatch {
+        view: read_view(&mut r)?,
+        commit: read_op(&mut r)?,
+        checkpoint_op: read_op(&mut r)?,
+        log: read_log(&mut r)?,
       }),
       other => return Err(CodecError::UnknownTag(other)),
     };
@@ -1753,6 +2621,39 @@ mod tests {
         0,
         body.clone()
       )),
+      Message::RepairBatch(RepairBatch::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(0),
+        std::vec![entry()]
+      )),
+      // The batched prepare retransmit advertises `self.view` exactly like each per-op `Prepare`
+      // it replaces.
+      Message::PrepareBatch(PrepareBatch::new(
+        View::with(1),
+        OpNumber::with(0),
+        OpNumber::with(0),
+        std::vec![entry()]
+      )),
+      // The chunked state-sync serves advertise `self.view` exactly like the whole SyncCheckpoint.
+      Message::SyncCheckpointMeta(SyncCheckpointMeta::new(
+        View::with(1),
+        OpNumber::with(2),
+        0,
+        64,
+        ReplicaId::new(0),
+        0
+      )),
+      Message::SyncChunk(SyncChunk::new(
+        View::with(1),
+        OpNumber::with(2),
+        0,
+        64,
+        0,
+        ReplicaId::new(0),
+        0,
+        body.clone()
+      )),
     ];
     for m in &gated {
       assert!(
@@ -1789,6 +2690,21 @@ mod tests {
         0,
         false
       )),
+      Message::RequestPrepareRange(RequestPrepareRange::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(2),
+        ReplicaId::new(2)
+      )),
+      // The chunk pull is a solicitation, like the RequestSync it follows.
+      Message::RequestSyncChunk(RequestSyncChunk::new(
+        View::with(1),
+        OpNumber::with(2),
+        0,
+        0,
+        ReplicaId::new(2),
+        0
+      )),
     ];
     for m in &ungated {
       assert!(
@@ -1800,8 +2716,8 @@ mod tests {
     // Every variant is covered exactly once across the two sets (no Message kind missed).
     assert_eq!(
       gated.len() + ungated.len(),
-      14,
-      "all 14 Message variants are classified"
+      20,
+      "all 20 Message variants are classified"
     );
     assert_eq!(
       Message::Commit(Commit::new(
@@ -1831,7 +2747,7 @@ mod tests {
     assert_eq!(rr.view(), View::with(3));
   }
 
-  // ── wire codec: all 14 Message variants ──
+  // ── wire codec: all 20 Message variants ──
 
   use crate::codec::CodecError;
 
@@ -1846,9 +2762,9 @@ mod tests {
 
   /// One representative [`Message`] per variant, deliberately exercising the edge cases each
   /// variant's codec must handle: an EMPTY body (`Request`), a POPULATED body (`Prepare`/`Reply`/
-  /// `SyncCheckpoint`), an EMPTY log slice (`StartView`), a POPULATED multi-entry log
+  /// `SyncCheckpoint`/`SyncChunk`), an EMPTY log slice (`StartView`), a POPULATED multi-entry log
   /// (`DoViewChange`/`RecoveryResponse`), the `recovery` bool both ways, and `u64::MAX`/`u128::MAX`
-  /// edge scalars. Covers all 14 tags so the round-trip + fuzz tests sweep the whole surface.
+  /// edge scalars. Covers all 20 tags so the round-trip + fuzz tests sweep the whole surface.
   fn one_of_each_variant() -> std::vec::Vec<Message> {
     std::vec![
       Message::Request(Request::new(
@@ -1884,32 +2800,38 @@ mod tests {
         OpNumber::with(7),
       )),
       Message::StartViewChange(StartViewChange::new(View::with(11), ReplicaId::new(2))),
-      Message::DoViewChange(DoViewChange::new(
-        View::with(3),
-        View::with(2),
-        OpNumber::with(6),
-        OpNumber::with(4),
-        ReplicaId::new(6),
-        // Populated: an empty-body Present entry, a populated Present entry, AND a header-only
-        // Repairing entry (op 6, body_checksum only) — exercises both body-state wire tags.
-        std::vec![
-          entry(4, b""),
-          entry(5, b"hi"),
-          PreparedEntry::repairing(
-            OpNumber::with(6),
-            ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
-            RequestNumber::with(6),
-            0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
-          ),
-        ],
-      )),
-      Message::StartView(StartView::new(
-        View::with(7),
-        OpNumber::with(0),
-        OpNumber::with(0),
-        ReplicaId::new(0),
-        std::vec![], // empty log slice edge
-      )),
+      Message::DoViewChange(
+        DoViewChange::new(
+          View::with(3),
+          View::with(2),
+          OpNumber::with(6),
+          OpNumber::with(4),
+          ReplicaId::new(6),
+          // Populated: an empty-body Present entry, a populated Present entry, AND a header-only
+          // Repairing entry (op 6, body_checksum only) — exercises both body-state wire tags.
+          std::vec![
+            entry(4, b""),
+            entry(5, b"hi"),
+            PreparedEntry::repairing(
+              OpNumber::with(6),
+              ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+              RequestNumber::with(6),
+              0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
+            ),
+          ],
+        )
+        .with_checkpoint_op(OpNumber::with(3)), // non-zero advertised floor — round-trips
+      ),
+      Message::StartView(
+        StartView::new(
+          View::with(7),
+          OpNumber::with(0),
+          OpNumber::with(0),
+          ReplicaId::new(0),
+          std::vec![], // empty log slice edge
+        )
+        .with_checkpoint_op(OpNumber::with(u64::MAX)), // edge scalar floor — round-trips
+      ),
       Message::GetView(GetView::new(View::with(5), ReplicaId::new(3), u64::MAX)),
       Message::RequestPrepare(RequestPrepare::new(
         View::with(2),
@@ -1917,14 +2839,17 @@ mod tests {
         ReplicaId::new(3),
       )),
       Message::Recovery(Recovery::new(ReplicaId::new(9), 0xABCD)),
-      Message::RecoveryResponse(RecoveryResponse::new(
-        View::with(3),
-        OpNumber::with(5),
-        OpNumber::with(4),
-        ReplicaId::new(0),
-        0xBEEF,
-        std::vec![entry(5, b"e")],
-      )),
+      Message::RecoveryResponse(
+        RecoveryResponse::new(
+          View::with(3),
+          OpNumber::with(5),
+          OpNumber::with(4),
+          ReplicaId::new(0),
+          0xBEEF,
+          std::vec![entry(5, b"e")],
+        )
+        .with_checkpoint_op(OpNumber::with(2)), // non-zero advertised floor — round-trips
+      ),
       Message::RequestSync(RequestSync::new(
         View::with(4),
         OpNumber::with(2),
@@ -1939,6 +2864,73 @@ mod tests {
         ReplicaId::new(0),
         0xBEEF,
         Bytes::from_static(b"snapshot-envelope"),
+      )),
+      Message::RequestPrepareRange(RequestPrepareRange::new(
+        View::with(2),
+        OpNumber::with(7),
+        OpNumber::with(70),
+        ReplicaId::new(3),
+      )),
+      Message::RepairBatch(RepairBatch::new(
+        View::with(4),
+        OpNumber::with(9),
+        OpNumber::with(7),
+        // Populated: an empty-body Present entry, a populated Present entry, AND a header-only
+        // Repairing entry — exercises both body-state wire tags inside the batch log slice.
+        std::vec![
+          entry(7, b""),
+          entry(8, b"hi"),
+          PreparedEntry::repairing(
+            OpNumber::with(9),
+            ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+            RequestNumber::with(9),
+            0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
+          ),
+        ],
+      )),
+      Message::SyncCheckpointMeta(SyncCheckpointMeta::new(
+        View::with(4),
+        OpNumber::with(8),
+        u128::MAX,
+        u64::MAX, // edge scalar total_len — round-trips
+        ReplicaId::new(0),
+        0xBEEF,
+      )),
+      Message::RequestSyncChunk(RequestSyncChunk::new(
+        View::with(4),
+        OpNumber::with(8),
+        u128::MAX,
+        u64::MAX, // edge scalar offset — round-trips
+        ReplicaId::new(3),
+        0xBEEF,
+      )),
+      Message::SyncChunk(SyncChunk::new(
+        View::with(4),
+        OpNumber::with(8),
+        u128::MAX,
+        17,
+        0,
+        ReplicaId::new(0),
+        0xBEEF,
+        Bytes::from_static(b"snapshot-envelope"),
+      )),
+      Message::PrepareBatch(PrepareBatch::new(
+        View::with(4),
+        OpNumber::with(9),
+        OpNumber::with(7),
+        // Populated: an empty-body Present entry, a populated Present entry, AND a header-only
+        // Repairing entry — exercises both body-state wire tags inside the batch log slice (the
+        // sender never emits a Repairing entry, but the codec must round-trip any well-formed one).
+        std::vec![
+          entry(10, b""),
+          entry(11, b"hi"),
+          PreparedEntry::repairing(
+            OpNumber::with(12),
+            ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+            RequestNumber::with(12),
+            0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
+          ),
+        ],
       )),
     ]
   }
@@ -1968,9 +2960,326 @@ mod tests {
   }
 
   #[test]
+  fn max_reply_body_len_is_tight_against_the_reply_carrier() {
+    // The reply-size contract is tight to the byte: a reply body of exactly `max_reply_body_len()`
+    // encodes as a `Reply` of exactly `MAX_FRAME_LEN` (deliverable), and one byte more exceeds the
+    // cap (the transport refuses the send — unrecoverable for an already-committed op, which is why
+    // `StateMachine::apply` carries the bound as an embedder obligation).
+    let reply_of = |len: usize| {
+      Message::Reply(Reply::new(
+        View::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        Bytes::from(std::vec![0u8; len]),
+      ))
+    };
+    let max = max_reply_body_len();
+    let cap = MAX_FRAME_LEN as usize;
+    assert_eq!(
+      reply_of(max).encode().len(),
+      cap,
+      "a max-size reply body lands exactly on MAX_FRAME_LEN"
+    );
+    assert!(
+      reply_of(max + 1).encode().len() > cap,
+      "one byte over the max pushes the Reply past the frame cap"
+    );
+    // The overhead const matches the Reply encode arm widths (header 3 + view 8 + client 16 +
+    // request 8 + body length prefix 4).
+    assert_eq!(REPLY_ENCODE_OVERHEAD, 39);
+    assert_eq!(reply_of(0).encode().len(), REPLY_ENCODE_OVERHEAD);
+  }
+
+  #[test]
+  fn chunked_sync_carriers_are_tight_against_the_frame_cap() {
+    // The chunked-transfer frame arithmetic, pinned by REAL encodings (not just the modelled
+    // consts): a max-fill SyncChunk lands EXACTLY on MAX_FRAME_LEN (so the chunked path can never
+    // produce an oversized frame, and the chunk size wastes nothing), one byte more exceeds it, and
+    // the unchunked threshold is byte-tight on the SyncCheckpoint carrier (an envelope of exactly
+    // `max_unchunked_snapshot_len()` ships whole at exactly the cap; one more byte forces chunking).
+    let cap = MAX_FRAME_LEN as usize;
+    let chunk_of = |len: usize| {
+      Message::SyncChunk(SyncChunk::new(
+        View::with(1),
+        OpNumber::with(8),
+        0xFEED,
+        len as u64,
+        0,
+        ReplicaId::new(0),
+        0xBEEF,
+        Bytes::from(std::vec![0u8; len]),
+      ))
+    };
+    assert_eq!(SYNC_CHUNK_CARRIER_OVERHEAD, 64);
+    assert_eq!(chunk_of(0).encode().len(), SYNC_CHUNK_CARRIER_OVERHEAD);
+    assert_eq!(
+      chunk_of(SYNC_CHUNK_LEN).encode().len(),
+      cap,
+      "a max-fill SyncChunk lands exactly on MAX_FRAME_LEN"
+    );
+    assert!(
+      chunk_of(SYNC_CHUNK_LEN + 1).encode().len() > cap,
+      "one byte over the chunk size exceeds the frame cap"
+    );
+
+    let checkpoint_of = |len: usize| {
+      Message::SyncCheckpoint(SyncCheckpoint::new(
+        View::with(1),
+        OpNumber::with(8),
+        0xFEED,
+        ReplicaId::new(0),
+        0xBEEF,
+        Bytes::from(std::vec![0u8; len]),
+      ))
+    };
+    assert_eq!(
+      checkpoint_of(max_unchunked_snapshot_len()).encode().len(),
+      cap,
+      "an envelope of exactly the unchunked threshold ships whole at exactly the cap"
+    );
+    assert!(
+      checkpoint_of(max_unchunked_snapshot_len() + 1)
+        .encode()
+        .len()
+        > cap,
+      "one byte over the threshold cannot ship whole — the donor must chunk it"
+    );
+
+    // The two fixed-size chunked-transfer messages are small constants (52 bytes each).
+    let meta = Message::SyncCheckpointMeta(SyncCheckpointMeta::new(
+      View::with(1),
+      OpNumber::with(8),
+      0xFEED,
+      1,
+      ReplicaId::new(0),
+      0xBEEF,
+    ));
+    let pull = Message::RequestSyncChunk(RequestSyncChunk::new(
+      View::with(1),
+      OpNumber::with(8),
+      0xFEED,
+      0,
+      ReplicaId::new(2),
+      0xBEEF,
+    ));
+    assert_eq!(meta.encode().len(), 52);
+    assert_eq!(pull.encode().len(), 52);
+  }
+
+  #[test]
+  fn prepare_batch_is_tight_against_the_frame_cap() {
+    // The batched-retransmit frame arithmetic, pinned by REAL encodings (not just the modelled
+    // consts): the carrier const matches the encode arm widths, a max-fill one-entry PrepareBatch
+    // lands EXACTLY on MAX_FRAME_LEN, one byte more exceeds it, and a multi-entry batch whose
+    // per-entry costs sum exactly to the budget also lands exactly on the cap — so the retransmit
+    // accumulator (budget = MAX_FRAME_LEN - PREPARE_BATCH_CARRIER_OVERHEAD, cost =
+    // present_entry_encoded_len) can never produce an oversized frame, and wastes nothing.
+    let cap = MAX_FRAME_LEN as usize;
+    let batch_of = |entries: std::vec::Vec<PreparedEntry>| {
+      Message::PrepareBatch(PrepareBatch::new(
+        View::with(1),
+        OpNumber::with(0),
+        OpNumber::with(0),
+        entries,
+      ))
+    };
+    let entry_of = |op: u64, len: usize| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::from(std::vec![0u8; len]),
+      )
+    };
+    // The carrier const matches the encode arm widths (header 3 + view/commit/checkpoint_op 24 +
+    // log count prefix 4) — an empty batch encodes to exactly the carrier.
+    assert_eq!(PREPARE_BATCH_CARRIER_OVERHEAD, 31);
+    assert_eq!(
+      batch_of(std::vec![]).encode().len(),
+      PREPARE_BATCH_CARRIER_OVERHEAD
+    );
+    let budget = cap - PREPARE_BATCH_CARRIER_OVERHEAD;
+    // Max-fill single entry: a body whose entry cost is exactly the budget lands exactly on the cap
+    // (the first-entry-progress case — one such op still ships); one byte more exceeds it.
+    let max = budget - present_entry_encoded_len(0);
+    assert_eq!(
+      batch_of(std::vec![entry_of(1, max)]).encode().len(),
+      cap,
+      "a max-fill one-entry PrepareBatch lands exactly on MAX_FRAME_LEN"
+    );
+    assert!(
+      batch_of(std::vec![entry_of(1, max + 1)]).encode().len() > cap,
+      "one byte over the max pushes the PrepareBatch past the frame cap"
+    );
+    // Multi-entry max-fill: two entries whose costs sum exactly to the budget land exactly on the
+    // cap — the running-cost accumulation models the encoding to the byte across entries.
+    let half = budget / 2;
+    let (a, b) = (
+      half - present_entry_encoded_len(0),
+      (budget - half) - present_entry_encoded_len(0),
+    );
+    assert_eq!(
+      present_entry_encoded_len(a) + present_entry_encoded_len(b),
+      budget
+    );
+    assert_eq!(
+      batch_of(std::vec![entry_of(1, a), entry_of(2, b)])
+        .encode()
+        .len(),
+      cap,
+      "two entries summing exactly to the budget land exactly on MAX_FRAME_LEN"
+    );
+  }
+
+  /// The transport's `max_request_body_len()` is the largest client body deliverable on EVERY message
+  /// that can carry it, and it is tight to the byte. The view-change log carriers
+  /// (`DoViewChange` / `StartView` / `RecoveryResponse`) are HEADER-ONLY (they ship no body — see
+  /// `Endpoint::log_entries`), so the SAME body bytes travel only as the `Request` the client sends, the
+  /// `Prepare` the primary replicates, and — once the op is logged — a single `Body::Present`
+  /// `PreparedEntry` inside a `RepairBatch` (the windowed peer-repair answer) or a `PrepareBatch` (the
+  /// primary's batched retransmit; byte-identical framing). This proves, via the ACTUAL
+  /// `encode().len()` (real messages, not just the modelled `encoded_len()`), that a body of exactly
+  /// the bound fits `MAX_FRAME_LEN` on ALL of those carriers, that the BINDING carriers are the tied
+  /// single-entry `RepairBatch`/`PrepareBatch` (each lands EXACTLY on the cap), that one byte more
+  /// pushes each past the cap, and — separately — that a header-only `DoViewChange` is INSENSITIVE to
+  /// body size (a whole band of max-body ops stays far under cap as fixed-size headers). Enumerating
+  /// every carrier here means a future message that wraps the body in MORE framing fails this test
+  /// until the bound accounts for it.
+  #[cfg(feature = "tcp")]
+  #[test]
+  fn max_request_body_len_is_tight_against_every_body_carrier() {
+    use crate::{MAX_FRAME_LEN, max_request_body_len};
+
+    let max = max_request_body_len();
+    let cap = MAX_FRAME_LEN as usize;
+
+    let client = ClientId::new(7);
+    let request = RequestNumber::with(1);
+
+    // Each closure builds a real message that carries a body of `len` bytes. The `RepairBatch` and
+    // `PrepareBatch` wrap it in a single-entry `Body::Present` log slice — the worst case for one
+    // maximal body (a multi-entry batch only spreads more fixed framing across more bodies; the
+    // byte-bounded serve/retransmit never exceeds the cap).
+    let body_of = |len: usize| Bytes::from(std::vec![0u8; len]);
+    let request_of = |len: usize| Message::Request(Request::new(client, request, body_of(len)));
+    let prepare_of = |len: usize| {
+      Message::Prepare(Prepare::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(0),
+        OpNumber::with(0),
+        client,
+        request,
+        body_of(len),
+      ))
+    };
+    let repair_batch_of = |len: usize| {
+      Message::RepairBatch(RepairBatch::new(
+        View::with(1),
+        OpNumber::with(1),
+        OpNumber::with(0),
+        std::vec![PreparedEntry::new(
+          OpNumber::with(1),
+          client,
+          request,
+          body_of(len),
+        )],
+      ))
+    };
+    let prepare_batch_of = |len: usize| {
+      Message::PrepareBatch(PrepareBatch::new(
+        View::with(1),
+        OpNumber::with(0),
+        OpNumber::with(0),
+        std::vec![PreparedEntry::new(
+          OpNumber::with(1),
+          client,
+          request,
+          body_of(len),
+        )],
+      ))
+    };
+
+    // Every BODY carrier of a max-size body, paired with its builder, checked by its REAL encoded length.
+    let carriers: [(&str, &dyn Fn(usize) -> Message); 4] = [
+      ("Request", &request_of),
+      ("Prepare", &prepare_of),
+      ("RepairBatch", &repair_batch_of),
+      ("PrepareBatch", &prepare_batch_of),
+    ];
+
+    // At the max: every body carrier fits the frame cap (the bound is the MAX over all per-carrier
+    // overheads, so the body fits the tightest carrier and a fortiori the rest).
+    let mut tightest = 0usize;
+    for (name, build) in carriers {
+      let encoded = build(max).encode().len();
+      assert!(
+        encoded <= cap,
+        "a max-size body carried by {name} must fit the frame cap: {encoded} > {cap}"
+      );
+      tightest = tightest.max(encoded);
+    }
+    // Tight: the tightest carrier sits EXACTLY at the cap, so the bound wastes nothing. The
+    // single-entry `RepairBatch` and `PrepareBatch` tie as this binding max — each larger than the
+    // `Prepare` hop by the per-entry log framing.
+    assert_eq!(
+      tightest, cap,
+      "the tightest body carrier lands exactly on MAX_FRAME_LEN at the max body"
+    );
+    let rb_at = repair_batch_of(max).encode().len();
+    assert_eq!(
+      rb_at, cap,
+      "a one-entry RepairBatch is a binding body carrier and lands exactly on MAX_FRAME_LEN"
+    );
+    let pb_at = prepare_batch_of(max).encode().len();
+    assert_eq!(
+      pb_at, cap,
+      "a one-entry PrepareBatch ties it and lands exactly on MAX_FRAME_LEN"
+    );
+
+    // One byte more: the BINDING carriers (`RepairBatch`/`PrepareBatch`) exceed the cap, so the
+    // transport would drop them. The smaller-overhead carriers (`Request`, `Prepare`) may still fit at
+    // max+1 — it is enough that the binding ones do not, which is exactly why the bound subtracts the
+    // LARGEST per-carrier overhead.
+    let rb_over = repair_batch_of(max + 1).encode().len();
+    assert!(
+      rb_over > cap,
+      "one byte over the max must push a one-entry RepairBatch past the frame cap: {rb_over} <= {cap}"
+    );
+    let pb_over = prepare_batch_of(max + 1).encode().len();
+    assert!(
+      pb_over > cap,
+      "one byte over the max must push a one-entry PrepareBatch past the frame cap: {pb_over} <= {cap}"
+    );
+
+    // The header-only view-change carriers are INSENSITIVE to body size: a `DoViewChange` whose entry is
+    // header-only (`Repairing`) encodes the same whether the op's body is empty or `max` bytes — it ships
+    // only the 16-byte `body_checksum`. So a max-body op rides a view change far under the frame cap, the
+    // whole point of the header-only carrier. (The DEEP-band fit is bounded separately by
+    // `MAX_HEADER_ONLY_BAND_DEPTH` / the `MAX_CHECKPOINT_OPS` cap.)
+    let header_only_dvc = Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(0),
+      ReplicaId::new(0),
+      std::vec![PreparedEntry::repairing(
+        OpNumber::with(1),
+        client,
+        request,
+        0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
+      )],
+    ));
+    assert!(
+      header_only_dvc.encode().len() < cap / 2,
+      "a header-only DoViewChange entry is body-size-insensitive and well under the frame cap"
+    );
+  }
+
+  #[test]
   fn every_variant_round_trips_through_the_wire_codec() {
     let all = one_of_each_variant();
-    assert_eq!(all.len(), 14, "every Message variant is represented");
+    assert_eq!(all.len(), 20, "every Message variant is represented");
     for m in &all {
       let bytes = m.encode();
       let back = Message::decode(&bytes).expect("round-trip decodes");
@@ -2009,51 +3318,59 @@ mod tests {
 
   #[test]
   fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
-    // A nested variant pinned exactly: header (ver 3 + tag 6), scalars, then a 1-entry log slice
-    // (count=1, op, client, request, body-state tag 0 = Present, length-prefixed body "hi").
-    let dvc = Message::DoViewChange(DoViewChange::new(
-      View::with(3),
-      View::with(2),
-      OpNumber::with(5),
-      OpNumber::with(4),
-      ReplicaId::new(6),
-      std::vec![PreparedEntry::new(
+    // A nested variant pinned exactly: header (ver 3 + tag 6), scalars (incl. the advertised
+    // checkpoint floor after the commit), then a 1-entry log slice (count=1, op, client, request,
+    // body-state tag 0 = Present, length-prefixed body "hi").
+    let dvc = Message::DoViewChange(
+      DoViewChange::new(
+        View::with(3),
+        View::with(2),
         OpNumber::with(5),
-        ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
-        RequestNumber::with(9),
-        Bytes::from_static(b"hi"),
-      )],
-    ));
+        OpNumber::with(4),
+        ReplicaId::new(6),
+        std::vec![PreparedEntry::new(
+          OpNumber::with(5),
+          ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+          RequestNumber::with(9),
+          Bytes::from_static(b"hi"),
+        )],
+      )
+      .with_checkpoint_op(OpNumber::with(3)),
+    );
     let expected: std::vec::Vec<u8> = std::vec![
       0, 3, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
-      0, 0, 0, 4, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-      14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 2, 104, 105,
+      0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6,
+      7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 2, 104, 105,
     ];
     assert_eq!(dvc.encode(), expected, "DoViewChange wire layout is pinned");
   }
 
   #[test]
   fn do_view_change_golden_bytes_pin_a_repairing_entry() {
-    // The header-only (Repairing) entry layout pinned exactly: same scalars, then body-state tag
-    // 1 = Repairing, followed by the 16-byte body_checksum (NO length-prefixed body).
-    let dvc = Message::DoViewChange(DoViewChange::new(
-      View::with(3),
-      View::with(2),
-      OpNumber::with(5),
-      OpNumber::with(4),
-      ReplicaId::new(6),
-      std::vec![PreparedEntry::repairing(
+    // The header-only (Repairing) entry layout pinned exactly: same scalars (incl. the advertised
+    // checkpoint floor after the commit), then body-state tag 1 = Repairing, followed by the
+    // 16-byte body_checksum (NO length-prefixed body).
+    let dvc = Message::DoViewChange(
+      DoViewChange::new(
+        View::with(3),
+        View::with(2),
         OpNumber::with(5),
-        ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
-        RequestNumber::with(9),
-        0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
-      )],
-    ));
+        OpNumber::with(4),
+        ReplicaId::new(6),
+        std::vec![PreparedEntry::repairing(
+          OpNumber::with(5),
+          ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+          RequestNumber::with(9),
+          0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
+        )],
+      )
+      .with_checkpoint_op(OpNumber::with(3)),
+    );
     let expected: std::vec::Vec<u8> = std::vec![
       0, 3, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
-      0, 0, 0, 4, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-      14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 1, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-      30, 31, 32,
+      0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6,
+      7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 1, 17, 18, 19, 20, 21, 22, 23,
+      24, 25, 26, 27, 28, 29, 30, 31, 32,
     ];
     assert_eq!(
       dvc.encode(),
@@ -2150,8 +3467,9 @@ mod tests {
       std::vec![entry(1, b"x")],
     ));
     let mut d = dvc.encode().to_vec();
-    // Locate the log count: ver(2)+tag(1)+view(8)+log_view(8)+op(8)+commit(8)+replica(1) = 36.
-    d[36..40].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    // Locate the log count:
+    // ver(2)+tag(1)+view(8)+log_view(8)+op(8)+commit(8)+checkpoint_op(8)+replica(1) = 44.
+    d[44..48].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
     assert!(matches!(
       Message::decode(&d),
       Err(CodecError::LengthOverflow { .. })

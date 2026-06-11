@@ -28,6 +28,18 @@
 //!
 //! The sweep runs a contiguous `0..SEEDS` range PLUS an explicit [`REGRESSION_SEEDS`] list of every
 //! seed that historically caught a real bug, so those stay pinned even above the contiguous range. A
+//! separate committed HOLD sweep ([`vopr_hold_sweep_no_violations`]) force-enables the unbounded-hold
+//! network axis over its own contiguous range — the axis the default schedule deliberately leaves off
+//! (see that test's doc) — and a committed WIPE sweep ([`vopr_wipe_sweep_no_violations`]) likewise
+//! force-enables the wipe-and-restart (amnesia) axis, where a crashed replica can rejoin with a
+//! fresh, empty disk. A committed ASYM sweep ([`vopr_asym_sweep_no_violations`]) force-enables
+//! DIRECTED one-way partitions (`from → to` cut while `to → from` flows — the deaf/mute-primary
+//! shapes the symmetric groups cannot express), and a committed SLOW-REPLICA sweep
+//! ([`vopr_slow_replica_sweep_no_violations`]) force-enables per-replica gray-failure delivery
+//! (messages a few seeded milliseconds late, never dropped). An `#[ignore]`d TORN-HEADER probe
+//! ([`vopr_torn_header_sweep_no_violations`])
+//! deliberately violates the `Wal` header-durability contract to measure its blast radius — it is a
+//! contract-violation measurement, never a CI gate. A
 //! wide catch-panic scan `0..512` at [`DEFAULT_TICKS`] with the async-superblock mode ON is verified
 //! clean end to end (including the final-quiesce fix — see below). The
 //! bounded-WAL axis (a fixed-`N` ring on the ~1/3 of seeds it seed-derives) is verified clean over the
@@ -135,7 +147,10 @@
 //!   than dropping it; that hole flows through the DoViewChange so `select_canonical_log` counts the op as
 //!   TAKEN (never re-minted) and the new primary peer-repairs the canonical body. `0..2048` is now clean.
 
-use viewstamp_simulation::{DEFAULT_TICKS, run_vopr, run_vopr_one};
+use viewstamp_simulation::{
+  DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_churn,
+  run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_torn_headers, run_vopr_with_wipe,
+};
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
 /// coverage over raw count: each seed runs a few thousand ticks of rich adversarial schedule. With the
@@ -186,6 +201,20 @@ fn vopr_sweep_no_violations() {
   let mut total_below_ring_window_syncs = 0u64;
   let mut max_bounded_committed = 0usize;
   let mut any_bounded_wrapped = false;
+  // Frame-cap axis: how many LARGE client bodies were minted across the sweep (must be `> 0` — the cap
+  // is exercised non-vacuously), and how many legitimate inter-replica messages were oversized-dropped
+  // (must be 0 — header-only carriers + the byte-bounded `RepairBatch` keep every peer message sub-cap
+  // regardless of body size; `run_vopr` already fails fast per tick on any drop, but tally it for the
+  // summary too).
+  let mut total_large_bodies = 0u64;
+  let mut total_oversized_dropped = 0u64;
+  // New-path witnesses: the header-only view-change/recovery carriers, the byte-bounded `RepairBatch`
+  // serve, and the floored canonical union must all genuinely FIRE somewhere across the sweep —
+  // otherwise the newest consensus paths are green only because they were never reached.
+  let mut total_header_only_carriers = 0u64;
+  let mut total_repair_batches = 0u64;
+  let mut total_prepare_batches = 0u64;
+  let mut total_unions_floored = 0u64;
   let contiguous = sweep_seed_count();
   println!(
     "VOPR sweep: 0..{contiguous} contiguous + {} pinned regression seeds, {DEFAULT_TICKS} ticks each",
@@ -201,6 +230,12 @@ fn vopr_sweep_no_violations() {
     max_recovered_band = max_recovered_band.max(r.recovered_band_max());
     total_forced_syncs += r.forced_syncs();
     total_misdirects += r.misdirects_fired();
+    total_large_bodies += r.large_bodies_sent();
+    total_oversized_dropped += r.oversized_dropped();
+    total_header_only_carriers += r.header_only_carriers_emitted();
+    total_repair_batches += r.repair_batches_served();
+    total_prepare_batches += r.prepare_batches_sent();
+    total_unions_floored += r.unions_floored();
     if r.wal_capacity().is_some() {
       bounded_seeds += 1;
       total_wal_stalls += r.wal_stalls();
@@ -262,6 +297,66 @@ fn vopr_sweep_no_violations() {
     "no forced-sync/peer-fetch escalation occurred across the sweep — finding B may have silently \
      removed that coverage (forced_syncs={total_forced_syncs})"
   );
+  // Frame-cap axis (the header-only view-change carriers + windowed `RepairBatch` repair):
+  // - the sweep genuinely PRODUCED large client bodies (`> 0`), so the frame cap is exercised — a
+  //   large-bodied uncheckpointed band really rode the view-change/recovery carriers + the repair
+  //   serve; without this the `oversized_dropped == 0` guarantee below would be vacuous;
+  // - and NOT ONE legitimate inter-replica message was oversized-dropped across the whole sweep: the
+  //   header-only carriers ship NO body (a fixed ~49 bytes/op) and the `RepairBatch` serve is
+  //   byte-bounded, so every peer message stays at/below `MAX_FRAME_LEN` no matter how large the
+  //   bodies are. (`run_vopr` already panics per-tick on any drop — this is the cumulative witness.)
+  //   A `> 0` here would be a REAL bug: a carrier overflowed the frame (the old full-body
+  //   view-change defect) — to report, never to mask by loosening the cap.
+  assert!(
+    total_large_bodies > 0,
+    "the sweep minted no large client bodies — the frame-cap axis is vacuous (header-only carriers + \
+     windowed repair are not being stressed by a large-bodied band)"
+  );
+  assert_eq!(
+    total_oversized_dropped, 0,
+    "a legitimate inter-replica message exceeded MAX_FRAME_LEN and was oversized-dropped \
+     ({total_oversized_dropped} across the sweep) — a view-change/recovery carrier or repair batch \
+     overflowed the frame (the old full-body view-change bug, or an incomplete bound); this is a REAL \
+     bug to fix, NOT to mask by loosening the cap"
+  );
+  // The newest consensus paths must genuinely FIRE under the combined-fault schedule (sweep-level
+  // evidence, not just focused unit gates):
+  // - HEADER-ONLY CARRIERS: every `DoViewChange`/`StartView`/`RecoveryResponse` log payload flows
+  //   through `log_entries`; view changes happen in many seeds, so a zero here means the carrier
+  //   chokepoint stopped being exercised (or the counter plumbing broke);
+  // - REPAIR-BATCH SERVES: peers under faults solicit windowed bulk repair (`RequestPrepareRange`)
+  //   and a donor must answer with NON-EMPTY byte-bounded batches — a zero means every repair
+  //   regressed to the per-op path and the windowed serve is untested;
+  // - FLOORED UNIONS: `select_canonical_log` dropping a canonical-donor entry at/below the vouched
+  //   checkpoint floor needs donors with divergent checkpoints inside ONE view change — a rare
+  //   confluence, but one the contiguous range reaches on its own (a 0..512 scan fires it on 101
+  //   seeds, six of them — 21, 28, 36, 51, 56, 61 — inside 0..64), so the assert needs no pinned
+  //   seed.
+  assert!(
+    total_header_only_carriers > 0,
+    "no header-only view-change/recovery carrier was built across the sweep \
+     (header_only_carriers={total_header_only_carriers}) — the carrier path is vacuous"
+  );
+  assert!(
+    total_repair_batches > 0,
+    "no non-empty RepairBatch was served across the sweep (repair_batches={total_repair_batches}) — \
+     the byte-bounded bulk-repair serve is vacuous"
+  );
+
+  // Prepare-retransmit batching non-vacuity: under the sweep's drop/dup axes some Prepare broadcast
+  // is always lost and re-sent, and the retransmit path emits batches — if this is ever zero the
+  // batched retransmit path has gone vacuous (or the axes stopped losing Prepares).
+  assert!(
+    total_prepare_batches > 0,
+    "no PrepareBatch retransmit was emitted across the sweep (prepare_batches={total_prepare_batches}) — \
+     the batched-retransmit path is vacuous"
+  );
+  assert!(
+    total_unions_floored > 0,
+    "no canonical-log selection floored its union across the sweep \
+     (unions_floored={total_unions_floored}) — the floored-union path is vacuous (a schedule change \
+     swept away every firing seed in the contiguous range; re-scan and pin one)"
+  );
   // Bounded-WAL (wrap) axis must genuinely fire, or the wrap coverage is vacuous:
   // - SOME seeds ran the bounded ring (the ~1/3 seed-derived draw — sanity that the axis is wired and
   //   the env mask is off);
@@ -298,8 +393,457 @@ fn vopr_sweep_no_violations() {
     "VOPR sweep OK: committed={total_committed} crashes={total_crashes} restarts={total_restarts} \
      partitions={total_partitions} view_change_seeds={seeds_with_view_change} \
      bounded_seeds={bounded_seeds} wal_stalls={total_wal_stalls} misdirects={total_misdirects} \
-     forced_syncs={total_forced_syncs} max_recovered_band={max_recovered_band}"
+     forced_syncs={total_forced_syncs} max_recovered_band={max_recovered_band} \
+     large_bodies={total_large_bodies} oversized_dropped={total_oversized_dropped} \
+     header_only_carriers={total_header_only_carriers} repair_batches={total_repair_batches} \
+     prepare_batches={total_prepare_batches} \
+     unions_floored={total_unions_floored}"
   );
+}
+
+/// The contiguous seed range for the committed HOLD sweep. Smaller than [`SEEDS`]: each hold-enabled
+/// run layers held messages (delivery pushed ~15s of virtual time out) onto the full adversarial
+/// schedule, and this lane is ADDITIVE to the default sweep, so its budget is kept modest.
+const HOLD_SEEDS: u64 = 16;
+
+/// The committed HOLD sweep: [`run_vopr_with_hold`] over `0..HOLD_SEEDS` — the unbounded-hold network
+/// axis FORCE-ENABLED programmatically (no env var, so it cannot race other tests in this process and
+/// cannot be forgotten by a runner). A held message's delivery is pushed far past the proto's
+/// repair-or-truncate grace, so a `PrepareOk` can OUTLIVE its op's truncation + re-mint and arrive at
+/// the new primary as a STALE-BODY vote for a live op number — the op-reuse / committed-divergence
+/// class the proto's content-addressed vote gate (votes keyed by the prepare's identity, not the op
+/// number alone) must reject, or a primary could commit an op no quorum durably holds.
+///
+/// The DEFAULT sweep deliberately leaves this axis OFF: enabling it consumes extra PRNG draws, which
+/// would shift every pinned regression seed off its historical schedule. So this lane runs the axis
+/// on its own seeds instead — hold-enabled runs are their own deterministic baselines (byte-identical
+/// to `VOPR_HOLD=1` runs of the same seeds), and the default sweep's schedules stay untouched.
+#[test]
+fn vopr_hold_sweep_no_violations() {
+  let mut total_holds = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR hold sweep: 0..{HOLD_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, hold axis forced on"
+  );
+  for seed in 0..HOLD_SEEDS {
+    let r = run_vopr_with_hold(seed, DEFAULT_TICKS);
+    total_holds += r.holds_fired();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity: the axis must genuinely FIRE across the sweep — otherwise this lane has silently
+  // decayed into a re-run of the default schedule and the stale-vote class is unguarded again.
+  assert!(
+    total_holds > 0,
+    "the hold axis never held a message across the sweep (holds_fired={total_holds}) — the hold lane \
+     is vacuous (the axis is not plumbed through, or its per-mille rate collapsed to 0)"
+  );
+  // And the hold-enabled runs still did real work: ops committed, and at least one seed drove a view
+  // change — truncation + re-mint (the window a held vote must outlive to become a stale-body vote)
+  // only opens across view changes, so a sweep with no view change could not reach the class this
+  // lane exists for.
+  assert!(
+    total_committed > 0,
+    "the hold sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no hold-sweep seed drove a view change — the truncation/re-mint window the held votes must \
+     outlive never opened"
+  );
+  println!(
+    "VOPR hold sweep OK: holds_fired={total_holds} committed={total_committed} \
+     view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed WIPE sweep (same budget rationale as [`HOLD_SEEDS`]).
+const WIPE_SEEDS: u64 = 16;
+
+/// The committed WIPE sweep: [`run_vopr_with_wipe`] over `0..WIPE_SEEDS` — the wipe-and-restart
+/// (amnesia) axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env var, no
+/// schedule races, cannot be forgotten by a runner). At most ONE crashed replica per run comes back
+/// with FRESH, EMPTY durable storage instead of recovering its persisted WAL/superblock — the
+/// classic VSR amnesia hazard: a replica that voted in view V (and durably held committed ops)
+/// rejoins at genesis with no memory of either. One lost durable state is within the crash-fault
+/// model's `<= f` budget, so the cluster-level invariants MUST hold: agreement + no committed op
+/// rewritten/lost across time + quorum-durable retention (honestly relaxed by exactly the wiped
+/// count, floor 1 — never further) + the post-quiesce survival of the whole committed history. The
+/// wiped replica is NEVER special-cased (it may be the sole quorum-intersection holder); the
+/// checkers judge the outcome.
+///
+/// A violation in this sweep is a REAL, potentially P0-class protocol finding (amnesia breaking
+/// quorum intersection) — report it with its seed; never mask it or weaken a checker to pass.
+///
+/// The DEFAULT sweep leaves this axis OFF (it consumes extra PRNG draws, which would shift every
+/// pinned regression seed off its historical schedule); wipe-enabled runs are their own
+/// deterministic baselines, byte-identical to `VOPR_WIPE=1` runs of the same seeds.
+#[test]
+fn vopr_wipe_sweep_no_violations() {
+  let mut total_wipes = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR wipe sweep: 0..{WIPE_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, wipe axis forced on"
+  );
+  for seed in 0..WIPE_SEEDS {
+    let r = run_vopr_with_wipe(seed, DEFAULT_TICKS);
+    total_wipes += r.wipes_fired();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity: the axis must genuinely FIRE across the sweep — a replica really came back with a
+  // wiped disk — or this lane has silently decayed into a re-run of the default schedule and the
+  // amnesia class is unguarded again.
+  assert!(
+    total_wipes > 0,
+    "the wipe axis never wiped a replica across the sweep (wipes_fired={total_wipes}) — the wipe \
+     lane is vacuous (the axis is not plumbed through, or no seed ever had a crashed replica when \
+     the wipe roll fired)"
+  );
+  // And the wipe-enabled runs still did real work: ops committed, and at least one seed drove a view
+  // change — re-voting across views is where a wiped replica's forgotten participation could break
+  // quorum intersection, so a sweep with no view change could not reach the class this lane exists
+  // for.
+  assert!(
+    total_committed > 0,
+    "the wipe sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no wipe-sweep seed drove a view change — the re-vote window a wiped replica's amnesia \
+     endangers never opened"
+  );
+  println!(
+    "VOPR wipe sweep OK: wipes_fired={total_wipes} committed={total_committed} \
+     view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed CHURN sweep (same budget rationale as [`HOLD_SEEDS`]).
+const CHURN_SEEDS: u64 = 16;
+
+/// The committed CLIENT-CHURN sweep: [`run_vopr_with_churn`] over `0..CHURN_SEEDS` — the
+/// client-churn axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env var,
+/// no schedule races, cannot be forgotten by a runner). The default sweep's client set is FIXED, so
+/// the session table converges to one row per client and the deterministic session-cap eviction can
+/// never engage; this lane retires active clients and spawns fresh `ClientId`s on a seeded cadence,
+/// over a SMALL seeded `max_client_sessions` — so the apply-time eviction genuinely runs under the
+/// full crash + partition + disk-fault schedule. The EXISTING safety / durability / view-monotonic /
+/// boundedness / liveness checkers judge the outcome: the session table rides every checkpoint
+/// envelope, so a NON-deterministic eviction (divergent victims across replicas) would diverge the
+/// restored tables and surface through the at-most-once / agreement oracles, and an eviction that
+/// broke admission would surface as a calm-window livelock. A violation here is a REAL finding in
+/// the eviction design — report it with its seed; never mask it or weaken a checker to pass.
+///
+/// The DEFAULT sweep leaves this axis OFF (it consumes extra PRNG draws, which would shift every
+/// pinned regression seed off its historical schedule); churn-enabled runs are their own
+/// deterministic baselines, byte-identical to `VOPR_CHURN=1` runs of the same seeds.
+#[test]
+fn vopr_churn_sweep_no_violations() {
+  let mut total_churns = 0u64;
+  let mut total_evictions = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR churn sweep: 0..{CHURN_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, churn axis forced on"
+  );
+  for seed in 0..CHURN_SEEDS {
+    let r = run_vopr_with_churn(seed, DEFAULT_TICKS);
+    total_churns += r.churns_fired();
+    total_evictions += r.sessions_evicted();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity, both halves of the lane:
+  // - the axis genuinely CHURNED clients (retire + fresh spawn actions fired), and
+  // - the session-cap EVICTION genuinely engaged (sessions were evicted at apply time across the
+  //   sweep) — otherwise the deterministic-eviction design ran vacuously and this lane has decayed
+  //   into a re-run of the fixed-client default.
+  assert!(
+    total_churns > 0,
+    "the churn axis never retired/spawned a client across the sweep (churns_fired={total_churns}) — \
+     the churn lane is vacuous"
+  );
+  assert!(
+    total_evictions > 0,
+    "no session was ever evicted across the churn sweep (sessions_evicted={total_evictions}) — the \
+     session-cap eviction is untested (cap too high for the churned population, or the eviction is \
+     not engaging)"
+  );
+  // And the churn-enabled runs still did real work: ops committed, and at least one seed drove a
+  // view change — the table rides checkpoints ACROSS view changes and restarts, which is where a
+  // non-deterministic eviction would diverge the replicas.
+  assert!(
+    total_committed > 0,
+    "the churn sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no churn-sweep seed drove a view change — the cross-view session-table agreement this lane \
+     guards never came under test"
+  );
+  println!(
+    "VOPR churn sweep OK: churns_fired={total_churns} sessions_evicted={total_evictions} \
+     committed={total_committed} view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed ASYM sweep (same budget rationale as [`HOLD_SEEDS`]).
+const ASYM_SEEDS: u64 = 16;
+
+/// The committed ASYMMETRIC-PARTITION sweep: [`run_vopr_with_asym`] over `0..ASYM_SEEDS` — the
+/// one-way partition axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env
+/// var, no schedule races, cannot be forgotten by a runner). The default sweep's partitions are
+/// SYMMETRIC (group membership: either both sides see each other or neither does); this lane installs
+/// DIRECTED blocks — `blocked[from][to]` drops `from → to` while `to → from` keeps flowing — the
+/// one-way reachability real networks produce and the first schedule the forfeit/idle machinery
+/// faces it under. The headline shape is a DEAF PRIMARY (the victim draw biases toward a current
+/// primary half the time): its heartbeats flow OUT — suppressing every backup's idle view-change
+/// timer — while the PrepareOks never ARRIVE, so nothing commits for the whole episode; the mirror
+/// MUTE shape and a single-edge shape are also drawn. Victims count against the same minority budget
+/// as crash/isolate; episodes heal exactly like symmetric partitions (a seeded heal branch, plus
+/// every calm window/final quiesce restores full bidirectional connectivity first — a calm window
+/// requires full bidirectional connectivity, so progress is never demanded DURING an episode, only
+/// after heal). Safety/durability/agreement are judged as-is every tick throughout.
+///
+/// A violation in this sweep is a REAL finding — one-way reachability wedging post-heal recovery,
+/// or splitting commit accounting across a directed cut — report it with its seed; never mask it or
+/// weaken a checker to pass.
+///
+/// The DEFAULT sweep leaves this axis OFF (it consumes extra PRNG draws, which would shift every
+/// pinned regression seed off its historical schedule); asym-enabled runs are their own
+/// deterministic baselines, byte-identical to `VOPR_ASYM=1` runs of the same seeds.
+#[test]
+fn vopr_asym_sweep_no_violations() {
+  let mut total_episodes = 0u64;
+  let mut total_one_way_dropped = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR asym sweep: 0..{ASYM_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, asym axis forced on"
+  );
+  for seed in 0..ASYM_SEEDS {
+    let r = run_vopr_with_asym(seed, DEFAULT_TICKS);
+    total_episodes += r.asym_episodes();
+    total_one_way_dropped += r.one_way_dropped();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity, in two layers:
+  // - episodes were genuinely INSTALLED (the axis is plumbed through and the budget left room), and
+  // - a directed block genuinely CUT live traffic (messages were dropped on a one-way leg) — an
+  //   episode that never intersected a message would leave the axis untested.
+  assert!(
+    total_episodes > 0,
+    "the asym axis never installed a one-way episode across the sweep \
+     (asym_episodes={total_episodes}) — the asym lane is vacuous"
+  );
+  assert!(
+    total_one_way_dropped > 0,
+    "no message was ever dropped by a one-way block across the sweep \
+     (one_way_dropped={total_one_way_dropped}) — the episodes never cut live traffic"
+  );
+  // And the asym-enabled runs still did real work: ops committed, and at least one seed drove a
+  // view change — the deaf/mute shapes interact with failover (a deaf new primary cannot complete
+  // its view change; the cluster must escalate past it), so a sweep with no view change could not
+  // reach the class this lane exists for.
+  assert!(
+    total_committed > 0,
+    "the asym sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no asym-sweep seed drove a view change — the one-way/failover interleavings this lane guards \
+     never came under test"
+  );
+  println!(
+    "VOPR asym sweep OK: asym_episodes={total_episodes} one_way_dropped={total_one_way_dropped} \
+     committed={total_committed} view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed SLOW-replica sweep (same budget rationale as
+/// [`HOLD_SEEDS`]).
+const SLOW_SEEDS: u64 = 16;
+
+/// The committed SLOW-REPLICA (gray failure) sweep: [`run_vopr_with_slow`] over `0..SLOW_SEEDS` —
+/// the slow axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern). On a seeded
+/// cadence ONE replica's inter-replica delivery degrades for a bounded episode window: every message
+/// on its seeded legs (inbound, outbound, or both) arrives a few seeded milliseconds LATE — never
+/// dropped. This is the failure mode between the crash model (the replica never stops) and the
+/// partition model (nothing is ever lost): a consistently-behind participant whose late acks, late
+/// heartbeats, and late votes every timer interaction must tolerate. The band (≤ ~22 ms extra) sits
+/// deliberately BELOW the proto's 50 ms commit-heartbeat / 200 ms idle cadences, so the victim is
+/// degraded-but-alive and no view change is legitimately OWED — yet stale-by-milliseconds messages
+/// keep landing in every window (view changes, repair, checkpoint races) under the full crash +
+/// partition + disk-fault schedule. Episodes are bounded (a seeded tick window) and healed like
+/// partitions (calm windows and the final quiesce end them first), so liveness is judged over a
+/// fully-prompt cluster; safety/durability/agreement are judged as-is every tick throughout.
+///
+/// A violation in this sweep is a REAL finding (gray failure wedging a timer interaction or
+/// diverging replicas) — report it with its seed; never mask it or weaken a checker to pass.
+///
+/// The DEFAULT sweep leaves this axis OFF (it consumes extra PRNG draws, which would shift every
+/// pinned regression seed off its historical schedule); slow-enabled runs are their own
+/// deterministic baselines, byte-identical to `VOPR_SLOW=1` runs of the same seeds.
+#[test]
+fn vopr_slow_replica_sweep_no_violations() {
+  let mut total_episodes = 0u64;
+  let mut total_slow_delays = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR slow-replica sweep: 0..{SLOW_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, slow axis \
+     forced on"
+  );
+  for seed in 0..SLOW_SEEDS {
+    let r = run_vopr_with_slow(seed, DEFAULT_TICKS);
+    total_episodes += r.slow_episodes();
+    total_slow_delays += r.slow_delays();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity, in two layers: episodes genuinely INSTALLED, and live traffic genuinely DELAYED
+  // (an episode on an idle link would leave the gray-failure schedule untested).
+  assert!(
+    total_episodes > 0,
+    "the slow axis never installed an episode across the sweep (slow_episodes={total_episodes}) — \
+     the slow lane is vacuous"
+  );
+  assert!(
+    total_slow_delays > 0,
+    "no message ever picked up a slow-replica delay across the sweep \
+     (slow_delays={total_slow_delays}) — the episodes never touched live traffic"
+  );
+  // And the slow-enabled runs still did real work: ops committed, and at least one seed drove a
+  // view change — a gray replica riding through failover (its late votes/acks landing across view
+  // boundaries) is the interleaving this lane exists to stress.
+  assert!(
+    total_committed > 0,
+    "the slow sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no slow-sweep seed drove a view change — the late-delivery/failover interleavings this lane \
+     guards never came under test"
+  );
+  println!(
+    "VOPR slow sweep OK: slow_episodes={total_episodes} slow_delays={total_slow_delays} \
+     committed={total_committed} view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the torn-header probe lane (same budget as the other axis lanes).
+const TORN_HEADER_SEEDS: u64 = 16;
+
+/// CONTRACT-VIOLATION PROBE (not a CI gate — `#[ignore]`d, run on demand): what happens when an
+/// embedder violates the `Wal` header-durability contract?
+///
+/// The contract (`viewstamp-proto/src/storage.rs`, trait-level docs) requires slot HEADERS to be
+/// durable INDEPENDENTLY of bodies: a body-level fault must never lose the header, because the
+/// keep-header-only recovery shape (`Body::Repairing`) uses the surviving header to prove a
+/// committed op EXISTS at its op number (pinning its canonical identity) so the body can be
+/// peer-repaired — the structural fix for the storage-fault committed-op-loss class. This lane
+/// FORCE-ENABLES a fault the contract forbids ([`run_vopr_with_torn_headers`]): a seed-chosen
+/// per-mille of completed appends lose their header too — the slot reads back `Absent`/`Empty`,
+/// `header() == None`, as if never written.
+///
+/// EXPECTATION: violations here are EXPECTED EVIDENCE that the contract is load-bearing (the
+/// committed-op-survival design genuinely leans on header durability), NOT proto bugs to fix — the
+/// lane exists to measure the blast radius of the contract violation. A clean sweep would be the
+/// (also valuable) finding that the proto tolerates even headerless faults. Run with:
+/// `cargo test --release -p viewstamp-simulation --test vopr vopr_torn_header_sweep_no_violations \
+///  -- --ignored --nocapture`
+/// Every seed is run (`catch_unwind`, the `vopr_collect_failures` pattern) so ONE run records every
+/// violating seed + its verbatim message; the test then fails iff any seed violated — its exit code
+/// is the probe's measurement, not a regression signal.
+///
+/// MEASURED BLAST RADIUS (16/16 seeds violate; the contract is demonstrably load-bearing). Two
+/// invariant classes collapse, neither maskable without weakening a real checker:
+///
+/// - **Quorum-durable retention of a committed op** (seed 0, verbatim):
+///   `vopr seed 0 tick 3352: committed op 603 is durably held on only 1 replicas (< required 2 =
+///   quorum 2 - wipes 0) — a committed op is not retained durably by the surviving quorum`
+///   — torn headers erase completed appends outright, so a committed op's durable holder set falls
+///   below quorum: precisely the committed-op-LOSS class the contract paragraph in the trait doc
+///   predicts ("the op's existence is forgotten, its number can be re-minted ... a client-acked
+///   committed op silently disappears").
+/// - **Append-before-ack** (most seeds, e.g. seed 7, verbatim):
+///   `vopr seed 7 tick 88: replica 1 emitted PrepareOk(op=20, msg_view=0) but its WAL append has not
+///   completed (wal_status=empty, ...) — append-before-ack violated`
+///   — the append COMPLETED (`Appended` fired, so the proto legitimately acks) but the slot reads
+///   back `Empty`, so the replica's commit-quorum vote references state its disk no longer
+///   evidences: the vote-backed-by-durable-state premise quorum intersection stands on is gone
+///   within ~100 ticks in every seed.
+#[test]
+#[ignore = "contract-violation probe: measures the blast radius when the Wal header-durability contract is broken; not a CI gate"]
+fn vopr_torn_header_sweep_no_violations() {
+  println!(
+    "VOPR torn-header probe: 0..{TORN_HEADER_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, \
+     torn-header axis forced on"
+  );
+  // Silence the per-panic backtrace spam; the verbatim message is recovered from the payload.
+  let prev_hook = std::panic::take_hook();
+  std::panic::set_hook(Box::new(|_| {}));
+  let mut failures: Vec<(u64, String)> = Vec::new();
+  let mut total_torn = 0u64;
+  let mut clean_seeds = 0u64;
+  for seed in 0..TORN_HEADER_SEEDS {
+    match std::panic::catch_unwind(|| run_vopr_with_torn_headers(seed, DEFAULT_TICKS)) {
+      Ok(r) => {
+        total_torn += r.torn_headers_fired();
+        clean_seeds += 1;
+      }
+      Err(payload) => {
+        let msg = if let Some(s) = payload.downcast_ref::<String>() {
+          s.clone()
+        } else if let Some(s) = payload.downcast_ref::<&str>() {
+          (*s).to_string()
+        } else {
+          "<non-string panic payload>".to_string()
+        };
+        failures.push((seed, msg));
+      }
+    }
+  }
+  std::panic::set_hook(prev_hook);
+  println!(
+    "=== VOPR torn-header probe 0..{TORN_HEADER_SEEDS}: {} violating seeds, {clean_seeds} clean \
+     (torn_headers_fired={total_torn} across the clean seeds) ===",
+    failures.len()
+  );
+  for (seed, msg) in &failures {
+    println!("  seed {seed}: {msg}");
+  }
+  // The probe PASSES by demonstrating the violations: losing a slot's header after its append
+  // completed breaks the durability accounting (append-before-ack and its siblings fire), which is
+  // exactly why the Wal contract requires headers to be independently durable from bodies. If this
+  // ever finds NO violations, the proto has become torn-header-tolerant and the contract (and this
+  // probe) should be re-evaluated — that surprising outcome is the failure mode worth flagging.
+  if failures.is_empty() {
+    assert!(
+      total_torn > 0,
+      "the torn-header axis never fired across an all-clean sweep (torn_headers_fired={total_torn}) \
+       — the probe is vacuous"
+    );
+    panic!(
+      "no seed violated under torn headers (torn_headers_fired={total_torn}) — the proto now \
+       tolerates headerless faults; re-evaluate whether the Wal header-durability contract (and \
+       this probe) can be relaxed"
+    );
+  }
 }
 
 /// Diagnostic (NOT a gate): sweep `0..VOPR_SEEDS` (default 64) but CATCH each seed's violation with
@@ -399,7 +943,8 @@ fn replay_single_seed() {
   println!(
     "vopr seed {} OK: ticks={} replicas={} clients={} max_committed={} crashes={} restarts={} \
      partitions={} heals={} calm_windows={} max_view={} all_clients_done={} \
-     wal_capacity={:?} wal_stalls={} below_ring_window_syncs={} bounded_seed_wrapped={}",
+     wal_capacity={:?} wal_stalls={} below_ring_window_syncs={} sync_chunk_transfers={} \
+     bounded_seed_wrapped={} large_bodies={} oversized_dropped={}",
     r.seed(),
     r.ticks(),
     r.replicas(),
@@ -415,6 +960,9 @@ fn replay_single_seed() {
     r.wal_capacity(),
     r.wal_stalls(),
     r.below_ring_window_syncs(),
+    r.sync_chunk_transfers(),
     r.bounded_seed_wrapped(),
+    r.large_bodies_sent(),
+    r.oversized_dropped(),
   );
 }

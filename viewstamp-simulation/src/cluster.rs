@@ -9,7 +9,7 @@ use viewstamp_proto::{
 
 use crate::client::ClientModel;
 use crate::clock::Clock;
-use crate::network::{Faults, InFlight, Network, Target};
+use crate::network::{Faults, InFlight, Network, SlowProfile, Target};
 use crate::sm::LogSm;
 use crate::storage::{InMemorySuperblock, InMemoryWal, StorageFaults};
 
@@ -45,10 +45,27 @@ pub struct Cluster {
   replica_count: u8,
   /// The checkpoint interval, retained so `restart` rebuilds a replica with the same config.
   checkpoint_ops: u64,
+  /// `None` (default) ⇒ the proto's default client-session cap. `Some(n)` ⇒ every replica's
+  /// `Config::with_max_client_sessions(n)` — the small cap the churn lane uses so the deterministic
+  /// apply-time eviction genuinely engages within a run's tick budget. Retained so `restart` /
+  /// `wipe_and_restart` rebuild a replica with the same config (the cap is part of the cluster
+  /// configuration and must be identical on every replica).
+  max_client_sessions: Option<u32>,
   crashed: Vec<bool>,
   /// Partition group id per replica. Replica↔replica messages between different groups are
   /// dropped. All replicas start in group 0 (no partition).
   groups: Vec<u8>,
+  /// DIRECTED replica↔replica block matrix: `one_way[from][to]` ⇒ `from`'s messages to `to` are
+  /// dropped while `to → from` still flows — the ASYMMETRIC partition shape the symmetric `groups`
+  /// cannot express (e.g. a primary whose heartbeats flow OUT while the acks never arrive). All
+  /// `false` by default; cleared by [`heal`](Self::heal) / [`heal_one_way`](Self::heal_one_way).
+  /// The diagonal is never set (a replica always reaches itself).
+  one_way: Vec<Vec<bool>>,
+  /// Per-replica GRAY-FAILURE delivery profile: `Some(p)` ⇒ this replica's inter-replica messages
+  /// (inbound and/or outbound per `p`) each pick up an extra seeded delay from `p`'s band — late,
+  /// NOT dropped. `None` (default) ⇒ no degradation and, crucially, NO extra PRNG draw per message,
+  /// so default schedules stay byte-identical (the hold-axis discipline).
+  slow: Vec<Option<SlowProfile>>,
   /// Set by [`tick`](Self::tick) when a replica emitted a `PrepareOk(op)` for an op that is NOT
   /// durable in its OWN WAL+snapshot at emission time — the append-before-ack invariant, checked
   /// structurally "via the sim's storage view". Stays `None` in the absence of a violation; a checker
@@ -88,6 +105,33 @@ pub struct Cluster {
   /// MUST be `> checkpoint_ops + pipeline headroom` or the stall never releases (see the `Wal` capacity
   /// liveness contract).
   wal_capacity: Option<u64>,
+  /// How many INTER-REPLICA messages this cluster dropped because their `encoded_len()` exceeded the
+  /// transport frame cap [`MAX_FRAME_LEN`] — modelling the real transport's send-path frame guard,
+  /// which refuses a peer message larger than one frame. Only `replica → replica` traffic is measured
+  /// (the transport caps the peer wire; client↔replica delivery is a different path and is not
+  /// dropped here, mirroring what the real transport drops). A correct header-only carrier +
+  /// byte-bounded `RepairBatch` keeps EVERY legitimate peer message at/below the cap, so this stays `0`
+  /// for legitimate traffic; the VOPR harness asserts exactly that while large bodies are exercised, so
+  /// a regression that let a carrier overflow the frame (the old full-body view-change bug) would trip.
+  oversized_dropped: u64,
+  /// How many messages the network elected to HOLD ([`Faults::hold_per_mille`] fired) — delivery
+  /// pushed [`HOLD_DELAY`] into the virtual future instead of `latency + jitter`. Monotone over the
+  /// cluster's lifetime (the cluster struct persists across replica crash/restart, and nothing resets
+  /// it), so a high-water read is exact. `0` unless a fault plan with a non-zero hold rate is
+  /// installed. The VOPR hold sweep reads this as its non-vacuity witness: a held message is what lets
+  /// a `PrepareOk` outlive its op's truncation + re-mint and arrive as a stale-body vote, so the sweep
+  /// asserts holds genuinely fired rather than silently running the default schedule.
+  holds_fired: u64,
+  /// How many inter-replica messages a DIRECTED one-way block dropped (`one_way[from][to]` fired).
+  /// Monotone over the cluster's lifetime, like [`Self::holds_fired`]. `0` unless one-way blocks are
+  /// installed. The VOPR asym sweep reads this as its deep non-vacuity witness: episodes were not
+  /// merely installed — traffic genuinely flowed one way and was cut the other.
+  one_way_dropped: u64,
+  /// How many inter-replica messages picked up a SLOW-replica extra delay (a [`SlowProfile`] leg
+  /// fired). Monotone, like [`Self::holds_fired`]. `0` unless a slow profile is installed. The VOPR
+  /// slow sweep reads this as its deep non-vacuity witness: messages were genuinely delivered LATE,
+  /// not merely flagged slow.
+  slow_delays_applied: u64,
 }
 
 impl Cluster {
@@ -124,7 +168,7 @@ impl Cluster {
       })
       .collect();
     let client_set: Vec<ClientModel> = (0..clients)
-      .map(|i| ClientModel::new((i as u128) + 1, requests_per_client))
+      .map(|i| ClientModel::new((i as u128) + 1, requests_per_client, seed))
       .collect();
     let n = replicas as usize;
     let storage_faults = StorageFaults::none();
@@ -142,13 +186,20 @@ impl Cluster {
       storage_faults,
       replica_count: replicas,
       checkpoint_ops,
+      max_client_sessions: None,
       crashed: vec![false; n],
       groups: vec![0; n],
+      one_way: vec![vec![false; n]; n],
+      slow: vec![None; n],
       append_before_ack_violation: None,
       durable_view_violation: None,
       async_wal_delay: None,
       async_sb_delay: None,
       wal_capacity: None,
+      oversized_dropped: 0,
+      holds_fired: 0,
+      one_way_dropped: 0,
+      slow_delays_applied: 0,
     }
   }
 
@@ -413,6 +464,7 @@ impl Cluster {
       // Emitting it for a view above the sender's durable view advertises a view a crash could
       // roll back — the same hazard as a StartView, on the prepare path.
       Message::Prepare(p) => ("Prepare", p.view().get()),
+      Message::PrepareBatch(pb) => ("PrepareBatch", pb.view().get()),
       // A PrepareOk is a backup's VOTE the primary counts toward a COMMIT quorum (it carries
       // `self.view`). Acking in a not-yet-durable view helps commit an op under a view this replica
       // could regress out of — a vote in a view it has not persisted, the backup-side analogue of the
@@ -545,6 +597,25 @@ impl Cluster {
     self.clients.len()
   }
 
+  /// How many INTER-REPLICA messages were dropped because their encoded length exceeded the transport
+  /// frame cap `MAX_FRAME_LEN` (the modelled send-path frame guard). `0` for legitimate traffic: the
+  /// header-only view-change carriers + the byte-bounded `RepairBatch` keep every peer message
+  /// at/below the cap regardless of body size. The VOPR harness reads this to assert the cap is REAL
+  /// (a focused test drops a deliberately oversized message) yet NEVER fires for the protocol's own
+  /// traffic even while large client bodies are exercised — the non-vacuity oracle for the header-only
+  /// carriers + windowed repair.
+  pub fn oversized_dropped(&self) -> u64 {
+    self.oversized_dropped
+  }
+
+  /// How many messages the network has HELD so far ([`Faults::hold_per_mille`] fired: delivery pushed
+  /// `HOLD_DELAY` into the virtual future). Monotone; `0` unless a fault plan with a non-zero hold
+  /// rate is installed. The VOPR hold sweep asserts this fired across its seeds, so the hold lane can
+  /// never silently become a no-op.
+  pub fn holds_fired(&self) -> u64 {
+    self.holds_fired
+  }
+
   /// True once all clients are done and nothing is in flight.
   pub fn is_quiescent(&self) -> bool {
     self.net.is_empty() && self.clients.iter().all(ClientModel::is_done)
@@ -585,13 +656,7 @@ impl Cluster {
   /// main `tick` loop also pumps `handle_storage` every tick, so an un-pumped restart would still
   /// recover; this pump is purely for test-assertion timing.)
   pub fn restart(&mut self, i: usize) {
-    let cfg = Config::with_checkpoint_ops(
-      1,
-      ReplicaId::new(i as u8),
-      self.replica_count,
-      self.checkpoint_ops,
-    )
-    .expect("valid cluster config");
+    let cfg = self.replica_config(i as u8);
     let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
     let now = self.clock.now();
     self.replicas[i] = Endpoint::recover(
@@ -614,9 +679,91 @@ impl Cluster {
     self.crashed[i] = false;
   }
 
+  /// Restart a previously-crashed replica with WIPED durable storage: its WAL + superblock are
+  /// REPLACED by fresh, empty ones (same fault plan / async modes / ring capacity — a swapped disk on
+  /// the same deployment), and the replica then boots the SAME path as [`restart`](Self::restart):
+  /// `Endpoint::recover` over what the disk holds — here nothing, so recovery degenerates to the
+  /// genesis state (view 0, no checkpoint, empty log) and completes inline to `Normal`. A real wiped
+  /// node does exactly this: it cannot know it was wiped, it just recovers an empty disk.
+  ///
+  /// This is the classic VSR AMNESIA hazard: every promise the replica's durable state ever made
+  /// (its view participation, its durable quorum copies of committed ops) is forfeited. Losing one
+  /// replica's durable state is within the crash-fault model's `<= f` budget; the cluster-level
+  /// invariant (committed ops survive, no divergence) must still hold, which the VOPR wipe lane's
+  /// checkers judge. The caller is responsible for telling the stateful checkers about the wipe
+  /// (their per-replica monotonicity baselines — durable view, checkpoint high-water — are forfeit
+  /// with the disk).
+  pub fn wipe_and_restart(&mut self, i: usize) {
+    let s = Self::storage_seed(self.seed, i as u8);
+    let mut w = match self.async_wal_delay {
+      Some(d) => InMemoryWal::with_async_appends_and_faults(self.storage_faults, s, d),
+      None => InMemoryWal::with_faults(self.storage_faults, s),
+    };
+    w.set_capacity(self.wal_capacity);
+    self.wals[i] = w;
+    self.sbs[i] = match self.async_sb_delay {
+      Some(d) => InMemorySuperblock::with_async_writes_and_faults(self.storage_faults, s, d),
+      None => InMemorySuperblock::with_faults(self.storage_faults, s),
+    };
+    self.restart(i);
+  }
+
   /// Whether replica `i` is crashed.
   pub fn is_crashed(&self, i: usize) -> bool {
     self.crashed[i]
+  }
+
+  /// The per-replica `Config` (cluster id 1, this cluster's checkpoint interval and — when set — its
+  /// client-session cap), shared by construction-time builds and `restart`/`wipe_and_restart` so a
+  /// recovered replica keeps the identical cluster configuration.
+  fn replica_config(&self, i: u8) -> Config {
+    let cfg = Config::with_checkpoint_ops(
+      1,
+      ReplicaId::new(i),
+      self.replica_count,
+      self.checkpoint_ops,
+    )
+    .expect("valid cluster config");
+    match self.max_client_sessions {
+      Some(cap) => cfg
+        .with_max_client_sessions(cap)
+        .expect("a non-zero session cap"),
+      None => cfg,
+    }
+  }
+
+  /// Cap every replica's client-session table at `n` applied sessions (the proto's deterministic
+  /// apply-time eviction then engages past it; `None` restores the proto default). Call BEFORE
+  /// running: like [`Cluster::set_storage_faults`], this REBUILDS each replica's endpoint fresh with
+  /// the new config (warm in-memory state would be discarded), and the retained value makes every
+  /// later `restart`/`wipe_and_restart` rebuild with the same cap — the cap is cluster configuration,
+  /// identical on every replica, which is what keeps the eviction replica-deterministic.
+  pub fn set_max_client_sessions(&mut self, n: Option<u32>) {
+    self.max_client_sessions = n;
+    for i in 0..self.replica_count {
+      let cfg = self.replica_config(i);
+      let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
+      self.replicas[i as usize] = Endpoint::new(cfg, seed, LogSm::default());
+    }
+  }
+
+  /// RETIRE client `i`: it permanently stops issuing/retransmitting and counts as done for the
+  /// liveness checks (see [`ClientModel::retire`]). Its session rows on the replicas go idle and age
+  /// toward the deterministic cap eviction.
+  pub fn retire_client(&mut self, i: usize) {
+    self.clients[i].retire();
+  }
+
+  /// Spawn a FRESH client (a never-before-seen `ClientId` — one past the highest id ever minted)
+  /// issuing `requests` requests, returning its index. The churn lane pairs this with
+  /// [`Cluster::retire_client`] so the ACTIVE client count stays level while distinct client ids
+  /// accumulate over the run — the population pressure that drives the session-cap eviction.
+  pub fn spawn_client(&mut self, requests: u64) -> usize {
+    let next_id = self.clients.iter().map(|c| c.id().get()).max().unwrap_or(0) + 1;
+    self
+      .clients
+      .push(ClientModel::new(next_id, requests, self.seed));
+    self.clients.len() - 1
   }
 
   #[doc(hidden)]
@@ -729,6 +876,86 @@ impl Cluster {
     self.replicas[i].below_ring_window_syncs()
   }
 
+  /// Test-only: how many CHUNKED checkpoint transfers replica `i` completed (an announced
+  /// over-frame checkpoint pulled chunk-by-chunk, assembled, and verified against the pinned content
+  /// id). The large-snapshot gate asserts this goes `>= 1` to prove the CHUNKED path genuinely
+  /// carried the sync (vs the single-frame fast path); the VOPR sweep folds it reset-robustly.
+  /// Mirrors the proto's `Endpoint::sync_chunk_transfers_completed`.
+  #[doc(hidden)]
+  pub fn replica_sync_chunk_transfers_completed(&self, i: usize) -> u64 {
+    self.replicas[i].sync_chunk_transfers_completed()
+  }
+
+  /// Test-only: the donor replica `i`'s chunked transfer is currently pinned to, or `None` when no
+  /// chunked pull is in progress. The donor-crash gate variant uses this to crash the LIVE donor
+  /// deterministically mid-transfer (forcing the failover re-pin). Mirrors the proto's
+  /// `Endpoint::sync_transfer_donor`.
+  #[doc(hidden)]
+  pub fn replica_sync_transfer_donor(&self, i: usize) -> Option<u8> {
+    self.replicas[i].sync_transfer_donor()
+  }
+
+  /// Test-only: the byte length of replica `i`'s LIVE ROOTED checkpoint envelope (exactly the bytes
+  /// a state-sync serve would carry), or `None` when no checkpoint has been rooted. The
+  /// large-snapshot gate compares this against `max_unchunked_snapshot_len()` to assert the
+  /// would-have-wedged precondition (an envelope only the chunked path can deliver).
+  #[doc(hidden)]
+  pub fn replica_durable_envelope_len(&self, i: usize) -> Option<usize> {
+    self.sbs[i].live_checkpoint_len()
+  }
+
+  /// Make EVERY client request carry exactly `len` body bytes (replacing the seeded small/large
+  /// mix). Call before running. The large-snapshot state-sync gate uses this to push the cluster's
+  /// checkpoint envelope past the one-frame threshold within a short run.
+  pub fn set_fixed_client_body_len(&mut self, len: usize) {
+    for c in &mut self.clients {
+      c.set_fixed_body_len(len);
+    }
+  }
+
+  /// Test-only: how many canonical-log selections on replica `i` actually FLOORED the union
+  /// (`select_canonical_log` dropped at least one canonical-donor entry at/below the vouched
+  /// checkpoint floor). The VOPR sweep folds this (reset-robustly, the counter zeroes on `recover`)
+  /// to prove the floored-union path genuinely fired. Mirrors the proto's `Endpoint::unions_floored`.
+  #[doc(hidden)]
+  pub fn replica_unions_floored(&self, i: usize) -> u64 {
+    self.replicas[i].unions_floored()
+  }
+
+  /// Test-only: how many client sessions replica `i` EVICTED at apply time (the deterministic
+  /// session-cap eviction). The churn lane folds this (reset-robustly, the counter zeroes on
+  /// `recover`) as its non-vacuity witness — the cap genuinely engaged under client churn. Mirrors
+  /// the proto's `Endpoint::sessions_evicted`.
+  #[doc(hidden)]
+  pub fn replica_sessions_evicted(&self, i: usize) -> u64 {
+    self.replicas[i].sessions_evicted()
+  }
+
+  /// Test-only: how many NON-EMPTY `RepairBatch`es replica `i` served answering peers'
+  /// `RequestPrepareRange`s — the windowed bulk-repair channel genuinely shipping bodies. The VOPR
+  /// sweep folds this (reset-robustly) to prove the byte-bounded repair-serve path fired. Mirrors the
+  /// proto's `Endpoint::repair_batches_served`.
+  #[doc(hidden)]
+  pub fn replica_repair_batches_served(&self, i: usize) -> u64 {
+    self.replicas[i].repair_batches_served()
+  }
+
+  /// Test/observability accessor: this replica's emitted prepare-batch count, mirroring the
+  /// proto's `Endpoint::prepare_batches_sent`.
+  #[doc(hidden)]
+  pub fn replica_prepare_batches_sent(&self, i: usize) -> u64 {
+    self.replicas[i].prepare_batches_sent()
+  }
+
+  /// Test-only: how many header-only carrier slices replica `i` built (`log_entries` — the single
+  /// chokepoint every `DoViewChange`/`StartView`/`RecoveryResponse` log payload flows through). The
+  /// VOPR sweep folds this (reset-robustly) to prove the header-only carrier path fired. Mirrors the
+  /// proto's `Endpoint::header_only_carriers_emitted`.
+  #[doc(hidden)]
+  pub fn replica_header_only_carriers_emitted(&self, i: usize) -> u64 {
+    self.replicas[i].header_only_carriers_emitted()
+  }
+
   /// Test-only: how many of replica `i`'s WAL slots in `1..=op` are PERMANENTLY corrupt (bit-rot or
   /// torn) — i.e. would read back faulty. The permanent-fault gate uses this to assert recovery is
   /// non-vacuous (the crashed replica genuinely must peer-repair some rotted committed slot).
@@ -743,6 +970,14 @@ impl Cluster {
   #[doc(hidden)]
   pub fn wal_misdirects_fired(&self, i: usize) -> u64 {
     self.wals[i].misdirects_fired()
+  }
+
+  /// Test-only: how many of replica `i`'s completed WAL appends LOST their header (the torn-header
+  /// contract-violation verdict). The torn-header probe lane sums this across replicas as its
+  /// non-vacuity witness.
+  #[doc(hidden)]
+  pub fn wal_torn_headers_fired(&self, i: usize) -> u64 {
+    self.wals[i].torn_headers_fired()
   }
 
   /// Replica `i`'s RECOVERED COMMITTED BAND width: `commit_max - checkpoint_op`, the count of
@@ -772,9 +1007,57 @@ impl Cluster {
     self.groups = groups;
   }
 
-  /// Heal all partitions (a single group).
+  /// Heal all partitions: a single symmetric group AND no one-way blocks. Full bidirectional
+  /// connectivity — what a calm window / final quiesce requires.
   pub fn heal(&mut self) {
     self.groups = vec![0; self.replicas.len()];
+    self.heal_one_way();
+  }
+
+  /// Heal only the DIRECTED one-way blocks, leaving any symmetric group partition in place (the
+  /// asym action's own heal branch; [`heal`](Self::heal) clears both).
+  pub fn heal_one_way(&mut self) {
+    for row in &mut self.one_way {
+      row.fill(false);
+    }
+  }
+
+  /// Install a DIRECTED block: `from`'s messages to `to` are dropped until healed, while `to → from`
+  /// still flows. The asymmetric analogue of [`partition`](Self::partition).
+  pub fn block_one_way(&mut self, from: u8, to: u8) {
+    assert_ne!(from, to, "a replica always reaches itself");
+    self.one_way[from as usize][to as usize] = true;
+  }
+
+  /// Whether `from`'s messages to `to` are currently blocked by a DIRECTED one-way block (the
+  /// asymmetric check; independent of the symmetric [`partitioned`](Self::partitioned)).
+  pub fn one_way_blocked(&self, from: u8, to: u8) -> bool {
+    self.one_way[from as usize][to as usize]
+  }
+
+  /// How many inter-replica messages a directed one-way block has dropped so far. Monotone; `0`
+  /// unless one-way blocks are installed. The asym sweep's deep non-vacuity witness.
+  pub fn one_way_dropped(&self) -> u64 {
+    self.one_way_dropped
+  }
+
+  /// Install (or with `None`, clear) replica `i`'s GRAY-FAILURE delivery profile: its inter-replica
+  /// messages (the legs `profile` selects) each pick up an extra seeded delay from the profile's
+  /// band — late, never dropped. With no profile installed no per-message PRNG draw is taken, so
+  /// default schedules stay byte-identical.
+  pub fn set_slow_replica(&mut self, i: usize, profile: Option<SlowProfile>) {
+    self.slow[i] = profile;
+  }
+
+  /// Clear every replica's slow profile (full prompt delivery — calm-window connectivity).
+  pub fn clear_slow_replicas(&mut self) {
+    self.slow.fill(None);
+  }
+
+  /// How many inter-replica messages have picked up a slow-replica extra delay so far. Monotone;
+  /// `0` unless a slow profile is installed. The slow sweep's deep non-vacuity witness.
+  pub fn slow_delays_applied(&self) -> u64 {
+    self.slow_delays_applied
   }
 
   /// Whether replica↔replica traffic between replicas `a` and `b` is currently partitioned.
@@ -976,6 +1259,24 @@ impl Cluster {
       if self.partitioned(from_r.get(), to_r) {
         return;
       }
+      // The DIRECTED one-way block: this leg is cut while the reverse leg still flows (the
+      // asymmetric-partition axis). Checked after the symmetric groups (either suffices to drop)
+      // and counted, so the asym sweep can assert traffic was genuinely cut one-way.
+      if self.one_way_blocked(from_r.get(), to_r) {
+        self.one_way_dropped += 1;
+        return;
+      }
+      // The transport's send-path frame guard: a peer message larger than one frame
+      // ([`MAX_FRAME_LEN`]) cannot be sent and is dropped at the source. Model it here so the
+      // inter-replica wire enforces the SAME cap the real transport does (the message-VOPR runs
+      // without the transport). Header-only view-change carriers + the byte-bounded `RepairBatch` keep
+      // every legitimate peer message at/below the cap, so a drop here is a REAL bug — a carrier
+      // that overflowed the frame (the old full-body view-change defect). Only `replica → replica`
+      // traffic is capped (client↔replica is a different path, not dropped — what the transport drops).
+      if msg.encoded_len() > viewstamp_proto::MAX_FRAME_LEN as usize {
+        self.oversized_dropped += 1;
+        return;
+      }
     }
     if self.faults.drop_per_mille > 0 && self.prng.chance(self.faults.drop_per_mille, 1000) {
       return;
@@ -989,7 +1290,17 @@ impl Cluster {
     // happens, so a held message's deliver_at is overridden without perturbing the stream. When
     // `hold_per_mille` is 0 the `&&` short-circuits — no draw — so default schedules are byte-identical.
     let hold = self.faults.hold_per_mille > 0 && self.prng.chance(self.faults.hold_per_mille, 1000);
-    let base_at = now + self.faults.latency + Duration::from_nanos(self.jitter_ns());
+    if hold {
+      self.holds_fired += 1;
+    }
+    // Each copy's slow-replica extra delay is drawn right after its jitter (its own independent
+    // draw, like the jitter itself). With no slow profile installed the call returns without
+    // touching the PRNG, so default schedules stay byte-identical; a held message's deliver_at is
+    // overridden below without perturbing the stream (the jitter discipline).
+    let base_at = now
+      + self.faults.latency
+      + Duration::from_nanos(self.jitter_ns())
+      + self.slow_extra(from, target);
     let deliver_at = if hold { now + HOLD_DELAY } else { base_at };
     self.net.enqueue(InFlight {
       deliver_at,
@@ -999,8 +1310,12 @@ impl Cluster {
       seq: 0,
     });
     if duplicate {
-      // The second copy gets its OWN jitter, so it can arrive before or after the first.
-      let dup_at = now + self.faults.latency + Duration::from_nanos(self.jitter_ns());
+      // The second copy gets its OWN jitter (and slow extra), so it can arrive before or after the
+      // first.
+      let dup_at = now
+        + self.faults.latency
+        + Duration::from_nanos(self.jitter_ns())
+        + self.slow_extra(from, target);
       self.net.enqueue(InFlight {
         deliver_at: dup_at,
         from,
@@ -1009,6 +1324,44 @@ impl Cluster {
         seq: 0,
       });
     }
+  }
+
+  /// The slow-replica extra delay for one delivery of a `from → target` message: a seeded draw from
+  /// the sender's outbound band (when the sender is slow) plus the receiver's inbound band (when the
+  /// receiver is slow). Only replica↔replica traffic is shaped (mirroring the partitions + the frame
+  /// cap), and self-delivery is exempt (the slow link models the replica's NIC, not its local loop).
+  /// Returns `Duration::ZERO` WITHOUT a PRNG draw when no installed profile applies, so schedules
+  /// without a slow replica are byte-identical.
+  fn slow_extra(&mut self, from: Peer, target: Target) -> Duration {
+    let (Peer::Replica(from_r), Target::Replica(to_r)) = (from, target) else {
+      return Duration::ZERO;
+    };
+    let (f, t) = (from_r.get() as usize, to_r as usize);
+    if f == t {
+      return Duration::ZERO;
+    }
+    let mut extra = Duration::ZERO;
+    if let Some(p) = self.slow[f] {
+      if p.outbound {
+        extra += self.slow_draw(p);
+      }
+    }
+    if let Some(p) = self.slow[t] {
+      if p.inbound {
+        extra += self.slow_draw(p);
+      }
+    }
+    if !extra.is_zero() {
+      self.slow_delays_applied += 1;
+    }
+    extra
+  }
+
+  /// One uniform draw from a slow profile's `[min_extra, max_extra]` band (inclusive).
+  fn slow_draw(&mut self, p: SlowProfile) -> Duration {
+    let lo = p.min_extra.as_nanos() as u64;
+    let span = p.max_extra.saturating_sub(p.min_extra).as_nanos() as u64;
+    Duration::from_nanos(lo + self.prng.below(span + 1))
   }
 
   /// One independent jitter draw in nanoseconds (`0` when jitter is disabled).
@@ -1180,6 +1533,140 @@ mod tests {
   }
 
   #[test]
+  fn one_way_blocks_are_directed_counted_and_healed() {
+    // The DIRECTED block: 0 → 1 is cut while 1 → 0 still flows — the asymmetric shape the
+    // symmetric groups cannot express. The blocked leg is dropped + counted; the reverse leg and
+    // client-bound traffic are untouched; `heal` restores full bidirectional connectivity.
+    let mut c = Cluster::new(3, 1, 1, /*seed*/ 7);
+    let now = c.now();
+    c.block_one_way(0, 1);
+    assert!(c.one_way_blocked(0, 1), "the installed leg is blocked");
+    assert!(!c.one_way_blocked(1, 0), "the REVERSE leg still flows");
+    let small = Message::Commit(viewstamp_proto::Commit::new(
+      viewstamp_proto::View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(0),
+    ));
+    // Blocked leg: dropped + counted, never enqueued.
+    c.schedule(
+      now,
+      Peer::Replica(ReplicaId::new(0)),
+      Target::Replica(1),
+      small.clone(),
+    );
+    assert_eq!(c.one_way_dropped(), 1, "the blocked leg drop is counted");
+    assert!(
+      c.net.is_empty(),
+      "the blocked message never reached the wire"
+    );
+    // Reverse leg: delivered.
+    c.schedule(
+      now,
+      Peer::Replica(ReplicaId::new(1)),
+      Target::Replica(0),
+      small.clone(),
+    );
+    assert_eq!(c.one_way_dropped(), 1, "the reverse leg is NOT blocked");
+    assert!(!c.net.is_empty(), "the reverse-leg message was enqueued");
+    // Heal: the leg flows again.
+    c.heal();
+    c.schedule(
+      now,
+      Peer::Replica(ReplicaId::new(0)),
+      Target::Replica(1),
+      small,
+    );
+    assert_eq!(c.one_way_dropped(), 1, "heal cleared the one-way block");
+  }
+
+  #[test]
+  fn slow_profile_delays_but_delivers_and_clears() {
+    // The GRAY-FAILURE profile: a slow replica's messages ARRIVE (never dropped), each at least
+    // `min_extra` later than an unshaped message — late, not lost — and clearing the profile
+    // restores prompt delivery (and stops consuming PRNG draws).
+    let mut c = Cluster::new(3, 1, 1, /*seed*/ 7);
+    let now = c.now();
+    let small = Message::Commit(viewstamp_proto::Commit::new(
+      viewstamp_proto::View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(0),
+    ));
+    let min_extra = Duration::from_millis(5);
+    c.set_slow_replica(
+      1,
+      Some(SlowProfile {
+        inbound: true,
+        outbound: true,
+        min_extra,
+        max_extra: Duration::from_millis(20),
+      }),
+    );
+    // Outbound leg (slow sender) and inbound leg (slow receiver): both delayed by >= min_extra over
+    // the base latency; an unrelated 0 → 2 message is unshaped. No jitter in the default fault
+    // plan, so the base delivery is exactly `now + latency`.
+    let base = now + Faults::none().latency;
+    c.schedule(
+      now,
+      Peer::Replica(ReplicaId::new(1)),
+      Target::Replica(2),
+      small.clone(),
+    );
+    c.schedule(
+      now,
+      Peer::Replica(ReplicaId::new(0)),
+      Target::Replica(1),
+      small.clone(),
+    );
+    c.schedule(
+      now,
+      Peer::Replica(ReplicaId::new(0)),
+      Target::Replica(2),
+      small.clone(),
+    );
+    let due = c.net.take_due(now + Duration::from_secs(3600));
+    assert_eq!(due.len(), 3, "slow messages are DELIVERED, not dropped");
+    let at = |from: u8, to: u8| {
+      due
+        .iter()
+        .find(|m| m.from == Peer::Replica(ReplicaId::new(from)) && m.target == Target::Replica(to))
+        .expect("the scheduled message is in flight")
+        .deliver_at
+    };
+    assert!(
+      at(1, 2) >= base + min_extra,
+      "the slow sender's outbound message is late by at least the band floor"
+    );
+    assert!(
+      at(0, 1) >= base + min_extra,
+      "the slow receiver's inbound message is late by at least the band floor"
+    );
+    assert_eq!(
+      at(0, 2),
+      base,
+      "a message not touching the slow replica is unshaped"
+    );
+    assert_eq!(c.slow_delays_applied(), 2, "both shaped legs are counted");
+    // Clearing restores prompt delivery.
+    c.clear_slow_replicas();
+    c.schedule(
+      now,
+      Peer::Replica(ReplicaId::new(0)),
+      Target::Replica(1),
+      small,
+    );
+    let due = c.net.take_due(now + Duration::from_secs(3600));
+    assert_eq!(
+      due[0].deliver_at, base,
+      "clearing the profile restores prompt delivery"
+    );
+    assert_eq!(
+      c.slow_delays_applied(),
+      2,
+      "no further delays after the clear"
+    );
+  }
+
+  #[test]
   fn durable_view_checker_flags_a_sync_checkpoint_above_the_durable_view() {
     // CHECKER NON-VACUITY: the durable-view oracle must flag a `SyncCheckpoint` advertising a view
     // ABOVE the emitter's durable view — the state-sync serve was previously an unchecked blind spot
@@ -1227,6 +1714,202 @@ mod tests {
     assert!(
       c.take_durable_view_violation().is_none(),
       "a SyncCheckpoint at the durable view is a legitimate serve and must NOT be flagged"
+    );
+  }
+
+  #[test]
+  fn network_drops_an_oversized_inter_replica_message_but_not_small_or_client_ones() {
+    // The CONVERSE that proves the frame cap is REAL and would have caught the old full-body
+    // view-change bug: a full-`Present` 8-entry `DoViewChange` of large bodies — exactly the carrier
+    // the header-only change replaced — EXCEEDS `MAX_FRAME_LEN`, and the sim network drops it on the
+    // inter-replica path (counting it), while a header-only carrier of the SAME band, a small message,
+    // and an (oversized) client-bound message all pass. This is the modelled transport send-path frame
+    // guard; it is what makes the VOPR's `oversized_dropped == 0` for legitimate traffic a real oracle.
+    use viewstamp_proto::{
+      ClientId, DoViewChange, MAX_FRAME_LEN, OpNumber, PreparedEntry, ReplicaId, RequestNumber,
+      View, max_request_body_len,
+    };
+
+    let big = max_request_body_len() / 4; // each ~4 MiB; 8 of them full-bodied dwarf the 16 MiB frame
+    let body = bytes::Bytes::from(std::vec![0x5Au8; big]);
+    let full_body: Vec<PreparedEntry> = (1..=8u64)
+      .map(|op| {
+        PreparedEntry::new(
+          OpNumber::with(op),
+          ClientId::new(7),
+          RequestNumber::with(op),
+          body.clone(),
+        )
+      })
+      .collect();
+    let header_only: Vec<PreparedEntry> = (1..=8u64)
+      .map(|op| {
+        PreparedEntry::repairing(
+          OpNumber::with(op),
+          ClientId::new(7),
+          RequestNumber::with(op),
+          0,
+        )
+      })
+      .collect();
+    let dvc_full = Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(1),
+      OpNumber::with(8),
+      OpNumber::with(8),
+      ReplicaId::new(0),
+      full_body,
+    ));
+    let dvc_header = Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(1),
+      OpNumber::with(8),
+      OpNumber::with(8),
+      ReplicaId::new(0),
+      header_only,
+    ));
+    // The full-body band is over the frame; the header-only band of the SAME ops is far under it.
+    assert!(
+      dvc_full.encoded_len() > MAX_FRAME_LEN as usize,
+      "a full-body 8-entry DoViewChange of large bodies must exceed the frame cap (the old bug)"
+    );
+    assert!(
+      dvc_header.encoded_len() < MAX_FRAME_LEN as usize,
+      "a header-only DoViewChange of the same band must fit the frame cap"
+    );
+
+    let mut c = Cluster::new(3, 1, 1, /*seed*/ 7);
+    let now = c.now();
+    let from = Peer::Replica(ReplicaId::new(0));
+    // Peer → peer, oversized: DROPPED + counted.
+    c.schedule(now, from, Target::Replica(1), dvc_full.clone());
+    assert_eq!(
+      c.oversized_dropped(),
+      1,
+      "an oversized inter-replica message is dropped by the send-path frame guard and counted"
+    );
+    assert!(
+      c.net.is_empty(),
+      "the oversized peer message was dropped, not enqueued"
+    );
+    // Peer → peer, header-only (same band): delivered, no new drop.
+    c.schedule(now, from, Target::Replica(1), dvc_header.clone());
+    assert_eq!(
+      c.oversized_dropped(),
+      1,
+      "a header-only carrier of the same band fits the frame and is NOT dropped"
+    );
+    assert!(!c.net.is_empty(), "the header-only carrier was enqueued");
+    // A small peer message: delivered, no new drop.
+    let small = Message::Commit(viewstamp_proto::Commit::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(0),
+    ));
+    c.schedule(now, from, Target::Replica(2), small);
+    assert_eq!(
+      c.oversized_dropped(),
+      1,
+      "a small peer message is never dropped"
+    );
+    // An oversized CLIENT-bound message is NOT capped here (only peer traffic is — mirroring what the
+    // real transport drops). Build a Reply that itself exceeds the frame and confirm it is not dropped.
+    let huge_reply = Message::Reply(viewstamp_proto::Reply::new(
+      View::with(1),
+      ClientId::new(1),
+      RequestNumber::with(1),
+      bytes::Bytes::from(std::vec![0u8; MAX_FRAME_LEN as usize + 1024]),
+    ));
+    assert!(huge_reply.encoded_len() > MAX_FRAME_LEN as usize);
+    c.schedule(now, from, Target::Client(1), huge_reply);
+    assert_eq!(
+      c.oversized_dropped(),
+      1,
+      "a client-bound message is not subject to the inter-replica frame cap (different path)"
+    );
+  }
+
+  #[test]
+  fn an_over_threshold_sync_checkpoint_would_drop_but_its_chunks_all_fit() {
+    // The chunked state-sync CONVERSE: a whole `SyncCheckpoint` of an envelope just past the
+    // unchunked threshold is EXACTLY what the single-frame path would have sent — the modelled
+    // transport frame guard DROPS it (counted), which on a laggard whose only recovery is that
+    // envelope was a permanent liveness wedge. Every `SyncChunk` of the SAME envelope fits the cap
+    // by construction, a max-fill chunk landing EXACTLY on it — so the chunked path keeps
+    // `oversized_dropped == 0` a real oracle over SyncCheckpoint traffic of any size.
+    use viewstamp_proto::{
+      MAX_FRAME_LEN, OpNumber, ReplicaId, SYNC_CHUNK_LEN, SyncCheckpoint, SyncChunk, View,
+      max_unchunked_snapshot_len,
+    };
+
+    let env_len = max_unchunked_snapshot_len() + 1; // one byte past the whole-message threshold
+    let env = bytes::Bytes::from(std::vec![0x5Au8; env_len]);
+    let whole = Message::SyncCheckpoint(SyncCheckpoint::new(
+      View::with(1),
+      OpNumber::with(8),
+      0xFEED,
+      ReplicaId::new(0),
+      7,
+      env.clone(),
+    ));
+    assert!(
+      whole.encoded_len() > MAX_FRAME_LEN as usize,
+      "one byte past the threshold makes the whole SyncCheckpoint oversized"
+    );
+
+    let mut c = Cluster::new(3, 1, 1, /*seed*/ 7);
+    let now = c.now();
+    let from = Peer::Replica(ReplicaId::new(0));
+    c.schedule(now, from, Target::Replica(1), whole);
+    assert_eq!(
+      c.oversized_dropped(),
+      1,
+      "the whole over-threshold envelope is dropped + counted by the frame guard"
+    );
+    assert!(
+      c.net.is_empty(),
+      "the oversized serve never reached the wire"
+    );
+
+    // EVERY chunk of the same envelope is deliverable; the max-fill first chunk lands exactly on
+    // the cap and the partial tail is far under it.
+    let mut offset = 0usize;
+    let mut chunks = 0usize;
+    while offset < env_len {
+      let end = (offset + SYNC_CHUNK_LEN).min(env_len);
+      let chunk = Message::SyncChunk(SyncChunk::new(
+        View::with(1),
+        OpNumber::with(8),
+        0xFEED,
+        env_len as u64,
+        offset as u64,
+        ReplicaId::new(0),
+        7,
+        env.slice(offset..end),
+      ));
+      assert!(
+        chunk.encoded_len() <= MAX_FRAME_LEN as usize,
+        "every chunk of the over-threshold envelope fits the frame cap"
+      );
+      if end - offset == SYNC_CHUNK_LEN {
+        assert_eq!(
+          chunk.encoded_len(),
+          MAX_FRAME_LEN as usize,
+          "a max-fill chunk lands exactly on the cap (the chunk size wastes nothing)"
+        );
+      }
+      c.schedule(now, from, Target::Replica(1), chunk);
+      offset = end;
+      chunks += 1;
+    }
+    assert_eq!(
+      chunks, 2,
+      "one byte past the threshold splits into exactly two chunks"
+    );
+    assert_eq!(
+      c.oversized_dropped(),
+      1,
+      "no chunk was dropped — the chunked path never produces an oversized frame"
     );
   }
 }

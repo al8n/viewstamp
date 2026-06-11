@@ -10,8 +10,35 @@ use std::collections::VecDeque;
 use super::TransportError;
 
 /// The default maximum framed-unit length (16 MiB). Bounds buffering against a hostile peer; viewstamp's
-/// largest messages (StartView / DoViewChange / SyncCheckpoint) fit well under.
-pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+/// largest messages (StartView / DoViewChange / SyncCheckpoint) fit well under. Re-exported from the
+/// base crate (`crate::message::MAX_FRAME_LEN`) so it is the SAME cap the always-available byte-bounded
+/// repair serve sizes its batches against (one source of truth across the feature boundary).
+pub const MAX_FRAME_LEN: u32 = crate::message::MAX_FRAME_LEN;
+
+/// The largest client-request body the transport can deliver end-to-end, in bytes: [`MAX_FRAME_LEN`]
+/// minus the worst-case per-message encoding overhead a client request incurs
+/// (`crate::message::MAX_REQUEST_BODY_OVERHEAD`).
+///
+/// A client body does not travel alone — the SAME body bytes are wrapped by a [`Request`](crate::Request)
+/// encoding on the client → primary hop, by a (larger) [`Prepare`](crate::Prepare) encoding on the
+/// primary → backups hop, and — once the op is logged — by a single
+/// [`PreparedEntry`](crate::PreparedEntry) inside the log slice a
+/// [`DoViewChange`](crate::DoViewChange) / [`StartView`](crate::StartView) /
+/// [`RecoveryResponse`](crate::RecoveryResponse) carries at view change or recovery. The send path
+/// refuses any message whose `encoded_len()` exceeds [`MAX_FRAME_LEN`], and
+/// `MAX_REQUEST_BODY_OVERHEAD` is the largest of those
+/// per-carrier overheads (the log carriers, not the `Prepare` hop, bind it). A body of at most this many
+/// bytes therefore encodes to at most [`MAX_FRAME_LEN`] on EVERY message that can carry it, so it is
+/// deliverable on every hop; one byte more would push the tightest carrier (a one-entry log slice) past
+/// the frame cap and be dropped by the transport, wedging a view change or recovery that had accepted
+/// it. A driver should reject an over-this-size submit up front rather than admit a request the cluster
+/// can never commit.
+///
+/// `const`: [`MAX_FRAME_LEN`] (16 MiB) dwarfs the fixed overhead, so the subtraction never underflows.
+#[cfg_attr(not(tarpaulin), inline)]
+pub const fn max_request_body_len() -> usize {
+  MAX_FRAME_LEN as usize - crate::message::MAX_REQUEST_BODY_OVERHEAD
+}
 
 /// The per-pass plaintext budget a coordinator reads from one stream before draining the frames it
 /// produced — the single source of truth for both stream coordinators. A read pass copies at most

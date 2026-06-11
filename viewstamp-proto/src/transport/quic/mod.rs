@@ -15,7 +15,7 @@ mod table;
 mod testutil;
 
 pub use bridge::DialError;
-pub use crypto::{ClusterTls, QuicOptions};
+pub use crypto::{ClusterTls, QuicOptions, QuicTuning};
 pub use identity::{
   CertOid, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome, IdentitySource,
   ProvidedIdentity,
@@ -32,7 +32,8 @@ use layout::StreamClass;
 
 use crate::Endpoint;
 use crate::{
-  Event, Instant, Message, Outgoing, Peer, Recipient, ReplicaId, StateMachine, Superblock, Wal,
+  Event, Instant, Message, Outgoing, Peer, Recipient, ReplicaId, Request, StateMachine, Superblock,
+  Wal,
 };
 
 /// Derive the SNI server-name a dial presents for `expected` in `cluster`, matching the per-replica
@@ -349,6 +350,16 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     self.endpoint.poll_event()
   }
 
+  /// Whether a BOUND (identity-validated) connection to `peer` currently exists — the link the
+  /// `Backups`/`AllReplicas` fan-out routes consensus frames over. A driver polls this to redial a
+  /// configured peer whose connection idled out or was lost: without redial a dead mesh edge stays
+  /// dead (retransmits route to no bound conn) until the peer happens to dial back. `false` also
+  /// while a dial/handshake is still in flight, so a redialing caller must pace itself (back off)
+  /// rather than treat every `false` as dead-link proof.
+  pub fn has_bound_conn(&self, peer: Peer) -> bool {
+    self.bridge.handle_for(peer).is_some()
+  }
+
   /// The number of outgoing protocol messages this coordinator refused to send because their encoded
   /// frame would exceed `MAX_FRAME_LEN` (the inbound frame cap). Such a message — e.g. a large
   /// checkpoint / view-change carrier awaiting deferred snapshot chunking — cannot be framed, so the send
@@ -357,6 +368,49 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// is required. Forwards the bridge's counter, mirroring `StreamCoordinator::oversized_outbound_dropped`.
   pub fn oversized_outbound_dropped(&self) -> u64 {
     self.bridge.oversized_dropped()
+  }
+
+  /// Submit a client request originating at this node's local application.
+  ///
+  /// Delivers the request to this replica (served immediately iff this replica is the primary for the
+  /// current view) and broadcasts it to the other replicas so whichever holds the primary role serves
+  /// it — mirroring the simulation client, which broadcasts and lets the primary act. `on_request`
+  /// ignores the transport sender (it keys on the embedded `ClientId`), so a relayed copy is served
+  /// normally. The committed reply is surfaced through [`Self::poll_event`] as
+  /// [`crate::Event::Committed`] once this replica applies the op (every replica applies committed ops).
+  ///
+  /// A request whose body exceeds [`max_request_body_len`](crate::transport::frame::max_request_body_len)
+  /// is DROPPED here — not delivered to the endpoint and not routed to backups (the same
+  /// transport-ingress gate `Self::deliver_decoded` applies to a relayed inbound `Request`). Such a
+  /// body would frame past [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN) as the resulting
+  /// `Prepare`, so the primary could append an op it can never replicate; rejecting it before any
+  /// session/log mutation keeps the consensus core transport-agnostic.
+  pub fn submit_client_request<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    request: Request,
+  ) {
+    if request.body().len() > crate::transport::frame::max_request_body_len() {
+      return;
+    }
+    let self_id = self.endpoint.replica();
+    self.endpoint.handle_message(
+      now,
+      wal,
+      sb,
+      Peer::Client(request.client()),
+      Message::Request(request.clone()),
+    );
+    let std_now = self.quinn_now(now);
+    self.route(
+      std_now,
+      Recipient::Backups,
+      &Message::Request(request),
+      self_id,
+    );
+    self.pump(now);
   }
 
   /// Drain the bridge's connection-event queues:
@@ -436,11 +490,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
           // A validated connection: the frame is a consensus message. A frame that fails to decode
           // is dropped (the consensus layer retransmits); keep draining the rest of the batch.
           if let (Some(from), Ok(msg)) = (self.bridge.bound_peer_of(h), Message::decode(&payload)) {
-            self.endpoint.handle_message(now, wal, sb, from, msg);
-            #[cfg(test)]
-            {
-              self.consensus_frames_delivered += 1;
-            }
+            self.deliver_decoded(now, wal, sb, from, msg);
           }
         } else {
           // `Closed` (or otherwise no longer routable): drop the remaining frames.
@@ -454,11 +504,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       if self.bridge.is_validated(h) {
         while let Some(payload) = self.bridge.next_frame(h, StreamClass::Bulk) {
           if let (Some(from), Ok(msg)) = (self.bridge.bound_peer_of(h), Message::decode(&payload)) {
-            self.endpoint.handle_message(now, wal, sb, from, msg);
-            #[cfg(test)]
-            {
-              self.consensus_frames_delivered += 1;
-            }
+            self.deliver_decoded(now, wal, sb, from, msg);
           }
         }
       }
@@ -477,6 +523,40 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     }
     while let Some(h) = self.bridge.take_lost() {
       self.bridge.reap(h);
+    }
+  }
+
+  /// Deliver one decoded inbound `(from, msg)` to the consensus endpoint, enforcing the transport's
+  /// deliverable-body bound at this ingress: a `Message::Request` whose body exceeds
+  /// [`max_request_body_len`](crate::transport::frame::max_request_body_len) is DROPPED before it
+  /// reaches the endpoint, so no op is appended, no client session row is created, and no `Prepare` is
+  /// routed.
+  ///
+  /// This ingress accepts a `Request` RELAYED by another replica (not only one straight from
+  /// the client). A buggy or version-skewed member could relay a `Request` that fits the `Request`
+  /// frame yet whose resulting `Prepare` would exceed
+  /// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN) — the primary would log an op it can then
+  /// never replicate (the oversized `Prepare` is dropped by the send path), wedging that op. Gating at
+  /// the coordinator — which owns `MAX_FRAME_LEN` — keeps the consensus core (`Endpoint`)
+  /// transport-agnostic: it never learns the frame limit. Every other message kind is forwarded
+  /// unchanged. Single chokepoint for both decoded stream classes (Control and Bulk).
+  fn deliver_decoded<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    from: Peer,
+    msg: Message,
+  ) {
+    if let Message::Request(r) = &msg {
+      if r.body().len() > crate::transport::frame::max_request_body_len() {
+        return;
+      }
+    }
+    self.endpoint.handle_message(now, wal, sb, from, msg);
+    #[cfg(test)]
+    {
+      self.consensus_frames_delivered += 1;
     }
   }
 
@@ -635,9 +715,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     }
   }
 
-  /// Feeds one message straight to the endpoint then pumps (test shortcut for the decode path),
-  /// mirroring `StreamCoordinator::inject_message_for_test`. The live caller is the two-replica
-  /// loopback, which seeds the primary with a client request once the link is up.
+  /// Feeds one message through the inbound ingress (`deliver_decoded`, so the deliverable-body gate
+  /// applies) then pumps — the test shortcut for the decode path, mirroring
+  /// `StreamCoordinator::inject_message_for_test`. The live caller is the two-replica loopback, which
+  /// seeds the primary with a client request once the link is up.
   #[cfg(test)]
   #[allow(dead_code)]
   pub(crate) fn inject_message_for_test<W: Wal, B: Superblock>(
@@ -648,7 +729,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     from: Peer,
     msg: Message,
   ) {
-    self.endpoint.handle_message(now, wal, sb, from, msg);
+    self.deliver_decoded(now, wal, sb, from, msg);
     self.pump(now);
   }
 
@@ -1082,6 +1163,94 @@ mod tests {
     assert!(
       n1 >= 4,
       "even a 1-replica node keeps a small connection floor ({n1}) for accept/reconnect headroom"
+    );
+  }
+
+  /// A relayed (replica-sent) `Request` whose body is ONE byte over the deliverable maximum is dropped
+  /// at the QUIC transport ingress BEFORE the endpoint: it appends no op and is never fed to
+  /// `handle_message` (the consensus-frame counter does not advance). The hazard: a buggy /
+  /// version-skewed member relays a `Request` that fits its own frame but whose resulting `Prepare`
+  /// would exceed `MAX_FRAME_LEN`, so the primary would log an op it can never replicate. The
+  /// at-maximum body, by contrast, is served
+  /// and reaches the endpoint — the boundary is usable. The gate keeps the consensus `Endpoint`
+  /// transport-agnostic.
+  #[test]
+  fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() {
+    use crate::transport::frame::{MAX_FRAME_LEN, max_request_body_len};
+    use crate::transport::testutil::{TestSb, TestWal};
+    use crate::{ClientId, Message, Request, RequestNumber};
+    use bytes::Bytes;
+
+    let cluster = 0x5151;
+    // Replica 0 is the primary of view 0, so an admitted relayed Request would be served.
+    let cfg = Config::try_new(cluster, ReplicaId::new(0), 3).unwrap();
+    let mut wal = TestWal::default();
+    let mut sb = TestSb::default();
+    let mut c = QuicCoordinator::with_identity(
+      Endpoint::new(cfg, 1, CountSm::default()),
+      mtls_opts(cluster),
+      Some([0u8; 32]),
+      IdentityConfig::Hello { cluster },
+    );
+    assert_eq!(c.endpoint().op().get(), 0, "no op before any request");
+    assert_eq!(
+      c.consensus_frames_delivered(),
+      0,
+      "no consensus frame delivered yet"
+    );
+
+    // A relayed Request (from a configured REPLICA — the replica-relayed ingress this gate guards)
+    // whose body is one byte past the deliverable maximum: its resulting Prepare would exceed
+    // MAX_FRAME_LEN.
+    let over = Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(1),
+      Bytes::from(vec![0u8; max_request_body_len() + 1]),
+    ));
+    c.inject_message_for_test(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      over,
+    );
+    assert_eq!(
+      c.endpoint().op().get(),
+      0,
+      "an over-max relayed request appends no op (dropped before the endpoint)"
+    );
+    assert_eq!(
+      c.consensus_frames_delivered(),
+      0,
+      "an over-max relayed request is never fed to handle_message (dropped at ingress)"
+    );
+
+    // The BOUNDARY: a body of EXACTLY max_request_body_len() reaches the endpoint and is served.
+    assert!(
+      max_request_body_len() < MAX_FRAME_LEN as usize,
+      "the deliverable max is under the frame cap by the request overhead"
+    );
+    let at_max = Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(1),
+      Bytes::from(vec![0u8; max_request_body_len()]),
+    ));
+    c.inject_message_for_test(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      at_max,
+    );
+    assert_eq!(
+      c.consensus_frames_delivered(),
+      1,
+      "an at-maximum relayed request IS delivered to the endpoint (the boundary is usable)"
+    );
+    assert_eq!(
+      c.endpoint().op().get(),
+      1,
+      "and it IS served: one op appended (the gate admits exactly the max)"
     );
   }
 }

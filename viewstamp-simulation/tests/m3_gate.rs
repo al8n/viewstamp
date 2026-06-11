@@ -83,11 +83,9 @@ fn the_m3_gate_committed_ops_survive_everything() {
     // mask the permanent path by clearing on retry). High enough that some committed slot rots across
     // the sweep, exercising the permanent-fault recovery + the force-sync strand.
     c.set_storage_faults(StorageFaults {
-      read_fault_per_mille: 0,
       torn_write_per_mille: 150,
       bit_rot_per_mille: 150,
-      misdirect_read_per_mille: 0,
-      corrupt_checkpoint_read_per_mille: 0,
+      ..StorageFaults::none()
     });
 
     // Safety + boundedness, asserted EVERY tick in EVERY phase. (Liveness is asserted only in phase 4,

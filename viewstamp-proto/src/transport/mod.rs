@@ -35,17 +35,89 @@ mod testutil;
 mod tls;
 pub use conn::Conn;
 pub use coordinator::StreamCoordinator;
+pub use frame::{MAX_FRAME_LEN, max_request_body_len};
 pub use labeled::{LabelOptions, Labeled};
 pub use passthrough::Passthrough;
 #[cfg(feature = "quic")]
 pub use quic::{
   CertOid, ClusterTls, DialError, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome,
-  IdentitySource, ProvidedIdentity, QuicCoordinator, QuicOptions, StreamLayout,
+  IdentitySource, ProvidedIdentity, QuicCoordinator, QuicOptions, QuicTuning, StreamLayout,
 };
 pub use router::{ConnId, PeerRouter};
 pub use stream::{Intake, StreamTransport};
 #[cfg(feature = "tls")]
 pub use tls::{TlsOptions, TlsRecords};
+
+/// Why the transport closed a connection, drained alongside its [`ConnId`] from
+/// [`StreamCoordinator::poll_conn_closed`] / [`PeerRouter::poll_closed`]. Transport diagnostics —
+/// the conn lifecycle never reaches the consensus event stream. A driver also uses these causes to
+/// label closes it decides itself (an auth-deadline reap, an out-queue overflow, an at-capacity
+/// accept drop), so one vocabulary covers every close site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
+#[repr(u8)]
+pub enum CloseCause {
+  /// The record layer rejected the stream (a TLS reject, a cluster-handshake mismatch, or a
+  /// handshake that stalled without progress).
+  RecordRejected,
+  /// An inbound frame declared a length over the frame cap.
+  FrameTooLong,
+  /// A complete inbound frame failed to decode as a [`Message`](crate::Message).
+  BadFrame,
+  /// The peer finished mid-frame (a partial frame remained buffered at EOF).
+  TruncatedFrame,
+  /// The peer finished cleanly (EOF on a frame boundary).
+  PeerClosed,
+  /// Queued outbound exceeded the per-conn cap (or the record layer refused part of a frame).
+  OutboundOverflow,
+  /// The handshake-authenticated identity failed the binding policy (a dialed conn validated as a
+  /// different peer than it dialed).
+  IdentityRejected,
+  /// The conn never validated within the driver's authentication deadline.
+  AuthDeadline,
+  /// An accepted socket was dropped at the driver's live-connection cap before registration.
+  AcceptCapacity,
+}
+
+impl CloseCause {
+  /// The number of causes — sizes a per-cause counter array (`[u64; CloseCause::COUNT]`).
+  pub const COUNT: usize = Self::AcceptCapacity as usize + 1;
+
+  /// The dense counter-array slot of this cause (`0..COUNT`).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn index(self) -> usize {
+    self as usize
+  }
+
+  /// The stable string name of this cause (snake_case, serialization-stable).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::RecordRejected => "record_rejected",
+      Self::FrameTooLong => "frame_too_long",
+      Self::BadFrame => "bad_frame",
+      Self::TruncatedFrame => "truncated_frame",
+      Self::PeerClosed => "peer_closed",
+      Self::OutboundOverflow => "outbound_overflow",
+      Self::IdentityRejected => "identity_rejected",
+      Self::AuthDeadline => "auth_deadline",
+      Self::AcceptCapacity => "accept_capacity",
+    }
+  }
+}
+
+impl From<&TransportError> for CloseCause {
+  /// The cause a conn records when this error closes it (the `Conn` close sites are the callers, so
+  /// the error→cause mapping lives in one place).
+  fn from(e: &TransportError) -> Self {
+    match e {
+      TransportError::FrameTooLong { .. } => Self::FrameTooLong,
+      TransportError::TruncatedFrame { .. } => Self::TruncatedFrame,
+      TransportError::RecordRejected => Self::RecordRejected,
+      TransportError::Decode(_) => Self::BadFrame,
+    }
+  }
+}
 
 /// An error from the transport layer (framing or a terminal record-layer reject).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

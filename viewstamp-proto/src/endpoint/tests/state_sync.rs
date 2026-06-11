@@ -108,6 +108,12 @@ fn stale_checkpoint_commit_triggers_request_sync() {
     Status::Normal,
     "still Normal (sync is in-band, not a status)"
   );
+  // The fresh arm surfaced as an observability event carrying the solicited target.
+  assert!(
+    core::iter::from_fn(|| e.poll_event())
+      .any(|ev| ev == Event::StateSyncStarted(OpNumber::with(8))),
+    "arming a state-sync emits StateSyncStarted with the target checkpoint op"
+  );
 }
 
 #[test]
@@ -244,6 +250,90 @@ fn primary_answers_request_sync_with_sync_checkpoint() {
     crate::checkpoint_id(s.snapshot()),
     s.checkpoint_id(),
     "shipped snapshot provably matches its advertised id"
+  );
+}
+
+#[test]
+fn repeat_request_sync_from_one_requester_yields_one_serve_and_one_ship() {
+  // `sync_serving` is keyed by REQUESTER: a solicit burst from one replica (here two back-to-back
+  // RequestSyncs, e.g. a buggy/impatient peer re-soliciting before the first serve-read completes)
+  // must NOT stack a second checkpoint read — the repeat only REFRESHES the echoed nonce, and the
+  // single completion ships ONE SyncCheckpoint answering the LATEST solicitation. (A map keyed per
+  // minted read id would stack N reads for N solicits, each completion shipping a full snapshot.)
+  let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
+  let now = Instant::ZERO;
+  while e.poll_message().is_some() {} // drain the warm-up
+  let solicit = |nonce: u64| {
+    Message::RequestSync(crate::RequestSync::new(
+      View::with(0),
+      OpNumber::with(0),
+      ReplicaId::new(2),
+      nonce,
+      false,
+    ))
+  };
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    solicit(0xAAAA),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    solicit(0xBBBB),
+  );
+  assert_eq!(
+    e.sync_serving.len(),
+    1,
+    "one outstanding serve per requester — the repeat solicit must not stack a second read"
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the single serve-read completes
+  let mut ships = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::SyncCheckpoint(s) = out.msg_ref() {
+      ships.push((out.to(), s.clone()));
+    }
+  }
+  assert_eq!(
+    ships.len(),
+    1,
+    "the burst is answered by exactly ONE shipped snapshot"
+  );
+  let (to, s) = &ships[0];
+  assert_eq!(*to, Recipient::To(Peer::Replica(ReplicaId::new(2))));
+  assert_eq!(
+    s.nonce(),
+    0xBBBB,
+    "the completion answers the LATEST solicitation's nonce"
+  );
+  assert_eq!(s.checkpoint_op(), OpNumber::with(2));
+  assert!(
+    e.sync_serving.is_empty(),
+    "the serve entry is retired on completion"
+  );
+  // A fresh solicit AFTER completion is served anew (the dedupe holds only while a serve is
+  // outstanding — it never starves a requester).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    solicit(0xCCCC),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  let mut again = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::SyncCheckpoint(s) = out.msg_ref() {
+      again = Some(s.clone());
+    }
+  }
+  assert_eq!(
+    again.expect("a post-completion solicit is served").nonce(),
+    0xCCCC
   );
 }
 
@@ -584,6 +674,17 @@ fn sync_checkpoint_restores_and_resumes_at_the_synced_point() {
     "synced checkpoint is now durable"
   );
   assert_eq!(sb.state().checkpoint_id(), id);
+  // The sync's full arc surfaced as observability events: armed at the learned target, completed
+  // once the synced checkpoint went durable.
+  let events: std::vec::Vec<Event> = core::iter::from_fn(|| e.poll_event()).collect();
+  assert!(
+    events.contains(&Event::StateSyncStarted(OpNumber::with(4))),
+    "the sync arm emitted StateSyncStarted"
+  );
+  assert!(
+    events.contains(&Event::StateSyncCompleted(OpNumber::with(4))),
+    "the durable install emitted StateSyncCompleted"
+  );
 }
 
 #[test]
@@ -2369,4 +2470,1320 @@ fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies
   // checkpoints at `target_op = commit_min`), so `checkpoint_op <= commit_min < sync.target` always holds
   // — a local checkpoint can NEVER make `sync.target <= checkpoint_op`. So a checkpoint-advance
   // satisfied-sync cancel would be dead code; Part A closes the wedge at the root (the arm site).
+}
+
+// ── Chunked state-sync transfer: the donor side ──
+
+/// A Normal donor (replica 0 of 3) whose DURABLE checkpoint at `ckpt` carries a `snapshot_len`-byte
+/// SM snapshot — sized by the caller so the chunked-path tests can exceed the one-frame budget. The
+/// checkpoint is PLANTED (durable root + readable snapshot, with the endpoint state aligned) rather
+/// than driven through the commit pipeline, so a test does not shuffle tens of MiB through prepares.
+fn donor_with_planted_checkpoint(
+  ckpt: u64,
+  snapshot_len: usize,
+) -> (Endpoint<CountSm>, TestWal, TestSb, Bytes, u128) {
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, ckpt).unwrap();
+  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(ckpt),
+    &BTreeMap::new(),
+    &std::vec![0xA5u8; snapshot_len],
+  );
+  let id = crate::checkpoint_id(&env);
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(ckpt),
+    OpNumber::with(ckpt),
+    id,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: Some((OpNumber::with(ckpt), env.clone())),
+  };
+  e.force_state_for_test(0, ckpt, ckpt, ckpt, &[]);
+  (e, TestWal::default(), sb, env, id)
+}
+
+#[test]
+fn over_frame_checkpoint_is_announced_and_chunks_reassemble_it() {
+  // A donor whose envelope EXCEEDS the one-frame budget answers a RequestSync with a
+  // SyncCheckpointMeta announce (never an oversized SyncCheckpoint), warms its serve cache from the
+  // verified read, and then serves the whole envelope as cache-sliced chunks: a max-fill first chunk
+  // landing exactly on the frame cap, a partial tail chunk, and the two reassembling bit-identically
+  // to the envelope. A pull at/past the end is dropped (malformed offset).
+  let big = crate::message::max_unchunked_snapshot_len() + 1024;
+  let (mut e, mut wal, mut sb, env, id) = donor_with_planted_checkpoint(4, big);
+  assert!(
+    env.len() > crate::message::max_unchunked_snapshot_len(),
+    "setup: the envelope exceeds the unchunked threshold"
+  );
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSync(crate::RequestSync::new(
+      e.view(),
+      OpNumber::with(0),
+      ReplicaId::new(2),
+      0xCAFE,
+      false,
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // serve-read completes → announce
+  let mut meta = None;
+  let mut whole = false;
+  while let Some(out) = e.poll_message() {
+    match out.msg_ref() {
+      Message::SyncCheckpointMeta(m) => meta = Some((out.to(), *m)),
+      Message::SyncCheckpoint(_) => whole = true,
+      _ => {}
+    }
+  }
+  assert!(
+    !whole,
+    "an over-frame envelope is NEVER shipped as one SyncCheckpoint"
+  );
+  let (to, m) = meta.expect("the donor announces the over-frame checkpoint");
+  assert_eq!(to, Recipient::To(Peer::Replica(ReplicaId::new(2))));
+  assert_eq!(m.checkpoint_op(), OpNumber::with(4));
+  assert_eq!(m.checkpoint_id(), id);
+  assert_eq!(m.total_len(), env.len() as u64);
+  assert_eq!(m.nonce(), 0xCAFE);
+  assert!(
+    e.sync_donating.is_some(),
+    "the verified serve-read warmed the donor cache"
+  );
+
+  // Pull the whole envelope chunk by chunk from the warm cache (no further superblock read).
+  let pull = |e: &mut Endpoint<CountSm>, wal: &mut TestWal, sb: &mut TestSb, offset: u64| {
+    e.handle_message(
+      now,
+      wal,
+      sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::RequestSyncChunk(crate::RequestSyncChunk::new(
+        View::new(),
+        OpNumber::with(4),
+        id,
+        offset,
+        ReplicaId::new(2),
+        0xCAFE,
+      )),
+    );
+    let mut chunk = None;
+    while let Some(out) = e.poll_message() {
+      if let Message::SyncChunk(c) = out.msg_ref() {
+        chunk = Some(c.clone());
+      }
+    }
+    chunk
+  };
+  let first = pull(&mut e, &mut wal, &mut sb, 0).expect("the first chunk is served");
+  assert!(
+    e.sync_serving.is_empty(),
+    "a cache-hit chunk is served WITHOUT a serve-read (zero-copy slice)"
+  );
+  assert_eq!(first.bytes().len(), crate::message::SYNC_CHUNK_LEN);
+  assert_eq!(
+    Message::SyncChunk(first.clone()).encoded_len(),
+    crate::message::MAX_FRAME_LEN as usize,
+    "a max-fill chunk lands exactly on the frame cap"
+  );
+  assert_eq!(first.total_len(), env.len() as u64);
+  let tail_offset = first.bytes().len() as u64;
+  let tail = pull(&mut e, &mut wal, &mut sb, tail_offset).expect("the tail chunk is served");
+  assert_eq!(tail.offset(), tail_offset);
+  assert_eq!(
+    tail.bytes().len() as u64,
+    env.len() as u64 - tail_offset,
+    "the tail chunk carries exactly the remainder"
+  );
+  let mut staged = std::vec::Vec::with_capacity(env.len());
+  staged.extend_from_slice(first.bytes());
+  staged.extend_from_slice(tail.bytes());
+  assert_eq!(
+    staged,
+    env.as_ref(),
+    "the chunks reassemble the envelope bit-identically"
+  );
+  assert_eq!(crate::checkpoint_id(&staged), id);
+
+  // A malformed pull at/past the end is dropped silently.
+  assert!(
+    pull(&mut e, &mut wal, &mut sb, env.len() as u64).is_none(),
+    "an offset at the envelope end is dropped"
+  );
+}
+
+#[test]
+fn donor_serves_pinned_old_checkpoint_from_cache_after_advancing() {
+  // The keep-serving property: the donor cache deliberately SURVIVES the donor's own checkpoint
+  // advance (committed content is immutable), so a receiver pinned mid-transfer to the OLD
+  // checkpoint keeps pulling its chunks rather than restarting on every donor checkpoint.
+  let (mut e, mut wal, mut sb, env, id) = donor_with_planted_checkpoint(4, 64);
+  let now = Instant::ZERO;
+  // Warm the cache via an ordinary serve (the envelope is small → ships whole AND warms the cache).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSync(crate::RequestSync::new(
+      e.view(),
+      OpNumber::with(0),
+      ReplicaId::new(2),
+      0xCAFE,
+      false,
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  assert!(e.sync_donating.is_some(), "cache warm after the serve");
+  // The donor's own frontier advances past the cached checkpoint (head/commit/checkpoint all at 8).
+  e.force_state_for_test(0, 8, 8, 8, &[]);
+  // A pull pinned to the OLD (4, id) checkpoint is still served from the cache.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSyncChunk(crate::RequestSyncChunk::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      0,
+      ReplicaId::new(2),
+      0xCAFE,
+    )),
+  );
+  let mut chunk = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::SyncChunk(c) = out.msg_ref() {
+      chunk = Some(c.clone());
+    }
+  }
+  let c = chunk.expect("the pinned OLD checkpoint is still served after the donor advanced");
+  assert_eq!(c.checkpoint_op(), OpNumber::with(4));
+  assert_eq!(c.checkpoint_id(), id);
+  assert_eq!(
+    c.bytes(),
+    env.as_ref(),
+    "one small chunk carries the whole envelope"
+  );
+}
+
+#[test]
+fn cold_cache_chunk_request_rereads_and_ships() {
+  // A donor that restarted mid-transfer has a COLD cache but still holds the pinned checkpoint as
+  // its durable root: a chunk pull triggers a serve-read (ServeKind::Chunk), whose verified
+  // completion warms the cache AND ships the requested chunk.
+  let (mut e, mut wal, mut sb, env, id) = donor_with_planted_checkpoint(4, 64);
+  let now = Instant::ZERO;
+  assert!(e.sync_donating.is_none(), "setup: cold cache");
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSyncChunk(crate::RequestSyncChunk::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      8,
+      ReplicaId::new(2),
+      0xF00D,
+    )),
+  );
+  assert_eq!(
+    e.sync_serving.len(),
+    1,
+    "a cold-cache pull submits ONE serve-read for the requester"
+  );
+  assert!(
+    e.poll_message().is_none(),
+    "nothing ships until the read completes"
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the read completes → verify + warm + ship
+  let mut chunk = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::SyncChunk(c) = out.msg_ref() {
+      chunk = Some(c.clone());
+    }
+  }
+  let c = chunk.expect("the cold-cache pull is answered after the re-read");
+  assert_eq!(c.offset(), 8);
+  assert_eq!(
+    c.bytes(),
+    &env.as_ref()[8..],
+    "the chunk starts at the requested offset"
+  );
+  assert!(
+    e.sync_donating.is_some(),
+    "the verified re-read warmed the cache"
+  );
+  assert!(
+    e.sync_serving.is_empty(),
+    "the serve entry retired on completion"
+  );
+}
+
+// ── Chunked state-sync transfer: the receiver pull loop ──
+
+/// A `SyncCheckpointMeta` announcing the `(op, id)` envelope of `total` bytes from `donor`.
+fn meta_of(op: u64, id: u128, total: usize, donor: u8, nonce: u64) -> Message {
+  Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
+    View::new(),
+    OpNumber::with(op),
+    id,
+    total as u64,
+    ReplicaId::new(donor),
+    nonce,
+  ))
+}
+
+/// A `SyncChunk` carrying `env[range]` of the `(op, id)` envelope from `donor`.
+fn chunk_of(
+  op: u64,
+  id: u128,
+  env: &Bytes,
+  range: core::ops::Range<usize>,
+  donor: u8,
+  nonce: u64,
+) -> Message {
+  Message::SyncChunk(crate::SyncChunk::new(
+    View::new(),
+    OpNumber::with(op),
+    id,
+    env.len() as u64,
+    range.start as u64,
+    ReplicaId::new(donor),
+    nonce,
+    env.slice(range),
+  ))
+}
+
+/// Drain the laggard's outgoing queue, returning the last `RequestSyncChunk` (destination, message).
+fn drain_chunk_pull(e: &mut Endpoint<CountSm>) -> Option<(Recipient, crate::RequestSyncChunk)> {
+  let mut pull = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::RequestSyncChunk(r) = out.msg_ref() {
+      pull = Some((out.to(), *r));
+    }
+  }
+  pull
+}
+
+#[test]
+fn chunked_transfer_assembles_in_order_and_installs_via_the_whole_message_path() {
+  // The receiver pull loop end to end: an announce pins the transfer and pulls offset 0; each
+  // accepted chunk extends the staged prefix and pulls the new frontier (stop-and-wait,
+  // self-clocking); a DUPLICATE or REORDERED chunk is inert (its offset is not the frontier); the
+  // final chunk's verified assembly re-enters the ordinary SyncCheckpoint path and installs with
+  // the full durable-root barrier, exactly as a single-frame envelope would.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  // The announce pins the transfer and pulls offset 0 from the announcing donor.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, env.len(), 0, nonce),
+  );
+  let (to, pull) = drain_chunk_pull(&mut e).expect("the announce triggers the first pull");
+  assert_eq!(to, Recipient::To(Peer::Replica(ReplicaId::new(0))));
+  assert_eq!(pull.offset(), 0);
+  assert_eq!(pull.checkpoint_op(), OpNumber::with(4));
+  assert_eq!(pull.checkpoint_id(), id);
+  assert_eq!(pull.nonce(), nonce);
+  // First chunk (an arbitrary split — the receiver accepts any non-empty in-order size).
+  let split = 10usize.min(env.len() - 1);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, 0..split, 0, nonce),
+  );
+  let (_, pull) = drain_chunk_pull(&mut e).expect("an accepted chunk pulls the new frontier");
+  assert_eq!(pull.offset(), split as u64);
+  // A DUPLICATE of the first chunk is inert: offset 0 is no longer the frontier.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, 0..split, 0, nonce),
+  );
+  assert!(
+    drain_chunk_pull(&mut e).is_none(),
+    "a duplicate chunk neither extends the staged prefix nor re-pulls"
+  );
+  // A REORDERED (future-offset) chunk is likewise inert.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, (split + 1)..env.len(), 0, nonce),
+  );
+  assert!(
+    drain_chunk_pull(&mut e).is_none(),
+    "an out-of-order chunk is dropped (the ARQ re-pulls the exact frontier)"
+  );
+  assert_eq!(
+    e.sync_transfer.as_ref().map(|t| t.staged.len()),
+    Some(split),
+    "the staged prefix is exactly the in-order bytes"
+  );
+  // The final chunk completes the assembly → verified → re-enters the SyncCheckpoint path → STAGE.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, split..env.len(), 0, nonce),
+  );
+  assert_eq!(
+    e.sync_chunk_transfers_completed(),
+    1,
+    "the chunked transfer completed (assembled + verified)"
+  );
+  assert!(
+    e.sync_transfer.is_none(),
+    "the transfer is retired at completion"
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the two-write persist → durable root → install
+  assert_eq!(e.checkpoint_op(), OpNumber::with(4));
+  assert_eq!(e.commit(), OpNumber::with(4));
+  assert_eq!(e.op(), OpNumber::with(4));
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(
+    e.state_machine_ref().applied().len(),
+    4,
+    "the SM restored from the assembled snapshot"
+  );
+  assert_eq!(e.state_syncs_applied(), 1, "the sync fully applied");
+  assert_eq!(
+    e.sync_target_for_test(),
+    None,
+    "the sync handshake retired on the durable root"
+  );
+}
+
+#[test]
+fn overflowing_or_empty_chunk_aborts_the_transfer_but_keeps_the_sync_armed() {
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  // Announce a LYING total_len SMALLER than the envelope, so an honest-size chunk overflows it.
+  let lying_total = env.len() - 4;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, lying_total, 0, nonce),
+  );
+  assert!(e.sync_transfer.is_some(), "the transfer pinned");
+  while e.poll_message().is_some() {}
+  // A chunk past the announced end: offset 0 == frontier, but 0 + env.len() > lying_total → abort.
+  let mut over = crate::SyncChunk::new(
+    View::new(),
+    OpNumber::with(4),
+    id,
+    lying_total as u64,
+    0,
+    ReplicaId::new(0),
+    nonce,
+    env.clone(),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncChunk(over.clone()),
+  );
+  assert!(
+    e.sync_transfer.is_none(),
+    "an overflowing chunk ABORTS the transfer (staged bytes freed)"
+  );
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "the sync stays armed — the solicit timer re-announces"
+  );
+  // An EMPTY chunk (no progress) aborts the same way on a fresh pin.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, lying_total, 0, nonce),
+  );
+  assert!(e.sync_transfer.is_some(), "re-pinned after the abort");
+  while e.poll_message().is_some() {}
+  over = crate::SyncChunk::new(
+    View::new(),
+    OpNumber::with(4),
+    id,
+    lying_total as u64,
+    0,
+    ReplicaId::new(0),
+    nonce,
+    Bytes::new(),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncChunk(over),
+  );
+  assert!(
+    e.sync_transfer.is_none(),
+    "an empty chunk (no progress) aborts the transfer"
+  );
+  assert_eq!(e.sync_chunk_transfers_completed(), 0);
+  assert_eq!(e.state_syncs_applied(), 0, "nothing installed");
+}
+
+#[test]
+fn oversized_meta_announce_is_ignored_and_the_sync_stays_armed() {
+  // `SyncCheckpointMeta.total_len` is a wire-supplied CLAIM: a buggy donor can announce any length
+  // in one small frame, and the receiver would size its staging from it before any chunk or hash
+  // evidence exists. An announce above the configured envelope cap must be ignored outright — no
+  // transfer pinned (so nothing is ever sized from the claim), no pull, no panic — with the
+  // solicitation left armed so a sane donor's next announce proceeds normally.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  // A `u64::MAX` claim (the most hostile shape; on a 32-bit target the same gates also reject it
+  // as unrepresentable before anything is sized from it).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      u64::MAX,
+      ReplicaId::new(0),
+      nonce,
+    )),
+  );
+  assert!(e.sync_transfer.is_none(), "the claim is never pinned");
+  assert!(
+    drain_chunk_pull(&mut e).is_none(),
+    "no pull is issued for an inadmissible announce"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(4),
+    "the sync stays armed for another donor"
+  );
+  // A claim just over the cap is rejected by the same admission gate.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::MAX_SYNC_ENVELOPE_LEN + 1,
+      ReplicaId::new(0),
+      nonce,
+    )),
+  );
+  assert!(e.sync_transfer.is_none(), "an over-cap claim is ignored");
+  assert_eq!(e.sync_target_for_test(), Some(4), "still armed");
+  // A subsequent IN-BOUNDS announce from another donor pins and pulls normally.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    meta_of(4, id, env.len(), 2, nonce),
+  );
+  let (to, pull) = drain_chunk_pull(&mut e).expect("a sane announce proceeds");
+  assert_eq!(to, Recipient::To(Peer::Replica(ReplicaId::new(2))));
+  assert_eq!(pull.offset(), 0);
+  assert_eq!(
+    e.sync_transfer.as_ref().map(|t| t.total_len),
+    Some(env.len() as u64),
+    "the pinned transfer carries the sane announce's length"
+  );
+}
+
+#[test]
+fn oversized_meta_announce_never_displaces_a_pinned_transfer() {
+  // An inadmissible announce for a STRICTLY NEWER checkpoint (the shape that would otherwise
+  // supersede the live pin) must be ignored BEFORE the supersede logic: the live pin and its
+  // staged prefix survive, and the in-flight transfer still completes and installs.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, env.len(), 0, nonce),
+  );
+  let split = 10usize.min(env.len() - 1);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, 0..split, 0, nonce),
+  );
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
+      View::new(),
+      OpNumber::with(8),
+      0xBAD,
+      u64::MAX,
+      ReplicaId::new(0),
+      nonce,
+    )),
+  );
+  let t = e.sync_transfer.as_ref().expect("the live pin survives");
+  assert_eq!(t.checkpoint_op, OpNumber::with(4), "the pin is unchanged");
+  assert_eq!(t.staged.len(), split, "the staged prefix is kept");
+  assert!(
+    drain_chunk_pull(&mut e).is_none(),
+    "the bogus announce drives no pull"
+  );
+  // The pinned transfer still completes and installs through the whole-message path.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, split..env.len(), 0, nonce),
+  );
+  assert_eq!(e.sync_chunk_transfers_completed(), 1);
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(e.checkpoint_op(), OpNumber::with(4));
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the survived transfer installed"
+  );
+}
+
+#[test]
+fn unallocatable_meta_announce_is_ignored_and_the_sync_stays_armed() {
+  // The fallible-reservation backstop behind the admission cap: with the cap raised to `u64::MAX`,
+  // a `u64::MAX` claim passes admission and reaches the staging reservation, which fails
+  // deterministically (`Vec` capacity is bounded by `isize::MAX` bytes) — the announce is dropped
+  // with nothing pinned and the sync stays armed. (On a 32-bit target the representability gate
+  // rejects the same claim earlier, with the identical observable outcome.)
+  let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  let mut e = Endpoint::new(
+    Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2)
+      .unwrap()
+      .with_max_sync_envelope_len(u64::MAX)
+      .unwrap(),
+    0,
+    CountSm::default(),
+  );
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      u64::MAX,
+      ReplicaId::new(0),
+      nonce,
+    )),
+  );
+  assert!(
+    e.sync_transfer.is_none(),
+    "a refused reservation adopts nothing"
+  );
+  assert!(drain_chunk_pull(&mut e).is_none(), "no pull is issued");
+  assert_eq!(e.sync_target_for_test(), Some(4), "the sync stays armed");
+  // A sane announce then proceeds normally under the same (huge) cap.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, env.len(), 0, nonce),
+  );
+  let (_, pull) = drain_chunk_pull(&mut e).expect("a sane announce proceeds");
+  assert_eq!(pull.offset(), 0);
+}
+
+#[test]
+fn assembled_envelope_with_a_mismatched_hash_is_dropped_and_the_sync_resolicits() {
+  // Garbage chunks that fill the announced total but do not hash to the pinned content id must be
+  // dropped at assembly — nothing reaches the install path; the sync stays armed to re-announce.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, env.len(), 0, nonce),
+  );
+  while e.poll_message().is_some() {}
+  // One full-length chunk of WRONG bytes (right total, wrong content).
+  let garbage = Bytes::from(std::vec![0xEEu8; env.len()]);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncChunk(crate::SyncChunk::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      env.len() as u64,
+      0,
+      ReplicaId::new(0),
+      nonce,
+      garbage,
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    e.sync_transfer.is_none(),
+    "the mismatched assembly dropped the transfer"
+  );
+  assert_eq!(
+    e.sync_chunk_transfers_completed(),
+    0,
+    "a mismatched assembly is NOT a completed transfer"
+  );
+  assert_eq!(e.checkpoint_op(), OpNumber::with(0), "nothing installed");
+  assert_eq!(e.state_machine_ref().applied().len(), 0, "SM untouched");
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "the sync stays armed — re-solicit finds an honest donor"
+  );
+}
+
+#[test]
+fn donor_failover_re_pins_the_donor_and_keeps_the_staged_prefix() {
+  // Chunks of the pinned content are interchangeable across donors (the id pins the bytes): a fresh
+  // announce of the SAME (op, id) from a DIFFERENT donor re-pins only the donor — the staged prefix
+  // is kept and the next pull resumes at the same frontier, addressed to the new donor.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, env.len(), 0, nonce),
+  );
+  while e.poll_message().is_some() {}
+  let split = 10usize.min(env.len() - 1);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, 0..split, 0, nonce),
+  );
+  while e.poll_message().is_some() {}
+  assert_eq!(e.sync_transfer_donor(), Some(0), "pinned to donor 0");
+  // Donor 0 dies; the re-broadcast RequestSync is answered by donor 2's announce of the SAME content.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    meta_of(4, id, env.len(), 2, nonce),
+  );
+  let (to, pull) = drain_chunk_pull(&mut e).expect("the failover announce resumes the pull");
+  assert_eq!(
+    to,
+    Recipient::To(Peer::Replica(ReplicaId::new(2))),
+    "the next pull is addressed to the NEW donor"
+  );
+  assert_eq!(
+    pull.offset(),
+    split as u64,
+    "the staged prefix survived the failover — the pull resumes at the frontier"
+  );
+  assert_eq!(e.sync_transfer_donor(), Some(2));
+  // The new donor finishes the transfer; it installs normally.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    chunk_of(4, id, &env, split..env.len(), 2, nonce),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(e.checkpoint_op(), OpNumber::with(4));
+  assert_eq!(e.sync_chunk_transfers_completed(), 1);
+}
+
+#[test]
+fn ordinary_transfer_completes_below_a_target_raised_mid_transfer() {
+  // The ordinary target is a freshness FLOOR: a target raised while chunks are in flight (the
+  // cluster checkpointed again) must NOT discard the pinned transfer — at completion the assembled
+  // envelope still passes every SAFETY gate and installs (strict progress); the next trigger then
+  // chases the newer checkpoint. Without this, a sustained checkpoint cadence could outrun every
+  // transfer and the laggard would restart forever.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, env.len(), 0, nonce),
+  );
+  while e.poll_message().is_some() {}
+  let split = 10usize.min(env.len() - 1);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, 0..split, 0, nonce),
+  );
+  while e.poll_message().is_some() {}
+  // Mid-transfer the cluster checkpoints again: the target raises 4 → 9 (ordinary raise).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(9),
+    )),
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(9),
+    "the ordinary target raised mid-transfer"
+  );
+  assert!(
+    e.sync_transfer.is_some(),
+    "the ordinary raise does NOT abort the pinned transfer"
+  );
+  while e.poll_message().is_some() {}
+  // Complete the transfer pinned at op 4 — BELOW the raised target.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, split..env.len(), 0, nonce),
+  );
+  assert_eq!(e.sync_chunk_transfers_completed(), 1);
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the assembled transfer INSTALLED below the raised freshness floor (strict progress)"
+  );
+  assert_eq!(e.state_syncs_applied(), 1);
+  assert_eq!(
+    e.sync_target_for_test(),
+    None,
+    "the handshake retired; the next Commit re-fires the trigger toward 9"
+  );
+}
+
+#[test]
+fn forced_target_raise_aborts_the_pinned_transfer() {
+  // A FORCED target is LOAD-BEARING (repair holes at/below it were cleared against a snapshot
+  // at/above it), so raising it past the pinned op invalidates the transfer: the pin is dropped at
+  // the raise (no wasted round trips), the strict `>= target` gate stays, and the sync re-announces
+  // toward the new floor. Late chunks of the dropped pin are inert.
+  let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  let mut e = sync_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.arm_forced_sync_for_test(4);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, env.len(), 0, nonce),
+  );
+  assert!(e.sync_transfer.is_some(), "the forced transfer pinned at 4");
+  while e.poll_message().is_some() {}
+  let split = 10usize.min(env.len() - 1);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, 0..split, 0, nonce),
+  );
+  while e.poll_message().is_some() {}
+  // The forced target raises past the pin (a higher cluster checkpoint while still forced).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(0),
+      OpNumber::with(9),
+    )),
+  );
+  assert!(
+    e.sync_is_forced_for_test(),
+    "the raise preserved forced-ness"
+  );
+  assert_eq!(e.sync_target_for_test(), Some(9));
+  assert!(
+    e.sync_transfer.is_none(),
+    "the forced raise ABORTS the transfer pinned below the new target"
+  );
+  // A late chunk of the dropped pin is inert.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, split..env.len(), 0, nonce),
+  );
+  assert_eq!(e.sync_chunk_transfers_completed(), 0);
+  assert_eq!(e.state_syncs_applied(), 0);
+}
+
+#[test]
+fn a_primary_does_not_start_a_chunked_transfer_it_steps_down_instead() {
+  // The apply-site step-down, moved to transfer START: a primary that receives an announce for a
+  // sync it could never apply in place must not burn a whole transfer pulling chunks it will
+  // discard — it abdicates immediately (deferred forfeit), drops the sync, and pulls nothing.
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
+  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  for rn in 1..=4u64 {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::PrepareOk(PrepareOk::new(
+        View::new(),
+        OpNumber::with(rn),
+        ReplicaId::new(1),
+        OpNumber::new(),
+        crate::storage::prepare_identity(
+          ClientId::new(7),
+          RequestNumber::with(rn),
+          crate::storage::fnv1a_128(&[rn as u8]),
+        ),
+      )),
+    );
+  }
+  assert!(e.is_primary());
+  while e.poll_message().is_some() {}
+  e.arm_forced_sync_for_test(6);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    meta_of(6, 0xFEED, 1024, 1, nonce),
+  );
+  assert!(
+    e.pending_forfeit_for_test(),
+    "the primary flagged the deferred forfeit at transfer START"
+  );
+  assert_eq!(e.sync_target_for_test(), None, "the sync was dropped");
+  assert!(e.sync_transfer.is_none(), "no transfer was pinned");
+  let mut pulled = false;
+  while let Some(out) = e.poll_message() {
+    pulled |= out.msg_ref().is_request_sync_chunk();
+  }
+  assert!(!pulled, "the stepping-down primary pulls NO chunks");
+}
+
+#[test]
+fn recovery_peer_fetch_converges_over_a_chunked_transfer() {
+  // The Recovering ingress exception extends to the chunked form of the peer-checkpoint answer: a
+  // replica whose own snapshot is unreadable accepts the announce + chunks while
+  // `awaiting_peer_checkpoint`, re-pulls on the recover-retry cadence, and the assembled envelope
+  // re-enters `on_recover_sync_checkpoint` — converging to Normal exactly as a whole-message answer.
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+  let now = Instant::ZERO;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let mut wal = TestWal {
+    entries: BTreeMap::new(),
+    head: 2,
+    done: VecDeque::new(),
+  };
+  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(e.status(), Status::Recovering);
+  assert!(e.awaiting_peer_checkpoint_for_test());
+  let mut req = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::RequestSync(r) = out.msg_ref() {
+      req = Some(*r);
+    }
+  }
+  let req = req.expect("the escalation solicited");
+  // The donor's checkpoint at the SAME op (2), announced chunked.
+  let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(2);
+  let (env, id) = donor_envelope(&dsb);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    meta_of(2, id, env.len(), 0, req.nonce()),
+  );
+  let (to, pull) = drain_chunk_pull(&mut e).expect("the recovering replica pulls chunk 0");
+  assert_eq!(to, Recipient::To(Peer::Replica(ReplicaId::new(0))));
+  assert_eq!(pull.offset(), 0);
+  // The recover-retry cadence is the ARQ here: firing it re-sends the SAME pull (the answer was lost).
+  let later = now + RECOVER_READ_RETRANSMIT;
+  e.handle_timeout(later, &mut wal, &mut sb);
+  let (_, repull) = drain_chunk_pull(&mut e).expect("recover_retry re-drives the pull");
+  assert_eq!(repull.offset(), 0, "the ARQ re-pulls the exact frontier");
+  // Deliver the envelope in two chunks; the assembly completes recovery.
+  let split = 10usize.min(env.len() - 1);
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    chunk_of(2, id, &env, 0..split, 0, req.nonce()),
+  );
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    chunk_of(2, id, &env, split..env.len(), 0, req.nonce()),
+  );
+  sb.flush();
+  e.handle_storage(later, &mut wal, &mut sb);
+  sb.flush();
+  e.handle_storage(later, &mut wal, &mut sb);
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the recovering replica converged via the chunked peer fetch"
+  );
+  assert_eq!(e.checkpoint_op(), OpNumber::with(2));
+  assert!(!e.awaiting_peer_checkpoint_for_test());
+  assert_eq!(e.sync_chunk_transfers_completed(), 1);
+  assert_eq!(
+    e.state_machine_ref().applied().len(),
+    2,
+    "the SM restored from the assembled snapshot"
+  );
+}
+
+#[test]
+fn recovery_peer_fetch_ignores_an_oversized_meta_announce() {
+  // The Recovering peer-fetch ingress dispatches into the SAME `on_sync_checkpoint_meta`, so its
+  // announces pass the SAME admission gates: an over-cap claim is ignored (no pin, no pull, still
+  // Recovering + awaiting, sync armed), and a sane announce then proceeds.
+  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+  let now = Instant::ZERO;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let mut wal = TestWal {
+    entries: BTreeMap::new(),
+    head: 2,
+    done: VecDeque::new(),
+  };
+  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(e.status(), Status::Recovering);
+  assert!(e.awaiting_peer_checkpoint_for_test());
+  let mut req = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::RequestSync(r) = out.msg_ref() {
+      req = Some(*r);
+    }
+  }
+  let req = req.expect("the escalation solicited");
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
+      View::new(),
+      OpNumber::with(2),
+      0xFEED,
+      u64::MAX,
+      ReplicaId::new(0),
+      req.nonce(),
+    )),
+  );
+  assert!(e.sync_transfer.is_none(), "the claim is never pinned");
+  assert!(drain_chunk_pull(&mut e).is_none(), "no pull is issued");
+  assert_eq!(e.status(), Status::Recovering, "still recovering");
+  assert!(e.awaiting_peer_checkpoint_for_test(), "still awaiting");
+  assert!(e.sync_target_for_test().is_some(), "the fetch stays armed");
+  // A sane announce of the donor's real envelope then pins and pulls normally.
+  let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(2);
+  let (env, id) = donor_envelope(&dsb);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    meta_of(2, id, env.len(), 0, req.nonce()),
+  );
+  let (_, pull) = drain_chunk_pull(&mut e).expect("a sane announce proceeds");
+  assert_eq!(pull.offset(), 0);
+}
+
+#[test]
+fn sync_solicit_timer_re_pulls_the_frontier_and_re_broadcasts() {
+  // The stop-and-wait ARQ: on the solicit cadence with a transfer pinned, the receiver re-sends the
+  // one outstanding chunk pull (idempotent — the exact staged frontier) AND re-broadcasts
+  // RequestSync (dead-donor replacement).
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    meta_of(4, id, env.len(), 0, nonce),
+  );
+  let split = 10usize.min(env.len() - 1);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk_of(4, id, &env, 0..split, 0, nonce),
+  );
+  while e.poll_message().is_some() {}
+  // Fire the solicit deadline: both the frontier re-pull and the RequestSync re-broadcast go out.
+  let later = now + SYNC_SOLICIT + core::time::Duration::from_millis(1);
+  e.handle_timeout(later, &mut wal, &mut sb);
+  let (mut saw_pull_at_frontier, mut saw_resolicit) = (false, false);
+  while let Some(out) = e.poll_message() {
+    match out.msg_ref() {
+      Message::RequestSyncChunk(r) => saw_pull_at_frontier |= r.offset() == split as u64,
+      Message::RequestSync(_) => saw_resolicit = true,
+      _ => {}
+    }
+  }
+  assert!(
+    saw_pull_at_frontier,
+    "the ARQ re-pulls the exact staged frontier"
+  );
+  assert!(
+    saw_resolicit,
+    "the cadence still re-broadcasts RequestSync for donor replacement"
+  );
+}
+
+#[test]
+fn stale_pinned_chunk_request_yields_a_fresh_offer() {
+  // The donor-pruned-mid-transfer recovery: a pull pinned to a checkpoint BELOW the donor's durable
+  // one (and not cached) is answered with a FRESH OFFER of the donor's current checkpoint — the
+  // receiver aborts its stale pin and re-pins to the newer announce (or installs the whole message).
+  let (mut e, mut wal, mut sb, _env, _id) = donor_with_planted_checkpoint(4, 64);
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSyncChunk(crate::RequestSyncChunk::new(
+      View::new(),
+      OpNumber::with(2), // below the donor's checkpoint (4)
+      0xDEAD_BEEF,       // content the donor no longer holds
+      0,
+      ReplicaId::new(2),
+      0xF00D,
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the offer-read completes
+  let mut offered = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::SyncCheckpoint(s) = out.msg_ref() {
+      offered = Some(s.clone());
+    }
+  }
+  let s = offered.expect("a stale pin is answered with a fresh offer of the CURRENT checkpoint");
+  assert_eq!(s.checkpoint_op(), OpNumber::with(4));
+  assert_eq!(s.nonce(), 0xF00D);
 }

@@ -1,0 +1,53 @@
+# cargo-deny configuration (licenses / advisories / bans / sources).
+# Run locally with: cargo deny check
+
+[graph]
+all-features = false
+# The dependency set CI actually ships: every feature the platform-portable CI sweeps
+# exercise, including the quic transport with its mandatory crypto provider. The
+# aws-lc-rs providers are excluded for the same reason ci.yml excludes them (they need
+# C/CMake/NASM toolchains and are not exercised in CI).
+features = ["std", "alloc", "tcp", "tls", "tls-rustls-ring", "quic"]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # `time` < 0.3.47: DoS via stack exhaustion in `time`'s parsing (RUSTSEC-2026-0009).
+  # The fixed release (0.3.47) requires Rust 1.88, above this workspace's MSRV (1.85),
+  # and the MSRV-aware resolver therefore pins 0.3.45. Exposure here is marginal:
+  # `time` is reached only through x509-parser (certificate validity times on
+  # cluster-private mTLS certs issued by the operator's own CA) and rcgen/dev-deps —
+  # viewstamp never parses untrusted time strings. Drop this ignore when the
+  # workspace MSRV reaches 1.88.
+  "RUSTSEC-2026-0009",
+]
+
+[licenses]
+version = 2
+# Everything in the tree is a permissive license. Expressions with an OR pick any
+# allowed branch (e.g. `Unlicense OR MIT` passes via MIT; `... OR LGPL-2.1-or-later`
+# passes via MIT/Apache-2.0, so no copyleft obligation is ever selected).
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "ISC",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate transitive versions are tolerated (warn, not deny): the tree currently
+# carries two `windows-sys` and two `getrandom` majors via compio/rustls transitive
+# pins — harmless build-size overhead, not unsoundness, and not ours to unify.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

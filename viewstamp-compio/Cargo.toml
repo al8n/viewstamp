@@ -3,11 +3,26 @@ name = "viewstamp-compio"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
+repository = "https://github.com/al8n/viewstamp"
 license = "MIT OR Apache-2.0"
-description = "Proactor (compio) driver for viewstamp-proto (implemented in M4)"
+description = "Proactor (compio) QUIC driver for viewstamp-proto"
 
 [dependencies]
-viewstamp-proto = { workspace = true }
+viewstamp-proto = { workspace = true, features = ["std", "quic", "tls-rustls-ring"] }
+bytes = { workspace = true, features = ["std"] }
+compio = { workspace = true, features = ["net", "runtime", "macros", "time", "io-uring", "polling"] }
+flume = { workspace = true }
+futures-channel = { workspace = true }
+futures-util = { workspace = true }
+# Peer-socket options compio does not surface directly (SO_KEEPALIVE, TCP_USER_TIMEOUT); already a
+# transitive dep via compio-net. `all` unlocks the platform-specific setters (TCP_USER_TIMEOUT).
+socket2 = { version = "0.6", features = ["all"] }
+thiserror = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+viewstamp-simulation = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
 
 [lints]
 workspace = true

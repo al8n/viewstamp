@@ -11,8 +11,8 @@ use super::stream::{Intake, RecordIo};
 /// the wire. No confidentiality, no handshake.
 ///
 /// Its byte buffers are bounded per direction so a caller cannot grow them without limit:
-/// inbound intake applies [`Intake::Pending`] backpressure at [`RECV_LIMIT`], and outbound
-/// plaintext is capped at [`SEND_LIMIT`]. Normally the record layer is driven by
+/// inbound intake applies [`Intake::Pending`] backpressure at `RECV_LIMIT`, and outbound
+/// plaintext is capped at `SEND_LIMIT`. Normally the record layer is driven by
 /// [`StreamCoordinator`](super::StreamCoordinator), which already bounds intake by feeding fixed
 /// chunks and bounds outbound via the router cap, so neither limit trips on that path; they only
 /// guard a caller that drives the public record-layer methods directly.

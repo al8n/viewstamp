@@ -165,7 +165,7 @@ pub trait IdentitySource {
 
 // ── Hello ─────────────────────────────────────────────────────────────────────
 
-/// Identity via the [`labeled`](crate::transport::labeled) hello codec as the first control-stream
+/// Identity via the `labeled` hello codec as the first control-stream
 /// frame. The hello encodes `cluster || peer_kind || peer_id`; `authenticate` parses it against
 /// `our_cluster` and returns the claimed peer as a candidate.
 pub struct Hello {
@@ -294,7 +294,7 @@ fn parse_identity_ext(value: &[u8], expected_cluster: u128) -> IdentityOutcome {
   IdentityOutcome::Identified(Identified::new(who, cluster))
 }
 
-/// Identity from a binary OID extension ([`IDENTITY_OID`]) in the validated peer certificate. The
+/// Identity from a binary OID extension (`IDENTITY_OID`) in the validated peer certificate. The
 /// extension value is the same `cluster || kind || id` layout the [`Hello`] codec uses, but
 /// CA-attested instead of self-claimed; `authenticate` parses it ONCE from the end-entity cert at
 /// `Connected` (by OID, irrespective of the extension's criticality flag).

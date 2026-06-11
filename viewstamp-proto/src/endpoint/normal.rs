@@ -105,35 +105,91 @@ impl<S: StateMachine> Endpoint<S> {
       self.timers.commit = Some(now + COMMIT_HEARTBEAT); // re-arm THIS timer only
     }
     if self.timers.prepare.is_some_and(|d| d <= now) {
-      // Retransmit every un-committed prepare, in op order (`commit_min+1 ..= op`). A backup that fell
-      // BELOW the primary's `commit_min` is caught up not by this (those ops are `<= commit_min`) but by
-      // its OWN tail-gap solicitation ([`Self::request_tail_gap`], driven on every Commit heartbeat),
-      // which fetches the missing committed band above its head via `RequestPrepare`.
+      // Retransmit un-committed prepares in op order, WINDOWED to the first
+      // [`PREPARE_RETRANSMIT_WINDOW`] ops of `(commit_min, op]` — the ones the commit is waiting on.
+      // Re-broadcasting the WHOLE window with full bodies every 100ms is unbounded work once the
+      // pipeline is deep (it can legally hold up to MAX_PIPELINE ops); the lowest ops are the only
+      // ones whose acks ADVANCE `commit_min`, and each advance slides this window up, so the tail
+      // drains incrementally. A backup that fell BELOW the primary's `commit_min` is caught up not by
+      // this (those ops are `<= commit_min`) but by its OWN tail-gap solicitation
+      // ([`Self::request_tail_gap`], driven on every Commit heartbeat) — and the same tail-gap pull
+      // covers a backup missing an op ABOVE this window that it has learned is committed, so the
+      // window bounds only the primary-push side, never strands an op.
+      //
+      // The window ships BATCHED: instead of one full-body `Prepare` frame per windowed op per tick
+      // (up to [`PREPARE_RETRANSMIT_WINDOW`] frames per backup under loss), the entries accumulate
+      // into [`crate::PrepareBatch`]es bounded by the frame budget — the same accumulate-until-cap
+      // shape as the repair serve ([`Self::on_request_prepare_range`]) — so one tick emits one (or,
+      // past the budget, a few) frames carrying the same prepares. The receiver replays each entry
+      // through `on_prepare` ([`Self::on_prepare_batch`]), so every per-op gate re-evaluates exactly
+      // as for the per-op form. Only this RETRANSMIT path batches: the accept-path fresh broadcast
+      // stays a per-op `Prepare` (each op ships the moment it is minted — there is no accumulated
+      // window to batch, and batching it would need a flush trigger the mint path has no business
+      // owning).
       let lo = self.commit_min.get() + 1;
-      let hi = self.op.get();
+      let hi = self.op.get().min(
+        lo.saturating_add(PREPARE_RETRANSMIT_WINDOW)
+          .saturating_sub(1),
+      );
+      // The budget is the frame cap less the `PrepareBatch` carrier framing; each `Present` entry
+      // costs `present_entry_encoded_len(body)`, so a produced batch never exceeds the frame cap.
+      let budget =
+        crate::message::MAX_FRAME_LEN as usize - crate::message::PREPARE_BATCH_CARRIER_OVERHEAD;
+      let mut running = 0usize;
+      let mut entries: std::vec::Vec<crate::PreparedEntry> = std::vec::Vec::new();
       for op in lo..=hi {
-        // SKIP a body-`Repairing` hole: a `Prepare` carries the body bytes, which an absent-body op
-        // does not hold, so it cannot be retransmitted (it is itself awaiting peer-repair). Treated like
-        // an op the log is missing — the outer `if let Some(..)` already skips those.
+        // SKIP a body-`Repairing` hole: a retransmitted entry carries the body bytes, which an
+        // absent-body op does not hold, so it cannot be retransmitted. A primary CAN legitimately
+        // hold such holes inside the un-acked window — a view-change adoption installs header-only
+        // entries for ops whose bodies no donor shipped (the log carriers are header-only) — and the
+        // windowed repair channel (`RequestPrepareRange` → `RepairBatch`) owns filling them; this
+        // primary is itself soliciting those bodies, so there is nothing to push. Treated like an op
+        // the log is missing — the `if let Some(..)` already skips those.
         if let Some(LogEntry {
           client,
           request,
           body: Body::Present(body),
         }) = self.log.get(&op).cloned()
         {
-          self.emit(Outgoing::new(
-            Recipient::Backups,
-            Message::Prepare(Prepare::new(
-              self.view,
-              OpNumber::with(op),
-              self.commit_min,
-              self.checkpoint_op,
-              client,
-              request,
-              body,
-            )),
+          let cost = crate::message::present_entry_encoded_len(body.len());
+          // Adding this entry would push the batch past the frame budget — flush what accumulated
+          // and start the next batch with it. The FIRST entry of a batch is always included (an
+          // empty `entries` never flushes): a single op's body fits a one-entry batch by the
+          // request-body bound (see [`crate::message::MAX_REQUEST_BODY_OVERHEAD`], which accounts
+          // for the single-entry `PrepareBatch` carrier), so the window always makes progress.
+          if !entries.is_empty() && running + cost > budget {
+            self.prepare_batches_sent += 1;
+            self.emit(Outgoing::new(
+              Recipient::Backups,
+              Message::PrepareBatch(crate::PrepareBatch::new(
+                self.view,
+                self.commit_min,
+                self.checkpoint_op,
+                core::mem::take(&mut entries),
+              )),
+            ));
+            running = 0;
+          }
+          running += cost;
+          entries.push(crate::PreparedEntry::new(
+            OpNumber::with(op),
+            client,
+            request,
+            body,
           ));
         }
+      }
+      if !entries.is_empty() {
+        self.prepare_batches_sent += 1;
+        self.emit(Outgoing::new(
+          Recipient::Backups,
+          Message::PrepareBatch(crate::PrepareBatch::new(
+            self.view,
+            self.commit_min,
+            self.checkpoint_op,
+            entries,
+          )),
+        ));
       }
       // re-arm THIS timer only (clear once everything is committed)
       self.timers.prepare = if self.commit_min.get() < self.op.get() {
@@ -194,48 +250,94 @@ impl<S: StateMachine> Endpoint<S> {
     if self.commit_max.get() > self.commit_min.get() || !self.repair.is_empty() {
       return;
     }
+    // Dedup against an EXISTING session (clients send one request at a time, numbered 1..). An
+    // UNKNOWN client mints NO row in this pass — its row is inserted only at ACCEPT below — so a
+    // stale/gap/refused probe from an unregistered client id cannot grow the table.
+    let key = r.client().get();
+    if let Some(session) = self.clients.get(&key) {
+      if r.request().get() < session.request.get() {
+        return; // stale
+      }
+      if r.request().get() == session.request.get() {
+        // Duplicate of the latest accepted request.
+        // Clone the cached reply data out before dropping the session borrow so
+        // that pushing to self.outgoing (which requires &mut self) is borrow-safe.
+        let cached = session.reply.as_ref().and_then(|(rn, body)| {
+          if *rn == r.request() {
+            Some((*rn, body.clone()))
+          } else {
+            None
+          }
+        });
+        if let Some((rn, body)) = cached {
+          let reply = Reply::new(self.view, r.client(), rn, body);
+          self.emit(Outgoing::new(
+            Recipient::To(Peer::Client(r.client())),
+            Message::Reply(reply),
+          ));
+        }
+        return; // either resent the cached reply, or it's still in flight
+      }
+      if r.request().get() != session.request.get() + 1 {
+        return; // gap: client violated one-in-flight; ignore
+      }
+    } else {
+      // A brand-new client (no session row): only request 1 opens a fresh session — the same gap
+      // rule as an existing watermark-0 row, without minting the row for a refused probe. This is
+      // also the EVICTED-CLIENT contract surface ([`crate::MAX_CLIENT_SESSIONS`]): an evicted client
+      // that returns mid-numbering is silently dropped here until it re-registers from request 1.
+      if r.request().get() != 1 {
+        return;
+      }
+      // SessionsFull admission backstop: never mint a NEW provisional row past the hard bound
+      // (the applied cap plus a pipeline of in-flight provisional rows). Apply-time eviction keeps
+      // the APPLIED table at the cap, the pipeline-cap admission below bounds the in-flight
+      // provisional rows, and view transitions drop stale provisionals — so this is unreachable in
+      // healthy operation: a structural memory floor, not a normal-path limit. Silent drop (no
+      // non-committed error-Reply path exists): the client retries and is admitted once in-flight
+      // rows transition to applied (eviction then frees applied slots).
+      if self.clients.len() >= self.session_table_hard_bound() {
+        return;
+      }
+    }
+
+    // Pipeline-cap admission: never let the accepted-but-uncommitted window `(commit_min, op]` exceed
+    // [`MAX_PIPELINE`] — the sibling of the WAL-ring/carrier stalls below (drop this request WITHOUT
+    // advancing the watermark or minting the op; the client retransmits). Releases as commits advance
+    // `commit_min`. Bounds the prepare-retransmit working set ([`PREPARE_RETRANSMIT_WINDOW`]) and the
+    // bodies a slow quorum can pin in `self.log`/WAL above the commit frontier.
+    if self.op.get().saturating_sub(self.commit_min.get()) >= MAX_PIPELINE {
+      return;
+    }
+
     // Physical bounded-WAL stall-before-wrap: never assign an op whose ring slot still holds an
     // un-pruned op (one not yet checkpoint-subsumed on a quorum). The un-pruned window `(floor, op]`
     // must fit in the WAL's `capacity()` slots; minting the next op would make it `next_op - floor`
     // wide, so if THAT exceeds `capacity()` we STALL (drop this request — the client retransmits),
-    // applying back-pressure until the quorum checkpoints forward and `run_gc` frees slots. Computed
-    // BEFORE the session borrow below (which holds `&mut self.clients`, blocking `self.prune_floor()`);
-    // the decision is only ACTED ON in the accept branch, right before the op assignment, so a stale /
-    // duplicate request (which mints no op) still gets its cached-reply resend. The unbounded WAL
-    // (`capacity() == u64::MAX`) never overflows, so the default never stalls. Requires `capacity >
-    // checkpoint_ops + pipeline headroom` or the stall would never release (documented on
-    // [`Self::prune_floor`] / the `Wal` capacity contract); a sub-interval ring would wedge here.
+    // applying back-pressure until the quorum checkpoints forward and `run_gc` frees slots. A stale /
+    // duplicate request (which mints no op) already got its cached-reply resend above, so the stall
+    // gates only a would-be NEW op. The unbounded WAL (`capacity() == u64::MAX`) never overflows, so
+    // the default never stalls. Requires `capacity > checkpoint_ops + pipeline headroom` or the stall
+    // would never release (documented on [`Self::prune_floor`] / the `Wal` capacity contract); a
+    // sub-interval ring would wedge here.
     let next_op = self.op.get().saturating_add(1);
-    let wal_would_overflow = next_op.saturating_sub(self.prune_floor().get()) > wal.capacity();
-    let key = r.client().get();
-    let session = self.clients.entry(key).or_default();
-
-    // Dedup against the session (clients send one request at a time, numbered 1..).
-    if r.request().get() < session.request.get() {
-      return; // stale
-    }
-    if r.request().get() == session.request.get() {
-      // Duplicate of the latest accepted request.
-      // Clone the cached reply data out before dropping the session borrow so
-      // that pushing to self.outgoing (which requires &mut self) is borrow-safe.
-      let cached = session.reply.as_ref().and_then(|(rn, body)| {
-        if *rn == r.request() {
-          Some((*rn, body.clone()))
-        } else {
-          None
-        }
-      });
-      if let Some((rn, body)) = cached {
-        let reply = Reply::new(self.view, r.client(), rn, body);
-        self.emit(Outgoing::new(
-          Recipient::To(Peer::Client(r.client())),
-          Message::Reply(reply),
-        ));
-      }
-      return; // either resent the cached reply, or it's still in flight
-    }
-    if r.request().get() != session.request.get() + 1 {
-      return; // gap: client violated one-in-flight; ignore
+    let unpruned_window = next_op.saturating_sub(self.prune_floor().get());
+    let wal_would_overflow = unpruned_window > wal.capacity();
+    // Header-only view-change-carrier backpressure — the frame-fit closure for an UNBOUNDED-WAL
+    // embedder, where `wal_would_overflow` never fires. Minting the next op grows both the retained
+    // `self.log` (the carrier-entry count) and the head span; [`Self::band_at_capacity`] documents the
+    // two-clause bound and why it gates the ACTUAL log, not the `next_op - prune_floor()` proxy.
+    let band_would_overflow = self.band_at_capacity();
+    // Op-admission backpressure: drop this NEW request — WITHOUT advancing `session.request` (so the
+    // client's retransmit is still the canonical next request, not seen as a gap) and WITHOUT minting
+    // the op — when minting the next op would EITHER overflow the WAL ring (its slot still holds an op
+    // the quorum has not yet checkpoint-subsumed) OR push the header-only view-change-carrier band past
+    // the frame-fit depth. Both self-release as `quorum_checkpoint_op` rises and `run_gc` frees slots /
+    // shrinks the band. An unbounded WAL never trips `wal_would_overflow`; the band bound is the
+    // frame-fit floor that still holds for it.
+    if wal_would_overflow || band_would_overflow {
+      self.wal_stalls += 1; // observability: prove the admission stall genuinely engaged
+      return;
     }
 
     // Accept: assign the next op, submit to WAL, cache, broadcast Prepare.
@@ -243,15 +345,10 @@ impl<S: StateMachine> Endpoint<S> {
     let client = r.client();
     let request = r.request();
     let body_bytes = r.body_bytes();
-    // Stall-before-wrap (decision computed above the session borrow): the next op would overflow
-    // the WAL ring — its slot still holds an op the quorum has not yet checkpoint-subsumed. STALL: drop
-    // this NEW request WITHOUT advancing `session.request` (so the client's retransmit is still the
-    // canonical next request, not seen as a gap) and WITHOUT minting the op. Back-pressure self-releases
-    // as `quorum_checkpoint_op` rises and `run_gc` frees ring slots. Unbounded WAL never reaches here.
-    if wal_would_overflow {
-      self.wal_stalls += 1; // observability: prove the stall genuinely engaged
-      return;
-    }
+    // The accept-time session row: PROVISIONAL for a brand-new client (`last_op` stays 0 — invisible
+    // to the deterministic eviction until its op APPLIES; see [`Session::last_op`]); for a known
+    // client this only bumps the watermark so the in-flight request's retransmits dedup.
+    let session = self.clients.entry(key).or_default();
     session.request = request;
     self.op = self.op.next();
     let header = Header::new(self.op, self.view, client, request, r.body());
@@ -353,24 +450,38 @@ impl<S: StateMachine> Endpoint<S> {
     // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
     // dropped it rather than adopt a wrong/empty body), OR is present as a body-`Repairing` HOLE (the
     // op's existence survived but its bytes did not). Either way, instead of panicking, hold the commit
-    // and fetch the op from a peer (`RequestPrepare` → `Prepare`); a later try_commit resumes here.
+    // and fetch the WHOLE contiguous hole run from a peer (`RequestPrepareRange` → `RepairBatch`),
+    // windowed so a deep header-only band is repaired pipelined rather than one round trip per op; a
+    // later try_commit resumes here.
     let Some(entry) = self.log.get(&op).cloned() else {
-      self.request_repair(now, op);
+      self.request_repair_run(now, op);
       return false;
     };
     let Some(body) = entry.body.as_present() else {
       // A body-absent (`Repairing`) hole: handled EXACTLY like a wholly-missing slot above — hold the
-      // commit and peer-repair the body.
-      self.request_repair(now, op);
+      // commit and peer-repair the contiguous hole run.
+      self.request_repair_run(now, op);
       return false;
     };
     let reply_body = self.sm.apply(OpNumber::with(op), body);
+    // Reply-size contract (see `StateMachine::apply`): an over-bound reply encodes past the frame
+    // cap and the transport refuses the send — unrecoverable, since the op is already committed.
+    debug_assert!(
+      reply_body.len() <= crate::message::max_reply_body_len(),
+      "StateMachine::apply returned a {}-byte reply for op {} (> max_reply_body_len {}): the Reply \
+       cannot be framed and the committed result is undeliverable",
+      reply_body.len(),
+      op,
+      crate::message::max_reply_body_len(),
+    );
     self.set_commit_min(OpNumber::with(op));
     if let Some(inflight) = self.inflight.get_mut(&op) {
       inflight.committed = true;
     }
-    let session = self.clients.entry(entry.client.get()).or_default();
-    session.reply = Some((entry.request, reply_body.clone()));
+    // The SHARED apply-time session update (watermark + reply cache + last-activity stamp +
+    // deterministic cap eviction) — identical to the backup path in `advance_commit`, so primary and
+    // backups converge on identical tables at identical applied ops.
+    self.note_applied_session(op, entry.client, entry.request, &reply_body);
 
     self.emit(Outgoing::new(
       Recipient::To(Peer::Client(entry.client)),
@@ -523,14 +634,24 @@ impl<S: StateMachine> Endpoint<S> {
       if self.maybe_sync_below_ring_window(now, wal, pop, p.checkpoint_op()) {
         return;
       }
+      // Header-only view-change-carrier backpressure on the BACKUP head-extend — the unbounded-WAL
+      // analogue of the ring-window stall above, gating the carrier instead of the ring (see
+      // [`Self::band_at_capacity`]). REFUSE to extend the head (drop this prepare; the primary
+      // retransmits); releases as the backup checkpoints + `run_gc` trims `self.log`.
+      if self.band_at_capacity() {
+        return;
+      }
       self.append_prepare(wal, p);
       // Drain any buffered, now-contiguous prepares — each also extends the head, so it too could fall
-      // below the ring window. Stop draining at the first op that would overflow (it + every higher
-      // buffered op is unreachable until the sync just armed installs; the `sync.is_some()` guard then
-      // drops their retransmits).
+      // below the ring window OR push the carrier band past the frame-fit depth. Stop draining at the
+      // first op that would overflow (it + every higher buffered op is unreachable until the sync just
+      // armed installs / a checkpoint frees band; the `sync.is_some()` guard then drops their retransmits,
+      // and a later heartbeat re-drains the buffer once the band has room).
       while let Some(next) = self.buffer.get(&(self.op.get() + 1)) {
         let (next_op, next_ckpt) = (next.op().get(), next.checkpoint_op());
-        if self.maybe_sync_below_ring_window(now, wal, next_op, next_ckpt) {
+        if self.maybe_sync_below_ring_window(now, wal, next_op, next_ckpt)
+          || self.band_at_capacity()
+        {
           break;
         }
         let next = self
@@ -546,9 +667,90 @@ impl<S: StateMachine> Endpoint<S> {
       // Future op: buffer it, and solicit the committed band between our head and it that the primary's
       // retransmit (only `commit_min+1..=op`) will never re-send (those ops are `<= commit_min`). This
       // fills the gap so the buffered op becomes reachable instead of stranding the backup at its head.
-      self.buffer.insert(pop, p);
+      //
+      // BOUNDED: only an op within [`TAIL_GAP_WINDOW`] of the head is buffered — each entry can hold
+      // a frame-sized body, so an in-threat-model buggy primary emitting sparse far-future Prepares
+      // must not grow the buffer without bound. A beyond-window Prepare is DROPPED, the same
+      // backpressure shape as the ring stall: it is unreachable until the head closes the gap (one
+      // tail-gap window at a time) anyway, and the primary's retransmit redelivers it once it is.
+      if pop <= self.op.get().saturating_add(TAIL_GAP_WINDOW) {
+        self.buffer.insert(pop, p);
+      }
       self.request_tail_gap();
     }
+  }
+
+  /// Apply the primary's batched prepare retransmit ([`crate::PrepareBatch`]): reconstruct the per-op
+  /// [`Prepare`] from the batch envelope (`view`/`commit`/`checkpoint_op`) + each entry's
+  /// (`op`/`client`/`request`/body) and feed it through the ordinary [`Self::on_prepare`] ingress.
+  /// This is purely an UN-BATCHING — NOT a parallel prepare path: every per-op gate (the repair-fill
+  /// short-circuit, the higher-view catch-up, the status/view/role guards, the sync drop, the
+  /// durable-view drop, the ring-window/band-cap stalls, the re-ack identity proof, the tail-gap
+  /// buffer window) re-evaluates per entry inside `on_prepare` itself, so a batch of N entries is
+  /// semantically the N separate `Prepare` deliveries it replaces, in the same ascending-op order.
+  /// An entry a gate drops is dropped exactly as its per-op form would be (the primary's next
+  /// retransmit re-ships it); a header-only (`Repairing`) entry carries no bytes to prepare, so it
+  /// is SKIPPED — the sender never emits one (its retransmit loop skips its own holes), and
+  /// hole-filling is owned by the windowed repair channel, not the retransmit.
+  pub(crate) fn on_prepare_batch<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    m: crate::PrepareBatch,
+  ) {
+    let (view, commit, checkpoint_op) = (m.view(), m.commit(), m.checkpoint_op());
+    for e in m.into_log() {
+      // The decoded `Body::Present` bytes are MOVED out of the owned entry (`into_parts`) — the
+      // decode boundary already paid the wire→owned copy, so a per-entry re-copy here would be pure
+      // waste on the retransmit path (the same move `on_repair_batch` does).
+      let (op, client, request, body) = e.into_parts();
+      let Body::Present(body) = body else {
+        continue;
+      };
+      self.on_prepare(
+        now,
+        wal,
+        sb,
+        Prepare::new(view, op, commit, checkpoint_op, client, request, body),
+      );
+    }
+  }
+
+  /// Whether the retained `self.log` band has reached the header-only view-change-carrier frame-fit
+  /// depth — the SINGLE source of truth for the carrier backpressure on every path that GROWS
+  /// `self.log` (the primary's `on_request` op mint, the backup's `on_prepare` head-extend + buffer
+  /// drain). Two clauses, each load-bearing for a different carrier:
+  ///
+  /// - **The COUNT clause (`self.log.len()`) bounds THIS replica's own carrier.** The carrier is the
+  ///   ACTUAL retained log: `log_entries()` emits one HEADER-ONLY entry per `self.log` op (no range
+  ///   filter), so `self.log.len()` IS the entry count a `DoViewChange` / `StartView` /
+  ///   `RecoveryResponse` would encode. At `MAX_HEADER_ONLY_BAND_DEPTH` the next growth would make
+  ///   the carrier exceed `MAX_FRAME_LEN` (the transport then drops it on the send path — wedging a
+  ///   view change/recovery). Gating on the len — NOT a `next_op - prune_floor` proxy — is
+  ///   load-bearing: `prune_floor` advances the instant a quorum checkpoint REPORT raises
+  ///   `quorum_checkpoint_op`, but `self.log` is trimmed only by `run_gc` at the next LOCAL
+  ///   checkpoint, so the proxy can sit below the real retained span (GC lag) and under-count.
+  ///
+  /// - **The SPAN clause (`op - log_floor`) bounds the next view change's FLOORED UNION.** The len
+  ///   alone does not bound the band's op-number WIDTH: interior holes (recovery-faulty drops,
+  ///   repair-pending gaps) let the head extend while the count stays flat, so `op - log_floor`
+  ///   can outrun the len. `select_canonical_log` floors its cross-donor union at the canonical
+  ///   generation's max advertised floor and bounds the union's entry count by the HEAD donor's span
+  ///   `op_head - its log_floor` — so every replica must keep that span within the same depth, or
+  ///   its band (unioned with a lower-floor donor's) could push the canonical carrier over the
+  ///   frame even though each donor's len was individually within bound. Same backpressure, gating
+  ///   the SPAN the union inherits rather than the count this replica re-emits.
+  ///
+  /// Both release as the replica checkpoints/state-syncs (run_gc trims the len; `log_floor` rises
+  /// with the checkpoint, shrinking the span). The bound is huge (~342k), far above any realistic
+  /// in-flight band, so this never perturbs normal liveness or the VOPR — a release-build frame-fit
+  /// floor under `log_entries()`'s / `select_canonical_log`'s `debug_assert`s, not a normal-path
+  /// limit.
+  fn band_at_capacity(&self) -> bool {
+    self.log.len() >= crate::message::MAX_HEADER_ONLY_BAND_DEPTH
+      || self.op.get().saturating_sub(self.log_floor.get())
+        >= crate::message::MAX_HEADER_ONLY_BAND_DEPTH as u64
   }
 
   fn append_prepare<W: Wal>(&mut self, wal: &mut W, p: Prepare) {
@@ -685,43 +887,35 @@ impl<S: StateMachine> Endpoint<S> {
       // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
       // dropped it rather than adopt a wrong/empty body), OR is present as a body-`Repairing` HOLE (the
       // op's existence survived but its bytes did not). Instead of panicking, HOLD the commit at the
-      // hole — never skip op N to apply N+1 — and fetch op N from a peer (`RequestPrepare` →
-      // `Prepare`); a later advance_commit (after the op arrives) resumes from exactly here.
+      // hole — never skip op N to apply N+1 — and fetch the WHOLE contiguous hole run from a peer
+      // (`RequestPrepareRange` → `RepairBatch`), windowed so a deep header-only band (a view-change
+      // carrier carrying the whole uncheckpointed log as `Repairing` holes) is repaired PIPELINED rather
+      // than one round trip per op; a later advance_commit (after the ops arrive) resumes from exactly here.
       let Some(entry) = self.log.get(&op).cloned() else {
-        self.request_repair(now, op);
+        self.request_repair_run(now, op);
         break;
       };
       let Some(body) = entry.body.as_present() else {
         // A body-absent (`Repairing`) hole: handled EXACTLY like a wholly-missing slot above — hold the
-        // commit and peer-repair the body.
-        self.request_repair(now, op);
+        // commit and peer-repair the contiguous hole run.
+        self.request_repair_run(now, op);
         break;
       };
       let reply = self.sm.apply(OpNumber::with(op), body);
+      // Reply-size contract (see `StateMachine::apply`): mirrors the primary's apply-site assert.
+      debug_assert!(
+        reply.len() <= crate::message::max_reply_body_len(),
+        "StateMachine::apply returned a {}-byte reply for op {} (> max_reply_body_len {}): the \
+         Reply cannot be framed and the committed result is undeliverable",
+        reply.len(),
+        op,
+        crate::message::max_reply_body_len(),
+      );
       self.set_commit_min(OpNumber::with(op));
-      // Maintain the client-session request high-water + CACHED REPLY as we apply (mirrors the
-      // primary's `commit_op`). The request watermark is the at-most-once dedup watermark a
-      // backup-turned-primary needs in `on_request`. It MUST be tracked here on every apply — NOT
-      // reconstructed from the `log` cache when becoming primary — because GC prunes the `log`
-      // below the checkpoint, so a backup whose log is empty (everything checkpointed+pruned) would
-      // otherwise carry a stale `session.request` of 0 and wedge every client on the gap check
-      // (`r.request() != session.request + 1`). The snapshot also restores these on recover/state-sync,
-      // so the watermark survives both GC and a checkpoint restore.
-      //
-      // Caching the REPLY body here (not just the watermark) closes a real liveness gap: if a client's
-      // reply is LOST in flight and then the primary fails over, the new primary (this former backup)
-      // sees the client's resend as a duplicate (`request == session.request`) and must resend the
-      // cached reply — but the OLD code cached the reply only on the primary's `commit_op`, so a
-      // backup-turned-primary had `session.reply == None` and stayed SILENT, hanging the client forever
-      // even though a healthy quorum exists. The reply is the SM's deterministic apply output, so every
-      // replica that applies the op can cache it (it survives the failover; for an op recovered via a
-      // checkpoint snapshot the dedup watermark still gates correctness, and the recent above-checkpoint
-      // ops that a lost reply concerns are always applied through here).
-      let session = self.clients.entry(entry.client.get()).or_default();
-      if entry.request.get() > session.request.get() {
-        session.request = entry.request;
-        session.reply = Some((entry.request, reply.clone()));
-      }
+      // The SHARED apply-time session update (watermark + reply cache + last-activity stamp +
+      // deterministic cap eviction; see [`Self::note_applied_session`]) — identical to the primary's
+      // `commit_op`, so primary and backups converge on identical tables at identical applied ops.
+      self.note_applied_session(op, entry.client, entry.request, &reply);
       self
         .events
         .push_back(Event::Committed(crate::Committed::new(
@@ -738,6 +932,85 @@ impl<S: StateMachine> Endpoint<S> {
     self.cancel_forced_sync_if_satisfied();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(sb);
+  }
+
+  /// The SINGLE apply-time client-session update, shared by the primary's [`Self::commit_op`] and the
+  /// backup's [`Self::advance_commit`] so both roles run the IDENTICAL update at the IDENTICAL applied
+  /// op — the structural basis of session-table determinism (the table rides every checkpoint
+  /// envelope, so divergent updates would diverge checkpoint content across replicas).
+  ///
+  /// Per applied op it:
+  /// - advances the at-most-once dedup WATERMARK (monotone max — the watermark a backup-turned-primary
+  ///   needs in `on_request`; tracked at every apply, NOT reconstructed from the GC-pruned `log`, and
+  ///   also restored from checkpoint snapshots, so it survives GC and restores);
+  /// - caches the REPLY body whenever this apply is the freshest for the session (no LATER request's
+  ///   reply already cached — per-client requests apply in order, so the guard only rejects a stale
+  ///   overwrite). Caching on EVERY replica closes the failover lost-reply gap: a backup-turned-primary
+  ///   resends the cached reply to a duplicate whose original reply was lost. The watermark and the
+  ///   reply cache are deliberately SEPARATE concerns: the watermark can sit at/above this request
+  ///   without a cached reply (accept-time seeding, snapshot restore, view-change backfill), and gating
+  ///   the cache on the watermark advancing would then skip the reply forever (the client's retry would
+  ///   dedup with no reply — a permanent hang);
+  /// - stamps the session's LAST-ACTIVITY op (`last_op = op` — a row's first stamp makes it APPLIED,
+  ///   visible to the eviction order below);
+  /// - enforces the session cap ([`Config::max_client_sessions`]) by DETERMINISTIC EVICTION: when this
+  ///   apply grew the APPLIED-session count past the cap, evict the session with the smallest
+  ///   `(last_op, client)` — the oldest-activity row, ties (only possible among restored/injected
+  ///   rows; live applied stamps are unique) broken by lowest client id. The decision reads ONLY
+  ///   applied rows (`last_op > 0`): provisional accept-time/backfill rows exist solely on the replica
+  ///   that minted them, so counting or evicting them would diverge primary and backup tables — they
+  ///   stay invisible until their own op applies (identically everywhere). The evicted client's
+  ///   at-most-once history is gone — the table-residency contract on [`crate::MAX_CLIENT_SESSIONS`].
+  fn note_applied_session(
+    &mut self,
+    op: u64,
+    client: ClientId,
+    request: RequestNumber,
+    reply: &Bytes,
+  ) {
+    let session = self.clients.entry(client.get()).or_default();
+    let newly_applied = session.last_op.get() == 0;
+    session.last_op = OpNumber::with(op);
+    if request.get() > session.request.get() {
+      session.request = request;
+    }
+    if session
+      .reply
+      .as_ref()
+      .is_none_or(|(rn, _)| rn.get() <= request.get())
+    {
+      session.reply = Some((request, reply.clone()));
+    }
+    // The applied count can only have GROWN if this apply turned a provisional/absent row applied;
+    // the (rare) count + eviction scan runs only then, never on the steady per-op path.
+    if !newly_applied {
+      return;
+    }
+    let cap = self.config.max_client_sessions() as usize;
+    let mut applied = self
+      .clients
+      .values()
+      .filter(|s| s.last_op.get() > 0)
+      .count();
+    while applied > cap {
+      let victim = self
+        .clients
+        .iter()
+        .filter(|(_, s)| s.last_op.get() > 0)
+        .map(|(&c, s)| (s.last_op.get(), c))
+        .min()
+        .map(|(_, c)| c)
+        .expect("an over-cap applied table is non-empty");
+      // `cap >= 1` (Config-validated) and `applied > cap` ⇒ at least two applied rows, and the
+      // just-applied row holds the maximal `last_op` (this op) — so the minimum is never it.
+      debug_assert!(
+        victim != client.get(),
+        "the just-applied session must never be its own eviction victim"
+      );
+      self.clients.remove(&victim);
+      self.sessions_evicted += 1;
+      applied -= 1;
+    }
   }
 
   /// Solicit committed ops that sit strictly ABOVE this replica's head — the band

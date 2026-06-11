@@ -64,9 +64,12 @@ pub(crate) const PREPARE_BULK_THRESHOLD: usize = 64 * 1024;
 /// - State-transfer / whole-log carriers (`SyncCheckpoint`, `DoViewChange`,
 ///   `StartView`, `RecoveryResponse`) → `Bulk`.
 /// - A `Prepare` whose body exceeds `PREPARE_BULK_THRESHOLD` → `Bulk`.
+/// - A `PrepareBatch` whose encoded size exceeds `PREPARE_BULK_THRESHOLD` →
+///   `Bulk` (the batched retransmit of the same prepares; its whole frame is
+///   what would occupy the stream, so the threshold applies to the encoding).
 /// - Everything else → `Control`: `Commit` / heartbeat, `PrepareOk`, `Reply`,
 ///   `StartViewChange`, `GetView`, `RequestPrepare`, `Recovery`, `RequestSync`,
-///   `Request`, and small `Prepare`s.
+///   `Request`, and small `Prepare`s / `PrepareBatch`es.
 ///
 /// The COORDINATOR's send-path router ([`write_to_peer`](super::QuicCoordinator)) is the live caller.
 pub(crate) fn partition(msg: &Message, layout: StreamLayout) -> StreamClass {
@@ -81,9 +84,13 @@ pub(crate) fn partition(msg: &Message, layout: StreamLayout) -> StreamClass {
     | Message::RecoveryResponse(_) => StreamClass::Bulk,
     // A large prepare body must not block a heartbeat on Control.
     Message::Prepare(p) if p.body().len() > PREPARE_BULK_THRESHOLD => StreamClass::Bulk,
+    // The batched retransmit aggregates many prepare bodies into one frame — the same
+    // must-not-block-a-heartbeat rule, applied to the frame the batch actually occupies the
+    // stream with (its exact pre-encode size, `encoded_len`).
+    Message::PrepareBatch(_) if msg.encoded_len() > PREPARE_BULK_THRESHOLD => StreamClass::Bulk,
     // All other messages — Commit/heartbeat, PrepareOk, Reply, StartViewChange,
-    // GetView, RequestPrepare, Recovery, RequestSync, Request, and small Prepares
-    // — ride Control.
+    // GetView, RequestPrepare, Recovery, RequestSync, Request, and small
+    // Prepares / PrepareBatches — ride Control.
     _ => StreamClass::Control,
   }
 }
@@ -132,6 +139,17 @@ mod tests {
       client(),
       req(),
       body,
+    ))
+  }
+
+  fn prepare_batch_msg(body: Bytes) -> Message {
+    use crate::PreparedEntry;
+    use crate::message::PrepareBatch;
+    Message::PrepareBatch(PrepareBatch::new(
+      view(1),
+      op(0),
+      op(0),
+      vec![PreparedEntry::new(op(1), client(), req(), body)],
     ))
   }
 
@@ -195,6 +213,19 @@ mod tests {
     // Large Prepare (body > 64 KiB) → Bulk to avoid blocking heartbeats.
     let big_body = Bytes::from(vec![0u8; PREPARE_BULK_THRESHOLD + 1]);
     assert_eq!(partition(&prepare_msg(big_body), l), StreamClass::Bulk);
+
+    // Small PrepareBatch (encoded size well under the threshold) → Control; a batch whose
+    // encoding exceeds it → Bulk (the batched-retransmit analogue of the Prepare rule).
+    let small_batch = prepare_batch_msg(Bytes::from(vec![0u8; 100]));
+    assert!(small_batch.encoded_len() <= PREPARE_BULK_THRESHOLD);
+    assert_eq!(partition(&small_batch, l), StreamClass::Control);
+    let big_batch = prepare_batch_msg(Bytes::from(vec![0u8; PREPARE_BULK_THRESHOLD + 1]));
+    assert!(big_batch.encoded_len() > PREPARE_BULK_THRESHOLD);
+    assert_eq!(partition(&big_batch, l), StreamClass::Bulk);
+    assert_eq!(
+      partition(&big_batch, StreamLayout::Single),
+      StreamClass::Control
+    );
 
     // Single collapses everything to Control regardless of message type.
     let big_body2 = Bytes::from(vec![0u8; PREPARE_BULK_THRESHOLD + 1]);

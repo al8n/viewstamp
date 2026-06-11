@@ -113,6 +113,40 @@ fn two_replicas_commit_over_plain_tcp() {
   assert_converged(&r0, &r1, converged, b"x");
 }
 
+// The PUBLIC node-local submit path: `StreamCoordinator::submit_client_request` injects a client
+// request at this replica AND broadcasts it to the backups, so the view-0 primary (replica 0) serves
+// it — the driver's real submit surface (the `inject_message_for_test` seam is `#[cfg(test)]`). Two
+// replicas converge over plain TCP with the request fed through the public api, not the inject seam.
+#[test]
+fn public_submit_client_request_over_tcp_converges() {
+  fn dialer(me: u8) -> Conn<Labeled<Passthrough>> {
+    let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+    Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+  }
+  fn acceptor(me: u8) -> Conn<Labeled<Passthrough>> {
+    let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+    Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+  }
+  let (mut r0, mut wal0, mut sb0) = replica::<Labeled<Passthrough>>(0);
+  let (mut r1, mut wal1, mut sb1) = replica::<Labeled<Passthrough>>(1);
+  let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0));
+  let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1));
+  r0.submit_client_request(
+    Instant::ZERO,
+    &mut wal0,
+    &mut sb0,
+    Request::new(
+      ClientId::new(1),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"x"),
+    ),
+  );
+  let converged = run_until_converged(
+    &mut r0, &mut wal0, &mut sb0, c0, &mut r1, &mut wal1, &mut sb1, c1,
+  );
+  assert_converged(&r0, &r1, converged, b"x");
+}
+
 // A raw Passthrough (no handshake) converges without any test-only validation nudge: registration
 // validates each conn immediately, so a primary that emits before any inbound read is not
 // black-holed.

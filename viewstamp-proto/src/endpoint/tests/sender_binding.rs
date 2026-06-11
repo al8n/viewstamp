@@ -316,6 +316,65 @@ fn forged_prepare_from_a_non_primary_replica_is_dropped() {
 }
 
 #[test]
+fn forged_prepare_batch_from_a_non_primary_is_dropped_by_the_sender_binding() {
+  // `PrepareBatch` is the primary's batched retransmit of its un-acked window — it carries no self
+  // `replica()` and (unlike `Prepare`) has NO repair-serve role, so it binds STRICTLY to
+  // `config.primary(view)` like `Commit`/`StartView`. A batch from a non-primary replica (replica 2;
+  // the view-0 primary is replica 0) — or from a client — is forged/misrouted and must be dropped
+  // WHOLE: no entry reaches `on_prepare`, so the backup appends nothing and emits no PrepareOk
+  // (which the primary would otherwise count toward a commit quorum).
+  let mut e = backup(); // replica 1 of 3
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let batch = || {
+    Message::PrepareBatch(crate::PrepareBatch::new(
+      View::new(),
+      OpNumber::new(),
+      OpNumber::new(),
+      std::vec![PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        Bytes::copy_from_slice(&[1u8]),
+      )],
+    ))
+  };
+  // Forged: the batch from replica 2 (NOT the view-0 primary), then from a client.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    batch(),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    batch(),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::new(),
+    "a PrepareBatch from a non-primary `from` is dropped whole: nothing appended",
+  );
+  assert!(
+    e.poll_message().is_none(),
+    "the dropped batch emits no PrepareOk (no forged vote reaches the primary's quorum)",
+  );
+  // Positive control: the identical batch from the genuine primary (replica 0) is appended + acked.
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), batch());
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the identical PrepareBatch from the genuine primary is appended",
+  );
+}
+
+#[test]
 fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
   // MEMBERSHIP RANGE CHECK (vote surface): a PrepareOk whose self-claimed replica is NOT
   // a configured cluster member (replica 5 in a 3-replica cluster) — delivered from a matching

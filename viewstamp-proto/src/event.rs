@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::{ClientId, OpNumber, RequestNumber};
+use crate::{ClientId, OpNumber, RequestNumber, Status, View};
 
 /// A committed operation that was applied to the state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +54,66 @@ impl Committed {
   }
 }
 
-/// An application-facing event emitted by an `Endpoint`.
+/// A view this replica formed or adopted (the payload of [`Event::ViewChanged`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewChanged {
+  view: View,
+  is_primary: bool,
+}
+
+impl ViewChanged {
+  /// Creates a view-changed record.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(view: View, is_primary: bool) -> Self {
+    Self { view, is_primary }
+  }
+
+  /// The view this replica is now operating in.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// Whether this replica is the primary of the new view.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_primary(&self) -> bool {
+    self.is_primary
+  }
+}
+
+/// A windowed peer-repair solicitation for the contiguous committed hole band `[lo, hi]` (the
+/// payload of [`Event::RepairStarted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairStarted {
+  lo: OpNumber,
+  hi: OpNumber,
+}
+
+impl RepairStarted {
+  /// Creates a repair-started record.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(lo: OpNumber, hi: OpNumber) -> Self {
+    Self { lo, hi }
+  }
+
+  /// The lowest op of the solicited hole band.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn lo(&self) -> OpNumber {
+    self.lo
+  }
+
+  /// The highest op of the solicited hole band.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn hi(&self) -> OpNumber {
+    self.hi
+  }
+}
+
+/// An application-facing event emitted by an `Endpoint`, drained via `poll_event`.
+///
+/// Observability only: every variant copies a few scalars at its emission chokepoint (no formatting,
+/// no allocation beyond the payload it already holds), and NOTHING in the protocol depends on the
+/// events being consumed — a driver forwards them to the embedder best-effort.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
@@ -64,4 +123,17 @@ impl Committed {
 pub enum Event {
   /// An operation was committed and applied to the state machine.
   Committed(Committed),
+  /// This replica formed (as the new primary) or adopted (as a backup) a view.
+  ViewChanged(ViewChanged),
+  /// This replica's status changed (Normal / ViewChange / Recovering / RecoveringHead).
+  StatusChanged(Status),
+  /// A state-sync was armed: this replica learned of a cluster checkpoint it must fetch (the
+  /// payload is the solicited target checkpoint op).
+  StateSyncStarted(OpNumber),
+  /// A state-sync completed: the synced checkpoint (the payload op) is installed and durable.
+  StateSyncCompleted(OpNumber),
+  /// A windowed peer-repair solicitation went out for a contiguous committed hole band.
+  RepairStarted(RepairStarted),
+  /// A checkpoint's root write landed: the checkpoint at the payload op is durable.
+  CheckpointDurable(OpNumber),
 }

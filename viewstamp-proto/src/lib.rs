@@ -49,14 +49,19 @@ mod time;
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 mod transport;
 pub use codec::{CodecError, WIRE_VERSION};
-pub use config::{Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS};
+pub use config::{
+  Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS, MAX_CLIENT_SESSIONS,
+  MAX_SYNC_ENVELOPE_LEN,
+};
 pub use endpoint::Endpoint;
-pub use event::{Committed, Event};
+pub use event::{Committed, Event, RepairStarted, ViewChanged};
 pub use id::{ClientId, Peer, Recipient, ReplicaId};
 pub use message::{
-  Commit, DoViewChange, GetView, Message, Outgoing, Prepare, PrepareOk, PreparedEntry, Recovery,
-  RecoveryResponse, Reply, Request, RequestPrepare, RequestSync, StartView, StartViewChange,
-  SyncCheckpoint,
+  Commit, DoViewChange, GetView, Message, Outgoing, Prepare, PrepareBatch, PrepareOk,
+  PreparedEntry, REPLY_ENCODE_OVERHEAD, Recovery, RecoveryResponse, RepairBatch, Reply, Request,
+  RequestPrepare, RequestPrepareRange, RequestSync, RequestSyncChunk, SYNC_CHUNK_LEN, StartView,
+  StartViewChange, SyncCheckpoint, SyncCheckpointMeta, SyncChunk, max_reply_body_len,
+  max_unchunked_snapshot_len,
 };
 pub use number::{OpNumber, RequestNumber, View};
 pub use prng::Prng;
@@ -72,13 +77,13 @@ pub use time::Instant;
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
 pub use transport::{
   CertOid, ClusterTls, DialError, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome,
-  IdentitySource, ProvidedIdentity, QuicCoordinator, QuicOptions, StreamLayout,
+  IdentitySource, ProvidedIdentity, QuicCoordinator, QuicOptions, QuicTuning, StreamLayout,
 };
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 pub use transport::{
-  Conn, ConnId, Intake, LabelOptions, Labeled, Passthrough, PeerRouter, StreamCoordinator,
-  StreamTransport, TransportError,
+  CloseCause, Conn, ConnId, Intake, LabelOptions, Labeled, MAX_FRAME_LEN, Passthrough, PeerRouter,
+  StreamCoordinator, StreamTransport, TransportError, max_request_body_len,
 };
 #[cfg(feature = "tls")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]

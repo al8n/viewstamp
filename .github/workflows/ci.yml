@@ -118,6 +118,58 @@ jobs:
           rustup target add ${{ matrix.target }}
           cargo build --target ${{ matrix.target }}
 
+  # Prove the declared MSRV (rust-version in every crate's Cargo.toml) actually compiles the
+  # feature set CI ships. The MSRV-aware resolver (workspace resolver = "3") picks 1.85-compatible
+  # dependency versions on its own, so this is a plain check on the old toolchain: the workspace on
+  # default features, plus viewstamp-proto with the full portable feature union (the powerset is
+  # stable-toolchain territory in `build`/`test`; MSRV needs the additive union, exercised once).
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Rust 1.85
+      run: rustup toolchain install 1.85 --profile minimal && rustup default 1.85
+    - name: Check the workspace on the MSRV
+      run: cargo check --workspace
+    - name: Check viewstamp-proto's portable feature union on the MSRV
+      run: cargo check -p viewstamp-proto --features alloc,tcp,tls,tls-rustls-ring,quic
+
+  # Hold rustdoc to the same -D warnings bar the code is held to (broken intra-doc links are the
+  # usual offender). Same provider/feature selection as the sweeps: tls-rustls-ring, quic enabled
+  # explicitly. ubuntu-only — rustdoc output is platform-independent.
+  docs:
+    name: docs (rustdoc -D warnings)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Rust
+      run: rustup update stable --no-self-update && rustup default stable
+    - name: cargo doc viewstamp-proto
+      run: cargo doc --no-deps -p viewstamp-proto --features quic,tcp,tls,tls-rustls-ring
+    - name: cargo doc viewstamp-compio
+      run: cargo doc --no-deps -p viewstamp-compio
+    - name: cargo doc viewstamp-simulation
+      run: cargo doc --no-deps -p viewstamp-simulation
+
+  # Licenses / security advisories / bans / sources over the whole dependency graph; the policy
+  # (and the documented allowances) lives in deny.toml at the workspace root.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Rust
+      run: rustup update stable --no-self-update && rustup default stable
+    - name: Install cargo-deny
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
+    - name: Run cargo deny
+      run: cargo deny check
+
   # Prove the no_std core (viewstamp-proto) links on a real bare-metal target with
   # only `alloc` and no `std`. Any accidental std dependency fails to build here.
   no-std:

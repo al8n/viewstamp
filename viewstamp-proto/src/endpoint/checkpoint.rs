@@ -13,8 +13,26 @@ impl<S: StateMachine> Endpoint<S> {
       self.on_recover_wal_done(now, wal, sb, done);
       return;
     }
-    let WalDone::Appended(id) = done else {
-      return; // Normal op: only an append matters (reads/faults occur during recovery).
+    let id = match done {
+      WalDone::Appended(id) => id,
+      // DEFENSIVE: a `Fault` completion whose OpId matches a pending APPEND. The `Wal` contract
+      // requires appends to complete as `Appended` (the embedder retries / fail-stops internally —
+      // see [`Wal::submit_append`]), so this is a contract violation — but silently dropping it
+      // would LEAK the op's in-flight bookkeeping (its `Pending` entry + `appending` mark) until
+      // the next view transition: the op could never be (re-)acked, `has_inflight_storage()` would
+      // read true forever (breaking a graceful shutdown), and a leaked `RepairFill` would hold the
+      // commit at its hole. Degrade the violation to a RETRY instead: clear the stale entry/mark
+      // and re-submit the append from the still-held data, so a transient embedder fault costs one
+      // round trip, not a wedge. A `Fault` not matching a pending append is a read verdict (or
+      // stale/superseded) and is ignored.
+      WalDone::Fault(id) => {
+        if let Some(p) = self.pending.remove(&id.get()) {
+          self.appending.remove(&p.op().get());
+          self.resubmit_faulted_append(wal, p);
+        }
+        return;
+      }
+      _ => return, // Normal op: only appends matter (reads + their verdicts occur during recovery).
     };
     // Append-before-ack dispatch by the recorded kind. An OpId not in `self.pending` is a
     // stale/superseded completion → ignore. (A peer-repair fill is tracked as `Pending::RepairFill`
@@ -108,6 +126,45 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
+  /// Re-submit a WAL append whose completion FAULTED (an embedder [`Wal::submit_append`] contract
+  /// violation), rebuilding it from the data the endpoint still holds so the deferred ack/vote/fill
+  /// the append owes is retried rather than leaked. The caller has already removed the stale
+  /// `Pending` entry + `appending` mark; this re-records both under a fresh `OpId`. Per kind:
+  /// - `Ack`/`AdoptVote`/`AdoptAck`: the op's entry is in `self.log` — re-append its `Present` body
+  ///   under the current view (the entry survives exactly as long as the pending action does: every
+  ///   view transition clears both). An absent or body-`Repairing` entry has no bytes to re-append
+  ///   (the op is checkpoint-subsumed and GC-pruned, or awaiting peer-repair), so the action is
+  ///   dropped — nothing is owed off an absent body, and the retransmit/repair paths re-drive it.
+  /// - `RepairFill`: the staged canonical body rides in the variant itself — re-append it and
+  ///   re-stage the same fill, leaving the hole open until the retry lands (exactly as at stage
+  ///   time; a still-faulting backend degrades to the solicit-retry cadence, never a silent leak).
+  fn resubmit_faulted_append<W: Wal>(&mut self, wal: &mut W, kind: Pending) {
+    let op = kind.op();
+    let (entry, kind) = match kind {
+      Pending::RepairFill(rf) => {
+        let entry = rf.into_entry();
+        (
+          entry.clone(),
+          Pending::RepairFill(RepairFill::new(op, entry)),
+        )
+      }
+      kind => {
+        let Some(entry) = self.log.get(&op.get()).cloned() else {
+          return;
+        };
+        (entry, kind)
+      }
+    };
+    let Body::Present(body) = entry.body else {
+      return; // header-only: no bytes to re-append (peer-repair supplies the canonical body)
+    };
+    let header = Header::new(op, self.view, entry.client, entry.request, &body);
+    let id = self.mint_op_id();
+    wal.submit_append(id, op, header, body);
+    self.pending.insert(id.get(), kind);
+    self.appending.insert(op.get());
+  }
+
   pub(crate) fn on_sb_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -131,9 +188,11 @@ impl<S: StateMachine> Endpoint<S> {
         return;
       }
       SuperblockDone::Fault(id) => {
-        // A faulted serve-read: drop the serving entry (if any) and stay silent. (A faulted root/
-        // checkpoint WRITE outside recovery is not produced by our backends; dropping is defensive.)
-        self.sync_serving.remove(&id.get());
+        // A faulted serve-read: drop the serving entry whose recorded read id matches (the map is
+        // keyed by requester) and stay silent — the requester re-solicits and is then served by a
+        // fresh read. (A faulted root/checkpoint WRITE outside recovery is not produced by our
+        // backends; dropping is defensive.)
+        self.sync_serving.retain(|_, s| s.read != id.get());
         return;
       }
     };
@@ -231,11 +290,20 @@ impl<S: StateMachine> Endpoint<S> {
               // `checkpoint_op`). After this, `checkpoint_op`, the durable root id, and `commit_min`/`op`
               // all agree at the synced point.
               self.advance_checkpoint_op(pc.target_op);
+              // Observability: the synced checkpoint is installed AND durable — the sync is complete
+              // (covers both the deferred Normal install and the eager recovery install, which both
+              // finish at exactly this root). Scalar copy only.
+              self
+                .events
+                .push_back(Event::StateSyncCompleted(pc.target_op));
               // Resume as a Normal backup: clear the sync bookkeeping + solicit timer and re-arm timers.
               // (`self.sync` is `Some` here — the sync's re-persist completing means its handshake is the
-              // live one; this is the SAME sync whose `apply_sync` staged this root.)
+              // live one; this is the SAME sync whose `apply_sync` staged this root. Any chunked
+              // transfer was already retired when its assembly fed this sync — cleared here as the
+              // paired teardown.)
               let forced = self.sync.is_some_and(|s| s.forced);
               self.sync = None;
+              self.sync_transfer = None;
               self.timers.sync_solicit = None;
               // Non-vacuity signal: a state-sync just fully applied + became durable.
               self.state_syncs_applied += 1;
@@ -254,6 +322,11 @@ impl<S: StateMachine> Endpoint<S> {
               // deliberately left intact here (this root is NOT its re-persist), so it completes on its
               // own handshake.
               self.advance_checkpoint_op(pc.target_op);
+              // Observability: this replica's own checkpoint at `target_op` is root-durable. (A sync
+              // re-persist's root reports as `StateSyncCompleted` above instead.) Scalar copy only.
+              self
+                .events
+                .push_back(Event::CheckpointDurable(pc.target_op));
               self.run_gc(wal);
             }
           }
@@ -300,6 +373,9 @@ impl<S: StateMachine> Endpoint<S> {
     let snapshot = self.sm.snapshot();
     // Bind the checkpoint op into the envelope so `checkpoint_id` covers it: the written op and
     // the op hashed inside the snapshot are the SAME, so a later restore can prove they agree.
+    // The envelope is UNBOUNDED by the frame cap: state-sync serves it whole when it fits one
+    // frame and chunked (`SyncCheckpointMeta` → `SyncChunk`) when it does not, so an arbitrarily
+    // large `StateMachine::snapshot` (+ session table) remains servable.
     let envelope = Self::encode_checkpoint(target_op, &self.clients, &snapshot);
     let checkpoint_id = crate::checkpoint_id(&envelope);
     let id = self.mint_op_id();
