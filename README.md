@@ -83,12 +83,14 @@ schedule within the crash-stop fault model (a quorum always survives):
   discarded at the crash boundary; a wipe lane where a crashed replica rejoins with an
   empty disk.
 - **Network faults** — reorder, drop, duplicate, delay; a hold lane where messages are
-  held arbitrarily long and released late.
+  held arbitrarily long and released late; a one-way (asymmetric) partition lane and a
+  slow-replica (gray-failure) lane.
 - **Storage faults** — read faults, torn writes, bit-rot, misdirected reads (a read
   returning a wrong-but-valid sibling slot), recover-time fault injection.
 - **Structural axes** — async WAL + async superblock completion windows, small and
-  large checkpoint intervals, and a physical bounded-WAL ring on a third of seeds
-  (stall-before-wrap, recovery off a wrapped ring).
+  large checkpoint intervals, a physical bounded-WAL ring on a third of seeds
+  (stall-before-wrap, recovery off a wrapped ring), and a client-churn lane driving
+  the session-cap eviction.
 
 Safety, durability, view-monotonicity, boundedness, append-before-ack, and
 ring-residency invariants are checked every tick; liveness is judged over calm windows
