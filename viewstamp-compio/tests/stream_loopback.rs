@@ -888,3 +888,46 @@ mod tls {
     }
   }
 }
+
+/// The storage notifier is a wake-latency optimization the embedder may not wire at all: dropping
+/// every sender clone must DOWNGRADE storage pumping to timer cadence, not turn the dead channel
+/// into an always-ready select arm. This builds a driver whose notifier is disconnected from the
+/// start and drives the production `run()` loop on the single-threaded executor: a spinning loop
+/// would starve the timer driver and the sleep below would never fire (a HANG here is the
+/// regression); parked correctly, the sleep elapses and the shutdown acks within its bound.
+#[compio::test]
+async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
+  let dialer: Rc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>>> = Rc::new(move |_peer| {
+    let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(0)));
+    Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+  });
+  let acceptor: Rc<dyn Fn() -> Conn<Labeled<Passthrough>>> = Rc::new(move || {
+    let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(0)));
+    Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+  });
+  let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+  // The notifier sender is dropped on the spot: the driver must treat the dead channel as
+  // "downgrade to timer cadence", not as a wake source.
+  let (_, ready_rx) = flume::unbounded();
+  let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
+    config,
+    viewstamp_simulation::sm::LogSm::default(),
+    InMemoryWal::new(),
+    InMemorySuperblock::new(),
+    viewstamp_proto::ClientId::new(1),
+    0,
+    "127.0.0.1:45700".parse().unwrap(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    ready_rx,
+  )
+  .await
+  .expect("driver builds");
+  compio::runtime::spawn(driver.run()).detach();
+  compio::time::sleep(std::time::Duration::from_millis(10)).await;
+  compio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+    .await
+    .expect("the shutdown ack arrives")
+    .expect("driver acks shutdown");
+}

@@ -65,4 +65,19 @@ pub enum DriverError {
     /// The peer that could not be dialed.
     peer: viewstamp_proto::Peer,
   },
+  /// The configured connection cap cannot admit the configured peer mesh. The mesh is
+  /// mutual-dial: every replica dials each configured peer AND must accept each peer's dial back
+  /// (an inbound socket is admission-controlled until its handshake validates, so the cap must
+  /// leave room for it) — the floor is therefore TWICE the peer count. Mesh links are consensus
+  /// liveness and never load-shed, so a cap below that floor is a misconfiguration the
+  /// constructor refuses rather than a load condition the driver could shed its way out of.
+  #[error(
+    "max_conns ({max_conns}) is below twice the configured peer count ({peers}); the cap must admit every dialed AND accepted mesh connection"
+  )]
+  CapBelowPeerMesh {
+    /// The configured connection cap.
+    max_conns: usize,
+    /// The configured peer-mesh size; the cap must be at least twice this.
+    peers: usize,
+  },
 }
