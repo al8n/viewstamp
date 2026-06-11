@@ -313,6 +313,31 @@ async fn quic_driver_exits_when_all_handles_dropped() {
     .expect("driver.run() returns within 5s after the last Handle is dropped");
 }
 
+/// SHUTDOWN-ACK REBIND BARRIER (QUIC): `Handle::shutdown().await` resolves only after the driver's
+/// UDP socket fd is fully RELEASED — the recv task's socket clone and its in-flight `recv_from`
+/// reference are gone and the fd closed — so constructing a new driver bound to the SAME address
+/// IMMEDIATELY after the ack must succeed. The await of the ack is the ONLY synchronization here:
+/// no awaiting the (detached) run task, no settling sleeps. UDP binds without `SO_REUSEADDR`, so a
+/// still-open prior fd fails the rebind with `DriverError::Bind`. An ack sent before the fd release
+/// (e.g. tearing the recv task down by `JoinHandle` drop alone, whose cancel is only marked +
+/// scheduled) races the runtime's cancel processing; looping the cycle pins the contract rather
+/// than one lucky pass.
+#[compio::test]
+async fn shutdown_ack_frees_the_address_for_immediate_rebind() {
+  let ca = TestCa::new();
+  let bind: SocketAddr = "127.0.0.1:41040".parse().unwrap();
+  for i in 0..5 {
+    // Iterations 1.. bind the address the PREVIOUS iteration's driver just released: this
+    // `build_driver` succeeding immediately after the ack is the assertion.
+    let (driver, handle) = build_driver(&ca, 0, bind, Vec::new()).await;
+    compio::runtime::spawn(driver.run()).detach();
+    handle
+      .shutdown()
+      .await
+      .unwrap_or_else(|e| panic!("shutdown #{i} acks teardown: {e:?}"));
+  }
+}
+
 /// The relayed-backup request path: submitting at a backup (replica 1 in view 0) and relying on the
 /// coordinator to relay the `Request` to the primary over the mesh. `submit_client_request` broadcasts
 /// the `Request` to peers, so it reaches the primary tagged `Peer::Replica(1)`; the consensus ingress

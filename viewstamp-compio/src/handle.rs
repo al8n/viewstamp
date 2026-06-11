@@ -1,3 +1,5 @@
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use bytes::Bytes;
 use viewstamp_proto::Event;
 
@@ -20,14 +22,17 @@ pub enum Command {
     reply: futures_channel::oneshot::Sender<Reply>,
     /// The owning `InflightBudget` reservation for this submit. Carried with the queued command so
     /// the reservation is released by its `Drop` wherever the command finally dies: the driver MOVES
-    /// it into the `Pending` entry on drain, or it drops with the command channel if a `Shutdown`
-    /// tears the driver down before this submit is drained (so a submit racing shutdown cannot leak
-    /// budget). It is the SINGLE owner of the reservation — never released manually here.
+    /// it into the `Pending` entry on drain, or the teardown's close-then-drain of the command
+    /// channel drops it still-queued if a `Shutdown` tears the driver down first (so a submit racing
+    /// shutdown cannot leak budget). It is the SINGLE owner of the reservation — never released
+    /// manually here.
     reservation: ReservationGuard,
   },
   /// Ask the driver to stop; `ack` is signalled once teardown completes.
   Shutdown {
-    /// Signalled after the driver loop exits and the socket is dropped.
+    /// Signalled after the driver loop exits and its socket/listener fd is fully RELEASED
+    /// (closed, with every helper-task and in-flight-op reference gone) — so the bound address is
+    /// immediately rebindable when the ack arrives.
     ack: futures_channel::oneshot::Sender<()>,
   },
 }
@@ -37,34 +42,58 @@ pub enum Command {
 /// Cloning is O(1) (channel-handle + two `Arc` clones). All clones share one node-local client
 /// session — including its `InflightBudget`, so the count/byte submit caps apply across all clones,
 /// not per clone.
-#[derive(Clone)]
 pub struct Handle {
-  commands: flume::Sender<Command>,
+  /// The command sender, `Mutex`-wrapped because `futures_channel::mpsc::Sender::try_send` takes
+  /// `&mut self` (the sender tracks its own parked state) while `submit`/`shutdown` take `&self`.
+  /// The lock is held only across a non-blocking `try_send`/`clone` — never across an await — so
+  /// callers sharing one clone by reference serialize only the enqueue itself.
+  commands: Mutex<futures_channel::mpsc::Sender<Command>>,
   events: flume::Receiver<Event>,
   budget: InflightBudget,
 }
 
+impl Clone for Handle {
+  fn clone(&self) -> Self {
+    // A cloned sender starts fresh (unparked) and carries its own guaranteed channel slot: the
+    // command channel admits up to its buffer plus one in-flight command per live sender, so each
+    // `Handle` clone widens the queue's slack by one. The submit BUDGET — shared by all clones — is
+    // the binding bound on in-flight submits, not that slack (see `DriverConfig::cmd_cap`).
+    Self {
+      commands: Mutex::new(self.commands().clone()),
+      events: self.events.clone(),
+      budget: self.budget.clone(),
+    }
+  }
+}
+
 impl Handle {
   pub(crate) fn new(
-    commands: flume::Sender<Command>,
+    commands: futures_channel::mpsc::Sender<Command>,
     events: flume::Receiver<Event>,
     budget: InflightBudget,
   ) -> Self {
     Self {
-      commands,
+      commands: Mutex::new(commands),
       events,
       budget,
     }
+  }
+
+  /// Lock the command sender. A poisoned lock only means another thread panicked while holding it;
+  /// the sender is a plain channel handle whose state cannot be torn by an unwind mid-`try_send`,
+  /// so the inner value is taken either way rather than cascading the panic into every clone.
+  fn commands(&self) -> MutexGuard<'_, futures_channel::mpsc::Sender<Command>> {
+    self.commands.lock().unwrap_or_else(PoisonError::into_inner)
   }
 
   /// Submit a client request and await its committed reply body.
   ///
   /// This RESERVES one slot of the shared in-flight submit budget (by count and by `body` length)
   /// BEFORE sending the command, and never blocks waiting for budget: if either cap is already full,
-  /// or the bounded command channel is full, it returns [`DriverError::Busy`] immediately without
-  /// minting a request. The reservation is held until the driver resolves the submit (commit,
-  /// cancellation, or shutdown), which releases it; the await below only parks on the reply, not on
-  /// budget.
+  /// or the bounded command channel refuses the send, it returns [`DriverError::Busy`] immediately
+  /// without minting a request. The reservation is held until the driver resolves the submit
+  /// (commit, cancellation, or shutdown), which releases it; the await below only parks on the
+  /// reply, not on budget.
   ///
   /// # Errors
   /// [`DriverError::RequestTooLarge`] if `body` exceeds
@@ -73,9 +102,9 @@ impl Handle {
   /// dropped, so no commit could arrive; it is rejected up front WITHOUT reserving budget or enqueueing
   /// a command (the budget is untouched and nothing is minted), so an undeliverable request can neither
   /// hang nor pin the shared submit budget; [`DriverError::Busy`] if the in-flight submit budget (count
-  /// or bytes) or the command channel is full — shed load and retry later; [`DriverError::DriverGone`]
-  /// if the driver task has stopped; [`DriverError::ReplyDropped`] if the driver dropped the reply
-  /// channel without answering (e.g. shutdown mid-flight).
+  /// or bytes) is full or the command channel refuses the send — shed load and retry later;
+  /// [`DriverError::DriverGone`] if the driver task has stopped; [`DriverError::ReplyDropped`] if the
+  /// driver dropped the reply channel without answering (e.g. shutdown mid-flight).
   pub async fn submit(&self, body: impl Into<Bytes>) -> Result<Reply, DriverError> {
     let body = body.into();
     let body_len = body.len();
@@ -96,32 +125,43 @@ impl Handle {
       return Err(DriverError::Busy);
     };
     let (reply, rx) = futures_channel::oneshot::channel();
-    // `try_send` (never block): a full bounded command channel is backpressure, surfaced as `Busy`; a
-    // disconnected channel means the driver is gone. On either, the un-sent `Command` carried in the
-    // error — and so its `reservation` guard — drops, releasing the slot; no manual rollback.
-    match self.commands.try_send(Command::Submit {
+    // `try_send` (never block; the lock spans only this call): a refusing command channel is
+    // backpressure, surfaced as `Busy`; a closed channel means the driver is gone. On either, the
+    // un-sent `Command` carried back in the error — and so its `reservation` guard — drops,
+    // releasing the slot; no manual rollback.
+    let sent = self.commands().try_send(Command::Submit {
       body,
       reply,
       reservation,
-    }) {
-      Ok(()) => {}
-      Err(flume::TrySendError::Full(_)) => return Err(DriverError::Busy),
-      Err(flume::TrySendError::Disconnected(_)) => return Err(DriverError::DriverGone),
+    });
+    if let Err(err) = sent {
+      return Err(if err.is_full() {
+        DriverError::Busy
+      } else {
+        DriverError::DriverGone
+      });
     }
     rx.await.map_err(|_| DriverError::ReplyDropped)
   }
 
   /// Request shutdown and await teardown completion.
   ///
+  /// The returned future resolves only after the driver has fully RELEASED its socket/listener
+  /// fd — the fd is closed, not merely scheduled to close — so the address the driver was bound
+  /// to is immediately rebindable: constructing a new driver on the same address right after this
+  /// returns must succeed.
+  ///
   /// # Errors
   /// [`DriverError::DriverGone`] if the driver task has already stopped.
   pub async fn shutdown(&self) -> Result<(), DriverError> {
     let (ack, rx) = futures_channel::oneshot::channel();
-    self
-      .commands
-      .send_async(Command::Shutdown { ack })
-      .await
-      .map_err(|_| DriverError::DriverGone)?;
+    // A fresh sender clone starts unparked with its own guaranteed channel slot, so the Shutdown
+    // enqueues immediately even when the buffer is full of submits; the only send failure is a
+    // closed channel — the driver is already gone.
+    let mut commands = self.commands().clone();
+    if commands.try_send(Command::Shutdown { ack }).is_err() {
+      return Err(DriverError::DriverGone);
+    }
     rx.await.map_err(|_| DriverError::ReplyDropped)
   }
 
@@ -148,10 +188,18 @@ mod tests {
   };
   use bytes::Bytes;
 
+  /// `Handle` must stay `Send + Sync`: it is the one object meant to cross threads (any thread may
+  /// `submit` to any group), so the command-sender wrapping may not cost it either auto trait.
+  #[test]
+  fn handle_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Handle>();
+  }
+
   #[test]
   fn submit_sends_a_command_carrying_its_reply_channel() {
-    // CMD_CAP-sized (bounded) channel; the budget starts empty.
-    let (tx, rx) = flume::bounded::<Command>(8);
+    // cmd_cap-sized (bounded) channel; the budget starts empty.
+    let (tx, mut rx) = futures_channel::mpsc::channel::<Command>(8);
     let (_events_tx, events_rx) = flume::unbounded();
     let handle = Handle::new(
       tx,
@@ -182,36 +230,46 @@ mod tests {
     }
   }
 
-  /// A `submit` that cannot enqueue (the bounded command channel is full) returns `Busy` and ROLLS
-  /// BACK its budget reservation — it never leaks a slot for a command the driver never sees. After
-  /// the rollback the count is back to zero, so the budget is not silently exhausted by refused
-  /// submits.
+  /// A `submit` the command channel refuses returns `Busy` and ROLLS BACK its budget reservation —
+  /// it never leaks a slot for a command the driver never sees. The channel admits its buffer plus
+  /// one in-flight command per live sender (this `Handle` is the one sender here), so with a 1-slot
+  /// buffer the first TWO submits enqueue and the THIRD is the refused one; after the rollback the
+  /// count stays at the two live submits, so the budget is not silently exhausted by refused
+  /// submits. (In production the submit budget binds first — `cmd_cap` exceeds `max_inflight` — so
+  /// this refusal is the defensive mapping, not the steady-state bound.)
   #[test]
   fn submit_on_a_full_command_channel_is_busy_and_rolls_back_budget() {
-    let (tx, _rx) = flume::bounded::<Command>(1);
+    let (tx, _rx) = futures_channel::mpsc::channel::<Command>(1);
     let (_events_tx, events_rx) = flume::unbounded();
     let budget = InflightBudget::new(MAX_INFLIGHT, MAX_PENDING_BYTES);
     let handle = Handle::new(tx, events_rx, budget.clone());
     let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
 
-    // Fill the 1-slot channel with a first submit (parks on its reply).
+    // Fill the 1-slot buffer, then the sender's guaranteed slot: both submits park on their replies.
     let fut1 = handle.submit(Bytes::from_static(b"a"));
     futures_util::pin_mut!(fut1);
     let _ = std::future::Future::poll(fut1, &mut cx);
-    assert_eq!(budget.count(), 1, "the first submit holds one reservation");
-
-    // The channel is now full: the next submit must be Busy and leave the budget at 1 (its own
-    // reservation rolled back), not 2.
     let fut2 = handle.submit(Bytes::from_static(b"b"));
     futures_util::pin_mut!(fut2);
-    match std::future::Future::poll(fut2, &mut cx) {
+    let _ = std::future::Future::poll(fut2, &mut cx);
+    assert_eq!(
+      budget.count(),
+      2,
+      "the enqueued submits hold their reservations"
+    );
+
+    // The channel now refuses this sender: the next submit must be Busy and leave the budget at 2
+    // (its own reservation rolled back), not 3.
+    let fut3 = handle.submit(Bytes::from_static(b"c"));
+    futures_util::pin_mut!(fut3);
+    match std::future::Future::poll(fut3, &mut cx) {
       std::task::Poll::Ready(Err(DriverError::Busy)) => {}
-      other => panic!("expected Ready(Err(Busy)) on a full command channel, got {other:?}"),
+      other => panic!("expected Ready(Err(Busy)) on a refusing command channel, got {other:?}"),
     }
     assert_eq!(
       budget.count(),
-      1,
-      "a Busy submit rolls back its reservation: the count stays at the one live submit"
+      2,
+      "a Busy submit rolls back its reservation: the count stays at the live submits"
     );
   }
 
@@ -221,7 +279,7 @@ mod tests {
   /// `MAX_FRAME_LEN`) never reserves a slot nor enqueues a command — it cannot hang or pin the budget.
   #[test]
   fn submit_over_the_max_body_is_rejected_without_touching_budget_or_channel() {
-    let (tx, rx) = flume::bounded::<Command>(8);
+    let (tx, mut rx) = futures_channel::mpsc::channel::<Command>(8);
     let (_events_tx, events_rx) = flume::unbounded();
     let budget = InflightBudget::new(MAX_INFLIGHT, MAX_PENDING_BYTES);
     let handle = Handle::new(tx, events_rx, budget.clone());

@@ -153,6 +153,13 @@ impl DriverConfig {
   /// `max_inflight` so the submit budget — not this queue — is the binding limit on concurrent
   /// submits (every reservation the budget admits has a queue slot), and the `+ 1` leaves room for
   /// a `Shutdown` to enqueue alongside a full submit backlog.
+  ///
+  /// This is the futures-mpsc BUFFER size; the channel actually admits `cmd_cap` plus one
+  /// in-flight command per live sender (each sender owns a guaranteed slot on top of the shared
+  /// buffer). That slack never weakens the submit bound — a `Submit` cannot exist without a budget
+  /// reservation acquired BEFORE it is sent, so at most `max_inflight` of them are alive anywhere
+  /// (queued or pending) regardless of channel slack — and it is what lets a `Shutdown` (sent on a
+  /// fresh sender clone) always enqueue immediately.
   #[inline(always)]
   pub const fn cmd_cap(&self) -> usize {
     self.max_inflight + 1

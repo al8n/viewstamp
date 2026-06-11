@@ -492,6 +492,146 @@ async fn stream_driver_exits_when_all_handles_dropped() {
     .expect("driver.run() returns within 5s after the last Handle is dropped");
 }
 
+/// SHUTDOWN-ACK REBIND BARRIER (stream): `Handle::shutdown().await` resolves only after the
+/// driver's listener fd is fully RELEASED — the accept task's listener clone and its in-flight
+/// `accept()` reference are gone and the fd closed — so constructing a new driver bound to the
+/// SAME address IMMEDIATELY after the ack must succeed. The await of the ack is the ONLY
+/// synchronization: unlike the restart gate (which also awaits the victim's run task before
+/// rebinding), this pins the ack itself as the barrier. A live prior listener fails the rebind
+/// with `DriverError::Bind` even under `SO_REUSEADDR` (that option only bypasses `TIME_WAIT`
+/// remnants, not a still-open listener). An ack sent before the fd release (a `JoinHandle`-drop
+/// teardown alone, whose cancel is only marked + scheduled) races the runtime's cancel
+/// processing; looping the cycle pins the contract rather than one lucky pass.
+#[compio::test]
+async fn shutdown_ack_frees_the_address_for_immediate_rebind_stream() {
+  let mk_dialer = |me: u8| -> Rc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>>> {
+    Rc::new(move |_peer| {
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+    })
+  };
+  let mk_acceptor = |me: u8| -> Rc<dyn Fn() -> Conn<Labeled<Passthrough>>> {
+    Rc::new(move || {
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+    })
+  };
+
+  let bind: SocketAddr = "127.0.0.1:45600".parse().unwrap();
+  for i in 0..5 {
+    // Iterations 1.. bind the address the PREVIOUS iteration's driver just released: this
+    // constructor succeeding immediately after the ack is the assertion.
+    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+    let (ready_tx, ready_rx) = flume::unbounded();
+    let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
+    let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
+      config,
+      viewstamp_simulation::sm::LogSm::default(),
+      wal,
+      sb,
+      viewstamp_proto::ClientId::new(1),
+      0,
+      bind,
+      Vec::new(), // no peers: nothing dials, the node just binds + runs
+      mk_dialer(0),
+      mk_acceptor(0),
+      ready_rx,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("rebind #{i} immediately after the ack succeeds: {e:?}"));
+    compio::runtime::spawn(driver.run()).detach();
+    handle
+      .shutdown()
+      .await
+      .unwrap_or_else(|e| panic!("shutdown #{i} acks teardown: {e:?}"));
+    // The command channel is non-admitting once the ack arrives: a surviving clone's submit takes
+    // the disconnected path immediately (no parked command, no pinned reservation).
+    let post = handle.submit(bytes::Bytes::from_static(b"post-ack")).await;
+    assert!(
+      matches!(post, Err(viewstamp_compio::DriverError::DriverGone)),
+      "a post-ack submit is DriverGone, got {post:?}"
+    );
+  }
+}
+
+/// The shutdown ack releases driver-held QUEUED resources, not just the listener: a completed dial
+/// whose `TcpStream` is still in flight toward the run loop (queued as a dial completion, or just
+/// promoted to an unvalidated conn) must be closed by the time `shutdown().await` resolves — on
+/// either path (the teardown drains the dial-completion queue; cleared conns cancel their tasks).
+/// The witness is the test-held PEER socket: it reads EOF/reset within a short bound after the ack.
+/// A regression that acks while the queued stream is still alive leaves the peer read blocked.
+#[compio::test]
+async fn shutdown_releases_a_queued_dial_completion() {
+  let mk_dialer = |me: u8| -> Rc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>>> {
+    Rc::new(move |_peer| {
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+    })
+  };
+  let mk_acceptor = |me: u8| -> Rc<dyn Fn() -> Conn<Labeled<Passthrough>>> {
+    Rc::new(move || {
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+    })
+  };
+
+  // A raw listener the driver will dial; the test accepts the connection and never speaks the
+  // protocol, so the driver-side stream stays queued/unvalidated until teardown releases it.
+  let raw = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let peer_addr = raw.local_addr().unwrap();
+
+  let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+  let (ready_tx, ready_rx) = flume::unbounded();
+  let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
+  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
+    config,
+    viewstamp_simulation::sm::LogSm::default(),
+    wal,
+    sb,
+    viewstamp_proto::ClientId::new(1),
+    0,
+    "127.0.0.1:45620".parse().unwrap(),
+    vec![(ReplicaId::new(1), peer_addr)],
+    mk_dialer(0),
+    mk_acceptor(0),
+    ready_rx,
+  )
+  .await
+  .unwrap();
+  compio::runtime::spawn(driver.run()).detach();
+
+  // The driver's dial lands here; hold the peer end open and silent.
+  let (peer_stream, _) = raw.accept().await.unwrap();
+
+  handle.shutdown().await.unwrap();
+
+  // The ack barrier: the driver-side stream is gone (drained from the queue or torn down with the
+  // conn table), so this end observes EOF/reset within a short bound rather than blocking.
+  // Drain until EOF/reset: depending on how far the dial got before the ack, the peer may first
+  // receive the driver's hello bytes (the dialer speaks first once a bridge starts); the assertion
+  // is that the stream CLOSES within the bound, on either teardown path.
+  let read = compio::time::timeout(std::time::Duration::from_secs(3), async {
+    use compio::io::AsyncRead;
+    let mut s = peer_stream;
+    let mut buf = vec![0u8; 64];
+    loop {
+      let compio::buf::BufResult(res, returned) = s.read(buf).await;
+      buf = returned;
+      match res {
+        Ok(0) | Err(_) => return, // EOF or reset: the driver-side fd is released
+        Ok(_) => {}               // hello bytes from a briefly-live bridge: keep draining
+      }
+    }
+  })
+  .await;
+  assert!(
+    read.is_ok(),
+    "the peer socket stayed open past the shutdown ack"
+  );
+}
+
 /// Accept-side admission control: a peer that completes the TCP connect but sends NOTHING (no
 /// `Labeled` hello, so the conn never validates) must NOT pin a connection slot forever — the driver
 /// reaps it at `AUTH_DEADLINE` (5 s). We build a 1-node driver (no peers, so the ONLY conn is the
