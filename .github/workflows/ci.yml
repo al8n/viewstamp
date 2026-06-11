@@ -114,9 +114,11 @@ jobs:
       - name: Install Rust
         run: rustup update stable && rustup default stable
       - name: cargo build --target ${{ matrix.target }}
+        # The portable core only: the compio driver crate is native-only (io_uring/kqueue/IOCP)
+        # and pulls C crypto that needs a per-target cross toolchain.
         run: |
           rustup target add ${{ matrix.target }}
-          cargo build --target ${{ matrix.target }}
+          cargo build --target ${{ matrix.target }} -p viewstamp-proto
 
   # Prove the declared MSRV (rust-version in every crate's Cargo.toml) actually compiles the
   # feature set CI ships. The MSRV-aware resolver (workspace resolver = "3") picks 1.95-compatible
@@ -168,7 +170,9 @@ jobs:
       with:
         tool: cargo-deny
     - name: Run cargo deny
-      run: cargo deny check
+      # A fresh lockfile so the check sees the resolution the declared rust-version actually
+      # produces (a restored cache could otherwise pin dependencies resolved under an older MSRV).
+      run: cargo generate-lockfile && cargo deny check
 
   # Prove the no_std core (viewstamp-proto) links on a real bare-metal target with
   # only `alloc` and no `std`. Any accidental std dependency fails to build here.
