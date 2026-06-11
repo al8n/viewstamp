@@ -126,6 +126,13 @@ pub struct CompioQuicDriver<S, W, B, I> {
   /// (`while self.storage_ready.try_recv().is_ok() {}`), so the driver retains at most the in-flight
   /// signals queued within one iteration — no per-submit growth.
   storage_ready: flume::Receiver<()>,
+  /// Latched once every notifier sender has dropped. The notifier is a wake-latency optimization,
+  /// not a liveness dependency — `pump_outputs` runs `handle_storage` every iteration regardless —
+  /// so an embedder dropping every clone merely downgrades storage completions to timer cadence.
+  /// The latch is what makes that degradation SAFE: a disconnected flume receiver resolves
+  /// `recv_async` immediately (and forever), so without it the dead channel would turn the storage
+  /// arm into an always-ready select winner and the loop into a hot spin that never parks.
+  storage_notifier_closed: bool,
 }
 
 impl<S, W, B> CompioQuicDriver<S, W, B, ProvidedIdentity>
@@ -276,6 +283,7 @@ where
       commands: commands_rx,
       events: events_tx,
       storage_ready,
+      storage_notifier_closed: false,
     };
     let handle = Handle::new(commands_tx, events_rx, budget);
     Ok((driver, handle))
@@ -384,17 +392,26 @@ where
       // only writes a captured local; no whole-`self` work happens in an arm. All four arms are
       // plain channel/timer waits — the socket I/O itself lives in the recv task and
       // `pump_outputs` — so a losing arm never cancels an in-flight socket op.
-      let (inbound, fire_timeout, command, exit) = {
+      let (inbound, fire_timeout, command, exit, storage_closed) = {
         let recv_fut = recv_rx.recv_async().fuse();
         let timer_fut = compio::time::sleep_until(deadline).fuse();
         let cmd_fut = self.commands.recv().fuse();
-        let storage_fut = self.storage_ready.recv_async().fuse();
+        // A disconnected notifier resolves `recv_async` immediately and forever; once latched the
+        // arm parks on a never-ready future so the dead channel cannot keep the select hot (see
+        // the `storage_notifier_closed` field).
+        let storage_fut = if self.storage_notifier_closed {
+          futures_util::future::pending::<Result<(), flume::RecvError>>().right_future()
+        } else {
+          self.storage_ready.recv_async().left_future()
+        }
+        .fuse();
         futures_util::pin_mut!(recv_fut, timer_fut, cmd_fut, storage_fut);
 
         let mut inbound: Option<(Vec<u8>, SocketAddr)> = None;
         let mut fire_timeout = false;
         let mut command: Option<Command> = None;
         let mut exit = false;
+        let mut storage_closed = false;
 
         select_biased! {
             // `Err` (a closed channel) is unreachable while this scope holds `recv_task`: the
@@ -406,11 +423,14 @@ where
             cmd = cmd_fut => {
                 match cmd { Ok(c) => command = Some(c), Err(_) => exit = true }
             }
-            _ = storage_fut => {}
+            s = storage_fut => { storage_closed = s.is_err(); }
         }
-        (inbound, fire_timeout, command, exit)
+        (inbound, fire_timeout, command, exit, storage_closed)
       };
       while self.storage_ready.try_recv().is_ok() {}
+      if storage_closed {
+        self.storage_notifier_closed = true;
+      }
       if exit {
         break;
       }
@@ -1387,5 +1407,23 @@ mod tests {
     );
     drop(survivor);
     drop(handle);
+  }
+
+  /// The storage notifier is a wake-latency optimization the embedder may not wire at all:
+  /// dropping every sender clone must DOWNGRADE storage pumping to timer cadence, not turn the
+  /// dead channel into an always-ready select arm. The fixture's notifier is already
+  /// disconnected, so this drives the production `run()` loop on the single-threaded executor and
+  /// hands it the thread: a spinning loop would starve the timer driver and the sleep below would
+  /// never fire (a HANG here is the regression); parked correctly, the sleep elapses and the
+  /// shutdown acks within its bound.
+  #[compio::test]
+  async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
+    let (driver, handle) = test_quic_driver_with_handle().await;
+    compio::runtime::spawn(driver.run()).detach();
+    compio::time::sleep(std::time::Duration::from_millis(10)).await;
+    compio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+      .await
+      .expect("the shutdown ack arrives")
+      .expect("driver acks shutdown");
   }
 }

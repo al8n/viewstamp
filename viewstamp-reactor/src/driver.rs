@@ -93,6 +93,13 @@ pub struct ReactorQuicDriver<R: Runtime, S, W, B, I> {
   /// (`while self.storage_ready.try_recv().is_ok() {}`), so the driver retains at most the in-flight
   /// signals queued within one iteration — no per-submit growth.
   storage_ready: flume::Receiver<()>,
+  /// Latched once every notifier sender has dropped. The notifier is a wake-latency optimization,
+  /// not a liveness dependency — `pump_outputs` runs `handle_storage` every iteration regardless —
+  /// so an embedder dropping every clone merely downgrades storage completions to timer cadence.
+  /// The latch is what makes that degradation SAFE: a disconnected flume receiver resolves
+  /// `recv_async` immediately (and forever), so without it the dead channel would turn the storage
+  /// arm into an always-ready select winner and the loop into a hot spin that never parks.
+  storage_notifier_closed: bool,
 }
 
 impl<R, S, W, B> ReactorQuicDriver<R, S, W, B, ProvidedIdentity>
@@ -246,6 +253,7 @@ where
       commands: commands_rx,
       events: events_tx,
       storage_ready,
+      storage_notifier_closed: false,
     };
     let handle = Handle::new(commands_tx, events_rx, budget);
     Ok((driver, handle))
@@ -267,8 +275,11 @@ where
   /// helper task holds a clone), so the teardown's `drop` of the socket closes the fd
   /// synchronously, and an embedder may bind a new driver to the same address the moment
   /// `shutdown().await` (or an awaited `run()` task) returns. Cancelling the `run()` future
-  /// itself (dropping its spawn handle, where the runtime's drop cancels) releases the fd just as
-  /// promptly: dropping the future drops the whole driver, socket included.
+  /// itself releases the fd just as promptly — dropping the future drops the whole driver,
+  /// socket included — but reaching that cancellation is runtime-specific: aborting the spawned
+  /// task cancels everywhere, while dropping a raw spawn handle does NOT (tokio detaches, leaving
+  /// the task running and the socket owned; smol cancels). The portable stop paths are
+  /// [`Handle::shutdown`], dropping every `Handle`, or an explicit task abort.
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 
@@ -354,7 +365,7 @@ where
       // plain restartable waits, and the readiness `recv_from` consumes nothing unless it
       // completed — a datagram it did not return stays in the kernel buffer for the next
       // iteration's arm.
-      let (inbound, recv_err, fire_timeout, command, exit) = {
+      let (inbound, recv_err, fire_timeout, command, exit, storage_closed) = {
         let recv_fut = match self.recv_backoff_until {
           // The recv arm IS the socket read: a by-ref readiness receive into the driver-lifetime
           // buffer, cancel-safe to lose.
@@ -369,7 +380,15 @@ where
         let timer_fut =
           R::sleep(deadline.saturating_duration_since(std::time::Instant::now())).fuse();
         let cmd_fut = self.commands.recv().fuse();
-        let storage_fut = self.storage_ready.recv_async().fuse();
+        // A disconnected notifier resolves `recv_async` immediately and forever; once latched the
+        // arm parks on a never-ready future so the dead channel cannot keep the select hot (see
+        // the `storage_notifier_closed` field).
+        let storage_fut = if self.storage_notifier_closed {
+          futures_util::future::pending::<Result<(), flume::RecvError>>().right_future()
+        } else {
+          self.storage_ready.recv_async().left_future()
+        }
+        .fuse();
         futures_util::pin_mut!(recv_fut, timer_fut, cmd_fut, storage_fut);
 
         let mut inbound: Option<(usize, SocketAddr)> = None;
@@ -377,6 +396,7 @@ where
         let mut fire_timeout = false;
         let mut command: Option<Command> = None;
         let mut exit = false;
+        let mut storage_closed = false;
 
         select_biased! {
             got = recv_fut => {
@@ -389,11 +409,21 @@ where
             cmd = cmd_fut => {
                 match cmd { Ok(c) => command = Some(c), Err(_) => exit = true }
             }
-            _ = storage_fut => {}
+            s = storage_fut => { storage_closed = s.is_err(); }
         }
-        (inbound, recv_err, fire_timeout, command, exit)
+        (
+          inbound,
+          recv_err,
+          fire_timeout,
+          command,
+          exit,
+          storage_closed,
+        )
       };
       while self.storage_ready.try_recv().is_ok() {}
+      if storage_closed {
+        self.storage_notifier_closed = true;
+      }
       if exit {
         break;
       }
@@ -1376,5 +1406,23 @@ mod tests {
     );
     drop(survivor);
     drop(handle);
+  }
+
+  /// The storage notifier is a wake-latency optimization the embedder may not wire at all:
+  /// dropping every sender clone must DOWNGRADE storage pumping to timer cadence, not turn the
+  /// dead channel into an always-ready select arm. The fixture's notifier is already
+  /// disconnected, so this drives the production `run()` loop on the single-thread test flavor
+  /// and hands it the worker: a spinning loop would monopolize the thread and never schedule this
+  /// task again (a HANG here is the regression); parked correctly, every yield returns and the
+  /// shutdown acks.
+  #[tokio::test]
+  async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
+    let (driver, handle) = test_quic_driver_with_handle().await;
+    let task = tokio::spawn(driver.run());
+    for _ in 0..8 {
+      tokio::task::yield_now().await;
+    }
+    handle.shutdown().await.expect("driver acks shutdown");
+    task.await.expect("run() returns after the ack");
   }
 }

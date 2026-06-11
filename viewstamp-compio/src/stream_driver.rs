@@ -177,6 +177,13 @@ pub struct CompioStreamDriver<S, R, W, B> {
   /// (`while self.storage_ready.try_recv().is_ok() {}`), so the driver retains at most the in-flight
   /// signals queued within one iteration — no per-submit growth.
   storage_ready: flume::Receiver<()>,
+  /// Latched once every notifier sender has dropped. The notifier is a wake-latency optimization,
+  /// not a liveness dependency — `pump_outputs` runs `handle_storage` every iteration regardless —
+  /// so an embedder dropping every clone merely downgrades storage completions to timer cadence.
+  /// The latch is what makes that degradation SAFE: a disconnected flume receiver resolves
+  /// `recv_async` immediately (and forever), so without it the dead channel would turn the storage
+  /// arm into an always-ready select winner and the loop into a hot spin that never parks.
+  storage_notifier_closed: bool,
 }
 
 impl<S, R, W, B> CompioStreamDriver<S, R, W, B>
@@ -313,6 +320,7 @@ where
       dial_ready_tx: dr_tx,
       dial_ready_rx: dr_rx,
       storage_ready,
+      storage_notifier_closed: false,
     };
     let handle = Handle::new(commands_tx, events_rx, budget);
     Ok((driver, handle))
@@ -471,13 +479,23 @@ where
       let mut command = None;
       let mut inbound = None;
       let mut dial_ready = None;
+      let mut storage_closed = false;
       {
         let accept_fut = accept_rx.recv_async().fuse();
         let timer_fut = compio::time::sleep_until(deadline).fuse();
         let cmd_fut = self.commands.recv().fuse();
         let inbound_fut = self.bridge_inbound_rx.recv_async().fuse();
         let dial_fut = self.dial_ready_rx.recv_async().fuse();
-        let storage_fut = self.storage_ready.recv_async().fuse();
+        // A disconnected notifier resolves `recv_async` immediately and forever; once latched the
+        // arm parks on a never-ready future so the dead channel cannot keep the select hot (see
+        // the `storage_notifier_closed` field). The inbound/dial arms are immune by construction:
+        // the driver retains a sender clone of each for the conns it has yet to mint.
+        let storage_fut = if self.storage_notifier_closed {
+          futures_util::future::pending::<Result<(), flume::RecvError>>().right_future()
+        } else {
+          self.storage_ready.recv_async().left_future()
+        }
+        .fuse();
         futures_util::pin_mut!(
           accept_fut,
           timer_fut,
@@ -497,8 +515,11 @@ where
           c = cmd_fut => { command = Some(c); }
           i = inbound_fut => { if let Ok(i) = i { inbound = Some(i); } }
           d = dial_fut => { if let Ok(d) = d { dial_ready = Some(d); } }
-          _ = storage_fut => {}
+          s = storage_fut => { storage_closed = s.is_err(); }
         }
+      }
+      if storage_closed {
+        self.storage_notifier_closed = true;
       }
       let now = self.clock.now();
 
@@ -2394,5 +2415,23 @@ mod tests {
     );
     drop(survivor);
     drop(handle);
+  }
+
+  /// The storage notifier is a wake-latency optimization the embedder may not wire at all:
+  /// dropping every sender clone must DOWNGRADE storage pumping to timer cadence, not turn the
+  /// dead channel into an always-ready select arm. The fixture's notifier is already
+  /// disconnected, so this drives the production `run()` loop on the single-threaded executor and
+  /// hands it the thread: a spinning loop would starve the timer driver and the sleep below would
+  /// never fire (a HANG here is the regression); parked correctly, the sleep elapses and the
+  /// shutdown acks within its bound.
+  #[compio::test]
+  async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
+    let (driver, handle) = test_driver_with_handle().await;
+    compio::runtime::spawn(driver.run()).detach();
+    compio::time::sleep(std::time::Duration::from_millis(10)).await;
+    compio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+      .await
+      .expect("the shutdown ack arrives")
+      .expect("driver acks shutdown");
   }
 }
