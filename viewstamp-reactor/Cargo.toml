@@ -5,10 +5,30 @@ edition = "2024"
 rust-version = "1.95"
 repository = "https://github.com/al8n/viewstamp"
 license = "MIT OR Apache-2.0"
-description = "Reactor (tokio/async-io) driver for viewstamp-proto (implemented in M6)"
+description = "Reactor-I/O (tokio/smol via agnostic) driver for viewstamp-proto"
+
+[features]
+# Pull in a concrete `agnostic` runtime for embedders that want one wired here; the driver itself
+# is generic over any `agnostic::Runtime` and needs neither feature to compile.
+tokio = ["agnostic/tokio"]
+smol = ["agnostic/smol"]
 
 [dependencies]
-viewstamp-proto = { workspace = true }
+viewstamp-proto = { workspace = true, features = ["std", "quic", "tls-rustls-ring"] }
+viewstamp-driver = { workspace = true }
+agnostic = { workspace = true, features = ["net"] }
+agnostic-lite = { workspace = true, features = ["time"] }
+bytes = { workspace = true, features = ["std"] }
+flume = { workspace = true }
+futures-channel = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+viewstamp-simulation = { workspace = true }
+agnostic = { workspace = true, features = ["net", "tokio"] }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true
