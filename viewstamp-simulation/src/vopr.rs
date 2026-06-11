@@ -161,8 +161,8 @@ pub struct VoprReport {
   /// [`MAX_FRAME_LEN`] (the modelled send-path frame guard). For the protocol's own traffic this MUST
   /// stay `0`: header-only carriers + the byte-bounded `RepairBatch` keep every legitimate peer message
   /// at/below the cap regardless of body size. A non-zero value is a REAL bug (a carrier overflowed
-  /// the frame — the old full-body view-change defect, or an incomplete bound); `run_vopr` asserts it
-  /// stays `0` every tick, so such a regression fails fast with its seed + tick.
+  /// the frame, or a bound is incomplete); `run_vopr` asserts it stays `0` every tick, so such a
+  /// regression fails fast with its seed + tick.
   oversized_dropped: u64,
   /// How many messages the virtual network HELD this run ([`Faults::hold_per_mille`] fired — delivery
   /// pushed far into the virtual future, past the proto's repair-or-truncate grace). `0` unless the
@@ -616,9 +616,8 @@ pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
 /// one process cannot race each other's schedules). A hold-enabled run is still a pure function of
 /// `(seed, ticks)` and is byte-identical to a `VOPR_HOLD=1` run of the same seed; it is its OWN
 /// deterministic baseline, distinct from the default schedule (the hold axis consumes extra PRNG
-/// draws). This is the entry point for the committed hold sweep, so the axis that reaches the
-/// op-reuse / stale-vote class (a held message outliving its op's truncation + re-mint) runs in every
-/// gate rather than only when the env var is set by hand.
+/// draws). The entry point for the committed hold sweep — the axis that reaches the op-reuse /
+/// stale-vote class (a held message outliving its op's truncation + re-mint).
 pub fn run_vopr_with_hold(seed: u64, ticks: u64) -> VoprReport {
   let mut v = Vopr::new(seed);
   v.hold_axis = true;
@@ -667,7 +666,7 @@ pub fn run_vopr_with_torn_headers(seed: u64, ticks: u64) -> VoprReport {
 /// default schedule's partitions are SYMMETRIC (group membership: either side sees the other, or
 /// neither does); this axis installs DIRECTED blocks — `blocked[from][to]` drops `from → to` while
 /// `to → from` flows — the one-way reachability real networks produce (a half-dead NIC, an
-/// asymmetric route/firewall) and the shape the forfeit/idle machinery has otherwise never faced.
+/// asymmetric route/firewall).
 /// The liveness-killer instance is a DEAF primary: its heartbeats flow OUT (suppressing the backups'
 /// idle view-change timers) while the acks never ARRIVE (nothing commits) — so the victim draw
 /// biases toward a current primary half the time. Victims count against the same minority budget as
@@ -929,9 +928,9 @@ impl Vopr {
       4 + self.prng.below(9)
     };
     // seed-derive a PHYSICAL bounded-WAL ring for ~1/3 of seeds (the rest keep the
-    // UNBOUNDED default), so the adversarial sweep finally EXERCISES wrap (stall-before-wrap + recover
-    // off a wrapped ring + a below-ring-window backup overflow) UNDER the full fault schedule — crash +
-    // partition + disk faults together — covering the "VOPR-green overstates safety" gap.
+    // UNBOUNDED default), so the adversarial sweep EXERCISES wrap (stall-before-wrap + recover off a
+    // wrapped ring + a below-ring-window backup overflow) UNDER the full fault schedule — crash +
+    // partition + disk faults together.
     //
     // CRITICAL headroom constraint: the primary stalls op-assignment so the un-pruned window
     // `(prune_floor, op]` never exceeds `N` slots, and that stall RELEASES only as the quorum checkpoint
@@ -979,9 +978,8 @@ impl Vopr {
     let delay = 1 + self.prng.below(4) as u32;
     c.set_async_wal_delay(Some(delay));
     // Async SUPERBLOCK: a per-write in-flight window of 1..=4 polls (the pending durable-view window
-    // the durable-view-before-participate gate must survive. With the superblock
-    // completing synchronously the `pending_sb` window never opened, so the VOPR could not probe it;
-    // staging the view-change/checkpoint root writes opens it. Seeded per-run; a `crash` discards any
+    // the durable-view-before-participate gate must survive; a synchronously-completing superblock
+    // never opens it). Seeded per-run; a `crash` discards any
     // in-flight write so a not-yet-durable view is genuinely lost.
     // The `sb_delay` is drawn UNCONDITIONALLY (determinism); `VOPR_NO_ASYNC_SB` only suppresses
     // APPLYING it, so a shrink run stays on the exact same PRNG stream/schedule — for root-causing
@@ -1400,8 +1398,7 @@ impl Vopr {
           eprintln!("tick {tick}: HEAL partition");
         }
         // `Cluster::heal` restores FULL connectivity (groups + one-way blocks), so the driver-side
-        // victim bookkeeping must clear with it — the helper keeps both sides in sync. (With the
-        // asym axis off the victim set is always empty and this is exactly the old groups-only heal.)
+        // victim bookkeeping must clear with it — the helper keeps both sides in sync.
         self.heal_all_partitions(c);
         self.report.heals += 1;
       }
@@ -1677,8 +1674,8 @@ impl Vopr {
     // header-only view-change carriers + the byte-bounded `RepairBatch` keep every peer message
     // at/below `MAX_FRAME_LEN` regardless of body size, so the modelled send-path drop must NEVER fire
     // for the protocol's own traffic — even while large client bodies build a deep uncheckpointed band.
-    // A drop here is a REAL bug (a carrier overflowed the frame — the old full-body view-change
-    // defect, or an incomplete bound), located by seed + tick. (Loosening the cap to pass would mask it.)
+    // A drop here is a REAL bug (a carrier overflowed the frame, or a bound is incomplete), located
+    // by seed + tick. (Loosening the cap to pass would mask it.)
     if c.oversized_dropped() > 0 {
       panic!(
         "vopr seed {} tick {tick}: frame-cap: a legitimate inter-replica message exceeded \
@@ -1819,7 +1816,7 @@ impl Vopr {
   /// resident map by op number, so a later congruent op being resident is the exact, unambiguous physical
   /// signature of `op` having been overwritten. (Also bound by `commit_min`, not `head`: a backup can
   /// ADOPT a head far ahead of its resident tail with a legitimate un-repaired uncommitted `Empty` gap —
-  /// a backup can adopt a head far ahead of its resident tail, e.g. head=1436 over commit_min=1401, which is repair territory, not a wrap.)
+  /// e.g. head=1436 over commit_min=1401 — which is repair territory, not a wrap.)
   ///
   /// This is the observable analogue of the proto's permanent `append_prepare` debug-assert (which panics
   /// at append time if any append would overwrite an un-pruned slot): both backstop the stall-before-wrap
@@ -1988,7 +1985,7 @@ impl Vopr {
       }
       self.sync_chunk_transfers_seen[i] = transfers;
     }
-    // New-path witnesses: floored canonical unions, served `RepairBatch`es, header-only carriers.
+    // Non-vacuity witnesses: floored canonical unions, served `RepairBatch`es, header-only carriers.
     // All three live on the `Endpoint` and reset to 0 on `recover`, so they use the SAME reset-robust
     // positive-delta accumulation as `forced_syncs` above (a plain high-water would lose a
     // pre-restart burst). The sweeps assert their cross-seed sums are `> 0` (non-vacuity).

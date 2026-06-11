@@ -8,7 +8,7 @@ use viewstamp_proto::{
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// One in `LARGE_BODY_DENOM` requests (seeded, per client+request) carries a LARGE body instead of
-/// the default 8 bytes — the rest stay small. Kept rare so most of the schedule is unchanged: the
+/// the default 8 bytes — the rest stay small. Kept rare so most requests stay cheap: the
 /// large ones are what build a large-bodied uncheckpointed band that rides the (header-only)
 /// view-change carriers + the byte-bounded `RepairBatch` repair serve.
 const LARGE_BODY_DENOM: u32 = 12;
@@ -17,15 +17,15 @@ const LARGE_BODY_DENOM: u32 = 12;
 /// every single-message carrier — `Request`/`Prepare`/single-entry `RepairBatch` — by construction).
 /// A large request draws a size in `[1, max_request_body_len() / LARGE_BODY_DIVISOR]` ≈ `[1, 64 KiB]`.
 /// Well under the per-message bound, so any single `Prepare`/`Request` stays far below the frame cap (a
-/// legitimate single-message carrier is NEVER oversized-dropped), while a DEEP band of such ops — were
-/// it carried full-bodied as the OLD view-change carriers did — would sum past the frame: the overflow
-/// the header-only carriers now avoid, and what makes `oversized_dropped == 0` a real oracle as large
+/// legitimate single-message carrier is NEVER oversized-dropped), while a DEEP band of such ops,
+/// carried full-bodied, would sum past the frame: the overflow header-only carriers exist to avoid,
+/// and what makes `oversized_dropped == 0` a real oracle as large
 /// bodies flow through view-change/recovery. ~64 KiB (not the multi-MiB `max`) is the sweet spot: still
 /// ~8000× the 8-byte default — genuinely large, building a non-trivial band — yet small enough that the
 /// MiB-scale clone/encode churn (broadcast × duplicate × thousands of ticks × up to 6 replicas) does
 /// NOT blow the VOPR's wall-clock. The frame-overflow CONVERSE (a full-bodied band would be dropped) is
 /// proven separately with near-`max` bodies in the focused proto + `cluster.rs` unit tests, so the
-/// sweep does not need maximal bodies to make the cap a real, would-have-caught-the-bug oracle.
+/// sweep does not need maximal bodies for the cap to stay a real oracle.
 const LARGE_BODY_DIVISOR: usize = 256;
 
 /// The minimum LARGE-body size (bytes). A "large" request is floored here so it is ALWAYS strictly
