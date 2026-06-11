@@ -3,7 +3,7 @@ members = [
   "viewstamp-proto",
   "viewstamp-compio",
   "viewstamp-reactor",
-  "viewstamp-simulation",
+  "tests/viewstamp-simulation",
 ]
 # The fuzz harness is its own nested workspace (nightly + libFuzzer instrumentation); keep it out
 # of the stable workspace and its feature-powerset sweeps.
@@ -22,7 +22,7 @@ futures-channel = { version = "0.3", default-features = false, features = ["std"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-viewstamp-simulation = { path = "viewstamp-simulation", version = "0.0.0" }
+viewstamp-simulation = { path = "tests/viewstamp-simulation", version = "0.0.0" }
 
 [profile.bench]
 opt-level = 3
