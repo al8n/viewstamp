@@ -37,9 +37,10 @@ against a genuinely malicious replica — signatures, BFT voting — is out of s
 | Crate | What it is |
 |---|---|
 | [`viewstamp-proto`](viewstamp-proto) | The Sans-I/O consensus core (`no_std` + `alloc` capable), plus feature-gated Sans-I/O transports: `tcp` (length-prefixed framing + connection lifecycle + peer routing), `tls` (rustls record layer), `quic` (quinn-proto with mandatory cluster-private mTLS). |
+| [`viewstamp-driver`](viewstamp-driver) | The runtime-agnostic driver core shared by both driver crates: the embedder `Handle`/`Command` surface, in-flight submit budgets, the `DriverConfig` tuning surface, the `Clock`, and `DriverError`. |
 | [`viewstamp-compio`](viewstamp-compio) | Real-I/O drivers on the [compio] proactor runtime: a QUIC driver and a TCP/TLS stream driver. Generic over storage, state machine, and identity — they bundle no backend. |
 | [`viewstamp-simulation`](viewstamp-simulation) | The deterministic simulation harness + the VOPR adversarial sweep (see below). Also home of the in-memory `Wal`/`Superblock` fixtures. |
-| [`viewstamp-reactor`](viewstamp-reactor) | Placeholder for a reactor-style (tokio/async-io) driver. Empty today. |
+| [`viewstamp-reactor`](viewstamp-reactor) | Reactor-I/O drivers on tokio or smol via the [agnostic] runtime abstraction: a QUIC driver and a TCP/TLS stream driver. Generic over storage, state machine, and identity — they bundle no backend. |
 
 ## Quickstart
 
@@ -50,10 +51,17 @@ A runnable three-node cluster over real loopback TCP lives in
 cargo run -p viewstamp-compio --example three_node
 ```
 
-It boots three in-process replicas, submits a few operations through a backup (which
+The same embedding over the reactor drivers (on tokio) lives in
+[`viewstamp-reactor/examples/three_node.rs`](viewstamp-reactor/examples/three_node.rs):
+
+```sh
+cargo run -p viewstamp-reactor --example three_node --features tokio
+```
+
+Each boots three in-process replicas, submits a few operations through a backup (which
 relays to the primary), prints the committed replies, and shuts down. The comments
 narrate each embedder obligation — storage, client identity, the driver handle — and the
-example uses the simulation crate's in-memory storage, which you replace with your
+examples use the simulation crate's in-memory storage, which you replace with your
 durable implementation in production.
 
 ## The embedder contract
@@ -150,3 +158,4 @@ Copyright (c) 2021 Al Liu.
 [TigerBeetle]: https://github.com/tigerbeetle/tigerbeetle
 [VOPR-style]: https://docs.tigerbeetle.com/concepts/safety/
 [compio]: https://github.com/compio-rs/compio
+[agnostic]: https://github.com/al8n/agnostic

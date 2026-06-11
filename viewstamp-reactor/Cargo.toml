@@ -42,5 +42,9 @@ required-features = ["tokio"]
 name = "stream_loopback"
 required-features = ["tokio"]
 
+[[example]]
+name = "three_node"
+required-features = ["tokio"]
+
 [lints]
 workspace = true

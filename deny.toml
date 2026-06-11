@@ -7,12 +7,17 @@ all-features = false
 # exercise, including the quic transport with its mandatory crypto provider. The
 # aws-lc-rs providers are excluded for the same reason ci.yml excludes them (they need
 # C/CMake/NASM toolchains and are not exercised in CI).
-features = ["std", "alloc", "tcp", "tls", "tls-rustls-ring", "quic"]
+features = ["std", "alloc", "tcp", "tls", "tls-rustls-ring", "quic", "tokio", "smol"]
 
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+  # Unmaintained-status advisory (not a vulnerability): paste is a compile-time
+  # proc-macro reached through agnostic-lite. The durable fix is upstream — agnostic-lite
+  # migrating to its maintained fork (pastey) — not a change this workspace can make.
+  "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
