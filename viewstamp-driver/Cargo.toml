@@ -1,0 +1,21 @@
+[package]
+name = "viewstamp-driver"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+repository = "https://github.com/al8n/viewstamp"
+license = "MIT OR Apache-2.0"
+description = "Runtime-agnostic driver core shared by the viewstamp drivers"
+
+[dependencies]
+viewstamp-proto = { workspace = true, features = ["std", "tcp"] }
+bytes = { workspace = true, features = ["std"] }
+flume = { workspace = true }
+futures-channel = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+futures-util = { workspace = true }
+
+[lints]
+workspace = true

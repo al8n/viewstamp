@@ -7,13 +7,13 @@ use crate::session::{EVENTS_CAP, MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOU
 /// Default first redial delay once a peer link is observed lost — the base of the per-peer
 /// exponential backoff; doubles per consecutive loss up to [`REDIAL_BACKOFF_CAP`] and resets to
 /// this base when the link validates/binds. Shared by both drivers.
-pub(crate) const REDIAL_BACKOFF_BASE: Duration = Duration::from_millis(200);
+pub const REDIAL_BACKOFF_BASE: Duration = Duration::from_millis(200);
 
 /// Default redial backoff ceiling: a dead peer is probed at most this often, so an unreachable or
 /// RST-fast replica is never hammered at the base cadence (the per-redial jitter decorrelates
 /// dialers after a common-mode loss). Retries continue forever at this bounded cadence — correct
 /// for consensus, where a configured peer may always return. Shared by both drivers.
-pub(crate) const REDIAL_BACKOFF_CAP: Duration = Duration::from_secs(5);
+pub const REDIAL_BACKOFF_CAP: Duration = Duration::from_secs(5);
 
 /// Default bound on one TCP connect attempt (stream driver). A connect to a black-holed address
 /// otherwise parks the dial task for the kernel's SYN-retry horizon (minutes), and the redial
@@ -26,7 +26,7 @@ pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// a coordinator router entry) forever. Matches the QUIC bridge's auth deadline: 5 s is far above
 /// any legitimate handshake (the real mesh validates in well under a second over loopback) yet
 /// bounded, so a stalled conn frees its slot in seconds.
-pub(crate) const AUTH_DEADLINE: Duration = Duration::from_secs(5);
+pub const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Default global live-connection cap (stream driver; dialed + accepted). On ACCEPT past this bound
 /// the socket is dropped (closed) without registering, so a peer that floods sockets cannot grow
@@ -35,10 +35,10 @@ pub(crate) const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 /// never refuses a legitimate peer while still bounding an accept flood.
 pub(crate) const MAX_CONNS: usize = 1024;
 
-/// Tunable operational parameters for both drivers ([`crate::CompioQuicDriver`] and
-/// [`crate::CompioStreamDriver`]), with `Default` = the constants the drivers pin without an
-/// override (each default constant carries the sizing rationale). Pass a non-default config through
-/// the drivers' `with_config` constructors; the plain `new` constructors use the defaults.
+/// Tunable operational parameters for both drivers (the QUIC driver and the stream driver), with
+/// `Default` = the constants the drivers pin without an override (each default constant carries
+/// the sizing rationale). Pass a non-default config through the drivers' `with_config`
+/// constructors; the plain `new` constructors use the defaults.
 ///
 /// Three knobs apply to the STREAM driver only — [`Self::dial_timeout`], [`Self::auth_deadline`],
 /// and [`Self::max_conns`]: the QUIC transport owns the equivalent bounds inside

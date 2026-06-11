@@ -6,7 +6,7 @@ use viewstamp_proto::Instant;
 ///
 /// The driver holds one `Clock` and reads [`Clock::now`] once per wake to feed the coordinator's
 /// `handle_*` methods. A proto [`Instant`] deadline returned by a coordinator's `poll_timeout` is
-/// mapped back to a `std::time::Instant` (for `compio::time::sleep_until`) via [`Clock::to_std`].
+/// mapped back to a `std::time::Instant` (for the runtime's deadline timer) via [`Clock::to_std`].
 pub struct Clock {
   base: StdInstant,
 }
@@ -30,7 +30,7 @@ impl Clock {
   }
 
   /// Map a proto [`Instant`] deadline back to a `std::time::Instant` on the same epoch, for
-  /// `compio::time::sleep_until`.
+  /// the runtime's deadline timer.
   #[must_use]
   pub fn to_std(&self, at: Instant) -> StdInstant {
     self.base + Duration::from_nanos(at.as_nanos())
@@ -49,7 +49,7 @@ impl Default for Clock {
 /// schedule — no RNG dependency needed. Monotone in `base` with jitter at most `base / 4`, so a
 /// doubled base always schedules strictly later than the previous jittered delay (the strict
 /// spacing an exponential redial schedule needs).
-pub(crate) fn jittered(base: Duration) -> Duration {
+pub fn jittered(base: Duration) -> Duration {
   let nanos = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map_or(0, |d| d.subsec_nanos());

@@ -39,7 +39,7 @@ pub enum Command {
 
 /// A cheaply-cloneable handle to submit client requests and observe committed events.
 ///
-/// Cloning is O(1) (channel-handle + two `Arc` clones). All clones share one node-local client
+/// Cloning is O(1) (two channel handles plus the budget's two `Arc`s). All clones share one node-local client
 /// session — including its `InflightBudget`, so the count/byte submit caps apply across all clones,
 /// not per clone.
 pub struct Handle {
@@ -67,7 +67,8 @@ impl Clone for Handle {
 }
 
 impl Handle {
-  pub(crate) fn new(
+  #[doc(hidden)]
+  pub fn new(
     commands: futures_channel::mpsc::Sender<Command>,
     events: flume::Receiver<Event>,
     budget: InflightBudget,
@@ -167,7 +168,8 @@ impl Handle {
 
   /// A receiver of consensus events — every [`Event`] the replica emits ([`Event::Committed`] plus
   /// the observability variants: view/status transitions, state-sync progress, repair solicits,
-  /// durable checkpoints). (First cut: single-consumer; clones compete for events.)
+  /// durable checkpoints). (Single-consumer: clones compete for events — each event reaches
+  /// exactly one receiver, not every clone.)
   ///
   /// This is a BEST-EFFORT observation stream: the channel is bounded, so events are
   /// DROPPED if this receiver is not drained fast enough (or never drained) — observing events is

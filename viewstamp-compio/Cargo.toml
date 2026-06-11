@@ -9,6 +9,7 @@ description = "Proactor (compio) QUIC driver for viewstamp-proto"
 
 [dependencies]
 viewstamp-proto = { workspace = true, features = ["std", "quic", "tls-rustls-ring"] }
+viewstamp-driver = { workspace = true }
 bytes = { workspace = true, features = ["std"] }
 compio = { workspace = true, features = ["net", "runtime", "macros", "time", "io-uring", "polling"] }
 flume = { workspace = true }
@@ -17,7 +18,6 @@ futures-util = { workspace = true }
 # Peer-socket options compio does not surface directly (SO_KEEPALIVE, TCP_USER_TIMEOUT); already a
 # transitive dep via compio-net. `all` unlocks the platform-specific setters (TCP_USER_TIMEOUT).
 socket2 = { version = "0.6", features = ["all"] }
-thiserror = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 viewstamp-simulation = { workspace = true }
