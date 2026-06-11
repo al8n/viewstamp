@@ -22,6 +22,10 @@ bytes = { workspace = true, features = ["std"] }
 flume = { workspace = true }
 futures-channel = { workspace = true }
 futures-util = { workspace = true }
+# Peer-socket options the agnostic traits do not surface directly (SO_KEEPALIVE,
+# TCP_USER_TIMEOUT); reached through the sockets' std fd traits. `all` unlocks the
+# platform-specific setters (TCP_USER_TIMEOUT).
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 viewstamp-simulation = { workspace = true }
