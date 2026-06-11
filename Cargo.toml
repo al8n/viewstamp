@@ -18,7 +18,7 @@ thiserror = { version = "2", default-features = false }
 smol_str = "0.3"
 compio = { version = "0.19", default-features = false }
 flume = { version = "0.12", default-features = false, features = ["async"] }
-futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+futures-channel = { version = "0.3.32", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }

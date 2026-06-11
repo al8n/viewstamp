@@ -8,9 +8,11 @@
 //! | retained state            | bound                                                              |
 //! |---------------------------|--------------------------------------------------------------------|
 //! | `pending` submit map      | [`MAX_INFLIGHT`] entries AND [`MAX_PENDING_BYTES`] of request body  |
-//! | command channel           | `max_inflight + 1` queued [`crate::Command`]s (bounded; `try_send`) |
+//! | command channel           | `max_inflight + 1` buffered [`crate::Command`]s, + one in-flight per live sender (bounded; `try_send`) |
 //! | events channel            | [`EVENTS_CAP`] (bounded best-effort; dropped-on-full)              |
+//! | QUIC recv channel         | `RECV_CAP` datagrams (bounded; recv-task `send_async` backpressure) |
 //! | stream inbound channel    | `INBOUND_CAP` frames (bounded; bridge `send_async` backpressure)    |
+//! | stream accept channel     | `ACCEPT_CAP` sockets (bounded; accept task parks, kernel backlog)   |
 //! | per-conn out-queue        | `max_outbound_backlog` + one wire chunk (byte-bounded on enqueue)   |
 //! | `conns` connection table  | `max_conns` live connections (accept admission control)            |
 //! | dial-ready channel        | live dial count, itself bounded by `max_conns`                     |
@@ -92,6 +94,32 @@ where
 /// `DriverConfig::with_request_timeout` (a geo-replicated cluster whose commit latency nears 250 ms
 /// raises it so steady-state submits are not re-broadcast spuriously).
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Ceiling on the interval between in-flight `pending` scans ([`reap_and_collect_retransmits`]).
+/// The scan is O(in-flight) — a cancelled-check plus duration math per entry — and the drivers'
+/// run loops would otherwise pay it on EVERY wake, making it the one per-message O(in-flight)
+/// cost under a full session at per-datagram wake rates. Both of the scan's jobs tolerate ~25 ms
+/// of staleness instead: retransmission runs on the 250 ms default [`REQUEST_TIMEOUT`] cadence
+/// (a scan up to 25 ms late defers a re-broadcast by at most a tenth of that cadence), and
+/// cancellation reclaim only has to free a dropped submit's entry + budget promptly — a caller
+/// retrying after `Busy` cannot distinguish a slot freed now from one freed tens of milliseconds
+/// later.
+pub(crate) const PENDING_SCAN_MAX_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The re-arm interval of the drivers' deadline-gated `pending` scan, for a driver configured
+/// with `request_timeout`: an eighth of the timeout, capped at [`PENDING_SCAN_MAX_INTERVAL`].
+/// The `/ 8` keeps the gate proportional when an embedder configures a far smaller timeout (each
+/// entry's staleness is still sampled ~8x per timeout window, so a due retransmit fires within
+/// ~12.5% of its cadence); the cap keeps a LARGER configured timeout from slowing cancellation
+/// reclaim below the default cadence.
+pub(crate) fn pending_scan_interval(request_timeout: Duration) -> Duration {
+  // Floored at 1ms: a zero or near-zero configured timeout must not produce a zero interval,
+  // which — folded into the wake deadline while work is pending — would wake-scan-rearm without
+  // ever parking the shared thread.
+  (request_timeout / 8)
+    .min(PENDING_SCAN_MAX_INTERVAL)
+    .max(Duration::from_millis(1))
+}
 
 /// Default maximum number of submitted-but-not-yet-resolved client requests the node-local session
 /// holds in flight at once, shared by both drivers. Each in-flight submit retains a `pending` entry
@@ -211,14 +239,16 @@ impl InflightBudget {
 /// no manual release is needed at any submit-exit site:
 ///
 /// - A successful [`crate::Handle::submit`] reservation produces a guard and moves it into the
-///   `Command::Submit` it enqueues. If the `try_send` fails (channel full → `Busy`, disconnected →
+///   `Command::Submit` it enqueues. If the `try_send` fails (channel refuses → `Busy`, closed →
 ///   `DriverGone`) the un-sent `Command` — and so its guard — drops on the early return, releasing the
 ///   slot: an un-sent submit cannot leak.
 /// - When the driver drains a `Submit` into `pending`, the guard MOVES into the [`Pending`] entry. The
 ///   reservation then lives with the entry: dropping the entry on commit, on cancellation reclaim, or
 ///   on shutdown drain drops the guard, which releases.
-/// - A `Submit` still queued in the command channel when the driver tears down (the channel is dropped)
-///   drops its guard too, so a submit racing shutdown before it reaches `pending` cannot leak budget.
+/// - A `Submit` still queued in the command channel when the driver tears down is dropped by the
+///   teardown's close-then-drain of that channel (or by the receiver's own draining drop), its guard
+///   with it, so a submit racing shutdown before it reaches `pending` cannot leak budget — and cannot
+///   outlive the shutdown ack behind a surviving `Handle` clone.
 ///
 /// There is no disarm/forget path in use, so a guard ALWAYS releases on drop — the budget tracks live
 /// reservations exactly and can neither leak nor double-release.
@@ -264,7 +294,9 @@ pub(crate) fn drain_pending(pending: &mut PendingMap) {
 }
 
 /// Reap cancelled submits, then collect the requests due for retransmission. Shared by both drivers'
-/// per-tick `retransmit_stale`. Two responsibilities, in one pass over `pending`:
+/// `retransmit_stale`, which deadline-gates this walk to the [`pending_scan_interval`] cadence (the
+/// walk is O(in-flight); the gate's staleness budget is documented on
+/// [`PENDING_SCAN_MAX_INTERVAL`]). Two responsibilities, in one pass over `pending`:
 ///
 /// 1. CANCELLATION RECLAIM. A submit whose returned reply future (the `oneshot::Receiver`) has been
 ///    dropped is cancelled: its `p.reply` sender reports [`futures_channel::oneshot::Sender::is_canceled`].
@@ -436,6 +468,33 @@ mod tests {
       budget.count(),
       0,
       "the commit removes the entry (its guard releases) even with the reply receiver gone (no leak)"
+    );
+  }
+
+  /// `pending_scan_interval` derives from the configured request timeout: an eighth of it, capped
+  /// at `PENDING_SCAN_MAX_INTERVAL`. The default 250 ms timeout hits the cap; a small timeout
+  /// scales down proportionally so the scan still samples each entry ~8x per timeout window; a
+  /// huge timeout never slows cancellation reclaim past the cap.
+  #[test]
+  fn pending_scan_interval_derives_from_the_request_timeout() {
+    assert_eq!(
+      super::pending_scan_interval(super::REQUEST_TIMEOUT),
+      super::PENDING_SCAN_MAX_INTERVAL,
+      "the default request timeout's eighth (31.25ms) is capped at the 25ms ceiling"
+    );
+    assert_eq!(
+      super::pending_scan_interval(Duration::from_millis(80)),
+      Duration::from_millis(10),
+      "a small configured timeout scales the scan interval down to an eighth of it"
+    );
+    assert_eq!(
+      super::pending_scan_interval(Duration::from_secs(10)),
+      super::PENDING_SCAN_MAX_INTERVAL,
+      "a large configured timeout never slows the scan past the ceiling"
+    );
+    assert!(
+      super::pending_scan_interval(Duration::ZERO) >= Duration::from_millis(1),
+      "a zero configured timeout still yields a positive scan interval (no wake-scan-rearm spin)"
     );
   }
 

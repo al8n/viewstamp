@@ -13,11 +13,60 @@ use crate::{
   handle::{Command, Handle},
   session::{
     InflightBudget, Pending, PendingMap, build_endpoint, deliver_event, drain_pending,
-    reap_and_collect_retransmits,
+    pending_scan_interval, reap_and_collect_retransmits,
   },
 };
 
 const RECV_BUF_LEN: usize = 65_507; // IP-layer max UDP payload
+
+/// Capacity of the bounded datagram channel (recv task -> run loop). Bounds the parked inbound
+/// bytes at `RECV_CAP` exact-sized datagram copies (each at most [`RECV_BUF_LEN`]); once full the
+/// recv task's `send_async` parks, no `recv_from` is in flight, and further arrivals queue in —
+/// then overflow — the kernel socket buffer. That is exactly UDP socket backpressure, whose drops
+/// QUIC's own loss recovery already absorbs. The run loop receives one datagram per iteration
+/// (the select's highest-priority arm), so the channel only fills under genuine overload.
+const RECV_CAP: usize = 256;
+/// Backoff before retrying a failed `recv_from`, bounding the retry rate under a persistent
+/// synchronously-resolving error so the shared thread always makes progress.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+
+/// The persistent datagram-receive task: owns a clone of the driver's socket (compio sockets share
+/// one fd across clones) plus ONE receive buffer for its whole life, looping `recv_from` and
+/// forwarding each datagram — copied exact-sized, the same hand-back idiom as the stream bridges —
+/// into the bounded channel the run loop selects on.
+///
+/// Keeping the read in its own task is what makes the run loop's recv arm a plain channel wait: on
+/// a proactor, DROPPING a not-yet-finished op future (what a losing select arm does) submits an
+/// asynchronous CANCEL and forfeits the op's buffer, so a loop that re-arms `recv_from` per
+/// iteration pays a cancel syscall plus a zeroed 64 KiB allocation on every submit/timer/storage
+/// wake. Here the op is never dropped while the driver runs; each completed read hands the buffer
+/// back in its `BufResult` and it is re-lent forever.
+///
+/// A receive error is transient for an unconnected UDP socket (anything lost under it is QUIC's
+/// loss recovery to repair), so the loop keeps receiving. The task exits when the driver drops the
+/// channel receiver; the driver also OWNS the task's `JoinHandle`, whose drop cancels the task on
+/// every run-loop exit path. That cancel is asynchronous — dropping the handle marks the task
+/// cancelled and schedules it, the executor's next pass drops this future (with its socket clone),
+/// and dropping the in-flight `recv_from` submits a proactor-level cancel that holds a further fd
+/// reference until processed — so the orderly teardown in `run()` does not treat the drop as the
+/// fd release; the socket `close().await` there is what waits out both references.
+async fn recv_datagrams(socket: UdpSocket, inbound: flume::Sender<(Vec<u8>, SocketAddr)>) {
+  let mut buf = vec![0u8; RECV_BUF_LEN];
+  loop {
+    let compio::buf::BufResult(res, returned) = socket.recv_from(buf).await;
+    buf = returned;
+    let Ok((n, from)) = res else {
+      // Park on the timer before retrying: on the polling backend a receive error can resolve
+      // synchronously, and a persistent one (rather than per-datagram noise on an unconnected UDP
+      // socket) would otherwise hot-spin this task on the one shared thread.
+      compio::time::sleep(RECV_ERROR_BACKOFF).await;
+      continue;
+    };
+    if inbound.send_async((buf[..n].to_vec(), from)).await.is_err() {
+      return; // the driver dropped its receiver: it is tearing down
+    }
+  }
+}
 
 /// Redial state for one configured peer. The driver retains every configured `(id, addr)` so a
 /// connection that idles out or is lost can be re-established by THIS side — without it, a dead mesh
@@ -36,7 +85,9 @@ struct PeerLink {
   next_dial: Option<Instant>,
 }
 
-/// The compio (proactor) QUIC driver. Owns the coordinator + storage + socket on one task.
+/// The compio (proactor) QUIC driver. Owns the coordinator + storage + socket on one task; a
+/// persistent same-thread recv task (holding a clone of the socket, owned via its `JoinHandle` by
+/// `run()`) feeds it inbound datagrams.
 pub struct CompioQuicDriver<S, W, B, I> {
   coord: QuicCoordinator<S, I>,
   wal: W,
@@ -49,6 +100,12 @@ pub struct CompioQuicDriver<S, W, B, I> {
   client: ClientId,
   next_request: u64,
   pending: PendingMap,
+  /// When the next in-flight `pending` scan (cancellation reclaim + retransmit collection) may
+  /// run — the deadline gate on [`Self::retransmit_stale`]'s O(in-flight) walk. Starts at zero so
+  /// a fresh driver's first scan is never deferred; each scan re-arms it one
+  /// `pending_scan_interval` ahead, and [`Self::next_deadline`] folds it in (while anything is
+  /// pending) so a parked driver wakes ON the scan schedule.
+  next_pending_scan: Instant,
   /// The configured peer mesh with per-peer redial backoff state (see [`PeerLink`]); reconciled
   /// against the coordinator's bound-connection table every loop iteration.
   peers: Vec<PeerLink>,
@@ -59,8 +116,11 @@ pub struct CompioQuicDriver<S, W, B, I> {
   /// the driver itself never releases against this handle.
   #[cfg(test)]
   budget: InflightBudget,
-  /// Bounded `flume::bounded(cfg.cmd_cap())`: a full channel surfaces as `Busy` rather than growing.
-  commands: flume::Receiver<Command>,
+  /// Bounded `futures_channel::mpsc::channel(cfg.cmd_cap())`: a refused send surfaces as `Busy`
+  /// rather than growing, and `Receiver::close` is the teardown primitive — it refuses new sends
+  /// (bouncing the command back to its sender) while this receiver still drains what was already
+  /// buffered, so the shutdown ack can promise no queued command survives it.
+  commands: futures_channel::mpsc::Receiver<Command>,
   /// Bounded `flume::bounded(cfg.events_cap())`: best-effort, dropped-on-full (see `deliver_event`).
   events: flume::Sender<Event>,
   /// Embedder-owned notifier. Carries a unit signal only and is drained to empty every loop iteration
@@ -189,10 +249,13 @@ where
     }
 
     // Bounded command channel: a partitioned/slow driver (not draining commands) can't grow it
-    // without bound; a full channel surfaces as `DriverError::Busy` (see `Handle::submit`). Sized
+    // without bound; a refused send surfaces as `DriverError::Busy` (see `Handle::submit`). Sized
     // `cmd_cap` (= max_inflight + 1) so the in-flight budget, not this queue, is the binding submit
-    // limit.
-    let (commands_tx, commands_rx) = flume::bounded(cfg.cmd_cap());
+    // limit. futures-mpsc rather than flume for its `Receiver::close`: the teardown must refuse
+    // new commands while still draining the buffered ones — flume frees buffered items only when
+    // every sender (every live `Handle` clone) drops, which would pin a queued submit's reply and
+    // budget past the shutdown ack.
+    let (commands_tx, commands_rx) = futures_channel::mpsc::channel(cfg.cmd_cap());
     // Bounded best-effort: a slow/absent `Handle::events()` consumer drops events rather than
     // growing the channel without bound (see `deliver_event`). Submit replies are unaffected.
     let (events_tx, events_rx) = flume::bounded(cfg.events_cap());
@@ -207,6 +270,7 @@ where
       client,
       next_request: first_request,
       pending: PendingMap::new(),
+      next_pending_scan: Instant::ZERO,
       peers: peer_links,
       #[cfg(test)]
       budget: budget.clone(),
@@ -227,6 +291,15 @@ where
   I: viewstamp_proto::IdentitySource,
 {
   /// Run the driver to completion. Returns on a `Shutdown` command or when all `Handle` clones drop.
+  ///
+  /// Both orderly exits — and therefore the ack a [`Handle::shutdown`] awaits — are fd-release
+  /// barriers: before acking/returning, the teardown waits for the recv task's socket clone and
+  /// its in-flight op's fd reference to drop and then CLOSES the socket fd, so an embedder may
+  /// bind a new driver to the same address the moment `shutdown().await` (or an awaited `run()`
+  /// task) returns. Cancelling the `run()` future itself (dropping its spawn handle) cannot
+  /// barrier — drop glue cannot await — but still releases the fd promptly: the owned recv-task
+  /// `JoinHandle` drops with it, and the fd closes once the runtime processes the scheduled
+  /// cancellations (within its next passes, not synchronously with the drop).
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 
@@ -235,25 +308,27 @@ where
     /// progress under a recv flood.
     const CMD_BUDGET: usize = 64;
 
+    // The persistent recv task (see [`recv_datagrams`]): its socket clone shares the driver's fd,
+    // and the bounded channel is the run loop's inbound face. The `JoinHandle` is OWNED by this
+    // scope — never detached — so EVERY exit path (Shutdown, handle-drop, or this whole future
+    // being cancelled) drops it, cancelling the task with its in-flight `recv_from` and its
+    // socket clone. The cancel is mark-and-schedule, not synchronous teardown: the orderly exits
+    // below follow it with the socket `close().await` as the true fd-release barrier, and a
+    // cancellation of this whole future releases the fd on the runtime's next passes instead
+    // (see [`Self::run`]'s contract).
+    let (recv_tx, recv_rx) = flume::bounded(RECV_CAP);
+    let recv_task = compio::runtime::spawn(recv_datagrams(self.socket.clone(), recv_tx));
+
     let now = self.clock.now();
     self.pump_outputs(now).await;
 
     let mut shutdown_ack: Option<futures_channel::oneshot::Sender<()>> = None;
-    // Reusable UDP receive buffer. When the recv arm WINS the select, the completed read hands the
-    // buffer back (compio returns the owned buffer in its `BufResult`) and it is parked here for the
-    // next iteration — under a receive-heavy load (the hot path) every wake reuses one allocation.
-    // When another arm wins, the in-flight recv op is cancelled with its buffer (compio must keep a
-    // submitted op's buffer alive until the kernel completes), so the next iteration allocates fresh.
-    let mut recv_pool: Option<Vec<u8>> = None;
     loop {
       let now = self.clock.now();
 
       // (1) Fairness: drain up to CMD_BUDGET commands before the biased I/O select, so a continuous
       // recv backlog (e.g. a UDP flood that always wins the `recv_fut` arm) can't starve
       // `Shutdown`/`Submit`.
-      if self.commands.sender_count() == 0 {
-        break; // all Handles dropped: exit now, discard queued commands
-      }
       let mut exit = false;
       for _ in 0..CMD_BUDGET {
         match self.commands.try_recv() {
@@ -263,12 +338,14 @@ where
               break;
             }
           }
-          // No command pending right now: stop draining and fall through to the I/O select.
-          Err(flume::TryRecvError::Empty) => break,
-          // All `Handle` clones dropped: the command channel is closed for good, so exit the run
-          // loop (a continuously-readable socket would otherwise keep the biased recv arm hot and
-          // the task + socket alive forever).
-          Err(flume::TryRecvError::Disconnected) => {
+          // No command buffered right now: stop draining and fall through to the I/O select.
+          Err(futures_channel::mpsc::TryRecvError::Empty) => break,
+          // All `Handle` clones dropped AND the buffer is drained: the command channel has ended
+          // for good, so exit the run loop (a continuously-readable socket would otherwise keep
+          // the biased recv arm hot and the task + socket alive forever). Termination is the
+          // stream END, not a sender-count probe: commands queued by since-dropped handles flow
+          // through the arm above first, bounded by the channel buffer.
+          Err(futures_channel::mpsc::TryRecvError::Closed) => {
             exit = true;
             break;
           }
@@ -301,28 +378,30 @@ where
       // immediate select-timer fire for the timer we just serviced).
       let deadline = self.next_deadline();
 
-      // The four futures BORROW driver fields (`recv_fut` holds `&self.socket`, `cmd_fut`
-      // `&self.commands`, `storage_fut` `&self.storage_ready`). Confine their construction +
-      // `select_biased!` to this inner scope: when it ends the pinned futures (and the recv
-      // buffer they own) drop, releasing those borrows so the `&mut self` pumping below is
-      // legal. Each arm only writes a captured local; no `&mut self` work happens in an arm.
+      // The four futures BORROW the recv channel + driver fields (`recv_fut` holds `&recv_rx`,
+      // `cmd_fut` `&mut self.commands`, `storage_fut` `&self.storage_ready` — disjoint fields).
+      // Confine their construction + `select_biased!` to this inner scope: when it ends the pinned
+      // futures drop, releasing those borrows so the `&mut self` pumping below is legal. Each arm
+      // only writes a captured local; no whole-`self` work happens in an arm. All four arms are
+      // plain channel/timer waits — the socket I/O itself lives in the recv task and
+      // `pump_outputs` — so a losing arm never cancels an in-flight socket op.
       let (inbound, fire_timeout, command, exit) = {
-        let recv_buf = recv_pool.take().unwrap_or_else(|| vec![0u8; RECV_BUF_LEN]);
-        let recv_fut = self.socket.recv_from(recv_buf).fuse();
+        let recv_fut = recv_rx.recv_async().fuse();
         let timer_fut = compio::time::sleep_until(deadline).fuse();
-        let cmd_fut = self.commands.recv_async().fuse();
+        let cmd_fut = self.commands.recv().fuse();
         let storage_fut = self.storage_ready.recv_async().fuse();
         futures_util::pin_mut!(recv_fut, timer_fut, cmd_fut, storage_fut);
 
-        let mut inbound: Option<(usize, SocketAddr, Vec<u8>)> = None;
+        let mut inbound: Option<(Vec<u8>, SocketAddr)> = None;
         let mut fire_timeout = false;
         let mut command: Option<Command> = None;
         let mut exit = false;
 
         select_biased! {
+            // `Err` (a closed channel) is unreachable while this scope holds `recv_task`: the
+            // task only exits when the receiver it sends to drops.
             got = recv_fut => {
-                let compio::buf::BufResult(res, buf) = got;
-                if let Ok((n, from)) = res { inbound = Some((n, from, buf)); }
+                if let Ok(datagram) = got { inbound = Some(datagram); }
             }
             _ = timer_fut => { fire_timeout = true; }
             cmd = cmd_fut => {
@@ -338,12 +417,10 @@ where
       }
 
       let now = self.clock.now();
-      if let Some((n, from, buf)) = inbound {
+      if let Some((datagram, from)) = inbound {
         self
           .coord
-          .handle_udp(now, from, None, &buf[..n], &mut self.wal, &mut self.sb);
-        // The read returned the owned buffer; park it for the next iteration's recv.
-        recv_pool = Some(buf);
+          .handle_udp(now, from, None, &datagram, &mut self.wal, &mut self.sb);
       }
       if fire_timeout {
         self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
@@ -359,10 +436,43 @@ where
 
     // Drop every still-pending submit (its commit never arrived) and clear the map: each entry's
     // `ReservationGuard` releases its budget slot on drop, so the budget never leaks across the
-    // driver's life. A `Submit` still queued in the command channel drops with the channel (below),
-    // its guard releasing too.
+    // driver's life. A `Submit` still queued in the command channel releases in the
+    // close-then-drain below, its guard with it.
     drain_pending(&mut self.pending);
-    drop(self.socket);
+    // Dropping the `JoinHandle` only MARKS the recv task cancelled and SCHEDULES it: the task —
+    // its socket clone and its in-flight `recv_from` — is dropped on the executor's next pass,
+    // and dropping that in-flight op merely submits an asynchronous proactor cancel which itself
+    // holds an fd reference until the cancellation is processed. Nothing is released yet when
+    // this drop returns.
+    drop(recv_task);
+    // Dropping the datagram receiver releases this side; the buffered datagrams themselves free
+    // with the recv task's sender clone, which the socket `close().await` below waits out. That
+    // is the general teardown shape for DRIVER-INTERNAL queues: their senders all live in tasks
+    // this teardown just cancelled, so they release with those tasks — promptly, but
+    // asynchronously.
+    drop(recv_rx);
+    // The command channel is the one queue whose senders OUTLIVE the driver (every `Handle`
+    // clone), so its release must not depend on them dropping: close-then-drain makes the queued
+    // commands airtight at the ack. `close()` turns the channel non-admitting — a `Handle` racing
+    // this teardown has its `try_send` refused WITH the command, so its own rollback path runs
+    // (DriverGone, reservation released) — while this receiver can still drain everything already
+    // buffered. The AWAITED drain then releases every pre-close command: each dropped `Submit`
+    // frees its budget reservation and its reply oneshot resolves as dropped (`ReplyDropped` at
+    // the caller). Awaiting (rather than a non-blocking try loop) matters because a send racing
+    // the close can have reserved its place with the push itself still in flight; the channel
+    // ends only at closed-AND-empty, so the drain observes that command too. No command —
+    // queued or in flight — survives the ack.
+    self.commands.close();
+    while let Ok(cmd) = self.commands.recv().await {
+      drop(cmd);
+    }
+    // The fd-release barrier: `close` parks until every other reference to the socket's fd — the
+    // recv task's clone and its cancelled-but-unprocessed op — has dropped, then closes the fd
+    // with a real close op. Once this await returns the bound address is free, which is what
+    // makes the ack below (and `run()`'s return) an immediate-rebind contract rather than a hope
+    // that the runtime already processed the scheduled cancellations. A close error is ignored:
+    // there is no recovery at teardown, and the fd is released regardless.
+    let _ = self.socket.close().await;
     if let Some(ack) = shutdown_ack {
       let _ = ack.send(());
     }
@@ -384,6 +494,15 @@ where
         reply,
         reservation,
       } => {
+        // A submit whose caller is already gone (the reply future dropped) must not enter
+        // consensus: nobody can observe its commit, and the cancellation reap would only evict it
+        // AFTER it minted a request. Dropping it here releases its reservation immediately. This
+        // is also what keeps the teardown drain equivalent to discarding: queued submits from
+        // dropped handles are dead by definition.
+        if reply.is_canceled() {
+          drop(reservation);
+          return false;
+        }
         self.next_request += 1;
         let request_number = RequestNumber::with(self.next_request);
         let request = Request::new(self.client, request_number, body);
@@ -429,9 +548,12 @@ where
   }
 
   /// Nearest of the earliest real deadline ([`Self::earliest_deadline`]), the earliest armed peer
-  /// redial, and a 50ms idle fallback (so a quiet node still re-pumps storage and retransmits stale
-  /// requests). The redial deadline is folded in as a REAL wake deadline so redialing never depends
-  /// on the idle fallback happening to wake the loop.
+  /// redial, the next pending scan, and a 50ms idle fallback (so a quiet node still re-pumps
+  /// storage). The redial and scan deadlines are folded in as REAL wake deadlines so redialing and
+  /// the gated `pending` scan never depend on the idle fallback happening to wake the loop. The
+  /// scan deadline counts only while something IS pending: with the map empty the scan has nothing
+  /// to reap or retransmit, so folding its (typically already-elapsed) deadline would only turn an
+  /// idle driver's 50ms fallback into a busier wake cadence for no work.
   fn next_deadline(&mut self) -> std::time::Instant {
     let fallback = std::time::Instant::now() + std::time::Duration::from_millis(50);
     let redial = self
@@ -440,7 +562,8 @@ where
       .filter_map(|link| link.next_dial)
       .min()
       .map(|d| self.clock.to_std(d));
-    [self.earliest_deadline(), redial]
+    let scan = (!self.pending.is_empty()).then(|| self.clock.to_std(self.next_pending_scan));
+    [self.earliest_deadline(), redial, scan]
       .into_iter()
       .flatten()
       .fold(fallback, std::time::Instant::min)
@@ -482,9 +605,20 @@ where
   /// Reap cancelled submits (releasing their budget), then re-broadcast pending requests not committed
   /// within the request timeout (the proto session table dedups). The cancellation reclaim is the
   /// caller-cancellation release site: a submit whose reply future was dropped is removed + its budget
-  /// freed within this tick, so a cancelled submit's memory can't be pinned until its commit arrives.
-  /// Retransmission lets a request submitted before the mesh is up reach the primary once links come up.
+  /// freed within one scan interval, so a cancelled submit's memory can't be pinned until its commit
+  /// arrives. Retransmission lets a request submitted before the mesh is up reach the primary once
+  /// links come up.
+  ///
+  /// DEADLINE-GATED: the underlying walk is O(in-flight), so it runs only when `next_pending_scan`
+  /// is due, then re-arms one [`pending_scan_interval`] ahead — call sites stay per-iteration (a
+  /// not-yet-due call returns immediately), and `next_deadline` folds the scan deadline in so a
+  /// parked driver wakes ON this schedule. The staleness the gate introduces is what both jobs
+  /// tolerate (see `PENDING_SCAN_MAX_INTERVAL`).
   fn retransmit_stale(&mut self, now: Instant) {
+    if now < self.next_pending_scan {
+      return;
+    }
+    self.next_pending_scan = now + pending_scan_interval(self.cfg.request_timeout());
     let stale = reap_and_collect_retransmits(&mut self.pending, now, self.cfg.request_timeout());
     for request in stale {
       self
@@ -883,7 +1017,7 @@ mod tests {
   /// (its relayed `Request`/`Prepare` would exceed `MAX_FRAME_LEN` and be dropped).
   #[compio::test]
   async fn over_frame_submit_is_rejected_without_side_effects_quic() {
-    let (driver, handle) = test_quic_driver_with_handle().await;
+    let (mut driver, handle) = test_quic_driver_with_handle().await;
 
     let oversized = Bytes::from(vec![0u8; viewstamp_proto::max_request_body_len() + 1]);
     let fut = handle.submit(oversized);
@@ -1003,6 +1137,119 @@ mod tests {
     drop(live); // keep the other in-flight reply receivers alive until here (so they stay uncancelled)
   }
 
+  /// SCAN GATE (QUIC driver): `retransmit_stale` walks `pending` only when its scan deadline is
+  /// due, then re-arms `pending_scan_interval` ahead — so per-datagram wakes never pay an
+  /// O(in-flight) walk each. The gate starts disarmed (a fresh driver's first call scans), a call
+  /// strictly before the re-armed deadline must NOT reap a newly-cancelled entry, and a call AT
+  /// the deadline must. The skipped call is exactly the bounded staleness the cancellation-reclaim
+  /// property tolerates (one scan interval, not "every call").
+  #[compio::test]
+  async fn the_pending_scan_is_deadline_gated_quic() {
+    let (mut driver, handle) = test_quic_driver_with_handle().await;
+    let interval = crate::session::pending_scan_interval(driver.cfg.request_timeout());
+
+    let mut first: std::pin::Pin<Box<SubmitFut<'_>>> =
+      Box::pin(handle.submit(Bytes::from_static(b"a")));
+    assert!(poll_submit(first.as_mut()).is_none(), "first submit parks");
+    drain_one_command(&mut driver);
+    drop(first); // cancel: drops the reply receiver
+
+    let t0 = viewstamp_proto::Instant::ZERO + REQUEST_TIMEOUT;
+    driver.retransmit_stale(t0);
+    assert!(
+      driver.pending.is_empty(),
+      "the gate starts disarmed: a fresh driver's first call scans and reaps the cancelled submit"
+    );
+
+    let mut second: std::pin::Pin<Box<SubmitFut<'_>>> =
+      Box::pin(handle.submit(Bytes::from_static(b"b")));
+    assert!(
+      poll_submit(second.as_mut()).is_none(),
+      "second submit parks"
+    );
+    drain_one_command(&mut driver);
+    drop(second); // cancel
+
+    driver.retransmit_stale(t0 + (interval - std::time::Duration::from_millis(1)));
+    assert_eq!(
+      driver.pending.len(),
+      1,
+      "strictly before the re-armed deadline the walk is skipped: the cancelled entry survives"
+    );
+
+    driver.retransmit_stale(t0 + interval);
+    assert!(
+      driver.pending.is_empty(),
+      "AT the re-armed deadline the scan runs and reaps the cancelled entry"
+    );
+  }
+
+  /// The pending-scan deadline is folded into `next_deadline` as a REAL wake deadline whenever a
+  /// submit is in flight, so a parked driver wakes ON the scan schedule (reclaiming cancellations
+  /// and retransmitting on cadence) instead of relying on the 50ms idle fallback. With NOTHING
+  /// pending the scan is NOT folded: the gate value is a past instant once a scan has run, and an
+  /// empty map gives the scan nothing to do — so an idle driver's baseline stays the fallback
+  /// (which the first assert pins: an unconditional fold would return the past scan instant and
+  /// fail it).
+  #[compio::test]
+  async fn next_deadline_folds_the_pending_scan_deadline_quic() {
+    let (mut driver, handle) = test_quic_driver_with_handle().await;
+
+    // Baseline: nothing pending, no peers, a never-driven endpoint — the ~50ms idle fallback
+    // governs, proving the (elapsed) scan deadline is not folded for an empty pending map.
+    let baseline = driver.next_deadline();
+    assert!(
+      baseline >= std::time::Instant::now() + std::time::Duration::from_millis(40),
+      "with nothing pending the idle fallback governs (the scan deadline is not folded)"
+    );
+
+    // One in-flight submit + a scan deadline ~5ms out: next_deadline must move to it, well under
+    // the fallback.
+    let mut fut: std::pin::Pin<Box<SubmitFut<'_>>> =
+      Box::pin(handle.submit(Bytes::from_static(b"x")));
+    assert!(poll_submit(fut.as_mut()).is_none(), "submit parks");
+    drain_one_command(&mut driver);
+    let due = driver.clock.now() + std::time::Duration::from_millis(5);
+    driver.next_pending_scan = due;
+    assert!(
+      driver.next_deadline() <= driver.clock.to_std(due),
+      "with a submit in flight the scan deadline is folded into next_deadline as a real wake"
+    );
+    drop(fut);
+  }
+
+  /// A submit whose CALLER IS GONE before the driver processes it (the reply future dropped — its
+  /// oneshot receiver canceled) must never enter consensus: `handle_command` drops it without
+  /// minting a request, releasing its reservation. Without the guard, the teardown drain of a
+  /// dead handle's queued submits would EXECUTE them into the endpoint during exit — irreversible
+  /// operations nobody can observe.
+  #[compio::test]
+  async fn a_canceled_queued_submit_never_enters_consensus_quic() {
+    let (mut driver, handle) = test_quic_driver_with_handle().await;
+    let observer = driver.budget.clone();
+
+    let mut fut: std::pin::Pin<Box<SubmitFut<'_>>> =
+      Box::pin(handle.submit(Bytes::from_static(b"dead")));
+    assert!(poll_submit(fut.as_mut()).is_none(), "accepted + queued");
+    drop(fut); // the caller is gone: the reply receiver cancels
+    assert_eq!(
+      observer.count(),
+      1,
+      "the queued command still holds its reservation"
+    );
+
+    let cmd = driver.commands.try_recv().expect("the command is buffered");
+    let before = driver.next_request;
+    let mut ack = None;
+    let exit = driver.handle_command(viewstamp_proto::Instant::ZERO, cmd, &mut ack);
+    assert!(!exit, "a dropped submit is not an exit signal");
+    assert_eq!(driver.next_request, before, "no request number was minted");
+    assert!(driver.pending.is_empty(), "nothing entered the pending map");
+    assert_eq!(observer.count(), 0, "the reservation released on the spot");
+    assert_eq!(observer.bytes(), 0, "and its bytes with it");
+    drop(handle);
+  }
+
   /// SHUTDOWN RACE — NO BUDGET LEAK (QUIC driver): submits that reserved the budget and were enqueued
   /// but NOT yet drained into `pending` when the driver tears down must not leak their reservation.
   /// Each `Handle::submit` carries its `ReservationGuard` inside the queued `Command::Submit`; tearing
@@ -1043,12 +1290,18 @@ mod tests {
     );
     assert!(driver.pending.is_empty(), "none was drained into pending");
 
-    // Tear the driver down WITHOUT draining the commands: dropping the driver drops the command-channel
-    // receiver; dropping the submit futures releases their borrow of `handle` (and their reply
-    // receivers); dropping `handle` (the last sender) then frees the buffered `Command::Submit`s — each
-    // drops its guard, releasing. This is the queued-submit-vs-shutdown race: the guards are the single
-    // release owner, so no reservation is stranded.
+    // Tear the driver down WITHOUT draining the commands: dropping the driver drops the
+    // command-channel receiver, whose drop closes the channel and drains the buffered
+    // `Command::Submit`s — each drops its guard, releasing — while `handle` (a live sender) and
+    // the parked submit futures still exist. This is the queued-submit-vs-shutdown race: the
+    // guards are the single release owner, so no reservation is stranded behind a surviving
+    // sender.
     drop(driver);
+    assert_eq!(
+      observer.count(),
+      0,
+      "dropping the receiver alone releases every queued submit's guard — no waiting on the Handle"
+    );
     drop(futs);
     drop(handle);
 
@@ -1062,5 +1315,81 @@ mod tests {
       0,
       "and the reserved bytes return to zero, so a surviving Handle sees no spurious Busy"
     );
+  }
+
+  /// SHUTDOWN-RACE AIRTIGHTNESS (QUIC driver): a `Submit` queued BEHIND the `Shutdown` command —
+  /// enqueued after `shutdown()` but before the run loop drains it — must RESOLVE and release its
+  /// budget by the time the shutdown ack arrives, even though `Handle` clones (command-channel
+  /// senders) stay alive past the ack. The run loop exits on the `Shutdown` with the submits still
+  /// buffered; the teardown's close-then-drain of the command channel drops each queued `Submit`,
+  /// so its reply oneshot resolves as dropped (`ReplyDropped`) and its `ReservationGuard` releases.
+  /// A teardown that releases buffered commands only when every sender drops would instead pin the
+  /// racing submits' replies and budget for as long as any `Handle` clone lives: the awaiting
+  /// callers — themselves keeping a `Handle` borrowed — would hang indefinitely.
+  #[compio::test]
+  async fn submits_queued_behind_a_shutdown_resolve_and_release_budget_quic() {
+    let (driver, handle) = test_quic_driver_with_handle().await;
+    let observer = driver.budget.clone();
+    // The clone that SURVIVES the ack: it keeps the command channel's sender side alive, which is
+    // exactly what must NOT keep the queued commands (and their budget) alive.
+    let survivor = handle.clone();
+
+    // Enqueue the Shutdown FIRST: one poll sends the command and parks on the ack.
+    let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+    let mut shutdown_fut = Box::pin(handle.shutdown());
+    assert!(
+      std::future::Future::poll(shutdown_fut.as_mut(), &mut cx).is_pending(),
+      "the shutdown enqueues its command and parks on the ack"
+    );
+
+    // Then several submits BEHIND it: each reserves budget and enqueues, parking on its reply.
+    let mut racing: Vec<std::pin::Pin<Box<SubmitFut<'_>>>> = Vec::new();
+    let mut total_bytes = 0usize;
+    for i in 0..4u8 {
+      let body = Bytes::from(vec![i; 32]);
+      total_bytes += body.len();
+      let mut fut: std::pin::Pin<Box<SubmitFut<'_>>> = Box::pin(handle.submit(body));
+      assert!(
+        poll_submit(fut.as_mut()).is_none(),
+        "a submit racing the queued shutdown is accepted (reserves + enqueues)"
+      );
+      racing.push(fut);
+    }
+    assert_eq!(observer.count(), 4, "the racing submits hold budget");
+    assert_eq!(observer.bytes(), total_bytes, "and their reserved bytes");
+
+    // Run the driver: it drains the Shutdown first and tears down with the submits still queued.
+    compio::runtime::spawn(driver.run()).detach();
+    compio::time::timeout(std::time::Duration::from_secs(5), shutdown_fut)
+      .await
+      .expect("the shutdown ack arrives")
+      .expect("shutdown acks teardown");
+
+    // Every racing submit RESOLVES after the ack (bounded await, no hang)...
+    for (i, fut) in racing.into_iter().enumerate() {
+      let res = compio::time::timeout(std::time::Duration::from_secs(5), fut)
+        .await
+        .unwrap_or_else(|_| panic!("racing submit #{i} must resolve at teardown, not hang"));
+      assert!(
+        matches!(
+          res,
+          Err(DriverError::ReplyDropped | DriverError::DriverGone)
+        ),
+        "racing submit #{i} resolves as dropped/gone, got {res:?}"
+      );
+    }
+    // ...and the shared budget is FULLY released — count AND bytes — while the clones still live.
+    assert_eq!(
+      observer.count(),
+      0,
+      "the budget count returns to zero at the ack even with Handle clones alive"
+    );
+    assert_eq!(
+      observer.bytes(),
+      0,
+      "and the reserved bytes return to zero (no reservation pinned by a queued command)"
+    );
+    drop(survivor);
+    drop(handle);
   }
 }
