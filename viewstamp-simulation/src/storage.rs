@@ -489,9 +489,9 @@ impl Wal for InMemoryWal {
       body
     };
     // TORN-HEADER probe verdict (contract violation, probe lane only): the slot completes its append
-    // but loses the header too — it will read back as if never written. Rolled AFTER the existing
+    // but loses the header too — it will read back as if never written. Rolled AFTER the other
     // verdicts and only when armed (`per_mille > 0` short-circuits the draw), so every zero-rate run
-    // keeps its exact historical fault-PRNG stream.
+    // keeps its exact fault-PRNG stream (pinned seeds reproduce).
     let torn_header = self.faults.torn_header_per_mille > 0
       && self.prng.chance(self.faults.torn_header_per_mille, 1000);
     match self.async_delay {

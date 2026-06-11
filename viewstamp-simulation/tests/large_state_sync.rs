@@ -8,8 +8,8 @@
 //! `LogSm::snapshot` is the FULL applied history, so fixed large client bodies grow the checkpoint
 //! envelope linearly with committed ops. Each run first drives load until the DURABLE envelope
 //! exceeds `max_unchunked_snapshot_len()` — the exact threshold past which a whole `SyncCheckpoint`
-//! encodes over `MAX_FRAME_LEN` and the transport's send-path frame guard would drop it. Before the
-//! chunked transfer, a laggard below such a checkpoint was a PERMANENT liveness wedge: it solicits
+//! encodes over `MAX_FRAME_LEN` and the transport's send-path frame guard would drop it. Without the
+//! chunked transfer, a laggard below such a checkpoint is a PERMANENT liveness wedge: it solicits
 //! on the 100ms cadence, every serve is refused at the frame guard, and `on_prepare` drops
 //! head-extends while `sync.is_some()`. The cluster.rs converse test pins that drop; this gate
 //! proves the chunked path delivers the same envelope.

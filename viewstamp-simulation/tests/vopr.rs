@@ -208,9 +208,9 @@ fn vopr_sweep_no_violations() {
   // summary too).
   let mut total_large_bodies = 0u64;
   let mut total_oversized_dropped = 0u64;
-  // New-path witnesses: the header-only view-change/recovery carriers, the byte-bounded `RepairBatch`
-  // serve, and the floored canonical union must all genuinely FIRE somewhere across the sweep —
-  // otherwise the newest consensus paths are green only because they were never reached.
+  // Non-vacuity witnesses: the header-only view-change/recovery carriers, the byte-bounded
+  // `RepairBatch` serve, and the floored canonical union must all genuinely FIRE somewhere across the
+  // sweep — otherwise those consensus paths are green only because they were never reached.
   let mut total_header_only_carriers = 0u64;
   let mut total_repair_batches = 0u64;
   let mut total_prepare_batches = 0u64;
@@ -305,8 +305,8 @@ fn vopr_sweep_no_violations() {
   //   header-only carriers ship NO body (a fixed ~49 bytes/op) and the `RepairBatch` serve is
   //   byte-bounded, so every peer message stays at/below `MAX_FRAME_LEN` no matter how large the
   //   bodies are. (`run_vopr` already panics per-tick on any drop — this is the cumulative witness.)
-  //   A `> 0` here would be a REAL bug: a carrier overflowed the frame (the old full-body
-  //   view-change defect) — to report, never to mask by loosening the cap.
+  //   A `> 0` here would be a REAL bug: a carrier overflowed the frame — to report, never to mask by
+  //   loosening the cap.
   assert!(
     total_large_bodies > 0,
     "the sweep minted no large client bodies — the frame-cap axis is vacuous (header-only carriers + \
@@ -319,7 +319,7 @@ fn vopr_sweep_no_violations() {
      overflowed the frame (the old full-body view-change bug, or an incomplete bound); this is a REAL \
      bug to fix, NOT to mask by loosening the cap"
   );
-  // The newest consensus paths must genuinely FIRE under the combined-fault schedule (sweep-level
+  // These consensus paths must genuinely FIRE under the combined-fault schedule (sweep-level
   // evidence, not just focused unit gates):
   // - HEADER-ONLY CARRIERS: every `DoViewChange`/`StartView`/`RecoveryResponse` log payload flows
   //   through `log_entries`; view changes happen in many seeds, so a zero here means the carrier
@@ -604,8 +604,8 @@ const ASYM_SEEDS: u64 = 16;
 /// var, no schedule races, cannot be forgotten by a runner). The default sweep's partitions are
 /// SYMMETRIC (group membership: either both sides see each other or neither does); this lane installs
 /// DIRECTED blocks — `blocked[from][to]` drops `from → to` while `to → from` keeps flowing — the
-/// one-way reachability real networks produce and the first schedule the forfeit/idle machinery
-/// faces it under. The headline shape is a DEAF PRIMARY (the victim draw biases toward a current
+/// one-way reachability real networks produce (a half-dead NIC, an asymmetric route/firewall).
+/// The headline shape is a DEAF PRIMARY (the victim draw biases toward a current
 /// primary half the time): its heartbeats flow OUT — suppressing every backup's idle view-change
 /// timer — while the PrepareOks never ARRIVE, so nothing commits for the whole episode; the mirror
 /// MUTE shape and a single-edge shape are also drawn. Victims count against the same minority budget

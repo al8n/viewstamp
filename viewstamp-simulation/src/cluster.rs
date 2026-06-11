@@ -69,8 +69,7 @@ pub struct Cluster {
   /// Set by [`tick`](Self::tick) when a replica emitted a `PrepareOk(op)` for an op that is NOT
   /// durable in its OWN WAL+snapshot at emission time — the append-before-ack invariant, checked
   /// structurally "via the sim's storage view". Stays `None` in the absence of a violation; a checker
-  /// (the VOPR driver) drains it each tick via [`take_append_before_ack_violation`]. Existing gates
-  /// never read it, so it is inert for them.
+  /// (the VOPR driver) drains it each tick via [`take_append_before_ack_violation`].
   append_before_ack_violation: Option<SmolStr>,
   /// Set by [`tick`](Self::tick) when a replica emitted ANY view-advertising / primary-authority
   /// participation message — a `StartView`/`RecoveryResponse`, a `DoViewChange` vote, a `Prepare`, a
@@ -83,23 +82,23 @@ pub struct Cluster {
   /// `DoViewChange`/`PrepareOk` is a VOTE the prospective/current primary counts toward FORMING view V
   /// / committing an op in it. Emitting any of them for a `V` above the durable view means the replica
   /// participated in a view a crash could regress it out of. Stays `None` absent a violation; the VOPR
-  /// driver drains it each tick via [`take_durable_view_violation`]. Inert for existing gates (they
-  /// never read it). See [`record_durable_view_violation`](Self::record_durable_view_violation).
+  /// driver drains it each tick via [`take_durable_view_violation`]. See
+  /// [`record_durable_view_violation`](Self::record_durable_view_violation).
   durable_view_violation: Option<SmolStr>,
-  /// `None` (default) ⇒ every replica's WAL appends SYNCHRONOUSLY (existing-gate behaviour). `Some(d)`
-  /// ⇒ async-append mode with per-append delay `d` polls — the Phase-A in-flight window the
+  /// `None` (default) ⇒ every replica's WAL appends SYNCHRONOUSLY (the deterministic gates' mode).
+  /// `Some(d)` ⇒ async-append mode with per-append delay `d` polls — the in-flight window the
   /// append-before-ack invariant must survive. Set via [`set_async_wal_delay`] before running;
   /// persists across `crash`/`restart` because the WAL struct does.
   async_wal_delay: Option<u32>,
-  /// `None` (default) ⇒ every replica's superblock writes complete SYNCHRONOUSLY (existing-gate
-  /// behaviour). `Some(d)` ⇒ async-write mode with per-write delay `d` polls — the pending
+  /// `None` (default) ⇒ every replica's superblock writes complete SYNCHRONOUSLY (the deterministic
+  /// gates' mode). `Some(d)` ⇒ async-write mode with per-write delay `d` polls — the pending
   /// durable-view window the durable-view-before-participate gate must survive. Set via
   /// [`set_async_superblock_delay`] before running; persists across `crash`/`restart` because the
   /// superblock struct does. A `crash` additionally DISCARDS any in-flight superblock write (a real
   /// crash loses an `fsync` mid-flight), so a not-yet-durable view write is genuinely lost.
   async_sb_delay: Option<u32>,
   /// `None` (default) ⇒ every replica's WAL is UNBOUNDED (`capacity() == u64::MAX`, the proto's
-  /// stall-before-wrap never engages — existing-gate behaviour). `Some(n)` ⇒ a fixed RING of `n` slots
+  /// stall-before-wrap never engages). `Some(n)` ⇒ a fixed RING of `n` slots
   /// per replica: the proto stalls op-assignment before wrapping an un-pruned slot. Set via
   /// [`set_wal_capacity`] before running; persists across `crash`/`restart` because the WAL struct does.
   /// MUST be `> checkpoint_ops + pipeline headroom` or the stall never releases (see the `Wal` capacity
@@ -112,7 +111,7 @@ pub struct Cluster {
   /// dropped here, mirroring what the real transport drops). A correct header-only carrier +
   /// byte-bounded `RepairBatch` keeps EVERY legitimate peer message at/below the cap, so this stays `0`
   /// for legitimate traffic; the VOPR harness asserts exactly that while large bodies are exercised, so
-  /// a regression that let a carrier overflow the frame (the old full-body view-change bug) would trip.
+  /// a regression that let a carrier overflow the frame would trip.
   oversized_dropped: u64,
   /// How many messages the network elected to HOLD ([`Faults::hold_per_mille`] fired) — delivery
   /// pushed [`HOLD_DELAY`] into the virtual future instead of `latency + jitter`. Monotone over the
@@ -432,7 +431,7 @@ impl Cluster {
   ///   broadcast in the not-yet-durable view.
   /// - `SyncCheckpoint` — the state-sync serve answering a `RequestSync`: it advertises
   ///   `self.view` as the server's authoritative view; shipping it from a not-yet-durable view
-  ///   advertises a view a crash could roll back (previously an unchecked blind spot).
+  ///   advertises a view a crash could roll back.
   ///
   /// The durable view is read off the same superblock the proto recovers from; it is MONOTONE (it only
   /// advances when a view-change/adoption write lands), so a message legitimately built while its view
@@ -476,10 +475,9 @@ impl Cluster {
       Message::Commit(commit) => ("Commit", commit.view().get()),
       // A SyncCheckpoint is the state-sync serve answering a peer's RequestSync: it advertises
       // `self.view` as the serving replica's authoritative view. Shipping it from a not-yet-durable
-      // view advertises a view a crash could roll back — previously an unchecked blind spot (the
-      // checker covered StartView/RecoveryResponse/DoViewChange/Prepare/PrepareOk/Commit but not
-      // this serve). The checkpoint content is view-independent, so the requester re-solicits and a
-      // Normal+durable peer answers; serving it during `pending_sb` is the same class as the others.
+      // view advertises a view a crash could roll back — the same participation class as the
+      // StartView/RecoveryResponse/DoViewChange/Prepare/PrepareOk/Commit arms above. The checkpoint
+      // content is view-independent, so the requester re-solicits and a Normal+durable peer answers.
       Message::SyncCheckpoint(sc) => ("SyncCheckpoint", sc.view().get()),
       _ => return,
     };
@@ -630,9 +628,9 @@ impl Cluster {
   ///   view write is actually lost, so the replica recovers to the OLD view (and the proto must never
   ///   have acted in the new one);
   /// - the WAL, so any STAGED (not-yet-durable) append is genuinely LOST — the faithful
-  ///   fsync-loss-on-crash model. Previously a staged append was left in place, so the async-WAL
-  ///   `poll` later RELEASED it into the durable log AFTER recovery (a stale `Appended` carrying a
-  ///   superseded `OpId`) — inverting real crash semantics, where an un-`fsync`'d WAL write is lost.
+  ///   fsync-loss-on-crash model. A staged append left in place would be RELEASED into the durable
+  ///   log by a later `poll` AFTER recovery (a stale `Appended` carrying a superseded `OpId`),
+  ///   inverting real crash semantics, where an un-`fsync`'d WAL write is lost.
   ///   Dropping it means a crash exercises the "in-flight WAL write lost" case directly: the recovered
   ///   replica's WAL head sits at most at its last DURABLE op, exactly the stale-WAL-slot class the
   ///   proto's recovery (and `truncate_wal_above_adopted_head`) must defend.
@@ -649,10 +647,10 @@ impl Cluster {
   /// recovered replica keeps its identity. Its in-memory state (log cache, SM) is reconstructed
   /// from storage; everything not yet durable is lost (as a real crash would lose it).
   ///
-  /// `recover` is now a metadata-only constructor that returns in `Status::Recovering` and drives
+  /// `recover` is a metadata-only constructor that returns in `Status::Recovering` and drives
   /// its WAL-tail (+ checkpoint) reads via `handle_storage` (retrying any fault). We pump
   /// `handle_storage` here in a bounded loop so the replica reaches `Normal`/`RecoveringHead` before
-  /// the next `tick` — keeping the existing "assert state right after restart" gates stable. (The
+  /// the next `tick` — letting gates assert state right after a restart. (The
   /// main `tick` loop also pumps `handle_storage` every tick, so an un-pumped restart would still
   /// recover; this pump is purely for test-assertion timing.)
   pub fn restart(&mut self, i: usize) {
@@ -868,7 +866,7 @@ impl Cluster {
   /// Test-only: how many times replica `i` (a backup) fell BELOW its bounded-WAL ring
   /// window on a head-extending `Prepare` and STATE-SYNCED to the cluster checkpoint instead of
   /// overwriting an un-pruned slot. `0` for an unbounded WAL or an in-quorum backup. The bounded-WAL
-  /// Phase-B gate asserts the SUM across replicas goes `> 0` to prove the connected backup-overflow path
+  /// gate asserts the SUM across replicas goes `> 0` to prove the connected backup-overflow path
   /// genuinely fired (distinct from the ordinary `> self.op` state-sync trigger). Mirrors the proto's
   /// `Endpoint::below_ring_window_syncs`.
   #[doc(hidden)]
@@ -1271,7 +1269,7 @@ impl Cluster {
       // inter-replica wire enforces the SAME cap the real transport does (the message-VOPR runs
       // without the transport). Header-only view-change carriers + the byte-bounded `RepairBatch` keep
       // every legitimate peer message at/below the cap, so a drop here is a REAL bug — a carrier
-      // that overflowed the frame (the old full-body view-change defect). Only `replica → replica`
+      // overflowed the frame. Only `replica → replica`
       // traffic is capped (client↔replica is a different path, not dropped — what the transport drops).
       if msg.encoded_len() > viewstamp_proto::MAX_FRAME_LEN as usize {
         self.oversized_dropped += 1;
@@ -1669,10 +1667,10 @@ mod tests {
   #[test]
   fn durable_view_checker_flags_a_sync_checkpoint_above_the_durable_view() {
     // CHECKER NON-VACUITY: the durable-view oracle must flag a `SyncCheckpoint` advertising a view
-    // ABOVE the emitter's durable view — the state-sync serve was previously an unchecked blind spot
-    // (the checker covered StartView/RecoveryResponse/DoViewChange/Prepare/PrepareOk/Commit but NOT
-    // this serve). A fresh cluster's durable view is 0; a SyncCheckpoint(view=1) is therefore a
-    // participation in a not-yet-durable view and MUST trip.
+    // ABOVE the emitter's durable view — the state-sync serve participates like
+    // StartView/RecoveryResponse/DoViewChange/Prepare/PrepareOk/Commit. A fresh cluster's durable
+    // view is 0; a SyncCheckpoint(view=1) is therefore a participation in a not-yet-durable view and
+    // MUST trip.
     let mut c = Cluster::new(3, 1, 1, 1);
     assert_eq!(
       c.replica_durable_view(0).get(),
@@ -1719,9 +1717,9 @@ mod tests {
 
   #[test]
   fn network_drops_an_oversized_inter_replica_message_but_not_small_or_client_ones() {
-    // The CONVERSE that proves the frame cap is REAL and would have caught the old full-body
-    // view-change bug: a full-`Present` 8-entry `DoViewChange` of large bodies — exactly the carrier
-    // the header-only change replaced — EXCEEDS `MAX_FRAME_LEN`, and the sim network drops it on the
+    // The CONVERSE that proves the frame cap is REAL: a full-`Present` 8-entry `DoViewChange` of
+    // large bodies — the carrier shape header-only carriers exist to avoid — EXCEEDS `MAX_FRAME_LEN`,
+    // and the sim network drops it on the
     // inter-replica path (counting it), while a header-only carrier of the SAME band, a small message,
     // and an (oversized) client-bound message all pass. This is the modelled transport send-path frame
     // guard; it is what makes the VOPR's `oversized_dropped == 0` for legitimate traffic a real oracle.
