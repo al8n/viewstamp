@@ -36,6 +36,9 @@ quinn-proto = { version = "0.11", default-features = false, optional = true }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 
 [dev-dependencies]
+# Carries the workspace's time resolution bound into every graph that builds rcgen (see the
+# workspace manifest's comment).
+time = { workspace = true }
 criterion = "0.8"
 rcgen = "0.14"
 ring = "0.17"
