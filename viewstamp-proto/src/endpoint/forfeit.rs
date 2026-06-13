@@ -181,6 +181,11 @@ impl<S: StateMachine> Endpoint<S> {
   /// cluster believes is ancient. A replica that somehow holds `view == u64::MAX` keeps proposing
   /// `u64::MAX` — its peers ignore the stale target and no quorum forms — which is inert, not corrupt.
   pub(crate) fn propose_next_view<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+    if self.is_learner() {
+      // A non-voting replica never initiates or joins a view change: it has no vote to cast and is
+      // never a candidate primary. It learns of a completed change from the new primary's StartView.
+      return;
+    }
     let target = self.view.next();
     if target.get() > self.svc_target.get() {
       self.svc_target = target;

@@ -1499,6 +1499,15 @@ impl<S> Endpoint<S> {
     self.config.node_count()
   }
 
+  /// True iff THIS replica is a non-voting learner (its own id is `>= replica_count`). A learner
+  /// applies the committed log but never acknowledges a prepare, never casts a view-change vote, and
+  /// is never primary — it follows the cluster via the primary's broadcasts and catches up by
+  /// soliciting state, exactly like a TigerBeetle standby.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_learner(&self) -> bool {
+    self.config.is_learner(self.config.replica())
+  }
+
   /// Whether this replica is the primary of the current view.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn is_primary(&self) -> bool {
@@ -2379,13 +2388,15 @@ where
       }
       Status::Normal => {
         // backup: bootstrap + fire primary_idle, then re-arm THIS timer only so we
-        // re-propose at the primary_idle cadence (not every tick).
+        // re-propose at the primary_idle cadence (not every tick). A non-voting learner never arms
+        // primary_idle (`arm_primary_idle` is a no-op for it), so this whole proposal path stays inert:
+        // it never proposes a view change and never retransmits an SVC — it only follows the primary.
         if self.timers.primary_idle.is_none() {
-          self.timers.primary_idle = Some(now + PRIMARY_IDLE);
+          self.arm_primary_idle(now);
         }
         if self.timers.primary_idle.is_some_and(|d| d <= now) {
           self.on_primary_idle(now, sb);
-          self.timers.primary_idle = Some(now + PRIMARY_IDLE);
+          self.arm_primary_idle(now);
         }
         // Once this backup has PROPOSED a view change off
         // its idle timeout (`on_primary_idle` -> `propose_next_view` -> `join_svc`), it ARMS `svc_message`
@@ -2460,6 +2471,16 @@ where
     self.assert_invariants();
   }
 
+  /// Arms the `primary_idle` deadline — but never for a non-voting learner, which has no view-change
+  /// vote to cast and so never proposes a view change on an idle primary. Centralizing the arm here
+  /// keeps every site that defers the idle timeout (`note_primary_contact`, the `handle_timeout`
+  /// bootstrap/re-arm, the `arm_timers` Normal-backup role arm) learner-aware through one predicate.
+  fn arm_primary_idle(&mut self, now: Instant) {
+    if !self.is_learner() {
+      self.timers.primary_idle = Some(now + PRIMARY_IDLE);
+    }
+  }
+
   /// (Re)arms this replica's timers for its current role/status.
   fn arm_timers(&mut self, now: Instant) {
     // clear all, then set the ones for this role. PRESERVE the forfeit grace timer across the reset:
@@ -2502,11 +2523,17 @@ where
         }
       }
       Status::Normal => {
-        self.timers.primary_idle = Some(now + PRIMARY_IDLE);
+        self.arm_primary_idle(now);
       }
       Status::ViewChange if self.catching_up() => {
         self.timers.get_view_message = Some(now + VC_MESSAGE_RETRANSMIT);
-        self.timers.view_change_status = Some(now + VIEW_CHANGE_STATUS);
+        // A catching-up replica re-solicits StartView via `get_view_message`; only a voter also arms
+        // `view_change_status`, the timer whose expiry ESCALATES a stalled catch-up into actively
+        // driving the next view. A learner never escalates — it stays catching up until it adopts a
+        // StartView — so it leaves `view_change_status` disarmed and follows the voters' change.
+        if !self.is_learner() {
+          self.timers.view_change_status = Some(now + VIEW_CHANGE_STATUS);
+        }
       }
       Status::ViewChange => {
         self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
@@ -2650,13 +2677,18 @@ where
       | TimerKind::Prepare
       | TimerKind::ForfeitArmed
       | TimerKind::RepairOrTruncate => self.participates_as_primary() && !self.pending_forfeit,
-      TimerKind::PrimaryIdle => self.status.is_normal() && !self.is_primary(),
+      // A non-voting learner never proposes or escalates a view change, so the whole vote/idle timer
+      // plane (`primary_idle`, `svc_message`, `dvc_message`, `view_change_status`) is non-serviceable
+      // for it — it never arms them, and this keeps the no-orphan-due assert satisfied if a stale
+      // deadline ever lingered. Its only view-change timer is `get_view_message` (the catch-up re-solicit).
+      TimerKind::PrimaryIdle => self.status.is_normal() && !self.is_primary() && !self.is_learner(),
       // Three disjoint servicers (see the doc): forfeit re-propose, backup retransmit, or the
       // active view-change driver.
       TimerKind::SvcMessage => {
-        (self.status.is_normal() && self.is_primary() && self.pending_forfeit)
-          || (self.status.is_normal() && !self.is_primary())
-          || (self.status.is_view_change() && !self.catching_up())
+        !self.is_learner()
+          && ((self.status.is_normal() && self.is_primary() && self.pending_forfeit)
+            || (self.status.is_normal() && !self.is_primary())
+            || (self.status.is_view_change() && !self.catching_up()))
       }
       // The DVC retransmit is a VOTE the new primary counts toward forming the view, so it is
       // serviceable only once this replica's view is DURABLE — durable-view-before-participate in the
@@ -2671,9 +2703,12 @@ where
       // *request-to-change* (an SVC), not a vote, and `get_view_message` is a catch-up READ that (by the
       // `catching_up` discriminant) never coexists with the SendDoViewChange `pending_sb` window.
       TimerKind::DvcMessage => {
-        self.status.is_view_change() && !self.catching_up() && self.pending_sb.is_none()
+        !self.is_learner()
+          && self.status.is_view_change()
+          && !self.catching_up()
+          && self.pending_sb.is_none()
       }
-      TimerKind::ViewChangeStatus => self.status.is_view_change(),
+      TimerKind::ViewChangeStatus => self.status.is_view_change() && !self.is_learner(),
       TimerKind::GetViewMessage => self.status.is_view_change() && self.catching_up(),
       TimerKind::RecoverRetry => self.status.is_recovering(),
       TimerKind::RecoverHead => self.status.is_recovering_head(),

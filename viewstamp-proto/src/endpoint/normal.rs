@@ -832,6 +832,11 @@ impl<S: StateMachine> Endpoint<S> {
   /// lands; `on_prepare`'s in-flight-gated re-ack branch) are responsible for not calling this for an
   /// in-flight op — this assert backstops that contract.
   pub(crate) fn send_prepare_ok(&mut self, op: OpNumber) {
+    if self.is_learner() {
+      // A non-voting replica applies the committed log but never acknowledges a prepare: its ack would
+      // be dropped at the primary's vote ingress regardless, and a learner is outside every quorum.
+      return;
+    }
     debug_assert!(
       !self.appending.contains(&op.get()),
       "append-before-ack: PrepareOk for op {} whose WAL append is still in flight",
