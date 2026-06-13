@@ -24,7 +24,7 @@ features = ["std", "tcp"]
 # Supplies the in-memory Wal/Superblock fixtures + LogSm the stream_ingress harness drives the
 # coordinator with — the same fixtures the simulator and the driver tests use.
 [dependencies.viewstamp-simulation]
-path = "../viewstamp-simulation"
+path = "../tests/viewstamp-simulation"
 
 [[bin]]
 name = "message_decode"
@@ -43,6 +43,13 @@ bench = false
 [[bin]]
 name = "superblock_decode"
 path = "fuzz_targets/superblock_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "batch_codec"
+path = "fuzz_targets/batch_codec.rs"
 test = false
 doc = false
 bench = false
