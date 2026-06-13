@@ -759,7 +759,7 @@ fn a_quorum_checkpoint_report_advances_prune_floor_without_a_gc_trim_yet_the_car
   // checkpoint ran, so no `run_gc`). Model the report via the exact mechanism a `Commit`/`PrepareOk`
   // uses — `record_peer_checkpoint` — for a quorum (self + one peer) at a HIGH checkpoint op.
   let high = depth as u64 - 1;
-  e.record_peer_checkpoint(1, OpNumber::with(high));
+  e.record_peer_checkpoint(ReplicaId::new(1), OpNumber::with(high));
   // self's own report (quorum of 2-of-3 now at `high`); the helper keeps the log_floor coupling AND
   // the cached quorum statistic coherent, as a real checkpoint advance would.
   e.set_own_checkpoint_for_test(high);

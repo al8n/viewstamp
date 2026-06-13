@@ -85,7 +85,7 @@ pub enum ConfigError {
   #[error("replica index {index} out of range for a {count}-replica cluster")]
   ReplicaIndexOutOfRange {
     /// The offending replica index.
-    index: u8,
+    index: u16,
     /// The cluster size.
     count: u8,
   },
@@ -140,7 +140,7 @@ impl Config {
     if replica_count == 0 {
       return Err(ConfigError::ZeroReplicaCount);
     }
-    if replica.get() >= replica_count {
+    if replica.get() >= replica_count as u16 {
       return Err(ConfigError::ReplicaIndexOutOfRange {
         index: replica.get(),
         count: replica_count,
@@ -305,7 +305,7 @@ impl Config {
   /// The primary for a given view: `view % replica_count`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn primary(&self, view: View) -> ReplicaId {
-    ReplicaId::new((view.get() % self.replica_count as u64) as u8)
+    ReplicaId::new((view.get() % self.replica_count as u64) as u16)
   }
 
   /// Whether this replica is the primary for `view`.

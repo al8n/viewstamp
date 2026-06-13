@@ -2735,7 +2735,7 @@ fn cold_cache_chunk_request_rereads_and_ships() {
 // ── Chunked state-sync transfer: the receiver pull loop ──
 
 /// A `SyncCheckpointMeta` announcing the `(op, id)` envelope of `total` bytes from `donor`.
-fn meta_of(op: u64, id: u128, total: usize, donor: u8, nonce: u64) -> Message {
+fn meta_of(op: u64, id: u128, total: usize, donor: u16, nonce: u64) -> Message {
   Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
     View::new(),
     OpNumber::with(op),
@@ -2752,7 +2752,7 @@ fn chunk_of(
   id: u128,
   env: &Bytes,
   range: core::ops::Range<usize>,
-  donor: u8,
+  donor: u16,
   nonce: u64,
 ) -> Message {
   Message::SyncChunk(crate::SyncChunk::new(

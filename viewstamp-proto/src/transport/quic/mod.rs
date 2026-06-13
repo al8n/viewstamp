@@ -608,7 +608,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     // fanout, yet the endpoint's own `sender_matches` then drops every inbound consensus frame from it —
     // slot and traffic wasted. In-model misconfiguration, not a Byzantine claim.
     match candidate.as_replica() {
-      Some(r) if r.get() < self.replica_count() => {}
+      Some(r) if r.get() < self.replica_count() as u16 => {}
       _ => {
         self.bridge.close_local(std_now, h);
         return;
@@ -906,7 +906,7 @@ mod tests {
       c.connect(
         Instant::ZERO,
         addr(1000 + i as u16),
-        Peer::Replica(ReplicaId::new(1 + i as u8)),
+        Peer::Replica(ReplicaId::new(1 + i as u16)),
       )
       .expect("a dial under the cap is admitted");
     }
@@ -972,7 +972,7 @@ mod tests {
       c.connect(
         Instant::ZERO,
         addr(1000 + i as u16),
-        Peer::Replica(ReplicaId::new(1 + i as u8)),
+        Peer::Replica(ReplicaId::new(1 + i as u16)),
       )
       .expect("a dial under the cap is admitted");
     }

@@ -1108,7 +1108,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || !self.is_primary() || ok.view() != self.view {
       return;
     }
-    if ok.replica().get() >= self.config.replica_count() {
+    if ok.replica().get() >= self.config.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     // Record this backup's reported checkpoint for the checkpoint-quorum (the range check above
@@ -1116,7 +1116,7 @@ impl<S: StateMachine> Endpoint<S> {
     // carries a fresh checkpoint report. Drives `quorum_checkpoint_op` → the GC prune floor.
     // MONOTONE: a reordered older report must never lower the recorded value (the GC floor and the
     // force-sync trigger that read it must not regress under reordering/partitions).
-    self.record_peer_checkpoint(ok.replica().get(), ok.checkpoint_op());
+    self.record_peer_checkpoint(ok.replica(), ok.checkpoint_op());
     // State-sync trigger (symmetric): a backup reporting a checkpoint above our head means we are the
     // laggard (e.g. a partition-healed old primary). The `> self.op` gate keeps this a no-op normally.
     self.maybe_request_sync(now, ok.checkpoint_op());
@@ -1153,7 +1153,7 @@ impl<S: StateMachine> Endpoint<S> {
     // primary's last-known checkpoint rather than 0. Bounded by `replica_count`. MONOTONE: a
     // reordered older Commit must never lower the recorded value (so the force-sync trigger this
     // backup reads via `quorum_checkpoint_op` does not regress under reordering/partitions).
-    self.record_peer_checkpoint(self.config.primary(self.view).get(), c.checkpoint_op());
+    self.record_peer_checkpoint(self.config.primary(self.view), c.checkpoint_op());
     // State-sync trigger: if the cluster has checkpointed past our WAL head, solicit a SyncCheckpoint
     // (the ops we'd need are below the cluster checkpoint and may be pruned — tail-apply can't reach).
     self.maybe_request_sync(now, c.checkpoint_op());

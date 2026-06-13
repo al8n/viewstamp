@@ -43,7 +43,7 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// The prospective-primary DVC collection (read). Only ever called inside `Status::ViewChange` (where
   /// the collection is `Some`); `expect` documents that invariant.
-  fn dvc_from(&self) -> &BTreeMap<u8, DoViewChange> {
+  fn dvc_from(&self) -> &BTreeMap<ReplicaId, DoViewChange> {
     &self
       .view_change
       .as_ref()
@@ -52,7 +52,7 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// The prospective-primary DVC collection (mutable). Only ever called inside `Status::ViewChange`.
-  fn dvc_from_mut(&mut self) -> &mut BTreeMap<u8, DoViewChange> {
+  fn dvc_from_mut(&mut self) -> &mut BTreeMap<ReplicaId, DoViewChange> {
     &mut self
       .view_change
       .as_mut()
@@ -133,7 +133,7 @@ impl<S: StateMachine> Endpoint<S> {
       // via a real Prepare/Commit from its primary (the higher-view rule), not via SVCs.
       return;
     }
-    if m.replica().get() >= self.config.replica_count() {
+    if m.replica().get() >= self.config.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     if target.get() > self.svc_target.get() {
@@ -430,7 +430,7 @@ impl<S: StateMachine> Endpoint<S> {
     {
       return;
     }
-    if m.replica().get() >= self.config.replica_count() {
+    if m.replica().get() >= self.config.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     // Record the donor's vouched checkpoint floor, mirroring the `PrepareOk`/`Commit` recording
@@ -438,10 +438,10 @@ impl<S: StateMachine> Endpoint<S> {
     // GC-quorum floors fresh across the view transition that cleared `peer_checkpoint`: a sub-floor
     // committed hole the floored union cannot carry must still cross `max_peer_checkpoint_op()` so
     // the escalation fires (the donor's checkpoint proves a servable snapshot at/above it exists).
-    self.record_peer_checkpoint(m.replica().get(), m.checkpoint_op());
+    self.record_peer_checkpoint(m.replica(), m.checkpoint_op());
     // Ensure our own DVC is represented (keyed by replica → a self-addressed DVC is idempotent).
     // Compute the own-DVC into a local FIRST to avoid a self borrow conflict, then insert.
-    let own = self.config.replica().get();
+    let own = self.config.replica();
     if !self.dvc_from().contains_key(&own) {
       let own_dvc = crate::DoViewChange::new(
         self.view,
@@ -461,11 +461,11 @@ impl<S: StateMachine> Endpoint<S> {
     // Keep the most-advanced DVC per replica.
     let replace = self
       .dvc_from()
-      .get(&m.replica().get())
+      .get(&m.replica())
       .map(|cur| (m.log_view().get(), m.op().get()) > (cur.log_view().get(), cur.op().get()))
       .unwrap_or(true);
     if replace {
-      self.dvc_from_mut().insert(m.replica().get(), m);
+      self.dvc_from_mut().insert(m.replica(), m);
     }
     if self.dvc_from().len() >= self.config.quorum_view_change() {
       self.start_view_as_new_primary(now, wal, sb);
@@ -1226,7 +1226,7 @@ impl<S: StateMachine> Endpoint<S> {
     // first trigger. A zero floor carries no information and is skipped, keeping the freshly-reset
     // map genuinely empty for a floor-less adoption.
     if floor > 0 {
-      self.record_peer_checkpoint(self.config.primary(view).get(), OpNumber::with(floor));
+      self.record_peer_checkpoint(self.config.primary(view), OpNumber::with(floor));
     }
     // ViewChange EXIT (adoption → Normal): retire the ViewChange-only collection (DVC + catch-up). The
     // shared reset above is bidirectional, so the `take`-to-`None` lives here. (`is_some() ==

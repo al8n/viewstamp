@@ -764,7 +764,7 @@ impl TestClusterCa {
 
   /// Issue a leaf certificate signed by this CA with the SAN
   /// `replica-<n>.<cluster_id_hex>.viewstamp`.
-  pub(crate) fn issue_replica(&self, n: u8, cluster: u128) -> TestReplicaCert {
+  pub(crate) fn issue_replica(&self, n: u16, cluster: u128) -> TestReplicaCert {
     let san = format!("replica-{n}.{cluster:032x}.viewstamp");
     let mut params =
       rcgen::CertificateParams::new(vec![san]).expect("valid DNS SAN for replica cert");
@@ -788,7 +788,7 @@ impl TestClusterCa {
   /// viewstamp identity extension attesting `Peer::Replica(n)` for `cluster` — the input a
   /// [`CertOid`](super::CertOid) verifier parses. The extension is added NON-critical so the stock
   /// cluster-CA WebPki verifier does not reject the chain over it (see [`CertOid`](super::CertOid)).
-  pub(crate) fn issue_replica_with_oid(&self, n: u8, cluster: u128) -> TestReplicaCert {
+  pub(crate) fn issue_replica_with_oid(&self, n: u16, cluster: u128) -> TestReplicaCert {
     use super::identity::{IDENTITY_OID, encode_identity_ext};
 
     let san = format!("replica-{n}.{cluster:032x}.viewstamp");

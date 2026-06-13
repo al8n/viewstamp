@@ -8,15 +8,15 @@ use crate::{ClientId, Instant, Peer, ReplicaId};
 use super::stream::{Intake, RecordIo, StreamTransport};
 
 const HELLO_TAG: u8 = 0x0C;
-const HELLO_VERSION: u8 = 1;
+const HELLO_VERSION: u8 = 2;
 const PEER_REPLICA: u8 = 0;
 const PEER_CLIENT: u8 = 1;
 /// The maximum encoded length of a hello: tag+ver+cluster(16)+peer_tag = 19, then up to a 16-byte
-/// client id = 35 (a replica hello is 20). This is the EXACT upper bound of [`encode_hello`], so no
-/// valid hello ever exceeds it. Two callers rely on it: the TCP byte-stream path bounds its reassembly
-/// buffer (an unparsed prefix longer than this is a malformed stream → reject), and the QUIC transport
-/// sizes its pre-authentication Control frame decoder to this cap (a peer cannot pin a larger first
-/// Control frame before its identity validates).
+/// client id = 35 (a replica hello is 21: a 2-byte replica id). This is the EXACT upper bound of
+/// [`encode_hello`], so no valid hello ever exceeds it. Two callers rely on it: the TCP byte-stream path
+/// bounds its reassembly buffer (an unparsed prefix longer than this is a malformed stream → reject),
+/// and the QUIC transport sizes its pre-authentication Control frame decoder to this cap (a peer cannot
+/// pin a larger first Control frame before its identity validates).
 pub(crate) const MAX_HELLO_LEN: usize = 1 + 1 + 16 + 1 + 16;
 
 /// Immutable handshake options: this node's cluster id and its own claimed identity. The inner
@@ -53,7 +53,7 @@ pub(crate) fn encode_hello(cluster: u128, who: Peer, out: &mut Vec<u8>) {
   match who {
     Peer::Replica(r) => {
       out.push(PEER_REPLICA);
-      out.push(r.get());
+      out.extend_from_slice(&r.get().to_be_bytes());
     }
     Peer::Client(c) => {
       out.push(PEER_CLIENT);
@@ -91,10 +91,15 @@ pub(crate) fn classify_hello(buf: &[u8], expected_cluster: u128) -> HelloOutcome
   }
   match buf.get(18) {
     None => HelloOutcome::Incomplete,
-    Some(&PEER_REPLICA) => match buf.get(19) {
-      Some(&idx) => HelloOutcome::Accepted(Peer::Replica(ReplicaId::new(idx)), 20),
-      None => HelloOutcome::Incomplete,
-    },
+    Some(&PEER_REPLICA) => {
+      // The replica id is a 2-byte big-endian field at offsets 19..21 (consumed length 21).
+      if buf.len() < 21 {
+        HelloOutcome::Incomplete
+      } else {
+        let idx = u16::from_be_bytes(buf[19..21].try_into().expect("2 bytes"));
+        HelloOutcome::Accepted(Peer::Replica(ReplicaId::new(idx)), 21)
+      }
+    }
     Some(&PEER_CLIENT) => {
       if buf.len() < 35 {
         HelloOutcome::Incomplete
@@ -433,6 +438,39 @@ mod tests {
     );
     pump(&mut dialer, &mut acceptor);
     assert_eq!(acceptor.peer_identity(), Some(c));
+  }
+
+  #[test]
+  fn a_replica_id_above_a_byte_round_trips_through_the_hello() {
+    // The replica id rides the hello as a 2-byte big-endian field, so an index above a single byte
+    // encodes and classifies back to the same id. The classifier also reports the exact consumed
+    // length (21 for a replica hello), and a hello buffered one byte short is Incomplete, not accepted
+    // on a truncated id.
+    let r = Peer::Replica(ReplicaId::new(300));
+    let mut hello = Vec::new();
+    encode_hello(CLUSTER, r, &mut hello);
+    assert_eq!(hello.len(), 21, "a replica hello is 21 bytes (a 2-byte id)");
+    match classify_hello(&hello, CLUSTER) {
+      HelloOutcome::Accepted(peer, consumed) => {
+        assert_eq!(peer, r);
+        assert_eq!(consumed, 21);
+      }
+      _ => panic!("a complete replica hello must be accepted"),
+    }
+    // One byte short of the full id is Incomplete (never accepted on a half-read id).
+    assert!(matches!(
+      classify_hello(&hello[..hello.len() - 1], CLUSTER),
+      HelloOutcome::Incomplete
+    ));
+    // And it round-trips end-to-end through the dialer/acceptor pump.
+    let mut dialer: Labeled<crate::Passthrough> =
+      Labeled::dialer(crate::Passthrough::new(), &opts(r));
+    let mut acceptor: Labeled<crate::Passthrough> = Labeled::acceptor(
+      crate::Passthrough::new(),
+      &opts(Peer::Replica(ReplicaId::new(0))),
+    );
+    pump(&mut dialer, &mut acceptor);
+    assert_eq!(acceptor.peer_identity(), Some(r));
   }
 
   #[test]

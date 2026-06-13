@@ -134,7 +134,7 @@ const PREPARE_BATCH_BODY_OVERHEAD: usize = PREPARE_BATCH_CARRIER_OVERHEAD + LOG_
 
 /// Fixed bytes a [`SyncCheckpoint`] encoding wraps around its checkpoint envelope: the
 /// [`ENCODE_HEADER_LEN`] message header, then `view` + `checkpoint_op` (two `u64`s) + `checkpoint_id`
-/// (`u128`) + `replica` (`u8`) + `nonce` (`u64`), then the envelope's [`BYTES_LEN_PREFIX`]. Derived
+/// (`u128`) + `replica` (`u16`) + `nonce` (`u64`), then the envelope's [`BYTES_LEN_PREFIX`]. Derived
 /// from the exact widths [`Message::encode`]/[`Message::encoded_len`] write for the
 /// [`Message::SyncCheckpoint`] arm. The state-sync serve branches on
 /// `MAX_FRAME_LEN - SYNC_CHECKPOINT_CARRIER_OVERHEAD` ([`max_unchunked_snapshot_len`]): an envelope
@@ -142,7 +142,7 @@ const PREPARE_BATCH_BODY_OVERHEAD: usize = PREPARE_BATCH_CARRIER_OVERHEAD + LOG_
 /// cap), a larger one ships chunked ([`SyncCheckpointMeta`] → [`RequestSyncChunk`] → [`SyncChunk`]) so
 /// no serve can ever exceed the frame cap.
 pub(crate) const SYNC_CHECKPOINT_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 16 + 1 + 8 + BYTES_LEN_PREFIX;
+  ENCODE_HEADER_LEN + 8 + 8 + 16 + 2 + 8 + BYTES_LEN_PREFIX;
 
 /// The largest checkpoint envelope that ships UNCHUNKED — as one [`SyncCheckpoint`] of exactly
 /// `MAX_FRAME_LEN` at this size. The state-sync donor branches here: an envelope at/under this
@@ -156,11 +156,11 @@ pub const fn max_unchunked_snapshot_len() -> usize {
 
 /// Fixed bytes a [`SyncChunk`] encoding wraps around its chunk payload: the [`ENCODE_HEADER_LEN`]
 /// message header, then `view` + `checkpoint_op` (two `u64`s) + `checkpoint_id` (`u128`) +
-/// `total_len` + `offset` (two `u64`s) + `replica` (`u8`) + `nonce` (`u64`), then the payload's
-/// [`BYTES_LEN_PREFIX`] — 64 bytes. Derived from the exact widths
+/// `total_len` + `offset` (two `u64`s) + `replica` (`u16`) + `nonce` (`u64`), then the payload's
+/// [`BYTES_LEN_PREFIX`] — 65 bytes. Derived from the exact widths
 /// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::SyncChunk`] arm.
 pub(crate) const SYNC_CHUNK_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 16 + 8 + 8 + 1 + 8 + BYTES_LEN_PREFIX;
+  ENCODE_HEADER_LEN + 8 + 8 + 16 + 8 + 8 + 2 + 8 + BYTES_LEN_PREFIX;
 
 /// The chunk size of the chunked state-sync transfer: the largest payload a [`SyncChunk`] can carry
 /// with its encoding landing exactly on `MAX_FRAME_LEN` (max-fill, pinned exact by test). Every
@@ -1908,7 +1908,7 @@ impl Message {
       Self::PrepareOk(m) => {
         out.put_u64(m.view.get());
         out.put_u64(m.op.get());
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         out.put_u64(m.checkpoint_op.get());
         out.put_u128(m.prepare_checksum);
       }
@@ -1925,7 +1925,7 @@ impl Message {
       }
       Self::StartViewChange(m) => {
         out.put_u64(m.view.get());
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
       }
       Self::DoViewChange(m) => {
         out.put_u64(m.view.get());
@@ -1933,7 +1933,7 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         write_log(&mut out, &m.log);
       }
       Self::StartView(m) => {
@@ -1941,21 +1941,21 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         write_log(&mut out, &m.log);
       }
       Self::GetView(m) => {
         out.put_u64(m.view.get());
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
       }
       Self::RequestPrepare(m) => {
         out.put_u64(m.view.get());
         out.put_u64(m.op.get());
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
       }
       Self::Recovery(m) => {
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
       }
       Self::RecoveryResponse(m) => {
@@ -1963,14 +1963,14 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
         write_log(&mut out, &m.log);
       }
       Self::RequestSync(m) => {
         out.put_u64(m.view.get());
         out.put_u64(m.checkpoint_op.get());
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
         out.put_u8(m.recovery as u8);
       }
@@ -1978,7 +1978,7 @@ impl Message {
         out.put_u64(m.view.get());
         out.put_u64(m.checkpoint_op.get());
         out.put_u128(m.checkpoint_id);
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
         write_bytes_u32(&mut out, &m.snapshot);
       }
@@ -1986,7 +1986,7 @@ impl Message {
         out.put_u64(m.view.get());
         out.put_u64(m.lo.get());
         out.put_u64(m.hi.get());
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
       }
       Self::RepairBatch(m) => {
         out.put_u64(m.view.get());
@@ -1999,7 +1999,7 @@ impl Message {
         out.put_u64(m.checkpoint_op.get());
         out.put_u128(m.checkpoint_id);
         out.put_u64(m.total_len);
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
       }
       Self::RequestSyncChunk(m) => {
@@ -2007,7 +2007,7 @@ impl Message {
         out.put_u64(m.checkpoint_op.get());
         out.put_u128(m.checkpoint_id);
         out.put_u64(m.offset);
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
       }
       Self::SyncChunk(m) => {
@@ -2016,7 +2016,7 @@ impl Message {
         out.put_u128(m.checkpoint_id);
         out.put_u64(m.total_len);
         out.put_u64(m.offset);
-        out.put_u8(m.replica.get());
+        out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
         write_bytes_u32(&mut out, &m.bytes);
       }
@@ -2042,6 +2042,7 @@ impl Message {
     // Fixed-width scalar widths as `encode` writes them.
     const U64: usize = 8;
     const U128: usize = 16;
+    const U16: usize = 2;
     const U8: usize = 1;
     // A `write_bytes_u32` payload is a u32 length prefix plus the bytes.
     fn bytes_u32(len: usize) -> usize {
@@ -2064,23 +2065,23 @@ impl Message {
     let body = match self {
       Self::Request(m) => U128 + U64 + bytes_u32(m.body.len()),
       Self::Prepare(m) => U64 + U64 + U64 + U64 + U128 + U64 + bytes_u32(m.body.len()),
-      Self::PrepareOk(_) => U64 + U64 + U8 + U64 + U128,
+      Self::PrepareOk(_) => U64 + U64 + U16 + U64 + U128,
       Self::Reply(m) => U64 + U128 + U64 + bytes_u32(m.body.len()),
       Self::Commit(_) => U64 + U64 + U64,
-      Self::StartViewChange(_) => U64 + U8,
-      Self::DoViewChange(m) => U64 + U64 + U64 + U64 + U64 + U8 + log(&m.log),
-      Self::StartView(m) => U64 + U64 + U64 + U64 + U8 + log(&m.log),
-      Self::GetView(_) => U64 + U8 + U64,
-      Self::RequestPrepare(_) => U64 + U64 + U8,
-      Self::Recovery(_) => U8 + U64,
-      Self::RecoveryResponse(m) => U64 + U64 + U64 + U64 + U8 + U64 + log(&m.log),
-      Self::RequestSync(_) => U64 + U64 + U8 + U64 + U8,
-      Self::SyncCheckpoint(m) => U64 + U64 + U128 + U8 + U64 + bytes_u32(m.snapshot.len()),
-      Self::RequestPrepareRange(_) => U64 + U64 + U64 + U8,
+      Self::StartViewChange(_) => U64 + U16,
+      Self::DoViewChange(m) => U64 + U64 + U64 + U64 + U64 + U16 + log(&m.log),
+      Self::StartView(m) => U64 + U64 + U64 + U64 + U16 + log(&m.log),
+      Self::GetView(_) => U64 + U16 + U64,
+      Self::RequestPrepare(_) => U64 + U64 + U16,
+      Self::Recovery(_) => U16 + U64,
+      Self::RecoveryResponse(m) => U64 + U64 + U64 + U64 + U16 + U64 + log(&m.log),
+      Self::RequestSync(_) => U64 + U64 + U16 + U64 + U8,
+      Self::SyncCheckpoint(m) => U64 + U64 + U128 + U16 + U64 + bytes_u32(m.snapshot.len()),
+      Self::RequestPrepareRange(_) => U64 + U64 + U64 + U16,
       Self::RepairBatch(m) => U64 + U64 + U64 + log(&m.log),
-      Self::SyncCheckpointMeta(_) => U64 + U64 + U128 + U64 + U8 + U64,
-      Self::RequestSyncChunk(_) => U64 + U64 + U128 + U64 + U8 + U64,
-      Self::SyncChunk(m) => U64 + U64 + U128 + U64 + U64 + U8 + U64 + bytes_u32(m.bytes.len()),
+      Self::SyncCheckpointMeta(_) => U64 + U64 + U128 + U64 + U16 + U64,
+      Self::RequestSyncChunk(_) => U64 + U64 + U128 + U64 + U16 + U64,
+      Self::SyncChunk(m) => U64 + U64 + U128 + U64 + U64 + U16 + U64 + bytes_u32(m.bytes.len()),
       Self::PrepareBatch(m) => U64 + U64 + U64 + log(&m.log),
     };
     HEADER + body
@@ -2271,7 +2272,7 @@ fn read_client(r: &mut Reader<'_>) -> Result<ClientId, CodecError> {
 
 #[cfg_attr(not(tarpaulin), inline)]
 fn read_replica(r: &mut Reader<'_>) -> Result<ReplicaId, CodecError> {
-  Ok(ReplicaId::new(r.u8()?))
+  Ok(ReplicaId::new(r.u16()?))
 }
 
 #[cfg_attr(not(tarpaulin), inline)]
@@ -3018,7 +3019,7 @@ mod tests {
         Bytes::from(std::vec![0u8; len]),
       ))
     };
-    assert_eq!(SYNC_CHUNK_CARRIER_OVERHEAD, 64);
+    assert_eq!(SYNC_CHUNK_CARRIER_OVERHEAD, 65);
     assert_eq!(chunk_of(0).encode().len(), SYNC_CHUNK_CARRIER_OVERHEAD);
     assert_eq!(
       chunk_of(SYNC_CHUNK_LEN).encode().len(),
@@ -3053,7 +3054,7 @@ mod tests {
       "one byte over the threshold cannot ship whole — the donor must chunk it"
     );
 
-    // The two fixed-size chunked-transfer messages are small constants (52 bytes each).
+    // The two fixed-size chunked-transfer messages are small constants (53 bytes each).
     let meta = Message::SyncCheckpointMeta(SyncCheckpointMeta::new(
       View::with(1),
       OpNumber::with(8),
@@ -3070,8 +3071,8 @@ mod tests {
       ReplicaId::new(2),
       0xBEEF,
     ));
-    assert_eq!(meta.encode().len(), 52);
-    assert_eq!(pull.encode().len(), 52);
+    assert_eq!(meta.encode().len(), 53);
+    assert_eq!(pull.encode().len(), 53);
   }
 
   #[test]
@@ -3311,6 +3312,52 @@ mod tests {
   }
 
   #[test]
+  fn a_replica_id_above_a_byte_round_trips_through_the_wire_codec() {
+    // The replica id is a u16 on the wire (two big-endian bytes), so an index that does not fit a
+    // single byte survives encode→decode unchanged on every replica-bearing variant. 300 = 0x012C
+    // exercises both bytes.
+    let id = ReplicaId::new(300);
+    assert!(id.get() > u16::from(u8::MAX), "the id is above a single byte");
+    let carriers = std::vec![
+      Message::PrepareOk(PrepareOk::new(
+        View::with(4),
+        OpNumber::with(5),
+        id,
+        OpNumber::with(6),
+        0xCAFE_F00D_DEAD_BEEF_0102_0304_0506_0708,
+      )),
+      Message::StartViewChange(StartViewChange::new(View::with(11), id)),
+      Message::DoViewChange(DoViewChange::new(
+        View::with(3),
+        View::with(2),
+        OpNumber::with(6),
+        OpNumber::with(4),
+        id,
+        std::vec![entry(5, b"hi")],
+      )),
+      Message::Recovery(Recovery::new(id, 0xABCD)),
+      Message::SyncChunk(SyncChunk::new(
+        View::with(1),
+        OpNumber::with(8),
+        0xFEED,
+        4,
+        0,
+        id,
+        0xBEEF,
+        Bytes::from_static(b"abc"),
+      )),
+    ];
+    for m in &carriers {
+      let back = Message::decode(&m.encode()).expect("round-trips");
+      assert_eq!(&back, m, "decode(encode(m)) == m for {}", m.kind_str());
+    }
+    // The big-endian id occupies exactly two bytes: a `Recovery` leads its body with the replica id
+    // right after the 3-byte header, so bytes [3..5] are `0x01, 0x2C`.
+    let rec = Message::Recovery(Recovery::new(id, 0)).encode();
+    assert_eq!(&rec[3..5], &300u16.to_be_bytes(), "the replica id is a 2-byte big-endian field");
+  }
+
+  #[test]
   fn commit_golden_bytes_pin_the_wire_layout() {
     // A small variant pinned exactly: WIRE_VERSION(u16) ++ tag 4 ++ view ++ commit ++ checkpoint_op.
     let c = Message::Commit(Commit::new(
@@ -3319,16 +3366,16 @@ mod tests {
       OpNumber::with(7),
     ));
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 3, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7,
+      0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7,
     ];
     assert_eq!(c.encode(), expected, "Commit wire layout is pinned");
   }
 
   #[test]
   fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
-    // A nested variant pinned exactly: header (ver 3 + tag 6), scalars (incl. the advertised
-    // checkpoint floor after the commit), then a 1-entry log slice (count=1, op, client, request,
-    // body-state tag 0 = Present, length-prefixed body "hi").
+    // A nested variant pinned exactly: header (ver 4 + tag 6), scalars (incl. the advertised
+    // checkpoint floor after the commit, then the u16 replica id), then a 1-entry log slice (count=1,
+    // op, client, request, body-state tag 0 = Present, length-prefixed body "hi").
     let dvc = Message::DoViewChange(
       DoViewChange::new(
         View::with(3),
@@ -3346,9 +3393,9 @@ mod tests {
       .with_checkpoint_op(OpNumber::with(3)),
     );
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 3, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
-      0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6,
-      7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 2, 104, 105,
+      0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+      0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5,
+      6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 2, 104, 105,
     ];
     assert_eq!(dvc.encode(), expected, "DoViewChange wire layout is pinned");
   }
@@ -3356,8 +3403,8 @@ mod tests {
   #[test]
   fn do_view_change_golden_bytes_pin_a_repairing_entry() {
     // The header-only (Repairing) entry layout pinned exactly: same scalars (incl. the advertised
-    // checkpoint floor after the commit), then body-state tag 1 = Repairing, followed by the
-    // 16-byte body_checksum (NO length-prefixed body).
+    // checkpoint floor after the commit, then the u16 replica id), then body-state tag 1 = Repairing,
+    // followed by the 16-byte body_checksum (NO length-prefixed body).
     let dvc = Message::DoViewChange(
       DoViewChange::new(
         View::with(3),
@@ -3375,9 +3422,9 @@ mod tests {
       .with_checkpoint_op(OpNumber::with(3)),
     );
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 3, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
-      0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5, 6,
-      7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 1, 17, 18, 19, 20, 21, 22, 23,
+      0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+      0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5,
+      6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 1, 17, 18, 19, 20, 21, 22, 23,
       24, 25, 26, 27, 28, 29, 30, 31, 32,
     ];
     assert_eq!(
@@ -3476,8 +3523,8 @@ mod tests {
     ));
     let mut d = dvc.encode().to_vec();
     // Locate the log count:
-    // ver(2)+tag(1)+view(8)+log_view(8)+op(8)+commit(8)+checkpoint_op(8)+replica(1) = 44.
-    d[44..48].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    // ver(2)+tag(1)+view(8)+log_view(8)+op(8)+commit(8)+checkpoint_op(8)+replica(2) = 45.
+    d[45..49].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
     assert!(matches!(
       Message::decode(&d),
       Err(CodecError::LengthOverflow { .. })

@@ -245,7 +245,7 @@ const IDENTITY_EXT_LEN: usize = 16 + 1 + 16;
 
 /// Encode the fixed `cluster(16 BE) || kind(1) || id(16 BE)` identity extension value (33 bytes).
 ///
-/// A replica's id is its `u8` index widened to the 16-byte field; a client's id is its full `u128`.
+/// A replica's id is its `u16` index widened to the 16-byte field; a client's id is its full `u128`.
 #[cfg_attr(
   not(test),
   expect(dead_code, reason = "only the #[cfg(test)] cert generator encodes")
@@ -269,7 +269,7 @@ pub(crate) fn encode_identity_ext(cluster: u128, who: Peer) -> Vec<u8> {
 /// Total-parse the identity extension value against `expected_cluster`.
 ///
 /// Rejects: any length other than 33; a cluster that is not `expected_cluster`; an unknown kind
-/// byte; and a replica id whose 16-byte field exceeds `u8::MAX` (a replica index must fit
+/// byte; and a replica id whose 16-byte field exceeds `u16::MAX` (a replica index must fit
 /// [`ReplicaId`]). On success returns the attested peer AND the attested cluster as a candidate the
 /// coordinator re-checks (the cluster equals `expected_cluster`, which on the live path is the
 /// endpoint's own cluster — so the coordinator re-asserts it against `Config.cluster`).
@@ -284,7 +284,7 @@ fn parse_identity_ext(value: &[u8], expected_cluster: u128) -> IdentityOutcome {
   let kind = value[16];
   let id = u128::from_be_bytes(value[17..33].try_into().expect("16 bytes"));
   let who = match kind {
-    KIND_REPLICA => match u8::try_from(id) {
+    KIND_REPLICA => match u16::try_from(id) {
       Ok(index) => Peer::Replica(ReplicaId::new(index)),
       Err(_) => return IdentityOutcome::Rejected,
     },
@@ -669,9 +669,18 @@ mod tests {
     let mut bad_kind = r.clone();
     bad_kind[16] = 9;
     assert!(parse_identity_ext(&bad_kind, cluster).is_rejected());
-    // Replica index that does not fit u8 (id high bytes set with kind=Replica) → Rejected.
+    // A replica index above a single byte (300 = 0x012C) is valid — it fits the u16 id and round-trips.
+    let wide = encode_identity_ext(cluster, Peer::Replica(ReplicaId::new(300)));
+    assert_eq!(
+      parse_identity_ext(&wide, cluster)
+        .try_unwrap_identified()
+        .unwrap()
+        .who(),
+      Peer::Replica(ReplicaId::new(300))
+    );
+    // Replica index that does not fit u16 (a high id byte set with kind=Replica) → Rejected.
     let mut wide_replica = encode_identity_ext(cluster, Peer::Replica(ReplicaId::new(2)));
-    wide_replica[17] = 1; // set a high id byte so the 17-byte id is > 255
+    wide_replica[17] = 1; // set the id's most-significant byte so the 16-byte id is > u16::MAX
     assert!(parse_identity_ext(&wide_replica, cluster).is_rejected());
   }
 
@@ -696,6 +705,26 @@ mod tests {
       CertOid::new(0x9999)
         .authenticate(&IdentityCtx::new(&der, None, 0x9999))
         .is_rejected()
+    );
+  }
+
+  #[test]
+  fn cert_oid_extracts_a_replica_id_above_a_byte() {
+    use crate::transport::quic::crypto::test_ca;
+
+    // A CA-attested identity extension carries the replica index in a 16-byte field, so an index above
+    // a single byte (300) is attested and parsed back unchanged.
+    let cluster = 0x5151_u128;
+    let ca = test_ca();
+    let cert = ca.issue_replica_with_oid(300, cluster);
+    let der = [cert.end_entity_der()];
+    assert_eq!(
+      CertOid::new(cluster)
+        .authenticate(&IdentityCtx::new(&der, None, cluster))
+        .try_unwrap_identified()
+        .unwrap()
+        .who(),
+      Peer::Replica(ReplicaId::new(300))
     );
   }
 

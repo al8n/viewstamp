@@ -411,7 +411,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() {
       return; // only a Normal replica has a trustworthy durable checkpoint to serve
     }
-    if m.replica().get() >= self.config.replica_count() {
+    if m.replica().get() >= self.config.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     if self.checkpoint_op.get() == 0 {
@@ -450,7 +450,7 @@ impl<S: StateMachine> Endpoint<S> {
     nonce: u64,
     kind: ServeKind,
   ) {
-    if let Some(serving) = self.sync_serving.get_mut(&requester.get()) {
+    if let Some(serving) = self.sync_serving.get_mut(&requester) {
       serving.nonce = nonce;
       serving.kind = kind;
       return;
@@ -458,7 +458,7 @@ impl<S: StateMachine> Endpoint<S> {
     let id = self.mint_op_id();
     sb.submit_read_checkpoint(id);
     self.sync_serving.insert(
-      requester.get(),
+      requester,
       SyncServe {
         read: id.get(),
         nonce,
@@ -488,11 +488,11 @@ impl<S: StateMachine> Endpoint<S> {
       .sync_serving
       .iter()
       .find(|(_, s)| s.read == cr.id().get())
-      .map(|(&to, s)| (ReplicaId::new(to), s.nonce, s.kind))
+      .map(|(&to, s)| (to, s.nonce, s.kind))
     else {
       return;
     };
-    self.sync_serving.remove(&to.get());
+    self.sync_serving.remove(&to);
     // Durable-view-before-participate: the shipped `SyncCheckpoint` advertises
     // `self.view` (see below). A replica in its `pending_sb` window (a new primary between
     // `start_view_as_new_primary` and the `on_sb_done` that makes its view durable — or any replica mid
@@ -508,7 +508,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || self.pending_sb.is_some() {
       return; // no longer a trustworthy server, or our view is not yet durable — drop.
     }
-    if to.get() >= self.config.replica_count() {
+    if to.get() >= self.config.replica_count() as u16 {
       return; // defensive range re-check.
     }
     // Only ship when the READ's op matches our CURRENT durable `checkpoint_op`: we advertise
@@ -638,7 +638,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() {
       return; // only a Normal replica has a trustworthy durable checkpoint to serve
     }
-    if m.replica().get() >= self.config.replica_count() {
+    if m.replica().get() >= self.config.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     // Durable-view-before-participate at the DIRECT-ship gate: a cache-hit chunk is emitted from

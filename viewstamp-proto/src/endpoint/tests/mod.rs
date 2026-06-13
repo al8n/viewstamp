@@ -418,7 +418,7 @@ fn prepare_ck(op: u64, commit: u64, checkpoint_op: u64) -> Message {
 }
 
 /// Build a DoViewChange whose log is the contiguous prefix `[1..=op]`.
-fn dvc(replica: u8, log_view: u64, op: u64, commit: u64) -> DoViewChange {
+fn dvc(replica: u16, log_view: u64, op: u64, commit: u64) -> DoViewChange {
   let log = (1..=op)
     .map(|i| {
       PreparedEntry::new(
@@ -785,7 +785,7 @@ fn sync_apply_harness(checkpoint_op: u64) -> (Endpoint<CountSm>, TestWal, TestSb
 
 /// A DVC whose dense log starts at `floor+1` (a state-synced donor, checkpoint at `floor`), head
 /// `op`, commit `commit`. Models the offset log a synced replica carries.
-fn dvc_offset(replica: u8, log_view: u64, floor: u64, op: u64, commit: u64) -> DoViewChange {
+fn dvc_offset(replica: u16, log_view: u64, floor: u64, op: u64, commit: u64) -> DoViewChange {
   let log = ((floor + 1)..=op)
     .map(|i| {
       PreparedEntry::new(
@@ -810,7 +810,7 @@ fn dvc_offset(replica: u8, log_view: u64, floor: u64, op: u64, commit: u64) -> D
 /// as its vouched floor — the exact wire shape `log_entries()` emits for a deep band (fixed 49
 /// bytes per entry), so frame-cap arithmetic on it matches a real carrier.
 fn dvc_header_band(
-  replica: u8,
+  replica: u16,
   log_view: u64,
   checkpoint: u64,
   floor: u64,
@@ -842,7 +842,7 @@ fn dvc_header_band(
 /// (`1..=present`). Models a peer (or fuzzed wire input) advertising an enormous op far above its
 /// actual log — the attack shape.
 fn dvc_claiming(
-  replica: u8,
+  replica: u16,
   log_view: u64,
   claimed_op: u64,
   commit: u64,
