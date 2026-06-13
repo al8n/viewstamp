@@ -602,10 +602,16 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
   // view-2 prospective primary's canonical-log selection. Three donors with `op < 3` (the laggards plus
   // r2 is the ONLY donor at op 3) form a nack quorum on op 3 — so a `commit*` below 3 WOULD truncate it.
   let mut selector = Endpoint::new(Config::try_new(2, ReplicaId::new(2), 5).unwrap(), 0, NoopSm);
-  selector.dvc_from_mut_for_test().insert(ReplicaId::new(2), r2_dvc);
+  selector
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(2), r2_dvc);
   // Two laggards in an OLDER generation (log_view 0) at head op 2, commit 2: they nack op 3.
-  selector.dvc_from_mut_for_test().insert(ReplicaId::new(3), dvc(3, 0, 2, 2));
-  selector.dvc_from_mut_for_test().insert(ReplicaId::new(4), dvc(4, 0, 2, 2));
+  selector
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(3), dvc(3, 0, 2, 2));
+  selector
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(4), dvc(4, 0, 2, 2));
   let (log, op_head, commit_star, _) = selector.select_canonical_log();
   // THE SAFETY PROPERTY: op 3 survives. `commit* >= 3` (replica 2 reported it committed), so op 3 is in
   // the committed band and the nack scan (which only truncates the UNCOMMITTED tail `> commit*`) cannot
@@ -1261,9 +1267,12 @@ fn new_primary_reconstructs_sessions_so_retries_dedup() {
 fn canonical_selection_prefers_highest_log_view_over_longer_log() {
   // r0 has the newest generation (log_view 2) but a SHORTER log; r1/r2 are longer but stale.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(0), dvc(0, 2, 3, 1));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(1), dvc(1, 1, 5, 1));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(2), dvc(2, 1, 5, 1));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc(0, 2, 3, 1));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(1), dvc(1, 1, 5, 1));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(2), dvc(2, 1, 5, 1));
   let (log, op_head, commit_star, _) = e.select_canonical_log();
   assert_eq!(op_head, 3, "newest log_view wins, not the longer stale log");
   assert_eq!(log.len(), 3);
@@ -1275,10 +1284,14 @@ fn nack_prepare_truncates_provably_uncommitted_tail() {
   // N=5 → quorum_nack_prepare = 3. Head op 5 held only by r0; r1,r2,r3 stop at op 2.
   // ops 3..=5 each get 3 nacks (r1,r2,r3) ≥ 3 → truncated to op 2.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(0), dvc(0, 1, 5, 2));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(1), dvc(1, 1, 2, 2));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(2), dvc(2, 1, 2, 2));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(3), dvc(3, 1, 2, 2));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc(0, 1, 5, 2));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(1), dvc(1, 1, 2, 2));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(2), dvc(2, 1, 2, 2));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(3), dvc(3, 1, 2, 2));
   let (log, op_head, _, _) = e.select_canonical_log();
   assert_eq!(op_head, 2, "ops 3..=5 had a nack quorum → truncated");
   assert_eq!(log.len(), 2);
@@ -1288,10 +1301,14 @@ fn nack_prepare_truncates_provably_uncommitted_tail() {
 fn committed_ops_are_never_truncated() {
   // commit* = 4: op 5 is the only uncommitted op, nacked by 3 → truncated; 1..=4 survive.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(0), dvc(0, 1, 5, 4));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(1), dvc(1, 1, 4, 4));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(2), dvc(2, 1, 4, 4));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(3), dvc(3, 1, 4, 4));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc(0, 1, 5, 4));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(1), dvc(1, 1, 4, 4));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(2), dvc(2, 1, 4, 4));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(3), dvc(3, 1, 4, 4));
   let (log, op_head, commit_star, _) = e.select_canonical_log();
   assert_eq!(commit_star, 4);
   assert_eq!(
@@ -1306,9 +1323,12 @@ fn no_truncation_at_minimal_quorum() {
   // Documents the contiguous-model property: with exactly quorum_view_change=3 DVCs,
   // the head-holder (r0) prevents a nack quorum (≤ 2 nacks < 3) → adopt whole.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 5).unwrap(), 0, NoopSm);
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(0), dvc(0, 1, 5, 2));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(1), dvc(1, 1, 2, 2));
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(2), dvc(2, 1, 2, 2));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc(0, 1, 5, 2));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(1), dvc(1, 1, 2, 2));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(2), dvc(2, 1, 2, 2));
   let (_, op_head, _, _) = e.select_canonical_log();
   assert_eq!(
     op_head, 5,
@@ -2505,7 +2525,8 @@ fn canonical_selection_with_a_checkpoint_offset_log_is_safe() {
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
   // r0: a full-from-1 log (head 5, commit 4). r1: the SAME generation but state-synced — its log
   // starts at op 5 (checkpoint 4), head 5, commit 4. Same log_view → both canonical.
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(0), dvc(0, 1, 5, 4));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc(0, 1, 5, 4));
   e.dvc_from_mut_for_test()
     .insert(ReplicaId::new(1), dvc_offset(1, 1, 4, 5, 4));
   let (log, op_head, commit_star, _) = e.select_canonical_log();
@@ -2579,7 +2600,8 @@ fn canonical_selection_with_a_fully_checkpoint_synced_participant_is_safe() {
   // log entries at all). select_canonical_log must handle commit == op_head with an empty offset log
   // without panicking or fabricating ops.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(0), dvc(0, 1, 5, 4));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc(0, 1, 5, 4));
   e.dvc_from_mut_for_test()
     .insert(ReplicaId::new(1), dvc_offset(1, 1, 4, 4, 4)); // tail-empty synced participant
   let (_log, op_head, commit_star, _) = e.select_canonical_log();
@@ -2669,7 +2691,8 @@ fn select_canonical_log_bounds_a_dvc_claiming_a_huge_op() {
   // N=3 → quorum_nack_prepare = 2, so we make TWO donors claim the phantom head.
   let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
   // r0: honest — holds ops 1,2,3 (head 3, commit 2).
-  e.dvc_from_mut_for_test().insert(ReplicaId::new(0), dvc(0, 1, 3, 2));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc(0, 1, 3, 2));
   // r1, r2 (SAME generation): MALFORMED — each claims op == u64::MAX but carries only ops 1..=3.
   e.dvc_from_mut_for_test()
     .insert(ReplicaId::new(1), dvc_claiming(1, 1, u64::MAX, 2, 3));
@@ -3593,9 +3616,15 @@ fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_gra
     ],
   );
   let mut selector = Endpoint::new(Config::try_new(2, ReplicaId::new(2), 5).unwrap(), 0, NoopSm);
-  selector.dvc_from_mut_for_test().insert(ReplicaId::new(2), committed_donor);
-  selector.dvc_from_mut_for_test().insert(ReplicaId::new(3), dvc(3, 0, 1, 1)); // laggard, head op 1, nacks op 2
-  selector.dvc_from_mut_for_test().insert(ReplicaId::new(4), dvc(4, 0, 1, 1)); // laggard, head op 1, nacks op 2
+  selector
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(2), committed_donor);
+  selector
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(3), dvc(3, 0, 1, 1)); // laggard, head op 1, nacks op 2
+  selector
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(4), dvc(4, 0, 1, 1)); // laggard, head op 1, nacks op 2
   let (log, op_head, commit_star, _) = selector.select_canonical_log();
   assert!(
     commit_star >= 2 && op_head >= 2,

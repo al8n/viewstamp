@@ -40,7 +40,13 @@ fn sender_matches_accepts_serve_and_solicit_messages_from_a_learner() {
     Message::RequestPrepare(crate::RequestPrepare::new(v, op, learner)),
     Message::RequestPrepareRange(crate::RequestPrepareRange::new(v, op, op, learner)),
     Message::Recovery(crate::Recovery::new(learner, 7)),
-    Message::RequestSync(crate::RequestSync::new(v, OpNumber::new(), learner, 7, false)),
+    Message::RequestSync(crate::RequestSync::new(
+      v,
+      OpNumber::new(),
+      learner,
+      7,
+      false,
+    )),
     Message::RequestSyncChunk(crate::RequestSyncChunk::new(
       v,
       OpNumber::with(4),
@@ -181,7 +187,11 @@ fn on_request_prepare_serves_a_learner_requester() {
     &mut wal,
     &mut sb,
     Peer::Replica(learner),
-    Message::RequestPrepare(crate::RequestPrepare::new(View::new(), OpNumber::with(1), learner)),
+    Message::RequestPrepare(crate::RequestPrepare::new(
+      View::new(),
+      OpNumber::with(1),
+      learner,
+    )),
   );
   let out = e
     .poll_message()
@@ -204,7 +214,8 @@ fn on_recovery_serves_a_learner_requester() {
   // addressed back to the learner. (A learner adopts a head only from the primary; the SERVE side is
   // membership-wide.)
   let mut e = Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(0), 3, 2).expect("voter 0 (primary of view 0) + 2 learners"),
+    Config::try_new_member(1, ReplicaId::new(0), 3, 2)
+      .expect("voter 0 (primary of view 0) + 2 learners"),
     0,
     NoopSm,
   );
@@ -240,7 +251,8 @@ fn compute_quorum_checkpoint_op_on_a_learner_excludes_its_own_checkpoint() {
   // `peer_checkpoint`, the learner computes the conservative floor 0, so a high learner checkpoint
   // cannot lift the GC floor and free an op a voter quorum still needs.
   let mut learner = Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(LEARNER), 3, 2).expect("learner id 3 of a 3-voter set"),
+    Config::try_new_member(1, ReplicaId::new(LEARNER), 3, 2)
+      .expect("learner id 3 of a 3-voter set"),
     0,
     NoopSm,
   );
@@ -278,7 +290,8 @@ fn compute_quorum_checkpoint_op_on_a_learner_excludes_its_own_checkpoint() {
 /// the primary of view 0; voter 1 is the primary of view 1.
 fn learner_self() -> Endpoint<NoopSm> {
   Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(LEARNER), 3, 2).expect("learner id 3 of a 3-voter set"),
+    Config::try_new_member(1, ReplicaId::new(LEARNER), 3, 2)
+      .expect("learner id 3 of a 3-voter set"),
     0,
     NoopSm,
   )
@@ -353,10 +366,17 @@ fn a_quorum_of_voter_svcs_does_not_activate_a_learner() {
   );
   let later = now + core::time::Duration::from_millis(10_000);
   e.handle_timeout(later, &mut wal, &mut sb);
-  assert_eq!(e.status(), Status::Normal, "...and still does not after time advances");
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "...and still does not after time advances"
+  );
   while let Some(out) = e.poll_message() {
     assert!(
-      !matches!(out.into_msg(), Message::StartViewChange(_) | Message::DoViewChange(_)),
+      !matches!(
+        out.into_msg(),
+        Message::StartViewChange(_) | Message::DoViewChange(_)
+      ),
       "a learner emits no SVC/DVC",
     );
   }
