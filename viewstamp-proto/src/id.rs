@@ -1,6 +1,7 @@
 //! Identity types for replicas, clients, and message routing.
 
-/// Index of a replica within a cluster, in `0..replica_count`.
+/// Index of a replica within a cluster, in `0..node_count`. A voting replica
+/// has an id `< replica_count`; the remaining ids are non-voting replicas.
 ///
 /// This is the protocol identity. The mapping from `ReplicaId` to a network
 /// address is a driver concern, not the state machine's.

@@ -1484,6 +1484,13 @@ impl<S> Endpoint<S> {
     self.config.replica_count()
   }
 
+  /// The total number of replicas in the configured cluster: the voting replicas plus the
+  /// non-voting learners (`replica_count + learner_count`). Every replica id is in `0..node_count`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn node_count(&self) -> u16 {
+    self.config.node_count()
+  }
+
   /// Whether this replica is the primary of the current view.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn is_primary(&self) -> bool {
