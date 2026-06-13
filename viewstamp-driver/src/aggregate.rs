@@ -36,6 +36,7 @@
 //! retrying is a correctness decision only the embedder can make.
 
 use std::{
+  cell::RefCell,
   collections::VecDeque,
   future::{Future, poll_fn},
   pin::{Pin, pin},
@@ -206,6 +207,10 @@ pub enum OutcomeUnknownReason {
   /// treated as unknown because claiming `Refused` falsely would license a double-apply.
   #[error("the driver failed the submit without establishing the body's fate")]
   Driver,
+  /// The pump died — its `run()` future dropped — while this unit's body was IN FLIGHT: the body
+  /// was already handed to the driver and may commit regardless of the pump's death.
+  #[error("the pump died with the unit's body in flight")]
+  PumpGone,
 }
 
 impl OutcomeUnknownReason {
@@ -216,6 +221,7 @@ impl OutcomeUnknownReason {
       Self::ReplyDropped => "reply_dropped",
       Self::Stalled => "stalled",
       Self::Driver => "driver",
+      Self::PumpGone => "pump_gone",
     }
   }
 }
@@ -385,8 +391,11 @@ impl BatchHandle {
   /// [`BatchError::Refused`] with [`RefusedReason::UnitTooLarge`] if the unit can never fit any
   /// body (checked against limits snapshotted at construction, BEFORE touching the queue budget);
   /// [`RefusedReason::QueueFull`] if the queue budget (count or bytes) is full — shed load and
-  /// retry; [`RefusedReason::PumpGone`] if the pump is no longer running. After the body ships,
-  /// the [`BatchError::OutcomeUnknown`] / [`BatchError::CommittedReplyLost`] classes per their
+  /// retry; [`RefusedReason::PumpGone`] if the pump died before accepting the unit, or after
+  /// accepting it while it was still queued or deferred (it never entered consensus). A pump
+  /// dying while the unit's BODY is in flight resolves [`OutcomeUnknownReason::PumpGone`]
+  /// instead — the body may commit regardless. After the body ships, the
+  /// [`BatchError::OutcomeUnknown`] / [`BatchError::CommittedReplyLost`] classes per their
   /// retry contracts.
   pub async fn submit(&self, unit: Bytes) -> Result<Bytes, BatchError> {
     if !self.limits.admits(1, core::iter::once(unit.len())) {
@@ -406,8 +415,12 @@ impl BatchHandle {
       units: vec![PendingUnit { body: unit, reply }],
       reservation,
     })?;
-    rx.await.map_err(|_| BatchError::Refused {
-      reason: RefusedReason::PumpGone,
+    // Unreachable by construction: every pump death resolves observable callers explicitly
+    // (queued and deferred as Refused, in-flight as OutcomeUnknown), so this oneshot always
+    // carries a sent value. The conservative arm exists for the contract's sake — a false
+    // refusal would license a double-apply, a false unknown only suppresses a safe retry.
+    rx.await.map_err(|_| BatchError::OutcomeUnknown {
+      reason: OutcomeUnknownReason::PumpGone,
     })?
   }
 
@@ -456,8 +469,10 @@ impl BatchHandle {
     self.send(Entry { units, reservation })?;
     let mut replies = Vec::with_capacity(receivers.len());
     for rx in receivers {
-      replies.push(rx.await.map_err(|_| BatchError::Refused {
-        reason: RefusedReason::PumpGone,
+      // Same conservative unreachable arm as `submit`: explicit resolution everywhere makes a
+      // dropped oneshot impossible; if one were ever observed, unknown is the safe reading.
+      replies.push(rx.await.map_err(|_| BatchError::OutcomeUnknown {
+        reason: OutcomeUnknownReason::PumpGone,
       })??);
     }
     Ok(replies)
@@ -529,7 +544,8 @@ enum Verdict {
 /// [`Self::run`] exactly as it spawns the driver's own `run()`.
 ///
 /// Dropping the pump — never run, or with its `run()` future cancelled — resolves every entry
-/// still queued [`BatchError::Refused`] / [`RefusedReason::PumpGone`]-shaped and releases its
+/// still queued or deferred [`BatchError::Refused`] / [`RefusedReason::PumpGone`]-shaped (an
+/// in-flight body's callers resolve [`OutcomeUnknownReason::PumpGone`] instead) and releases its
 /// queue budget: the explicit [`Drop`] drains the queue channel (whose shared buffer otherwise
 /// outlives the receiver while any [`BatchHandle`] holds a sender), and entries the dropped run
 /// future held locally resolve through their dropped oneshots.
@@ -538,23 +554,46 @@ pub struct AggregatorPump<F> {
   entries: flume::Receiver<Entry>,
   stall: Option<Stall<F>>,
   limits: BodyLimits,
+  /// Entries popped from the channel but not yet packed (a group deferred whole when a body
+  /// filled). Lives in the pump — not as a `run()` local — so a dropped run future resolves them
+  /// EXPLICITLY in `Drop` as `Refused` (they never entered consensus) instead of leaving their
+  /// callers to misread dropped oneshots.
+  deferred: RefCell<VecDeque<Entry>>,
+  /// The callers of the body currently handed to the driver, staged here for the duration of the
+  /// in-flight await. Lives in the pump so a dropped run future resolves them EXPLICITLY in
+  /// `Drop` as `OutcomeUnknown` — the body is already in the driver and may commit; a dropped
+  /// oneshot would otherwise read as a retry-safe refusal and license a double-apply.
+  in_flight: RefCell<Vec<UnitReply>>,
 }
 
 impl<F> Drop for AggregatorPump<F> {
   fn drop(&mut self) {
-    // Dropping the receiver alone leaves queued entries alive in the channel's shared buffer
-    // (senders keep it allocated), which would park their callers and pin their queue budget
-    // forever; drain and resolve them instead. Runs on every pump death — un-run, a cancelled
-    // `run()` future, or `run()` returning (an async fn drops its locals, this pump included, as
-    // it returns) — so even an entry enqueued between the stall path's drain and that return
-    // resolves here instead of parking its caller.
+    // Every pump death resolves every observable caller EXPLICITLY, classified by how far its
+    // work got — never by dropping oneshots (a dropped oneshot carries no classification, and
+    // misreading an in-flight body as refused would license a double-apply). Runs on every pump
+    // death: un-run, a cancelled `run()` future, or `run()` returning (an async fn drops its
+    // locals, this pump included, as it returns) — so even an entry enqueued between a teardown
+    // drain and that return resolves here instead of parking its caller.
+    //
+    // The in-flight body was handed to the driver and may commit regardless: unknown.
+    resolve_all(
+      self.in_flight.take(),
+      &BatchError::OutcomeUnknown {
+        reason: OutcomeUnknownReason::PumpGone,
+      },
+    );
+    // Deferred and still-queued entries never entered consensus: refused, safe to resubmit.
+    // (Dropping the receiver alone would leave queued entries alive in the channel's shared
+    // buffer — senders keep it allocated — parking their callers and pinning their queue budget
+    // forever; the drain is what frees both.)
+    let refused = BatchError::Refused {
+      reason: RefusedReason::PumpGone,
+    };
+    for entry in self.deferred.take() {
+      resolve_all(entry.into_replies(), &refused);
+    }
     while let Ok(entry) = self.entries.try_recv() {
-      resolve_all(
-        entry.into_replies(),
-        &BatchError::Refused {
-          reason: RefusedReason::PumpGone,
-        },
-      );
+      resolve_all(entry.into_replies(), &refused);
     }
   }
 }
@@ -621,6 +660,8 @@ fn split<F>(
       entries: rx,
       stall,
       limits,
+      deferred: RefCell::new(VecDeque::new()),
+      in_flight: RefCell::new(Vec::new()),
     },
   )
 }
@@ -738,17 +779,15 @@ where
   /// }
   /// ```
   pub async fn run(self) {
-    // Entries popped but not yet packable (a group deferred whole when a body filled). Packing
-    // always drains this before the channel, preserving FIFO across deferrals. Local to the
-    // future: if the future is dropped mid-run, these entries resolve through their dropped
-    // oneshots (`PumpGone`-shaped) and their guards release.
-    let mut deferred: VecDeque<Entry> = VecDeque::new();
+    // Deferral (`self.deferred`) preserves FIFO across whole-group deferrals: packing always
+    // drains it before the channel. It lives in the pump so a dropped run future resolves its
+    // entries explicitly in `Drop`.
     loop {
       // THE BATCHING CLOCK, phase 1: no body is in flight. Park until at least one entry exists
       // (`Err` = every BatchHandle dropped and the queue drained: teardown).
-      if deferred.is_empty() {
+      if self.deferred.borrow().is_empty() {
         match self.entries.recv_async().await {
-          Ok(entry) => deferred.push_back(entry),
+          Ok(entry) => self.deferred.borrow_mut().push_back(entry),
           Err(_) => return,
         }
       }
@@ -759,7 +798,8 @@ where
       let mut callers = Vec::new();
       let mut guards = Vec::new();
       loop {
-        let entry = match deferred.pop_front() {
+        let popped = self.deferred.borrow_mut().pop_front();
+        let entry = match popped {
           Some(entry) => entry,
           None => match self.entries.try_recv() {
             Ok(entry) => entry,
@@ -789,7 +829,7 @@ where
             resolve_all(entry.into_replies(), &BatchError::Refused { reason });
             continue;
           }
-          deferred.push_front(entry);
+          self.deferred.borrow_mut().push_front(entry);
           break;
         }
         for unit in entry.units {
@@ -810,6 +850,11 @@ where
 
       // Phase 3: submit the body — the ONE in-flight submit — and resolve it.
       let mut submit = pin!(self.handle.submit(body));
+      // Stage the body's callers in the pump for the in-flight window: from here until the
+      // verdict, a dropped run future must resolve them OutcomeUnknown in `Drop` (the body is in
+      // — or about to be handed to — the driver and may commit), never leave them to read their
+      // dropped oneshots as a refusal.
+      *self.in_flight.borrow_mut() = callers;
       // First poll: `Handle::submit` runs synchronously up to its reply await, so after this poll
       // the driver's OWN reservation (or its outright refusal) exists. Only now do the queue
       // guards drop — the handoff is reserve-then-release, never under-counted.
@@ -844,6 +889,8 @@ where
         }
       };
 
+      // The in-flight window is over: reclaim the callers for explicit resolution below.
+      let callers = self.in_flight.take();
       match verdict {
         Verdict::Resolved(Ok(reply_body)) => demux(callers, &reply_body),
         Verdict::Resolved(Err(err)) => resolve_all(callers, &submit_failure(&err)),
@@ -862,7 +909,7 @@ where
           let stalled = BatchError::Refused {
             reason: RefusedReason::Stalled,
           };
-          for entry in deferred.drain(..) {
+          for entry in self.deferred.take() {
             resolve_all(entry.into_replies(), &stalled);
           }
           while let Ok(entry) = self.entries.try_recv() {
@@ -1577,6 +1624,47 @@ mod tests {
       "an entry within the remaining capacity is admitted"
     );
     assert_eq!(batch.queue_budget().bytes(), 10, "the cap is byte-exact");
+  }
+
+  /// A pump dying with a body IN FLIGHT resolves that body's callers `OutcomeUnknown` — the body
+  /// is already in the driver and may commit regardless, so reading the death as a retry-safe
+  /// refusal would license a double-apply — while a unit still QUEUED behind it resolves
+  /// `Refused`: it never entered consensus. The classification split is the whole contract.
+  #[test]
+  fn dropping_the_run_future_with_a_body_in_flight_is_outcome_unknown() {
+    let (handle, mut driver) = driver_handle(MAX_PENDING_BYTES);
+    let (batch, pump) = aggregator(handle, BatchConfig::new(64));
+    let mut run = Box::pin(pump.run());
+
+    let s1 = batch.submit(Bytes::from_static(b"flying"));
+    pin_mut!(s1);
+    assert!(poll_once(&mut s1).is_pending());
+    // The pump packs and hands the body to the driver; the test driver holds the reply pending.
+    assert!(poll_once(&mut run.as_mut()).is_pending());
+    let (_, _, _reply) = driver.next_body();
+
+    // A second unit queues behind the flying body and is never packed.
+    let s2 = batch.submit(Bytes::from_static(b"queued"));
+    pin_mut!(s2);
+    assert!(poll_once(&mut s2).is_pending());
+
+    drop(run);
+    assert_eq!(
+      poll_once(&mut s1),
+      Poll::Ready(Err(BatchError::OutcomeUnknown {
+        reason: OutcomeUnknownReason::PumpGone,
+      })),
+      "the in-flight body's unit must read as maybe-committed, never as refused"
+    );
+    assert_eq!(
+      poll_once(&mut s2),
+      Poll::Ready(Err(BatchError::Refused {
+        reason: RefusedReason::PumpGone,
+      })),
+      "the queued unit never entered consensus and is safe to resubmit"
+    );
+    assert_eq!(batch.queue_budget().count(), 0, "every guard released");
+    assert_eq!(batch.queue_budget().bytes(), 0);
   }
 
   /// Teardown of an un-run pump: dropping the pump drops the queue, resolving waiting callers
