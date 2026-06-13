@@ -270,11 +270,20 @@ impl Config {
   /// cluster's learners; a learner builds its own config via [`Config::try_new_member`].
   ///
   /// # Errors
-  /// [`ConfigError::TooManyNodes`] if `replica_count + learner_count` exceeds `u16::MAX`.
+  /// [`ConfigError::TooManyNodes`] if `replica_count + learner_count` exceeds `u16::MAX`;
+  /// [`ConfigError::ReplicaIndexOutOfRange`] if shrinking the learner count would put this config's
+  /// own replica id at or above the new `node_count` (calling this on a learner's own config with a
+  /// count below its id) — every constructor keeps `replica < node_count`, so this setter does too.
   pub const fn with_learner_count(self, learner_count: u16) -> Result<Self, ConfigError> {
     let node_count = self.replica_count as u32 + learner_count as u32;
     if node_count > u16::MAX as u32 {
       return Err(ConfigError::TooManyNodes { count: node_count });
+    }
+    if (self.replica.get() as u32) >= node_count {
+      return Err(ConfigError::ReplicaIndexOutOfRange {
+        index: self.replica.get(),
+        count: self.replica_count,
+      });
     }
     Ok(Self {
       learner_count,
@@ -655,5 +664,32 @@ mod tests {
       DEFAULT_CHECKPOINT_OPS
     ); // without the setter it is the default
     assert!(learner.with_checkpoint_interval(0).is_err()); // zero rejected
+  }
+
+  #[test]
+  fn with_learner_count_cannot_shrink_a_learner_out_of_range() {
+    // `with_learner_count` keeps the `replica < node_count` invariant every constructor enforces, so a
+    // learner's own config (its id is `>= replica_count`) cannot have its learner count shrunk below
+    // its id — that would leave the id out of range, where it is neither voter nor learner and the
+    // learner guards (which key on `is_learner(self.replica())`) would no longer protect it.
+    let learner = Config::try_new_member(1, ReplicaId::new(70), 3, 100).unwrap(); // id 70, node_count 103
+    assert!(learner.is_learner(ReplicaId::new(70)));
+    // Shrinking the learner count so node_count <= 70 is rejected (id 70 would be out of range).
+    assert!(matches!(
+      learner.with_learner_count(10), // node_count would be 13, but our id is 70
+      Err(ConfigError::ReplicaIndexOutOfRange {
+        index: 70,
+        count: 3
+      })
+    ));
+    assert!(learner.with_learner_count(0).is_err()); // node_count 3 <= 70 — rejected
+    // A learner count that still covers the id is fine.
+    assert_eq!(
+      learner.with_learner_count(68).unwrap().node_count(),
+      71 // id 70 < node_count 71
+    );
+    // A VOTER config (id < replica_count) is never affected — shrinking to zero learners is valid.
+    let voter = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+    assert_eq!(voter.with_learner_count(0).unwrap().node_count(), 3);
   }
 }
