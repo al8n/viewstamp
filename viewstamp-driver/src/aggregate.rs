@@ -573,6 +573,11 @@ pub type NoStall = fn(Duration) -> NeverReady;
 enum Verdict {
   Resolved(Result<Bytes, DriverError>),
   Stalled,
+  /// Every caller of the in-flight body cancelled: no one can observe any outcome, so the pump
+  /// drops the submit (the driver's cancellation reclaim releases its pending entry and budget)
+  /// and tears down terminally — minting another request after abandoning this one would leave
+  /// the same silent number gap a stall would.
+  Abandoned,
 }
 
 /// The aggregator's run loop, holding the consumed driver [`Handle`]; the embedder spawns
@@ -596,8 +601,12 @@ pub struct AggregatorPump<F> {
   /// The callers of the body currently handed to the driver, staged here for the duration of the
   /// in-flight await. Lives in the pump so a dropped run future resolves them EXPLICITLY in
   /// `Drop` as `OutcomeUnknown` — the body is already in the driver and may commit; a dropped
-  /// oneshot would otherwise read as a retry-safe refusal and license a double-apply.
-  in_flight: RefCell<Vec<UnitReply>>,
+  /// oneshot would otherwise read as a retry-safe refusal and license a double-apply. A `Mutex`
+  /// (not a `RefCell`) because the abandonment arm polls cancellation from inside the in-flight
+  /// race: the closure holds a shared reference across the await, and the run future stays
+  /// `Send` only over a `Sync` cell. The lock is single-task and uncontended; it never nests
+  /// with the queue lock.
+  in_flight: Mutex<Vec<UnitReply>>,
   /// The queue shared with every [`BatchHandle`] (see [`QueueState`]): teardown closes and
   /// drains it under its one lock; the pump parks on its waker slot.
   queue: Arc<Mutex<QueueState>>,
@@ -613,8 +622,14 @@ impl<F> Drop for AggregatorPump<F> {
     // drain and that return resolves here instead of parking its caller.
     //
     // The in-flight body was handed to the driver and may commit regardless: unknown.
+    let in_flight = core::mem::take(
+      &mut *self
+        .in_flight
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner),
+    );
     resolve_all(
-      self.in_flight.take(),
+      in_flight,
       &BatchError::OutcomeUnknown {
         reason: OutcomeUnknownReason::PumpGone,
       },
@@ -709,7 +724,7 @@ fn split<F>(
       stall,
       limits,
       deferred: RefCell::new(VecDeque::new()),
-      in_flight: RefCell::new(Vec::new()),
+      in_flight: Mutex::new(Vec::new()),
       queue,
     },
   )
@@ -959,7 +974,10 @@ where
       // verdict, a dropped run future must resolve them OutcomeUnknown in `Drop` (the body is in
       // — or about to be handed to — the driver and may commit), never leave them to read their
       // dropped oneshots as a refusal.
-      *self.in_flight.borrow_mut() = callers;
+      *self
+        .in_flight
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = callers;
       // First poll: `Handle::submit` runs synchronously up to its reply await, so after this poll
       // the driver's OWN reservation (or its outright refusal) exists. Only now do the queue
       // guards drop — the handoff is reserve-then-release, never under-counted.
@@ -988,6 +1006,23 @@ where
             {
               return Poll::Ready(Verdict::Stalled);
             }
+            // Abandonment: when EVERY staged caller has cancelled, nobody can observe any
+            // outcome — and only this arm can free the driver's pending entry, since the driver
+            // sees the AGGREGATOR as the live caller, not the units. `poll_canceled` registers
+            // this task for each receiver's drop, so the last cancellation wakes the race.
+            {
+              let mut staged = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+              if !staged.is_empty()
+                && staged
+                  .iter_mut()
+                  .all(|reply| matches!(reply.poll_canceled(cx), Poll::Ready(())))
+              {
+                return Poll::Ready(Verdict::Abandoned);
+              }
+            }
             Poll::Pending
           })
           .await
@@ -995,7 +1030,12 @@ where
       };
 
       // The in-flight window is over: reclaim the callers for explicit resolution below.
-      let callers = self.in_flight.take();
+      let callers = core::mem::take(
+        &mut *self
+          .in_flight
+          .lock()
+          .unwrap_or_else(PoisonError::into_inner),
+      );
       match verdict {
         Verdict::Resolved(Ok(reply_body)) => demux(callers, &reply_body),
         Verdict::Resolved(Err(err)) => resolve_all(callers, &submit_failure(&err)),
@@ -1031,6 +1071,34 @@ where
           }
           for entry in drained {
             resolve_all(entry.into_replies(), &stalled);
+          }
+          return;
+        }
+        Verdict::Abandoned => {
+          // TERMINAL: every caller of the in-flight body cancelled, so no outcome is observable
+          // by anyone. Dropping the submit (with the loop scope) is what lets the driver's
+          // cancellation reclaim release the pending entry and its budget — the driver sees the
+          // PUMP as the live caller, never the units. The pump then exits without minting
+          // another request on this handle: the abandoned body's number may never have reached
+          // the primary, and minting past it would leave the silent gap that wedges every later
+          // request. `callers` (all cancelled) drop unobserved.
+          drop(callers);
+          let refused = BatchError::Refused {
+            reason: RefusedReason::PumpGone,
+          };
+          for entry in self.deferred.take() {
+            resolve_all(entry.into_replies(), &refused);
+          }
+          // Close-then-drain under the queue's lock; resolve after release (see `Drop`).
+          let mut drained = Vec::new();
+          {
+            let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            queue.closed = true;
+            queue.waker = None;
+            drained.extend(queue.entries.drain(..));
+          }
+          for entry in drained {
+            resolve_all(entry.into_replies(), &refused);
           }
           return;
         }
@@ -1741,6 +1809,49 @@ mod tests {
       "an entry within the remaining capacity is admitted"
     );
     assert_eq!(batch.queue_budget().bytes(), 10, "the cap is byte-exact");
+  }
+
+  /// An in-flight body whose EVERY caller cancelled tears the pump down: only the pump can free
+  /// the driver's pending entry (the driver sees the aggregator as the live caller, not the
+  /// units), so the abandonment arm drops the submit — releasing the driver-side reply sender —
+  /// refuses everything queued, and returns without minting another request (the abandoned
+  /// number may never have reached the primary; minting past it would wedge the session on a
+  /// silent gap).
+  #[test]
+  fn an_in_flight_body_with_every_caller_cancelled_tears_the_pump_down() {
+    let (handle, mut driver) = driver_handle(MAX_PENDING_BYTES);
+    let (batch, pump) = aggregator(handle, BatchConfig::new(64));
+    let mut run = Box::pin(pump.run());
+
+    // One unit flies; the driver never answers. Box-pinned so the drop below drops the FUTURE
+    // (pin_mut! shadows to a Pin reference, whose drop would release nothing).
+    let mut s1 = Box::pin(batch.submit(Bytes::from_static(b"abandoned")));
+    assert!(poll_once(&mut s1.as_mut()).is_pending());
+    assert!(poll_once(&mut run.as_mut()).is_pending());
+    let (_, _, reply) = driver.next_body();
+
+    // A second unit queues behind it.
+    let s2 = batch.submit(Bytes::from_static(b"queued"));
+    pin_mut!(s2);
+    assert!(poll_once(&mut s2).is_pending());
+
+    // Every caller of the flying body cancels: the pump must observe it, drop the submit (the
+    // driver-side reply sender sees its receiver gone), refuse the queued unit, and return.
+    drop(s1);
+    assert!(
+      poll_once(&mut run.as_mut()).is_ready(),
+      "the pump tore down"
+    );
+    assert!(reply.is_canceled(), "the driver pending entry was released");
+    assert_eq!(
+      poll_once(&mut s2),
+      Poll::Ready(Err(BatchError::Refused {
+        reason: RefusedReason::PumpGone,
+      })),
+      "the queued unit never entered consensus"
+    );
+    assert_eq!(batch.queue_budget().count(), 0, "every guard released");
+    assert_eq!(batch.queue_budget().bytes(), 0);
   }
 
   /// The final handle drop's wake must let even an INLINE-polled pump observe teardown: the
