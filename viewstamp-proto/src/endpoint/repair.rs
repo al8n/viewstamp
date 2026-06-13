@@ -345,8 +345,8 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || self.pending_sb.is_some() {
       return; // only a Normal replica whose view is durable may serve a (view-advertising) repair Prepare
     }
-    if m.replica().get() >= self.config.replica_count() as u16 {
-      return; // ignore malformed/out-of-range replica id
+    if m.replica().get() >= self.config.node_count() {
+      return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     let op = m.op().get();
     // Serve an op we hold in our log at or below our head (`op <= self.op`). A body-`Repairing` entry
@@ -414,8 +414,8 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || self.pending_sb.is_some() {
       return;
     }
-    if m.replica().get() >= self.config.replica_count() as u16 {
-      return; // ignore malformed/out-of-range replica id
+    if m.replica().get() >= self.config.node_count() {
+      return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     let lo = m.lo().get();
     // Clamp the served interval to the requester's own solicitation window (`request_repair_run` caps

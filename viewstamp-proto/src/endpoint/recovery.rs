@@ -237,9 +237,13 @@ impl<S: StateMachine> Endpoint<S> {
       log_floor: OpNumber::with(checkpoint_op),
       peer_checkpoint: BTreeMap::new(),
       // The quorum-th order statistic over {own durable checkpoint, no peer reports} — coherent with
-      // `recompute_quorum_checkpoint` over the fields above (own checkpoint counts only when
-      // `quorum == 1`, i.e. a solo cluster; otherwise the unheard peers pin it to 0).
-      quorum_checkpoint: if config.quorum() == 1 {
+      // `recompute_quorum_checkpoint` (and its staleness assert) over the fields above. The own
+      // checkpoint seeds the statistic only when self is a VOTER in a solo voting set (`quorum == 1`):
+      // there the single voter's own checkpoint IS the quorum. Otherwise — more than one voter, or a
+      // non-voting member (which `compute_quorum_checkpoint_op` excludes from the statistic entirely) —
+      // the unheard voters pin it to 0. Without the voter gate a recovering learner in a 1-voter cluster
+      // would seed its own checkpoint here while a fresh compute yields 0, tripping the staleness assert.
+      quorum_checkpoint: if config.quorum() == 1 && config.is_voter(config.replica()) {
         OpNumber::with(checkpoint_op)
       } else {
         OpNumber::new()
@@ -1244,8 +1248,8 @@ impl<S: StateMachine> Endpoint<S> {
     if self.pending_sb.is_some() {
       return;
     }
-    if m.replica().get() >= self.config.replica_count() as u16 {
-      return; // ignore malformed/out-of-range replica id
+    if m.replica().get() >= self.config.node_count() {
+      return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     let (op, commit, floor, log) = if self.is_primary() {
       // Advertise the KNOWN-committed frontier `commit_max`, not the APPLIED frontier `commit_min`

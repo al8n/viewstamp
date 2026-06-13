@@ -411,8 +411,8 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() {
       return; // only a Normal replica has a trustworthy durable checkpoint to serve
     }
-    if m.replica().get() >= self.config.replica_count() as u16 {
-      return; // ignore malformed/out-of-range replica id
+    if m.replica().get() >= self.config.node_count() {
+      return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     if self.checkpoint_op.get() == 0 {
       return; // nothing durable to serve — silent.
@@ -508,8 +508,8 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || self.pending_sb.is_some() {
       return; // no longer a trustworthy server, or our view is not yet durable — drop.
     }
-    if to.get() >= self.config.replica_count() as u16 {
-      return; // defensive range re-check.
+    if to.get() >= self.config.node_count() {
+      return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     // Only ship when the READ's op matches our CURRENT durable `checkpoint_op`: we advertise
     // `cr.op()` and bind it into the snapshot, so the op we ship must be the one whose bytes these are.
@@ -638,8 +638,8 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() {
       return; // only a Normal replica has a trustworthy durable checkpoint to serve
     }
-    if m.replica().get() >= self.config.replica_count() as u16 {
-      return; // ignore malformed/out-of-range replica id
+    if m.replica().get() >= self.config.node_count() {
+      return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     // Durable-view-before-participate at the DIRECT-ship gate: a cache-hit chunk is emitted from
     // this handler (no read completion re-gates it), and a `SyncChunk` advertises `self.view` — so
