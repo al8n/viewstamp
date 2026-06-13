@@ -3,8 +3,10 @@ use viewstamp_proto::{Instant, Message, Peer};
 /// Where a delivered message goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
-  /// A replica, by index.
-  Replica(u8),
+  /// A replica, by index. The index spans the full membership (`0..node_count`), so it is a
+  /// `u16` to match [`ReplicaId::get`](viewstamp_proto::ReplicaId::get) — a high member id cannot
+  /// truncate or alias a low one.
+  Replica(u16),
   /// A client, by id.
   Client(u128),
 }

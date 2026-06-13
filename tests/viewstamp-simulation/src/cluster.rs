@@ -61,7 +61,13 @@ pub struct Cluster {
   /// WAL/SB structs persist across crash/restart, so permanent verdicts (torn / bit-rot) and the
   /// fault PRNG survive a restart unchanged — recovery faces the same durable medium it crashed on.
   storage_faults: StorageFaults,
+  /// The VOTING-replica count: the size of the set that drives every quorum and against which the
+  /// fault budget is charged. Voting replicas occupy ids `0..replica_count`.
   replica_count: u8,
+  /// The non-voting LEARNER count: learners follow the voting set, occupying ids
+  /// `[replica_count, node_count)`. Retained so `restart`/`wipe_and_restart` rebuild a replica with
+  /// the identical cluster configuration (the learner count is part of every replica's `Config`).
+  learner_count: u16,
   /// The checkpoint interval, retained so `restart` rebuilds a replica with the same config.
   checkpoint_ops: u64,
   /// `None` (default) ⇒ the proto's default client-session cap. `Some(n)` ⇒ every replica's
@@ -195,7 +201,8 @@ impl Cluster {
   }
 
   /// Like [`Cluster::new`] but with an explicit checkpoint interval, so short runs can exercise
-  /// checkpoints + checkpoint-based recovery.
+  /// checkpoints + checkpoint-based recovery. Builds a cluster of `replicas` VOTING replicas and no
+  /// learners.
   pub fn with_checkpoint_ops(
     replicas: u8,
     clients: u32,
@@ -203,10 +210,35 @@ impl Cluster {
     seed: u64,
     checkpoint_ops: u64,
   ) -> Self {
-    let replica_set: Vec<Endpoint<SimSm>> = (0..replicas)
+    Self::with_members(replicas, 0, clients, requests_per_client, seed, checkpoint_ops)
+  }
+
+  /// Builds a cluster of `replica_count` VOTING replicas plus `learner_count` non-voting learners
+  /// (the total membership, `node_count = replica_count + learner_count`), with an explicit
+  /// checkpoint interval. The voting count drives every quorum and the fault budget; the node count
+  /// sizes every per-replica vector, the routing target space, and the storage seeding. Voting
+  /// replicas build their config via [`Config::with_checkpoint_ops`] carrying the learner count;
+  /// learners build theirs via [`Config::try_new_member`].
+  pub fn with_members(
+    replica_count: u8,
+    learner_count: u16,
+    clients: u32,
+    requests_per_client: u64,
+    seed: u64,
+    checkpoint_ops: u64,
+  ) -> Self {
+    let node_count = replica_count as u16 + learner_count;
+    let replica_set: Vec<Endpoint<SimSm>> = (0..node_count)
       .map(|i| {
-        let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(i), replicas, checkpoint_ops)
-          .expect("valid cluster config");
+        let cfg = if i < replica_count as u16 {
+          Config::with_checkpoint_ops(1, ReplicaId::new(i), replica_count, checkpoint_ops)
+            .expect("valid cluster config")
+            .with_learner_count(learner_count)
+            .expect("valid learner count")
+        } else {
+          Config::try_new_member(1, ReplicaId::new(i), replica_count, learner_count)
+            .expect("valid cluster config")
+        };
         Endpoint::new(
           cfg,
           seed ^ (i as u64).wrapping_mul(0x1234_5678),
@@ -217,9 +249,9 @@ impl Cluster {
     let client_set: Vec<ClientModel> = (0..clients)
       .map(|i| ClientModel::new((i as u128) + 1, requests_per_client, seed))
       .collect();
-    let n = replicas as usize;
+    let n = node_count as usize;
     let storage_faults = StorageFaults::none();
-    let (wals, sbs) = Self::seed_storage(replicas, seed, storage_faults, None, None, None);
+    let (wals, sbs) = Self::seed_storage(node_count, seed, storage_faults, None, None, None);
     Self {
       replicas: replica_set,
       wals,
@@ -231,7 +263,8 @@ impl Cluster {
       seed,
       faults: Faults::none(),
       storage_faults,
-      replica_count: replicas,
+      replica_count,
+      learner_count,
       checkpoint_ops,
       max_client_sessions: None,
       batch_mode: false,
@@ -262,14 +295,14 @@ impl Cluster {
   /// composed with the fault plan. When `wal_capacity` is `Some(n)`, every WAL is a fixed ring of `n`
   /// slots, composed with the fault/async modes.
   fn seed_storage(
-    replicas: u8,
+    nodes: u16,
     seed: u64,
     faults: StorageFaults,
     async_wal_delay: Option<u32>,
     async_sb_delay: Option<u32>,
     wal_capacity: Option<u64>,
   ) -> (Vec<InMemoryWal>, Vec<InMemorySuperblock>) {
-    let wals = (0..replicas)
+    let wals = (0..nodes)
       .map(|i| {
         let s = Self::storage_seed(seed, i);
         let mut w = match async_wal_delay {
@@ -282,7 +315,7 @@ impl Cluster {
         w
       })
       .collect();
-    let sbs = (0..replicas)
+    let sbs = (0..nodes)
       .map(|i| {
         let s = Self::storage_seed(seed, i);
         match async_sb_delay {
@@ -295,7 +328,7 @@ impl Cluster {
   }
 
   /// The per-replica storage-fault seed.
-  fn storage_seed(seed: u64, replica: u8) -> u64 {
+  fn storage_seed(seed: u64, replica: u16) -> u64 {
     seed ^ (replica as u64).wrapping_mul(STORAGE_SEED_MAGIC) ^ STORAGE_SEED_MAGIC
   }
 
@@ -311,7 +344,7 @@ impl Cluster {
   pub fn set_storage_faults(&mut self, faults: StorageFaults) {
     self.storage_faults = faults;
     let (wals, sbs) = Self::seed_storage(
-      self.replica_count,
+      self.replicas.len() as u16,
       self.seed,
       faults,
       self.async_wal_delay,
@@ -331,7 +364,7 @@ impl Cluster {
   pub fn set_async_wal_delay(&mut self, delay: Option<u32>) {
     self.async_wal_delay = delay;
     let (wals, sbs) = Self::seed_storage(
-      self.replica_count,
+      self.replicas.len() as u16,
       self.seed,
       self.storage_faults,
       delay,
@@ -355,7 +388,7 @@ impl Cluster {
   pub fn set_async_superblock_delay(&mut self, delay: Option<u32>) {
     self.async_sb_delay = delay;
     let (wals, sbs) = Self::seed_storage(
-      self.replica_count,
+      self.replicas.len() as u16,
       self.seed,
       self.storage_faults,
       self.async_wal_delay,
@@ -377,7 +410,7 @@ impl Cluster {
   pub fn set_wal_capacity(&mut self, n: Option<u64>) {
     self.wal_capacity = n;
     let (wals, sbs) = Self::seed_storage(
-      self.replica_count,
+      self.replicas.len() as u16,
       self.seed,
       self.storage_faults,
       self.async_wal_delay,
@@ -673,9 +706,26 @@ impl Cluster {
     self.clients[i].batching_mut()
   }
 
-  /// Number of replicas (for invariant checking).
+  /// Total number of replicas: voters plus learners (`replica_count + learner_count`). Every
+  /// per-replica vector and the routing target space is sized by this; a per-replica iteration
+  /// (draining apply streams, sizing a per-replica checker) spans it. Equals [`Self::voting_count`]
+  /// when there are no learners.
+  pub fn node_count(&self) -> usize {
+    self.replicas.len()
+  }
+
+  /// Number of replicas, for invariant checking — the TOTAL membership (voters plus learners),
+  /// because a checker sizes its per-replica state and drains every replica's apply stream. A
+  /// synonym of [`Self::node_count`]; the quorum-bearing VOTING count is [`Self::voting_count`].
   pub fn replica_count(&self) -> usize {
     self.replicas.len()
+  }
+
+  /// Number of VOTING replicas: the quorum-bearing set that drives every quorum and against which
+  /// the fault budget is charged. Voters occupy ids `0..voting_count`; the remaining ids
+  /// (`[voting_count, node_count)`) are non-voting learners.
+  pub fn voting_count(&self) -> usize {
+    self.replica_count as usize
   }
 
   /// Number of clients.
@@ -752,7 +802,7 @@ impl Cluster {
     // re-emits from its durable checkpoint (recovery re-applies `(checkpoint_op .. commit_max]`; a
     // wiped disk re-applies from genesis), so per-incarnation stream invariants start afresh.
     self.incarnations[i] += 1;
-    let cfg = self.replica_config(i as u8);
+    let cfg = self.replica_config(i as u16);
     let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
     let now = self.clock.now();
     self.replicas[i] = Endpoint::recover(
@@ -790,7 +840,7 @@ impl Cluster {
   /// (their per-replica monotonicity baselines — durable view, checkpoint high-water — are forfeit
   /// with the disk).
   pub fn wipe_and_restart(&mut self, i: usize) {
-    let s = Self::storage_seed(self.seed, i as u8);
+    let s = Self::storage_seed(self.seed, i as u16);
     let mut w = match self.async_wal_delay {
       Some(d) => InMemoryWal::with_async_appends_and_faults(self.storage_faults, s, d),
       None => InMemoryWal::with_faults(self.storage_faults, s),
@@ -811,15 +861,19 @@ impl Cluster {
 
   /// The per-replica `Config` (cluster id 1, this cluster's checkpoint interval and — when set — its
   /// client-session cap), shared by construction-time builds and `restart`/`wipe_and_restart` so a
-  /// recovered replica keeps the identical cluster configuration.
-  fn replica_config(&self, i: u8) -> Config {
-    let cfg = Config::with_checkpoint_ops(
-      1,
-      ReplicaId::new(i),
-      self.replica_count,
-      self.checkpoint_ops,
-    )
-    .expect("valid cluster config");
+  /// recovered replica keeps the identical cluster configuration. A voting id
+  /// (`i < replica_count`) builds via [`Config::with_checkpoint_ops`] carrying the learner count; a
+  /// learner id (`[replica_count, node_count)`) builds via [`Config::try_new_member`].
+  fn replica_config(&self, i: u16) -> Config {
+    let cfg = if i < self.replica_count as u16 {
+      Config::with_checkpoint_ops(1, ReplicaId::new(i), self.replica_count, self.checkpoint_ops)
+        .expect("valid cluster config")
+        .with_learner_count(self.learner_count)
+        .expect("valid learner count")
+    } else {
+      Config::try_new_member(1, ReplicaId::new(i), self.replica_count, self.learner_count)
+        .expect("valid cluster config")
+    };
     match self.max_client_sessions {
       Some(cap) => cfg
         .with_max_client_sessions(cap)
@@ -852,7 +906,7 @@ impl Cluster {
   /// in-memory state is discarded; durable storage is untouched). Each rebuilt endpoint restarts
   /// its apply stream — a new incarnation, like `restart`.
   fn rebuild_endpoints(&mut self) {
-    for i in 0..self.replica_count {
+    for i in 0..self.replicas.len() as u16 {
       let cfg = self.replica_config(i);
       let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
       self.replicas[i as usize] = Endpoint::new(cfg, seed, self.make_sm());
@@ -956,7 +1010,7 @@ impl Cluster {
       }
       probed += 1;
       // A peer (the next replica id) solicits — both a head (GetView) and a recovery handshake.
-      let peer = viewstamp_proto::ReplicaId::new(((i + 1) % self.replicas.len()) as u8);
+      let peer = viewstamp_proto::ReplicaId::new(((i + 1) % self.replicas.len()) as u16);
       let from = Peer::Replica(peer);
       let view = self.replicas[i].view();
       let gv = Message::GetView(viewstamp_proto::GetView::new(view, peer, 0xF1_u64));
@@ -974,7 +1028,7 @@ impl Cluster {
         drained.push(out);
       }
       for out in drained {
-        self.route(now, ReplicaId::new(i as u8), out);
+        self.route(now, ReplicaId::new(i as u16), out);
       }
     }
     probed
@@ -1034,7 +1088,7 @@ impl Cluster {
   /// deterministically mid-transfer (forcing the failover re-pin). Mirrors the proto's
   /// `Endpoint::sync_transfer_donor`.
   #[doc(hidden)]
-  pub fn replica_sync_transfer_donor(&self, i: usize) -> Option<u8> {
+  pub fn replica_sync_transfer_donor(&self, i: usize) -> Option<u16> {
     self.replicas[i].sync_transfer_donor()
   }
 
@@ -1166,16 +1220,17 @@ impl Cluster {
   }
 
   /// Install a DIRECTED block: `from`'s messages to `to` are dropped until healed, while `to → from`
-  /// still flows. The asymmetric analogue of [`partition`](Self::partition).
-  pub fn block_one_way(&mut self, from: u8, to: u8) {
+  /// still flows. The asymmetric analogue of [`partition`](Self::partition). Ids are member ids
+  /// (`0..node_count`), so they are `u16` — a high id cannot truncate into a low one's row/column.
+  pub fn block_one_way(&mut self, from: u16, to: u16) {
     assert_ne!(from, to, "a replica always reaches itself");
-    self.one_way[from as usize][to as usize] = true;
+    self.one_way[usize::from(from)][usize::from(to)] = true;
   }
 
   /// Whether `from`'s messages to `to` are currently blocked by a DIRECTED one-way block (the
   /// asymmetric check; independent of the symmetric [`partitioned`](Self::partitioned)).
-  pub fn one_way_blocked(&self, from: u8, to: u8) -> bool {
-    self.one_way[from as usize][to as usize]
+  pub fn one_way_blocked(&self, from: u16, to: u16) -> bool {
+    self.one_way[usize::from(from)][usize::from(to)]
   }
 
   /// How many inter-replica messages a directed one-way block has dropped so far. Monotone; `0`
@@ -1252,9 +1307,10 @@ impl Cluster {
     self.stale_read_probes_fired
   }
 
-  /// Whether replica↔replica traffic between replicas `a` and `b` is currently partitioned.
-  pub fn partitioned(&self, a: u8, b: u8) -> bool {
-    self.groups[a as usize] != self.groups[b as usize]
+  /// Whether replica↔replica traffic between replicas `a` and `b` is currently partitioned. Ids are
+  /// member ids (`0..node_count`), so they are `u16` — a high id indexes its own group slot.
+  pub fn partitioned(&self, a: u16, b: u16) -> bool {
+    self.groups[usize::from(a)] != self.groups[usize::from(b)]
   }
 
   /// One simulation step.
@@ -1269,7 +1325,7 @@ impl Cluster {
             self.schedule(
               now,
               from,
-              Target::Replica(ri as u8),
+              Target::Replica(ri as u16),
               Message::Request(req.clone()),
             );
           }
@@ -1337,7 +1393,7 @@ impl Cluster {
         // retransmit path) for a view above the emitter's durable view is a participation in a
         // not-yet-recoverable view.
         self.record_durable_view_violation(ri, &out);
-        outgoing.push((ReplicaId::new(ri as u8), out));
+        outgoing.push((ReplicaId::new(ri as u16), out));
       }
     }
     for (from, out) in outgoing {
@@ -1349,7 +1405,7 @@ impl Cluster {
     for m in self.net.take_due(now) {
       match m.target {
         Target::Replica(idx) => {
-          let ri = idx as usize;
+          let ri = usize::from(idx);
           if !self.crashed[ri] {
             self.replicas[ri].handle_message(
               now,
@@ -1436,7 +1492,7 @@ impl Cluster {
   fn route(&mut self, now: Instant, from: ReplicaId, out: Outgoing) {
     // Belt-and-suspenders: a crashed replica should never be polled, but
     // drop any outgoing it might emit just in case.
-    if self.crashed[from.get() as usize] {
+    if self.crashed[usize::from(from.get())] {
       return;
     }
     let (to, msg) = (out.to(), out.into_msg());
@@ -1448,14 +1504,15 @@ impl Cluster {
         self.schedule(now, Peer::Replica(from), Target::Client(c.get()), msg);
       }
       Recipient::Backups => {
-        for idx in 0..self.replica_count {
+        // A fan-out spans the full membership (every voting and non-voting member but this one).
+        for idx in 0..self.replicas.len() as u16 {
           if idx != from.get() {
             self.schedule(now, Peer::Replica(from), Target::Replica(idx), msg.clone());
           }
         }
       }
       Recipient::AllReplicas => {
-        for idx in 0..self.replica_count {
+        for idx in 0..self.replicas.len() as u16 {
           self.schedule(now, Peer::Replica(from), Target::Replica(idx), msg.clone());
         }
       }
@@ -1547,7 +1604,7 @@ impl Cluster {
     let (Peer::Replica(from_r), Target::Replica(to_r)) = (from, target) else {
       return Duration::ZERO;
     };
-    let (f, t) = (from_r.get() as usize, to_r as usize);
+    let (f, t) = (usize::from(from_r.get()), usize::from(to_r));
     if f == t {
       return Duration::ZERO;
     }
@@ -1967,7 +2024,7 @@ mod tests {
     );
     let due = c.net.take_due(now + Duration::from_secs(3600));
     assert_eq!(due.len(), 3, "slow messages are DELIVERED, not dropped");
-    let at = |from: u8, to: u8| {
+    let at = |from: u16, to: u16| {
       due
         .iter()
         .find(|m| m.from == Peer::Replica(ReplicaId::new(from)) && m.target == Target::Replica(to))

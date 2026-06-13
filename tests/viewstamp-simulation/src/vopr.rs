@@ -538,13 +538,22 @@ impl VoprReport {
 struct Vopr {
   seed: u64,
   prng: Prng,
-  n: usize,
-  /// `⌊(N-1)/2⌋` — the maximum number of replicas that may be knocked out (crashed ∪ isolated) at any
-  /// instant while still leaving a connected majority.
+  /// The TOTAL membership: voting replicas plus learners. Sizes every per-replica vector, the
+  /// routing target space, the cluster construction, and every fan-out / per-replica iteration.
+  node_count: usize,
+  /// The VOTING-replica count: the quorum-bearing set. Drives [`Self::minority_budget`] and bounds
+  /// the budget-charged crash/isolate/asym victim pickers (a learner never consumes the budget).
+  /// Equals [`Self::node_count`] when there are no learners.
+  voting_count: usize,
+  /// `⌊(voting_count-1)/2⌋` — the maximum number of VOTING replicas that may be knocked out
+  /// (crashed ∪ isolated ∪ one-way victims) at any instant while still leaving a connected
+  /// voting majority, so a quorum can always still commit.
   minority_budget: usize,
-  /// Which replicas are currently isolated into the partition minority (group 1). Disjoint from the
-  /// crashed set by construction (we never isolate a crashed replica), so `crashed + isolated`
-  /// knocked-out replicas are counted without double-counting.
+  /// Which replicas are currently isolated into the partition minority (group 1). Sized by the total
+  /// membership (one slot per member); the budget picker only ever isolates VOTERS, so an isolated
+  /// replica always counts against the voting fault budget. Disjoint from the crashed set by
+  /// construction (we never isolate a crashed replica), so `crashed + isolated` knocked-out replicas
+  /// are counted without double-counting.
   isolated: Vec<bool>,
   /// `true` while inside a calm window (no faults, all replicas up); the chaos chooser is suppressed.
   calm: bool,
@@ -863,10 +872,10 @@ pub fn run_vopr_with_stale_read(seed: u64, ticks: u64) -> VoprReport {
 fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
   let mut c = v.build_cluster();
 
-  let mut dur = DurabilityChecker::new(v.n);
-  let mut vm = ViewMonotonicChecker::new(v.n);
-  let mut applied_once = AppliedOnceChecker::new(v.n);
-  let mut staleness = StalenessChecker::new(v.n, v.report.clients);
+  let mut dur = DurabilityChecker::new(v.node_count);
+  let mut vm = ViewMonotonicChecker::new(v.node_count);
+  let mut applied_once = AppliedOnceChecker::new(v.node_count);
+  let mut staleness = StalenessChecker::new(v.node_count, v.report.clients);
   // Generous structural bound: the per-op caches/WAL plateau near a few checkpoint intervals plus
   // pipeline headroom; a real unbounded-growth leak blows well past this. Clients are bounded by the
   // active client set — which the churn axis GROWS by up to CHURN_BUDGET distinct ids over the run
@@ -877,7 +886,7 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
   } else {
     0
   };
-  let bound = BoundednessChecker::new(4_096, v.n + v.report.clients + churn_headroom + 8);
+  let bound = BoundednessChecker::new(4_096, v.node_count + v.report.clients + churn_headroom + 8);
 
   for tick in 0..ticks {
     v.step_phase(&mut c, tick);
@@ -1019,36 +1028,40 @@ const CHURN_BUDGET: u64 = 48;
 impl Vopr {
   fn new(seed: u64) -> Self {
     let mut prng = Prng::new(seed);
-    // Cluster size from {2, 3, 4, 5, 6} — including EVEN N and the sharp N=2 case (covering
+    // VOTING-replica count from {2, 3, 4, 5, 6} — including EVEN N and the sharp N=2 case (covering
     // the quorum/nack arithmetic). `Config::try_new` accepts any `1..=64`, and the derived quorums are
     // sane for every size: quorum = ⌊n/2⌋+1, quorum_view_change = quorum_nack_prepare = n − quorum + 1
     // (N=2 → quorum 2 = unanimous, vc/nack 1 = a single DVC/nack suffices; N=4 → 3 / 2; N=6 → 4 / 3),
     // and the replication↔view-change intersection `quorum + quorum_view_change > n` holds for all.
-    let n = 2 + (prng.below(5) as usize);
-    // ⌊(N−1)/2⌋ — the minority a quorum survives: N=2→0, N=3→1, N=4→1, N=5→2, N=6→2. For N=2 the budget
-    // is 0, so the chaos chooser never knocks out a replica (any single fault would break the unanimous
-    // quorum 2 and stall progress LEGITIMATELY) — only network drop/dup/jitter and async storage churn
-    // apply, which a 2-node cluster must still make progress under.
-    let minority_budget = (n - 1) / 2;
+    let voting_count = 2 + (prng.below(5) as usize);
+    // The cluster runs with no learners, so the total membership equals the voting set.
+    let node_count = voting_count;
+    // ⌊(N−1)/2⌋ over the VOTING set — the minority a quorum survives: N=2→0, N=3→1, N=4→1, N=5→2,
+    // N=6→2. For N=2 the budget is 0, so the chaos chooser never knocks out a voter (any single fault
+    // would break the unanimous quorum 2 and stall progress LEGITIMATELY) — only network
+    // drop/dup/jitter and async storage churn apply, which a 2-node cluster must still make progress
+    // under.
+    let minority_budget = (voting_count - 1) / 2;
     // A handful of clients: 2..=4.
     let clients = 2 + (prng.below(3) as usize);
     Self {
       seed,
       prng,
-      n,
+      node_count,
+      voting_count,
       minority_budget,
-      isolated: vec![false; n],
+      isolated: vec![false; node_count],
       calm: false,
       phase_until: 0,
       calm_start_virtual: Instant::ZERO,
-      forced_sync_seen: vec![0; n],
-      wal_stalls_seen: vec![0; n],
-      below_ring_window_syncs_seen: vec![0; n],
-      sync_chunk_transfers_seen: vec![0; n],
-      unions_floored_seen: vec![0; n],
-      repair_batches_served_seen: vec![0; n],
-      prepare_batches_sent_seen: vec![0; n],
-      header_only_carriers_seen: vec![0; n],
+      forced_sync_seen: vec![0; node_count],
+      wal_stalls_seen: vec![0; node_count],
+      below_ring_window_syncs_seen: vec![0; node_count],
+      sync_chunk_transfers_seen: vec![0; node_count],
+      unions_floored_seen: vec![0; node_count],
+      repair_batches_served_seen: vec![0; node_count],
+      prepare_batches_sent_seen: vec![0; node_count],
+      header_only_carriers_seen: vec![0; node_count],
       calm_baseline_committed: 0,
       calm_had_outstanding: false,
       // Set by `build_cluster` (which draws the bounded-WAL decision off the prng); `None` until then.
@@ -1060,18 +1073,18 @@ impl Vopr {
       churn_axis: env_flag("VOPR_CHURN"),
       churn_actions: 0,
       asym_axis: env_flag("VOPR_ASYM"),
-      asym_victims: vec![false; n],
+      asym_victims: vec![false; node_count],
       slow_axis: env_flag("VOPR_SLOW"),
       slow_active: None,
       slow_until: 0,
       batching_axis: env_flag("VOPR_BATCHING"),
       stale_read_axis: env_flag("VOPR_STALE_READ"),
       active_stale_probe: None,
-      sessions_evicted_seen: vec![0; n],
+      sessions_evicted_seen: vec![0; node_count],
       wiped_pending: Vec::new(),
       report: VoprReport {
         seed,
-        replicas: n,
+        replicas: node_count,
         clients,
         ..VoprReport::default()
       },
@@ -1150,8 +1163,10 @@ impl Vopr {
     };
     self.wal_capacity = wal_capacity;
     self.report.wal_capacity = wal_capacity;
-    let mut c = Cluster::with_checkpoint_ops(
-      self.n as u8,
+    let learner_count = self.node_count.saturating_sub(self.voting_count) as u16;
+    let mut c = Cluster::with_members(
+      self.voting_count as u8,
+      learner_count,
       clients,
       requests_per_client,
       self.seed,
@@ -1383,7 +1398,7 @@ impl Vopr {
   fn enter_calm(&mut self, c: &mut Cluster, tick: u64) {
     self.heal_all_partitions(c);
     self.end_slow_episode(c);
-    for i in 0..self.n {
+    for i in 0..self.node_count {
       if c.is_crashed(i) {
         self.restart_and_track(c, i);
       }
@@ -1457,7 +1472,7 @@ impl Vopr {
     // replica restarted, no network/storage chaos.
     self.heal_all_partitions(c);
     self.end_slow_episode(c);
-    for i in 0..self.n {
+    for i in 0..self.node_count {
       if c.is_crashed(i) {
         self.restart_and_track(c, i);
       }
@@ -1492,7 +1507,7 @@ impl Vopr {
       self.dump_divergence(c, ticks);
     }
     let committed = max_committed(c);
-    let applied_hw = (0..self.n)
+    let applied_hw = (0..self.node_count)
       .filter(|&i| !c.is_crashed(i))
       .map(|i| c.replica_sm(i).applied().len())
       .max()
@@ -1643,8 +1658,9 @@ impl Vopr {
         if let Some(v) = self.pick_asym_victim(c) {
           let shape = self.prng.below(3);
           // The single-edge peer + direction draws happen for EVERY install (not just shape 2) so
-          // the stream never depends on which shape was drawn.
-          let mut w = self.prng.below((self.n - 1) as u64) as usize;
+          // the stream never depends on which shape was drawn. The peer ranges over the full
+          // membership: a directed edge can touch any member, voter or learner.
+          let mut w = self.prng.below((self.node_count - 1) as u64) as usize;
           if w >= v {
             w += 1;
           }
@@ -1654,24 +1670,24 @@ impl Vopr {
             match shape {
               // DEAF: every peer's messages TO the victim are dropped; the victim's own flow out.
               0 => {
-                for x in 0..self.n {
+                for x in 0..self.node_count {
                   if x != v {
-                    c.block_one_way(x as u8, v as u8);
+                    c.block_one_way(x as u16, v as u16);
                   }
                 }
               }
               // MUTE: the victim's messages to every peer are dropped; everyone still reaches it.
               1 => {
-                for x in 0..self.n {
+                for x in 0..self.node_count {
                   if x != v {
-                    c.block_one_way(v as u8, x as u8);
+                    c.block_one_way(v as u16, x as u16);
                   }
                 }
               }
               // SINGLE EDGE: one directed leg between the victim and a seeded peer.
               _ => {
                 let (f, t) = if to_victim { (w, v) } else { (v, w) };
-                c.block_one_way(f as u8, t as u8);
+                c.block_one_way(f as u16, t as u16);
               }
             }
             self.report.asym_episodes += 1;
@@ -1775,7 +1791,7 @@ impl Vopr {
         self.end_slow_episode(c);
       }
       if self.prng.chance(1, 90) && self.slow_active.is_none() {
-        let candidates: Vec<usize> = (0..self.n).filter(|&i| !c.is_crashed(i)).collect();
+        let candidates: Vec<usize> = (0..self.node_count).filter(|&i| !c.is_crashed(i)).collect();
         if let Some(v) = self.pick(&candidates) {
           // Legs: 0 ⇒ inbound only (slow to hear), 1 ⇒ outbound only (slow to be heard), 2 ⇒ both.
           let legs = self.prng.below(3);
@@ -1814,7 +1830,9 @@ impl Vopr {
   /// Push the current `isolated` set into the cluster as a 2-group partition: isolated replicas →
   /// group 1, the rest (the majority component) → group 0.
   fn apply_partition(&self, c: &mut Cluster) {
-    let groups: Vec<u8> = (0..self.n).map(|i| u8::from(self.isolated[i])).collect();
+    let groups: Vec<u8> = (0..self.node_count)
+      .map(|i| u8::from(self.isolated[i]))
+      .collect();
     c.partition(groups);
   }
 
@@ -1844,12 +1862,13 @@ impl Vopr {
     (probe, false)
   }
 
-  /// The number of replicas currently knocked out: crashed plus isolated plus one-way victims
+  /// The number of VOTING replicas currently knocked out: crashed plus isolated plus one-way victims
   /// (disjoint sets — the pickers exclude each other's members). A one-way victim is budgeted as
   /// knocked out because it cannot complete any round-trip exchange while its episode lasts, so the
-  /// connected, fully-bidirectional majority component must survive WITHOUT it.
+  /// connected, fully-bidirectional voting majority must survive WITHOUT it. Counts over the voting
+  /// set only: a learner impairment never consumes the voting fault budget.
   fn knocked_out(&self, c: &Cluster) -> usize {
-    (0..self.n)
+    (0..self.voting_count)
       .filter(|&i| c.is_crashed(i) || self.isolated[i] || self.asym_victims[i])
       .count()
   }
@@ -1862,7 +1881,7 @@ impl Vopr {
     if self.knocked_out(c) >= self.minority_budget {
       return None;
     }
-    let candidates: Vec<usize> = (0..self.n)
+    let candidates: Vec<usize> = (0..self.voting_count)
       .filter(|&i| !c.is_crashed(i) && !self.isolated[i] && !self.asym_victims[i])
       .collect();
     self.pick(&candidates)
@@ -1874,7 +1893,7 @@ impl Vopr {
     if self.knocked_out(c) >= self.minority_budget {
       return None;
     }
-    let candidates: Vec<usize> = (0..self.n)
+    let candidates: Vec<usize> = (0..self.voting_count)
       .filter(|&i| !c.is_crashed(i) && !self.isolated[i] && !self.asym_victims[i])
       .collect();
     self.pick(&candidates)
@@ -1891,7 +1910,7 @@ impl Vopr {
     if self.knocked_out(c) >= self.minority_budget {
       return None;
     }
-    let candidates: Vec<usize> = (0..self.n)
+    let candidates: Vec<usize> = (0..self.voting_count)
       .filter(|&i| !c.is_crashed(i) && !self.isolated[i] && !self.asym_victims[i])
       .collect();
     if candidates.is_empty() {
@@ -1915,7 +1934,7 @@ impl Vopr {
   /// (the heal actions, calm windows, the final quiesce) goes through here so the driver's budget
   /// view can never desync from the cluster's connectivity.
   fn heal_all_partitions(&mut self, c: &mut Cluster) {
-    for i in 0..self.n {
+    for i in 0..self.node_count {
       self.isolated[i] = false;
       self.asym_victims[i] = false;
     }
@@ -1937,7 +1956,7 @@ impl Vopr {
 
   /// Pick a currently-crashed replica to restart, if any.
   fn pick_crashed(&mut self, c: &Cluster) -> Option<usize> {
-    let candidates: Vec<usize> = (0..self.n).filter(|&i| c.is_crashed(i)).collect();
+    let candidates: Vec<usize> = (0..self.node_count).filter(|&i| c.is_crashed(i)).collect();
     self.pick(&candidates)
   }
 
@@ -2049,7 +2068,7 @@ impl Vopr {
   /// it). Plus, for the cluster's committed history, that every committed op is durably present on at
   /// least a quorum (WAL `Clean` or `<= checkpoint_op`).
   fn check_structural(&self, c: &Cluster, tick: u64) {
-    for i in 0..self.n {
+    for i in 0..self.node_count {
       let op = c.replica_op(i).get();
       let cmax = c.replica_commit_max(i).get();
       let cmin = c.replica_commit(i).get();
@@ -2083,13 +2102,14 @@ impl Vopr {
     if committed == 0 {
       return;
     }
-    let quorum = self.n / 2 + 1;
+    let quorum = self.voting_count / 2 + 1;
     // Check the newest committed op (the one most at risk of not yet being durable on a quorum). It
     // is a sound proxy for the whole prefix: a committed op was, at commit time, durably appended on
     // a quorum, and a committed slot stays occupied thereafter — so if the newest committed op is
-    // held by a quorum, every older committed op is too.
+    // held by a quorum, every older committed op is too. Count holders among VOTERS only: the
+    // commit quorum is a voter quorum, so a learner holding the op cannot stand in for a voter.
     let top = committed as u64;
-    let holders = (0..self.n)
+    let holders = (0..self.voting_count)
       .filter(|&i| c.replica_appended_op(i, viewstamp_proto::OpNumber::with(top)))
       .count();
     // The committed-history high-water means at least one replica APPLIED op `top`, which the
@@ -2159,7 +2179,7 @@ impl Vopr {
     let Some(n) = self.wal_capacity else {
       return;
     };
-    for i in 0..self.n {
+    for i in 0..self.node_count {
       // A crashed replica is powered off — its volatile state is meaningless and its durable WAL is read
       // only on the next `recover`; the residency invariant is checked on the OPERATIONAL replicas (and
       // re-checked on a recovered one once it rejoins). Mirrors the `bounded_wal.rs` gate, which checks
@@ -2214,7 +2234,7 @@ impl Vopr {
       "=== VOPR divergence dump seed {} tick {tick} ===",
       self.seed
     );
-    let logs: Vec<Vec<(u64, Bytes)>> = (0..self.n)
+    let logs: Vec<Vec<(u64, Bytes)>> = (0..self.node_count)
       .map(|i| c.replica_sm(i).applied().to_vec())
       .collect();
     // First position where any two replicas disagree.
@@ -2269,21 +2289,21 @@ impl Vopr {
   /// pending-view-window counter is maintained by the per-tick probe in [`run_vopr`], not here.
   fn update_report(&mut self, c: &Cluster) {
     self.report.max_committed = self.report.max_committed.max(max_committed(c));
-    let mv = (0..self.n)
+    let mv = (0..self.node_count)
       .map(|i| c.replica_view(i).get())
       .max()
       .unwrap_or(0);
     self.report.max_view = self.report.max_view.max(mv);
     // MISDIRECTED-read high-water (summed over replicas' persistent WAL counters). Tracked as a max so
     // a mid-run WAL rebuild (none happens in the VOPR, but defensively) cannot lower it.
-    let md: u64 = (0..self.n).map(|i| c.wal_misdirects_fired(i)).sum();
+    let md: u64 = (0..self.node_count).map(|i| c.wal_misdirects_fired(i)).sum();
     self.report.misdirects_fired = self.report.misdirects_fired.max(md);
     // FORCED-sync (peer-fetch escalation) cumulative accumulation. The proto's per-replica counter
     // resets to 0 on `recover` (each restart), so we fold each POSITIVE delta into the running total
     // and always re-baseline `forced_sync_seen` — a reset's downward step then contributes nothing and
     // the next climb from 0 is counted afresh. This makes `forced_syncs` a true run-cumulative count of
     // peer-fetch escalations, robust to the per-restart reset.
-    for i in 0..self.n {
+    for i in 0..self.node_count {
       let cur = c.replica_forced_sync_count(i);
       if cur > self.forced_sync_seen[i] {
         self.report.forced_syncs += cur - self.forced_sync_seen[i];
@@ -2297,7 +2317,7 @@ impl Vopr {
     // above (a plain per-tick-sum high-water would lose a pre-restart burst). Always `0` on an unbounded
     // seed (the ring is `u64::MAX`, never overflows), so these stay 0 there and the sweep's
     // bounded-seed-only assertions are sound.
-    for i in 0..self.n {
+    for i in 0..self.node_count {
       let stalls = c.replica_wal_stalls(i);
       if stalls > self.wal_stalls_seen[i] {
         self.report.wal_stalls += stalls - self.wal_stalls_seen[i];
@@ -2321,7 +2341,7 @@ impl Vopr {
     // All three live on the `Endpoint` and reset to 0 on `recover`, so they use the SAME reset-robust
     // positive-delta accumulation as `forced_syncs` above (a plain high-water would lose a
     // pre-restart burst). The sweeps assert their cross-seed sums are `> 0` (non-vacuity).
-    for i in 0..self.n {
+    for i in 0..self.node_count {
       let floored = c.replica_unions_floored(i);
       if floored > self.unions_floored_seen[i] {
         self.report.unions_floored += floored - self.unions_floored_seen[i];
@@ -2352,7 +2372,7 @@ impl Vopr {
     }
     // Torn-header probe witness (summed over the persistent WALs, high-water like `misdirects_fired`
     // so a storage rebuild can never lower it). Stays 0 with the axis off.
-    let th: u64 = (0..self.n).map(|i| c.wal_torn_headers_fired(i)).sum();
+    let th: u64 = (0..self.node_count).map(|i| c.wal_torn_headers_fired(i)).sum();
     self.report.torn_headers_fired = self.report.torn_headers_fired.max(th);
     // Genuine-WRAP witness: a BOUNDED seed whose committed history exceeded its ring size `N` has had an
     // op `K + N` physically reuse op `K`'s slot — the ring truly wrapped (not merely filled). Latches
