@@ -3,8 +3,8 @@ use core::time::Duration;
 use smol_str::SmolStr;
 
 use viewstamp_proto::{
-  Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Instant, Message, OpNumber, Outgoing, Peer, Prng,
-  Recipient, ReplicaId, Wal,
+  Committed, Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, Message, OpNumber, Outgoing,
+  Peer, Prng, Recipient, ReplicaId, Wal,
 };
 
 use crate::{
@@ -25,6 +25,21 @@ const STORAGE_SEED_MAGIC: u64 = 0x5151_DEAD_BEEF_0F0F;
 /// content-addressed vote gate defends. The event-driven clock jumps to it: a held message keeps the
 /// network non-empty, so it is always eventually delivered within the tick budget.
 const HOLD_DELAY: Duration = Duration::from_millis(15_000);
+
+/// One entry of a replica's recorded apply stream ([`Cluster::replica_applied_events`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedEvent {
+  /// The replica applied a committed op (the proto's [`Committed`] payload: op, client, request,
+  /// reply) — one per state-machine apply, in apply order.
+  Committed(Committed),
+  /// The replica completed a state-sync: its state machine was REPLACED by the checkpoint snapshot
+  /// bound at this op, so the apply stream REBASES — the ops folded into the snapshot are never
+  /// individually re-emitted, and commits resume contiguously above the synced point. A checker must
+  /// treat this as the justification for the op jump, and forward-only: the recovery peer-fetch path
+  /// installs the snapshot eagerly but reports the sync only once its root is durable, so the marker
+  /// can trail the first post-install commits.
+  SyncPoint(OpNumber),
+}
 
 /// A deterministic single-thread cluster of `Endpoint<LogSm>` replicas + clients.
 pub struct Cluster {
@@ -133,6 +148,19 @@ pub struct Cluster {
   /// slow sweep reads this as its deep non-vacuity witness: messages were genuinely delivered LATE,
   /// not merely flagged slow.
   slow_delays_applied: u64,
+  /// Per-replica recorded APPLY STREAM: every `Committed` + `StateSyncCompleted` event drained from
+  /// the endpoint, tagged with the replica's incarnation at emission. Filled by the per-tick event
+  /// drain (and by [`crash`](Self::crash), which captures the not-yet-drained tail before the
+  /// endpoint goes dark — `restart` replaces the endpoint, dropping its queue). Observation-only
+  /// bookkeeping for the applied-once checker: capturing events the endpoint already produced takes
+  /// no PRNG draw, sends no message, and writes no storage.
+  applied_streams: Vec<Vec<(u64, AppliedEvent)>>,
+  /// Per-replica INCARNATION counter: 0 from construction, +1 per [`restart`](Self::restart) /
+  /// [`wipe_and_restart`](Self::wipe_and_restart) (and per pre-run endpoint rebuild in
+  /// [`set_max_client_sessions`](Self::set_max_client_sessions)). An incarnation boundary is where a
+  /// replica's apply stream legitimately re-emits from its durable checkpoint (recovery re-applies
+  /// `(checkpoint_op .. commit_max]`; a wipe re-applies from genesis).
+  incarnations: Vec<u64>,
 }
 
 impl Cluster {
@@ -201,6 +229,8 @@ impl Cluster {
       holds_fired: 0,
       one_way_dropped: 0,
       slow_delays_applied: 0,
+      applied_streams: vec![Vec::new(); n],
+      incarnations: vec![0; n],
     }
   }
 
@@ -346,6 +376,21 @@ impl Cluster {
   /// Read access to replica `i`'s state machine (for invariant checking).
   pub fn replica_sm(&self, i: usize) -> &LogSm {
     self.replicas[i].state_machine_ref()
+  }
+
+  /// Replica `i`'s recorded APPLY STREAM (for the applied-once checker): every [`Committed`] it
+  /// emitted — one per state-machine apply, in apply order — plus every state-sync rebase point,
+  /// each tagged with the incarnation (see [`Self::replica_incarnation`]) it was emitted in. The
+  /// stream is append-only across the cluster's lifetime.
+  pub fn replica_applied_events(&self, i: usize) -> &[(u64, AppliedEvent)] {
+    &self.applied_streams[i]
+  }
+
+  /// Replica `i`'s current INCARNATION (for the applied-once checker): 0 from construction, +1 on
+  /// every [`restart`](Self::restart) / [`wipe_and_restart`](Self::wipe_and_restart). A new
+  /// incarnation's apply stream legitimately re-emits from the replica's durable checkpoint.
+  pub fn replica_incarnation(&self, i: usize) -> u64 {
+    self.incarnations[i]
   }
 
   /// Replica `i`'s current view (for invariant checking).
@@ -639,6 +684,12 @@ impl Cluster {
   ///
   /// In synchronous mode both are no-ops (nothing is ever staged).
   pub fn crash(&mut self, i: usize) {
+    // Capture any application events still queued on the endpoint: the ops they record WERE applied
+    // before the power went out, and `restart` replaces the endpoint (dropping its queue), so an
+    // uncaptured tail would make an acked op applied only in that window vanish from every recorded
+    // stream and falsely read as lost. Observation-only — the events are observability the protocol
+    // never depends on, and the crashed endpoint is never polled again.
+    self.record_applied_events(i);
     self.crashed[i] = true;
     self.sbs[i].discard_inflight();
     self.wals[i].discard_inflight();
@@ -656,6 +707,10 @@ impl Cluster {
   /// main `tick` loop also pumps `handle_storage` every tick, so an un-pumped restart would still
   /// recover; this pump is purely for test-assertion timing.)
   pub fn restart(&mut self, i: usize) {
+    // A restart begins a new INCARNATION of this replica's apply stream: the rebuilt endpoint
+    // re-emits from its durable checkpoint (recovery re-applies `(checkpoint_op .. commit_max]`; a
+    // wiped disk re-applies from genesis), so per-incarnation stream invariants start afresh.
+    self.incarnations[i] += 1;
     let cfg = self.replica_config(i as u8);
     let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
     let now = self.clock.now();
@@ -744,6 +799,8 @@ impl Cluster {
       let cfg = self.replica_config(i);
       let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
       self.replicas[i as usize] = Endpoint::new(cfg, seed, LogSm::default());
+      // A rebuilt endpoint restarts its apply stream — a new incarnation, like `restart`.
+      self.incarnations[i as usize] += 1;
     }
   }
 
@@ -1188,7 +1245,7 @@ impl Cluster {
       if self.crashed[ri] {
         continue;
       }
-      while self.replicas[ri].poll_event().is_some() {}
+      self.record_applied_events(ri);
     }
 
     let next = [
@@ -1218,6 +1275,25 @@ impl Cluster {
       self.replicas[ri].handle_timeout(now, &mut self.wals[ri], &mut self.sbs[ri]);
       // Pump storage after timeout: drives append-before-ack (on_wal_done) + durable-view (on_sb_done).
       self.replicas[ri].handle_storage(now, &mut self.wals[ri], &mut self.sbs[ri]);
+    }
+  }
+
+  /// Drains replica `ri`'s pending application events into its recorded apply stream, tagged with
+  /// its current incarnation: every [`Event::Committed`] (one per state-machine apply, in apply
+  /// order) and every [`Event::StateSyncCompleted`] (the snapshot-rebase point that justifies the op
+  /// jump a bulk restore produces). Other event kinds are embedder observability with no bearing on
+  /// the apply stream. Recording is observation-only: no PRNG draw, no message, no storage write.
+  fn record_applied_events(&mut self, ri: usize) {
+    while let Some(ev) = self.replicas[ri].poll_event() {
+      match ev {
+        Event::Committed(c) => {
+          self.applied_streams[ri].push((self.incarnations[ri], AppliedEvent::Committed(c)));
+        }
+        Event::StateSyncCompleted(op) => {
+          self.applied_streams[ri].push((self.incarnations[ri], AppliedEvent::SyncPoint(op)));
+        }
+        _ => {}
+      }
     }
   }
 
@@ -1518,6 +1594,46 @@ mod tests {
       0,
       "no forced sync in a clean run"
     );
+  }
+
+  #[test]
+  fn apply_stream_records_committed_ops_per_incarnation() {
+    let mut c = Cluster::new(3, 1, 3, 11);
+    for _ in 0..5_000 {
+      c.tick();
+      if c.is_quiescent() {
+        break;
+      }
+    }
+    assert_eq!(c.replica_incarnation(0), 0, "no restart yet");
+    // The view-0 primary's stream carries one Committed per apply, in apply order, all tagged with
+    // incarnation 0 — exactly its state machine's applied ops.
+    let ops: Vec<u64> = c
+      .replica_applied_events(0)
+      .iter()
+      .filter_map(|(inc, e)| {
+        assert_eq!(
+          *inc, 0,
+          "every entry of an unrestarted replica is incarnation 0"
+        );
+        match e {
+          AppliedEvent::Committed(commit) => Some(commit.op().get()),
+          AppliedEvent::SyncPoint(_) => None,
+        }
+      })
+      .collect();
+    let expect: Vec<u64> = (1..=c.replica_sm(0).applied().len() as u64).collect();
+    assert!(!expect.is_empty(), "the run committed ops");
+    assert_eq!(ops, expect, "one Committed per apply, in apply order");
+    // A crash captures the queued event tail; a restart begins a new incarnation.
+    let before = c.replica_applied_events(1).len();
+    c.crash(1);
+    assert!(
+      c.replica_applied_events(1).len() >= before,
+      "crash never drops recorded events"
+    );
+    c.restart(1);
+    assert_eq!(c.replica_incarnation(1), 1, "restart bumps the incarnation");
   }
 
   #[test]

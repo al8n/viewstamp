@@ -14,9 +14,10 @@ pub mod storage;
 pub mod vopr;
 
 pub use checker::{
-  BoundednessChecker, CheckResult, DurabilityChecker, ViewMonotonicChecker, check_safety,
+  AppliedOnceChecker, BoundednessChecker, CheckResult, DurabilityChecker, ViewMonotonicChecker,
+  check_safety,
 };
-pub use cluster::Cluster;
+pub use cluster::{AppliedEvent, Cluster};
 pub use network::{Faults, SlowProfile};
 pub use storage::{InMemorySuperblock, InMemoryWal, StorageFaults};
 pub use vopr::{
