@@ -289,18 +289,18 @@ const MIN_CONNECTION_FLOOR: usize = 4;
 /// **Formula:** `max(MIN_CONNECTION_FLOOR, 3 * (replica_count - 1))`.
 ///
 /// **Rationale.** The mutual-dial design keeps TWO physical connections per peer pair (each side dials
-/// the other and both are kept; see `Bridge::bind_validated`), so an `N`-replica node holds `2*(N-1)`
-/// steady-state connections. A reconnecting peer can briefly hold a THIRD connection (the new dial /
-/// accept overlapping the old one before it idle-times-out or is reaped), so we add one reconnect slot
-/// per peer — `(N-1)` — for a total of `3*(N-1)`. For the supported 64-replica maximum that is 189,
-/// comfortably above the `2*63 = 126` bare-mesh requirement; for `N <= 1` it is the floor.
+/// the other and both are kept; see `Bridge::bind_validated`), so in an `N`-member cluster (every
+/// member — voting or not — joins the mesh) a node holds `2*(N-1)` steady-state connections. A
+/// reconnecting peer can briefly hold a THIRD connection (the new dial / accept overlapping the old one
+/// before it idle-times-out or is reaped), so we add one reconnect slot per peer — `(N-1)` — for a
+/// total of `3*(N-1)`, comfortably above the `2*(N-1)` bare-mesh requirement; for `N <= 1` it is the floor.
 ///
 /// The coordinator RAISES `max_connections` to this when the caller-configured cap is lower, so the cap
-/// can never refuse a legitimate steady-state mesh connection (a liveness failure at scale — the
-/// 64-default refuses mesh dials past ~33 replicas). It still bounds an untrusted-network flood; it is
-/// just sized to the configured membership rather than a fixed constant.
-pub(crate) const fn mesh_connection_floor(replica_count: u8) -> usize {
-  let peers = (replica_count as usize).saturating_sub(1);
+/// can never refuse a legitimate steady-state mesh connection (a liveness failure at scale). It still
+/// bounds an untrusted-network flood; it is just sized to the configured membership (`node_count`,
+/// voters plus non-voting members) rather than a fixed constant.
+pub(crate) const fn mesh_connection_floor(node_count: u16) -> usize {
+  let peers = (node_count as usize).saturating_sub(1);
   let mesh_with_reconnect = peers * 3;
   if mesh_with_reconnect > MIN_CONNECTION_FLOOR {
     mesh_with_reconnect

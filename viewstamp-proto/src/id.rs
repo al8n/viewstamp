@@ -90,14 +90,17 @@ impl Peer {
   }
 }
 
-/// The intended destination set for an outgoing message.
+/// The intended destination set for an outgoing message. A fan-out variant
+/// spans the full configured membership — every voting and non-voting replica
+/// — which the driver resolves against its live connection table; the core
+/// never enumerates ids for a fan-out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Recipient {
   /// A single peer.
   To(Peer),
-  /// Every replica except this one.
+  /// Every other replica, voting or not (every member except this one).
   Backups,
-  /// Every replica including this one (loopback handled by the driver).
+  /// Every replica including this one, voting or not (loopback handled by the driver).
   AllReplicas,
 }
 

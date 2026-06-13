@@ -30,9 +30,9 @@ pub const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Default global live-connection cap (stream driver; dialed + accepted). On ACCEPT past this bound
 /// the socket is dropped (closed) without registering, so a peer that floods sockets cannot grow
-/// `conns` + the coordinator router without bound. 1024 is generous: a full mutual-dial mesh needs
-/// only ~`2*(replica_count-1)` steady connections (e.g. 126 for the 64-replica voting cap), so this
-/// never refuses a legitimate peer while still bounding an accept flood.
+/// `conns` + the coordinator router without bound. 1024 is generous: a full mutual-dial mesh over the
+/// configured membership needs only ~`2*(node_count-1)` steady connections (126 for a 64-member
+/// cluster), so this never refuses a legitimate peer while still bounding an accept flood.
 pub(crate) const MAX_CONNS: usize = 1024;
 
 /// Tunable operational parameters for both drivers (the QUIC driver and the stream driver), with
@@ -226,7 +226,7 @@ impl DriverConfig {
   }
 
   /// Override the global live-connection cap (stream driver only; clamped to at least 1). Size it
-  /// above `2*(replica_count-1)` plus reconnect headroom or the mesh itself is refused.
+  /// above `2*(node_count-1)` plus reconnect headroom or the mesh itself is refused.
   #[must_use]
   pub const fn with_max_conns(mut self, max: usize) -> Self {
     self.max_conns = if max == 0 { 1 } else { max };
