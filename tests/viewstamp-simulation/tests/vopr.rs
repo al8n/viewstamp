@@ -148,8 +148,9 @@
 //!   TAKEN (never re-minted) and the new primary peer-repairs the canonical body. `0..2048` is now clean.
 
 use viewstamp_simulation::{
-  DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_churn,
-  run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_torn_headers, run_vopr_with_wipe,
+  DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
+  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_torn_headers,
+  run_vopr_with_wipe,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -593,6 +594,88 @@ fn vopr_churn_sweep_no_violations() {
   println!(
     "VOPR churn sweep OK: churns_fired={total_churns} sessions_evicted={total_evictions} \
      committed={total_committed} view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed BATCHING sweep (same budget rationale as
+/// [`HOLD_SEEDS`]).
+const BATCHING_SEEDS: u64 = 16;
+
+/// The committed EDGE-BATCHING sweep: [`run_vopr_with_batching`] over `0..BATCHING_SEEDS` — the
+/// batching axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env var,
+/// no schedule races, cannot be forgotten by a runner). The cluster runs the batch-aware state
+/// machine (every committed body parsed with the REAL batch codec, applied per unit, per-unit
+/// replies sealed by the real `ReplyBuilder`), and a seeded subset of the clients drive the
+/// deterministic aggregator model: seeded unit emission (a per-tick rate that can exceed one — the
+/// queued excess is what forms multi-unit bodies), occasional atomic groups, FIFO packing under
+/// the dual-budget rule, and per-unit reply demux asserted at every ack. The full adversarial
+/// schedule (crashes, partitions, view changes, repair, state-sync) runs UNDER the batched
+/// traffic, judged by the standard per-tick invariant suite + `AppliedOnce`, and post-quiesce by
+/// the per-unit oracle: every acked unit applied exactly once at its request's committed
+/// `(op, unit_index)` with the submitted bytes and the SM's deterministic reply; groups on one op,
+/// adjacent, never split.
+///
+/// A violation in this sweep is a REAL finding (a batched body double-applied, a unit re-ordered
+/// or rewritten across view change/repair/state-sync, a split group) — report it with its seed;
+/// never mask it or weaken a checker to pass.
+///
+/// The DEFAULT sweep leaves this axis OFF (its build-time draws would shift every pinned
+/// regression seed off its historical schedule); batching-enabled runs are their own deterministic
+/// baselines, byte-identical to `VOPR_BATCHING=1` runs of the same seeds.
+#[test]
+fn vopr_batching_sweep_no_violations() {
+  let mut total_multi_unit_bodies = 0u64;
+  let mut total_groups = 0u64;
+  let mut max_units = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR batching sweep: 0..{BATCHING_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, batching \
+     axis forced on"
+  );
+  for seed in 0..BATCHING_SEEDS {
+    let r = run_vopr_with_batching(seed, DEFAULT_TICKS);
+    total_multi_unit_bodies += r.bodies_with_multiple_units();
+    total_groups += r.groups_submitted();
+    max_units = max_units.max(r.max_units_per_body());
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity, the lane's committed core: batching must genuinely ENGAGE — the closed loop
+  // queued 2+ units while a body flew and the model packed them into one consensus op. A zero here
+  // means every body carried a single unit and the lane decayed into the plain schedule with a
+  // codec wrapper.
+  assert!(
+    total_multi_unit_bodies > 0,
+    "no packed body ever carried more than one unit across the sweep \
+     (bodies_with_multiple_units={total_multi_unit_bodies}) — batching never engaged; the lane is \
+     vacuous"
+  );
+  // The atomic-group path (whole-or-deferred, never split) must also be genuinely exercised.
+  assert!(
+    total_groups > 0,
+    "no atomic group was ever enqueued across the sweep (groups_submitted={total_groups}) — the \
+     group path is vacuous"
+  );
+  // And the batching-enabled runs still did real work: ops committed, and at least one seed drove
+  // a view change — re-packing + retransmission across failover is exactly the window where a
+  // batched body could double-apply or tear, so a sweep with no view change could not reach the
+  // class this lane exists for.
+  assert!(
+    total_committed > 0,
+    "the batching sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no batching-sweep seed drove a view change — the failover interleavings this lane guards \
+     never came under test"
+  );
+  println!(
+    "VOPR batching sweep OK: bodies_with_multiple_units={total_multi_unit_bodies} \
+     groups_submitted={total_groups} max_units_per_body={max_units} committed={total_committed} \
+     view_change_seeds={seeds_with_view_change}"
   );
 }
 

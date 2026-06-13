@@ -243,6 +243,20 @@ pub struct VoprReport {
   /// run (the cluster's monotone counter). `> 0` proves an episode genuinely delayed live traffic —
   /// the slow sweep's deep non-vacuity witness.
   slow_delays: u64,
+  /// How many packed request bodies carried MORE than one unit this run (summed over the batching
+  /// clients' monotone counters, high-water — client models persist across replica crashes and
+  /// nothing resets them). `0` unless the batching axis is enabled (`VOPR_BATCHING`, or
+  /// [`run_vopr_with_batching`]). `> 0` proves batching genuinely ENGAGED — the closed loop queued
+  /// 2+ units while a body flew and the model packed them into one consensus op — which is the
+  /// batching sweep's headline non-vacuity witness.
+  bodies_with_multiple_units: u64,
+  /// The largest unit count any single packed body carried this run (max over the batching
+  /// clients' monotone high-waters). `0` with the axis off.
+  max_units_per_body: u64,
+  /// How many atomic GROUPS the batching clients enqueued this run (summed over their monotone
+  /// counters, high-water). `0` with the axis off; the batching sweep asserts the cross-seed sum
+  /// is `> 0` so the group (whole-or-deferred, never split) path is genuinely exercised.
+  groups_submitted: u64,
 }
 
 impl VoprReport {
@@ -472,6 +486,23 @@ impl VoprReport {
   pub const fn slow_delays(&self) -> u64 {
     self.slow_delays
   }
+
+  /// How many packed bodies carried more than one unit (the batching lane's headline non-vacuity
+  /// witness: batching genuinely engaged). `0` with the axis off.
+  pub const fn bodies_with_multiple_units(&self) -> u64 {
+    self.bodies_with_multiple_units
+  }
+
+  /// The largest unit count any single packed body carried. `0` with the axis off.
+  pub const fn max_units_per_body(&self) -> u64 {
+    self.max_units_per_body
+  }
+
+  /// How many atomic groups the batching clients enqueued. `0` with the axis off; the batching
+  /// sweep asserts the cross-seed sum is `> 0`.
+  pub const fn groups_submitted(&self) -> u64 {
+    self.groups_submitted
+  }
 }
 
 /// The driver's own seeded RNG + bookkeeping. Separate from the cluster's internal network/storage
@@ -598,6 +629,14 @@ struct Vopr {
   /// The tick at which the active slow episode expires (the bounded episode window; calm windows
   /// and the final quiesce end it early).
   slow_until: u64,
+  /// Whether the EDGE-BATCHING axis is enabled for this run: the `VOPR_BATCHING` env var, or
+  /// force-enabled via [`run_vopr_with_batching`] (the committed batching sweep). Same discipline
+  /// as [`Self::hold_axis`]: with the axis OFF no build-time draw is consumed and the cluster runs
+  /// the plain state machine — the default per-seed schedule stays byte-identical; a
+  /// batching-enabled run is its OWN deterministic baseline. The per-tick unit emission never
+  /// touches the action PRNG at all (each batching client draws from its own seed-derived stream),
+  /// so the chaos schedule composes with batching untouched.
+  batching_axis: bool,
   /// Per-replica last-observed session-eviction count, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
   sessions_evicted_seen: Vec<u64>,
@@ -713,6 +752,30 @@ pub fn run_vopr_with_slow(seed: u64, ticks: u64) -> VoprReport {
   run_seeded(v, ticks)
 }
 
+/// Like [`run_vopr`] but with the EDGE-BATCHING axis FORCE-ENABLED, independent of the
+/// `VOPR_BATCHING` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]). The
+/// cluster runs the batch-aware state machine (every committed body is parsed with the REAL batch
+/// codec and applied per unit), and a seeded subset of the clients become BATCHING clients driving
+/// the deterministic aggregator model: units (and occasional atomic groups) are emitted on a
+/// seeded per-tick cadence, queued while a body is in flight, packed FIFO into ONE request body
+/// under the aggregator's dual-budget rule, and demultiplexed per unit on the ack — so batching
+/// semantics (unit exactly-once, group atomicity, per-unit reply pairing) are judged under the
+/// FULL adversarial schedule (crashes, partitions, view changes, repair, state-sync) by the
+/// standard checkers plus the per-unit oracle ([`check_batching`](crate::batching::check_batching),
+/// run post-quiesce). The remaining clients ride the single-unit wrap, so every body in the run is
+/// codec-built.
+///
+/// The DEFAULT sweep leaves this axis OFF (its build-time draws would shift every pinned
+/// regression seed off its historical schedule); batching-enabled runs are their own deterministic
+/// baselines, byte-identical to `VOPR_BATCHING=1` runs of the same seeds. Unit emission draws from
+/// per-client seed-derived PRNGs — never the action stream — so the chaos schedule composes with
+/// batching unperturbed.
+pub fn run_vopr_with_batching(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed);
+  v.batching_axis = true;
+  run_seeded(v, ticks)
+}
+
 /// Like [`run_vopr`] but with the CLIENT-CHURN axis FORCE-ENABLED, independent of the `VOPR_CHURN`
 /// env var (the same programmatic-override pattern as [`run_vopr_with_hold`]). The default sweep's
 /// client set is FIXED for a whole run, so the session table converges to one row per client and the
@@ -793,6 +856,15 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
   if let crate::checker::CheckResult::Violation(why) = applied_once.check(&c) {
     panic!(
       "vopr seed {} tick {ticks} (final, post-quiesce): applied-once: {why}",
+      v.seed
+    );
+  }
+  // Final per-unit batching oracle (a cheap no-op when no client batched): every acked unit is in
+  // the recorded unit history exactly once at its request's committed (op, unit_index) with the
+  // submitted bytes and the SM's deterministic reply, and groups rode one op on adjacent indices.
+  if let crate::checker::CheckResult::Violation(why) = crate::batching::check_batching(&c) {
+    panic!(
+      "vopr seed {} tick {ticks} (final, post-quiesce): batching: {why}",
       v.seed
     );
   }
@@ -902,6 +974,7 @@ impl Vopr {
       slow_axis: env_flag("VOPR_SLOW"),
       slow_active: None,
       slow_until: 0,
+      batching_axis: env_flag("VOPR_BATCHING"),
       sessions_evicted_seen: vec![0; n],
       wiped_pending: Vec::new(),
       report: VoprReport {
@@ -1030,6 +1103,42 @@ impl Vopr {
     if self.churn_axis {
       let cap = clients + 4 + self.prng.below(4) as u32;
       c.set_max_client_sessions(Some(cap));
+    }
+    // BATCHING axis: switch the cluster to the batch-aware state machine and turn a seeded subset
+    // of the clients into batching clients driving the aggregator model; the rest ride the
+    // single-unit wrap so EVERY committed body is codec-built (BatchSm panics on anything else).
+    // All draws are CONDITIONAL on the axis (no PRNG value consumed otherwise — the default
+    // per-seed schedule stays byte-identical; a batching-enabled run is its own deterministic
+    // baseline, like the hold axis), and the per-tick unit emission draws from per-client
+    // seed-derived PRNGs, never this action stream, so the chaos schedule composes unperturbed.
+    // Ranges are modest by design — unit payloads of at most a few dozen bytes and bodies capped
+    // by the small sim budgets — because the lane stresses batching SEMANTICS under chaos, not
+    // body size (the frame-cap axis owns size stress).
+    if self.batching_axis {
+      c.set_batch_mode(true);
+      let batching_clients = 1 + self.prng.below(clients as u64) as usize;
+      let max_rate = 1 + self.prng.below(3);
+      let group_denom = 4 + self.prng.below(9) as u32;
+      let max_unit_len = 8 + self.prng.below(41) as usize;
+      for i in 0..clients as usize {
+        if i < batching_clients {
+          c.enable_client_batching(
+            i,
+            crate::batching::BatchingConfig {
+              seed: self.seed,
+              client: (i as u128) + 1,
+              max_rate,
+              group_denom,
+              max_unit_len,
+              // Generous, like requests_per_client: the run keeps offering unit load for the
+              // whole tick window, so the liveness oracle stays non-vacuous.
+              auto_units: 4_000,
+            },
+          );
+        } else {
+          c.wrap_client_bodies(i);
+        }
+      }
     }
     c
   }
@@ -2074,6 +2183,19 @@ impl Vopr {
     // episode genuinely intersected live traffic rather than merely being installed.
     self.report.one_way_dropped = self.report.one_way_dropped.max(c.one_way_dropped());
     self.report.slow_delays = self.report.slow_delays.max(c.slow_delays_applied());
+    // Batching-axis witnesses: each batching client's counters are monotone over the run (client
+    // models persist across replica crash/restart and nothing resets them — the `holds_fired`
+    // discipline), so the cross-client sums are monotone too and `max` folds them exactly. All 0
+    // with the axis off (plain clients report zeros).
+    let (mut multi, mut groups, mut max_units) = (0u64, 0u64, 0u64);
+    for i in 0..c.client_count() {
+      multi += c.client(i).bodies_with_multiple_units();
+      groups += c.client(i).groups_submitted();
+      max_units = max_units.max(c.client(i).max_units_per_body());
+    }
+    self.report.bodies_with_multiple_units = self.report.bodies_with_multiple_units.max(multi);
+    self.report.groups_submitted = self.report.groups_submitted.max(groups);
+    self.report.max_units_per_body = self.report.max_units_per_body.max(max_units);
   }
 }
 

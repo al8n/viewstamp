@@ -1,5 +1,6 @@
 use core::time::Duration;
 
+use bytes::Bytes;
 use smol_str::SmolStr;
 
 use viewstamp_proto::{
@@ -8,10 +9,11 @@ use viewstamp_proto::{
 };
 
 use crate::{
+  batching::{BatchingClient, BatchingConfig},
   client::ClientModel,
   clock::Clock,
   network::{Faults, InFlight, Network, SlowProfile, Target},
-  sm::LogSm,
+  sm::{BatchSm, LogSm, SimSm},
   storage::{InMemorySuperblock, InMemoryWal, StorageFaults},
 };
 
@@ -41,9 +43,9 @@ pub enum AppliedEvent {
   SyncPoint(OpNumber),
 }
 
-/// A deterministic single-thread cluster of `Endpoint<LogSm>` replicas + clients.
+/// A deterministic single-thread cluster of `Endpoint<SimSm>` replicas + clients.
 pub struct Cluster {
-  replicas: Vec<Endpoint<LogSm>>,
+  replicas: Vec<Endpoint<SimSm>>,
   /// Per-replica write-ahead logs (persist across crashes; see `crash`).
   wals: Vec<InMemoryWal>,
   /// Per-replica superblocks (persist across crashes; see `crash`).
@@ -68,6 +70,14 @@ pub struct Cluster {
   /// `wipe_and_restart` rebuild a replica with the same config (the cap is part of the cluster
   /// configuration and must be identical on every replica).
   max_client_sessions: Option<u32>,
+  /// `false` (default) ⇒ every replica runs the plain [`LogSm`] (as [`SimSm::Plain`]) — no
+  /// batching draw is consumed, so default per-seed schedules (and every pinned regression seed)
+  /// stay byte-identical. `true` ⇒ every replica runs the batch-aware
+  /// [`SimSm::Batch`], whose `apply` parses every committed body with the real batch codec. Set
+  /// via [`set_batch_mode`](Self::set_batch_mode) BEFORE running; retained so
+  /// `restart`/`wipe_and_restart` rebuild a replica with the same state-machine variant (the mode
+  /// is cluster configuration, identical on every replica).
+  batch_mode: bool,
   crashed: Vec<bool>,
   /// Partition group id per replica. Replica↔replica messages between different groups are
   /// dropped. All replicas start in group 0 (no partition).
@@ -156,8 +166,9 @@ pub struct Cluster {
   /// no PRNG draw, sends no message, and writes no storage.
   applied_streams: Vec<Vec<(u64, AppliedEvent)>>,
   /// Per-replica INCARNATION counter: 0 from construction, +1 per [`restart`](Self::restart) /
-  /// [`wipe_and_restart`](Self::wipe_and_restart) (and per pre-run endpoint rebuild in
-  /// [`set_max_client_sessions`](Self::set_max_client_sessions)). An incarnation boundary is where a
+  /// [`wipe_and_restart`](Self::wipe_and_restart) (and per pre-run endpoint rebuild —
+  /// [`set_max_client_sessions`](Self::set_max_client_sessions) /
+  /// [`set_batch_mode`](Self::set_batch_mode)). An incarnation boundary is where a
   /// replica's apply stream legitimately re-emits from its durable checkpoint (recovery re-applies
   /// `(checkpoint_op .. commit_max]`; a wipe re-applies from genesis).
   incarnations: Vec<u64>,
@@ -185,14 +196,14 @@ impl Cluster {
     seed: u64,
     checkpoint_ops: u64,
   ) -> Self {
-    let replica_set: Vec<Endpoint<LogSm>> = (0..replicas)
+    let replica_set: Vec<Endpoint<SimSm>> = (0..replicas)
       .map(|i| {
         let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(i), replicas, checkpoint_ops)
           .expect("valid cluster config");
         Endpoint::new(
           cfg,
           seed ^ (i as u64).wrapping_mul(0x1234_5678),
-          LogSm::default(),
+          SimSm::Plain(LogSm::default()),
         )
       })
       .collect();
@@ -216,6 +227,7 @@ impl Cluster {
       replica_count: replicas,
       checkpoint_ops,
       max_client_sessions: None,
+      batch_mode: false,
       crashed: vec![false; n],
       groups: vec![0; n],
       one_way: vec![vec![false; n]; n],
@@ -374,8 +386,14 @@ impl Cluster {
   }
 
   /// Read access to replica `i`'s state machine (for invariant checking).
-  pub fn replica_sm(&self, i: usize) -> &LogSm {
+  pub fn replica_sm(&self, i: usize) -> &SimSm {
     self.replicas[i].state_machine_ref()
+  }
+
+  /// Replica `i`'s recorded per-UNIT history `(op, unit_index, unit_bytes)` (for the per-unit
+  /// batching oracle). Empty unless the cluster runs in batch mode.
+  pub fn replica_unit_history(&self, i: usize) -> &[(u64, u32, Bytes)] {
+    self.replicas[i].state_machine_ref().units()
   }
 
   /// Replica `i`'s recorded APPLY STREAM (for the applied-once checker): every [`Committed`] it
@@ -387,7 +405,8 @@ impl Cluster {
   }
 
   /// Replica `i`'s current INCARNATION (for the applied-once checker): 0 from construction, +1 on
-  /// every [`restart`](Self::restart) / [`wipe_and_restart`](Self::wipe_and_restart). A new
+  /// every [`restart`](Self::restart) / [`wipe_and_restart`](Self::wipe_and_restart) and every
+  /// pre-run endpoint rebuild. A new
   /// incarnation's apply stream legitimately re-emits from the replica's durable checkpoint.
   pub fn replica_incarnation(&self, i: usize) -> u64 {
     self.incarnations[i]
@@ -632,6 +651,12 @@ impl Cluster {
     &self.clients[i]
   }
 
+  /// Mutable access to client `i`'s batching model (`None` for a plain client) — the scripted
+  /// gates' enqueue path (`enqueue_unit` / `enqueue_group`).
+  pub fn client_batching_mut(&mut self, i: usize) -> Option<&mut BatchingClient> {
+    self.clients[i].batching_mut()
+  }
+
   /// Number of replicas (for invariant checking).
   pub fn replica_count(&self) -> usize {
     self.replicas.len()
@@ -717,7 +742,7 @@ impl Cluster {
     self.replicas[i] = Endpoint::recover(
       cfg,
       seed,
-      LogSm::default(),
+      self.make_sm(),
       &mut self.wals[i],
       &mut self.sbs[i],
     );
@@ -795,13 +820,54 @@ impl Cluster {
   /// identical on every replica, which is what keeps the eviction replica-deterministic.
   pub fn set_max_client_sessions(&mut self, n: Option<u32>) {
     self.max_client_sessions = n;
+    self.rebuild_endpoints();
+  }
+
+  /// The state machine a (re)built replica runs: the variant matching the cluster's mode.
+  fn make_sm(&self) -> SimSm {
+    if self.batch_mode {
+      SimSm::Batch(BatchSm::default())
+    } else {
+      SimSm::Plain(LogSm::default())
+    }
+  }
+
+  /// Rebuilds every replica's endpoint fresh with the current cluster configuration (warm
+  /// in-memory state is discarded; durable storage is untouched). Each rebuilt endpoint restarts
+  /// its apply stream — a new incarnation, like `restart`.
+  fn rebuild_endpoints(&mut self) {
     for i in 0..self.replica_count {
       let cfg = self.replica_config(i);
       let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
-      self.replicas[i as usize] = Endpoint::new(cfg, seed, LogSm::default());
-      // A rebuilt endpoint restarts its apply stream — a new incarnation, like `restart`.
+      self.replicas[i as usize] = Endpoint::new(cfg, seed, self.make_sm());
       self.incarnations[i as usize] += 1;
     }
+  }
+
+  /// Switch every replica to the batch-aware state machine (`true`) or back to the plain default
+  /// (`false`). Call BEFORE running, like [`Cluster::set_max_client_sessions`]: this REBUILDS each
+  /// replica's endpoint fresh with the chosen variant, and the retained flag makes every later
+  /// `restart`/`wipe_and_restart` rebuild with the same one — the SM variant is cluster
+  /// configuration, identical on every replica. In batch mode EVERY committed body must be
+  /// codec-built (the batching client model, or the plain clients' single-unit wrap): `BatchSm`
+  /// panics loudly on a non-batch body, because a malformed body in the sim is a bug.
+  pub fn set_batch_mode(&mut self, on: bool) {
+    self.batch_mode = on;
+    self.rebuild_endpoints();
+  }
+
+  /// Turn client `i` into a BATCHING client driving the aggregator model (call before running;
+  /// see [`ClientModel::enable_batching`]). The cluster must be in batch mode, or its replicas
+  /// will panic on the first packed body.
+  pub fn enable_client_batching(&mut self, i: usize, cfg: BatchingConfig) {
+    self.clients[i].enable_batching(cfg);
+  }
+
+  /// Wrap client `i`'s plain bodies as single-unit batches (call before running; see
+  /// [`ClientModel::wrap_bodies_as_single_unit_batches`]) so a batch-mode cluster can carry a
+  /// plain client's traffic.
+  pub fn wrap_client_bodies(&mut self, i: usize) {
+    self.clients[i].wrap_bodies_as_single_unit_batches();
   }
 
   /// RETIRE client `i`: it permanently stops issuing/retransmitting and counts as done for the
@@ -817,9 +883,13 @@ impl Cluster {
   /// accumulate over the run — the population pressure that drives the session-cap eviction.
   pub fn spawn_client(&mut self, requests: u64) -> usize {
     let next_id = self.clients.iter().map(|c| c.id().get()).max().unwrap_or(0) + 1;
-    self
-      .clients
-      .push(ClientModel::new(next_id, requests, self.seed));
+    let mut client = ClientModel::new(next_id, requests, self.seed);
+    // A batch-mode cluster parses every committed body with the batch codec, so a freshly-spawned
+    // plain client must ride the single-unit wrap (the churn axis composing with batch mode).
+    if self.batch_mode {
+      client.wrap_bodies_as_single_unit_batches();
+    }
+    self.clients.push(client);
     self.clients.len() - 1
   }
 

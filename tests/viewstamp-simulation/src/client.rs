@@ -2,8 +2,11 @@ use core::time::Duration;
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Instant, Message, Prng, Request, RequestNumber, max_request_body_len,
+  BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, ClientId, Instant, Message, Prng,
+  Request, RequestNumber, max_request_body_len,
 };
+
+use crate::batching::{BatchingClient, BatchingConfig, SubmittedBody};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -62,6 +65,16 @@ pub struct ClientModel {
   /// state-sync gate sets this so a short run accumulates a checkpoint envelope past the one-frame
   /// threshold without thousands of requests.
   fixed_body_len: Option<usize>,
+  /// `Some` ⇒ this client is a BATCHING client: bodies are packed from the model's unit queue
+  /// instead of [`Self::body_for`], replies are demultiplexed per unit, and the model keeps the
+  /// per-unit bookkeeping the unit oracle consumes. `None` (default) ⇒ the plain client path,
+  /// whose per-seed schedules stay byte-identical (no batching draw is consumed).
+  batching: Option<BatchingClient>,
+  /// `true` ⇒ every plain body is wrapped as a ONE-unit batch through the real codec, so a
+  /// batching-mode cluster (whose `BatchSm` parses every committed body) can carry this client's
+  /// traffic. Plain clients in a batching lane set this; the default `false` leaves bodies
+  /// untouched (pinned-seed schedules stay byte-identical).
+  wrap_single_unit: bool,
 }
 
 impl ClientModel {
@@ -78,7 +91,67 @@ impl ClientModel {
       seed,
       large_bodies_sent: 0,
       fixed_body_len: None,
+      batching: None,
+      wrap_single_unit: false,
     }
+  }
+
+  /// Turn this client into a BATCHING client driving the aggregator model (call before the run
+  /// starts): units are emitted on `cfg`'s seeded cadence, queued, packed FIFO into one-in-flight
+  /// request bodies, and demultiplexed per unit on ack. Replaces the plain body generation
+  /// entirely; the request numbering, one-in-flight discipline, and retransmit cadence are the
+  /// existing client model's.
+  pub fn enable_batching(&mut self, cfg: BatchingConfig) {
+    self.batching = Some(BatchingClient::new(cfg));
+  }
+
+  /// Make every plain body a ONE-unit batch (call before the run starts): the codec wrap that lets
+  /// a batching-mode cluster parse this client's traffic. A no-op for a batching client.
+  pub fn wrap_bodies_as_single_unit_batches(&mut self) {
+    self.wrap_single_unit = true;
+  }
+
+  /// The batching model's mutable half, for scripted gates (`enqueue_unit` / `enqueue_group`).
+  /// `None` for a plain client.
+  pub fn batching_mut(&mut self) -> Option<&mut BatchingClient> {
+    self.batching.as_mut()
+  }
+
+  /// The packed-body bookkeeping the unit oracle consumes (empty for a plain client).
+  pub fn batched_bodies(&self) -> &[SubmittedBody] {
+    self.batching.as_ref().map_or(&[], |b| b.bodies())
+  }
+
+  /// How many bodies packed more than one unit (0 for a plain client). Monotone.
+  pub fn bodies_with_multiple_units(&self) -> u64 {
+    self
+      .batching
+      .as_ref()
+      .map_or(0, BatchingClient::bodies_with_multiple_units)
+  }
+
+  /// The largest unit count any single body carried (0 for a plain client). Monotone.
+  pub fn max_units_per_body(&self) -> u64 {
+    self
+      .batching
+      .as_ref()
+      .map_or(0, BatchingClient::max_units_per_body)
+  }
+
+  /// How many atomic groups were enqueued (0 for a plain client). Monotone.
+  pub fn groups_submitted(&self) -> u64 {
+    self
+      .batching
+      .as_ref()
+      .map_or(0, BatchingClient::groups_submitted)
+  }
+
+  /// How many units have been acked (0 for a plain client). Monotone.
+  pub fn units_acked(&self) -> u64 {
+    self
+      .batching
+      .as_ref()
+      .map_or(0, BatchingClient::units_acked)
   }
 
   /// Make EVERY request from this client carry exactly `len` body bytes (replacing the seeded
@@ -104,9 +177,13 @@ impl ClientModel {
     self.large_bodies_sent
   }
 
-  /// True once every request has received its reply.
+  /// True once every request has received its reply. A batching client is done when its emission
+  /// budget is spent, its queue is drained, and nothing is in flight (every packed body acked).
   pub fn is_done(&self) -> bool {
-    self.replies.len() as u64 == self.total
+    match &self.batching {
+      Some(b) => b.is_drained() && self.inflight.is_none(),
+      None => self.replies.len() as u64 == self.total,
+    }
   }
 
   /// RETIRE this client: it permanently stops issuing/retransmitting (any in-flight request is
@@ -117,6 +194,9 @@ impl ClientModel {
     self.total = self.replies.len() as u64;
     self.inflight = None;
     self.last_sent = None;
+    if let Some(b) = self.batching.as_mut() {
+      b.retire();
+    }
   }
 
   /// The body for request number `req`: the default 8 bytes, or — for a seeded ~1/[`LARGE_BODY_DENOM`]
@@ -159,12 +239,38 @@ impl ClientModel {
   /// Returns the request to (re)send this instant, if any: mints the next request
   /// when idle, and (re)transmits the in-flight request when first sent or when
   /// `REQUEST_TIMEOUT` has elapsed since the last send. Returns `None` otherwise.
+  ///
+  /// A BATCHING client mints its next request by stepping the model's seeded emission once (this
+  /// is the per-tick call) and, when idle, packing the queue FIFO into one body; the one-in-flight
+  /// and retransmit discipline below is shared verbatim with the plain path.
   pub fn pending(&mut self, now: Instant) -> Option<Request> {
-    if self.inflight.is_none() && self.next_request <= self.total {
+    if let Some(b) = self.batching.as_mut() {
+      b.step_emission();
+      if self.inflight.is_none()
+        && let Some(body) = b.pack(self.next_request)
+      {
+        self.inflight = Some(Request::new(
+          self.id,
+          RequestNumber::with(self.next_request),
+          body,
+        ));
+        self.last_sent = None;
+      }
+    } else if self.inflight.is_none() && self.next_request <= self.total {
       let body = self.body_for(self.next_request);
       if body.len() > 8 {
         self.large_bodies_sent += 1;
       }
+      // The single-unit wrap (batching-mode clusters only): the SAME plain body, riding the codec
+      // layout so the BatchSm can parse it. Applied after the large-body accounting so that
+      // witness keeps counting the inner payload.
+      let body = if self.wrap_single_unit {
+        let mut wrap = BatchBuilder::new(body.len() + BATCH_COUNT_OVERHEAD + BATCH_UNIT_OVERHEAD);
+        wrap.push(&body).expect("the wrap budget is exact");
+        wrap.finish().expect("one unit pushed")
+      } else {
+        body
+      };
       self.inflight = Some(Request::new(
         self.id,
         RequestNumber::with(self.next_request),
@@ -184,13 +290,19 @@ impl ClientModel {
     }
   }
 
-  /// Handles a reply: if it matches the in-flight request, record it and advance.
+  /// Handles a reply: if it matches the in-flight request, record it and advance. A batching
+  /// client first demultiplexes the reply body per unit (count + per-unit reply assertions, and
+  /// the oracle's bookkeeping) through the model.
   pub fn handle(&mut self, msg: Message) {
     if let Message::Reply(r) = msg
       && let Some(req) = &self.inflight
       && req.request() == r.request()
     {
-      self.replies.push((r.request().get(), r.body_bytes()));
+      let body = r.body_bytes();
+      if let Some(b) = self.batching.as_mut() {
+        b.on_ack(r.request().get(), &body);
+      }
+      self.replies.push((r.request().get(), body));
       self.inflight = None;
       self.last_sent = None;
       self.next_request += 1;
