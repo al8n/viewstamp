@@ -114,7 +114,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// A Normal backup heard from its primary this view: defer the idle timeout.
   pub(crate) fn note_primary_contact(&mut self, now: Instant) {
     if self.status.is_normal() && !self.is_primary() {
-      self.timers.primary_idle = Some(now + PRIMARY_IDLE);
+      self.arm_primary_idle(now);
     }
   }
 
@@ -124,6 +124,12 @@ impl<S: StateMachine> Endpoint<S> {
     sb: &mut B,
     m: crate::StartViewChange,
   ) {
+    if self.is_learner() {
+      // A non-voting replica is not a view-change participant: it neither joins the StartViewChange
+      // quorum nor casts a vote. It follows a completed view change by adopting the new primary's
+      // StartView (catching up via GetView if it falls behind), never by driving the change itself.
+      return;
+    }
     let target = m.view();
     // `View::next()` saturates, so this comparison cannot overflow even at `view == u64::MAX`
     // (where the first clause already rejects every possible target).

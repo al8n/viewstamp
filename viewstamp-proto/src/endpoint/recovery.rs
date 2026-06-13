@@ -920,12 +920,14 @@ impl<S: StateMachine> Endpoint<S> {
       // resuming as the established primary.
       self.enter_view_change_from_recovery(now, sb, self.view.next());
     } else {
-      // Backup, or a SOLO replica (its own primary, no quorum to view-change) → resume Normal.
+      // Backup, a non-voting learner, or a SOLO replica (its own primary, no quorum to view-change)
+      // → resume Normal.
       self.set_status(Status::Normal);
-      if self.config.replica_count() == 1 {
-        // Solo: rebuild the pipeline for the recovered tail so `try_commit` can re-commit ops the
+      if self.config.replica_count() == 1 && !self.is_learner() {
+        // Solo VOTER: rebuild the pipeline for the recovered tail so `try_commit` can re-commit ops the
         // solo primary had already committed pre-crash (an empty `inflight` would stall them — solo
-        // commits via the own-vote quorum of 1). Mirror `start_view_as_new_primary`'s rebuild.
+        // commits via the own-vote quorum of 1). Mirror `start_view_as_new_primary`'s rebuild. A learner
+        // in a single-voter cluster is a follower, not the solo primary, so it takes the backup path.
         self.inflight.clear();
         let own = 1u64 << self.config.replica().get();
         for op in (self.commit_min.get() + 1)..=self.op.get() {

@@ -6,7 +6,10 @@
 //! and never pollutes the GC quorum order statistic.
 
 use super::*;
-use crate::{ClientId, Config, DoViewChange, OpNumber, ReplicaId, Request, RequestNumber, View};
+use crate::{
+  ClientId, Commit, Config, DoViewChange, OpNumber, ReplicaId, Request, RequestNumber,
+  StartViewChange, View,
+};
 
 /// A 3-voter cluster (ids 0,1,2) with 2 learners (ids 3,4 — `node_count == 5`), self = voter 0.
 fn voter_with_learners() -> Endpoint<NoopSm> {
@@ -268,5 +271,185 @@ fn compute_quorum_checkpoint_op_on_a_learner_excludes_its_own_checkpoint() {
     solo_voter.compute_quorum_checkpoint_op(),
     OpNumber::with(9),
     "a voter in a 1-voter set counts its own checkpoint (it IS the quorum)",
+  );
+}
+
+/// A LEARNER endpoint (self = learner id 3) in a 3-voter (0,1,2) + 2-learner (3,4) cluster. Voter 0 is
+/// the primary of view 0; voter 1 is the primary of view 1.
+fn learner_self() -> Endpoint<NoopSm> {
+  Endpoint::new(
+    Config::try_new_member(1, ReplicaId::new(LEARNER), 3, 2).expect("learner id 3 of a 3-voter set"),
+    0,
+    NoopSm,
+  )
+}
+
+#[test]
+fn a_learner_never_acks_a_prepare_or_proposes_a_view_change_on_idle() {
+  // A learner applies the committed feed but emits NO PrepareOk, and never arms/fires `primary_idle` —
+  // so when the primary goes quiet it proposes NO view change. Drive it with a Prepare (which on a voter
+  // backup acks) and a Commit (which on a voter backup defers the idle timeout), then advance far past
+  // PRIMARY_IDLE and fire timers: nothing is acked, nothing is proposed, and it stays Normal.
+  let mut e = learner_self();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+  );
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.into_msg(), Message::PrepareOk(_)),
+      "a learner never emits a PrepareOk",
+    );
+  }
+  // `primary_idle` is never armed for a learner, so firing timers far past it (the no-orphan-due assert
+  // inside `handle_timeout` must hold) proposes nothing and leaves it Normal.
+  let later = now + core::time::Duration::from_millis(10_000);
+  e.handle_timeout(later, &mut wal, &mut sb);
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "a learner stays Normal — it never proposes a view change on idle",
+  );
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(
+        out.into_msg(),
+        Message::StartViewChange(_) | Message::DoViewChange(_) | Message::PrepareOk(_)
+      ),
+      "a learner emits no vote/SVC/DVC on idle",
+    );
+  }
+}
+
+#[test]
+fn a_quorum_of_voter_svcs_does_not_activate_a_learner() {
+  // A learner is not a view-change participant: a full voter StartViewChange quorum delivered to it does
+  // NOT transition it to an active view change (`on_start_view_change` early-returns), so `join_svc` —
+  // whose `1 << id` would overflow for a high learner id — is never reached and no panic occurs.
+  let mut e = learner_self();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // quorum_view_change for 3 voters is 2: deliver StartViewChange(view 1) from voters 0 and 1.
+  for v in [0u16, 1] {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(v)),
+      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(v))),
+    );
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "a learner does not enter ViewChange from a voter SVC quorum",
+  );
+  let later = now + core::time::Duration::from_millis(10_000);
+  e.handle_timeout(later, &mut wal, &mut sb);
+  assert_eq!(e.status(), Status::Normal, "...and still does not after time advances");
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.into_msg(), Message::StartViewChange(_) | Message::DoViewChange(_)),
+      "a learner emits no SVC/DVC",
+    );
+  }
+}
+
+#[test]
+fn a_learner_catch_up_does_not_escalate_to_active_view_change() {
+  // A learner that sees a higher view enters catch-up (ViewChange + catching_up, soliciting GetView). It
+  // must NEVER escalate to active: `view_change_status` is voter-only, so the catch-up keeps re-soliciting
+  // GetView (never flips catching_up to false, never emits SVC/DVC) until it adopts a StartView.
+  let mut e = learner_self();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // A higher-view Commit from view 1's primary (`primary(1) == Replica(1)`) triggers catch_up_to_view(1).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Commit(Commit::new(View::with(1), OpNumber::new(), OpNumber::new())),
+  );
+  assert!(
+    e.status().is_view_change() && e.catching_up(),
+    "a higher view puts the learner into catch-up",
+  );
+  let mut saw_get_view = false;
+  while let Some(out) = e.poll_message() {
+    match out.into_msg() {
+      Message::GetView(_) => saw_get_view = true,
+      Message::StartViewChange(_) | Message::DoViewChange(_) => {
+        panic!("a catching-up learner emits no SVC/DVC")
+      }
+      _ => {}
+    }
+  }
+  assert!(saw_get_view, "catch-up solicits GetView");
+  // Advance well past VIEW_CHANGE_STATUS and fire timers repeatedly — a VOTER would escalate to active here.
+  let mut t = now;
+  for _ in 0..5 {
+    t = t + core::time::Duration::from_millis(600);
+    e.handle_timeout(t, &mut wal, &mut sb);
+  }
+  assert!(
+    e.status().is_view_change() && e.catching_up(),
+    "the learner is STILL catching up — it never escalated to an active view change",
+  );
+  let mut still_soliciting = false;
+  while let Some(out) = e.poll_message() {
+    match out.into_msg() {
+      Message::GetView(_) => still_soliciting = true,
+      Message::StartViewChange(_) | Message::DoViewChange(_) => {
+        panic!("a catching-up learner never escalates to SVC/DVC")
+      }
+      _ => {}
+    }
+  }
+  assert!(
+    still_soliciting,
+    "the learner keeps re-soliciting GetView while catching up",
+  );
+}
+
+#[test]
+fn a_voter_backup_still_acks_and_proposes_unlike_a_learner() {
+  // Positive control: the SAME drive on a VOTER backup (id 1) DOES ack the prepare and DOES propose a
+  // view change when the primary goes idle — so the learner exclusions are learner-specific, not a
+  // blanket disable of the backup machinery.
+  let mut e = Endpoint::new(
+    Config::try_new_member(1, ReplicaId::new(1), 3, 2).expect("voter 1 backup + 2 learners"),
+    0,
+    NoopSm,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.handle_storage(now, &mut wal, &mut sb);
+  let mut acked = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.into_msg(), Message::PrepareOk(_)) {
+      acked = true;
+    }
+  }
+  assert!(acked, "a voter backup acks a prepare");
+  let later = now + core::time::Duration::from_millis(10_000);
+  e.handle_timeout(later, &mut wal, &mut sb);
+  let mut proposed = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.into_msg(), Message::StartViewChange(_)) {
+      proposed = true;
+    }
+  }
+  assert!(
+    proposed,
+    "a voter backup proposes a view change when the primary goes idle",
   );
 }
