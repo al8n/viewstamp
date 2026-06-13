@@ -157,6 +157,12 @@ fn report_digest(r: &VoprReport) -> u64 {
     // column differ between checkouts for a reason other than a behavioral change. The report hash
     // stays a stable cross-checkout quantity; an accidental off-axis stale-read engagement would
     // depose a primary and so perturb the applied-history and committed digest columns regardless.
+    // The learner witnesses (learner_ops_applied / learner_repairs_served /
+    // learner_view_changes_followed) are likewise NOT folded, for the same reason: zero on the
+    // default schedule, and folding them would change this hash's schema for a non-behavioral reason.
+    // The learner axis only GROWS node_count behind a separate magic-seeded draw, so an off-axis run
+    // never engages it and the applied/committed columns (over the no-learner default schedule) stay
+    // identical regardless.
   ] {
     fnv1a_u64(&mut h, v);
   }
