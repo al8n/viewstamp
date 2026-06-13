@@ -95,6 +95,14 @@ pub enum ConfigError {
     /// The offending cluster size.
     count: u8,
   },
+  /// `replica_count + learner_count` exceeds the number of representable replica ids: every replica
+  /// (voting or learner) is addressed by a `ReplicaId`, whose index is a `u16`, so the node count
+  /// cannot exceed `u16::MAX`.
+  #[error("node_count {count} exceeds the maximum of {} (a replica id is a u16)", u16::MAX)]
+  TooManyNodes {
+    /// The offending node count (`replica_count + learner_count`).
+    count: u32,
+  },
   /// `checkpoint_ops` was zero.
   #[error("checkpoint_ops must be > 0")]
   ZeroCheckpointOps,
@@ -120,13 +128,15 @@ pub struct Config {
   cluster: u128,
   replica: ReplicaId,
   replica_count: u8,
+  learner_count: u16,
   checkpoint_ops: u64,
   max_client_sessions: u32,
   max_sync_envelope_len: u64,
 }
 
 impl Config {
-  /// Creates a configuration, validating the cluster invariants.
+  /// Creates a configuration for a VOTING replica, validating the cluster invariants. The cluster
+  /// has no learners (`learner_count == 0`); chain [`Config::with_learner_count`] to record some.
   ///
   /// # Errors
   /// Returns [`ConfigError`] if `replica_count == 0`, `replica >= replica_count`,
@@ -137,10 +147,32 @@ impl Config {
     replica: ReplicaId,
     replica_count: u8,
   ) -> Result<Self, ConfigError> {
+    Self::try_new_member(cluster, replica, replica_count, 0)
+  }
+
+  /// Creates a configuration for any cluster member, voting or learner, validating the cluster
+  /// invariants. The voting set is `replica_count` (it drives every quorum); `learner_count`
+  /// non-voting learners follow it, so the replica ids span `0..replica_count + learner_count`
+  /// (the `node_count`). Unlike [`Config::try_new`], `replica` may be a learner id (one in
+  /// `[replica_count, node_count)`): this is the path a learner uses to build its own config.
+  ///
+  /// # Errors
+  /// Returns [`ConfigError`] if `replica_count == 0`, `replica` is not in `0..node_count`,
+  /// `replica_count > 64`, or `node_count` exceeds `u16::MAX`.
+  pub const fn try_new_member(
+    cluster: u128,
+    replica: ReplicaId,
+    replica_count: u8,
+    learner_count: u16,
+  ) -> Result<Self, ConfigError> {
     if replica_count == 0 {
       return Err(ConfigError::ZeroReplicaCount);
     }
-    if replica.get() >= replica_count as u16 {
+    let node_count = replica_count as u32 + learner_count as u32;
+    if node_count > u16::MAX as u32 {
+      return Err(ConfigError::TooManyNodes { count: node_count });
+    }
+    if (replica.get() as u32) >= node_count {
       return Err(ConfigError::ReplicaIndexOutOfRange {
         index: replica.get(),
         count: replica_count,
@@ -155,6 +187,7 @@ impl Config {
       cluster,
       replica,
       replica_count,
+      learner_count,
       checkpoint_ops: DEFAULT_CHECKPOINT_OPS,
       max_client_sessions: MAX_CLIENT_SESSIONS,
       max_sync_envelope_len: MAX_SYNC_ENVELOPE_LEN,
@@ -185,6 +218,7 @@ impl Config {
         cluster: c.cluster,
         replica: c.replica,
         replica_count: c.replica_count,
+        learner_count: c.learner_count,
         checkpoint_ops,
         max_client_sessions: c.max_client_sessions,
         max_sync_envelope_len: c.max_sync_envelope_len,
@@ -227,6 +261,24 @@ impl Config {
     })
   }
 
+  /// Returns this configuration with the learner count replaced (chainable; consumes the copy):
+  /// the number of non-voting learner replicas, which follow the voting set so the replica ids span
+  /// `0..replica_count + learner_count`. This is the path a voting replica uses to record the
+  /// cluster's learners; a learner builds its own config via [`Config::try_new_member`].
+  ///
+  /// # Errors
+  /// [`ConfigError::TooManyNodes`] if `replica_count + learner_count` exceeds `u16::MAX`.
+  pub const fn with_learner_count(self, learner_count: u16) -> Result<Self, ConfigError> {
+    let node_count = self.replica_count as u32 + learner_count as u32;
+    if node_count > u16::MAX as u32 {
+      return Err(ConfigError::TooManyNodes { count: node_count });
+    }
+    Ok(Self {
+      learner_count,
+      ..self
+    })
+  }
+
   /// The cluster id.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn cluster(&self) -> u128 {
@@ -243,6 +295,34 @@ impl Config {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn replica_count(&self) -> u8 {
     self.replica_count
+  }
+
+  /// The number of non-voting learner replicas. Learners follow the voting set, occupying the
+  /// replica ids in `[replica_count, node_count)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn learner_count(&self) -> u16 {
+    self.learner_count
+  }
+
+  /// The total replica count: voting replicas plus learners (`replica_count + learner_count`).
+  /// Every replica id is in `0..node_count`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn node_count(&self) -> u16 {
+    self.replica_count as u16 + self.learner_count
+  }
+
+  /// Whether `id` is a voting replica (one in `0..replica_count`). Voting replicas drive every
+  /// quorum; learners do not vote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_voter(&self, id: ReplicaId) -> bool {
+    id.get() < self.replica_count as u16
+  }
+
+  /// Whether `id` is a non-voting learner replica (one in `[replica_count, node_count)`). An id at
+  /// or beyond `node_count` is out of range — neither a voter nor a learner.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_learner(&self, id: ReplicaId) -> bool {
+    id.get() >= self.replica_count as u16 && id.get() < self.node_count()
   }
 
   /// The replication / view-change quorum size: `floor(n/2) + 1`.
@@ -416,5 +496,117 @@ mod tests {
       Config::try_new(0, ReplicaId::new(0), 65),
       Err(ConfigError::TooManyReplicas { count: 65 })
     );
+  }
+
+  #[test]
+  fn node_count_is_voters_plus_learners() {
+    // No learners: node_count == replica_count (byte-identical to the voter-only world).
+    let c = Config::try_new(0, ReplicaId::new(0), 3).unwrap();
+    assert_eq!(c.learner_count(), 0);
+    assert_eq!(c.node_count(), 3);
+    // Two learners follow the three voters.
+    let c = c.with_learner_count(2).unwrap();
+    assert_eq!(c.learner_count(), 2);
+    assert_eq!(c.node_count(), 5);
+    // with_learner_count preserves the other fields.
+    assert_eq!(c.replica_count(), 3);
+    assert_eq!(c.quorum(), 2); // quorum is over the voting count only
+  }
+
+  #[test]
+  fn is_voter_and_is_learner_partition_node_range() {
+    // 3 voters (ids 0..3), 2 learners (ids 3..5).
+    let c = Config::try_new(0, ReplicaId::new(0), 3)
+      .unwrap()
+      .with_learner_count(2)
+      .unwrap();
+    for id in 0..3u16 {
+      assert!(c.is_voter(ReplicaId::new(id)), "id {id} is a voter");
+      assert!(!c.is_learner(ReplicaId::new(id)));
+    }
+    for id in 3..5u16 {
+      assert!(c.is_learner(ReplicaId::new(id)), "id {id} is a learner");
+      assert!(!c.is_voter(ReplicaId::new(id)));
+    }
+    // An id at or beyond node_count is neither a voter nor a learner.
+    for id in [5u16, 6, 100] {
+      assert!(!c.is_voter(ReplicaId::new(id)));
+      assert!(!c.is_learner(ReplicaId::new(id)), "id {id} is out of range");
+    }
+  }
+
+  #[test]
+  fn learner_owns_config_via_member_constructor() {
+    // A learner's own config: its id (4) sits in [replica_count, node_count) = [3, 5).
+    // try_new would reject it, but try_new_member accepts it.
+    assert_eq!(
+      Config::try_new(0, ReplicaId::new(4), 3),
+      Err(ConfigError::ReplicaIndexOutOfRange { index: 4, count: 3 })
+    );
+    let learner = Config::try_new_member(0, ReplicaId::new(4), 3, 2).unwrap();
+    assert_eq!(learner.replica(), ReplicaId::new(4));
+    assert_eq!(learner.replica_count(), 3);
+    assert_eq!(learner.learner_count(), 2);
+    assert_eq!(learner.node_count(), 5);
+    assert!(learner.is_learner(learner.replica()));
+    assert!(!learner.is_voter(learner.replica()));
+    // An id at node_count is still out of range for the member constructor.
+    assert_eq!(
+      Config::try_new_member(0, ReplicaId::new(5), 3, 2),
+      Err(ConfigError::ReplicaIndexOutOfRange { index: 5, count: 3 })
+    );
+  }
+
+  #[test]
+  fn try_new_still_rejects_out_of_range_with_zero_learners() {
+    // With no learners, node_count == replica_count, so try_new's range check is unchanged:
+    // an id >= replica_count is rejected exactly as before.
+    assert_eq!(
+      Config::try_new(0, ReplicaId::new(3), 3),
+      Err(ConfigError::ReplicaIndexOutOfRange { index: 3, count: 3 })
+    );
+    assert_eq!(
+      Config::try_new_member(0, ReplicaId::new(3), 3, 0),
+      Err(ConfigError::ReplicaIndexOutOfRange { index: 3, count: 3 })
+    );
+  }
+
+  #[test]
+  fn node_count_overflow_is_rejected() {
+    // replica_count + learner_count must fit a u16 replica id. With replica_count == 64,
+    // a learner_count of u16::MAX - 63 pushes node_count to u16::MAX + 1.
+    let over = u16::MAX - 63;
+    assert_eq!(
+      Config::try_new_member(0, ReplicaId::new(0), 64, over),
+      Err(ConfigError::TooManyNodes {
+        count: 64 + over as u32
+      })
+    );
+    // The chainable builder enforces the same cap.
+    assert_eq!(
+      Config::try_new(0, ReplicaId::new(0), 64)
+        .unwrap()
+        .with_learner_count(over),
+      Err(ConfigError::TooManyNodes {
+        count: 64 + over as u32
+      })
+    );
+    // The largest in-range node_count (exactly u16::MAX) is accepted.
+    let max = Config::try_new_member(0, ReplicaId::new(0), 1, u16::MAX - 1).unwrap();
+    assert_eq!(max.node_count(), u16::MAX);
+  }
+
+  #[test]
+  fn with_learner_count_chains() {
+    let c = Config::with_checkpoint_ops(7, ReplicaId::new(1), 5, 16)
+      .unwrap()
+      .with_learner_count(3)
+      .unwrap();
+    assert_eq!(c.cluster(), 7);
+    assert_eq!(c.replica(), ReplicaId::new(1));
+    assert_eq!(c.replica_count(), 5);
+    assert_eq!(c.learner_count(), 3);
+    assert_eq!(c.node_count(), 8);
+    assert_eq!(c.checkpoint_ops(), 16); // earlier builder steps are preserved
   }
 }
