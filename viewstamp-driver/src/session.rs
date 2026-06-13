@@ -196,24 +196,31 @@ impl InflightBudget {
   /// `Handle` clones: two reservers cannot both read room and both commit past the cap, because each
   /// reserves first and only keeps the reservation if the post-add total is within cap.
   pub(crate) fn try_acquire(&self, body_len: usize) -> Option<ReservationGuard> {
-    let new_count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+    self.try_acquire_many(1, body_len)
+  }
+
+  /// As [`Self::try_acquire`] but reserving `count` slots at once (an aggregator group charges
+  /// one slot per unit); the returned guard releases exactly what it reserved.
+  pub(crate) fn try_acquire_many(&self, count: usize, body_len: usize) -> Option<ReservationGuard> {
+    let new_count = self.count.fetch_add(count, Ordering::Relaxed) + count;
     let new_bytes = self.bytes.fetch_add(body_len, Ordering::Relaxed) + body_len;
     if new_count > self.max_count || new_bytes > self.max_bytes {
-      self.count.fetch_sub(1, Ordering::Relaxed);
+      self.count.fetch_sub(count, Ordering::Relaxed);
       self.bytes.fetch_sub(body_len, Ordering::Relaxed);
       return None;
     }
     Some(ReservationGuard {
       budget: self.clone(),
+      count,
       bytes: body_len,
     })
   }
 
-  /// Release ONE in-flight slot of `body_len` bytes, reversing exactly one prior reservation. Private:
+  /// Release `count` in-flight slots of `body_len` bytes, reversing exactly one prior reservation. Private:
   /// the ONLY caller is [`ReservationGuard::drop`], so a reservation is released exactly once, by the
   /// guard that owns it, no matter where that guard finally dies.
-  fn release(&self, body_len: usize) {
-    self.count.fetch_sub(1, Ordering::Relaxed);
+  fn release(&self, count: usize, body_len: usize) {
+    self.count.fetch_sub(count, Ordering::Relaxed);
     self.bytes.fetch_sub(body_len, Ordering::Relaxed);
   }
 
@@ -242,7 +249,8 @@ impl InflightBudget {
 }
 
 /// An owning RAII handle to ONE [`InflightBudget`] reservation: it holds a budget clone plus the
-/// reserved body length, and its [`Drop`] releases that one slot (count + bytes). It is the SINGLE
+/// reserved slot count and body length, and its [`Drop`] releases exactly that reservation
+/// (count + bytes). It is the SINGLE
 /// owner of its reservation, so the budget is freed exactly once wherever the guard finally dies and
 /// no manual release is needed at any submit-exit site:
 ///
@@ -267,12 +275,13 @@ impl InflightBudget {
 #[derive(Debug)]
 pub struct ReservationGuard {
   budget: InflightBudget,
+  count: usize,
   bytes: usize,
 }
 
 impl Drop for ReservationGuard {
   fn drop(&mut self) {
-    self.budget.release(self.bytes);
+    self.budget.release(self.count, self.bytes);
   }
 }
 

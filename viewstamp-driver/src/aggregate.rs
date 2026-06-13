@@ -53,19 +53,24 @@ use crate::{
   session::{InflightBudget, ReservationGuard},
 };
 
-/// Default cap on queued entries (a [`BatchHandle::submit`] is one entry; a whole
-/// [`BatchHandle::submit_group`] is one entry). Mirrors the driver's in-flight submit count cap
-/// (`MAX_INFLIGHT`): 4096 distinct waiting callers is far more concurrency than one aggregator
-/// feeds a single client session, yet each queued entry costs only its `Bytes` handles, oneshots,
-/// and budget guard. Past the cap a submit returns [`BatchError::Refused`] /
-/// [`RefusedReason::QueueFull`]. Tunable via [`BatchConfig::with_max_queued_units`].
+/// Default cap on queued units. Mirrors the driver's in-flight submit count cap
+/// (`MAX_INFLIGHT`): 4096 waiting units is far more concurrency than one aggregator
+/// feeds a single client session, yet each queued unit costs only its `Bytes` handle, oneshot,
+/// and budget share. Every UNIT counts — a group charges one slot per member, since each retains
+/// its own reply channel and per-unit state. Past the cap a submit returns
+/// [`BatchError::Refused`] / [`RefusedReason::QueueFull`]. Tunable via
+/// [`BatchConfig::with_max_queued_units`].
 const MAX_QUEUED_UNITS: usize = 4096;
 
-/// Default cap on total queued unit bytes (logical [`Bytes::len`] accounting). Mirrors the
-/// driver's in-flight byte cap (`MAX_PENDING_BYTES`, 128 MiB): far above any realistic waiting
-/// working set — about eight maximal request bodies — yet a hard bound a flooding caller cannot
-/// exceed. Past the cap a submit returns [`BatchError::Refused`] / [`RefusedReason::QueueFull`].
-/// Tunable via [`BatchConfig::with_max_queued_bytes`].
+/// Default cap on total queued unit bytes, charged at each unit's ENCODED cost: its logical
+/// [`Bytes::len`] plus the codec's per-unit framing ([`BATCH_UNIT_OVERHEAD`]) — so even
+/// zero-length units pay for the queue state they retain, and a flood of tiny units cannot ride
+/// under the byte axis. (A `Bytes` sliced from a larger allocation still retains that backing
+/// while queued — the caller's choice, identical to handing the same slice to `Handle::submit`.)
+/// Mirrors the driver's in-flight byte cap (`MAX_PENDING_BYTES`, 128 MiB): far above any
+/// realistic waiting working set — about eight maximal request bodies — yet a hard bound a
+/// flooding caller cannot exceed. Past the cap a submit returns [`BatchError::Refused`] /
+/// [`RefusedReason::QueueFull`]. Tunable via [`BatchConfig::with_max_queued_bytes`].
 const MAX_QUEUED_BYTES: usize = 128 * 1024 * 1024;
 
 /// Tunable aggregator parameters. Unlike [`crate::DriverConfig`] there is no zero-argument
@@ -74,7 +79,7 @@ const MAX_QUEUED_BYTES: usize = 128 * 1024 * 1024;
 /// the queue caps carry defaults (each default constant documents its sizing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchConfig {
-  /// Count cap on queued entries (the queue budget's first axis AND the queue channel's bound).
+  /// Count cap on queued units (the queue budget's first axis).
   max_queued_units: usize,
   /// Byte cap across all queued unit bodies (the queue budget's second axis).
   max_queued_bytes: usize,
@@ -102,7 +107,7 @@ impl BatchConfig {
     }
   }
 
-  /// Count cap on queued entries; a submit past it returns [`BatchError::Refused`] /
+  /// Count cap on queued units; a submit past it returns [`BatchError::Refused`] /
   /// [`RefusedReason::QueueFull`].
   #[inline(always)]
   pub const fn max_queued_units(&self) -> usize {
@@ -122,8 +127,8 @@ impl BatchConfig {
     self.max_unit_reply_len
   }
 
-  /// Override the queued-entry count cap (clamped to at least 1 so an idle aggregator can always
-  /// admit one entry).
+  /// Override the queued-unit count cap (clamped to at least 1 so an idle aggregator can always
+  /// admit one lone unit).
   #[must_use]
   pub const fn with_max_queued_units(mut self, max: usize) -> Self {
     self.max_queued_units = if max == 0 { 1 } else { max };
@@ -292,7 +297,7 @@ struct PendingUnit {
 
 /// One queued submission — a single unit or a whole atomic group — plus the queue-budget guard
 /// that travels with it. The guard releases wherever the entry dies before packing (pre-pack
-/// cancellation skip, stall/teardown drain, or the channel dropping it whole); on packing the pump
+/// cancellation skip, or the stall/teardown drains); on packing the pump
 /// holds it until the driver's own reservation exists, then drops it (see `AggregatorPump::run`).
 struct Entry {
   units: Vec<PendingUnit>,
@@ -371,7 +376,7 @@ impl BodyLimits {
 }
 
 /// A cheaply-cloneable handle submitting units to the batching aggregator. Unconditionally
-/// `Send + Sync` (channel ends, the queue budget, and copied limits), independent of the pump's
+/// `Send + Sync` (the shared queue `Arc`, the queue budget, and copied limits), independent of the pump's
 /// sleep factory: any thread may submit while the pump runs wherever the embedder spawned it.
 pub struct BatchHandle {
   queue: Arc<Mutex<QueueState>>,
@@ -428,9 +433,10 @@ impl BatchHandle {
         reason: RefusedReason::UnitTooLarge,
       });
     }
-    // Reserve the queue budget BEFORE enqueueing (logical Bytes::len accounting); the guard
-    // travels with the entry and releases wherever the entry dies pre-pack.
-    let Some(reservation) = self.budget.try_acquire(unit.len()) else {
+    // Reserve the queue budget BEFORE enqueueing, charging the unit's ENCODED cost — its bytes
+    // plus the codec's per-unit framing — so even a zero-length unit pays for the queue state it
+    // retains. The guard travels with the entry and releases wherever the entry dies pre-pack.
+    let Some(reservation) = self.budget.try_acquire(BATCH_UNIT_OVERHEAD + unit.len()) else {
       return Err(BatchError::Refused {
         reason: RefusedReason::QueueFull,
       });
@@ -474,10 +480,16 @@ impl BatchHandle {
         reason: RefusedReason::GroupTooLarge,
       });
     }
-    // One queue-budget slot for the whole entry; bytes are the group's logical sum. `admits`
-    // bounded the encoded sum above, so the logical sum cannot overflow.
-    let logical: usize = units.iter().map(Bytes::len).sum();
-    let Some(reservation) = self.budget.try_acquire(logical) else {
+    // One queue-budget slot PER UNIT and the group's ENCODED byte sum (payload plus per-unit
+    // framing): a group retains per-unit channel state and per-unit encoded cost, so both caps
+    // must see every unit — a flood of tiny or empty units inside few groups would otherwise
+    // bypass the advertised bounds. `admits` bounded the encoded sum above, so it cannot
+    // overflow.
+    let encoded: usize = units
+      .iter()
+      .map(|unit| BATCH_UNIT_OVERHEAD + unit.len())
+      .sum();
+    let Some(reservation) = self.budget.try_acquire_many(units.len(), encoded) else {
       return Err(BatchError::Refused {
         reason: RefusedReason::QueueFull,
       });
@@ -503,10 +515,8 @@ impl BatchHandle {
     Ok(replies)
   }
 
-  /// Enqueue one entry, mapping the channel's refusals. A `Full` refusal is asserted unreachable:
-  /// the budget reserves BEFORE the send and its count cap equals the channel bound, so every
-  /// reserved entry has a channel slot. Either error drops the entry — and its guard — rolling
-  /// the budget back.
+  /// Enqueue one entry under the queue lock, refusing [`RefusedReason::PumpGone`] once the queue
+  /// is closed; the refusal drops the entry — and its guard — rolling the budget back.
   fn send(&self, entry: Entry) -> Result<(), BatchError> {
     let waker = {
       let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -586,9 +596,10 @@ enum Verdict {
 /// Dropping the pump — never run, or with its `run()` future cancelled — resolves every entry
 /// still queued or deferred [`BatchError::Refused`] / [`RefusedReason::PumpGone`]-shaped (an
 /// in-flight body's callers resolve [`OutcomeUnknownReason::PumpGone`] instead) and releases its
-/// queue budget: the explicit [`Drop`] drains the queue channel (whose shared buffer otherwise
-/// outlives the receiver while any [`BatchHandle`] holds a sender), and entries the dropped run
-/// future held locally resolve through their dropped oneshots.
+/// queue budget: the explicit [`Drop`] closes the shared queue under its lock and resolves
+/// everything it drains (the queue outlives the pump while any [`BatchHandle`] holds the `Arc`),
+/// and the deferred and in-flight entries live in the pump itself, so the same [`Drop`] resolves
+/// them too.
 pub struct AggregatorPump<F> {
   handle: Handle,
   stall: Option<Stall<F>>,
@@ -694,8 +705,8 @@ where
 }
 
 /// The shared constructor: snapshot the per-body limits from the consumed handle + config, and
-/// wire the bounded queue channel (the belt to the queue budget's braces — its bound equals the
-/// budget's count cap, so a reserved entry always has a slot).
+/// share the queue state between handle and pump (the deque is bounded by the queue budget's
+/// count cap alone — every entry reserves before it enqueues).
 fn split<F>(
   handle: Handle,
   cfg: BatchConfig,
@@ -879,7 +890,7 @@ where
   /// ```
   pub async fn run(self) {
     // Deferral (`self.deferred`) preserves FIFO across whole-group deferrals: packing always
-    // drains it before the channel. It lives in the pump so a dropped run future resolves its
+    // drains it before the shared queue. It lives in the pump so a dropped run future resolves its
     // entries explicitly in `Drop`.
     loop {
       // THE BATCHING CLOCK, phase 1: no body is in flight. Park until at least one entry exists,
@@ -1057,10 +1068,10 @@ where
           for entry in self.deferred.take() {
             resolve_all(entry.into_replies(), &stalled);
           }
-          // Close-then-drain under the shared gate (see `Drop`): a send racing this drain either
+          // Close-then-drain under the queue lock (see `Drop`): a send racing this drain either
           // landed before it (drained as Stalled below) or observes `closed` and refuses. The
           // drain only COLLECTS under the lock — resolution wakes receivers, and nothing
-          // wake-capable runs under the gate (a re-entrant waker retrying a submit would
+          // wake-capable runs under the lock (a re-entrant waker retrying a submit would
           // deadlock the non-reentrant mutex).
           let mut drained = Vec::new();
           {
@@ -1230,6 +1241,7 @@ mod tests {
     assert_eq!(RefusedReason::DriverRefused.as_str(), "driver_refused");
     assert_eq!(OutcomeUnknownReason::ReplyDropped.as_str(), "reply_dropped");
     assert_eq!(OutcomeUnknownReason::Stalled.as_str(), "stalled");
+    assert_eq!(OutcomeUnknownReason::PumpGone.as_str(), "pump_gone");
     assert_eq!(OutcomeUnknownReason::Driver.as_str(), "driver");
     assert_eq!(ReplyLostReason::MalformedReply.as_str(), "malformed_reply");
     assert_eq!(
@@ -1774,12 +1786,13 @@ mod tests {
   #[test]
   fn the_queue_byte_budget_refuses_over_cap_without_growth() {
     let (handle, _driver) = driver_handle(MAX_PENDING_BYTES);
-    let (batch, _pump) = aggregator(handle, BatchConfig::new(64).with_max_queued_bytes(10));
+    // The byte axis charges ENCODED cost: an 8-byte unit costs 8 + the per-unit framing (4).
+    let (batch, _pump) = aggregator(handle, BatchConfig::new(64).with_max_queued_bytes(20));
 
     let s1 = batch.submit(Bytes::from(vec![1u8; 8]));
     pin_mut!(s1);
     assert!(poll_once(&mut s1).is_pending());
-    assert_eq!(batch.queue_budget().bytes(), 8);
+    assert_eq!(batch.queue_budget().bytes(), 12);
 
     let s2 = batch.submit(Bytes::from(vec![2u8; 8]));
     pin_mut!(s2);
@@ -1796,19 +1809,65 @@ mod tests {
     );
     assert_eq!(
       batch.queue_budget().bytes(),
-      8,
+      12,
       "no retained growth past the cap"
     );
 
-    // Capacity returns once the queued entry leaves (here: refused submits keep failing until
-    // then, proving the cap binds on live entries, not on a leaked high-water mark).
+    // The rollback left the headroom intact: an entry within the remaining capacity is admitted
+    // — a reservation leaked by the refusal would have refused this too.
     let s3 = batch.submit(Bytes::from(vec![3u8; 2]));
     pin_mut!(s3);
     assert!(
       poll_once(&mut s3).is_pending(),
       "an entry within the remaining capacity is admitted"
     );
-    assert_eq!(batch.queue_budget().bytes(), 10, "the cap is byte-exact");
+    assert_eq!(
+      batch.queue_budget().bytes(),
+      18,
+      "the cap binds on encoded cost"
+    );
+  }
+
+  /// Queue admission sees EVERY unit of a group: each member charges a count slot and its
+  /// encoded byte cost (payload plus per-unit framing), so a flood of zero-length units inside
+  /// few groups cannot ride under either cap while retaining per-unit channel state behind a
+  /// stalled body.
+  #[test]
+  fn empty_unit_groups_cannot_bypass_the_queue_caps() {
+    let (handle, mut driver) = driver_handle(MAX_PENDING_BYTES);
+    let (batch, pump) = aggregator(handle, BatchConfig::new(64).with_max_queued_units(8));
+    let mut run = Box::pin(pump.run());
+
+    // Stall the pump on a first body the driver never answers.
+    let s1 = batch.submit(Bytes::from_static(b"flying"));
+    pin_mut!(s1);
+    assert!(poll_once(&mut s1).is_pending());
+    assert!(poll_once(&mut run.as_mut()).is_pending());
+    let (_, _, _reply) = driver.next_body();
+
+    // Nine empty units in one group exceed the eight-slot count cap: refused at submit, with
+    // nothing retained.
+    let over = batch.submit_group(vec![Bytes::new(); 9]);
+    pin_mut!(over);
+    assert_eq!(
+      poll_once(&mut over),
+      Poll::Ready(Err(BatchError::Refused {
+        reason: RefusedReason::QueueFull,
+      })),
+      "the count cap counts units, not group entries"
+    );
+    assert_eq!(batch.queue_budget().count(), 0, "nothing retained");
+
+    // A group inside the cap charges one slot per unit and the encoded byte cost.
+    let fits = batch.submit_group(vec![Bytes::new(); 3]);
+    pin_mut!(fits);
+    assert!(poll_once(&mut fits).is_pending());
+    assert_eq!(batch.queue_budget().count(), 3, "one slot per unit");
+    assert_eq!(
+      batch.queue_budget().bytes(),
+      3 * viewstamp_proto::BATCH_UNIT_OVERHEAD,
+      "empty units still pay their encoded framing"
+    );
   }
 
   /// An in-flight body whose EVERY caller cancelled tears the pump down: only the pump can free
@@ -1975,12 +2034,12 @@ mod tests {
     drop(batch.clone());
   }
 
-  /// Submits racing pump teardown from other threads can never strand: flume has no
-  /// close-then-drain, so without the shared gate a send slipping past the Drop drain's final
-  /// `try_recv` would park its caller forever on an entry no one can observe and pin its queue
-  /// budget. Under the gate every racer either lands before the drain (resolved `Refused` by it)
-  /// or observes the closed gate (refused at send) — so every submit RESOLVES and the budget
-  /// drains to zero. The threads hammer the window; the join is the no-strand witness.
+  /// Submits racing pump teardown from other threads can never strand: the closed flag and the
+  /// queue mutate under one lock, so every racer either lands before the `Drop` drain (resolved
+  /// `Refused` by it) or observes `closed` and refuses at send — every submit RESOLVES and the
+  /// budget drains to zero. (A channel with no close-then-drain would let a send slip past the
+  /// final drain and park its caller forever, pinning its budget.) The threads hammer the
+  /// window; the join is the no-strand witness.
   #[test]
   fn submits_racing_pump_teardown_never_strand() {
     for _ in 0..64 {
@@ -2004,7 +2063,7 @@ mod tests {
               };
               if matches!(outcome, Err(BatchError::Refused { .. })) {
                 // The retry a refusal licenses: it must itself resolve (a second refusal), never
-                // block on teardown's gate or strand.
+                // block on the closed queue or strand.
                 let retry = batch.submit(Bytes::from_static(b"retry"));
                 pin_mut!(retry);
                 loop {
