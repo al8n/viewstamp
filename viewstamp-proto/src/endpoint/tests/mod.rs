@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 mod checkpoint;
 mod forfeit;
 mod invariants;
+mod learner_membership;
 mod normal;
 mod recovery;
 mod repair;

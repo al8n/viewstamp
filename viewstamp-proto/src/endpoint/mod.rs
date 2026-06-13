@@ -1401,22 +1401,30 @@ impl<S> Endpoint<S> {
     self.quorum_checkpoint = self.compute_quorum_checkpoint_op();
   }
 
-  /// The uncached quorum-th order statistic: sort all replicas' reported checkpoints (self's own
-  /// durable checkpoint; unheard peers as 0) descending and take the `quorum`-th highest.
+  /// The uncached quorum-th order statistic: sort the VOTING replicas' reported checkpoints (a voter's
+  /// own durable checkpoint; unheard voters as 0) descending and take the `quorum`-th highest. The
+  /// statistic is voter-only BY CONSTRUCTION — a non-voter never appears in it, so its (possibly high)
+  /// checkpoint cannot lift the GC floor. On a voter self this yields exactly the voters (self + the
+  /// other voters); on a non-voting member self the seed below is skipped and the iteration covers only
+  /// the voters, so a learner — which populates no voter `peer_checkpoint` — computes ~0 (the safe
+  /// conservative floor that frees nothing).
   fn compute_quorum_checkpoint_op(&self) -> OpNumber {
     let count = self.config.replica_count();
     let mut cps: std::vec::Vec<u64> = std::vec::Vec::with_capacity(count as usize);
     let me = self.config.replica();
-    cps.push(self.checkpoint_op.get()); // self always counts its own durable checkpoint
+    if self.config.is_voter(me) {
+      cps.push(self.checkpoint_op.get()); // a voter counts its own durable checkpoint; a learner does not
+    }
     for r in 0..count {
       let rid = ReplicaId::new(u16::from(r));
       if rid == me {
-        continue;
+        continue; // a learner `me` is never in `0..count`, so this skips nothing — the seed above is what gates self
       }
       cps.push(self.peer_checkpoint.get(&rid).map_or(0, |c| c.get()));
     }
     cps.sort_unstable_by(|a, b| b.cmp(a)); // descending
-    // `cps.len() == replica_count >= quorum`, so `cps[quorum - 1]` is always in bounds.
+    // On a voter `cps.len() == replica_count`; on a learner `cps.len() == replica_count` too (the seed
+    // is skipped but no voter is). Either way `cps.len() >= quorum`, so `cps[quorum - 1]` is in bounds.
     OpNumber::with(cps[self.config.quorum() - 1])
   }
 
@@ -2090,15 +2098,21 @@ impl<S> Endpoint<S> {
   /// fault tolerance) — that is explicitly OUT OF SCOPE (a BFT/blockchain concern).
   ///
   /// The per-kind bindings (each accessor verified against `message.rs`):
-  /// - **Client-originated** — `Request` binds to `from == Peer::Client(r.client())`.
-  /// - **Self-identifying replica messages** (carry the sender's OWN `replica()` id) — bind to
-  ///   `from == Peer::Replica(msg.replica())`: the VOTES `PrepareOk`/`StartViewChange`/`DoViewChange`
-  ///   (the MUST-HAVE spoof guard), the solicitations `GetView`/`RequestPrepare`/`Recovery`/
-  ///   `RequestSync`, and the serves `RecoveryResponse`/`SyncCheckpoint`. The latter two carry BOTH a
-  ///   `view()` and a self `replica()`, but are legitimately sent by ANY `Normal` replica (a backup
-  ///   answers a `Recovery` with its view; any newer-checkpoint peer serves a `RequestSync`), so they
-  ///   bind to their self `replica()` — NOT `config.primary(view)`, which would drop an honest
-  ///   backup-originated serve.
+  /// - **Client-originated** — `Request` binds to `from == Peer::Client(r.client())`, OR a relay from
+  ///   a VOTING replica (a non-voting member does not relay client writes).
+  /// - **Self-identifying replica messages** (carry the sender's OWN `replica()` id) split by AUTHORITY:
+  ///   - **Votes** bind to the VOTING set (`sender_is_voter`): `PrepareOk`/`StartViewChange`/
+  ///     `DoViewChange` (the MUST-HAVE spoof guard). A learner-id sender is rejected — a vote from a
+  ///     non-voting member must never reach the quorum bitset / vote maps.
+  ///   - **Serves and solicitations of committed content** bind to the FULL membership
+  ///     (`sender_is_member`): the solicitations `GetView`/`RequestPrepare`/`RequestPrepareRange`/
+  ///     `Recovery`/`RequestSync`/`RequestSyncChunk`, and the serves `RecoveryResponse`/`SyncCheckpoint`/
+  ///     `SyncCheckpointMeta`/`SyncChunk`. A non-voting member legitimately solicits committed state and
+  ///     can serve committed content to others, so these bind to the self `replica()` over the full node
+  ///     range — NOT `config.primary(view)`, which would drop an honest backup-originated serve, and not
+  ///     the voting set, which would drop a learner soliciting/serving committed state. They carry
+  ///     committed CONTENT verified independently (checksum + committed-vouch; checkpoint-id), not quorum
+  ///     authority, so a member serving them is safe.
   /// - **Primary-authority broadcasts** (only the primary of the advertised view legitimately sends
   ///   them, and they carry NO self `replica()` to bind to) — bind to
   ///   `from == Peer::Replica(self.config.primary(msg.view()))`: `Commit` and `StartView`. This also
@@ -2120,46 +2134,53 @@ impl<S> Endpoint<S> {
   /// escape. This leaves no spoof gap on the vote/quorum surface this check protects.
   fn sender_matches(&self, from: Peer, msg: &Message) -> bool {
     match msg {
-      // Client-originated: accept from the issuing client OR relayed by a configured cluster replica.
-      // A local-application client co-located with a backup reaches the primary only by forwarding its
+      // Client-originated: accept from the issuing client OR relayed by a VOTING cluster replica. A
+      // local-application client co-located with a backup reaches the primary only by forwarding its
       // request over the replica mesh, where the transport tags the frame with the RELAYING replica's id
       // (not the client's). Accepting that relay is safe in the non-Byzantine model: the sender is an
       // authenticated cluster member (mTLS over cluster-private roots), `on_request` serves a request ONLY
       // at the primary and dedups by client session (a relayed copy executes at most once), and a Request
       // carries no view/quorum authority to forge — it is strictly weaker than the replica's existing
-      // consensus role. Out-of-range / non-member peers are still rejected by the membership bound.
+      // consensus role. The relay binds to the VOTING set (`< replica_count`): a non-voting member does
+      // not relay client writes — it has no client-ingress role. Out-of-range / non-member peers are
+      // rejected by the bound.
       Message::Request(r) => {
         from == Peer::Client(r.client())
           || from
             .as_replica()
             .is_some_and(|id| id.get() < self.config.replica_count() as u16)
       }
-      // Self-identifying replica messages: the authenticated peer must be the claimed sender AND a
-      // CONFIGURED cluster member (`replica < replica_count`). The membership range check is CENTRALIZED
-      // in `sender_is_member_replica`: without it, `from == Peer::Replica(m.replica())`
-      // accepts an out-of-range id (e.g. `Peer::Replica(5)` in a 3-replica cluster with `m.replica() == 5`)
+      // Self-identifying replica messages: the authenticated peer must be the claimed sender AND in the
+      // appropriate range, split by AUTHORITY. Without the range check, `from == Peer::Replica(m.replica())`
+      // accepts an out-of-range id (e.g. `Peer::Replica(99)` in a 3-replica cluster with `m.replica() == 99`)
       // — a non-member — whose self-consistent message then reaches the quorum / apply path (some
       // handlers, e.g. `on_prepare_ok`, range-check downstream, but `serve_sync_checkpoint`/`apply_sync`
-      // did not, extending checkpoint trust outside `Config`). Binding here closes it for ALL self-id
-      // messages at once, regardless of per-handler downstream checks.
-      Message::PrepareOk(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::StartViewChange(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::DoViewChange(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::GetView(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::RequestPrepare(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::RequestPrepareRange(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::Recovery(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::RequestSync(m) => self.sender_is_member_replica(from, m.replica()),
-      // Serves that carry a self `replica()` AND a `view()` but may come from ANY Normal replica
-      // (a backup, not only the primary) — bind to the self id, not `config.primary(view)`.
-      Message::RecoveryResponse(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::SyncCheckpoint(m) => self.sender_is_member_replica(from, m.replica()),
+      // did not, extending trust outside `Config`). Binding here closes it for ALL self-id messages.
+      //
+      // VOTES bind to the VOTING set (`sender_is_voter`): a vote from a non-voting member must never be
+      // counted in any quorum bitset / vote map.
+      Message::PrepareOk(m) => self.sender_is_voter(from, m.replica()),
+      Message::StartViewChange(m) => self.sender_is_voter(from, m.replica()),
+      Message::DoViewChange(m) => self.sender_is_voter(from, m.replica()),
+      // SERVES and SOLICITATIONS of committed content bind to the FULL membership (`sender_is_member`):
+      // a non-voting member legitimately solicits committed state AND can serve committed content to
+      // others. They carry no quorum authority; the content is verified independently downstream. The
+      // serves (`RecoveryResponse`/`SyncCheckpoint`/…) carry a self `replica()` AND a `view()` but may
+      // come from ANY Normal member (a backup or a learner, not only the primary) — bind to the self id,
+      // not `config.primary(view)`.
+      Message::GetView(m) => self.sender_is_member(from, m.replica()),
+      Message::RequestPrepare(m) => self.sender_is_member(from, m.replica()),
+      Message::RequestPrepareRange(m) => self.sender_is_member(from, m.replica()),
+      Message::Recovery(m) => self.sender_is_member(from, m.replica()),
+      Message::RequestSync(m) => self.sender_is_member(from, m.replica()),
+      Message::RecoveryResponse(m) => self.sender_is_member(from, m.replica()),
+      Message::SyncCheckpoint(m) => self.sender_is_member(from, m.replica()),
       // The chunked state-sync trio all carry a self `replica()`: the announce + chunk are serves
-      // from ANY Normal holder (like `SyncCheckpoint`); the chunk pull is a solicitation (like
-      // `RequestSync`). All bind to the claimed self id + the membership range.
-      Message::SyncCheckpointMeta(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::RequestSyncChunk(m) => self.sender_is_member_replica(from, m.replica()),
-      Message::SyncChunk(m) => self.sender_is_member_replica(from, m.replica()),
+      // from ANY Normal member (like `SyncCheckpoint`); the chunk pull is a solicitation (like
+      // `RequestSync`). All bind to the claimed self id + the full membership range.
+      Message::SyncCheckpointMeta(m) => self.sender_is_member(from, m.replica()),
+      Message::RequestSyncChunk(m) => self.sender_is_member(from, m.replica()),
+      Message::SyncChunk(m) => self.sender_is_member(from, m.replica()),
       // Primary-authority broadcasts (no self id): only the primary of the advertised view sends them.
       Message::Commit(m) => from == Peer::Replica(self.config.primary(m.view())),
       Message::StartView(m) => from == Peer::Replica(self.config.primary(m.view())),
@@ -2174,32 +2195,35 @@ impl<S> Endpoint<S> {
       // the gap where a misrouted non-primary replica Prepare drives a backup's normal append + PrepareOk.
       // But a committed-op REPAIR serve (answering our `RequestPrepare` for a hole in `self.repair`)
       // legitimately comes from ANY Normal holder, so ALSO accept a Prepare whose op is one of our
-      // registered repair holes — but ONLY from a CONFIGURED replica `from`: a repair-serve is
-      // always a peer replica that holds the committed op, NEVER a client or an out-of-range id. Without
-      // the replica-peer guard, an authenticated `Peer::Client` (or an out-of-range `Peer::Replica`)
-      // whose forged/misrouted Prepare's op happened to be one of our holes passed ingress and reached
-      // `fill_repair` (which checks only commit>=op + `Header::verify` self-consistency, BEFORE any role
-      // check), so a buggy/misrouting driver could fill a committed hole from a non-replica peer.
-      // (`fill_repair` then verifies the body — checksum + the commit>=op committed-vouch — and a
-      // hole-targeted Prepare it DECLINES is dropped by the hole-ownership guard in
-      // `on_prepare` before any view catch-up, so the `repair` escape cannot inject a bad body nor drive
-      // a spurious catch-up; a repair op is `<= self.op`, so it cannot advance the head.)
+      // registered repair holes — but ONLY from a CONFIGURED MEMBER `from` (`< node_count`): a
+      // repair-serve is always a peer replica that holds the committed op, NEVER a client or an
+      // out-of-range id. A non-voting member holding a committed op can serve it (the escape carries no
+      // quorum authority — `fill_repair` independently verifies the body). Without the member guard, an
+      // authenticated `Peer::Client` (or an out-of-range `Peer::Replica`) whose forged/misrouted
+      // Prepare's op happened to be one of our holes passed ingress and reached `fill_repair` (which
+      // checks only commit>=op + `Header::verify` self-consistency, BEFORE any role check), so a
+      // buggy/misrouting driver could fill a committed hole from a non-member peer. (`fill_repair` then
+      // verifies the body — checksum + the commit>=op committed-vouch — and a hole-targeted Prepare it
+      // DECLINES is dropped by the hole-ownership guard in `on_prepare` before any view catch-up, so the
+      // `repair` escape cannot inject a bad body nor drive a spurious catch-up; a repair op is
+      // `<= self.op`, so it cannot advance the head.)
       Message::Prepare(p) => {
         from == Peer::Replica(self.config.primary(p.view()))
-          || (matches!(from, Peer::Replica(r) if r.get() < self.config.replica_count() as u16)
+          || (matches!(from, Peer::Replica(r) if r.get() < self.config.node_count())
             && self.repair.contains(&p.op().get()))
       }
       // `RepairBatch` is the windowed analogue of a repair-serve `Prepare`: it carries NO self
-      // `replica()` (only a `view()`) and is legitimately sent by ANY Normal holder — incl. a BACKUP —
-      // so it binds to "any CONFIGURED replica `from`" (an in-range `Peer::Replica`), never a client /
-      // out-of-range id. The serve is committed, view-independent content; binding it to
-      // `config.primary(view)` would drop an honest backup-originated batch. The narrowing to a peer
-      // replica is the same guard the `Prepare` repair escape uses; `fill_repair_batch` then runs the
-      // per-entry `fill_repair` (placement `repair.contains(op)` + checksum + committed-vouch) on EACH
-      // entry, so an unsolicited / forged batch is rejected entry-by-entry exactly like a forged repair
-      // `Prepare` — no committed slot is filled from a non-replica peer or an unverified body.
+      // `replica()` (only a `view()`) and is legitimately sent by ANY Normal holder — incl. a BACKUP or a
+      // non-voting member — so it binds to "any CONFIGURED member `from`" (`< node_count`), never a
+      // client / out-of-range id. The serve is committed, view-independent content carrying no quorum
+      // authority; binding it to `config.primary(view)` would drop an honest backup-originated batch. The
+      // narrowing to a member peer is the same guard the `Prepare` repair escape uses; `fill_repair_batch`
+      // then runs the per-entry `fill_repair` (placement `repair.contains(op)` + checksum +
+      // committed-vouch) on EACH entry, so an unsolicited / forged batch is rejected entry-by-entry
+      // exactly like a forged repair `Prepare` — no committed slot is filled from a non-member peer or an
+      // unverified body.
       Message::RepairBatch(_) => {
-        matches!(from, Peer::Replica(r) if r.get() < self.config.replica_count() as u16)
+        matches!(from, Peer::Replica(r) if r.get() < self.config.node_count())
       }
       // `Reply` is ignored by replicas (dropped in the dispatch) — no-op.
       Message::Reply(_) => true,
@@ -2207,14 +2231,27 @@ impl<S> Endpoint<S> {
   }
 
   /// True iff `from` is the authenticated peer for the self-identifying `claimed` replica AND `claimed`
-  /// is a CONFIGURED cluster member (`< replica_count`). The membership range check is the load-bearing
-  /// half: a message whose body claims an OUT-OF-RANGE replica id (a non-member), with a
-  /// matching out-of-range `from` from a buggy/misrouting driver, must not reach the quorum / apply path
-  /// — it would extend trust outside `Config`. Centralized here so every self-id replica message
-  /// (`PrepareOk`/`StartViewChange`/`DoViewChange`/`SyncCheckpoint`/…) is membership-checked uniformly,
-  /// not relying on each handler's own (inconsistent) downstream range check.
-  fn sender_is_member_replica(&self, from: Peer, claimed: ReplicaId) -> bool {
+  /// is a VOTING replica (`< replica_count`). For messages that carry QUORUM / VOTE authority: a
+  /// `claimed` outside the voting set — a non-voting member's id, or an out-of-range id — is REJECTED,
+  /// so a vote can never reach a quorum bitset / vote map. (The bitset is also `u64`-indexed by the
+  /// voter id, so admitting a high id would overflow the shift — another reason a vote stays
+  /// voting-bounded.) The range check is the load-bearing half: without it, `from == Peer::Replica(claimed)`
+  /// accepts a self-consistent message from a non-member `from` supplied by a buggy/misrouting driver.
+  fn sender_is_voter(&self, from: Peer, claimed: ReplicaId) -> bool {
     claimed.get() < self.config.replica_count() as u16 && from == Peer::Replica(claimed)
+  }
+
+  /// True iff `from` is the authenticated peer for the self-identifying `claimed` replica AND `claimed`
+  /// is a CONFIGURED cluster MEMBER (`< node_count` — a voter OR a non-voting member). For messages that
+  /// SERVE or SOLICIT committed content: a non-voting member legitimately solicits committed state and
+  /// can serve committed content to others, so it is a valid sender; only an OUT-OF-RANGE id (a
+  /// non-member, `>= node_count`) is rejected. These messages carry no quorum authority — the content is
+  /// verified independently downstream — so admitting the full membership extends no trust the
+  /// independent verification does not already gate. Centralized here so every such self-id message
+  /// (`GetView`/`Recovery`/`RequestSync`/`SyncCheckpoint`/…) is membership-checked uniformly, not relying
+  /// on each handler's own (inconsistent) downstream range check.
+  fn sender_is_member(&self, from: Peer, claimed: ReplicaId) -> bool {
+    claimed.get() < self.config.node_count() && from == Peer::Replica(claimed)
   }
 }
 
