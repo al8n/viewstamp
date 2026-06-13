@@ -164,7 +164,8 @@ async fn build_driver(
   let (chain, key) = ca.issue(id);
   let opts: QuicOptions = ClusterTls::new(ca.roots(), chain, key).build();
   let config =
-    viewstamp_proto::Config::try_new(CLUSTER, viewstamp_proto::ReplicaId::new(id), 3).unwrap();
+    viewstamp_proto::Config::try_new(CLUSTER, viewstamp_proto::ReplicaId::new(id as u16), 3)
+      .unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
@@ -193,7 +194,7 @@ async fn spawn_cluster(ca: &TestCa, base_port: u16) -> Vec<viewstamp_compio::Han
   let addrs: Vec<SocketAddr> = (0..3)
     .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
     .collect();
-  let rid = |i: u8| viewstamp_proto::ReplicaId::new(i);
+  let rid = |i: u8| viewstamp_proto::ReplicaId::new(i as u16);
 
   let mut handles = Vec::new();
   for id in 0u8..3 {

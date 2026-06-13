@@ -232,7 +232,8 @@ where
   let mut reps: Vec<Replica<S>> = (0..REPLICAS)
     .map(|i| Replica {
       ep: Endpoint::new(
-        Config::try_new(1, ReplicaId::new(i as u8), REPLICAS as u8).expect("a valid 3-node config"),
+        Config::try_new(1, ReplicaId::new(i as u16), REPLICAS as u8)
+          .expect("a valid 3-node config"),
         0xBE7C_0FFE ^ (i as u64).wrapping_mul(0x1234_5678),
         S::default(),
       ),
@@ -285,7 +286,7 @@ where
     loop {
       let mut moved = false;
       for (i, r) in reps.iter_mut().enumerate() {
-        let from = Peer::Replica(ReplicaId::new(i as u8));
+        let from = Peer::Replica(ReplicaId::new(i as u16));
         while let Some(out) = r.ep.poll_message() {
           moved = true;
           let (to, msg) = (out.to(), out.into_msg());

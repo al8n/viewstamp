@@ -141,14 +141,14 @@ type GateDriver = viewstamp_reactor::ReactorStreamDriver<
 
 fn mk_dialer(me: u8) -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
   Arc::new(move |_peer| {
-    let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+    let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
     Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
   })
 }
 
 fn mk_acceptor(me: u8) -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
   Arc::new(move || {
-    let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+    let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   })
 }
@@ -168,9 +168,9 @@ async fn spawn_cluster(
   for id in 0u8..3 {
     let peers: Vec<_> = (0u8..3)
       .filter(|&p| p != id)
-      .map(|p| (ReplicaId::new(p), addrs[p as usize]))
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
       .collect();
-    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(id), 3).unwrap();
+    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(id as u16), 3).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
