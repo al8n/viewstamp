@@ -141,9 +141,9 @@ async fn main() {
     .collect();
 
   let mut handles = Vec::new();
-  for id in 0u8..3 {
+  for id in 0u16..3 {
     // The peer map: everyone but me.
-    let peers: Vec<(ReplicaId, SocketAddr)> = (0u8..3)
+    let peers: Vec<(ReplicaId, SocketAddr)> = (0u16..3)
       .filter(|&p| p != id)
       .map(|p| (ReplicaId::new(p), addrs[p as usize]))
       .collect();

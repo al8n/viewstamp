@@ -222,9 +222,9 @@ where
   for id in 0u8..3 {
     let peers: Vec<_> = (0u8..3)
       .filter(|&p| p != id)
-      .map(|p| (ReplicaId::new(p), addrs[p as usize]))
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
       .collect();
-    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(id), 3).unwrap();
+    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(id as u16), 3).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
@@ -264,13 +264,13 @@ where
 async fn three_node_tcp_cluster_commits_a_client_request() {
   let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move |_peer| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     })
   };
   let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move || {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
@@ -316,13 +316,13 @@ async fn wait_until(secs: u64, mut cond: impl FnMut() -> bool, what: &str) {
 async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
   let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move |_peer| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     })
   };
   let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move || {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
@@ -332,7 +332,7 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
   let peers_of = |id: u8| -> Vec<(ReplicaId, SocketAddr)> {
     (0u8..3)
       .filter(|&p| p != id)
-      .map(|p| (ReplicaId::new(p), addrs[p as usize]))
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
       .collect()
   };
 
@@ -348,7 +348,7 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
   let mut handles = Vec::new();
   let mut victim_task = None;
   for id in 0u8..3 {
-    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(id), 3).unwrap();
+    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(id as u16), 3).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Shared::new(wals[id as usize].clone(), ready_tx.clone());
     let sb = Shared::new(sbs[id as usize].clone(), ready_tx);
@@ -484,13 +484,13 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
 async fn stream_driver_exits_when_all_handles_dropped() {
   let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move |_peer| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     })
   };
   let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move || {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
@@ -542,13 +542,13 @@ async fn stream_driver_exits_when_all_handles_dropped() {
 async fn shutdown_ack_frees_the_address_for_immediate_rebind_stream() {
   let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move |_peer| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     })
   };
   let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move || {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
@@ -604,13 +604,13 @@ async fn shutdown_ack_frees_the_address_for_immediate_rebind_stream() {
 async fn shutdown_releases_a_queued_dial_completion() {
   let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move |_peer| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     })
   };
   let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move || {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
@@ -686,13 +686,13 @@ async fn stalled_unvalidated_accept_is_reaped_at_the_auth_deadline() {
 
   let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move |_peer| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     })
   };
   let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move || {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
@@ -759,13 +759,13 @@ async fn stalled_unvalidated_accept_is_reaped_at_the_auth_deadline() {
 async fn stalled_dialed_conn_is_reaped_at_the_auth_deadline_and_redials() {
   let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move |_peer| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     })
   };
   let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move || {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
@@ -902,7 +902,7 @@ mod tls {
     let mk_dialer = move |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<TlsRecords>> + Send + Sync> {
       let client = client.clone();
       Arc::new(move |_peer| {
-        let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+        let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let inner = TlsRecords::client(client.clone(), name).unwrap();
         Conn::from_parts(Labeled::dialer(inner, &opts))
@@ -911,7 +911,7 @@ mod tls {
     let mk_acceptor = move |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<TlsRecords>> + Send + Sync> {
       let server = server.clone();
       Arc::new(move || {
-        let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+        let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
         let inner = TlsRecords::server(server.clone()).unwrap();
         Conn::from_parts(Labeled::acceptor(inner, &opts))
       })
@@ -946,13 +946,13 @@ async fn a_full_cap_evicts_the_oldest_unvalidated_accept_for_a_fresh_one() {
 
   let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move |_peer| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     })
   };
   let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
     Arc::new(move || {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me as u16)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
