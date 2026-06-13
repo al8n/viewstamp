@@ -3317,7 +3317,10 @@ mod tests {
     // single byte survives encode→decode unchanged on every replica-bearing variant. 300 = 0x012C
     // exercises both bytes.
     let id = ReplicaId::new(300);
-    assert!(id.get() > u16::from(u8::MAX), "the id is above a single byte");
+    assert!(
+      id.get() > u16::from(u8::MAX),
+      "the id is above a single byte"
+    );
     let carriers = std::vec![
       Message::PrepareOk(PrepareOk::new(
         View::with(4),
@@ -3354,7 +3357,11 @@ mod tests {
     // The big-endian id occupies exactly two bytes: a `Recovery` leads its body with the replica id
     // right after the 3-byte header, so bytes [3..5] are `0x01, 0x2C`.
     let rec = Message::Recovery(Recovery::new(id, 0)).encode();
-    assert_eq!(&rec[3..5], &300u16.to_be_bytes(), "the replica id is a 2-byte big-endian field");
+    assert_eq!(
+      &rec[3..5],
+      &300u16.to_be_bytes(),
+      "the replica id is a 2-byte big-endian field"
+    );
   }
 
   #[test]
@@ -3424,8 +3431,8 @@ mod tests {
     let expected: std::vec::Vec<u8> = std::vec![
       0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
       0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5,
-      6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 1, 17, 18, 19, 20, 21, 22, 23,
-      24, 25, 26, 27, 28, 29, 30, 31, 32,
+      6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 1, 17, 18, 19, 20, 21, 22,
+      23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
     ];
     assert_eq!(
       dvc.encode(),

@@ -98,7 +98,10 @@ pub enum ConfigError {
   /// `replica_count + learner_count` exceeds the number of representable replica ids: every replica
   /// (voting or learner) is addressed by a `ReplicaId`, whose index is a `u16`, so the node count
   /// cannot exceed `u16::MAX`.
-  #[error("node_count {count} exceeds the maximum of {} (a replica id is a u16)", u16::MAX)]
+  #[error(
+    "node_count {count} exceeds the maximum of {} (a replica id is a u16)",
+    u16::MAX
+  )]
   TooManyNodes {
     /// The offending node count (`replica_count + learner_count`).
     count: u32,
