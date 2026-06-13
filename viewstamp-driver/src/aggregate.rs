@@ -713,6 +713,30 @@ where
   /// inside) and holds each body's armed sleep `Fut` across awaits. [`BatchHandle`] is
   /// `Send + Sync` unconditionally, so a `!Send` timer source costs only where the PUMP may run,
   /// never where callers submit from.
+  ///
+  /// A `!Send` timer therefore cannot cross a `Send`-requiring spawner — the run future inherits
+  /// the factory's locality:
+  ///
+  /// ```compile_fail
+  /// fn requires_send<T: Send>(_: T) {}
+  /// fn pin_it(
+  ///   handle: viewstamp_driver::Handle,
+  ///   cfg: viewstamp_driver::BatchConfig,
+  ///   sleep: std::rc::Rc<()>,
+  /// ) {
+  ///   // The factory captures an Rc, so F is !Send — and so is run().
+  ///   let (_batch, pump) = viewstamp_driver::aggregator_with_stall(
+  ///     handle,
+  ///     cfg,
+  ///     core::time::Duration::from_secs(1),
+  ///     move |_d| {
+  ///       let _local = sleep.clone();
+  ///       core::future::ready(())
+  ///     },
+  ///   );
+  ///   requires_send(pump.run());
+  /// }
+  /// ```
   pub async fn run(self) {
     // Entries popped but not yet packable (a group deferred whole when a body filled). Packing
     // always drains this before the channel, preserving FIFO across deferrals. Local to the

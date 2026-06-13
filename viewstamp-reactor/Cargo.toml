@@ -42,6 +42,10 @@ required-features = ["tokio"]
 name = "stream_loopback"
 required-features = ["tokio"]
 
+[[test]]
+name = "batching_loopback"
+required-features = ["tokio"]
+
 [[example]]
 name = "three_node"
 required-features = ["tokio"]
