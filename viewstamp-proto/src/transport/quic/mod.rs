@@ -192,11 +192,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// [`Self::clock_anchor`]).
   ///
   /// The connection cap is sized to the configured membership here: the effective `max_connections`
-  /// is RAISED to [`crypto::mesh_connection_floor`] of the endpoint's `replica_count` whenever the
+  /// is RAISED to [`crypto::mesh_connection_floor`] of the endpoint's `node_count` whenever the
   /// caller-configured cap is lower, so the bridge can never refuse a legitimate steady-state
-  /// mutual-dial mesh connection (each peer pair keeps two connections, so an `N`-replica node needs
-  /// `2*(N-1)` plus reconnect headroom — far past the 64 default for a large cluster). The cap still
-  /// bounds an untrusted-network flood; it is just sized to the membership rather than a fixed constant.
+  /// mutual-dial mesh connection (each peer pair keeps two connections, so an `N`-member node needs
+  /// `2*(N-1)` plus reconnect headroom). The cap still bounds an untrusted-network flood; it is just
+  /// sized to the full membership (voters plus non-voting members) rather than a fixed constant.
   fn build(
     endpoint: Endpoint<S>,
     opts: QuicOptions,
@@ -204,7 +204,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     identity: I,
   ) -> Self {
     let layout = opts.layout();
-    let mesh_floor = crypto::mesh_connection_floor(endpoint.replica_count());
+    let mesh_floor = crypto::mesh_connection_floor(endpoint.node_count());
     let effective_cap = opts.max_connections().max(mesh_floor);
     let opts = opts.with_max_connections(effective_cap);
     Self {
@@ -230,11 +230,12 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     self.endpoint.cluster()
   }
 
-  /// The configured cluster membership size, single-sourced from the endpoint's `Config` (no duplicate
-  /// field). The binding policy rejects a replica whose attested index is outside `0..replica_count`.
+  /// The configured cluster membership size (voters plus non-voting members), single-sourced from the
+  /// endpoint's `Config` (no duplicate field). The binding policy rejects a replica whose attested
+  /// index is outside `0..node_count`.
   #[inline(always)]
-  fn replica_count(&self) -> u8 {
-    self.endpoint.replica_count()
+  fn node_count(&self) -> u16 {
+    self.endpoint.node_count()
   }
 
   /// This node's own peer identity, single-sourced from the endpoint's `Config` (no duplicate
@@ -601,14 +602,15 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       return;
     }
     let candidate = identified.who();
-    // Only a replica WITHIN this endpoint's configured membership (`0..replica_count`) may bind. Two
-    // rejections collapse here: a CLIENT identity (clients use a separate endpoint), so `as_replica()` is
-    // `None`; and a replica index `>= replica_count` — a retired/misconfigured cert from a since-shrunk
-    // cluster. Without this gate such a peer would consume a slot and join the `Backups`/`AllReplicas`
-    // fanout, yet the endpoint's own `sender_matches` then drops every inbound consensus frame from it —
-    // slot and traffic wasted. In-model misconfiguration, not a Byzantine claim.
+    // Only a replica WITHIN this endpoint's configured membership (`0..node_count`, voters plus
+    // non-voting members) may bind. Two rejections collapse here: a CLIENT identity (clients use a
+    // separate endpoint), so `as_replica()` is `None`; and a replica index `>= node_count` — a
+    // retired/misconfigured cert from a since-shrunk cluster. Without this gate such a peer would
+    // consume a slot and join the `Backups`/`AllReplicas` fanout, yet the endpoint's own
+    // `sender_matches` then drops every inbound consensus frame from it — slot and traffic wasted.
+    // In-model misconfiguration, not a Byzantine claim.
     match candidate.as_replica() {
-      Some(r) if r.get() < self.replica_count() as u16 => {}
+      Some(r) if r.get() < self.node_count() => {}
       _ => {
         self.bridge.close_local(std_now, h);
         return;
