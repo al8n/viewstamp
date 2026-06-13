@@ -14,6 +14,15 @@
 //! committed ops on a fresh 3-replica cluster; throughput is reported in
 //! ELEMENTS (committed ops) per second.
 //!
+//! The `commit_loop_units_per_body` group measures edge-batching amortization through
+//! the SAME loop: each request body carries 1 / 4 / 16 / 64 user units packed with
+//! [`BatchBuilder`], and the state machine decodes the committed body with [`BatchView`],
+//! applies each unit, and seals one result per unit into the reply with a
+//! [`ReplyBuilder`]. Every variant commits the same 256 op bodies, so reporting
+//! throughput in ELEMENTS (committed USER UNITS) per second makes the curve read the
+//! amortization directly: per-unit cost is the roughly-constant per-op cost divided by
+//! units-per-body, until per-unit decode/apply/reply work starts to bind.
+//!
 //! # Baseline — MACHINE-SPECIFIC, for trend comparison on the same box only
 //!
 //! Recorded from one local `cargo bench` run (Apple M1 Max, macOS,
@@ -22,6 +31,16 @@
 //! | benchmark                        | time per 256 ops | throughput    |
 //! |----------------------------------|------------------|---------------|
 //! | `commit_loop/3_replicas_256_ops` | ~554 µs          | ~462 Kelem/s  |
+//!
+//! The amortization curve, from the same run shape (every row commits 256 bodies; the
+//! elements are user units):
+//!
+//! | benchmark                       | time per 256 bodies | throughput     |
+//! |---------------------------------|---------------------|----------------|
+//! | `commit_loop_units_per_body/1`  | ~707 µs             | ~362 Kelem/s   |
+//! | `commit_loop_units_per_body/4`  | ~901 µs             | ~1.14 Melem/s  |
+//! | `commit_loop_units_per_body/16` | ~1.44 ms            | ~2.84 Melem/s  |
+//! | `commit_loop_units_per_body/64` | ~3.62 ms            | ~4.53 Melem/s  |
 
 use std::{
   collections::{BTreeMap, VecDeque},
@@ -30,17 +49,24 @@ use std::{
 };
 
 use bytes::Bytes;
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use viewstamp_proto::{
-  CheckpointRead, ClientId, Config, Endpoint, Header, Instant, Message, OpId, OpNumber, Peer,
-  Recipient, ReplicaId, Request, RequestNumber, SlotStatus, StateMachine, Superblock,
-  SuperblockDone, VsrState, Wal, WalDone,
+  BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchView, CheckpointRead, ClientId,
+  Config, Endpoint, Header, Instant, Message, OpId, OpNumber, Peer, Recipient, ReplicaId,
+  ReplyBuilder, Request, RequestNumber, SlotStatus, StateMachine, Superblock, SuperblockDone,
+  VsrState, Wal, WalDone, max_reply_body_len,
 };
 
 const REPLICAS: usize = 3;
 const CLIENTS: u64 = 4;
 const OPS_PER_CLIENT: u64 = 64;
 const TOTAL_OPS: u64 = CLIENTS * OPS_PER_CLIENT;
+/// The units-per-body axis of the amortization curve; every point commits the same
+/// `TOTAL_OPS` bodies.
+const UNITS_PER_BODY: [u64; 4] = [1, 4, 16, 64];
+/// Every user unit is 8 small bytes — the same payload size the unbatched loop's whole
+/// request body carries, so the curve varies ONLY the packing factor.
+const UNIT_LEN: usize = 8;
 
 /// A minimal synchronous in-memory WAL over the public [`Wal`] trait: appends/reads
 /// complete immediately into the completion queue (drained by the endpoint's
@@ -146,8 +172,41 @@ impl StateMachine for CounterSm {
   }
 }
 
-struct Replica {
-  ep: Endpoint<CounterSm>,
+/// The batch-aware counterpart of [`CounterSm`]: every committed body is a batch, decoded
+/// with [`BatchView`]; each unit is applied as the same O(1) counter bump, and one 8-byte
+/// result per unit is sealed into the reply with a [`ReplyBuilder`] — the decode →
+/// apply-per-unit → reply-per-unit shape a batch-aware embedder state machine runs, so
+/// the measurement includes the real per-unit codec work.
+#[derive(Default)]
+struct BatchCounterSm {
+  applied_units: u64,
+}
+
+impl StateMachine for BatchCounterSm {
+  fn apply(&mut self, _op: OpNumber, body: &[u8]) -> Bytes {
+    let view = BatchView::parse(body).expect("the bench clients mint codec-built batch bodies");
+    let mut reply = ReplyBuilder::new(max_reply_body_len(), UNIT_LEN);
+    for _unit in view.units() {
+      self.applied_units += 1;
+      reply
+        .push(&self.applied_units.to_be_bytes())
+        .expect("8-byte unit replies of a small bench batch fit the reply budget");
+    }
+    reply
+      .finish()
+      .expect("a parsed batch carries at least one unit")
+  }
+  fn snapshot(&self) -> Bytes {
+    Bytes::copy_from_slice(&self.applied_units.to_be_bytes())
+  }
+  fn restore(&mut self, snapshot: &[u8]) {
+    self.applied_units =
+      u64::from_be_bytes(snapshot.try_into().expect("an 8-byte counter snapshot"));
+  }
+}
+
+struct Replica<S> {
+  ep: Endpoint<S>,
   wal: BenchWal,
   sb: BenchSb,
 }
@@ -160,18 +219,22 @@ struct Client {
   inflight: Option<u64>,
 }
 
-/// Drive `TOTAL_OPS` small requests to commitment on a fresh 3-replica cluster and
-/// return the reply count (asserted complete). Fault-free and instant-delivery, so
-/// the run stays in view 0 with replica 0 as primary; timers are still fired every
-/// virtual millisecond, exactly like a driver would, so heartbeats and checkpoint
-/// cadence run their normal course.
-fn run_commit_loop() -> u64 {
-  let mut reps: Vec<Replica> = (0..REPLICAS)
+/// Drive `TOTAL_OPS` requests — each carrying `body(request_number)` — to commitment on
+/// a fresh 3-replica cluster of `S` state machines and return the reply count (asserted
+/// complete). Fault-free and instant-delivery, so the run stays in view 0 with replica 0
+/// as primary; timers are still fired every virtual millisecond, exactly like a driver
+/// would, so heartbeats and checkpoint cadence run their normal course.
+fn run_commit_loop<S, B>(body: B) -> u64
+where
+  S: StateMachine + Default,
+  B: Fn(u64) -> Bytes,
+{
+  let mut reps: Vec<Replica<S>> = (0..REPLICAS)
     .map(|i| Replica {
       ep: Endpoint::new(
         Config::try_new(1, ReplicaId::new(i as u8), REPLICAS as u8).expect("a valid 3-node config"),
         0xBE7C_0FFE ^ (i as u64).wrapping_mul(0x1234_5678),
-        CounterSm::default(),
+        S::default(),
       ),
       wal: BenchWal::default(),
       sb: BenchSb::default(),
@@ -199,14 +262,10 @@ fn run_commit_loop() -> u64 {
     now = now + Duration::from_millis(1);
 
     // Closed-loop ingress: every idle client submits its next request to the
-    // view-0 primary (replica 0); the body is 8 small bytes.
+    // view-0 primary (replica 0), with the body the variant under measurement mints.
     for cl in &mut clients {
       if cl.inflight.is_none() && cl.next <= OPS_PER_CLIENT {
-        let req = Request::new(
-          cl.id,
-          RequestNumber::with(cl.next),
-          Bytes::copy_from_slice(&cl.next.to_be_bytes()),
-        );
+        let req = Request::new(cl.id, RequestNumber::with(cl.next), body(cl.next));
         cl.inflight = Some(cl.next);
         cl.next += 1;
         let r = &mut reps[0];
@@ -225,9 +284,9 @@ fn run_commit_loop() -> u64 {
     // events; repeat until a full pass moves nothing.
     loop {
       let mut moved = false;
-      for i in 0..REPLICAS {
+      for (i, r) in reps.iter_mut().enumerate() {
         let from = Peer::Replica(ReplicaId::new(i as u8));
-        while let Some(out) = reps[i].ep.poll_message() {
+        while let Some(out) = r.ep.poll_message() {
           moved = true;
           let (to, msg) = (out.to(), out.into_msg());
           match to {
@@ -284,14 +343,49 @@ fn run_commit_loop() -> u64 {
   replies
 }
 
+/// One request body of `units` user units for request number `next`, packed with the
+/// production [`BatchBuilder`] against an exactly-sized budget; each unit is a distinct
+/// 8-byte payload.
+fn batch_body(units: u64, next: u64) -> Bytes {
+  let mut builder =
+    BatchBuilder::new(BATCH_COUNT_OVERHEAD + units as usize * (BATCH_UNIT_OVERHEAD + UNIT_LEN));
+  for k in 0..units {
+    builder
+      .push(&(next * units + k).to_be_bytes())
+      .expect("the budget is sized for exactly `units` units");
+  }
+  builder.finish().expect("at least one unit was pushed")
+}
+
 fn bench_commit_loop(c: &mut Criterion) {
   let mut g = c.benchmark_group("commit_loop");
   g.throughput(Throughput::Elements(TOTAL_OPS));
   g.bench_function("3_replicas_256_ops", |b| {
-    b.iter(|| black_box(run_commit_loop()))
+    b.iter(|| {
+      black_box(run_commit_loop::<CounterSm, _>(|next| {
+        Bytes::copy_from_slice(&next.to_be_bytes())
+      }))
+    })
   });
   g.finish();
 }
 
-criterion_group!(benches, bench_commit_loop);
+fn bench_commit_loop_units_per_body(c: &mut Criterion) {
+  let mut g = c.benchmark_group("commit_loop_units_per_body");
+  for units in UNITS_PER_BODY {
+    // Every point commits the same TOTAL_OPS bodies; the elements are USER UNITS, so
+    // the per-point throughput reads the amortization factor off the report directly.
+    g.throughput(Throughput::Elements(TOTAL_OPS * units));
+    g.bench_with_input(BenchmarkId::from_parameter(units), &units, |b, &units| {
+      b.iter(|| {
+        black_box(run_commit_loop::<BatchCounterSm, _>(|next| {
+          batch_body(units, next)
+        }))
+      })
+    });
+  }
+  g.finish();
+}
+
+criterion_group!(benches, bench_commit_loop, bench_commit_loop_units_per_body);
 criterion_main!(benches);

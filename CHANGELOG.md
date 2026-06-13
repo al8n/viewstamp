@@ -36,3 +36,11 @@ Nothing has been released yet; everything below is the current state of the tree
   over any `agnostic` runtime (tokio/smol via features): a QUIC driver and a TCP/TLS
   stream driver with abort-on-drop ownership of every spawned task, passing the same
   loopback/restart/shutdown gate suite as the compio drivers.
+- **Edge batching** — many user units riding one consensus op body: the shared
+  request/reply batch codec with budget-bounded builders and exact-layout zero-copy
+  views (`viewstamp-proto`); the driver-side aggregator — a cloneable `BatchHandle`
+  plus a pump consuming the driver `Handle` — with atomic groups, the
+  `Refused`/`OutcomeUnknown`/`CommittedReplyLost` retry-contract taxonomy, and an
+  injected terminal stall timer (`viewstamp-driver`); the simulation batching lane and
+  an applied-once oracle over per-replica apply streams (`viewstamp-simulation`); and
+  real-cluster batching gates over the compio and reactor drivers.

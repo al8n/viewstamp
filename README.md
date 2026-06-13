@@ -77,6 +77,28 @@ writing a backend; each clause is load-bearing for committed-op survival.
 The state machine side is three methods (`apply` / `snapshot` / `restore`), required to
 be deterministic across replicas.
 
+### Edge batching
+
+Many small operations can share one consensus op: callers hand individual units (or
+atomic groups) to a batching aggregator, which consumes a driver `Handle`, packs
+everything queued into the next request body while one is in flight, and demultiplexes
+each committed reply back to its callers. Your `apply` then decodes each committed body
+with the shared codec — `BatchView` in, one result per unit out through a
+`ReplyBuilder`:
+
+```rust
+let (batch, pump) = aggregator(handle, BatchConfig::new(max_unit_reply_len));
+// spawn pump.run() exactly like the driver's own run(); then, from any task:
+let reply = batch.submit(unit).await?;
+```
+
+A body applies atomically (it is one op) and a group is never split across bodies, but
+batches are not transactions — units stay independent operations that share an op. The
+codec layout, the request/reply budget contracts, and the aggregator's retry-contract
+error taxonomy are documented in the
+[`batch` module](viewstamp-proto/src/batch.rs) and the
+[`aggregate` module](viewstamp-driver/src/aggregate.rs).
+
 ## Validation: the VOPR
 
 The flagship test rig is a [VOPR-style] deterministic simulator
