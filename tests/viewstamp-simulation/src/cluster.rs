@@ -158,6 +158,13 @@ pub struct Cluster {
   /// slow sweep reads this as its deep non-vacuity witness: messages were genuinely delivered LATE,
   /// not merely flagged slow.
   slow_delays_applied: u64,
+  /// How many times the STALE-READ lane partitioned the CURRENT primary out (every directed leg
+  /// to/from it cut, so it is both deaf and mute — the survivors stop hearing it and fail over while
+  /// it sits deposed in its old view). Monotone over the cluster's lifetime, like [`Self::holds_fired`]
+  /// (nothing resets it). `0` unless the stale-read lane installs an episode. The lane reads this as
+  /// its non-vacuity witness: a primary was genuinely deposed, the failover the staleness floor must
+  /// stay monotone through.
+  stale_read_probes_fired: u64,
   /// Per-replica recorded APPLY STREAM: every `Committed` + `StateSyncCompleted` event drained from
   /// the endpoint, tagged with the replica's incarnation at emission. Filled by the per-tick event
   /// drain (and by [`crash`](Self::crash), which captures the not-yet-drained tail before the
@@ -241,6 +248,7 @@ impl Cluster {
       holds_fired: 0,
       one_way_dropped: 0,
       slow_delays_applied: 0,
+      stale_read_probes_fired: 0,
       applied_streams: vec![Vec::new(); n],
       incarnations: vec![0; n],
     }
@@ -649,6 +657,14 @@ impl Cluster {
   /// Read access to client `i` (for invariant checking).
   pub fn client(&self, i: usize) -> &ClientModel {
     &self.clients[i]
+  }
+
+  /// Client `i`'s acked replies STAMPED with their ack instant (for the staleness oracle):
+  /// `(request, reply_body, ack_instant)` per recorded reply, in reply order. Mirrors how
+  /// [`ClientModel::replies`] is surfaced via [`Self::client`], but carries the virtual instant each
+  /// reply was delivered — observation-only bookkeeping, like the apply-stream capture.
+  pub fn client_replies_at(&self, i: usize) -> &[(u64, Bytes, Instant)] {
+    self.clients[i].replies_at()
   }
 
   /// Mutable access to client `i`'s batching model (`None` for a plain client) — the scripted
@@ -1187,6 +1203,55 @@ impl Cluster {
     self.slow_delays_applied
   }
 
+  /// The cluster's SERVING primary: the non-crashed replica that is `Normal` AND `is_primary` with
+  /// the HIGHEST view. A deposed old-view primary stays `Normal` + `is_primary` in its stale view
+  /// until it learns a higher one, so a status predicate alone would count it as primary; the
+  /// serving primary is the highest-view such replica — the one whose writes would actually commit.
+  /// `None` during an election window (no normal primary yet).
+  pub fn serving_primary(&self) -> Option<usize> {
+    (0..self.replicas.len())
+      .filter(|&i| {
+        !self.crashed[i] && self.replicas[i].status().is_normal() && self.replicas[i].is_primary()
+      })
+      .max_by_key(|&i| self.replicas[i].view().get())
+  }
+
+  /// Cut every directed inter-replica leg to AND from `target` — deaf (its peers' acks/votes never
+  /// arrive) and mute (its heartbeats/prepares never reach the survivors, whose idle view-change
+  /// timers then fire and elect a new primary while the deposed one sits in its old view). A no-op
+  /// returning `false` unless `target` is currently [`serving_primary`](Self::serving_primary)
+  /// (never reselects, never counts a deposed old-view primary); on a genuine cut it advances
+  /// [`stale_read_probes_fired`](Self::stale_read_probes_fired) and returns `true`. The directed
+  /// blocks heal like any one-way episode ([`heal`](Self::heal) / [`heal_one_way`](Self::heal_one_way)),
+  /// so the stale-read lane composes with the standard heal/calm machinery.
+  pub fn partition_primary_out(&mut self, target: usize) -> bool {
+    // Cut EXACTLY the caller's chosen replica, and ONLY if it is the cluster's SERVING primary —
+    // never reselect, never count a deposed old-view primary that still believes itself primary.
+    // A reselection or a status-agnostic predicate could cut (and bump the witness for) a replica
+    // that is not the active primary, leaving the intended one unpartitioned and the failover
+    // unforced — a false non-vacuity signal. A non-serving-primary target is a no-op (the witness
+    // counts only genuine deposals of the serving primary, each of which forces a real failover).
+    if self.serving_primary() != Some(target) {
+      return false;
+    }
+    for x in 0..self.replicas.len() {
+      if x != target {
+        // Deaf: peer -> primary cut. Mute: primary -> peer cut.
+        self.one_way[x][target] = true;
+        self.one_way[target][x] = true;
+      }
+    }
+    self.stale_read_probes_fired += 1;
+    true
+  }
+
+  /// How many times the stale-read lane partitioned the current primary out so far. Monotone; `0`
+  /// unless the lane installs an episode. The lane's non-vacuity witness (a primary was genuinely
+  /// deposed and the cluster forced to fail over).
+  pub fn stale_read_probes_fired(&self) -> u64 {
+    self.stale_read_probes_fired
+  }
+
   /// Whether replica↔replica traffic between replicas `a` and `b` is currently partitioned.
   pub fn partitioned(&self, a: u8, b: u8) -> bool {
     self.groups[a as usize] != self.groups[b as usize]
@@ -1297,7 +1362,7 @@ impl Cluster {
         }
         Target::Client(id) => {
           if let Some(c) = self.clients.iter_mut().find(|c| c.id().get() == id) {
-            c.handle(m.msg);
+            c.handle(now, m.msg);
           }
         }
       }
@@ -1763,6 +1828,97 @@ mod tests {
       small,
     );
     assert_eq!(c.one_way_dropped(), 1, "heal cleared the one-way block");
+  }
+
+  #[test]
+  fn partition_primary_out_deposes_the_primary_and_heals() {
+    // The stale-read lane's partition mechanism: cut every leg to AND from the current primary
+    // (deaf + mute), so the survivors stop hearing it. The witness advances, the deposed primary's
+    // legs are blocked both ways, and `heal` restores connectivity.
+    let mut c = Cluster::new(3, 1, 2, /*seed*/ 7);
+    for _ in 0..2000 {
+      c.tick();
+      if c.is_quiescent() {
+        break;
+      }
+    }
+    assert!(c.replica_is_primary(0), "replica 0 is the view-0 primary");
+    assert_eq!(c.stale_read_probes_fired(), 0, "no probe yet");
+    assert!(
+      c.partition_primary_out(0),
+      "replica 0 is a live primary the lane deposes"
+    );
+    assert_eq!(c.stale_read_probes_fired(), 1, "the probe witness advanced");
+    // Targeting a non-primary is a no-op: no cut, no witness bump (a false witness would mask the
+    // intended primary going unpartitioned).
+    assert!(!c.partition_primary_out(1), "replica 1 is not a primary");
+    assert_eq!(
+      c.stale_read_probes_fired(),
+      1,
+      "the witness counts only genuine deposals"
+    );
+    // Both directions are cut for every peer.
+    assert!(
+      c.one_way_blocked(1, 0) && c.one_way_blocked(0, 1),
+      "deaf + mute vs peer 1"
+    );
+    assert!(
+      c.one_way_blocked(2, 0) && c.one_way_blocked(0, 2),
+      "deaf + mute vs peer 2"
+    );
+    // The survivors stop hearing the old primary and fail over to a higher view.
+    let mut failed_over = false;
+    for _ in 0..200_000 {
+      c.tick();
+      if c.any_replica_view_advanced_beyond(0) {
+        failed_over = true;
+        break;
+      }
+    }
+    assert!(
+      failed_over,
+      "deposing the primary (deaf + mute) forces the survivors to elect a new primary"
+    );
+    // A new primary now serves in a higher view; replica 0, still cut, is at best a STALE old-view
+    // primary (or has forfeited) — NOT the cluster's serving primary. Re-targeting it must be a
+    // no-op with the witness unchanged: a status-agnostic predicate would wrongly count the stale
+    // primary and leave the real one unpartitioned.
+    let mut serving = None;
+    for _ in 0..200_000 {
+      c.tick();
+      if let Some(p) = c.serving_primary()
+        && c.replica_view(p).get() > 0
+      {
+        serving = Some(p);
+        break;
+      }
+    }
+    let serving = serving.expect("a new serving primary stabilized in a higher view");
+    assert_ne!(
+      serving, 0,
+      "the deposed primary 0 is not the new serving primary"
+    );
+    let witness = c.stale_read_probes_fired();
+    assert!(
+      !c.partition_primary_out(0),
+      "the deposed old-view primary 0 is not the serving primary {serving}"
+    );
+    assert_eq!(
+      c.stale_read_probes_fired(),
+      witness,
+      "no false witness for a stale old-view primary"
+    );
+    // Heal restores full connectivity; the witness is monotone (a heal never lowers it).
+    c.heal();
+    assert!(
+      !c.one_way_blocked(1, 0) && !c.one_way_blocked(0, 1),
+      "heal cleared the cut"
+    );
+    assert_eq!(
+      c.stale_read_probes_fired(),
+      1,
+      "the witness is monotone across heal"
+    );
   }
 
   #[test]

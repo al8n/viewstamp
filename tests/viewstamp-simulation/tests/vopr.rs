@@ -149,8 +149,8 @@
 
 use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
-  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_torn_headers,
-  run_vopr_with_wipe,
+  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_stale_read,
+  run_vopr_with_torn_headers, run_vopr_with_wipe,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -825,6 +825,68 @@ fn vopr_slow_replica_sweep_no_violations() {
   println!(
     "VOPR slow sweep OK: slow_episodes={total_episodes} slow_delays={total_slow_delays} \
      committed={total_committed} view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed STALE-READ sweep (same budget rationale as
+/// [`HOLD_SEEDS`]).
+const STALE_READ_SEEDS: u64 = 16;
+
+/// The committed STALE-READ sweep: [`run_vopr_with_stale_read`] over `0..STALE_READ_SEEDS` — the
+/// stale-read axis FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env var, no
+/// schedule races, cannot be forgotten by a runner). On a seeded cadence the lane deterministically
+/// partitions the CURRENT primary OUT — every directed leg to/from it cut, so it is at once deaf
+/// (acks/votes never arrive) and mute (its heartbeats never reach the survivors, whose idle
+/// view-change timers then fire) — forcing the survivors to elect a NEW primary while the deposed one
+/// sits in its old view. The [`StalenessChecker`](viewstamp_simulation::StalenessChecker) runs LIVE
+/// across the failover: the staleness floor (the committed-history high-water) is asserted MONOTONE
+/// through the view change, the cross-check this lane exercises now. The deposed primary reuses the
+/// asym victim/budget/heal bookkeeping (it counts against the minority budget and heals like any
+/// one-way episode), so a quorum of survivors always remains to elect + commit.
+///
+/// The read-specific assertion (the deposed primary cannot serve a STALE read) is DEFERRED to the
+/// future read-path step — there is no read path today, so no read is recorded and the staleness
+/// enforcement is vacuous. This lane lands now exercising the failover schedule that assertion will
+/// later hang on. A violation here is a REAL finding (the committed-history high-water regressing
+/// across the failover) — report it with its seed; never mask it or weaken a checker to pass.
+///
+/// The DEFAULT sweep leaves this axis OFF (it consumes extra PRNG draws, which would shift every
+/// pinned regression seed off its historical schedule); stale-read-enabled runs are their own
+/// deterministic baselines, byte-identical to `VOPR_STALE_READ=1` runs of the same seeds.
+#[test]
+fn vopr_stale_read_sweep_no_violations() {
+  let mut total_probes = 0u64;
+  let mut total_failovers = 0u64;
+  let mut total_committed = 0usize;
+  println!(
+    "VOPR stale-read sweep: 0..{STALE_READ_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, \
+     stale-read axis forced on"
+  );
+  for seed in 0..STALE_READ_SEEDS {
+    let r = run_vopr_with_stale_read(seed, DEFAULT_TICKS);
+    total_probes += r.stale_read_probes_fired();
+    total_failovers += r.stale_read_failovers_observed();
+    total_committed += r.max_committed();
+  }
+  // CAUSAL non-vacuity: the lane deposed a serving primary and then OBSERVED the resulting failover
+  // (a higher-view serving primary while the deposed one stayed cut) — so the staleness floor was
+  // genuinely exercised across a completed deposed-primary failover window, not merely a cut that
+  // a heal could have undone before any view change. A bare cut-install count (or any view change,
+  // which crash/partition churn also drives) would not prove the intended window was exercised.
+  assert!(
+    total_failovers > 0,
+    "the stale-read axis observed no probe-induced failover across the sweep \
+     (stale_read_failovers_observed={total_failovers}, cut installs={total_probes}) — the \
+     stale-read lane is vacuous: no deposed-primary failover window was exercised"
+  );
+  // And the stale-read-enabled runs still did real work.
+  assert!(
+    total_committed > 0,
+    "the stale-read sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  println!(
+    "VOPR stale-read sweep OK: stale_read_failovers_observed={total_failovers} \
+     cut_installs={total_probes} committed={total_committed}"
   );
 }
 

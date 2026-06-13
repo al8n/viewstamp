@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use smol_str::SmolStr;
+use viewstamp_proto::Instant;
 
 use crate::cluster::{AppliedEvent, Cluster};
 
@@ -393,6 +394,260 @@ impl AppliedOnceChecker {
           ));
         }
         Some(_) => {}
+      }
+    }
+    CheckResult::Ok
+  }
+}
+
+/// One client's ack-time record entry as the staleness fold consumes it: `(request, reply_body,
+/// ack_instant)` — the shape [`Cluster::client_replies_at`] yields per client.
+type AckRecord = (u64, Bytes, Instant);
+
+/// Stateful **linearizable-read staleness** oracle: the cluster's write-reply staleness floor over
+/// time, and the enforcement a linearizable-read path must satisfy the moment one exists.
+///
+/// A linearizable read returning at real time `T` must reflect every write that was ACKED to a client
+/// before `T`. This checker maintains the two quantities that obligation rests on and joins them:
+///
+/// 1. **The staleness floor** — the cluster's **committed history** high-water: the longest applied
+///    `(op, body)` prefix ever observed on any replica (the same quantity [`DurabilityChecker`]
+///    tracks), monotonically extended. Its length is monotone non-decreasing **by construction** (a
+///    fold only ever extends it), and each [`observe`](Self::observe) re-asserts that the prefix is
+///    not REWRITTEN — a newly observed applied log that disagrees with the committed history on their
+///    common prefix is a floor regression and trips. This is a deliberate defense-in-depth cross-check
+///    of the same no-rewrite invariant [`DurabilityChecker`] enforces: the staleness floor can never
+///    silently move backwards.
+/// 2. **The acked set** — every client-acked write paired with the instant it was acked. Each ack is
+///    `(client, request, ack_instant)` (drained from [`Cluster::client_replies_at`]); the op it
+///    committed at is resolved by folding the replicas' apply streams into a `(client, request) -> op`
+///    map (the apply stream is the authority on which op a request committed at). The resolved acked
+///    set is therefore `(op, ack_instant)` pairs — exactly the writes a later read must not be stale
+///    against.
+///
+/// A read is recorded via [`record_read`](Self::record_read) as `(issue_instant, returned_index,
+/// returned_body)`. [`check`](Self::check) (post-quiesce) enforces the staleness obligation: every
+/// recorded read at instant `T` returning applied index `R` must satisfy `R >= N`, where `N` is the
+/// highest committed op whose ack_instant is strictly before `T` (the highest write acked before the
+/// read issued). It also enforces **non-vacuity**: the resolved acked set is non-empty whenever the
+/// cluster committed anything (the capture itself recorded something).
+///
+/// In the behavior-preserving phase there is no read path, so no read is ever recorded and the
+/// staleness enforcement is vacuously satisfied — which is correct and intended. The live value now is
+/// the floor monotonicity (every tick) plus the non-vacuity witness; the checker is STRUCTURALLY READY
+/// to enforce reads the moment a linearizable-read path records them.
+#[derive(Debug)]
+pub struct StalenessChecker {
+  /// The committed history high-water (the staleness floor): the longest applied `(op, body)` prefix
+  /// ever observed on any replica, monotonically extended. Its length is the floor's numeric value.
+  committed: Vec<(u64, Bytes)>,
+  /// Per-replica count of apply-stream entries already folded (the streams are append-only), to learn
+  /// the `(client, request) -> op` map without re-scanning.
+  cursor: Vec<usize>,
+  /// Per-replica incarnation of the segment currently being folded (an incarnation boundary is where
+  /// a replica's apply stream legitimately re-emits from its durable checkpoint — agreement makes the
+  /// re-emissions converge on the same op for a `(client, request)`).
+  incarnation: Vec<u64>,
+  /// The `(client, request) -> op` map learned from the apply streams — the authority on which op a
+  /// request committed at, used to resolve each ack to its committed op.
+  op_of: HashMap<(u128, u64), u64>,
+  /// Per-client count of acked replies already drained from [`Cluster::client_replies_at`] (the
+  /// per-client ack record is append-only).
+  ack_cursor: Vec<usize>,
+  /// The acked set: `(client, request, ack_instant)` per client-acked write, in ack order. Resolved
+  /// to `(op, ack_instant)` against [`Self::op_of`] at check time (the apply stream is fully folded by
+  /// then, so every acked request's op is known).
+  acked: Vec<(u128, u64, Instant)>,
+  /// Recorded linearizable-read observations: `(issue_instant, returned_index, returned_body)`. Empty
+  /// until a read path exists; the staleness enforcement folds these against the acked set.
+  reads: Vec<(Instant, u64, Bytes)>,
+}
+
+impl StalenessChecker {
+  /// A staleness checker for a cluster of `replica_count` replicas and `client_count` clients.
+  pub fn new(replica_count: usize, client_count: usize) -> Self {
+    Self {
+      committed: Vec::new(),
+      cursor: vec![0; replica_count],
+      incarnation: vec![0; replica_count],
+      op_of: HashMap::new(),
+      ack_cursor: vec![0; client_count],
+      acked: Vec::new(),
+      reads: Vec::new(),
+    }
+  }
+
+  /// Fold one tick of cluster state into the floor + the op map + the acked set, returning the first
+  /// violation. Pure over its inputs so the floor + acked-set logic is unit-testable without a live
+  /// `Cluster`: `streams[i]` is replica `i`'s full apply stream (an append-only extension of the slice
+  /// passed previously), `applied[i]` is replica `i`'s current applied `(op, body)` log, and each
+  /// `acks[c]` is `(client_id, record)` with `record` client `c`'s full `(request, reply,
+  /// ack_instant)` ack history (also append-only). The client id is threaded explicitly so an ack
+  /// resolves to its op via the `(client, request) -> op` map without relying on an index convention.
+  fn fold(
+    &mut self,
+    streams: &[&[(u64, AppliedEvent)]],
+    applied: &[Vec<(u64, Bytes)>],
+    acks: &[(u128, &[AckRecord])],
+  ) -> CheckResult {
+    // (1) The staleness floor: extend the committed history, firing on a rewritten committed op (a
+    // floor regression). Identical in spirit to `DurabilityChecker::fold`'s no-rewrite check — a
+    // deliberate independent cross-check that the floor never moves backwards.
+    for (i, a) in applied.iter().enumerate() {
+      let n = a.len().min(self.committed.len());
+      if a[..n] != self.committed[..n] {
+        let pos = (0..n).find(|&p| a[p] != self.committed[p]).unwrap_or(0);
+        let (cop, cbody) = &self.committed[pos];
+        let (aop, abody) = &a[pos];
+        return CheckResult::violation(format!(
+          "replica {i}: applied prefix diverges from the committed history at op {cop} — the \
+           staleness floor regressed (a committed op was rewritten): committed=({cop},{cbody:?}) \
+           replica=({aop},{abody:?})"
+        ));
+      }
+      if a.len() > self.committed.len() {
+        self.committed = a.clone();
+      }
+    }
+    // (2) Learn `(client, request) -> op` from the apply streams (the op authority). Re-emissions
+    // across incarnations agree, so a later identical insertion is a no-op; a DISAGREEMENT would be a
+    // double-apply the `AppliedOnceChecker` owns, so this map just keeps the first-seen op.
+    for (i, stream) in streams.iter().enumerate() {
+      while self.cursor[i] < stream.len() {
+        let (incarnation, entry) = &stream[self.cursor[i]];
+        self.cursor[i] += 1;
+        if *incarnation != self.incarnation[i] {
+          self.incarnation[i] = *incarnation;
+        }
+        if let AppliedEvent::Committed(c) = entry {
+          self
+            .op_of
+            .entry((c.client().get(), c.request().get()))
+            .or_insert_with(|| c.op().get());
+        }
+      }
+    }
+    // (3) Drain new acks into the acked set (append-only per client), tagged with the client id so an
+    // ack later resolves to its committed op via the `(client, request) -> op` map.
+    for (c, (client_id, record)) in acks.iter().enumerate() {
+      while self.ack_cursor[c] < record.len() {
+        let (request, _reply, ack_instant) = &record[self.ack_cursor[c]];
+        self.ack_cursor[c] += 1;
+        self.acked.push((*client_id, *request, *ack_instant));
+      }
+    }
+    CheckResult::Ok
+  }
+
+  /// Record a linearizable-read observation: a read issued at `issue_instant` returned applied index
+  /// `returned_index` carrying `returned_body`. Stored for the staleness enforcement in
+  /// [`check`](Self::check). No read path exists in the behavior-preserving phase, so this is unused
+  /// today — it is the seam a future linearizable-read path reports through.
+  pub fn record_read(&mut self, issue_instant: Instant, returned_index: u64, returned_body: Bytes) {
+    self
+      .reads
+      .push((issue_instant, returned_index, returned_body));
+  }
+
+  /// Sample the cluster: fold the floor, the op map, and the acked set for this tick, returning a
+  /// violation on a floor regression. Call every tick.
+  pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
+    let streams: Vec<&[(u64, AppliedEvent)]> = (0..cluster.replica_count())
+      .map(|i| cluster.replica_applied_events(i))
+      .collect();
+    let applied: Vec<Vec<(u64, Bytes)>> = (0..cluster.replica_count())
+      .map(|i| cluster.replica_sm(i).applied().to_vec())
+      .collect();
+    let acks: Vec<(u128, &[AckRecord])> = (0..cluster.client_count())
+      .map(|i| (cluster.client(i).id().get(), cluster.client_replies_at(i)))
+      .collect();
+    // The client-spawn churn lane can grow the client set mid-run; keep the ack cursor in step so a
+    // spawned client's acks are folded rather than panicking on a missing cursor.
+    while self.ack_cursor.len() < acks.len() {
+      self.ack_cursor.push(0);
+    }
+    self.fold(&streams, &applied, &acks)
+  }
+
+  /// Final staleness assertion (run post-quiesce): folds any not-yet-observed state, then enforces
+  /// that every recorded read is not stale against the writes acked before it issued, and that the
+  /// acked set is non-empty whenever the cluster committed anything (the capture is non-vacuous).
+  pub fn check(&mut self, cluster: &Cluster) -> CheckResult {
+    if let v @ CheckResult::Violation(_) = self.observe(cluster) {
+      return v;
+    }
+    let committed_any = !self.committed.is_empty();
+    // Resolve every ack to its committed op via the apply-stream map (now fully folded). FAIL
+    // CLOSED on a miss: an acked request was answered with a `Reply`, so its op committed and
+    // applied, so it MUST appear in some replica's apply stream. Silently skipping an unresolved
+    // ack would DROP it from the floor — masking a higher acked op behind a lower resolved one and
+    // letting a stale read pass — the exact way an oracle weakens itself into vacuity.
+    let resolved = match Self::resolve_acks(&self.acked, &self.op_of) {
+      Ok(resolved) => resolved,
+      Err((client, request)) => {
+        return CheckResult::violation(format!(
+          "client {client} request {request} was acked but appears in no apply stream — the \
+           staleness oracle cannot resolve its committed op (failing closed: a dropped ack would \
+           silently lower the floor and pass a stale read)"
+        ));
+      }
+    };
+    Self::check_reads(&resolved, &self.reads, committed_any)
+  }
+
+  /// Resolve each acked `(client, request, ack_instant)` to `(op, ack_instant)` via the
+  /// apply-stream op map. Pure so the fail-closed resolution is unit-testable without a live
+  /// `Cluster`. `Err((client, request))` if any acked request is absent from the map — the caller
+  /// turns that into a violation rather than dropping the ack from the floor.
+  fn resolve_acks(
+    acked: &[(u128, u64, Instant)],
+    op_of: &HashMap<(u128, u64), u64>,
+  ) -> Result<Vec<(u64, Instant)>, (u128, u64)> {
+    let mut resolved = Vec::with_capacity(acked.len());
+    for (client, request, ack_instant) in acked {
+      match op_of.get(&(*client, *request)) {
+        Some(&op) => resolved.push((op, *ack_instant)),
+        None => return Err((*client, *request)),
+      }
+    }
+    Ok(resolved)
+  }
+
+  /// The final-check core over the resolved acked set (`(op, ack_instant)` pairs) and the recorded
+  /// reads. Pure over its inputs so the staleness logic is unit-testable without a live `Cluster`:
+  ///
+  /// - **non-vacuity**: if the cluster committed anything but the acked set is empty, the capture
+  ///   recorded nothing — the oracle would otherwise pass vacuously forever.
+  /// - **staleness**: every read at instant `T` returning index `R` must satisfy `R >= N`, where `N`
+  ///   is the highest committed op acked strictly before `T`. A read returning below a write that
+  ///   completed before it issued is a stale (non-linearizable) read.
+  fn check_reads(
+    acked: &[(u64, Instant)],
+    reads: &[(Instant, u64, Bytes)],
+    committed_any: bool,
+  ) -> CheckResult {
+    if committed_any && acked.is_empty() {
+      return CheckResult::violation(
+        "the cluster committed ops but the staleness acked set is empty — the ack-time capture \
+         recorded nothing",
+      );
+    }
+    for (issued_at, returned_index, _body) in reads {
+      // The staleness floor for this read: the highest op acked strictly before it issued.
+      let floor = acked
+        .iter()
+        .filter(|(_, ack_at)| ack_at < issued_at)
+        .map(|(op, _)| *op)
+        .max();
+      if let Some(n) = floor
+        && *returned_index < n
+      {
+        return CheckResult::violation(format!(
+          "linearizable read issued at {} returned applied index {returned_index}, below the \
+           staleness floor {n} (a write committed at op {n} was acked before the read issued) — a \
+           stale read",
+          issued_at.as_nanos(),
+        ));
       }
     }
     CheckResult::Ok
@@ -859,6 +1114,168 @@ mod tests {
     assert!(
       once.fold(&[&s0]).is_violation(),
       "an op regression within an incarnation must be flagged"
+    );
+  }
+
+  #[test]
+  fn staleness_checker_clean_run_passes() {
+    // A clean run records no reads (there is no read path), so the staleness enforcement is
+    // vacuously satisfied; the floor stays monotone and the acked set is non-empty (clients are
+    // acked), so the non-vacuity guard passes.
+    let mut c = Cluster::new(3, 2, 3, 9);
+    let mut stale = StalenessChecker::new(c.replica_count(), c.client_count());
+    for _ in 0..50_000 {
+      c.tick();
+      assert!(stale.observe(&c).is_ok());
+      if (0..c.client_count()).all(|i| c.client(i).is_done()) {
+        break;
+      }
+    }
+    assert!(
+      stale.check(&c).is_ok(),
+      "a clean run keeps the floor monotone and records no stale read"
+    );
+  }
+
+  #[test]
+  fn staleness_checker_flags_a_read_below_a_write_acked_before_it() {
+    // A read issued at T=100 returns applied index 4, but a write committed at op 5 was acked at
+    // T=50 (before the read issued) — the read is stale (it failed to reflect a completed write).
+    let acked = [(5u64, Instant::from_nanos(50))];
+    let reads = [(Instant::from_nanos(100), 4u64, Bytes::from_static(b"r"))];
+    assert!(
+      StalenessChecker::check_reads(&acked, &reads, true).is_violation(),
+      "a read returning below a write acked before it issued must be flagged"
+    );
+  }
+
+  #[test]
+  fn staleness_checker_passes_a_fresh_read() {
+    // A read at or above every write acked before it issued is fresh. Op 5 acked at T=50; a read at
+    // T=100 returning index 5 (== floor) and one returning 7 (> floor) both pass.
+    let acked = [(5u64, Instant::from_nanos(50))];
+    assert!(
+      StalenessChecker::check_reads(
+        &acked,
+        &[(Instant::from_nanos(100), 5u64, Bytes::from_static(b"r"))],
+        true,
+      )
+      .is_ok(),
+      "a read returning exactly the floor is fresh"
+    );
+    assert!(
+      StalenessChecker::check_reads(
+        &acked,
+        &[(Instant::from_nanos(100), 7u64, Bytes::from_static(b"r"))],
+        true,
+      )
+      .is_ok(),
+      "a read returning above the floor is fresh"
+    );
+    // A read that issued BEFORE the write was acked owes nothing to that write — only writes acked
+    // strictly before the read constrain it. A read at T=40 (before the op-5 ack at T=50) returning
+    // index 0 is fine.
+    assert!(
+      StalenessChecker::check_reads(
+        &acked,
+        &[(Instant::from_nanos(40), 0u64, Bytes::from_static(b"r"))],
+        true,
+      )
+      .is_ok(),
+      "a read that issued before a write was acked is not stale against it"
+    );
+  }
+
+  #[test]
+  fn staleness_checker_flags_a_regressed_floor() {
+    // The staleness floor is the committed history high-water; a committed op that reads back with a
+    // DIFFERENT body across observations is a floor regression (a committed op was rewritten).
+    let mut stale = StalenessChecker::new(2, 0);
+    let o1: Vec<Vec<(u64, Bytes)>> = vec![
+      vec![(1, Bytes::from_static(b"a")), (2, Bytes::from_static(b"b"))],
+      vec![(1, Bytes::from_static(b"a")), (2, Bytes::from_static(b"b"))],
+    ];
+    assert!(stale.fold(&[&[], &[]], &o1, &[]).is_ok());
+    let o2: Vec<Vec<(u64, Bytes)>> = vec![
+      vec![(1, Bytes::from_static(b"a")), (2, Bytes::from_static(b"b"))],
+      vec![(1, Bytes::from_static(b"a")), (2, Bytes::from_static(b"X"))],
+    ];
+    assert!(
+      stale.fold(&[&[], &[]], &o2, &[]).is_violation(),
+      "a rewritten committed op (floor regression) must be flagged"
+    );
+  }
+
+  #[test]
+  fn staleness_checker_fails_closed_on_an_unresolved_ack() {
+    // An ack whose op the apply streams never recorded must FAIL the resolution — never be dropped.
+    // Dropping it would lower the floor: here client 7's request 2 (the higher op, acked later) is
+    // missing from the map while request 1 (op 5) resolves; silently skipping request 2 would let a
+    // later read returning index 5 pass even though a higher write was acked before it.
+    let mut op_of = HashMap::new();
+    op_of.insert((7u128, 1u64), 5u64);
+    let acked = [
+      (7u128, 1u64, Instant::from_nanos(50)),
+      (7u128, 2u64, Instant::from_nanos(60)),
+    ];
+    assert_eq!(
+      StalenessChecker::resolve_acks(&acked, &op_of),
+      Err((7u128, 2u64)),
+      "an acked request absent from the apply-stream map fails closed, not silently dropped"
+    );
+    // With the full map both resolve.
+    op_of.insert((7u128, 2u64), 6u64);
+    assert!(
+      StalenessChecker::resolve_acks(&acked, &op_of).is_ok(),
+      "a fully-mapped acked set resolves"
+    );
+  }
+
+  #[test]
+  fn staleness_checker_final_check_is_non_vacuous() {
+    // The cluster committed ops but no client was acked — the ack-time capture recorded nothing, so
+    // the staleness oracle would otherwise pass vacuously.
+    assert!(
+      StalenessChecker::check_reads(&[], &[], true).is_violation(),
+      "committed ops with an empty acked set must be flagged"
+    );
+    assert!(
+      StalenessChecker::check_reads(&[], &[], false).is_ok(),
+      "nothing committed, nothing required"
+    );
+  }
+
+  #[test]
+  fn staleness_checker_resolves_acked_ops_from_the_apply_stream() {
+    // End-to-end through the live `fold`: an apply stream records client 7's request 1 at op 5 and
+    // request 2 at op 6; the client's ack record carries both with ack instants. After folding, a
+    // read at T just after the op-6 ack that returns index 5 is stale (op 6 was acked before it).
+    let mut stale = StalenessChecker::new(1, 1);
+    let stream = vec![applied(0, 5, 7, 1, b"a"), applied(0, 6, 7, 2, b"b")];
+    let applied_log: Vec<Vec<(u64, Bytes)>> = vec![vec![
+      (5, Bytes::from_static(b"a")),
+      (6, Bytes::from_static(b"b")),
+    ]];
+    let acks: &[(u64, Bytes, Instant)] = &[
+      (1, Bytes::from_static(b"a"), Instant::from_nanos(50)),
+      (2, Bytes::from_static(b"b"), Instant::from_nanos(60)),
+    ];
+    assert!(
+      stale
+        .fold(&[&stream], &applied_log, &[(7u128, acks)])
+        .is_ok()
+    );
+    // Resolve the acked set the way `check` does, then drive a stale read against it.
+    stale.record_read(Instant::from_nanos(70), 5, Bytes::from_static(b"stale"));
+    let mut resolved: Vec<(u64, Instant)> = Vec::new();
+    for (client, request, ack_instant) in &stale.acked {
+      if let Some(&op) = stale.op_of.get(&(*client, *request)) {
+        resolved.push((op, *ack_instant));
+      }
+    }
+    assert!(
+      StalenessChecker::check_reads(&resolved, &stale.reads, true).is_violation(),
+      "a read returning op 5 after op 6 was acked is stale once acks resolve to their committed ops"
     );
   }
 

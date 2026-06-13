@@ -151,6 +151,11 @@ fn report_digest(r: &VoprReport) -> u64 {
     r.bodies_with_multiple_units(),
     r.max_units_per_body(),
     r.groups_submitted(),
+    // The stale-read witnesses are deliberately NOT folded here: they are zero on the default
+    // schedule, but folding a field changes this report hash's schema, which would make the report
+    // column differ between checkouts for a reason other than a behavioral change. The report hash
+    // stays a stable cross-checkout quantity; an accidental off-axis stale-read engagement would
+    // depose a primary and so perturb the applied-history and committed digest columns regardless.
   ] {
     fnv1a_u64(&mut h, v);
   }
