@@ -254,6 +254,8 @@ impl Cluster {
         } else {
           Config::try_new_member(1, ReplicaId::new(i), replica_count, learner_count)
             .expect("valid cluster config")
+            .with_checkpoint_interval(checkpoint_ops)
+            .expect("valid checkpoint interval")
         };
         Endpoint::new(
           cfg,
@@ -903,6 +905,8 @@ impl Cluster {
     } else {
       Config::try_new_member(1, ReplicaId::new(i), self.replica_count, self.learner_count)
         .expect("valid cluster config")
+        .with_checkpoint_interval(self.checkpoint_ops)
+        .expect("valid checkpoint interval")
     };
     match self.max_client_sessions {
       Some(cap) => cfg

@@ -282,6 +282,29 @@ impl Config {
     })
   }
 
+  /// Returns this configuration with the checkpoint interval replaced (chainable; consumes the copy).
+  /// The interval MUST be identical on every replica of the cluster. This is the path to set a
+  /// non-default interval on a config built via [`Config::try_new_member`] (a learner's own config),
+  /// mirroring the interval [`Config::with_checkpoint_ops`] takes for a voter at construction.
+  ///
+  /// # Errors
+  /// [`ConfigError::ZeroCheckpointOps`] if `checkpoint_ops == 0`; [`ConfigError::CheckpointOpsTooLarge`]
+  /// if it exceeds [`MAX_CHECKPOINT_OPS`].
+  pub const fn with_checkpoint_interval(self, checkpoint_ops: u64) -> Result<Self, ConfigError> {
+    if checkpoint_ops == 0 {
+      return Err(ConfigError::ZeroCheckpointOps);
+    }
+    if checkpoint_ops > MAX_CHECKPOINT_OPS {
+      return Err(ConfigError::CheckpointOpsTooLarge {
+        ops: checkpoint_ops,
+      });
+    }
+    Ok(Self {
+      checkpoint_ops,
+      ..self
+    })
+  }
+
   /// The cluster id.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn cluster(&self) -> u128 {
@@ -611,5 +634,26 @@ mod tests {
     assert_eq!(c.learner_count(), 3);
     assert_eq!(c.node_count(), 8);
     assert_eq!(c.checkpoint_ops(), 16); // earlier builder steps are preserved
+  }
+
+  #[test]
+  fn with_checkpoint_interval_sets_a_learners_interval() {
+    // A learner's own config (built via `try_new_member`, which uses the default interval) takes the
+    // cluster's checkpoint interval via the chainable setter — so a learner checkpoints on the same
+    // cadence as the voters.
+    let learner = Config::try_new_member(7, ReplicaId::new(5), 3, 4)
+      .unwrap()
+      .with_checkpoint_interval(16)
+      .unwrap();
+    assert_eq!(learner.checkpoint_ops(), 16);
+    assert!(learner.is_learner(ReplicaId::new(5))); // id 5 is in [replica_count 3, node_count 7)
+    assert_eq!(learner.replica_count(), 3); // the voting set is unchanged
+    assert_eq!(
+      Config::try_new_member(7, ReplicaId::new(5), 3, 4)
+        .unwrap()
+        .checkpoint_ops(),
+      DEFAULT_CHECKPOINT_OPS
+    ); // without the setter it is the default
+    assert!(learner.with_checkpoint_interval(0).is_err()); // zero rejected
   }
 }
