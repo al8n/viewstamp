@@ -345,7 +345,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || self.pending_sb.is_some() {
       return; // only a Normal replica whose view is durable may serve a (view-advertising) repair Prepare
     }
-    if m.replica().get() >= self.config.replica_count() {
+    if m.replica().get() >= self.config.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     let op = m.op().get();
@@ -414,7 +414,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || self.pending_sb.is_some() {
       return;
     }
-    if m.replica().get() >= self.config.replica_count() {
+    if m.replica().get() >= self.config.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     let lo = m.lo().get();

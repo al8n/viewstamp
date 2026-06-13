@@ -292,7 +292,7 @@ pub(crate) struct PendingInstall {
 struct ViewChangeCollection {
   /// Prospective primary: collected DoViewChange messages, keyed by replica index. Empty for a
   /// catching-up replica (it solicits a `StartView`, never collects DVCs).
-  dvc_from: BTreeMap<u8, DoViewChange>,
+  dvc_from: BTreeMap<ReplicaId, DoViewChange>,
   /// Prospective primary: the canonical log has been formed this view (the DVC quorum was reached and
   /// `start_view_as_new_primary` ran). Gates `on_do_view_change` against re-forming a finished view.
   dvc_quorum: bool,
@@ -864,7 +864,7 @@ pub struct Endpoint<S> {
   /// frees an op a `quorum` of replicas has not yet checkpointed. Bounded by `replica_count` (<= 64);
   /// cleared on every view-change transition (a new generation re-establishes the pipeline, so old
   /// reports are stale — clearing keeps the primary conservative until fresh `PrepareOk`s arrive).
-  peer_checkpoint: BTreeMap<u8, OpNumber>,
+  peer_checkpoint: BTreeMap<ReplicaId, OpNumber>,
   /// CACHED [`Self::quorum_checkpoint_op`] (the quorum-th order statistic over
   /// `self.checkpoint_op` + the `peer_checkpoint` reports). The uncached computation allocates +
   /// sorts per call, and `prune_floor()` reads it on EVERY client request (the WAL-stall check), so
@@ -918,7 +918,7 @@ pub struct Endpoint<S> {
   /// `SyncCheckpointMeta` announce when it does not, or one `SyncChunk` for a cold-cache pull; a
   /// `Fault` drops the entry silently (the requester re-solicits; another peer answers). Cleared per
   /// entry on completion/fault.
-  sync_serving: BTreeMap<u8, SyncServe>,
+  sync_serving: BTreeMap<ReplicaId, SyncServe>,
   /// The donor-side serve cache ([`SyncDonating`]): the last VERIFIED checkpoint serve-read, kept so
   /// chunk pulls slice it zero-copy instead of re-reading + re-hashing the superblock per chunk.
   /// `None` until the first verified serve-read (or after a crash — volatile); survives the donor's
@@ -1361,7 +1361,7 @@ impl<S> Endpoint<S> {
   /// after a partition heals) must never lower the value we hold. Keeping this monotone keeps the GC
   /// prune floor (`quorum_checkpoint_op`) and the force-sync/forfeit triggers that read it from
   /// moving backward — a regressing floor could spuriously un-fire the force-sync escalation. (T1)
-  fn record_peer_checkpoint(&mut self, replica: u8, reported: OpNumber) {
+  fn record_peer_checkpoint(&mut self, replica: ReplicaId, reported: OpNumber) {
     let prev = self
       .peer_checkpoint
       .get(&replica)
@@ -1406,13 +1406,14 @@ impl<S> Endpoint<S> {
   fn compute_quorum_checkpoint_op(&self) -> OpNumber {
     let count = self.config.replica_count();
     let mut cps: std::vec::Vec<u64> = std::vec::Vec::with_capacity(count as usize);
-    let me = self.config.replica().get();
+    let me = self.config.replica();
     cps.push(self.checkpoint_op.get()); // self always counts its own durable checkpoint
     for r in 0..count {
-      if r == me {
+      let rid = ReplicaId::new(u16::from(r));
+      if rid == me {
         continue;
       }
-      cps.push(self.peer_checkpoint.get(&r).map_or(0, |c| c.get()));
+      cps.push(self.peer_checkpoint.get(&rid).map_or(0, |c| c.get()));
     }
     cps.sort_unstable_by(|a, b| b.cmp(a)); // descending
     // `cps.len() == replica_count >= quorum`, so `cps[quorum - 1]` is always in bounds.
@@ -1600,7 +1601,10 @@ impl<S> Endpoint<S> {
   /// Test-only: the per-peer recorded checkpoint (0 if unheard). Proves T1 monotonicity directly.
   #[cfg(test)]
   fn peer_checkpoint_for_test(&self, replica: u8) -> u64 {
-    self.peer_checkpoint.get(&replica).map_or(0, |c| c.get())
+    self
+      .peer_checkpoint
+      .get(&ReplicaId::new(u16::from(replica)))
+      .map_or(0, |c| c.get())
   }
 
   /// Test-only: directly seed a peer's reported checkpoint (bypassing a real PrepareOk/Commit), so a
@@ -1608,7 +1612,7 @@ impl<S> Endpoint<S> {
   /// MONOTONE recorder, so a lower injection cannot regress a higher recorded value.
   #[cfg(test)]
   fn inject_peer_checkpoint_for_test(&mut self, replica: u8, op: u64) {
-    self.record_peer_checkpoint(replica, OpNumber::with(op));
+    self.record_peer_checkpoint(ReplicaId::new(u16::from(replica)), OpNumber::with(op));
   }
 
   /// Test-only: set this replica's own durable `checkpoint_op` (the value the forfeit gate compares
@@ -1827,7 +1831,7 @@ impl<S> Endpoint<S> {
   /// deterministically. Not part of the stable API.
   #[doc(hidden)]
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn sync_transfer_donor(&self) -> Option<u8> {
+  pub fn sync_transfer_donor(&self) -> Option<u16> {
     self.sync_transfer.as_ref().map(|t| t.donor.get())
   }
 
@@ -1952,7 +1956,7 @@ impl<S> Endpoint<S> {
     self.svc_from = 0b101;
     let mut dvc_from = BTreeMap::new();
     dvc_from.insert(
-      0,
+      ReplicaId::new(0),
       crate::DoViewChange::new(
         self.view,
         View::new(),
@@ -1970,7 +1974,7 @@ impl<S> Endpoint<S> {
     self.pending.insert(7, Pending::Ack(OpNumber::with(1)));
     self.appending.insert(1);
     // Through the production recorder so the cached quorum statistic stays coherent.
-    self.record_peer_checkpoint(2, OpNumber::with(3));
+    self.record_peer_checkpoint(ReplicaId::new(2), OpNumber::with(3));
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op: self.commit_min,
       checkpoint_id: 0,
@@ -2030,7 +2034,7 @@ impl<S> Endpoint<S> {
   /// freshly-`new`'d (Normal) endpoint without running a real ViewChange entry, so they seed the DVC map
   /// directly through this — sidestepping the production `dvc_from_mut`'s "ViewChange only" `expect`.
   #[cfg(test)]
-  fn dvc_from_mut_for_test(&mut self) -> &mut BTreeMap<u8, DoViewChange> {
+  fn dvc_from_mut_for_test(&mut self) -> &mut BTreeMap<ReplicaId, DoViewChange> {
     &mut self
       .view_change
       .get_or_insert_with(|| ViewChangeCollection::entering(false))
@@ -2121,7 +2125,7 @@ impl<S> Endpoint<S> {
         from == Peer::Client(r.client())
           || from
             .as_replica()
-            .is_some_and(|id| id.get() < self.config.replica_count())
+            .is_some_and(|id| id.get() < self.config.replica_count() as u16)
       }
       // Self-identifying replica messages: the authenticated peer must be the claimed sender AND a
       // CONFIGURED cluster member (`replica < replica_count`). The membership range check is CENTRALIZED
@@ -2175,7 +2179,7 @@ impl<S> Endpoint<S> {
       // a spurious catch-up; a repair op is `<= self.op`, so it cannot advance the head.)
       Message::Prepare(p) => {
         from == Peer::Replica(self.config.primary(p.view()))
-          || (matches!(from, Peer::Replica(r) if r.get() < self.config.replica_count())
+          || (matches!(from, Peer::Replica(r) if r.get() < self.config.replica_count() as u16)
             && self.repair.contains(&p.op().get()))
       }
       // `RepairBatch` is the windowed analogue of a repair-serve `Prepare`: it carries NO self
@@ -2188,7 +2192,7 @@ impl<S> Endpoint<S> {
       // entry, so an unsolicited / forged batch is rejected entry-by-entry exactly like a forged repair
       // `Prepare` — no committed slot is filled from a non-replica peer or an unverified body.
       Message::RepairBatch(_) => {
-        matches!(from, Peer::Replica(r) if r.get() < self.config.replica_count())
+        matches!(from, Peer::Replica(r) if r.get() < self.config.replica_count() as u16)
       }
       // `Reply` is ignored by replicas (dropped in the dispatch) — no-op.
       Message::Reply(_) => true,
@@ -2203,7 +2207,7 @@ impl<S> Endpoint<S> {
   /// (`PrepareOk`/`StartViewChange`/`DoViewChange`/`SyncCheckpoint`/…) is membership-checked uniformly,
   /// not relying on each handler's own (inconsistent) downstream range check.
   fn sender_is_member_replica(&self, from: Peer, claimed: ReplicaId) -> bool {
-    claimed.get() < self.config.replica_count() && from == Peer::Replica(claimed)
+    claimed.get() < self.config.replica_count() as u16 && from == Peer::Replica(claimed)
   }
 }
 

@@ -6,18 +6,18 @@
 /// address is a driver concern, not the state machine's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct ReplicaId(u8);
+pub struct ReplicaId(u16);
 
 impl ReplicaId {
   /// Creates a replica id.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(index: u8) -> Self {
+  pub const fn new(index: u16) -> Self {
     Self(index)
   }
 
   /// The replica index.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn get(self) -> u8 {
+  pub const fn get(self) -> u16 {
     self.0
   }
 }

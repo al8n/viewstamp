@@ -1244,7 +1244,7 @@ impl<S: StateMachine> Endpoint<S> {
     if self.pending_sb.is_some() {
       return;
     }
-    if m.replica().get() >= self.config.replica_count() {
+    if m.replica().get() >= self.config.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     let (op, commit, floor, log) = if self.is_primary() {

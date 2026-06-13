@@ -338,7 +338,7 @@ mod tests {
     Conn::from_parts(Passthrough::new())
   }
 
-  fn labeled_conn(cluster: u128, me: u8, accept: bool) -> Conn<Labeled<Passthrough>> {
+  fn labeled_conn(cluster: u128, me: u16, accept: bool) -> Conn<Labeled<Passthrough>> {
     let opts = LabelOptions::new(cluster, Peer::Replica(ReplicaId::new(me)));
     if accept {
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))

@@ -65,7 +65,7 @@ pub(super) enum Scheme {
 /// `layout` selects the QUIC stream layout (threaded into the per-replica [`ClusterTls`] builder).
 pub(super) fn replica(
   ca: &TestClusterCa,
-  id: u8,
+  id: u16,
   rng_seed: [u8; 32],
   scheme: Scheme,
   layout: StreamLayout,
@@ -548,7 +548,7 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
   // Two coordinators over accept-any TLS (so the QUIC handshake completes regardless of identity),
   // each with a custom source that writes the REAL cluster in its preface but attests a FOREIGN
   // cluster in `authenticate`. The coordinator must reject the wrong-cluster candidate.
-  let build = |id: u8,
+  let build = |id: u16,
                seed: [u8; 32]|
    -> (
     QuicCoordinator<CountSm, WrongClusterSource>,
@@ -644,7 +644,7 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
 /// a cert for a replica index the receiving node no longer recognises.
 fn replica_in_cluster_of(
   ca: &TestClusterCa,
-  id: u8,
+  id: u16,
   count: u8,
   rng_seed: [u8; 32],
   scheme: Scheme,
@@ -695,7 +695,7 @@ fn small_node_binds_peer(scheme: Scheme, peer_id: u8) -> bool {
   // The dialing peer: genuine `Replica(peer_id)` of its own (possibly larger) cluster config.
   let mut peer = replica_in_cluster_of(
     &ca,
-    peer_id,
+    u16::from(peer_id),
     peer_count,
     [1u8; 32],
     scheme,
@@ -747,13 +747,13 @@ fn small_node_binds_peer(scheme: Scheme, peer_id: u8) -> bool {
   // An out-of-membership peer must also never have pinned a connection slot: the reject path runs
   // BEFORE `bind_validated`, so a rejected candidate leaves the small node holding no live connection
   // for it. (The peer's own redial attempts are each closed the same way.)
-  if !bound.contains(&Peer::Replica(ReplicaId::new(peer_id))) {
+  if !bound.contains(&Peer::Replica(ReplicaId::new(u16::from(peer_id)))) {
     assert!(
       small.0.bridge_table_len() == 0,
       "a rejected out-of-membership candidate must not pin a connection slot on the small node"
     );
   }
-  bound.contains(&Peer::Replica(ReplicaId::new(peer_id)))
+  bound.contains(&Peer::Replica(ReplicaId::new(u16::from(peer_id))))
 }
 
 /// A replica whose validly-attested index is OUTSIDE the receiving node's configured membership

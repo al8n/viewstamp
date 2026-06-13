@@ -14,7 +14,7 @@ use crate::{
 
 const CLUSTER: u128 = 0x5151;
 
-fn replica<R: StreamTransport>(id: u8) -> (StreamCoordinator<CountSm, R>, TestWal, TestSb) {
+fn replica<R: StreamTransport>(id: u16) -> (StreamCoordinator<CountSm, R>, TestWal, TestSb) {
   let cfg = Config::try_new(CLUSTER, ReplicaId::new(id), 2).unwrap();
   let coord = StreamCoordinator::new(Endpoint::new(cfg, u64::from(id) + 1, CountSm::default()));
   (coord, TestWal::default(), TestSb::default())
@@ -88,11 +88,11 @@ fn assert_converged<R: StreamTransport>(
 
 #[test]
 fn two_replicas_commit_over_plain_tcp() {
-  fn dialer(me: u8) -> Conn<Labeled<Passthrough>> {
+  fn dialer(me: u16) -> Conn<Labeled<Passthrough>> {
     let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
     Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
   }
-  fn acceptor(me: u8) -> Conn<Labeled<Passthrough>> {
+  fn acceptor(me: u16) -> Conn<Labeled<Passthrough>> {
     let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   }
@@ -119,11 +119,11 @@ fn two_replicas_commit_over_plain_tcp() {
 // replicas converge over plain TCP with the request fed through the public api, not the inject seam.
 #[test]
 fn public_submit_client_request_over_tcp_converges() {
-  fn dialer(me: u8) -> Conn<Labeled<Passthrough>> {
+  fn dialer(me: u16) -> Conn<Labeled<Passthrough>> {
     let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
     Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
   }
-  fn acceptor(me: u8) -> Conn<Labeled<Passthrough>> {
+  fn acceptor(me: u16) -> Conn<Labeled<Passthrough>> {
     let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   }
@@ -194,13 +194,13 @@ mod tls {
       .with_no_client_auth();
     TlsOptions::new(server, client)
   }
-  fn dialer(me: u8, opts: &TlsOptions) -> Conn<Labeled<TlsRecords>> {
+  fn dialer(me: u16, opts: &TlsOptions) -> Conn<Labeled<TlsRecords>> {
     let lopts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let inner = TlsRecords::client(opts.client_arc(), name).unwrap();
     Conn::from_parts(Labeled::dialer(inner, &lopts))
   }
-  fn acceptor(me: u8, opts: &TlsOptions) -> Conn<Labeled<TlsRecords>> {
+  fn acceptor(me: u16, opts: &TlsOptions) -> Conn<Labeled<TlsRecords>> {
     let lopts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
     let inner = TlsRecords::server(opts.server_arc()).unwrap();
     Conn::from_parts(Labeled::acceptor(inner, &lopts))
