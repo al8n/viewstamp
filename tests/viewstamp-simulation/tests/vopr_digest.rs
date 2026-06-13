@@ -145,6 +145,12 @@ fn report_digest(r: &VoprReport) -> u64 {
     r.one_way_dropped(),
     r.slow_episodes(),
     r.slow_delays(),
+    // The batching witnesses: identically zero with the axis off, so default-lane digests are
+    // unchanged by their presence — and a regression that accidentally engaged batching draws
+    // perturbs the digest loudly.
+    r.bodies_with_multiple_units(),
+    r.max_units_per_body(),
+    r.groups_submitted(),
   ] {
     fnv1a_u64(&mut h, v);
   }

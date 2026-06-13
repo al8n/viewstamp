@@ -4,6 +4,7 @@
 //! network with a virtual clock and one seeded PRNG, so a whole cluster is a
 //! deterministic function of its seed.
 
+pub mod batching;
 pub mod checker;
 pub mod client;
 pub mod clock;
@@ -13,6 +14,7 @@ pub mod sm;
 pub mod storage;
 pub mod vopr;
 
+pub use batching::{BatchingConfig, check_batching};
 pub use checker::{
   AppliedOnceChecker, BoundednessChecker, CheckResult, DurabilityChecker, ViewMonotonicChecker,
   check_safety,
@@ -21,6 +23,7 @@ pub use cluster::{AppliedEvent, Cluster};
 pub use network::{Faults, SlowProfile};
 pub use storage::{InMemorySuperblock, InMemoryWal, StorageFaults};
 pub use vopr::{
-  DEFAULT_TICKS, VoprReport, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_churn,
-  run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_torn_headers, run_vopr_with_wipe,
+  DEFAULT_TICKS, VoprReport, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
+  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_torn_headers,
+  run_vopr_with_wipe,
 };
