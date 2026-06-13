@@ -40,6 +40,7 @@ use std::{
   collections::VecDeque,
   future::{Future, poll_fn},
   pin::{Pin, pin},
+  sync::{Arc, Mutex, PoisonError},
   task::{Context, Poll},
   time::Duration,
 };
@@ -372,11 +373,35 @@ impl BodyLimits {
 /// A cheaply-cloneable handle submitting units to the batching aggregator. Unconditionally
 /// `Send + Sync` (channel ends, the queue budget, and copied limits), independent of the pump's
 /// sleep factory: any thread may submit while the pump runs wherever the embedder spawned it.
-#[derive(Clone)]
 pub struct BatchHandle {
-  entries: flume::Sender<Entry>,
+  queue: Arc<Mutex<QueueState>>,
   budget: InflightBudget,
   limits: BodyLimits,
+}
+
+/// The aggregator's ONE synchronization domain: the entry queue, the teardown flag, and the
+/// pump's park waker, under a single lock. Two hazard classes shaped this:
+///
+/// - A channel with no close-then-drain lets a send race past a teardown drain into a dead
+///   buffer — caller parked forever, guard pinned. Here the closed flag and the queue mutate
+///   under ONE lock: a send either lands before the drain (which then resolves it) or observes
+///   `closed` and refuses; the stranded interleaving is unrepresentable.
+/// - A wake fired under a held lock deadlocks an inline-polling waker that re-enters (a retry on
+///   refusal, the pump's own park). Every operation here therefore only MUTATES under the lock
+///   and TAKES the waker out with it; the wake — and every oneshot resolution — fires after
+///   release. No wake-capable call exists inside any lock scope, by construction.
+pub(crate) struct QueueState {
+  entries: VecDeque<Entry>,
+  closed: bool,
+  /// The pump's park waker (single consumer): registered when the pump finds the queue empty,
+  /// taken — under the lock — by whichever send or teardown should wake it.
+  waker: Option<core::task::Waker>,
+  /// Live [`BatchHandle`] count, mutated UNDER the lock by the handles' manual `Clone`/`Drop`.
+  /// This — not the queue Arc's strong count — is the pump's teardown signal: an Arc count is
+  /// observed by an inline-polled pump BEFORE the dropping handle's own Arc field is released
+  /// (fields drop after `Drop::drop` returns), which loses the final wakeup; this count
+  /// decrements under the lock before the wake fires, so a woken pump always observes zero.
+  handles: usize,
 }
 
 impl BatchHandle {
@@ -483,21 +508,31 @@ impl BatchHandle {
   /// reserved entry has a channel slot. Either error drops the entry — and its guard — rolling
   /// the budget back.
   fn send(&self, entry: Entry) -> Result<(), BatchError> {
-    match self.entries.try_send(entry) {
-      Ok(()) => Ok(()),
-      Err(flume::TrySendError::Full(_)) => {
-        debug_assert!(
-          false,
-          "the queue budget reserves before the send, so a reserved entry always has a slot"
-        );
-        Err(BatchError::Refused {
-          reason: RefusedReason::QueueFull,
-        })
+    let waker = {
+      let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+      if queue.closed {
+        // The pump has torn down (or is tearing down under this same lock): refuse — the entry,
+        // and its guard, roll back with the early return. (The queue budget's count cap bounds
+        // the queue length; no separate capacity refusal exists.)
+        return Err(BatchError::Refused {
+          reason: RefusedReason::PumpGone,
+        });
       }
-      Err(flume::TrySendError::Disconnected(_)) => Err(BatchError::Refused {
-        reason: RefusedReason::PumpGone,
-      }),
+      queue.entries.push_back(entry);
+      queue.waker.take()
+    };
+    // The wake fires OUTSIDE the lock: an inline-polling waker may immediately run the pump —
+    // which takes this same lock.
+    if let Some(waker) = waker {
+      waker.wake();
     }
+    Ok(())
+  }
+
+  /// The shared queue, for the wake-discipline assertion (a probing waker try_locks it).
+  #[cfg(test)]
+  pub(crate) fn queue_state(&self) -> Arc<Mutex<QueueState>> {
+    Arc::clone(&self.queue)
   }
 
   /// The queue budget, for test assertions on reservation/release accounting.
@@ -551,7 +586,6 @@ enum Verdict {
 /// future held locally resolve through their dropped oneshots.
 pub struct AggregatorPump<F> {
   handle: Handle,
-  entries: flume::Receiver<Entry>,
   stall: Option<Stall<F>>,
   limits: BodyLimits,
   /// Entries popped from the channel but not yet packed (a group deferred whole when a body
@@ -564,6 +598,9 @@ pub struct AggregatorPump<F> {
   /// `Drop` as `OutcomeUnknown` — the body is already in the driver and may commit; a dropped
   /// oneshot would otherwise read as a retry-safe refusal and license a double-apply.
   in_flight: RefCell<Vec<UnitReply>>,
+  /// The queue shared with every [`BatchHandle`] (see [`QueueState`]): teardown closes and
+  /// drains it under its one lock; the pump parks on its waker slot.
+  queue: Arc<Mutex<QueueState>>,
 }
 
 impl<F> Drop for AggregatorPump<F> {
@@ -583,16 +620,21 @@ impl<F> Drop for AggregatorPump<F> {
       },
     );
     // Deferred and still-queued entries never entered consensus: refused, safe to resubmit.
-    // (Dropping the receiver alone would leave queued entries alive in the channel's shared
-    // buffer — senders keep it allocated — parking their callers and pinning their queue budget
-    // forever; the drain is what frees both.)
     let refused = BatchError::Refused {
       reason: RefusedReason::PumpGone,
     };
     for entry in self.deferred.take() {
       resolve_all(entry.into_replies(), &refused);
     }
-    while let Ok(entry) = self.entries.try_recv() {
+    // Close and collect under the queue's one lock, resolve AFTER releasing it (resolution
+    // wakes receivers; no wake-capable call runs under the lock — see `QueueState`).
+    let drained = {
+      let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+      queue.closed = true;
+      queue.waker = None;
+      core::mem::take(&mut queue.entries)
+    };
+    for entry in drained {
       resolve_all(entry.into_replies(), &refused);
     }
   }
@@ -648,22 +690,64 @@ fn split<F>(
     submit_limit: handle.submit_byte_limit(),
     max_units: max_units_per_body(cfg.max_unit_reply_len()),
   };
-  let (tx, rx) = flume::bounded(cfg.max_queued_units());
+  let queue = Arc::new(Mutex::new(QueueState {
+    // The queue budget's count cap (= max_queued_units, reserved before every send) is what
+    // bounds this deque; no separate channel capacity exists.
+    entries: VecDeque::new(),
+    closed: false,
+    waker: None,
+    handles: 1,
+  }));
   (
     BatchHandle {
-      entries: tx,
+      queue: Arc::clone(&queue),
       budget: InflightBudget::new(cfg.max_queued_units(), cfg.max_queued_bytes()),
       limits,
     },
     AggregatorPump {
       handle,
-      entries: rx,
       stall,
       limits,
       deferred: RefCell::new(VecDeque::new()),
       in_flight: RefCell::new(Vec::new()),
+      queue,
     },
   )
+}
+
+impl Clone for BatchHandle {
+  fn clone(&self) -> Self {
+    self
+      .queue
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .handles += 1;
+    Self {
+      queue: Arc::clone(&self.queue),
+      budget: self.budget.clone(),
+      limits: self.limits,
+    }
+  }
+}
+
+impl Drop for BatchHandle {
+  fn drop(&mut self) {
+    // The decrement happens UNDER the lock, BEFORE the wake fires: a parked pump woken by the
+    // final drop — even one polled inline from this very wake — observes `handles == 0` and
+    // returns. Only the final drop takes the waker; earlier drops change no observation.
+    let waker = {
+      let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+      queue.handles -= 1;
+      if queue.handles == 0 {
+        queue.waker.take()
+      } else {
+        None
+      }
+    };
+    if let Some(waker) = waker {
+      waker.wake();
+    }
+  }
 }
 
 /// Resolve every unit of `units` with the same error (whole-body outcomes resolve uniformly);
@@ -783,12 +867,29 @@ where
     // drains it before the channel. It lives in the pump so a dropped run future resolves its
     // entries explicitly in `Drop`.
     loop {
-      // THE BATCHING CLOCK, phase 1: no body is in flight. Park until at least one entry exists
-      // (`Err` = every BatchHandle dropped and the queue drained: teardown).
+      // THE BATCHING CLOCK, phase 1: no body is in flight. Park until at least one entry exists,
+      // returning on teardown: the queue's explicit handle count reaching zero means every
+      // BatchHandle has dropped — decremented under the lock before the final drop's wake fires,
+      // so even an inline-polled pump observes it.
       if self.deferred.borrow().is_empty() {
-        match self.entries.recv_async().await {
-          Ok(entry) => self.deferred.borrow_mut().push_back(entry),
-          Err(_) => return,
+        let received = poll_fn(|cx| {
+          let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+          if let Some(entry) = queue.entries.pop_front() {
+            return Poll::Ready(Some(entry));
+          }
+          if queue.closed || queue.handles == 0 {
+            return Poll::Ready(None);
+          }
+          match &mut queue.waker {
+            Some(waker) if waker.will_wake(cx.waker()) => {}
+            slot => *slot = Some(cx.waker().clone()),
+          }
+          Poll::Pending
+        })
+        .await;
+        match received {
+          Some(entry) => self.deferred.borrow_mut().push_back(entry),
+          None => return,
         }
       }
 
@@ -798,13 +899,17 @@ where
       let mut callers = Vec::new();
       let mut guards = Vec::new();
       loop {
-        let popped = self.deferred.borrow_mut().pop_front();
+        let popped = self.deferred.borrow_mut().pop_front().or_else(|| {
+          self
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .pop_front()
+        });
         let entry = match popped {
           Some(entry) => entry,
-          None => match self.entries.try_recv() {
-            Ok(entry) => entry,
-            Err(_) => break,
-          },
+          None => break,
         };
         // Pre-pack cancellation: an entry no caller can observe never enters consensus. Dropping
         // it here releases its queue-budget guard.
@@ -912,7 +1017,19 @@ where
           for entry in self.deferred.take() {
             resolve_all(entry.into_replies(), &stalled);
           }
-          while let Ok(entry) = self.entries.try_recv() {
+          // Close-then-drain under the shared gate (see `Drop`): a send racing this drain either
+          // landed before it (drained as Stalled below) or observes `closed` and refuses. The
+          // drain only COLLECTS under the lock — resolution wakes receivers, and nothing
+          // wake-capable runs under the gate (a re-entrant waker retrying a submit would
+          // deadlock the non-reentrant mutex).
+          let mut drained = Vec::new();
+          {
+            let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            queue.closed = true;
+            queue.waker = None;
+            drained.extend(queue.entries.drain(..));
+          }
+          for entry in drained {
             resolve_all(entry.into_replies(), &stalled);
           }
           return;
@@ -1624,6 +1741,179 @@ mod tests {
       "an entry within the remaining capacity is admitted"
     );
     assert_eq!(batch.queue_budget().bytes(), 10, "the cap is byte-exact");
+  }
+
+  /// The final handle drop's wake must let even an INLINE-polled pump observe teardown: the
+  /// live-handle count decrements under the lock before the wake fires, so a waker that polls
+  /// `run()` synchronously from inside that wake sees zero and returns. (An Arc-strong-count
+  /// signal loses this wakeup: the dropping handle's own Arc field is released only after its
+  /// `Drop` returns, so the inline poll would observe a still-live count, re-park, and never be
+  /// woken again.)
+  #[test]
+  fn the_final_handle_drop_wakes_an_inline_polled_pump_to_completion() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type BoxedRun = Pin<Box<dyn Future<Output = ()> + Send>>;
+    struct InlinePoller {
+      slot: std::sync::Mutex<Option<BoxedRun>>,
+      done: AtomicBool,
+    }
+    impl std::task::Wake for InlinePoller {
+      fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+      }
+      fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        // Poll the parked run future synchronously, right here inside the wake.
+        let Some(mut run) = self.slot.lock().unwrap().take() else {
+          return;
+        };
+        let waker = std::task::Waker::from(std::sync::Arc::clone(self));
+        let mut cx = Context::from_waker(&waker);
+        if run.as_mut().poll(&mut cx).is_ready() {
+          self.done.store(true, Ordering::SeqCst);
+        } else {
+          *self.slot.lock().unwrap() = Some(run);
+        }
+      }
+    }
+
+    let (handle, _driver) = driver_handle(MAX_PENDING_BYTES);
+    let (batch, pump) = aggregator(handle, BatchConfig::new(64));
+    let poller = std::sync::Arc::new(InlinePoller {
+      slot: std::sync::Mutex::new(None),
+      done: AtomicBool::new(false),
+    });
+
+    // Park the pump with the inline poller as its waker, then stash the future in the poller.
+    let mut run: BoxedRun = Box::pin(pump.run());
+    let waker = std::task::Waker::from(std::sync::Arc::clone(&poller));
+    let mut cx = Context::from_waker(&waker);
+    assert!(run.as_mut().poll(&mut cx).is_pending());
+    *poller.slot.lock().unwrap() = Some(run);
+
+    // The final handle drop: its wake inline-polls the parked pump, which must observe zero
+    // handles and complete.
+    drop(batch);
+    assert!(
+      poller.done.load(Ordering::SeqCst),
+      "the inline-polled pump observed teardown and returned"
+    );
+  }
+
+  /// EVERY wake fires outside the queue lock: the probing waker try_locks the queue inside its
+  /// `wake()` and panics if the lock is held — so a wake-capable call under any lock scope (the
+  /// send's pump wake, a handle-drop wake, a teardown resolution) fails the test at the wake
+  /// site. This pins the discipline that keeps an inline-polling waker from deadlocking the
+  /// non-reentrant mutex by re-entering a submit or the pump.
+  #[test]
+  fn every_wake_fires_outside_the_queue_lock() {
+    struct LockProbe {
+      queue: std::sync::Arc<std::sync::Mutex<super::QueueState>>,
+    }
+    impl std::task::Wake for LockProbe {
+      fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+      }
+      fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        assert!(
+          self.queue.try_lock().is_ok(),
+          "a wake fired while the queue lock was held"
+        );
+      }
+    }
+
+    let (handle, mut driver) = driver_handle(MAX_PENDING_BYTES);
+    let (batch, pump) = aggregator(handle, BatchConfig::new(64));
+    let probe = std::sync::Arc::new(LockProbe {
+      queue: batch.queue_state(),
+    });
+    let waker = std::task::Waker::from(std::sync::Arc::clone(&probe));
+    let mut cx = Context::from_waker(&waker);
+
+    let mut run = Box::pin(pump.run());
+    // Park the pump: it registers the probe as its park waker.
+    assert!(run.as_mut().poll(&mut cx).is_pending());
+
+    // The send's pump wake fires the probe (outside the lock, or it panics).
+    let s1 = batch.submit(Bytes::from_static(b"w"));
+    pin_mut!(s1);
+    assert!(s1.as_mut().poll(&mut cx).is_pending());
+
+    // Pack + hand off; resolve the reply: the demux resolution wakes s1's probe.
+    assert!(run.as_mut().poll(&mut cx).is_pending());
+    let (_, units, reply) = driver.next_body();
+    let mut rb = ReplyBuilder::new(viewstamp_proto::max_reply_body_len(), 64);
+    for _ in 0..units.len() {
+      rb.push(b"ok").expect("reply fits");
+    }
+    reply
+      .send(rb.finish().expect("a unit was pushed"))
+      .expect("the pump awaits the reply");
+    assert!(run.as_mut().poll(&mut cx).is_ready() || run.as_mut().poll(&mut cx).is_pending());
+    assert!(s1.as_mut().poll(&mut cx).is_ready());
+
+    // A unit queued at teardown: the Drop resolution wakes its probe after the lock released.
+    let s2 = batch.submit(Bytes::from_static(b"q"));
+    pin_mut!(s2);
+    assert!(s2.as_mut().poll(&mut cx).is_pending());
+    drop(run);
+    assert!(s2.as_mut().poll(&mut cx).is_ready());
+
+    // A handle drop's wake path (a clone dropping runs the same Drop): no pump is parked, the
+    // take is None — the lock scope's discipline is still exercised.
+    drop(batch.clone());
+  }
+
+  /// Submits racing pump teardown from other threads can never strand: flume has no
+  /// close-then-drain, so without the shared gate a send slipping past the Drop drain's final
+  /// `try_recv` would park its caller forever on an entry no one can observe and pin its queue
+  /// budget. Under the gate every racer either lands before the drain (resolved `Refused` by it)
+  /// or observes the closed gate (refused at send) — so every submit RESOLVES and the budget
+  /// drains to zero. The threads hammer the window; the join is the no-strand witness.
+  #[test]
+  fn submits_racing_pump_teardown_never_strand() {
+    for _ in 0..64 {
+      let (handle, _driver) = driver_handle(MAX_PENDING_BYTES);
+      let (batch, pump) = aggregator(handle, BatchConfig::new(64));
+      let workers: Vec<_> = (0..3)
+        .map(|_| {
+          let batch = batch.clone();
+          std::thread::spawn(move || {
+            for _ in 0..16 {
+              let submit = batch.submit(Bytes::from_static(b"racer"));
+              pin_mut!(submit);
+              // Drive the future to completion by hand (no runtime in this crate): every
+              // resolution is acceptable — Refused before/at teardown, or a strand (which this
+              // loop would turn into a hang, the failure signal).
+              let outcome = loop {
+                match poll_once(&mut submit) {
+                  Poll::Ready(outcome) => break outcome,
+                  Poll::Pending => std::thread::yield_now(),
+                }
+              };
+              if matches!(outcome, Err(BatchError::Refused { .. })) {
+                // The retry a refusal licenses: it must itself resolve (a second refusal), never
+                // block on teardown's gate or strand.
+                let retry = batch.submit(Bytes::from_static(b"retry"));
+                pin_mut!(retry);
+                loop {
+                  match poll_once(&mut retry) {
+                    Poll::Ready(_) => break,
+                    Poll::Pending => std::thread::yield_now(),
+                  }
+                }
+              }
+            }
+          })
+        })
+        .collect();
+      drop(pump);
+      for w in workers {
+        w.join().expect("no racer stranded or panicked");
+      }
+      assert_eq!(batch.queue_budget().count(), 0, "every guard released");
+      assert_eq!(batch.queue_budget().bytes(), 0);
+    }
   }
 
   /// A pump dying with a body IN FLIGHT resolves that body's callers `OutcomeUnknown` — the body
