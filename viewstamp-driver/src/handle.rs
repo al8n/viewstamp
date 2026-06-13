@@ -145,6 +145,21 @@ impl Handle {
     rx.await.map_err(|_| DriverError::ReplyDropped)
   }
 
+  /// The largest body a single [`Self::submit`] on this handle can ever carry to a commit: the
+  /// smaller of the transport bound
+  /// ([`viewstamp_proto::max_request_body_len()`](viewstamp_proto::max_request_body_len), past
+  /// which `submit` returns [`DriverError::RequestTooLarge`]) and this driver's configured
+  /// in-flight byte cap (the budget's `max_bytes`, past which even a LONE body can never reserve
+  /// and `submit` returns [`DriverError::Busy`] forever).
+  ///
+  /// Anything that packs bodies for this handle — the batching aggregator — must size them against
+  /// THIS limit, read from the handle it submits through: packing against the transport bound
+  /// alone would mint bodies a smaller-than-default byte cap permanently refuses.
+  #[must_use]
+  pub fn submit_byte_limit(&self) -> usize {
+    viewstamp_proto::max_request_body_len().min(self.budget.max_bytes())
+  }
+
   /// Request shutdown and await teardown completion.
   ///
   /// The returned future resolves only after the driver has fully RELEASED its socket/listener
@@ -196,6 +211,34 @@ mod tests {
   fn handle_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Handle>();
+  }
+
+  /// `submit_byte_limit` is the min of the transport bound and the driver's byte cap, whichever
+  /// binds: at the default caps the transport bound is the smaller (128 MiB >> one max frame), and
+  /// a small configured byte cap takes over so a packer can never mint a body the budget refuses
+  /// forever.
+  #[test]
+  fn submit_byte_limit_is_the_binding_min_of_transport_and_budget() {
+    let (_events_tx, events_rx) = flume::unbounded();
+    let (tx, _rx) = futures_channel::mpsc::channel::<Command>(8);
+    let default_caps = Handle::new(
+      tx,
+      events_rx.clone(),
+      InflightBudget::new(MAX_INFLIGHT, MAX_PENDING_BYTES),
+    );
+    assert_eq!(
+      default_caps.submit_byte_limit(),
+      viewstamp_proto::max_request_body_len(),
+      "at the default byte cap the transport bound binds"
+    );
+
+    let (tx, _rx) = futures_channel::mpsc::channel::<Command>(8);
+    let tiny_cap = Handle::new(tx, events_rx, InflightBudget::new(MAX_INFLIGHT, 64));
+    assert_eq!(
+      tiny_cap.submit_byte_limit(),
+      64,
+      "a configured byte cap below the transport bound binds instead"
+    );
   }
 
   #[test]

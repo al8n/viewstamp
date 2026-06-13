@@ -5,14 +5,20 @@
 //! [`Handle`] and its [`Command`] protocol, the in-flight submit budget the handle reserves
 //! against, the [`DriverConfig`] tuning surface, the [`Clock`] anchoring the proto's monotonic
 //! instants to std time, the session run-loop helpers (endpoint construction, pending-submit
-//! bookkeeping, retransmission, committed-event delivery), and the [`DriverError`] type drivers
-//! surface to the application.
+//! bookkeeping, retransmission, committed-event delivery), the [`DriverError`] type drivers
+//! surface to the application, and the edge-batching [`aggregator`] coalescing many caller units
+//! into one consensus op per submit.
 
+mod aggregate;
 mod clock;
 mod config;
 mod handle;
 mod session;
 
+pub use aggregate::{
+  AggregatorPump, BatchConfig, BatchError, BatchHandle, NeverReady, NoStall, OutcomeUnknownReason,
+  RefusedReason, ReplyLostReason, aggregator, aggregator_with_stall,
+};
 pub use clock::Clock;
 pub use config::DriverConfig;
 pub use handle::{Command, Handle, Reply};

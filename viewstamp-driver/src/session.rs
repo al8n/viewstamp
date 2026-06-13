@@ -226,6 +226,19 @@ impl InflightBudget {
   pub fn bytes(&self) -> usize {
     self.bytes.load(Ordering::Relaxed)
   }
+
+  /// The count cap this budget enforces (immutable after construction).
+  pub const fn max_count(&self) -> usize {
+    self.max_count
+  }
+
+  /// The byte cap this budget enforces (immutable after construction). This is the binding bound
+  /// on a single submit's body: a body longer than this can never reserve, so anything packing
+  /// bodies for [`crate::Handle::submit`] must size them against it (see
+  /// [`crate::Handle::submit_byte_limit`]).
+  pub const fn max_bytes(&self) -> usize {
+    self.max_bytes
+  }
 }
 
 /// An owning RAII handle to ONE [`InflightBudget`] reservation: it holds a budget clone plus the
@@ -403,6 +416,22 @@ mod tests {
       reservation,
     };
     (entry, reply_rx)
+  }
+
+  /// The cap accessors report the construction-time bounds verbatim, independent of how much is
+  /// currently reserved — they are the budget's static shape, not its live counters.
+  #[test]
+  fn budget_caps_are_readable_and_immutable() {
+    let budget = InflightBudget::new(7, 99);
+    assert_eq!(budget.max_count(), 7);
+    assert_eq!(budget.max_bytes(), 99);
+    let _guard = budget.try_acquire(10).expect("room for one reservation");
+    assert_eq!(
+      budget.max_count(),
+      7,
+      "a live reservation moves the counters, not the caps"
+    );
+    assert_eq!(budget.max_bytes(), 99);
   }
 
   #[test]
