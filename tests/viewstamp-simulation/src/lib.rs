@@ -24,6 +24,6 @@ pub use network::{Faults, SlowProfile};
 pub use storage::{InMemorySuperblock, InMemoryWal, StorageFaults};
 pub use vopr::{
   DEFAULT_TICKS, VoprReport, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
-  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_stale_read,
-  run_vopr_with_torn_headers, run_vopr_with_wipe,
+  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_learners, run_vopr_with_slow,
+  run_vopr_with_stale_read, run_vopr_with_torn_headers, run_vopr_with_wipe,
 };

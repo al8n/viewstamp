@@ -118,6 +118,15 @@ pub struct Cluster {
   /// driver drains it each tick via [`take_durable_view_violation`]. See
   /// [`record_durable_view_violation`](Self::record_durable_view_violation).
   durable_view_violation: Option<SmolStr>,
+  /// Set by [`schedule`](Self::schedule) when a NON-VOTING learner (a `from` id `>= replica_count`)
+  /// was the source of a COUNTED message — a `PrepareOk`, `StartViewChange`, or `DoViewChange`. A
+  /// learner follows the committed log but must NEVER emit any of these (it is never a voter, never a
+  /// prospective primary, never an active view-change participant), so this stays `None` for a correct
+  /// proto; a recorded value is a REAL finding (a learner participating in consensus). Drained each
+  /// tick by the VOPR driver via [`take_learner_emission_violation`]. Recorded structurally at
+  /// schedule time, which sees every emitted inter-replica message with its `from` regardless of
+  /// whether a fault later drops it — recording changes no scheduling and takes no PRNG draw.
+  learner_emission_violation: Option<SmolStr>,
   /// `None` (default) ⇒ every replica's WAL appends SYNCHRONOUSLY (the deterministic gates' mode).
   /// `Some(d)` ⇒ async-append mode with per-append delay `d` polls — the in-flight window the
   /// append-before-ack invariant must survive. Set via [`set_async_wal_delay`] before running;
@@ -210,7 +219,14 @@ impl Cluster {
     seed: u64,
     checkpoint_ops: u64,
   ) -> Self {
-    Self::with_members(replicas, 0, clients, requests_per_client, seed, checkpoint_ops)
+    Self::with_members(
+      replicas,
+      0,
+      clients,
+      requests_per_client,
+      seed,
+      checkpoint_ops,
+    )
   }
 
   /// Builds a cluster of `replica_count` VOTING replicas plus `learner_count` non-voting learners
@@ -274,6 +290,7 @@ impl Cluster {
       slow: vec![None; n],
       append_before_ack_violation: None,
       durable_view_violation: None,
+      learner_emission_violation: None,
       async_wal_delay: None,
       async_sb_delay: None,
       wal_capacity: None,
@@ -514,6 +531,14 @@ impl Cluster {
   /// kinds), if any. `None` when none has occurred since the last drain.
   pub fn take_durable_view_violation(&mut self) -> Option<SmolStr> {
     self.durable_view_violation.take()
+  }
+
+  /// Drains the most recent learner-emission violation observed during [`tick`](Self::tick) (a
+  /// non-voting learner emitted a `PrepareOk`/`StartViewChange`/`DoViewChange` — a counted message it
+  /// must never send), if any. `None` when none has occurred since the last drain. Recorded
+  /// structurally at schedule time against the emitter's id.
+  pub fn take_learner_emission_violation(&mut self) -> Option<SmolStr> {
+    self.learner_emission_violation.take()
   }
 
   /// Record a durable-view-before-participate violation if `out` (emitted by replica `ri`) advertises
@@ -866,10 +891,15 @@ impl Cluster {
   /// learner id (`[replica_count, node_count)`) builds via [`Config::try_new_member`].
   fn replica_config(&self, i: u16) -> Config {
     let cfg = if i < self.replica_count as u16 {
-      Config::with_checkpoint_ops(1, ReplicaId::new(i), self.replica_count, self.checkpoint_ops)
-        .expect("valid cluster config")
-        .with_learner_count(self.learner_count)
-        .expect("valid learner count")
+      Config::with_checkpoint_ops(
+        1,
+        ReplicaId::new(i),
+        self.replica_count,
+        self.checkpoint_ops,
+      )
+      .expect("valid cluster config")
+      .with_learner_count(self.learner_count)
+      .expect("valid learner count")
     } else {
       Config::try_new_member(1, ReplicaId::new(i), self.replica_count, self.learner_count)
         .expect("valid cluster config")
@@ -1524,6 +1554,31 @@ impl Cluster {
   /// exercising the protocol's idempotency / re-ack paths.
   fn schedule(&mut self, now: Instant, from: Peer, target: Target, msg: Message) {
     if let (Peer::Replica(from_r), Target::Replica(to_r)) = (from, target) {
+      // A NON-VOTING learner (id `>= replica_count`) must never emit a COUNTED message: a `PrepareOk`
+      // (a commit-quorum vote), a `StartViewChange` or a `DoViewChange` (active view-change
+      // participation). It applies the committed log and may solicit catch-up, but it is never a voter
+      // and never a prospective primary, so any such emission is a REAL finding (a learner taking part
+      // in consensus). Recorded BEFORE the partition/one-way/frame drops below, so a learner's counted
+      // message trips this even when a fault would later drop it; the recording changes no scheduling
+      // and takes no PRNG draw. Drained by the VOPR driver each tick.
+      if usize::from(from_r.get()) >= self.replica_count as usize
+        && matches!(
+          msg,
+          Message::PrepareOk(_) | Message::StartViewChange(_) | Message::DoViewChange(_)
+        )
+        && self.learner_emission_violation.is_none()
+      {
+        self.learner_emission_violation = Some(
+          format!(
+            "learner {} emitted a counted message {} — a non-voting learner must never send a \
+             PrepareOk/StartViewChange/DoViewChange (it is never a voter, prospective primary, or \
+             active view-change participant)",
+            from_r.get(),
+            msg.kind_str(),
+          )
+          .into(),
+        );
+      }
       if self.partitioned(from_r.get(), to_r) {
         return;
       }

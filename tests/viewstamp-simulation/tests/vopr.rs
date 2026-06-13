@@ -149,8 +149,8 @@
 
 use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
-  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_slow, run_vopr_with_stale_read,
-  run_vopr_with_torn_headers, run_vopr_with_wipe,
+  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_learners, run_vopr_with_slow,
+  run_vopr_with_stale_read, run_vopr_with_torn_headers, run_vopr_with_wipe,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -887,6 +887,93 @@ fn vopr_stale_read_sweep_no_violations() {
   println!(
     "VOPR stale-read sweep OK: stale_read_failovers_observed={total_failovers} \
      cut_installs={total_probes} committed={total_committed}"
+  );
+}
+
+/// The contiguous seed range for the committed LEARNER sweep (same budget rationale as
+/// [`HOLD_SEEDS`]).
+const LEARNER_SEEDS: u64 = 64;
+
+/// The committed LEARNER sweep: [`run_vopr_with_learners`] over `0..LEARNER_SEEDS` — the learner axis
+/// FORCE-ENABLED programmatically (the [`run_vopr_with_hold`] pattern: no env var, no schedule races,
+/// cannot be forgotten by a runner). The cluster carries 1..=3 NON-VOTING learners alongside the
+/// voting set; a learner applies the committed log the voters agreed on but NEVER emits a counted
+/// message (PrepareOk/StartViewChange/DoViewChange), is NEVER primary, and may catch up via
+/// state-sync. UNDER the axis the driver also crashes a learner for a sustained window WITHOUT
+/// charging the minority budget, so the calm-window committed-progress assertion must STILL advance
+/// using the voters alone — voter fault tolerance is independent of learner health.
+///
+/// The oracles run inside every `run_vopr_with_learners` call: never-primary and no-learner-emit
+/// every tick, learner convergence post-quiesce, and the calm-window progress assertion across the
+/// learner outage. A violation in any of them PANICS with its seed (a learner voting/leading, a
+/// learner diverging from the committed history, or a learner outage stalling voter progress is a
+/// REAL finding) — so simply running this sweep exercises them. This test additionally asserts the
+/// axis is NON-VACUOUS: across the seeds, learners genuinely applied ops, caught up via state-sync,
+/// AND followed view changes — otherwise the learner plumbing ran without doing learner work.
+///
+/// The DEFAULT sweep leaves this axis OFF (the learner count grows `node_count` behind a separate
+/// magic-seeded draw, leaving the action stream byte-identical when off); learner-enabled runs are
+/// their own deterministic baselines, byte-identical to `VOPR_LEARNER=1` runs of the same seeds.
+#[test]
+fn learner_axis_is_non_vacuous() {
+  let mut total_ops_applied = 0u64;
+  let mut total_repairs = 0u64;
+  let mut total_view_changes_followed = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR learner sweep: 0..{LEARNER_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, learner axis \
+     forced on"
+  );
+  for seed in 0..LEARNER_SEEDS {
+    let r = run_vopr_with_learners(seed, DEFAULT_TICKS);
+    total_ops_applied += r.learner_ops_applied();
+    total_repairs += r.learner_repairs_served();
+    total_view_changes_followed += r.learner_view_changes_followed();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity across all three witnesses — each proves a distinct learner behavior genuinely
+  // happened under the full adversarial schedule:
+  // - learners APPLIED committed ops (they follow the committed log the voters agreed on),
+  assert!(
+    total_ops_applied > 0,
+    "no learner applied any committed op across the sweep (learner_ops_applied={total_ops_applied}) \
+     — the learner lane is vacuous: learners are not following the committed log"
+  );
+  // - learners CAUGHT UP via state-sync (a learner that fell behind was brought current by the same
+  //   repair/state-sync machinery a lagging voter is), and
+  assert!(
+    total_repairs > 0,
+    "no learner ever completed a state-sync across the sweep (learner_repairs_served={total_repairs}) \
+     — a learner that fell behind never caught up via the repair/state-sync path"
+  );
+  // - learners FOLLOWED view changes (a learner adopted a new primary's view without ever being an
+  //   active view-change participant).
+  assert!(
+    total_view_changes_followed > 0,
+    "no learner ever followed a view change across the sweep \
+     (learner_view_changes_followed={total_view_changes_followed}) — learners never adopted a higher \
+     view, so the view-following path is untested"
+  );
+  // And the learner-enabled runs still did real work, with at least one seed driving a view change —
+  // a learner following a view change requires a view change to occur somewhere in the sweep.
+  assert!(
+    total_committed > 0,
+    "the learner sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no learner-sweep seed drove a view change — the view-following path this lane guards never came \
+     under test"
+  );
+  println!(
+    "VOPR learner sweep OK: learner_ops_applied={total_ops_applied} \
+     learner_repairs_served={total_repairs} \
+     learner_view_changes_followed={total_view_changes_followed} committed={total_committed} \
+     view_change_seeds={seeds_with_view_change}"
   );
 }
 

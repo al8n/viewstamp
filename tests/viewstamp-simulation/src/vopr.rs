@@ -270,6 +270,23 @@ pub struct VoprReport {
   /// installed. `0` unless the stale-read axis is enabled; the committed sweep asserts the
   /// cross-seed sum is `> 0`.
   stale_read_failovers_observed: u64,
+  /// Cumulative committed ops APPLIED across all learners this run, summed reset-robustly over the
+  /// learner ids (a `recover` re-applies from the durable checkpoint, so positive deltas are folded
+  /// like [`Self::forced_syncs`]). `0` with the axis off (no learners). `> 0` proves a learner
+  /// genuinely follows the committed log — the headline that a non-voting member applies the same
+  /// history as the voters. The learner sweep asserts the cross-seed sum is `> 0`.
+  learner_ops_applied: u64,
+  /// Cumulative state-syncs a LEARNER completed (fetched + installed a checkpoint past its head) this
+  /// run, summed reset-robustly over the learner ids like [`Self::forced_syncs`] (the `Endpoint`
+  /// counter zeroes on `recover`). `0` with the axis off. `> 0` proves a learner that fell behind
+  /// CAUGHT UP via the repair/state-sync path — a learner is brought current by the same machinery a
+  /// lagging voter is. The learner sweep asserts the cross-seed sum is `> 0`.
+  learner_repairs_served: u64,
+  /// Cumulative view ADVANCES a learner followed this run (each time a learner adopted a strictly
+  /// higher view via `GetView`), summed over the learner ids. `0` with the axis off. `> 0` proves a
+  /// learner TRACKS view changes — it adopts the new primary's view without ever being an active
+  /// view-change participant. The learner sweep asserts the cross-seed sum is `> 0`.
+  learner_view_changes_followed: u64,
 }
 
 impl VoprReport {
@@ -530,6 +547,26 @@ impl VoprReport {
   pub const fn stale_read_failovers_observed(&self) -> u64 {
     self.stale_read_failovers_observed
   }
+
+  /// The run-cumulative count of committed ops applied across all learners. `0` with the axis off;
+  /// the learner sweep asserts the cross-seed sum is `> 0` — a non-voting learner genuinely follows
+  /// the committed log.
+  pub const fn learner_ops_applied(&self) -> u64 {
+    self.learner_ops_applied
+  }
+
+  /// The run-cumulative count of state-syncs a learner completed (it caught up from behind via the
+  /// repair/state-sync path). `0` with the axis off; the learner sweep asserts the cross-seed sum is
+  /// `> 0`.
+  pub const fn learner_repairs_served(&self) -> u64 {
+    self.learner_repairs_served
+  }
+
+  /// The run-cumulative count of view advances a learner followed (it adopted a higher view via
+  /// `GetView`). `0` with the axis off; the learner sweep asserts the cross-seed sum is `> 0`.
+  pub const fn learner_view_changes_followed(&self) -> u64 {
+    self.learner_view_changes_followed
+  }
 }
 
 /// The driver's own seeded RNG + bookkeeping. Separate from the cluster's internal network/storage
@@ -686,6 +723,39 @@ struct Vopr {
   /// target stays cut is the causal failover witness; a heal first abandons the probe — so the
   /// lane's non-vacuity counts completed failovers, not bare cut installs.
   active_stale_probe: Option<(usize, u64)>,
+  /// Whether the LEARNER axis is enabled for this run: the `VOPR_LEARNER` env var, or force-enabled
+  /// via [`run_vopr_with_learners`] (the committed learner sweep). When ON, the cluster carries
+  /// 1..=3 non-voting learners (ids `[voting_count, node_count)`) drawn from a SEPARATE per-seed PRNG
+  /// so the action stream is unperturbed; when OFF no learner draw is consumed and `node_count`
+  /// equals `voting_count`, leaving the default per-seed schedule byte-identical. A learner follows
+  /// the voting set's committed log, never emits a counted message, is never primary, and may catch
+  /// up via state-sync — so a learner outage never reduces voter fault tolerance. Under the axis the
+  /// driver also crashes a learner for a sustained window (NOT charged against the minority budget)
+  /// to witness that voter progress is independent of learner health.
+  learner_axis: bool,
+  /// Per-replica last-observed applied-op count on a learner, so [`Self::learner_ops_applied`] folds
+  /// the cumulative ops a learner applied across crash/restart (a `recover` re-applies from the
+  /// durable checkpoint, so a plain high-water would under- or double-count). Indexed by replica; a
+  /// voter slot stays 0 (only learner ids are sampled). The reset-robust positive-delta accumulation
+  /// of [`Self::forced_sync_seen`].
+  learner_applied_seen: Vec<usize>,
+  /// Per-replica last-observed view on a learner, so [`Self::learner_view_changes_followed`] folds
+  /// each time a learner ADOPTS a higher view (it caught up to a new primary's view via `GetView`).
+  /// Indexed by replica; a voter slot stays 0. A learner view is monotone within an incarnation, so a
+  /// plain positive-delta over the run counts the view advances it followed.
+  learner_view_seen: Vec<u64>,
+  /// Per-replica last-observed COMPLETED-state-sync count on a learner, so
+  /// [`Self::learner_repairs_served`] folds each catch-up a learner completed. Indexed by replica; a
+  /// voter slot stays 0. The `Endpoint` counter zeroes on `recover`, so this uses the same
+  /// reset-robust positive-delta accumulation as [`Self::forced_sync_seen`].
+  learner_repairs_seen: Vec<u64>,
+  /// The tick at which the active learner-chaos crash window expires (the sustained learner outage
+  /// the liveness-independence oracle installs). `0` when no learner is crashed by the axis.
+  learner_crash_until: u64,
+  /// The learner currently crashed by the learner-chaos behavior, if any (one at a time). Restarted
+  /// at [`Self::learner_crash_until`], on calm-window entry, and by the final quiesce. NOT counted
+  /// against the minority budget — a learner outage must never reduce voter fault tolerance.
+  learner_crashed: Option<usize>,
   /// Per-replica last-observed session-eviction count, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
   sessions_evicted_seen: Vec<u64>,
@@ -704,7 +774,7 @@ struct Vopr {
 /// view-monotonicity, boundedness, append-before-ack, structural-ordering, or liveness (including
 /// final-quiesce non-convergence) violation — so a failing seed is reproducible via [`run_vopr_one`].
 pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
-  run_seeded(Vopr::new(seed), ticks)
+  run_seeded(Vopr::new(seed, env_flag("VOPR_LEARNER")), ticks)
 }
 
 /// Like [`run_vopr`] but with the unbounded-HOLD network axis FORCE-ENABLED, independent of the
@@ -715,7 +785,7 @@ pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
 /// draws). The entry point for the committed hold sweep — the axis that reaches the op-reuse /
 /// stale-vote class (a held message outliving its op's truncation + re-mint).
 pub fn run_vopr_with_hold(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed);
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.hold_axis = true;
   run_seeded(v, ticks)
 }
@@ -735,7 +805,7 @@ pub fn run_vopr_with_hold(seed: u64, ticks: u64) -> VoprReport {
 /// baseline (the axis consumes extra PRNG draws); this is the entry point for the committed wipe
 /// sweep.
 pub fn run_vopr_with_wipe(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed);
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.wipe_axis = true;
   run_seeded(v, ticks)
 }
@@ -752,7 +822,7 @@ pub fn run_vopr_with_wipe(seed: u64, ticks: u64) -> VoprReport {
 /// headerless faults. NOT part of the committed gates — see the `#[ignore]`d probe lane in
 /// `tests/vopr.rs`.
 pub fn run_vopr_with_torn_headers(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed);
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.torn_header_axis = true;
   run_seeded(v, ticks)
 }
@@ -775,7 +845,7 @@ pub fn run_vopr_with_torn_headers(seed: u64, ticks: u64) -> VoprReport {
 /// its own deterministic baseline (the axis consumes extra PRNG draws); this is the entry point for
 /// the committed asym sweep.
 pub fn run_vopr_with_asym(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed);
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.asym_axis = true;
   run_seeded(v, ticks)
 }
@@ -796,7 +866,7 @@ pub fn run_vopr_with_asym(seed: u64, ticks: u64) -> VoprReport {
 /// `(seed, ticks)` and its own deterministic baseline; this is the entry point for the committed
 /// slow sweep.
 pub fn run_vopr_with_slow(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed);
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.slow_axis = true;
   run_seeded(v, ticks)
 }
@@ -820,7 +890,7 @@ pub fn run_vopr_with_slow(seed: u64, ticks: u64) -> VoprReport {
 /// per-client seed-derived PRNGs — never the action stream — so the chaos schedule composes with
 /// batching unperturbed.
 pub fn run_vopr_with_batching(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed);
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.batching_axis = true;
   run_seeded(v, ticks)
 }
@@ -839,7 +909,7 @@ pub fn run_vopr_with_batching(seed: u64, ticks: u64) -> VoprReport {
 /// function of `(seed, ticks)` and its own deterministic baseline (the axis consumes extra PRNG
 /// draws); this is the entry point for the committed churn sweep.
 pub fn run_vopr_with_churn(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed);
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.churn_axis = true;
   run_seeded(v, ticks)
 }
@@ -862,9 +932,29 @@ pub fn run_vopr_with_churn(seed: u64, ticks: u64) -> VoprReport {
 /// deterministic baseline (the axis consumes extra PRNG draws); this is the entry point for the
 /// committed stale-read sweep.
 pub fn run_vopr_with_stale_read(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed);
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.stale_read_axis = true;
   run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the LEARNER axis FORCE-ENABLED, independent of the `VOPR_LEARNER` env
+/// var (the same programmatic-override pattern as [`run_vopr_with_hold`]). The cluster carries
+/// 1..=3 NON-VOTING learners alongside the voting set (ids `[voting_count, node_count)`), drawn from
+/// a SEPARATE per-seed PRNG so the action stream is byte-identical to the no-learner run of the same
+/// seed at every shared draw — the learner count only GROWS `node_count` (and so the per-replica
+/// vectors + the routing fan-out), it does not perturb the chaos schedule. A learner applies the
+/// committed log the voters agree on but NEVER emits a counted message (no PrepareOk / StartViewChange
+/// / DoViewChange), is NEVER primary, and may catch up via state-sync; it is never an active
+/// view-change participant. The oracle witnesses each claim (never-primary, no-learner-emit,
+/// convergence) and, UNDER THE AXIS, crashes a learner for a sustained window WITHOUT charging the
+/// minority budget — so the calm-window committed-progress assertion must still advance using voters
+/// alone, proving voter fault tolerance is independent of learner health. A violation here is a REAL
+/// finding (a learner voting/leading, or a learner outage stalling voter progress) — report it with
+/// its seed; never mask it. A learner-enabled run is a pure function of `(seed, ticks)` and is
+/// byte-identical to a `VOPR_LEARNER=1` run of the same seed; this is the entry point for the
+/// committed learner sweep.
+pub fn run_vopr_with_learners(seed: u64, ticks: u64) -> VoprReport {
+  run_seeded(Vopr::new(seed, true), ticks)
 }
 
 /// The shared run loop behind [`run_vopr`] / [`run_vopr_with_hold`]: the driver `v` already carries
@@ -967,6 +1057,10 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
       v.seed
     );
   }
+  // Final learner-convergence oracle (a cheap no-op with no learners): after the quiesce drain, every
+  // non-crashed learner has applied the SAME committed `(op, body)` history as the voters, up to the
+  // committed-history high-water — it follows the committed log to convergence.
+  v.check_learner_convergence(&c, ticks);
   v.report.ticks = ticks;
   v.report.all_clients_done = (0..c.client_count()).all(|i| c.client(i).is_done());
   v.update_report(&c);
@@ -1025,8 +1119,15 @@ const WIPE_BUDGET: u64 = 1;
 /// times over within a run's tick budget.
 const CHURN_BUDGET: u64 = 48;
 
+/// The magic mixed into the seed for the learner-count PRNG. A distinct local stream (NOT the action
+/// stream `self.prng`), so when the learner axis is OFF no learner draw happens and `node_count`
+/// equals `voting_count`, leaving the default per-seed schedule byte-identical; when ON, the learner
+/// count is a pure deterministic function of the seed independent of every other draw. Must not
+/// collide with `BOUNDED_WAL_SEED_MAGIC` or any other `_MAGIC` in this crate.
+const LEARNER_SEED_MAGIC: u64 = 0x1EA2_4E11_5EED_C0DE;
+
 impl Vopr {
-  fn new(seed: u64) -> Self {
+  fn new(seed: u64, learner_axis: bool) -> Self {
     let mut prng = Prng::new(seed);
     // VOTING-replica count from {2, 3, 4, 5, 6} — including EVEN N and the sharp N=2 case (covering
     // the quorum/nack arithmetic). `Config::try_new` accepts any `1..=64`, and the derived quorums are
@@ -1034,8 +1135,19 @@ impl Vopr {
     // (N=2 → quorum 2 = unanimous, vc/nack 1 = a single DVC/nack suffices; N=4 → 3 / 2; N=6 → 4 / 3),
     // and the replication↔view-change intersection `quorum + quorum_view_change > n` holds for all.
     let voting_count = 2 + (prng.below(5) as usize);
-    // The cluster runs with no learners, so the total membership equals the voting set.
-    let node_count = voting_count;
+    // The learner count: 1..=3 NON-VOTING learners when the axis is on, none otherwise. Drawn from a
+    // SEPARATE per-seed PRNG (`seed ^ LEARNER_SEED_MAGIC`), NOT the action stream `self.prng`, so with
+    // the axis OFF no draw is consumed and `node_count` equals `voting_count` — the default per-seed
+    // schedule stays byte-identical. With the axis ON the count is a pure function of the seed,
+    // independent of the chaos schedule (it only GROWS the membership, never perturbs the action
+    // stream). Kept small (≤3) so the per-replica vectors stay modest.
+    let learner_count = if learner_axis {
+      Prng::new(seed ^ LEARNER_SEED_MAGIC).below(3) as usize + 1
+    } else {
+      0
+    };
+    // The TOTAL membership: voters plus learners. Sizes every per-replica vector + the routing fan-out.
+    let node_count = voting_count + learner_count;
     // ⌊(N−1)/2⌋ over the VOTING set — the minority a quorum survives: N=2→0, N=3→1, N=4→1, N=5→2,
     // N=6→2. For N=2 the budget is 0, so the chaos chooser never knocks out a voter (any single fault
     // would break the unanimous quorum 2 and stall progress LEGITIMATELY) — only network
@@ -1080,6 +1192,12 @@ impl Vopr {
       batching_axis: env_flag("VOPR_BATCHING"),
       stale_read_axis: env_flag("VOPR_STALE_READ"),
       active_stale_probe: None,
+      learner_axis,
+      learner_applied_seen: vec![0; node_count],
+      learner_view_seen: vec![0; node_count],
+      learner_repairs_seen: vec![0; node_count],
+      learner_crash_until: 0,
+      learner_crashed: None,
       sessions_evicted_seen: vec![0; node_count],
       wiped_pending: Vec::new(),
       report: VoprReport {
@@ -1395,11 +1513,17 @@ impl Vopr {
   /// episode (calm also requires PROMPT delivery), restart every crashed replica, drop all network +
   /// storage faults, and snapshot the liveness baseline. Runs for a stretch long enough for the
   /// cluster to converge.
+  ///
+  /// The learner-chaos victim is DELIBERATELY left crashed across the calm window (it is restarted on
+  /// its OWN window expiry or by the final quiesce, never here): the calm-window committed-progress
+  /// assertion must then advance using the VOTERS ALONE while a learner is down — the liveness
+  /// independence claim. Because a learner is not a voter, the fully-healed voting majority still
+  /// commits, so this is a sound assertion, not a flaky one.
   fn enter_calm(&mut self, c: &mut Cluster, tick: u64) {
     self.heal_all_partitions(c);
     self.end_slow_episode(c);
     for i in 0..self.node_count {
-      if c.is_crashed(i) {
+      if c.is_crashed(i) && Some(i) != self.learner_crashed {
         self.restart_and_track(c, i);
       }
     }
@@ -1825,6 +1949,62 @@ impl Vopr {
         }
       }
     }
+
+    // (f) LEARNER CHAOS (the liveness-independence axis): crash ONE learner for a sustained window.
+    // A learner outage must NEVER reduce voter fault tolerance, so the victim is drawn from the
+    // LEARNER range `[voting_count, node_count)` and is NOT charged against `minority_budget` (the
+    // `knocked_out`/budget pickers never see it). Meanwhile the calm-window committed-progress
+    // assertion must STILL advance using the voters alone — that is the claim this exercises. Only
+    // with the axis enabled (a learner-enabled run is its own deterministic baseline; with the axis
+    // OFF no draw is consumed, mirroring the hold axis). One episode at a time, a long stretch so the
+    // outage spans calm windows where voter progress is owed; the generic restart action, calm-window
+    // entry, and the final quiesce can all end it early (each restarts every crashed id), so the
+    // expiry only clears bookkeeping if the cluster has not already restarted the learner.
+    if self.learner_axis {
+      if let Some(l) = self.learner_crashed
+        && (tick >= self.learner_crash_until || !c.is_crashed(l))
+      {
+        if trace {
+          eprintln!("tick {tick}: LEARNER-CHAOS episode for learner {l} ended");
+        }
+        self.end_learner_crash(c);
+      }
+      if self.prng.chance(1, 80)
+        && self.learner_crashed.is_none()
+        && self.node_count > self.voting_count
+      {
+        let candidates: Vec<usize> = (self.voting_count..self.node_count)
+          .filter(|&i| !c.is_crashed(i))
+          .collect();
+        if let Some(l) = self.pick(&candidates) {
+          // A long outage (a few calm windows wide) so voter progress is genuinely owed while the
+          // learner is down — the independence claim is judged across a calm window with the learner
+          // crashed throughout.
+          let window = 600 + self.prng.below(600);
+          c.crash(l);
+          self.learner_crashed = Some(l);
+          self.learner_crash_until = tick + window;
+          if trace {
+            eprintln!("tick {tick}: LEARNER-CHAOS crash learner {l} window={window}");
+          }
+        }
+      }
+    }
+  }
+
+  /// End the active learner-chaos episode: restart the crashed learner if it is still down (the
+  /// generic restart action / calm window / final quiesce may have already restarted it) and clear
+  /// the bookkeeping. NOT routed through [`Self::restart_and_track`]'s recovered-band sampling caveat:
+  /// it simply restores the learner so it rejoins and converges.
+  fn end_learner_crash(&mut self, c: &mut Cluster) {
+    // `take()` always clears the bookkeeping; the restart runs only if the learner is still down (the
+    // generic restart action / calm window / final quiesce may have restarted it already).
+    if let Some(l) = self.learner_crashed.take()
+      && c.is_crashed(l)
+    {
+      self.restart_and_track(c, l);
+    }
+    self.learner_crash_until = 0;
   }
 
   /// Push the current `isolated` set into the cluster as a 2-group partition: isolated replicas →
@@ -2057,8 +2237,74 @@ impl Vopr {
     if let Violation(why) = bound.observe(c) {
       panic!("vopr seed {} tick {tick}: boundedness: {why}", self.seed);
     }
+    // Never-primary: NO learner id (`i >= voting_count`) is ever the primary of its view. The
+    // proto's `primary(view) = view % replica_count` can only name a VOTER, so a learner-as-primary
+    // would be a modulus break that misroutes every client request and prepare. Checked every tick,
+    // unconditionally — cheap and on every lane (a learner range is non-empty only under the axis, so
+    // off-axis this loop is empty). A violation here is a REAL finding.
+    for i in self.voting_count..self.node_count {
+      if c.replica_is_primary(i) {
+        panic!(
+          "vopr seed {} tick {tick}: learner {i} is acting as PRIMARY (view {}) — a non-voting \
+           learner must never be primary (primary(view) = view % voting_count names only a voter)",
+          self.seed,
+          c.replica_view(i).get(),
+        );
+      }
+    }
+    // No-learner-emit: a learner never SENT a counted message (PrepareOk/StartViewChange/DoViewChange),
+    // observed at schedule time during the tick we just ran. A learner emitting one is a REAL finding
+    // (consensus participation by a non-voter); the cluster records it structurally and we drain it here.
+    if let Some(why) = c.take_learner_emission_violation() {
+      panic!("vopr seed {} tick {tick}: {why}", self.seed);
+    }
     self.check_structural(c, tick);
     self.check_ring_residency(c, tick);
+  }
+
+  /// Learner CONVERGENCE, asserted once after the final quiesce drain: a non-voting learner FOLLOWS
+  /// the committed log the voters agreed on, applying the SAME committed ops in the same order.
+  ///
+  /// The check is AGREEMENT over the learner's applied prefix: every op the learner has applied equals
+  /// the committed history at that position. The reference history is the longest applied `(op, body)`
+  /// prefix on any replica — agreement (checked every tick) makes all replicas' applied prefixes
+  /// consistent, so the longest IS the committed history — and the learner's prefix must equal it
+  /// element-for-element over the learner's length. A mismatch is a learner applying a DIFFERENT
+  /// committed op than the voters — a REAL finding.
+  ///
+  /// This deliberately does NOT require the learner to reach the frontier LENGTH. The sim drives a
+  /// continuous sequential client load that does not fully drain within the run + quiesce budget, so
+  /// the primary's committed head keeps advancing and a passive learner — which follows commits rather
+  /// than voting on them — legitimately trails the head by the in-flight/repair window indefinitely;
+  /// requiring an exact length match would assert a moving target that never settles. The LIVENESS
+  /// claim that a learner actively follows and catches up is witnessed instead by the sweep's
+  /// non-vacuity counters: [`VoprReport::learner_ops_applied`] (it applies committed ops by the
+  /// thousand), [`VoprReport::learner_repairs_served`] (it state-syncs to catch up when it falls
+  /// behind), and [`VoprReport::learner_view_changes_followed`] (it adopts new views). A no-op with no
+  /// learners (the off-axis learner range is empty).
+  fn check_learner_convergence(&self, c: &Cluster, ticks: u64) {
+    // The committed-history frontier (for the AGREEMENT comparison): the longest applied `(op, body)`
+    // prefix on any replica.
+    let frontier = (0..self.node_count)
+      .max_by_key(|&i| c.replica_sm(i).applied().len())
+      .map(|i| c.replica_sm(i).applied().to_vec())
+      .unwrap_or_default();
+    for i in self.voting_count..self.node_count {
+      if c.is_crashed(i) {
+        continue; // a crashed learner is powered off — its convergence is asserted on a live one.
+      }
+      let learner = c.replica_sm(i).applied();
+      for (pos, (want, got)) in frontier.iter().zip(learner.iter()).enumerate() {
+        if want != got {
+          panic!(
+            "vopr seed {} tick {ticks} (final, post-quiesce): learner {i} diverges from the \
+             committed history at applied position {pos}: learner has {got:?} but the committed \
+             history has {want:?} — a learner applied a different committed op than the voters",
+            self.seed,
+          );
+        }
+      }
+    }
   }
 
   /// The structural per-replica invariants, read directly off the sim state each tick:
@@ -2296,7 +2542,9 @@ impl Vopr {
     self.report.max_view = self.report.max_view.max(mv);
     // MISDIRECTED-read high-water (summed over replicas' persistent WAL counters). Tracked as a max so
     // a mid-run WAL rebuild (none happens in the VOPR, but defensively) cannot lower it.
-    let md: u64 = (0..self.node_count).map(|i| c.wal_misdirects_fired(i)).sum();
+    let md: u64 = (0..self.node_count)
+      .map(|i| c.wal_misdirects_fired(i))
+      .sum();
     self.report.misdirects_fired = self.report.misdirects_fired.max(md);
     // FORCED-sync (peer-fetch escalation) cumulative accumulation. The proto's per-replica counter
     // resets to 0 on `recover` (each restart), so we fold each POSITIVE delta into the running total
@@ -2370,9 +2618,39 @@ impl Vopr {
       }
       self.sessions_evicted_seen[i] = evicted;
     }
+    // LEARNER non-vacuity witnesses (the learner lane), accumulated over the learner ids only — a
+    // voter slot stays 0. All three use the SAME reset-robust positive-delta accumulation as
+    // `forced_syncs`: a `recover` rebuilds the `Endpoint` (resetting the applied log, the view to the
+    // durable view, and the state-sync counter), so a plain high-water would miss a pre-restart climb;
+    // re-baselining each tick and folding positive deltas counts each climb-from-its-base. Off-axis the
+    // learner range is empty, so every counter stays 0 — the default report digest is unperturbed.
+    for i in self.voting_count..self.node_count {
+      // Committed ops APPLIED on the learner (it follows the committed log). `applied().len()` is the
+      // SM's applied-history length, which the recover re-applies from the durable checkpoint.
+      let applied = c.replica_sm(i).applied().len();
+      if applied > self.learner_applied_seen[i] {
+        self.report.learner_ops_applied += (applied - self.learner_applied_seen[i]) as u64;
+      }
+      self.learner_applied_seen[i] = applied;
+      // State-syncs the learner COMPLETED (it caught up from behind via the repair/state-sync path).
+      let synced = c.replica_state_sync_count(i);
+      if synced > self.learner_repairs_seen[i] {
+        self.report.learner_repairs_served += synced - self.learner_repairs_seen[i];
+      }
+      self.learner_repairs_seen[i] = synced;
+      // View advances the learner FOLLOWED (it adopted a higher view via `GetView`). `replica_view`
+      // is monotone within an incarnation and recovers to the durable view on restart.
+      let view = c.replica_view(i).get();
+      if view > self.learner_view_seen[i] {
+        self.report.learner_view_changes_followed += view - self.learner_view_seen[i];
+      }
+      self.learner_view_seen[i] = view;
+    }
     // Torn-header probe witness (summed over the persistent WALs, high-water like `misdirects_fired`
     // so a storage rebuild can never lower it). Stays 0 with the axis off.
-    let th: u64 = (0..self.node_count).map(|i| c.wal_torn_headers_fired(i)).sum();
+    let th: u64 = (0..self.node_count)
+      .map(|i| c.wal_torn_headers_fired(i))
+      .sum();
     self.report.torn_headers_fired = self.report.torn_headers_fired.max(th);
     // Genuine-WRAP witness: a BOUNDED seed whose committed history exceeded its ring size `N` has had an
     // op `K + N` physically reuse op `K`'s slot — the ring truly wrapped (not merely filled). Latches
