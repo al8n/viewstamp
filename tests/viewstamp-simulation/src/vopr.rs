@@ -24,7 +24,10 @@
 //!
 //! - **Safety — EVERY tick, unconditionally** (must hold under ANY faults): [`check_safety`]
 //!   (contiguity + cross-replica agreement + per-client reply ordering), [`DurabilityChecker`]
-//!   (no committed op rewritten/lost across time; checkpoints monotone), [`ViewMonotonicChecker`]
+//!   (no committed op rewritten/lost across time; checkpoints monotone), [`AppliedOnceChecker`]
+//!   (every replica's apply stream is structurally sound per incarnation, and across the run every
+//!   `(client, request)` is applied at exactly one op with one reply — the double-apply / op-reuse
+//!   oracle), [`ViewMonotonicChecker`]
 //!   (no view regression), [`BoundednessChecker`] (per-op maps + WAL stay bounded under GC). Plus the
 //!   structural invariants checked directly off the sim state each tick: `op >= commit_min >=
 //!   checkpoint_op` and `commit_max >= commit_min` per replica (note `commit_max` is a re-learnable
@@ -53,7 +56,9 @@ use core::time::Duration;
 use viewstamp_proto::{Instant, Prng};
 
 use crate::{
-  checker::{BoundednessChecker, DurabilityChecker, ViewMonotonicChecker, check_safety},
+  checker::{
+    AppliedOnceChecker, BoundednessChecker, DurabilityChecker, ViewMonotonicChecker, check_safety,
+  },
   cluster::Cluster,
   network::Faults,
   storage::StorageFaults,
@@ -605,8 +610,9 @@ struct Vopr {
 /// Run one VOPR simulation for `ticks` ticks, seeded entirely by `seed`. Returns a [`VoprReport`]
 /// summarising the schedule explored. After the chaos loop it runs a bounded final QUIESCE phase
 /// (heal everything, restart all, no faults, tick to convergence — the `run_final_quiesce` step)
-/// before the end-of-run durability assertion, so the survivors apply any durably-held committed tail
-/// first. **Panics** (with `seed` + `tick` + a one-line description) on any safety, durability,
+/// before the end-of-run durability + applied-once assertions, so the survivors apply any
+/// durably-held committed tail first. **Panics** (with `seed` + `tick` + a one-line description) on
+/// any safety, durability, applied-once,
 /// view-monotonicity, boundedness, append-before-ack, structural-ordering, or liveness (including
 /// final-quiesce non-convergence) violation — so a failing seed is reproducible via [`run_vopr_one`].
 pub fn run_vopr(seed: u64, ticks: u64) -> VoprReport {
@@ -733,6 +739,7 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
 
   let mut dur = DurabilityChecker::new(v.n);
   let mut vm = ViewMonotonicChecker::new(v.n);
+  let mut applied_once = AppliedOnceChecker::new(v.n);
   // Generous structural bound: the per-op caches/WAL plateau near a few checkpoint intervals plus
   // pipeline headroom; a real unbounded-growth leak blows well past this. Clients are bounded by the
   // active client set — which the churn axis GROWS by up to CHURN_BUDGET distinct ids over the run
@@ -755,7 +762,7 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
     // probe (rather than incidental coincidence) is what actually exercises the
     // durable-view-before-participate gates; the checkers below catch any cross-view participation.
     v.report.pending_view_windows_seen += c.probe_pending_view_window();
-    v.check_invariants(&mut c, tick, &mut dur, &mut vm, &bound);
+    v.check_invariants(&mut c, tick, &mut dur, &mut vm, &mut applied_once, &bound);
     v.update_report(&c);
   }
 
@@ -770,13 +777,22 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
   // applied invariants. The per-tick checks keep running THROUGHOUT the drain, so the drain can expose
   // (never hide) a divergence, and a genuine loss — a committed op held by NO quorum — still fails (it
   // cannot be reconstructed from a non-existent quorum source, so convergence times out below).
-  v.run_final_quiesce(&mut c, ticks, &mut dur, &mut vm, &bound);
+  v.run_final_quiesce(&mut c, ticks, &mut dur, &mut vm, &mut applied_once, &bound);
 
   // Final durability assertion: after convergence, the whole committed history survives, applied, on
   // at least one operational replica — proving no committed op was lost across the run.
   if let crate::checker::CheckResult::Violation(why) = dur.check(&c) {
     panic!(
       "vopr seed {} tick {ticks} (final, post-quiesce): {why}",
+      v.seed
+    );
+  }
+  // Final applied-once assertion: every client-acked reply is present in the global applied map with
+  // a matching reply body (acked-but-never-applied = a lost committed op), and the map is non-empty
+  // whenever anything committed — every request a client was acked for was applied exactly once.
+  if let crate::checker::CheckResult::Violation(why) = applied_once.check(&c) {
+    panic!(
+      "vopr seed {} tick {ticks} (final, post-quiesce): applied-once: {why}",
       v.seed
     );
   }
@@ -1231,6 +1247,7 @@ impl Vopr {
     ticks: u64,
     dur: &mut DurabilityChecker,
     vm: &mut ViewMonotonicChecker,
+    applied_once: &mut AppliedOnceChecker,
     bound: &BoundednessChecker,
   ) {
     // Heal: all partitions (symmetric and one-way) cleared, any slow episode ended, every crashed
@@ -1256,7 +1273,7 @@ impl Vopr {
       // view-monotonicity, boundedness. The drain must heal, never mask — a divergence surfacing here
       // is a real bug, and the strict quorum-durability invariant continues to hold every tick. (Tick
       // label `ticks + k` locates a drain-phase violation.)
-      self.check_invariants(c, ticks + k, dur, vm, bound);
+      self.check_invariants(c, ticks + k, dur, vm, applied_once, bound);
       // Converged once the end-of-run durability assertion would pass: the committed history is
       // applied on an operational replica.
       if dur.check(c).is_ok() {
@@ -1657,6 +1674,7 @@ impl Vopr {
     tick: u64,
     dur: &mut DurabilityChecker,
     vm: &mut ViewMonotonicChecker,
+    applied_once: &mut AppliedOnceChecker,
     bound: &BoundednessChecker,
   ) {
     use crate::checker::CheckResult::Violation;
@@ -1703,6 +1721,9 @@ impl Vopr {
     }
     if let Violation(why) = dur.observe(c) {
       panic!("vopr seed {} tick {tick}: durability: {why}", self.seed);
+    }
+    if let Violation(why) = applied_once.observe(c) {
+      panic!("vopr seed {} tick {tick}: applied-once: {why}", self.seed);
     }
     if let Violation(why) = vm.observe(c) {
       panic!("vopr seed {} tick {tick}: view-monotonic: {why}", self.seed);

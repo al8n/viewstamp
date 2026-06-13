@@ -1,9 +1,11 @@
 //! Safety / agreement checks over a cluster run.
 
+use std::collections::{HashMap, HashSet};
+
 use bytes::Bytes;
 use smol_str::SmolStr;
 
-use crate::cluster::Cluster;
+use crate::cluster::{AppliedEvent, Cluster};
 
 /// Outcome of checking a cluster's invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +189,213 @@ impl DurabilityChecker {
         self.committed.len()
       ))
     }
+  }
+}
+
+/// Stateful **applied-once** checker: every client-acked request is applied **exactly once** across
+/// commits, view changes, repair, state-sync, and restarts.
+///
+/// It folds each replica's recorded apply stream ([`Cluster::replica_applied_events`] — one
+/// `Committed` per state-machine apply, in apply order, tagged with the replica's incarnation and
+/// rebased at state-sync points) into two layers of invariant, checked on every
+/// [`observe`](Self::observe):
+///
+/// 1. **Per replica, per incarnation** — the stream is structurally an apply log: op numbers never
+///    regress, and consecutive distinct ops differ by exactly 1 unless a completed state-sync rebased
+///    the stream in between (the snapshot bulk-restores the skipped band, so those ops are never
+///    individually re-emitted). An incarnation may START at any op — recovery re-applies only
+///    `(checkpoint_op .. commit_max]`, never the snapshot-restored prefix. No `(client, request)`
+///    pair is applied twice within one incarnation (a duplicate request must be deduplicated by the
+///    session table, never re-applied).
+/// 2. **Globally, across the whole run** — every stream folds into ONE injective map
+///    `(client, request) → (op, reply)`: the same request applied at two different ops (a request
+///    committed twice), two different requests at the same op (an op number reused — the
+///    committed-op-loss + re-mint class), or two different replies for the same request (divergent
+///    applies) are all violations.
+///
+/// [`check`](Self::check) then enforces the headline no-loss property (post-quiesce): every
+/// client-acked reply is present in the map with a matching reply body — acked-but-never-applied is
+/// a lost committed op — and the map is non-empty whenever the cluster committed anything (the
+/// capture itself is non-vacuous).
+#[derive(Debug)]
+pub struct AppliedOnceChecker {
+  /// Per-replica count of stream entries already folded (the streams are append-only).
+  cursor: Vec<usize>,
+  /// Per-replica incarnation of the segment currently being folded.
+  incarnation: Vec<u64>,
+  /// Per-replica applied frontier within the current incarnation: the last committed op folded, or
+  /// the latest state-sync rebase point — `None` until the incarnation's first entry (it may start
+  /// at any op).
+  last_op: Vec<Option<u64>>,
+  /// Per-replica `(client, request)` pairs applied within the current incarnation.
+  seen: Vec<HashSet<(u128, u64)>>,
+  /// The global injective map: `(client, request) → (op, reply)` across every replica and
+  /// incarnation. Agreement makes re-emissions (recovery, wipes, backups) converge on identical
+  /// values; any disagreement is a double-apply/divergence violation.
+  by_key: HashMap<(u128, u64), (u64, Bytes)>,
+  /// The reverse direction of injectivity: `op → (client, request)` — one request per op number,
+  /// ever.
+  by_op: HashMap<u64, (u128, u64)>,
+}
+
+impl AppliedOnceChecker {
+  /// An applied-once checker for a cluster of `replica_count` replicas.
+  pub fn new(replica_count: usize) -> Self {
+    Self {
+      cursor: vec![0; replica_count],
+      incarnation: vec![0; replica_count],
+      last_op: vec![None; replica_count],
+      seen: vec![HashSet::new(); replica_count],
+      by_key: HashMap::new(),
+      by_op: HashMap::new(),
+    }
+  }
+
+  /// Folds each replica's not-yet-seen apply-stream suffix into the per-incarnation and global
+  /// invariants, returning the first violation. Pure over its inputs so the invariant logic is
+  /// unit-testable without a live `Cluster`; each `streams[i]` must be an append-only extension of
+  /// the slice passed previously.
+  fn fold(&mut self, streams: &[&[(u64, AppliedEvent)]]) -> CheckResult {
+    for (i, stream) in streams.iter().enumerate() {
+      while self.cursor[i] < stream.len() {
+        let (incarnation, entry) = &stream[self.cursor[i]];
+        self.cursor[i] += 1;
+        if *incarnation != self.incarnation[i] {
+          // A restart/wipe rebuilt the endpoint: its apply stream re-emits from its durable
+          // checkpoint, so the segment state (frontier + per-incarnation pairs) starts afresh.
+          self.incarnation[i] = *incarnation;
+          self.last_op[i] = None;
+          self.seen[i].clear();
+        }
+        match entry {
+          AppliedEvent::SyncPoint(op) => {
+            // A completed state-sync REBASED the state machine onto the checkpoint at `op`: commits
+            // resume at `op + 1`. Forward-only (`max`): the recovery peer-fetch path installs the
+            // snapshot eagerly and reports the sync only once its root is durable, so the marker can
+            // trail commits already folded above the synced point — it must never regress the
+            // frontier.
+            let target = op.get();
+            self.last_op[i] = Some(self.last_op[i].map_or(target, |last| last.max(target)));
+          }
+          AppliedEvent::Committed(c) => {
+            let op = c.op().get();
+            let client = c.client().get();
+            let request = c.request().get();
+            if let Some(last) = self.last_op[i] {
+              if op < last {
+                return CheckResult::violation(format!(
+                  "replica {i}: committed op regressed within an incarnation ({last} -> {op}) — \
+                   the apply stream re-applied below its frontier"
+                ));
+              }
+              if op > last + 1 {
+                return CheckResult::violation(format!(
+                  "replica {i}: committed-op gap within an incarnation ({last} -> {op}) with no \
+                   completed state-sync between them — an applied op was skipped"
+                ));
+              }
+            }
+            self.last_op[i] = Some(op);
+            if !self.seen[i].insert((client, request)) {
+              return CheckResult::violation(format!(
+                "replica {i}: client {client} request {request} applied twice within one \
+                 incarnation (second apply at op {op})"
+              ));
+            }
+            if let Some(&(c2, r2)) = self.by_op.get(&op)
+              && (c2, r2) != (client, request)
+            {
+              return CheckResult::violation(format!(
+                "op {op} carries two different requests: client {c2} request {r2} vs client \
+                 {client} request {request} — an op number was reused for a second request"
+              ));
+            }
+            self.by_op.insert(op, (client, request));
+            let reply = c.reply_bytes();
+            match self.by_key.get(&(client, request)) {
+              Some((op2, reply2)) => {
+                if *op2 != op {
+                  return CheckResult::violation(format!(
+                    "client {client} request {request} applied at two different ops ({op2} and \
+                     {op}) — a request committed twice"
+                  ));
+                }
+                if *reply2 != reply {
+                  return CheckResult::violation(format!(
+                    "client {client} request {request} (op {op}): applied replies diverge \
+                     ({reply2:?} vs {reply:?})"
+                  ));
+                }
+              }
+              None => {
+                self.by_key.insert((client, request), (op, reply));
+              }
+            }
+          }
+        }
+      }
+    }
+    CheckResult::Ok
+  }
+
+  /// Sample the cluster: fold every replica's newly recorded apply-stream entries (the streams are
+  /// append-only) and return a violation on any double-apply, op reuse, divergent reply, or broken
+  /// stream structure. Call every tick.
+  pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
+    let streams: Vec<&[(u64, AppliedEvent)]> = (0..cluster.replica_count())
+      .map(|i| cluster.replica_applied_events(i))
+      .collect();
+    self.fold(&streams)
+  }
+
+  /// Final applied-once assertion (run post-quiesce): folds any not-yet-observed stream entries,
+  /// then enforces that the map is non-empty whenever the cluster committed anything, and that
+  /// every client-acked reply is present in the map with a matching reply body. An
+  /// acked-but-never-applied request is a lost committed op — the headline invariant.
+  pub fn check(&mut self, cluster: &Cluster) -> CheckResult {
+    if let v @ CheckResult::Violation(_) = self.observe(cluster) {
+      return v;
+    }
+    let committed_any =
+      (0..cluster.replica_count()).any(|i| !cluster.replica_sm(i).applied().is_empty());
+    let mut acked = Vec::new();
+    for i in 0..cluster.client_count() {
+      let client = cluster.client(i).id().get();
+      for (request, body) in cluster.client(i).replies() {
+        acked.push((client, *request, body.clone()));
+      }
+    }
+    self.check_acked(&acked, committed_any)
+  }
+
+  /// The final-check core over the collected acked replies (`(client, request, reply)` triples) and
+  /// whether the cluster committed anything. Pure over its inputs so the no-loss logic is
+  /// unit-testable without a live `Cluster`.
+  fn check_acked(&self, acked: &[(u128, u64, Bytes)], committed_any: bool) -> CheckResult {
+    if committed_any && self.by_key.is_empty() {
+      return CheckResult::violation(
+        "the cluster committed ops but the applied-once map is empty — the apply-stream capture \
+         recorded nothing",
+      );
+    }
+    for (client, request, reply) in acked {
+      match self.by_key.get(&(*client, *request)) {
+        None => {
+          return CheckResult::violation(format!(
+            "client {client}: acked request {request} was never applied on any replica — a \
+             client-acked committed op was lost"
+          ));
+        }
+        Some((op, applied)) if applied != reply => {
+          return CheckResult::violation(format!(
+            "client {client}: acked request {request} disagrees with the applied reply at op {op} \
+             ({reply:?} acked vs {applied:?} applied)"
+          ));
+        }
+        Some(_) => {}
+      }
+    }
+    CheckResult::Ok
   }
 }
 
@@ -441,6 +650,215 @@ mod tests {
       dur.check(&c).is_violation(),
       "with no operational replica retaining the committed history the final assertion must FAIL — \
        the quiesce fix drains before this check but never relaxes its strictness"
+    );
+  }
+
+  /// One fabricated apply-stream entry: incarnation `inc` applied op `op` for `(client, request)`
+  /// producing `reply`.
+  fn applied(
+    inc: u64,
+    op: u64,
+    client: u128,
+    request: u64,
+    reply: &'static [u8],
+  ) -> (u64, AppliedEvent) {
+    use viewstamp_proto::{ClientId, Committed, OpNumber, RequestNumber};
+    (
+      inc,
+      AppliedEvent::Committed(Committed::new(
+        OpNumber::with(op),
+        ClientId::new(client),
+        RequestNumber::with(request),
+        Bytes::from_static(reply),
+      )),
+    )
+  }
+
+  #[test]
+  fn applied_once_clean_run_passes() {
+    let mut c = Cluster::new(3, 2, 3, 9);
+    let mut once = AppliedOnceChecker::new(c.replica_count());
+    for _ in 0..50_000 {
+      c.tick();
+      assert!(once.observe(&c).is_ok());
+      if (0..c.client_count()).all(|i| c.client(i).is_done()) {
+        break;
+      }
+    }
+    assert!(
+      once.check(&c).is_ok(),
+      "a clean run applies every acked request exactly once"
+    );
+  }
+
+  #[test]
+  fn applied_once_checker_flags_a_double_applied_request() {
+    // The same (client, request) applied at two ops within one incarnation: the session dedup
+    // failed and the request committed twice — a double-apply.
+    let mut once = AppliedOnceChecker::new(1);
+    let s0 = vec![
+      applied(0, 1, 7, 1, b"a"),
+      applied(0, 2, 7, 2, b"b"),
+      applied(0, 3, 7, 1, b"c"),
+    ];
+    assert!(
+      once.fold(&[&s0]).is_violation(),
+      "a request applied at two ops must be flagged"
+    );
+  }
+
+  #[test]
+  fn applied_once_checker_flags_a_request_committed_twice_across_replicas() {
+    // The injective-map direction: replica 1's stream carries the same (client, request) at a
+    // DIFFERENT op than replica 0 recorded — the request committed twice cluster-wide.
+    let mut once = AppliedOnceChecker::new(2);
+    let s0 = vec![applied(0, 1, 7, 1, b"a")];
+    let s1 = vec![applied(0, 2, 7, 1, b"a")];
+    assert!(
+      once.fold(&[&s0, &s1]).is_violation(),
+      "one request at two different ops across replicas must be flagged"
+    );
+  }
+
+  #[test]
+  fn applied_once_checker_flags_a_reused_op_number() {
+    // The same op number carrying two DIFFERENT requests on two replicas: a committed op was lost
+    // and its number re-minted for another request — the loss + re-mint divergence class.
+    let mut once = AppliedOnceChecker::new(2);
+    let s0 = vec![applied(0, 5, 1, 1, b"a")];
+    let s1 = vec![applied(0, 5, 2, 1, b"a")];
+    assert!(
+      once.fold(&[&s0, &s1]).is_violation(),
+      "an op number reused for a second request must be flagged"
+    );
+  }
+
+  #[test]
+  fn applied_once_checker_flags_a_divergent_reply() {
+    // The same (client, request) at the same op but with two different replies: the applies
+    // diverged (non-deterministic apply or a corrupted body slipped through).
+    let mut once = AppliedOnceChecker::new(2);
+    let s0 = vec![applied(0, 5, 1, 1, b"a")];
+    let s1 = vec![applied(0, 5, 1, 1, b"X")];
+    assert!(
+      once.fold(&[&s0, &s1]).is_violation(),
+      "divergent replies for one request must be flagged"
+    );
+  }
+
+  #[test]
+  fn applied_once_checker_flags_a_lost_acked_reply() {
+    // A client holds an acked reply for a request NO replica's apply stream ever carried — a
+    // client-acked committed op was lost. The matching acked reply passes; a divergent one trips.
+    let mut once = AppliedOnceChecker::new(1);
+    let s0 = vec![applied(0, 1, 7, 1, b"a")];
+    assert!(once.fold(&[&s0]).is_ok());
+    assert!(
+      once
+        .check_acked(&[(7, 2, Bytes::from_static(b"b"))], true)
+        .is_violation(),
+      "an acked-but-never-applied request must be flagged"
+    );
+    assert!(
+      once
+        .check_acked(&[(7, 1, Bytes::from_static(b"a"))], true)
+        .is_ok(),
+      "an acked reply matching the applied reply passes"
+    );
+    assert!(
+      once
+        .check_acked(&[(7, 1, Bytes::from_static(b"X"))], true)
+        .is_violation(),
+      "an acked reply disagreeing with the applied reply must be flagged"
+    );
+  }
+
+  #[test]
+  fn applied_once_checker_final_check_is_non_vacuous() {
+    // An empty map while the cluster committed ops means the capture recorded nothing — the oracle
+    // would otherwise pass vacuously forever.
+    let once = AppliedOnceChecker::new(1);
+    assert!(
+      once.check_acked(&[], true).is_violation(),
+      "committed ops with an empty applied map must be flagged"
+    );
+    assert!(
+      once.check_acked(&[], false).is_ok(),
+      "nothing committed, nothing required"
+    );
+  }
+
+  #[test]
+  fn applied_once_checker_allows_recovery_re_emission_in_a_new_incarnation() {
+    // A restarted replica re-applies its recovered band: the same (client, request) pairs re-emit
+    // at the SAME ops with the SAME replies — a new incarnation, not a double-apply. The new
+    // incarnation may also start above op 1 (recovery never re-emits below its checkpoint).
+    let mut once = AppliedOnceChecker::new(1);
+    let s0 = vec![
+      applied(0, 1, 7, 1, b"a"),
+      applied(0, 2, 7, 2, b"b"),
+      applied(1, 2, 7, 2, b"b"),
+      applied(1, 3, 7, 3, b"c"),
+    ];
+    assert!(
+      once.fold(&[&s0]).is_ok(),
+      "re-emission across incarnations is recovery, not double-apply"
+    );
+  }
+
+  #[test]
+  fn applied_once_checker_allows_a_state_sync_rebase_but_flags_a_bare_gap() {
+    use viewstamp_proto::OpNumber;
+    // A completed state-sync bulk-restores the skipped band: the marker justifies the jump and
+    // commits resume contiguously above the synced point.
+    let mut once = AppliedOnceChecker::new(1);
+    let synced = vec![
+      applied(0, 1, 7, 1, b"a"),
+      applied(0, 2, 7, 2, b"b"),
+      (0, AppliedEvent::SyncPoint(OpNumber::with(10))),
+      applied(0, 11, 7, 11, b"k"),
+      applied(0, 12, 7, 12, b"l"),
+    ];
+    assert!(
+      once.fold(&[&synced]).is_ok(),
+      "a synced jump is a rebase, not a skipped apply"
+    );
+    // A LATE marker (the recovery peer-fetch path installs eagerly, reporting only once the synced
+    // root is durable) sits below the already-folded frontier: forward-only, it must not regress
+    // the frontier and flag the next contiguous op.
+    let mut once = AppliedOnceChecker::new(1);
+    let late = vec![
+      applied(0, 41, 7, 41, b"a"),
+      applied(0, 42, 7, 42, b"b"),
+      (0, AppliedEvent::SyncPoint(OpNumber::with(40))),
+      applied(0, 43, 7, 43, b"c"),
+    ];
+    assert!(
+      once.fold(&[&late]).is_ok(),
+      "a late sync marker never regresses the frontier"
+    );
+    // The same jump WITHOUT a sync between is a skipped apply.
+    let mut once = AppliedOnceChecker::new(1);
+    let gap = vec![
+      applied(0, 1, 7, 1, b"a"),
+      applied(0, 2, 7, 2, b"b"),
+      applied(0, 11, 7, 11, b"k"),
+    ];
+    assert!(
+      once.fold(&[&gap]).is_violation(),
+      "an op gap with no state-sync between must be flagged"
+    );
+  }
+
+  #[test]
+  fn applied_once_checker_flags_a_regressed_op() {
+    // An op below the incarnation's applied frontier is a re-apply (the recovered-band re-emission
+    // lives in its own incarnation, never inline).
+    let mut once = AppliedOnceChecker::new(1);
+    let s0 = vec![applied(0, 5, 7, 5, b"a"), applied(0, 4, 7, 4, b"b")];
+    assert!(
+      once.fold(&[&s0]).is_violation(),
+      "an op regression within an incarnation must be flagged"
     );
   }
 
