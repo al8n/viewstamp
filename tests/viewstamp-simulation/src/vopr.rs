@@ -57,7 +57,8 @@ use viewstamp_proto::{Instant, Prng};
 
 use crate::{
   checker::{
-    AppliedOnceChecker, BoundednessChecker, DurabilityChecker, ViewMonotonicChecker, check_safety,
+    AppliedOnceChecker, BoundednessChecker, DurabilityChecker, StalenessChecker,
+    ViewMonotonicChecker, check_safety,
   },
   cluster::Cluster,
   network::Faults,
@@ -257,6 +258,18 @@ pub struct VoprReport {
   /// counters, high-water). `0` with the axis off; the batching sweep asserts the cross-seed sum
   /// is `> 0` so the group (whole-or-deferred, never split) path is genuinely exercised.
   groups_submitted: u64,
+  /// How many times the STALE-READ lane installed a deaf+mute cut on the cluster's SERVING primary
+  /// this run (the cluster's monotone counter, high-water). Identity-sound (only the highest-view
+  /// normal primary is ever cut) but NOT a causal failover signal — a cut could be healed before a
+  /// failover completes. The sweep asserts [`Self::stale_read_failovers_observed`] instead.
+  stale_read_probes_fired: u64,
+  /// How many times the lane OBSERVED a probe-induced failover this run: a deposed serving primary
+  /// was cut and, while still cut, a DIFFERENT serving primary emerged in a strictly higher view.
+  /// This is the lane's CAUSAL non-vacuity witness — it proves the staleness floor was actually
+  /// exercised across a completed deposed-primary failover window, not merely that a cut was
+  /// installed. `0` unless the stale-read axis is enabled; the committed sweep asserts the
+  /// cross-seed sum is `> 0`.
+  stale_read_failovers_observed: u64,
 }
 
 impl VoprReport {
@@ -503,6 +516,20 @@ impl VoprReport {
   pub const fn groups_submitted(&self) -> u64 {
     self.groups_submitted
   }
+
+  /// How many times the stale-read lane installed a cut on the serving primary. `0` with the axis
+  /// off. Identity-sound but not causal; the sweep asserts [`Self::stale_read_failovers_observed`].
+  pub const fn stale_read_probes_fired(&self) -> u64 {
+    self.stale_read_probes_fired
+  }
+
+  /// How many probe-induced failovers the stale-read lane observed (a deposed serving primary, then
+  /// a strictly-higher-view serving primary while it remained cut). `0` with the axis off; the
+  /// committed stale-read sweep asserts the cross-seed sum is `> 0` — the staleness floor was
+  /// genuinely exercised across a completed deposed-primary failover, not merely a cut install.
+  pub const fn stale_read_failovers_observed(&self) -> u64 {
+    self.stale_read_failovers_observed
+  }
 }
 
 /// The driver's own seeded RNG + bookkeeping. Separate from the cluster's internal network/storage
@@ -637,6 +664,19 @@ struct Vopr {
   /// touches the action PRNG at all (each batching client draws from its own seed-derived stream),
   /// so the chaos schedule composes with batching untouched.
   batching_axis: bool,
+  /// Whether the STALE-READ axis is enabled for this run: the `VOPR_STALE_READ` env var, or
+  /// force-enabled via [`run_vopr_with_stale_read`] (the committed stale-read sweep). Same discipline
+  /// as [`Self::hold_axis`]: with the axis OFF its per-tick chance draw is skipped entirely (no PRNG
+  /// value consumed — the default per-seed schedule stays byte-identical); a stale-read-enabled run is
+  /// its OWN deterministic baseline. The lane deterministically partitions the current primary OUT (a
+  /// deaf + mute one-way cut, reusing the asym victim/heal bookkeeping) to force a failover with the
+  /// [`StalenessChecker`] live across the view change.
+  stale_read_axis: bool,
+  /// The stale-read lane's in-flight probe: `(deposed target, the view it served in when cut)`.
+  /// `None` between probes. Resolved each tick — a strictly-higher-view serving primary while the
+  /// target stays cut is the causal failover witness; a heal first abandons the probe — so the
+  /// lane's non-vacuity counts completed failovers, not bare cut installs.
+  active_stale_probe: Option<(usize, u64)>,
   /// Per-replica last-observed session-eviction count, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
   sessions_evicted_seen: Vec<u64>,
@@ -795,6 +835,29 @@ pub fn run_vopr_with_churn(seed: u64, ticks: u64) -> VoprReport {
   run_seeded(v, ticks)
 }
 
+/// Like [`run_vopr`] but with the STALE-READ axis FORCE-ENABLED, independent of the `VOPR_STALE_READ`
+/// env var (the same programmatic-override pattern as [`run_vopr_with_hold`]). On a seeded cadence the
+/// lane deterministically partitions the CURRENT primary OUT — every directed inter-replica leg
+/// to/from it cut, so it is at once deaf (acks/votes never arrive) and mute (its heartbeats/prepares
+/// never reach the survivors, whose idle view-change timers then fire) — forcing the survivors to
+/// elect a NEW primary while the deposed one sits in its old view. The episode reuses the asym
+/// victim/budget/heal bookkeeping (the deposed primary counts against the minority budget and heals
+/// like any one-way episode), and the [`StalenessChecker`] runs LIVE across the failover, so the
+/// staleness floor (the committed-history high-water) is asserted MONOTONE through the view change —
+/// the real cross-check this lane exercises now.
+///
+/// The read-specific assertion (the deposed primary cannot serve a STALE read) is DEFERRED to the
+/// future read-path step: there is no read path today, so no read is recorded and the staleness
+/// enforcement is vacuous — this lane lands now exercising the failover schedule that assertion will
+/// later hang on. A stale-read-enabled run is a pure function of `(seed, ticks)` and its own
+/// deterministic baseline (the axis consumes extra PRNG draws); this is the entry point for the
+/// committed stale-read sweep.
+pub fn run_vopr_with_stale_read(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed);
+  v.stale_read_axis = true;
+  run_seeded(v, ticks)
+}
+
 /// The shared run loop behind [`run_vopr`] / [`run_vopr_with_hold`]: the driver `v` already carries
 /// the seed and the axis configuration.
 fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
@@ -803,6 +866,7 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
   let mut dur = DurabilityChecker::new(v.n);
   let mut vm = ViewMonotonicChecker::new(v.n);
   let mut applied_once = AppliedOnceChecker::new(v.n);
+  let mut staleness = StalenessChecker::new(v.n, v.report.clients);
   // Generous structural bound: the per-op caches/WAL plateau near a few checkpoint intervals plus
   // pipeline headroom; a real unbounded-growth leak blows well past this. Clients are bounded by the
   // active client set — which the churn axis GROWS by up to CHURN_BUDGET distinct ids over the run
@@ -825,7 +889,15 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
     // probe (rather than incidental coincidence) is what actually exercises the
     // durable-view-before-participate gates; the checkers below catch any cross-view participation.
     v.report.pending_view_windows_seen += c.probe_pending_view_window();
-    v.check_invariants(&mut c, tick, &mut dur, &mut vm, &mut applied_once, &bound);
+    v.check_invariants(
+      &mut c,
+      tick,
+      &mut dur,
+      &mut vm,
+      &mut applied_once,
+      &mut staleness,
+      &bound,
+    );
     v.update_report(&c);
   }
 
@@ -840,7 +912,15 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
   // applied invariants. The per-tick checks keep running THROUGHOUT the drain, so the drain can expose
   // (never hide) a divergence, and a genuine loss — a committed op held by NO quorum — still fails (it
   // cannot be reconstructed from a non-existent quorum source, so convergence times out below).
-  v.run_final_quiesce(&mut c, ticks, &mut dur, &mut vm, &mut applied_once, &bound);
+  v.run_final_quiesce(
+    &mut c,
+    ticks,
+    &mut dur,
+    &mut vm,
+    &mut applied_once,
+    &mut staleness,
+    &bound,
+  );
 
   // Final durability assertion: after convergence, the whole committed history survives, applied, on
   // at least one operational replica — proving no committed op was lost across the run.
@@ -856,6 +936,16 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
   if let crate::checker::CheckResult::Violation(why) = applied_once.check(&c) {
     panic!(
       "vopr seed {} tick {ticks} (final, post-quiesce): applied-once: {why}",
+      v.seed
+    );
+  }
+  // Final staleness assertion: the committed-history high-water (the staleness floor) stayed monotone,
+  // and every recorded linearizable read reflected every write acked before it issued (vacuous today —
+  // no read path records reads — but the acked set is non-empty whenever anything committed, so the
+  // capture is non-vacuous). Structurally ready to enforce reads the moment a read path exists.
+  if let crate::checker::CheckResult::Violation(why) = staleness.check(&c) {
+    panic!(
+      "vopr seed {} tick {ticks} (final, post-quiesce): staleness: {why}",
       v.seed
     );
   }
@@ -975,6 +1065,8 @@ impl Vopr {
       slow_active: None,
       slow_until: 0,
       batching_axis: env_flag("VOPR_BATCHING"),
+      stale_read_axis: env_flag("VOPR_STALE_READ"),
+      active_stale_probe: None,
       sessions_evicted_seen: vec![0; n],
       wiped_pending: Vec::new(),
       report: VoprReport {
@@ -1350,6 +1442,7 @@ impl Vopr {
   /// cannot be repaired from a non-existent source — the cluster never converges it, so the drain hits
   /// its bound and this panics with a liveness/non-convergence wedge (a real bug to STOP and report),
   /// rather than silently passing.
+  #[allow(clippy::too_many_arguments)]
   fn run_final_quiesce(
     &mut self,
     c: &mut Cluster,
@@ -1357,6 +1450,7 @@ impl Vopr {
     dur: &mut DurabilityChecker,
     vm: &mut ViewMonotonicChecker,
     applied_once: &mut AppliedOnceChecker,
+    staleness: &mut StalenessChecker,
     bound: &BoundednessChecker,
   ) {
     // Heal: all partitions (symmetric and one-way) cleared, any slow episode ended, every crashed
@@ -1382,7 +1476,7 @@ impl Vopr {
       // view-monotonicity, boundedness. The drain must heal, never mask — a divergence surfacing here
       // is a real bug, and the strict quorum-durability invariant continues to hold every tick. (Tick
       // label `ticks + k` locates a drain-phase violation.)
-      self.check_invariants(c, ticks + k, dur, vm, applied_once, bound);
+      self.check_invariants(c, ticks + k, dur, vm, applied_once, staleness, bound);
       // Converged once the end-of-run durability assertion would pass: the committed history is
       // applied on an operational replica.
       if dur.check(c).is_ok() {
@@ -1599,6 +1693,72 @@ impl Vopr {
       }
     }
 
+    // (d'') STALE-READ probe: deterministically partition the CURRENT primary OUT (a deaf + mute
+    // one-way cut both ways), forcing the survivors to elect a new primary while the deposed one sits
+    // in its old view — the failover the staleness floor must stay monotone through. The install/heal
+    // coin mirrors the asym action (d'), and the deposed primary reuses the asym victim bookkeeping
+    // (it counts against the same minority budget and heals on the one-way heal branch / calm window /
+    // final quiesce). Only with the axis enabled (a stale-read-enabled run is its own deterministic
+    // baseline; with the axis OFF no draw is consumed, mirroring the hold axis), and only within the
+    // minority budget (a quorum of survivors must remain to elect + commit). The
+    // [`StalenessChecker`] runs live across the failover; the read-specific assertion (the deposed
+    // primary cannot serve a stale read) is deferred to the future read-path step.
+    if self.stale_read_axis && self.prng.chance(1, 90) {
+      if self.prng.chance(1, 2) {
+        // Budget permitting, depose the cluster's SERVING primary (the highest-view normal primary
+        // — not a deposed old-view primary that still believes itself primary) if it is a fresh
+        // victim (not already crashed, isolated, or one-way-impaired — deposing an already-knocked-out
+        // replica would be redundant and double-count the budget).
+        if self.knocked_out(c) < self.minority_budget
+          && let Some(p) = c
+            .serving_primary()
+            .filter(|&p| !self.isolated[p] && !self.asym_victims[p])
+        {
+          self.asym_victims[p] = true;
+          let old_view = c.replica_view(p).get();
+          let deposed = c.partition_primary_out(p);
+          assert!(
+            deposed,
+            "the budgeted primary {p} must be a live primary the lane actually deposes"
+          );
+          // Track the probe: the causal witness fires later, when a higher-view serving primary
+          // emerges while p remains cut (a heal first abandons it — see `resolve_stale_probe`).
+          self.active_stale_probe = Some((p, old_view));
+          if trace {
+            eprintln!("tick {tick}: STALE-READ depose primary {p}");
+          }
+        }
+      } else if self.asym_victims.iter().any(|&b| b) {
+        if trace {
+          eprintln!("tick {tick}: HEAL one-way blocks (stale-read)");
+        }
+        for b in &mut self.asym_victims {
+          *b = false;
+        }
+        // The cut is healed: abandon the probe so a later failover is not mis-attributed to it.
+        self.active_stale_probe = None;
+        c.heal_one_way();
+        self.report.heals += 1;
+      }
+    }
+
+    // Resolve the in-flight stale-read probe every tick (no PRNG — pure observation of cluster
+    // state). A higher-view serving primary emerging while the deposed target stays cut is the
+    // causal failover witness; a heal first abandons the probe. Axis-gated, so off-axis is
+    // untouched.
+    if self.stale_read_axis && self.active_stale_probe.is_some() {
+      let target_cut = self
+        .active_stale_probe
+        .is_some_and(|(t, _)| self.asym_victims[t]);
+      let serving = c.serving_primary().map(|p| (p, c.replica_view(p).get()));
+      let (next, failed_over) =
+        Self::resolve_stale_probe(self.active_stale_probe, target_cut, serving);
+      self.active_stale_probe = next;
+      if failed_over {
+        self.report.stale_read_failovers_observed += 1;
+      }
+    }
+
     // (e) SLOW REPLICA (gray failure): degrade ONE replica's delivery for a bounded episode window —
     // every inter-replica message touching its seeded legs (inbound/outbound/both) arrives a few
     // seeded milliseconds LATE, never dropped. NOT a partition and NOT budgeted as knocked out: the
@@ -1656,6 +1816,32 @@ impl Vopr {
   fn apply_partition(&self, c: &mut Cluster) {
     let groups: Vec<u8> = (0..self.n).map(|i| u8::from(self.isolated[i])).collect();
     c.partition(groups);
+  }
+
+  /// Decide an in-flight stale-read probe's fate from observed state, returning `(next probe, a
+  /// failover was observed)`. Pure so the causality is unit-testable. The deposed target must STILL
+  /// be cut for any witness — a target no longer cut was healed before its failover, so the cut
+  /// cannot have caused the view change (abandoned, no witness, even if a higher-view primary now
+  /// exists). With the target still cut, a DIFFERENT serving primary in a strictly higher view is
+  /// the causal failover witness (and resolves the probe); otherwise the probe stays pending.
+  fn resolve_stale_probe(
+    probe: Option<(usize, u64)>,
+    target_still_cut: bool,
+    serving: Option<(usize, u64)>,
+  ) -> (Option<(usize, u64)>, bool) {
+    let Some((target, old_view)) = probe else {
+      return (None, false);
+    };
+    if !target_still_cut {
+      return (None, false);
+    }
+    if let Some((p, view)) = serving
+      && p != target
+      && view > old_view
+    {
+      return (None, true);
+    }
+    (probe, false)
   }
 
   /// The number of replicas currently knocked out: crashed plus isolated plus one-way victims
@@ -1733,6 +1919,10 @@ impl Vopr {
       self.isolated[i] = false;
       self.asym_victims[i] = false;
     }
+    // Abandon any in-flight stale-read probe: its cut is gone, so a later failover cannot be
+    // attributed to it (the resolver gates on `target_still_cut`, but clearing here keeps the
+    // probe state honest across the calm window, where the resolver does not run).
+    self.active_stale_probe = None;
     c.heal();
   }
 
@@ -1777,6 +1967,7 @@ impl Vopr {
   }
 
   /// Run all per-tick invariant checks; panic with `seed`+`tick` on any violation.
+  #[allow(clippy::too_many_arguments)]
   fn check_invariants(
     &mut self,
     c: &mut Cluster,
@@ -1784,6 +1975,7 @@ impl Vopr {
     dur: &mut DurabilityChecker,
     vm: &mut ViewMonotonicChecker,
     applied_once: &mut AppliedOnceChecker,
+    staleness: &mut StalenessChecker,
     bound: &BoundednessChecker,
   ) {
     use crate::checker::CheckResult::Violation;
@@ -1833,6 +2025,12 @@ impl Vopr {
     }
     if let Violation(why) = applied_once.observe(c) {
       panic!("vopr seed {} tick {tick}: applied-once: {why}", self.seed);
+    }
+    // Staleness floor monotonicity (the committed-history high-water never regresses), observed every
+    // tick across the stale-read failover — the live value of the staleness oracle in this phase (the
+    // read enforcement is vacuous until a read path records reads).
+    if let Violation(why) = staleness.observe(c) {
+      panic!("vopr seed {} tick {tick}: staleness: {why}", self.seed);
     }
     if let Violation(why) = vm.observe(c) {
       panic!("vopr seed {} tick {tick}: view-monotonic: {why}", self.seed);
@@ -2183,6 +2381,12 @@ impl Vopr {
     // episode genuinely intersected live traffic rather than merely being installed.
     self.report.one_way_dropped = self.report.one_way_dropped.max(c.one_way_dropped());
     self.report.slow_delays = self.report.slow_delays.max(c.slow_delays_applied());
+    // Stale-read witness: the cluster's monotone primary-deposition counter (nothing resets it, so
+    // `max` is exact). 0 with the axis off; the stale-read sweep asserts the cross-seed sum is `> 0`.
+    self.report.stale_read_probes_fired = self
+      .report
+      .stale_read_probes_fired
+      .max(c.stale_read_probes_fired());
     // Batching-axis witnesses: each batching client's counters are monotone over the run (client
     // models persist across replica crash/restart and nothing resets them — the `holds_fired`
     // discipline), so the cross-client sums are monotone too and `max` folds them exactly. All 0
@@ -2214,4 +2418,58 @@ fn max_committed(c: &Cluster) -> usize {
     .map(|i| c.replica_sm(i).applied().len())
     .max()
     .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::Vopr;
+
+  // The causal stale-read witness fires ONLY on an observed probe-induced failover, never on a bare
+  // cut and never after a heal-before-failover — so the lane's non-vacuity cannot be satisfied
+  // without exercising a completed deposed-primary failover window.
+  #[test]
+  fn resolve_stale_probe_distinguishes_failover_from_heal() {
+    // No probe in flight: nothing to resolve.
+    assert_eq!(Vopr::resolve_stale_probe(None, false, None), (None, false));
+
+    // A DIFFERENT serving primary in a strictly higher view while the target is still cut: the
+    // probe-induced failover — the witness fires and the probe resolves.
+    assert_eq!(
+      Vopr::resolve_stale_probe(Some((0, 0)), true, Some((1, 1))),
+      (None, true),
+      "a higher-view serving primary while the target is cut is the failover witness"
+    );
+
+    // The regression: a heal BEFORE any failover (target no longer cut, no higher-view primary yet)
+    // abandons the probe WITHOUT a witness — a cut undone before it forced a view change must not
+    // count.
+    assert_eq!(
+      Vopr::resolve_stale_probe(Some((0, 0)), false, None),
+      (None, false),
+      "a heal before any failover abandons the probe with no witness"
+    );
+
+    // Still pending: the target is cut, but no higher-view serving primary has emerged yet (election
+    // ongoing, or only the same/lower view present).
+    assert_eq!(
+      Vopr::resolve_stale_probe(Some((0, 0)), true, None),
+      (Some((0, 0)), false),
+      "an election window leaves the probe pending"
+    );
+    assert_eq!(
+      Vopr::resolve_stale_probe(Some((0, 5)), true, Some((1, 5))),
+      (Some((0, 5)), false),
+      "a same-view primary is not the awaited higher-view failover"
+    );
+
+    // A target HEALED before the failover never counts, even if a higher-view serving primary now
+    // exists — the cut was undone before it could cause the view change, so attributing the
+    // failover to the probe would be non-causal (the calm-window-heal path the witness must
+    // exclude).
+    assert_eq!(
+      Vopr::resolve_stale_probe(Some((0, 0)), false, Some((1, 2))),
+      (None, false),
+      "a higher-view primary after the cut was healed is not a probe-caused failover"
+    );
+  }
 }

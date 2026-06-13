@@ -50,6 +50,12 @@ pub struct ClientModel {
   total: u64,
   next_request: u64,
   replies: Vec<(u64, Bytes)>,
+  /// Parallel to [`Self::replies`], one entry per recorded reply in the SAME order, each carrying the
+  /// virtual instant the matching `Reply` was delivered to the client — i.e. when the request was
+  /// ACKED at real (sim) time. The staleness oracle folds these to learn each acked op's
+  /// ack-instant; the plain [`Self::replies`] record is kept untouched so the other checkers and the
+  /// digest harness read it unchanged.
+  replies_at: Vec<(u64, Bytes, Instant)>,
   inflight: Option<Request>,
   /// Last instant at which the inflight request was transmitted; `None` means
   /// "not yet sent this cycle" so the next `pending` call must transmit.
@@ -86,6 +92,7 @@ impl ClientModel {
       total,
       next_request: 1,
       replies: Vec::new(),
+      replies_at: Vec::new(),
       inflight: None,
       last_sent: None,
       seed,
@@ -169,6 +176,13 @@ impl ClientModel {
   /// The replies received so far.
   pub fn replies(&self) -> &[(u64, Bytes)] {
     &self.replies
+  }
+
+  /// The replies received so far, each STAMPED with the virtual instant it was acked (the `Reply`
+  /// delivery instant) — `(request, reply_body, ack_instant)`, in the same order as [`Self::replies`].
+  /// The staleness oracle reads this to learn when each committed op was acked to a client.
+  pub fn replies_at(&self) -> &[(u64, Bytes, Instant)] {
+    &self.replies_at
   }
 
   /// How many LARGE-bodied requests this client has minted (the non-vacuity witness for the frame-cap
@@ -290,10 +304,11 @@ impl ClientModel {
     }
   }
 
-  /// Handles a reply: if it matches the in-flight request, record it and advance. A batching
-  /// client first demultiplexes the reply body per unit (count + per-unit reply assertions, and
-  /// the oracle's bookkeeping) through the model.
-  pub fn handle(&mut self, msg: Message) {
+  /// Handles a reply delivered at virtual instant `now`: if it matches the in-flight request, record
+  /// it (stamping the parallel ack-instant record at `now`) and advance. A batching client first
+  /// demultiplexes the reply body per unit (count + per-unit reply assertions, and the oracle's
+  /// bookkeeping) through the model.
+  pub fn handle(&mut self, now: Instant, msg: Message) {
     if let Message::Reply(r) = msg
       && let Some(req) = &self.inflight
       && req.request() == r.request()
@@ -302,7 +317,8 @@ impl ClientModel {
       if let Some(b) = self.batching.as_mut() {
         b.on_ack(r.request().get(), &body);
       }
-      self.replies.push((r.request().get(), body));
+      self.replies.push((r.request().get(), body.clone()));
+      self.replies_at.push((r.request().get(), body, now));
       self.inflight = None;
       self.last_sent = None;
       self.next_request += 1;
