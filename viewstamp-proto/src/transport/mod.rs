@@ -40,8 +40,9 @@ pub use labeled::{LabelOptions, Labeled};
 pub use passthrough::Passthrough;
 #[cfg(feature = "quic")]
 pub use quic::{
-  CertOid, ClusterTls, DialError, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome,
-  IdentitySource, ProvidedIdentity, QuicCoordinator, QuicOptions, QuicTuning, StreamLayout,
+  AttestedId, CertOid, ClusterTls, DialError, Hello, Identified, IdentityConfig, IdentityCtx,
+  IdentityOutcome, IdentitySource, ProvidedIdentity, QuicCoordinator, QuicOptions, QuicTuning,
+  StreamLayout,
 };
 pub use router::{ConnId, PeerRouter};
 pub use stream::{Intake, StreamTransport};

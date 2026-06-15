@@ -318,12 +318,12 @@ mod tests {
 
   use super::*;
   use crate::{
-    ClientId, Config, LabelOptions, Labeled, ReplicaId, RequestNumber,
+    ClientId, Config, LabelOptions, Labeled, MemberId, ReplicaId, RequestNumber,
     message::Request,
     transport::{
       Passthrough,
       stream::RecordIo,
-      testutil::{CountSm, TestSb, TestWal},
+      testutil::{CountSm, TestSb, TestWal, genesis},
     },
   };
 
@@ -349,11 +349,15 @@ mod tests {
 
   #[test]
   fn inbound_request_produces_outbound_to_a_backup() {
-    let cfg = Config::try_new(0xABCD, ReplicaId::new(0), 3).unwrap(); // replica 0 = primary of view 0
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap(); // replica 0 = primary of view 0
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord =
-      StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(cfg, 1, CountSm::default()));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+    ));
     // A raw Passthrough has no handshake identity; registration validates it immediately (it trusts
     // the registered peer), so each backup conn is a routing target without any extra nudge.
     coord.register_dialed(Peer::Replica(ReplicaId::new(1)), conn());
@@ -395,11 +399,15 @@ mod tests {
     use crate::transport::frame::{MAX_FRAME_LEN, max_request_body_len};
 
     // Replica 0 is the primary of view 0, so an admitted relayed Request would be served.
-    let cfg = Config::try_new(0xABCD, ReplicaId::new(0), 3).unwrap();
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord =
-      StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(cfg, 1, CountSm::default()));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+    ));
     // Two raw Passthrough backups (validated on register), so a served Prepare HAS somewhere to route —
     // proving the over-max case routes NOTHING, not merely that no conn was available.
     coord.register_dialed(Peer::Replica(ReplicaId::new(1)), conn());
@@ -485,11 +493,15 @@ mod tests {
   #[test]
   fn a_large_multi_chunk_read_is_processed_without_closing_the_conn() {
     use crate::transport::frame::encode_frame;
-    let cfg = Config::try_new(0xABCD, ReplicaId::new(0), 3).unwrap();
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord =
-      StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(cfg, 1, CountSm::default()));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+    ));
     // A raw Passthrough validates on register; inbound decodes are tagged with the bound peer.
     let id = coord.register_dialed(Peer::Replica(ReplicaId::new(1)), conn());
     // Build more than one 64 KiB STAGE_CHUNK worth of framed messages so the read spans chunks.
@@ -510,9 +522,13 @@ mod tests {
   // prediction. A default-cap coordinator reports 2x the default 64 MiB staging cap.
   #[test]
   fn max_outbound_backlog_is_twice_the_router_outbound_cap() {
-    let cfg = Config::try_new(0xABCD, ReplicaId::new(0), 3).unwrap();
-    let coord =
-      StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(cfg, 1, CountSm::default()));
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+    let coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+    ));
     const DEFAULT_CAP: usize = 64 * 1024 * 1024;
     assert_eq!(
       coord.max_outbound_backlog(),
@@ -525,11 +541,12 @@ mod tests {
   // A peer presenting the wrong cluster id is rejected and the conn reaped.
   #[test]
   fn wrong_cluster_conn_is_reaped() {
-    let cfg = Config::try_new(0xAAAA, ReplicaId::new(0), 3).unwrap();
+    let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
     let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::new(
       cfg,
+      genesis(3),
       1,
       CountSm::default(),
     ));
@@ -558,11 +575,12 @@ mod tests {
   // spurious closes for the surviving healthy table).
   #[test]
   fn an_internally_reaped_conn_surfaces_through_poll_conn_closed() {
-    let cfg = Config::try_new(0xAAAA, ReplicaId::new(0), 3).unwrap();
+    let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
     let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::new(
       cfg,
+      genesis(3),
       1,
       CountSm::default(),
     ));
@@ -601,11 +619,15 @@ mod tests {
   // driver attributes the close to, instead of a bare id.
   #[test]
   fn a_bad_frame_close_yields_its_cause_through_poll_conn_closed() {
-    let cfg = Config::try_new(0xABCD, ReplicaId::new(0), 3).unwrap();
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord =
-      StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(cfg, 1, CountSm::default()));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+    ));
     // A raw Passthrough validates on register, so the garbage frame reaches the decode stage.
     let id = coord.register_dialed(Peer::Replica(ReplicaId::new(1)), conn());
     assert_eq!(coord.poll_conn_closed(), None, "no closed conn initially");
@@ -629,11 +651,12 @@ mod tests {
   // NOT authoritative until its handshake validates (note_established is the sole writer of `peers`).
   #[test]
   fn a_redial_is_registered_but_not_authoritative_until_validated() {
-    let cfg = Config::try_new(0xABCD, ReplicaId::new(0), 3).unwrap();
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
     let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::new(
       cfg,
+      genesis(3),
       1,
       CountSm::default(),
     ));
@@ -663,11 +686,12 @@ mod tests {
   // A still-handshaking conn receives no app bytes (the prepare is not routed to it).
   #[test]
   fn route_skips_a_handshaking_conn() {
-    let cfg = Config::try_new(0xABCD, ReplicaId::new(0), 3).unwrap();
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
     let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::new(
       cfg,
+      genesis(3),
       1,
       CountSm::default(),
     ));
@@ -708,11 +732,15 @@ mod tests {
   fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
     use crate::{GetView, View, transport::frame::encode_frame};
     // Replica 0 is the primary of view 0, so it answers a GetView(view 0) synchronously.
-    let cfg = Config::try_new(0xABCD, ReplicaId::new(0), 3).unwrap();
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord =
-      StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(cfg, 1, CountSm::default()));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+    ));
     let peer = Peer::Replica(ReplicaId::new(1));
     // Two raw Passthrough conns for the same peer: the first becomes a live standby, the second (last
     // established) is authoritative. A raw conn validates on register, so both are routing-eligible.
@@ -724,7 +752,13 @@ mod tests {
       "last-established conn is authoritative; the first is a live standby"
     );
     // A complete GetView frame AND eof arrive together on the authoritative conn.
-    let get_view = Message::GetView(GetView::new(View::with(0), ReplicaId::new(1), 0x1234));
+    let get_view = Message::GetView(GetView::new(
+      View::with(0),
+      ReplicaId::new(1),
+      0x1234,
+      crate::Epoch::new(0),
+      0,
+    ));
     let mut framed = Vec::new();
     encode_frame(&get_view.encode(), &mut framed);
     coord.handle_conn_data(

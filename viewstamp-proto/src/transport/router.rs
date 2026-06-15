@@ -505,6 +505,8 @@ mod tests {
       View::with(1),
       OpNumber::with(5),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     ))
   }
 

@@ -6,17 +6,22 @@
 use core::time::Duration;
 
 use crate::{
-  ClientId, Config, Conn, ConnId, Endpoint, Instant, LabelOptions, Labeled, Message, Passthrough,
-  Peer, ReplicaId, RequestNumber, StreamCoordinator, StreamTransport,
+  ClientId, Config, Conn, ConnId, Endpoint, Instant, LabelOptions, Labeled, MemberId, Message,
+  Passthrough, Peer, ReplicaId, RequestNumber, StreamCoordinator, StreamTransport,
   message::Request,
-  transport::testutil::{CountSm, TestSb, TestWal},
+  transport::testutil::{CountSm, TestSb, TestWal, genesis},
 };
 
 const CLUSTER: u128 = 0x5151;
 
 fn replica<R: StreamTransport>(id: u16) -> (StreamCoordinator<CountSm, R>, TestWal, TestSb) {
-  let cfg = Config::try_new(CLUSTER, ReplicaId::new(id), 2).unwrap();
-  let coord = StreamCoordinator::new(Endpoint::new(cfg, u64::from(id) + 1, CountSm::default()));
+  let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
+  let coord = StreamCoordinator::new(Endpoint::new(
+    cfg,
+    genesis(2),
+    u64::from(id) + 1,
+    CountSm::default(),
+  ));
   (coord, TestWal::default(), TestSb::default())
 }
 

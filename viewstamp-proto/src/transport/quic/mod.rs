@@ -17,8 +17,8 @@ mod testutil;
 pub use bridge::DialError;
 pub use crypto::{ClusterTls, QuicOptions, QuicTuning};
 pub use identity::{
-  CertOid, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome, IdentitySource,
-  ProvidedIdentity,
+  AttestedId, CertOid, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome,
+  IdentitySource, ProvidedIdentity,
 };
 pub use layout::StreamLayout;
 
@@ -230,19 +230,14 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     self.endpoint.cluster()
   }
 
-  /// The configured cluster membership size (voters plus non-voting members), single-sourced from the
-  /// endpoint's `Config` (no duplicate field). The binding policy rejects a replica whose attested
-  /// index is outside `0..node_count`.
+  /// This node's own attested identity (its stable [`MemberId`]), single-sourced from the endpoint's
+  /// `Config` (no duplicate field). Written into the control-stream preface so peers learn who
+  /// dialed/accepted them, and compared (by member id) in the self-reject. Attesting the stable member
+  /// id — not the slot it currently occupies — is what lets a peer resolve it against ITS active
+  /// membership.
   #[inline(always)]
-  fn node_count(&self) -> u16 {
-    self.endpoint.node_count()
-  }
-
-  /// This node's own peer identity, single-sourced from the endpoint's `Config` (no duplicate
-  /// field). Written into the control-stream preface so peers learn who dialed/accepted them.
-  #[inline(always)]
-  fn me(&self) -> Peer {
-    Peer::Replica(self.endpoint.replica())
+  fn me(&self) -> AttestedId {
+    AttestedId::Replica(self.endpoint.local())
   }
 
   /// `now` mapped onto quinn's `std::time::Instant` clock: the std anchor plus the viewstamp nanos
@@ -562,20 +557,23 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// Apply the coordinator-owned binding policy to an [`IdentityOutcome`] for connection `h`.
   ///
   /// - `Identified(candidate)`: the candidate's attested cluster MUST equal this endpoint's
-  ///   `Config.cluster` (the cross-check the COORDINATOR owns), the candidate must be a REPLICA
-  ///   WITHIN the configured membership (`index < replica_count`), and it must NOT be THIS replica's
-  ///   own id (a replica never binds a peer claiming to be itself — the gate an ACCEPTED connection's
-  ///   absent dialed expectation would otherwise miss); then a DIALED connection requires
-  ///   `candidate == dialed_expectation` (match-or-abort) while an ACCEPTED connection ADOPTS the
-  ///   candidate. On acceptance the peer is bound and the connection promoted to `Validated` (flushing
+  ///   `Config.cluster` (the cross-check the COORDINATOR owns); the candidate must be a REPLICA whose
+  ///   attested stable [`MemberId`] is IN the active membership — resolved to a routing slot via
+  ///   `Endpoint::slot_of` (an absent member is REJECTED: it is not part of the active configuration);
+  ///   and it must NOT be THIS node's own member id (a replica never binds a peer claiming to be
+  ///   itself — the gate an ACCEPTED connection's absent dialed expectation would otherwise miss). Then
+  ///   a DIALED connection requires the resolved routing peer to equal the dialed expectation
+  ///   (match-or-abort) while an ACCEPTED connection ADOPTS it. On acceptance the peer is bound (keyed
+  ///   by its routing slot `Peer::Replica(slot)`) and the connection promoted to `Validated` (flushing
   ///   staged consensus); on any mismatch the connection is closed + reaped.
   /// - `Pending`: more control bytes are needed — leave the connection `Authenticating`.
   /// - `Rejected`: close + reap.
   ///
-  /// For the PROVIDED sources the cluster cross-check is un-bypassable (they report the genuine
-  /// attested cluster parsed from the handshake material); a [`Self::dangerous_custom_identity`]
-  /// source owns its own attested cluster, so the check there only re-confirms what the source
-  /// reports.
+  /// The attestation + admission are MemberId-based; the ConnTable routing stays keyed by the resolved
+  /// `Peer::Replica(slot)`. For the PROVIDED sources the cluster cross-check is un-bypassable (they
+  /// report the genuine attested cluster parsed from the handshake material); a
+  /// [`Self::dangerous_custom_identity`] source owns its own attested cluster, so the check there only
+  /// re-confirms what the source reports.
   fn apply_outcome(
     &mut self,
     std_now: std::time::Instant,
@@ -591,51 +589,54 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       }
     };
     // Cluster cross-check, OWNED by the coordinator: the attested cluster the source REPORTS must
-    // equal this endpoint's `Config.cluster`, asserted BEFORE `is_replica` and the dialed-match/adopt.
-    // For the PROVIDED sources this is un-bypassable: `Hello`/`CertOid` report the genuine cluster
-    // parsed from the handshake material, so a misconfigured-field source still keys off the endpoint
-    // cluster and a wrong-cluster peer is rejected here. A `dangerous_custom_identity` source owns its
-    // own attested cluster (it may report any cluster), so this only re-confirms what that source
-    // asserts — the embedder owns that correctness per the named hazard.
+    // equal this endpoint's `Config.cluster`, asserted BEFORE the membership resolution and the
+    // dialed-match/adopt. For the PROVIDED sources this is un-bypassable: `Hello`/`CertOid` report the
+    // genuine cluster parsed from the handshake material, so a misconfigured-field source still keys off
+    // the endpoint cluster and a wrong-cluster peer is rejected here. A `dangerous_custom_identity`
+    // source owns its own attested cluster (it may report any cluster), so this only re-confirms what
+    // that source asserts — the embedder owns that correctness per the named hazard.
     if identified.cluster() != self.cluster() {
       self.bridge.close_local(std_now, h);
       return;
     }
-    let candidate = identified.who();
-    // Only a replica WITHIN this endpoint's configured membership (`0..node_count`, voters plus
-    // non-voting members) may bind. Two rejections collapse here: a CLIENT identity (clients use a
-    // separate endpoint), so `as_replica()` is `None`; and a replica index `>= node_count` — a
-    // retired/misconfigured cert from a since-shrunk cluster. Without this gate such a peer would
-    // consume a slot and join the `Backups`/`AllReplicas` fanout, yet the endpoint's own
-    // `sender_matches` then drops every inbound consensus frame from it — slot and traffic wasted.
-    // In-model misconfiguration, not a Byzantine claim.
-    match candidate.as_replica() {
-      Some(r) if r.get() < self.node_count() => {}
-      _ => {
-        self.bridge.close_local(std_now, h);
-        return;
-      }
-    }
-    // A replica must NEVER bind a peer claiming to be ITSELF. An ACCEPTED connection has no dialed
-    // expectation, so without this gate a duplicate-id / misconfigured member presenting a valid cluster
-    // cert for THIS replica's own id would bind AS this replica — and that bound peer becomes the `from` a
-    // consensus frame is delivered under, satisfying the endpoint's sender check for a network-supplied
-    // self-identifying message. In-model duplicate-identity (it needs a valid cluster cert for our id),
-    // not a Byzantine claim.
-    if candidate == self.me() {
+    // The attested identity must be a REPLICA's stable `MemberId` (a CLIENT identity uses a separate
+    // endpoint, so `as_replica()` is `None` → reject).
+    let Some(member_id) = identified.id().as_replica() else {
+      self.bridge.close_local(std_now, h);
+      return;
+    };
+    // A replica must NEVER bind a peer claiming to be ITSELF, keyed on the stable member id. An ACCEPTED
+    // connection has no dialed expectation, so without this gate a duplicate-id / misconfigured member
+    // presenting a valid cluster cert for THIS node's own member id would bind AS this node — and that
+    // bound peer becomes the `from` a consensus frame is delivered under, satisfying the endpoint's
+    // sender check for a network-supplied self-identifying message. In-model duplicate-identity (it
+    // needs a valid cluster cert for our id), not a Byzantine claim. Checked BEFORE the membership
+    // resolution: a node IS in its own membership, so resolving first would admit the self-claim.
+    if member_id == self.endpoint.local() {
       self.bridge.close_local(std_now, h);
       return;
     }
+    // Resolve the attested stable `MemberId` to its routing slot against the ACTIVE membership. `Some`
+    // ⇒ the peer is a member of the active configuration; bind it under `Peer::Replica(slot)`. `None` ⇒
+    // the member is NOT in the active membership (a retired / not-yet-added / foreign-but-cluster-valid
+    // cert), so REJECT: without this gate such a peer would consume a slot and join the
+    // `Backups`/`AllReplicas` fanout, yet the endpoint's own `sender_matches` then drops every inbound
+    // consensus frame from it. In-model misconfiguration, not a Byzantine claim.
+    let Some(slot) = self.endpoint.slot_of(member_id) else {
+      self.bridge.close_local(std_now, h);
+      return;
+    };
+    let routing_peer = Peer::Replica(slot);
     match self.bridge.dialed_expectation_of(h) {
-      // Dialed: the authenticated identity must be exactly the peer we meant to reach.
-      Some(expected) if candidate != expected => {
+      // Dialed: the resolved routing peer must be exactly the peer we meant to reach.
+      Some(expected) if routing_peer != expected => {
         self.bridge.close_local(std_now, h);
         return;
       }
       // Dialed-and-matched, or accepted (adopt): fall through to bind.
       _ => {}
     }
-    self.bridge.bind_validated(std_now, h, candidate);
+    self.bridge.bind_validated(std_now, h, routing_peer);
   }
 
   /// Drain the endpoint's outgoing backlog into an owned `Vec` (releasing the endpoint borrow),
@@ -832,10 +833,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
 mod tests {
   use super::*;
   use crate::{
-    Config, Endpoint, Instant, Peer, ReplicaId,
+    Config, Endpoint, Instant, MemberId, Peer, ReplicaId,
     transport::{
       quic::{crypto::test_ca, testutil::addr},
-      testutil::CountSm,
+      testutil::{CountSm, genesis},
     },
   };
 
@@ -852,9 +853,9 @@ mod tests {
   #[test]
   fn connect_emits_an_initial_datagram() {
     let cluster = 0x5151;
-    let cfg = Config::try_new(cluster, ReplicaId::new(0), 2).unwrap();
+    let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, 1, CountSm::default()),
+      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
       mtls_opts(cluster),
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -892,9 +893,9 @@ mod tests {
   #[test]
   fn a_public_connect_over_the_cap_returns_at_capacity_and_allocates_nothing() {
     let cluster = 0x5151;
-    let cfg = Config::try_new(cluster, ReplicaId::new(0), 2).unwrap();
+    let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, 1, CountSm::default()),
+      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
       // Explicit `1` is floored up to the mutual-dial-mesh minimum; read the effective cap below.
       mtls_opts(cluster).with_max_connections(1),
       Some([0u8; 32]),
@@ -959,9 +960,9 @@ mod tests {
     use crate::DialError;
 
     let cluster = 0x5151;
-    let cfg = Config::try_new(cluster, ReplicaId::new(0), 2).unwrap();
+    let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, 1, CountSm::default()),
+      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
       // Explicit `1` is floored up to the mutual-dial-mesh minimum; read the effective cap below.
       mtls_opts(cluster).with_max_connections(1),
       Some([0u8; 32]),
@@ -1013,9 +1014,9 @@ mod tests {
     use core::time::Duration;
 
     let cluster = 0x5151;
-    let cfg = Config::try_new(cluster, ReplicaId::new(0), 2).unwrap();
+    let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, 1, CountSm::default()),
+      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
       mtls_opts(cluster),
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -1062,11 +1063,11 @@ mod tests {
   #[should_panic(expected = "mandatory mTLS")]
   fn with_identity_rejects_options_without_mandatory_client_auth() {
     let cluster = 0x5151;
-    let cfg = Config::try_new(cluster, ReplicaId::new(0), 2).unwrap();
+    let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     // `accept_any_for_test` builds a server WITHOUT client auth (`requires_client_auth() == false`):
     // the provided-identity invariant forbids it on the safe path.
     let _ = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, 1, CountSm::default()),
+      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
       QuicOptions::accept_any_for_test(),
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -1084,10 +1085,10 @@ mod tests {
       opts.requires_client_auth(),
       "a ClusterTls::build bundle carries mandatory client auth"
     );
-    let cfg = Config::try_new(cluster, ReplicaId::new(0), 2).unwrap();
+    let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     // Must not panic: the safe provided-identity path accepts a mandatory-mTLS options bundle.
     let c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, 1, CountSm::default()),
+      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
       opts,
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -1103,13 +1104,13 @@ mod tests {
   /// overriding the connection cap, and return the EFFECTIVE cap the bridge ended up with.
   fn effective_cap(replica_count: u8, override_cap: Option<usize>) -> usize {
     let cluster = 0x5151;
-    let cfg = Config::try_new(cluster, ReplicaId::new(0), replica_count).unwrap();
+    let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut opts = mtls_opts(cluster);
     if let Some(cap) = override_cap {
       opts = opts.with_max_connections(cap);
     }
     let c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, 1, CountSm::default()),
+      Endpoint::new(cfg, genesis(replica_count), 1, CountSm::default()),
       opts,
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -1190,11 +1191,11 @@ mod tests {
 
     let cluster = 0x5151;
     // Replica 0 is the primary of view 0, so an admitted relayed Request would be served.
-    let cfg = Config::try_new(cluster, ReplicaId::new(0), 3).unwrap();
+    let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, 1, CountSm::default()),
+      Endpoint::new(cfg, genesis(3), 1, CountSm::default()),
       mtls_opts(cluster),
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
