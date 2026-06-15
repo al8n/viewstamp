@@ -23,7 +23,7 @@ mod sealed {
 /// `SingleChange` and `Joint` join in later milestones, and the
 /// [`Endpoint`](crate::Endpoint)`<S, R: Reconfig>` type-state is wired then.
 ///
-/// Sealed: implementable only inside this crate (the private [`sealed::Sealed`] supertrait).
+/// Sealed: implementable only inside this crate (a private `Sealed` supertrait).
 pub trait Reconfig: sealed::Sealed {}
 
 /// The offline-restart reconfiguration capability: the cluster is stopped, a successor

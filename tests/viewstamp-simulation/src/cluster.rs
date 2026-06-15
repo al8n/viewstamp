@@ -1022,7 +1022,7 @@ impl Cluster {
   /// escalation. The steps mirror the proto's `recovering_head_post_reconfig` fixture at cluster scale:
   ///
   /// 1. **Quiesce (route A precondition):** heal every partition, drop all network faults, restart any
-  ///    crashed node, and [`drive_to_quiesced_normal`](Self::drive_to_quiesced_normal) so every
+  ///    crashed node, and `drive_to_quiesced_normal` so every
   ///    non-crashed node is `Normal` at a COMMON view `V` with the network idle. (An offline stop is on
   ///    healthy disks, so committed data is sound throughout.) `None` if the cluster cannot quiesce
   ///    within the budget (no swap is attempted).

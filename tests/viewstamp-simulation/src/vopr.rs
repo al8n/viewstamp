@@ -794,7 +794,7 @@ struct Vopr {
   /// wedge being driven by head-slot read-faults on the UNCOMMITTED tail alone.
   reconfig_axis: bool,
   /// How many coordinated offline reconfigurations this run has fired (counted against
-  /// [`RECONFIG_BUDGET`]). `0` unless the reconfig axis is enabled.
+  /// `RECONFIG_BUDGET`). `0` unless the reconfig axis is enabled.
   reconfig_actions: u64,
   /// The durable `(epoch, view)` split-brain regression net, observed every tick. Held on the driver
   /// (not threaded through [`Self::check_invariants`]'s already-long signature) because it is a pure
@@ -1008,7 +1008,7 @@ pub fn run_vopr_with_learners(seed: u64, ticks: u64) -> VoprReport {
 
 /// Like [`run_vopr`] but with the TIER C RECONFIGURATION axis FORCE-ENABLED, independent of the
 /// `VOPR_RECONFIG` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]). On a
-/// seeded cadence (within [`RECONFIG_BUDGET`]) the driver fires a coordinated OFFLINE reconfiguration
+/// seeded cadence (within `RECONFIG_BUDGET`) the driver fires a coordinated OFFLINE reconfiguration
 /// ([`Cluster::reconfigure_offline`], route A): it drains the cluster to all-`Normal` at a common
 /// view, mints one UNCOMMITTED tail op above the committed frontier, pre-writes a successor durable
 /// root on every node via `prepare_restart` (KEEPING the voting set — a no-op-membership reconfig that
@@ -2086,7 +2086,7 @@ impl Vopr {
     }
 
     // (g) TIER C RECONFIGURATION (the all-`RecoveringHead` re-formation axis): on a seeded cadence,
-    // within [`RECONFIG_BUDGET`], fire a coordinated OFFLINE reconfiguration that drives the
+    // within `RECONFIG_BUDGET`, fire a coordinated OFFLINE reconfiguration that drives the
     // all-`RecoveringHead` wedge — the empirical oracle for the proto's `retire_recover_and_escalate`
     // escalation. `Cluster::reconfigure_offline` drains the cluster to all-`Normal` at a common view,
     // mints one UNCOMMITTED tail op, pre-writes a successor durable root on every node (same voting
