@@ -205,6 +205,9 @@ impl<S: StateMachine> Endpoint<S> {
         PendingSbAction::SendDoViewChange => self.send_do_view_change(now),
         PendingSbAction::StartViewAsPrimary => self.start_view_participate(now, sb),
         PendingSbAction::AdoptedStartView => self.start_view_acks(wal),
+        // A frontier seal has no follow-up: the durable root now carries `commit_max`, which is all
+        // the operator awaited before deriving an offline-restart successor.
+        PendingSbAction::Seal => {}
       }
       return;
     }
@@ -653,6 +656,26 @@ impl<S: StateMachine> Endpoint<S> {
     let id = self.mint_op_id();
     sb.submit_write(id, state);
     self.pending_sb = Some((id, action));
+  }
+
+  /// Seal the in-memory committed frontier into the durable superblock root: persist `commit_max`
+  /// and its committed-band headers so the durable root's `commit` equals the live committed frontier.
+  ///
+  /// Between checkpoints (and view changes) `commit_max` advances only IN MEMORY — the durable root's
+  /// commit lags it. That lag is harmless in normal operation, where a recovering node catches the gap
+  /// up from a `Normal` peer. But a coordinated offline restart brings EVERY node down at the same stale
+  /// durable commit, so no peer can supply a committed op above it, and the bounded recover tail window
+  /// can strand such an op below the re-formed head. The operator MUST call this on every node, while
+  /// it is still up and `Normal`, and AWAIT its superblock write, BEFORE reading the root to derive a
+  /// successor with [`prepare_restart`](crate::prepare_restart) — so the successor root carries the
+  /// true committed prefix and every committed op is read back on restart.
+  ///
+  /// A no-op unless the node is `Normal` with no durable-view write already in flight — both of which
+  /// the quiesced-stop precondition (the cluster drained to all-`Normal`, idle) already guarantees.
+  pub fn seal_committed_frontier(&mut self, sb: &mut impl Superblock) {
+    if self.status.is_normal() && self.pending_sb.is_none() {
+      self.submit_durable_view(PendingSbAction::Seal, sb);
+    }
   }
 
   /// Build a durable root carrying the active [`Membership`] — a v4 root (epoch =

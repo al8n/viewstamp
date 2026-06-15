@@ -444,3 +444,245 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
     "the re-fire targets the new view + 1",
   );
 }
+
+// ── committed-frontier seal (`seal_committed_frontier`) ────────────────────────────────────
+//
+// An offline-restart successor root copies `cur.commit()` — the DURABLE-root commit, which LAGS the in-memory
+// `commit_max` between checkpoints (commit advances in memory via `advance_commit`; the durable root's
+// commit is persisted only at a checkpoint boundary or a view-change durable-view write). With
+// `checkpoint_ops > RECOVER_TAIL_WINDOW` a client-acked committed op K can sit MORE than
+// `RECOVER_TAIL_WINDOW` ops above a node's stale durable commit C0. After a coordinated restart EVERY
+// node has the same stale C0, so no peer holds a higher commit to repair from, and the bounded recover
+// tail window (`hi = head.min(commit_max + RECOVER_TAIL_WINDOW)`, floored at the durable commit) caps
+// `self.op` at `C0 + RECOVER_TAIL_WINDOW < K` — K is stranded below the re-formed head, its op-number
+// freed and overwritten: a committed-op LOSS with zero storage faults.
+//
+// `seal_committed_frontier` closes this: called on every node while it is still up and `Normal`, it
+// persists `commit_max` (+ its committed-band headers) into the durable root, so the successor
+// `prepare_restart` derives carries the true committed prefix and every committed op is read back.
+
+/// A v4 root carrying `genesis(3)` at `(view = 0, log_view = 0, commit, checkpoint_op = 0)` with the
+/// dense committed band `1..=commit` (one canonical header per op). Body `[op as u8]` matches what
+/// `ScriptedWal::with_entries` stores, so a recover off the successor reads each op back header-matched.
+/// This is the SHAPE a SEALED root has — `commit == commit_max`, every committed op vouched.
+fn sealed_root(commit: u64) -> VsrState {
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let headers: std::vec::Vec<Header> = (1..=commit).map(mk).collect();
+  let genesis = genesis(3);
+  let epoch = genesis.epoch();
+  VsrState::try_new_v4(
+    View::new(),
+    View::new(),
+    OpNumber::with(commit),
+    OpNumber::new(),
+    0,
+    headers,
+    epoch,
+    epoch,
+    genesis,
+  )
+  .expect("valid sealed v4 root")
+}
+
+#[test]
+fn seal_committed_frontier_persists_commit_max_into_the_durable_root() {
+  // (a) THE SEAL MECHANISM. A `Normal` node whose in-memory `commit_max` is K = RECOVER_TAIL_WINDOW + 2
+  // sits above a STALE low durable-root commit C0 = 0 (the between-checkpoints lag). `seal_committed_frontier`
+  // must persist `commit_max` into the durable root, so a successor `prepare_restart` derives off the
+  // SEALED root carries the true committed prefix K — not the stale C0.
+  let k = RECOVER_TAIL_WINDOW + 2;
+  let mut e = Endpoint::new(
+    Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap(),
+    genesis(3),
+    0,
+    CountSm::default(),
+  );
+  // Force the held-frontier shape: in-memory `commit_max == op == K`, `checkpoint_op == 0`. The durable
+  // root (`TestSb::default()` → `VsrState::new()`) still names the STALE commit C0 == 0 — the lag.
+  e.force_state_for_test(0, k, k, 0, &[]);
+  let mut sb = TestSb::default();
+  assert_eq!(
+    sb.state().commit(),
+    OpNumber::new(),
+    "precondition: the durable root commit is the STALE C0 == 0 (below commit_max == K)"
+  );
+  assert_eq!(
+    e.commit_max(),
+    OpNumber::with(k),
+    "precondition: the in-memory known-committed frontier is K, above the durable root"
+  );
+
+  let now = Instant::ZERO;
+  e.seal_committed_frontier(&mut sb);
+  assert!(
+    e.pending_sb_for_test(),
+    "the seal armed a durable-root write (the node is Normal with no write in flight)"
+  );
+  // Drive the seal's superblock write to completion, exactly as a recover/view-change test drains it.
+  let mut wal = ScriptedWal::with_entries(0);
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    !e.pending_sb_for_test(),
+    "the seal's durable-root write completed"
+  );
+  // THE CORE assertion: the durable root now names the known-committed frontier K, not the stale C0.
+  // (FAIL-BEFORE: with `seal_committed_frontier` a no-op the root stays at C0 == 0.)
+  assert_eq!(
+    sb.state().commit(),
+    OpNumber::with(k),
+    "the seal persisted commit_max == K into the durable root (FAIL-BEFORE: stayed at C0 == 0)"
+  );
+}
+
+#[test]
+fn sealed_successor_root_carries_the_committed_frontier_across_a_restart() {
+  // (b) THE END-TO-END FIX. Take the SEALED root (commit == K, dense headers 1..=K), run `prepare_restart`
+  // to derive the offline-restart successor (bumped epoch, commit PRESERVED == K), recover a fresh node off the
+  // successor + a WAL holding 1..=K, and assert the recovered head reads the FULL committed band — K
+  // survives the coordinated restart.
+  let k = RECOVER_TAIL_WINDOW + 2;
+  let sealed = sealed_root(k);
+  assert_eq!(
+    sealed.commit(),
+    OpNumber::with(k),
+    "precondition: the sealed root names the committed frontier K"
+  );
+  let successor = crate::endpoint::prepare_restart(
+    &sealed,
+    3,
+    0,
+    std::vec![MemberId::new(0), MemberId::new(1), MemberId::new(2)],
+  )
+  .expect("successor root off the sealed predecessor");
+  assert_eq!(
+    successor.commit(),
+    OpNumber::with(k),
+    "prepare_restart PRESERVES the committed frontier — the successor still names K"
+  );
+  assert!(
+    successor.epoch() > successor.prev_epoch(),
+    "the successor is on-axis (bumped epoch), the realistic offline restart"
+  );
+
+  // The WAL holds canonical ops 1..=K (head == K), each body [op] header-matched, so recover reads the
+  // full sealed band back. A large checkpoint interval matches the regime in which the hazard is reachable.
+  let mut wal = ScriptedWal::with_entries(k);
+  let mut sb = sb_with_state(successor);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
+  let now = Instant::ZERO;
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  // The recovered head reads up to the sealed committed frontier K, not C0 + RECOVER_TAIL_WINDOW.
+  assert_eq!(
+    r.op(),
+    OpNumber::with(k),
+    "recover off the SEALED successor reads the full committed band (self.op == K), so K is not stranded"
+  );
+  assert!(
+    r.op().get() > RECOVER_TAIL_WINDOW,
+    "the committed op K above the window is held, not capped away"
+  );
+  for _ in 0..(k + 8) {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal, "tail consistent → Normal");
+  assert_eq!(
+    r.op(),
+    OpNumber::with(k),
+    "the full committed band frontier is preserved into Normal — K SURVIVES the offline restart"
+  );
+  assert_eq!(
+    r.commit_max(),
+    OpNumber::with(k),
+    "the recovered node carries the durable known-committed frontier K"
+  );
+  // The top op K (above the old window cap) is read + cached, not a hole — it is genuinely held.
+  assert!(
+    r.log
+      .get(&k)
+      .is_some_and(|e| e.body.as_present() == Some(&[k as u8][..])),
+    "the committed op K is read + cached with its canonical body (survived end to end)"
+  );
+  assert!(
+    !r.has_repair_hole_for_test(k),
+    "K is HELD, not a repair hole"
+  );
+}
+
+#[test]
+fn unsealed_successor_strands_a_committed_op_above_the_window() {
+  // (c) THE BUG WITNESS (non-vacuity). WITHOUT the seal the successor copies the STALE durable commit
+  // C0 == 0 even though the WAL holds a committed op K = RECOVER_TAIL_WINDOW + 2. On recover the tail
+  // window floors at the durable commit C0, so `hi = head.min(C0 + RECOVER_TAIL_WINDOW)` caps `self.op`
+  // at C0 + RECOVER_TAIL_WINDOW < K — K is STRANDED below the re-formed head, its op-number freed and
+  // overwritten on the next round: a committed-op loss. This pins WHY the seal is needed; it is today's
+  // pre-seal recover behaviour for a stale root.
+  let k = RECOVER_TAIL_WINDOW + 2;
+  // The UNSEALED predecessor: a v4 root whose durable commit is the STALE C0 == 0, with NO committed
+  // header above C0 (the band was never sealed). `prepare_restart` faithfully copies that stale commit.
+  let unsealed = v4_root(genesis(3), 0);
+  assert_eq!(
+    unsealed.commit(),
+    OpNumber::new(),
+    "the unsealed predecessor carries the STALE durable commit C0 == 0"
+  );
+  let successor = crate::endpoint::prepare_restart(
+    &unsealed,
+    3,
+    0,
+    std::vec![MemberId::new(0), MemberId::new(1), MemberId::new(2)],
+  )
+  .expect("successor root off the unsealed predecessor");
+  assert_eq!(
+    successor.commit(),
+    OpNumber::new(),
+    "WITHOUT the seal the successor inherits the stale C0 == 0 (the committed frontier was NOT sealed)"
+  );
+
+  // The WAL HOLDS the committed op K (head == K, every body header-matched) — the bytes are durably on
+  // disk — but the root vouches NO commit above C0, so recover cannot know K is committed and the window
+  // bounds the read.
+  let mut wal = ScriptedWal::with_entries(k);
+  let mut sb = sb_with_state(successor);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
+  let now = Instant::ZERO;
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  // THE HAZARD: the recovered head is capped at C0 + RECOVER_TAIL_WINDOW, STRICTLY BELOW K — the held
+  // committed op K is stranded above the read frontier (the loss the seal prevents).
+  assert_eq!(
+    r.op(),
+    OpNumber::with(RECOVER_TAIL_WINDOW),
+    "the unsealed stale root caps recover at C0 + RECOVER_TAIL_WINDOW < K — K is stranded above the window"
+  );
+  assert!(
+    r.op().get() < k,
+    "the recovered head is BELOW the held committed op K — without the seal K is not read back"
+  );
+  for _ in 0..(RECOVER_TAIL_WINDOW + 8) {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the capped recover still reaches Normal"
+  );
+  assert!(
+    !r.log.contains_key(&k),
+    "the stranded committed op K is NOT in the recovered cache — its slot is free to be overwritten"
+  );
+}

@@ -98,6 +98,9 @@ pub(crate) enum PendingSbAction {
   SendDoViewChange,
   StartViewAsPrimary,
   AdoptedStartView,
+  /// An operator-requested frontier seal ([`Endpoint::seal_committed_frontier`]): the write persists
+  /// the current `commit_max` + committed-band headers and has no follow-up participation.
+  Seal,
 }
 
 /// Which of a checkpoint's two superblock writes is outstanding. Kept SEPARATE from
