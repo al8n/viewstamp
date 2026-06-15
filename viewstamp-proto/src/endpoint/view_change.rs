@@ -5,7 +5,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// the primary's normal-path own append (`Pending::Ack`) and the view-change adoption append
   /// (`Pending::AdoptVote`) — both record the own vote ONLY once the op's WAL append is durable.
   pub(crate) fn record_own_vote(&mut self, op: u64) {
-    let own = 1u64 << self.config.replica().get();
+    let own = 1u64 << self.local_slot().get();
     // The primary's own vote is for the operation IT is driving at `op`, which is exactly the operation
     // whose identity seeded this inflight entry (the `on_request` mint, the view-change adopt loop, or —
     // for an adopted `Repairing` tail — the now-`Present` peer-repaired body `fill_repair` verified
@@ -62,7 +62,7 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Set our own bit for `svc_target` and broadcast a `StartViewChange{svc_target}`.
   pub(crate) fn join_svc(&mut self, now: Instant) {
-    self.svc_from |= 1u64 << self.config.replica().get();
+    self.svc_from |= 1u64 << self.local_slot().get();
     self.push_svc(self.svc_target);
     self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
   }
@@ -71,7 +71,12 @@ impl<S: StateMachine> Endpoint<S> {
   pub(crate) fn push_svc(&mut self, view: View) {
     self.emit(Outgoing::new(
       Recipient::Backups,
-      Message::StartViewChange(crate::StartViewChange::new(view, self.config.replica())),
+      Message::StartViewChange(crate::StartViewChange::new(
+        view,
+        self.local_slot(),
+        self.membership.epoch(),
+        self.membership.config_id(),
+      )),
     ));
   }
 
@@ -139,7 +144,7 @@ impl<S: StateMachine> Endpoint<S> {
       // via a real Prepare/Commit from its primary (the higher-view rule), not via SVCs.
       return;
     }
-    if m.replica().get() >= self.config.replica_count() as u16 {
+    if m.replica().get() >= self.membership.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     if target.get() > self.svc_target.get() {
@@ -155,7 +160,7 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   pub(crate) fn maybe_start_view_change<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
-    if (self.svc_from.count_ones() as usize) >= self.config.quorum_view_change() {
+    if (self.svc_from.count_ones() as usize) >= self.membership.quorum_view_change() {
       self.transition_to_view_change_status(now, sb, self.svc_target);
     }
   }
@@ -332,7 +337,7 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Send our full log + position to the prospective primary of the current view.
   pub(crate) fn send_do_view_change(&mut self, _now: Instant) {
-    let primary = self.config.primary(self.view);
+    let primary = self.membership.primary(self.view);
     let entries = self.log_entries();
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
@@ -351,7 +356,9 @@ impl<S: StateMachine> Endpoint<S> {
           // a committed op N is held by a write-quorum, which intersects the DVC quorum, so some donor
           // claims `op >= N` → `commit* (<= max commit_max == N) <= op_head` holds.
           self.commit_max,
-          self.config.replica(),
+          self.membership.epoch(),
+          self.membership.config_id(),
+          self.local_slot(),
           entries,
         )
         // The vouched floor of the carried log: every op this DVC omits at/below it is folded into a
@@ -430,13 +437,15 @@ impl<S: StateMachine> Endpoint<S> {
     // `!is_view_change()` short-circuits BEFORE `dvc_quorum()` reads the (then-`None`) collection, so
     // the collection is `Some` on every non-returning path below (ViewChange ⟹ `view_change.is_some()`).
     if m.view() != self.view
-      || !self.config.is_primary(self.view)
+      || !self
+        .membership
+        .is_primary_slot(self.local_slot(), self.view)
       || !self.status.is_view_change()
       || self.dvc_quorum()
     {
       return;
     }
-    if m.replica().get() >= self.config.replica_count() as u16 {
+    if m.replica().get() >= self.membership.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     // Record the donor's vouched checkpoint floor, mirroring the `PrepareOk`/`Commit` recording
@@ -447,7 +456,7 @@ impl<S: StateMachine> Endpoint<S> {
     self.record_peer_checkpoint(m.replica(), m.checkpoint_op());
     // Ensure our own DVC is represented (keyed by replica → a self-addressed DVC is idempotent).
     // Compute the own-DVC into a local FIRST to avoid a self borrow conflict, then insert.
-    let own = self.config.replica();
+    let own = self.local_slot();
     if !self.dvc_from().contains_key(&own) {
       let own_dvc = crate::DoViewChange::new(
         self.view,
@@ -457,7 +466,9 @@ impl<S: StateMachine> Endpoint<S> {
         // `send_do_view_change`. This own-DVC feeds the same `select_canonical_log`
         // `commit*` union, so it must carry the same frontier the wire DVC does.
         self.commit_max,
-        self.config.replica(),
+        self.membership.epoch(),
+        self.membership.config_id(),
+        self.local_slot(),
         self.log_entries(),
       )
       // The same vouched floor the wire DVC carries (`send_do_view_change`).
@@ -473,7 +484,7 @@ impl<S: StateMachine> Endpoint<S> {
     if replace {
       self.dvc_from_mut().insert(m.replica(), m);
     }
-    if self.dvc_from().len() >= self.config.quorum_view_change() {
+    if self.dvc_from().len() >= self.membership.quorum_view_change() {
       self.start_view_as_new_primary(now, wal, sb);
     }
   }
@@ -604,7 +615,7 @@ impl<S: StateMachine> Endpoint<S> {
     // crossing DIRECTLY from the sorted donor ops — bounded by the DVC count, never the op range, and
     // overflow-free (saturating). This acts on the UNCOMMITTED tail `(commit* .. op_head]` only — a
     // committed op is never truncated — and yields the IDENTICAL truncation point as the per-op scan.
-    let threshold = self.config.quorum_nack_prepare();
+    let threshold = self.membership.quorum_nack_prepare();
     let mut donor_ops: std::vec::Vec<u64> = dvcs.iter().map(|d| d.op().get()).collect();
     donor_ops.sort_unstable();
     if threshold >= 1 && threshold <= donor_ops.len() {
@@ -963,7 +974,9 @@ impl<S: StateMachine> Endpoint<S> {
           self.view,
           self.op,
           self.commit_max,
-          self.config.replica(),
+          self.membership.epoch(),
+          self.membership.config_id(),
+          self.local_slot(),
           entries,
         )
         // The vouched floor of the broadcast canonical log (raised to the union's floor* during
@@ -1092,7 +1105,7 @@ impl<S: StateMachine> Endpoint<S> {
     {
       return;
     }
-    if m.replica() != self.config.primary(m.view()) {
+    if m.replica() != self.membership.primary(m.view()) {
       return; // must come from the view's primary
     }
     self.adopt_canonical_head(
@@ -1211,7 +1224,7 @@ impl<S: StateMachine> Endpoint<S> {
       .events
       .push_back(Event::ViewChanged(crate::ViewChanged::new(
         view,
-        self.config.is_primary(view),
+        self.membership.is_primary_slot(self.local_slot(), view),
       )));
     // Tear down ALL old-generation in-flight state in one place: SVC bits (svc_from),
     // in-flight appends (pending/appending), peer-checkpoint reports, in-flight checkpoint, in-flight
@@ -1232,7 +1245,7 @@ impl<S: StateMachine> Endpoint<S> {
     // first trigger. A zero floor carries no information and is skipped, keeping the freshly-reset
     // map genuinely empty for a floor-less adoption.
     if floor > 0 {
-      self.record_peer_checkpoint(self.config.primary(view), OpNumber::with(floor));
+      self.record_peer_checkpoint(self.membership.primary(view), OpNumber::with(floor));
     }
     // ViewChange EXIT (adoption → Normal): retire the ViewChange-only collection (DVC + catch-up). The
     // shared reset above is bidirectional, so the `take`-to-`None` lives here. (`is_some() ==

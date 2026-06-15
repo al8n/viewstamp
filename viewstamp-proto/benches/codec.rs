@@ -53,6 +53,8 @@ fn prepare_1kib() -> Message {
     OpNumber::with(1_000),
     OpNumber::with(998),
     OpNumber::with(992),
+    viewstamp_proto::Epoch::new(0),
+    0,
     ClientId::new(7),
     RequestNumber::with(40),
     body(KIB),
@@ -67,6 +69,8 @@ fn prepare_ok() -> Message {
     ReplicaId::new(2),
     OpNumber::with(992),
     0x1234_5678_9ABC_DEF0_1122_3344_5566_7788,
+    viewstamp_proto::Epoch::new(0),
+    0,
   ))
 }
 
@@ -76,6 +80,8 @@ fn commit() -> Message {
     View::with(3),
     OpNumber::with(1_000),
     OpNumber::with(992),
+    viewstamp_proto::Epoch::new(0),
+    0,
   ))
 }
 
@@ -97,6 +103,8 @@ fn dvc_64_header_only() -> Message {
     View::with(3),
     OpNumber::with(1_000),
     OpNumber::with(998),
+    viewstamp_proto::Epoch::new(0),
+    0,
     ReplicaId::new(1),
     log,
   ))
@@ -118,6 +126,7 @@ fn repair_batch_4x1kib() -> Message {
     View::with(3),
     OpNumber::with(1_000),
     OpNumber::with(992),
+    0,
     log,
   ))
 }

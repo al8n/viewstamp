@@ -100,7 +100,13 @@ impl<S: StateMachine> Endpoint<S> {
     if self.timers.commit.is_some_and(|d| d <= now) {
       self.emit(Outgoing::new(
         Recipient::Backups,
-        Message::Commit(Commit::new(self.view, self.commit_min, self.checkpoint_op)),
+        Message::Commit(Commit::new(
+          self.view,
+          self.commit_min,
+          self.checkpoint_op,
+          self.membership.epoch(),
+          self.membership.config_id(),
+        )),
       ));
       self.timers.commit = Some(now + COMMIT_HEARTBEAT); // re-arm THIS timer only
     }
@@ -165,6 +171,8 @@ impl<S: StateMachine> Endpoint<S> {
                 self.view,
                 self.commit_min,
                 self.checkpoint_op,
+                self.membership.epoch(),
+                self.membership.config_id(),
                 core::mem::take(&mut entries),
               )),
             ));
@@ -187,6 +195,8 @@ impl<S: StateMachine> Endpoint<S> {
             self.view,
             self.commit_min,
             self.checkpoint_op,
+            self.membership.epoch(),
+            self.membership.config_id(),
             entries,
           )),
         ));
@@ -387,6 +397,8 @@ impl<S: StateMachine> Endpoint<S> {
         self.op,
         self.commit_min,
         self.checkpoint_op,
+        self.membership.epoch(),
+        self.membership.config_id(),
         client,
         request,
         body_bytes,
@@ -400,7 +412,7 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Commits the longest contiguous quorum-acked prefix beyond `commit_min`.
   pub(crate) fn try_commit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
-    let quorum = self.config.quorum() as u32;
+    let quorum = self.membership.quorum() as u32;
     let mut advanced = false;
     loop {
       let next = self.commit_min.get() + 1;
@@ -428,7 +440,13 @@ impl<S: StateMachine> Endpoint<S> {
       // Tell backups the commit advanced (also serves as a heartbeat).
       self.emit(Outgoing::new(
         Recipient::Backups,
-        Message::Commit(Commit::new(self.view, self.commit_min, self.checkpoint_op)),
+        Message::Commit(Commit::new(
+          self.view,
+          self.commit_min,
+          self.checkpoint_op,
+          self.membership.epoch(),
+          self.membership.config_id(),
+        )),
       ));
     }
     // Cancel an outstanding FORCED sync the commit just satisfied (its target is
@@ -528,6 +546,17 @@ impl<S: StateMachine> Endpoint<S> {
     // NOT yank us into a spurious view change off a body the repair path explicitly rejected; the repair
     // solicitation re-asks until a committed-vouching `Prepare` fills the hole via `fill_repair`.
     if self.repair.contains(&p.op().get()) {
+      return;
+    }
+    // STRICT epoch gate for the NORMAL head-advancing arm. The repair-serve arm above
+    // (`fill_repair` + the hole-ownership guard) has already consumed any committed-hole serve, which
+    // is AGNOSTIC (its `config_id` lineage was checked at the central ingress gate). Everything
+    // reaching here drives the head: a `catch_up_to_view`, a normal append + `PrepareOk` vote, or a
+    // current-view re-ack — all AUTHORITY in MY configuration, so the sending primary must be in MY
+    // epoch. (The `config_id` half was already proven in-lineage at the central
+    // `epoch_authority_admits` gate; in PR1 in-lineage == same-config, so this completes the strict
+    // `(epoch, config_id)` match for the normal arm.) A foreign-epoch Prepare contributes nothing.
+    if p.epoch() != self.membership.epoch() {
       return;
     }
     if p.view().get() > self.view.get() {
@@ -699,7 +728,13 @@ impl<S: StateMachine> Endpoint<S> {
     sb: &mut B,
     m: crate::PrepareBatch,
   ) {
-    let (view, commit, checkpoint_op) = (m.view(), m.commit(), m.checkpoint_op());
+    let (view, commit, checkpoint_op, epoch, config_id) = (
+      m.view(),
+      m.commit(),
+      m.checkpoint_op(),
+      m.epoch(),
+      m.config_id(),
+    );
     for e in m.into_log() {
       // The decoded `Body::Present` bytes are MOVED out of the owned entry (`into_parts`) — the
       // decode boundary already paid the wire→owned copy, so a per-entry re-copy here would be pure
@@ -712,7 +747,20 @@ impl<S: StateMachine> Endpoint<S> {
         now,
         wal,
         sb,
-        Prepare::new(view, op, commit, checkpoint_op, client, request, body),
+        // Each reconstructed per-op `Prepare` carries the BATCH's epoch-policy pair (the envelope
+        // every per-op `Prepare` would have carried), not this replica's — the un-batching preserves
+        // the sender's `(epoch, config_id)` exactly as it preserves `view`/`commit`/`checkpoint_op`.
+        Prepare::new(
+          view,
+          op,
+          commit,
+          checkpoint_op,
+          epoch,
+          config_id,
+          client,
+          request,
+          body,
+        ),
       );
     }
   }
@@ -856,15 +904,17 @@ impl<S: StateMachine> Endpoint<S> {
       .get(&op.get())
       .map(|e| crate::storage::prepare_identity(e.client, e.request, e.body.body_checksum()))
       .unwrap_or(0);
-    let primary = self.config.primary(self.view);
+    let primary = self.membership.primary(self.view);
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
       Message::PrepareOk(PrepareOk::new(
         self.view,
         op,
-        self.config.replica(),
+        self.local_slot(),
         self.checkpoint_op,
         prepare_checksum,
+        self.membership.epoch(),
+        self.membership.config_id(),
       )),
     ));
   }
@@ -1113,7 +1163,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || !self.is_primary() || ok.view() != self.view {
       return;
     }
-    if ok.replica().get() >= self.config.replica_count() as u16 {
+    if ok.replica().get() >= self.membership.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
     }
     // Record this backup's reported checkpoint for the checkpoint-quorum (the range check above
@@ -1158,7 +1208,7 @@ impl<S: StateMachine> Endpoint<S> {
     // primary's last-known checkpoint rather than 0. Bounded by `replica_count`. MONOTONE: a
     // reordered older Commit must never lower the recorded value (so the force-sync trigger this
     // backup reads via `quorum_checkpoint_op` does not regress under reordering/partitions).
-    self.record_peer_checkpoint(self.config.primary(self.view), c.checkpoint_op());
+    self.record_peer_checkpoint(self.membership.primary(self.view), c.checkpoint_op());
     // State-sync trigger: if the cluster has checkpointed past our WAL head, solicit a SyncCheckpoint
     // (the ops we'd need are below the cluster checkpoint and may be pruned — tail-apply can't reach).
     self.maybe_request_sync(now, c.checkpoint_op());

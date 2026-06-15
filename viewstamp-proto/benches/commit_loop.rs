@@ -52,9 +52,9 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use viewstamp_proto::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchView, CheckpointRead, ClientId,
-  Config, Endpoint, Header, Instant, Message, OpId, OpNumber, Peer, Recipient, ReplicaId,
-  ReplyBuilder, Request, RequestNumber, SlotStatus, StateMachine, Superblock, SuperblockDone,
-  VsrState, Wal, WalDone, max_reply_body_len,
+  Config, Endpoint, Header, Instant, MemberId, Membership, Message, OpId, OpNumber, Peer,
+  Recipient, ReplicaId, ReplyBuilder, Request, RequestNumber, SlotStatus, StateMachine, Superblock,
+  SuperblockDone, VsrState, Wal, WalDone, max_reply_body_len,
 };
 
 const REPLICAS: usize = 3;
@@ -232,8 +232,13 @@ where
   let mut reps: Vec<Replica<S>> = (0..REPLICAS)
     .map(|i| Replica {
       ep: Endpoint::new(
-        Config::try_new(1, ReplicaId::new(i as u16), REPLICAS as u8)
-          .expect("a valid 3-node config"),
+        Config::try_new(1, MemberId::new(i as u128)).expect("a valid 3-node config"),
+        Membership::genesis(
+          REPLICAS as u8,
+          0,
+          (0..REPLICAS as u128).map(MemberId::new).collect(),
+        )
+        .expect("a valid 3-node genesis membership"),
         0xBE7C_0FFE ^ (i as u64).wrapping_mul(0x1234_5678),
         S::default(),
       ),

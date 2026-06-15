@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, VecDeque};
 use bytes::Bytes;
 
 use crate::{
-  ClientId, Commit, Config, DoViewChange, Event, Header, Instant, Message, OpNumber, Outgoing,
-  Peer, Prepare, PrepareOk, Prng, Recipient, ReplicaId, Reply, RequestNumber, SlotStatus,
-  StateMachine, Status, Superblock, SuperblockDone, View, Wal, WalDone,
+  ClientId, Commit, Config, DoViewChange, Epoch, Event, Header, Instant, MemberId, Membership,
+  Message, OpNumber, Outgoing, Peer, Prepare, PrepareOk, Prng, Recipient, ReplicaId, Reply,
+  RequestNumber, SlotStatus, StateMachine, Status, Superblock, SuperblockDone, View, Wal, WalDone,
 };
 
 mod checkpoint;
@@ -15,6 +15,8 @@ mod recovery;
 mod repair;
 mod state_sync;
 mod view_change;
+
+pub use recovery::{Recovered, Retired};
 
 /// What the endpoint does when a submitted WAL append completes. Append-before-ack: the vote/ack a
 /// completion owes is always deferred to `on_wal_done`, never cast before the op is durable. A
@@ -750,6 +752,17 @@ impl TimerKind {
 #[derive(Debug)]
 pub struct Endpoint<S> {
   config: Config,
+  /// The active, epoch-versioned cluster configuration: who votes, who leads, the quorum sizes, and
+  /// this node's slot. The single source of truth for quorum/primary/voter decisions (the static
+  /// per-node parameters stay on [`Config`]). For PR1 (Tier C) this is fixed per incarnation — it
+  /// changes only across an offline restart — so no runtime-mutation machinery rides it here.
+  membership: Membership,
+  /// The PREVIOUS epoch — the durable backward link of the `config_id` lineage, carried so every
+  /// durable-root write persists the membership as a v4 root (epoch = `membership.epoch()`,
+  /// prev_epoch = this) rather than dropping it to a legacy root. Set from the recovered root (a v4
+  /// root's own `prev_epoch`, or the membership epoch for a legacy bridge); at genesis it equals the
+  /// membership epoch. Fixed per incarnation (Tier C changes the configuration only across a restart).
+  prev_epoch: Epoch,
   status: Status,
   view: View,
   /// Head op (most recently prepared locally).
@@ -1021,16 +1034,37 @@ pub struct Endpoint<S> {
 }
 
 impl<S> Endpoint<S> {
-  /// Creates a fresh endpoint in `Status::Normal`, view 0.
+  /// Creates a fresh endpoint in `Status::Normal`, view 0, for the genesis `membership`.
+  ///
+  /// The static per-node parameters come from `config`; the active cluster configuration (the
+  /// quorum/primary/voter logic + this node's slot) comes from `membership`. The local member
+  /// ([`Config::local`]) MUST occupy a slot in `membership` — asserted at construction (release too).
   ///
   /// **`seed` must carry fresh entropy per incarnation**: the solicitation-freshness nonce is
   /// derived deterministically from it, so a process restarted with a reused seed re-mints the same
   /// nonce and a delayed response to the previous incarnation passes the freshness checks. See
   /// [`Self::recover`] (where the hazard is concrete) for the full contract.
-  pub fn new(config: Config, seed: u64, sm: S) -> Self {
+  pub fn new(config: Config, membership: Membership, seed: u64, sm: S) -> Self {
+    // A construction PRECONDITION enforced in RELEASE too (not merely debug): a fresh endpoint's local
+    // member MUST occupy a slot in its own membership. `local_slot()` — used by `replica()`, the
+    // timers, the ingress path, and the coordinator pump — resolves it via `slot_of` and would
+    // otherwise `expect`-panic LATER on an already-installed, running node. A local member absent from
+    // its GENESIS membership is a caller misconfiguration (a field-validated `Config` paired with the
+    // wrong `Membership`), so it fails FAST at construction rather than mid-operation. (`recover`
+    // treats ABSENCE as the distinct `Recovered::Retired` runtime outcome — a node REMOVED by a
+    // reconfiguration — which is a legitimate state, not a misconfiguration.)
+    assert!(
+      membership.slot_of(config.local()).is_some(),
+      "the local member {} must occupy a slot in its own membership",
+      config.local(),
+    );
     let nonce = Prng::new(seed).next_u64();
+    // Genesis: the lineage has no predecessor, so prev_epoch == the (genesis) epoch.
+    let prev_epoch = membership.epoch();
     Self {
       config,
+      membership,
+      prev_epoch,
       status: Status::Normal,
       view: View::new(),
       op: OpNumber::new(),
@@ -1409,10 +1443,10 @@ impl<S> Endpoint<S> {
   /// the voters, so a learner — which populates no voter `peer_checkpoint` — computes ~0 (the safe
   /// conservative floor that frees nothing).
   fn compute_quorum_checkpoint_op(&self) -> OpNumber {
-    let count = self.config.replica_count();
+    let count = self.membership.replica_count();
     let mut cps: std::vec::Vec<u64> = std::vec::Vec::with_capacity(count as usize);
-    let me = self.config.replica();
-    if self.config.is_voter(me) {
+    let me = self.local_slot();
+    if self.membership.is_voter(me) {
       cps.push(self.checkpoint_op.get()); // a voter counts its own durable checkpoint; a learner does not
     }
     for r in 0..count {
@@ -1425,7 +1459,7 @@ impl<S> Endpoint<S> {
     cps.sort_unstable_by(|a, b| b.cmp(a)); // descending
     // On a voter `cps.len() == replica_count`; on a learner `cps.len() == replica_count` too (the seed
     // is skipped but no voter is). Either way `cps.len() >= quorum`, so `cps[quorum - 1]` is in bounds.
-    OpNumber::with(cps[self.config.quorum() - 1])
+    OpNumber::with(cps[self.membership.quorum() - 1])
   }
 
   /// The highest `checkpoint_op` ANY single peer (or self) has reported — i.e. the newest durable
@@ -1470,10 +1504,43 @@ impl<S> Endpoint<S> {
     self.log_view
   }
 
-  /// This replica's id.
+  /// This replica's slot in the active [`Membership`] — where its stable [`MemberId`]
+  /// ([`Config::local`]) resolves. Every quorum/primary/voter decision keys on this slot, so a
+  /// reconfiguration that moves the node to a different slot is transparent to the call sites.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn replica(&self) -> ReplicaId {
-    self.config.replica()
+  pub fn replica(&self) -> ReplicaId {
+    self.local_slot()
+  }
+
+  /// This replica's slot in the active membership: the slot its stable [`MemberId`]
+  /// ([`Config::local`]) occupies. The single relocation target for the former `self.config.replica()`
+  /// — every former local-slot read now routes through here.
+  ///
+  /// Infallible: [`Self::new`]/[`Self::recover`] only ever build an endpoint whose local member is in
+  /// its own membership (the `new` debug-assert / the `recover` resolution), so the lookup always hits.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn local_slot(&self) -> ReplicaId {
+    self
+      .membership
+      .slot_of(self.config.local())
+      .expect("local member is in its own membership")
+  }
+
+  /// This node's stable [`MemberId`] ([`Config::local`]). The QUIC coordinator reads it to attest its
+  /// own identity in the handshake preface and to self-reject a peer claiming this node's identity —
+  /// both keyed on the stable member id, not the slot it currently occupies.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn local(&self) -> MemberId {
+    self.config.local()
+  }
+
+  /// Resolve a member to its slot in the active [`Membership`], if present. The QUIC coordinator reads
+  /// it to bind a peer that attested its stable [`MemberId`]: an in-membership member resolves to the
+  /// routing slot it currently occupies, an absent one yields `None` (the coordinator then rejects the
+  /// connection). Delegates to [`Membership::slot_of`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn slot_of(&self, who: MemberId) -> Option<ReplicaId> {
+    self.membership.slot_of(who)
   }
 
   /// The cluster id this replica was configured for. The QUIC coordinator reads it to single-source
@@ -1483,35 +1550,52 @@ impl<S> Endpoint<S> {
     self.config.cluster()
   }
 
-  /// The number of replicas in the configured cluster. The QUIC coordinator reads it to single-source
-  /// the configured membership: it rejects binding a peer whose attested replica index is outside
-  /// `0..replica_count` (a retired / misconfigured cert from a since-shrunk cluster), and it sizes the
-  /// connection cap to the mutual-dial mesh — both without duplicating the count.
+  /// The number of voting replicas in the active membership. The QUIC coordinator reads it to
+  /// single-source the configured membership: it rejects binding a peer whose attested replica index
+  /// is outside `0..replica_count`, and it sizes the connection cap to the mutual-dial mesh — both
+  /// without duplicating the count.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn replica_count(&self) -> u8 {
-    self.config.replica_count()
+    self.membership.replica_count()
   }
 
-  /// The total number of replicas in the configured cluster: the voting replicas plus the
+  /// The total number of replicas in the active membership: the voting replicas plus the
   /// non-voting learners (`replica_count + learner_count`). Every replica id is in `0..node_count`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn node_count(&self) -> u16 {
-    self.config.node_count()
+    self.membership.node_count()
   }
 
-  /// True iff THIS replica is a non-voting learner (its own id is `>= replica_count`). A learner
+  /// True iff `other` is a `config_id` in THIS replica's configuration lineage — the in-lineage
+  /// admission test for the AGNOSTIC, view-independent serves/solicitations (the committed-content
+  /// repair + state-sync messages, and the repair-serve arm of `Prepare`). Such a message carries no
+  /// vote/lead authority — its content is verified independently downstream — so it is admitted from
+  /// any config in the chain, letting a node catch up across an epoch boundary.
+  ///
+  /// PR1 retains only the CURRENT `config_id`, so same-`config_id` IS the lineage check: in Tier C
+  /// (coordinated offline restart) every live node shares one configuration at any instant. The
+  /// multi-epoch lineage chain (carrying superseded `config_id`s to admit live cross-epoch catch-up)
+  /// is a later milestone.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn in_lineage(&self, other: u128) -> bool {
+    other == self.membership.config_id()
+  }
+
+  /// True iff THIS replica is a non-voting learner (its own slot is `>= replica_count`). A learner
   /// applies the committed log but never acknowledges a prepare, never casts a view-change vote, and
   /// is never primary — it follows the cluster via the primary's broadcasts and catches up by
   /// soliciting state, exactly like a TigerBeetle standby.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn is_learner(&self) -> bool {
-    self.config.is_learner(self.config.replica())
+  pub fn is_learner(&self) -> bool {
+    self.membership.is_learner(self.local_slot())
   }
 
   /// Whether this replica is the primary of the current view.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn is_primary(&self) -> bool {
-    self.config.is_primary(self.view)
+    self
+      .membership
+      .is_primary_slot(self.local_slot(), self.view)
   }
 
   /// The HARD bound on the raw session-table size at accept-time admission: the applied-session cap
@@ -1986,6 +2070,8 @@ impl<S> Endpoint<S> {
         View::new(),
         OpNumber::with(1),
         OpNumber::new(),
+        self.membership.epoch(),
+        self.membership.config_id(),
         ReplicaId::new(0),
         std::vec::Vec::new(),
       ),
@@ -2124,7 +2210,7 @@ impl<S> Endpoint<S> {
   ///     authority, so a member serving them is safe.
   /// - **Primary-authority broadcasts** (only the primary of the advertised view legitimately sends
   ///   them, and they carry NO self `replica()` to bind to) — bind to
-  ///   `from == Peer::Replica(self.config.primary(msg.view()))`: `Commit` and `StartView`. This also
+  ///   `from == Peer::Replica(self.membership.primary(msg.view()))`: `Commit` and `StartView`. This also
   ///   closes a forged `Commit`/`StartView` from a non-primary.
   /// - **`Reply`** — replicas ignore it (the dispatch is a no-op), so this is a no-op: returns `true`.
   ///
@@ -2157,7 +2243,7 @@ impl<S> Endpoint<S> {
         from == Peer::Client(r.client())
           || from
             .as_replica()
-            .is_some_and(|id| id.get() < self.config.replica_count() as u16)
+            .is_some_and(|id| id.get() < self.membership.replica_count() as u16)
       }
       // Self-identifying replica messages: the authenticated peer must be the claimed sender AND in the
       // appropriate range, split by AUTHORITY. Without the range check, `from == Peer::Replica(m.replica())`
@@ -2191,14 +2277,14 @@ impl<S> Endpoint<S> {
       Message::RequestSyncChunk(m) => self.sender_is_member(from, m.replica()),
       Message::SyncChunk(m) => self.sender_is_member(from, m.replica()),
       // Primary-authority broadcasts (no self id): only the primary of the advertised view sends them.
-      Message::Commit(m) => from == Peer::Replica(self.config.primary(m.view())),
-      Message::StartView(m) => from == Peer::Replica(self.config.primary(m.view())),
+      Message::Commit(m) => from == Peer::Replica(self.membership.primary(m.view())),
+      Message::StartView(m) => from == Peer::Replica(self.membership.primary(m.view())),
       // `PrepareBatch` is the primary's BATCHED retransmit of its un-acked window — unlike the
       // path-sensitive `Prepare` it has NO repair-serve role (the windowed repair answer is
       // `RepairBatch`), so it binds strictly to `config.primary(view)` like `Commit`/`StartView`. A
       // batch from any other peer is forged/misrouted: each entry would otherwise reconstruct a
       // head-advancing `Prepare` that drives a backup's append + PrepareOk vote.
-      Message::PrepareBatch(m) => from == Peer::Replica(self.config.primary(m.view())),
+      Message::PrepareBatch(m) => from == Peer::Replica(self.membership.primary(m.view())),
       // `Prepare` is PATH-SENSITIVE. A NORMAL head-advancing / re-ack Prepare
       // comes ONLY from the primary of its advertised view — binding it to `config.primary(view)` closes
       // the gap where a misrouted non-primary replica Prepare drives a backup's normal append + PrepareOk.
@@ -2217,8 +2303,8 @@ impl<S> Endpoint<S> {
       // `repair` escape cannot inject a bad body nor drive a spurious catch-up; a repair op is
       // `<= self.op`, so it cannot advance the head.)
       Message::Prepare(p) => {
-        from == Peer::Replica(self.config.primary(p.view()))
-          || (matches!(from, Peer::Replica(r) if r.get() < self.config.node_count())
+        from == Peer::Replica(self.membership.primary(p.view()))
+          || (matches!(from, Peer::Replica(r) if r.get() < self.membership.node_count())
             && self.repair.contains(&p.op().get()))
       }
       // `RepairBatch` is the windowed analogue of a repair-serve `Prepare`: it carries NO self
@@ -2232,7 +2318,7 @@ impl<S> Endpoint<S> {
       // exactly like a forged repair `Prepare` — no committed slot is filled from a non-member peer or an
       // unverified body.
       Message::RepairBatch(_) => {
-        matches!(from, Peer::Replica(r) if r.get() < self.config.node_count())
+        matches!(from, Peer::Replica(r) if r.get() < self.membership.node_count())
       }
       // `Reply` is ignored by replicas (dropped in the dispatch) — no-op.
       Message::Reply(_) => true,
@@ -2247,7 +2333,7 @@ impl<S> Endpoint<S> {
   /// voting-bounded.) The range check is the load-bearing half: without it, `from == Peer::Replica(claimed)`
   /// accepts a self-consistent message from a non-member `from` supplied by a buggy/misrouting driver.
   fn sender_is_voter(&self, from: Peer, claimed: ReplicaId) -> bool {
-    claimed.get() < self.config.replica_count() as u16 && from == Peer::Replica(claimed)
+    claimed.get() < self.membership.replica_count() as u16 && from == Peer::Replica(claimed)
   }
 
   /// True iff `from` is the authenticated peer for the self-identifying `claimed` replica AND `claimed`
@@ -2260,7 +2346,79 @@ impl<S> Endpoint<S> {
   /// (`GetView`/`Recovery`/`RequestSync`/`SyncCheckpoint`/…) is membership-checked uniformly, not relying
   /// on each handler's own (inconsistent) downstream range check.
   fn sender_is_member(&self, from: Peer, claimed: ReplicaId) -> bool {
-    claimed.get() < self.config.node_count() && from == Peer::Replica(claimed)
+    claimed.get() < self.membership.node_count() && from == Peer::Replica(claimed)
+  }
+
+  /// The (epoch, config_id) AUTHORITY gate, layered ON TOP of [`Self::sender_matches`]: it admits a
+  /// message to the dispatch only when its configuration claim entitles it to the AUTHORITY it would
+  /// exercise. `sender_matches` answers "is `from` the slot that may send this kind?"; this answers
+  /// "is the SENDER's configuration mine?". One place, every ingress path — the configuration analogue
+  /// of the sender-binding chokepoint.
+  ///
+  /// The matrix (the message's vote/lead/serve authority):
+  /// - **STRICT** — `Prepare`(normal head-advancing arm), `PrepareOk`, `Commit`, `StartViewChange`,
+  ///   `DoViewChange`, `StartView`, `GetView`, `Recovery`, `RecoveryResponse`, `PrepareBatch`: the
+  ///   message drives an APPEND / VOTE / VIEW-ADOPTION in MY configuration, so it is admitted only on
+  ///   an exact `(epoch, config_id)` match. A foreign-epoch / foreign-config message contributes
+  ///   NOTHING (dropped for authority) — a peer in a different configuration neither votes in mine nor
+  ///   makes me adopt its view.
+  /// - **AGNOSTIC** — `RequestPrepare`, `RequestPrepareRange`, `RepairBatch`, `RequestSync`,
+  ///   `RequestSyncChunk`, `SyncCheckpoint`, `SyncCheckpointMeta`, `SyncChunk`: committed,
+  ///   view-independent content carrying NO vote/lead authority (verified independently downstream —
+  ///   checksum + committed-vouch / checkpoint-id), so it is admitted from any config IN MY LINEAGE
+  ///   ([`Self::in_lineage`]), letting a node catch up across an epoch boundary.
+  /// - **NEITHER** — `Request`, `Reply`: client-facing, carry no `(epoch, config_id)` — always
+  ///   admitted here.
+  ///
+  /// PATH-SENSITIVE `Prepare`: the two arms (`on_prepare`) carry DIFFERENT authority. The repair-serve
+  /// arm (the op is one of our `repair` holes) serves committed, view-independent content, so it is
+  /// AGNOSTIC — gated here on `in_lineage(config_id)` only (the arm common to both `Prepare` paths in
+  /// PR1, where in-lineage == same-config). The normal head-advancing arm (`from == primary`) DRIVES an
+  /// append + a `PrepareOk` vote, so it is STRICT — but its EPOCH check cannot be made here without
+  /// knowing the arm, so it is branched INSIDE `on_prepare` (an `epoch == self.epoch` guard on the
+  /// normal arm, after the repair arm has had its chance). This central gate therefore admits a
+  /// `Prepare` iff its `config_id` is in lineage; the normal arm then additionally proves the epoch.
+  fn epoch_authority_admits(&self, msg: &Message) -> bool {
+    match msg {
+      // STRICT: exact (epoch, config_id) — drives append / vote / view-adoption in my configuration.
+      Message::PrepareOk(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      Message::Commit(m) => m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id()),
+      Message::StartViewChange(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      Message::DoViewChange(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      Message::StartView(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      Message::GetView(m) => m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id()),
+      Message::Recovery(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      Message::RecoveryResponse(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      Message::PrepareBatch(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      // PATH-SENSITIVE `Prepare`: gate the config_id (common to both arms); the normal arm's epoch
+      // check is branched inside `on_prepare`. A foreign-lineage Prepare is dead on BOTH arms.
+      Message::Prepare(m) => self.in_lineage(m.config_id()),
+      // AGNOSTIC: in-lineage only — committed, view-independent content with no vote/lead authority.
+      Message::RequestPrepare(m) => self.in_lineage(m.config_id()),
+      Message::RequestPrepareRange(m) => self.in_lineage(m.config_id()),
+      Message::RepairBatch(m) => self.in_lineage(m.config_id()),
+      Message::RequestSync(m) => self.in_lineage(m.config_id()),
+      Message::RequestSyncChunk(m) => self.in_lineage(m.config_id()),
+      Message::SyncCheckpoint(m) => self.in_lineage(m.config_id()),
+      Message::SyncCheckpointMeta(m) => self.in_lineage(m.config_id()),
+      Message::SyncChunk(m) => self.in_lineage(m.config_id()),
+      // NEITHER: client-facing, no (epoch, config_id) to check.
+      Message::Request(_) | Message::Reply(_) => true,
+    }
   }
 }
 
@@ -2304,6 +2462,19 @@ where
     // the normal dispatch. This is the ingress analogue of the `emit` egress chokepoint: one place,
     // every path. See [`Self::sender_matches`] for the per-kind bindings + the `Prepare` exception.
     if !self.sender_matches(from, &msg) {
+      return;
+    }
+    // Configuration-authority backstop, layered ON TOP of `sender_matches`: a message whose claimed
+    // (epoch, config_id) does not entitle it to the AUTHORITY it would exercise contributes NOTHING.
+    // STRICT messages (the vote/lead drivers) require an exact (epoch, config_id) match; AGNOSTIC
+    // serves/solicitations require only an in-lineage `config_id`. Placed HERE — at the same ingress
+    // chokepoint as `sender_matches`, BEFORE the Recovering/RecoveringHead exceptions — so a
+    // foreign-configuration `StartView`/`RecoveryResponse` cannot drive a RecoveringHead's head
+    // adoption, nor a foreign-lineage `SyncCheckpoint` an awaiting-checkpoint Recovering replica's
+    // restore. `Prepare` is admitted here on its `config_id` lineage only; its STRICT normal-arm epoch
+    // check is branched inside `on_prepare` (the repair-serve arm stays AGNOSTIC). See
+    // [`Self::epoch_authority_admits`].
+    if !self.epoch_authority_admits(&msg) {
       return;
     }
     // A Recovering replica does NOT process ANY consensus message: it is still draining its own

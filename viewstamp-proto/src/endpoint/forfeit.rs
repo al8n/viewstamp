@@ -49,7 +49,7 @@ impl<S: StateMachine> Endpoint<S> {
     // forfeit precondition (a permanent committed-WAL-slot fault with no peer to repair from) is itself
     // unrecoverable on a solo cluster, but abdicating to a non-existent quorum is strictly worse than
     // holding. So a solo replica never forfeits (and never even arms the grace timer).
-    if self.config.replica_count() <= 1 {
+    if self.membership.replica_count() <= 1 {
       // Disarm any stale grace timer defensively (it can only have been set before this guard existed;
       // a solo replica never arms it now).
       self.timers.forfeit_armed = None;
@@ -160,7 +160,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// — `pending_forfeit` may only be set on a Normal primary (the `assert_invariants` clause) — so it is
   /// intentionally NOT routed through here.
   pub(crate) fn abdicate_if_primary(&mut self, now: Instant) -> bool {
-    if self.config.replica_count() > 1 && self.is_primary() {
+    if self.membership.replica_count() > 1 && self.is_primary() {
       self.defer_forfeit(now);
       true
     } else {
