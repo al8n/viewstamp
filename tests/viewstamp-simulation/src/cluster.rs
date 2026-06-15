@@ -50,8 +50,9 @@ pub struct OfflineReconfig {
   /// The common preserved view `V` every voter recovered into (and at which the wedge formed). The
   /// re-formation escalation targets `V + 1` uniformly.
   view: u64,
-  /// The uncommitted tail op (ABOVE the committed history) whose head read-fault drove every voter
-  /// into `RecoveringHead` — so no committed op was put at risk.
+  /// A representative (the LOWEST) of the per-voter uncommitted head ops whose read-fault drove the
+  /// voters into `RecoveringHead`. Each voter's own head is faulted (not a single fixed op), and every
+  /// such head is ABOVE the committed history, so no committed op was put at risk.
   faulted_op: u64,
 }
 
@@ -61,7 +62,8 @@ impl OfflineReconfig {
     self.view
   }
 
-  /// The uncommitted tail op whose head read-fault drove every voter into `RecoveringHead`.
+  /// A representative (the lowest) faulted voter head — the uncommitted tail op whose read-fault drove
+  /// the voters into `RecoveringHead`. Above the committed history on every voter.
   pub const fn faulted_op(&self) -> u64 {
     self.faulted_op
   }
@@ -1026,25 +1028,34 @@ impl Cluster {
   ///    non-crashed node is `Normal` at a COMMON view `V` with the network idle. (An offline stop is on
   ///    healthy disks, so committed data is sound throughout.) `None` if the cluster cannot quiesce
   ///    within the budget (no swap is attempted).
-  /// 2. **Uncommitted tail:** the durable frontier under load always carries an uncommitted tail
+  /// 2. **Seal the committed frontier:** call [`seal_committed_frontier`](Endpoint::seal_committed_frontier)
+  ///    on every node and AWAIT its superblock write, so each durable root carries `commit_max`. Between
+  ///    checkpoints the durable commit lags the in-memory frontier; an offline-restart successor copies the durable
+  ///    commit, so without this seal a coordinated restart could strand a committed op above every node's
+  ///    stale durable commit. The seal makes the successor roots correct-by-construction.
+  /// 3. **Uncommitted tail:** the durable frontier under load always carries an uncommitted tail
   ///    (`op > commit`); a quiesced cluster has committed everything, so re-open the window by minting
   ///    exactly one UNCOMMITTED op above the committed frontier — drive the primary to append the next
   ///    op + broadcast its `Prepare` while every backup→primary `PrepareOk` leg is cut, so each voter
   ///    durably appends the op but the commit never advances. That head op is ABOVE the cluster's
   ///    committed history, so faulting it loses no committed data (route A keeps committed data sound).
-  /// 3. **Pre-write successors:** for every node build the successor durable root via
+  /// 4. **Pre-write successors:** for every node build the successor durable root via
   ///    [`prepare_restart`] off its OWN durable root, KEEPING the same voting set (a no-op-membership
   ///    reconfig — it still bumps the epoch, the realistic "restart into a new epoch" case), and
   ///    [`install_root_for_test`](InMemorySuperblock::install_root_for_test) it while the node is
   ///    stopped. `prepare_restart` preserves view/log_view/commit, so every voter recovers the same
   ///    durable view `V` and targets the same `V + 1` on escalation.
-  /// 4. **Head-fault wave + restart:** crash every node, inject a PERMANENT head read-fault on each
-  ///    VOTER's uncommitted tail slot ([`InMemoryWal::fault_read_at`]), and restart all. Each voter's
-  ///    recovery cannot trust its head → `RecoveringHead` at view `V`; no `Normal` node answers a
-  ///    `Recovery`, the wedge. (Learners restart normally — they never escalate and never count toward
-  ///    the voting quorum the gate needs.)
+  /// 5. **Head-fault wave + restart:** crash every node, inject a PERMANENT head read-fault on each
+  ///    VOTER's OWN current head ([`InMemoryWal::fault_read_at`]) — sampled per voter (the in-tree
+  ///    clients can append past the minted tail, so a fixed op could miss a voter's real head and leave
+  ///    it `Normal`), each above the cut committed frontier — and restart all. Each voter's recovery
+  ///    cannot trust its head → `RecoveringHead` at view `V`; no `Normal` node answers a `Recovery`, the
+  ///    wedge. (Learners restart normally — they never escalate and never count toward the voting quorum
+  ///    the gate needs.) The function then REQUIRES a voting quorum to have reached `RecoveringHead`,
+  ///    returning `None` otherwise (the wedge did not form, so this must not count as a re-formation
+  ///    scenario).
   ///
-  /// Returns the common view `V` and the faulted (uncommitted) head op, so a caller can assert the
+  /// Returns the common view `V` and a representative faulted head op, so a caller can assert the
   /// wedge formed at `V` and that re-formation converges to `V + 1`. The escalation itself is observed
   /// via [`reform_escalations_fired`](Self::reform_escalations_fired) once the cluster is ticked.
   pub fn reconfigure_offline(&mut self) -> Option<OfflineReconfig> {
@@ -1058,21 +1069,76 @@ impl Cluster {
       }
     }
     let view = self.drive_to_quiesced_normal(40_000)?;
-    let primary = self.serving_primary()?;
-    let committed_before = (0..self.replicas.len())
-      .map(|i| self.replicas[i].state_machine_ref().applied().len())
-      .max()
-      .unwrap_or(0) as u64;
 
-    // (2) Mint ONE uncommitted tail op above the committed frontier: drive the primary to append +
-    // broadcast its Prepare while every backup→primary leg is cut, so the commit cannot advance.
+    let primary = self.serving_primary()?;
     let voters: Vec<usize> = (0..self.replica_count as usize).collect();
-    let target_head = committed_before + 1;
+
+    // Freeze the commit BEFORE sealing: cut every backup→primary PrepareOk so no op can commit while we
+    // seal and mint. Clients keep APPENDING during the ticks below, but those ops stay UNCOMMITTED.
+    // Without the freeze, the seal-drain ticks would commit more client ops PAST the just-sealed frontier
+    // — re-creating the durable-commit lag the seal exists to remove — and the restart would lose them
+    // (an op-number reuse the applied-once oracle catches).
     for x in 0..self.replicas.len() {
       if x != primary {
         self.one_way[x][primary] = true; // drop every PrepareOk back to the primary
       }
     }
+    // Propagate the primary's commit to every laggard backup so all voters share a COMMON commit_max
+    // before the seal. Backups lazily lag the primary's commit (it is carried by the periodic Commit /
+    // the next Prepare); the PrepareOk cut freezes the commit, but the primary→backup Commit still
+    // flows, so ticking catches the backups up. Sealing a NON-uniform commit would persist a committed
+    // op on only the leading node's durable root (< quorum), and a re-formation whose DVC quorum
+    // excluded that node would drop the committed op — the laggard-quorum truncation hazard.
+    for _ in 0..40_000 {
+      self.tick();
+      let commits: Vec<u64> = voters
+        .iter()
+        .map(|&v| self.replicas[v].commit_max().get())
+        .collect();
+      if commits.iter().all(|&c| c == commits[0]) {
+        break;
+      }
+    }
+    let committed_before = voters
+      .iter()
+      .map(|&v| self.replicas[v].commit_max().get())
+      .max()
+      .unwrap_or(0);
+
+    // (1b) Seal the committed frontier on every node BEFORE deriving the successor roots. Between
+    // checkpoints `commit_max` advances only in memory — the durable root's commit lags it — and an offline-restart
+    // successor copies that durable commit, so a coordinated restart can strand a committed op above
+    // every node's stale durable commit (no peer holds a higher commit to repair from). With the commit
+    // frozen above, `commit_max == committed_before`, so the seal persists exactly that frontier and the
+    // successor root `prepare_restart` reads below carries the true committed prefix.
+    for i in 0..self.replicas.len() {
+      if self.retired[i] {
+        continue;
+      }
+      self.replicas[i].seal_committed_frontier(&mut self.sbs[i]);
+    }
+    // Tick until every non-retired node's pending superblock write has COMPLETED, so each durable root
+    // reflects the frozen `commit_max`. With the PrepareOk legs cut these ticks only complete the seal
+    // writes (and append uncommitted client ops) — they cannot advance the committed frontier.
+    let mut sealed = false;
+    for _ in 0..40_000 {
+      self.tick();
+      if (0..self.replicas.len())
+        .all(|i| self.retired[i] || !self.replicas[i].has_inflight_storage())
+      {
+        sealed = true;
+        break;
+      }
+    }
+    if !sealed {
+      self.heal(); // restore the cut legs before bailing
+      return None; // the seal writes did not drain within the budget — do not proceed to the restart
+    }
+
+    // (2) Ensure every voter holds an UNCOMMITTED tail op above the frozen frontier — the head-fault
+    // target. The seal drain (PrepareOks cut) may already have let clients append some; inject one more
+    // to GUARANTEE a head above `committed_before` even if the clients were idle.
+    let target_head = committed_before + 1;
     // A fresh client (an id past every minted one) issues a single request only the primary sees, so
     // the op is genuinely new and the in-tree client models are untouched.
     let tail_client = viewstamp_proto::ClientId::new(
@@ -1108,8 +1174,6 @@ impl Cluster {
     if !minted {
       return None;
     }
-    // Every voter's WAL head is the uncommitted tail op; the commit never advanced past the frontier.
-    let faulted_op = target_head;
 
     // (3) Pre-write each node's successor durable root (same voting set, bumped epoch).
     for i in 0..self.replicas.len() {
@@ -1131,24 +1195,57 @@ impl Cluster {
       self.sbs[i].install_root_for_test(succ);
     }
 
-    // (4) Crash every node, fault each VOTER's uncommitted head slot, restart all. The voters cannot
-    // trust their head on recovery → `RecoveringHead` at the common view `V`.
+    // (4) Crash every node, fault each VOTER's ACTUAL CURRENT HEAD, restart all. The voters cannot
+    // trust their head on recovery → `RecoveringHead` at the common view `V`. The in-tree clients can
+    // append PAST `target_head` during the mint loop, so a voter's real head can sit above it; faulting
+    // a FIXED op could land on an interior (already-readable) slot and leave that voter `Normal`. Fault
+    // each voter's OWN durable head instead (sampled AFTER the crash drops any in-flight WAL write, so
+    // it is the head recovery will actually read) — every such head is above the cut committed frontier
+    // (the commit never advanced past `committed_before` while the PrepareOk legs were cut), so no
+    // committed op is ever put at risk.
     for i in 0..self.replicas.len() {
       if !self.retired[i] {
         self.crash(i);
       }
     }
+    let mut faulted_heads: Vec<u64> = Vec::new();
     for &v in &voters {
-      self.wals[v].fault_read_at(OpNumber::with(faulted_op));
+      let head = self.wal_head_for_test(v);
+      // The faulted head MUST be uncommitted (above the committed frontier captured after the seal
+      // drain) — the mint cut every PrepareOk so the commit stayed frozen while the head climbed, so
+      // `head > committed_before` always holds. Faulting a COMMITTED slot would lose a committed op.
+      debug_assert!(
+        head > committed_before,
+        "head-fault target {head} must be above the committed frontier {committed_before}"
+      );
+      self.wals[v].fault_read_at(OpNumber::with(head));
+      faulted_heads.push(head);
     }
     for i in 0..self.replicas.len() {
       if self.crashed[i] && !self.retired[i] {
         self.restart(i);
       }
     }
+
+    // The wedge must GENUINELY form: a VOTING QUORUM has to reach `RecoveringHead`, or this is not a
+    // re-formation scenario and must not count toward the axis. A head-fault that landed on an interior
+    // slot (a voter whose real head climbed past the faulted op) leaves that voter `Normal`, so without
+    // this gate the function could return `Some` for a cluster that never wedged. `restart` pumps each
+    // replica's recovery to a terminal status, so the statuses are settled here.
+    let voting_quorum = self.replica_count as usize / 2 + 1;
+    let wedged = voters
+      .iter()
+      .filter(|&&v| self.replica_status_is_recovering_head(v))
+      .count();
+    if wedged < voting_quorum {
+      return None;
+    }
+
     Some(OfflineReconfig {
       view: view.get(),
-      faulted_op,
+      // The representative (lowest) faulted head — every voter's faulted op is at least this, and all
+      // are above the committed frontier. Reported for observability/tracing only.
+      faulted_op: faulted_heads.iter().copied().min().unwrap_or(target_head),
     })
   }
 
