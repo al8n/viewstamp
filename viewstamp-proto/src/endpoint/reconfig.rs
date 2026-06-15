@@ -73,10 +73,17 @@ pub enum ReconfigError {
 /// whose `prev_epoch` is `cur.epoch()` (the durable backward link of the lineage), and whose
 /// membership is the successor.
 ///
-/// # Precondition: stop from a quiesced cluster
+/// # Precondition: seal the committed frontier, then stop from a quiesced cluster
 ///
-/// The operator MUST stop the cluster from a QUIESCED state — every voter `Normal` at a COMMON view —
-/// before pre-writing the successor roots. Because the successor preserves each node's own `view`,
+/// The successor copies `cur.commit()` — the DURABLE-root commit, which lags the live `commit_max`
+/// between checkpoints. The operator MUST therefore call
+/// [`Endpoint::seal_committed_frontier`](crate::Endpoint::seal_committed_frontier) on every node and
+/// await its superblock write BEFORE reading the root passed here, so `cur.commit()` is the true
+/// committed frontier. Without the seal, a coordinated restart can strand a committed op that sits
+/// above every node's stale durable commit (no peer holds a higher commit to repair from).
+///
+/// The operator MUST also stop the cluster from a QUIESCED state — every voter `Normal` at a COMMON
+/// view. Because the successor preserves each node's own `view`,
 /// a quiesced stop leaves every node at the same view, so if a head-fault wave on the restart drives
 /// a voting quorum into `RecoveringHead`, they all escalate to the SAME next view and the cluster
 /// re-forms. Stopping mid-view-change — leaving a `>= 2` view stagger across the voting set — is OUT
