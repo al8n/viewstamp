@@ -1060,6 +1060,13 @@ impl Cluster {
   /// via [`reform_escalations_fired`](Self::reform_escalations_fired) once the cluster is ticked.
   pub fn reconfigure_offline(&mut self) -> Option<OfflineReconfig> {
     use viewstamp_proto::Superblock;
+    // An all-`RecoveringHead` re-formation needs a VOTING QUORUM that can wedge with no `Normal`
+    // answerer. A single-voter cluster has no such quorum, and with no backup `PrepareOk` legs to cut
+    // the freeze below cannot stop the lone primary (its own append is a quorum) from committing past
+    // the captured frontier — so the head-fault could hit a freshly-committed op. Fence it out.
+    if self.replica_count < 2 {
+      return None;
+    }
     // (1) Quiesce to all-`Normal` at a common view — the route A precondition.
     self.heal();
     self.set_faults(Faults::none());
@@ -1083,21 +1090,30 @@ impl Cluster {
         self.one_way[x][primary] = true; // drop every PrepareOk back to the primary
       }
     }
-    // Propagate the primary's commit to every laggard backup so all voters share a COMMON commit_max
-    // before the seal. Backups lazily lag the primary's commit (it is carried by the periodic Commit /
-    // the next Prepare); the PrepareOk cut freezes the commit, but the primary→backup Commit still
-    // flows, so ticking catches the backups up. Sealing a NON-uniform commit would persist a committed
-    // op on only the leading node's durable root (< quorum), and a re-formation whose DVC quorum
-    // excluded that node would drop the committed op — the laggard-quorum truncation hazard.
+    // Settle for the seal: tick until every voter shares a COMMON commit_max AND no node has any durable
+    // write outstanding. The PrepareOk cut freezes the commit, so this only (a) propagates the primary's
+    // commit to laggard backups (they lazily lag it, via the periodic Commit / next Prepare) and (b)
+    // drains any pre-freeze checkpoint or append. Both are load-bearing: sealing a NON-uniform commit
+    // would persist a committed op on only the leading node's root (the laggard-quorum truncation
+    // hazard), and sealing behind in-flight durable work could revert a checkpoint or race the drain.
+    let mut settled = false;
     for _ in 0..40_000 {
       self.tick();
       let commits: Vec<u64> = voters
         .iter()
         .map(|&v| self.replicas[v].commit_max().get())
         .collect();
-      if commits.iter().all(|&c| c == commits[0]) {
+      let uniform = commits.iter().all(|&c| c == commits[0]);
+      let drained = (0..self.replicas.len())
+        .all(|i| self.retired[i] || !self.replicas[i].has_inflight_storage());
+      if uniform && drained {
+        settled = true;
         break;
       }
+    }
+    if !settled {
+      self.heal();
+      return None;
     }
     let committed_before = voters
       .iter()
@@ -1108,18 +1124,20 @@ impl Cluster {
     // (1b) Seal the committed frontier on every node BEFORE deriving the successor roots. Between
     // checkpoints `commit_max` advances only in memory — the durable root's commit lags it — and an offline-restart
     // successor copies that durable commit, so a coordinated restart can strand a committed op above
-    // every node's stale durable commit (no peer holds a higher commit to repair from). With the commit
-    // frozen above, `commit_max == committed_before`, so the seal persists exactly that frontier and the
-    // successor root `prepare_restart` reads below carries the true committed prefix.
+    // every node's stale durable commit. The settle above guarantees no durable work is in flight, so
+    // `seal_committed_frontier` fires (returns `true`) on every node; a `false` return means something is
+    // still outstanding and the seal would be unsafe, so bail.
     for i in 0..self.replicas.len() {
       if self.retired[i] {
         continue;
       }
-      self.replicas[i].seal_committed_frontier(&mut self.sbs[i]);
+      if !self.replicas[i].seal_committed_frontier(&mut self.sbs[i]) {
+        self.heal();
+        return None;
+      }
     }
-    // Tick until every non-retired node's pending superblock write has COMPLETED, so each durable root
-    // reflects the frozen `commit_max`. With the PrepareOk legs cut these ticks only complete the seal
-    // writes (and append uncommitted client ops) — they cannot advance the committed frontier.
+    // Drain the seal writes. With the PrepareOk legs cut these ticks only complete the seal roots (and
+    // append uncommitted client ops) — they cannot advance the committed frontier.
     let mut sealed = false;
     for _ in 0..40_000 {
       self.tick();
@@ -1131,8 +1149,17 @@ impl Cluster {
       }
     }
     if !sealed {
-      self.heal(); // restore the cut legs before bailing
-      return None; // the seal writes did not drain within the budget — do not proceed to the restart
+      self.heal();
+      return None;
+    }
+    // VERIFY the seal landed: every voter's durable root commit now equals the sealed frontier. This is
+    // the robust backstop — if a seal somehow raced an unrelated write, the successor would carry a
+    // stale commit, so refuse rather than risk stranding a committed op across `prepare_restart`.
+    for &v in &voters {
+      if self.sbs[v].state().commit().get() != committed_before {
+        self.heal();
+        return None;
+      }
     }
 
     // (2) Ensure every voter holds an UNCOMMITTED tail op above the frozen frontier — the head-fault
@@ -1172,6 +1199,16 @@ impl Cluster {
     }
     self.heal(); // restore the cut legs before the stop
     if !minted {
+      return None;
+    }
+    // Hard pre-fault check: the commit must NOT have advanced past the sealed frontier while we minted
+    // (the freeze held it). If it did — a freeze that did not fully freeze for this membership — the
+    // head-fault could hit a freshly-committed op the successor root never sealed; refuse rather than
+    // risk a committed-op loss. (No ticks run between here and the head-fault, so this holds through it.)
+    if voters
+      .iter()
+      .any(|&v| self.replicas[v].commit_max().get() != committed_before)
+    {
       return None;
     }
 
