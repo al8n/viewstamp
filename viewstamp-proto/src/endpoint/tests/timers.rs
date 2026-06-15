@@ -86,8 +86,8 @@ fn view_changing_replica_with_a_repair_hole_does_not_spin_a_poll_timeout_driver(
   // (earlier) deadline, so `poll_timeout()` pins there and a deadline-driven driver SPINS — the view
   // change never progresses. The fix gates `arm_timers`' `repair_retry` arming on `Status::Normal`, so
   // the arm-site condition matches the service-site gate and no orphaned timer is left in ViewChange.
-  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap(); // replica 1: backup of view 0
-  let mut e = Endpoint::new(cfg, 7, NoopSm);
+  let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap(); // replica 1: backup of view 0
+  let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   // A Normal backup holding a committed-op repair hole at op 2 (commit held at 1 below it).
   e.force_state_for_test(0, 10, 1, 0, &[2]);
@@ -108,7 +108,12 @@ fn view_changing_replica_with_a_repair_hole_does_not_spin_a_poll_timeout_driver(
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(0)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(e.status(), Status::ViewChange, "now view-changing");
   assert!(
@@ -166,8 +171,8 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
   // forfeit with NO repair hole and NO grace timer, so the ONLY armed cadence timer is the heartbeat
   // `commit` (50ms COMMIT_HEARTBEAT) — earlier than the post-forfeit `svc_message` (100ms
   // VC_MESSAGE_RETRANSMIT) — which is exactly the stale spinner.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Commit a tail (head == commit == 4) the real way: client requests → own append durable → a peer's
@@ -195,12 +200,13 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
         OpNumber::with(rn),
         ReplicaId::new(1),
         OpNumber::new(),
-        // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
         crate::storage::prepare_identity(
           ClientId::new(7),
           RequestNumber::with(rn),
           crate::storage::fnv1a_128(&[rn as u8]),
         ),
+        crate::Epoch::new(0),
+        0,
       )),
     );
   }
@@ -235,6 +241,7 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
       View::new(),
       OpNumber::with(6),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env,
@@ -321,8 +328,8 @@ fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
   // the StartViewChange{view+1} on its retransmit cadence) AND `poll_timeout`'s serviceable filter then
   // returns it only where it is acted on, so the clock strictly advances and the SVC is re-broadcast
   // across multiple windows.
-  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap(); // replica 1: backup of view 0
-  let mut e = Endpoint::new(cfg, 7, NoopSm);
+  let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap(); // replica 1: backup of view 0
+  let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   assert!(!e.is_primary());
   // Bootstrap the idle timer: the first Normal-backup tick only ARMS `primary_idle` (= now + 200ms), it
@@ -422,8 +429,8 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
   // The fix retires `self.forfeit_armed = None` in the `pending_forfeit` branch (and the
   // serviceability filter no longer returns it once `pending_forfeit` holds), so `svc_message` is the
   // sole primary-side driver and the clock strictly advances to the step-down re-proposal.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   // A Normal PRIMARY (replica 0, view 0) holding a committed `repair` hole at op 2 (commit held at 1
   // below it, head 10). `force_state_for_test` arms `repair_retry` and leaves commit_max > commit_min.
@@ -463,6 +470,7 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
       View::new(),
       OpNumber::with(6),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env,
@@ -565,8 +573,8 @@ fn poll_timeout_only_returns_serviceable_timers() {
 
   // (1) Normal PRIMARY (heartbeating): commit/prepare/forfeit_armed serviceable.
   {
-    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
-    let mut e = Endpoint::new(cfg, 0, CountSm::default());
+    let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
+    let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     // Commit a tail so prepare would also be relevant, then tick to arm the heartbeat.
     for rn in 1..=3u64 {
@@ -592,12 +600,13 @@ fn poll_timeout_only_returns_serviceable_timers() {
           OpNumber::with(rn),
           ReplicaId::new(1),
           OpNumber::new(),
-          // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
           crate::storage::prepare_identity(
             ClientId::new(7),
             RequestNumber::with(rn),
             crate::storage::fnv1a_128(&[rn as u8]),
           ),
+          crate::Epoch::new(0),
+          0,
         )),
       );
     }
@@ -609,8 +618,8 @@ fn poll_timeout_only_returns_serviceable_timers() {
 
   // (2) Normal PRIMARY then forced into pending_forfeit (the force-forfeited substate): only svc_message drives.
   {
-    let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
-    let mut e = Endpoint::new(cfg, 0, CountSm::default());
+    let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
+    let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     e.force_state_for_test(0, 10, 1, 0, &[2]); // committed repair hole → grace arms on the next tick
     e.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
@@ -628,6 +637,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
         View::new(),
         OpNumber::with(6),
         id,
+        0,
         ReplicaId::new(0),
         nonce,
         env,
@@ -642,8 +652,8 @@ fn poll_timeout_only_returns_serviceable_timers() {
 
   // (3) Normal BACKUP that proposed an idle SVC (the idle-SVC substate): primary_idle + svc_message.
   {
-    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
-    let mut e = Endpoint::new(cfg, 7, NoopSm);
+    let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
+    let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     e.handle_timeout(
       Instant::ZERO + core::time::Duration::from_millis(200),
@@ -659,8 +669,8 @@ fn poll_timeout_only_returns_serviceable_timers() {
 
   // (4) ViewChange (active SVC driver): svc_message + dvc_message + view_change_status.
   {
-    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
-    let mut e = Endpoint::new(cfg, 7, NoopSm);
+    let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
+    let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     // Drive into ViewChange(1) via an SVC quorum (replica 0 + our own bit).
     e.handle_timeout(
@@ -673,7 +683,12 @@ fn poll_timeout_only_returns_serviceable_timers() {
       &mut wal,
       &mut sb,
       Peer::Replica(ReplicaId::new(0)),
-      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+      Message::StartViewChange(StartViewChange::new(
+        View::with(1),
+        ReplicaId::new(0),
+        crate::Epoch::new(0),
+        0,
+      )),
     );
     assert_eq!(e.status(), Status::ViewChange);
     e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // land the durable-view write so it participates
@@ -685,12 +700,12 @@ fn poll_timeout_only_returns_serviceable_timers() {
 
   // (5) Recovering: recover_retry drives (and any sync_solicit armed by the peer-fetch must NOT spin).
   {
-    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
+    let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
     let mut sb = TestSb::default();
     // A WAL whose tail read faults forever on a non-head slot → the recover loop keeps retrying.
     let mut wal = ScriptedWal::with_entries(3);
     wal.script_read_fault(OpNumber::with(2), u8::MAX);
-    let mut e = Endpoint::recover(cfg, 7, NoopSm, &mut wal, &mut sb);
+    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb).expect_active();
     assert!(e.status().is_recovering() || e.status().is_recovering_head());
     e.handle_storage(Instant::ZERO, &mut wal, &mut sb);
     while e.poll_message().is_some() {}
@@ -701,12 +716,12 @@ fn poll_timeout_only_returns_serviceable_timers() {
 
   // (6) RecoveringHead: recover_head drives the Recovery re-solicitation.
   {
-    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
+    let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
     let mut sb = TestSb::default();
     // The HEAD slot reads back permanently faulty → RecoveringHead.
     let mut wal = ScriptedWal::with_entries(3);
     wal.script_read_fault(OpNumber::with(3), u8::MAX);
-    let mut e = Endpoint::recover(cfg, 7, NoopSm, &mut wal, &mut sb);
+    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb).expect_active();
     // Drain the recover loop to its terminal RecoveringHead (re-submit the faulty head read until the
     // budget exhausts), driving purely via the recover_retry timer.
     for _ in 0..64 {
@@ -740,7 +755,12 @@ fn sustained_client_load_does_not_starve_the_prepare_retransmit() {
   // resets `primary_idle`, so no failover) and the commit wedges below it until the load pauses a
   // full interval. The deadline must be PRESERVED across accepts (it may only move earlier), so
   // the retransmit fires at T despite continuous accepts.
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let t0 = Instant::ZERO;
 

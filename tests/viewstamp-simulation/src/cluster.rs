@@ -4,8 +4,8 @@ use bytes::Bytes;
 use smol_str::SmolStr;
 
 use viewstamp_proto::{
-  Committed, Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, Message, OpNumber, Outgoing,
-  Peer, Prng, Recipient, ReplicaId, Wal,
+  Committed, Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, MemberId, Membership,
+  Message, OpNumber, Outgoing, Peer, Prng, Recipient, Recovered, ReplicaId, Wal,
 };
 
 use crate::{
@@ -85,6 +85,14 @@ pub struct Cluster {
   /// is cluster configuration, identical on every replica).
   batch_mode: bool,
   crashed: Vec<bool>,
+  /// Per-replica RETIRED flag: `true` once this node has resolved [`Recovered::Retired`] on recover
+  /// (absent from its durable membership) and is parked. A retired node stays in the vectors (so
+  /// indices stay stable) but is permanently `crashed` — never ticked, polled, delivered to, or
+  /// restarted (the calm-window / final-quiesce / chaos restart loops skip it). Distinct from
+  /// `crashed`, which is transient; a retired node is gone for the rest of the run. No in-tree path
+  /// retires a node (a removal needs an offline reconfiguration), so this stays `false` for every node;
+  /// the flag + its restart-loop guards are the foundation seam a future reconfiguration would set.
+  retired: Vec<bool>,
   /// Partition group id per replica. Replica↔replica messages between different groups are
   /// dropped. All replicas start in group 0 (no partition).
   groups: Vec<u8>,
@@ -232,9 +240,9 @@ impl Cluster {
   /// Builds a cluster of `replica_count` VOTING replicas plus `learner_count` non-voting learners
   /// (the total membership, `node_count = replica_count + learner_count`), with an explicit
   /// checkpoint interval. The voting count drives every quorum and the fault budget; the node count
-  /// sizes every per-replica vector, the routing target space, and the storage seeding. Voting
-  /// replicas build their config via [`Config::with_checkpoint_ops`] carrying the learner count;
-  /// learners build theirs via [`Config::try_new_member`].
+  /// sizes every per-replica vector, the routing target space, and the storage seeding. Each node's
+  /// static [`Config`] carries its stable [`MemberId`]; the cluster SHAPE (the voting set + learners)
+  /// is the shared genesis [`Membership`] every node is built with.
   pub fn with_members(
     replica_count: u8,
     learner_count: u16,
@@ -244,21 +252,16 @@ impl Cluster {
     checkpoint_ops: u64,
   ) -> Self {
     let node_count = replica_count as u16 + learner_count;
+    let membership = Self::genesis_membership(replica_count, learner_count);
     let replica_set: Vec<Endpoint<SimSm>> = (0..node_count)
       .map(|i| {
-        let cfg = if i < replica_count as u16 {
-          Config::with_checkpoint_ops(1, ReplicaId::new(i), replica_count, checkpoint_ops)
-            .expect("valid cluster config")
-            .with_learner_count(learner_count)
-            .expect("valid learner count")
-        } else {
-          Config::try_new_member(1, ReplicaId::new(i), replica_count, learner_count)
-            .expect("valid cluster config")
-            .with_checkpoint_interval(checkpoint_ops)
-            .expect("valid checkpoint interval")
-        };
+        // `MemberId::new(i)` occupies slot `i` in the genesis membership, so every node's local slot
+        // equals its old replica index — quorum/primary/voter logic is byte-identical at epoch 0.
+        let cfg = Config::with_checkpoint_ops(1, MemberId::new(i as u128), checkpoint_ops)
+          .expect("valid cluster config");
         Endpoint::new(
           cfg,
+          membership.clone(),
           seed ^ (i as u64).wrapping_mul(0x1234_5678),
           SimSm::Plain(LogSm::default()),
         )
@@ -287,6 +290,7 @@ impl Cluster {
       max_client_sessions: None,
       batch_mode: false,
       crashed: vec![false; n],
+      retired: vec![false; n],
       groups: vec![0; n],
       one_way: vec![vec![false; n]; n],
       slow: vec![None; n],
@@ -700,6 +704,12 @@ impl Cluster {
     s.is_normal() || s.is_view_change()
   }
 
+  /// Test-only: replica `i`'s status as a short string (for debugging a wedge).
+  #[doc(hidden)]
+  pub fn replica_status_str(&self, i: usize) -> &'static str {
+    self.replicas[i].status().as_str()
+  }
+
   /// Replica `i`'s DURABLE (superblock) view — the view persisted in its on-disk VSR root, which is
   /// what a crash + `restart` recovers it to. Unlike the volatile in-memory [`Self::replica_view`]
   /// (which a self-driven view change advances BEFORE the matching `submit_durable_view` completes,
@@ -712,6 +722,43 @@ impl Cluster {
   pub fn replica_durable_view(&self, i: usize) -> viewstamp_proto::View {
     use viewstamp_proto::Superblock;
     self.sbs[i].state().view()
+  }
+
+  /// Replica `i`'s DURABLE (superblock) configuration epoch — the high-order coordinate of the
+  /// `(epoch, view)` pair, bumped per configuration epoch. A legacy (pre-membership) root reads `0`.
+  /// Read off the same superblock the proto recovers from, so it is monotone across an epoch transition
+  /// (a successor root is pre-written before any node recovers into it).
+  pub fn replica_durable_epoch(&self, i: usize) -> viewstamp_proto::Epoch {
+    use viewstamp_proto::Superblock;
+    self.sbs[i].state().epoch()
+  }
+
+  /// Replica `i`'s DURABLE configuration `config_id` — the lineage hash of the active membership. A
+  /// legacy (pre-membership) root reads `0`. Used by the membership-monotonicity checker to prove the
+  /// configuration history is a single non-forking chain.
+  pub fn replica_durable_config_id(&self, i: usize) -> u128 {
+    use viewstamp_proto::Superblock;
+    self.sbs[i]
+      .state()
+      .membership_opt()
+      .map_or(0, viewstamp_proto::Membership::config_id)
+  }
+
+  /// Replica `i`'s DURABLE `prev_epoch` — the backward link of the `config_id` lineage chain (the
+  /// epoch the current configuration succeeded). Equals the current epoch at genesis. Read off the
+  /// superblock the proto recovers from.
+  pub fn replica_durable_prev_epoch(&self, i: usize) -> viewstamp_proto::Epoch {
+    use viewstamp_proto::Superblock;
+    self.sbs[i].state().prev_epoch()
+  }
+
+  /// Whether replica `i`'s DURABLE root carries a membership (a v4 root). `false` for a node still on
+  /// its genesis (`VsrState::new`) root that has not yet written a durable root (no checkpoint / view
+  /// change since construction) — such a root is LEGACY and has no `config_id` lineage. The proto's
+  /// durable-root writes produce a v4 root on the first checkpoint / view change.
+  pub fn replica_has_durable_membership(&self, i: usize) -> bool {
+    use viewstamp_proto::Superblock;
+    self.sbs[i].state().membership_opt().is_some()
   }
 
   /// Read access to client `i` (for invariant checking).
@@ -825,31 +872,57 @@ impl Cluster {
   /// main `tick` loop also pumps `handle_storage` every tick, so an un-pumped restart would still
   /// recover; this pump is purely for test-assertion timing.)
   pub fn restart(&mut self, i: usize) {
-    // A restart begins a new INCARNATION of this replica's apply stream: the rebuilt endpoint
-    // re-emits from its durable checkpoint (recovery re-applies `(checkpoint_op .. commit_max]`; a
-    // wiped disk re-applies from genesis), so per-incarnation stream invariants start afresh.
+    // The replica restarts into its OWN durable membership and resolves itself present (at epoch 0 the
+    // genesis-fallback membership places it, and no in-tree path removes a node from a durable root), so
+    // `recover` returns `Active`. A `Retired` here — the node absent from its own durable membership —
+    // is a harness bug (a parked node must never be routed a plain restart).
+    if let Some(r) = self.recover_in_place(i) {
+      panic!("replica {i} recovered Retired (absent from its own durable membership): {r:?}");
+    }
+    self.crashed[i] = false;
+  }
+
+  /// Rebuild replica `i` from its durable WAL + superblock via `Endpoint::recover`, drive its
+  /// Recovering read loop to completion, and return `None` on [`Recovered::Active`] (the rebuilt
+  /// endpoint is installed) or `Some(retired)` on [`Recovered::Retired`] (a node absent from its durable
+  /// membership — the old endpoint is left in place as an inert placeholder, never ticked once parked).
+  /// Does NOT touch the `crashed` flag — the caller decides (a plain restart clears it on `Active`). The
+  /// passed membership is only `recover`'s legacy fallback — a v4 durable root's OWN membership wins, so
+  /// this resolves the node against the EFFECTIVE (durable) membership by its stable `MemberId`. A
+  /// restart begins a new INCARNATION of the apply stream (recovery re-emits from the durable
+  /// checkpoint), so the per-incarnation stream invariants start afresh.
+  fn recover_in_place(&mut self, i: usize) -> Option<viewstamp_proto::Retired> {
     self.incarnations[i] += 1;
     let cfg = self.replica_config(i as u16);
+    // The genesis-fallback membership for a legacy root (a v4 root ignores it). Sized by the CURRENT
+    // voting/learner split so a same-epoch legacy bridge still resolves every node.
+    let membership = Self::genesis_membership(self.replica_count, self.learner_count);
     let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
     let now = self.clock.now();
-    self.replicas[i] = Endpoint::recover(
+    match Endpoint::recover(
       cfg,
+      membership,
       seed,
       self.make_sm(),
       &mut self.wals[i],
       &mut self.sbs[i],
-    );
-    // Drain the Recovering read loop to completion. Bounded by the WAL-tail length × the per-slot
-    // retry budget plus a margin; a fault that never clears within this leaves the replica
-    // Recovering/RecoveringHead and the per-tick `handle_storage` keeps trying.
-    for _ in 0..4_096 {
-      if !self.replicas[i].status().is_recovering() {
-        break;
+    ) {
+      Recovered::Active(endpoint) => {
+        self.replicas[i] = endpoint;
+        // Drain the Recovering read loop to completion. Bounded by the WAL-tail length × the per-slot
+        // retry budget plus a margin; a fault that never clears within this leaves the replica
+        // Recovering/RecoveringHead and the per-tick `handle_storage` keeps trying.
+        for _ in 0..4_096 {
+          if !self.replicas[i].status().is_recovering() {
+            break;
+          }
+          self.replicas[i].handle_timeout(now, &mut self.wals[i], &mut self.sbs[i]);
+          self.replicas[i].handle_storage(now, &mut self.wals[i], &mut self.sbs[i]);
+        }
+        None
       }
-      self.replicas[i].handle_timeout(now, &mut self.wals[i], &mut self.sbs[i]);
-      self.replicas[i].handle_storage(now, &mut self.wals[i], &mut self.sbs[i]);
+      Recovered::Retired(r) => Some(r),
     }
-    self.crashed[i] = false;
   }
 
   /// Restart a previously-crashed replica with WIPED durable storage: its WAL + superblock are
@@ -881,39 +954,53 @@ impl Cluster {
     self.restart(i);
   }
 
+  /// Whether slot `i` is RETIRED (it resolved [`Recovered::Retired`] on recover — absent from its
+  /// durable membership — and was parked). A retired node is permanently `crashed` and never restarted.
+  /// No in-tree path retires a node, so this is currently always `false` (see the `retired` field).
+  pub fn is_retired(&self, i: usize) -> bool {
+    self.retired[i]
+  }
+
   /// Whether replica `i` is crashed.
   pub fn is_crashed(&self, i: usize) -> bool {
     self.crashed[i]
   }
 
-  /// The per-replica `Config` (cluster id 1, this cluster's checkpoint interval and — when set — its
-  /// client-session cap), shared by construction-time builds and `restart`/`wipe_and_restart` so a
-  /// recovered replica keeps the identical cluster configuration. A voting id
-  /// (`i < replica_count`) builds via [`Config::with_checkpoint_ops`] carrying the learner count; a
-  /// learner id (`[replica_count, node_count)`) builds via [`Config::try_new_member`].
+  /// The per-replica `Config` (cluster id 1, stable [`MemberId`], this cluster's checkpoint interval
+  /// and — when set — its client-session cap), shared by construction-time builds and
+  /// `restart`/`wipe_and_restart` so a recovered replica keeps the identical static parameters. The
+  /// node at index `i` is `MemberId::new(i)`, which occupies slot `i` in [`Self::genesis_membership`]
+  /// — so its local slot equals its old replica index (byte-identical at epoch 0). The cluster SHAPE
+  /// (voting set + learners) is the separate genesis [`Membership`].
   fn replica_config(&self, i: u16) -> Config {
-    let cfg = if i < self.replica_count as u16 {
-      Config::with_checkpoint_ops(
-        1,
-        ReplicaId::new(i),
-        self.replica_count,
-        self.checkpoint_ops,
-      )
-      .expect("valid cluster config")
-      .with_learner_count(self.learner_count)
-      .expect("valid learner count")
-    } else {
-      Config::try_new_member(1, ReplicaId::new(i), self.replica_count, self.learner_count)
-        .expect("valid cluster config")
-        .with_checkpoint_interval(self.checkpoint_ops)
-        .expect("valid checkpoint interval")
-    };
+    let cfg = Config::with_checkpoint_ops(1, MemberId::new(i as u128), self.checkpoint_ops)
+      .expect("valid cluster config");
     match self.max_client_sessions {
       Some(cap) => cfg
         .with_max_client_sessions(cap)
         .expect("a non-zero session cap"),
       None => cfg,
     }
+  }
+
+  /// The genesis [`Membership`] for `replica_count` voting replicas + `learner_count` learners: slot
+  /// `i` is `MemberId::new(i)`, voters in `0..replica_count` and learners after. Built fresh at
+  /// construction and every `restart`/`rebuild` so a recovered replica resolves to the identical
+  /// slot, keeping quorum/primary/voter logic byte-identical at epoch 0.
+  ///
+  /// Built with a fixed `config_id = 0` (via `from_durable_parts`) so the hand-built test messages the
+  /// cluster injects (which carry `config_id = 0`) pass the strict `(epoch, config_id)` ingress gate;
+  /// production uses the hash-chained id.
+  fn genesis_membership(replica_count: u8, learner_count: u16) -> Membership {
+    let node_count = replica_count as u128 + learner_count as u128;
+    Membership::from_durable_parts(
+      viewstamp_proto::Epoch::new(0),
+      replica_count,
+      learner_count,
+      (0..node_count).map(MemberId::new).collect(),
+      0,
+    )
+    .expect("valid genesis membership")
   }
 
   /// Cap every replica's client-session table at `n` applied sessions (the proto's deterministic
@@ -940,10 +1027,11 @@ impl Cluster {
   /// in-memory state is discarded; durable storage is untouched). Each rebuilt endpoint restarts
   /// its apply stream — a new incarnation, like `restart`.
   fn rebuild_endpoints(&mut self) {
+    let membership = Self::genesis_membership(self.replica_count, self.learner_count);
     for i in 0..self.replicas.len() as u16 {
       let cfg = self.replica_config(i);
       let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
-      self.replicas[i as usize] = Endpoint::new(cfg, seed, self.make_sm());
+      self.replicas[i as usize] = Endpoint::new(cfg, membership.clone(), seed, self.make_sm());
       self.incarnations[i as usize] += 1;
     }
   }
@@ -1047,9 +1135,20 @@ impl Cluster {
       let peer = viewstamp_proto::ReplicaId::new(((i + 1) % self.replicas.len()) as u16);
       let from = Peer::Replica(peer);
       let view = self.replicas[i].view();
-      let gv = Message::GetView(viewstamp_proto::GetView::new(view, peer, 0xF1_u64));
+      let gv = Message::GetView(viewstamp_proto::GetView::new(
+        view,
+        peer,
+        0xF1_u64,
+        viewstamp_proto::Epoch::new(0),
+        0,
+      ));
       self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, gv);
-      let rec = Message::Recovery(viewstamp_proto::Recovery::new(peer, 0xF2_u64));
+      let rec = Message::Recovery(viewstamp_proto::Recovery::new(
+        peer,
+        0xF2_u64,
+        viewstamp_proto::Epoch::new(0),
+        0,
+      ));
       self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, rec);
       // Fire the primary timers too (the `primary_timeouts` heartbeat/retransmit gate).
       self.replicas[i].handle_timeout(now, &mut self.wals[i], &mut self.sbs[i]);
@@ -1913,6 +2012,8 @@ mod tests {
       viewstamp_proto::View::with(1),
       OpNumber::with(1),
       OpNumber::with(0),
+      viewstamp_proto::Epoch::new(0),
+      0,
     ));
     // Blocked leg: dropped + counted, never enqueued.
     c.schedule(
@@ -2048,6 +2149,8 @@ mod tests {
       viewstamp_proto::View::with(1),
       OpNumber::with(1),
       OpNumber::with(0),
+      viewstamp_proto::Epoch::new(0),
+      0,
     ));
     let min_extra = Duration::from_millis(5);
     c.set_slow_replica(
@@ -2143,6 +2246,7 @@ mod tests {
         viewstamp_proto::View::with(1), // above the durable view 0
         OpNumber::with(4),
         0,
+        0,
         ReplicaId::new(0),
         0xD18F,
         bytes::Bytes::from_static(b"snapshot"),
@@ -2162,6 +2266,7 @@ mod tests {
       Message::SyncCheckpoint(viewstamp_proto::SyncCheckpoint::new(
         viewstamp_proto::View::with(0), // == durable view 0
         OpNumber::with(4),
+        0,
         0,
         ReplicaId::new(0),
         0xD18F,
@@ -2215,6 +2320,8 @@ mod tests {
       View::with(1),
       OpNumber::with(8),
       OpNumber::with(8),
+      viewstamp_proto::Epoch::new(0),
+      0,
       ReplicaId::new(0),
       full_body,
     ));
@@ -2223,6 +2330,8 @@ mod tests {
       View::with(1),
       OpNumber::with(8),
       OpNumber::with(8),
+      viewstamp_proto::Epoch::new(0),
+      0,
       ReplicaId::new(0),
       header_only,
     ));
@@ -2263,6 +2372,8 @@ mod tests {
       View::with(1),
       OpNumber::with(1),
       OpNumber::with(0),
+      viewstamp_proto::Epoch::new(0),
+      0,
     ));
     c.schedule(now, from, Target::Replica(2), small);
     assert_eq!(
@@ -2306,6 +2417,7 @@ mod tests {
       View::with(1),
       OpNumber::with(8),
       0xFEED,
+      0,
       ReplicaId::new(0),
       7,
       env.clone(),
@@ -2339,6 +2451,7 @@ mod tests {
         View::with(1),
         OpNumber::with(8),
         0xFEED,
+        0,
         env_len as u64,
         offset as u64,
         ReplicaId::new(0),

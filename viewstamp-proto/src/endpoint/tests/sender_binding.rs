@@ -10,7 +10,12 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
   // vote; a SECOND vote from a DISTINCT replica would reach quorum and commit. Deliver a PrepareOk
   // whose BODY claims replica 2 but whose authenticated `from` is replica 1 — a forged/misrouted
   // vote. It must NOT count toward the quorum: commit stays at 0 (only the primary's own vote stands).
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, EchoSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    EchoSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // The primary assigns op 1 to a client request and durably appends it (its OWN vote: bit 0).
@@ -42,9 +47,11 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
     Message::PrepareOk(PrepareOk::new(
       View::new(),
       OpNumber::with(1),
-      ReplicaId::new(2), // self-claimed sender — DISAGREES with `from`
+      ReplicaId::new(2),
       OpNumber::new(),
-      crate::storage::fnv1a_128(b"a"), // correct body checksum — the drop is purely sender-auth
+      crate::storage::fnv1a_128(b"a"),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -63,13 +70,15 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
     Message::PrepareOk(PrepareOk::new(
       View::new(),
       OpNumber::with(1),
-      ReplicaId::new(1), // matches `from`
+      ReplicaId::new(1),
       OpNumber::new(),
       crate::storage::prepare_identity(
         ClientId::new(7),
         RequestNumber::with(1),
         crate::storage::fnv1a_128(b"a"),
-      ), // matches the op-1 identity the primary is driving → counted
+      ),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -86,7 +95,12 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
   // deliver a DoViewChange whose BODY claims replica 2 but whose authenticated `from` is replica 0.
   // With its own DVC, ONE more genuine DVC reaches the view-change quorum (2) and it becomes primary;
   // the forged DVC must NOT contribute, so it stays in ViewChange (does not become a serving primary).
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Idle → propose SVC(view 1); a peer SVC completes the SVC quorum → enter ViewChange(1).
@@ -100,7 +114,12 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(0)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(e.status(), Status::ViewChange);
   assert!(!e.is_primary() || e.pending_sb_for_test()); // not yet a serving primary
@@ -117,7 +136,9 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
       View::with(0),
       OpNumber::with(2),
       OpNumber::with(1),
-      ReplicaId::new(2), // self-claimed sender — DISAGREES with `from`
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
       std::vec![],
     )),
   );
@@ -139,7 +160,9 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
       View::with(0),
       OpNumber::with(2),
       OpNumber::with(1),
-      ReplicaId::new(2), // matches `from`
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
       std::vec![],
     )),
   );
@@ -168,7 +191,12 @@ fn forged_start_view_change_from_a_different_sender_is_dropped() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(2)), // authenticated sender
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))), // claims R0
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )), // claims R0
   );
   assert_eq!(
     e.status(),
@@ -183,7 +211,12 @@ fn forged_start_view_change_from_a_different_sender_is_dropped() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(2)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))), // matches `from`
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(2),
+      crate::Epoch::new(0),
+      0,
+    )), // matches `from`
   );
   assert_eq!(
     e.status(),
@@ -219,7 +252,13 @@ fn forged_commit_from_a_non_primary_is_dropped_by_the_sender_binding() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(2)), // not the primary of view 0
-    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     e.commit(),
@@ -232,7 +271,13 @@ fn forged_commit_from_a_non_primary_is_dropped_by_the_sender_binding() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     e.commit(),
@@ -331,6 +376,8 @@ fn forged_prepare_batch_from_a_non_primary_is_dropped_by_the_sender_binding() {
       View::new(),
       OpNumber::new(),
       OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
       std::vec![PreparedEntry::new(
         OpNumber::with(1),
         ClientId::new(7),
@@ -380,7 +427,12 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
   // a configured cluster member (replica 5 in a 3-replica cluster) — delivered from a matching
   // out-of-range `from` by a buggy/misrouting driver — must NOT count toward the commit quorum. The
   // centralized `sender_is_member_replica` check drops it at ingress.
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, EchoSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    EchoSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // The primary assigns op 1 and durably appends it (its own vote: bit 0).
@@ -410,9 +462,11 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
     Message::PrepareOk(PrepareOk::new(
       View::new(),
       OpNumber::with(1),
-      ReplicaId::new(5), // non-member self-claim
+      ReplicaId::new(5),
       OpNumber::new(),
-      crate::storage::fnv1a_128(b"a"), // correct body checksum — the drop is purely the range guard
+      crate::storage::fnv1a_128(b"a"),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -436,7 +490,9 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
         ClientId::new(7),
         RequestNumber::with(1),
         crate::storage::fnv1a_128(b"a"),
-      ), // matches the op-1 identity the primary is driving → counted
+      ),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -465,6 +521,8 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -478,6 +536,7 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       ReplicaId::new(5), // non-member self-claim
       nonce,
       env.clone(),
@@ -504,6 +563,7 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env.clone(),
@@ -535,7 +595,13 @@ fn repair_hole_prepare_from_a_client_is_dropped() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert!(r.has_repair_hole_for_test(2), "the op-2 hole is registered");
   assert_eq!(r.commit(), OpNumber::with(1), "held at the hole");
@@ -596,7 +662,13 @@ fn repair_hole_prepare_from_an_out_of_range_replica_is_dropped() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert!(r.has_repair_hole_for_test(2), "the op-2 hole is registered");
   assert_eq!(r.commit(), OpNumber::with(1), "held at the hole");
@@ -659,7 +731,13 @@ fn higher_view_non_canonical_hole_prepare_does_not_trigger_catch_up() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert!(r.has_repair_hole_for_test(2), "the op-2 hole is registered");
   assert_eq!(r.status(), Status::Normal, "starts Normal");

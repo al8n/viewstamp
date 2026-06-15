@@ -801,6 +801,21 @@ impl InMemorySuperblock {
     self.snapshots.retain(|&op, _| op == live);
   }
 
+  /// Test-only: DIRECTLY install `state` as the durable root, bypassing the write path — modelling an
+  /// operator PRE-WRITING a successor durable root onto a STOPPED node during an offline (Tier C)
+  /// reconfiguration. Any in-flight staged write is dropped first (the node is stopped, like a crash),
+  /// and the retained checkpoint snapshots are left intact: a Tier C successor root PRESERVES
+  /// `checkpoint_op` / `checkpoint_id` (see [`prepare_restart`](viewstamp_proto::prepare_restart)), so
+  /// the live snapshot generation it names is still present and readable. The node then recovers off
+  /// this root on the next [`Endpoint::recover`](viewstamp_proto::Endpoint::recover). Only legitimate
+  /// while the node is not being polled (offline) — it makes the new root durable INSTANTLY, the
+  /// faithful "pre-written while stopped" semantics.
+  #[doc(hidden)]
+  pub fn install_root_for_test(&mut self, state: VsrState) {
+    self.staged.clear();
+    self.state = state;
+  }
+
   /// The op the CURRENT durable root names as its checkpoint — the generation `submit_read_checkpoint`
   /// must serve so recover's `cr.op() == state.checkpoint_op()` placement check always holds.
   fn live_checkpoint_op(&self) -> u64 {
