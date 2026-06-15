@@ -14,7 +14,9 @@ bytes = { workspace = true, features = ["std"] }
 compio = { workspace = true, features = ["net", "runtime", "macros", "time", "io-uring", "polling"] }
 flume = { workspace = true }
 futures-channel = { workspace = true }
-futures-util = { workspace = true }
+# `io` (AsyncRead/AsyncWrite) is enabled for `compio-runtime`, which references
+# `futures_util::AsyncWrite` on its `PollFd` poller without turning the feature on itself.
+futures-util = { workspace = true, features = ["io"] }
 # Peer-socket options compio does not surface directly (SO_KEEPALIVE, TCP_USER_TIMEOUT); already a
 # transitive dep via compio-net. `all` unlocks the platform-specific setters (TCP_USER_TIMEOUT).
 socket2 = { version = "0.6", features = ["all"] }
