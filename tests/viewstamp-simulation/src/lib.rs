@@ -16,8 +16,9 @@ pub mod vopr;
 
 pub use batching::{BatchingConfig, check_batching};
 pub use checker::{
-  AppliedOnceChecker, BoundednessChecker, CheckResult, DurabilityChecker, StalenessChecker,
-  ViewMonotonicChecker, check_safety,
+  AppliedOnceChecker, BoundednessChecker, CheckResult, DurabilityChecker,
+  EpochViewMonotonicChecker, MembershipMonotonicChecker, StalenessChecker, ViewMonotonicChecker,
+  check_safety,
 };
 pub use cluster::{AppliedEvent, Cluster};
 pub use network::{Faults, SlowProfile};

@@ -5,17 +5,55 @@
 
 use super::*;
 use crate::{
-  CheckpointRead, ClientId, Config, DoViewChange, Header, OpId, OpNumber, Prepare, PreparedEntry,
-  ReadOk, ReplicaId, Request, RequestNumber, SlotStatus, StartViewChange, Superblock,
-  SuperblockDone, View, VsrState, Wal, WalDone,
+  CheckpointRead, ClientId, Config, DoViewChange, Header, MemberId, Membership, OpId, OpNumber,
+  Prepare, PreparedEntry, ReadOk, ReplicaId, Request, RequestNumber, SlotStatus, StartViewChange,
+  Superblock, SuperblockDone, View, VsrState, Wal, WalDone,
 };
 use std::collections::VecDeque;
 
+/// The genesis membership for an `n`-voter cluster (no learners) used across the endpoint fixtures:
+/// `MemberId::new(i)` occupies slot `i`, so `slot_of(MemberId::new(i)) == ReplicaId::new(i)` and the
+/// relocated quorum/primary/voter logic is byte-identical to the pre-`Membership` `Config` at epoch 0.
+/// Pair it with a `Config` whose local member is `MemberId::new(old_replica_index)`.
+///
+/// Test fixtures use a fixed `config_id = 0` so hand-built test messages (which carry 0) pass the
+/// strict ingress gate; production uses the hash-chained id (`Membership::genesis`).
+fn genesis(n: u8) -> Membership {
+  Membership::from_durable_parts(
+    crate::Epoch::new(0),
+    n,
+    0,
+    (0..n as u128).map(MemberId::new).collect(),
+    0,
+  )
+  .expect("valid genesis membership")
+}
+
+/// The genesis membership for an `n`-voter cluster plus `learners` non-voting learners: voters take
+/// slots `0..n` and learners take `n..n+learners`, each `MemberId::new(slot)`. Mirrors [`genesis`]
+/// for the learner-membership fixtures.
+///
+/// Test fixtures use a fixed `config_id = 0` so hand-built test messages (which carry 0) pass the
+/// strict ingress gate; production uses the hash-chained id (`Membership::genesis`).
+fn genesis_with_learners(n: u8, learners: u16) -> Membership {
+  let total = n as u128 + learners as u128;
+  Membership::from_durable_parts(
+    crate::Epoch::new(0),
+    n,
+    learners,
+    (0..total).map(MemberId::new).collect(),
+    0,
+  )
+  .expect("valid genesis membership with learners")
+}
+
 mod checkpoint;
+mod epoch_ingress;
 mod forfeit;
 mod invariants;
 mod learner_membership;
 mod normal;
+mod reconfig;
 mod recovery;
 mod repair;
 mod sender_binding;
@@ -391,7 +429,8 @@ impl Wal for ScriptedWal {
 // Helper: build a backup endpoint (replica 1 of 3).
 fn backup() -> Endpoint<NoopSm> {
   Endpoint::new(
-    Config::try_new(1, ReplicaId::new(1), 3).expect("valid cluster config"),
+    Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
+    genesis(3),
     0,
     NoopSm,
   )
@@ -412,6 +451,8 @@ fn prepare_ck(op: u64, commit: u64, checkpoint_op: u64) -> Message {
     OpNumber::with(op),
     OpNumber::with(commit),
     OpNumber::with(checkpoint_op),
+    crate::Epoch::new(0),
+    0,
     ClientId::new(7),
     RequestNumber::with(op),
     Bytes::copy_from_slice(&[op as u8]),
@@ -435,6 +476,8 @@ fn dvc(replica: u16, log_view: u64, op: u64, commit: u64) -> DoViewChange {
     View::with(log_view),
     OpNumber::with(op),
     OpNumber::with(commit),
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(replica),
     log,
   )
@@ -448,6 +491,8 @@ fn repair_prepare(view: u64, op: u64, commit: u64) -> Message {
     OpNumber::with(op),
     OpNumber::with(commit),
     OpNumber::with(0),
+    crate::Epoch::new(0),
+    0,
     ClientId::new(7),
     RequestNumber::with(op),
     Bytes::copy_from_slice(&[op as u8]),
@@ -464,12 +509,14 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     CountSm::default(),
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -487,12 +534,14 @@ fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   for _ in 0..16 {
     r.handle_storage(now, &mut wal, &mut sb);
     if r.status() != Status::Recovering {
@@ -564,7 +613,12 @@ fn wal_in_view(head: u64, view: u64) -> TestWal {
 /// superblock write is left inflight (not flushed), so the view is NOT yet durable.
 #[cfg(test)]
 fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, StepSb) {
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
   let now = Instant::ZERO;
   // Drive into ViewChange(view 1) (replica 1 is primary of view 1): own SVC + replica 0's SVC.
@@ -578,7 +632,12 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(0)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(e.status(), Status::ViewChange);
   while e.poll_message().is_some() {}
@@ -588,6 +647,8 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
     View::with(0),
     OpNumber::with(2),
     OpNumber::with(1),
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(2),
     std::vec![
       PreparedEntry::new(
@@ -690,8 +751,8 @@ impl ScriptedCheckpointSb {
 /// endpoint + its storage so a test can read the checkpoint envelope back (the donor for sync apply
 /// tests). `checkpoint_ops == ckpt`, so committing `ckpt` ops takes exactly one checkpoint.
 fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb) {
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, ckpt).unwrap();
-  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let req = |rn: u64| {
@@ -720,12 +781,13 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
         OpNumber::with(rn),
         ReplicaId::new(1),
         OpNumber::new(),
-        // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
         crate::storage::prepare_identity(
           ClientId::new(7),
           RequestNumber::with(rn),
           crate::storage::fnv1a_128(&[rn as u8]),
         ),
+        crate::Epoch::new(0),
+        0,
       )),
     );
     e.handle_storage(now, &mut wal, &mut sb); // drain checkpoint writes
@@ -767,7 +829,8 @@ fn captured_sync_nonce(e: &mut Endpoint<CountSm>) -> u64 {
 // A backup over CountSm (replica 1 of 3) — the laggard in sync tests.
 fn sync_backup() -> Endpoint<CountSm> {
   Endpoint::new(
-    Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap(),
+    Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap(),
+    genesis(3),
     0,
     CountSm::default(),
   )
@@ -802,6 +865,8 @@ fn dvc_offset(replica: u16, log_view: u64, floor: u64, op: u64, commit: u64) -> 
     View::with(log_view),
     OpNumber::with(op),
     OpNumber::with(commit),
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(replica),
     log,
   )
@@ -833,6 +898,8 @@ fn dvc_header_band(
     View::with(log_view),
     OpNumber::with(op),
     OpNumber::with(commit),
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(replica),
     log,
   )
@@ -864,6 +931,8 @@ fn dvc_claiming(
     View::with(log_view),
     OpNumber::with(claimed_op),
     OpNumber::with(commit),
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(replica),
     log,
   )

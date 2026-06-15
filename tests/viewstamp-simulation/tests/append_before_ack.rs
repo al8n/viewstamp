@@ -13,8 +13,8 @@
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Config, Endpoint, Instant, Message, OpNumber, Peer, Prepare, ReplicaId, RequestNumber,
-  StateMachine, View, Wal,
+  ClientId, Config, Endpoint, Epoch, Instant, MemberId, Membership, Message, OpNumber, Peer,
+  Prepare, ReplicaId, RequestNumber, StateMachine, View, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
 
@@ -34,8 +34,18 @@ fn drain_prepare_oks<S: StateMachine>(e: &mut Endpoint<S>, want_op: OpNumber) ->
 #[test]
 fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   // Replica 2 of a 3-cluster: a BACKUP in view 0 (primary is replica 0), status Normal, head op 0.
-  let cfg = Config::try_new(1, ReplicaId::new(2), 3).unwrap();
-  let mut backup = Endpoint::new(cfg, 0, LogSm::default());
+  let cfg = Config::try_new(1, MemberId::new(2)).unwrap();
+  // A fixed `config_id = 0` (via `from_durable_parts`) so the hand-built `Prepare` below (which carries
+  // 0) passes the strict `(epoch, config_id)` ingress gate; production uses the hash-chained id.
+  let membership = Membership::from_durable_parts(
+    Epoch::new(0),
+    3,
+    0,
+    (0..3u128).map(MemberId::new).collect(),
+    0,
+  )
+  .expect("valid membership");
+  let mut backup = Endpoint::new(cfg, membership, 0, LogSm::default());
   // ASYNC WAL: an append stays in flight for a few polls (the append-before-ack window). The superblock
   // is the ordinary synchronous sim superblock — only the WAL append timing matters here.
   let mut wal = InMemoryWal::with_async_appends(4);
@@ -46,10 +56,12 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   let op1 = OpNumber::with(1);
   let prepare = || {
     Prepare::new(
-      View::new(),       // view 0 (current view — the re-ack branch only fires same-view)
-      op1,               // op 1
-      OpNumber::with(0), // primary commit
-      OpNumber::with(0), // checkpoint_op
+      View::new(),
+      op1,
+      OpNumber::with(0),
+      OpNumber::with(0),
+      viewstamp_proto::Epoch::new(0),
+      0,
       ClientId::new(7),
       RequestNumber::with(1),
       Bytes::from_static(b"v1"),

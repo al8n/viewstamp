@@ -87,6 +87,8 @@ fn stale_checkpoint_commit_triggers_request_sync() {
       View::new(),
       OpNumber::with(10),
       OpNumber::with(8),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let mut saw = None;
@@ -153,6 +155,8 @@ fn in_reach_checkpoint_does_not_trigger_sync() {
       View::new(),
       OpNumber::with(8),
       OpNumber::with(8),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let mut saw_sync = false;
@@ -178,6 +182,8 @@ fn already_syncing_does_not_emit_a_second_handshake_per_heartbeat() {
       View::new(),
       OpNumber::with(10),
       OpNumber::with(8),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let first: usize = {
@@ -198,6 +204,8 @@ fn already_syncing_does_not_emit_a_second_handshake_per_heartbeat() {
       View::new(),
       OpNumber::with(12),
       OpNumber::with(10),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let second: usize = {
@@ -230,7 +238,8 @@ fn primary_answers_request_sync_with_sync_checkpoint() {
       OpNumber::with(0),
       ReplicaId::new(2),
       0xCAFE,
-      false, // ordinary state-sync (not a recovery peer-fetch)
+      false,
+      0, // ordinary state-sync (not a recovery peer-fetch)
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb); // the checkpoint read completes → ship SyncCheckpoint
@@ -269,6 +278,7 @@ fn repeat_request_sync_from_one_requester_yields_one_serve_and_one_ship() {
       ReplicaId::new(2),
       nonce,
       false,
+      0,
     ))
   };
   e.handle_message(
@@ -366,6 +376,7 @@ fn serve_sync_checkpoint_drops_a_corrupt_checkpoint_read() {
         ReplicaId::new(2),
         0xABCD,
         false,
+        0,
       )),
     );
     e.handle_storage(now, &mut wal, &mut sb); // clean read completes → ship SyncCheckpoint
@@ -429,6 +440,7 @@ fn serve_sync_checkpoint_drops_a_corrupt_checkpoint_read() {
         ReplicaId::new(2),
         0xCAFE,
         false,
+        0,
       )),
     );
     e.handle_storage(now, &mut wal, &mut sb); // the corrupt read completes → must be DROPPED
@@ -462,7 +474,8 @@ fn peer_without_newer_checkpoint_does_not_answer_request_sync() {
       OpNumber::with(0),
       ReplicaId::new(0),
       1,
-      false, // ordinary state-sync (not a recovery peer-fetch)
+      false,
+      0, // ordinary state-sync (not a recovery peer-fetch)
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -493,7 +506,8 @@ fn recovery_request_sync_is_served_by_a_peer_at_the_same_checkpoint() {
       OpNumber::with(2), // EQUAL to the donor's checkpoint
       ReplicaId::new(2),
       0xF00D,
-      true, // recovery peer-fetch
+      true,
+      0, // recovery peer-fetch
     )),
   );
   donor.handle_storage(now, &mut wal, &mut sb); // checkpoint read completes → ship SyncCheckpoint
@@ -519,7 +533,8 @@ fn recovery_request_sync_is_served_by_a_peer_at_the_same_checkpoint() {
       OpNumber::with(2), // EQUAL to the donor's checkpoint
       ReplicaId::new(2),
       0xBEEF,
-      false, // ordinary state-sync
+      false,
+      0, // ordinary state-sync
     )),
   );
   donor.handle_storage(now, &mut wal, &mut sb);
@@ -541,7 +556,7 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
   // permanently unreadable escalates to a recovery peer-fetch; a Normal peer at the SAME checkpoint
   // op serves it; delivering that SyncCheckpoint converges the recovering replica to Normal. (Before
   // the fix the equal-checkpoint peer ignored the request and the replica never left Recovering.)
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
   // Durable root names a checkpoint at op 2; the scripted SB has an EMPTY read script → every
   // checkpoint read FAULTS (permanently-unreadable own snapshot).
@@ -560,7 +575,8 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
     head: 2, // head == checkpoint_op → empty tail; isolates the checkpoint path
     done: VecDeque::new(),
   };
-  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
   // Drive past the per-op retry budget so it escalates to a peer fetch.
   for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
     sb.flush();
@@ -638,6 +654,8 @@ fn sync_checkpoint_restores_and_resumes_at_the_synced_point() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -651,6 +669,7 @@ fn sync_checkpoint_restores_and_resumes_at_the_synced_point() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env.clone(),
@@ -699,8 +718,8 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
   let (env, id) = donor_envelope(&dsb);
   // The laggard: replica 1 of 3 over CountSm with a HUGE checkpoint interval (so committing its own
   // little band does NOT auto-checkpoint and race the sync's persist — it stays at checkpoint 0).
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
   // Give the laggard a small live WAL band (ops 1,2) below the synced point so the prune is OBSERVABLE.
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
@@ -726,6 +745,8 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -746,6 +767,7 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env.clone(),
@@ -847,8 +869,8 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
   let (env, id) = donor_envelope(&dsb);
   // The laggard: replica 1 of 3 over CountSm with a HUGE checkpoint interval (so its own band does not
   // auto-checkpoint and race the sync persist — it stays at its old durable checkpoint 0).
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
   let now = Instant::ZERO;
@@ -872,6 +894,8 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
       View::new(),
       OpNumber::with(0),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -884,6 +908,7 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env,
@@ -910,7 +935,12 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(2)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(2),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(e.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
   assert_eq!(
@@ -932,6 +962,8 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
       View::with(0),
       OpNumber::with(2),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ReplicaId::new(0),
       std::vec![
         PreparedEntry::new(
@@ -1004,6 +1036,8 @@ fn an_ordinary_checkpoint_completing_during_a_solicited_sync_advances_without_cl
       View::new(),
       OpNumber::with(2),
       OpNumber::with(99),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -1048,8 +1082,8 @@ fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
   // the checkpoint, and a recovered/op-reset primary can REUSE committed op numbers — divergence).
   // Instead it STEPS DOWN: flags the deferred forfeit and drops the sync, unchanged. A
   // caught-up replica then leads.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap(); // huge interval: no checkpoint
-  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap(); // huge interval: no checkpoint
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Drive the primary to op 4, commit 4 (no checkpoint — interval is huge).
@@ -1076,12 +1110,13 @@ fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
         OpNumber::with(rn),
         ReplicaId::new(1),
         OpNumber::new(),
-        // content-address the vote to op rn's full identity (client 7, request rn, body [rn])
         crate::storage::prepare_identity(
           ClientId::new(7),
           RequestNumber::with(rn),
           crate::storage::fnv1a_128(&[rn as u8]),
         ),
+        crate::Epoch::new(0),
+        0,
       )),
     );
   }
@@ -1104,6 +1139,7 @@ fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
       View::new(),
       OpNumber::with(6),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env,
@@ -1149,6 +1185,8 @@ fn sync_checkpoint_with_mismatched_id_is_rejected_not_restored() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -1164,6 +1202,7 @@ fn sync_checkpoint_with_mismatched_id_is_rejected_not_restored() {
       View::new(),
       OpNumber::with(4),
       advertised,
+      0,
       ReplicaId::new(0),
       nonce,
       bad_env,
@@ -1208,6 +1247,8 @@ fn sync_checkpoint_with_op_not_bound_to_the_snapshot_is_rejected_not_restored() 
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -1231,7 +1272,8 @@ fn sync_checkpoint_with_op_not_bound_to_the_snapshot_is_rejected_not_restored() 
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
       OpNumber::with(4), // OVERSTATED — does not match the op bound (2) inside the snapshot
-      real_id,           // matches checkpoint_id(stale_env), so the integrity gate PASSES
+      real_id,
+      0, // matches checkpoint_id(stale_env), so the integrity gate PASSES
       ReplicaId::new(0),
       nonce,
       stale_env,
@@ -1283,6 +1325,8 @@ fn stale_nonce_sync_checkpoint_is_ignored() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -1296,6 +1340,7 @@ fn stale_nonce_sync_checkpoint_is_ignored() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       ReplicaId::new(0),
       nonce.wrapping_add(1),
       env,
@@ -1330,6 +1375,8 @@ fn sync_checkpoint_below_target_is_ignored() {
       View::new(),
       OpNumber::with(6),
       OpNumber::with(6),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -1343,6 +1390,7 @@ fn sync_checkpoint_below_target_is_ignored() {
       View::new(),
       OpNumber::with(4),
       id4,
+      0,
       ReplicaId::new(0),
       nonce,
       env4,
@@ -1380,6 +1428,7 @@ fn sync_checkpoint_without_an_outstanding_sync_is_ignored() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       ReplicaId::new(0),
       0xABCD,
       env,
@@ -1411,6 +1460,8 @@ fn lower_sync_checkpoint_is_ignored_after_a_higher_one() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -1423,6 +1474,7 @@ fn lower_sync_checkpoint_is_ignored_after_a_higher_one() {
       View::new(),
       OpNumber::with(4),
       id4,
+      0,
       ReplicaId::new(0),
       nonce,
       env4,
@@ -1441,6 +1493,7 @@ fn lower_sync_checkpoint_is_ignored_after_a_higher_one() {
       View::new(),
       OpNumber::with(2),
       id2,
+      0,
       ReplicaId::new(0),
       nonce,
       env2,
@@ -1479,6 +1532,8 @@ fn sync_checkpoint_clears_a_pending_repair_hole_below_the_synced_point() {
       View::new(),
       OpNumber::with(6),
       OpNumber::with(6),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -1491,6 +1546,7 @@ fn sync_checkpoint_clears_a_pending_repair_hole_below_the_synced_point() {
       View::new(),
       OpNumber::with(6),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env,
@@ -1513,8 +1569,8 @@ fn a_pruned_committed_hole_forces_a_state_sync() {
   // where a QUORUM has checkpointed past N (so RequestPrepare is futile — the op is pruned on the
   // quorum). It must (a) clear the doomed hole, (b) emit a RequestSync (not just RequestPrepare),
   // (c) record a FORCED sync targeting the quorum checkpoint.
-  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
-  let mut ep = Endpoint::new(cfg, 7, NoopSm);
+  let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   // Normal-backup state: head op 4, commit held at 1, own checkpoint 0, a committed hole at op 2.
   ep.force_state_for_test(0, 4, 1, 0, &[2]);
@@ -1540,6 +1596,8 @@ fn a_pruned_committed_hole_forces_a_state_sync() {
       View::new(),
       OpNumber::with(1),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   // (a) the doomed hole is cleared, and its retry timer stopped.
@@ -1591,8 +1649,8 @@ fn force_sync_does_not_fire_when_the_op_is_still_peer_repairable() {
   // i.e. NO peer has checkpointed past it, so every reporter may still hold it as a servable prepare.
   // Here the only peer report (replica 0) is a checkpoint BELOW the hole (N=4, primary checkpoint=3),
   // so the max-peer floor stays below N → no force-sync.
-  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
-  let mut ep = Endpoint::new(cfg, 7, NoopSm);
+  let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   // Head op 6, commit held at 3, own checkpoint 0, a committed hole at op 4.
   ep.force_state_for_test(0, 6, 3, 0, &[4]);
@@ -1608,6 +1666,8 @@ fn force_sync_does_not_fire_when_the_op_is_still_peer_repairable() {
       View::new(),
       OpNumber::with(3),
       OpNumber::with(3),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -1639,8 +1699,8 @@ fn force_sync_fires_on_a_backup_that_only_hears_the_primary() {
   // checkpoint instead — otherwise a backup stuck on a pruned committed hole below the cluster
   // checkpoint (head above it) hangs at `commit_min == N-1` forever. Here a SINGLE peer report (the
   // primary's Commit, checkpoint=8) past the hole (N=2) is enough to force the sync.
-  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
-  let mut ep = Endpoint::new(cfg, 7, NoopSm);
+  let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   // Head op 10 (ABOVE the cluster checkpoint, so the ORDINARY `> self.op` sync stays FALSE — this is
   // the precise force-sync regime), commit held at 1, own checkpoint 0, a committed hole at op 2.
@@ -1659,6 +1719,8 @@ fn force_sync_fires_on_a_backup_that_only_hears_the_primary() {
       View::new(),
       OpNumber::with(1),
       OpNumber::with(8),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -1682,8 +1744,8 @@ fn force_sync_fires_on_a_backup_that_only_hears_the_primary() {
 fn force_sync_stays_dormant_until_a_quorum_floor_is_known() {
   // Empty repair set, or no quorum-checkpoint floor → the escalation is a no-op (it must never fire
   // spuriously). With a hole but a zero floor (partitioned: no peers heard), it stays dormant.
-  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(1), 3, 4).unwrap();
-  let mut ep = Endpoint::new(cfg, 7, NoopSm);
+  let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
   // No holes at all → maybe_force_sync is a no-op.
   ep.maybe_force_sync(Instant::ZERO);
   assert_eq!(ep.sync_target_for_test(), None);
@@ -1713,8 +1775,8 @@ fn forced_sync_preserves_a_held_tail_above_the_checkpoint_without_panic() {
   // subsume the doomed hole at 2.
   let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(3);
   let (env, id) = donor_envelope(&dsb);
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 4).unwrap();
-  let mut ep = Endpoint::new(cfg, 1, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 4).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 1, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   // A backup holding a tail at op 5, commit at 1, a committed hole at 2, own checkpoint 0. Seed the
   // in-memory tail entries (4, 5) it holds above the synced checkpoint (force_state_for_test leaves
@@ -1734,6 +1796,7 @@ fn forced_sync_preserves_a_held_tail_above_the_checkpoint_without_panic() {
       View::new(),
       OpNumber::with(3),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env,
@@ -1785,8 +1848,8 @@ fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_targ
   //
   // A real BACKUP (replica 1 of 3) over CountSm with a HUGE checkpoint interval, so applying its band
   // does NOT auto-checkpoint (which would otherwise set `pending_checkpoint` and short-circuit the path).
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 1_000).unwrap();
-  let mut ep = Endpoint::new(cfg, 7, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 7, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Head op 4, commit HELD at 1, own checkpoint 0, a committed hole at op 2. The above-hole committed
@@ -1807,6 +1870,8 @@ fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_targ
       View::new(),
       OpNumber::with(4),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -1878,6 +1943,7 @@ fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_targ
       View::new(),
       OpNumber::with(2),
       crate::checkpoint_id(&env),
+      0,
       ReplicaId::new(0),
       // a nonce that would have matched the cancelled forced sync (it is gone, so this is moot)
       7,
@@ -1912,8 +1978,8 @@ fn apply_sync_drops_a_stale_forced_sync_checkpoint_below_the_applied_frontier() 
   // target (2) is `<= self.op` (so the upstream `<= self.op → drop` guard is relaxed for the forced
   // path) and `< commit_min` (4) — applying it would rewind the applied frontier. Part B DROPS it
   // gracefully (no panic, no rewind) instead of asserting; the LEGITIMATE forced sync is unaffected.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 1_000).unwrap();
-  let mut ep = Endpoint::new(cfg, 7, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 7, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Head op 4, applied frontier already at 4, own checkpoint 0 (no hole — the band is fully applied).
@@ -1937,6 +2003,7 @@ fn apply_sync_drops_a_stale_forced_sync_checkpoint_below_the_applied_frontier() 
       View::new(),
       OpNumber::with(2),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env,
@@ -1975,8 +2042,8 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
   // from their old entries WITHOUT comparing bodies → the primary commits body B while backups applied
   // body A for the same op (committed-state divergence). The fix: the primary flags a deferred forfeit
   // and steps down on its next tick — `self.op` is NEVER rewound, and no forced sync is armed.
-  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
-  let mut ep = Endpoint::new(cfg, 7, NoopSm);
+  let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   assert!(ep.is_primary(), "replica 0 at view 0 is the primary");
   // The primary holds a head at op 10 with a committed-op hole at op 2 (commit held at 1 below it).
@@ -1996,7 +2063,9 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
       OpNumber::with(2),
       ReplicaId::new(1),
       OpNumber::with(8),
-      0, // no inflight at op 2 (force_state_for_test seeds none) — only checkpoint_op drives the strand
+      0,
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -2077,8 +2146,8 @@ fn a_primary_in_the_force_sync_strand_never_reuses_an_op_number() {
   // non-decreasing throughout: a request the (still-Normal, lone-SVC) primary serves lands at a FRESH
   // op ABOVE the old head (11), never at a reused number. Under the OLD force-sync behaviour `op`
   // would have collapsed to the checkpoint floor, and the next request would have reused op 9/10.
-  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
-  let mut ep = Endpoint::new(cfg, 7, NoopSm);
+  let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   ep.force_state_for_test(0, 10, 1, 0, &[2]);
   let head_at_strand = ep.op().get();
@@ -2094,7 +2163,9 @@ fn a_primary_in_the_force_sync_strand_never_reuses_an_op_number() {
       OpNumber::with(2),
       ReplicaId::new(1),
       OpNumber::with(8),
-      0, // no inflight at op 2 (force_state_for_test seeds none) — only checkpoint_op drives the strand
+      0,
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert!(ep.pending_forfeit_for_test());
@@ -2156,6 +2227,8 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -2168,6 +2241,7 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env,
@@ -2177,8 +2251,9 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
   assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
   drop(e); // crash
   // Recover from the same wal/sb: the synced checkpoint is the durable root.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
-  let mut recovered = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let mut recovered =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(
     recovered.checkpoint_op(),
     OpNumber::with(4),
@@ -2212,7 +2287,8 @@ fn synced_replica_reports_its_checkpoint_in_view_change() {
   let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(4);
   let (env, id) = donor_envelope(&dsb);
   let mut e = Endpoint::new(
-    Config::with_checkpoint_ops(1, ReplicaId::new(2), 3, 2).unwrap(),
+    Config::with_checkpoint_ops(1, MemberId::new(2), 2).unwrap(),
+    genesis(3),
     0,
     CountSm::default(),
   );
@@ -2227,6 +2303,8 @@ fn synced_replica_reports_its_checkpoint_in_view_change() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = {
@@ -2247,6 +2325,7 @@ fn synced_replica_reports_its_checkpoint_in_view_change() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       ReplicaId::new(0),
       nonce,
       env,
@@ -2266,7 +2345,12 @@ fn synced_replica_reports_its_checkpoint_in_view_change() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(0)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(e.status(), Status::ViewChange);
   assert_eq!(e.view(), View::with(1));
@@ -2324,8 +2408,8 @@ fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies
   // (the `==` case) while `5 <= head` (so the ORDINARY `> self.op` sync trigger correctly does NOT fire —
   // only the below-ring path can).
   const N: u64 = 4;
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 5).unwrap(); // checkpoint_ops == C
-  let mut e = Endpoint::new(cfg, 7, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 5).unwrap(); // checkpoint_ops == C
+  let mut e = Endpoint::new(cfg, genesis(3), 7, CountSm::default());
   let mut wal = RingWal::new(N);
   let mut sb = StepSb::default(); // async: the ordinary checkpoint root lands on a later flush
   let now = Instant::ZERO;
@@ -2449,6 +2533,8 @@ fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies
       View::new(),
       OpNumber::with(6),
       OpNumber::with(5),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -2481,8 +2567,8 @@ fn donor_with_planted_checkpoint(
   ckpt: u64,
   snapshot_len: usize,
 ) -> (Endpoint<CountSm>, TestWal, TestSb, Bytes, u128) {
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, ckpt).unwrap();
-  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
   let env = Endpoint::<CountSm>::encode_checkpoint(
     OpNumber::with(ckpt),
     &BTreeMap::new(),
@@ -2532,6 +2618,7 @@ fn over_frame_checkpoint_is_announced_and_chunks_reassemble_it() {
       ReplicaId::new(2),
       0xCAFE,
       false,
+      0,
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb); // serve-read completes → announce
@@ -2570,6 +2657,7 @@ fn over_frame_checkpoint_is_announced_and_chunks_reassemble_it() {
         View::new(),
         OpNumber::with(4),
         id,
+        0,
         offset,
         ReplicaId::new(2),
         0xCAFE,
@@ -2639,6 +2727,7 @@ fn donor_serves_pinned_old_checkpoint_from_cache_after_advancing() {
       ReplicaId::new(2),
       0xCAFE,
       false,
+      0,
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -2656,6 +2745,7 @@ fn donor_serves_pinned_old_checkpoint_from_cache_after_advancing() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       0,
       ReplicaId::new(2),
       0xCAFE,
@@ -2694,6 +2784,7 @@ fn cold_cache_chunk_request_rereads_and_ships() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       8,
       ReplicaId::new(2),
       0xF00D,
@@ -2740,6 +2831,7 @@ fn meta_of(op: u64, id: u128, total: usize, donor: u16, nonce: u64) -> Message {
     View::new(),
     OpNumber::with(op),
     id,
+    0,
     total as u64,
     ReplicaId::new(donor),
     nonce,
@@ -2759,6 +2851,7 @@ fn chunk_of(
     View::new(),
     OpNumber::with(op),
     id,
+    0,
     env.len() as u64,
     range.start as u64,
     ReplicaId::new(donor),
@@ -2796,6 +2889,8 @@ fn chunked_transfer_assembles_in_order_and_installs_via_the_whole_message_path()
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -2901,6 +2996,8 @@ fn overflowing_or_empty_chunk_aborts_the_transfer_but_keeps_the_sync_armed() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -2920,6 +3017,7 @@ fn overflowing_or_empty_chunk_aborts_the_transfer_but_keeps_the_sync_armed() {
     View::new(),
     OpNumber::with(4),
     id,
+    0,
     lying_total as u64,
     0,
     ReplicaId::new(0),
@@ -2955,6 +3053,7 @@ fn overflowing_or_empty_chunk_aborts_the_transfer_but_keeps_the_sync_armed() {
     View::new(),
     OpNumber::with(4),
     id,
+    0,
     lying_total as u64,
     0,
     ReplicaId::new(0),
@@ -2994,6 +3093,8 @@ fn oversized_meta_announce_is_ignored_and_the_sync_stays_armed() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -3008,6 +3109,7 @@ fn oversized_meta_announce_is_ignored_and_the_sync_stays_armed() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       u64::MAX,
       ReplicaId::new(0),
       nonce,
@@ -3033,6 +3135,7 @@ fn oversized_meta_announce_is_ignored_and_the_sync_stays_armed() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       crate::MAX_SYNC_ENVELOPE_LEN + 1,
       ReplicaId::new(0),
       nonce,
@@ -3074,6 +3177,8 @@ fn oversized_meta_announce_never_displaces_a_pinned_transfer() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -3102,6 +3207,7 @@ fn oversized_meta_announce_never_displaces_a_pinned_transfer() {
       View::new(),
       OpNumber::with(8),
       0xBAD,
+      0,
       u64::MAX,
       ReplicaId::new(0),
       nonce,
@@ -3142,10 +3248,11 @@ fn unallocatable_meta_announce_is_ignored_and_the_sync_stays_armed() {
   let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(4);
   let (env, id) = donor_envelope(&dsb);
   let mut e = Endpoint::new(
-    Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2)
+    Config::with_checkpoint_ops(1, MemberId::new(1), 2)
       .unwrap()
       .with_max_sync_envelope_len(u64::MAX)
       .unwrap(),
+    genesis(3),
     0,
     CountSm::default(),
   );
@@ -3161,6 +3268,8 @@ fn unallocatable_meta_announce_is_ignored_and_the_sync_stays_armed() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -3173,6 +3282,7 @@ fn unallocatable_meta_announce_is_ignored_and_the_sync_stays_armed() {
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       u64::MAX,
       ReplicaId::new(0),
       nonce,
@@ -3211,6 +3321,8 @@ fn assembled_envelope_with_a_mismatched_hash_is_dropped_and_the_sync_resolicits(
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -3233,6 +3345,7 @@ fn assembled_envelope_with_a_mismatched_hash_is_dropped_and_the_sync_resolicits(
       View::new(),
       OpNumber::with(4),
       id,
+      0,
       env.len() as u64,
       0,
       ReplicaId::new(0),
@@ -3274,6 +3387,8 @@ fn donor_failover_re_pins_the_donor_and_keeps_the_staged_prefix() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -3346,6 +3461,8 @@ fn ordinary_transfer_completes_below_a_target_raised_mid_transfer() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -3376,6 +3493,8 @@ fn ordinary_transfer_completes_below_a_target_raised_mid_transfer() {
       View::new(),
       OpNumber::with(0),
       OpNumber::with(9),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -3452,6 +3571,8 @@ fn forced_target_raise_aborts_the_pinned_transfer() {
       View::new(),
       OpNumber::with(0),
       OpNumber::with(9),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert!(
@@ -3480,8 +3601,8 @@ fn a_primary_does_not_start_a_chunked_transfer_it_steps_down_instead() {
   // The apply-site step-down, moved to transfer START: a primary that receives an announce for a
   // sync it could never apply in place must not burn a whole transfer pulling chunks it will
   // discard — it abdicates immediately (deferred forfeit), drops the sync, and pulls nothing.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, 0, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   for rn in 1..=4u64 {
@@ -3512,6 +3633,8 @@ fn a_primary_does_not_start_a_chunked_transfer_it_steps_down_instead() {
           RequestNumber::with(rn),
           crate::storage::fnv1a_128(&[rn as u8]),
         ),
+        crate::Epoch::new(0),
+        0,
       )),
     );
   }
@@ -3545,7 +3668,7 @@ fn recovery_peer_fetch_converges_over_a_chunked_transfer() {
   // replica whose own snapshot is unreadable accepts the announce + chunks while
   // `awaiting_peer_checkpoint`, re-pulls on the recover-retry cadence, and the assembled envelope
   // re-enters `on_recover_sync_checkpoint` — converging to Normal exactly as a whole-message answer.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
   let state = VsrState::try_new(
     View::new(),
@@ -3562,7 +3685,8 @@ fn recovery_peer_fetch_converges_over_a_chunked_transfer() {
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
     sb.flush();
     e.handle_storage(now, &mut wal, &mut sb);
@@ -3634,7 +3758,7 @@ fn recovery_peer_fetch_ignores_an_oversized_meta_announce() {
   // The Recovering peer-fetch ingress dispatches into the SAME `on_sync_checkpoint_meta`, so its
   // announces pass the SAME admission gates: an over-cap claim is ignored (no pin, no pull, still
   // Recovering + awaiting, sync armed), and a sane announce then proceeds.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
   let state = VsrState::try_new(
     View::new(),
@@ -3651,7 +3775,8 @@ fn recovery_peer_fetch_ignores_an_oversized_meta_announce() {
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
     sb.flush();
     e.handle_storage(now, &mut wal, &mut sb);
@@ -3674,6 +3799,7 @@ fn recovery_peer_fetch_ignores_an_oversized_meta_announce() {
       View::new(),
       OpNumber::with(2),
       0xFEED,
+      0,
       u64::MAX,
       ReplicaId::new(0),
       req.nonce(),
@@ -3714,6 +3840,8 @@ fn sync_solicit_timer_re_pulls_the_frontier_and_re_broadcasts() {
       View::new(),
       OpNumber::with(4),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let nonce = captured_sync_nonce(&mut e);
@@ -3769,7 +3897,8 @@ fn stale_pinned_chunk_request_yields_a_fresh_offer() {
     Message::RequestSyncChunk(crate::RequestSyncChunk::new(
       View::new(),
       OpNumber::with(2), // below the donor's checkpoint (4)
-      0xDEAD_BEEF,       // content the donor no longer holds
+      0xDEAD_BEEF,
+      0, // content the donor no longer holds
       0,
       ReplicaId::new(2),
       0xF00D,

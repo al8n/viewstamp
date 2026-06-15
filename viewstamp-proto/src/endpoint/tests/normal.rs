@@ -5,8 +5,8 @@ use crate::{
 
 #[test]
 fn fresh_endpoint_state() {
-  let cfg = Config::try_new(1, ReplicaId::new(0), 3).expect("valid cluster config");
-  let e = Endpoint::new(cfg, 99, NoopSm);
+  let cfg = Config::try_new(1, MemberId::new(0)).expect("valid cluster config");
+  let e = Endpoint::new(cfg, genesis(3), 99, NoopSm);
   assert_eq!(e.status(), Status::Normal);
   assert_eq!(e.view(), View::new());
   assert_eq!(e.op(), OpNumber::new());
@@ -75,7 +75,13 @@ fn backup_caches_the_reply_so_a_backup_turned_primary_can_resend_it() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(e.commit(), OpNumber::with(1), "the backup applied op 1");
   // The backup cached the reply for client 7's request 1 — so once it becomes primary it can resend
@@ -125,7 +131,13 @@ fn apply_caches_the_reply_even_when_the_watermark_was_pre_seeded_without_it() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(e.commit(), OpNumber::with(1), "the backup applied op 1");
   let cached = e.session_reply_for_test(7);
@@ -169,6 +181,8 @@ fn backup_below_primary_commit_solicits_the_committed_tail_gap() {
       View::new(),
       OpNumber::with(5),
       OpNumber::with(2),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   // It does NOT advance commit past its head (it lacks 3,4,5) and does NOT state-sync (head >= ckpt).
@@ -222,6 +236,8 @@ fn tail_gap_repair_is_bounded_per_call() {
       View::new(),
       OpNumber::with(bogus),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   // It records the learned commit_max but solicits only a bounded window above its head.
@@ -267,6 +283,8 @@ fn tail_gap_repair_within_the_window_requests_the_whole_gap() {
       View::new(),
       OpNumber::with(3),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   let mut requested: std::vec::Vec<u64> = std::vec::Vec::new();
@@ -285,7 +303,8 @@ fn tail_gap_repair_within_the_window_requests_the_whole_gap() {
 #[test]
 fn fresh_endpoint_log_view_is_zero() {
   let e = Endpoint::new(
-    Config::try_new(1, ReplicaId::new(0), 3).unwrap(),
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
     99,
     NoopSm,
   );
@@ -350,7 +369,12 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
   // claiming a durability this replica does not have (it could lose the op on crash). We reproduce
   // that exact divergent state directly: op 5 committed + at the head, but ABSENT from the WAL (a
   // not-yet-durable slot, exactly like an in-flight async append) and not in `appending`.
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(2)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // view 0 (primary is replica 0, so replica 2 is a backup), op 5 = commit_min (committed + at head),
@@ -440,8 +464,8 @@ fn on_request_is_dropped_while_a_sync_or_checkpoint_persist_is_in_flight() {
   // checkpoint_op + GCs), so assigning a new request an op now risks op-number reuse. Both an
   // outstanding `sync` and an outstanding `pending_checkpoint` must short-circuit `on_request`.
   let serve = |arm: fn(&mut Endpoint<NoopSm>)| -> bool {
-    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 4).unwrap();
-    let mut ep = Endpoint::new(cfg, 7, NoopSm);
+    let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
+    let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     assert!(ep.is_primary());
     let head_before = ep.op();
@@ -486,8 +510,8 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   // and assigned an op ABOVE the gap → when the hole fills, the apply loop (which has no dedup) would
   // execute BOTH the original AND the duplicate → divergence. The primary must catch up first; the
   // client retries.
-  let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 8).unwrap();
-  let mut ep = Endpoint::new(cfg, 7, CountSm::default());
+  let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
+  let mut ep = Endpoint::new(cfg, genesis(3), 7, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   // Primary holding a committed-op GAP: head op 4, commit HELD at 1 by a hole at op 2, but commit_max
   // = 4 (ops 2..=4 are known committed cluster-wide, merely unapplied here). Ops 3 + 4 are present in
@@ -618,8 +642,8 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
   // does not perturb normal admission right up to the edge (the band is huge — ~342k — so a real
   // in-flight band never reaches it; this is a release-build floor, not a normal-path limit).
   {
-    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 8).unwrap();
-    let mut ep = Endpoint::new(cfg, 7, NoopSm);
+    let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
+    let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     let head = depth - 1;
     ep.force_state_for_test(0, head, head, 0, &[]); // commit_min == op (caught up), no holes
@@ -674,8 +698,8 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
   // must STALL: the op does NOT advance, no Prepare is emitted, and the stall counter ticks —
   // backpressure before an oversized header-only carrier could ever be minted.
   {
-    let cfg = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 8).unwrap();
-    let mut ep = Endpoint::new(cfg, 7, NoopSm);
+    let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
+    let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     ep.force_state_for_test(0, depth, depth, 0, &[]); // head exactly at the bound, caught up, no holes
     for op in 1..=depth {
@@ -738,7 +762,12 @@ fn a_quorum_checkpoint_report_advances_prune_floor_without_a_gc_trim_yet_the_car
   // A Normal primary (replica 0 of 3, view 0 — replica 0 leads it) whose in-memory log holds the FULL
   // band `[1..=depth]` — exactly at the frame-fit ceiling. This is the state a primary reaches by
   // appending a deep tail before any local checkpoint lands.
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
   e.op = OpNumber::with(depth as u64);
   e.commit_min = OpNumber::with(depth as u64);
   e.commit_max = OpNumber::with(depth as u64);
@@ -788,6 +817,8 @@ fn a_quorum_checkpoint_report_advances_prune_floor_without_a_gc_trim_yet_the_car
     e.log_view,
     e.op,
     e.commit_max,
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(0),
     e.log_entries(),
   ));
@@ -886,6 +917,8 @@ fn a_backup_whose_checkpoint_lags_while_it_accepts_prepares_keeps_its_carrier_un
     e.log_view,
     e.op,
     e.commit_max,
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(1),
     e.log_entries(),
   ));
@@ -899,6 +932,8 @@ fn a_backup_whose_checkpoint_lags_while_it_accepts_prepares_keeps_its_carrier_un
     e.view,
     e.op,
     e.commit_max,
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(1),
     0xC0FFEE,
     e.log_entries(),
@@ -945,7 +980,13 @@ fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     e.commit(),
@@ -1001,8 +1042,8 @@ fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
   // op-reuse hole that body_checksum alone left open: two DISTINCT operations can share body bytes (same
   // body_checksum) yet differ in (client, request), so a stale ack for an op number that was truncated
   // and re-minted for a DIFFERENT request — even one with identical body bytes — must NOT be counted.
-  let cfg = Config::try_new(1, ReplicaId::new(0), 3).expect("valid cluster config");
-  let mut e = Endpoint::new(cfg, 7, NoopSm);
+  let cfg = Config::try_new(1, MemberId::new(0)).expect("valid cluster config");
+  let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   assert!(e.is_primary(), "replica 0 is primary of view 0");
   let now = Instant::ZERO;
@@ -1065,6 +1106,8 @@ fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
       ReplicaId::new(1),
       OpNumber::new(),
       same_body_other_op,
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -1090,6 +1133,8 @@ fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
       ReplicaId::new(1),
       OpNumber::new(),
       driven,
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -1186,11 +1231,11 @@ fn a_faulted_append_completion_retries_and_the_op_still_acks() {
 /// the primary-path half of the session-eviction determinism proof. Returns the endpoint with every
 /// op applied.
 fn solo_primary_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) {
-  let cfg = Config::try_new(1, ReplicaId::new(0), 1)
+  let cfg = Config::try_new(1, MemberId::new(0))
     .unwrap()
     .with_max_client_sessions(cap)
     .unwrap();
-  let mut e = Endpoint::new(cfg, 0, EchoSm);
+  let mut e = Endpoint::new(cfg, genesis(1), 0, EchoSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   for c in 1..=n {
@@ -1214,11 +1259,11 @@ fn solo_primary_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, Te
 /// Drive the SAME op stream (op `c` = client `c`, request 1, body `[c]`) through a BACKUP's
 /// `on_prepare` + `advance_commit` apply path — the backup-path half of the determinism proof.
 fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) {
-  let cfg = Config::try_new(1, ReplicaId::new(1), 2)
+  let cfg = Config::try_new(1, MemberId::new(1))
     .unwrap()
     .with_max_client_sessions(cap)
     .unwrap();
-  let mut e = Endpoint::new(cfg, 0, EchoSm);
+  let mut e = Endpoint::new(cfg, genesis(2), 0, EchoSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let from = Peer::Replica(ReplicaId::new(0)); // the view-0 primary of the 2-replica cluster
@@ -1231,8 +1276,10 @@ fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) 
       Message::Prepare(Prepare::new(
         View::new(),
         OpNumber::with(c),
-        OpNumber::with(c - 1), // the primary's commit so far — applies op c-1 on delivery
+        OpNumber::with(c - 1),
         OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
         ClientId::new(c as u128),
         RequestNumber::with(1),
         Bytes::from(std::vec![c as u8]),
@@ -1246,7 +1293,13 @@ fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) 
     &mut wal,
     &mut sb,
     from,
-    Message::Commit(Commit::new(View::new(), OpNumber::with(n), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(n),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(e.commit().get(), n, "the backup applied through op {n}");
   (e, wal, sb)
@@ -1285,11 +1338,11 @@ fn session_table_never_exceeds_the_cap_and_victims_are_oldest_first() {
   // Drive 3× the cap through the backup apply path, asserting after EVERY apply that the APPLIED
   // session count never exceeds the cap (the eviction is immediate, not amortized).
   let cap = 4u32;
-  let cfg = Config::try_new(1, ReplicaId::new(1), 2)
+  let cfg = Config::try_new(1, MemberId::new(1))
     .unwrap()
     .with_max_client_sessions(cap)
     .unwrap();
-  let mut e = Endpoint::new(cfg, 0, EchoSm);
+  let mut e = Endpoint::new(cfg, genesis(2), 0, EchoSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let from = Peer::Replica(ReplicaId::new(0));
@@ -1304,6 +1357,8 @@ fn session_table_never_exceeds_the_cap_and_victims_are_oldest_first() {
         OpNumber::with(c),
         OpNumber::with(c.saturating_sub(1)),
         OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
         ClientId::new(c as u128),
         RequestNumber::with(1),
         Bytes::from_static(b"x"),
@@ -1329,6 +1384,8 @@ fn session_table_never_exceeds_the_cap_and_victims_are_oldest_first() {
       View::new(),
       OpNumber::with(3 * cap as u64),
       OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   // The survivors are exactly the `cap` most-recently-applied clients.
@@ -1402,8 +1459,8 @@ fn pipeline_admission_stalls_at_the_cap_and_releases_as_commits_advance() {
   // the pipeline `(commit_min, op]` grows to MAX_PIPELINE — at which point admission STALLS (no op
   // minted, no watermark advanced, so the client's retransmit is still canonical). Acking the first
   // op then advances the commit and admission RELEASES.
-  let cfg = Config::try_new(1, ReplicaId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, 0, NoopSm);
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(2), 0, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let submit = |e: &mut Endpoint<NoopSm>, wal: &mut TestWal, sb: &mut TestSb, rn: u64| {
@@ -1452,6 +1509,8 @@ fn pipeline_admission_stalls_at_the_cap_and_releases_as_commits_advance() {
       ReplicaId::new(1),
       OpNumber::new(),
       identity,
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(e.commit().get(), 1, "op 1 committed off the backup ack");
@@ -1469,8 +1528,8 @@ fn prepare_retransmit_is_windowed_to_the_first_unacked_ops() {
   // per retransmit tick — the LOWEST ops (the ones the commit is waiting on) — not the whole window.
   // The window ships as a byte-bounded `PrepareBatch` (small bodies: ONE batch carrying the whole
   // window), never as per-op `Prepare` frames.
-  let cfg = Config::try_new(1, ReplicaId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, 0, NoopSm);
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(2), 0, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let deep = PREPARE_RETRANSMIT_WINDOW + 16;
@@ -1538,8 +1597,8 @@ fn prepare_retransmit_splits_batches_at_the_frame_budget() {
   // multiple batches, each under MAX_FRAME_LEN, together still covering the whole window. Three
   // 6 MiB ops: two fit one frame (12 MiB + framing < 16 MiB), the third would exceed the budget —
   // so the tick emits [1,2] then [3].
-  let cfg = Config::try_new(1, ReplicaId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, 0, NoopSm);
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(2), 0, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let big = 6 * 1024 * 1024usize;
@@ -1592,8 +1651,8 @@ fn prepare_retransmit_skips_a_repairing_hole_in_the_window() {
   // it has the op's identity but not its bytes (the windowed repair channel is fetching them). The
   // retransmit must SKIP it (there is no body to ship) while still batching the `Present` ops on
   // either side.
-  let cfg = Config::try_new(1, ReplicaId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, 0, NoopSm);
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(2), 0, NoopSm);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   for rn in 1..=3u64 {
@@ -1661,6 +1720,8 @@ fn prepare_batch_delivery_is_equivalent_to_the_separate_prepares() {
         OpNumber::with(op),
         commit,
         ck,
+        crate::Epoch::new(0),
+        0,
         ClientId::new(7),
         RequestNumber::with(op),
         body_of(op),
@@ -1687,7 +1748,14 @@ fn prepare_batch_delivery_is_equivalent_to_the_separate_prepares() {
     &mut wal_b,
     &mut sb_b,
     primary_peer(),
-    Message::PrepareBatch(crate::PrepareBatch::new(View::new(), commit, ck, entries)),
+    Message::PrepareBatch(crate::PrepareBatch::new(
+      View::new(),
+      commit,
+      ck,
+      crate::Epoch::new(0),
+      0,
+      entries,
+    )),
   );
 
   // Land the in-flight appends on both, so the deferred acks are emitted too.
@@ -1775,6 +1843,8 @@ fn prepare_batch_skips_a_repairing_entry_and_processes_the_rest() {
       View::new(),
       OpNumber::new(),
       OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
       std::vec![
         entry(1),
         PreparedEntry::repairing(

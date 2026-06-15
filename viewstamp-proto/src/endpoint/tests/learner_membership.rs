@@ -14,7 +14,8 @@ use crate::{
 /// A 3-voter cluster (ids 0,1,2) with 2 learners (ids 3,4 — `node_count == 5`), self = voter 0.
 fn voter_with_learners() -> Endpoint<NoopSm> {
   Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(0), 3, 2).expect("valid 3-voter + 2-learner config"),
+    Config::try_new(1, MemberId::new(0)).expect("valid 3-voter + 2-learner config"),
+    genesis_with_learners(3, 2),
     0,
     NoopSm,
   )
@@ -36,21 +37,23 @@ fn sender_matches_accepts_serve_and_solicit_messages_from_a_learner() {
   let op = OpNumber::with(1);
 
   let serves = [
-    Message::GetView(crate::GetView::new(v, learner, 7)),
-    Message::RequestPrepare(crate::RequestPrepare::new(v, op, learner)),
-    Message::RequestPrepareRange(crate::RequestPrepareRange::new(v, op, op, learner)),
-    Message::Recovery(crate::Recovery::new(learner, 7)),
+    Message::GetView(crate::GetView::new(v, learner, 7, crate::Epoch::new(0), 0)),
+    Message::RequestPrepare(crate::RequestPrepare::new(v, op, learner, 0)),
+    Message::RequestPrepareRange(crate::RequestPrepareRange::new(v, op, op, learner, 0)),
+    Message::Recovery(crate::Recovery::new(learner, 7, crate::Epoch::new(0), 0)),
     Message::RequestSync(crate::RequestSync::new(
       v,
       OpNumber::new(),
       learner,
       7,
       false,
+      0,
     )),
     Message::RequestSyncChunk(crate::RequestSyncChunk::new(
       v,
       OpNumber::with(4),
       0xab,
+      0,
       0,
       learner,
       7,
@@ -81,6 +84,8 @@ fn sender_matches_accepts_a_repair_serve_prepare_and_repair_batch_from_a_learner
     OpNumber::with(2),
     OpNumber::with(2),
     OpNumber::new(),
+    crate::Epoch::new(0),
+    0,
     ClientId::new(7),
     RequestNumber::with(2),
     Bytes::copy_from_slice(&[2u8]),
@@ -94,6 +99,7 @@ fn sender_matches_accepts_a_repair_serve_prepare_and_repair_batch_from_a_learner
     View::new(),
     OpNumber::with(2),
     OpNumber::new(),
+    0,
     std::vec::Vec::new(),
   ));
   assert!(
@@ -113,13 +119,26 @@ fn sender_matches_rejects_votes_from_a_learner() {
   let v = View::new();
   let op = OpNumber::with(1);
 
-  let prepare_ok = Message::PrepareOk(PrepareOk::new(v, op, learner, OpNumber::new(), 0));
+  let prepare_ok = Message::PrepareOk(PrepareOk::new(
+    v,
+    op,
+    learner,
+    OpNumber::new(),
+    0,
+    crate::Epoch::new(0),
+    0,
+  ));
   assert!(
     !e.sender_matches(from, &prepare_ok),
     "a PrepareOk from a learner id is a non-voter vote — rejected",
   );
 
-  let svc = Message::StartViewChange(crate::StartViewChange::new(View::with(1), learner));
+  let svc = Message::StartViewChange(crate::StartViewChange::new(
+    View::with(1),
+    learner,
+    crate::Epoch::new(0),
+    0,
+  ));
   assert!(
     !e.sender_matches(from, &svc),
     "a StartViewChange from a learner id is a non-voter vote — rejected",
@@ -130,6 +149,8 @@ fn sender_matches_rejects_votes_from_a_learner() {
     View::new(),
     op,
     OpNumber::new(),
+    crate::Epoch::new(0),
+    0,
     learner,
     std::vec::Vec::new(),
   ));
@@ -168,7 +189,8 @@ fn on_request_prepare_serves_a_learner_requester() {
   // (id 3) RequestPrepare for it — the holder answers with the Prepare addressed back to the learner.
   // Goes end-to-end through `handle_message`, so it also exercises `sender_is_member` for RequestPrepare.
   let mut e = Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(1), 3, 2).expect("voter 1 of 3 + 2 learners"),
+    Config::try_new(1, MemberId::new(1)).expect("voter 1 of 3 + 2 learners"),
+    genesis_with_learners(3, 2),
     0,
     NoopSm,
   );
@@ -191,6 +213,7 @@ fn on_request_prepare_serves_a_learner_requester() {
       View::new(),
       OpNumber::with(1),
       learner,
+      0,
     )),
   );
   let out = e
@@ -214,8 +237,8 @@ fn on_recovery_serves_a_learner_requester() {
   // addressed back to the learner. (A learner adopts a head only from the primary; the SERVE side is
   // membership-wide.)
   let mut e = Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(0), 3, 2)
-      .expect("voter 0 (primary of view 0) + 2 learners"),
+    Config::try_new(1, MemberId::new(0)).expect("voter 0 (primary of view 0) + 2 learners"),
+    genesis_with_learners(3, 2),
     0,
     NoopSm,
   );
@@ -228,7 +251,12 @@ fn on_recovery_serves_a_learner_requester() {
     &mut wal,
     &mut sb,
     Peer::Replica(learner),
-    Message::Recovery(crate::Recovery::new(learner, 0x1234)),
+    Message::Recovery(crate::Recovery::new(
+      learner,
+      0x1234,
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   let out = e
     .poll_message()
@@ -251,8 +279,8 @@ fn compute_quorum_checkpoint_op_on_a_learner_excludes_its_own_checkpoint() {
   // `peer_checkpoint`, the learner computes the conservative floor 0, so a high learner checkpoint
   // cannot lift the GC floor and free an op a voter quorum still needs.
   let mut learner = Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(LEARNER), 3, 2)
-      .expect("learner id 3 of a 3-voter set"),
+    Config::try_new(1, MemberId::new(LEARNER as u128)).expect("learner id 3 of a 3-voter set"),
+    genesis_with_learners(3, 2),
     0,
     NoopSm,
   );
@@ -274,7 +302,8 @@ fn compute_quorum_checkpoint_op_on_a_learner_excludes_its_own_checkpoint() {
   // Contrast: the SAME high own checkpoint on a VOTER (id 0) in a solo (1-voter) cluster IS the
   // quorum, so it seeds the statistic — proving the exclusion is voter-gated, not unconditional.
   let mut solo_voter = Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(0), 1, 2).expect("solo voter 0 + 2 learners"),
+    Config::try_new(1, MemberId::new(0)).expect("solo voter 0 + 2 learners"),
+    genesis_with_learners(1, 2),
     0,
     NoopSm,
   );
@@ -290,8 +319,8 @@ fn compute_quorum_checkpoint_op_on_a_learner_excludes_its_own_checkpoint() {
 /// the primary of view 0; voter 1 is the primary of view 1.
 fn learner_self() -> Endpoint<NoopSm> {
   Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(LEARNER), 3, 2)
-      .expect("learner id 3 of a 3-voter set"),
+    Config::try_new(1, MemberId::new(LEARNER as u128)).expect("learner id 3 of a 3-voter set"),
+    genesis_with_learners(3, 2),
     0,
     NoopSm,
   )
@@ -313,7 +342,13 @@ fn a_learner_never_acks_a_prepare_or_proposes_a_view_change_on_idle() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   while let Some(out) = e.poll_message() {
     assert!(
@@ -356,7 +391,12 @@ fn a_quorum_of_voter_svcs_does_not_activate_a_learner() {
       &mut wal,
       &mut sb,
       Peer::Replica(ReplicaId::new(v)),
-      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(v))),
+      Message::StartViewChange(StartViewChange::new(
+        View::with(1),
+        ReplicaId::new(v),
+        crate::Epoch::new(0),
+        0,
+      )),
     );
   }
   assert_eq!(
@@ -396,7 +436,13 @@ fn a_learner_catch_up_does_not_escalate_to_active_view_change() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(1)),
-    Message::Commit(Commit::new(View::with(1), OpNumber::new(), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert!(
     e.status().is_view_change() && e.catching_up(),
@@ -445,7 +491,8 @@ fn a_voter_backup_still_acks_and_proposes_unlike_a_learner() {
   // view change when the primary goes idle — so the learner exclusions are learner-specific, not a
   // blanket disable of the backup machinery.
   let mut e = Endpoint::new(
-    Config::try_new_member(1, ReplicaId::new(1), 3, 2).expect("voter 1 backup + 2 learners"),
+    Config::try_new(1, MemberId::new(1)).expect("voter 1 backup + 2 learners"),
+    genesis_with_learners(3, 2),
     0,
     NoopSm,
   );

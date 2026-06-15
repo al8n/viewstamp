@@ -50,9 +50,10 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   };
   let mut wal = ScriptedWal::with_entries(3);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot is permanently faulty → dropped
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -94,7 +95,12 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(0)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
   r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
@@ -127,6 +133,8 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
       View::with(0),
       OpNumber::with(1),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ReplicaId::new(0),
       std::vec![PreparedEntry::new(
         OpNumber::with(1),
@@ -230,9 +238,10 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   };
   let mut wal = ScriptedWal::with_entries(3);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot is permanently faulty → dropped
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -269,7 +278,12 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(0)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
   assert!(
@@ -327,8 +341,9 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   // DVC would under-report — re-opening the laggard-quorum truncation hazard the whole fix-chain closes.
   let mut wal2 = ScriptedWal::with_entries(3);
   wal2.script_read_fault(OpNumber::with(2), u8::MAX);
-  let cfg2 = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
-  let mut r2 = Endpoint::recover(cfg2, 0, CountSm::default(), &mut wal2, &mut sb);
+  let cfg2 = Config::try_new(1, MemberId::new(1)).unwrap();
+  let mut r2 =
+    Endpoint::recover(cfg2, genesis(3), 0, CountSm::default(), &mut wal2, &mut sb).expect_active();
   for _ in 0..32 {
     r2.handle_storage(now, &mut wal2, &mut sb);
     if !r2.status().is_recovering() {
@@ -385,9 +400,9 @@ fn recover_keeps_a_body_faulty_committed_op_as_repairing_then_peer_repairs_its_b
   };
   let mut wal = ScriptedWal::with_entries(1);
   wal.script_body_faulty(OpNumber::with(1)); // header durable, body unrecoverable → BodyFaulty
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, EchoSm, &mut wal, &mut sb);
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -507,9 +522,9 @@ fn recover_drops_a_stale_committed_op_read_back_body_faulty_not_resurrected_as_r
   // `with_entries` seeds op 2 under client 7 (the STALE local identity); its read is BodyFaulty.
   let mut wal = ScriptedWal::with_entries(3);
   wal.script_body_faulty(OpNumber::with(2));
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, EchoSm, &mut wal, &mut sb);
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -565,9 +580,9 @@ fn recover_drops_a_genuinely_absent_committed_op_as_today() {
   // pruning op 2 out of `entries`. `with_entries(3)` then op 2 removed leaves op 2 a genuine hole.
   let mut wal = ScriptedWal::with_entries(3);
   wal.remove_entry_for_test(OpNumber::with(2)); // op 2 has NO durable header → read is Absent
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, EchoSm, &mut wal, &mut sb);
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -603,12 +618,14 @@ fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
   drop(e);
 
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   assert_eq!(
     r.status(),
     Status::Recovering,
@@ -628,12 +645,14 @@ fn recover_retries_a_transient_read_fault_then_reaches_normal() {
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     EchoSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   assert_eq!(r.status(), Status::Recovering);
   // Pump until the retry clears (bounded): each handle_storage drains one round + re-submits.
   for _ in 0..8 {
@@ -660,12 +679,14 @@ fn recover_head_permanently_faulty_enters_recovering_head() {
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   for _ in 0..16 {
     r.handle_storage(now, &mut wal, &mut sb);
     if r.status() != Status::Recovering {
@@ -729,7 +750,13 @@ fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     r.commit(),
@@ -843,8 +870,9 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
     done: VecDeque::new(),
     checkpoint: None,
   };
-  let cfg = Config::try_new(1, ReplicaId::new(2), 3).unwrap();
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let cfg = Config::try_new(1, MemberId::new(2)).unwrap();
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -899,10 +927,12 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   let canonical_retransmit = Message::Prepare(Prepare::new(
     View::with(1),
     OpNumber::with(3),
-    OpNumber::with(2), // primary's commit_min (< op 3): does NOT register op 3 for repair (before-Commit)
+    OpNumber::with(2),
     OpNumber::new(),
-    ClientId::new(7), // CANONICAL identity (client 7, request 3, body [3]) — differs from the
-    RequestNumber::with(3), // stale slot's (client 9, request 99, body [0xAA])
+    crate::Epoch::new(0),
+    0,
+    ClientId::new(7),
+    RequestNumber::with(3),
     Bytes::copy_from_slice(&[3]),
   ));
   r.handle_message(now, &mut wal, &mut sb, primary1, canonical_retransmit);
@@ -964,6 +994,8 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
       View::with(1),
       OpNumber::with(3),
       OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   r.handle_storage(now, &mut wal, &mut sb);
@@ -1028,7 +1060,8 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
   // (a) buggy state: an uncommitted op stranded in `repair` → every client is dropped (the deadlock).
   {
     let mut p = Endpoint::new(
-      Config::try_new(1, ReplicaId::new(0), 3).unwrap(),
+      Config::try_new(1, MemberId::new(0)).unwrap(),
+      genesis(3),
       0,
       CountSm::default(),
     );
@@ -1049,7 +1082,8 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
   // (b) fixed state: empty repair (what recovery now leaves) → the primary serves the request.
   {
     let mut p = Endpoint::new(
-      Config::try_new(1, ReplicaId::new(0), 3).unwrap(),
+      Config::try_new(1, MemberId::new(0)).unwrap(),
+      genesis(3),
       0,
       CountSm::default(),
     );
@@ -1109,7 +1143,9 @@ fn recovering_head_adopts_start_view_and_becomes_normal() {
     View::new(),
     OpNumber::with(2),
     OpNumber::with(2),
-    ReplicaId::new(0), // primary of view 0
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(0),
     std::vec![
       PreparedEntry::new(
         OpNumber::with(1),
@@ -1170,12 +1206,14 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     CountSm::default(),
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if r.status() != Status::Recovering {
@@ -1195,6 +1233,8 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
     View::new(),
     OpNumber::with(4),
     OpNumber::with(4),
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(0),
     std::vec![
       PreparedEntry::new(
@@ -1275,6 +1315,8 @@ fn recovering_head_adopts_recovery_response_from_primary() {
     View::new(),
     OpNumber::with(2),
     OpNumber::with(2),
+    crate::Epoch::new(0),
+    0,
     ReplicaId::new(0),
     nonce,
     std::vec![
@@ -1332,8 +1374,10 @@ fn recovering_head_ignores_stale_or_non_primary_recovery_response() {
       View::new(),
       OpNumber::with(2),
       OpNumber::with(2),
+      crate::Epoch::new(0),
+      0,
       ReplicaId::new(0),
-      nonce.wrapping_add(1), // stale/forged
+      nonce.wrapping_add(1),
       std::vec![PreparedEntry::new(
         OpNumber::with(1),
         ClientId::new(7),
@@ -1357,7 +1401,9 @@ fn recovering_head_ignores_stale_or_non_primary_recovery_response() {
       View::new(),
       OpNumber::new(),
       OpNumber::new(),
-      ReplicaId::new(2), // NOT primary(view 0)
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
       nonce,
       std::vec![],
     )),
@@ -1388,6 +1434,8 @@ fn recovering_head_does_not_participate_on_non_head_learning_messages() {
       OpNumber::with(3),
       OpNumber::with(2),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ClientId::new(7),
       RequestNumber::with(3),
       Bytes::from_static(b"z"),
@@ -1401,7 +1449,13 @@ fn recovering_head_does_not_participate_on_non_head_learning_messages() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(1), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     r.status(),
@@ -1427,12 +1481,14 @@ fn recovered_primary_abdicates_to_a_view_change_instead_of_resuming_normal() {
   let mut sb = sb_with_view(0, 0);
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(0), 3).unwrap(),
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   for _ in 0..16 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -1477,12 +1533,14 @@ fn recovered_backup_resumes_normal_unchanged() {
   let mut sb = sb_with_view(0, 0);
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   for _ in 0..16 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -1511,12 +1569,14 @@ fn recovered_mid_view_change_redrives_the_in_progress_view_change() {
   let mut sb = sb_with_view(1, 0);
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(2), 3).unwrap(),
+    Config::try_new(1, MemberId::new(2)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   for _ in 0..16 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -1545,12 +1605,14 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
   let mut sb = sb_with_view(0, 0);
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(0), 1).unwrap(),
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(1),
     0,
     CountSm::default(),
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   for _ in 0..16 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -1607,7 +1669,12 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
 fn normal_primary_answers_recovery_with_canonical_response() {
   // A Normal primary answers a peer's Recovery with a RecoveryResponse carrying its canonical
   // log + head + commit, echoing the nonce. (Replica 0 is primary of view 0.)
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, EchoSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    EchoSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Give the primary one committed op so its response is non-trivial.
@@ -1630,7 +1697,12 @@ fn normal_primary_answers_recovery_with_canonical_response() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(2)),
-    Message::Recovery(Recovery::new(ReplicaId::new(2), 0x1234)),
+    Message::Recovery(Recovery::new(
+      ReplicaId::new(2),
+      0x1234,
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   let mut resp = None;
   while let Some(out) = e.poll_message() {
@@ -1652,7 +1724,12 @@ fn has_inflight_storage_is_true_mid_append_and_false_when_quiesced() {
   // `handle_storage` drains that completion (nothing left for the driver to deliver). (Replica 0 is
   // primary of view 0; a single own-vote is below the N=3 quorum of 2, so the drain commits nothing
   // and arms no superblock write — the endpoint is genuinely quiesced afterward.)
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(0), 3).unwrap(), 0, NoopSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   assert!(
@@ -1689,7 +1766,12 @@ fn has_inflight_storage_is_true_mid_append_and_false_when_quiesced() {
 fn normal_backup_answers_recovery_with_view_only() {
   // A Normal BACKUP answers a Recovery with only its view + echoed nonce (no canonical head):
   // op/commit are 0 and the log is empty. (Replica 2 is a backup of view 0.)
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(2), 3).unwrap(), 0, NoopSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(2)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   e.handle_message(
@@ -1697,7 +1779,12 @@ fn normal_backup_answers_recovery_with_view_only() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(1)),
-    Message::Recovery(Recovery::new(ReplicaId::new(1), 0x5678)),
+    Message::Recovery(Recovery::new(
+      ReplicaId::new(1),
+      0x5678,
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   let mut rr = None;
   while let Some(out) = e.poll_message() {
@@ -1723,12 +1810,14 @@ fn recover_read_ok_with_bad_checksum_does_not_adopt_the_corrupt_body() {
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   for _ in 0..16 {
     r.handle_storage(now, &mut wal, &mut sb);
     if r.status() != Status::Recovering {
@@ -1803,9 +1892,10 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
   );
   wal.entries.insert(2, (stale_header, stale_body));
 
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -1837,7 +1927,13 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     r.commit(),
@@ -1949,9 +2045,10 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
   );
   wal.entries.insert(2, (stale_header, stale_body));
 
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -1974,7 +2071,13 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     r.commit(),
@@ -2066,9 +2169,10 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   // The WAL: ops 1, 3, 4 canonical (header-matched); op 2's slot reads back permanently faulty → a hole.
   let mut wal = ScriptedWal::with_entries(4);
   wal.script_read_fault(OpNumber::with(2), u8::MAX);
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -2118,7 +2222,13 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(4), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     r.commit(),
@@ -2212,10 +2322,10 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
   // The WAL holds canonical ops 1..=commit_max (head == commit_max), each body [op] header-matched.
   let mut wal = ScriptedWal::with_entries(commit_max);
   // A checkpoint interval far above the window — the regime in which this hazard is reachable.
-  let cfg =
-    Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, crate::MAX_CHECKPOINT_OPS).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   // THE CORE assertion: the recovered head reads the FULL durable committed band — `self.op >=
   // commit_max`, NOT the old `checkpoint_op + RECOVER_TAIL_WINDOW`. (FAIL-BEFORE: `self.op ==
   // RECOVER_TAIL_WINDOW` < commit_max, hiding the top two held committed ops.)
@@ -2273,7 +2383,12 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(0)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(0))),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
   r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
@@ -2319,8 +2434,10 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
       View::with(0),
       OpNumber::with(RECOVER_TAIL_WINDOW),
       OpNumber::with(RECOVER_TAIL_WINDOW),
+      crate::Epoch::new(0),
+      0,
       ReplicaId::new(0),
-      std::vec::Vec::new(), // the laggard carries no entries (it does not supply the top band)
+      std::vec::Vec::new(),
     )),
   );
   assert!(
@@ -2348,7 +2465,7 @@ fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
   // `checkpoint_op + RECOVER_TAIL_WINDOW` — the window bounds the uncommitted tail against bit-rot, and
   // a corrupt superblock cannot inflate `commit_max` to widen it. This is the bogus-head defense the
   // recovery window bound must not weaken.
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut wal = ScriptedWal::with_entries(0);
   wal.head = u64::MAX; // a pathological / bit-rotted head
   let mut sb = TestSb::default(); // VsrState::new(): commit == checkpoint_op == 0
@@ -2358,7 +2475,8 @@ fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
     "the durable root has NO committed band above the checkpoint"
   );
   let now = Instant::ZERO;
-  let e = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let e =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(e.status(), Status::Recovering);
   // With commit_max == checkpoint_op == 0, the floor is checkpoint_op, so `hi` caps at
   // `checkpoint_op + RECOVER_TAIL_WINDOW`: exactly RECOVER_TAIL_WINDOW reads, NOT u64::MAX.
@@ -2447,9 +2565,10 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
   );
   wal.entries.insert(2, (wrong_identity_header, same_body));
 
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -2478,7 +2597,13 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     r.commit(),
@@ -2497,8 +2622,10 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
   let canonical_repair = Message::Prepare(Prepare::new(
     View::new(),
     OpNumber::with(2),
-    OpNumber::with(2), // commit >= op → a committed repair value
+    OpNumber::with(2),
     OpNumber::new(),
+    crate::Epoch::new(0),
+    0,
     client_b,
     RequestNumber::with(3),
     Bytes::copy_from_slice(&[2u8]),
@@ -2572,9 +2699,10 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
     checkpoint: None,
   };
   let mut wal = ScriptedWal::with_entries(3); // ops 1,2,3 all canonical [op]
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -2602,7 +2730,13 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(
     r.commit(),
@@ -2630,12 +2764,14 @@ fn recovering_replica_ignores_messages_and_does_not_join_a_view_change() {
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   assert_eq!(r.status(), Status::Recovering);
   // A higher-view Prepare (view 5) — would normally trigger catch_up_to_view → ViewChange.
   let higher = Message::Prepare(Prepare::new(
@@ -2643,6 +2779,8 @@ fn recovering_replica_ignores_messages_and_does_not_join_a_view_change() {
     OpNumber::with(3),
     OpNumber::with(2),
     OpNumber::with(0),
+    crate::Epoch::new(0),
+    0,
     ClientId::new(7),
     RequestNumber::with(3),
     Bytes::from_static(b"z"),
@@ -2671,12 +2809,14 @@ fn recover_timer_resubmits_a_dropped_transient_fault() {
   let mut sb = TestSb::default();
   let mut now = Instant::ZERO;
   let mut r = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     EchoSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   // A Recovering replica must arm a timer (so an owner driving poll_timeout makes progress).
   assert!(
     r.poll_timeout().is_some(),
@@ -2714,12 +2854,14 @@ fn recover_rebuilds_log_and_op_from_wal() {
   // Drop `e` (crash). Recover a fresh endpoint from the SAME durable wal/sb.
   drop(e);
   let mut recovered = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   assert_eq!(
     recovered.status(),
     Status::Recovering,
@@ -2753,17 +2895,18 @@ fn recover_restores_real_bodies() {
   // append ops 1,2 (bodies [1],[2]) to a backup, crash, recover with an echoing SM, then have
   // the primary announce commit=2 — the recovered backup re-applies both ops from its restored
   // WAL bodies, and the Committed events must carry the ORIGINAL bytes.
-  let cfg = || Config::try_new(1, ReplicaId::new(1), 3).expect("valid cluster config");
+  let cfg = || Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
 
-  let mut e = Endpoint::new(cfg(), 0, EchoSm);
+  let mut e = Endpoint::new(cfg(), genesis(3), 0, EchoSm);
   e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
   e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
   e.handle_storage(now, &mut wal, &mut sb);
   drop(e); // crash
 
-  let mut recovered = Endpoint::recover(cfg(), 0, EchoSm, &mut wal, &mut sb);
+  let mut recovered =
+    Endpoint::recover(cfg(), genesis(3), 0, EchoSm, &mut wal, &mut sb).expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
   recovered.handle_storage(now, &mut wal, &mut sb); // restore the tail bodies → Normal
   assert_eq!(recovered.status(), Status::Normal);
@@ -2772,7 +2915,13 @@ fn recover_restores_real_bodies() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
 
   let mut applied = std::vec::Vec::new();
@@ -2794,7 +2943,12 @@ fn recover_restores_a_nonzero_durable_view() {
   // which would risk a cross-view double-vote). Drive a backup into ViewChange(view 1) so it writes
   // the durable view, pump the write, then crash + recover from the SAME wal/sb.
   use crate::StartViewChange;
-  let mut e = Endpoint::new(Config::try_new(1, ReplicaId::new(1), 3).unwrap(), 0, NoopSm);
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
   e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1 (own SVC bit)
@@ -2803,7 +2957,12 @@ fn recover_restores_a_nonzero_durable_view() {
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(2)),
-    Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(2),
+      crate::Epoch::new(0),
+      0,
+    )),
   ); // SVC quorum → ViewChange(view 1) → durable-view write submitted
   e.handle_storage(later, &mut wal, &mut sb); // make the durable-view write complete
   assert_eq!(
@@ -2819,12 +2978,14 @@ fn recover_restores_a_nonzero_durable_view() {
   drop(e); // crash
 
   let recovered = Endpoint::recover(
-    Config::try_new(1, ReplicaId::new(1), 3).unwrap(),
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
     0,
     NoopSm,
     &mut wal,
     &mut sb,
-  );
+  )
+  .expect_active();
   assert_eq!(
     recovered.view(),
     View::with(1),
@@ -2850,7 +3011,7 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   // commit_min == checkpoint_op (NOT 0) — re-applying [1..=checkpoint_op] would double-apply.
   // (The implementation never prunes the WAL at this stage — so the WAL still holds ops [1..=head];
   //  the log cache is rebuilt for the tail (checkpoint_op..=head] only, the snapshot owns the rest.)
-  let cfg = || Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
+  let cfg = || Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let req = |rn: u64| {
@@ -2860,7 +3021,7 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
       Bytes::from(std::vec![rn as u8]),
     ))
   };
-  let mut e = Endpoint::new(cfg(), 0, CountSm::default());
+  let mut e = Endpoint::new(cfg(), genesis(1), 0, CountSm::default());
   for rn in 1..=2 {
     e.handle_message(
       now,
@@ -2886,7 +3047,8 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   // recover() restores from the checkpoint snapshot, NOT by replaying from op 0. The consensus
   // metadata (commit/checkpoint/op) is set synchronously in Phase 1; the SM snapshot restore
   // happens in the Recovering handle_storage loop (Phase 2), so pump it before the SM asserts.
-  let mut recovered = Endpoint::recover(cfg(), 0, CountSm::default(), &mut wal, &mut sb);
+  let mut recovered =
+    Endpoint::recover(cfg(), genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
   assert_eq!(
     recovered.commit(),
@@ -2962,9 +3124,10 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
     head: 2,
     done: VecDeque::new(),
   };
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let now = Instant::ZERO;
-  let mut e = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     e.commit(),
@@ -3048,9 +3211,10 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
     head: 2,
     done: VecDeque::new(),
   };
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 1, 2).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let now = Instant::ZERO;
-  let mut e = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   // Drain #1: the truncated read does NOT panic — it is rejected; still Recovering.
   sb.flush();
   e.handle_storage(now, &mut wal, &mut sb);
@@ -3082,7 +3246,7 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
   // bytes (a faulty/malicious superblock could do this at will). The fix ESCALATES to fetching the
   // checkpoint from a peer via state-sync (a forced sync + a `RequestSync`), staying in a recoverable
   // fault state, and completes recovery once a verified peer `SyncCheckpoint` restores the SM.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
   // Durable root: a checkpoint at op 2 naming SOME id. The scripted superblock has an EMPTY read
   // script, so EVERY `submit_read_checkpoint` FAULTS — a permanently-unreadable snapshot.
@@ -3102,7 +3266,8 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(e.status(), Status::Recovering);
 
   // Drive well past the per-op retry budget (RECOVER_READ_RETRIES). Each round: flush the inflight
@@ -3165,6 +3330,7 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
       View::new(),
       OpNumber::with(2),
       good_id,
+      0,
       ReplicaId::new(0),
       nonce,
       good_env.clone(),
@@ -3211,7 +3377,7 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   // state-sync sites: it flags `pending_forfeit` (the next `primary_timeouts` re-proposes view + 1)
   // rather than resume Normal as the established primary. This is the path the existing peer-fetch test
   // (a BACKUP) does NOT exercise; here the recovering replica IS the primary of view 0.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(0), 3, 2).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let now = Instant::ZERO;
   // Durable root at VIEW 0 (so replica 0 is the primary) with a checkpoint at op 2. The scripted
   // superblock has an EMPTY read script, so EVERY checkpoint read FAULTS — a permanently-unreadable
@@ -3231,7 +3397,8 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert!(
     e.is_primary(),
     "replica 0 recovered at view 0 is the primary of its view"
@@ -3269,6 +3436,7 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
       View::new(),
       OpNumber::with(2),
       good_id,
+      0,
       ReplicaId::new(1),
       nonce,
       good_env,
@@ -3319,7 +3487,7 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
   // REGRESSION (variant): the checkpoint read MATCHES our read id but its CONTENT is permanently
   // wrong (hash mismatch on every attempt) — the verify-failure path, not a raw Fault. It must route
   // to the SAME budget→peer-fetch escalation (no panic), then a peer's good SyncCheckpoint completes.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
   let good_snap = CountSm::default().snapshot();
   let good_env =
@@ -3345,7 +3513,8 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..(RECOVER_READ_RETRIES as usize + 8) {
     sb.flush();
     e.handle_storage(now, &mut wal, &mut sb); // must NOT panic on the verify-failure exhaustion
@@ -3367,6 +3536,7 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
       View::new(),
       OpNumber::with(2),
       good_id,
+      0,
       ReplicaId::new(0),
       nonce,
       good_env.clone(),
@@ -3404,7 +3574,7 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
   // permanently unreadable, forcing the peer fetch. A peer then serves checkpoint op 1; we drive to
   // completion, then deliver a Commit(3) and observe op 2 is a repair hole that is request-repaired
   // and applied with its REAL body — never empty.
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, 2).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
 
   // The canonical bodies of the committed band. op-2's body is what a healthy peer holds and what the
@@ -3457,7 +3627,8 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // never clears within any finite budget
 
-  let mut e = Endpoint::recover(cfg, 5, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     e.commit_max(),
@@ -3503,6 +3674,7 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
       View::new(),
       OpNumber::with(1),
       peer_id,
+      0,
       ReplicaId::new(0),
       nonce,
       peer_env,
@@ -3551,6 +3723,8 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
       View::new(),
       OpNumber::with(3),
       OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -3588,8 +3762,10 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
     Message::Prepare(Prepare::new(
       View::new(),
       OpNumber::with(2),
-      OpNumber::with(3), // the answering holder's commit >= op (it committed op 2)
+      OpNumber::with(3),
       OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
       ClientId::new(7),
       RequestNumber::with(2),
       body2.clone(),
@@ -3621,17 +3797,18 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
 fn recover_with_no_checkpoint_is_unchanged() {
   // Backward-compat guard: with checkpoint_op == 0 (no checkpoint yet), recover() behaves EXACTLY
   // as the no-checkpoint path — commit_min == commit_max == 0, a fresh SM (0 applied), log cache [1..=head].
-  let cfg = || Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = || Config::try_new(1, MemberId::new(1)).unwrap();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
-  let mut e = Endpoint::new(cfg(), 0, CountSm::default());
+  let mut e = Endpoint::new(cfg(), genesis(3), 0, CountSm::default());
   e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
   e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
   e.handle_storage(now, &mut wal, &mut sb);
   assert_eq!(e.checkpoint_op(), OpNumber::with(0), "no checkpoint taken");
   drop(e);
 
-  let mut recovered = Endpoint::recover(cfg(), 0, CountSm::default(), &mut wal, &mut sb);
+  let mut recovered =
+    Endpoint::recover(cfg(), genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
   recovered.handle_storage(now, &mut wal, &mut sb); // drain the tail reads → Normal
   assert_eq!(recovered.status(), Status::Normal);
@@ -3658,14 +3835,15 @@ fn recover_bounds_the_read_window_for_a_huge_op_head() {
   // With the fix, the per-recover window is capped at `RECOVER_TAIL_WINDOW`, so at most that many
   // reads are submitted regardless of the claimed head. (Before the fix this loops ~u64::MAX times
   // and never returns.)
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut wal = TestWal {
     entries: BTreeMap::new(),
     head: u64::MAX, // a pathological / bit-rotted head
     done: VecDeque::new(),
   };
   let mut sb = TestSb::default(); // no checkpoint (checkpoint_op == 0) → no checkpoint read
-  let e = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let e =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(e.status(), Status::Recovering);
   // `recover()` submits exactly one read per materialized tail slot, each queued in the WAL's
   // `done` buffer. The count must be bounded by the window, never the claimed head.
@@ -3709,9 +3887,10 @@ fn recover_does_not_overflow_with_a_checkpoint_op_near_u64_max() {
     head: near_max, // head == checkpoint_op → empty tail range
     done: VecDeque::new(),
   };
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   // The CORE assertion is simply that this does not overflow-panic.
-  let e = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let e =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     wal.done.len(),
@@ -3776,9 +3955,10 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
     done: VecDeque::new(),
     checkpoint: Some((OpNumber::with(checkpoint_op), env)),
   };
-  let cfg = Config::with_checkpoint_ops(1, ReplicaId::new(1), 3, RECOVER_TAIL_WINDOW).unwrap();
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), RECOVER_TAIL_WINDOW).unwrap();
   let now = Instant::ZERO;
-  let mut e = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   // THE core assertion: the recovered head is the VERIFIED read frontier, NOT the raw head.
   assert_eq!(
     e.op(),
@@ -3805,8 +3985,10 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
   let p = Prepare::new(
     View::new(),
     OpNumber::with(danger),
-    OpNumber::with(frontier), // commit (does not advance past held)
+    OpNumber::with(frontier),
     OpNumber::with(checkpoint_op),
+    crate::Epoch::new(0),
+    0,
     ClientId::new(7),
     RequestNumber::with(danger),
     Bytes::from(std::vec![0xAB]),

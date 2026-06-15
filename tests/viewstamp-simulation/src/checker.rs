@@ -99,6 +99,14 @@ pub struct DurabilityChecker {
   committed: Vec<(u64, Bytes)>,
   /// Per-replica high-water of `checkpoint_op` (monotonicity guard).
   checkpoint_hw: Vec<u64>,
+  /// Slots a reconfiguration REMOVED from the membership (recovered `Retired` and parked). A removed
+  /// slot drops from the survivor scan in [`check`](Self::check): it is no longer a member, so its
+  /// frozen applied log must NOT be required to still retain the committed history (that obligation
+  /// rests on the SURVIVING members). The committed history itself is kept as-is across the straddle —
+  /// `observe` still folds the removed slot's frozen log into the no-rewrite check (a removed node may
+  /// never read back a DIFFERENT body for a committed op it held), so removal weakens only the
+  /// "who must still hold it" obligation, never the "it was never rewritten" one.
+  removed: HashSet<usize>,
 }
 
 impl DurabilityChecker {
@@ -107,6 +115,7 @@ impl DurabilityChecker {
     Self {
       committed: Vec::new(),
       checkpoint_hw: vec![0; replica_count],
+      removed: HashSet::new(),
     }
   }
 
@@ -156,6 +165,18 @@ impl DurabilityChecker {
     self.checkpoint_hw[i] = 0;
   }
 
+  /// Record that slot `i` was REMOVED by an offline reconfiguration (it recovered `Retired` and is
+  /// parked, no longer a member). A removed slot is dropped from the survivor scan in
+  /// [`check`](Self::check) — the committed history must survive on the SURVIVING members, never on a
+  /// node the configuration retired (whose applied log is frozen at its pre-removal prefix). The
+  /// committed history is NOT relaxed: the removed slot's frozen log is still folded by `observe`
+  /// (a removed node may not read back a different body for a committed op), so the no-rewrite and
+  /// cluster-wide-survival invariants both hold across the straddle — only the removed node itself is
+  /// excused from being a required holder.
+  pub fn note_removed(&mut self, i: usize) {
+    self.removed.insert(i);
+  }
+
   /// Sample the cluster: update the committed history and return a violation if any replica rewrote a
   /// committed op or regressed its `checkpoint_op`. Call every tick.
   pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
@@ -176,7 +197,11 @@ impl DurabilityChecker {
       return CheckResult::Ok;
     }
     let survived = (0..cluster.replica_count()).any(|i| {
-      !cluster.is_crashed(i)
+      // A reconfiguration-removed slot is no longer a member — its frozen pre-removal log cannot
+      // stand in for a survivor (and must not be REQUIRED to retain the full history). Survival rests
+      // on the configuration's surviving members.
+      !self.removed.contains(&i)
+        && !cluster.is_crashed(i)
         && cluster.replica_status_is_operational(i)
         && cluster.replica_sm(i).applied().len() >= self.committed.len()
         && cluster.replica_sm(i).applied()[..self.committed.len()] == self.committed[..]
@@ -705,6 +730,182 @@ impl ViewMonotonicChecker {
         ));
       }
       self.max_view[i] = v;
+    }
+    CheckResult::Ok
+  }
+}
+
+/// Stateful checker: each replica's durable `(Epoch, View)` must never regress LEXICOGRAPHICALLY —
+/// the split-brain regression net across an epoch transition.
+///
+/// [`ViewMonotonicChecker`] proves the durable VIEW never regresses WITHIN an epoch; a Tier C
+/// reconfiguration legitimately RESETS the view per epoch (the successor root carries `cur`'s view,
+/// but the epoch is the high-order coordinate — a later epoch always dominates an earlier one
+/// regardless of view). So the right cross-epoch invariant is on the PAIR `(epoch, view)` ordered
+/// lexicographically (epoch high-order): it must be monotone non-decreasing per replica. A view DROP
+/// is allowed ONLY when the epoch strictly ROSE (the per-epoch view reset); a view drop AT THE SAME
+/// epoch, or ANY epoch regression, is a real durable split-brain hazard — a replica acting in a
+/// `(epoch, view)` it could be rolled back out of, the exact state two configurations diverging would
+/// produce. The quantity is the DURABLE `(epoch, view)` (read off the superblock the proto recovers
+/// from), monotone by the same durable-before-participate argument [`ViewMonotonicChecker`] documents,
+/// now lifted to the epoch-prefixed pair.
+#[derive(Debug)]
+pub struct EpochViewMonotonicChecker {
+  /// Per-replica high-water of the durable `(epoch, view)` pair (lexicographic, epoch high-order).
+  high_water: Vec<(u64, u64)>,
+}
+
+impl EpochViewMonotonicChecker {
+  /// A checker for a cluster of `replica_count` replicas (all start at `(epoch 0, view 0)`).
+  pub fn new(replica_count: usize) -> Self {
+    Self {
+      high_water: vec![(0, 0); replica_count],
+    }
+  }
+
+  /// Fold one durable `(epoch, view)` observation for replica `i` into its high-water, returning a
+  /// violation on a LEXICOGRAPHIC regression. Pure over its inputs so the ordering logic is
+  /// unit-testable without a live `Cluster`: a strictly-lower epoch, or the same epoch with a strictly
+  /// lower view, is a regression; a lower view at a HIGHER epoch is the legitimate per-epoch reset.
+  fn note(&mut self, i: usize, epoch: u64, view: u64) -> CheckResult {
+    let (max_epoch, max_view) = self.high_water[i];
+    if (epoch, view) < (max_epoch, max_view) {
+      // Name which monotonicity broke: an epoch regression, or a view drop within an epoch.
+      let reason = if epoch < max_epoch {
+        "epoch regressed"
+      } else {
+        "view regressed within an epoch (a view drop is allowed only when the epoch rose)"
+      };
+      return CheckResult::violation(format!(
+        "replica {i}: durable (epoch, view) regressed to ({epoch}, {view}) from ({max_epoch}, \
+         {max_view}) — {reason}"
+      ));
+    }
+    self.high_water[i] = (epoch, view);
+    CheckResult::Ok
+  }
+
+  /// Record that slot `i`'s durable storage was WIPED (the amnesia axis): its `(epoch, view)`
+  /// high-water is forfeit with the disk — the fresh superblock honestly reads `(epoch 0, view 0)`,
+  /// and that regression IS the amnesia hazard, judged by the safety/durability checkers (NOT relaxed).
+  pub fn note_wipe(&mut self, i: usize) {
+    self.high_water[i] = (0, 0);
+  }
+
+  /// Sample the cluster: returns a violation if any replica's durable `(epoch, view)` regressed
+  /// lexicographically. Call every tick.
+  pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
+    for i in 0..cluster.replica_count() {
+      let epoch = cluster.replica_durable_epoch(i).get();
+      let view = cluster.replica_durable_view(i).get();
+      if let v @ CheckResult::Violation(_) = self.note(i, epoch, view) {
+        return v;
+      }
+    }
+    CheckResult::Ok
+  }
+}
+
+/// Stateful checker: the durable `config_id` lineage forms a single non-forking CHAIN — every
+/// successor configuration chains from the configuration currently recorded, never from a fork.
+///
+/// A reconfiguration mints a successor `config_id` that hashes the new membership together with its
+/// PREDECESSOR's `config_id` (the lineage backward link, durably anchored by `prev_epoch`). For the
+/// configuration history to be a safe single line — not two configurations that each believe they
+/// succeeded the same parent (the split-brain reconfiguration hazard) — each newly observed
+/// `(config_id, prev_epoch)` must chain off the lineage already recorded: its `prev_epoch` names the
+/// CURRENT configuration's epoch, and a given epoch maps to exactly ONE `config_id` (a second,
+/// different `config_id` at an epoch already seen is a fork). The checker records the lineage as an
+/// `epoch -> config_id` map and the current epoch's high-water; a non-chained successor (its
+/// `prev_epoch` is not the recorded current epoch) or a conflicting `config_id` at a known epoch
+/// fires. Kept simple for PR1 (the chain is short — the offline axis bumps one epoch at a time).
+#[derive(Debug)]
+pub struct MembershipMonotonicChecker {
+  /// The lineage observed so far: `epoch -> config_id`. One `config_id` per epoch, ever — a second
+  /// distinct id at a known epoch is a fork.
+  lineage: HashMap<u64, u128>,
+  /// The current (highest) epoch whose configuration is recorded — the one a successor must chain off.
+  current_epoch: u64,
+}
+
+impl Default for MembershipMonotonicChecker {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl MembershipMonotonicChecker {
+  /// A fresh lineage checker: nothing recorded until the first observation seeds epoch 0's config.
+  pub fn new() -> Self {
+    Self {
+      lineage: HashMap::new(),
+      current_epoch: 0,
+    }
+  }
+
+  /// Fold one durable configuration observation `(epoch, config_id, prev_epoch)` into the lineage,
+  /// returning a violation on a FORK. Pure over its inputs so the chaining logic is unit-testable
+  /// without a live `Cluster`. The rules:
+  ///
+  /// - A `config_id` re-observed at a known epoch must MATCH the recorded one (the same durable
+  ///   configuration seen again — every node carries it). A DIFFERENT id at a known epoch is a fork.
+  /// - A NEW epoch (above the current) is a successor: its `prev_epoch` must name the recorded current
+  ///   epoch (it chains off the lineage tip), and the new epoch becomes current. A successor whose
+  ///   `prev_epoch` is some OTHER epoch forked off a stale parent.
+  ///
+  /// The genesis observation (`epoch == 0`, nothing recorded yet) seeds the lineage.
+  fn note(&mut self, epoch: u64, config_id: u128, prev_epoch: u64) -> CheckResult {
+    if let Some(&known) = self.lineage.get(&epoch) {
+      if known != config_id {
+        return CheckResult::violation(format!(
+          "configuration fork: epoch {epoch} carries two different config_ids ({known:#x} vs \
+           {config_id:#x}) — two configurations claim the same epoch"
+        ));
+      }
+      return CheckResult::Ok;
+    }
+    // A NEW epoch. Genesis (the first observation) seeds the lineage with no predecessor to chain.
+    if !self.lineage.is_empty() {
+      if epoch <= self.current_epoch {
+        // A new (never-recorded) config_id at or below the current epoch is a fork off a stale tip:
+        // the lineage already advanced past `epoch`, so a fresh configuration cannot legitimately
+        // appear there.
+        return CheckResult::violation(format!(
+          "configuration fork: a new config_id {config_id:#x} appeared at epoch {epoch} at or below \
+           the current lineage epoch {} — a successor must extend the tip, not branch below it",
+          self.current_epoch
+        ));
+      }
+      if prev_epoch != self.current_epoch {
+        return CheckResult::violation(format!(
+          "configuration fork: epoch {epoch}'s config chains from prev_epoch {prev_epoch}, not the \
+           current lineage epoch {} — a non-chained successor (a fork off a stale parent)",
+          self.current_epoch
+        ));
+      }
+    }
+    self.lineage.insert(epoch, config_id);
+    self.current_epoch = self.current_epoch.max(epoch);
+    CheckResult::Ok
+  }
+
+  /// Sample the cluster: fold every operational replica's durable `(epoch, config_id, prev_epoch)`
+  /// into the lineage, returning a violation on a fork. A crashed replica is skipped (its durable
+  /// root is read only on its next recover); a removed (`Retired`) slot still carries a valid
+  /// historical configuration, so it is folded like any other — agreement makes every node that holds
+  /// epoch K carry the SAME config_id, so the per-epoch uniqueness check is exactly the fork net.
+  /// Call every tick.
+  pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
+    for i in 0..cluster.replica_count() {
+      if cluster.is_crashed(i) {
+        continue;
+      }
+      let epoch = cluster.replica_durable_epoch(i).get();
+      let config_id = cluster.replica_durable_config_id(i);
+      let prev_epoch = cluster.replica_durable_prev_epoch(i).get();
+      if let v @ CheckResult::Violation(_) = self.note(epoch, config_id, prev_epoch) {
+        return v;
+      }
     }
     CheckResult::Ok
   }
@@ -1418,5 +1619,114 @@ mod tests {
         break;
       }
     }
+  }
+
+  #[test]
+  fn epoch_view_checker_allows_a_per_epoch_view_reset_but_flags_a_same_epoch_view_drop() {
+    let mut ev = EpochViewMonotonicChecker::new(1);
+    // View climbs within epoch 0.
+    assert!(ev.note(0, 0, 0).is_ok());
+    assert!(ev.note(0, 0, 5).is_ok());
+    // A view DROP at the SAME epoch is a split-brain regression.
+    assert!(
+      ev.note(0, 0, 4).is_violation(),
+      "a view drop within an epoch must be flagged"
+    );
+    // A view drop is allowed when the EPOCH rose (the per-epoch view reset): epoch 1, view 0.
+    let mut ev = EpochViewMonotonicChecker::new(1);
+    assert!(ev.note(0, 0, 5).is_ok());
+    assert!(
+      ev.note(0, 1, 0).is_ok(),
+      "a view reset to 0 at a higher epoch is the legitimate per-epoch reset"
+    );
+    // The pair is lexicographic: at the higher epoch the view climbs again.
+    assert!(ev.note(0, 1, 3).is_ok());
+    assert!(
+      ev.note(0, 1, 2).is_violation(),
+      "a view drop within the new epoch is still a regression"
+    );
+  }
+
+  #[test]
+  fn epoch_view_checker_flags_an_epoch_regression() {
+    let mut ev = EpochViewMonotonicChecker::new(1);
+    assert!(ev.note(0, 2, 1).is_ok());
+    // ANY epoch regression is a split-brain hazard, even with a higher view.
+    assert!(
+      ev.note(0, 1, 99).is_violation(),
+      "an epoch regression (even to a higher view) must be flagged"
+    );
+  }
+
+  #[test]
+  fn membership_checker_chains_a_lineage_and_flags_a_fork() {
+    // Genesis seeds the lineage; a chained successor (prev_epoch == current) extends it.
+    let mut m = MembershipMonotonicChecker::new();
+    assert!(m.note(0, 0xAAAA, 0).is_ok()); // epoch 0, config A (genesis)
+    assert!(m.note(0, 0xAAAA, 0).is_ok()); // the same config re-observed (another node) — fine
+    assert!(
+      m.note(1, 0xBBBB, 0).is_ok(),
+      "epoch 1 chaining from prev_epoch 0 (the current tip) extends the lineage"
+    );
+    assert!(m.note(2, 0xCCCC, 1).is_ok(), "epoch 2 chains from epoch 1");
+    // A FORK: a different config_id re-observed at a KNOWN epoch (two configs claim epoch 1).
+    assert!(
+      m.note(1, 0x9999, 0).is_violation(),
+      "two different config_ids at the same epoch is a fork"
+    );
+  }
+
+  #[test]
+  fn membership_checker_flags_a_non_chained_successor() {
+    // A successor whose prev_epoch is NOT the current tip is a fork off a stale parent.
+    let mut m = MembershipMonotonicChecker::new();
+    assert!(m.note(0, 0xAAAA, 0).is_ok());
+    assert!(m.note(1, 0xBBBB, 0).is_ok()); // current tip is now epoch 1
+    assert!(
+      m.note(2, 0xCCCC, 0).is_violation(),
+      "epoch 2 chaining from prev_epoch 0 (not the current tip 1) is a non-chained successor"
+    );
+  }
+
+  #[test]
+  fn durability_checker_excuses_a_removed_slot_from_the_survivor_scan() {
+    // Two replicas agree on a 3-op committed history; then a reconfiguration REMOVES replica 1. With
+    // replica 1 crashed (parked) and excused via `note_removed`, the final check must still pass
+    // because the SURVIVOR (replica 0) retains the history — the removed node is no longer a required
+    // holder. Without the excusal, a removed-then-crashed node could spuriously fail the check.
+    use crate::Cluster;
+    let mut c = Cluster::new(3, 2, 3, 9);
+    let mut dur = DurabilityChecker::new(c.replica_count());
+    for _ in 0..50_000 {
+      c.tick();
+      assert!(dur.observe(&c).is_ok());
+      if (0..c.client_count()).all(|i| c.client(i).is_done()) {
+        break;
+      }
+    }
+    assert!(c.replica_commit(0).get() >= 1, "the cluster committed ops");
+    // Model a removal: replica 2 is crashed (parked) AND excused. The survivors 0,1 still hold the
+    // history, so the check passes — the removed node was correctly dropped from the required set.
+    c.crash(2);
+    dur.note_removed(2);
+    assert!(
+      dur.check(&c).is_ok(),
+      "a removed (excused) crashed node does not break the no-loss check while survivors retain the \
+       history"
+    );
+    // Crash a SURVIVOR too: now only replica 0 is operational and not removed — still holds the full
+    // history, so the check passes (the removal did not relax the survivors' obligation).
+    c.crash(1);
+    assert!(
+      dur.check(&c).is_ok(),
+      "the surviving operational replica still retains the committed history"
+    );
+    // Crash the last survivor: NO operational non-removed replica retains the history → the check must
+    // FAIL (removal excuses only the removed node, never the headline no-loss guarantee).
+    c.crash(0);
+    assert!(
+      dur.check(&c).is_violation(),
+      "with no operational non-removed replica retaining the history the no-loss check must fail"
+    );
   }
 }

@@ -57,8 +57,8 @@ use viewstamp_proto::{Instant, Prng};
 
 use crate::{
   checker::{
-    AppliedOnceChecker, BoundednessChecker, DurabilityChecker, StalenessChecker,
-    ViewMonotonicChecker, check_safety,
+    AppliedOnceChecker, BoundednessChecker, DurabilityChecker, EpochViewMonotonicChecker,
+    MembershipMonotonicChecker, StalenessChecker, ViewMonotonicChecker, check_safety,
   },
   cluster::Cluster,
   network::Faults,
@@ -756,6 +756,15 @@ struct Vopr {
   /// at [`Self::learner_crash_until`], on calm-window entry, and by the final quiesce. NOT counted
   /// against the minority budget — a learner outage must never reduce voter fault tolerance.
   learner_crashed: Option<usize>,
+  /// The durable `(epoch, view)` split-brain regression net, observed every tick. Held on the driver
+  /// (not threaded through [`Self::check_invariants`]'s already-long signature) because it is a pure
+  /// observation — no PRNG draw, no cluster mutation — so running it every tick leaves the applied
+  /// digest byte-identical. It watches the static `(epoch 0, view 0)` lineage the foundation maintains:
+  /// the durable `(epoch, view)` pair never regresses lexicographically.
+  epoch_view: EpochViewMonotonicChecker,
+  /// The `config_id` lineage fork net, observed every tick (same on-driver rationale as
+  /// [`Self::epoch_view`]): the durable configuration history is a single non-forking chain.
+  membership: MembershipMonotonicChecker,
   /// Per-replica last-observed session-eviction count, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
   sessions_evicted_seen: Vec<u64>,
@@ -1198,6 +1207,8 @@ impl Vopr {
       learner_repairs_seen: vec![0; node_count],
       learner_crash_until: 0,
       learner_crashed: None,
+      epoch_view: EpochViewMonotonicChecker::new(node_count),
+      membership: MembershipMonotonicChecker::new(),
       sessions_evicted_seen: vec![0; node_count],
       wiped_pending: Vec::new(),
       report: VoprReport {
@@ -1445,6 +1456,9 @@ impl Vopr {
     } else {
       0
     };
+    // `VOPR_NO_PERM` masks PERMANENT corruption (torn-write / bit-rot of an already-durable committed
+    // slot), leaving the TRANSIENT faults (read / misdirect / corrupt-checkpoint, all of which clear on
+    // retry) on — an opt-in escape hatch for isolating a transient-fault repro.
     let mask_perm = env_flag("VOPR_NO_PERM");
     StorageFaults {
       read_fault_per_mille: if env_flag("VOPR_NO_READFAULT") {
@@ -1523,7 +1537,8 @@ impl Vopr {
     self.heal_all_partitions(c);
     self.end_slow_episode(c);
     for i in 0..self.node_count {
-      if c.is_crashed(i) && Some(i) != self.learner_crashed {
+      // A retired (reconfiguration-removed) node is parked crashed-forever — never restart it.
+      if c.is_crashed(i) && !c.is_retired(i) && Some(i) != self.learner_crashed {
         self.restart_and_track(c, i);
       }
     }
@@ -1593,11 +1608,12 @@ impl Vopr {
     bound: &BoundednessChecker,
   ) {
     // Heal: all partitions (symmetric and one-way) cleared, any slow episode ended, every crashed
-    // replica restarted, no network/storage chaos.
+    // replica restarted (EXCEPT a retired one — a reconfiguration removed it; it stays parked), no
+    // network/storage chaos.
     self.heal_all_partitions(c);
     self.end_slow_episode(c);
     for i in 0..self.node_count {
-      if c.is_crashed(i) {
+      if c.is_crashed(i) && !c.is_retired(i) {
         self.restart_and_track(c, i);
       }
     }
@@ -1974,7 +1990,7 @@ impl Vopr {
         && self.node_count > self.voting_count
       {
         let candidates: Vec<usize> = (self.voting_count..self.node_count)
-          .filter(|&i| !c.is_crashed(i))
+          .filter(|&i| !c.is_crashed(i) && !c.is_retired(i))
           .collect();
         if let Some(l) = self.pick(&candidates) {
           // A long outage (a few calm windows wide) so voter progress is genuinely owed while the
@@ -1998,9 +2014,12 @@ impl Vopr {
   /// it simply restores the learner so it rejoins and converges.
   fn end_learner_crash(&mut self, c: &mut Cluster) {
     // `take()` always clears the bookkeeping; the restart runs only if the learner is still down (the
-    // generic restart action / calm window / final quiesce may have restarted it already).
+    // generic restart action / calm window / final quiesce may have restarted it already) AND not
+    // retired (a reconfiguration could have REMOVED this learner while it was crashed — a retired node
+    // is parked, never restarted).
     if let Some(l) = self.learner_crashed.take()
       && c.is_crashed(l)
+      && !c.is_retired(l)
     {
       self.restart_and_track(c, l);
     }
@@ -2134,9 +2153,13 @@ impl Vopr {
     }
   }
 
-  /// Pick a currently-crashed replica to restart, if any.
+  /// Pick a currently-crashed replica to restart, if any. Excludes a RETIRED node (a reconfiguration
+  /// removed it; it is parked crashed-forever and must never be restarted — a restart would recover it
+  /// `Retired` and panic).
   fn pick_crashed(&mut self, c: &Cluster) -> Option<usize> {
-    let candidates: Vec<usize> = (0..self.node_count).filter(|&i| c.is_crashed(i)).collect();
+    let candidates: Vec<usize> = (0..self.node_count)
+      .filter(|&i| c.is_crashed(i) && !c.is_retired(i))
+      .collect();
     self.pick(&candidates)
   }
 
@@ -2180,12 +2203,16 @@ impl Vopr {
     use crate::checker::CheckResult::Violation;
 
     // Tell the stateful checkers about any wipe since the last check, BEFORE they observe: the wiped
-    // replica's per-replica monotonicity baselines (durable view, checkpoint high-water) are forfeit
-    // with its disk — its fresh superblock honestly reads view 0 / checkpoint 0, which is the amnesia
-    // itself, not a checker artifact. Every CLUSTER-level invariant below stays at full strength.
-    for i in self.wiped_pending.drain(..) {
+    // replica's per-replica monotonicity baselines (durable view, checkpoint high-water, durable
+    // (epoch, view)) are forfeit with its disk — its fresh superblock honestly reads epoch 0 / view 0
+    // / checkpoint 0, which is the amnesia itself, not a checker artifact. Every CLUSTER-level
+    // invariant below stays at full strength. (Drained into a local first so the on-driver
+    // `epoch_view` checker can be told without a second `&mut self` borrow conflicting with the drain.)
+    let wiped: Vec<usize> = self.wiped_pending.drain(..).collect();
+    for i in wiped {
       dur.note_wipe(i);
       vm.note_wipe(i);
+      self.epoch_view.note_wipe(i);
     }
 
     // Append-before-ack, observed during the tick we just ran (PrepareOk for a non-durable op).
@@ -2233,6 +2260,24 @@ impl Vopr {
     }
     if let Violation(why) = vm.observe(c) {
       panic!("vopr seed {} tick {tick}: view-monotonic: {why}", self.seed);
+    }
+    // The split-brain regression net: the durable `(epoch, view)` pair never regresses
+    // lexicographically (a view drop is legitimate ONLY when the epoch rose — the per-epoch view reset
+    // an epoch transition produces). Observed every tick; it watches the static `(epoch 0, view 0)`
+    // lineage the foundation maintains.
+    if let Violation(why) = self.epoch_view.observe(c) {
+      panic!(
+        "vopr seed {} tick {tick}: epoch-view-monotonic: {why}",
+        self.seed
+      );
+    }
+    // The configuration lineage fork net: the durable `config_id` history is a single non-forking
+    // chain (every successor chains off the recorded current configuration). Observed every tick.
+    if let Violation(why) = self.membership.observe(c) {
+      panic!(
+        "vopr seed {} tick {tick}: membership-monotonic: {why}",
+        self.seed
+      );
     }
     if let Violation(why) = bound.observe(c) {
       panic!("vopr seed {} tick {tick}: boundedness: {why}", self.seed);
@@ -2503,8 +2548,11 @@ impl Vopr {
     }
     for (i, log) in logs.iter().enumerate() {
       eprintln!(
-        "  replica {i}: crashed={} view={} op={} commit_min={} commit_max={} checkpoint_op={} applied_len={}",
+        "  replica {i}: crashed={} retired={} status={} epoch={} view={} op={} commit_min={} commit_max={} checkpoint_op={} applied_len={}",
         c.is_crashed(i),
+        c.is_retired(i),
+        c.replica_status_str(i),
+        c.replica_durable_epoch(i).get(),
         c.replica_view(i).get(),
         c.replica_op(i).get(),
         c.replica_commit(i).get(),

@@ -26,6 +26,7 @@ fn on_request_prepare_holder_replies_with_the_prepare() {
       View::new(),
       OpNumber::with(1),
       ReplicaId::new(2),
+      0,
     )),
   );
   let out = e.poll_message().expect("holder answers RequestPrepare");
@@ -59,6 +60,7 @@ fn on_request_prepare_for_an_op_we_lack_is_silent() {
       View::new(),
       OpNumber::with(9),
       ReplicaId::new(2),
+      0,
     )),
   );
   assert!(
@@ -106,6 +108,7 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
       View::new(),
       OpNumber::with(2),
       ReplicaId::new(2),
+      0,
     )),
   );
   match e
@@ -133,6 +136,7 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
       View::new(),
       OpNumber::with(1),
       ReplicaId::new(2),
+      0,
     )),
   );
   match e
@@ -160,6 +164,7 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
       View::new(),
       OpNumber::with(3),
       ReplicaId::new(2),
+      0,
     )),
   );
   assert!(
@@ -182,7 +187,13 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(r.commit(), OpNumber::with(1), "held at the hole");
 
@@ -236,7 +247,13 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(r.commit(), OpNumber::with(1));
   // A Prepare for op 5 (not our hole, op 2) is rejected by the placement check (`repair.contains`).
@@ -291,7 +308,13 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(3), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert_eq!(r.commit(), OpNumber::with(1), "held at the hole");
 
@@ -373,7 +396,13 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
       &mut wal,
       &mut sb,
       primary_peer(),
-      Message::Commit(Commit::new(View::new(), OpNumber::with(4), OpNumber::new())),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(4),
+        OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
+      )),
     );
     assert_eq!(
       r.commit(),
@@ -457,9 +486,10 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
   };
   let mut wal = ScriptedWal::with_entries(3);
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot is permanently faulty → dropped
-  let cfg = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, 0, CountSm::default(), &mut wal, &mut sb);
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
   for _ in 0..32 {
     r.handle_storage(now, &mut wal, &mut sb);
     if !r.status().is_recovering() {
@@ -479,7 +509,13 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
     &mut wal,
     &mut sb,
     primary_peer(),
-    Message::Commit(Commit::new(View::new(), OpNumber::with(2), OpNumber::new())),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
   );
   assert!(
     r.has_repair_hole_for_test(2),
