@@ -8,15 +8,66 @@ use std::vec::Vec;
 
 use rustls::pki_types::CertificateDer;
 
-use crate::{ClientId, Peer, ReplicaId};
+use crate::{ClientId, MemberId};
+
+// ── AttestedId ────────────────────────────────────────────────────────────────
+
+/// The stable identity a peer attests in its handshake material — a replica's slot-decoupled
+/// [`MemberId`] or a client's [`ClientId`].
+///
+/// A replica attests its globally-unique [`MemberId`], NOT the [`ReplicaId`](crate::ReplicaId) slot it
+/// currently occupies: the slot is a property of the active membership, so the coordinator resolves
+/// `MemberId` → slot against its own membership when it binds (see
+/// [`apply_outcome`](super::QuicCoordinator)). This is the attested candidate the coordinator
+/// re-checks; it never binds a routing slot directly from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestedId {
+  /// A replica attesting its stable [`MemberId`] (resolved to a routing slot at bind time).
+  Replica(MemberId),
+  /// A client attesting its [`ClientId`].
+  Client(ClientId),
+}
+
+impl AttestedId {
+  /// True iff this is a replica's attested identity.
+  #[inline(always)]
+  pub const fn is_replica(&self) -> bool {
+    matches!(self, Self::Replica(_))
+  }
+
+  /// True iff this is a client's attested identity.
+  #[inline(always)]
+  pub const fn is_client(&self) -> bool {
+    matches!(self, Self::Client(_))
+  }
+
+  /// The attested [`MemberId`], if this is a replica identity.
+  #[inline(always)]
+  pub const fn as_replica(&self) -> Option<MemberId> {
+    match self {
+      Self::Replica(m) => Some(*m),
+      Self::Client(_) => None,
+    }
+  }
+
+  /// The attested [`ClientId`], if this is a client identity.
+  #[inline(always)]
+  pub const fn as_client(&self) -> Option<ClientId> {
+    match self {
+      Self::Client(c) => Some(*c),
+      Self::Replica(_) => None,
+    }
+  }
+}
 
 // ── Identified ────────────────────────────────────────────────────────────────
 
 /// A settled, authenticated peer identity — an UNTRUSTED candidate the coordinator re-checks.
 ///
-/// Carries BOTH the attested peer AND the cluster it was attested for. The source REPORTS the cluster
-/// it parsed (from the hello frame or the cert extension); the coordinator then re-asserts that
-/// cluster equals its own `Config.cluster`.
+/// Carries BOTH the attested identity AND the cluster it was attested for. The source REPORTS the
+/// cluster it parsed (from the hello frame or the cert extension); the coordinator then re-asserts that
+/// cluster equals its own `Config.cluster`, and resolves the [`AttestedId`] (a replica's stable
+/// [`MemberId`]) against its active membership to a routing slot.
 ///
 /// For the PROVIDED sources ([`Hello`] / [`CertOid`]) this re-assertion is an un-bypassable gate: they
 /// report the GENUINE attested cluster they parsed from the handshake material, so the coordinator's
@@ -26,22 +77,23 @@ use crate::{ClientId, Peer, ReplicaId};
 /// cluster that source asserts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Identified {
-  who: Peer,
+  id: AttestedId,
   cluster: u128,
 }
 
 impl Identified {
-  /// Wrap a claimed peer attested for `cluster` (the coordinator re-checks BOTH before binding). The
-  /// provided sources pass the genuine parsed cluster; a custom source is trusted to pass the cluster
-  /// it actually attested (see the type docs).
-  pub const fn new(who: Peer, cluster: u128) -> Self {
-    Self { who, cluster }
+  /// Wrap a claimed [`AttestedId`] attested for `cluster` (the coordinator re-checks BOTH before
+  /// binding, resolving a replica's [`MemberId`] to a slot against its active membership). The provided
+  /// sources pass the genuine parsed cluster; a custom source is trusted to pass the cluster it actually
+  /// attested (see the type docs).
+  pub const fn new(id: AttestedId, cluster: u128) -> Self {
+    Self { id, cluster }
   }
 
-  /// The claimed peer identity.
+  /// The claimed attested identity (a replica's stable [`MemberId`], or a [`ClientId`]).
   #[inline(always)]
-  pub const fn who(&self) -> Peer {
-    self.who
+  pub const fn id(&self) -> AttestedId {
+    self.id
   }
 
   /// The cluster this identity was attested for. The coordinator binds only when this equals its own
@@ -132,7 +184,7 @@ impl<'a> IdentityCtx<'a> {
 
 // ── IdentitySource ────────────────────────────────────────────────────────────
 
-/// Establishes the authenticated [`Peer`] for a QUIC connection.
+/// Establishes the authenticated [`AttestedId`] for a QUIC connection.
 ///
 /// One impl per cluster, chosen at coordinator construction. Requires cluster-private roots +
 /// mandatory mTLS (supplied via [`ClusterTls`](super::ClusterTls)).
@@ -141,8 +193,9 @@ impl<'a> IdentityCtx<'a> {
 /// UNTRUSTED candidate; the coordinator does the dialed→match-or-abort / accepted→adopt step and
 /// the unconditional `cluster == Config.cluster` cross-check.
 pub trait IdentitySource {
-  /// Append this node's control-channel preface to `out`. Written as the FIRST frame on the
-  /// control send-stream. Impls whose identity rides entirely in the TLS certificate write nothing.
+  /// Append this node's control-channel preface to `out`, attesting `me` (this node's stable
+  /// [`AttestedId`] — a replica's [`MemberId`]). Written as the FIRST frame on the control send-stream.
+  /// Impls whose identity rides entirely in the TLS certificate write nothing.
   ///
   /// # Size contract
   ///
@@ -154,12 +207,12 @@ pub trait IdentitySource {
   /// [`dangerous_custom_identity`](super::QuicCoordinator::dangerous_custom_identity) that violates it
   /// does not panic the transport: the bridge counts the oversized preface and tears the connection
   /// down (it can never authenticate, since the frame would not decode).
-  fn write_control_preface(&self, me: Peer, out: &mut Vec<u8>);
+  fn write_control_preface(&self, me: AttestedId, out: &mut Vec<u8>);
 
   /// Authenticate the peer from handshake material only.
   ///
-  /// The returned `who` inside [`IdentityOutcome::Identified`] is a CANDIDATE the coordinator
-  /// re-checks (dialed-match / cluster cross-check) — never a binding.
+  /// The returned [`AttestedId`] inside [`IdentityOutcome::Identified`] is a CANDIDATE the coordinator
+  /// re-checks (dialed-match / cluster cross-check / `MemberId`→slot resolution) — never a binding.
   fn authenticate(&self, ctx: &IdentityCtx<'_>) -> IdentityOutcome;
 }
 
@@ -187,9 +240,29 @@ impl Hello {
   }
 }
 
+/// Map an [`AttestedId`] to the `labeled` hello codec's slot-agnostic [`HelloId`] (a replica's stable
+/// [`MemberId`] as the raw 16-byte id).
+fn hello_id_of(id: AttestedId) -> crate::transport::labeled::HelloId {
+  use crate::transport::labeled::HelloId;
+  match id {
+    AttestedId::Replica(m) => HelloId::Replica(m.get()),
+    AttestedId::Client(c) => HelloId::Client(c),
+  }
+}
+
+/// Map a parsed [`HelloId`] back to an [`AttestedId`]: the replica's raw 16-byte id IS its stable
+/// [`MemberId`] (the full u128 range — no slot narrowing).
+fn attested_of(id: crate::transport::labeled::HelloId) -> AttestedId {
+  use crate::transport::labeled::HelloId;
+  match id {
+    HelloId::Replica(m) => AttestedId::Replica(MemberId::new(m)),
+    HelloId::Client(c) => AttestedId::Client(c),
+  }
+}
+
 impl IdentitySource for Hello {
-  fn write_control_preface(&self, me: Peer, out: &mut Vec<u8>) {
-    crate::transport::labeled::encode_hello(self.cluster, me, out);
+  fn write_control_preface(&self, me: AttestedId, out: &mut Vec<u8>) {
+    crate::transport::labeled::encode_hello(self.cluster, hello_id_of(me), out);
   }
 
   fn authenticate(&self, ctx: &IdentityCtx<'_>) -> IdentityOutcome {
@@ -211,8 +284,10 @@ impl IdentitySource for Hello {
       // so require the consumed length to equal the frame's full length — any trailing byte (a valid-cert
       // but buggy/version-skew peer framing a hello plus junk) is rejected, not validated on the prefix.
       // The bridge frames our own hello as one exact Control frame, so a legitimate hello satisfies this.
-      HelloOutcome::Accepted(peer, consumed) if consumed == frame.len() => {
-        IdentityOutcome::Identified(Identified::new(peer, ctx.our_cluster()))
+      // The replica claim is the FULL u128 MemberId (no slot narrowing); the coordinator resolves it
+      // against the active membership when it binds.
+      HelloOutcome::Accepted(claimed, consumed) if consumed == frame.len() => {
+        IdentityOutcome::Identified(Identified::new(attested_of(claimed), ctx.our_cluster()))
       }
       HelloOutcome::Accepted(..) => IdentityOutcome::Rejected,
       // A DELIVERED first Control frame is the SOLE Hello opportunity (the bridge already popped the whole
@@ -245,20 +320,22 @@ const IDENTITY_EXT_LEN: usize = 16 + 1 + 16;
 
 /// Encode the fixed `cluster(16 BE) || kind(1) || id(16 BE)` identity extension value (33 bytes).
 ///
-/// A replica's id is its `u16` index widened to the 16-byte field; a client's id is its full `u128`.
+/// A replica's id is its stable [`MemberId`] (the FULL 16-byte field, NOT a slot); a client's id is its
+/// full [`ClientId`]. The CA attests this stable identity; the coordinator resolves a replica's
+/// `MemberId` to a routing slot against the active membership when it binds.
 #[cfg_attr(
   not(test),
   expect(dead_code, reason = "only the #[cfg(test)] cert generator encodes")
 )]
-pub(crate) fn encode_identity_ext(cluster: u128, who: Peer) -> Vec<u8> {
+pub(crate) fn encode_identity_ext(cluster: u128, who: AttestedId) -> Vec<u8> {
   let mut out = Vec::with_capacity(IDENTITY_EXT_LEN);
   out.extend_from_slice(&cluster.to_be_bytes());
   match who {
-    Peer::Replica(r) => {
+    AttestedId::Replica(m) => {
       out.push(KIND_REPLICA);
-      out.extend_from_slice(&u128::from(r.get()).to_be_bytes());
+      out.extend_from_slice(&m.get().to_be_bytes());
     }
-    Peer::Client(c) => {
+    AttestedId::Client(c) => {
       out.push(KIND_CLIENT);
       out.extend_from_slice(&c.get().to_be_bytes());
     }
@@ -268,9 +345,10 @@ pub(crate) fn encode_identity_ext(cluster: u128, who: Peer) -> Vec<u8> {
 
 /// Total-parse the identity extension value against `expected_cluster`.
 ///
-/// Rejects: any length other than 33; a cluster that is not `expected_cluster`; an unknown kind
-/// byte; and a replica id whose 16-byte field exceeds `u16::MAX` (a replica index must fit
-/// [`ReplicaId`]). On success returns the attested peer AND the attested cluster as a candidate the
+/// Rejects: any length other than 33; a cluster that is not `expected_cluster`; and an unknown kind
+/// byte. A replica's 16-byte id IS its stable [`MemberId`] — the FULL u128 range, so there is NO slot
+/// narrowing here (the coordinator resolves it to a slot against the active membership when it binds).
+/// On success returns the attested [`AttestedId`] AND the attested cluster as a candidate the
 /// coordinator re-checks (the cluster equals `expected_cluster`, which on the live path is the
 /// endpoint's own cluster — so the coordinator re-asserts it against `Config.cluster`).
 fn parse_identity_ext(value: &[u8], expected_cluster: u128) -> IdentityOutcome {
@@ -284,11 +362,8 @@ fn parse_identity_ext(value: &[u8], expected_cluster: u128) -> IdentityOutcome {
   let kind = value[16];
   let id = u128::from_be_bytes(value[17..33].try_into().expect("16 bytes"));
   let who = match kind {
-    KIND_REPLICA => match u16::try_from(id) {
-      Ok(index) => Peer::Replica(ReplicaId::new(index)),
-      Err(_) => return IdentityOutcome::Rejected,
-    },
-    KIND_CLIENT => Peer::Client(ClientId::new(id)),
+    KIND_REPLICA => AttestedId::Replica(MemberId::new(id)),
+    KIND_CLIENT => AttestedId::Client(ClientId::new(id)),
     _ => return IdentityOutcome::Rejected,
   };
   IdentityOutcome::Identified(Identified::new(who, cluster))
@@ -333,7 +408,7 @@ impl CertOid {
 }
 
 impl IdentitySource for CertOid {
-  fn write_control_preface(&self, _me: Peer, _out: &mut Vec<u8>) {
+  fn write_control_preface(&self, _me: AttestedId, _out: &mut Vec<u8>) {
     // Empty: a `CertOid` peer's identity rides in the validated certificate, not the control stream.
   }
 
@@ -425,7 +500,7 @@ pub enum ProvidedIdentity {
 }
 
 impl IdentitySource for ProvidedIdentity {
-  fn write_control_preface(&self, me: Peer, out: &mut Vec<u8>) {
+  fn write_control_preface(&self, me: AttestedId, out: &mut Vec<u8>) {
     match self {
       Self::Hello(h) => h.write_control_preface(me, out),
       Self::CertOid(c) => c.write_control_preface(me, out),
@@ -445,15 +520,35 @@ impl IdentitySource for ProvidedIdentity {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::MemberId;
+
+  /// The attested replica id for member `m`.
+  fn replica(m: u128) -> AttestedId {
+    AttestedId::Replica(MemberId::new(m))
+  }
+
+  #[test]
+  fn attested_id_predicates() {
+    let r = AttestedId::Replica(MemberId::new(2));
+    assert!(r.is_replica());
+    assert!(!r.is_client());
+    assert_eq!(r.as_replica(), Some(MemberId::new(2)));
+    assert_eq!(r.as_client(), None);
+    let c = AttestedId::Client(ClientId::new(9));
+    assert!(c.is_client());
+    assert!(!c.is_replica());
+    assert_eq!(c.as_client(), Some(ClientId::new(9)));
+    assert_eq!(c.as_replica(), None);
+  }
 
   #[test]
   fn outcome_predicates() {
-    let id = IdentityOutcome::Identified(Identified::new(Peer::Replica(ReplicaId::new(2)), 0x5151));
+    let id = IdentityOutcome::Identified(Identified::new(replica(2), 0x5151));
     assert!(id.is_identified());
     assert!(IdentityOutcome::Pending.is_pending());
     assert!(IdentityOutcome::Rejected.is_rejected());
     let unwrapped = id.try_unwrap_identified().unwrap();
-    assert_eq!(unwrapped.who(), Peer::Replica(ReplicaId::new(2)));
+    assert_eq!(unwrapped.id(), replica(2));
     assert_eq!(
       unwrapped.cluster(),
       0x5151,
@@ -466,12 +561,12 @@ mod tests {
     let cluster = 0x5151_u128;
     let src = Hello::new(cluster);
     let mut frame = Vec::new();
-    src.write_control_preface(Peer::Replica(ReplicaId::new(1)), &mut frame);
+    src.write_control_preface(replica(1), &mut frame);
     let id = src
       .authenticate(&IdentityCtx::new(&[], Some(&frame), cluster))
       .try_unwrap_identified()
       .unwrap();
-    assert_eq!(id.who(), Peer::Replica(ReplicaId::new(1)));
+    assert_eq!(id.id(), replica(1));
     assert_eq!(
       id.cluster(),
       cluster,
@@ -482,6 +577,60 @@ mod tests {
       Hello::new(0x9999)
         .authenticate(&IdentityCtx::new(&[], Some(&frame), 0x9999))
         .is_rejected()
+    );
+  }
+
+  /// A replica's attested identity is its FULL u128 [`MemberId`] — including beyond `u16::MAX` — and it
+  /// round-trips through BOTH the cert-OID extension AND the Hello preface with NO slot narrowing. This
+  /// pins that the old `u16::try_from` narrowing is gone: the whole member id is carried either way.
+  #[test]
+  fn a_member_id_beyond_u16_round_trips_through_the_cert_and_the_hello() {
+    use crate::transport::quic::crypto::test_ca;
+
+    let cluster = 0x5151_u128;
+    let big = u128::from(u16::MAX) + 1; // 0x1_0000 — does NOT fit u16
+    let attested = AttestedId::Replica(MemberId::new(big));
+
+    // Cert-OID path: a CA-attested ext for the big member id parses back to the same MemberId.
+    let ca = test_ca();
+    let cert = ca.issue_replica_with_member_oid(0, MemberId::new(big), cluster);
+    let der = [cert.end_entity_der()];
+    assert_eq!(
+      CertOid::new(cluster)
+        .authenticate(&IdentityCtx::new(&der, None, cluster))
+        .try_unwrap_identified()
+        .unwrap()
+        .id(),
+      attested,
+      "the cert-OID carries the full u128 MemberId (no u16 narrowing)"
+    );
+
+    // Hello path: the same big member id round-trips through the preface codec.
+    let mut frame = Vec::new();
+    Hello::new(cluster).write_control_preface(attested, &mut frame);
+    assert_eq!(
+      Hello::new(cluster)
+        .authenticate(&IdentityCtx::new(&[], Some(&frame), cluster))
+        .try_unwrap_identified()
+        .unwrap()
+        .id(),
+      attested,
+      "the Hello preface carries the full u128 MemberId (no u16 narrowing)"
+    );
+
+    // And the raw extension value parses to the big MemberId directly.
+    let ext = encode_identity_ext(cluster, attested);
+    assert_eq!(
+      ext.len(),
+      33,
+      "the id field stays 16 bytes (no wire-size change)"
+    );
+    assert_eq!(
+      parse_identity_ext(&ext, cluster)
+        .try_unwrap_identified()
+        .unwrap()
+        .id(),
+      attested
     );
   }
 
@@ -499,7 +648,7 @@ mod tests {
 
     // The exact hello validates.
     let mut exact = Vec::new();
-    src.write_control_preface(Peer::Replica(ReplicaId::new(1)), &mut exact);
+    src.write_control_preface(replica(1), &mut exact);
     assert!(
       src
         .authenticate(&IdentityCtx::new(&[], Some(&exact), cluster))
@@ -570,7 +719,7 @@ mod tests {
     // (delivered, short) A SHORT hello prefix (a valid tag+version but truncated before the peer id) is
     // `HelloOutcome::Incomplete`; as a delivered first frame it must be REJECTED, not Pending.
     let mut full = Vec::new();
-    src.write_control_preface(Peer::Replica(ReplicaId::new(1)), &mut full);
+    src.write_control_preface(replica(1), &mut full);
     let short = &full[..full.len() - 1]; // drop the last byte → a valid prefix that does not complete
     assert!(
       matches!(
@@ -608,8 +757,7 @@ mod tests {
     let endpoint_cluster = 0x5151_u128;
     // Hello: a source CONFIGURED for a different cluster still parses against the ctx and reports it.
     let mut frame = Vec::new();
-    Hello::new(endpoint_cluster)
-      .write_control_preface(Peer::Replica(ReplicaId::new(1)), &mut frame);
+    Hello::new(endpoint_cluster).write_control_preface(replica(1), &mut frame);
     let id = Hello::new(0xBEEF) // source field intentionally != endpoint cluster
       .authenticate(&IdentityCtx::new(&[], Some(&frame), endpoint_cluster))
       .try_unwrap_identified()
@@ -628,7 +776,7 @@ mod tests {
       .authenticate(&IdentityCtx::new(&der, None, endpoint_cluster))
       .try_unwrap_identified()
       .unwrap();
-    assert_eq!(id.who(), Peer::Replica(ReplicaId::new(2)));
+    assert_eq!(id.id(), replica(2));
     assert_eq!(
       id.cluster(),
       endpoint_cluster,
@@ -638,27 +786,28 @@ mod tests {
 
   #[test]
   fn identity_ext_round_trips_and_rejects_malformed() {
-    use crate::ClientId;
-
     let cluster = 0x5151_u128;
-    // Replica round-trip.
-    let r = encode_identity_ext(cluster, Peer::Replica(ReplicaId::new(7)));
+    // Replica round-trip (the attested value is a MemberId).
+    let r = encode_identity_ext(cluster, replica(7));
     assert_eq!(r.len(), 33);
     assert_eq!(
       parse_identity_ext(&r, cluster)
         .try_unwrap_identified()
         .unwrap()
-        .who(),
-      Peer::Replica(ReplicaId::new(7))
+        .id(),
+      replica(7)
     );
     // Client round-trip (a full u128 id, exercising the high bits).
-    let c = encode_identity_ext(cluster, Peer::Client(ClientId::new(0xDEAD_BEEF_0000_0001)));
+    let c = encode_identity_ext(
+      cluster,
+      AttestedId::Client(ClientId::new(0xDEAD_BEEF_0000_0001)),
+    );
     assert_eq!(
       parse_identity_ext(&c, cluster)
         .try_unwrap_identified()
         .unwrap()
-        .who(),
-      Peer::Client(ClientId::new(0xDEAD_BEEF_0000_0001))
+        .id(),
+      AttestedId::Client(ClientId::new(0xDEAD_BEEF_0000_0001))
     );
     // Cluster mismatch → Rejected.
     assert!(parse_identity_ext(&r, 0x9999).is_rejected());
@@ -669,19 +818,21 @@ mod tests {
     let mut bad_kind = r.clone();
     bad_kind[16] = 9;
     assert!(parse_identity_ext(&bad_kind, cluster).is_rejected());
-    // A replica index above a single byte (300 = 0x012C) is valid — it fits the u16 id and round-trips.
-    let wide = encode_identity_ext(cluster, Peer::Replica(ReplicaId::new(300)));
+    // A replica member id whose 16-byte field has a high byte set (> u16::MAX) is VALID — the full
+    // u128 MemberId range is carried now (the old u16 narrowing is gone), so it round-trips unchanged.
+    let mut wide_replica = encode_identity_ext(cluster, replica(2));
+    wide_replica[17] = 1; // set a high byte of the 16-byte id → member id 0x0100_0000_0000_0000_0002
+    let expected = MemberId::new(u128::from_be_bytes(
+      wide_replica[17..33].try_into().unwrap(),
+    ));
     assert_eq!(
-      parse_identity_ext(&wide, cluster)
+      parse_identity_ext(&wide_replica, cluster)
         .try_unwrap_identified()
         .unwrap()
-        .who(),
-      Peer::Replica(ReplicaId::new(300))
+        .id(),
+      AttestedId::Replica(expected),
+      "a member id beyond u16::MAX is carried, not rejected (the u16 narrowing is gone)"
     );
-    // Replica index that does not fit u16 (a high id byte set with kind=Replica) → Rejected.
-    let mut wide_replica = encode_identity_ext(cluster, Peer::Replica(ReplicaId::new(2)));
-    wide_replica[17] = 1; // set the id's most-significant byte so the 16-byte id is > u16::MAX
-    assert!(parse_identity_ext(&wide_replica, cluster).is_rejected());
   }
 
   #[test]
@@ -697,34 +848,14 @@ mod tests {
         .authenticate(&IdentityCtx::new(&der, None, cluster))
         .try_unwrap_identified()
         .unwrap()
-        .who(),
-      Peer::Replica(ReplicaId::new(2))
+        .id(),
+      replica(2)
     );
     // A verifier for a different cluster rejects the OID-attested cluster mismatch.
     assert!(
       CertOid::new(0x9999)
         .authenticate(&IdentityCtx::new(&der, None, 0x9999))
         .is_rejected()
-    );
-  }
-
-  #[test]
-  fn cert_oid_extracts_a_replica_id_above_a_byte() {
-    use crate::transport::quic::crypto::test_ca;
-
-    // A CA-attested identity extension carries the replica index in a 16-byte field, so an index above
-    // a single byte (300) is attested and parsed back unchanged.
-    let cluster = 0x5151_u128;
-    let ca = test_ca();
-    let cert = ca.issue_replica_with_oid(300, cluster);
-    let der = [cert.end_entity_der()];
-    assert_eq!(
-      CertOid::new(cluster)
-        .authenticate(&IdentityCtx::new(&der, None, cluster))
-        .try_unwrap_identified()
-        .unwrap()
-        .who(),
-      Peer::Replica(ReplicaId::new(300))
     );
   }
 
@@ -766,7 +897,7 @@ mod tests {
     let cluster = 0x5151_u128;
     let src = IdentityConfig::Hello { cluster }.into_source();
     let mut frame = Vec::new();
-    src.write_control_preface(Peer::Replica(ReplicaId::new(1)), &mut frame);
+    src.write_control_preface(replica(1), &mut frame);
     assert!(
       !frame.is_empty(),
       "the Hello scheme writes a non-empty preface"
@@ -776,8 +907,8 @@ mod tests {
         .authenticate(&IdentityCtx::new(&[], Some(&frame), cluster))
         .try_unwrap_identified()
         .unwrap()
-        .who(),
-      Peer::Replica(ReplicaId::new(1))
+        .id(),
+      replica(1)
     );
   }
 
@@ -789,7 +920,7 @@ mod tests {
     let cluster = 0x5151_u128;
     let src = IdentityConfig::CertOid { cluster }.into_source();
     let mut preface = Vec::new();
-    src.write_control_preface(Peer::Replica(ReplicaId::new(2)), &mut preface);
+    src.write_control_preface(replica(2), &mut preface);
     assert!(
       preface.is_empty(),
       "the CertOid scheme rides in the cert, writing no preface"
@@ -803,8 +934,8 @@ mod tests {
         .authenticate(&IdentityCtx::new(&der, None, cluster))
         .try_unwrap_identified()
         .unwrap()
-        .who(),
-      Peer::Replica(ReplicaId::new(2))
+        .id(),
+      replica(2)
     );
   }
 }

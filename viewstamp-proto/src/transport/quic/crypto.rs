@@ -785,13 +785,29 @@ impl TestClusterCa {
   }
 
   /// Issue a leaf certificate (as [`issue_replica`](Self::issue_replica)) that also carries the
-  /// viewstamp identity extension attesting `Peer::Replica(n)` for `cluster` — the input a
-  /// [`CertOid`](super::CertOid) verifier parses. The extension is added NON-critical so the stock
-  /// cluster-CA WebPki verifier does not reject the chain over it (see [`CertOid`](super::CertOid)).
+  /// viewstamp identity extension attesting the stable [`MemberId`] `MemberId::new(n)` for `cluster` —
+  /// the input a [`CertOid`](super::CertOid) verifier parses. The SAN index and the attested member id
+  /// coincide here (the common test fixture where `MemberId == slot`); use
+  /// [`issue_replica_with_member_oid`](Self::issue_replica_with_member_oid) to attest a member id that
+  /// differs from the SAN index (e.g. one beyond `u16::MAX`). The extension is added NON-critical so the
+  /// stock cluster-CA WebPki verifier does not reject the chain over it (see [`CertOid`](super::CertOid)).
   pub(crate) fn issue_replica_with_oid(&self, n: u16, cluster: u128) -> TestReplicaCert {
-    use super::identity::{IDENTITY_OID, encode_identity_ext};
+    self.issue_replica_with_member_oid(n, crate::MemberId::new(u128::from(n)), cluster)
+  }
 
-    let san = format!("replica-{n}.{cluster:032x}.viewstamp");
+  /// As [`issue_replica_with_oid`](Self::issue_replica_with_oid) but attests an EXPLICIT stable
+  /// [`MemberId`] independent of the SAN index `san_index` — so a test can mint a cert whose attested
+  /// member id is the full u128 range (including beyond `u16::MAX`), proving the cert-OID identity
+  /// carries the whole `MemberId` with no slot narrowing.
+  pub(crate) fn issue_replica_with_member_oid(
+    &self,
+    san_index: u16,
+    member: crate::MemberId,
+    cluster: u128,
+  ) -> TestReplicaCert {
+    use super::identity::{AttestedId, IDENTITY_OID, encode_identity_ext};
+
+    let san = format!("replica-{san_index}.{cluster:032x}.viewstamp");
     let mut params =
       rcgen::CertificateParams::new(vec![san]).expect("valid DNS SAN for replica cert");
     params
@@ -803,7 +819,7 @@ impl TestClusterCa {
     params
       .extended_key_usages
       .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
-    let content = encode_identity_ext(cluster, crate::Peer::Replica(crate::ReplicaId::new(n)));
+    let content = encode_identity_ext(cluster, AttestedId::Replica(member));
     let ext = rcgen::CustomExtension::from_oid_content(IDENTITY_OID, content);
     params.custom_extensions.push(ext);
     let leaf_key = rcgen::KeyPair::generate().expect("key pair generation succeeds");

@@ -2896,11 +2896,15 @@ mod tests {
       View::with(1),
       OpNumber::with(1),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
     ));
     let frame2 = Message::Commit(Commit::new(
       View::with(1),
       OpNumber::with(2),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
     ));
 
     // Continue the SAME monotonic clock the handshake left off at (a jump past the 1 s idle timeout
@@ -2977,6 +2981,24 @@ mod tests {
       View::with(1),
       OpNumber::with(op),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
+    ))
+  }
+
+  /// A keepalive frame that fits the PRE-AUTH Control cap (`MAX_HELLO_LEN`). The pre-auth Control reader
+  /// (`extend_first`) admits only a single hello-sized first frame; since the epoch-policy matrix pushed
+  /// every CONSENSUS carrier (even an empty `Commit`) past `MAX_HELLO_LEN`, a consensus keepalive sent
+  /// before validation would be rejected as an oversized first frame and reap the connection. An
+  /// empty-body `Request` (NEITHER in the matrix, so unchanged at 31 bytes) is the smallest message and
+  /// stays under the cap, so it keeps an `Authenticating` connection alive without tripping the
+  /// oversized-first-frame guard. `n` varies the client id so successive keepalives differ.
+  fn pre_auth_keepalive(n: u64) -> Message {
+    use crate::{ClientId, RequestNumber, message::Request};
+    Message::Request(Request::new(
+      ClientId::new(n as u128),
+      RequestNumber::with(0),
+      bytes::Bytes::new(),
     ))
   }
 
@@ -5010,6 +5032,8 @@ mod tests {
       OpNumber::with(1),
       OpNumber::with(0),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ClientId::new(7),
       RequestNumber::with(1),
       body,
@@ -5108,6 +5132,8 @@ mod tests {
       OpNumber::with(1),
       OpNumber::with(0),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ClientId::new(9),
       RequestNumber::with(1),
       bytes::Bytes::from(vec![0x6Cu8; 1024]),
@@ -5407,6 +5433,7 @@ mod tests {
     let huge = Message::SyncCheckpoint(SyncCheckpoint::new(
       View::with(1),
       OpNumber::with(1),
+      0,
       0,
       ReplicaId::new(0),
       0,
@@ -6193,7 +6220,7 @@ mod tests {
     for k in 1..4600u64 {
       let tick = start + Duration::from_millis(k);
       if k % 100 == 0 {
-        b.write_framed(tick, hb, StreamClass::Control, &commit(nonce));
+        b.write_framed(tick, hb, StreamClass::Control, &pre_auth_keepalive(nonce));
         nonce += 1;
       }
       ferry_once(
@@ -6932,7 +6959,7 @@ mod tests {
       let tick = start + Duration::from_millis(k * 5);
       // Periodic Control traffic from the validated side keeps A's connection from idling out.
       if k % 6 == 0 {
-        b.write_framed(tick, hb, StreamClass::Control, &commit(nonce));
+        b.write_framed(tick, hb, StreamClass::Control, &pre_auth_keepalive(nonce));
         nonce += 1;
       }
       ferry_once(
@@ -6991,7 +7018,7 @@ mod tests {
       now = tick;
       // Keep B driving a little Control traffic so the link stays warm while the buffered Bulk drains.
       if k % 6 == 0 {
-        b.write_framed(tick, hb, StreamClass::Control, &commit(nonce));
+        b.write_framed(tick, hb, StreamClass::Control, &pre_auth_keepalive(nonce));
         nonce += 1;
       }
       ferry_once(
@@ -7069,7 +7096,7 @@ mod tests {
       let tick = start + Duration::from_millis(k * 5);
       last = tick;
       if k % 6 == 0 {
-        b.write_framed(tick, hb, StreamClass::Control, &commit(nonce));
+        b.write_framed(tick, hb, StreamClass::Control, &pre_auth_keepalive(nonce));
         nonce += 1;
       }
       ferry_once(
@@ -8695,6 +8722,8 @@ mod tests {
       OpNumber::with(1),
       OpNumber::with(0),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ClientId::new(9),
       RequestNumber::with(1),
       bytes::Bytes::from(vec![0x6Cu8; 1024]),
@@ -8859,6 +8888,8 @@ mod tests {
       OpNumber::with(1),
       OpNumber::with(0),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ClientId::new(9),
       RequestNumber::with(1),
       bytes::Bytes::from(vec![0x6Cu8; 1024]),
@@ -9206,7 +9237,11 @@ mod tests {
       "the first frame must be a genuinely Incomplete hello prefix (the precondition under attack)"
     );
     let mut valid_hello = Vec::new();
-    crate::transport::labeled::encode_hello(CLUSTER, claimed, &mut valid_hello);
+    crate::transport::labeled::encode_hello(
+      CLUSTER,
+      crate::transport::labeled::HelloId::from_peer(claimed),
+      &mut valid_hello,
+    );
     let mut buf = Vec::new();
     encode_frame(short_first, &mut buf);
     encode_frame(&valid_hello, &mut buf);
@@ -9239,7 +9274,13 @@ mod tests {
     while let Some(payload) = a.next_frame(ha, StreamClass::Control) {
       if a.is_authenticating(ha) {
         match src.authenticate(&IdentityCtx::new(&[], Some(&payload), CLUSTER)) {
-          IdentityOutcome::Identified(id) => a.bind_validated(read_tick, ha, id.who()),
+          // This bridge-level replay maps the attested MemberId straight to a routing slot (the
+          // fixture's member id == slot); the coordinator's `apply_outcome` does this via the active
+          // membership. Unreached in the passing case — the short first frame rejects below.
+          IdentityOutcome::Identified(id) => {
+            let slot = id.id().as_replica().map(|m| m.get() as u16).unwrap_or(0);
+            a.bind_validated(read_tick, ha, Peer::Replica(ReplicaId::new(slot)));
+          }
           IdentityOutcome::Pending => {}
           IdentityOutcome::Rejected => {
             rejected_on_first = true;
@@ -9284,7 +9325,11 @@ mod tests {
   fn a_truncated_first_control_frame_does_not_let_a_later_frame_authenticate() {
     // A valid hello, minus its last byte → a genuine `Incomplete` prefix that does not complete.
     let mut full = Vec::new();
-    crate::transport::labeled::encode_hello(0x5151, Peer::Replica(ReplicaId::new(1)), &mut full);
+    crate::transport::labeled::encode_hello(
+      0x5151,
+      crate::transport::labeled::HelloId::from_peer(Peer::Replica(ReplicaId::new(1))),
+      &mut full,
+    );
     let short = &full[..full.len() - 1];
     a_short_first_control_frame_does_not_let_a_later_frame_authenticate(short);
   }

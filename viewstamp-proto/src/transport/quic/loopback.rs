@@ -26,7 +26,7 @@ use core::time::Duration;
 use bytes::Bytes;
 
 use crate::{
-  ClientId, Commit, Config, Endpoint, Event, Instant, Message, OpNumber, Peer, ReplicaId,
+  ClientId, Commit, Config, Endpoint, Event, Instant, MemberId, Message, OpNumber, Peer, ReplicaId,
   RequestNumber, View,
   message::Request,
   transport::{
@@ -36,7 +36,7 @@ use crate::{
       crypto::{ClusterTls, TestClusterCa, test_ca},
       testutil::{PacketPipe, addr},
     },
-    testutil::{CountSm, TestSb, TestWal},
+    testutil::{CountSm, TestSb, TestWal, genesis},
   },
 };
 
@@ -70,8 +70,8 @@ pub(super) fn replica(
   scheme: Scheme,
   layout: StreamLayout,
 ) -> Replica {
-  let cfg = Config::try_new(CLUSTER, ReplicaId::new(id), 2).unwrap();
-  let endpoint = Endpoint::new(cfg, u64::from(id) + 1, CountSm::default());
+  let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
+  let endpoint = Endpoint::new(cfg, genesis(2), u64::from(id) + 1, CountSm::default());
 
   let (cert, identity) = match scheme {
     Scheme::Hello => (
@@ -282,12 +282,12 @@ fn converges_with_foreign_ca() -> bool {
   let addr1 = addr(2);
 
   // r0: cert from CA-A, trusts CA-A.
-  let cfg0 = Config::try_new(CLUSTER, ReplicaId::new(0), 2).unwrap();
+  let cfg0 = Config::try_new(CLUSTER, MemberId::new(0)).unwrap();
   let cert0 = ca_a.issue_replica(0, CLUSTER);
   let opts0 = ClusterTls::new(ca_a.roots(), cert0.chain(), cert0.key()).build();
   let mut r0: Replica = (
     QuicCoordinator::with_identity(
-      Endpoint::new(cfg0, 1, CountSm::default()),
+      Endpoint::new(cfg0, genesis(2), 1, CountSm::default()),
       opts0,
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster: CLUSTER },
@@ -297,12 +297,12 @@ fn converges_with_foreign_ca() -> bool {
   );
 
   // r1 (the foreign replica): cert from CA-B, but trusts only CA-A.
-  let cfg1 = Config::try_new(CLUSTER, ReplicaId::new(1), 2).unwrap();
+  let cfg1 = Config::try_new(CLUSTER, MemberId::new(1)).unwrap();
   let cert1 = ca_b.issue_replica(1, CLUSTER);
   let opts1 = ClusterTls::new(ca_a.roots(), cert1.chain(), cert1.key()).build();
   let mut r1: Replica = (
     QuicCoordinator::with_identity(
-      Endpoint::new(cfg1, 2, CountSm::default()),
+      Endpoint::new(cfg1, genesis(2), 2, CountSm::default()),
       opts1,
       Some([1u8; 32]),
       IdentityConfig::Hello { cluster: CLUSTER },
@@ -451,6 +451,7 @@ fn an_oversized_outbound_message_is_surfaced_through_the_public_coordinator_coun
     View::with(1),
     OpNumber::with(1),
     0,
+    0,
     ReplicaId::new(0),
     0,
     snapshot,
@@ -477,6 +478,8 @@ fn an_oversized_outbound_message_is_surfaced_through_the_public_coordinator_coun
       View::with(1),
       OpNumber::with(1),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
     )),
   );
   assert_eq!(
@@ -510,22 +513,30 @@ struct WrongClusterSource {
 }
 
 impl super::IdentitySource for WrongClusterSource {
-  fn write_control_preface(&self, me: Peer, out: &mut Vec<u8>) {
-    crate::transport::labeled::encode_hello(self.write_cluster, me, out);
+  fn write_control_preface(&self, me: super::AttestedId, out: &mut Vec<u8>) {
+    let id = match me {
+      super::AttestedId::Replica(m) => crate::transport::labeled::HelloId::Replica(m.get()),
+      super::AttestedId::Client(c) => crate::transport::labeled::HelloId::Client(c),
+    };
+    crate::transport::labeled::encode_hello(self.write_cluster, id, out);
   }
 
   fn authenticate(&self, ctx: &super::IdentityCtx<'_>) -> super::IdentityOutcome {
-    use super::{Identified, IdentityOutcome};
-    use crate::transport::labeled::{HelloOutcome, classify_hello};
+    use super::{AttestedId, Identified, IdentityOutcome};
+    use crate::transport::labeled::{HelloId, HelloOutcome, classify_hello};
     // No control frame yet (the `Connected` cert-only probe): wait for the peer's first frame.
     let Some(frame) = ctx.control_frame() else {
       return IdentityOutcome::Pending;
     };
-    // Parse the genuine peer index from the hello, but REPORT the wrong cluster. The coordinator's
+    // Parse the genuine peer member id from the hello, but REPORT the wrong cluster. The coordinator's
     // cross-check is the only thing standing between this and a wrong-cluster bind.
     match classify_hello(frame, self.write_cluster) {
-      HelloOutcome::Accepted(peer, _) => {
-        IdentityOutcome::Identified(Identified::new(peer, self.attested_cluster))
+      HelloOutcome::Accepted(claimed, _) => {
+        let id = match claimed {
+          HelloId::Replica(m) => AttestedId::Replica(crate::MemberId::new(m)),
+          HelloId::Client(c) => AttestedId::Client(c),
+        };
+        IdentityOutcome::Identified(Identified::new(id, self.attested_cluster))
       }
       HelloOutcome::Incomplete | HelloOutcome::Rejected => IdentityOutcome::Rejected,
     }
@@ -555,8 +566,8 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
     TestWal,
     TestSb,
   ) {
-    let cfg = Config::try_new(CLUSTER, ReplicaId::new(id), 2).unwrap();
-    let endpoint = Endpoint::new(cfg, u64::from(id) + 1, CountSm::default());
+    let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
+    let endpoint = Endpoint::new(cfg, genesis(2), u64::from(id) + 1, CountSm::default());
     let opts = QuicOptions::accept_any_for_test();
     let src = WrongClusterSource {
       write_cluster: CLUSTER,
@@ -650,8 +661,8 @@ fn replica_in_cluster_of(
   scheme: Scheme,
   layout: StreamLayout,
 ) -> Replica {
-  let cfg = Config::try_new(CLUSTER, ReplicaId::new(id), count).unwrap();
-  let endpoint = Endpoint::new(cfg, u64::from(id) + 1, CountSm::default());
+  let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
+  let endpoint = Endpoint::new(cfg, genesis(count), u64::from(id) + 1, CountSm::default());
   let (cert, identity) = match scheme {
     Scheme::Hello => (
       ca.issue_replica(id, CLUSTER),
@@ -676,9 +687,9 @@ fn replica_in_cluster_of(
 /// takes the adopt branch). Returns whether the small node ended up with the peer in its bound replica
 /// fanout (`bound_replica_peers`).
 ///
-/// `peer_id < SMALL` is in the small node's configured membership and MUST bind; `peer_id >= SMALL` is
-/// outside it and MUST be rejected before `bind_validated` — never consuming a slot, never entering the
-/// fanout.
+/// `peer_id < SMALL` is a member id in the small node's active membership (`genesis(SMALL)`) and MUST
+/// bind (resolved to its slot); `peer_id >= SMALL` is NOT a member and MUST be rejected before
+/// `bind_validated` — never consuming a slot, never entering the fanout.
 fn small_node_binds_peer(scheme: Scheme, peer_id: u8) -> bool {
   const SMALL: u8 = 3;
   // The peer must live in a cluster large enough that `peer_id` is a valid index THERE (so it can
@@ -756,38 +767,40 @@ fn small_node_binds_peer(scheme: Scheme, peer_id: u8) -> bool {
   bound.contains(&Peer::Replica(ReplicaId::new(u16::from(peer_id))))
 }
 
-/// A replica whose validly-attested index is OUTSIDE the receiving node's configured membership
-/// (`index >= replica_count`) is REJECTED by the binding policy — for BOTH provided schemes (`Hello`
-/// and `CertOid`) — before it can consume a connection slot or join the outbound fanout. An IN-range
-/// replica still binds.
+/// A replica whose validly-attested stable [`MemberId`] is NOT in the receiving node's active
+/// membership is REJECTED by the binding policy — for BOTH provided schemes (`Hello` and `CertOid`) —
+/// before it can consume a connection slot or join the outbound fanout. An IN-membership member still
+/// binds (resolved to its routing slot).
 ///
 /// The mechanism: a node from a since-shrunk cluster (or a misconfigured / retired cert) presents a
-/// genuine cluster cert + Hello/OID for `Replica(replica_count)`. Its chain validates (same CA) and its
-/// attested cluster matches, so neither the TLS layer nor the cluster cross-check turns it away; only
-/// the coordinator's membership-range gate does. Without that gate it would bind, pin a slot, and enter
-/// `Backups`/`AllReplicas` — wasted, since the endpoint's own `sender_matches` then drops every inbound
-/// consensus frame from an out-of-membership sender.
+/// genuine cluster cert + Hello/OID for a member id the receiving node no longer carries. Its chain
+/// validates (same CA) and its attested cluster matches, so neither the TLS layer nor the cluster
+/// cross-check turns it away; only the coordinator's `Endpoint::slot_of` resolution does — an absent
+/// member yields `None`. Without that gate it would bind, pin a slot, and enter `Backups`/`AllReplicas`
+/// — wasted, since the endpoint's own `sender_matches` then drops every inbound consensus frame from an
+/// out-of-membership sender. (The test fixtures map `MemberId == slot`, so an out-of-range index IS an
+/// out-of-membership member id.)
 ///
-/// NEUTER CHECK: drop the `r.get() < replica_count` arm in `apply_outcome` and the out-of-range peer
-/// binds (enters `bound_replica_peers`), so the rejection assertion below fails — exactly the
-/// slot-and-fanout waste the gate closes.
+/// NEUTER CHECK: make the `slot_of` arm in `apply_outcome` bind on `None` (e.g. fall back to a fixed
+/// slot) and the out-of-membership peer binds (enters `bound_replica_peers`), so the rejection
+/// assertion below fails — exactly the slot-and-fanout waste the gate closes.
 #[test]
 fn an_out_of_membership_replica_is_rejected_for_both_provided_schemes() {
   for scheme in [Scheme::Hello, Scheme::CertOid] {
-    // In-range (index 1 < replica_count 3): binds.
+    // In-membership (member id 1 ∈ genesis(3)): binds.
     assert!(
       small_node_binds_peer(scheme, 1),
-      "an in-membership replica (index 1 < 3) must bind under {scheme:?}"
+      "an in-membership member (id 1 ∈ genesis(3)) must bind under {scheme:?}"
     );
-    // Out-of-range (index 3 == replica_count 3, and 4 > 3): rejected, never in the fanout.
+    // Out-of-membership (member id 3 ∉ genesis(3), and 4 ∉): rejected, never in the fanout.
     assert!(
       !small_node_binds_peer(scheme, 3),
-      "a replica at the membership boundary (index 3 == replica_count 3) must be rejected under \
-       {scheme:?}, never entering the bound fanout"
+      "a member at the membership boundary (id 3 ∉ genesis(3)) must be rejected under {scheme:?}, \
+       never entering the bound fanout"
     );
     assert!(
       !small_node_binds_peer(scheme, 4),
-      "a replica beyond the membership (index 4 > replica_count 3) must be rejected under {scheme:?}"
+      "a member beyond the membership (id 4 ∉ genesis(3)) must be rejected under {scheme:?}"
     );
   }
 }
@@ -798,13 +811,14 @@ fn an_out_of_membership_replica_is_rejected_for_both_provided_schemes() {
 /// self-id one and not a blanket refusal.
 ///
 /// The mechanism: a duplicate-id or misconfigured member presents a genuine cluster cert + Hello/OID
-/// for `Replica(0)`. Its chain validates (same CA), its attested cluster matches, and `0 < replica_count`,
-/// so neither the TLS layer nor the cluster / membership-range gates turn it away. It arrives as an
-/// ACCEPTED connection (the node did not dial itself), so there is NO dialed expectation to catch the
-/// mismatch — `dialed_expectation_of` is `None`. Without the `candidate != self.me()` gate it would bind
-/// AS `Replica(0)`, and that bound peer becomes the `from` a consensus frame is delivered under, so a
-/// network-supplied self-identifying message would satisfy the endpoint's sender check. This is in-model
-/// duplicate-identity / misconfiguration (it needs a valid cluster cert for our id), NOT a Byzantine claim.
+/// attesting member id 0 — the small node's OWN member id. Its chain validates (same CA), its attested
+/// cluster matches, and that member id IS in the membership, so neither the TLS layer nor the cluster /
+/// membership gates turn it away. It arrives as an ACCEPTED connection (the node did not dial itself),
+/// so there is NO dialed expectation to catch the mismatch — `dialed_expectation_of` is `None`. Without
+/// the `member_id == self.endpoint.local()` gate it would bind AS `Replica(0)`, and that bound peer
+/// becomes the `from` a consensus frame is delivered under, so a network-supplied self-identifying
+/// message would satisfy the endpoint's sender check. This is in-model duplicate-identity /
+/// misconfiguration (it needs a valid cluster cert for our id), NOT a Byzantine claim.
 ///
 /// NEUTER CHECK: drop the `candidate != self.me()` gate in `apply_outcome` and the self-claiming peer
 /// binds (enters `bound_replica_peers`), so the rejection assertion below fails — exactly the
@@ -874,6 +888,8 @@ fn a_buffered_tiny_frame_window_drains_one_budget_per_pump() {
       View::with(1),
       OpNumber::with(frames + 1),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
     ));
     encode_frame(&msg.encode(), &mut blob);
     frames += 1;

@@ -7,10 +7,28 @@ use std::collections::{BTreeMap, VecDeque};
 use bytes::Bytes;
 
 use crate::{
-  CheckpointRead, Header, Instant, OpId, OpNumber, Peer, ReadOk, SlotStatus, StateMachine,
-  Superblock, SuperblockDone, VsrState, Wal, WalDone,
+  CheckpointRead, Header, Instant, MemberId, Membership, OpId, OpNumber, Peer, ReadOk, SlotStatus,
+  StateMachine, Superblock, SuperblockDone, VsrState, Wal, WalDone,
   transport::stream::{Intake, RecordIo},
 };
+
+/// The genesis membership for an `n`-voter cluster (no learners) used across the transport tests:
+/// `MemberId::new(i)` occupies slot `i`, so the relocated quorum/primary/voter logic is byte-identical
+/// to the pre-`Membership` `Config` at epoch 0. Pair it with a `Config` whose local member is
+/// `MemberId::new(old_replica_index)`.
+///
+/// Test fixtures use a fixed `config_id = 0` so hand-built test messages (which carry 0) pass the
+/// strict ingress gate; production uses the hash-chained id (`Membership::genesis`).
+pub(crate) fn genesis(n: u8) -> Membership {
+  Membership::from_durable_parts(
+    crate::Epoch::new(0),
+    n,
+    0,
+    (0..n as u128).map(MemberId::new).collect(),
+    0,
+  )
+  .expect("valid genesis membership")
+}
 
 /// A record layer with a settable authenticated identity and handshake flag, for router/conn tests.
 pub(crate) struct MockRecords {

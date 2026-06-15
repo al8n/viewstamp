@@ -122,11 +122,19 @@ mod tests {
   }
 
   fn commit_msg() -> Message {
-    Message::Commit(Commit::new(view(1), op(1), op(0)))
+    Message::Commit(Commit::new(view(1), op(1), op(0), crate::Epoch::new(0), 0))
   }
 
   fn prepare_ok_msg() -> Message {
-    Message::PrepareOk(PrepareOk::new(view(1), op(1), replica(), op(0), 0))
+    Message::PrepareOk(PrepareOk::new(
+      view(1),
+      op(1),
+      replica(),
+      op(0),
+      0,
+      crate::Epoch::new(0),
+      0,
+    ))
   }
 
   fn prepare_msg(body: Bytes) -> Message {
@@ -136,6 +144,8 @@ mod tests {
       op(1),
       op(0),
       op(0),
+      crate::Epoch::new(0),
+      0,
       client(),
       req(),
       body,
@@ -148,6 +158,8 @@ mod tests {
       view(1),
       op(0),
       op(0),
+      crate::Epoch::new(0),
+      0,
       vec![PreparedEntry::new(op(1), client(), req(), body)],
     ))
   }
@@ -157,6 +169,7 @@ mod tests {
     Message::SyncCheckpoint(SyncCheckpoint::new(
       view(1),
       op(1),
+      0,
       0,
       replica(),
       99,
@@ -171,13 +184,23 @@ mod tests {
       view(1),
       op(10),
       op(5),
+      crate::Epoch::new(0),
+      0,
       replica(),
       vec![],
     ))
   }
 
   fn start_view_msg() -> Message {
-    Message::StartView(StartView::new(view(2), op(10), op(5), replica(), vec![]))
+    Message::StartView(StartView::new(
+      view(2),
+      op(10),
+      op(5),
+      crate::Epoch::new(0),
+      0,
+      replica(),
+      vec![],
+    ))
   }
 
   fn recovery_response_msg() -> Message {
@@ -185,6 +208,8 @@ mod tests {
       view(1),
       op(5),
       op(3),
+      crate::Epoch::new(0),
+      0,
       replica(),
       7,
       vec![],

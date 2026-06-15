@@ -11,13 +11,17 @@ const HELLO_TAG: u8 = 0x0C;
 const HELLO_VERSION: u8 = 2;
 const PEER_REPLICA: u8 = 0;
 const PEER_CLIENT: u8 = 1;
-/// The maximum encoded length of a hello: tag+ver+cluster(16)+peer_tag = 19, then up to a 16-byte
-/// client id = 35 (a replica hello is 21: a 2-byte replica id). This is the EXACT upper bound of
+/// The maximum encoded length of a hello: tag+ver+cluster(16)+peer_tag = 19, then a 16-byte id = 35
+/// (BOTH a replica and a client carry a 16-byte id: the replica field is a full 16-byte
+/// [`MemberId`](crate::MemberId), not a 2-byte slot). This is the EXACT upper bound of
 /// [`encode_hello`], so no valid hello ever exceeds it. Two callers rely on it: the TCP byte-stream path
 /// bounds its reassembly buffer (an unparsed prefix longer than this is a malformed stream → reject),
 /// and the QUIC transport sizes its pre-authentication Control frame decoder to this cap (a peer cannot
 /// pin a larger first Control frame before its identity validates).
 pub(crate) const MAX_HELLO_LEN: usize = 1 + 1 + 16 + 1 + 16;
+/// The fixed length of any complete hello: a replica and a client now share the 16-byte id field, so
+/// every valid hello is exactly [`MAX_HELLO_LEN`].
+const HELLO_LEN: usize = MAX_HELLO_LEN;
 
 /// Immutable handshake options: this node's cluster id and its own claimed identity. The inner
 /// record layer is built by the driver and passed straight to [`Labeled::dialer`]/[`Labeled::acceptor`],
@@ -46,16 +50,42 @@ impl LabelOptions {
   }
 }
 
-pub(crate) fn encode_hello(cluster: u128, who: Peer, out: &mut Vec<u8>) {
+/// The identity a hello attests, in the codec's own slot-agnostic vocabulary: a replica's claim is a
+/// raw 16-byte id and a client's is a [`ClientId`]. The codec is shared by two transports that
+/// interpret the replica id differently — the QUIC identity layer reads it as a stable
+/// [`MemberId`](crate::MemberId) (the full u128), while the TCP [`Labeled`] decorator maps it back to a
+/// [`ReplicaId`] slot (rejecting an id that does not fit u16). Keeping the codec free of either type
+/// lets `labeled` stay quic-feature-independent while still carrying the full u128 either consumer
+/// needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelloId {
+  /// A replica's attested identity as a raw 16-byte id (the QUIC layer reads it as a `MemberId`).
+  Replica(u128),
+  /// A client's attested identity.
+  Client(ClientId),
+}
+
+impl HelloId {
+  /// The replica id from a [`Peer`] is its slot widened to the 16-byte field (the TCP slot domain).
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub(crate) fn from_peer(who: Peer) -> Self {
+    match who {
+      Peer::Replica(r) => Self::Replica(u128::from(r.get())),
+      Peer::Client(c) => Self::Client(c),
+    }
+  }
+}
+
+pub(crate) fn encode_hello(cluster: u128, id: HelloId, out: &mut Vec<u8>) {
   out.push(HELLO_TAG);
   out.push(HELLO_VERSION);
   out.extend_from_slice(&cluster.to_be_bytes());
-  match who {
-    Peer::Replica(r) => {
+  match id {
+    HelloId::Replica(m) => {
       out.push(PEER_REPLICA);
-      out.extend_from_slice(&r.get().to_be_bytes());
+      out.extend_from_slice(&m.to_be_bytes());
     }
-    Peer::Client(c) => {
+    HelloId::Client(c) => {
       out.push(PEER_CLIENT);
       out.extend_from_slice(&c.get().to_be_bytes());
     }
@@ -63,15 +93,18 @@ pub(crate) fn encode_hello(cluster: u128, who: Peer, out: &mut Vec<u8>) {
 }
 
 pub(crate) enum HelloOutcome {
-  /// Validated; carries (claimed peer, bytes consumed from the buffer head).
-  Accepted(Peer, usize),
+  /// Validated; carries (claimed identity, bytes consumed from the buffer head).
+  Accepted(HelloId, usize),
   /// The prefix is not yet fully buffered.
   Incomplete,
   /// Terminal reject (bad header / cluster mismatch / bad peer encoding).
   Rejected,
 }
 
-/// Validates the prefix at the head of `buf` against `expected_cluster`.
+/// Validates the prefix at the head of `buf` against `expected_cluster`. The replica and client id
+/// fields are both 16 bytes, so a complete hello is exactly [`HELLO_LEN`] (consumed length) and the
+/// replica claim is the FULL 16-byte id — no slot narrowing happens here (the QUIC layer reads it as a
+/// `MemberId`; the TCP `Labeled` decorator narrows to a slot in its own domain).
 pub(crate) fn classify_hello(buf: &[u8], expected_cluster: u128) -> HelloOutcome {
   if buf.len() < 18 {
     if !buf.is_empty() && buf[0] != HELLO_TAG {
@@ -89,27 +122,22 @@ pub(crate) fn classify_hello(buf: &[u8], expected_cluster: u128) -> HelloOutcome
   if cluster != expected_cluster {
     return HelloOutcome::Rejected;
   }
-  match buf.get(18) {
-    None => HelloOutcome::Incomplete,
-    Some(&PEER_REPLICA) => {
-      // The replica id is a 2-byte big-endian field at offsets 19..21 (consumed length 21).
-      if buf.len() < 21 {
-        HelloOutcome::Incomplete
-      } else {
-        let idx = u16::from_be_bytes(buf[19..21].try_into().expect("2 bytes"));
-        HelloOutcome::Accepted(Peer::Replica(ReplicaId::new(idx)), 21)
-      }
-    }
-    Some(&PEER_CLIENT) => {
-      if buf.len() < 35 {
-        HelloOutcome::Incomplete
-      } else {
-        let id = u128::from_be_bytes(buf[19..35].try_into().expect("16 bytes"));
-        HelloOutcome::Accepted(Peer::Client(ClientId::new(id)), 35)
-      }
-    }
-    Some(_) => HelloOutcome::Rejected,
+  let kind = match buf.get(18) {
+    None => return HelloOutcome::Incomplete,
+    Some(&PEER_REPLICA) => PEER_REPLICA,
+    Some(&PEER_CLIENT) => PEER_CLIENT,
+    Some(_) => return HelloOutcome::Rejected,
+  };
+  // Both kinds carry a 16-byte id at offsets 19..35 (consumed length HELLO_LEN).
+  if buf.len() < HELLO_LEN {
+    return HelloOutcome::Incomplete;
   }
+  let id = u128::from_be_bytes(buf[19..HELLO_LEN].try_into().expect("16 bytes"));
+  let claimed = match kind {
+    PEER_REPLICA => HelloId::Replica(id),
+    _ => HelloId::Client(ClientId::new(id)),
+  };
+  HelloOutcome::Accepted(claimed, HELLO_LEN)
 }
 
 /// The cluster+identity handshake decorator over an inner record layer `R`.
@@ -165,7 +193,11 @@ impl<R: StreamTransport> Labeled<R> {
   }
 
   fn queue_prefix(&mut self) {
-    encode_hello(self.cluster, self.who, &mut self.outbound_prefix);
+    encode_hello(
+      self.cluster,
+      HelloId::from_peer(self.who),
+      &mut self.outbound_prefix,
+    );
   }
 
   /// Hands the queued prefix to the inner write path exactly once. The hello is at most
@@ -221,7 +253,18 @@ impl<R: StreamTransport> Labeled<R> {
     self.inbound_raw.extend_from_slice(&surfaced[..take]);
     let leftover = &surfaced[take..];
     match classify_hello(&self.inbound_raw, self.cluster) {
-      HelloOutcome::Accepted(peer, consumed) => {
+      HelloOutcome::Accepted(claimed, consumed) => {
+        // The TCP transport routes by SLOT: map the codec's raw replica id back to a `ReplicaId`,
+        // rejecting an id that does not fit u16. A TCP hello always encodes a slot (its `who` widened),
+        // so a >u16 id is a malformed/foreign peer for this slot-based path, not a stable `MemberId` to
+        // resolve (that resolution is the QUIC identity layer's job, against an active membership).
+        let peer = match claimed {
+          HelloId::Replica(m) => match u16::try_from(m) {
+            Ok(slot) => Peer::Replica(ReplicaId::new(slot)),
+            Err(_) => return Err(()),
+          },
+          HelloId::Client(c) => Peer::Client(c),
+        };
         let mut tail = self.inbound_raw.split_off(consumed);
         tail.extend_from_slice(leftover);
         self.inbound_raw = Vec::new();
@@ -442,18 +485,22 @@ mod tests {
 
   #[test]
   fn a_replica_id_above_a_byte_round_trips_through_the_hello() {
-    // The replica id rides the hello as a 2-byte big-endian field, so an index above a single byte
-    // encodes and classifies back to the same id. The classifier also reports the exact consumed
-    // length (21 for a replica hello), and a hello buffered one byte short is Incomplete, not accepted
-    // on a truncated id.
+    // The replica id rides the hello as a 16-byte big-endian field (the full MemberId range), so an
+    // index above a single byte encodes and classifies back to the same id. The classifier reports the
+    // exact consumed length (HELLO_LEN for any hello), and a hello buffered one byte short is
+    // Incomplete, not accepted on a truncated id.
     let r = Peer::Replica(ReplicaId::new(300));
     let mut hello = Vec::new();
-    encode_hello(CLUSTER, r, &mut hello);
-    assert_eq!(hello.len(), 21, "a replica hello is 21 bytes (a 2-byte id)");
+    encode_hello(CLUSTER, HelloId::from_peer(r), &mut hello);
+    assert_eq!(
+      hello.len(),
+      HELLO_LEN,
+      "a replica hello carries a 16-byte id (HELLO_LEN total)"
+    );
     match classify_hello(&hello, CLUSTER) {
-      HelloOutcome::Accepted(peer, consumed) => {
-        assert_eq!(peer, r);
-        assert_eq!(consumed, 21);
+      HelloOutcome::Accepted(HelloId::Replica(m), consumed) => {
+        assert_eq!(m, u128::from(300u16), "the raw replica id round-trips");
+        assert_eq!(consumed, HELLO_LEN);
       }
       _ => panic!("a complete replica hello must be accepted"),
     }
@@ -515,7 +562,7 @@ mod tests {
 
     let d_id = Peer::Replica(ReplicaId::new(1));
     let mut hello = Vec::new();
-    encode_hello(CLUSTER, d_id, &mut hello);
+    encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
       acceptor.handle_transport_data(&hello, Instant::ZERO),
       Intake::Failed,
@@ -549,7 +596,7 @@ mod tests {
     let dialer: Labeled<crate::Passthrough> =
       Labeled::dialer(crate::Passthrough::new(), &opts(d_id));
     let mut hello = Vec::new();
-    encode_hello(CLUSTER, d_id, &mut hello);
+    encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert!(
       dialer.buffered_outbound() >= hello.len(),
       "the queued hello is included in the record layer's buffered-outbound count"
@@ -593,14 +640,14 @@ mod tests {
 
     let d_id = Peer::Replica(ReplicaId::new(1));
     let mut hello = Vec::new();
-    encode_hello(CLUSTER, d_id, &mut hello);
+    encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
       acceptor.handle_transport_data(&hello, Instant::ZERO),
       Intake::Failed
     );
     assert!(!acceptor.is_handshaking(), "the acceptor is now settled");
     let mut local_hello = Vec::new();
-    encode_hello(CLUSTER, a_id, &mut local_hello);
+    encode_hello(CLUSTER, HelloId::from_peer(a_id), &mut local_hello);
     assert!(
       acceptor.buffered_outbound() >= local_hello.len(),
       "the local hello is queued before any app data"
@@ -625,14 +672,14 @@ mod tests {
     // drops `is_handshaking()`.
     let d_id = Peer::Replica(ReplicaId::new(1));
     let mut hello = Vec::new();
-    encode_hello(CLUSTER, d_id, &mut hello);
+    encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
       acceptor.handle_transport_data(&hello, Instant::ZERO),
       Intake::Failed
     );
     assert!(!acceptor.is_handshaking(), "the acceptor settled");
     let mut local_hello = Vec::new();
-    encode_hello(CLUSTER, a_id, &mut local_hello);
+    encode_hello(CLUSTER, HelloId::from_peer(a_id), &mut local_hello);
     assert!(
       acceptor.buffered_outbound() >= local_hello.len(),
       "the local hello is queued before clear_outbound"
@@ -674,7 +721,7 @@ mod tests {
     // arrived but not yet been drained — clear_outbound must drop it too.
     let d_id = Peer::Replica(ReplicaId::new(1));
     let mut hello = Vec::new();
-    encode_hello(CLUSTER, d_id, &mut hello);
+    encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
       acceptor.handle_transport_data(&hello, Instant::ZERO),
       Intake::Failed
@@ -690,7 +737,7 @@ mod tests {
 
     // Feeding a fresh valid hello plus an application tail must be a terminal reject, surfacing nothing.
     let mut hello_plus_tail = Vec::new();
-    encode_hello(CLUSTER, d_id, &mut hello_plus_tail);
+    encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello_plus_tail);
     hello_plus_tail.extend_from_slice(b"app-tail");
     assert_eq!(
       acceptor.handle_transport_data(&hello_plus_tail, Instant::ZERO),
@@ -794,14 +841,14 @@ mod tests {
 
     let d_id = Peer::Replica(ReplicaId::new(1));
     let mut hello = Vec::new();
-    encode_hello(CLUSTER, d_id, &mut hello);
+    encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
       acceptor.handle_transport_data(&hello, Instant::ZERO),
       Intake::Failed
     );
     assert!(!acceptor.is_handshaking());
     let mut local_hello = Vec::new();
-    encode_hello(CLUSTER, a_id, &mut local_hello);
+    encode_hello(CLUSTER, HelloId::from_peer(a_id), &mut local_hello);
     assert_eq!(
       acceptor.buffered_outbound(),
       local_hello.len(),
