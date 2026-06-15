@@ -162,7 +162,12 @@ fn report_digest(r: &VoprReport) -> u64 {
     // default schedule, and folding them would change this hash's schema for a non-behavioral reason.
     // The learner axis only GROWS node_count behind a separate magic-seeded draw, so an off-axis run
     // never engages it and the applied/committed columns (over the no-learner default schedule) stay
-    // identical regardless.
+    // identical regardless. The offline reconfig witnesses (reconfigs_fired / reform_escalations_fired)
+    // are NOT folded for the same reason: both are zero on the default schedule (the reconfig axis is
+    // off, and its escalation is off-axis-unsatisfiable), so folding them would change the report
+    // hash's schema without any behavioral change — the off-axis `reform_escalations_fired == 0` guard
+    // lives in the committed sweep instead (an accidental off-axis engagement would re-form a wedge and
+    // so perturb the applied/committed columns regardless).
   ] {
     fnv1a_u64(&mut h, v);
   }

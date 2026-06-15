@@ -178,6 +178,17 @@ pub struct InMemoryWal {
   /// header-durability contract (the probe lane measures the blast radius). Persists across restart;
   /// cleared when the slot is rewritten/truncated/pruned/ring-evicted, like `rotted`.
   torn_headers: BTreeSet<u64>,
+  /// Slots whose READS are made to fault PERMANENTLY by an explicit test injection
+  /// ([`fault_read_at`](Self::fault_read_at)) — NOT a seeded roll. Every read of such a slot resolves
+  /// `WalDone::Fault` (the `header()`/`status()` of the slot are otherwise untouched: the entry stays
+  /// in `entries`, so the slot's HEADER and committed bytes are intact). It models an UNRECOVERABLE
+  /// read of an UNCOMMITTED tail/head op on a node's own disk — the targeted fault that drives a
+  /// restart into `RecoveringHead` (the head slot cannot be trusted) without a probabilistic
+  /// `read_fault_per_mille` roll exhausting retries by luck. Because it is only ever set by an explicit
+  /// `fault_read_at` call (never a PRNG draw), an unfaulted WAL keeps its exact fault-PRNG stream, so
+  /// every existing seed reproduces byte-for-byte. Persists across restart (the struct survives
+  /// crash/restart) and clears when the slot is rewritten/truncated/pruned/ring-evicted, like `rotted`.
+  head_read_faults: BTreeSet<u64>,
   /// `None` (default) ⇒ synchronous appends. `Some(d)` ⇒ async mode: each `submit_append` stages for
   /// `d` `poll`s before becoming durable. `d == 0` releases on the very next `poll` (still NOT inline,
   /// so the in-flight window still exists for at least one tick).
@@ -225,6 +236,7 @@ impl InMemoryWal {
       prng: Prng::new(seed),
       rotted: BTreeSet::new(),
       torn_headers: BTreeSet::new(),
+      head_read_faults: BTreeSet::new(),
       async_delay: None,
       staged: VecDeque::new(),
       misdirects_fired: 0,
@@ -393,6 +405,21 @@ impl InMemoryWal {
     self.torn_headers_fired
   }
 
+  /// Test-only: make EVERY read of op `op` fault PERMANENTLY (an unrecoverable read of this slot on
+  /// this replica's own disk). The slot's stored `(header, body)` is left untouched, so its
+  /// `header()`/`status()` still report a durable entry — only `submit_read` resolves `Fault`. Used to
+  /// drive a restart into `RecoveringHead`: faulting the (uncommitted) HEAD slot means recovery
+  /// exhausts its per-slot retry budget and cannot trust its head, the exact precondition the offline-restart
+  /// re-formation escalation must resolve. Targeted at a chosen op (no PRNG draw), so an unfaulted WAL
+  /// keeps its exact fault stream and every existing seed reproduces byte-for-byte. The injection
+  /// persists across restart and clears when the slot is truncated/pruned/ring-evicted, like a bit-rot
+  /// verdict. Faulting an UNCOMMITTED op keeps committed data sound (the durability checker stays
+  /// satisfied); it is the caller's responsibility to target the uncommitted tail, never a committed op.
+  #[doc(hidden)]
+  pub fn fault_read_at(&mut self, op: OpNumber) {
+    self.head_read_faults.insert(op.get());
+  }
+
   /// Bounded-ring physical slot reuse: when a durable append at `op` lands in slot `op mod n`,
   /// EVICT whatever DIFFERENT op last held that slot (op `op - n`) — its bytes are physically gone (a
   /// clean wrap), so it leaves `entries`/`rotted`/`staged` and a subsequent read of it returns `Absent`.
@@ -409,6 +436,7 @@ impl InMemoryWal {
     self.entries.retain(|&o, _| o == op || o % n != slot);
     self.rotted.retain(|&o| o == op || o % n != slot);
     self.torn_headers.retain(|&o| o == op || o % n != slot);
+    self.head_read_faults.retain(|&o| o == op || o % n != slot);
     self.staged.retain(|s| s.op == op || s.op % n != slot);
   }
 }
@@ -553,6 +581,14 @@ impl Wal for InMemoryWal {
         .push_back(WalDone::BodyFaulty(BodyFaulty::new(id, stored_header)));
       return;
     }
+    // TARGETED PERMANENT read fault (an explicit `fault_read_at` injection, NOT a seeded roll): every
+    // read of this slot faults outright, modelling an unrecoverable read of an uncommitted tail/head op.
+    // Checked before the transient roll so it is DETERMINISTIC (no luck needed to exhaust the recover
+    // retry budget); the slot's header/body remain intact in `entries`, so only reads fault.
+    if self.head_read_faults.contains(&op.get()) {
+      self.completions.push_back(WalDone::Fault(id));
+      return;
+    }
     // TRANSIENT read fault: rolled independently per read, so a retry may succeed — this is what the
     // proto's recover retry loop relies on to clear a transient fault from its OWN disk.
     if self.faults.read_fault_per_mille > 0
@@ -593,6 +629,7 @@ impl Wal for InMemoryWal {
     // A truncated-away slot is no longer corrupt (it will be rewritten by a later append).
     self.rotted.retain(|&op| op <= above.get());
     self.torn_headers.retain(|&op| op <= above.get());
+    self.head_read_faults.retain(|&op| op <= above.get());
     // Drop any staged (in-flight) append above the truncation point: those bytes are abandoned and
     // must never later become durable above the new head (async mode only; a no-op otherwise).
     self.staged.retain(|s| s.op <= above.get());
@@ -603,6 +640,7 @@ impl Wal for InMemoryWal {
     self.entries.retain(|&op, _| op >= below.get());
     self.rotted.retain(|&op| op >= below.get());
     self.torn_headers.retain(|&op| op >= below.get());
+    self.head_read_faults.retain(|&op| op >= below.get());
     // A staged append below the GC floor is moot; drop it (async mode only).
     self.staged.retain(|s| s.op >= below.get());
   }

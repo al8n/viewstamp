@@ -5,7 +5,7 @@ use smol_str::SmolStr;
 
 use viewstamp_proto::{
   Committed, Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, MemberId, Membership,
-  Message, OpNumber, Outgoing, Peer, Prng, Recipient, Recovered, ReplicaId, Wal,
+  Message, OpNumber, Outgoing, Peer, Prng, Recipient, Recovered, ReplicaId, Wal, prepare_restart,
 };
 
 use crate::{
@@ -41,6 +41,30 @@ pub enum AppliedEvent {
   /// installs the snapshot eagerly but reports the sync only once its root is durable, so the marker
   /// can trail the first post-install commits.
   SyncPoint(OpNumber),
+}
+
+/// The outcome of a coordinated offline reconfiguration that drove the all-`RecoveringHead`
+/// re-formation wedge — see [`Cluster::reconfigure_offline`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfflineReconfig {
+  /// The common preserved view `V` every voter recovered into (and at which the wedge formed). The
+  /// re-formation escalation targets `V + 1` uniformly.
+  view: u64,
+  /// The uncommitted tail op (ABOVE the committed history) whose head read-fault drove every voter
+  /// into `RecoveringHead` — so no committed op was put at risk.
+  faulted_op: u64,
+}
+
+impl OfflineReconfig {
+  /// The common preserved view `V` every voter recovered into and at which the wedge formed.
+  pub const fn view(&self) -> u64 {
+    self.view
+  }
+
+  /// The uncommitted tail op whose head read-fault drove every voter into `RecoveringHead`.
+  pub const fn faulted_op(&self) -> u64 {
+    self.faulted_op
+  }
 }
 
 /// A deterministic single-thread cluster of `Endpoint<SimSm>` replicas + clients.
@@ -202,6 +226,20 @@ pub struct Cluster {
   /// replica's apply stream legitimately re-emits from its durable checkpoint (recovery re-applies
   /// `(checkpoint_op .. commit_max]`; a wipe re-applies from genesis).
   incarnations: Vec<u64>,
+  /// Per-replica edge-detector for the re-formation escalation: `true` if replica `i` was in
+  /// `Status::RecoveringHead` at the end of the PREVIOUS [`tick`](Self::tick). Sampled each tick to
+  /// count [`reform_escalations_fired`](Self::reform_escalations_fired): a node that was
+  /// `RecoveringHead` and is now `ViewChange` escalated, the UNIQUE `RecoveringHead → ViewChange`
+  /// transition the proto's `retire_recover_and_escalate` produces (a `RecoveringHead` node otherwise
+  /// only ever leaves to `Normal` via `StartView`/`RecoveryResponse` adoption).
+  was_recovering_head: Vec<bool>,
+  /// How many times a voting replica ESCALATED out of `Status::RecoveringHead` into a view change —
+  /// the observable of the proto's re-formation escalation (`retire_recover_and_escalate`),
+  /// counted by the `RecoveringHead → ViewChange` edge in [`tick`](Self::tick). Monotone over the
+  /// cluster's lifetime. `0` unless a coordinated all-`RecoveringHead` wedge formed and re-formed (the
+  /// `reconfigure_offline` axis), so the off-axis sweeps assert it stays `0` (byte-identity to a
+  /// no-escalation run) while the wedge repro asserts it goes `> 0` (the escalation genuinely fired).
+  reform_escalations_fired: u64,
 }
 
 impl Cluster {
@@ -307,6 +345,8 @@ impl Cluster {
       stale_read_probes_fired: 0,
       applied_streams: vec![Vec::new(); n],
       incarnations: vec![0; n],
+      was_recovering_head: vec![false; n],
+      reform_escalations_fired: 0,
     }
   }
 
@@ -710,6 +750,14 @@ impl Cluster {
     self.replicas[i].status().as_str()
   }
 
+  /// Whether replica `i` is in `Status::RecoveringHead` — it recovered a head it cannot trust and is
+  /// soliciting the canonical head from a peer, casting no vote. Used by the re-formation gate
+  /// to assert a voting quorum genuinely reached the wedge (a `RecoveringHead` quorum at a common view
+  /// with no `Normal` answerer) before the escalation re-forms the cluster.
+  pub fn replica_status_is_recovering_head(&self, i: usize) -> bool {
+    self.replicas[i].status().is_recovering_head()
+  }
+
   /// Replica `i`'s DURABLE (superblock) view — the view persisted in its on-disk VSR root, which is
   /// what a crash + `restart` recovers it to. Unlike the volatile in-memory [`Self::replica_view`]
   /// (which a self-driven view change advances BEFORE the matching `submit_durable_view` completes,
@@ -824,6 +872,17 @@ impl Cluster {
   /// never silently become a no-op.
   pub fn holds_fired(&self) -> u64 {
     self.holds_fired
+  }
+
+  /// How many times a voting replica ESCALATED out of `Status::RecoveringHead` into a view change so
+  /// far — the observable of the proto's re-formation escalation (`retire_recover_and_escalate`),
+  /// counted by the `RecoveringHead → ViewChange` edge in [`tick`](Self::tick). Monotone. `0` on every
+  /// schedule that never drove a coordinated all-`RecoveringHead` wedge (so an off-axis sweep asserts
+  /// it stays `0` — byte-identity to a no-escalation run), and `> 0` once the wedge formed and
+  /// re-formed (the [`reconfigure_offline`](Self::reconfigure_offline) axis), the non-vacuity witness
+  /// that the escalation genuinely fired.
+  pub fn reform_escalations_fired(&self) -> u64 {
+    self.reform_escalations_fired
   }
 
   /// True once all clients are done and nothing is in flight.
@@ -952,6 +1011,183 @@ impl Cluster {
       None => InMemorySuperblock::with_faults(self.storage_faults, s),
     };
     self.restart(i);
+  }
+
+  /// A coordinated offline reconfiguration that DELIBERATELY drives the
+  /// all-`RecoveringHead` re-formation wedge (route A: an operator-coordinated stop on a QUIESCED,
+  /// all-`Normal`, partition-free cluster — the precondition the escalation's single-view convergence
+  /// relies on). On success it leaves a VOTING QUORUM (in fact every voter) restarted into
+  /// `Status::RecoveringHead` at a common preserved view, so only the proto's
+  /// `retire_recover_and_escalate` escalation can re-form the cluster — the empirical oracle for that
+  /// escalation. The steps mirror the proto's `recovering_head_post_reconfig` fixture at cluster scale:
+  ///
+  /// 1. **Quiesce (route A precondition):** heal every partition, drop all network faults, restart any
+  ///    crashed node, and [`drive_to_quiesced_normal`](Self::drive_to_quiesced_normal) so every
+  ///    non-crashed node is `Normal` at a COMMON view `V` with the network idle. (An offline stop is on
+  ///    healthy disks, so committed data is sound throughout.) `None` if the cluster cannot quiesce
+  ///    within the budget (no swap is attempted).
+  /// 2. **Uncommitted tail:** the durable frontier under load always carries an uncommitted tail
+  ///    (`op > commit`); a quiesced cluster has committed everything, so re-open the window by minting
+  ///    exactly one UNCOMMITTED op above the committed frontier — drive the primary to append the next
+  ///    op + broadcast its `Prepare` while every backup→primary `PrepareOk` leg is cut, so each voter
+  ///    durably appends the op but the commit never advances. That head op is ABOVE the cluster's
+  ///    committed history, so faulting it loses no committed data (route A keeps committed data sound).
+  /// 3. **Pre-write successors:** for every node build the successor durable root via
+  ///    [`prepare_restart`] off its OWN durable root, KEEPING the same voting set (a no-op-membership
+  ///    reconfig — it still bumps the epoch, the realistic "restart into a new epoch" case), and
+  ///    [`install_root_for_test`](InMemorySuperblock::install_root_for_test) it while the node is
+  ///    stopped. `prepare_restart` preserves view/log_view/commit, so every voter recovers the same
+  ///    durable view `V` and targets the same `V + 1` on escalation.
+  /// 4. **Head-fault wave + restart:** crash every node, inject a PERMANENT head read-fault on each
+  ///    VOTER's uncommitted tail slot ([`InMemoryWal::fault_read_at`]), and restart all. Each voter's
+  ///    recovery cannot trust its head → `RecoveringHead` at view `V`; no `Normal` node answers a
+  ///    `Recovery`, the wedge. (Learners restart normally — they never escalate and never count toward
+  ///    the voting quorum the gate needs.)
+  ///
+  /// Returns the common view `V` and the faulted (uncommitted) head op, so a caller can assert the
+  /// wedge formed at `V` and that re-formation converges to `V + 1`. The escalation itself is observed
+  /// via [`reform_escalations_fired`](Self::reform_escalations_fired) once the cluster is ticked.
+  pub fn reconfigure_offline(&mut self) -> Option<OfflineReconfig> {
+    use viewstamp_proto::Superblock;
+    // (1) Quiesce to all-`Normal` at a common view — the route A precondition.
+    self.heal();
+    self.set_faults(Faults::none());
+    for i in 0..self.replicas.len() {
+      if self.crashed[i] && !self.retired[i] {
+        self.restart(i);
+      }
+    }
+    let view = self.drive_to_quiesced_normal(40_000)?;
+    let primary = self.serving_primary()?;
+    let committed_before = (0..self.replicas.len())
+      .map(|i| self.replicas[i].state_machine_ref().applied().len())
+      .max()
+      .unwrap_or(0) as u64;
+
+    // (2) Mint ONE uncommitted tail op above the committed frontier: drive the primary to append +
+    // broadcast its Prepare while every backup→primary leg is cut, so the commit cannot advance.
+    let voters: Vec<usize> = (0..self.replica_count as usize).collect();
+    let target_head = committed_before + 1;
+    for x in 0..self.replicas.len() {
+      if x != primary {
+        self.one_way[x][primary] = true; // drop every PrepareOk back to the primary
+      }
+    }
+    // A fresh client (an id past every minted one) issues a single request only the primary sees, so
+    // the op is genuinely new and the in-tree client models are untouched.
+    let tail_client = viewstamp_proto::ClientId::new(
+      self.clients.iter().map(|c| c.id().get()).max().unwrap_or(0) + 1,
+    );
+    let now = self.clock.now();
+    let req = Message::Request(viewstamp_proto::Request::new(
+      tail_client,
+      viewstamp_proto::RequestNumber::with(1),
+      Bytes::from_static(b"offline-tail"),
+    ));
+    self.replicas[primary].handle_message(
+      now,
+      &mut self.wals[primary],
+      &mut self.sbs[primary],
+      Peer::Client(tail_client),
+      req,
+    );
+    // Tick (PrepareOks cut) until every voter durably holds the new head op — robust to async-WAL
+    // delay. The primary's commit stays at the prior frontier because no PrepareOk reaches it.
+    let mut minted = false;
+    for _ in 0..4_000 {
+      self.tick();
+      if voters
+        .iter()
+        .all(|&v| self.wal_head_for_test(v) >= target_head)
+      {
+        minted = true;
+        break;
+      }
+    }
+    self.heal(); // restore the cut legs before the stop
+    if !minted {
+      return None;
+    }
+    // Every voter's WAL head is the uncommitted tail op; the commit never advanced past the frontier.
+    let faulted_op = target_head;
+
+    // (3) Pre-write each node's successor durable root (same voting set, bumped epoch).
+    for i in 0..self.replicas.len() {
+      if self.retired[i] {
+        continue;
+      }
+      let cur = self.sbs[i].state();
+      let Some(membership) = cur.membership_opt() else {
+        return None; // a legacy (pre-membership) root cannot chain a successor — never on a v4 cluster
+      };
+      let members: Vec<MemberId> = membership.members_slice().to_vec();
+      let succ = prepare_restart(
+        &cur,
+        membership.replica_count(),
+        membership.learner_count(),
+        members,
+      )
+      .ok()?;
+      self.sbs[i].install_root_for_test(succ);
+    }
+
+    // (4) Crash every node, fault each VOTER's uncommitted head slot, restart all. The voters cannot
+    // trust their head on recovery → `RecoveringHead` at the common view `V`.
+    for i in 0..self.replicas.len() {
+      if !self.retired[i] {
+        self.crash(i);
+      }
+    }
+    for &v in &voters {
+      self.wals[v].fault_read_at(OpNumber::with(faulted_op));
+    }
+    for i in 0..self.replicas.len() {
+      if self.crashed[i] && !self.retired[i] {
+        self.restart(i);
+      }
+    }
+    Some(OfflineReconfig {
+      view: view.get(),
+      faulted_op,
+    })
+  }
+
+  /// Drive the cluster until every non-crashed node is `Status::Normal` at a COMMON view with the
+  /// network idle, returning that common view — the quiesced-stop precondition
+  /// [`reconfigure_offline`](Self::reconfigure_offline) requires (route A). Assumes partitions are
+  /// already healed and faults cleared (the caller does so). `None` if the cluster does not settle
+  /// within `budget` ticks (a wedge or perpetual churn the caller must surface, not paper over).
+  fn drive_to_quiesced_normal(&mut self, budget: u64) -> Option<viewstamp_proto::View> {
+    for _ in 0..budget {
+      self.tick();
+      let common_view = self.common_normal_view();
+      if common_view.is_some() && self.net.is_empty() {
+        return common_view;
+      }
+    }
+    None
+  }
+
+  /// The single view at which EVERY non-crashed node is `Normal`, or `None` if any non-crashed node is
+  /// not `Normal` or the `Normal` nodes disagree on the view. A serving primary plus all-`Normal`
+  /// backups at one view is the quiesced shape a coordinated stop preserves.
+  fn common_normal_view(&self) -> Option<viewstamp_proto::View> {
+    let mut view = None;
+    for i in 0..self.replicas.len() {
+      if self.crashed[i] {
+        continue;
+      }
+      if !self.replicas[i].status().is_normal() {
+        return None;
+      }
+      let v = self.replicas[i].view();
+      match view {
+        None => view = Some(v),
+        Some(prev) if prev != v => return None,
+        _ => {}
+      }
+    }
+    view
   }
 
   /// Whether slot `i` is RETIRED (it resolved [`Recovered::Retired`] on recover — absent from its
@@ -1599,6 +1835,25 @@ impl Cluster {
       self.replicas[ri].handle_timeout(now, &mut self.wals[ri], &mut self.sbs[ri]);
       // Pump storage after timeout: drives append-before-ack (on_wal_done) + durable-view (on_sb_done).
       self.replicas[ri].handle_storage(now, &mut self.wals[ri], &mut self.sbs[ri]);
+    }
+
+    // re-formation observable: count the `RecoveringHead → ViewChange` edge — the UNIQUE
+    // transition the proto's `retire_recover_and_escalate` escalation produces (a `RecoveringHead`
+    // node otherwise only ever returns to `Normal` via a `StartView`/`RecoveryResponse` adoption, never
+    // to `ViewChange`). The escalation fires in `handle_timeout` above, so a node observed here in
+    // `ViewChange` that was `RecoveringHead` last tick just escalated. Pure observation (no PRNG draw,
+    // no message, no storage write), so it leaves every off-axis schedule byte-identical; a crashed
+    // node is left at its last sampled state until it restarts. This re-arms across a re-wedge: a node
+    // that escalates, then re-crashes back into `RecoveringHead`, then escalates again is counted twice.
+    for ri in 0..self.replicas.len() {
+      if self.crashed[ri] {
+        continue;
+      }
+      let rh_now = self.replicas[ri].status().is_recovering_head();
+      if self.was_recovering_head[ri] && self.replicas[ri].status().is_view_change() {
+        self.reform_escalations_fired += 1;
+      }
+      self.was_recovering_head[ri] = rh_now;
     }
   }
 
