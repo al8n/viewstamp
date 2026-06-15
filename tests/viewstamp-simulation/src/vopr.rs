@@ -287,6 +287,19 @@ pub struct VoprReport {
   /// learner TRACKS view changes — it adopts the new primary's view without ever being an active
   /// view-change participant. The learner sweep asserts the cross-seed sum is `> 0`.
   learner_view_changes_followed: u64,
+  /// How many coordinated offline reconfigurations the driver fired this run (a
+  /// [`Cluster::reconfigure_offline`] that drove the all-`RecoveringHead` wedge). `0` unless the
+  /// reconfig axis is enabled (`VOPR_RECONFIG`, or [`run_vopr_with_reconfig`]); the committed reconfig
+  /// sweep asserts the cross-seed sum is `> 0` so the lane cannot silently decay.
+  reconfigs_fired: u64,
+  /// How many times a voting replica ESCALATED out of `Status::RecoveringHead` into a view change
+  /// this run — the proto's re-formation escalation (`retire_recover_and_escalate`), observed
+  /// by the `RecoveringHead → ViewChange` edge in [`Cluster::tick`]. `0` on EVERY run without the
+  /// reconfig axis (the escalation is off-axis-unsatisfiable — `epoch > prev_epoch` is false without a
+  /// reconfiguration), so the off-axis sweep asserts this stays `0` (byte-identity to a no-escalation
+  /// run); `> 0` once a reconfig-axis run drove and re-formed the wedge — the non-vacuity witness that
+  /// the escalation genuinely fired.
+  reform_escalations_fired: u64,
 }
 
 impl VoprReport {
@@ -567,6 +580,19 @@ impl VoprReport {
   pub const fn learner_view_changes_followed(&self) -> u64 {
     self.learner_view_changes_followed
   }
+
+  /// How many coordinated offline reconfigurations the driver fired this run. `0` unless the
+  /// reconfig axis is enabled; the committed reconfig sweep asserts the cross-seed sum is `> 0`.
+  pub const fn reconfigs_fired(&self) -> u64 {
+    self.reconfigs_fired
+  }
+
+  /// How many times a voting replica escalated out of `RecoveringHead` into a view change this run —
+  /// the proto's re-formation escalation. `0` on every run without the reconfig axis (the
+  /// off-axis byte-identity guard); `> 0` once a reconfig-axis run drove and re-formed the wedge.
+  pub const fn reform_escalations_fired(&self) -> u64 {
+    self.reform_escalations_fired
+  }
 }
 
 /// The driver's own seeded RNG + bookkeeping. Separate from the cluster's internal network/storage
@@ -756,6 +782,20 @@ struct Vopr {
   /// at [`Self::learner_crash_until`], on calm-window entry, and by the final quiesce. NOT counted
   /// against the minority budget — a learner outage must never reduce voter fault tolerance.
   learner_crashed: Option<usize>,
+  /// Whether the TIER C RECONFIGURATION axis is enabled for this run: the `VOPR_RECONFIG` env var, or
+  /// force-enabled via [`run_vopr_with_reconfig`] (the committed reconfig sweep). When ON the driver
+  /// occasionally fires a coordinated offline reconfiguration ([`Cluster::reconfigure_offline`]) that
+  /// drives the all-`RecoveringHead` wedge, asserting the proto's escalation always re-forms the
+  /// cluster (no permanent `RecoveringHead` quorum) with safety/durability intact. With the axis OFF
+  /// no reconfiguration is ever attempted — the `RecoveringHead → ViewChange` escalation is
+  /// off-axis-unsatisfiable, so [`VoprReport::reform_escalations_fired`] stays `0` (the standing
+  /// off-axis byte-identity guard the sweep asserts). Route A (an offline stop is on healthy disks):
+  /// this axis MASKS the permanent torn/bit-rot storage faults so committed data stays sound, the
+  /// wedge being driven by head-slot read-faults on the UNCOMMITTED tail alone.
+  reconfig_axis: bool,
+  /// How many coordinated offline reconfigurations this run has fired (counted against
+  /// [`RECONFIG_BUDGET`]). `0` unless the reconfig axis is enabled.
+  reconfig_actions: u64,
   /// The durable `(epoch, view)` split-brain regression net, observed every tick. Held on the driver
   /// (not threaded through [`Self::check_invariants`]'s already-long signature) because it is a pure
   /// observation — no PRNG draw, no cluster mutation — so running it every tick leaves the applied
@@ -966,6 +1006,31 @@ pub fn run_vopr_with_learners(seed: u64, ticks: u64) -> VoprReport {
   run_seeded(Vopr::new(seed, true), ticks)
 }
 
+/// Like [`run_vopr`] but with the TIER C RECONFIGURATION axis FORCE-ENABLED, independent of the
+/// `VOPR_RECONFIG` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]). On a
+/// seeded cadence (within [`RECONFIG_BUDGET`]) the driver fires a coordinated OFFLINE reconfiguration
+/// ([`Cluster::reconfigure_offline`], route A): it drains the cluster to all-`Normal` at a common
+/// view, mints one UNCOMMITTED tail op above the committed frontier, pre-writes a successor durable
+/// root on every node via `prepare_restart` (KEEPING the voting set — a no-op-membership reconfig that
+/// still bumps the epoch), and restarts every voter into `Status::RecoveringHead` with a head read-fault
+/// on that uncommitted tail. That is the all-`RecoveringHead` wedge the proto's
+/// `retire_recover_and_escalate` escalation must resolve: no `Normal` node answers a `Recovery`, so only
+/// the escalation re-forms the cluster. The axis asserts the cluster ALWAYS re-forms (no permanent
+/// `RecoveringHead` quorum) with safety/durability/applied-once intact — and the wedge is driven by
+/// faulting the UNCOMMITTED tail, with the PERMANENT torn/bit-rot faults masked (route A: an offline stop
+/// is on healthy disks), so committed data stays sound and no committed op is ever at risk.
+///
+/// The DEFAULT sweep leaves this axis OFF: the escalation is off-axis-unsatisfiable (`epoch >
+/// prev_epoch` is false without a reconfiguration), so a default run never escalates and
+/// [`VoprReport::reform_escalations_fired`] stays `0` — the standing off-axis byte-identity guard. A
+/// reconfig-enabled run is a pure function of `(seed, ticks)` and its own deterministic baseline; this
+/// is the entry point for the committed reconfig sweep.
+pub fn run_vopr_with_reconfig(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.reconfig_axis = true;
+  run_seeded(v, ticks)
+}
+
 /// The shared run loop behind [`run_vopr`] / [`run_vopr_with_hold`]: the driver `v` already carries
 /// the seed and the axis configuration.
 fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
@@ -1128,6 +1193,13 @@ const WIPE_BUDGET: u64 = 1;
 /// times over within a run's tick budget.
 const CHURN_BUDGET: u64 = 48;
 
+/// The per-run TIER C RECONFIGURATION budget (reconfig-axis runs only): at most this many coordinated
+/// offline reconfigurations per run. A reconfiguration is heavy — it drains the cluster to all-`Normal`,
+/// mints an uncommitted tail, swaps every node's durable root, and re-forms from an all-`RecoveringHead`
+/// wedge — so a couple per run exercises the escalation (including an A2 re-wedge across two firings)
+/// without dominating the tick budget.
+const RECONFIG_BUDGET: u64 = 2;
+
 /// The magic mixed into the seed for the learner-count PRNG. A distinct local stream (NOT the action
 /// stream `self.prng`), so when the learner axis is OFF no learner draw happens and `node_count`
 /// equals `voting_count`, leaving the default per-seed schedule byte-identical; when ON, the learner
@@ -1207,6 +1279,8 @@ impl Vopr {
       learner_repairs_seen: vec![0; node_count],
       learner_crash_until: 0,
       learner_crashed: None,
+      reconfig_axis: env_flag("VOPR_RECONFIG"),
+      reconfig_actions: 0,
       epoch_view: EpochViewMonotonicChecker::new(node_count),
       membership: MembershipMonotonicChecker::new(),
       sessions_evicted_seen: vec![0; node_count],
@@ -1458,8 +1532,12 @@ impl Vopr {
     };
     // `VOPR_NO_PERM` masks PERMANENT corruption (torn-write / bit-rot of an already-durable committed
     // slot), leaving the TRANSIENT faults (read / misdirect / corrupt-checkpoint, all of which clear on
-    // retry) on — an opt-in escape hatch for isolating a transient-fault repro.
-    let mask_perm = env_flag("VOPR_NO_PERM");
+    // retry) on — an opt-in escape hatch for isolating a transient-fault repro. The RECONFIG axis masks
+    // it too: an offline stop is on HEALTHY disks (route A), so committed data must stay sound — the
+    // all-`RecoveringHead` wedge is driven by head-slot read-faults on the UNCOMMITTED tail alone, never
+    // by corrupting a committed op. (The draws above still happen, so the reconfig run stays on its own
+    // deterministic stream; only the applied permanent rate is zeroed.)
+    let mask_perm = env_flag("VOPR_NO_PERM") || self.reconfig_axis;
     StorageFaults {
       read_fault_per_mille: if env_flag("VOPR_NO_READFAULT") {
         0
@@ -2006,6 +2084,43 @@ impl Vopr {
         }
       }
     }
+
+    // (g) TIER C RECONFIGURATION (the all-`RecoveringHead` re-formation axis): on a seeded cadence,
+    // within [`RECONFIG_BUDGET`], fire a coordinated OFFLINE reconfiguration that drives the
+    // all-`RecoveringHead` wedge — the empirical oracle for the proto's `retire_recover_and_escalate`
+    // escalation. `Cluster::reconfigure_offline` drains the cluster to all-`Normal` at a common view,
+    // mints one UNCOMMITTED tail op, pre-writes a successor durable root on every node (same voting
+    // set, bumped epoch), and restarts every voter into `RecoveringHead` with a head read-fault on the
+    // uncommitted tail. Because it HEALS every partition + clears network faults and restarts all
+    // crashed nodes as part of the drain, the driver-side fault bookkeeping is synced to match
+    // (`heal_all_partitions` clears `isolated`/`asym_victims`/the stale-read probe; the slow episode and
+    // learner-chaos crash are ended) BEFORE the call, so the driver's view never desyncs from the
+    // healed cluster. Only with the axis enabled (no draw consumed otherwise — the default per-seed
+    // schedule stays byte-identical; the escalation is off-axis-unsatisfiable, so off-axis
+    // `reform_escalations_fired` stays 0). The cluster re-forms via the escalation on the subsequent
+    // chaos/calm ticks, and the per-tick safety/durability suite + the calm/final-quiesce liveness
+    // oracle judge that it ALWAYS re-forms (no permanent `RecoveringHead` quorum) without losing a
+    // committed op. A re-wedge across two firings exercises the A2 re-fire (the gate re-arms at the new
+    // epoch).
+    if self.reconfig_axis && self.prng.chance(1, 600) && self.reconfig_actions < RECONFIG_BUDGET {
+      self.reconfig_actions += 1;
+      // Sync the driver's fault bookkeeping to the heal `reconfigure_offline` performs internally.
+      self.heal_all_partitions(c);
+      self.end_slow_episode(c);
+      self.end_learner_crash(c);
+      if let Some(rc) = c.reconfigure_offline() {
+        self.report.reconfigs_fired += 1;
+        if trace {
+          eprintln!(
+            "tick {tick}: RECONFIG offline wedge at view {} (faulted op {})",
+            rc.view(),
+            rc.faulted_op(),
+          );
+        }
+      } else if trace {
+        eprintln!("tick {tick}: RECONFIG skipped (cluster did not quiesce to a v4 root in budget)");
+      }
+    }
   }
 
   /// End the active learner-chaos episode: restart the crashed learner if it is still down (the
@@ -2302,6 +2417,23 @@ impl Vopr {
     // (consensus participation by a non-voter); the cluster records it structurally and we drain it here.
     if let Some(why) = c.take_learner_emission_violation() {
       panic!("vopr seed {} tick {tick}: {why}", self.seed);
+    }
+    // Off-axis re-formation guard: WITHOUT the reconfig axis, the re-formation escalation is
+    // off-axis-unsatisfiable (`epoch > prev_epoch` is false absent a reconfiguration), so NO voter may
+    // ever escalate out of `RecoveringHead` into a view change — the `RecoveringHead → ViewChange`
+    // edge stays untaken and the cluster's counter stays 0. (Ordinary crash/restart faults can drive a
+    // single replica `RecoveringHead`, but it only ever returns to `Normal` via adoption, never to
+    // `ViewChange`.) A non-zero count off-axis would be a REAL finding: the escalation fired without a
+    // reconfiguration, breaking its off-axis inertness (the byte-identity property the default sweep
+    // rests on). The reconfig axis exercises the firing path separately.
+    if !self.reconfig_axis && c.reform_escalations_fired() > 0 {
+      panic!(
+        "vopr seed {} tick {tick}: a RecoveringHead voter escalated into a view change \
+         ({} times) WITHOUT a reconfiguration — the re-formation escalation must be off-axis-unsatisfiable \
+         (epoch > prev_epoch is false absent a reconfiguration)",
+        self.seed,
+        c.reform_escalations_fired(),
+      );
     }
     self.check_structural(c, tick);
     self.check_ring_residency(c, tick);
@@ -2721,6 +2853,14 @@ impl Vopr {
     // cluster struct persists across replica crash/restart and nothing resets it), so `max` is exact.
     // Stays 0 with the axis disabled; the hold sweep asserts the cross-seed sum is `> 0`.
     self.report.holds_fired = self.report.holds_fired.max(c.holds_fired());
+    // re-formation witness: how many times a voter escalated out of `RecoveringHead` into a view
+    // change (the proto's `retire_recover_and_escalate`). Monotone on the cluster, so `max` is exact.
+    // `0` on EVERY run without the reconfig axis (the escalation is off-axis-unsatisfiable), so the
+    // off-axis sweep asserts it stays 0; the reconfig sweep asserts the cross-seed sum is `> 0`.
+    self.report.reform_escalations_fired = self
+      .report
+      .reform_escalations_fired
+      .max(c.reform_escalations_fired());
     // Asym/slow-axis deep witnesses: the cluster's monotone one-way-drop and slow-delay counters
     // (same discipline as `holds_fired` — nothing resets them, so `max` is exact). Both stay 0 with
     // their axes disabled; the asym/slow sweeps assert their cross-seed sums are `> 0`, proving an

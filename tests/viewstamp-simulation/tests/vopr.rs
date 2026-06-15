@@ -149,8 +149,8 @@
 
 use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
-  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_learners, run_vopr_with_slow,
-  run_vopr_with_stale_read, run_vopr_with_torn_headers, run_vopr_with_wipe,
+  run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_learners, run_vopr_with_reconfig,
+  run_vopr_with_slow, run_vopr_with_stale_read, run_vopr_with_torn_headers, run_vopr_with_wipe,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -223,6 +223,22 @@ fn vopr_sweep_no_violations() {
   );
   for seed in (0..contiguous).chain(REGRESSION_SEEDS.iter().copied()) {
     let r = run_vopr(seed, DEFAULT_TICKS);
+    // Off-axis re-formation guard (the standing byte-identity net): WITHOUT the reconfig axis the
+    // re-formation escalation is off-axis-unsatisfiable (`epoch > prev_epoch` is false absent a
+    // reconfiguration), so NO voter ever escalates out of `RecoveringHead` and NO reconfiguration
+    // fires — a default run is byte-identical to a no-escalation run. (run_vopr already panics per
+    // tick on any off-axis escalation; this is the cross-seed witness that the lane stayed inert.)
+    assert_eq!(
+      r.reform_escalations_fired(),
+      0,
+      "seed {seed}: a RecoveringHead voter escalated into a view change WITHOUT a reconfiguration — \
+       the re-formation escalation must be off-axis-unsatisfiable"
+    );
+    assert_eq!(
+      r.reconfigs_fired(),
+      0,
+      "seed {seed}: a coordinated reconfiguration fired off-axis (the reconfig axis is off)"
+    );
     total_committed += r.max_committed();
     total_crashes += r.crashes();
     total_restarts += r.restarts();
@@ -973,6 +989,92 @@ fn learner_axis_is_non_vacuous() {
     "VOPR learner sweep OK: learner_ops_applied={total_ops_applied} \
      learner_repairs_served={total_repairs} \
      learner_view_changes_followed={total_view_changes_followed} committed={total_committed} \
+     view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed TIER C RECONFIGURATION sweep (same budget rationale as
+/// [`HOLD_SEEDS`]; each reconfig drains + re-forms, so it is kept modest).
+const RECONFIG_SEEDS: u64 = 16;
+
+/// The committed TIER C RECONFIGURATION sweep: [`run_vopr_with_reconfig`] over `0..RECONFIG_SEEDS` —
+/// the all-`RecoveringHead` re-formation axis FORCE-ENABLED programmatically (the
+/// [`run_vopr_with_hold`] pattern: no env var, no schedule races, cannot be forgotten by a runner).
+/// On a seeded cadence the driver fires a coordinated OFFLINE reconfiguration
+/// ([`Cluster::reconfigure_offline`](viewstamp_simulation::Cluster::reconfigure_offline), route A): it
+/// drains the cluster to all-`Normal` at a common view, mints one UNCOMMITTED tail op above the
+/// committed frontier, pre-writes a successor durable root on every node via `prepare_restart` (KEEPING
+/// the voting set — a no-op-membership reconfig that still bumps the epoch), and restarts every voter
+/// into `Status::RecoveringHead` with a head read-fault on that uncommitted tail. That is the wedge the
+/// proto's `retire_recover_and_escalate` escalation must resolve: no `Normal` node answers a `Recovery`,
+/// so ONLY the escalation re-forms the cluster.
+///
+/// The axis MASKS the permanent torn/bit-rot storage faults (route A: an offline stop is on healthy
+/// disks), so committed data stays sound and the wedge is driven by faulting the UNCOMMITTED tail
+/// alone — no committed op is ever at risk. The standard per-tick safety / durability / applied-once /
+/// view-monotonicity suite runs throughout (so a committed-op loss, a double-apply, or a view
+/// regression across the wedge surfaces immediately), and the calm-window + final-quiesce liveness
+/// oracle asserts the cluster ALWAYS re-forms (a permanent `RecoveringHead` quorum would be a
+/// non-convergence wedge the final quiesce reports). A violation here is a REAL finding (the escalation
+/// failing to re-form a wedged cluster, or losing a committed op across the coordinated restart) —
+/// report it with its seed; never mask it.
+///
+/// The DEFAULT sweep leaves this axis OFF: the escalation is off-axis-unsatisfiable, so a default run
+/// never escalates and `reform_escalations_fired` stays `0` (the standing off-axis byte-identity guard
+/// asserted in [`vopr_sweep_no_violations`]); reconfig-enabled runs are their own deterministic
+/// baselines, byte-identical to `VOPR_RECONFIG=1` runs of the same seeds.
+#[test]
+fn vopr_reconfig_sweep_no_violations() {
+  let mut total_reconfigs = 0u64;
+  let mut total_escalations = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR reconfig sweep: 0..{RECONFIG_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, reconfig axis \
+     forced on"
+  );
+  for seed in 0..RECONFIG_SEEDS {
+    let r = run_vopr_with_reconfig(seed, DEFAULT_TICKS);
+    total_reconfigs += r.reconfigs_fired();
+    total_escalations += r.reform_escalations_fired();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity, the lane's committed core:
+  // - the axis genuinely FIRED a coordinated reconfiguration (drained, swapped roots, re-formed from a
+  //   wedge) somewhere across the sweep, and
+  // - the proto's re-formation ESCALATION genuinely fired (a voting quorum escalated out of
+  //   `RecoveringHead` into a view change) — the empirical proof the escalation re-forms the wedge.
+  // A zero in either means the lane decayed (no reconfiguration reached the wedge, or the escalation
+  // path went unexercised), and the all-`RecoveringHead` re-formation is unguarded again.
+  assert!(
+    total_reconfigs > 0,
+    "the reconfig axis never fired a coordinated reconfiguration across the sweep \
+     (reconfigs_fired={total_reconfigs}) — the lane is vacuous (no seed quiesced to a v4 root when the \
+     reconfig roll fired?)"
+  );
+  assert!(
+    total_escalations > 0,
+    "no RecoveringHead voter ever escalated into a view change across the sweep \
+     (reform_escalations_fired={total_escalations}) — the re-formation escalation was never \
+     exercised (the wedge never formed, or the escalation never fired)"
+  );
+  // And the reconfig-enabled runs still did real work: ops committed, and at least one seed drove a
+  // view change — the escalation IS a view change, so a sweep that escalated must show view changes.
+  assert!(
+    total_committed > 0,
+    "the reconfig sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no reconfig-sweep seed drove a view change — the re-formation escalation (a view change) was \
+     never reached"
+  );
+  println!(
+    "VOPR reconfig sweep OK: reconfigs_fired={total_reconfigs} \
+     reform_escalations_fired={total_escalations} committed={total_committed} \
      view_change_seeds={seeds_with_view_change}"
   );
 }
