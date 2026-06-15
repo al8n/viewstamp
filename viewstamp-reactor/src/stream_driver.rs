@@ -18,8 +18,8 @@ use viewstamp_proto::Instant;
 // The proto's transport `Conn<T>` is aliased `TransportConn` here so the bare name `Conn` belongs to
 // the driver's owned per-connection unit (`crate::bridge::Conn`).
 use viewstamp_proto::{
-  ClientId, CloseCause, Config, Conn as TransportConn, ConnId, Peer, ReplicaId, Request,
-  RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock, Wal,
+  ClientId, CloseCause, Config, Conn as TransportConn, ConnId, Membership, Peer, ReplicaId,
+  Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock, Wal,
 };
 
 use viewstamp_driver::{
@@ -209,6 +209,7 @@ where
   #[allow(clippy::too_many_arguments)]
   pub async fn new(
     config: Config,
+    membership: Membership,
     state_machine: S,
     wal: W,
     sb: B,
@@ -222,6 +223,7 @@ where
   ) -> Result<(Self, Handle), DriverError> {
     Self::with_config(
       config,
+      membership,
       state_machine,
       wal,
       sb,
@@ -248,6 +250,7 @@ where
   #[allow(clippy::too_many_arguments)]
   pub async fn with_config(
     config: Config,
+    membership: Membership,
     state_machine: S,
     mut wal: W,
     mut sb: B,
@@ -277,7 +280,7 @@ where
     let listener = <R::Net as Net>::TcpListener::bind(bind_addr)
       .await
       .map_err(DriverError::Bind)?;
-    let endpoint = build_endpoint(config, state_machine, &mut wal, &mut sb);
+    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
     let coord = StreamCoordinator::new(endpoint);
     // Bounded command channel: a partitioned/slow driver (not draining commands) can't grow it
     // without bound; a refused send surfaces as `DriverError::Busy` (see `Handle::submit`). Sized
@@ -1145,10 +1148,26 @@ mod tests {
     task::AbortOnDrop,
   };
   use viewstamp_proto::{
-    ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled, OpNumber, Passthrough, Peer,
-    ReplicaId, StreamCoordinator, View,
+    ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled, MemberId, Membership,
+    OpNumber, Passthrough, Peer, ReplicaId, StreamCoordinator, View,
   };
   use viewstamp_simulation::sm::LogSm;
+
+  /// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`.
+  ///
+  /// Built with a fixed `config_id = 0` (via `from_durable_parts`) so any hand-built test message
+  /// (which carries 0) passes the strict `(epoch, config_id)` ingress gate; production uses the
+  /// hash-chained id.
+  fn genesis(n: u8) -> Membership {
+    Membership::from_durable_parts(
+      viewstamp_proto::Epoch::new(0),
+      n,
+      0,
+      (0..n as u128).map(MemberId::new).collect(),
+      0,
+    )
+    .expect("valid genesis membership")
+  }
 
   /// A type-erased in-flight `submit` future, lifetime-bound to the borrowed `Handle` it ran from.
   type SubmitFut<'a> = dyn std::future::Future<Output = Result<crate::Reply, DriverError>> + 'a;
@@ -1177,7 +1196,7 @@ mod tests {
   /// tests can hand it a dirty store.
   async fn test_driver_with_storage(wal: InMemoryWal, sb: InMemorySuperblock) -> TestStreamDriver {
     const CLUSTER: u128 = 0x7777;
-    let config = Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+    let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
     let dialer: super::DialerFactory<Labeled<Passthrough>> = Arc::new(|peer| {
       let opts = LabelOptions::new(CLUSTER, peer);
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
@@ -1189,6 +1208,7 @@ mod tests {
     let (_ready_tx, ready_rx) = flume::unbounded();
     let (driver, _handle) = ReactorStreamDriver::new(
       config,
+      genesis(3),
       LogSm::default(),
       wal,
       sb,
@@ -1209,7 +1229,7 @@ mod tests {
   /// drive a non-default [`crate::DriverConfig`] through the production path.
   async fn test_driver_with_config(cfg: crate::DriverConfig) -> TestStreamDriver {
     const CLUSTER: u128 = 0x7777;
-    let config = Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+    let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
     let dialer: super::DialerFactory<Labeled<Passthrough>> = Arc::new(|peer| {
       let opts = LabelOptions::new(CLUSTER, peer);
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
@@ -1221,6 +1241,7 @@ mod tests {
     let (_ready_tx, ready_rx) = flume::unbounded();
     let (driver, _handle) = ReactorStreamDriver::with_config(
       config,
+      genesis(3),
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
@@ -1266,7 +1287,8 @@ mod tests {
     let build = |cap: usize| async move {
       let (_ready_tx, ready_rx) = flume::unbounded();
       TestStreamDriver::with_config(
-        Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap(),
+        Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap(),
+        genesis(3),
         LogSm::default(),
         InMemoryWal::new(),
         InMemorySuperblock::new(),
@@ -1310,7 +1332,7 @@ mod tests {
   /// nothing ever commits on its own — exactly the partitioned/slow case the submit budget must bound.
   async fn test_driver_with_handle() -> (TestStreamDriver, crate::Handle) {
     const CLUSTER: u128 = 0x7777;
-    let config = Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+    let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
     let dialer: super::DialerFactory<Labeled<Passthrough>> = Arc::new(|peer| {
       let opts = LabelOptions::new(CLUSTER, peer);
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
@@ -1322,6 +1344,7 @@ mod tests {
     let (_ready_tx, ready_rx) = flume::unbounded();
     ReactorStreamDriver::new(
       config,
+      genesis(3),
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
@@ -1348,12 +1371,8 @@ mod tests {
   async fn test_driver_small_cap(cap: usize) -> TestStreamDriver {
     let mut driver = test_driver().await;
     const CLUSTER: u128 = 0x7777;
-    let config = Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
-    let endpoint = Endpoint::new(
-      config,
-      u64::from(config.replica().get()) + 1,
-      LogSm::default(),
-    );
+    let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
+    let endpoint = Endpoint::new(config, genesis(3), 1, LogSm::default());
     driver.coord = StreamCoordinator::with_outbound_cap(endpoint, cap);
     driver
   }
@@ -1518,7 +1537,8 @@ mod tests {
     });
     let (_ready_tx, ready_rx) = flume::unbounded();
     let (mut driver, _handle) = ReactorStreamDriver::<TestRt, _, _, _, _>::new(
-      Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap(),
+      Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap(),
+      genesis(3),
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
@@ -1544,8 +1564,9 @@ mod tests {
 
     // The remote replica (id 1): a stand-alone coordinator that accepts our conn and answers the
     // `Labeled` handshake.
-    let peer_config = Config::try_new(CLUSTER, ReplicaId::new(1), 3).unwrap();
-    let mut peer = StreamCoordinator::new(Endpoint::new(peer_config, 2, LogSm::default()));
+    let peer_config = Config::try_new(CLUSTER, MemberId::new(1_u128)).unwrap();
+    let mut peer =
+      StreamCoordinator::new(Endpoint::new(peer_config, genesis(3), 2, LogSm::default()));
     let peer_conn = Conn::from_parts(Labeled::acceptor(
       Passthrough::new(),
       &LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(1))),
@@ -1682,7 +1703,7 @@ mod tests {
   /// waiting out the dial timeout. A regression to a detached dial task fails the 5s bound.
   #[tokio::test]
   async fn run_exits_with_an_in_flight_dial_to_an_unreachable_peer() {
-    let config = Config::try_new(0x7777, ReplicaId::new(0), 3).unwrap();
+    let config = Config::try_new(0x7777, MemberId::new(0_u128)).unwrap();
     let dialer: super::DialerFactory<Labeled<Passthrough>> = Arc::new(|peer| {
       let opts = LabelOptions::new(0x7777, peer);
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
@@ -1697,6 +1718,7 @@ mod tests {
     let unreachable: std::net::SocketAddr = "203.0.113.1:9".parse().unwrap();
     let (driver, handle) = ReactorStreamDriver::<TestRt, _, _, _, _>::new(
       config,
+      genesis(3),
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),

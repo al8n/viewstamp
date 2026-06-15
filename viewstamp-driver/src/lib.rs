@@ -71,6 +71,19 @@ pub enum DriverError {
     /// The peer that could not be dialed.
     peer: viewstamp_proto::Peer,
   },
+  /// This node is no longer part of the recovered cluster membership: its stable
+  /// [`MemberId`](viewstamp_proto::MemberId) ([`Config::local`](viewstamp_proto::Config)) did not
+  /// resolve to any slot in the DURABLE root's membership, so a reconfiguration removed it (the
+  /// `Endpoint::recover` → [`Recovered::Retired`](viewstamp_proto::Recovered) path). A retired node
+  /// cannot run a replica loop; the driver refuses to start rather than booting a node the cluster
+  /// has dropped. Carries the local member id and the epoch it was retired at.
+  #[error("node {local} is retired at epoch {epoch}: it is absent from the recovered membership")]
+  Retired {
+    /// The local member id the recovered membership no longer contains.
+    local: viewstamp_proto::MemberId,
+    /// The configuration epoch this node was retired at.
+    epoch: viewstamp_proto::Epoch,
+  },
   /// The configured connection cap cannot admit the configured peer mesh. The mesh is
   /// mutual-dial: every replica dials each configured peer AND must accept each peer's dial back
   /// (an inbound socket is admission-controlled until its handshake validates, so the cap must

@@ -34,13 +34,30 @@ use std::{net::SocketAddr, rc::Rc};
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Config, Conn, LabelOptions, Labeled, Passthrough, Peer, ReplicaId, Superblock, Wal,
+  ClientId, Config, Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer,
+  ReplicaId, Superblock, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
 
 /// The cluster id every node (and the `Labeled` handshake) must agree on. Pick one per cluster;
 /// a node presenting a different id is rejected at the handshake.
 const CLUSTER: u128 = 0xD0C5;
+
+/// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`, so each
+/// node's local slot equals its old replica index.
+///
+/// Built with a fixed `config_id = 0` (via `from_durable_parts`), matching the test fixtures so the
+/// example shares the demonstration configuration; production uses the hash-chained id.
+fn genesis(n: u8) -> Membership {
+  Membership::from_durable_parts(
+    viewstamp_proto::Epoch::new(0),
+    n,
+    0,
+    (0..n as u128).map(MemberId::new).collect(),
+    0,
+  )
+  .expect("valid genesis membership")
+}
 
 /// Wraps a storage impl and signals the driver's storage-ready notifier on every submit.
 ///
@@ -150,7 +167,7 @@ async fn main() {
 
     // The cluster config: (cluster id, my replica id, cluster size). Replica ids are the dense
     // indices 0..n; view 0's primary is replica 0.
-    let config = Config::try_new(CLUSTER, ReplicaId::new(id), 3).unwrap();
+    let config = Config::try_new(CLUSTER, MemberId::new((id) as u128)).unwrap();
 
     // EMBEDDER OBLIGATION — storage. A fresh in-memory Wal + Superblock per replica, wrapped with
     // the storage-ready notifier. Replace `InMemoryWal`/`InMemorySuperblock` with your durable
@@ -182,6 +199,7 @@ async fn main() {
 
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
       config,
+      genesis(3),
       LogSm::default(), // EMBEDDER OBLIGATION — the deterministic state machine.
       wal,
       sb,

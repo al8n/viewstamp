@@ -37,12 +37,22 @@ use std::{
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Config, Endpoint, Event, Instant, Request, RequestNumber, StateMachine, Superblock,
-  VsrState, Wal,
+  ClientId, Config, Endpoint, Event, Instant, Membership, Recovered, Request, RequestNumber,
+  StateMachine, Superblock, VsrState, Wal,
 };
+
+use crate::DriverError;
 
 /// Construct a driver's consensus endpoint from its durable store — recover-or-new, decided by
 /// INSPECTING the store rather than by an embedder flag.
+///
+/// # Errors
+///
+/// [`DriverError::Retired`] when the recover path resolves THIS node to no slot in the durable
+/// root's membership — a reconfiguration removed it (the `Endpoint::recover` →
+/// [`Recovered::Retired`](viewstamp_proto::Recovered) outcome). A retired node cannot run a replica
+/// loop, so the driver refuses to start rather than booting a node the cluster has dropped. The
+/// genesis-boot path never returns this (a fresh node is in its own genesis membership).
 ///
 /// A genesis store — the fresh-cluster durable root ([`VsrState::new`]) AND an empty WAL — boots a
 /// fresh endpoint (`Endpoint::new`: `Normal`, view 0). ANY durable state instead reconstructs the
@@ -66,24 +76,39 @@ use viewstamp_proto::{
 /// completion this driver polls can predate its endpoint, PROVIDED the handles carry no in-flight
 /// ops from a previous incarnation (the drivers' constructor-level storage contract; a real crash
 /// satisfies it by construction because in-flight ops die with the process).
-pub fn build_endpoint<S, W, B>(config: Config, sm: S, wal: &mut W, sb: &mut B) -> Endpoint<S>
+pub fn build_endpoint<S, W, B>(
+  config: Config,
+  membership: Membership,
+  sm: S,
+  wal: &mut W,
+  sb: &mut B,
+) -> Result<Endpoint<S>, DriverError>
 where
   S: StateMachine,
   W: Wal,
   B: Superblock,
 {
-  // Wall-clock nanos make the seed (hence the nonces) fresh per incarnation; the replica id keeps
-  // replicas constructed in the same instant (a test cluster) on distinct seeds, rotated into the
-  // high bits so it does not collide with the fast-moving low nano bits. The truncation keeps the
-  // low 64 bits — exactly the fast-moving ones.
+  // Wall-clock nanos make the seed (hence the nonces) fresh per incarnation; the node's stable
+  // `MemberId` keeps replicas constructed in the same instant (a test cluster) on distinct seeds,
+  // rotated into the high bits so it does not collide with the fast-moving low nano bits. The
+  // truncation keeps the low 64 bits — exactly the fast-moving ones.
   let wall = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map_or(0, |d| d.as_nanos() as u64);
-  let seed = wall ^ (u64::from(config.replica().get()) + 1).rotate_left(48);
+  let seed = wall ^ ((config.local().get() as u64).wrapping_add(1)).rotate_left(48);
   if sb.state() == VsrState::new() && wal.op_head().get() == 0 {
-    Endpoint::new(config, seed, sm)
+    Ok(Endpoint::new(config, membership, seed, sm))
   } else {
-    Endpoint::recover(config, seed, sm, wal, sb)
+    // The recover path resolves THIS node against the DURABLE root's membership: a v4 root that no
+    // longer lists it (an offline reconfiguration removed it) yields `Recovered::Retired`, which the
+    // driver surfaces as a hard error — a retired node has no replica loop to run.
+    match Endpoint::recover(config, membership, seed, sm, wal, sb) {
+      Recovered::Active(endpoint) => Ok(endpoint),
+      Recovered::Retired(retired) => Err(DriverError::Retired {
+        local: retired.local(),
+        epoch: retired.epoch(),
+      }),
+    }
   }
 }
 
