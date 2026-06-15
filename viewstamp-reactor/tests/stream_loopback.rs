@@ -10,11 +10,28 @@ use std::{
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  Conn, LabelOptions, Labeled, Passthrough, Peer, ReplicaId, StreamTransport, Superblock, Wal,
+  Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer, ReplicaId, StreamTransport,
+  Superblock, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 const CLUSTER: u128 = 0x5151;
+
+/// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`, so each
+/// node's local slot equals its old replica index (byte-identical quorum/primary/voter at epoch 0).
+///
+/// Built with a fixed `config_id = 0` (via `from_durable_parts`) so any hand-built test message (which
+/// carries 0) passes the strict `(epoch, config_id)` ingress gate; production uses the hash-chained id.
+fn genesis(n: u8) -> Membership {
+  Membership::from_durable_parts(
+    viewstamp_proto::Epoch::new(0),
+    n,
+    0,
+    (0..n as u128).map(MemberId::new).collect(),
+    0,
+  )
+  .expect("valid genesis membership")
+}
 
 /// Wraps an in-memory store and signals the storage-ready notifier on every submit, so the driver
 /// re-pumps. (A real async store signals on completion; the synchronous in-memory store completes on
@@ -224,12 +241,14 @@ where
       .filter(|&p| p != id)
       .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
       .collect();
-    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(id as u16), 3).unwrap();
+    let config =
+      viewstamp_proto::Config::try_new(CLUSTER, MemberId::new((id as u16) as u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
     let (driver, handle) = GateDriver::new(
       config,
+      genesis(3),
       viewstamp_simulation::sm::LogSm::default(),
       wal,
       sb,
@@ -348,12 +367,14 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
   let mut handles = Vec::new();
   let mut victim_task = None;
   for id in 0u8..3 {
-    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(id as u16), 3).unwrap();
+    let config =
+      viewstamp_proto::Config::try_new(CLUSTER, MemberId::new((id as u16) as u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Shared::new(wals[id as usize].clone(), ready_tx.clone());
     let sb = Shared::new(sbs[id as usize].clone(), ready_tx);
     let (driver, handle) = RestartDriver::new(
       config,
+      genesis(3),
       viewstamp_simulation::sm::LogSm::default(),
       wal,
       sb,
@@ -423,7 +444,8 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
   let wal = Shared::new(wals[2].clone(), ready_tx.clone());
   let sb = Shared::new(sbs[2].clone(), ready_tx);
   let (driver, restarted) = RestartDriver::new(
-    viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(2), 3).unwrap(),
+    viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(2_u128)).unwrap(),
+    genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
@@ -495,13 +517,14 @@ async fn stream_driver_exits_when_all_handles_dropped() {
     })
   };
 
-  let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+  let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
   let bind: SocketAddr = "127.0.0.1:45200".parse().unwrap();
   let (driver, handle) = GateDriver::new(
     config,
+    genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
@@ -557,12 +580,13 @@ async fn shutdown_ack_frees_the_address_for_immediate_rebind_stream() {
   for i in 0..5 {
     // Iterations 1.. bind the address the PREVIOUS iteration's driver just released: this
     // constructor succeeding immediately after the ack is the assertion.
-    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+    let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
     let (driver, handle) = GateDriver::new(
       config,
+      genesis(3),
       viewstamp_simulation::sm::LogSm::default(),
       wal,
       sb,
@@ -620,12 +644,13 @@ async fn shutdown_releases_a_queued_dial_completion() {
   let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
   let peer_addr = raw.local_addr().unwrap();
 
-  let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+  let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
   let (driver, handle) = GateDriver::new(
     config,
+    genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
@@ -698,12 +723,13 @@ async fn stalled_unvalidated_accept_is_reaped_at_the_auth_deadline() {
   };
 
   let bind: SocketAddr = "127.0.0.1:45300".parse().unwrap();
-  let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+  let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
   let (driver, handle) = GateDriver::new(
     config,
+    genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
@@ -779,12 +805,13 @@ async fn stalled_dialed_conn_is_reaped_at_the_auth_deadline_and_redials() {
   let peer_addr: SocketAddr = peer_listener.local_addr().expect("listener has an address");
 
   let bind: SocketAddr = "127.0.0.1:45400".parse().unwrap();
-  let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+  let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
   let (driver, handle) = GateDriver::new(
     config,
+    genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
@@ -958,12 +985,13 @@ async fn a_full_cap_evicts_the_oldest_unvalidated_accept_for_a_fresh_one() {
   };
 
   let bind: SocketAddr = "127.0.0.1:45800".parse().unwrap();
-  let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+  let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
   let (driver, handle) = GateDriver::with_config(
     config,
+    genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,

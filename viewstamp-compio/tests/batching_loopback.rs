@@ -11,7 +11,8 @@ use std::{cell::RefCell, net::SocketAddr, rc::Rc, time::Duration};
 use bytes::Bytes;
 use viewstamp_driver::{BatchConfig, aggregator, aggregator_with_stall};
 use viewstamp_proto::{
-  Conn, LabelOptions, Labeled, Passthrough, Peer, ReplicaId, StateMachine, Superblock, Wal,
+  Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer, ReplicaId, StateMachine,
+  Superblock, Wal,
 };
 use viewstamp_simulation::{
   InMemorySuperblock, InMemoryWal,
@@ -19,6 +20,22 @@ use viewstamp_simulation::{
 };
 
 const CLUSTER: u128 = 0x5151;
+
+/// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`, so each
+/// node's local slot equals its old replica index (byte-identical quorum/primary/voter at epoch 0).
+///
+/// Built with a fixed `config_id = 0` (via `from_durable_parts`) so any hand-built test message (which
+/// carries 0) passes the strict `(epoch, config_id)` ingress gate; production uses the hash-chained id.
+fn genesis(n: u8) -> Membership {
+  Membership::from_durable_parts(
+    viewstamp_proto::Epoch::new(0),
+    n,
+    0,
+    (0..n as u128).map(MemberId::new).collect(),
+    0,
+  )
+  .expect("valid genesis membership")
+}
 
 /// Wraps an in-memory store and signals the storage-ready notifier on every submit, so the driver
 /// re-pumps. (A real async store signals on completion; the synchronous in-memory store completes on
@@ -154,13 +171,15 @@ async fn spawn_cluster(
       .filter(|&p| p != id)
       .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
       .collect();
-    let config = viewstamp_proto::Config::try_new(CLUSTER, ReplicaId::new(id as u16), 3).unwrap();
+    let config =
+      viewstamp_proto::Config::try_new(CLUSTER, MemberId::new((id as u16) as u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
     let (sm, recorder) = SharedSm::new();
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
       config,
+      genesis(3),
       sm,
       wal,
       sb,

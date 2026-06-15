@@ -12,6 +12,22 @@ use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 const CLUSTER: u128 = 0x5151;
 
+/// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`, so each
+/// node's local slot equals its old replica index (byte-identical quorum/primary/voter at epoch 0).
+///
+/// Built with a fixed `config_id = 0` (via `from_durable_parts`) so any hand-built test message (which
+/// carries 0) passes the strict `(epoch, config_id)` ingress gate; production uses the hash-chained id.
+fn genesis(n: u8) -> viewstamp_proto::Membership {
+  viewstamp_proto::Membership::from_durable_parts(
+    viewstamp_proto::Epoch::new(0),
+    n,
+    0,
+    (0..n as u128).map(viewstamp_proto::MemberId::new).collect(),
+    0,
+  )
+  .expect("valid genesis membership")
+}
+
 /// A self-signed cluster CA + per-replica leaf certs, mirroring the proto's own `test_ca` /
 /// `issue_replica` (`viewstamp-proto/src/transport/quic/crypto.rs`): same rcgen 0.14 API, same SAN
 /// form `replica-<n>.<cluster-hex>.viewstamp`, same EKU (ServerAuth + ClientAuth) and KU. The leaf
@@ -165,13 +181,14 @@ async fn build_driver(
   let (chain, key) = ca.issue(id);
   let opts: QuicOptions = ClusterTls::new(ca.roots(), chain, key).build();
   let config =
-    viewstamp_proto::Config::try_new(CLUSTER, viewstamp_proto::ReplicaId::new(id as u16), 3)
+    viewstamp_proto::Config::try_new(CLUSTER, viewstamp_proto::MemberId::new((id as u16) as u128))
       .unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
   GateDriver::new(
     config,
+    genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,

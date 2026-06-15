@@ -5,8 +5,8 @@ use agnostic::{
   net::{Net, UdpSocket},
 };
 use viewstamp_proto::{
-  ClientId, Config, Event, IdentityConfig, Instant, Peer, ProvidedIdentity, QuicCoordinator,
-  QuicOptions, ReplicaId, Request, RequestNumber, StateMachine, Superblock, Wal,
+  ClientId, Config, Event, IdentityConfig, Instant, Membership, Peer, ProvidedIdentity,
+  QuicCoordinator, QuicOptions, ReplicaId, Request, RequestNumber, StateMachine, Superblock, Wal,
 };
 
 use viewstamp_driver::{
@@ -144,6 +144,7 @@ where
   #[allow(clippy::too_many_arguments)]
   pub async fn new(
     config: Config,
+    membership: Membership,
     state_machine: S,
     wal: W,
     sb: B,
@@ -158,6 +159,7 @@ where
   ) -> Result<(Self, Handle), DriverError> {
     Self::with_config(
       config,
+      membership,
       state_machine,
       wal,
       sb,
@@ -183,6 +185,7 @@ where
   #[allow(clippy::too_many_arguments)]
   pub async fn with_config(
     config: Config,
+    membership: Membership,
     state_machine: S,
     mut wal: W,
     mut sb: B,
@@ -201,7 +204,7 @@ where
       .await
       .map_err(DriverError::Bind)?;
 
-    let endpoint = build_endpoint(config, state_machine, &mut wal, &mut sb);
+    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
     let mut coord = QuicCoordinator::with_identity(endpoint, opts, rng_seed, identity);
 
     let now = clock.now();
@@ -680,8 +683,24 @@ mod tests {
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
   };
-  use viewstamp_proto::{ClusterTls, Config, IdentityConfig, QuicOptions, ReplicaId};
+  use viewstamp_proto::{ClusterTls, Config, IdentityConfig, MemberId, Membership, QuicOptions};
   use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
+
+  /// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`.
+  ///
+  /// Built with a fixed `config_id = 0` (via `from_durable_parts`) so any hand-built test message
+  /// (which carries 0) passes the strict `(epoch, config_id)` ingress gate; production uses the
+  /// hash-chained id.
+  fn genesis(n: u8) -> Membership {
+    Membership::from_durable_parts(
+      viewstamp_proto::Epoch::new(0),
+      n,
+      0,
+      (0..n as u128).map(MemberId::new).collect(),
+      0,
+    )
+    .expect("valid genesis membership")
+  }
 
   use super::ReactorQuicDriver;
   use viewstamp_driver::{DriverError, MAX_INFLIGHT, MAX_PENDING_BYTES, REQUEST_TIMEOUT};
@@ -776,10 +795,11 @@ mod tests {
   ) -> (TestQuicDriver, crate::Handle) {
     let (roots, chain, key) = cluster_ca();
     let opts: QuicOptions = ClusterTls::new(roots, chain, key).build();
-    let config = Config::try_new(CLUSTER, ReplicaId::new(0), 3).unwrap();
+    let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
     let (_ready_tx, ready_rx) = flume::unbounded();
     ReactorQuicDriver::with_config(
       config,
+      genesis(3),
       LogSm::default(),
       wal,
       sb,
