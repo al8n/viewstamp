@@ -521,10 +521,20 @@ fn seal_committed_frontier_persists_commit_max_into_the_durable_root() {
   );
 
   let now = Instant::ZERO;
-  e.seal_committed_frontier(&mut sb);
+  assert!(
+    e.seal_committed_frontier(&mut sb),
+    "the seal fired (the node is Normal with no durable work in flight)"
+  );
   assert!(
     e.pending_sb_for_test(),
-    "the seal armed a durable-root write (the node is Normal with no write in flight)"
+    "the seal armed a durable-root write"
+  );
+  // A second seal while the first write is still in flight REFUSES (the in-flight-storage guard) — the
+  // load-bearing protection against a seal racing or landing behind other outstanding durable work
+  // (a queued checkpoint root, an append) and reverting it.
+  assert!(
+    !e.seal_committed_frontier(&mut sb),
+    "a seal is refused while a durable-root write is in flight"
   );
   // Drive the seal's superblock write to completion, exactly as a recover/view-change test drains it.
   let mut wal = ScriptedWal::with_entries(0);

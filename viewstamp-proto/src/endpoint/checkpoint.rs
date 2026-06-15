@@ -670,11 +670,21 @@ impl<S: StateMachine> Endpoint<S> {
   /// successor with [`prepare_restart`](crate::prepare_restart) — so the successor root carries the
   /// true committed prefix and every committed op is read back on restart.
   ///
-  /// A no-op unless the node is `Normal` with no durable-view write already in flight — both of which
-  /// the quiesced-stop precondition (the cluster drained to all-`Normal`, idle) already guarantees.
-  pub fn seal_committed_frontier(&mut self, sb: &mut impl Superblock) {
-    if self.status.is_normal() && self.pending_sb.is_none() {
+  /// Returns whether it sealed. It is a no-op (returns `false`) unless the node is `Normal` with NO
+  /// durable work outstanding — a WAL append, a durable-view write, a checkpoint root, a state-sync
+  /// install, or a sync-serve read ([`Self::has_inflight_storage`]). Refusing while any durable write
+  /// is in flight is load-bearing: a seal submitted behind a queued checkpoint root would carry the
+  /// stale `checkpoint_op` and land after it, reverting the checkpoint; and an operator that merely
+  /// drains `has_inflight_storage` after sealing could mistake an unrelated completion for the seal.
+  /// The operator therefore drains all in-flight storage FIRST, then seals (which now fires), then
+  /// verifies the durable root commit matches the sealed frontier before deriving a successor.
+  #[must_use = "an ignored seal may leave the durable root behind commit_max; check it fired"]
+  pub fn seal_committed_frontier(&mut self, sb: &mut impl Superblock) -> bool {
+    if self.status.is_normal() && !self.has_inflight_storage() {
       self.submit_durable_view(PendingSbAction::Seal, sb);
+      true
+    } else {
+      false
     }
   }
 
