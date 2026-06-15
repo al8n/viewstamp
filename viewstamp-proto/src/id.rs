@@ -30,6 +30,67 @@ impl core::fmt::Display for ReplicaId {
   }
 }
 
+/// A globally-unique, slot-decoupled replica identity. Stable across
+/// reconfigurations: a `MemberId` occupies a [`ReplicaId`] slot in the active
+/// membership, and a node is resolved by its `MemberId`, not its slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct MemberId(u128);
+
+impl MemberId {
+  /// Creates a member id.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(id: u128) -> Self {
+    Self(id)
+  }
+
+  /// The raw member id.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn get(self) -> u128 {
+    self.0
+  }
+}
+
+impl core::fmt::Display for MemberId {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    self.0.fmt(f)
+  }
+}
+
+/// A configuration version. Monotone across reconfigurations; high-order to the
+/// view in `(epoch, view)` leadership (view resets to 0 each epoch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct Epoch(u64);
+
+impl Epoch {
+  /// Creates an epoch.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(n: u64) -> Self {
+    Self(n)
+  }
+
+  /// The raw epoch number.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn get(self) -> u64 {
+    self.0
+  }
+
+  /// The next epoch (saturating).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn next(self) -> Self {
+    Self(self.0.saturating_add(1))
+  }
+}
+
+impl core::fmt::Display for Epoch {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    self.0.fmt(f)
+  }
+}
+
 /// A globally-unique client identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -146,5 +207,18 @@ mod tests {
     assert!(c.is_client() && c.as_replica().is_none());
     assert_eq!(ReplicaId::new(2).get(), 2);
     assert_eq!(ClientId::new(7).get(), 7);
+  }
+
+  #[test]
+  fn member_id_and_epoch_round_trip() {
+    let m = MemberId::new(0xDEAD_BEEF_0000_0001_0000_0000_0000_0002);
+    assert_eq!(m.get(), 0xDEAD_BEEF_0000_0001_0000_0000_0000_0002);
+    assert_eq!(MemberId::new(7), MemberId::new(7));
+    assert_ne!(MemberId::new(7), MemberId::new(8));
+    let e = Epoch::new(5);
+    assert_eq!(e.get(), 5);
+    assert!(Epoch::new(0) < Epoch::new(1));
+    assert_eq!(Epoch::new(4).next(), Epoch::new(5));
+    assert_eq!(std::format!("{}", MemberId::new(42)), "42");
   }
 }

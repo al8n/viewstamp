@@ -39,6 +39,7 @@ mod config;
 mod endpoint;
 mod event;
 mod id;
+mod membership;
 mod message;
 mod number;
 mod prng;
@@ -60,7 +61,8 @@ pub use config::{
 };
 pub use endpoint::Endpoint;
 pub use event::{Committed, Event, RepairStarted, ViewChanged};
-pub use id::{ClientId, Peer, Recipient, ReplicaId};
+pub use id::{ClientId, Epoch, MemberId, Peer, Recipient, ReplicaId};
+pub use membership::{Membership, MembershipError};
 pub use message::{
   Commit, DoViewChange, GetView, Message, Outgoing, Prepare, PrepareBatch, PrepareOk,
   PreparedEntry, REPLY_ENCODE_OVERHEAD, Recovery, RecoveryResponse, RepairBatch, Reply, Request,
