@@ -27,7 +27,7 @@ use bytes::BufMut;
 /// persisted root or blocks a rolling upgrade. A decode that reads a different version fails with
 /// [`CodecError::UnknownVersion`] rather than misinterpreting later bytes, letting each format evolve
 /// without silently reinterpreting old/foreign data.
-pub const WIRE_VERSION: u16 = 4;
+pub const WIRE_VERSION: u16 = 5;
 
 /// A typed, structured error from decoding a [`Header`](crate::Header),
 /// [`VsrState`](crate::VsrState), or [`Message`](crate::Message) from bytes (or from a
@@ -77,6 +77,20 @@ pub enum CodecError {
   /// underlying [`VsrStateError`](crate::VsrStateError).
   #[error("decoded VsrState is invalid: {0}")]
   InvalidVsrState(#[from] crate::VsrStateError),
+  /// A v4 [`VsrState`](crate::VsrState) root's `membership_present` flag was neither `0` (absent) nor
+  /// `1` (a membership block follows). Carries the unexpected byte.
+  #[error("invalid membership-present flag: {0}")]
+  InvalidMembershipPresent(u8),
+}
+
+impl From<crate::MembershipError> for CodecError {
+  /// A membership block decoded from a v4 root that violates the [`Membership`](crate::Membership)
+  /// structural invariants surfaces as an [`InvalidVsrState`](Self::InvalidVsrState) (the root is the
+  /// thing being decoded), routed through [`VsrStateError`](crate::VsrStateError).
+  #[cfg_attr(not(tarpaulin), inline)]
+  fn from(e: crate::MembershipError) -> Self {
+    Self::InvalidVsrState(e.into())
+  }
 }
 
 /// A forward-only, bounds-checked cursor over an input buffer.

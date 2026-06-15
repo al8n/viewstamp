@@ -1,4 +1,4 @@
-use crate::{ReplicaId, View};
+use crate::MemberId;
 
 /// Default ops between checkpoints (matches a small TB-style interval for fast sim coverage).
 pub const DEFAULT_CHECKPOINT_OPS: u64 = 32;
@@ -18,8 +18,8 @@ pub const DEFAULT_CHECKPOINT_OPS: u64 = 32;
 /// the capacity contract requires capacity above `checkpoint_ops + pipeline` for liveness either way). So
 /// the band depth is at most about `6 × checkpoint_ops + headroom`. Capping `checkpoint_ops` at `2^15`
 /// keeps even that worst case (`6 × 2^15 + 8 = 196_616`) at or below
-/// `MAX_HEADER_ONLY_BAND_DEPTH` (`(16 MiB − 64) / 49 =
-/// 342_391`), so a header-only carrier of the deepest band stays sub-frame-cap regardless of body sizes.
+/// `MAX_HEADER_ONLY_BAND_DEPTH` (`(16 MiB − 80) / 49 =
+/// 342_390`), so a header-only carrier of the deepest band stays sub-frame-cap regardless of body sizes.
 /// (A `2^20` cap would let a `49 × 2^20 ≈ 51 MiB` carrier overflow the 16 MiB frame.)
 /// [`Endpoint::log_entries`](crate::Endpoint) additionally `debug_assert`s each band against
 /// `MAX_HEADER_ONLY_BAND_DEPTH`, catching a bounded-WAL embedder that sized capacity beyond the `6×`
@@ -75,37 +75,13 @@ pub const MAX_CLIENT_SESSIONS: u32 = 4096;
 pub const MAX_SYNC_ENVELOPE_LEN: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Error constructing a [`Config`].
+///
+/// The cluster-shape invariants (voting count, learner count, member uniqueness) moved to
+/// [`Membership`](crate::Membership) — `Config` now validates only the static per-node parameters,
+/// so this enum carries only their errors.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigError {
-  /// `replica_count` was zero.
-  #[error("replica_count must be > 0")]
-  ZeroReplicaCount,
-  /// `replica` index is not in `0..replica_count`.
-  #[error("replica index {index} out of range for a {count}-replica cluster")]
-  ReplicaIndexOutOfRange {
-    /// The offending replica index.
-    index: u16,
-    /// The cluster size.
-    count: u8,
-  },
-  /// `replica_count` exceeds the 64-replica limit (the prepare-ok quorum uses a u64 bitset).
-  #[error("replica_count {count} exceeds the maximum of 64 (prepare-ok quorum uses a u64 bitset)")]
-  TooManyReplicas {
-    /// The offending cluster size.
-    count: u8,
-  },
-  /// `replica_count + learner_count` exceeds the number of representable replica ids: every replica
-  /// (voting or learner) is addressed by a `ReplicaId`, whose index is a `u16`, so the node count
-  /// cannot exceed `u16::MAX`.
-  #[error(
-    "node_count {count} exceeds the maximum of {} (a replica id is a u16)",
-    u16::MAX
-  )]
-  TooManyNodes {
-    /// The offending node count (`replica_count + learner_count`).
-    count: u32,
-  },
   /// `checkpoint_ops` was zero.
   #[error("checkpoint_ops must be > 0")]
   ZeroCheckpointOps,
@@ -124,73 +100,35 @@ pub enum ConfigError {
   ZeroMaxSyncEnvelopeLen,
 }
 
-/// Static cluster configuration for one replica. Immutable in v1
-/// (reconfiguration is deferred).
+/// The static, per-node parameters for one replica: the cluster id, this node's stable
+/// [`MemberId`], and the local tuning knobs (checkpoint interval + the two admission caps).
+///
+/// It is decoupled from the cluster SHAPE — who votes, who leads, the quorum sizes, and this node's
+/// slot — which is epoch-versioned and now lives in the active [`Membership`](crate::Membership) the
+/// [`Endpoint`](crate::Endpoint) holds. A node is resolved against that membership by its `MemberId`,
+/// so a reconfiguration can move it between slots (or remove it) without rewriting its `Config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
   cluster: u128,
-  replica: ReplicaId,
-  replica_count: u8,
-  learner_count: u16,
+  local: MemberId,
   checkpoint_ops: u64,
   max_client_sessions: u32,
   max_sync_envelope_len: u64,
 }
 
 impl Config {
-  /// Creates a configuration for a VOTING replica, validating the cluster invariants. The cluster
-  /// has no learners (`learner_count == 0`); chain [`Config::with_learner_count`] to record some.
+  /// Creates a configuration for one node, identified by its stable [`MemberId`]. The cluster shape
+  /// (the voting set, learners, and this node's slot) is supplied separately as the active
+  /// [`Membership`](crate::Membership) — `Config` carries only the static per-node parameters.
   ///
-  /// # Errors
-  /// Returns [`ConfigError`] if `replica_count == 0`, `replica >= replica_count`,
-  /// or `replica_count > 64`.
+  /// This is infallible at the `Config` layer: the only static parameters are caps that default to
+  /// valid values and the `MemberId`, which is opaque. The cluster-shape invariants are validated by
+  /// [`Membership::genesis`](crate::Membership::genesis).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn try_new(
-    cluster: u128,
-    replica: ReplicaId,
-    replica_count: u8,
-  ) -> Result<Self, ConfigError> {
-    Self::try_new_member(cluster, replica, replica_count, 0)
-  }
-
-  /// Creates a configuration for any cluster member, voting or learner, validating the cluster
-  /// invariants. The voting set is `replica_count` (it drives every quorum); `learner_count`
-  /// non-voting learners follow it, so the replica ids span `0..replica_count + learner_count`
-  /// (the `node_count`). Unlike [`Config::try_new`], `replica` may be a learner id (one in
-  /// `[replica_count, node_count)`): this is the path a learner uses to build its own config.
-  ///
-  /// # Errors
-  /// Returns [`ConfigError`] if `replica_count == 0`, `replica` is not in `0..node_count`,
-  /// `replica_count > 64`, or `node_count` exceeds `u16::MAX`.
-  pub const fn try_new_member(
-    cluster: u128,
-    replica: ReplicaId,
-    replica_count: u8,
-    learner_count: u16,
-  ) -> Result<Self, ConfigError> {
-    if replica_count == 0 {
-      return Err(ConfigError::ZeroReplicaCount);
-    }
-    let node_count = replica_count as u32 + learner_count as u32;
-    if node_count > u16::MAX as u32 {
-      return Err(ConfigError::TooManyNodes { count: node_count });
-    }
-    if (replica.get() as u32) >= node_count {
-      return Err(ConfigError::ReplicaIndexOutOfRange {
-        index: replica.get(),
-        count: replica_count,
-      });
-    }
-    if replica_count > 64 {
-      return Err(ConfigError::TooManyReplicas {
-        count: replica_count,
-      });
-    }
+  pub const fn try_new(cluster: u128, local: MemberId) -> Result<Self, ConfigError> {
     Ok(Self {
       cluster,
-      replica,
-      replica_count,
-      learner_count,
+      local,
       checkpoint_ops: DEFAULT_CHECKPOINT_OPS,
       max_client_sessions: MAX_CLIENT_SESSIONS,
       max_sync_envelope_len: MAX_SYNC_ENVELOPE_LEN,
@@ -200,12 +138,11 @@ impl Config {
   /// Like [`Config::try_new`] but with an explicit checkpoint interval.
   ///
   /// # Errors
-  /// In addition to [`Config::try_new`]'s errors: [`ConfigError::ZeroCheckpointOps`] if
-  /// `checkpoint_ops == 0`, [`ConfigError::CheckpointOpsTooLarge`] if it exceeds [`MAX_CHECKPOINT_OPS`].
+  /// [`ConfigError::ZeroCheckpointOps`] if `checkpoint_ops == 0`,
+  /// [`ConfigError::CheckpointOpsTooLarge`] if it exceeds [`MAX_CHECKPOINT_OPS`].
   pub const fn with_checkpoint_ops(
     cluster: u128,
-    replica: ReplicaId,
-    replica_count: u8,
+    local: MemberId,
     checkpoint_ops: u64,
   ) -> Result<Self, ConfigError> {
     if checkpoint_ops == 0 {
@@ -216,18 +153,13 @@ impl Config {
         ops: checkpoint_ops,
       });
     }
-    match Self::try_new(cluster, replica, replica_count) {
-      Ok(c) => Ok(Self {
-        cluster: c.cluster,
-        replica: c.replica,
-        replica_count: c.replica_count,
-        learner_count: c.learner_count,
-        checkpoint_ops,
-        max_client_sessions: c.max_client_sessions,
-        max_sync_envelope_len: c.max_sync_envelope_len,
-      }),
-      Err(e) => Err(e),
-    }
+    Ok(Self {
+      cluster,
+      local,
+      checkpoint_ops,
+      max_client_sessions: MAX_CLIENT_SESSIONS,
+      max_sync_envelope_len: MAX_SYNC_ENVELOPE_LEN,
+    })
   }
 
   /// Returns this configuration with the client-session cap replaced (chainable; consumes the copy).
@@ -264,37 +196,10 @@ impl Config {
     })
   }
 
-  /// Returns this configuration with the learner count replaced (chainable; consumes the copy):
-  /// the number of non-voting learner replicas, which follow the voting set so the replica ids span
-  /// `0..replica_count + learner_count`. This is the path a voting replica uses to record the
-  /// cluster's learners; a learner builds its own config via [`Config::try_new_member`].
-  ///
-  /// # Errors
-  /// [`ConfigError::TooManyNodes`] if `replica_count + learner_count` exceeds `u16::MAX`;
-  /// [`ConfigError::ReplicaIndexOutOfRange`] if shrinking the learner count would put this config's
-  /// own replica id at or above the new `node_count` (calling this on a learner's own config with a
-  /// count below its id) — every constructor keeps `replica < node_count`, so this setter does too.
-  pub const fn with_learner_count(self, learner_count: u16) -> Result<Self, ConfigError> {
-    let node_count = self.replica_count as u32 + learner_count as u32;
-    if node_count > u16::MAX as u32 {
-      return Err(ConfigError::TooManyNodes { count: node_count });
-    }
-    if (self.replica.get() as u32) >= node_count {
-      return Err(ConfigError::ReplicaIndexOutOfRange {
-        index: self.replica.get(),
-        count: self.replica_count,
-      });
-    }
-    Ok(Self {
-      learner_count,
-      ..self
-    })
-  }
-
   /// Returns this configuration with the checkpoint interval replaced (chainable; consumes the copy).
   /// The interval MUST be identical on every replica of the cluster. This is the path to set a
-  /// non-default interval on a config built via [`Config::try_new_member`] (a learner's own config),
-  /// mirroring the interval [`Config::with_checkpoint_ops`] takes for a voter at construction.
+  /// non-default interval on a config built via [`Config::try_new`],
+  /// mirroring the interval [`Config::with_checkpoint_ops`] takes at construction.
   ///
   /// # Errors
   /// [`ConfigError::ZeroCheckpointOps`] if `checkpoint_ops == 0`; [`ConfigError::CheckpointOpsTooLarge`]
@@ -320,66 +225,12 @@ impl Config {
     self.cluster
   }
 
-  /// This replica's id.
+  /// This node's stable [`MemberId`]. A node is resolved against the active
+  /// [`Membership`](crate::Membership) by this id (which slot it occupies, or whether it has been
+  /// removed), so it survives a reconfiguration that moves the node between slots.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn replica(&self) -> ReplicaId {
-    self.replica
-  }
-
-  /// The number of replicas in the cluster.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn replica_count(&self) -> u8 {
-    self.replica_count
-  }
-
-  /// The number of non-voting learner replicas. Learners follow the voting set, occupying the
-  /// replica ids in `[replica_count, node_count)`.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn learner_count(&self) -> u16 {
-    self.learner_count
-  }
-
-  /// The total replica count: voting replicas plus learners (`replica_count + learner_count`).
-  /// Every replica id is in `0..node_count`.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn node_count(&self) -> u16 {
-    self.replica_count as u16 + self.learner_count
-  }
-
-  /// Whether `id` is a voting replica (one in `0..replica_count`). Voting replicas drive every
-  /// quorum; learners do not vote.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn is_voter(&self, id: ReplicaId) -> bool {
-    id.get() < self.replica_count as u16
-  }
-
-  /// Whether `id` is a non-voting learner replica (one in `[replica_count, node_count)`). An id at
-  /// or beyond `node_count` is out of range — neither a voter nor a learner.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn is_learner(&self, id: ReplicaId) -> bool {
-    id.get() >= self.replica_count as u16 && id.get() < self.node_count()
-  }
-
-  /// The replication / view-change quorum size: `floor(n/2) + 1`.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn quorum(&self) -> usize {
-    (self.replica_count as usize) / 2 + 1
-  }
-
-  /// The view-change / DoViewChange quorum: `replica_count − quorum + 1`.
-  ///
-  /// Intersects every replication quorum (`quorum + quorum_view_change > replica_count`),
-  /// so a view change cannot start while normal commit is still possible.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn quorum_view_change(&self) -> usize {
-    self.replica_count as usize - self.quorum() + 1
-  }
-
-  /// The nack-prepare quorum (used by view change to truncate uncommitted ops):
-  /// `replica_count − quorum + 1`. Equal to `quorum_view_change`.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn quorum_nack_prepare(&self) -> usize {
-    self.replica_count as usize - self.quorum() + 1
+  pub const fn local(&self) -> MemberId {
+    self.local
   }
 
   /// Ops between checkpoints (a checkpoint is taken when commit_min reaches checkpoint_op + this).
@@ -416,39 +267,26 @@ impl Config {
   pub const fn forfeit_checkpoint_lag(&self) -> u64 {
     self.checkpoint_ops
   }
-
-  /// The primary for a given view: `view % replica_count`.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn primary(&self, view: View) -> ReplicaId {
-    ReplicaId::new((view.get() % self.replica_count as u64) as u16)
-  }
-
-  /// Whether this replica is the primary for `view`.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn is_primary(&self, view: View) -> bool {
-    self.primary(view).get() == self.replica.get()
-  }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{ReplicaId, View};
 
   #[test]
   fn checkpoint_ops_is_validated_and_accessible() {
-    let c = Config::try_new(0, ReplicaId::new(0), 3).unwrap();
+    let c = Config::try_new(0, MemberId::new(0)).unwrap();
     assert_eq!(c.checkpoint_ops(), DEFAULT_CHECKPOINT_OPS); // default interval
-    let c2 = Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 8).unwrap();
+    let c2 = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
     assert_eq!(c2.checkpoint_ops(), 8);
     // zero interval is rejected (a checkpoint every 0 ops is meaningless / would loop)
     assert_eq!(
-      Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, 0),
+      Config::with_checkpoint_ops(0, MemberId::new(0), 0),
       Err(ConfigError::ZeroCheckpointOps)
     );
     // an interval beyond the pipeline-headroom cap is rejected
     assert_eq!(
-      Config::with_checkpoint_ops(0, ReplicaId::new(0), 3, MAX_CHECKPOINT_OPS + 1),
+      Config::with_checkpoint_ops(0, MemberId::new(0), MAX_CHECKPOINT_OPS + 1),
       Err(ConfigError::CheckpointOpsTooLarge {
         ops: MAX_CHECKPOINT_OPS + 1
       })
@@ -456,13 +294,22 @@ mod tests {
   }
 
   #[test]
+  fn cluster_and_local_are_accessible() {
+    let c = Config::try_new(42, MemberId::new(7)).unwrap();
+    assert_eq!(c.cluster(), 42);
+    assert_eq!(c.local(), MemberId::new(7));
+    // forfeit lag is one checkpoint interval (the default here)
+    assert_eq!(c.forfeit_checkpoint_lag(), DEFAULT_CHECKPOINT_OPS);
+  }
+
+  #[test]
   fn max_client_sessions_is_validated_and_accessible() {
-    let c = Config::try_new(0, ReplicaId::new(0), 3).unwrap();
+    let c = Config::try_new(0, MemberId::new(0)).unwrap();
     assert_eq!(c.max_client_sessions(), MAX_CLIENT_SESSIONS); // the default cap
     let c2 = c.with_max_client_sessions(8).unwrap();
     assert_eq!(c2.max_client_sessions(), 8);
     // the other fields are preserved by the chainable setter
-    assert_eq!(c2.replica_count(), 3);
+    assert_eq!(c2.local(), MemberId::new(0));
     assert_eq!(c2.checkpoint_ops(), c.checkpoint_ops());
     // a zero cap is rejected (it would evict every session at first apply)
     assert_eq!(
@@ -473,12 +320,12 @@ mod tests {
 
   #[test]
   fn max_sync_envelope_len_is_validated_and_accessible() {
-    let c = Config::try_new(0, ReplicaId::new(0), 3).unwrap();
+    let c = Config::try_new(0, MemberId::new(0)).unwrap();
     assert_eq!(c.max_sync_envelope_len(), MAX_SYNC_ENVELOPE_LEN); // the default cap
     let c2 = c.with_max_sync_envelope_len(1 << 20).unwrap();
     assert_eq!(c2.max_sync_envelope_len(), 1 << 20);
     // the other fields are preserved by the chainable setter
-    assert_eq!(c2.replica_count(), 3);
+    assert_eq!(c2.local(), MemberId::new(0));
     assert_eq!(c2.max_client_sessions(), c.max_client_sessions());
     // a zero cap is rejected (it would refuse every chunked transfer)
     assert_eq!(
@@ -488,208 +335,25 @@ mod tests {
   }
 
   #[test]
-  fn quorum_and_primary() {
-    let c = Config::try_new(42, ReplicaId::new(1), 3).expect("valid cluster config");
-    assert_eq!(c.replica_count(), 3);
-    assert_eq!(c.quorum(), 2); // floor(3/2)+1
-    assert_eq!(c.primary(View::with(0)), ReplicaId::new(0));
-    assert_eq!(c.primary(View::with(1)), ReplicaId::new(1));
-    assert_eq!(c.primary(View::with(4)), ReplicaId::new(1)); // 4 % 3
-    assert!(c.is_primary(View::with(1)));
-    assert!(!c.is_primary(View::with(0)));
-  }
-
-  #[test]
-  fn quorum_five() {
-    let c = Config::try_new(0, ReplicaId::new(0), 5).expect("valid cluster config");
-    assert_eq!(c.quorum(), 3);
-  }
-
-  #[test]
-  fn view_change_and_nack_quorums() {
-    // N=3: quorum=2, vc=nack=3-2+1=2.  N=5: quorum=3, vc=nack=3.  N=4: quorum=3, vc=nack=2.
-    let c3 = Config::try_new(0, ReplicaId::new(0), 3).unwrap();
-    assert_eq!(c3.quorum_view_change(), 2);
-    assert_eq!(c3.quorum_nack_prepare(), 2);
-    let c5 = Config::try_new(0, ReplicaId::new(0), 5).unwrap();
-    assert_eq!(c5.quorum_view_change(), 3);
-    let c4 = Config::try_new(0, ReplicaId::new(0), 4).unwrap();
-    assert_eq!(c4.quorum_view_change(), 2); // 4 - 3 + 1
-  }
-
-  #[test]
-  fn try_new_errors() {
-    assert_eq!(
-      Config::try_new(0, ReplicaId::new(0), 0),
-      Err(ConfigError::ZeroReplicaCount)
-    );
-    assert_eq!(
-      Config::try_new(0, ReplicaId::new(3), 3),
-      Err(ConfigError::ReplicaIndexOutOfRange { index: 3, count: 3 })
-    );
-    assert_eq!(
-      Config::try_new(0, ReplicaId::new(0), 65),
-      Err(ConfigError::TooManyReplicas { count: 65 })
-    );
-  }
-
-  #[test]
-  fn node_count_is_voters_plus_learners() {
-    // No learners: node_count == replica_count (byte-identical to the voter-only world).
-    let c = Config::try_new(0, ReplicaId::new(0), 3).unwrap();
-    assert_eq!(c.learner_count(), 0);
-    assert_eq!(c.node_count(), 3);
-    // Two learners follow the three voters.
-    let c = c.with_learner_count(2).unwrap();
-    assert_eq!(c.learner_count(), 2);
-    assert_eq!(c.node_count(), 5);
-    // with_learner_count preserves the other fields.
-    assert_eq!(c.replica_count(), 3);
-    assert_eq!(c.quorum(), 2); // quorum is over the voting count only
-  }
-
-  #[test]
-  fn is_voter_and_is_learner_partition_node_range() {
-    // 3 voters (ids 0..3), 2 learners (ids 3..5).
-    let c = Config::try_new(0, ReplicaId::new(0), 3)
-      .unwrap()
-      .with_learner_count(2)
-      .unwrap();
-    for id in 0..3u16 {
-      assert!(c.is_voter(ReplicaId::new(id)), "id {id} is a voter");
-      assert!(!c.is_learner(ReplicaId::new(id)));
-    }
-    for id in 3..5u16 {
-      assert!(c.is_learner(ReplicaId::new(id)), "id {id} is a learner");
-      assert!(!c.is_voter(ReplicaId::new(id)));
-    }
-    // An id at or beyond node_count is neither a voter nor a learner.
-    for id in [5u16, 6, 100] {
-      assert!(!c.is_voter(ReplicaId::new(id)));
-      assert!(!c.is_learner(ReplicaId::new(id)), "id {id} is out of range");
-    }
-  }
-
-  #[test]
-  fn learner_owns_config_via_member_constructor() {
-    // A learner's own config: its id (4) sits in [replica_count, node_count) = [3, 5).
-    // try_new would reject it, but try_new_member accepts it.
-    assert_eq!(
-      Config::try_new(0, ReplicaId::new(4), 3),
-      Err(ConfigError::ReplicaIndexOutOfRange { index: 4, count: 3 })
-    );
-    let learner = Config::try_new_member(0, ReplicaId::new(4), 3, 2).unwrap();
-    assert_eq!(learner.replica(), ReplicaId::new(4));
-    assert_eq!(learner.replica_count(), 3);
-    assert_eq!(learner.learner_count(), 2);
-    assert_eq!(learner.node_count(), 5);
-    assert!(learner.is_learner(learner.replica()));
-    assert!(!learner.is_voter(learner.replica()));
-    // An id at node_count is still out of range for the member constructor.
-    assert_eq!(
-      Config::try_new_member(0, ReplicaId::new(5), 3, 2),
-      Err(ConfigError::ReplicaIndexOutOfRange { index: 5, count: 3 })
-    );
-  }
-
-  #[test]
-  fn try_new_still_rejects_out_of_range_with_zero_learners() {
-    // With no learners, node_count == replica_count, so try_new's range check is unchanged:
-    // an id >= replica_count is rejected exactly as before.
-    assert_eq!(
-      Config::try_new(0, ReplicaId::new(3), 3),
-      Err(ConfigError::ReplicaIndexOutOfRange { index: 3, count: 3 })
-    );
-    assert_eq!(
-      Config::try_new_member(0, ReplicaId::new(3), 3, 0),
-      Err(ConfigError::ReplicaIndexOutOfRange { index: 3, count: 3 })
-    );
-  }
-
-  #[test]
-  fn node_count_overflow_is_rejected() {
-    // replica_count + learner_count must fit a u16 replica id. With replica_count == 64,
-    // a learner_count of u16::MAX - 63 pushes node_count to u16::MAX + 1.
-    let over = u16::MAX - 63;
-    assert_eq!(
-      Config::try_new_member(0, ReplicaId::new(0), 64, over),
-      Err(ConfigError::TooManyNodes {
-        count: 64 + over as u32
-      })
-    );
-    // The chainable builder enforces the same cap.
-    assert_eq!(
-      Config::try_new(0, ReplicaId::new(0), 64)
-        .unwrap()
-        .with_learner_count(over),
-      Err(ConfigError::TooManyNodes {
-        count: 64 + over as u32
-      })
-    );
-    // The largest in-range node_count (exactly u16::MAX) is accepted.
-    let max = Config::try_new_member(0, ReplicaId::new(0), 1, u16::MAX - 1).unwrap();
-    assert_eq!(max.node_count(), u16::MAX);
-  }
-
-  #[test]
-  fn with_learner_count_chains() {
-    let c = Config::with_checkpoint_ops(7, ReplicaId::new(1), 5, 16)
-      .unwrap()
-      .with_learner_count(3)
-      .unwrap();
-    assert_eq!(c.cluster(), 7);
-    assert_eq!(c.replica(), ReplicaId::new(1));
-    assert_eq!(c.replica_count(), 5);
-    assert_eq!(c.learner_count(), 3);
-    assert_eq!(c.node_count(), 8);
-    assert_eq!(c.checkpoint_ops(), 16); // earlier builder steps are preserved
-  }
-
-  #[test]
-  fn with_checkpoint_interval_sets_a_learners_interval() {
-    // A learner's own config (built via `try_new_member`, which uses the default interval) takes the
-    // cluster's checkpoint interval via the chainable setter — so a learner checkpoints on the same
-    // cadence as the voters.
-    let learner = Config::try_new_member(7, ReplicaId::new(5), 3, 4)
+  fn with_checkpoint_interval_chains_onto_the_default() {
+    // A config built via `try_new` (the default interval) takes a non-default interval via the
+    // chainable setter, preserving the other static params.
+    let c = Config::try_new(7, MemberId::new(5))
       .unwrap()
       .with_checkpoint_interval(16)
       .unwrap();
-    assert_eq!(learner.checkpoint_ops(), 16);
-    assert!(learner.is_learner(ReplicaId::new(5))); // id 5 is in [replica_count 3, node_count 7)
-    assert_eq!(learner.replica_count(), 3); // the voting set is unchanged
+    assert_eq!(c.checkpoint_ops(), 16);
+    assert_eq!(c.cluster(), 7);
+    assert_eq!(c.local(), MemberId::new(5));
     assert_eq!(
-      Config::try_new_member(7, ReplicaId::new(5), 3, 4)
+      Config::try_new(7, MemberId::new(5))
         .unwrap()
         .checkpoint_ops(),
       DEFAULT_CHECKPOINT_OPS
     ); // without the setter it is the default
-    assert!(learner.with_checkpoint_interval(0).is_err()); // zero rejected
-  }
-
-  #[test]
-  fn with_learner_count_cannot_shrink_a_learner_out_of_range() {
-    // `with_learner_count` keeps the `replica < node_count` invariant every constructor enforces, so a
-    // learner's own config (its id is `>= replica_count`) cannot have its learner count shrunk below
-    // its id — that would leave the id out of range, where it is neither voter nor learner and the
-    // learner guards (which key on `is_learner(self.replica())`) would no longer protect it.
-    let learner = Config::try_new_member(1, ReplicaId::new(70), 3, 100).unwrap(); // id 70, node_count 103
-    assert!(learner.is_learner(ReplicaId::new(70)));
-    // Shrinking the learner count so node_count <= 70 is rejected (id 70 would be out of range).
-    assert!(matches!(
-      learner.with_learner_count(10), // node_count would be 13, but our id is 70
-      Err(ConfigError::ReplicaIndexOutOfRange {
-        index: 70,
-        count: 3
-      })
-    ));
-    assert!(learner.with_learner_count(0).is_err()); // node_count 3 <= 70 — rejected
-    // A learner count that still covers the id is fine.
-    assert_eq!(
-      learner.with_learner_count(68).unwrap().node_count(),
-      71 // id 70 < node_count 71
+    assert!(c.with_checkpoint_interval(0).is_err()); // zero rejected
+    assert!(
+      c.with_checkpoint_interval(MAX_CHECKPOINT_OPS + 1).is_err() // beyond the cap rejected
     );
-    // A VOTER config (id < replica_count) is never affected — shrinking to zero learners is valid.
-    let voter = Config::try_new(1, ReplicaId::new(1), 3).unwrap();
-    assert_eq!(voter.with_learner_count(0).unwrap().node_count(), 3);
   }
 }

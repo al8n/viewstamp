@@ -235,7 +235,7 @@ impl<S: StateMachine> Endpoint<S> {
           // max(commit_max, target_op)]` are then empty for a sync (the snapshot subsumes the prefix; any
           // forced-sync held tail is still uncommitted here, so `commit_max < target_op` ⇒ empty band).
           let root_commit = OpNumber::with(self.commit_max.get().max(pc.target_op.get()));
-          let state = crate::VsrState::try_new(
+          let state = self.durable_root(
             self.view,
             self.log_view,
             root_commit,
@@ -244,11 +244,10 @@ impl<S: StateMachine> Endpoint<S> {
             // SPARSE band headers over `(target_op .. min(commit_max, op)]` — bounded by the ACTUAL
             // known-committed frontier `commit_max` (NOT the lifted `root_commit`), so for a sync
             // re-persist (where `commit_max <= target_op`) the band is empty: every op `<= target_op`
-            // lives in the snapshot, and any forced-sync held tail above is not yet committed. `try_new`
-            // permits a header list SHORTER than `commit` (the prefix is vouched by the snapshot id).
+            // lives in the snapshot, and any forced-sync held tail above is not yet committed. The
+            // root permits a header list SHORTER than `commit` (the prefix is vouched by the snapshot id).
             self.committed_band_headers(pc.target_op),
-          )
-          .expect("checkpoint root: commit_max >= target_op and log_view <= view");
+          );
           sb.submit_write(root_id, state);
           self.pending_checkpoint = Some(PendingCheckpoint {
             step: CheckpointStep::AwaitRoot(root_id),
@@ -633,7 +632,7 @@ impl<S: StateMachine> Endpoint<S> {
 
   pub(crate) fn submit_durable_view(&mut self, action: PendingSbAction, sb: &mut impl Superblock) {
     let checkpoint_id = sb.state().checkpoint_id();
-    let state = crate::VsrState::try_new(
+    let state = self.durable_root(
       self.view,
       self.log_view,
       // Persist `commit_max` — the KNOWN-committed frontier — as the durable `VsrState` commit, NOT
@@ -642,7 +641,7 @@ impl<S: StateMachine> Endpoint<S> {
       // `commit_min < commit_max` by a stale/faulty repair hole, make `recover` read back a LOWERED
       // frontier — the recovered DVC would then under-report the known commit and the
       // laggard-quorum truncation hazard reappears. `commit_max >= commit_min >= checkpoint_op`, so
-      // `try_new`'s `commit >= checkpoint_op` invariant still holds; the committed-band headers below
+      // the `commit >= checkpoint_op` invariant still holds; the committed-band headers below
       // are the SPARSE canonical set from `self.log` — one header per HELD op in `(checkpoint_op ..
       // commit_max]`, SKIPPING holes — so a held committed op above a lower repair hole
       // keeps its header rather than being left header-less and dropped by recover.
@@ -650,10 +649,41 @@ impl<S: StateMachine> Endpoint<S> {
       self.checkpoint_op,
       checkpoint_id,
       self.committed_band_headers(self.checkpoint_op),
-    )
-    .expect("durable view: log_view <= view and commit_max >= checkpoint_op");
+    );
     let id = self.mint_op_id();
     sb.submit_write(id, state);
     self.pending_sb = Some((id, action));
+  }
+
+  /// Build a durable root carrying the active [`Membership`] — a v4 root (epoch =
+  /// `self.membership.epoch()`, prev_epoch = `self.prev_epoch`). Every durable-root write goes through
+  /// here so the durable epoch + membership SURVIVE normal operation (checkpoints + view changes): a
+  /// node that checkpoints or changes view and then crashes recovers its CURRENT configuration, never
+  /// falling back to the genesis membership (which would regress its epoch — a split-brain hazard). The
+  /// v4 invariant `root.epoch ==
+  /// membership.epoch` holds by construction. The scalar/header invariants are the same ones
+  /// [`VsrState::try_new`] checked (`log_view <= view`, `commit >= checkpoint_op`, in-band ascending
+  /// headers); a violation is a caller bug, so this `expect`s like the prior `try_new` did.
+  fn durable_root(
+    &self,
+    view: View,
+    log_view: View,
+    commit: OpNumber,
+    checkpoint_op: OpNumber,
+    checkpoint_id: u128,
+    committed_headers: std::vec::Vec<Header>,
+  ) -> crate::VsrState {
+    crate::VsrState::try_new_v4(
+      view,
+      log_view,
+      commit,
+      checkpoint_op,
+      checkpoint_id,
+      committed_headers,
+      self.membership.epoch(),
+      self.prev_epoch,
+      self.membership.clone(),
+    )
+    .expect("durable root: log_view <= view, commit >= checkpoint_op, membership epoch consistent")
   }
 }

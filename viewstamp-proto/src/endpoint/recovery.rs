@@ -1,4 +1,5 @@
 use super::*;
+use crate::id::{Epoch, MemberId};
 
 /// The committed-band recover verdict: does a recovered, SELF-VERIFYING WAL slot count as
 /// the canonical body for its op, or is it a stale/superseded slot that must be peer-repaired?
@@ -75,6 +76,76 @@ fn classify_committed_slot(
   }
 }
 
+/// The outcome of [`Endpoint::recover`]: this node either still belongs to the recovered membership
+/// (`Active`, holding a recovering [`Endpoint`]) or was removed by a reconfiguration (`Retired`, a
+/// terminal handle).
+///
+/// A node absent from the recovered membership has been removed by a reconfiguration; it recovers
+/// `Retired` and must not act as a replica. The membership is resolved from the DURABLE root: a v4
+/// root's own membership wins; a legacy (v1-3) root bridges to the genesis membership the caller
+/// supplies. This node is then resolved by its stable [`MemberId`] ([`Config::local`](crate::Config));
+/// present (a voter or learner) → `Active`, absent → `Retired`.
+///
+/// `large_enum_variant` is allowed deliberately: this is a `Result`-shaped, transient START-UP
+/// handle — `recover` returns exactly ONE, the caller destructures it immediately, and it is never
+/// stored in a collection — so the per-`Active`-variant memory the lint guards against is irrelevant,
+/// while boxing the common (`Active`) path would add a needless heap allocation on every successful
+/// recover (the same reason [`Result`] does not box its `Ok`).
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum Recovered<S> {
+  /// This node occupies a slot in the recovered membership — a recovering [`Endpoint`] resuming the
+  /// durable view in [`Status::Recovering`].
+  Active(Endpoint<S>),
+  /// This node is absent from the recovered membership (removed by a reconfiguration) — a terminal
+  /// [`Retired`] handle that does not participate.
+  Retired(Retired),
+}
+
+/// A terminal handle for a node that recovered into a membership it is no longer part of: its stable
+/// [`MemberId`] ([`Config::local`](crate::Config)) did not resolve to any slot in the durable root's
+/// membership, so a reconfiguration removed it. It carries only the local member id and the epoch it
+/// was retired at; it holds NO consensus state and participates in NOTHING (it never votes, prepares,
+/// or leads). The driver surfaces it as a hard error rather than running a replica loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retired {
+  local: MemberId,
+  epoch: Epoch,
+}
+
+impl<S> Recovered<S> {
+  /// Unwraps the [`Recovered::Active`] endpoint, panicking on [`Recovered::Retired`]. Test-only: the
+  /// fixtures always recover a present member, so they assert presence by construction.
+  #[cfg(test)]
+  pub(crate) fn expect_active(self) -> Endpoint<S> {
+    match self {
+      Recovered::Active(endpoint) => endpoint,
+      Recovered::Retired(retired) => {
+        panic!(
+          "expected Recovered::Active, got Retired({})",
+          retired.local()
+        )
+      }
+    }
+  }
+}
+
+impl Retired {
+  /// This node's stable member id — the [`Config::local`](crate::Config) that the recovered
+  /// membership no longer contains.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn local(&self) -> MemberId {
+    self.local
+  }
+
+  /// The configuration epoch this node was retired at — the epoch of the recovered membership that
+  /// no longer contains it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+}
+
 impl<S: StateMachine> Endpoint<S> {
   /// Reconstructs an endpoint from durable storage after a restart — a **metadata-only constructor**
   /// that enters [`Status::Recovering`] and defers all fallible reads to an async `handle_storage`
@@ -122,6 +193,18 @@ impl<S: StateMachine> Endpoint<S> {
   /// **Durable-view.** The view is persisted before any view-change participation, so `state.view()`
   /// is trustworthy: a recovered replica resumes the view it was in when it last participated.
   ///
+  /// **`membership` (the EFFECTIVE-membership rule).** The active membership is resolved from the
+  /// DURABLE root, not blindly from the param: a v4 root (`state.membership_opt().is_some()`) wins —
+  /// the durable config is authoritative, so an offline reconfiguration pre-written into the root
+  /// takes effect on the next recover regardless of what the caller passes.
+  /// A legacy (v1-3) root (`membership_opt().is_none()`) has no durable membership, so `recover`
+  /// BRIDGES to the passed `membership` — the genesis the embedder supplies (the param stays in the
+  /// signature solely as this legacy fallback). This node is then resolved against the effective
+  /// membership by its stable [`MemberId`] ([`Config::local`]): present (a voter or learner) →
+  /// [`Recovered::Active`] holding the recovering endpoint; ABSENT → [`Recovered::Retired`] (a
+  /// reconfiguration removed it — it must not act as a replica). The `Active` endpoint stores the
+  /// EFFECTIVE membership (so a v4 root's membership, never the param).
+  ///
   /// **`seed` must carry fresh entropy per incarnation.** The freshness nonce that tags this
   /// incarnation's solicitations (`Recovery`/`GetView`/`RequestSync`) is derived deterministically
   /// from `seed` alone (`Prng::new(seed)`), and nothing else the endpoint holds is guaranteed to
@@ -137,12 +220,29 @@ impl<S: StateMachine> Endpoint<S> {
   /// value per replica incarnation.)
   pub fn recover<W: Wal, B: Superblock>(
     config: Config,
+    membership: Membership,
     seed: u64,
     sm: S,
     wal: &mut W,
     sb: &mut B,
-  ) -> Self {
+  ) -> Recovered<S> {
     let state = sb.state();
+    // The EFFECTIVE membership: a v4 root's OWN membership is authoritative (the durable config wins,
+    // so an offline reconfiguration pre-written into the root takes effect here); a legacy (v1-3) root
+    // carries none, so bridge to the passed genesis `membership`. The struct stores THIS one.
+    let membership = match state.membership_opt() {
+      Some(durable) => durable.clone(),
+      None => membership,
+    };
+    // Resolve this node by its stable `MemberId` against the effective membership. ABSENT ⇒ a
+    // reconfiguration removed it: recover Retired (a terminal handle that never participates), BEFORE
+    // any storage read is submitted. PRESENT (a voter or learner) ⇒ build the recovering Endpoint.
+    let Some(local_slot) = membership.slot_of(config.local()) else {
+      return Recovered::Retired(Retired {
+        local: config.local(),
+        epoch: membership.epoch(),
+      });
+    };
     let nonce = Prng::new(seed).next_u64();
     let head = wal.op_head().get();
     let checkpoint_op = state.checkpoint_op().get();
@@ -186,8 +286,21 @@ impl<S: StateMachine> Endpoint<S> {
     // frontier (capped — the deep tail recovers incrementally as the primary re-announces it).
     let op = hi.max(checkpoint_op);
 
+    // `local_slot` is this node's slot in the EFFECTIVE membership, resolved by its stable `MemberId`
+    // at the top (the Retired early-return already handled an absent member).
+    // The own durable checkpoint seeds the quorum-th order statistic only when self is a VOTER in a
+    // solo voting set (`quorum == 1`) — there the single voter's own checkpoint IS the quorum.
+    // Computed before `membership` is moved into the struct below (it is not `Copy`).
+    let seed_own_checkpoint = membership.quorum() == 1 && membership.is_voter(local_slot);
+
     let mut endpoint = Self {
       config,
+      membership,
+      // The durable backward link of the lineage: a v4 root carries its own `prev_epoch`; a legacy
+      // (v1-3) root reads `prev_epoch == epoch == 0`, which equals the bridged genesis membership's
+      // epoch — so this is correct for both, and every durable-root write this incarnation makes
+      // re-persists the membership as a v4 root carrying it.
+      prev_epoch: state.prev_epoch(),
       status: Status::Recovering,
       view: state.view(),
       op: OpNumber::with(op),
@@ -243,7 +356,7 @@ impl<S: StateMachine> Endpoint<S> {
       // non-voting member (which `compute_quorum_checkpoint_op` excludes from the statistic entirely) —
       // the unheard voters pin it to 0. Without the voter gate a recovering learner in a 1-voter cluster
       // would seed its own checkpoint here while a fresh compute yields 0, tripping the staleness assert.
-      quorum_checkpoint: if config.quorum() == 1 && config.is_voter(config.replica()) {
+      quorum_checkpoint: if seed_own_checkpoint {
         OpNumber::with(checkpoint_op)
       } else {
         OpNumber::new()
@@ -339,7 +452,7 @@ impl<S: StateMachine> Endpoint<S> {
     // Otherwise this arms the recover_retry timer so an owner driving `poll_timeout`/`handle_timeout`
     // re-submits any read whose completion is dropped or whose transient fault clears on a later read.
     endpoint.recover_progress(Instant::ZERO, sb);
-    endpoint
+    Recovered::Active(endpoint)
   }
 
   /// Handles a WAL completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`). Adopts a
@@ -914,7 +1027,11 @@ impl<S: StateMachine> Endpoint<S> {
     if self.log_view.get() < self.view.get() {
       // Crashed mid-view-change (durable view advanced, new log not yet installed): re-drive VC(view).
       self.enter_view_change_from_recovery(now, sb, self.view);
-    } else if self.config.replica_count() > 1 && self.config.is_primary(self.view) {
+    } else if self.membership.replica_count() > 1
+      && self
+        .membership
+        .is_primary_slot(self.local_slot(), self.view)
+    {
       // Was Normal as the PRIMARY → abdicate: a restarted primary has no in-memory pipeline and a
       // checkpoint-only session table, so it forces a clean view change to view + 1 rather than
       // resuming as the established primary.
@@ -923,13 +1040,13 @@ impl<S: StateMachine> Endpoint<S> {
       // Backup, a non-voting learner, or a SOLO replica (its own primary, no quorum to view-change)
       // → resume Normal.
       self.set_status(Status::Normal);
-      if self.config.replica_count() == 1 && !self.is_learner() {
+      if self.membership.replica_count() == 1 && !self.is_learner() {
         // Solo VOTER: rebuild the pipeline for the recovered tail so `try_commit` can re-commit ops the
         // solo primary had already committed pre-crash (an empty `inflight` would stall them — solo
         // commits via the own-vote quorum of 1). Mirror `start_view_as_new_primary`'s rebuild. A learner
         // in a single-voter cluster is a follower, not the solo primary, so it takes the backup path.
         self.inflight.clear();
-        let own = 1u64 << self.config.replica().get();
+        let own = 1u64 << self.local_slot().get();
         for op in (self.commit_min.get() + 1)..=self.op.get() {
           // Content-address the rebuilt entry by the recovered operation IDENTITY (client, request,
           // body) it holds, keeping the `inflight.prepare_checksum == operation driven at op` invariant
@@ -1172,13 +1289,15 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   pub(crate) fn send_get_view(&mut self, now: Instant) {
-    let primary = self.config.primary(self.view);
+    let primary = self.membership.primary(self.view);
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(primary)),
       Message::GetView(crate::GetView::new(
         self.view,
-        self.config.replica(),
+        self.local_slot(),
         self.nonce,
+        self.membership.epoch(),
+        self.membership.config_id(),
       )),
     ));
     self.timers.get_view_message = Some(now + VC_MESSAGE_RETRANSMIT);
@@ -1190,7 +1309,12 @@ impl<S: StateMachine> Endpoint<S> {
   fn send_recovery(&mut self, now: Instant) {
     self.emit(Outgoing::new(
       Recipient::Backups,
-      Message::Recovery(crate::Recovery::new(self.config.replica(), self.nonce)),
+      Message::Recovery(crate::Recovery::new(
+        self.local_slot(),
+        self.nonce,
+        self.membership.epoch(),
+        self.membership.config_id(),
+      )),
     ));
     self.timers.recover_head = Some(now + RECOVER_HEAD_SOLICIT);
   }
@@ -1217,7 +1341,9 @@ impl<S: StateMachine> Endpoint<S> {
             self.view,
             self.op,
             self.commit_max,
-            self.config.replica(),
+            self.membership.epoch(),
+            self.membership.config_id(),
+            self.local_slot(),
             entries,
           )
           // The vouched floor of the carried log: an op it omits at/below this is
@@ -1250,7 +1376,7 @@ impl<S: StateMachine> Endpoint<S> {
     if self.pending_sb.is_some() {
       return;
     }
-    if m.replica().get() >= self.config.node_count() {
+    if m.replica().get() >= self.membership.node_count() {
       return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     let (op, commit, floor, log) = if self.is_primary() {
@@ -1275,8 +1401,17 @@ impl<S: StateMachine> Endpoint<S> {
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(m.replica())),
       Message::RecoveryResponse(
-        crate::RecoveryResponse::new(self.view, op, commit, self.config.replica(), m.nonce(), log)
-          .with_checkpoint_op(floor),
+        crate::RecoveryResponse::new(
+          self.view,
+          op,
+          commit,
+          self.membership.epoch(),
+          self.membership.config_id(),
+          self.local_slot(),
+          m.nonce(),
+          log,
+        )
+        .with_checkpoint_op(floor),
       ),
     ));
   }
@@ -1307,7 +1442,7 @@ impl<S: StateMachine> Endpoint<S> {
     if m.view().get() < self.view.get() {
       return; // a stale-view response cannot re-establish our head
     }
-    if m.replica() != self.config.primary(m.view()) {
+    if m.replica() != self.membership.primary(m.view()) {
       // A non-primary response (empty log) only confirms the current generation; we cannot adopt a
       // head from it. Stay RecoveringHead; the recover_head timer keeps soliciting until the
       // primary answers (or a StartView arrives).

@@ -311,9 +311,10 @@ impl<S: StateMachine> Endpoint<S> {
       Message::RequestSync(crate::RequestSync::new(
         self.view,
         self.checkpoint_op,
-        self.config.replica(),
+        self.local_slot(),
         nonce,
         recovery,
+        self.membership.config_id(),
       )),
     ));
     self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
@@ -359,8 +360,9 @@ impl<S: StateMachine> Endpoint<S> {
         self.view,
         checkpoint_op,
         checkpoint_id,
+        self.membership.config_id(),
         offset,
-        self.config.replica(),
+        self.local_slot(),
         s.nonce,
       )),
     ));
@@ -411,7 +413,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() {
       return; // only a Normal replica has a trustworthy durable checkpoint to serve
     }
-    if m.replica().get() >= self.config.node_count() {
+    if m.replica().get() >= self.membership.node_count() {
       return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     if self.checkpoint_op.get() == 0 {
@@ -508,7 +510,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || self.pending_sb.is_some() {
       return; // no longer a trustworthy server, or our view is not yet durable — drop.
     }
-    if to.get() >= self.config.node_count() {
+    if to.get() >= self.membership.node_count() {
       return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     // Only ship when the READ's op matches our CURRENT durable `checkpoint_op`: we advertise
@@ -552,7 +554,8 @@ impl<S: StateMachine> Endpoint<S> {
               self.view,
               cr.op(),
               id,
-              self.config.replica(),
+              self.membership.config_id(),
+              self.local_slot(),
               nonce,
               snapshot,
             )),
@@ -567,8 +570,9 @@ impl<S: StateMachine> Endpoint<S> {
               self.view,
               cr.op(),
               id,
+              self.membership.config_id(),
               snapshot.len() as u64,
-              self.config.replica(),
+              self.local_slot(),
               nonce,
             )),
           ));
@@ -597,15 +601,17 @@ impl<S: StateMachine> Endpoint<S> {
       .min(total_len);
     let chunk = d.snapshot.slice(offset as usize..end as usize);
     let (checkpoint_op, checkpoint_id) = (d.checkpoint_op, d.checkpoint_id);
+    let config_id = self.membership.config_id();
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(to)),
       Message::SyncChunk(crate::SyncChunk::new(
         self.view,
         checkpoint_op,
         checkpoint_id,
+        config_id,
         total_len,
         offset,
-        self.config.replica(),
+        self.local_slot(),
         nonce,
         chunk,
       )),
@@ -638,7 +644,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() {
       return; // only a Normal replica has a trustworthy durable checkpoint to serve
     }
-    if m.replica().get() >= self.config.node_count() {
+    if m.replica().get() >= self.membership.node_count() {
       return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     // Durable-view-before-participate at the DIRECT-ship gate: a cache-hit chunk is emitted from
@@ -987,6 +993,9 @@ impl<S: StateMachine> Endpoint<S> {
       m.view(),
       t.checkpoint_op,
       t.checkpoint_id,
+      // The reassembled whole-message form carries the chunk's `config_id` so it re-enters the
+      // existing `SyncCheckpoint` receive path byte-identically to one that arrived in one frame.
+      m.config_id(),
       m.replica(),
       s.nonce,
       Bytes::from(t.staged),

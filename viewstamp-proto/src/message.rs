@@ -4,7 +4,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::vec::Vec;
 
 use crate::{
-  ClientId, OpNumber, Recipient, ReplicaId, RequestNumber, View, WIRE_VERSION,
+  ClientId, Epoch, OpNumber, Recipient, ReplicaId, RequestNumber, View, WIRE_VERSION,
   codec::{CodecError, Reader, write_bytes_u32},
 };
 
@@ -47,15 +47,15 @@ pub const REQUEST_ENCODE_OVERHEAD: usize = ENCODE_HEADER_LEN + 16 + 8 + BYTES_LE
 #[cfg(feature = "tcp")]
 /// Fixed bytes a [`Prepare`] encoding wraps around the SAME client body once the primary replicates it
 /// to backups: the [`ENCODE_HEADER_LEN`] message header, then `view` + `op` + `commit` + `checkpoint_op`
-/// (four `u64`s) + `client` (`u128`) + `request` (`u64`), then the body's [`BYTES_LEN_PREFIX`]. So the
-/// same `b`-byte client body that arrived as a `Request` leaves as a `Prepare` of
-/// `PREPARE_ENCODE_OVERHEAD + b` bytes. Derived from the exact widths
-/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::Prepare`] arm. This is strictly
-/// larger than [`REQUEST_ENCODE_OVERHEAD`] (a `Prepare` carries the extra consensus header fields), but
-/// it is NOT the worst hop the body sees — the log-slice carriers below wrap it in more — so it is only
-/// one input to [`MAX_REQUEST_BODY_OVERHEAD`].
+/// (four `u64`s) + the strict epoch-policy pair `epoch` (`u64`) + `config_id` (`u128`) + `client`
+/// (`u128`) + `request` (`u64`), then the body's [`BYTES_LEN_PREFIX`]. So the same `b`-byte client body
+/// that arrived as a `Request` leaves as a `Prepare` of `PREPARE_ENCODE_OVERHEAD + b` bytes. Derived
+/// from the exact widths [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::Prepare`]
+/// arm. This is strictly larger than [`REQUEST_ENCODE_OVERHEAD`] (a `Prepare` carries the extra
+/// consensus header fields), but it is NOT the worst hop the body sees — the log-slice carriers below
+/// wrap it in more — so it is only one input to [`MAX_REQUEST_BODY_OVERHEAD`].
 pub const PREPARE_ENCODE_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 8 + 8 + 16 + 8 + BYTES_LEN_PREFIX;
+  ENCODE_HEADER_LEN + 8 + 8 + 8 + 8 + 8 + 16 + 16 + 8 + BYTES_LEN_PREFIX;
 
 /// Fixed bytes a [`Reply`] encoding wraps around its body: the `ENCODE_HEADER_LEN` message header,
 /// then `view` (`u64`) + `client` (`u128`) + `request` (`u64`), then the body's `BYTES_LEN_PREFIX`.
@@ -92,13 +92,13 @@ const LOG_COUNT_PREFIX: usize = 4;
 
 /// Fixed bytes a [`RepairBatch`] encoding wraps around its served log slice, BEFORE the per-entry
 /// framing: the [`ENCODE_HEADER_LEN`] message header, then `view` + `commit` + `checkpoint_op` (three
-/// `u64`s), then the log slice's [`LOG_COUNT_PREFIX`]. The byte-bounded serve
-/// ([`Endpoint::on_request_prepare_range`](crate::Endpoint)) subtracts this from
+/// `u64`s) + the agnostic `config_id` (`u128`), then the log slice's [`LOG_COUNT_PREFIX`]. The
+/// byte-bounded serve ([`Endpoint::on_request_prepare_range`](crate::Endpoint)) subtracts this from
 /// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN) to get the budget for the per-entry payloads
 /// it accumulates, so the produced `RepairBatch` never exceeds the frame cap. Derived from the exact
 /// widths [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::RepairBatch`] arm.
 pub(crate) const REPAIR_BATCH_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 8 + LOG_COUNT_PREFIX;
+  ENCODE_HEADER_LEN + 8 + 8 + 8 + 16 + LOG_COUNT_PREFIX;
 
 #[cfg(feature = "tcp")]
 /// Fixed bytes a [`RepairBatch`] encoding wraps around ONE client body when that body is the sole
@@ -113,14 +113,15 @@ const REPAIR_BATCH_BODY_OVERHEAD: usize = REPAIR_BATCH_CARRIER_OVERHEAD + LOG_EN
 
 /// Fixed bytes a [`PrepareBatch`] encoding wraps around its retransmitted log slice, BEFORE the
 /// per-entry framing: the [`ENCODE_HEADER_LEN`] message header, then `view` + `commit` +
-/// `checkpoint_op` (three `u64`s), then the log slice's [`LOG_COUNT_PREFIX`]. The primary's
-/// byte-bounded prepare retransmit ([`Endpoint::primary_timeouts`](crate::Endpoint) via its
-/// `prepare` timer) subtracts this from [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN)
-/// to get the budget for the per-entry payloads each batch accumulates, so a produced
-/// `PrepareBatch` never exceeds the frame cap. Derived from the exact widths
-/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::PrepareBatch`] arm.
+/// `checkpoint_op` (three `u64`s) + the strict epoch-policy pair `epoch` (`u64`) + `config_id`
+/// (`u128`), then the log slice's [`LOG_COUNT_PREFIX`]. The primary's byte-bounded prepare retransmit
+/// ([`Endpoint::primary_timeouts`](crate::Endpoint) via its `prepare` timer) subtracts this from
+/// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN) to get the budget for the per-entry
+/// payloads each batch accumulates, so a produced `PrepareBatch` never exceeds the frame cap. Derived
+/// from the exact widths [`Message::encode`]/[`Message::encoded_len`] write for the
+/// [`Message::PrepareBatch`] arm.
 pub(crate) const PREPARE_BATCH_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 8 + LOG_COUNT_PREFIX;
+  ENCODE_HEADER_LEN + 8 + 8 + 8 + 8 + 16 + LOG_COUNT_PREFIX;
 
 #[cfg(feature = "tcp")]
 /// Fixed bytes a [`PrepareBatch`] encoding wraps around ONE client body when that body is the sole
@@ -134,15 +135,16 @@ const PREPARE_BATCH_BODY_OVERHEAD: usize = PREPARE_BATCH_CARRIER_OVERHEAD + LOG_
 
 /// Fixed bytes a [`SyncCheckpoint`] encoding wraps around its checkpoint envelope: the
 /// [`ENCODE_HEADER_LEN`] message header, then `view` + `checkpoint_op` (two `u64`s) + `checkpoint_id`
-/// (`u128`) + `replica` (`u16`) + `nonce` (`u64`), then the envelope's [`BYTES_LEN_PREFIX`]. Derived
-/// from the exact widths [`Message::encode`]/[`Message::encoded_len`] write for the
-/// [`Message::SyncCheckpoint`] arm. The state-sync serve branches on
-/// `MAX_FRAME_LEN - SYNC_CHECKPOINT_CARRIER_OVERHEAD` ([`max_unchunked_snapshot_len`]): an envelope
-/// at/under it ships as ONE `SyncCheckpoint` (the unchunked fast path, byte-tight against the frame
-/// cap), a larger one ships chunked ([`SyncCheckpointMeta`] → [`RequestSyncChunk`] → [`SyncChunk`]) so
-/// no serve can ever exceed the frame cap.
+/// (`u128`) + the agnostic `config_id` (`u128`) + `replica` (`u16`) + `nonce` (`u64`), then the
+/// envelope's [`BYTES_LEN_PREFIX`]. Derived from the exact widths
+/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::SyncCheckpoint`] arm. The
+/// state-sync serve branches on `MAX_FRAME_LEN - SYNC_CHECKPOINT_CARRIER_OVERHEAD`
+/// ([`max_unchunked_snapshot_len`]): an envelope at/under it ships as ONE `SyncCheckpoint` (the
+/// unchunked fast path, byte-tight against the frame cap), a larger one ships chunked
+/// ([`SyncCheckpointMeta`] → [`RequestSyncChunk`] → [`SyncChunk`]) so no serve can ever exceed the frame
+/// cap.
 pub(crate) const SYNC_CHECKPOINT_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 16 + 2 + 8 + BYTES_LEN_PREFIX;
+  ENCODE_HEADER_LEN + 8 + 8 + 16 + 16 + 2 + 8 + BYTES_LEN_PREFIX;
 
 /// The largest checkpoint envelope that ships UNCHUNKED — as one [`SyncCheckpoint`] of exactly
 /// `MAX_FRAME_LEN` at this size. The state-sync donor branches here: an envelope at/under this
@@ -156,11 +158,11 @@ pub const fn max_unchunked_snapshot_len() -> usize {
 
 /// Fixed bytes a [`SyncChunk`] encoding wraps around its chunk payload: the [`ENCODE_HEADER_LEN`]
 /// message header, then `view` + `checkpoint_op` (two `u64`s) + `checkpoint_id` (`u128`) +
-/// `total_len` + `offset` (two `u64`s) + `replica` (`u16`) + `nonce` (`u64`), then the payload's
-/// [`BYTES_LEN_PREFIX`] — 65 bytes. Derived from the exact widths
+/// `total_len` + `offset` (two `u64`s) + the agnostic `config_id` (`u128`) + `replica` (`u16`) +
+/// `nonce` (`u64`), then the payload's [`BYTES_LEN_PREFIX`] — 81 bytes. Derived from the exact widths
 /// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::SyncChunk`] arm.
 pub(crate) const SYNC_CHUNK_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 16 + 8 + 8 + 2 + 8 + BYTES_LEN_PREFIX;
+  ENCODE_HEADER_LEN + 8 + 8 + 16 + 8 + 8 + 16 + 2 + 8 + BYTES_LEN_PREFIX;
 
 /// The chunk size of the chunked state-sync transfer: the largest payload a [`SyncChunk`] can carry
 /// with its encoding landing exactly on `MAX_FRAME_LEN` (max-fill, pinned exact by test). Every
@@ -189,16 +191,18 @@ pub(crate) const PER_HEADER_ENTRY_BYTES: usize = 8 + 16 + 8 + 1 + 16;
 
 /// The MAXIMUM header-only band depth (op count) that fits one view-change log carrier under the frame
 /// cap, by construction: the frame budget less the largest carrier framing, divided by the fixed
-/// per-header-entry size. The carrier framing is the largest of the three log carriers — a
-/// `DoViewChange` (header + `view`/`log_view`/`op`/`commit`/`checkpoint_op` five `u64`s + `replica`
-/// `u8` + [`LOG_COUNT_PREFIX`]) and a `RecoveryResponse` (header + four `u64`s + `replica` `u8` +
-/// `nonce` `u64` + [`LOG_COUNT_PREFIX`]) tie at the larger framing; we use a generous fixed `64`-byte
-/// allowance that exceeds either (each is `48`). [`crate::config::MAX_CHECKPOINT_OPS`] is capped so the
+/// per-header-entry size. The carrier framing is the largest of the three strict log carriers — a
+/// `DoViewChange` (header + `view`/`log_view`/`op`/`commit`/`checkpoint_op` five `u64`s + the strict
+/// `epoch` `u64` + `config_id` `u128` + `replica` `u16` + [`LOG_COUNT_PREFIX`]) and a
+/// `RecoveryResponse` (header + four `u64`s + `epoch` `u64` + `config_id` `u128` + `replica` `u16` +
+/// `nonce` `u64` + [`LOG_COUNT_PREFIX`]) tie at the larger framing; we use a generous fixed `80`-byte
+/// allowance that exceeds either (each is `73`). [`crate::config::MAX_CHECKPOINT_OPS`] is capped so the
 /// deepest achievable band `(checkpoint_op .. op]` stays at/below this, making a header-only carrier
 /// sub-cap by construction; [`Endpoint::log_entries`](crate::Endpoint) also `debug_assert`s the band
-/// against it.
+/// against it. The strict carrier grows +24 bytes (epoch + config_id); the per-entry log bytes are
+/// UNCHANGED (only the carrier framing grew), so [`PER_HEADER_ENTRY_BYTES`] stays the same.
 pub(crate) const MAX_HEADER_ONLY_BAND_DEPTH: usize =
-  (MAX_FRAME_LEN as usize - 64) / PER_HEADER_ENTRY_BYTES;
+  (MAX_FRAME_LEN as usize - 80) / PER_HEADER_ENTRY_BYTES;
 
 #[cfg(feature = "tcp")]
 /// `const` max of two `usize`s ([`usize::max`] is not yet `const` in this MSRV).
@@ -212,21 +216,25 @@ const fn max_usize(a: usize, b: usize) -> usize {
 /// encodes to at most the frame cap on its tightest carrier and is therefore deliverable on every hop it
 /// causes. The same body bytes are wrapped, in turn, by:
 ///
-/// - the [`Request`] the client sends ([`REQUEST_ENCODE_OVERHEAD`] = 31),
-/// - the [`Prepare`] the primary replicates ([`PREPARE_ENCODE_OVERHEAD`] = 63),
+/// - the [`Request`] the client sends ([`REQUEST_ENCODE_OVERHEAD`] = 31; AGNOSTIC-NEITHER, no
+///   epoch-policy fields),
+/// - the [`Prepare`] the primary replicates ([`PREPARE_ENCODE_OVERHEAD`] = 87; STRICT, +24 for
+///   `epoch` + `config_id`),
 /// - and — once the op is logged — a single [`Body::Present`] [`PreparedEntry`] inside a
-///   [`RepairBatch`] ([`REPAIR_BATCH_BODY_OVERHEAD`] = 68), the windowed peer-repair answer that ships
-///   a committed op's full body, or inside a [`PrepareBatch`] ([`PREPARE_BATCH_BODY_OVERHEAD`],
-///   byte-identical at 68), the primary's batched retransmit of the un-acked window.
+///   [`RepairBatch`] ([`REPAIR_BATCH_BODY_OVERHEAD`] = 84; AGNOSTIC, +16 for `config_id`), the windowed
+///   peer-repair answer that ships a committed op's full body, or inside a [`PrepareBatch`]
+///   ([`PREPARE_BATCH_BODY_OVERHEAD`] = 92; STRICT, +24), the primary's batched retransmit of the
+///   un-acked window.
 ///
 /// The view-change log carriers (`DoViewChange` / `StartView` / `RecoveryResponse`) are NOT in
 /// this list: they carry every entry HEADER-ONLY (see [`Endpoint::log_entries`](crate::Endpoint)),
-/// so they ship NO client body — the binding BODY carriers are the batch slices. The BINDING max
-/// is therefore the tied `RepairBatch`/`PrepareBatch` pair (68), which exceeds the `Prepare` hop (63)
-/// by the single-entry log framing they wrap the body in. Bounding by `Prepare` alone (63) would let a
-/// max-size body served as a one-entry batch encode to `MAX_FRAME_LEN + 5` and be dropped on the
-/// repair/retransmit path, leaving a single max-body committed op unrepairable. The transport's
-/// `max_request_body_len()` subtracts exactly this from
+/// so they ship NO client body — the binding BODY carriers are the batch slices. The BINDING max is
+/// therefore the STRICT `PrepareBatch` carrier (92): the epoch-policy matrix makes it strictly larger
+/// than the agnostic `RepairBatch` (84), so the two batch carriers no longer tie — `PrepareBatch` alone
+/// is the worst hop, exceeding the `Prepare` hop (87) by the single-entry log framing it wraps the body
+/// in. Bounding by `Prepare` alone would let a max-size body retransmitted as a one-entry `PrepareBatch`
+/// encode past the frame cap and be dropped, leaving a single max-body committed op unrepairable. The
+/// transport's `max_request_body_len()` subtracts exactly this from
 /// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN); each batch's per-entry byte cap then
 /// guarantees a single served entry (a max body) lands exactly on the cap.
 pub const MAX_REQUEST_BODY_OVERHEAD: usize = max_usize(
@@ -288,19 +296,25 @@ pub struct Prepare {
   op: OpNumber,
   commit: OpNumber,
   checkpoint_op: OpNumber,
+  epoch: Epoch,
+  config_id: u128,
   client: ClientId,
   request: RequestNumber,
   body: Bytes,
 }
 
 impl Prepare {
-  /// Creates a prepare.
+  /// Creates a prepare. `epoch` + `config_id` are the sender's active configuration (the STRICT
+  /// epoch-policy pair every consensus carrier carries).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[allow(clippy::too_many_arguments)] // the wire layout, in canonical field order
   pub fn new(
     view: View,
     op: OpNumber,
     commit: OpNumber,
     checkpoint_op: OpNumber,
+    epoch: Epoch,
+    config_id: u128,
     client: ClientId,
     request: RequestNumber,
     body: Bytes,
@@ -310,6 +324,8 @@ impl Prepare {
       op,
       commit,
       checkpoint_op,
+      epoch,
+      config_id,
       client,
       request,
       body,
@@ -320,6 +336,18 @@ impl Prepare {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn view(&self) -> View {
     self.view
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The op number assigned to this operation.
@@ -381,19 +409,25 @@ pub struct PrepareOk {
   replica: ReplicaId,
   checkpoint_op: OpNumber,
   prepare_checksum: u128,
+  epoch: Epoch,
+  config_id: u128,
 }
 
 impl PrepareOk {
   /// Creates a prepare acknowledgement. `prepare_checksum` is the operation IDENTITY content address
   /// (`prepare_identity` over `(client, request, body_checksum)`) of the operation the acking replica
-  /// holds at `op` — the address the primary's `on_prepare_ok` matches the vote against before counting it.
+  /// holds at `op` — the address the primary's `on_prepare_ok` matches the vote against before counting
+  /// it. `epoch` + `config_id` are the sender's active configuration (the STRICT epoch-policy pair).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[allow(clippy::too_many_arguments)] // the wire layout, in canonical field order
   pub const fn new(
     view: View,
     op: OpNumber,
     replica: ReplicaId,
     checkpoint_op: OpNumber,
     prepare_checksum: u128,
+    epoch: Epoch,
+    config_id: u128,
   ) -> Self {
     Self {
       view,
@@ -401,7 +435,21 @@ impl PrepareOk {
       replica,
       checkpoint_op,
       prepare_checksum,
+      epoch,
+      config_id,
     }
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The view of the acknowledged prepare.
@@ -495,17 +543,40 @@ pub struct Commit {
   view: View,
   commit: OpNumber,
   checkpoint_op: OpNumber,
+  epoch: Epoch,
+  config_id: u128,
 }
 
 impl Commit {
-  /// Creates a commit heartbeat.
+  /// Creates a commit heartbeat. `epoch` + `config_id` are the sender's active configuration (the
+  /// STRICT epoch-policy pair).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(view: View, commit: OpNumber, checkpoint_op: OpNumber) -> Self {
+  pub const fn new(
+    view: View,
+    commit: OpNumber,
+    checkpoint_op: OpNumber,
+    epoch: Epoch,
+    config_id: u128,
+  ) -> Self {
     Self {
       view,
       commit,
       checkpoint_op,
+      epoch,
+      config_id,
     }
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The current view.
@@ -679,19 +750,39 @@ impl PreparedEntry {
 pub struct StartViewChange {
   view: View,
   replica: ReplicaId,
+  epoch: Epoch,
+  config_id: u128,
 }
 
 impl StartViewChange {
-  /// Creates a StartViewChange.
+  /// Creates a StartViewChange. `epoch` + `config_id` are the sender's active configuration (the
+  /// STRICT epoch-policy pair).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(view: View, replica: ReplicaId) -> Self {
-    Self { view, replica }
+  pub const fn new(view: View, replica: ReplicaId, epoch: Epoch, config_id: u128) -> Self {
+    Self {
+      view,
+      replica,
+      epoch,
+      config_id,
+    }
   }
 
   /// The view this replica proposes to enter.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn view(&self) -> View {
     self.view
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The sending replica.
@@ -709,6 +800,8 @@ pub struct DoViewChange {
   op: OpNumber,
   commit: OpNumber,
   checkpoint_op: OpNumber,
+  epoch: Epoch,
+  config_id: u128,
   replica: ReplicaId,
   log: Vec<PreparedEntry>,
 }
@@ -716,13 +809,17 @@ pub struct DoViewChange {
 impl DoViewChange {
   /// Creates a DoViewChange with no checkpoint floor advertised (`checkpoint_op` 0 — the
   /// never-checkpointed sender's form). A sender with a durable-checkpoint-vouched log floor chains
-  /// [`Self::with_checkpoint_op`].
+  /// [`Self::with_checkpoint_op`]. `epoch` + `config_id` are the sender's active configuration (the
+  /// STRICT epoch-policy pair).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[allow(clippy::too_many_arguments)] // the wire layout, in canonical field order
   pub fn new(
     view: View,
     log_view: View,
     op: OpNumber,
     commit: OpNumber,
+    epoch: Epoch,
+    config_id: u128,
     replica: ReplicaId,
     log: Vec<PreparedEntry>,
   ) -> Self {
@@ -732,6 +829,8 @@ impl DoViewChange {
       op,
       commit,
       checkpoint_op: OpNumber::new(),
+      epoch,
+      config_id,
       replica,
       log,
     }
@@ -742,6 +841,18 @@ impl DoViewChange {
   pub fn with_checkpoint_op(mut self, checkpoint_op: OpNumber) -> Self {
     self.checkpoint_op = checkpoint_op;
     self
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The view being entered.
@@ -808,18 +919,24 @@ pub struct StartView {
   op: OpNumber,
   commit: OpNumber,
   checkpoint_op: OpNumber,
+  epoch: Epoch,
+  config_id: u128,
   replica: ReplicaId,
   log: Vec<PreparedEntry>,
 }
 
 impl StartView {
   /// Creates a StartView with no checkpoint floor advertised (`checkpoint_op` 0). A primary with a
-  /// durable-checkpoint-vouched log floor chains [`Self::with_checkpoint_op`].
+  /// durable-checkpoint-vouched log floor chains [`Self::with_checkpoint_op`]. `epoch` + `config_id`
+  /// are the sender's active configuration (the STRICT epoch-policy pair).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[allow(clippy::too_many_arguments)] // the wire layout, in canonical field order
   pub fn new(
     view: View,
     op: OpNumber,
     commit: OpNumber,
+    epoch: Epoch,
+    config_id: u128,
     replica: ReplicaId,
     log: Vec<PreparedEntry>,
   ) -> Self {
@@ -828,6 +945,8 @@ impl StartView {
       op,
       commit,
       checkpoint_op: OpNumber::new(),
+      epoch,
+      config_id,
       replica,
       log,
     }
@@ -838,6 +957,18 @@ impl StartView {
   pub fn with_checkpoint_op(mut self, checkpoint_op: OpNumber) -> Self {
     self.checkpoint_op = checkpoint_op;
     self
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The new view.
@@ -895,17 +1026,40 @@ pub struct GetView {
   view: View,
   replica: ReplicaId,
   nonce: u64,
+  epoch: Epoch,
+  config_id: u128,
 }
 
 impl GetView {
-  /// Creates a GetView.
+  /// Creates a GetView. `epoch` + `config_id` are the sender's active configuration (the STRICT
+  /// epoch-policy pair).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(view: View, replica: ReplicaId, nonce: u64) -> Self {
+  pub const fn new(
+    view: View,
+    replica: ReplicaId,
+    nonce: u64,
+    epoch: Epoch,
+    config_id: u128,
+  ) -> Self {
     Self {
       view,
       replica,
       nonce,
+      epoch,
+      config_id,
     }
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The view being requested.
@@ -939,13 +1093,26 @@ pub struct RequestPrepare {
   view: View,
   op: OpNumber,
   replica: ReplicaId,
+  config_id: u128,
 }
 
 impl RequestPrepare {
-  /// Creates a RequestPrepare for the missing committed op `op`.
+  /// Creates a RequestPrepare for the missing committed op `op`. `config_id` is the sender's active
+  /// configuration lineage (the AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(view: View, op: OpNumber, replica: ReplicaId) -> Self {
-    Self { view, op, replica }
+  pub const fn new(view: View, op: OpNumber, replica: ReplicaId, config_id: u128) -> Self {
+    Self {
+      view,
+      op,
+      replica,
+      config_id,
+    }
+  }
+
+  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The requester's current view.
@@ -981,18 +1148,33 @@ pub struct RequestPrepareRange {
   lo: OpNumber,
   hi: OpNumber,
   replica: ReplicaId,
+  config_id: u128,
 }
 
 impl RequestPrepareRange {
-  /// Creates a RequestPrepareRange for the contiguous missing committed run `[lo, hi]`.
+  /// Creates a RequestPrepareRange for the contiguous missing committed run `[lo, hi]`. `config_id` is
+  /// the sender's active configuration lineage (the AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(view: View, lo: OpNumber, hi: OpNumber, replica: ReplicaId) -> Self {
+  pub const fn new(
+    view: View,
+    lo: OpNumber,
+    hi: OpNumber,
+    replica: ReplicaId,
+    config_id: u128,
+  ) -> Self {
     Self {
       view,
       lo,
       hi,
       replica,
+      config_id,
     }
+  }
+
+  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The requester's current view.
@@ -1028,13 +1210,33 @@ impl RequestPrepareRange {
 pub struct Recovery {
   replica: ReplicaId,
   nonce: u64,
+  epoch: Epoch,
+  config_id: u128,
 }
 
 impl Recovery {
-  /// Creates a Recovery solicitation.
+  /// Creates a Recovery solicitation. `epoch` + `config_id` are the sender's active configuration (the
+  /// STRICT epoch-policy pair).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(replica: ReplicaId, nonce: u64) -> Self {
-    Self { replica, nonce }
+  pub const fn new(replica: ReplicaId, nonce: u64, epoch: Epoch, config_id: u128) -> Self {
+    Self {
+      replica,
+      nonce,
+      epoch,
+      config_id,
+    }
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The recovering replica.
@@ -1061,6 +1263,8 @@ pub struct RecoveryResponse {
   op: OpNumber,
   commit: OpNumber,
   checkpoint_op: OpNumber,
+  epoch: Epoch,
+  config_id: u128,
   replica: ReplicaId,
   nonce: u64,
   log: Vec<PreparedEntry>,
@@ -1069,12 +1273,16 @@ pub struct RecoveryResponse {
 impl RecoveryResponse {
   /// Creates a RecoveryResponse. The primary fills `op`/`commit`/`log` from its canonical state and
   /// chains [`Self::with_checkpoint_op`] for its vouched log floor; a backup passes `op = commit = 0`
-  /// and an empty `log` (view + nonce only, no floor).
+  /// and an empty `log` (view + nonce only, no floor). `epoch` + `config_id` are the sender's active
+  /// configuration (the STRICT epoch-policy pair).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[allow(clippy::too_many_arguments)] // the wire layout, in canonical field order
   pub fn new(
     view: View,
     op: OpNumber,
     commit: OpNumber,
+    epoch: Epoch,
+    config_id: u128,
     replica: ReplicaId,
     nonce: u64,
     log: Vec<PreparedEntry>,
@@ -1084,6 +1292,8 @@ impl RecoveryResponse {
       op,
       commit,
       checkpoint_op: OpNumber::new(),
+      epoch,
+      config_id,
       replica,
       nonce,
       log,
@@ -1095,6 +1305,18 @@ impl RecoveryResponse {
   pub fn with_checkpoint_op(mut self, checkpoint_op: OpNumber) -> Self {
     self.checkpoint_op = checkpoint_op;
     self
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The responder's current view.
@@ -1166,24 +1388,34 @@ pub struct RepairBatch {
   view: View,
   commit: OpNumber,
   checkpoint_op: OpNumber,
+  config_id: u128,
   log: Vec<PreparedEntry>,
 }
 
 impl RepairBatch {
-  /// Creates a RepairBatch carrying the served prefix `log` of a solicited committed run.
+  /// Creates a RepairBatch carrying the served prefix `log` of a solicited committed run. `config_id`
+  /// is the sender's active configuration lineage (the AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
     commit: OpNumber,
     checkpoint_op: OpNumber,
+    config_id: u128,
     log: Vec<PreparedEntry>,
   ) -> Self {
     Self {
       view,
       commit,
       checkpoint_op,
+      config_id,
       log,
     }
+  }
+
+  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The responder's current view (routing/freshness; a committed op's content is view-independent).
@@ -1235,24 +1467,43 @@ pub struct PrepareBatch {
   view: View,
   commit: OpNumber,
   checkpoint_op: OpNumber,
+  epoch: Epoch,
+  config_id: u128,
   log: Vec<PreparedEntry>,
 }
 
 impl PrepareBatch {
-  /// Creates a PrepareBatch carrying the retransmitted run `log` of un-acked ops.
+  /// Creates a PrepareBatch carrying the retransmitted run `log` of un-acked ops. `epoch` +
+  /// `config_id` are the sender's active configuration (the STRICT epoch-policy pair).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
     commit: OpNumber,
     checkpoint_op: OpNumber,
+    epoch: Epoch,
+    config_id: u128,
     log: Vec<PreparedEntry>,
   ) -> Self {
     Self {
       view,
       commit,
       checkpoint_op,
+      epoch,
+      config_id,
       log,
     }
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict/agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The view in which these prepares were created (the view each reconstructed [`Prepare`] carries).
@@ -1303,6 +1554,7 @@ pub struct RequestSync {
   replica: ReplicaId,
   nonce: u64,
   recovery: bool,
+  config_id: u128,
 }
 
 impl RequestSync {
@@ -1310,7 +1562,8 @@ impl RequestSync {
   /// set only on the recovery peer-fetch escalation (a replica whose OWN durable checkpoint snapshot
   /// read back permanently corrupt) — there a peer at the SAME `checkpoint_op` must still serve, since
   /// the requester's local bytes are unusable; ordinary state-sync leaves it `false` (a peer answers
-  /// only with something strictly newer).
+  /// only with something strictly newer). `config_id` is the sender's active configuration lineage (the
+  /// AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     view: View,
@@ -1318,6 +1571,7 @@ impl RequestSync {
     replica: ReplicaId,
     nonce: u64,
     recovery: bool,
+    config_id: u128,
   ) -> Self {
     Self {
       view,
@@ -1325,7 +1579,14 @@ impl RequestSync {
       replica,
       nonce,
       recovery,
+      config_id,
     }
+  }
+
+  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The requester's current view.
@@ -1377,18 +1638,21 @@ pub struct SyncCheckpoint {
   view: View,
   checkpoint_op: OpNumber,
   checkpoint_id: u128,
+  config_id: u128,
   replica: ReplicaId,
   nonce: u64,
   snapshot: Bytes,
 }
 
 impl SyncCheckpoint {
-  /// Creates a SyncCheckpoint carrying the durable checkpoint snapshot envelope.
+  /// Creates a SyncCheckpoint carrying the durable checkpoint snapshot envelope. `config_id` is the
+  /// sender's active configuration lineage (the AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn new(
     view: View,
     checkpoint_op: OpNumber,
     checkpoint_id: u128,
+    config_id: u128,
     replica: ReplicaId,
     nonce: u64,
     snapshot: Bytes,
@@ -1397,10 +1661,17 @@ impl SyncCheckpoint {
       view,
       checkpoint_op,
       checkpoint_id,
+      config_id,
       replica,
       nonce,
       snapshot,
     }
+  }
+
+  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The responder's current view (routing/freshness; the checkpoint content is view-independent).
@@ -1460,6 +1731,7 @@ pub struct SyncCheckpointMeta {
   view: View,
   checkpoint_op: OpNumber,
   checkpoint_id: u128,
+  config_id: u128,
   total_len: u64,
   replica: ReplicaId,
   nonce: u64,
@@ -1467,12 +1739,14 @@ pub struct SyncCheckpointMeta {
 
 impl SyncCheckpointMeta {
   /// Creates a chunked-transfer announce for the checkpoint `(checkpoint_op, checkpoint_id)` whose
-  /// envelope is `total_len` bytes.
+  /// envelope is `total_len` bytes. `config_id` is the sender's active configuration lineage (the
+  /// AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     view: View,
     checkpoint_op: OpNumber,
     checkpoint_id: u128,
+    config_id: u128,
     total_len: u64,
     replica: ReplicaId,
     nonce: u64,
@@ -1481,10 +1755,17 @@ impl SyncCheckpointMeta {
       view,
       checkpoint_op,
       checkpoint_id,
+      config_id,
       total_len,
       replica,
       nonce,
     }
+  }
+
+  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The donor's current view (routing/freshness; the checkpoint content is view-independent).
@@ -1537,6 +1818,7 @@ pub struct RequestSyncChunk {
   view: View,
   checkpoint_op: OpNumber,
   checkpoint_id: u128,
+  config_id: u128,
   offset: u64,
   replica: ReplicaId,
   nonce: u64,
@@ -1544,11 +1826,13 @@ pub struct RequestSyncChunk {
 
 impl RequestSyncChunk {
   /// Creates a chunk request for the pinned checkpoint `(checkpoint_op, checkpoint_id)` at `offset`.
+  /// `config_id` is the sender's active configuration lineage (the AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     view: View,
     checkpoint_op: OpNumber,
     checkpoint_id: u128,
+    config_id: u128,
     offset: u64,
     replica: ReplicaId,
     nonce: u64,
@@ -1557,10 +1841,17 @@ impl RequestSyncChunk {
       view,
       checkpoint_op,
       checkpoint_id,
+      config_id,
       offset,
       replica,
       nonce,
     }
+  }
+
+  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The requester's current view.
@@ -1612,6 +1903,7 @@ pub struct SyncChunk {
   view: View,
   checkpoint_op: OpNumber,
   checkpoint_id: u128,
+  config_id: u128,
   total_len: u64,
   offset: u64,
   replica: ReplicaId,
@@ -1621,13 +1913,15 @@ pub struct SyncChunk {
 
 impl SyncChunk {
   /// Creates a chunk of the pinned checkpoint `(checkpoint_op, checkpoint_id)`: the envelope bytes
-  /// at `offset .. offset + bytes.len()` of a `total_len`-byte envelope.
+  /// at `offset .. offset + bytes.len()` of a `total_len`-byte envelope. `config_id` is the sender's
+  /// active configuration lineage (the AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
   #[allow(clippy::too_many_arguments)] // the wire layout, in canonical field order
   pub const fn new(
     view: View,
     checkpoint_op: OpNumber,
     checkpoint_id: u128,
+    config_id: u128,
     total_len: u64,
     offset: u64,
     replica: ReplicaId,
@@ -1638,12 +1932,19 @@ impl SyncChunk {
       view,
       checkpoint_op,
       checkpoint_id,
+      config_id,
       total_len,
       offset,
       replica,
       nonce,
       bytes,
     }
+  }
+
+  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
   }
 
   /// The donor's current view (routing/freshness; the chunk content is view-independent).
@@ -1901,6 +2202,8 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
         out.put_u128(m.client.get());
         out.put_u64(m.request.get());
         write_bytes_u32(&mut out, &m.body);
@@ -1911,6 +2214,8 @@ impl Message {
         out.put_u16(m.replica.get());
         out.put_u64(m.checkpoint_op.get());
         out.put_u128(m.prepare_checksum);
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
       }
       Self::Reply(m) => {
         out.put_u64(m.view.get());
@@ -1922,10 +2227,14 @@ impl Message {
         out.put_u64(m.view.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
       }
       Self::StartViewChange(m) => {
         out.put_u64(m.view.get());
         out.put_u16(m.replica.get());
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
       }
       Self::DoViewChange(m) => {
         out.put_u64(m.view.get());
@@ -1933,6 +2242,8 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
         out.put_u16(m.replica.get());
         write_log(&mut out, &m.log);
       }
@@ -1941,6 +2252,8 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
         out.put_u16(m.replica.get());
         write_log(&mut out, &m.log);
       }
@@ -1948,21 +2261,28 @@ impl Message {
         out.put_u64(m.view.get());
         out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
       }
       Self::RequestPrepare(m) => {
         out.put_u64(m.view.get());
         out.put_u64(m.op.get());
         out.put_u16(m.replica.get());
+        out.put_u128(m.config_id);
       }
       Self::Recovery(m) => {
         out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
       }
       Self::RecoveryResponse(m) => {
         out.put_u64(m.view.get());
         out.put_u64(m.op.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
         out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
         write_log(&mut out, &m.log);
@@ -1973,11 +2293,13 @@ impl Message {
         out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
         out.put_u8(m.recovery as u8);
+        out.put_u128(m.config_id);
       }
       Self::SyncCheckpoint(m) => {
         out.put_u64(m.view.get());
         out.put_u64(m.checkpoint_op.get());
         out.put_u128(m.checkpoint_id);
+        out.put_u128(m.config_id);
         out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
         write_bytes_u32(&mut out, &m.snapshot);
@@ -1987,17 +2309,20 @@ impl Message {
         out.put_u64(m.lo.get());
         out.put_u64(m.hi.get());
         out.put_u16(m.replica.get());
+        out.put_u128(m.config_id);
       }
       Self::RepairBatch(m) => {
         out.put_u64(m.view.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
+        out.put_u128(m.config_id);
         write_log(&mut out, &m.log);
       }
       Self::SyncCheckpointMeta(m) => {
         out.put_u64(m.view.get());
         out.put_u64(m.checkpoint_op.get());
         out.put_u128(m.checkpoint_id);
+        out.put_u128(m.config_id);
         out.put_u64(m.total_len);
         out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
@@ -2006,6 +2331,7 @@ impl Message {
         out.put_u64(m.view.get());
         out.put_u64(m.checkpoint_op.get());
         out.put_u128(m.checkpoint_id);
+        out.put_u128(m.config_id);
         out.put_u64(m.offset);
         out.put_u16(m.replica.get());
         out.put_u64(m.nonce);
@@ -2014,6 +2340,7 @@ impl Message {
         out.put_u64(m.view.get());
         out.put_u64(m.checkpoint_op.get());
         out.put_u128(m.checkpoint_id);
+        out.put_u128(m.config_id);
         out.put_u64(m.total_len);
         out.put_u64(m.offset);
         out.put_u16(m.replica.get());
@@ -2024,6 +2351,8 @@ impl Message {
         out.put_u64(m.view.get());
         out.put_u64(m.commit.get());
         out.put_u64(m.checkpoint_op.get());
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
         write_log(&mut out, &m.log);
       }
     }
@@ -2062,27 +2391,32 @@ impl Message {
       }
       n
     }
+    // The epoch-policy matrix widths: a STRICT carrier adds `epoch` (u64) + `config_id` (u128); an
+    // AGNOSTIC carrier adds `config_id` (u128); `Request`/`Reply` add neither. Spelled out per arm in
+    // canonical field order so this preflight stays byte-identical to `encode`.
     let body = match self {
       Self::Request(m) => U128 + U64 + bytes_u32(m.body.len()),
-      Self::Prepare(m) => U64 + U64 + U64 + U64 + U128 + U64 + bytes_u32(m.body.len()),
-      Self::PrepareOk(_) => U64 + U64 + U16 + U64 + U128,
+      Self::Prepare(m) => U64 + U64 + U64 + U64 + U64 + U128 + U128 + U64 + bytes_u32(m.body.len()),
+      Self::PrepareOk(_) => U64 + U64 + U16 + U64 + U128 + U64 + U128,
       Self::Reply(m) => U64 + U128 + U64 + bytes_u32(m.body.len()),
-      Self::Commit(_) => U64 + U64 + U64,
-      Self::StartViewChange(_) => U64 + U16,
-      Self::DoViewChange(m) => U64 + U64 + U64 + U64 + U64 + U16 + log(&m.log),
-      Self::StartView(m) => U64 + U64 + U64 + U64 + U16 + log(&m.log),
-      Self::GetView(_) => U64 + U16 + U64,
-      Self::RequestPrepare(_) => U64 + U64 + U16,
-      Self::Recovery(_) => U16 + U64,
-      Self::RecoveryResponse(m) => U64 + U64 + U64 + U64 + U16 + U64 + log(&m.log),
-      Self::RequestSync(_) => U64 + U64 + U16 + U64 + U8,
-      Self::SyncCheckpoint(m) => U64 + U64 + U128 + U16 + U64 + bytes_u32(m.snapshot.len()),
-      Self::RequestPrepareRange(_) => U64 + U64 + U64 + U16,
-      Self::RepairBatch(m) => U64 + U64 + U64 + log(&m.log),
-      Self::SyncCheckpointMeta(_) => U64 + U64 + U128 + U64 + U16 + U64,
-      Self::RequestSyncChunk(_) => U64 + U64 + U128 + U64 + U16 + U64,
-      Self::SyncChunk(m) => U64 + U64 + U128 + U64 + U64 + U16 + U64 + bytes_u32(m.bytes.len()),
-      Self::PrepareBatch(m) => U64 + U64 + U64 + log(&m.log),
+      Self::Commit(_) => U64 + U64 + U64 + U64 + U128,
+      Self::StartViewChange(_) => U64 + U16 + U64 + U128,
+      Self::DoViewChange(m) => U64 + U64 + U64 + U64 + U64 + U64 + U128 + U16 + log(&m.log),
+      Self::StartView(m) => U64 + U64 + U64 + U64 + U64 + U128 + U16 + log(&m.log),
+      Self::GetView(_) => U64 + U16 + U64 + U64 + U128,
+      Self::RequestPrepare(_) => U64 + U64 + U16 + U128,
+      Self::Recovery(_) => U16 + U64 + U64 + U128,
+      Self::RecoveryResponse(m) => U64 + U64 + U64 + U64 + U64 + U128 + U16 + U64 + log(&m.log),
+      Self::RequestSync(_) => U64 + U64 + U16 + U64 + U8 + U128,
+      Self::SyncCheckpoint(m) => U64 + U64 + U128 + U128 + U16 + U64 + bytes_u32(m.snapshot.len()),
+      Self::RequestPrepareRange(_) => U64 + U64 + U64 + U16 + U128,
+      Self::RepairBatch(m) => U64 + U64 + U64 + U128 + log(&m.log),
+      Self::SyncCheckpointMeta(_) => U64 + U64 + U128 + U128 + U64 + U16 + U64,
+      Self::RequestSyncChunk(_) => U64 + U64 + U128 + U128 + U64 + U16 + U64,
+      Self::SyncChunk(m) => {
+        U64 + U64 + U128 + U128 + U64 + U64 + U16 + U64 + bytes_u32(m.bytes.len())
+      }
+      Self::PrepareBatch(m) => U64 + U64 + U64 + U64 + U128 + log(&m.log),
     };
     HEADER + body
   }
@@ -2116,6 +2450,8 @@ impl Message {
         op: read_op(&mut r)?,
         commit: read_op(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
         client: read_client(&mut r)?,
         request: read_request(&mut r)?,
         body: read_body(&mut r)?,
@@ -2126,6 +2462,8 @@ impl Message {
         replica: read_replica(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
         prepare_checksum: r.u128()?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
       }),
       3 => Self::Reply(Reply {
         view: read_view(&mut r)?,
@@ -2137,10 +2475,14 @@ impl Message {
         view: read_view(&mut r)?,
         commit: read_op(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
       }),
       5 => Self::StartViewChange(StartViewChange {
         view: read_view(&mut r)?,
         replica: read_replica(&mut r)?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
       }),
       6 => Self::DoViewChange(DoViewChange {
         view: read_view(&mut r)?,
@@ -2148,6 +2490,8 @@ impl Message {
         op: read_op(&mut r)?,
         commit: read_op(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
         replica: read_replica(&mut r)?,
         log: read_log(&mut r)?,
       }),
@@ -2156,6 +2500,8 @@ impl Message {
         op: read_op(&mut r)?,
         commit: read_op(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
         replica: read_replica(&mut r)?,
         log: read_log(&mut r)?,
       }),
@@ -2163,21 +2509,28 @@ impl Message {
         view: read_view(&mut r)?,
         replica: read_replica(&mut r)?,
         nonce: r.u64()?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
       }),
       9 => Self::RequestPrepare(RequestPrepare {
         view: read_view(&mut r)?,
         op: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
+        config_id: r.u128()?,
       }),
       10 => Self::Recovery(Recovery {
         replica: read_replica(&mut r)?,
         nonce: r.u64()?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
       }),
       11 => Self::RecoveryResponse(RecoveryResponse {
         view: read_view(&mut r)?,
         op: read_op(&mut r)?,
         commit: read_op(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
         replica: read_replica(&mut r)?,
         nonce: r.u64()?,
         log: read_log(&mut r)?,
@@ -2188,11 +2541,13 @@ impl Message {
         replica: read_replica(&mut r)?,
         nonce: r.u64()?,
         recovery: read_bool(&mut r)?,
+        config_id: r.u128()?,
       }),
       13 => Self::SyncCheckpoint(SyncCheckpoint {
         view: read_view(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
         checkpoint_id: r.u128()?,
+        config_id: r.u128()?,
         replica: read_replica(&mut r)?,
         nonce: r.u64()?,
         snapshot: read_body(&mut r)?,
@@ -2202,17 +2557,20 @@ impl Message {
         lo: read_op(&mut r)?,
         hi: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
+        config_id: r.u128()?,
       }),
       15 => Self::RepairBatch(RepairBatch {
         view: read_view(&mut r)?,
         commit: read_op(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+        config_id: r.u128()?,
         log: read_log(&mut r)?,
       }),
       16 => Self::SyncCheckpointMeta(SyncCheckpointMeta {
         view: read_view(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
         checkpoint_id: r.u128()?,
+        config_id: r.u128()?,
         total_len: r.u64()?,
         replica: read_replica(&mut r)?,
         nonce: r.u64()?,
@@ -2221,6 +2579,7 @@ impl Message {
         view: read_view(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
         checkpoint_id: r.u128()?,
+        config_id: r.u128()?,
         offset: r.u64()?,
         replica: read_replica(&mut r)?,
         nonce: r.u64()?,
@@ -2229,6 +2588,7 @@ impl Message {
         view: read_view(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
         checkpoint_id: r.u128()?,
+        config_id: r.u128()?,
         total_len: r.u64()?,
         offset: r.u64()?,
         replica: read_replica(&mut r)?,
@@ -2239,6 +2599,8 @@ impl Message {
         view: read_view(&mut r)?,
         commit: read_op(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
         log: read_log(&mut r)?,
       }),
       other => return Err(CodecError::UnknownTag(other)),
@@ -2258,6 +2620,11 @@ fn read_view(r: &mut Reader<'_>) -> Result<View, CodecError> {
 #[cfg_attr(not(tarpaulin), inline)]
 fn read_op(r: &mut Reader<'_>) -> Result<OpNumber, CodecError> {
   Ok(OpNumber::with(r.u64()?))
+}
+
+#[cfg_attr(not(tarpaulin), inline)]
+fn read_epoch(r: &mut Reader<'_>) -> Result<Epoch, CodecError> {
+  Ok(Epoch::new(r.u64()?))
 }
 
 #[cfg_attr(not(tarpaulin), inline)]
@@ -2377,7 +2744,13 @@ mod tests {
 
   #[test]
   fn commit_and_prepare_ok_carry_checkpoint_op() {
-    let c = Commit::new(View::with(1), OpNumber::with(5), OpNumber::with(4));
+    let c = Commit::new(
+      View::with(1),
+      OpNumber::with(5),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    );
     assert_eq!(c.checkpoint_op(), OpNumber::with(4));
     let ok = PrepareOk::new(
       View::with(1),
@@ -2385,6 +2758,8 @@ mod tests {
       ReplicaId::new(2),
       OpNumber::with(4),
       0x1234_5678_9abc_def0_1122_3344_5566_7788,
+      crate::Epoch::new(0),
+      0,
     );
     assert_eq!(ok.checkpoint_op(), OpNumber::with(4));
     // The vote is content-addressed: it carries the operation-identity checksum verbatim.
@@ -2404,6 +2779,8 @@ mod tests {
       ReplicaId::new(3),
       OpNumber::with(4),
       u128::MAX,
+      crate::Epoch::new(0),
+      0,
     ));
     let back = Message::decode(&ok.encode()).expect("round-trips");
     assert_eq!(back, ok);
@@ -2418,7 +2795,9 @@ mod tests {
       View::with(1),
       OpNumber::with(5),
       OpNumber::with(4),
-      OpNumber::with(2), // checkpoint_op
+      OpNumber::with(2),
+      crate::Epoch::new(0),
+      0,
       ClientId::new(7),
       RequestNumber::with(5),
       Bytes::from_static(b"x"),
@@ -2433,6 +2812,8 @@ mod tests {
       OpNumber::with(1),
       OpNumber::with(0),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ClientId::new(9),
       RequestNumber::with(1),
       Bytes::copy_from_slice(&[1, 2, 3]),
@@ -2446,13 +2827,20 @@ mod tests {
   #[test]
   fn view_change_messages_construct_and_predicate() {
     use crate::ReplicaId;
-    let svc = Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2)));
+    let svc = Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(2),
+      crate::Epoch::new(0),
+      0,
+    ));
     assert!(svc.is_start_view_change());
     let dvc = Message::DoViewChange(DoViewChange::new(
       View::with(1),
       View::with(0),
       OpNumber::with(3),
       OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
       ReplicaId::new(2),
       std::vec![PreparedEntry::new(
         OpNumber::with(1),
@@ -2468,7 +2856,12 @@ mod tests {
   fn recovery_messages_construct_and_round_trip() {
     use crate::ReplicaId;
     // A RecoveringHead replica broadcasts Recovery{replica, nonce}.
-    let rec = Message::Recovery(Recovery::new(ReplicaId::new(2), 0xABCD));
+    let rec = Message::Recovery(Recovery::new(
+      ReplicaId::new(2),
+      0xABCD,
+      crate::Epoch::new(0),
+      0,
+    ));
     assert!(rec.is_recovery());
     let r = rec.unwrap_recovery();
     assert_eq!(r.replica(), ReplicaId::new(2));
@@ -2479,6 +2872,8 @@ mod tests {
       View::with(3),
       OpNumber::with(5),
       OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
       ReplicaId::new(0),
       0xABCD,
       std::vec![PreparedEntry::new(
@@ -2507,6 +2902,7 @@ mod tests {
       View::with(2),
       OpNumber::with(7),
       ReplicaId::new(3),
+      0,
     ));
     assert!(m.is_request_prepare());
     let rp = m.unwrap_request_prepare();
@@ -2525,6 +2921,7 @@ mod tests {
       ReplicaId::new(3),
       0xBEEF,
       false,
+      0,
     ));
     assert!(rq.is_request_sync());
     let r = rq.unwrap_request_sync();
@@ -2540,6 +2937,7 @@ mod tests {
       ReplicaId::new(3),
       0xBEEF,
       true,
+      0,
     );
     assert!(rec.recovery());
 
@@ -2549,6 +2947,7 @@ mod tests {
       View::with(4),
       OpNumber::with(8),
       0x1234_5678_9abc,
+      0,
       ReplicaId::new(0),
       0xBEEF,
       snap.clone(),
@@ -2583,48 +2982,61 @@ mod tests {
         OpNumber::with(1),
         OpNumber::with(0),
         OpNumber::with(0),
+        crate::Epoch::new(0),
+        0,
         ClientId::new(7),
         RequestNumber::with(1),
-        body.clone()
+        body.clone(),
       )),
       Message::PrepareOk(PrepareOk::new(
         View::with(1),
         OpNumber::with(1),
         ReplicaId::new(2),
         OpNumber::with(0),
-        0
+        0,
+        crate::Epoch::new(0),
+        0,
       )),
       Message::Commit(Commit::new(
         View::with(1),
         OpNumber::with(1),
-        OpNumber::with(0)
+        OpNumber::with(0),
+        crate::Epoch::new(0),
+        0,
       )),
       Message::DoViewChange(DoViewChange::new(
         View::with(1),
         View::with(0),
         OpNumber::with(1),
         OpNumber::with(1),
+        crate::Epoch::new(0),
+        0,
         ReplicaId::new(2),
-        std::vec![entry()]
+        std::vec![entry()],
       )),
       Message::StartView(StartView::new(
         View::with(1),
         OpNumber::with(1),
         OpNumber::with(1),
+        crate::Epoch::new(0),
+        0,
         ReplicaId::new(0),
-        std::vec![entry()]
+        std::vec![entry()],
       )),
       Message::RecoveryResponse(RecoveryResponse::new(
         View::with(1),
         OpNumber::with(1),
         OpNumber::with(1),
+        crate::Epoch::new(0),
+        0,
         ReplicaId::new(0),
         0,
-        std::vec![entry()]
+        std::vec![entry()],
       )),
       Message::SyncCheckpoint(SyncCheckpoint::new(
         View::with(1),
         OpNumber::with(2),
+        0,
         0,
         ReplicaId::new(0),
         0,
@@ -2634,6 +3046,7 @@ mod tests {
         View::with(1),
         OpNumber::with(1),
         OpNumber::with(0),
+        0,
         std::vec![entry()]
       )),
       // The batched prepare retransmit advertises `self.view` exactly like each per-op `Prepare`
@@ -2642,12 +3055,15 @@ mod tests {
         View::with(1),
         OpNumber::with(0),
         OpNumber::with(0),
-        std::vec![entry()]
+        crate::Epoch::new(0),
+        0,
+        std::vec![entry()],
       )),
       // The chunked state-sync serves advertise `self.view` exactly like the whole SyncCheckpoint.
       Message::SyncCheckpointMeta(SyncCheckpointMeta::new(
         View::with(1),
         OpNumber::with(2),
+        0,
         0,
         64,
         ReplicaId::new(0),
@@ -2656,6 +3072,7 @@ mod tests {
       Message::SyncChunk(SyncChunk::new(
         View::with(1),
         OpNumber::with(2),
+        0,
         0,
         64,
         0,
@@ -2684,31 +3101,46 @@ mod tests {
         RequestNumber::with(1),
         body.clone()
       )),
-      Message::StartViewChange(StartViewChange::new(View::with(1), ReplicaId::new(2))),
-      Message::GetView(GetView::new(View::with(1), ReplicaId::new(2), 0)),
+      Message::StartViewChange(StartViewChange::new(
+        View::with(1),
+        ReplicaId::new(2),
+        crate::Epoch::new(0),
+        0
+      )),
+      Message::GetView(GetView::new(
+        View::with(1),
+        ReplicaId::new(2),
+        0,
+        crate::Epoch::new(0),
+        0
+      )),
       Message::RequestPrepare(RequestPrepare::new(
         View::with(1),
         OpNumber::with(1),
-        ReplicaId::new(2)
+        ReplicaId::new(2),
+        0
       )),
-      Message::Recovery(Recovery::new(ReplicaId::new(2), 0)),
+      Message::Recovery(Recovery::new(ReplicaId::new(2), 0, crate::Epoch::new(0), 0)),
       Message::RequestSync(RequestSync::new(
         View::with(1),
         OpNumber::with(0),
         ReplicaId::new(2),
         0,
-        false
+        false,
+        0
       )),
       Message::RequestPrepareRange(RequestPrepareRange::new(
         View::with(1),
         OpNumber::with(1),
         OpNumber::with(2),
-        ReplicaId::new(2)
+        ReplicaId::new(2),
+        0
       )),
       // The chunk pull is a solicitation, like the RequestSync it follows.
       Message::RequestSyncChunk(RequestSyncChunk::new(
         View::with(1),
         OpNumber::with(2),
+        0,
         0,
         0,
         ReplicaId::new(2),
@@ -2732,7 +3164,9 @@ mod tests {
       Message::Commit(Commit::new(
         View::with(1),
         OpNumber::with(1),
-        OpNumber::with(0)
+        OpNumber::with(0),
+        crate::Epoch::new(0),
+        0,
       ))
       .kind_str(),
       "Commit"
@@ -2747,6 +3181,8 @@ mod tests {
       View::with(3),
       OpNumber::new(),
       OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
       ReplicaId::new(2),
       0xFEED,
       std::vec![],
@@ -2786,6 +3222,8 @@ mod tests {
         OpNumber::with(u64::MAX),
         OpNumber::with(2),
         OpNumber::with(3),
+        crate::Epoch::new(0),
+        0,
         ClientId::new(7),
         RequestNumber::with(9),
         Bytes::from_static(b"prepare-body"),
@@ -2796,6 +3234,8 @@ mod tests {
         ReplicaId::new(255),
         OpNumber::with(6),
         0xCAFE_F00D_DEAD_BEEF_0102_0304_0506_0708,
+        crate::Epoch::new(0),
+        0,
       )),
       Message::Reply(Reply::new(
         View::with(2),
@@ -2807,17 +3247,24 @@ mod tests {
         View::with(4),
         OpNumber::with(9),
         OpNumber::with(7),
+        crate::Epoch::new(0),
+        0,
       )),
-      Message::StartViewChange(StartViewChange::new(View::with(11), ReplicaId::new(2))),
+      Message::StartViewChange(StartViewChange::new(
+        View::with(11),
+        ReplicaId::new(2),
+        crate::Epoch::new(0),
+        0
+      )),
       Message::DoViewChange(
         DoViewChange::new(
           View::with(3),
           View::with(2),
           OpNumber::with(6),
           OpNumber::with(4),
+          crate::Epoch::new(0),
+          0,
           ReplicaId::new(6),
-          // Populated: an empty-body Present entry, a populated Present entry, AND a header-only
-          // Repairing entry (op 6, body_checksum only) — exercises both body-state wire tags.
           std::vec![
             entry(4, b""),
             entry(5, b"hi"),
@@ -2836,23 +3283,39 @@ mod tests {
           View::with(7),
           OpNumber::with(0),
           OpNumber::with(0),
+          crate::Epoch::new(0),
+          0,
           ReplicaId::new(0),
-          std::vec![], // empty log slice edge
+          std::vec![],
         )
         .with_checkpoint_op(OpNumber::with(u64::MAX)), // edge scalar floor — round-trips
       ),
-      Message::GetView(GetView::new(View::with(5), ReplicaId::new(3), u64::MAX)),
+      Message::GetView(GetView::new(
+        View::with(5),
+        ReplicaId::new(3),
+        u64::MAX,
+        crate::Epoch::new(0),
+        0
+      )),
       Message::RequestPrepare(RequestPrepare::new(
         View::with(2),
         OpNumber::with(7),
         ReplicaId::new(3),
+        0,
       )),
-      Message::Recovery(Recovery::new(ReplicaId::new(9), 0xABCD)),
+      Message::Recovery(Recovery::new(
+        ReplicaId::new(9),
+        0xABCD,
+        crate::Epoch::new(0),
+        0
+      )),
       Message::RecoveryResponse(
         RecoveryResponse::new(
           View::with(3),
           OpNumber::with(5),
           OpNumber::with(4),
+          crate::Epoch::new(0),
+          0,
           ReplicaId::new(0),
           0xBEEF,
           std::vec![entry(5, b"e")],
@@ -2864,12 +3327,14 @@ mod tests {
         OpNumber::with(2),
         ReplicaId::new(3),
         0xBEEF,
-        true, // recovery flag set
+        true,
+        0, // recovery flag set
       )),
       Message::SyncCheckpoint(SyncCheckpoint::new(
         View::with(4),
         OpNumber::with(8),
         u128::MAX,
+        0,
         ReplicaId::new(0),
         0xBEEF,
         Bytes::from_static(b"snapshot-envelope"),
@@ -2879,11 +3344,13 @@ mod tests {
         OpNumber::with(7),
         OpNumber::with(70),
         ReplicaId::new(3),
+        0,
       )),
       Message::RepairBatch(RepairBatch::new(
         View::with(4),
         OpNumber::with(9),
         OpNumber::with(7),
+        0,
         // Populated: an empty-body Present entry, a populated Present entry, AND a header-only
         // Repairing entry — exercises both body-state wire tags inside the batch log slice.
         std::vec![
@@ -2901,6 +3368,7 @@ mod tests {
         View::with(4),
         OpNumber::with(8),
         u128::MAX,
+        0,
         u64::MAX, // edge scalar total_len — round-trips
         ReplicaId::new(0),
         0xBEEF,
@@ -2909,6 +3377,7 @@ mod tests {
         View::with(4),
         OpNumber::with(8),
         u128::MAX,
+        0,
         u64::MAX, // edge scalar offset — round-trips
         ReplicaId::new(3),
         0xBEEF,
@@ -2917,6 +3386,7 @@ mod tests {
         View::with(4),
         OpNumber::with(8),
         u128::MAX,
+        0,
         17,
         0,
         ReplicaId::new(0),
@@ -2927,9 +3397,8 @@ mod tests {
         View::with(4),
         OpNumber::with(9),
         OpNumber::with(7),
-        // Populated: an empty-body Present entry, a populated Present entry, AND a header-only
-        // Repairing entry — exercises both body-state wire tags inside the batch log slice (the
-        // sender never emits a Repairing entry, but the codec must round-trip any well-formed one).
+        crate::Epoch::new(0),
+        0,
         std::vec![
           entry(10, b""),
           entry(11, b"hi"),
@@ -2964,6 +3433,7 @@ mod tests {
       ReplicaId::new(3),
       0xBEEF,
       false,
+      0,
     ));
     assert_eq!(rq.encoded_len(), rq.encode().len());
   }
@@ -3012,6 +3482,7 @@ mod tests {
         View::with(1),
         OpNumber::with(8),
         0xFEED,
+        0,
         len as u64,
         0,
         ReplicaId::new(0),
@@ -3019,7 +3490,7 @@ mod tests {
         Bytes::from(std::vec![0u8; len]),
       ))
     };
-    assert_eq!(SYNC_CHUNK_CARRIER_OVERHEAD, 65);
+    assert_eq!(SYNC_CHUNK_CARRIER_OVERHEAD, 81); // +16 for the agnostic config_id
     assert_eq!(chunk_of(0).encode().len(), SYNC_CHUNK_CARRIER_OVERHEAD);
     assert_eq!(
       chunk_of(SYNC_CHUNK_LEN).encode().len(),
@@ -3036,6 +3507,7 @@ mod tests {
         View::with(1),
         OpNumber::with(8),
         0xFEED,
+        0,
         ReplicaId::new(0),
         0xBEEF,
         Bytes::from(std::vec![0u8; len]),
@@ -3054,11 +3526,13 @@ mod tests {
       "one byte over the threshold cannot ship whole — the donor must chunk it"
     );
 
-    // The two fixed-size chunked-transfer messages are small constants (53 bytes each).
+    // The two fixed-size chunked-transfer messages are small constants (69 bytes each: 53 + 16 for the
+    // agnostic config_id).
     let meta = Message::SyncCheckpointMeta(SyncCheckpointMeta::new(
       View::with(1),
       OpNumber::with(8),
       0xFEED,
+      0,
       1,
       ReplicaId::new(0),
       0xBEEF,
@@ -3068,11 +3542,12 @@ mod tests {
       OpNumber::with(8),
       0xFEED,
       0,
+      0,
       ReplicaId::new(2),
       0xBEEF,
     ));
-    assert_eq!(meta.encode().len(), 53);
-    assert_eq!(pull.encode().len(), 53);
+    assert_eq!(meta.encode().len(), 69);
+    assert_eq!(pull.encode().len(), 69);
   }
 
   #[test]
@@ -3089,6 +3564,8 @@ mod tests {
         View::with(1),
         OpNumber::with(0),
         OpNumber::with(0),
+        crate::Epoch::new(0),
+        0,
         entries,
       ))
     };
@@ -3100,9 +3577,10 @@ mod tests {
         Bytes::from(std::vec![0u8; len]),
       )
     };
-    // The carrier const matches the encode arm widths (header 3 + view/commit/checkpoint_op 24 +
-    // log count prefix 4) — an empty batch encodes to exactly the carrier.
-    assert_eq!(PREPARE_BATCH_CARRIER_OVERHEAD, 31);
+    // The carrier const matches the encode arm widths (header 3 + view/commit/checkpoint_op 24 + the
+    // strict epoch(8)+config_id(16) 24 + log count prefix 4) — an empty batch encodes to exactly the
+    // carrier.
+    assert_eq!(PREPARE_BATCH_CARRIER_OVERHEAD, 55);
     assert_eq!(
       batch_of(std::vec![]).encode().len(),
       PREPARE_BATCH_CARRIER_OVERHEAD
@@ -3146,14 +3624,16 @@ mod tests {
   /// `Endpoint::log_entries`), so the SAME body bytes travel only as the `Request` the client sends, the
   /// `Prepare` the primary replicates, and — once the op is logged — a single `Body::Present`
   /// `PreparedEntry` inside a `RepairBatch` (the windowed peer-repair answer) or a `PrepareBatch` (the
-  /// primary's batched retransmit; byte-identical framing). This proves, via the ACTUAL
-  /// `encode().len()` (real messages, not just the modelled `encoded_len()`), that a body of exactly
-  /// the bound fits `MAX_FRAME_LEN` on ALL of those carriers, that the BINDING carriers are the tied
-  /// single-entry `RepairBatch`/`PrepareBatch` (each lands EXACTLY on the cap), that one byte more
-  /// pushes each past the cap, and — separately — that a header-only `DoViewChange` is INSENSITIVE to
-  /// body size (a whole band of max-body ops stays far under cap as fixed-size headers). Enumerating
-  /// every carrier here means a future message that wraps the body in MORE framing fails this test
-  /// until the bound accounts for it.
+  /// primary's batched retransmit). The epoch-policy matrix makes the STRICT `PrepareBatch` carrier
+  /// (epoch + config_id) strictly larger than the AGNOSTIC `RepairBatch` carrier (config_id only), so
+  /// the two batch carriers no longer TIE — `PrepareBatch` is the sole BINDING carrier. This proves,
+  /// via the ACTUAL `encode().len()` (real messages, not just the modelled `encoded_len()`), that a
+  /// body of exactly the bound fits `MAX_FRAME_LEN` on ALL of those carriers, that the binding
+  /// single-entry `PrepareBatch` lands EXACTLY on the cap (and a `RepairBatch` sits just under it by the
+  /// strict/agnostic 8-byte carrier gap), that one byte more pushes the binding `PrepareBatch` past the
+  /// cap, and — separately — that a header-only `DoViewChange` is INSENSITIVE to body size (a whole band
+  /// of max-body ops stays far under cap as fixed-size headers). Enumerating every carrier here means a
+  /// future message that wraps the body in MORE framing fails this test until the bound accounts for it.
   #[cfg(feature = "tcp")]
   #[test]
   fn max_request_body_len_is_tight_against_every_body_carrier() {
@@ -3177,6 +3657,8 @@ mod tests {
         OpNumber::with(1),
         OpNumber::with(0),
         OpNumber::with(0),
+        crate::Epoch::new(0),
+        0,
         client,
         request,
         body_of(len),
@@ -3187,6 +3669,7 @@ mod tests {
         View::with(1),
         OpNumber::with(1),
         OpNumber::with(0),
+        0,
         std::vec![PreparedEntry::new(
           OpNumber::with(1),
           client,
@@ -3200,6 +3683,8 @@ mod tests {
         View::with(1),
         OpNumber::with(0),
         OpNumber::with(0),
+        crate::Epoch::new(0),
+        0,
         std::vec![PreparedEntry::new(
           OpNumber::with(1),
           client,
@@ -3228,37 +3713,44 @@ mod tests {
       );
       tightest = tightest.max(encoded);
     }
-    // Tight: the tightest carrier sits EXACTLY at the cap, so the bound wastes nothing. The
-    // single-entry `RepairBatch` and `PrepareBatch` tie as this binding max — each larger than the
-    // `Prepare` hop by the per-entry log framing.
+    // Tight: the tightest carrier sits EXACTLY at the cap, so the bound wastes nothing. The single-entry
+    // STRICT `PrepareBatch` is this binding max — larger than the `Prepare` hop by the per-entry log
+    // framing, and larger than the AGNOSTIC `RepairBatch` by the strict epoch (the +8 epoch field; the
+    // +16 config_id is shared).
     assert_eq!(
       tightest, cap,
       "the tightest body carrier lands exactly on MAX_FRAME_LEN at the max body"
     );
-    let rb_at = repair_batch_of(max).encode().len();
-    assert_eq!(
-      rb_at, cap,
-      "a one-entry RepairBatch is a binding body carrier and lands exactly on MAX_FRAME_LEN"
-    );
     let pb_at = prepare_batch_of(max).encode().len();
     assert_eq!(
       pb_at, cap,
-      "a one-entry PrepareBatch ties it and lands exactly on MAX_FRAME_LEN"
+      "the binding one-entry PrepareBatch lands exactly on MAX_FRAME_LEN"
+    );
+    // The agnostic `RepairBatch` carrier is 8 bytes smaller (no `epoch`), so a max-size body in a
+    // one-entry RepairBatch sits exactly 8 bytes under the cap — comfortably deliverable, never the
+    // binding carrier.
+    let rb_at = repair_batch_of(max).encode().len();
+    assert_eq!(
+      rb_at,
+      cap - 8,
+      "a one-entry RepairBatch sits 8 bytes under the cap (it lacks the strict epoch field)"
     );
 
-    // One byte more: the BINDING carriers (`RepairBatch`/`PrepareBatch`) exceed the cap, so the
-    // transport would drop them. The smaller-overhead carriers (`Request`, `Prepare`) may still fit at
-    // max+1 — it is enough that the binding ones do not, which is exactly why the bound subtracts the
-    // LARGEST per-carrier overhead.
-    let rb_over = repair_batch_of(max + 1).encode().len();
-    assert!(
-      rb_over > cap,
-      "one byte over the max must push a one-entry RepairBatch past the frame cap: {rb_over} <= {cap}"
-    );
+    // One byte more: the BINDING carrier (`PrepareBatch`) exceeds the cap, so the transport would drop
+    // it. The smaller-overhead carriers (`Request`, `Prepare`, `RepairBatch`) may still fit at max+1 — it
+    // is enough that the binding one does not, which is exactly why the bound subtracts the LARGEST
+    // per-carrier overhead.
     let pb_over = prepare_batch_of(max + 1).encode().len();
     assert!(
       pb_over > cap,
       "one byte over the max must push a one-entry PrepareBatch past the frame cap: {pb_over} <= {cap}"
+    );
+    // The RepairBatch still fits at max+1 (it had 8 bytes of headroom): this documents that it is NOT
+    // the binding carrier — only the strict PrepareBatch is.
+    let rb_over = repair_batch_of(max + 1).encode().len();
+    assert!(
+      rb_over <= cap,
+      "a one-entry RepairBatch still fits at max+1 (it is not the binding carrier): {rb_over} > {cap}"
     );
 
     // The header-only view-change carriers are INSENSITIVE to body size: a `DoViewChange` whose entry is
@@ -3271,6 +3763,8 @@ mod tests {
       View::with(1),
       OpNumber::with(1),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ReplicaId::new(0),
       std::vec![PreparedEntry::repairing(
         OpNumber::with(1),
@@ -3307,6 +3801,7 @@ mod tests {
       ReplicaId::new(3),
       0xBEEF,
       false,
+      0,
     ));
     assert_eq!(Message::decode(&rq.encode()).unwrap(), rq);
   }
@@ -3328,21 +3823,31 @@ mod tests {
         id,
         OpNumber::with(6),
         0xCAFE_F00D_DEAD_BEEF_0102_0304_0506_0708,
+        crate::Epoch::new(0),
+        0,
       )),
-      Message::StartViewChange(StartViewChange::new(View::with(11), id)),
+      Message::StartViewChange(StartViewChange::new(
+        View::with(11),
+        id,
+        crate::Epoch::new(0),
+        0
+      )),
       Message::DoViewChange(DoViewChange::new(
         View::with(3),
         View::with(2),
         OpNumber::with(6),
         OpNumber::with(4),
+        crate::Epoch::new(0),
+        0,
         id,
         std::vec![entry(5, b"hi")],
       )),
-      Message::Recovery(Recovery::new(id, 0xABCD)),
+      Message::Recovery(Recovery::new(id, 0xABCD, crate::Epoch::new(0), 0)),
       Message::SyncChunk(SyncChunk::new(
         View::with(1),
         OpNumber::with(8),
         0xFEED,
+        0,
         4,
         0,
         id,
@@ -3356,7 +3861,7 @@ mod tests {
     }
     // The big-endian id occupies exactly two bytes: a `Recovery` leads its body with the replica id
     // right after the 3-byte header, so bytes [3..5] are `0x01, 0x2C`.
-    let rec = Message::Recovery(Recovery::new(id, 0)).encode();
+    let rec = Message::Recovery(Recovery::new(id, 0, crate::Epoch::new(0), 0)).encode();
     assert_eq!(
       &rec[3..5],
       &300u16.to_be_bytes(),
@@ -3366,29 +3871,40 @@ mod tests {
 
   #[test]
   fn commit_golden_bytes_pin_the_wire_layout() {
-    // A small variant pinned exactly: WIRE_VERSION(u16) ++ tag 4 ++ view ++ commit ++ checkpoint_op.
+    // A small STRICT variant pinned exactly: WIRE_VERSION(u16=5) ++ tag 4 ++ view ++ commit ++
+    // checkpoint_op ++ the strict epoch-policy pair epoch(u64) ++ config_id(u128).
     let c = Message::Commit(Commit::new(
       View::with(4),
       OpNumber::with(9),
       OpNumber::with(7),
+      crate::Epoch::new(0),
+      0,
     ));
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7,
+      0, 5, 4, // version 5, tag 4 (Commit)
+      0, 0, 0, 0, 0, 0, 0, 4, // view = 4
+      0, 0, 0, 0, 0, 0, 0, 9, // commit = 9
+      0, 0, 0, 0, 0, 0, 0, 7, // checkpoint_op = 7
+      0, 0, 0, 0, 0, 0, 0, 0, // epoch = 0
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // config_id = 0 (u128)
     ];
     assert_eq!(c.encode(), expected, "Commit wire layout is pinned");
   }
 
   #[test]
   fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
-    // A nested variant pinned exactly: header (ver 4 + tag 6), scalars (incl. the advertised
-    // checkpoint floor after the commit, then the u16 replica id), then a 1-entry log slice (count=1,
-    // op, client, request, body-state tag 0 = Present, length-prefixed body "hi").
+    // A nested STRICT variant pinned exactly: header (ver 5 + tag 6), scalars (incl. the advertised
+    // checkpoint floor after the commit, then the strict epoch-policy pair epoch(u64)+config_id(u128)
+    // before the u16 replica id), then a 1-entry log slice (count=1, op, client, request, body-state
+    // tag 0 = Present, length-prefixed body "hi").
     let dvc = Message::DoViewChange(
       DoViewChange::new(
         View::with(3),
         View::with(2),
         OpNumber::with(5),
         OpNumber::with(4),
+        crate::Epoch::new(0),
+        0,
         ReplicaId::new(6),
         std::vec![PreparedEntry::new(
           OpNumber::with(5),
@@ -3400,9 +3916,21 @@ mod tests {
       .with_checkpoint_op(OpNumber::with(3)),
     );
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
-      0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5,
-      6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 2, 104, 105,
+      0, 5, 6, // version 5, tag 6 (DoViewChange)
+      0, 0, 0, 0, 0, 0, 0, 3, // view = 3
+      0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
+      0, 0, 0, 0, 0, 0, 0, 5, // op = 5
+      0, 0, 0, 0, 0, 0, 0, 4, // commit = 4
+      0, 0, 0, 0, 0, 0, 0, 3, // checkpoint_op = 3
+      0, 0, 0, 0, 0, 0, 0, 0, // epoch = 0
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // config_id = 0 (u128)
+      0, 6, // replica = 6 (u16)
+      0, 0, 0, 1, // log count = 1
+      0, 0, 0, 0, 0, 0, 0, 5, // entry op = 5
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // entry client (u128)
+      0, 0, 0, 0, 0, 0, 0, 9, // entry request = 9
+      0, // body-state tag 0 = Present
+      0, 0, 0, 2, 104, 105, // body length 2, "hi"
     ];
     assert_eq!(dvc.encode(), expected, "DoViewChange wire layout is pinned");
   }
@@ -3410,14 +3938,17 @@ mod tests {
   #[test]
   fn do_view_change_golden_bytes_pin_a_repairing_entry() {
     // The header-only (Repairing) entry layout pinned exactly: same scalars (incl. the advertised
-    // checkpoint floor after the commit, then the u16 replica id), then body-state tag 1 = Repairing,
-    // followed by the 16-byte body_checksum (NO length-prefixed body).
+    // checkpoint floor after the commit, then the strict epoch-policy pair epoch(u64)+config_id(u128)
+    // before the u16 replica id), then body-state tag 1 = Repairing, followed by the 16-byte
+    // body_checksum (NO length-prefixed body).
     let dvc = Message::DoViewChange(
       DoViewChange::new(
         View::with(3),
         View::with(2),
         OpNumber::with(5),
         OpNumber::with(4),
+        crate::Epoch::new(0),
+        0,
         ReplicaId::new(6),
         std::vec![PreparedEntry::repairing(
           OpNumber::with(5),
@@ -3429,10 +3960,21 @@ mod tests {
       .with_checkpoint_op(OpNumber::with(3)),
     );
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
-      0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 1, 2, 3, 4, 5,
-      6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 9, 1, 17, 18, 19, 20, 21, 22,
-      23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+      0, 5, 6, // version 5, tag 6 (DoViewChange)
+      0, 0, 0, 0, 0, 0, 0, 3, // view = 3
+      0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
+      0, 0, 0, 0, 0, 0, 0, 5, // op = 5
+      0, 0, 0, 0, 0, 0, 0, 4, // commit = 4
+      0, 0, 0, 0, 0, 0, 0, 3, // checkpoint_op = 3
+      0, 0, 0, 0, 0, 0, 0, 0, // epoch = 0
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // config_id = 0 (u128)
+      0, 6, // replica = 6 (u16)
+      0, 0, 0, 1, // log count = 1
+      0, 0, 0, 0, 0, 0, 0, 5, // entry op = 5
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // entry client (u128)
+      0, 0, 0, 0, 0, 0, 0, 9, // entry request = 9
+      1, // body-state tag 1 = Repairing
+      17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, // body_checksum (u128)
     ];
     assert_eq!(
       dvc.encode(),
@@ -3459,6 +4001,8 @@ mod tests {
       View::with(1),
       OpNumber::with(1),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
     ))
     .encode();
     // Empty / too-short to even hold the version → Truncated.
@@ -3506,12 +4050,14 @@ mod tests {
       View::with(1),
       OpNumber::with(1),
       0,
+      0,
       ReplicaId::new(0),
       0,
       Bytes::from_static(b"abc"),
     ));
     let mut bytes = sc.encode().to_vec();
-    // The snapshot length prefix is the last 4 bytes before the 3 body bytes.
+    // The snapshot length prefix is the last 4 bytes before the 3 body bytes (the agnostic config_id
+    // sits BEFORE the snapshot, so this end-relative offset is unchanged by the epoch-policy matrix).
     let n = bytes.len();
     bytes[n - 7..n - 3].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
     assert!(matches!(
@@ -3525,13 +4071,16 @@ mod tests {
       View::with(0),
       OpNumber::with(1),
       OpNumber::with(0),
+      crate::Epoch::new(0),
+      0,
       ReplicaId::new(0),
       std::vec![entry(1, b"x")],
     ));
     let mut d = dvc.encode().to_vec();
-    // Locate the log count:
-    // ver(2)+tag(1)+view(8)+log_view(8)+op(8)+commit(8)+checkpoint_op(8)+replica(2) = 45.
-    d[45..49].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    // Locate the log count (after the strict epoch-policy pair epoch(8)+config_id(16) added before the
+    // replica id): ver(2)+tag(1)+view(8)+log_view(8)+op(8)+commit(8)+checkpoint_op(8)+epoch(8)+
+    // config_id(16)+replica(2) = 69.
+    d[69..73].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
     assert!(matches!(
       Message::decode(&d),
       Err(CodecError::LengthOverflow { .. })

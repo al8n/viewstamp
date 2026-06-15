@@ -41,7 +41,8 @@ impl<S: StateMachine> Endpoint<S> {
       Message::RequestPrepare(crate::RequestPrepare::new(
         self.view,
         OpNumber::with(op),
-        self.config.replica(),
+        self.local_slot(),
+        self.membership.config_id(),
       )),
     ));
   }
@@ -114,7 +115,8 @@ impl<S: StateMachine> Endpoint<S> {
         self.view,
         OpNumber::with(lo),
         OpNumber::with(hi),
-        self.config.replica(),
+        self.local_slot(),
+        self.membership.config_id(),
       )),
     ));
   }
@@ -345,7 +347,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || self.pending_sb.is_some() {
       return; // only a Normal replica whose view is durable may serve a (view-advertising) repair Prepare
     }
-    if m.replica().get() >= self.config.node_count() {
+    if m.replica().get() >= self.membership.node_count() {
       return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     let op = m.op().get();
@@ -373,6 +375,8 @@ impl<S: StateMachine> Endpoint<S> {
       OpNumber::with(op),
       self.commit_min,
       self.checkpoint_op,
+      self.membership.epoch(),
+      self.membership.config_id(),
       entry.client,
       entry.request,
       body.clone(),
@@ -414,7 +418,7 @@ impl<S: StateMachine> Endpoint<S> {
     if !self.status.is_normal() || self.pending_sb.is_some() {
       return;
     }
-    if m.replica().get() >= self.config.node_count() {
+    if m.replica().get() >= self.membership.node_count() {
       return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     let lo = m.lo().get();
@@ -467,6 +471,7 @@ impl<S: StateMachine> Endpoint<S> {
         self.view,
         self.commit_min,
         self.checkpoint_op,
+        self.membership.config_id(),
         entries,
       )),
     ));
@@ -494,6 +499,12 @@ impl<S: StateMachine> Endpoint<S> {
   ) {
     let commit = m.commit();
     let checkpoint_op = m.checkpoint_op();
+    // The served batch is AGNOSTIC: it carries the donor's `config_id` (the committed-content lineage)
+    // but no `epoch`. The per-entry `Prepare` reconstructed below is a LOCAL value fed straight into
+    // `fill_repair` (never re-emitted), so it carries the batch's `config_id` and this replica's own
+    // current `epoch` — the fill path gates on placement/checksum/vouch, not on either field.
+    let config_id = m.config_id();
+    let epoch = self.membership.epoch();
     for e in m.into_log() {
       // Reconstruct the per-entry `Prepare` the per-op repair path expects, carrying the batch's
       // `commit` as the committed-vouch (so `fill_repair`'s `commit >= op` gate sees the same signal a
@@ -506,7 +517,17 @@ impl<S: StateMachine> Endpoint<S> {
       let Body::Present(body) = body else {
         continue;
       };
-      let prepare = Prepare::new(self.view, op, commit, checkpoint_op, client, request, body);
+      let prepare = Prepare::new(
+        self.view,
+        op,
+        commit,
+        checkpoint_op,
+        epoch,
+        config_id,
+        client,
+        request,
+        body,
+      );
       // The SAME verify + durability core as the single-op path: `fill_repair` rejects this entry
       // (silently; re-solicited) or stages its own `Pending::RepairFill` — see the doc above.
       self.fill_repair(now, wal, sb, &prepare);
