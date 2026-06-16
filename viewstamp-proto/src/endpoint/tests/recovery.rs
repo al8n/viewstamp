@@ -3818,6 +3818,409 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
 }
 
 #[test]
+fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_applies_it_empty() {
+  // A peer `SyncCheckpoint` can complete recovery while a committed tail read is still in flight. The
+  // peer-fetch escalation (`escalate_checkpoint_to_peer_fetch`) is NOT gated on `rec.pending`, so a
+  // `SyncCheckpoint` (a `handle_message`) can race in AHEAD of a tail read's completion (a
+  // `handle_storage`). `apply_sync` RETAINS the held tail above the synced checkpoint, so a committed tail
+  // op's Phase-1 `Present(empty)` placeholder would survive into Normal (its later read completion is
+  // ignored once `recover` is cleared) and `advance_commit` would apply it with `&[]`: committed-state
+  // divergence. The fix RESOLVES every still-in-flight tail op above the synced checkpoint from its durable
+  // header — a Verified committed op is KEPT header-only as `Body::Repairing` (body peer-repaired on
+  // demand) — completing WITHOUT waiting on `rec.pending` (a wait would wedge: the retry timer re-mints
+  // each read's id every `RECOVER_READ_RETRANSMIT`, so a read slower than that never resolves and the
+  // pending set never empties).
+  //
+  // The deterministic `handle_storage` drains ALL WAL completions before the SB checkpoint completion, so
+  // a tail read can never be in flight when the checkpoint escalates here — the race needs a real async
+  // driver's interleaved completions. Reproduce that one missing condition directly: drive to a genuine
+  // `awaiting_peer_checkpoint` (all tail reads settled), then re-mark a committed tail op as an in-flight
+  // read with a `Present(empty)` placeholder the way an async driver would have.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let now = Instant::ZERO;
+  let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
+  let body3 = Bytes::copy_from_slice(b"OP3-REAL-BODY");
+  let h2 = Header::new(
+    OpNumber::with(2),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(2),
+    &body2,
+  );
+  let h3 = Header::new(
+    OpNumber::with(3),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(3),
+    &body3,
+  );
+  // Durable root: known-committed frontier 3, checkpoint at op 1 (its own snapshot is unreadable), band
+  // [h2, h3]. All WAL tail reads succeed, so the drive settles `rec.pending` to empty before escalating.
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(3),
+    OpNumber::with(1),
+    0xDEAD_BEEF,
+    std::vec![h2, h3],
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let mut entries = BTreeMap::new();
+  entries.insert(2u64, (h2, body2.clone()));
+  entries.insert(3u64, (h3, body3.clone()));
+  let mut wal = ScriptedWal {
+    entries,
+    head: 3,
+    read_faults: BTreeMap::new(),
+    corrupt: std::collections::BTreeSet::new(),
+    body_faulty: std::collections::BTreeSet::new(),
+    append_faults: BTreeMap::new(),
+    append_submits: BTreeMap::new(),
+    done: VecDeque::new(),
+  };
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  // Drive: tail reads settle (Present), the own checkpoint read exhausts → peer-fetch escalation.
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "escalated to a peer fetch (own checkpoint unreadable)"
+  );
+  assert!(
+    e.recover.as_ref().is_some_and(|rec| rec.pending.is_empty()),
+    "the deterministic drain settled every tail read before escalating",
+  );
+
+  // Build the verified peer SyncCheckpoint (checkpoint op 1). Captured once so the deferred and the
+  // completing delivery use the SAME fresh nonce.
+  let mut peer_sm = CountSm::default();
+  peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
+  let peer_snap = peer_sm.snapshot();
+  let peer_env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(1), &BTreeMap::new(), &peer_snap);
+  let peer_id = crate::checkpoint_id(&peer_env);
+  let nonce = e.sync_nonce_for_test();
+  let sync = crate::SyncCheckpoint::new(
+    View::new(),
+    OpNumber::with(1),
+    peer_id,
+    0,
+    ReplicaId::new(0),
+    nonce,
+    peer_env,
+  );
+
+  // Re-mark committed op 2 as an IN-FLIGHT tail read holding only a `Present(empty)` placeholder — the
+  // state a real async driver leaves when the checkpoint completion + the peer SyncCheckpoint arrive
+  // before op 2's WAL read does.
+  e.log.insert(
+    2,
+    LogEntry::present(ClientId::new(7), RequestNumber::with(2), Bytes::new()),
+  );
+  e.recover
+    .as_mut()
+    .unwrap()
+    .pending
+    .insert(2, RECOVER_READ_RETRIES);
+
+  // Deliver the verified SyncCheckpoint WHILE op 2's read is in flight. Recovery COMPLETES (it does not
+  // wait on `rec.pending` — that could wedge), RESOLVING the in-flight committed op 2 from its durable
+  // header to a header-only `Body::Repairing` hole (body peer-repaired on demand) — never a held
+  // `Present(empty)` entry.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(sync),
+  );
+  for _ in 0..3 {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the verified SyncCheckpoint completes recovery WITHOUT waiting on the in-flight read (no wedge)",
+  );
+  // THE FIX: op 2's `Present(empty)` placeholder was RESOLVED to a `Body::Repairing` hole carrying the
+  // durable canonical body_checksum — NOT retained as a held empty entry. (FAIL-BEFORE: op 2 survived
+  // `apply_sync` as `Some({body: EMPTY})` and a later `advance_commit` applied committed op 2 with `&[]`.)
+  assert_eq!(
+    e.log.get(&2).map(|entry| &entry.body),
+    Some(&Body::Repairing(h2.body_checksum())),
+    "the in-flight committed op 2 is a Body::Repairing hole, not a held Present(empty) entry to apply with &[]",
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "commit_min is the synced checkpoint op 1 (op 2 is a held hole below the known frontier)",
+  );
+  assert_eq!(
+    e.state_machine_ref().applied(),
+    &[(1u64, b"OP1-REAL-BODY".to_vec())],
+    "only the restored op 1 is applied — committed op 2 was NEVER applied empty",
+  );
+}
+
+#[test]
+fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_it_empty() {
+  // The same peer-checkpoint race for an UNCOMMITTED in-flight tail op (op == commit_max + 1). An op above
+  // this replica's STALE durable `commit_max` can still be COMMITTED later — by the primary, or already
+  // committed elsewhere but unlearned here before the crash — so leaving its Phase-1 `Present(empty)`
+  // placeholder retained by `apply_sync` is NOT harmless: a later `Commit` makes `advance_commit` apply it
+  // with `&[]`, and a view change advertises its empty-body header. The fix RESOLVES it from its durable
+  // header to a header-only `Body::Repairing` hole (truncatable / peer-repaired if committed), so a
+  // `Commit` HOLDS + peer-repairs instead of applying empty.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let now = Instant::ZERO;
+  let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
+  let body3 = Bytes::copy_from_slice(b"OP3-REAL-BODY");
+  let h2 = Header::new(
+    OpNumber::with(2),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(2),
+    &body2,
+  );
+  let h3 = Header::new(
+    OpNumber::with(3),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(3),
+    &body3,
+  );
+  // Durable root: commit 2 (op 2 committed, band [h2]), checkpoint op 1 (its snapshot unreadable). op 3 is
+  // the UNCOMMITTED tail (op 3 == commit_max + 1).
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    0xDEAD_BEEF,
+    std::vec![h2],
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let mut entries = BTreeMap::new();
+  entries.insert(2u64, (h2, body2.clone()));
+  entries.insert(3u64, (h3, body3.clone()));
+  let mut wal = ScriptedWal {
+    entries,
+    head: 3,
+    read_faults: BTreeMap::new(),
+    corrupt: std::collections::BTreeSet::new(),
+    body_faulty: std::collections::BTreeSet::new(),
+    append_faults: BTreeMap::new(),
+    append_submits: BTreeMap::new(),
+    done: VecDeque::new(),
+  };
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "escalated to a peer fetch (own checkpoint unreadable)"
+  );
+  let mut peer_sm = CountSm::default();
+  peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
+  let peer_snap = peer_sm.snapshot();
+  let peer_env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(1), &BTreeMap::new(), &peer_snap);
+  let peer_id = crate::checkpoint_id(&peer_env);
+  let nonce = e.sync_nonce_for_test();
+  let sync = crate::SyncCheckpoint::new(
+    View::new(),
+    OpNumber::with(1),
+    peer_id,
+    0,
+    ReplicaId::new(0),
+    nonce,
+    peer_env,
+  );
+  // Re-mark UNCOMMITTED op 3 (== commit_max + 1) as an in-flight tail read with a `Present(empty)` placeholder.
+  e.log.insert(
+    3,
+    LogEntry::present(ClientId::new(7), RequestNumber::with(3), Bytes::new()),
+  );
+  e.recover
+    .as_mut()
+    .unwrap()
+    .pending
+    .insert(3, RECOVER_READ_RETRIES);
+  // Deliver the verified SyncCheckpoint while op 3's read is in flight → completes, resolving op 3 to a
+  // header-only `Body::Repairing` hole (it is uncommitted, so kept on its durable header without a
+  // canonical cross-check).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(sync),
+  );
+  for _ in 0..3 {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the SyncCheckpoint completes recovery WITHOUT waiting on the in-flight read (no wedge)",
+  );
+  assert_eq!(
+    e.log.get(&3).map(|entry| &entry.body),
+    Some(&Body::Repairing(h3.body_checksum())),
+    "the in-flight UNCOMMITTED op 3 is resolved to a Body::Repairing hole — not a held Present(empty) entry",
+  );
+  // A Commit for op 3 (committing op 3) must HOLD at its Repairing hole + peer-repair, NEVER apply op 3
+  // with `&[]`. (FAIL-BEFORE: op 3's Present(empty) survived and advance_commit applied op 3 empty.)
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(3),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    e.state_machine_ref()
+      .applied()
+      .iter()
+      .all(|(op, _)| *op != 3),
+    "committed op 3 is HELD at its Repairing hole (peer-repaired), NEVER applied with &[]",
+  );
+  assert!(
+    e.commit().get() < 3,
+    "commit is held below the op-3 Repairing hole — op 3 is not applied",
+  );
+}
+
+#[test]
+fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
+  // An in-flight UNCOMMITTED tail op whose durable header is a SUPERSEDED earlier-view proposal (its
+  // `view` is BELOW this replica's durable `log_view`) must NOT be kept as a canonical `Body::Repairing`
+  // hole: the replica already advanced `log_view` past that generation, so the slot is an abandoned
+  // proposal. If kept, a `Commit` for the op registers the STALE Repairing as a repair hole and
+  // `fill_repair` then rejects the REAL committed body (its identity differs) — `commit_min` wedges — and
+  // a view change advertises the stale header as the canonical tail identity. The resolution runs the SAME
+  // `classify_committed_slot` verdict the Fault arm does, whose above-commit arm classes a `slot_view <
+  // log_view` slot StaleCommitted, so it is DROPPED to a peer-repaired hole the canonical op then fills.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let now = Instant::ZERO;
+  let body2 = Bytes::copy_from_slice(b"OP2-REAL-BODY");
+  let stale3 = Bytes::copy_from_slice(b"OP3-STALE-V0");
+  let h2 = Header::new(
+    OpNumber::with(2),
+    View::with(1),
+    ClientId::new(7),
+    RequestNumber::with(2),
+    &body2,
+  );
+  // op 3's durable WAL header is a stale view-0 proposal — BELOW the durable log_view 1.
+  let h3_stale = Header::new(
+    OpNumber::with(3),
+    View::new(),
+    ClientId::new(7),
+    RequestNumber::with(3),
+    &stale3,
+  );
+  // Durable root: view 1, log_view 1, commit 2 (op 2 committed, band [h2]), checkpoint op 1.
+  let state = VsrState::try_new(
+    View::with(1),
+    View::with(1),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    0xDEAD_BEEF,
+    std::vec![h2],
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let mut entries = BTreeMap::new();
+  entries.insert(2u64, (h2, body2.clone()));
+  entries.insert(3u64, (h3_stale, stale3.clone()));
+  let mut wal = ScriptedWal {
+    entries,
+    head: 3,
+    read_faults: BTreeMap::new(),
+    corrupt: std::collections::BTreeSet::new(),
+    body_faulty: std::collections::BTreeSet::new(),
+    append_faults: BTreeMap::new(),
+    append_submits: BTreeMap::new(),
+    done: VecDeque::new(),
+  };
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "escalated to a peer fetch"
+  );
+  let mut peer_sm = CountSm::default();
+  peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
+  let peer_snap = peer_sm.snapshot();
+  let peer_env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(1), &BTreeMap::new(), &peer_snap);
+  let peer_id = crate::checkpoint_id(&peer_env);
+  let nonce = e.sync_nonce_for_test();
+  let sync = crate::SyncCheckpoint::new(
+    View::with(1),
+    OpNumber::with(1),
+    peer_id,
+    0,
+    ReplicaId::new(0),
+    nonce,
+    peer_env,
+  );
+  // Re-mark the SUPERSEDED op 3 as an in-flight tail read with a `Present(empty)` placeholder.
+  e.log.insert(
+    3,
+    LogEntry::present(ClientId::new(7), RequestNumber::with(3), Bytes::new()),
+  );
+  e.recover
+    .as_mut()
+    .unwrap()
+    .pending
+    .insert(3, RECOVER_READ_RETRIES);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(sync),
+  );
+  for _ in 0..3 {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(e.status(), Status::Normal, "recovery completes (no wedge)");
+  // THE FIX: the superseded above-commit slot is DROPPED to a peer-repaired hole — NOT kept as a stale
+  // Body::Repairing entry whose identity a later `fill_repair` would require the REAL committed body to
+  // match (rejecting it, wedging commit_min) and whose header a view change would advertise as canonical.
+  // (FAIL-BEFORE the classify gate: op 3 was kept as Repairing(h3_stale checksum).) With no stale entry,
+  // the canonical view-1 op 3 fills the hole through the ordinary committed-hole repair path (a hole
+  // `advance_commit` registers + `fill_repair` fills — see the peer-fetch recovery test).
+  assert!(
+    !e.log.contains_key(&3),
+    "the superseded view-0 op 3 is dropped to a hole, not kept as a stale Body::Repairing entry",
+  );
+}
+
+#[test]
 fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placeholder() {
   // The Fault-path keep-as-Repairing promotion must adopt the FULL identity (client, request,
   // body_checksum) of the durable header it consults at retry-exhaustion — never splice the durable
