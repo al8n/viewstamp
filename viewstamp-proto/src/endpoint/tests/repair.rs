@@ -459,8 +459,8 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
   //
   // Setup (the held-committed-hole shape): replica 1 of 3, durable commit 2 (op 2 KNOWN
   // committed), checkpoint_op 0, canonical headers for ops 1 + 2. WAL head 3, slot 2 reads back
-  // PERMANENTLY FAULTY → recover drops it to a COMMITTED repair hole (op 1 held canonical, op 3 the
-  // uncommitted tail). commit_max == 2, commit_min == 0.
+  // PERMANENTLY FAULTY → recover keeps it header-only as a `Body::Repairing` COMMITTED hole (op 1 held
+  // canonical, op 3 the uncommitted tail). commit_max == 2, commit_min == 0.
   let mk_header = |op: u64| {
     Header::new(
       OpNumber::with(op),
@@ -485,7 +485,7 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
     checkpoint: None,
   };
   let mut wal = ScriptedWal::with_entries(3);
-  wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot is permanently faulty → dropped
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot read permanently faults → Repairing
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut r =
@@ -563,10 +563,17 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
     "op 2 is NOT applied to the SM before its append is durable \
      (FAIL-BEFORE: op 2 applied immediately on the staged append)"
   );
-  assert!(
-    !r.log_entries().iter().any(|e| e.op() == OpNumber::with(2)),
-    "op 2 is NOT exposed in a DoViewChange/StartView log_slice while its RepairFill is pending \
-     (it is still a repair hole — the body rides in Pending::RepairFill, not self.log)"
+  // op 2's HEADER stays exposed in the log_slice as a `Repairing` hole — seed-774 keeps a committed op's
+  // existence in the DVC (header-only) so a new primary peer-repairs it; that header has been durable in
+  // the committed band since recovery, independent of this staged fill. The consensus-critical barrier is
+  // that the STAGED RepairFill body is NOT folded into a `Present` entry before it is durable: op 2 stays
+  // `Repairing` (the body rides in `Pending::RepairFill`, not `self.log`), so this replica never sources
+  // the non-durable repaired body.
+  assert_eq!(
+    r.log.get(&2).expect("op 2 is a held Repairing hole").body,
+    Body::Repairing(mk_header(2).body_checksum()),
+    "op 2 stays Repairing (header-only) while its RepairFill is pending — the staged body is NOT folded \
+     in (FAIL-BEFORE: fill_repair inserted the repaired body into self.log on the staged append)"
   );
 
   // Now the repaired append completes (on_wal_done's RepairFill arm): the body lands in self.log, the

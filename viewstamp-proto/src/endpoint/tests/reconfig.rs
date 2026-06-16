@@ -695,6 +695,191 @@ fn a_since_recovered_peer_drops_out_of_the_two_window_intersection() {
   );
 }
 
+#[test]
+fn an_escalation_carries_a_repairing_committed_op_into_the_view_change() {
+  // PRIMARY committed-op-loss fix, exercised in the re-formation escalation path. A RecoveringHead voter holds a
+  // COMMITTED op whose recovery read FAULTED but whose durable header survives — kept header-only as
+  // `Body::Repairing`, NOT dropped to a bare hole. When it escalates the wedge into a view change, that op
+  // must be CARRIED: its existence + identity flow into the DoViewChange / StartView log_slice so a new
+  // primary peer-repairs it and never re-mints its op number. Dropping it would lose it if this voter then
+  // solo/minimal-forms the next view (the seed-774 intersection class).
+  //
+  // Setup: a SEALED offline-restart successor (commit 2, dense band [h1, h2]); WAL head 3. op 1 reads clean
+  // (Present); op 2 (committed, durable band header) read FAULTS → kept as `Body::Repairing`; op 3 (the
+  // uncommitted tail head) faults → RecoveringHead. commit_max == 2, so op 2 is the interior committed op.
+  let successor = crate::endpoint::prepare_restart(
+    &sealed_root(2),
+    3,
+    0,
+    std::vec![MemberId::new(0), MemberId::new(1), MemberId::new(2)],
+  )
+  .expect("sealed successor root");
+  let (epoch, config_id) = (successor.epoch(), successor.membership().config_id());
+  let mut wal = ScriptedWal::with_entries(3);
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // committed interior → kept as Repairing
+  wal.script_read_fault(OpNumber::with(3), u8::MAX); // uncommitted head → RecoveringHead
+  let mut sb = sb_with_state(successor);
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let mut now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb).expect_active();
+  for _ in 0..16 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if r.status() != Status::Recovering {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "faulty head at a bumped epoch → RecoveringHead",
+  );
+  assert_eq!(r.commit_max(), OpNumber::with(2), "op 2 is KNOWN committed");
+  // op 2 is KEPT as a Repairing committed hole (durable header), NOT in rec.faulty — so the escalation
+  // gate's committed-band guard stays satisfied (a held committed op is vouched, never unvouchable).
+  assert!(
+    r.log
+      .get(&2)
+      .is_some_and(|e| matches!(e.body, Body::Repairing(_))),
+    "op 2 is kept header-only as Body::Repairing (durable header preserved), not dropped",
+  );
+  assert!(
+    r.recover
+      .as_ref()
+      .is_some_and(|rec| !rec.faulty.contains(&2)),
+    "the held committed op is NOT in rec.faulty (it is Repairing, vouched by its durable header)",
+  );
+  while r.poll_message().is_some() {}
+  // Mature G1, then feed a co-recovering voting quorum across two windows — the exact `under_fire...` inputs.
+  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 2) {
+    now = now + RECOVER_HEAD_SOLICIT;
+    r.handle_timeout(now, &mut wal, &mut sb);
+    while r.poll_message().is_some() {}
+  }
+  for _window in 0..2 {
+    for slot in [0u16, 2] {
+      let (from, msg) = peer_recovery(slot, epoch, config_id);
+      r.handle_message(now, &mut wal, &mut sb, from, msg);
+    }
+    now = now + RECOVER_HEAD_SOLICIT;
+    r.handle_timeout(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    r.status(),
+    Status::ViewChange,
+    "G1 + a two-window co-recovering quorum → escalate (the committed band is intact)",
+  );
+  // THE CARRY: op 2 survived the escalation as a Repairing committed op, and it is EXPOSED in the log_slice
+  // a DoViewChange / StartView carries — so a new primary sees op 2 exists and peer-repairs it, never
+  // re-mints its op number. (FAIL-BEFORE the PRIMARY fix: op 2 was dropped to a bare hole, omitted here.)
+  assert!(
+    r.log
+      .get(&2)
+      .is_some_and(|e| matches!(e.body, Body::Repairing(_))),
+    "op 2 is CARRIED through the escalation as a Repairing committed op (not dropped)",
+  );
+  assert!(
+    r.log_entries().iter().any(|e| e.op() == OpNumber::with(2)),
+    "op 2 is exposed in the DoViewChange / StartView log_slice — its existence flows into the view change",
+  );
+}
+
+#[test]
+fn an_unvouchable_committed_op_blocks_escalation_into_a_wedge() {
+  // BELT-AND-SUSPENDERS committed-op-loss defense, complementing the PRIMARY keep-as-Repairing fix. A
+  // RecoveringHead voter that holds a faulty COMMITTED op it CANNOT vouch — a StaleCommitted slot or one it
+  // never held, routed to `rec.faulty` (NOT the durable-header Repairing path) — must NOT escalate: as the
+  // solo/minimal-quorum primary for view+1 it would OMIT that op from its DoViewChange and lose it. The
+  // gate `committed_band_intact` (no rec.faulty op <= commit_max) refuses, converting a rare committed LOSS
+  // into a resolvable liveness WEDGE — it stays RecoveringHead soliciting, so a peer that holds the op
+  // re-establishes the head and supplies it.
+  //
+  // Setup: an offline-restart successor with durable commit 1 (op 1 KNOWN committed) but an EMPTY band — op 1 has no
+  // canonical header (the writer never held it). On recover op 1 classifies StaleCommitted → `rec.faulty`;
+  // op 2 (head) faults → RecoveringHead. op 1 (<= commit_max 1) is the unvouchable committed hole. The
+  // co-recovering-quorum inputs are IDENTICAL to `under_fire...` (which escalates at commit 0) — so the
+  // ONLY difference that withholds the escalation is the unvouchable committed op.
+  let successor = crate::endpoint::prepare_restart(
+    &v4_root(genesis(3), 1),
+    3,
+    0,
+    std::vec![MemberId::new(0), MemberId::new(1), MemberId::new(2)],
+  )
+  .expect("successor root (commit 1, empty band)");
+  let (epoch, config_id) = (successor.epoch(), successor.membership().config_id());
+  let mut wal = ScriptedWal::with_entries(2);
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // head → RecoveringHead
+  let mut sb = sb_with_state(successor);
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let mut now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb).expect_active();
+  for _ in 0..16 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if r.status() != Status::Recovering {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "faulty head at a bumped epoch → RecoveringHead",
+  );
+  assert_eq!(r.commit_max(), OpNumber::with(1), "op 1 is KNOWN committed");
+  assert!(
+    r.recover
+      .as_ref()
+      .is_some_and(|rec| rec.faulty.contains(&1)),
+    "op 1 (committed, no canonical header) classifies StaleCommitted → rec.faulty (the unvouchable hole)",
+  );
+  while r.poll_message().is_some() {}
+  // Mature G1 (no co-recovering peers — each window's intersection is empty).
+  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 2) {
+    now = now + RECOVER_HEAD_SOLICIT;
+    r.handle_timeout(now, &mut wal, &mut sb);
+    while r.poll_message().is_some() {}
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "G1 maturing, not yet a candidate"
+    );
+  }
+  // Window 1 of the co-recovering feed: tick (this window becomes `prev`; intersection with the empty prior
+  // window is still 0).
+  for slot in [0u16, 2] {
+    let (from, msg) = peer_recovery(slot, epoch, config_id);
+    r.handle_message(now, &mut wal, &mut sb, from, msg);
+  }
+  now = now + RECOVER_HEAD_SOLICIT;
+  r.handle_timeout(now, &mut wal, &mut sb);
+  while r.poll_message().is_some() {}
+  // Window 2: feed the SAME quorum. The two-window intersection now holds the quorum — G2 IS satisfied.
+  for slot in [0u16, 2] {
+    let (from, msg) = peer_recovery(slot, epoch, config_id);
+    r.handle_message(now, &mut wal, &mut sb, from, msg);
+  }
+  let g2 = r
+    .recover
+    .as_ref()
+    .map(|rec| (rec.peers_recovering & rec.peers_recovering_prev).count_ones())
+    .unwrap_or(0);
+  assert!(
+    g2 >= 1,
+    "non-vacuity: G2 is satisfied — a co-recovering voter quorum spans both windows ({g2} voters)",
+  );
+  // The deciding tick: G1 matured + G2 satisfied — the SAME inputs `under_fire...` escalates on. The ONLY
+  // thing withholding the escalation here is the unvouchable committed op (committed_band_intact == false).
+  now = now + RECOVER_HEAD_SOLICIT;
+  r.handle_timeout(now, &mut wal, &mut sb);
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "the unvouchable committed op blocks the escalation (committed_band_intact is false) — wedge, not loss",
+  );
+  assert!(
+    r.recover.is_some(),
+    "the recover incarnation is retained — still RecoveringHead and soliciting for the missing committed op",
+  );
+}
+
 // ── committed-frontier seal (`seal_committed_frontier`) ────────────────────────────────────
 //
 // An offline-restart successor root copies `cur.commit()` — the DURABLE-root commit, which LAGS the in-memory

@@ -596,14 +596,13 @@ impl<S: StateMachine> Endpoint<S> {
         rec.reads.remove(&id.get());
         rec.pending.remove(&op);
         rec.faulty.remove(&op);
-        match self.log.get_mut(&op) {
-          Some(entry) => entry.body = Body::Present(body),
-          None => {
-            self
-              .log
-              .insert(op, LogEntry::present(client, request, body));
-          }
-        }
+        // Replace the FULL identity from the verified read (client, request, body) — `insert` overwrites
+        // any existing placeholder or seeds a fresh one, both with the verified identity. NOT a partial
+        // body-only overwrite that could strand a Phase-1 placeholder's stale (client, request) beside the
+        // new body (a mixed identity whose reply would route to the wrong client/request).
+        self
+          .log
+          .insert(op, LogEntry::present(client, request, body));
       }
       Outcome::KeepRepairing(client, request, body_checksum) => {
         // KEEP the op header-only as a `Body::Repairing` hole, retiring this read. Its existence +
@@ -618,19 +617,18 @@ impl<S: StateMachine> Endpoint<S> {
         rec.reads.remove(&id.get());
         rec.pending.remove(&op);
         rec.faulty.remove(&op);
-        match self.log.get_mut(&op) {
-          Some(entry) => entry.body = Body::Repairing(body_checksum),
-          None => {
-            self.log.insert(
-              op,
-              LogEntry {
-                client,
-                request,
-                body: Body::Repairing(body_checksum),
-              },
-            );
-          }
-        }
+        // Replace the FULL identity from the verified header (client, request, body_checksum) — never a
+        // partial body-only overwrite that could strand a Phase-1 placeholder's stale (client, request)
+        // beside the new checksum, an unfillable mixed identity that peer repair (which validates all
+        // three fields) cannot fill.
+        self.log.insert(
+          op,
+          LogEntry {
+            client,
+            request,
+            body: Body::Repairing(body_checksum),
+          },
+        );
       }
       Outcome::StaleCommitted => {
         // The persisted vsr_header says this committed slot's canonical body differs from the WAL's:
@@ -655,7 +653,55 @@ impl<S: StateMachine> Endpoint<S> {
           wal.submit_read(new_id, OpNumber::with(op));
         } else {
           rec.pending.remove(&op);
-          rec.faulty.insert(op);
+          // A whole-slot read FAULT on a HELD committed op whose HEADER is independently durable: the
+          // body is unreadable but the identity is CERTAIN, so KEEP it header-only as `Body::Repairing`
+          // (exactly like a `BodyFaulty`) rather than DROP it to a bare hole. Dropping it omits the op
+          // from a later `DoViewChange` — and if this replica then solo/minimal-forms a view change
+          // (`quorum_view_change` donors), a committed op no other selected donor holds is lost. Consult
+          // the durable header (the WAL contract guarantees it for a held committed op) and run the SAME
+          // `classify_committed_slot` verdict a `BodyFaulty` runs; only a Verified COMMITTED slot is kept
+          // — a Stale/superseded slot is still dropped + peer-repaired, and an UNCOMMITTED faulty slot
+          // (`op > commit_max`, the faulty HEAD included) stays faulty so it still drives `RecoveringHead`
+          // / is truncated, NOT resurrected as a committed identity.
+          let verified = (op <= durable_commit)
+            .then(|| wal.header(OpNumber::with(op)))
+            .flatten()
+            // PLACEMENT: the durable header must be FOR `op`. `Wal::header` returns the header at `op`'s
+            // slot, which a misdirected write can leave holding a SIBLING op's header — not a trustworthy
+            // read of THIS op. Guard it exactly as the ReadOk/BodyFaulty arms do via `header().op() == op`.
+            .filter(|h| h.op() == OpNumber::with(op))
+            .filter(|h| {
+              matches!(
+                classify_committed_slot(
+                  (h.client(), h.request(), h.body_checksum()),
+                  rec.canonical.get(&op).copied(),
+                  op,
+                  h.view().get(),
+                  durable_commit,
+                  durable_log_view,
+                ),
+                SlotVerdict::Verified
+              )
+            });
+          match verified {
+            Some(h) => {
+              // Replace the FULL identity from the verified durable header (client, request,
+              // body_checksum) — never a partial body-only overwrite that could strand a Phase-1
+              // placeholder's stale (client, request) beside the new checksum (an unfillable mixed
+              // identity that peer repair, which validates all three fields, cannot fill).
+              self.log.insert(
+                op,
+                LogEntry {
+                  client: h.client(),
+                  request: h.request(),
+                  body: Body::Repairing(h.body_checksum()),
+                },
+              );
+            }
+            None => {
+              rec.faulty.insert(op);
+            }
+          }
         }
       }
     }
@@ -1167,16 +1213,26 @@ impl<S: StateMachine> Endpoint<S> {
     // TWO CONSECUTIVE windows counts toward G2; then roll the ring (this window becomes `prev`) and
     // CLEAR for the next window (read-before-clear). The two-window intersection is freshness by
     // construction — see [`Self::may_escalate_reformation`].
-    let Some((reform_attempts, fresh_corecovering)) = self.recover.as_mut().map(|rec| {
-      rec.reform_attempts = rec.reform_attempts.saturating_add(1);
-      let fresh = rec.peers_recovering & rec.peers_recovering_prev;
-      rec.peers_recovering_prev = rec.peers_recovering;
-      rec.peers_recovering = 0;
-      (rec.reform_attempts, fresh)
-    }) else {
+    let commit_max = self.commit_max.get();
+    let Some((reform_attempts, fresh_corecovering, committed_band_intact)) =
+      self.recover.as_mut().map(|rec| {
+        rec.reform_attempts = rec.reform_attempts.saturating_add(1);
+        let fresh = rec.peers_recovering & rec.peers_recovering_prev;
+        rec.peers_recovering_prev = rec.peers_recovering;
+        rec.peers_recovering = 0;
+        // No faulty slot remains in the COMMITTED band: a committed op this replica cannot vouch (a
+        // StaleCommitted slot, or one it never held — both routed to `rec.faulty`, NOT the now-Repairing
+        // read-fault path) would be OMITTED from its DoViewChange, so escalating + solo/minimal-forming a
+        // view change could lose it. Refuse to escalate while one exists; stay RecoveringHead and keep
+        // soliciting — a peer that holds the op can re-establish the head and supply it. (Every
+        // `rec.faulty` op is above `checkpoint_op`; we test the committed band `op <= commit_max`.)
+        let intact = !rec.faulty.iter().any(|&op| op <= commit_max);
+        (rec.reform_attempts, fresh, intact)
+      })
+    else {
       return;
     };
-    if self.may_escalate_reformation(reform_attempts, fresh_corecovering) {
+    if self.may_escalate_reformation(reform_attempts, fresh_corecovering, committed_band_intact) {
       self.retire_recover_and_escalate(now, sb);
       return;
     }
@@ -1217,11 +1273,25 @@ impl<S: StateMachine> Endpoint<S> {
   /// strictly-uncommitted faulty tail. Hardening G2 against replay would treat a liveness heuristic as if
   /// safety depended on it (and need a wire-format sequence + per-peer state) — a posture this
   /// crash-fault state machine deliberately avoids, exactly like TigerBeetle.
-  fn may_escalate_reformation(&self, reform_attempts: u8, fresh_corecovering: u64) -> bool {
+  ///
+  /// `committed_band_intact` IS a safety guard (unlike G2): this replica must hold NO unvouchable slot in
+  /// its committed band (`op <= commit_max`). A committed op it cannot vouch would be OMITTED from its
+  /// DoViewChange, and if it then becomes the solo/minimal-quorum primary for `view + 1` (decisively at
+  /// `quorum_view_change == 1`) the op is lost. Refusing keeps it `RecoveringHead`, soliciting — a peer
+  /// that holds the op can re-establish the head and supply it; a liveness wedge is the correct trade
+  /// over a committed-op loss. (A held committed read-fault is now carried as `Body::Repairing`, not
+  /// faulty, so this fires only for a genuinely unvouchable committed slot.)
+  fn may_escalate_reformation(
+    &self,
+    reform_attempts: u8,
+    fresh_corecovering: u64,
+    committed_band_intact: bool,
+  ) -> bool {
     let other_voters = self.membership.quorum().saturating_sub(1);
     self.membership.replica_count() > 1
       && self.membership.is_voter(self.local_slot())
       && self.membership.epoch() > self.prev_epoch
+      && committed_band_intact
       && reform_attempts >= RECOVER_HEAD_REFORM_ATTEMPTS
       && (fresh_corecovering.count_ones() as usize) >= other_voters
   }
