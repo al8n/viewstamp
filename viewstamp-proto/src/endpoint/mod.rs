@@ -2760,6 +2760,19 @@ where
     // preserved deadline always originates in the current Normal-primary stint.
     let prior_commit = self.timers.commit;
     let prior_prepare = self.timers.prepare;
+    // PRESERVE an already-armed EARLIER recover-retransmit deadline across the role-timer reset, for the
+    // SAME reason as `commit`/`prepare` above: `recover_retry`/`recover_head` are retransmit-cadence
+    // timers whose RECOVERY makes progress ONLY when they fire (the tail/head read budget exhausts on
+    // `recover_timeouts`; the re-formation escalation fires on `recover_head_timeouts`). Every inbound
+    // message while Recovering/RecoveringHead ends in `arm_timers`, so re-arming to `now + interval`
+    // unconditionally lets a steady sub-interval message cadence (peers soliciting each other through the
+    // re-formation) slide the deadline forward forever — the read budget then never exhausts and the
+    // escalation never fires, wedging recovery (a cluster-wide all-`RecoveringHead` stall never re-forms).
+    // The deadline may only move EARLIER here; the forward re-arm after servicing belongs to
+    // `recover_timeouts`/`send_recovery`. No stale deadline leaks across recovery generations: exiting to
+    // any non-recovering status clears both (this reset, with neither arm below re-setting them).
+    let prior_recover_retry = self.timers.recover_retry;
+    let prior_recover_head = self.timers.recover_head;
     self.timers = Timers::default();
     self.timers.forfeit_armed = forfeit_armed;
     self.timers.repair_or_truncate = repair_or_truncate;
@@ -2794,14 +2807,18 @@ where
       // so the loop terminates even if a real async driver drops a completion or a transient fault
       // only clears on a later read.
       Status::Recovering => {
-        self.timers.recover_retry = Some(now + RECOVER_READ_RETRANSMIT);
+        let recover_retry = now + RECOVER_READ_RETRANSMIT;
+        self.timers.recover_retry =
+          Some(prior_recover_retry.map_or(recover_retry, |d| d.min(recover_retry)));
       }
       // RecoveringHead: re-broadcast the `Recovery` solicitation on a cadence. A permanently-faulty
       // head cannot be repaired from local disk, so the replica solicits the canonical head from a
       // peer until a `RecoveryResponse`/`StartView` re-establishes it (then adoption arms the Normal
       // timers).
       Status::RecoveringHead => {
-        self.timers.recover_head = Some(now + RECOVER_HEAD_SOLICIT);
+        let recover_head = now + RECOVER_HEAD_SOLICIT;
+        self.timers.recover_head =
+          Some(prior_recover_head.map_or(recover_head, |d| d.min(recover_head)));
       }
     }
     // Peer fault-repair runs alongside the role timers: while a committed-op hole is outstanding AND we

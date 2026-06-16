@@ -3147,6 +3147,90 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
 }
 
 #[test]
+fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_read_restores() {
+  // TIMER-OWNERSHIP REGRESSION: the recover-retry TIMER (`recover_timeouts`) is the SOLE owner of the
+  // checkpoint-read retry budget; it re-submits ADDITIVELY, so a real async superblock can have several
+  // checkpoint reads in flight at once and older ones may FAULT out of order while a later one still
+  // carries the valid snapshot. A `Fault` (or verify-mismatch) delivered through `on_recover_sb_done` is
+  // therefore a NO-OP — it must NOT decrement the budget or escalate. Otherwise a STORM of such faults
+  // would exhaust the budget and escalate to a peer fetch BEFORE the in-flight valid read lands (and the
+  // valid read would then be treated as foreign and dropped — a solo/partitioned wedge). Here a storm of
+  // in-band faults (far exceeding the budget) arrives WITHOUT firing the timer; recovery stays Recovering
+  // with the checkpoint outstanding (NOT escalated), and the still-in-flight valid read then restores the
+  // SM LOCALLY — no peer. (FAIL-BEFORE, were a fault to escalate in-band: the storm sets
+  // `awaiting_peer_checkpoint`, failing the asserts below.)
+  let good_snap = CountSm::default().snapshot();
+  let good_env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(2), &BTreeMap::new(), &good_snap);
+  let good_id = crate::checkpoint_id(&good_env);
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    good_id,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  // The Phase-1 checkpoint read submitted by recover() carries the genuine snapshot, but it stays IN
+  // FLIGHT (not flushed) while the fault storm arrives.
+  let mut sb = ScriptedCheckpointSb::new(
+    state,
+    VecDeque::from(std::vec![(OpNumber::with(2), good_env.clone())]),
+  );
+  let mut wal = TestWal {
+    entries: BTreeMap::new(),
+    head: 2,
+    done: VecDeque::new(),
+  };
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
+  let now = Instant::ZERO;
+  let mut e =
+    Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  assert_eq!(e.status(), Status::Recovering);
+  assert!(
+    e.recover.as_ref().unwrap().checkpoint.is_some(),
+    "the Phase-1 checkpoint read is outstanding (in flight, not yet flushed)"
+  );
+
+  // A STORM of in-band checkpoint faults under arbitrary ids — none may decrement the budget or escalate.
+  for k in 0..(4 * RECOVER_READ_RETRIES as u64) {
+    e.on_recover_sb_done(now, &mut sb, SuperblockDone::Fault(OpId::new(9000 + k)));
+  }
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "a storm of in-band checkpoint faults must NOT escalate — the timer owns the budget"
+  );
+  assert!(
+    !e.awaiting_peer_checkpoint_for_test(),
+    "no premature peer-fetch escalation from the in-band fault storm"
+  );
+  assert!(
+    e.recover.as_ref().unwrap().checkpoint.is_some(),
+    "the checkpoint read is still outstanding after the fault storm"
+  );
+
+  // The still-in-flight valid read lands → SM restored LOCALLY, recovery completes. No peer was needed.
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the still-in-flight valid checkpoint read restores the SM locally after the fault storm"
+  );
+  assert!(
+    !e.awaiting_peer_checkpoint_for_test(),
+    "restored from the local read — never fell back to a peer"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "checkpoint_op restored from the durable root"
+  );
+}
+
+#[test]
 fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   // A single-replica primary commits past a checkpoint (checkpoint_ops=2), so the checkpoint is
   // durable; then it "crashes". recover() MUST restore the SM from the checkpoint snapshot and set
@@ -3291,6 +3375,11 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
     "still recovering after rejecting the corrupt read (retry armed)"
   );
 
+  // Pump the recover-retry timer so the next checkpoint read is submitted (the timer is the sole
+  // owner of the read-retry budget).
+  let t = e.poll_timeout().expect("recover-retry timer armed");
+  e.handle_timeout(t, &mut wal, &mut sb);
+
   // Drain #2: the wrong-op read is REJECTED too — still no restore, still Recovering.
   sb.flush(); // release the retry read submitted in drain #1 (the wrong-op one)
   e.handle_storage(now, &mut wal, &mut sb);
@@ -3304,6 +3393,10 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
     Status::Recovering,
     "still recovering after the wrong-op read"
   );
+
+  // Pump the recover-retry timer again so the genuine retry read is submitted.
+  let t = e.poll_timeout().expect("recover-retry timer armed");
+  e.handle_timeout(t, &mut wal, &mut sb);
 
   // Drain #3: the genuine read is accepted → SM restored, recovery completes to Normal.
   sb.flush(); // release the retry read submitted in drain #2 (the genuine one)
@@ -3370,6 +3463,9 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
     0,
     "nothing restored from garbage bytes"
   );
+  // Pump the recover-retry timer so the genuine retry read is submitted.
+  let t = e.poll_timeout().expect("recover-retry timer armed");
+  e.handle_timeout(t, &mut wal, &mut sb);
   // Drain #2: the genuine read completes recovery.
   sb.flush();
   e.handle_storage(now, &mut wal, &mut sb);
@@ -3412,12 +3508,10 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
     Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
   assert_eq!(e.status(), Status::Recovering);
 
-  // Drive well past the per-op retry budget (RECOVER_READ_RETRIES). Each round: flush the inflight
-  // fault, then drain. The CORE property: this NEVER panics (the old `assert!` is gone).
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
-  }
+  // Drive well past the per-op retry budget (RECOVER_READ_RETRIES), pumping the recover-retry timer
+  // each round (the timer is the sole owner of the read-retry budget). The CORE property: this NEVER
+  // panics (the old `assert!` is gone).
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
   // After exhaustion the replica escalated to a peer fetch: still Recovering (SM not yet restored —
   // never silently Normal with a fresh SM at commit_min == 2), awaiting a peer checkpoint, with a
   // FORCED sync armed at our own checkpoint op and a RequestSync emitted.
@@ -3548,10 +3642,7 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   assert_eq!(e.status(), Status::Recovering);
 
   // Exhaust the checkpoint-read budget → escalate to a peer fetch (still Recovering, SM not restored).
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
-  }
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "the primary escalated to a peer fetch (its own checkpoint is unreadable)"
@@ -3657,10 +3748,8 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
   };
   let mut e =
     Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 8) {
-    sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb); // must NOT panic on the verify-failure exhaustion
-  }
+  // Drive the verify-failure exhaustion (pumping the recover-retry timer each round) → must NOT panic.
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
   assert_eq!(
     e.status(),
     Status::Recovering,
@@ -3782,11 +3871,8 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   );
 
   // Drive past the per-op + checkpoint retry budgets so op-2 classes permanently faulty AND the own
-  // checkpoint read exhausts → escalation to a peer fetch.
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
-  }
+  // checkpoint read exhausts → escalation to a peer fetch (pumping the recover-retry timer each round).
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
   assert_eq!(
     e.status(),
     Status::Recovering,
@@ -4009,11 +4095,9 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
   };
   let mut e =
     Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  // Drive: tail reads settle (Present), the own checkpoint read exhausts → peer-fetch escalation.
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
-  }
+  // Drive: tail reads settle (Present), the own checkpoint read exhausts → peer-fetch escalation
+  // (pumping the recover-retry timer each round).
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch (own checkpoint unreadable)"
@@ -4151,10 +4235,7 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
   };
   let mut e =
     Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
-  }
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch (own checkpoint unreadable)"
@@ -4294,10 +4375,7 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
   };
   let mut e =
     Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
-  }
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch"
