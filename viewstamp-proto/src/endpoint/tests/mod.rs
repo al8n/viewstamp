@@ -820,6 +820,35 @@ impl ScriptedCheckpointSb {
   }
 }
 
+/// Drive a `ScriptedCheckpointSb` recovery to its terminal state on a LOCAL advancing clock, flushing the
+/// scripted superblock and pumping the recover-retry timer each round. The checkpoint-read budget is owned
+/// by `recover_timeouts` (the timer is the SOLE retry owner), so a recovery whose checkpoint reads
+/// fault/mismatch makes progress only when the timer fires: `flush` surfaces the inflight read,
+/// `handle_storage` processes it (a fault/mismatch is discarded), then a timer fire re-submits the next
+/// read (decrementing the absolute budget) or, on exhaustion, escalates to a peer fetch. Mirrors
+/// [`drive_recovery`] but flushes the scripted SB (whose reads surface only on `flush`). Stops early once
+/// recovery leaves the Recovering/RecoveringHead states (a verified read restored the SM → Normal); an
+/// escalated replica stays Recovering (awaiting a peer checkpoint), so the loop runs its full budget there.
+fn drive_recovery_scripted_sb<S: StateMachine, W: Wal>(
+  r: &mut Endpoint<S>,
+  wal: &mut W,
+  sb: &mut ScriptedCheckpointSb,
+  now: Instant,
+) {
+  let mut t = now;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 8) {
+    sb.flush();
+    r.handle_storage(t, wal, sb);
+    if !r.status().is_recovering() && !r.status().is_recovering_head() {
+      break;
+    }
+    if let Some(deadline) = r.poll_timeout() {
+      t = deadline;
+      r.handle_timeout(t, wal, sb);
+    }
+  }
+}
+
 /// Drive a real 3-replica primary (replica 0) to a DURABLE checkpoint at `ckpt`, returning the
 /// endpoint + its storage so a test can read the checkpoint envelope back (the donor for sync apply
 /// tests). `checkpoint_ops == ckpt`, so committing `ckpt` ops takes exactly one checkpoint.

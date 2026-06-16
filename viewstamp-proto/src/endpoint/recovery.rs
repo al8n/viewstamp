@@ -745,13 +745,14 @@ impl<S: StateMachine> Endpoint<S> {
     }
   }
 
-  /// Handles a superblock completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`).
-  /// A `CheckpointRead` restores the SM + client sessions (moved out of the old synchronous drain);
-  /// a `Fault` is retried within the checkpoint budget. Calls `recover_progress` after each.
-  pub(crate) fn on_recover_sb_done<W: Wal, B: Superblock>(
+  /// Handles a superblock completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`). A VALID
+  /// `CheckpointRead` (verified against the durable root) restores the SM + client sessions and drives
+  /// `recover_progress`; a `Fault` or a verify-mismatch is DISCARDED — `recover_timeouts` is the sole owner
+  /// of the checkpoint retry + ABSOLUTE budget (decremented per tick), re-submitting until a valid read
+  /// lands or the budget exhausts into a peer fetch.
+  pub(crate) fn on_recover_sb_done<B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
     sb: &mut B,
     done: SuperblockDone,
   ) {
@@ -786,11 +787,12 @@ impl<S: StateMachine> Endpoint<S> {
           .as_ref()
           .is_some_and(|(bound_op, _, _)| *bound_op == cr.op());
         let Some((_, sessions, sm_tail)) = decoded.filter(|_| id_ok && op_ok && bound_ok) else {
-          // Any mismatch (wrong op / wrong hash / wrong bound op / unparsable) is a FAULT — route to the
-          // SAME retry path as `SuperblockDone::Fault`: re-submit within the recover budget (or, on
-          // exhaustion, escalate to a peer fetch), do NOT restore, do NOT panic. (If the bytes happened
-          // to parse but failed a check, we still discard them.)
-          self.retry_recover_checkpoint_read(now, wal, sb);
+          // Any mismatch (wrong op / wrong hash / wrong bound op / unparsable) is treated as a FAULT:
+          // DISCARD the bytes and leave the checkpoint outstanding for `recover_timeouts` to re-submit — it
+          // owns the checkpoint retry + ABSOLUTE budget (decremented per tick), exactly as for a real
+          // `SuperblockDone::Fault`. Do NOT restore, do NOT panic. A permanently root-inconsistent snapshot
+          // (mismatch on EVERY read) thus exhausts the budget on the timer and escalates to a peer fetch,
+          // identical to a permanently-faulting read.
           return;
         };
         self.sm.restore(sm_tail);
@@ -800,67 +802,21 @@ impl<S: StateMachine> Endpoint<S> {
         }
         self.recover_progress(now, sb);
       }
-      SuperblockDone::Fault(id) => {
-        // A read fault while a checkpoint read is OUTSTANDING is the checkpoint read's (the only recovery
-        // superblock read); accept it under any in-flight id, as with `CheckpointRead` above.
-        let _ = id;
-        let is_ours = self.recover.as_ref().and_then(|r| r.checkpoint).is_some();
-        if !is_ours {
-          return;
-        }
-        self.retry_recover_checkpoint_read(now, wal, sb);
+      SuperblockDone::Fault(_) => {
+        // A checkpoint-read FAULT needs no in-band handling: `recover_timeouts` is the SOLE checkpoint
+        // retry+budget owner (it re-submits ADDITIVELY and decrements the ABSOLUTE budget per tick,
+        // escalating to a peer fetch on exhaustion), the exact mirror of the tail-read `Fault` arm in
+        // `on_recover_wal_done`. Counting the budget on the TIMER rather than here is what makes it robust
+        // both to a fault STORM (several superseded additive reads faulting out of order) and to a fault
+        // landing AFTER a re-mint (latency over the retransmit interval): neither over- nor under-counts.
+        // The checkpoint stays outstanding (`recover.checkpoint` still `Some`), so the timer keeps retrying
+        // until a valid read restores it or the budget exhausts.
       }
       SuperblockDone::Wrote(_) => {
         // A stale durable-root/checkpoint *write* completion from before the crash cannot occur
         // (a fresh recover issues no writes); ignore defensively rather than panic.
       }
     }
-  }
-
-  /// Re-submit the recover checkpoint read within the retry budget — or, on EXHAUSTION, escalate to a
-  /// PEER FETCH. Shared by the `Fault` arm and the VERIFY-failure path (a `CheckpointRead` whose
-  /// op/hash mismatched or that failed to parse) of [`Self::on_recover_sb_done`], so a corrupt/torn/
-  /// stale read is retried EXACTLY like a transient fault — never restored, never panicked on.
-  ///
-  /// While the budget remains, a transient checkpoint-read `Fault`/mismatch is re-submitted (the
-  /// common case — the durable root usually names a fully-written snapshot, the root write being
-  /// step 2 after the snapshot is durable, so the budget clears). EXHAUSTION means the durable root
-  /// names a snapshot that is PERMANENTLY unreadable or permanently inconsistent with the root (wrong
-  /// op/hash/unparsable on EVERY read) — bit-rot/torn write in this replica's single durable copy.
-  /// We must NOT panic on storage-controlled bytes (a malicious/faulty superblock could otherwise
-  /// crash the replica at will). The replica instead FETCHES the checkpoint from a peer via the
-  /// state-sync machinery: it arms a FORCED [`SyncState`] targeting its own `checkpoint_op` (a peer
-  /// with a checkpoint `>= ours` answers) and broadcasts a `RequestSync`, then marks
-  /// `awaiting_peer_checkpoint` so `recover_progress` does NOT complete (the SM is not yet restored)
-  /// and `handle_message` accepts the incoming `SyncCheckpoint`. A permanent single-copy corruption
-  /// that no peer can serve leaves the replica re-soliciting in this recoverable fault state (never a
-  /// panic); it ultimately needs backend redundancy (spec §10) — but a healthy cluster heals it.
-  fn retry_recover_checkpoint_read<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-  ) {
-    let budget = self
-      .recover
-      .as_ref()
-      .map(|r| r.checkpoint_retries)
-      .unwrap_or(0);
-    if budget == 0 {
-      // Budget exhausted → escalate to a peer fetch instead of panicking.
-      self.escalate_checkpoint_to_peer_fetch(now);
-      let _ = &mut *wal;
-      return;
-    }
-    let new_id = self.mint_op_id();
-    if let Some(rec) = self.recover.as_mut() {
-      rec.checkpoint = Some(new_id.get());
-      rec.checkpoint_retries = budget - 1;
-    }
-    sb.submit_read_checkpoint(new_id);
-    // No progress to report yet (still awaiting the snapshot); but keep wal in the signature uniform
-    // with on_recover_wal_done for the handle_storage call site.
-    let _ = &mut *wal;
   }
 
   /// Escalate a permanently-unreadable own checkpoint to a PEER FETCH. Stops local checkpoint
@@ -1187,13 +1143,14 @@ impl<S: StateMachine> Endpoint<S> {
     }
     // Snapshot the PENDING ops (the in-flight tail reads) so we can re-borrow `recover` per op while
     // iterating. Faulty ops are NOT re-read (already resolved to a peer-repaired hole).
-    let (ops, want_checkpoint, awaiting_peer) = match self.recover.as_ref() {
+    let (ops, want_checkpoint, checkpoint_retries, awaiting_peer) = match self.recover.as_ref() {
       Some(rec) => (
         rec.pending.keys().copied().collect::<std::vec::Vec<u64>>(),
         rec.checkpoint,
+        rec.checkpoint_retries,
         rec.awaiting_peer_checkpoint,
       ),
-      None => (std::vec::Vec::new(), None, false),
+      None => (std::vec::Vec::new(), None, 0, false),
     };
     // Peer-fetch: if our own checkpoint read exhausted and we are awaiting a PEER `SyncCheckpoint`,
     // re-broadcast the `RequestSync` on this cadence (the Normal-only `sync_timeouts` does not run
@@ -1233,17 +1190,28 @@ impl<S: StateMachine> Endpoint<S> {
         None => {}
       }
     }
-    // Re-issue the checkpoint read if it is still outstanding (a prior completion was dropped or is slow).
-    // ADDITIVE: submit a fresh id but do NOT retire prior in-flight reads (`on_recover_sb_done` accepts any
-    // while one is outstanding) and do NOT reset `checkpoint_retries` — the budget counts down only via the
-    // in-band `retry_recover_checkpoint_read` on a Fault/verify mismatch, so a slow read still resolves and
-    // a permanently-faulty one still exhausts into the peer fetch (it is never reset back to full here).
+    // Re-issue the checkpoint read if it is still outstanding (a prior completion was dropped or is slow),
+    // decrementing the ABSOLUTE budget — `recover_timeouts` is the SOLE checkpoint retry+budget owner, the
+    // exact mirror of the tail-read ownership above. ADDITIVE: submit a fresh id but do NOT retire prior
+    // in-flight reads (`on_recover_sb_done` accepts any VALID read while one is outstanding, so a slow read
+    // completing after this retransmit still resolves). Counting the budget per TICK here — never per FAULT
+    // in the completion arm — is what makes it robust BOTH to a fault STORM (several superseded additive
+    // reads faulting out of order would each over-count a per-fault budget) AND to a fault that lands AFTER
+    // this re-mint (latency over the retransmit interval would be missed by a strict per-id fault match):
+    // the count is independent of which id any fault arrives under. On exhaustion (budget zero) escalate to
+    // a PEER FETCH — the durable root names a permanently-unreadable or root-inconsistent snapshot
+    // (bit-rot/torn write in this replica's single durable copy), unrecoverable from local disk.
     if want_checkpoint.is_some() {
-      let new_id = self.mint_op_id();
-      if let Some(rec) = self.recover.as_mut() {
-        rec.checkpoint = Some(new_id.get());
+      if checkpoint_retries == 0 {
+        self.escalate_checkpoint_to_peer_fetch(now);
+      } else {
+        let new_id = self.mint_op_id();
+        if let Some(rec) = self.recover.as_mut() {
+          rec.checkpoint = Some(new_id.get());
+          rec.checkpoint_retries = checkpoint_retries - 1;
+        }
+        sb.submit_read_checkpoint(new_id);
       }
-      sb.submit_read_checkpoint(new_id);
     }
     // Re-arm so we keep retrying until the loop completes.
     self.timers.recover_retry = Some(now + RECOVER_READ_RETRANSMIT);
@@ -1386,8 +1354,9 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// Receive a `SyncCheckpoint` while RECOVERING and AWAITING A PEER CHECKPOINT — the escalation
   /// path for a replica whose OWN durable checkpoint snapshot read back permanently unreadable/
-  /// inconsistent ([`Self::retry_recover_checkpoint_read`] exhaustion). It cannot restore its SM from
-  /// disk, so it solicited a peer; this verifies and applies the answer, completing recovery.
+  /// inconsistent ([`Self::recover_timeouts`] checkpoint-budget exhaustion → a peer fetch). It cannot
+  /// restore its SM from disk, so it solicited a peer; this verifies and applies the answer,
+  /// completing recovery.
   ///
   /// Verification (no SM mutation until ALL pass): an outstanding forced `sync` with a matching nonce;
   /// the peer is at least as advanced as our corrupt checkpoint (`checkpoint_op >= self.checkpoint_op`,

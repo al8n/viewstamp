@@ -174,7 +174,7 @@ impl<S: StateMachine> Endpoint<S> {
   ) {
     // Recovery checkpoint-read completions route through the recover loop (restore SM + retry).
     if self.status.is_recovering() || self.status.is_recovering_head() {
-      self.on_recover_sb_done(now, wal, sb, done);
+      self.on_recover_sb_done(now, sb, done);
       return;
     }
     // State-sync peer side: outside recovery a `CheckpointRead`/`Fault` means a read WE issued to

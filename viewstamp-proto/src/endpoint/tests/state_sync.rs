@@ -577,11 +577,9 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
   };
   let mut e =
     Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  // Drive past the per-op retry budget so it escalates to a peer fetch.
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
-  }
+  // Drive past the per-op retry budget so it escalates to a peer fetch (pumping the recover-retry
+  // timer each round — the timer owns the read-retry budget).
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
   assert_eq!(e.status(), Status::Recovering);
   assert!(e.awaiting_peer_checkpoint_for_test());
   // The escalation emits a RequestSync flagged `recovery` and advertising our own checkpoint op (2).
@@ -3687,9 +3685,21 @@ fn recovery_peer_fetch_converges_over_a_chunked_transfer() {
   };
   let mut e =
     Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+  // Drive to the peer-fetch escalation by pumping the recover-retry timer (its sole retry owner) each
+  // round on a local advancing clock. Inlined rather than via `drive_recovery_scripted_sb` so the final
+  // advanced clock stays in scope: the ARQ assertion below fires the SAME timer one retransmit later, so
+  // it must advance PAST the deadline the escalation drive left armed.
+  let mut now = now;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 8) {
     sb.flush();
     e.handle_storage(now, &mut wal, &mut sb);
+    if !e.status().is_recovering() && !e.status().is_recovering_head() {
+      break;
+    }
+    if let Some(deadline) = e.poll_timeout() {
+      now = deadline;
+      e.handle_timeout(now, &mut wal, &mut sb);
+    }
   }
   assert_eq!(e.status(), Status::Recovering);
   assert!(e.awaiting_peer_checkpoint_for_test());
@@ -3777,10 +3787,7 @@ fn recovery_peer_fetch_ignores_an_oversized_meta_announce() {
   };
   let mut e =
     Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
-  }
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
   assert_eq!(e.status(), Status::Recovering);
   assert!(e.awaiting_peer_checkpoint_for_test());
   let mut req = None;
