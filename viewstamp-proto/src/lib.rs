@@ -59,7 +59,9 @@ pub use config::{
   Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS, MAX_CLIENT_SESSIONS,
   MAX_SYNC_ENVELOPE_LEN,
 };
-pub use endpoint::{Endpoint, Recovered, Retired};
+pub use endpoint::{
+  Endpoint, Reconfig, ReconfigError, Recovered, RestartOnly, Retired, prepare_restart,
+};
 pub use event::{Committed, Event, RepairStarted, ViewChanged};
 pub use id::{ClientId, Epoch, MemberId, Peer, Recipient, ReplicaId};
 pub use membership::{Membership, MembershipError};

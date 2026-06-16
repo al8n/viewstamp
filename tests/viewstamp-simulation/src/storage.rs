@@ -802,9 +802,9 @@ impl InMemorySuperblock {
   }
 
   /// Test-only: DIRECTLY install `state` as the durable root, bypassing the write path — modelling an
-  /// operator PRE-WRITING a successor durable root onto a STOPPED node during an offline (Tier C)
+  /// operator PRE-WRITING a successor durable root onto a STOPPED node during an offline
   /// reconfiguration. Any in-flight staged write is dropped first (the node is stopped, like a crash),
-  /// and the retained checkpoint snapshots are left intact: a Tier C successor root PRESERVES
+  /// and the retained checkpoint snapshots are left intact: an offline-restart successor root PRESERVES
   /// `checkpoint_op` / `checkpoint_id` (see [`prepare_restart`](viewstamp_proto::prepare_restart)), so
   /// the live snapshot generation it names is still present and readable. The node then recovers off
   /// this root on the next [`Endpoint::recover`](viewstamp_proto::Endpoint::recover). Only legitimate

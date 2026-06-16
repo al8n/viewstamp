@@ -1139,10 +1139,65 @@ impl<S: StateMachine> Endpoint<S> {
 
   /// RecoveringHead solicitation timer: re-broadcast the `Recovery` request (and re-arm) until a
   /// peer's `RecoveryResponse`/`StartView` re-establishes the head and adoption returns us to Normal.
-  pub(crate) fn recover_head_timeouts(&mut self, now: Instant) {
-    if self.timers.recover_head.is_some_and(|d| d <= now) {
-      self.send_recovery(now); // re-broadcasts and re-arms recover_head
+  ///
+  /// This is also the ONE evaluation point of the re-formation ESCALATION. A coordinated
+  /// all-restart into a bumped epoch can leave a voting quorum in `RecoveringHead` with no `Normal`
+  /// node to answer a `Recovery` — `RecoveringHead` otherwise has no escalation path, a permanent
+  /// wedge. We escalate into a view change iff ALL of:
+  /// - `epoch > prev_epoch` — a reconfiguration genuinely happened. The only endpoint assignments to
+  ///   `prev_epoch` are genesis (`prev_epoch == epoch`) and `recover` (the durable root's
+  ///   `prev_epoch`), so off an offline restart this is unsatisfiable — the gate is wholly inert without
+  ///   a real reconfiguration, and stays true for the whole reset incarnation (so it re-arms across a
+  ///   re-wedge at any view), auto-expiring only on a further genuine `epoch++`.
+  /// - `reform_attempts >= RECOVER_HEAD_REFORM_ATTEMPTS` (G1) — enough solicitation windows elapsed
+  ///   that a LIVE quorum would have answered, so a legitimately-slow recovery never escalates.
+  /// - `peers_recovering.count_ones() >= quorum - 1` (G2) — at least the OTHER voters of a voting
+  ///   quorum (exclude self) are concurrently `RecoveringHead`, the actual wedge signature.
+  ///
+  /// READ-BEFORE-CLEAR: the gate is evaluated on the CURRENT `peers_recovering` snapshot, which is
+  /// only then cleared for the next window — clearing first would pin G2 at 0 and never fire. On a
+  /// fire we escalate and DO NOT also re-broadcast `Recovery` this tick.
+  pub(crate) fn recover_head_timeouts<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+    if self.timers.recover_head.is_none_or(|d| d > now) {
+      return;
     }
+    // Per-window bookkeeping: count this solicitation window toward G1 (saturating), then SNAPSHOT
+    // the co-recovering voter set for the gate and CLEAR it for the next window (read-before-clear).
+    // Done under one `recover` borrow; absent a live recover incarnation there is nothing to escalate.
+    let Some((reform_attempts, peers_recovering)) = self.recover.as_mut().map(|rec| {
+      rec.reform_attempts = rec.reform_attempts.saturating_add(1);
+      let snapshot = (rec.reform_attempts, rec.peers_recovering);
+      rec.peers_recovering = 0;
+      snapshot
+    }) else {
+      return;
+    };
+    // The escalation gate. `quorum - 1` counts the OTHER voters (self excludes itself); use the voting
+    // quorum of the ACTIVE membership. `epoch > prev_epoch` keeps this off-axis-unsatisfiable.
+    let other_voters = self.membership.quorum().saturating_sub(1);
+    if self.membership.epoch() > self.prev_epoch
+      && reform_attempts >= RECOVER_HEAD_REFORM_ATTEMPTS
+      && (peers_recovering.count_ones() as usize) >= other_voters
+    {
+      self.retire_recover_and_escalate(now, sb);
+      return;
+    }
+    self.send_recovery(now); // re-broadcasts and re-arms recover_head
+  }
+
+  /// Retire `RecoveringHead` and escalate into a view change at `view + 1` — the re-formation
+  /// chokepoint, fired by [`Self::recover_head_timeouts`] once the gate holds. EVERY wedged voter
+  /// recovered the SAME durable view `V` from the coordinated reset, so all target `V + 1` uniformly
+  /// and the cluster re-forms.
+  ///
+  /// `recover = None` is EXPLICIT (`reset_for_view_transition`, reached via `enter_view_change`, does
+  /// NOT clear `recover`), dropping the re-formation counters with it. This deliberately does NOT go
+  /// through `complete_recovery`: that path's primary/backup role-branching (abdicate to `view + 1`
+  /// vs resume Normal) would split a freshly-reset cluster's view targets, whereas every wedged voter
+  /// must converge on the single `view + 1`.
+  fn retire_recover_and_escalate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+    self.recover = None;
+    self.enter_view_change_from_recovery(now, sb, self.view.next());
   }
 
   /// Receive a `SyncCheckpoint` while RECOVERING and AWAITING A PEER CHECKPOINT — the escalation
