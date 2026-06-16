@@ -233,8 +233,27 @@ pub struct Cluster {
   /// count [`reform_escalations_fired`](Self::reform_escalations_fired): a node that was
   /// `RecoveringHead` and is now `ViewChange` escalated, the UNIQUE `RecoveringHead → ViewChange`
   /// transition the proto's `retire_recover_and_escalate` produces (a `RecoveringHead` node otherwise
-  /// only ever leaves to `Normal` via `StartView`/`RecoveryResponse` adoption).
+  /// only ever leaves to `Normal` via `StartView`/`RecoveryResponse` adoption). Paired with
+  /// [`was_recovering_head_inc`](Self::was_recovering_head_inc) so only a SAME-INCARNATION edge counts.
   was_recovering_head: Vec<bool>,
+  /// The incarnation [`was_recovering_head`](Self::was_recovering_head) was last sampled at, per replica.
+  /// A crash + restart between samples bumps the incarnation (`recover` rebuilds the endpoint), so a
+  /// `RecoveringHead` observed before the crash must NOT pair with a `ViewChange` the restarted node
+  /// reaches through ordinary recovery completion — that crossed a crash/restart boundary, not the
+  /// proto's re-formation transition. The edge counts only when this equals the current incarnation.
+  was_recovering_head_inc: Vec<u64>,
+  /// High-water of the recover read-window's HELD TAIL above the durable checkpoint
+  /// (`op - checkpoint_op`), sampled ONCE per recovery at recover construction in
+  /// [`recover_in_place`](Self::recover_in_place). `op` is the held head the recover read loop scans and
+  /// repairs (`head.min(commit_max + RECOVER_TAIL_WINDOW).max(checkpoint_op)`), fixed at construction and
+  /// never raised by the loop — so this construction-time sample has no completion-edge instant to miss
+  /// (the four review-round fragility this replaced). It equals the committed band
+  /// (`commit_max - checkpoint_op`) when the WAL holds it — the intended large-`checkpoint_ops` case — and
+  /// otherwise the committed band above the checkpoint is re-learned from PEERS only AFTER recovery, so
+  /// the band is NOT what the read-window reconstructs; the held tail IS. The VOPR driver folds this as
+  /// the non-vacuity witness that the large-`checkpoint_ops` axis drove the read-window over a
+  /// non-trivial tail.
+  recovered_band_high_water: u64,
   /// How many times a voting replica ESCALATED out of `Status::RecoveringHead` into a view change —
   /// the observable of the proto's re-formation escalation (`retire_recover_and_escalate`),
   /// counted by the `RecoveringHead → ViewChange` edge in [`tick`](Self::tick). Monotone over the
@@ -348,6 +367,8 @@ impl Cluster {
       applied_streams: vec![Vec::new(); n],
       incarnations: vec![0; n],
       was_recovering_head: vec![false; n],
+      was_recovering_head_inc: vec![0; n],
+      recovered_band_high_water: 0,
       reform_escalations_fired: 0,
     }
   }
@@ -887,6 +908,16 @@ impl Cluster {
     self.reform_escalations_fired
   }
 
+  /// High-water of the recover read-window's HELD TAIL above the durable checkpoint
+  /// (`op - checkpoint_op`), sampled once per recovery at recover construction — the span the read loop
+  /// scans/repairs. The VOPR sweep folds it as the witness that the large-`checkpoint_ops` axis drove the
+  /// read-window over a non-trivial tail (asserted well above the small-interval ceiling), not always the
+  /// tiny tail the small-interval seeds yield. See the field doc for why this is sampled at construction,
+  /// not at a post-operational instant.
+  pub fn recovered_band_high_water(&self) -> u64 {
+    self.recovered_band_high_water
+  }
+
   /// True once all clients are done and nothing is in flight.
   pub fn is_quiescent(&self) -> bool {
     self.net.is_empty() && self.clients.iter().all(ClientModel::is_done)
@@ -926,17 +957,21 @@ impl Cluster {
   /// recovered replica keeps its identity. Its in-memory state (log cache, SM) is reconstructed
   /// from storage; everything not yet durable is lost (as a real crash would lose it).
   ///
-  /// `recover` is a metadata-only constructor that returns in `Status::Recovering` and drives
-  /// its WAL-tail (+ checkpoint) reads via `handle_storage` (retrying any fault). We pump
-  /// `handle_storage` here in a bounded loop so the replica reaches `Normal`/`RecoveringHead` before
-  /// the next `tick` — letting gates assert state right after a restart. (The
-  /// main `tick` loop also pumps `handle_storage` every tick, so an un-pumped restart would still
-  /// recover; this pump is purely for test-assertion timing.)
+  /// `recover` is a metadata-only constructor that returns in `Status::Recovering` and drives its
+  /// WAL-tail (+ checkpoint) reads via `handle_storage`. This does the SYNCHRONOUS recover-read drain
+  /// only (`recover_in_place`), leaving a faulted replica Recovering for the CALLER to drive to a
+  /// terminal status under its OWN per-tick observers — the VOPR driver's pending-view probe + phase
+  /// handling + invariant suite, or a test's own checkers. The recover read retry is timer-driven, so
+  /// driving the recovery INSIDE this helper would run cluster ticks that BYPASS those observers (e.g. a
+  /// restart-triggered view change could open and close the short pending-durable-view window entirely
+  /// unprobed); the recovery must advance in the observed main loop instead. [`Self::reconfigure_offline`]
+  /// drives the post-restart wedge with its own setup tick loop.
+  ///
+  /// The replica restarts into its OWN durable membership and resolves itself present (at epoch 0 the
+  /// genesis-fallback membership places it, and no in-tree path removes a node from a durable root), so
+  /// `recover` returns `Active`. A `Retired` here — the node absent from its own durable membership — is a
+  /// harness bug (a parked node must never be routed a plain restart).
   pub fn restart(&mut self, i: usize) {
-    // The replica restarts into its OWN durable membership and resolves itself present (at epoch 0 the
-    // genesis-fallback membership places it, and no in-tree path removes a node from a durable root), so
-    // `recover` returns `Active`. A `Retired` here — the node absent from its own durable membership —
-    // is a harness bug (a parked node must never be routed a plain restart).
     if let Some(r) = self.recover_in_place(i) {
       panic!("replica {i} recovered Retired (absent from its own durable membership): {r:?}");
     }
@@ -959,7 +994,6 @@ impl Cluster {
     // voting/learner split so a same-epoch legacy bridge still resolves every node.
     let membership = Self::genesis_membership(self.replica_count, self.learner_count);
     let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
-    let now = self.clock.now();
     match Endpoint::recover(
       cfg,
       membership,
@@ -970,16 +1004,22 @@ impl Cluster {
     ) {
       Recovered::Active(endpoint) => {
         self.replicas[i] = endpoint;
-        // Drain the Recovering read loop to completion. Bounded by the WAL-tail length × the per-slot
-        // retry budget plus a margin; a fault that never clears within this leaves the replica
-        // Recovering/RecoveringHead and the per-tick `handle_storage` keeps trying.
-        for _ in 0..4_096 {
-          if !self.replicas[i].status().is_recovering() {
-            break;
-          }
-          self.replicas[i].handle_timeout(now, &mut self.wals[i], &mut self.sbs[i]);
-          self.replicas[i].handle_storage(now, &mut self.wals[i], &mut self.sbs[i]);
-        }
+        // Drain the IMMEDIATE recover reads (synchronous in the sim). A faulted read leaves the op pending
+        // and the replica Recovering; the recover-retry timer is then driven to a terminal status by the
+        // CALLER — `restart` advances the shared clock for a single node, while `reconfigure_offline` ticks
+        // the whole cluster so every voter recovers IN PARALLEL (aligned recover-head windows, which the
+        // re-formation escalation's two-window gate needs). Driving here, per node, would stagger them.
+        self.replicas[i].handle_storage(self.clock.now(), &mut self.wals[i], &mut self.sbs[i]);
+        // Witness the recover read-window's HELD TAIL above the durable checkpoint, captured ONCE here at
+        // construction: `op` is the held head the read loop scans/repairs, fixed at recover and never
+        // raised by it (see `recovered_band_high_water`), so there is no later completion-edge instant to
+        // miss. `commit_max` above the checkpoint is re-learned from peers only AFTER recovery, so the
+        // held tail — not the committed band — is the faithful, edge-free witness of the read-window.
+        let tail = self.replicas[i]
+          .op()
+          .get()
+          .saturating_sub(self.replicas[i].checkpoint_op().get());
+        self.recovered_band_high_water = self.recovered_band_high_water.max(tail);
         None
       }
       Recovered::Retired(r) => Some(r),
@@ -1258,6 +1298,11 @@ impl Cluster {
       self.wals[v].fault_read_at(OpNumber::with(head));
       faulted_heads.push(head);
     }
+    // Restart every voter (the sync recover-read drain only — `restart` no longer drives): the
+    // head-faulted voters are left Recovering, then the wedge-formation loop below ticks the WHOLE cluster
+    // so they reach `RecoveringHead` IN PARALLEL — aligned recover-head windows, which the re-formation
+    // escalation's two-window gate needs. Driving each node to a terminal status one at a time would
+    // stagger the windows and the escalation could fail to re-fire across a re-wedge.
     for i in 0..self.replicas.len() {
       if self.crashed[i] && !self.retired[i] {
         self.restart(i);
@@ -1266,14 +1311,26 @@ impl Cluster {
 
     // The wedge must GENUINELY form: a VOTING QUORUM has to reach `RecoveringHead`, or this is not a
     // re-formation scenario and must not count toward the axis. A head-fault that landed on an interior
-    // slot (a voter whose real head climbed past the faulted op) leaves that voter `Normal`, so without
-    // this gate the function could return `Some` for a cluster that never wedged. `restart` pumps each
-    // replica's recovery to a terminal status, so the statuses are settled here.
+    // slot (a voter whose real head climbed past the faulted op) leaves that voter `Normal`.
+    //
+    // A faulted-head read resolves on the recover-retry TIMER (its read budget exhausts across the
+    // recover-retry cadence), NOT synchronously inside `restart`, so the voters reach `RecoveringHead`
+    // only after that timer fires across the budget. Tick the SHARED clock (every replica stays on one
+    // monotonic clock — no skew) until a voting quorum has wedged, stopping the INSTANT it forms: the
+    // re-formation escalation needs further recover-head windows, so an immediate break leaves it
+    // un-fired for the MAIN loop to drive and the oracle to observe.
     let voting_quorum = self.replica_count as usize / 2 + 1;
-    let wedged = voters
-      .iter()
-      .filter(|&&v| self.replica_status_is_recovering_head(v))
-      .count();
+    let mut wedged = 0;
+    for _ in 0..4_096 {
+      wedged = voters
+        .iter()
+        .filter(|&&v| self.replica_status_is_recovering_head(v))
+        .count();
+      if wedged >= voting_quorum {
+        break;
+      }
+      self.tick();
+    }
     if wedged < voting_quorum {
       return None;
     }
@@ -1680,22 +1737,6 @@ impl Cluster {
     self.wals[i].torn_headers_fired()
   }
 
-  /// Replica `i`'s RECOVERED COMMITTED BAND width: `commit_max - checkpoint_op`, the count of
-  /// known-committed ops the replica holds ABOVE its durable checkpoint. This is exactly the span the
-  /// recover read-window logic materializes (`recover` reads + re-applies `(checkpoint_op ..
-  /// commit_max]` from the WAL, bounded by `RECOVER_TAIL_WINDOW`). Read right after a `restart`, it is
-  /// the band that recovery actually reconstructed; the simulator tracks its high-water across the run
-  /// so the large-`checkpoint_ops` axis can be asserted NON-vacuous (a replica really recovered a
-  /// non-trivial band, not always the tiny ≈4..=12 the small-interval seeds produce). Saturating, since
-  /// a re-learnable `commit_max` hint can momentarily exceed a freshly-recovered `checkpoint_op` only
-  /// upward (the subtraction floors at 0 when `checkpoint_op > commit_max`, which recovery never sets).
-  pub fn replica_recovered_band(&self, i: usize) -> u64 {
-    self.replicas[i]
-      .commit_max()
-      .get()
-      .saturating_sub(self.replicas[i].checkpoint_op().get())
-  }
-
   /// Partition the replicas into groups: `groups[i]` is replica `i`'s group id. Replica↔replica
   /// messages between different groups are dropped until `heal`. (Client↔replica traffic is unaffected.)
   pub fn partition(&mut self, groups: Vec<u8>) {
@@ -1971,23 +2012,38 @@ impl Cluster {
       self.replicas[ri].handle_storage(now, &mut self.wals[ri], &mut self.sbs[ri]);
     }
 
-    // re-formation observable: count the `RecoveringHead → ViewChange` edge — the UNIQUE
-    // transition the proto's `retire_recover_and_escalate` escalation produces (a `RecoveringHead`
-    // node otherwise only ever returns to `Normal` via a `StartView`/`RecoveryResponse` adoption, never
-    // to `ViewChange`). The escalation fires in `handle_timeout` above, so a node observed here in
-    // `ViewChange` that was `RecoveringHead` last tick just escalated. Pure observation (no PRNG draw,
-    // no message, no storage write), so it leaves every off-axis schedule byte-identical; a crashed
-    // node is left at its last sampled state until it restarts. This re-arms across a re-wedge: a node
-    // that escalates, then re-crashes back into `RecoveringHead`, then escalates again is counted twice.
-    for ri in 0..self.replicas.len() {
+    // Per-tick re-formation observer — pure observation (no PRNG draw, message, or storage write), so
+    // off-axis schedules stay byte-identical. A crashed node is skipped (its state and incarnation are
+    // frozen until it restarts); this runs at the one point every tick passes through, so an escalation
+    // inside `reconfigure_offline`'s internal drive is observed too.
+    //
+    // Re-formation escalation: the `RecoveringHead → ViewChange` edge — the UNIQUE transition
+    // `retire_recover_and_escalate` produces (a `RecoveringHead` node otherwise only returns to `Normal`
+    // via `StartView`/`RecoveryResponse`, never to `ViewChange`). Keyed by incarnation so a crash +
+    // restart boundary is not mistaken for it, while still re-arming across a genuine re-wedge (each
+    // escalation pairs within its own incarnation).
+    //
+    // (The recovered read-window tail witness is NOT observed here: it is sampled once at recover
+    // construction in `recover_in_place`, since the held head is fixed there and the committed band above
+    // the checkpoint is peer-learned only after recovery — there is no completion-edge band to observe.)
+    //
+    // Only VOTERS run the re-formation escalation (a voting-quorum path); a learner is never an active
+    // view-change participant, so iterate the voter prefix `0..replica_count` — a non-voter must never
+    // pollute this voter-only non-vacuity witness.
+    for ri in 0..self.replica_count as usize {
       if self.crashed[ri] {
         continue;
       }
-      let rh_now = self.replicas[ri].status().is_recovering_head();
-      if self.was_recovering_head[ri] && self.replicas[ri].status().is_view_change() {
+      let inc = self.incarnations[ri];
+      let is_recovering_head = self.replicas[ri].status().is_recovering_head();
+      if self.was_recovering_head[ri]
+        && self.was_recovering_head_inc[ri] == inc
+        && self.replicas[ri].status().is_view_change()
+      {
         self.reform_escalations_fired += 1;
       }
-      self.was_recovering_head[ri] = rh_now;
+      self.was_recovering_head[ri] = is_recovering_head;
+      self.was_recovering_head_inc[ri] = inc;
     }
   }
 

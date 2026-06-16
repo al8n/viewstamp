@@ -88,13 +88,27 @@ fn committed_ops_survive_crash_storage_fault_and_restart() {
       c.tick();
       assert!(dur.observe(&c).is_ok(), "seed {seed}: durability (crashed)");
     }
-    // Recover via the async Recovering loop, which retries the faulted reads from its own WAL.
+    // Restart does the synchronous recover-read drain only; the recovery is async (the recover-retry
+    // timer retries the faulted reads). Drive it in the OBSERVED main loop — tick the cluster so the timer
+    // fires, running the durability checker EVERY tick — until the survivor reaches a participating state;
+    // the transient faults clear within the retry budget. (Driving the recovery inside `restart` would run
+    // cluster ticks the durability checker never sees.)
     c.restart(survivor);
-    // Right after restart the replica must be operational (Normal/ViewChange), never stranded in
-    // Recovering — the transient faults cleared within the retry budget.
+    let mut operational = false;
+    for _ in 0..3_000 {
+      c.tick();
+      assert!(
+        dur.observe(&c).is_ok(),
+        "seed {seed}: durability (recovering)"
+      );
+      if c.replica_status_is_operational(survivor) {
+        operational = true;
+        break;
+      }
+    }
     assert!(
-      c.replica_status_is_operational(survivor),
-      "seed {seed}: restart drove the Recovering loop to a participating state under transient faults"
+      operational,
+      "seed {seed}: the async recovery reaches a participating state under transient faults"
     );
 
     let mut done = false;

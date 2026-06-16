@@ -6,7 +6,8 @@
 //! appends (modelling real fsync-loss-on-crash); network reorder/drop/duplicate/delay; storage
 //! read/torn/bit-rot faults + MISDIRECTED reads (a read returns a wrong-but-valid sibling slot,
 //! exercising the recovery/repair placement-integrity checks); small AND large `checkpoint_ops` (the
-//! latter recovers a non-trivial committed band — the large-checkpoint recover read-window path); a redundant-copy
+//! latter holds a non-trivial recover tail above the checkpoint — the large-checkpoint recover
+//! read-window path); a redundant-copy
 //! Superblock that retains the last-rooted checkpoint until a new one is durably rooted (finding B); and
 //! a seed-derived PHYSICAL BOUNDED-WAL RING on ~1/3 of seeds (the rest unbounded), where
 //! each WAL is a fixed `N`-slot ring so the primary STALLS op-assignment before it would wrap an
@@ -292,9 +293,9 @@ fn vopr_sweep_no_violations() {
     "async-superblock never opened the pending-durable-view window — the durable-view gate is untested"
   );
   // Adversarial-coverage axes must actually FIRE, or they are vacuous:
-  // - large `checkpoint_ops` materialized a NON-trivial recovered committed band (well above the small
-  //   interval's ~12 ceiling), so the large-checkpoint recover read-window path (`commit_max` far above
-  //   `checkpoint_op`) is exercised over a real multi-hundred-op band, not always a tiny one;
+  // - large `checkpoint_ops` drove the recover read-window over a NON-trivial held tail (`op` far above
+  //   `checkpoint_op`, sampled at recover construction — see `Cluster::recovered_band_high_water`), well
+  //   above the small interval's ~12 ceiling, not always a tiny one;
   // - the misdirected-read axis fired, exercising the recovery/repair placement-integrity checks
   //   (`header.op() == op`) that the DST otherwise never reaches;
   // - the two-slot/redundant-copy superblock (finding B) still drives GENUINE peer-fetch escalations
@@ -302,8 +303,8 @@ fn vopr_sweep_no_violations() {
   //   really had to fetch a checkpoint/op from a peer because its own disk could not serve it.
   assert!(
     max_recovered_band > 50,
-    "no seed recovered a non-trivial committed band (max={max_recovered_band}) — the \
-     large-checkpoint_ops axis is vacuous"
+    "no seed drove the recover read-window over a non-trivial held tail (max={max_recovered_band}) — \
+     the large-checkpoint_ops axis is vacuous"
   );
   assert!(
     total_misdirects > 0,
