@@ -1361,18 +1361,92 @@ impl<S: StateMachine> Endpoint<S> {
       Some((bound_op, _, _)) if bound_op == m.checkpoint_op() => {}
       _ => return, // unparsable, or the bound op disagrees with the advertised op — reject, keep awaiting.
     }
-    // CENTRALIZED faulty-slot drop, via the `finalize_recovery` choke: before we
-    // abandon local recovery (`recover = None` discards `rec.faulty`) and `apply_sync` (whose held-tail
-    // retain KEEPS `self.log` entries above the synced checkpoint), drop every permanently-faulty
-    // committed-band slot's EMPTY placeholder. Otherwise such a slot survives `apply_sync` as
-    // `Some({body: EMPTY})` and a later `advance_commit` applies the committed op with `&[]` —
-    // committed-state divergence. This is the SAME invariant `recover_progress` enforces; the
-    // peer-checkpoint-fetch path completes HERE (not through `recover_progress`'s finalize tail), so it
-    // routes the drop through the SAME choke (which also debug-asserts no faulty slot survives). After the
-    // drop the faulty slot is a genuine repair hole `advance_commit` peer-repairs on demand.
-    // (`recover_progress` already dropped these once tail verification settled, so this is normally a
-    // no-op; it is belt-and-suspenders for any path that reaches here with a faulty slot still in
-    // `self.log`.)
+    // Every still-IN-FLIGHT tail op that `apply_sync` would RETAIN above the synced checkpoint holds only
+    // a Phase-1 `Present(empty)` placeholder, and its WAL read completion is ignored once `recover` is
+    // cleared below — so it must NOT survive into Normal: `advance_commit` would apply a committed op with
+    // `&[]`, and a view change would advertise the empty-body header (an op above this replica's stale
+    // durable `commit_max` can still be committed later, or already be committed elsewhere). Resolve each
+    // from its durable header instead of WAITING for the read — a wait on `rec.pending` could wedge: the
+    // retry timer re-mints each read's id every `RECOVER_READ_RETRANSMIT`, so a read slower than that never
+    // resolves (its completion always arrives under a retired id) and the pending set never empties.
+    // Mirror the Fault retry-exhaustion arm EXACTLY — same placement check, same `classify_committed_slot`
+    // verdict: KEEP it header-only as `Body::Repairing` only when Verified — a committed op that matches
+    // the canonical band, or an uncommitted op whose header is CURRENT-GENERATION (its `view` is not below
+    // the durable `log_view`, so it is not a superseded earlier-view proposal this replica has abandoned).
+    // Else DROP it to a peer-repaired hole (a committed StaleCommitted slot routes through `rec.faulty` so the
+    // `finalize_recovery` survival assert holds; an uncommitted hole is just removed, never advertised).
+    let durable_commit = self.commit_max.get();
+    let durable_log_view = self.log_view.get();
+    let synced_checkpoint = m.checkpoint_op().get();
+    let pending_tail: std::vec::Vec<u64> = self
+      .recover
+      .as_ref()
+      .map(|rec| {
+        rec
+          .pending
+          .keys()
+          .copied()
+          .filter(|&op| op > synced_checkpoint)
+          .collect()
+      })
+      .unwrap_or_default();
+    for op in pending_tail {
+      let canonical = self
+        .recover
+        .as_ref()
+        .and_then(|rec| rec.canonical.get(&op).copied());
+      let keep = wal
+        .header(OpNumber::with(op))
+        .filter(|h| h.op() == OpNumber::with(op))
+        .filter(|h| {
+          matches!(
+            classify_committed_slot(
+              (h.client(), h.request(), h.body_checksum()),
+              canonical,
+              op,
+              h.view().get(),
+              durable_commit,
+              durable_log_view,
+            ),
+            SlotVerdict::Verified
+          )
+        });
+      if let Some(rec) = self.recover.as_mut() {
+        rec.pending.remove(&op);
+        rec.reads.retain(|_, &mut o| o != op);
+      }
+      match keep {
+        Some(h) => {
+          if let Some(rec) = self.recover.as_mut() {
+            rec.faulty.remove(&op);
+          }
+          self.log.insert(
+            op,
+            LogEntry {
+              client: h.client(),
+              request: h.request(),
+              body: Body::Repairing(h.body_checksum()),
+            },
+          );
+        }
+        None if op <= durable_commit => {
+          if let Some(rec) = self.recover.as_mut() {
+            rec.faulty.insert(op);
+          }
+        }
+        None => {
+          self.log.remove(&op);
+        }
+      }
+    }
+    // CENTRALIZED committed-band drop via the `finalize_recovery` choke: before we abandon local recovery
+    // (`recover = None` discards `rec.faulty`) and `apply_sync` (whose held-tail retain KEEPS `self.log`
+    // entries above the synced checkpoint), drop every faulty committed-band slot's EMPTY placeholder
+    // (including the now-faulty in-flight reads routed above) so none survives as `Some({body: EMPTY})`
+    // for a later `advance_commit` to apply with `&[]`. The peer-checkpoint-fetch path completes HERE (not
+    // through `recover_progress`'s finalize tail), so it routes the drop through the SAME choke (which
+    // also debug-asserts no faulty slot survives). Each dropped slot is a genuine repair hole
+    // `advance_commit` peer-repairs on demand.
     self.finalize_recovery();
     // Fully verified → abandon local recovery and apply via the shared state-sync core. Flip to Normal
     // FIRST so the re-persist completions route through the ordinary `on_sb_done` (which clears `sync` +
