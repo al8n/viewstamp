@@ -16,7 +16,9 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   // checkpoint_op), so if the DVC quorum is this recovered replica + a LAGGARD (the other old
   // commit-quorum holder crashed/partitioned), `commit*` never reached N, the offset-union treated the
   // missing op N as an UNCOMMITTED interior gap, and `start_view_as_new_primary` TRUNCATED — LOSING the
-  // known-committed op N.
+  // known-committed op N. (N's slot read back faulty; its durable HEADER survives, so N is now kept
+  // header-only as `Body::Repairing` — but this test pins the commit-frontier carry independently, the
+  // belt to the Repairing suspenders.)
   //
   // Fix: `recover` sets commit_max = state.commit() (the durable known frontier, keeping commit_min ==
   // checkpoint_op), and the DVC reports commit_max (VSR's commit-number `k` = highest KNOWN committed),
@@ -24,7 +26,8 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   //
   // Setup: replica 1 of 3. Durable root: view 0, commit 2 (op 2 is KNOWN committed), checkpoint_op 0,
   // with canonical vsr_headers for ops 1 + 2. WAL head 3, but slot 2 reads back PERMANENTLY FAULTY → the
-  // recover loop drops it (an interior committed hole). Op 3 is the uncommitted tail.
+  // recover loop keeps it header-only as `Body::Repairing` (durable header), an interior committed hole.
+  // Op 3 is the uncommitted tail.
   let mk_header = |op: u64| {
     Header::new(
       OpNumber::with(op),
@@ -49,7 +52,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     checkpoint: None,
   };
   let mut wal = ScriptedWal::with_entries(3);
-  wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot is permanently faulty → dropped
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot read permanently faults → Repairing
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut r =
@@ -65,9 +68,17 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     Status::Normal,
     "recovers to Normal (op 2 below the head 3 → peer-repair)"
   );
-  assert!(
-    !r.log.contains_key(&2),
-    "the faulty committed slot is dropped from the cache (interior hole)"
+  // The faulty committed slot (durable header, only the READ faults) is KEPT header-only as a
+  // `Body::Repairing` hole — its existence + identity flow into the DVC and the durable band, never a
+  // bare hole a later view change could omit. The body is peer-repaired on demand.
+  let entry = r
+    .log
+    .get(&2)
+    .expect("the faulty committed op is KEPT as Repairing (durable header), not dropped");
+  assert_eq!(
+    entry.body,
+    Body::Repairing(mk_header(2).body_checksum()),
+    "kept header-only as Body::Repairing carrying the durable canonical body_checksum"
   );
   // The durable known-committed frontier is CARRIED: commit_max == 2 (NOT checkpoint_op 0). commit_min
   // stays at checkpoint_op 0 (the SM is restored to the checkpoint; the band re-applies via the WAL).
@@ -211,8 +222,9 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   //
   // Setup: replica 1 of 3, recovered into the held-at-repair-hole shape — durable root view 0,
   // commit 2 (op 2 KNOWN committed), checkpoint_op 0, vsr_headers for ops 1 + 2; WAL head 3 with slot 2
-  // permanently faulty → dropped → an interior committed repair hole. So commit_max == 2 while
-  // commit_min == 0 (the SM is restored to the checkpoint; op 2 is a held hole).
+  // permanently faulty → kept header-only as `Body::Repairing` (durable header) → an interior committed
+  // repair hole. So commit_max == 2 while commit_min == 0 (the SM is restored to the checkpoint; op 2 is
+  // a held hole).
   let mk_header = |op: u64| {
     Header::new(
       OpNumber::with(op),
@@ -237,7 +249,7 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
     checkpoint: None,
   };
   let mut wal = ScriptedWal::with_entries(3);
-  wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot is permanently faulty → dropped
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot read permanently faults → Repairing
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut r =
@@ -263,9 +275,16 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
     OpNumber::with(0),
     "commit_min stays at checkpoint_op — op 2 is a held hole below the known frontier"
   );
-  assert!(
-    !r.log.contains_key(&2),
-    "the faulty committed slot is dropped from the cache (interior hole, repaired on demand)"
+  // The faulty committed slot (durable header, only the READ faults) is KEPT header-only as a
+  // `Body::Repairing` hole — a held committed hole below the known frontier, repaired on demand.
+  let entry = r
+    .log
+    .get(&2)
+    .expect("the faulty committed op is KEPT as Repairing (durable header), not dropped");
+  assert_eq!(
+    entry.body,
+    Body::Repairing(mk_header(2).body_checksum()),
+    "kept header-only as Body::Repairing carrying the durable canonical body_checksum"
   );
   while r.poll_message().is_some() {} // discard recovery chatter
   while r.poll_event().is_some() {}
@@ -304,22 +323,21 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
     "the durable-view ROOT persists the known-committed frontier commit_max == 2 \
      (FAIL-BEFORE: it persisted commit_min == 0, lowering the durable frontier)"
   );
-  // The committed band is now the SPARSE canonical set over `(checkpoint_op .. commit_max] == (0 .. 2]`
-  //: one header per HELD op, skipping the op-2 hole. This replica HOLDS op 1 (canonical)
-  // but op 2 read back faulty → dropped, so the band records ONLY op 1 — SHORTER than `commit == 2` and
-  // with a gap at op 2. The header list is legitimately shorter than `commit`, and the key invariant
-  // is that op 1 (a held committed op) keeps its canonical header even though `commit_min == 0`,
-  // while the genuinely-not-held op 2 is left header-less
-  // and peer-repaired on the next recover. (FAIL-BEFORE the sparse change ranged only up to commit_min,
-  // so the band was empty.)
+  // The committed band is the SPARSE canonical set over `(checkpoint_op .. commit_max] == (0 .. 2]`: one
+  // header per HELD op. This replica HOLDS op 1 (canonical, Present) AND op 2 (header-only, kept as
+  // `Body::Repairing` from its durable header), so the band records BOTH — op 2's header carries its
+  // durable canonical body_checksum even though the bytes are absent. The key invariant is that a held
+  // committed op keeps its canonical header even though `commit_min == 0`; a body-`Repairing` hole is
+  // STILL held (existence preserved into the band + the DVC), not left header-less. (FAIL-BEFORE the
+  // sparse change ranged only up to commit_min, so the band was empty.)
   assert_eq!(
     sb.state()
       .committed_headers_slice()
       .iter()
       .map(|h| h.op().get())
       .collect::<std::vec::Vec<_>>(),
-    std::vec![1],
-    "the SPARSE band records the held op 1, skips the op-2 hole — shorter than commit == 2, with a gap"
+    std::vec![1, 2],
+    "the SPARSE band records both held committed ops — op 1 (Present) and op 2 (Repairing, header-only)"
   );
 
   // The recovered DVC for view 1 reports the KNOWN committed frontier (commit_max == 2). Drain it.
@@ -3554,19 +3572,20 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
 }
 
 #[test]
-fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empty() {
+fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_them_empty() {
   // CRITICAL (committed-state divergence via the peer-checkpoint-fetch recovery path): Phase 1
   // of `recover` seeds an EMPTY-body placeholder for every tail op (headers readable, bodies pending).
-  // Phase 2 verifies each; a permanently-faulty COMMITTED-band slot (op 2 here) exhausts its retry
-  // budget and lands in `rec.faulty` — but its empty placeholder stays in `self.log`. The protective
-  // drop that turns such a slot into a genuine repair hole lives at the END of `recover_progress`,
-  // BELOW the `awaiting_peer_checkpoint` early-return. So when the OWN checkpoint snapshot is ALSO
-  // unreadable, the replica escalates to a peer fetch, every later `recover_progress` early-returns
-  // ABOVE the drop, and `on_recover_sync_checkpoint` then sets `recover = None` + `apply_sync` WITHOUT
-  // dropping the faulty slot — `apply_sync`'s held-tail retain keeps `self.log[2] = {body: EMPTY}`. A
-  // later `Commit`/`advance_commit` finds `Some({body: EMPTY})` (NOT a hole) and applies the committed
-  // op with `&[]` → divergence. FAIL-BEFORE: `self.sm.apply(2, &[])` runs (op 2 applied empty) / op 2
-  // is not a repair hole.
+  // Phase 2 (`on_recover_wal_done`) verifies each; a permanently-faulty COMMITTED-band slot (op 2 here)
+  // exhausts its retry budget. Its READ faults but its durable HEADER survives, so the budget-exhaustion
+  // arm KEEPS it header-only as a `Body::Repairing` hole (existence + identity preserved) IN PLACE of the
+  // empty placeholder — never a bare hole a later view change could omit, never a held EMPTY entry. The
+  // conversion happens during phase-2 verification, NOT at the end-of-`recover_progress` drop that the
+  // `awaiting_peer_checkpoint` early-return skips — so it is robust on the peer-fetch path: when the OWN
+  // checkpoint snapshot is ALSO unreadable, the replica escalates to a peer fetch, `apply_sync`'s
+  // held-tail retain keeps `self.log[2]` as the `Repairing` hole, and `advance_commit` treats it EXACTLY
+  // like a wholly-missing slot (hold the commit + peer-repair), so it is NEVER applied with `&[]`.
+  // FAIL-BEFORE: the budget-exhaustion arm dropped op 2 to `rec.faulty` without consulting the durable
+  // header, the end-of-progress drop was skipped on the peer-fetch path, and `self.sm.apply(2, &[])` ran.
   //
   // Setup: replica 1 of 3, checkpoint interval 2. Durable root: commit == commit_max == 3,
   // checkpoint_op == 1, with the SPARSE canonical band headers [h2, h3]. WAL head 3 holds ops 2,3;
@@ -3697,14 +3716,19 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
     "commit_min is the synced checkpoint op (op 2 is NOT applied empty)"
   );
 
-  // THE CORE SAFETY PROPERTY (post-recovery): op 2's EMPTY placeholder was DROPPED from `self.log`, so
-  // the apply path treats it as a missing-body hole rather than a held empty entry that advance_commit
-  // would apply with `&[]`. (It is not yet REGISTERED in `self.repair` — that is deferred to the
-  // on-demand `advance_commit` once commit reaches it, asserted after the Commit below.) The SM reflects
-  // only the restored op 1 — op 2 was never applied (empty or otherwise) on any recovery-completion path.
-  assert!(
-    !e.has_log_entry_for_test(2),
-    "op 2's empty placeholder was dropped from the log cache (NOT a held empty entry to apply with &[])"
+  // THE CORE SAFETY PROPERTY (post-recovery): op 2's EMPTY placeholder was REPLACED by a `Body::Repairing`
+  // hole (header-only, carrying the durable canonical body_checksum), so the apply path treats it as a
+  // missing-body hole rather than a held empty entry that advance_commit would apply with `&[]`. (It is
+  // not yet REGISTERED in `self.repair` — that is deferred to the on-demand `advance_commit` once commit
+  // reaches it, asserted after the Commit below.) The SM reflects only the restored op 1 — op 2 was never
+  // applied (empty or otherwise) on any recovery-completion path.
+  let entry = e.log.get(&2).expect(
+    "op 2 is KEPT as a Body::Repairing hole (durable header), neither dropped nor held empty",
+  );
+  assert_eq!(
+    entry.body,
+    Body::Repairing(h2.body_checksum()),
+    "op 2 is a header-only Repairing hole (NOT a held empty entry to apply with &[])"
   );
   assert_eq!(
     e.state_machine_ref().applied(),
@@ -3790,6 +3814,197 @@ fn recover_peer_fetch_drops_faulty_committed_slots_instead_of_applying_them_empt
       (3u64, b"OP3-REAL-BODY".to_vec()),
     ],
     "op 2 applied with its CANONICAL body (never `&[]`); the committed prefix is consistent"
+  );
+}
+
+#[test]
+fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placeholder() {
+  // The Fault-path keep-as-Repairing promotion must adopt the FULL identity (client, request,
+  // body_checksum) of the durable header it consults at retry-exhaustion — never splice the durable
+  // body_checksum onto a Phase-1 placeholder's STALE (client, request). A mixed identity (old
+  // client/request, new checksum) is UNFILLABLE by peer repair — `fill_repair` validates all three
+  // fields — so it would wedge the committed op or carry the wrong identity through a re-formation.
+  //
+  // The deterministic WAL returns a STABLE header, so Phase-1 and the fault-exhaustion fallback normally
+  // read the SAME identity. Force the divergence an in-model header resolution can produce: Phase-1 reads
+  // header H1 (client 99, request 99) for committed op 2 and seeds a placeholder with it; the durable
+  // root's canonical band vouches a DIFFERENT identity H2 (client 20, request 20). Between Phase-1 and op
+  // 2's read-fault retry exhaustion, replace the WAL's durable header for op 2 with H2 (the resolution
+  // that now agrees with the band). The fallback reads H2, classifies it Verified, and must keep op 2 as
+  // Body::Repairing with H2's FULL identity — NOT (client 99, request 99, Repairing(H2 checksum)).
+  let mk = |op: u64, client: u128, request: u64, body: &[u8]| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(client),
+      RequestNumber::with(request),
+      body,
+    )
+  };
+  let canon2 = Bytes::copy_from_slice(b"OP2-CANON");
+  let h2_canon = mk(2, 20, 20, &canon2); // the canonical identity the band vouches
+  let h1_phase1 = mk(2, 99, 99, b"OP2-STALE"); // a DIFFERENT identity Phase-1 reads first
+  let h1 = mk(1, 7, 1, b"\x01");
+  let body3 = Bytes::copy_from_slice(b"OP3");
+  let h3 = mk(3, 7, 3, &body3);
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2), // commit 2: ops 1 + 2 committed
+    OpNumber::new(),   // checkpoint_op 0
+    0,
+    std::vec![h1, h2_canon], // canonical band vouches H2 for op 2
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut entries = BTreeMap::new();
+  entries.insert(1u64, (h1, Bytes::copy_from_slice(b"\x01")));
+  entries.insert(2u64, (h1_phase1, Bytes::copy_from_slice(b"OP2-STALE"))); // Phase-1 reads H1 here
+  entries.insert(3u64, (h3, body3.clone()));
+  let mut wal = ScriptedWal {
+    entries,
+    head: 3,
+    read_faults: BTreeMap::new(),
+    corrupt: std::collections::BTreeSet::new(),
+    body_faulty: std::collections::BTreeSet::new(),
+    append_faults: BTreeMap::new(),
+    append_submits: BTreeMap::new(),
+    done: VecDeque::new(),
+  };
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's read always faults → fault-exhaustion path
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let now = Instant::ZERO;
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  assert_eq!(
+    r.log.get(&2).map(|e| e.client),
+    Some(ClientId::new(99)),
+    "precondition: Phase-1 seeded op 2's placeholder with the STALE H1 identity (client 99)",
+  );
+  // The in-model header resolution now agrees with the canonical band: op 2's durable header becomes H2.
+  wal.entries.insert(2u64, (h2_canon, canon2.clone()));
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovers to Normal (op 2 a held committed Repairing hole below head 3)",
+  );
+  // THE FIX: op 2 is kept as Body::Repairing with H2's FULL identity — client 20, request 20, the
+  // canonical checksum — NOT a mixed (client 99, request 99, Repairing(H2 checksum)).
+  let entry = r
+    .log
+    .get(&2)
+    .expect("op 2 is kept as a Repairing committed hole");
+  assert_eq!(
+    entry.client,
+    ClientId::new(20),
+    "adopts the durable header's client (FAIL-BEFORE: the stale Phase-1 client 99 survived)",
+  );
+  assert_eq!(
+    entry.request,
+    RequestNumber::with(20),
+    "adopts the durable header's request (FAIL-BEFORE: the stale Phase-1 request 99 survived)",
+  );
+  assert_eq!(
+    entry.body,
+    Body::Repairing(h2_canon.body_checksum()),
+    "Body::Repairing carrying the canonical body_checksum",
+  );
+}
+
+#[test]
+fn fault_exhaustion_rejects_a_misdirected_durable_header() {
+  // The Fault-path promotion applies the SAME placement guard as the ReadOk/BodyFaulty arms: the durable
+  // header it consults must be FOR `op`. `Wal::header` returns the header at op's slot, which a misdirected
+  // write can leave holding a SIBLING op's header — even one whose identity coincides with op's canonical.
+  // Such a header is not a trustworthy read of THIS op, so the op is left `rec.faulty` (a peer-repaired
+  // hole), never promoted to Repairing off a misplaced slot.
+  //
+  // Setup: committed op 2, canonical identity (client 20, request 20). The WAL slot for op 2 holds a header
+  // stamped for a DIFFERENT op (op 99) that otherwise carries op-2's canonical identity — so only the
+  // placement check (h.op() == op), NOT classify, distinguishes it. op 2's read faults → fault-exhaustion
+  // → the misplaced header is rejected → op 2 stays a dropped/peer-repaired hole, not a Repairing entry.
+  let stamped = |slot_stamp: u64, client: u128, request: u64, body: &[u8]| {
+    // `slot_stamp` is the op number STAMPED in the header (what `header().op()` returns); the entry is
+    // stored at its own WAL key. A misdirected slot stores a header whose stamp differs from its key.
+    Header::new(
+      OpNumber::with(slot_stamp),
+      View::new(),
+      ClientId::new(client),
+      RequestNumber::with(request),
+      body,
+    )
+  };
+  let canon2 = Bytes::copy_from_slice(b"OP2-CANON");
+  let h2_canon = stamped(2, 20, 20, &canon2);
+  let h1 = stamped(1, 7, 1, b"\x01");
+  let body3 = Bytes::copy_from_slice(b"OP3");
+  let h3 = stamped(3, 7, 3, &body3);
+  // op 2's slot holds a header STAMPED op 99 but carrying op-2's canonical identity (client 20, request
+  // 20, canonical body) — passes classify, fails placement.
+  let misdirected = stamped(99, 20, 20, &canon2);
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![h1, h2_canon],
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut entries = BTreeMap::new();
+  entries.insert(1u64, (h1, Bytes::copy_from_slice(b"\x01")));
+  entries.insert(2u64, (misdirected, canon2.clone()));
+  entries.insert(3u64, (h3, body3.clone()));
+  let mut wal = ScriptedWal {
+    entries,
+    head: 3,
+    read_faults: BTreeMap::new(),
+    corrupt: std::collections::BTreeSet::new(),
+    body_faulty: std::collections::BTreeSet::new(),
+    append_faults: BTreeMap::new(),
+    append_submits: BTreeMap::new(),
+    done: VecDeque::new(),
+  };
+  wal.script_read_fault(OpNumber::with(2), u8::MAX);
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let now = Instant::ZERO;
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal, "recovers to Normal");
+  // THE PLACEMENT GUARD: op 2 is NOT promoted to Repairing off the misplaced (op-99-stamped) header — it
+  // is dropped to a peer-repaired hole. (FAIL-BEFORE the placement check: classify accepted the
+  // identity-matching header and op 2 was kept as a Repairing entry off a misplaced slot.)
+  assert!(
+    r.log
+      .get(&2)
+      .is_none_or(|e| !matches!(e.body, Body::Repairing(_))),
+    "op 2 is not kept as Repairing off a misdirected (op-99-stamped) header — it is a peer-repaired hole",
+  );
+  assert_eq!(
+    r.commit_max(),
+    OpNumber::with(2),
+    "op 2 is still KNOWN committed (the durable frontier is carried) and will be peer-repaired",
   );
 }
 
