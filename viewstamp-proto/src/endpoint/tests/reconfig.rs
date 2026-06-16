@@ -326,6 +326,143 @@ fn over_fire_guard_no_co_recovering_peers_never_escalates() {
 }
 
 #[test]
+fn solo_voting_set_never_escalates_despite_a_bumped_epoch() {
+  // A SOLO voting set (`replica_count == 1`) in `RecoveringHead` at a bumped epoch must NEVER escalate
+  // into a view change: a single voter has no quorum to re-form among, and `quorum - 1 == 0` makes the
+  // co-recovering-peer check (G2) VACUOUSLY true — so ONLY the `replica_count() > 1` guard stops it. A
+  // solo replica that cannot read its head is genuinely stuck (no peer to repair from), exactly as
+  // `forfeit` holds a solo primary rather than abdicating to a non-existent quorum. It stays
+  // `RecoveringHead`, never `ViewChange`. (Remove the guard and this test escalates — G1 matures and G2
+  // is vacuous, so the guard is the sole thing preventing the unsupported solo view change.)
+  let cur = v4_root(genesis(1), 0);
+  let succ = crate::endpoint::prepare_restart(&cur, 1, 0, std::vec![MemberId::new(0)])
+    .expect("solo successor root");
+  assert!(
+    succ.epoch() > succ.prev_epoch(),
+    "the solo successor is on-axis: epoch > prev_epoch",
+  );
+  let mut wal = ScriptedWal::with_entries(2);
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // head read never clears → permanently faulty
+  let mut sb = sb_with_state(succ);
+  let cfg = Config::try_new(0, MemberId::new(0)).unwrap(); // local = MemberId 0 → slot 0 (the only voter)
+  let mut now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, genesis(1), 0, NoopSm, &mut wal, &mut sb).expect_active();
+  for _ in 0..16 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if r.status() != Status::Recovering {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "solo: faulty head at a bumped epoch → RecoveringHead",
+  );
+  while r.poll_message().is_some() {}
+  // Drive far past `RECOVER_HEAD_REFORM_ATTEMPTS` windows; the solo guard must hold every tick.
+  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize + 8) {
+    now = now + RECOVER_HEAD_SOLICIT;
+    r.handle_timeout(now, &mut wal, &mut sb);
+    while let Some(out) = r.poll_message() {
+      assert!(
+        !matches!(out.msg_ref(), Message::StartViewChange(_)),
+        "a solo voting set must not escalate into a view change",
+      );
+    }
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "a solo voting set stays RecoveringHead (the replica_count > 1 guard blocks escalation)",
+    );
+  }
+  assert!(
+    r.recover
+      .as_ref()
+      .is_some_and(|rec| rec.reform_attempts >= RECOVER_HEAD_REFORM_ATTEMPTS),
+    "G1 matured — so only the solo guard, not an unmet G1, prevented escalation",
+  );
+}
+
+#[test]
+fn a_learner_never_escalates_a_recovering_head_wedge() {
+  // A non-voting LEARNER that faults its head reaches `RecoveringHead` too, but it must NEVER join the
+  // active view-change / SVC / DVC path. The gate's `is_voter(self.local_slot())` blocks it even when
+  // G1 matures AND a co-recovering VOTER quorum is tallied (G2) at a bumped epoch. (Remove the
+  // is_voter guard and this escalates — every other gate term holds for a learner in a 2v+1l set.)
+  let members = std::vec![MemberId::new(10), MemberId::new(11), MemberId::new(12)];
+  let cur = v4_root(
+    Membership::from_durable_parts(Epoch::new(0), 2, 1, members.clone(), 0).unwrap(),
+    0,
+  );
+  let succ = crate::endpoint::prepare_restart(&cur, 2, 1, members).expect("2v+1l successor root");
+  assert!(succ.epoch() > succ.prev_epoch(), "the successor is on-axis");
+  let mut wal = ScriptedWal::with_entries(2);
+  wal.script_read_fault(OpNumber::with(2), u8::MAX);
+  let mut sb = sb_with_state(succ);
+  let cfg = Config::try_new(2, MemberId::new(12)).unwrap(); // local = the LEARNER at slot 2
+  let mut now = Instant::ZERO;
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb).expect_active();
+  assert!(
+    r.is_learner(),
+    "the local node is a learner (slot 2 in 2v+1l)"
+  );
+  for _ in 0..16 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if r.status() != Status::Recovering {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "a learner with a faulty head at a bumped epoch → RecoveringHead",
+  );
+  let (epoch, config_id) = (r.membership.epoch(), r.membership.config_id());
+  while r.poll_message().is_some() {}
+  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize + 8) {
+    let (from, msg) = peer_recovery(0, epoch, config_id); // a co-recovering VOTER → satisfies G2
+    r.handle_message(now, &mut wal, &mut sb, from, msg);
+    now = now + RECOVER_HEAD_SOLICIT;
+    r.handle_timeout(now, &mut wal, &mut sb);
+    while let Some(out) = r.poll_message() {
+      assert!(
+        !matches!(out.msg_ref(), Message::StartViewChange(_)),
+        "a learner must never escalate into a view change",
+      );
+    }
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "the learner stays RecoveringHead (the is_voter guard blocks escalation)",
+    );
+  }
+}
+
+#[test]
+fn a_self_looped_recovery_does_not_count_toward_g2() {
+  // The G2 tally counts only OTHER voters: a looped-back LOCAL `Recovery` (sender == self) must NOT set
+  // its own bit, else a node could satisfy the OTHER-voters quorum alone (decisive for a 2-voter set
+  // where `quorum - 1 == 1`). Feed a `RecoveringHead` voter its OWN `Recovery`; `peers_recovering`
+  // stays 0. A DIFFERENT voter's `Recovery` then sets its bit, confirming the tally still works.
+  let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig(); // 3v, local slot 1
+  let now = Instant::ZERO;
+  let (from_self, msg_self) = peer_recovery(1, epoch, config_id); // slot 1 == the local slot — a self-loop
+  r.handle_message(now, &mut wal, &mut sb, from_self, msg_self);
+  assert_eq!(
+    r.recover.as_ref().map(|rec| rec.peers_recovering),
+    Some(0),
+    "a self-looped Recovery is not tallied (only OTHER voters count toward G2)",
+  );
+  let (from_other, msg_other) = peer_recovery(0, epoch, config_id); // slot 0 — a genuine OTHER voter
+  r.handle_message(now, &mut wal, &mut sb, from_other, msg_other);
+  assert_eq!(
+    r.recover.as_ref().map(|rec| rec.peers_recovering),
+    Some(1u64 << 0),
+    "an OTHER voter's Recovery sets exactly its own bit",
+  );
+}
+
+#[test]
 fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   // The fire path: a `RecoveringHead` voter with `epoch > prev_epoch`, `G1` matured, AND a
   // co-recovering voting quorum (`peers_recovering` reaches quorum-1 via tallied peer `Recovery`)
@@ -334,10 +471,12 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
   while r.poll_message().is_some() {}
   let start_view = r.view();
+  let start_log_view = r.log_view();
   let mut now = Instant::ZERO;
-  // Mature G1 WITHOUT firing: tick (REFORM_ATTEMPTS - 1) windows with no co-recovering peers, so each
-  // window the snapshot is empty (G2 unmet) and reform_attempts climbs. Stays RecoveringHead.
-  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 1) {
+  // Mature G1 WITHOUT firing: tick (REFORM_ATTEMPTS - 2) windows with no co-recovering peers, so each
+  // window the intersection is empty (G2 unmet) and reform_attempts climbs. Stays RecoveringHead. Two
+  // windows are left for the co-recovering feed — G2 is a TWO-window intersection (freshness guard).
+  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 2) {
     now = now + RECOVER_HEAD_SOLICIT;
     r.handle_timeout(now, &mut wal, &mut sb);
     while r.poll_message().is_some() {}
@@ -347,30 +486,49 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
       "not yet escalating (G1 maturing)"
     );
   }
-  // The FINAL window: tally a co-recovering voting quorum FIRST (quorum-1 = 1 other voter for N=3; feed
-  // both other voters to be unambiguous), THEN tick — read-before-clear evaluates the gate on this
-  // snapshot. All three conjuncts now hold → escalate.
+  // WINDOW 1 of the feed: tally the OTHER-voter quorum (quorum-1 = 1 other voter for N=3; feed both to
+  // be unambiguous), then tick. This window's snapshot becomes `peers_recovering_prev`; the intersection
+  // with the still-empty PRIOR window is 0, so the gate does NOT fire yet — one window is not enough.
   for slot in [0u16, 2] {
     let (from, msg) = peer_recovery(slot, epoch, config_id);
     r.handle_message(now, &mut wal, &mut sb, from, msg);
   }
-  assert!(
-    r.recover
-      .as_ref()
-      .is_some_and(|rec| rec.peers_recovering.count_ones() >= 1),
-    "the co-recovering quorum is tallied before the tick (read-before-clear)",
+  now = now + RECOVER_HEAD_SOLICIT;
+  r.handle_timeout(now, &mut wal, &mut sb);
+  while r.poll_message().is_some() {}
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "one window of co-recovering evidence is not enough — the two-window intersection is still empty",
   );
+  // WINDOW 2: tally the SAME quorum again, then tick. Now `peers_recovering & peers_recovering_prev`
+  // holds the quorum (co-recovering across BOTH windows) → G2 met, G1 matured → escalate.
+  for slot in [0u16, 2] {
+    let (from, msg) = peer_recovery(slot, epoch, config_id);
+    r.handle_message(now, &mut wal, &mut sb, from, msg);
+  }
   now = now + RECOVER_HEAD_SOLICIT;
   r.handle_timeout(now, &mut wal, &mut sb);
   assert_eq!(
     r.status(),
     Status::ViewChange,
-    "the gate fired: RecoveringHead escalated into a view change",
+    "the gate fired: a quorum co-recovering across two windows escalated into a view change",
   );
   assert_eq!(
     r.view(),
     start_view.next(),
     "the escalation targets view + 1 (the uniform convergence target)",
+  );
+  // SAFETY-LOAD-BEARING: the escalation bumps `view` but NOT `log_view` — so the escalator enters the
+  // view change as an EQUAL co-canonical donor (same `log_view` as the rest), never a privileged
+  // higher-generation one. That is what makes a spurious escalation harmless: the escalator cannot win
+  // `select_canonical_log` in any way that truncates a committed op the quorum holds (its only droppable
+  // op is its own strictly-uncommitted faulty tail). G2's freshness only avoids unnecessary escalations;
+  // committed-op safety never depends on it.
+  assert_eq!(
+    r.log_view(),
+    start_log_view,
+    "escalation preserves log_view (the escalator is an equal co-canonical donor, cannot truncate committed data)",
   );
   assert!(
     r.recover.is_none(),
@@ -417,22 +575,28 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   assert!(
     r2.recover
       .as_ref()
-      .is_some_and(|rec| rec.reform_attempts == 0 && rec.peers_recovering == 0),
-    "a fresh recover() resets G1/G2 to zero (the counters are not one-shot state)",
+      .is_some_and(|rec| rec.reform_attempts == 0
+        && rec.peers_recovering == 0
+        && rec.peers_recovering_prev == 0),
+    "a fresh recover() resets G1/G2 (incl. both intersection windows) to zero",
   );
   let re_view = r2.view();
   let mut t = Instant::ZERO;
-  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 1) {
+  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 2) {
     t = t + RECOVER_HEAD_SOLICIT;
     r2.handle_timeout(t, &mut wal2, &mut sb2);
     while r2.poll_message().is_some() {}
   }
-  for slot in [0u16, 2] {
-    let (from, msg) = peer_recovery(slot, epoch, config_id);
-    r2.handle_message(t, &mut wal2, &mut sb2, from, msg);
+  // Two consecutive windows of the co-recovering quorum (the two-window intersection), then it fires.
+  for _ in 0..2 {
+    for slot in [0u16, 2] {
+      let (from, msg) = peer_recovery(slot, epoch, config_id);
+      r2.handle_message(t, &mut wal2, &mut sb2, from, msg);
+    }
+    t = t + RECOVER_HEAD_SOLICIT;
+    r2.handle_timeout(t, &mut wal2, &mut sb2);
+    while r2.poll_message().is_some() {}
   }
-  t = t + RECOVER_HEAD_SOLICIT;
-  r2.handle_timeout(t, &mut wal2, &mut sb2);
   assert_eq!(
     r2.status(),
     Status::ViewChange,
@@ -442,6 +606,92 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
     r2.view(),
     re_view.next(),
     "the re-fire targets the new view + 1",
+  );
+}
+
+#[test]
+fn a_single_window_stale_recovery_does_not_escalate() {
+  // R5: a STALE same-epoch Recovery — a single late message from a voter that has SINCE returned to
+  // Normal (and stopped re-broadcasting) — appears in at most ONE solicitation window. G2 is the
+  // TWO-window intersection (`peers_recovering & peers_recovering_prev`), so a single-window bit is
+  // dropped and never reaches the co-recovering quorum. With the OLD single-window snapshot this would
+  // escalate (G1 matured + the quorum present this window); the intersection makes it inert.
+  let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
+  while r.poll_message().is_some() {}
+  let mut now = Instant::ZERO;
+  // Mature G1 well past the bound with EMPTY windows — so only the missing two-window evidence can hold
+  // the gate, not an unmet G1.
+  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize + 4) {
+    now = now + RECOVER_HEAD_SOLICIT;
+    r.handle_timeout(now, &mut wal, &mut sb);
+    while r.poll_message().is_some() {}
+    assert_eq!(
+      r.status(),
+      Status::RecoveringHead,
+      "G1 maturing with no co-recovering evidence"
+    );
+  }
+  // ONE window with the FULL co-recovering quorum tallied, then tick. The prior window was empty, so the
+  // intersection is 0 → NO escalation despite G1 long matured and the quorum present this window.
+  for slot in [0u16, 2] {
+    let (from, msg) = peer_recovery(slot, epoch, config_id);
+    r.handle_message(now, &mut wal, &mut sb, from, msg);
+  }
+  now = now + RECOVER_HEAD_SOLICIT;
+  r.handle_timeout(now, &mut wal, &mut sb);
+  while let Some(out) = r.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::StartViewChange(_)),
+      "a single-window (stale-shaped) co-recovering Recovery must not escalate",
+    );
+  }
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "a single-window co-recovering quorum does not escalate (the two-window intersection drops it)",
+  );
+}
+
+#[test]
+fn a_since_recovered_peer_drops_out_of_the_two_window_intersection() {
+  // The complement: a voter co-recovering in window N-1 but NOT in window N (it recovered to Normal and
+  // stopped broadcasting) is dropped by the intersection — the prev-window bit ALONE is insufficient.
+  // This confirms G2 is an AND of two windows, not an OR-accumulator, and models the exact R5 timeline.
+  let (mut r, mut wal, mut sb, epoch, config_id) = recovering_head_post_reconfig();
+  while r.poll_message().is_some() {}
+  let mut now = Instant::ZERO;
+  for _ in 0..(RECOVER_HEAD_REFORM_ATTEMPTS as usize - 1) {
+    now = now + RECOVER_HEAD_SOLICIT;
+    r.handle_timeout(now, &mut wal, &mut sb);
+    while r.poll_message().is_some() {}
+  }
+  // Window N-1: the quorum is co-recovering (tallied), then tick (it becomes `prev`).
+  for slot in [0u16, 2] {
+    let (from, msg) = peer_recovery(slot, epoch, config_id);
+    r.handle_message(now, &mut wal, &mut sb, from, msg);
+  }
+  now = now + RECOVER_HEAD_SOLICIT;
+  r.handle_timeout(now, &mut wal, &mut sb);
+  while r.poll_message().is_some() {}
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "one window alone does not fire"
+  );
+  // Window N: the peers have recovered — NOTHING is tallied — then tick. fresh = 0 (empty) & prev (Q) =
+  // 0 → no escalation. The prev-window evidence does not linger.
+  now = now + RECOVER_HEAD_SOLICIT;
+  r.handle_timeout(now, &mut wal, &mut sb);
+  while let Some(out) = r.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::StartViewChange(_)),
+      "a peer present only in the PRIOR window must not escalate (the intersection is an AND)",
+    );
+  }
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "a since-recovered peer drops out of the two-window intersection",
   );
 }
 

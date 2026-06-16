@@ -1161,28 +1161,69 @@ impl<S: StateMachine> Endpoint<S> {
     if self.timers.recover_head.is_none_or(|d| d > now) {
       return;
     }
-    // Per-window bookkeeping: count this solicitation window toward G1 (saturating), then SNAPSHOT
-    // the co-recovering voter set for the gate and CLEAR it for the next window (read-before-clear).
-    // Done under one `recover` borrow; absent a live recover incarnation there is nothing to escalate.
-    let Some((reform_attempts, peers_recovering)) = self.recover.as_mut().map(|rec| {
+    // Per-window bookkeeping under one `recover` borrow (absent a live incarnation there is nothing to
+    // escalate): count this solicitation window toward G1 (saturating); INTERSECT the current window's
+    // co-recovering OTHER-voter set with the PREVIOUS window's, so only a voter seen co-recovering in
+    // TWO CONSECUTIVE windows counts toward G2; then roll the ring (this window becomes `prev`) and
+    // CLEAR for the next window (read-before-clear). The two-window intersection is freshness by
+    // construction — see [`Self::may_escalate_reformation`].
+    let Some((reform_attempts, fresh_corecovering)) = self.recover.as_mut().map(|rec| {
       rec.reform_attempts = rec.reform_attempts.saturating_add(1);
-      let snapshot = (rec.reform_attempts, rec.peers_recovering);
+      let fresh = rec.peers_recovering & rec.peers_recovering_prev;
+      rec.peers_recovering_prev = rec.peers_recovering;
       rec.peers_recovering = 0;
-      snapshot
+      (rec.reform_attempts, fresh)
     }) else {
       return;
     };
-    // The escalation gate. `quorum - 1` counts the OTHER voters (self excludes itself); use the voting
-    // quorum of the ACTIVE membership. `epoch > prev_epoch` keeps this off-axis-unsatisfiable.
-    let other_voters = self.membership.quorum().saturating_sub(1);
-    if self.membership.epoch() > self.prev_epoch
-      && reform_attempts >= RECOVER_HEAD_REFORM_ATTEMPTS
-      && (peers_recovering.count_ones() as usize) >= other_voters
-    {
+    if self.may_escalate_reformation(reform_attempts, fresh_corecovering) {
       self.retire_recover_and_escalate(now, sb);
       return;
     }
     self.send_recovery(now); // re-broadcasts and re-arms recover_head
+  }
+
+  /// Whether a `RecoveringHead` voter may escalate the all-`RecoveringHead` wedge into a view change —
+  /// the SINGLE chokepoint for the whole re-formation gate, so no sub-case can be reopened in isolation.
+  /// ALL must hold:
+  /// - `replica_count() > 1`: a SOLO voting set cannot view-change (no quorum to re-form among, and
+  ///   `quorum - 1 == 0` would make the co-recovering check vacuous) — like `forfeit` holding a solo
+  ///   primary rather than abdicating to a non-existent quorum.
+  /// - `is_voter(local_slot())`: only a VOTER escalates; a LEARNER reaches `RecoveringHead` too but is
+  ///   never a view-change / SVC / DVC participant.
+  /// - `epoch() > prev_epoch`: an offline reset — off-axis-unsatisfiable, the byte-identity fence.
+  /// - `reform_attempts >= RECOVER_HEAD_REFORM_ATTEMPTS` (G1): enough solicitation windows elapsed that
+  ///   a reachable Normal quorum would have answered and pulled this node OUT of `RecoveringHead`.
+  /// - `fresh_corecovering.count_ones() >= quorum - 1` (G2): a quorum of OTHER voters CONTINUOUSLY
+  ///   co-recovering across the last two solicitation windows (`peers_recovering & peers_recovering_prev`).
+  ///   The two-window intersection is FRESHNESS BY CONSTRUCTION: a peer is `RecoveringHead` for at most
+  ///   ONE contiguous interval per incarnation (the sole entry sets it and every exit leaves it, with no
+  ///   path back without a fresh `recover()`), re-broadcasting `Recovery` EVERY window for that whole
+  ///   interval and emitting none once it leaves — so a genuinely-wedged peer's bit is in BOTH windows,
+  ///   while a single late stale `Recovery` from a since-recovered peer is in at most one window and the
+  ///   intersection drops it.
+  ///
+  /// G2 is a BEST-EFFORT disruption-avoidance heuristic, NOT a safety gate. The network is unreliable —
+  /// it may DELAY and DUPLICATE messages — so two stale same-epoch `Recovery` duplicates from a peer
+  /// that has since returned to `Normal` can both land within the two-window intersection and spuriously
+  /// satisfy G2, triggering an escalation with no live co-recovering quorum. That is harmless: a spurious
+  /// escalation only recruits the healthy quorum into one unnecessary but always-SAFE, convergent view
+  /// change. Committed-op safety rests SOLELY on `select_canonical_log` (the write-quorum ∩
+  /// view-change-quorum intersection retains every committed op, the canonical-generation union, the
+  /// `commit_star` floor and its release-active `commit_star <= op_head` fail-stop, and
+  /// `assert_committed_survives` at every destructive site) — NEVER on G2's freshness. The escalator
+  /// enters the view change at the SAME `log_view` as the rest (the escalation bumps `view`, never
+  /// `log_view`), so it is an equal co-canonical donor whose only droppable op is its own
+  /// strictly-uncommitted faulty tail. Hardening G2 against replay would treat a liveness heuristic as if
+  /// safety depended on it (and need a wire-format sequence + per-peer state) — a posture this
+  /// crash-fault state machine deliberately avoids, exactly like TigerBeetle.
+  fn may_escalate_reformation(&self, reform_attempts: u8, fresh_corecovering: u64) -> bool {
+    let other_voters = self.membership.quorum().saturating_sub(1);
+    self.membership.replica_count() > 1
+      && self.membership.is_voter(self.local_slot())
+      && self.membership.epoch() > self.prev_epoch
+      && reform_attempts >= RECOVER_HEAD_REFORM_ATTEMPTS
+      && (fresh_corecovering.count_ones() as usize) >= other_voters
   }
 
   /// Retire `RecoveringHead` and escalate into a view change at `view + 1` — the re-formation
