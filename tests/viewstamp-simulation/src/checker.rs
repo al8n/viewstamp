@@ -738,7 +738,7 @@ impl ViewMonotonicChecker {
 /// Stateful checker: each replica's durable `(Epoch, View)` must never regress LEXICOGRAPHICALLY —
 /// the split-brain regression net across an epoch transition.
 ///
-/// [`ViewMonotonicChecker`] proves the durable VIEW never regresses WITHIN an epoch; a Tier C
+/// [`ViewMonotonicChecker`] proves the durable VIEW never regresses WITHIN an epoch; an offline-restart
 /// reconfiguration legitimately RESETS the view per epoch (the successor root carries `cur`'s view,
 /// but the epoch is the high-order coordinate — a later epoch always dominates an earlier one
 /// regardless of view). So the right cross-epoch invariant is on the PAIR `(epoch, view)` ordered

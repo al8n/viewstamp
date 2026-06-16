@@ -11,11 +11,13 @@ use crate::{
 mod checkpoint;
 mod forfeit;
 mod normal;
+mod reconfig;
 mod recovery;
 mod repair;
 mod state_sync;
 mod view_change;
 
+pub use reconfig::{Reconfig, ReconfigError, RestartOnly, prepare_restart};
 pub use recovery::{Recovered, Retired};
 
 /// What the endpoint does when a submitted WAL append completes. Append-before-ack: the vote/ack a
@@ -386,6 +388,15 @@ const RECOVER_READ_RETRIES: u8 = 8;
 /// from local disk, so the replica keeps soliciting a peer until a `RecoveryResponse`/`StartView`
 /// re-establishes its head.
 const RECOVER_HEAD_SOLICIT: core::time::Duration = core::time::Duration::from_millis(100);
+/// RecoveringHead re-formation gate (G1): how many `RECOVER_HEAD_SOLICIT` windows must elapse with no
+/// peer re-establishing the head before a post-reconfiguration replica MAY escalate from
+/// `RecoveringHead` into a view change. This MUST comfortably exceed the round-trip latency for a LIVE
+/// `Normal` quorum to answer a `Recovery` (a `RecoveryResponse`/`StartView`): the escalation exists
+/// only for the all-`RecoveringHead` wedge where NO node is `Normal` to answer, so a legitimately-slow recovery
+/// against a healthy cluster must be answered first and never reach this threshold (validated by the
+/// axis-off byte-identity net). Several windows of slack — generous on purpose, since the escalation
+/// is gated additionally on `epoch > prev_epoch` (off-axis-unsatisfiable) and a co-recovering quorum.
+const RECOVER_HEAD_REFORM_ATTEMPTS: u8 = 6;
 /// Peer fault-repair: how often a replica holding a permanently-faulty committed-op hole re-broadcasts
 /// `RequestPrepare` for each unrepaired op, until a peer answers with the missing `Prepare`. Mirrors
 /// the recover-read retransmit cadence; the commit is HELD below the hole until the op arrives.
@@ -520,6 +531,23 @@ struct RecoverState {
   /// recorded canonical header) are trusted from the WAL as before. Bounded by the band length
   /// (~checkpoint_ops).
   canonical: BTreeMap<u64, (ClientId, RequestNumber, u128)>,
+  /// G1 of the `RecoveringHead` re-formation gate: how many `Recovery` solicitation windows have
+  /// elapsed in THIS incarnation without a peer re-establishing the head (incremented, saturating,
+  /// once per `recover_head_timeouts` tick). A coordinated offline all-restart can leave a voting
+  /// quorum in `RecoveringHead` with no `Normal` node to answer — a permanent wedge; once this
+  /// matures past `RECOVER_HEAD_REFORM_ATTEMPTS` (so a legitimately-slow recovery against a LIVE
+  /// quorum has had ample time to be answered first), the escalation is allowed to fire. Dropped with
+  /// `RecoverState` at `recover = None`; a fresh `recover()` resets it, so each incarnation re-counts
+  /// from zero. NEVER hashed/serialized/emitted.
+  reform_attempts: u8,
+  /// G2 of the `RecoveringHead` re-formation gate: a PER-WINDOW voter-slot bitset (same shape as
+  /// `svc_from`) of the OTHER voters seen concurrently soliciting `Recovery` while we are in
+  /// `RecoveringHead`. It is a SNAPSHOT, not an OR-accumulator across windows: `recover_head_timeouts`
+  /// reads it and then CLEARS it for the next solicitation window, so a since-recovered peer's stale
+  /// bit cannot linger toward the quorum (decisive in a 3-voter cluster). Set by the `RecoveringHead`
+  /// `Message::Recovery` tally arm with ZERO emission. Dropped with `RecoverState` at `recover =
+  /// None`; reset by a fresh `recover()`. NEVER hashed/serialized/emitted.
+  peers_recovering: u64,
 }
 
 /// The body-state of a log entry — `Present` (bytes held) or `Repairing` (header-only, body
@@ -754,14 +782,14 @@ pub struct Endpoint<S> {
   config: Config,
   /// The active, epoch-versioned cluster configuration: who votes, who leads, the quorum sizes, and
   /// this node's slot. The single source of truth for quorum/primary/voter decisions (the static
-  /// per-node parameters stay on [`Config`]). For PR1 (Tier C) this is fixed per incarnation — it
+  /// per-node parameters stay on [`Config`]). For PR1 (offline restart only) this is fixed per incarnation — it
   /// changes only across an offline restart — so no runtime-mutation machinery rides it here.
   membership: Membership,
   /// The PREVIOUS epoch — the durable backward link of the `config_id` lineage, carried so every
   /// durable-root write persists the membership as a v4 root (epoch = `membership.epoch()`,
   /// prev_epoch = this) rather than dropping it to a legacy root. Set from the recovered root (a v4
   /// root's own `prev_epoch`, or the membership epoch for a legacy bridge); at genesis it equals the
-  /// membership epoch. Fixed per incarnation (Tier C changes the configuration only across a restart).
+  /// membership epoch. Fixed per incarnation (the offline-restart capability changes the configuration only across a restart).
   prev_epoch: Epoch,
   status: Status,
   view: View,
@@ -1572,8 +1600,8 @@ impl<S> Endpoint<S> {
   /// vote/lead authority — its content is verified independently downstream — so it is admitted from
   /// any config in the chain, letting a node catch up across an epoch boundary.
   ///
-  /// PR1 retains only the CURRENT `config_id`, so same-`config_id` IS the lineage check: in Tier C
-  /// (coordinated offline restart) every live node shares one configuration at any instant. The
+  /// PR1 retains only the CURRENT `config_id`, so same-`config_id` IS the lineage check: under an offline restart,
+  /// every live node shares one configuration at any instant. The
   /// multi-epoch lineage chain (carrying superseded `config_id`s to admit live cross-epoch catch-up)
   /// is a later milestone.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -2505,13 +2533,31 @@ where
     // authoritative peer. We relax the guard for EXACTLY the two head-learning messages — a
     // `StartView` (the new primary's full canonical log+head+commit) and a `RecoveryResponse` from
     // the primary (the recovery-handshake equivalent). It still does NOT participate: every other
-    // message (Prepare/PrepareOk/Commit/SVC/DVC/GetView/Recovery/Request) is dropped, so it casts no
-    // ack/vote until adoption returns it to Normal. (Dropping a peer's `Recovery` here is correct: a
-    // replica that cannot read its own head has no canonical head to hand out.)
+    // message (Prepare/PrepareOk/Commit/SVC/DVC/GetView/Request) is dropped, so it casts no ack/vote
+    // until adoption returns it to Normal.
+    //
+    // A peer's `Recovery` is the THIRD relaxed message — but it is TALLIED, not answered: a replica
+    // that cannot read its own head has no canonical head to hand out, so it emits NOTHING here. It
+    // records the soliciting VOTER's slot in `peers_recovering` (G2 of the re-formation gate), so the
+    // `recover_head_timeouts` escalation can detect a co-recovering voting quorum (the all-`RecoveringHead` wedge:
+    // an all-restart left a quorum in `RecoveringHead` with no `Normal` node to answer). This arm is
+    // STRICTLY AFTER `sender_matches` + `epoch_authority_admits` above, so only an in-configuration
+    // member is tallied; it is NOT on the `emit` egress path (zero emission → byte-identity safe).
     if self.status.is_recovering_head() {
       match msg {
         Message::StartView(m) => self.on_start_view(now, wal, sb, m),
         Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
+        Message::Recovery(m) => {
+          // Tally a co-recovering VOTER (only a voter counts toward the voting quorum G2), with ZERO
+          // emission. `sender_matches` already bound `from` to `m.replica()` and admitted the full
+          // membership range, so re-check the VOTER subset here. The bit is keyed by the sender slot
+          // (the `svc_from` shape); `recover_head_timeouts` reads then clears this set per window.
+          if self.membership.is_voter(m.replica())
+            && let Some(rec) = self.recover.as_mut()
+          {
+            rec.peers_recovering |= 1u64 << m.replica().get();
+          }
+        }
         _ => {}
       }
       return;
@@ -2594,7 +2640,7 @@ where
       // dropped completion / slow-clearing transient). RecoveringHead re-broadcasts its Recovery
       // solicitation until a peer hands it the canonical head.
       Status::Recovering => self.recover_timeouts(now, wal, sb),
-      Status::RecoveringHead => self.recover_head_timeouts(now),
+      Status::RecoveringHead => self.recover_head_timeouts(now, sb),
     }
     // Peer fault-repair retransmit runs only in Normal (the only status that can solicit/serve a hole
     // and adopt the reply). It re-solicits every unrepaired committed-op hole until each is filled.
