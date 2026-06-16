@@ -104,13 +104,15 @@ pub struct VoprReport {
   /// genuinely fired, so the proto's recovery placement check (`header.op() == op`) was exercised
   /// rather than merely armed. (Summed since each replica's WAL persists across crash/restart.)
   misdirects_fired: u64,
-  /// The high-water mark of the RECOVERED COMMITTED BAND width (`commit_max - checkpoint_op`) sampled
-  /// on a replica IMMEDIATELY AFTER a `restart` (i.e. right after `recover` ran). `> ~12` proves the
-  /// large-`checkpoint_ops` axis genuinely materialized a NON-trivial committed band on a recovering
-  /// replica — so the recover read-window logic (`commit_max` well above `checkpoint_op`) was
-  /// exercised over a real multi-hundred-op band, not always the tiny ≈4..=12 the small-interval seeds
-  /// produce. Stays far below `RECOVER_TAIL_WINDOW = 8192` (the tick budget caps committed ops at
-  /// ~1.1k), so the extreme window-clip case remains unit-tested in the proto.
+  /// The high-water mark of the recover read-window's HELD TAIL above the durable checkpoint
+  /// (`op - checkpoint_op`), folded from [`Cluster::recovered_band_high_water`] — which samples it ONCE
+  /// per recovery at recover construction (the held head is fixed there; the committed band above the
+  /// checkpoint is peer-learned only AFTER recovery, so the held tail, not the band, is what the
+  /// read-window actually scans). `> ~12` proves the large-`checkpoint_ops` axis drove the read-window
+  /// over a NON-trivial tail — a real multi-hundred-op `op` span above `checkpoint_op` — not always the
+  /// tiny ≈4..=12 the small-interval seeds produce. Stays far below `RECOVER_TAIL_WINDOW = 8192` (the
+  /// tick budget caps committed ops at ~1.1k), so the extreme window-clip case remains unit-tested in the
+  /// proto.
   recovered_band_max: u64,
   /// Cumulative count of FORCED state-syncs applied across the run, summed over replicas and
   /// accumulated across crash/restart (each `recover` resets the proto's per-replica counter, so this
@@ -376,10 +378,11 @@ impl VoprReport {
     self.misdirects_fired
   }
 
-  /// The high-water of the RECOVERED COMMITTED BAND width (`commit_max - checkpoint_op`) sampled right
-  /// after a `restart`. A value well above the small-interval ceiling (≈12) ⇒ the large-`checkpoint_ops`
-  /// axis genuinely had a recovering replica reconstruct a non-trivial committed band via the
-  /// recover read-window path, rather than always the trivially-tiny band the small interval yields.
+  /// The high-water of the recover read-window's HELD TAIL above the durable checkpoint
+  /// (`op - checkpoint_op`), sampled once per recovery at recover construction. A value well above the
+  /// small-interval ceiling (≈12) ⇒ the large-`checkpoint_ops` axis genuinely drove the read-window over
+  /// a non-trivial tail, rather than always the trivially-tiny tail the small interval yields. See
+  /// [`Cluster::recovered_band_high_water`] for why this is the held tail (not the peer-learned band).
   pub const fn recovered_band_max(&self) -> u64 {
     self.recovered_band_max
   }
@@ -1305,21 +1308,20 @@ impl Vopr {
     let requests_per_client = 1_000;
     // Checkpoint interval. MOST seeds use a SMALL interval (4..=12) so a few-thousand-tick run crosses
     // several checkpoints (exercising checkpoint + GC + checkpoint-based recovery repeatedly). But a
-    // small interval keeps the durable `checkpoint_op` always close behind `commit_max`, so the
-    // RECOVERED COMMITTED BAND (`(checkpoint_op .. commit_max]` — the span the recover
-    // read-window logic materializes + re-applies) is ALWAYS trivially tiny. So ~1/3 of seeds instead
-    // pick a substantially LARGER interval (256..=768): such a run rarely (or never) reaches the first
-    // checkpoint within the tick budget, so `checkpoint_op` stays low while `commit_max` climbs into
-    // the hundreds — a restart then recovers a non-trivial committed band, genuinely exercising the
-    // recover read-window path (`commit_max` far above `checkpoint_op`) rather than always the ≈4..=12
-    // case. Both
-    // branches draw from the SAME prng position regardless (the `large_ckpt` roll is unconditional), so
-    // the schedule stays a pure function of the seed. NOTE (honest limitation): the 4000-tick budget
-    // commits at most ~1.1k ops in a typical run, so even the largest band stays
-    // FAR below `RECOVER_TAIL_WINDOW = 8192` — this axis stops the band from being trivially small and
-    // exercises the read-window arithmetic over a real multi-hundred-op band, but the EXTREME
-    // case (`commit_max > 8192`, where the window cap actually clips a held committed op) remains
-    // unit-tested in `viewstamp-proto`, not reachable here.
+    // small interval keeps the durable `checkpoint_op` always close behind the WAL head, so the recover
+    // read-window's HELD TAIL above the checkpoint (`op - checkpoint_op` — the span the read loop scans +
+    // repairs, captured at construction) is ALWAYS trivially tiny. So ~1/3 of seeds instead pick a
+    // substantially LARGER interval (256..=768): such a run rarely (or never) reaches the first checkpoint
+    // within the tick budget, so `checkpoint_op` stays low while the held head `op` climbs into the
+    // hundreds — a restart then holds a non-trivial recover tail (`op` far above `checkpoint_op`),
+    // genuinely exercising the recover read-window path rather than always the ≈4..=12 case. Both branches
+    // draw from the SAME prng position regardless (the `large_ckpt` roll is unconditional), so the
+    // schedule stays a pure function of the seed. NOTE (honest limitation): the 4000-tick budget commits
+    // at most ~1.1k ops in a typical run, so even the largest held tail stays FAR below
+    // `RECOVER_TAIL_WINDOW = 8192` — this axis stops the tail from being trivially small and exercises the
+    // read-window over a real multi-hundred-op span, but the EXTREME case (a held tail past 8192, where
+    // the window cap actually clips a held committed op) remains unit-tested in `viewstamp-proto`, not
+    // reachable here.
     let large_ckpt = self.prng.chance(1, 3);
     let checkpoint_ops = if large_ckpt {
       256 + self.prng.below(513)
@@ -2278,20 +2280,13 @@ impl Vopr {
     self.pick(&candidates)
   }
 
-  /// Restart replica `i` and SAMPLE its recovered committed band (`commit_max - checkpoint_op`,
-  /// reconstructed by `recover` and reflected immediately because `Cluster::restart` drains the
-  /// Recovering loop synchronously). Folds the band into the report high-water so the
-  /// large-`checkpoint_ops` axis can be asserted non-vacuous — a recovering replica really did
-  /// materialize a non-trivial committed band via the recover read-window path. Every restart site goes
-  /// through here so the high-water captures the band wherever recovery fires (chaos action, calm
-  /// window, or final quiesce). Bumps the restart counter too (one place).
+  /// Restart replica `i` and bump the restart counter (one place, so every VOPR-driver restart is
+  /// counted). The recover read-window's held tail is folded into the report separately, sampled at
+  /// recover construction by the cluster (see [`Cluster::recovered_band_high_water`]) — so the witness
+  /// needs no driver-side per-restart bookkeeping.
   fn restart_and_track(&mut self, c: &mut Cluster, i: usize) {
     c.restart(i);
     self.report.restarts += 1;
-    self.report.recovered_band_max = self
-      .report
-      .recovered_band_max
-      .max(c.replica_recovered_band(i));
   }
 
   /// Seeded choice from a candidate list (`None` if empty).
@@ -2798,6 +2793,14 @@ impl Vopr {
       }
       self.sessions_evicted_seen[i] = evicted;
     }
+    // Recovered read-window non-vacuity witness: fold the cluster's held-tail high-water — sampled once
+    // per recovery at recover construction (the held head above the checkpoint, the span the read loop
+    // scans; see `Cluster::recovered_band_high_water`) — into the report. `> ~12` proves the
+    // large-`checkpoint_ops` axis drove the read-window over a non-trivial tail.
+    self.report.recovered_band_max = self
+      .report
+      .recovered_band_max
+      .max(c.recovered_band_high_water());
     // LEARNER non-vacuity witnesses (the learner lane), accumulated over the learner ids only — a
     // voter slot stays 0. All three use the SAME reset-robust positive-delta accumulation as
     // `forced_syncs`: a `recover` rebuilds the `Endpoint` (resetting the applied log, the view to the
