@@ -551,6 +551,14 @@ struct RecoverState {
   /// `Message::Recovery` tally arm with ZERO emission. Dropped with `RecoverState` at `recover =
   /// None`; reset by a fresh `recover()`. NEVER hashed/serialized/emitted.
   peers_recovering: u64,
+  /// The IMMEDIATELY-PRECEDING solicitation window's `peers_recovering` snapshot (same `svc_from`
+  /// shape). `recover_head_timeouts` ANDs it with the current `peers_recovering` so a voter counts
+  /// toward G2 only if seen co-recovering in TWO CONSECUTIVE windows — a genuinely-wedged peer
+  /// re-broadcasts every window (bit in both), while a single late stale `Recovery` from a
+  /// since-recovered peer is in at most one window and the intersection drops it. Rolled forward each
+  /// window. Dropped with `RecoverState` at `recover = None`; reset by a fresh `recover()`. NEVER
+  /// hashed/serialized/emitted.
+  peers_recovering_prev: u64,
 }
 
 /// The body-state of a log entry — `Present` (bytes held) or `Repairing` (header-only, body
@@ -2551,11 +2559,21 @@ where
         Message::StartView(m) => self.on_start_view(now, wal, sb, m),
         Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
         Message::Recovery(m) => {
-          // Tally a co-recovering VOTER (only a voter counts toward the voting quorum G2), with ZERO
-          // emission. `sender_matches` already bound `from` to `m.replica()` and admitted the full
-          // membership range, so re-check the VOTER subset here. The bit is keyed by the sender slot
-          // (the `svc_from` shape); `recover_head_timeouts` reads then clears this set per window.
+          // Tally a co-recovering OTHER VOTER (only another voter counts toward the voting-quorum
+          // evidence G2), with ZERO emission. `sender_matches` already bound `from` to `m.replica()`
+          // and admitted the full membership range, so re-check the VOTER subset here AND exclude self
+          // — a looped-back local `Recovery` must not count toward the OTHER-voters quorum (else a node
+          // could satisfy G2 alone). The bit is keyed by the sender slot (the `svc_from` shape);
+          // `recover_head_timeouts` reads then clears this set per window.
+          //
+          // Keyed by slot ONLY, with no per-incarnation sequence: a replayed/duplicate `Recovery` just
+          // re-sets the same bit. That is intentional — the tally stays ZERO-EMISSION (byte-identity
+          // safe) and the `Recovery` nonce is the sender's own token, identical across a duplicate, so it
+          // cannot distinguish a replay. A duplicate-replay that spuriously satisfies G2 only triggers an
+          // always-SAFE convergent view change (see `may_escalate_reformation`): committed-op safety
+          // never depends on this tally's freshness.
           if self.membership.is_voter(m.replica())
+            && m.replica() != self.local_slot()
             && let Some(rec) = self.recover.as_mut()
           {
             rec.peers_recovering |= 1u64 << m.replica().get();
