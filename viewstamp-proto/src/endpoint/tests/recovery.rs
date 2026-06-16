@@ -57,12 +57,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   let now = Instant::ZERO;
   let mut r =
     Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if !r.status().is_recovering() {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -254,12 +249,7 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   let now = Instant::ZERO;
   let mut r =
     Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if !r.status().is_recovering() {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -601,12 +591,7 @@ fn recover_drops_a_genuinely_absent_committed_op_as_today() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb).expect_active();
-  for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if !r.status().is_recovering() {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -672,13 +657,9 @@ fn recover_retries_a_transient_read_fault_then_reaches_normal() {
   )
   .expect_active();
   assert_eq!(r.status(), Status::Recovering);
-  // Pump until the retry clears (bounded): each handle_storage drains one round + re-submits.
-  for _ in 0..8 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() == Status::Normal {
-      break;
-    }
-  }
+  // Pump storage + the recover-retry timer until the retry clears (bounded): the timer re-reads the
+  // pending op additively and the next drain consumes the now-clean completion.
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -705,12 +686,7 @@ fn recover_head_permanently_faulty_enters_recovering_head() {
     &mut sb,
   )
   .expect_active();
-  for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -1232,12 +1208,7 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
     &mut sb,
   )
   .expect_active();
-  for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -1836,12 +1807,7 @@ fn recover_read_ok_with_bad_checksum_does_not_adopt_the_corrupt_body() {
     &mut sb,
   )
   .expect_active();
-  for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -2191,12 +2157,7 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   let now = Instant::ZERO;
   let mut r =
     Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if !r.status().is_recovering() {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -2859,6 +2820,102 @@ fn recover_timer_resubmits_a_dropped_transient_fault() {
 }
 
 #[test]
+fn recover_resolves_a_read_that_completes_after_a_retransmit() {
+  // A real async WAL whose tail-read latency exceeds `RECOVER_READ_RETRANSMIT` must still recover: the
+  // read submitted now completes LATER (after a retry tick), under the id it was submitted with.
+  // Retransmission is ADDITIVE — `recover_timeouts` mints a fresh read id WITHOUT retiring the prior
+  // ones — and the absolute per-op budget is decremented only by the timer, so when the original (slow)
+  // completion finally arrives under its still-live id it RESOLVES the op and recovery reaches Normal.
+  //
+  // FAIL-BEFORE (the churn this fixes): the old `recover_timeouts` RE-MINTED each pending op's id every
+  // tick and RETIRED the prior id (`rec.reads.retain(|_, o| o != op)`), then RESET the budget. A read
+  // slower than `RECOVER_READ_RETRANSMIT` therefore always completed under an already-RETIRED id, so
+  // `on_recover_wal_done`'s `rec.reads.get(&id)` missed it and dropped the completion; the budget kept
+  // resetting and `rec.pending` never emptied, wedging normal recovery in `Status::Recovering` forever.
+  // (The in-tree fixtures complete reads synchronously at `submit_read`, so only this DEFERRED-completion
+  // model can exhibit the churn — hence the dedicated WAL capability.)
+  let mk_header = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  // Replica 1 of 3. Durable root: view 0, commit 2 (ops 1 + 2 KNOWN committed), checkpoint 0, canonical
+  // band [h1, h2] matching the WAL bodies. WAL head 2; op 2's read is DEFERRED (a slow async read), op 1
+  // reads clean.
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![mk_header(1), mk_header(2)],
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(2);
+  wal.script_defer_read(OpNumber::with(2)); // op 2's read is HELD — it completes only on release
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let mut now = Instant::ZERO;
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+
+  // Drain op 1's clean read (resolved); op 2 stays pending with NO completion (its read is held).
+  r.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "op 2's read has not completed yet — still recovering",
+  );
+
+  // One recover-retry tick: `recover_timeouts` re-submits op 2 ADDITIVELY (a fresh id, prior id kept)
+  // and decrements its absolute budget. op 2's read is STILL held, so this enqueues no completion.
+  now = now + RECOVER_READ_RETRANSMIT;
+  r.handle_timeout(now, &mut wal, &mut sb);
+  assert_eq!(
+    r.status(),
+    Status::Recovering,
+    "still recovering after the retransmit (op 2's read remains in flight)",
+  );
+
+  // The original (slow) op-2 read now completes under its ORIGINAL id — the id a retire-on-retry
+  // retransmit would already have discarded. With additive ids it is still live, so it resolves op 2.
+  assert!(
+    wal.release_deferred(OpNumber::with(2)),
+    "op 2 had an outstanding (held) read to release",
+  );
+
+  // Drive to completion (pump storage + the retry timer); recovery reaches Normal with op 2 resolved.
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the slow read's late completion (under a still-live additive id) resolves op 2 → Normal \
+     (FAIL-BEFORE: a retired id dropped it and rec.pending never emptied — a permanent wedge)",
+  );
+  let entry = r.log.get(&2).expect("op 2 is present in the recovered log");
+  assert_eq!(
+    entry.body,
+    Body::Present(Bytes::copy_from_slice(&[2u8])),
+    "op 2 holds its REAL body from the released read (not an empty placeholder / Repairing hole)",
+  );
+  assert_eq!(
+    entry.client,
+    ClientId::new(7),
+    "op 2's identity is its real client"
+  );
+  assert_eq!(r.op(), OpNumber::with(2), "the recovered head is op 2");
+}
+
+#[test]
 fn recover_rebuilds_log_and_op_from_wal() {
   // A backup appends ops 1,2 durably, then "crashes". recover() from the SAME wal/sb rebuilds
   // op=2 with REAL bodies, view from the superblock. recover() is now metadata-only (returns
@@ -3019,6 +3076,73 @@ fn recover_restores_a_nonzero_durable_view() {
     recovered.status(),
     Status::ViewChange,
     "a mid-view-change recovery re-drives the view change, it does not resume Normal"
+  );
+}
+
+#[test]
+fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
+  // The recover-retry timer re-submits the checkpoint read ADDITIVELY (a fresh id without retiring the
+  // prior). On a real async superblock a slow read completes AFTER a retransmit minted a newer id, so its
+  // `CheckpointRead` arrives under a SUPERSEDED id. `on_recover_sb_done` must accept ANY read while one is
+  // outstanding (the bytes are checksum-verified regardless) — matching only the latest id would drop the
+  // late completion and, with the budget no longer reset on the timer, wedge recovery in `Recovering`.
+  // (The deterministic `TestSb` completes the checkpoint read on submit, so reproduce the superseded id
+  // directly: re-mark `rec.checkpoint` to a fresh id before draining the original read's completion.)
+  let cfg = || Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let mut e = Endpoint::new(cfg(), genesis(1), 0, CountSm::default());
+  for rn in 1..=2u64 {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Client(ClientId::new(7)),
+      Message::Request(Request::new(
+        ClientId::new(7),
+        RequestNumber::with(rn),
+        Bytes::from(std::vec![rn as u8]),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "the checkpoint is durable"
+  );
+  drop(e); // crash
+
+  let mut r =
+    Endpoint::recover(cfg(), genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  // Simulate the recover-retry timer minting a FRESH checkpoint read id before the original (slow) read's
+  // completion is drained — the completion will then arrive under a SUPERSEDED id.
+  let original = r
+    .recover
+    .as_ref()
+    .unwrap()
+    .checkpoint
+    .expect("a checkpoint read is outstanding after recover()");
+  r.recover.as_mut().unwrap().checkpoint = Some(original.wrapping_add(1000));
+  // Drain: the original checkpoint read completes under `original` (now superseded). It MUST be accepted,
+  // restoring the SM and completing recovery. (FAIL-BEFORE the additive accept: the superseded id is
+  // ignored, the SM is never restored, and recovery stays `Recovering`.)
+  for _ in 0..4 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if r.status() != Status::Recovering {
+      break;
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the checkpoint read under a superseded id is accepted → recovery completes",
+  );
+  assert_eq!(
+    r.state_machine_ref().applied().len(),
+    2,
+    "the SM is restored from the (superseded-id) checkpoint read",
   );
 }
 
@@ -3642,6 +3766,8 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
     body_faulty: std::collections::BTreeSet::new(),
     append_faults: BTreeMap::new(),
     append_submits: BTreeMap::new(),
+    deferred: std::collections::BTreeSet::new(),
+    deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // never clears within any finite budget
@@ -3877,6 +4003,8 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
     body_faulty: std::collections::BTreeSet::new(),
     append_faults: BTreeMap::new(),
     append_submits: BTreeMap::new(),
+    deferred: std::collections::BTreeSet::new(),
+    deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
   };
   let mut e =
@@ -4017,6 +4145,8 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     body_faulty: std::collections::BTreeSet::new(),
     append_faults: BTreeMap::new(),
     append_submits: BTreeMap::new(),
+    deferred: std::collections::BTreeSet::new(),
+    deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
   };
   let mut e =
@@ -4158,6 +4288,8 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     body_faulty: std::collections::BTreeSet::new(),
     append_faults: BTreeMap::new(),
     append_submits: BTreeMap::new(),
+    deferred: std::collections::BTreeSet::new(),
+    deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
   };
   let mut e =
@@ -4276,6 +4408,8 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
     body_faulty: std::collections::BTreeSet::new(),
     append_faults: BTreeMap::new(),
     append_submits: BTreeMap::new(),
+    deferred: std::collections::BTreeSet::new(),
+    deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's read always faults → fault-exhaustion path
@@ -4290,12 +4424,7 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
   );
   // The in-model header resolution now agrees with the canonical band: op 2's durable header becomes H2.
   wal.entries.insert(2u64, (h2_canon, canon2.clone()));
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if !r.status().is_recovering() {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -4381,6 +4510,8 @@ fn fault_exhaustion_rejects_a_misdirected_durable_header() {
     body_faulty: std::collections::BTreeSet::new(),
     append_faults: BTreeMap::new(),
     append_submits: BTreeMap::new(),
+    deferred: std::collections::BTreeSet::new(),
+    deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX);
@@ -4388,12 +4519,7 @@ fn fault_exhaustion_rejects_a_misdirected_durable_header() {
   let now = Instant::ZERO;
   let mut r =
     Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if !r.status().is_recovering() {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(r.status(), Status::Normal, "recovers to Normal");
   // THE PLACEMENT GUARD: op 2 is NOT promoted to Repairing off the misplaced (op-99-stamped) header — it
   // is dropped to a peer-repaired hole. (FAIL-BEFORE the placement check: classify accepted the
