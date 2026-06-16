@@ -544,6 +544,20 @@ impl<S: StateMachine> Endpoint<S> {
     // of the destructive-site trim.
     self.assert_committed_survives(floor, checkpoint_floor);
     self.log.retain(|&op, _| op > floor);
+    // Every RETAINED held-tail entry must be a FAITHFULLY-resolved slot — a real `Present(body)` op or a
+    // `Body::Repairing` hole — NEVER a `Present(EMPTY)` placeholder (an unresolved Phase-1 recovery seed).
+    // Such an empty entry would later apply with `&[]` (`advance_commit`) or advertise an empty-body header
+    // (a view-change `log_slice`). The recovery-completion paths resolve every in-flight tail op before any
+    // trim/install reaches here, and Normal operation never holds an empty `Present`; this turns that
+    // implicit precondition of the body-blind retain into a checked invariant.
+    #[cfg(debug_assertions)]
+    for (&op, entry) in &self.log {
+      debug_assert!(
+        !entry.body.as_present().is_some_and(|b| b.is_empty()),
+        "held-tail op {op} retained as a Present(EMPTY) placeholder — a recovery completion path left an \
+         in-flight tail read unresolved (it would apply empty / advertise an empty-body header)"
+      );
+    }
   }
 
   /// Persist the durable VSR root for the current `(view, log_view, commit_max)` and arm the

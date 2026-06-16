@@ -490,12 +490,7 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
   let now = Instant::ZERO;
   let mut r =
     Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
-  for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if !r.status().is_recovering() {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(r.status(), Status::Normal, "recovers to Normal");
   assert_eq!(r.commit_max(), OpNumber::with(2), "op 2 is KNOWN committed");
   while r.poll_message().is_some() {} // discard recovery chatter

@@ -226,12 +226,7 @@ fn recovering_head_post_reconfig() -> (Endpoint<NoopSm>, ScriptedWal, TestSb, Ep
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap(); // local = MemberId 1 → slot 1 (a voter)
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb).expect_active();
-  for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -347,12 +342,7 @@ fn solo_voting_set_never_escalates_despite_a_bumped_epoch() {
   let cfg = Config::try_new(0, MemberId::new(0)).unwrap(); // local = MemberId 0 → slot 0 (the only voter)
   let mut now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(1), 0, NoopSm, &mut wal, &mut sb).expect_active();
-  for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -406,12 +396,7 @@ fn a_learner_never_escalates_a_recovering_head_wedge() {
     r.is_learner(),
     "the local node is a learner (slot 2 in 2v+1l)"
   );
-  for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -561,12 +546,7 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now2 = Instant::ZERO;
   let mut r2 = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal2, &mut sb2).expect_active();
-  for _ in 0..16 {
-    r2.handle_storage(now2, &mut wal2, &mut sb2);
-    if r2.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r2, &mut wal2, &mut sb2, now2);
   assert_eq!(
     r2.status(),
     Status::RecoveringHead,
@@ -722,12 +702,7 @@ fn an_escalation_carries_a_repairing_committed_op_into_the_view_change() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb).expect_active();
-  for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -812,12 +787,7 @@ fn an_unvouchable_committed_op_blocks_escalation_into_a_wedge() {
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
   let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb).expect_active();
-  for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,

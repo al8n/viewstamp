@@ -300,6 +300,17 @@ struct ScriptedWal {
   /// `op → count` of `submit_append` calls observed, so a test can prove a faulted append was
   /// re-submitted.
   append_submits: BTreeMap<u64, u32>,
+  /// Ops whose READ is HELD (deferred), modelling a real async WAL whose read latency exceeds the
+  /// recover-retry cadence: `submit_read` records the submitted id in `deferred_reads` but enqueues NO
+  /// completion. `release_deferred(op)` later completes the OLDEST still-held submission under its
+  /// ORIGINAL id — the way a real proactor completes the read that was actually submitted first, long
+  /// after a retry has minted a newer id. Additive-id retransmission keeps that original id live, so the
+  /// late completion resolves; the old retire-on-retry behavior had retired it (the completion would be
+  /// ignored and the pending set never empty — the wedge this models).
+  deferred: std::collections::BTreeSet<u64>,
+  /// Per deferred op: the submitted read ids still HELD, oldest-first. Each `submit_read` of a deferred
+  /// op pushes its id; `release_deferred` pops the front (the original slow read finally completing).
+  deferred_reads: BTreeMap<u64, VecDeque<OpId>>,
   done: VecDeque<WalDone>,
 }
 impl ScriptedWal {
@@ -325,6 +336,8 @@ impl ScriptedWal {
       body_faulty: std::collections::BTreeSet::new(),
       append_faults: BTreeMap::new(),
       append_submits: BTreeMap::new(),
+      deferred: std::collections::BTreeSet::new(),
+      deferred_reads: BTreeMap::new(),
       done: VecDeque::new(),
     }
   }
@@ -354,6 +367,31 @@ impl ScriptedWal {
   /// `op` resolves to `WalDone::Absent`. Models a genuine hole the writer never held.
   fn remove_entry_for_test(&mut self, op: OpNumber) {
     self.entries.remove(&op.get());
+  }
+  /// HOLD every read of `op`: `submit_read` records the submitted id (pushed oldest-first) but enqueues
+  /// NO completion, modelling a real async WAL whose read latency exceeds the recover-retry cadence.
+  /// `release_deferred(op)` later completes the OLDEST held submission under its original id.
+  fn script_defer_read(&mut self, op: OpNumber) {
+    self.deferred.insert(op.get());
+  }
+  /// Complete the OLDEST still-held read of a deferred `op` under its ORIGINAL id — the slow first
+  /// submission finally landing, AFTER a retry has minted a newer id. (Under retire-on-retry that
+  /// original id was retired, so the completion would be IGNORED and recovery would never resolve `op`;
+  /// additive ids keep it live, so this resolves.) Returns `false` if no read of `op` is outstanding.
+  fn release_deferred(&mut self, op: OpNumber) -> bool {
+    let Some(id) = self
+      .deferred_reads
+      .get_mut(&op.get())
+      .and_then(|q| q.pop_front())
+    else {
+      return false;
+    };
+    let done = match self.entries.get(&op.get()) {
+      Some((h, b)) => WalDone::ReadOk(ReadOk::new(id, *h, b.clone())),
+      None => WalDone::Absent(id),
+    };
+    self.done.push_back(done);
+    true
   }
 }
 impl Wal for ScriptedWal {
@@ -394,6 +432,16 @@ impl Wal for ScriptedWal {
         *remaining -= 1;
       }
       self.done.push_back(WalDone::Fault(id));
+      return;
+    }
+    // A DEFERRED read is HELD: record the submitted id (oldest-first) and enqueue NOTHING.
+    // `release_deferred(op)` later completes the OLDEST held submission under its original id.
+    if self.deferred.contains(&op.get()) {
+      self
+        .deferred_reads
+        .entry(op.get())
+        .or_default()
+        .push_back(id);
       return;
     }
     let done = match self.entries.get(&op.get()) {
@@ -517,13 +565,43 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
     &mut sb,
   )
   .expect_active();
-  for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  (r, wal, sb)
+}
+
+/// Drive a `Recovering` replica to a terminal status, pumping BOTH storage completions AND the
+/// recover-retry timer — the way a real async driver does. Retransmission + budget-exhaustion
+/// resolution of a faulty/slow tail read live on the `recover_retry` timer (`recover_timeouts`), so a
+/// fixture whose reads fault/defer must fire that timer to make progress; a `handle_storage`-only loop
+/// would never exhaust the budget (the completion arm submits no re-read). Each iteration drains the
+/// WAL/SB completions, then advances to the next armed deadline and fires it (re-submitting an additive
+/// read whose scripted completion the next drain consumes). Bounded so a genuinely-stuck recovery still
+/// returns rather than spins.
+fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
+  r: &mut Endpoint<S>,
+  wal: &mut W,
+  sb: &mut B,
+  now: Instant,
+) {
+  // Drive on a LOCAL advancing clock `t` so the recover-retry timer actually fires across the budget;
+  // the deterministic fixtures complete each (re)read synchronously, so one storage drain + one timer
+  // fire per step is enough to count a pending op's budget down to its exhaustion resolution.
+  let mut t = now;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
+    r.handle_storage(t, wal, sb);
     if !r.status().is_recovering() {
       break;
     }
+    if let Some(deadline) = r.poll_timeout() {
+      t = deadline;
+      r.handle_timeout(t, wal, sb);
+    }
   }
-  (r, wal, sb)
+  // Re-baseline every timer to the caller's `now`, so the terminal state is observably identical to a
+  // synchronous (clock-at-`now`) recovery: the retransmission this helper drove on the timer advanced
+  // the endpoint's clock, but the production code exposes no such offset (a real driver advances real
+  // time), and the recover-phase timing tests downstream phase their ticks from `now`.
+  r.arm_timers(now);
 }
 
 /// Drive a replica (replica 1 of 3) into `RecoveringHead` by permanently faulting its head op's
@@ -542,12 +620,7 @@ fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
     &mut sb,
   )
   .expect_active();
-  for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
-    if r.status() != Status::Recovering {
-      break;
-    }
-  }
+  drive_recovery(&mut r, &mut wal, &mut sb, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,

@@ -492,10 +492,15 @@ const MAX_VIEW_JUMP: u64 = 1 << 32;
 /// bounded by the WAL-tail length (bounded by the checkpoint-interval headroom).
 #[derive(Debug, Default)]
 struct RecoverState {
-  /// Ops whose body read is still outstanding → remaining retry budget. Non-empty ⇒ reads in flight.
+  /// Ops whose body read is still outstanding → remaining ABSOLUTE retransmission budget. Non-empty ⇒
+  /// reads in flight. Seeded ONCE per op at the Phase-1 submit (`RECOVER_READ_RETRIES`) and decremented
+  /// ONLY by `recover_timeouts` (never reset, never touched by a completion); at zero the op is resolved
+  /// from its durable header (`resolve_exhausted_tail_read`). A clean completion removes the op's entry.
   pending: BTreeMap<u64, u8>,
   /// Maps an in-flight read's `OpId` → the op it reads, so a `Fault`/`Absent` completion (which
-  /// carries only the `OpId`) is attributed to the right slot.
+  /// carries only the `OpId`) is attributed to the right slot. An op can have SEVERAL live ids at once:
+  /// `recover_timeouts` re-submits ADDITIVELY (a fresh id without retiring the prior ones), so a late
+  /// completion under any still-live id resolves the op; resolving an op retires ALL of its ids.
   reads: BTreeMap<u64, u64>,
   /// Ops that read back permanently faulty/absent (retry budget exhausted). Drives the
   /// `Normal`-vs-`RecoveringHead` decision in `recover_progress`.
@@ -1897,9 +1902,16 @@ impl<S> Endpoint<S> {
   /// cache empty). Does not touch the WAL.
   #[cfg(test)]
   fn seed_log_entry_for_test(&mut self, op: u64) {
+    // A realistic held-tail entry: a `Present` op with a NON-EMPTY body (a Normal replica never holds a
+    // `Present(EMPTY)` placeholder — that is a recovery-only Phase-1 seed — so seeding one would trip the
+    // held-tail "no empty Present survives a trim" invariant).
     self.log.insert(
       op,
-      LogEntry::present(ClientId::new(1), RequestNumber::with(op), Bytes::new()),
+      LogEntry::present(
+        ClientId::new(1),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      ),
     );
   }
 
