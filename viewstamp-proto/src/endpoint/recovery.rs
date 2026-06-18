@@ -1061,7 +1061,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// would stall its recovered tail `(commit_min, op]` — ops it had already committed pre-crash. We
   /// therefore REBUILD that pipeline (own-vote set, mirroring `start_view_as_new_primary`) and drive
   /// `try_commit`, so the solo primary re-commits its tail and makes progress immediately.
-  fn complete_recovery<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn complete_recovery<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     self.recover = None;
     if self.log_view.get() < self.view.get() {
       // Crashed mid-view-change (durable view advanced, new log not yet installed): re-drive VC(view).
@@ -1080,38 +1080,44 @@ impl<S: StateMachine> Endpoint<S> {
       // → resume Normal.
       self.set_status(Status::Normal);
       if self.membership.replica_count() == 1 && !self.is_learner() {
-        // Solo VOTER: rebuild the pipeline for the recovered tail so `try_commit` can re-commit ops the
-        // solo primary had already committed pre-crash (an empty `inflight` would stall them — solo
-        // commits via the own-vote quorum of 1). Mirror `start_view_as_new_primary`'s rebuild. A learner
-        // in a single-voter cluster is a follower, not the solo primary, so it takes the backup path.
-        self.inflight.clear();
-        let own = 1u64 << self.local_slot().get();
-        for op in (self.commit_min.get() + 1)..=self.op.get() {
-          // Content-address the rebuilt entry by the recovered operation IDENTITY (client, request,
-          // body) it holds, keeping the `inflight.prepare_checksum == operation driven at op` invariant
-          // uniform across every seeding site. (A solo replica has no peers, so no PrepareOk is ever
-          // matched against it; the own-vote quorum-of-1 commits via `oks` directly — but the identity is
-          // stamped consistently.)
-          let prepare_checksum = self
-            .log
-            .get(&op)
-            .map(|e| crate::storage::prepare_identity(e.client, e.request, e.body.body_checksum()))
-            .unwrap_or(0);
-          self.inflight.insert(
-            op,
-            Inflight {
-              oks: own,
-              committed: false,
-              prepare_checksum,
-            },
-          );
-        }
-        self.arm_timers(now);
-        self.try_commit(now, sb);
+        // Solo VOTER: rebuild the pipeline for the recovered tail so `try_commit` re-commits ops it holds
+        // (an empty `inflight` would stall them). A learner in a single-voter cluster is a follower, not
+        // the solo primary, so it takes the backup path.
+        self.resume_solo_voter_pipeline(now, sb);
       } else {
         self.arm_timers(now);
       }
     }
+  }
+
+  /// Rebuild a solo VOTER's commit pipeline for its recovered tail `(commit_min .. op]`, arm the
+  /// Normal-primary timers, and drive `try_commit` — so the solo primary re-commits ops it already holds
+  /// (an empty `inflight` would stall them; a solo voter commits via its own-vote quorum of 1). Mirrors
+  /// `start_view_as_new_primary`'s rebuild. The caller establishes this IS the solo voter (a single-voter
+  /// cluster, not a learner). Each rebuilt entry is content-addressed by the recovered operation IDENTITY
+  /// (client, request, body) the op holds, keeping the `inflight.prepare_checksum == op driven` invariant
+  /// uniform across seeding sites — a solo replica has no peers, so no PrepareOk is matched against it (the
+  /// own-vote quorum-of-1 commits via `oks` directly), but the identity is stamped consistently.
+  pub(crate) fn resume_solo_voter_pipeline<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+    self.inflight.clear();
+    let own = 1u64 << self.local_slot().get();
+    for op in (self.commit_min.get() + 1)..=self.op.get() {
+      let prepare_checksum = self
+        .log
+        .get(&op)
+        .map(|e| crate::storage::prepare_identity(e.client, e.request, e.body.body_checksum()))
+        .unwrap_or(0);
+      self.inflight.insert(
+        op,
+        Inflight {
+          oks: own,
+          committed: false,
+          prepare_checksum,
+        },
+      );
+    }
+    self.arm_timers(now);
+    self.try_commit(now, sb);
   }
 
   /// Recover-retry timer: the SOLE retry+budget owner for the tail reads (and the checkpoint read), so
@@ -1365,12 +1371,17 @@ impl<S: StateMachine> Endpoint<S> {
   /// == checkpoint_id`; and a clean decode. Any failure REJECTS the message (no panic, no restore) and
   /// leaves us awaiting — the recover-retry timer re-solicits and another peer answers.
   ///
-  /// On full success it hands off to the SHARED [`Self::apply_sync`] (restore SM + sessions, advance to
-  /// the synced point, durably RE-PERSIST so a re-crash recovers cleanly at the synced point, not the
-  /// corrupt one): it abandons local recovery (`recover = None`) and flips to `Normal` FIRST so the
-  /// re-persist's superblock completions route through the ordinary `on_sb_done` (which clears the
-  /// sync + counts a forced state-sync on the root write), exactly like a Normal state-sync — recovery
-  /// is thereby complete the instant the synced checkpoint is durable.
+  /// On full success it hands off to the SHARED [`Self::apply_sync`], which STAGES the durable re-persist
+  /// (write the snapshot, then in `on_sb_done` the new root naming it) but does NOTHING destructive yet —
+  /// it abandons local recovery (`recover = None`) and STAYS `Recovering`. Both the install (restore
+  /// SM + sessions, advance the frontier, prune the WAL) AND the flip to `Normal` DEFER to `on_sb_done`
+  /// (the durable root), exactly like the Normal deferred-sync path: its `CheckpointKind::SyncRepersist`
+  /// arm installs, advances `checkpoint_op`, then `complete_recovery` flips to Normal and
+  /// abdicates/rebuilds/resumes. The re-persist completion is routed by the TYPED `pc.kind` (not status),
+  /// so staging while Recovering is sound, and a `Recovering` replica is excluded from all Normal-path
+  /// participation by the central ingress — so there is NO window where a Normal node holds an advanced
+  /// commit frontier + pruned WAL over a durable root still naming the OLD checkpoint. Recovery is
+  /// complete the instant the synced checkpoint root is durable.
   pub(crate) fn on_recover_sync_checkpoint<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -1472,41 +1483,24 @@ impl<S: StateMachine> Endpoint<S> {
     // also debug-asserts no faulty slot survives). Each dropped slot is a genuine repair hole
     // `advance_commit` peer-repairs on demand.
     self.finalize_recovery();
-    // Fully verified → abandon local recovery and apply via the shared state-sync core. Flip to Normal
-    // FIRST so the re-persist completions route through the ordinary `on_sb_done` (which clears `sync` +
-    // counts a forced state-sync on the root write), then `apply_sync` STAGES the durable re-persist.
-    self.recover = None;
-    self.set_status(Status::Normal);
+    // STAGE the durable re-persist via the shared state-sync core, but STAY Recovering: both the
+    // destructive install (`install_sync`: restore the SM/sessions, advance `commit_min`/`commit_max`/`op`,
+    // prune the WAL) AND the flip-to-Normal DEFER to `on_sb_done` (the durable root), exactly like the
+    // Normal deferred-sync path. A `Recovering` replica is excluded from ALL Normal-path participation by
+    // the central ingress (it accepts only `SyncCheckpoint`/`Meta`/`Chunk`), so there is NO window where a
+    // Normal node holds an advanced commit frontier + pruned WAL over a durable root still naming the OLD
+    // checkpoint. The re-persist completion is routed by the TYPED `pc.kind` (not status), so staging while
+    // Recovering is sound; `on_sb_done`'s SyncRepersist arm installs, advances `checkpoint_op`, then
+    // `complete_recovery` flips to Normal and abdicates/rebuilds/resumes — atomically, with the durable
+    // root already caught up to the synced frontier.
     self.apply_sync(now, sb, &m);
-    // EAGER INSTALL: the Normal state-sync path DEFERS the destructive install to the
-    // durable root (so a view change cannot strand a pruned-but-stale band), but the RECOVERY peer-fetch
-    // path must NOT reach Normal with an UNRESTORED SM — its own checkpoint snapshot is permanently
-    // unreadable, so until the restore lands the SM is indeterminate, and a Normal replica must hold a
-    // valid SM (the `escalate_checkpoint_to_peer_fetch` invariant: "never completes to Normal with an
-    // unrestored SM"). So install IMMEDIATELY here — restore the SM/sessions + advance/prune at flip
-    // time — while the staged re-persist still goes durable in the background. The `on_sb_done` root
-    // completion then finds `pending_install` already taken (no second install) and runs only the sync
-    // completion bookkeeping (clear `sync`, count the forced sync, re-arm). This path is not subject to
-    // deferred-install wedge: a `Recovering` replica is not a Normal replica advertising a checkpoint, and the
-    // restore-at-flip keeps the long-standing recovery safety contract intact.
-    if let Some(install) = self.pending_install.take() {
-      self.install_sync(wal, install);
-    }
-    // STEP DOWN if we are the primary (async-superblock path), via the single
-    // `abdicate_if_primary` chokepoint. This peer-checkpoint fetch RESTORED our SM from a
-    // peer snapshot and KEPT our retained tail `(commit_min .. op]`, but — exactly like a state-sync on a
-    // Normal primary, and like a restarted primary in `complete_recovery` — it left `inflight` (the
-    // commit pipeline) CLEARED while we remain the primary of our view. A Normal primary with a torn-down
-    // pipeline wedges: `try_commit` cannot advance past `commit_min` (the missing inflight entry at
-    // `commit_min + 1` breaks the in-order loop; re-acked PrepareOks drop on the empty pipeline). So a
-    // multi-replica primary ABDICATES (the chokepoint flags the deferred forfeit + bootstraps the
-    // serviceable `svc_message` wake so the next `primary_timeouts` re-proposes `view + 1` and a
-    // caught-up replica leads; every replica already holds the committed tail durably). The SM is
-    // restored (we needed the snapshot to recover at all), so we abdicate AFTER applying — unlike
-    // `on_sync_checkpoint`, where a Normal primary's SM is already valid and we step down without
-    // applying. SOLO is a no-op (no peers ⇒ this peer-fetch path is unreachable; `complete_recovery`
-    // enforces the same abdication for a disk-recovered primary).
-    self.abdicate_if_primary(now);
+    // The recovery READ phase is done (the peer snapshot is fetched + staged); the re-persist is now
+    // storage-driven, so abandon local recovery bookkeeping and retire the recovery/solicit timers — the
+    // node waits for `on_sb_done`, not a timer (a still-armed recover-retry / sync-solicit would spin a
+    // poll_timeout-driven driver, neither serviced while Recovering with a staged sync).
+    self.recover = None;
+    self.timers.recover_retry = None;
+    self.timers.sync_solicit = None;
   }
 
   /// Higher-view rule: a newer primary already exists (we saw its Prepare/Commit/PrepareOk) and we

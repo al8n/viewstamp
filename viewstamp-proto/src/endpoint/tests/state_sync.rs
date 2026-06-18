@@ -616,8 +616,8 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
   }
   let answer = answer.expect("the equal-checkpoint peer SERVES the recovery request");
 
-  // Deliver the peer's SyncCheckpoint back to the recovering replica → it applies + re-persists +
-  // converges to Normal at the synced point.
+  // Deliver the peer's SyncCheckpoint back to the recovering replica → it STAGES the re-persist (staying
+  // Recovering); once the SyncRepersist root is durable it installs + flips to Normal at the synced point.
   e.handle_message(
     now,
     &mut wal,
@@ -625,7 +625,16 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(answer),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // drive the durable re-persist
+  // Drive the durable re-persist to completion: flush the scripted superblock each round so the two staged
+  // writes (snapshot, then the root) surface and `on_sb_done` lands the root, completing recovery. (The
+  // node stays Recovering until the root is durable — the install + flip-to-Normal defer to `on_sb_done`.)
+  for _ in 0..16 {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+    if !e.status().is_recovering() {
+      break;
+    }
+  }
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -1166,6 +1175,110 @@ fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
     e.sync_target_for_test(),
     None,
     "the sync was dropped (the primary is stepping down, not syncing)"
+  );
+}
+
+#[test]
+fn a_recovery_peer_fetch_stays_recovering_until_the_sync_root_is_durable() {
+  // REGRESSION (the dissolved recovery eager-install window). A replica whose OWN durable checkpoint
+  // snapshot is permanently unreadable escalates to a recovery peer-fetch. When the answering
+  // SyncCheckpoint arrives it STAGES the durable re-persist but STAYS `Recovering` — both the destructive
+  // install (restore SM, advance the frontier, prune the WAL) AND the flip to Normal DEFER to `on_sb_done`
+  // (the durable root). So there is NO window where a Normal node holds an advanced commit frontier + a
+  // pruned WAL over a durable root still naming the OLD checkpoint: a `Recovering` replica is excluded
+  // from all Normal-path participation by the central ingress (it accepts only SyncCheckpoint/Meta/Chunk
+  // while awaiting a peer checkpoint, and once the sync is staged it accepts nothing). The CRUX is that
+  // delivering the SyncCheckpoint does NOT eagerly flip the node to Normal or advance `checkpoint_op`.
+  let now = Instant::ZERO;
+  // The recovering replica is MemberId 0 — the PRIMARY of view 0 in genesis(3). Durable root at view 0,
+  // checkpoint op 2, with an EMPTY checkpoint read script → its own snapshot is permanently unreadable, so
+  // recovery escalates to a peer fetch.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let mut wal = TestWal {
+    entries: BTreeMap::new(),
+    head: 2,
+    done: VecDeque::new(),
+  };
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  assert_eq!(e.status(), Status::Recovering);
+  assert!(e.awaiting_peer_checkpoint_for_test());
+  while e.poll_message().is_some() {} // drain the solicited RequestSync
+  let nonce = e.sync_nonce_for_test();
+  // A donor at a HIGHER checkpoint (op 6 > our 2): delivering its SyncCheckpoint stages the re-persist to
+  // the synced point and prunes the band (2..6] — but only once the SyncRepersist root lands in
+  // `on_sb_done`.
+  let (_d, _dw, dsb) = donor_primary_at_checkpoint(6);
+  let (env, id) = donor_envelope(&dsb);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(6),
+      id,
+      0,
+      ReplicaId::new(1),
+      nonce,
+      env,
+    )),
+  );
+  // THE CRUX: AFTER delivery but BEFORE driving storage, the node has NOT eagerly flipped/installed. It
+  // STAYS Recovering and its durable checkpoint is STILL the OLD one (the SyncRepersist root has not yet
+  // landed). The old eager path flipped to Normal here and advanced the in-memory frontier over a stale
+  // durable root — exactly the window this refactor dissolves.
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "the peer-fetch STAGES the re-persist and STAYS Recovering — no eager flip to Normal"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "durable checkpoint still the OLD one — the SyncRepersist root has not landed (no eager install)"
+  );
+  // Now drive storage to completion: flush the scripted superblock each round so the two staged writes
+  // (snapshot, then the root naming it) surface and `on_sb_done` lands the root. The SyncRepersist arm then
+  // installs ATOMICALLY (restore + advance `checkpoint_op` to 6) and `complete_recovery` finishes recovery.
+  for _ in 0..16 {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb);
+    if !e.status().is_recovering() {
+      break;
+    }
+  }
+  // The install + durable-root advance landed ATOMICALLY: `checkpoint_op` is now the synced point 6 (never
+  // advanced before the root was durable), and recovery is complete (the node has LEFT Recovering).
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(6),
+    "the SyncRepersist root landed → install + `checkpoint_op` advance are atomic at the synced point 6"
+  );
+  assert!(
+    !e.status().is_recovering(),
+    "recovery completed once the synced root was durable"
+  );
+  // MemberId 0 is the PRIMARY of view 0, so `complete_recovery` ABDICATES (a restarted primary forces a
+  // clean view change rather than resuming as the established primary) → ViewChange, not Normal. The
+  // BACKUP case (which resumes Normal at the synced point) is covered end-to-end by
+  // `recovery_peer_fetch_converges_against_an_equal_checkpoint_peer`.
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "a recovered PRIMARY abdicates on completion (a backup would resume Normal instead)"
   );
 }
 

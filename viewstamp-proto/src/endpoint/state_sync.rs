@@ -1180,17 +1180,17 @@ impl<S: StateMachine> Endpoint<S> {
   /// [`Self::apply_sync`]. Restores the SM + sessions, advances `commit_min`/`commit_max`/`op` to the
   /// synced point (preserving the forced-sync held tail), and prunes the WAL. (The caller advances
   /// `self.checkpoint_op` — see the note at the tail — so the durable checkpoint pointer moves only when
-  /// the synced root is durable.) On the DEFERRED Normal path this runs in `on_sb_done` once the sync
-  /// ROOT (step 2) is durable, the destructive effects then ATOMICALLY justified by that durable root; on
-  /// the EAGER recovery peer-fetch path it runs at flip-to-Normal (the recovery contract forbids reaching
-  /// Normal with an unrestored SM) while the re-persist completes in the background. After the caller
-  /// advances `checkpoint_op`, `(checkpoint_op, the durable root id)` and `commit_min`/`op` are ALL
+  /// the synced root is durable.) BOTH paths run it in `on_sb_done` once the sync ROOT (step 2) is
+  /// durable, the destructive effects then ATOMICALLY justified by that durable root: the Normal
+  /// deferred-sync path (already Normal) and the recovery peer-fetch path (which STAGED the re-persist and
+  /// STAYED `Recovering`, then `complete_recovery` flips it to Normal right after this install). After the
+  /// caller advances `checkpoint_op`, `(checkpoint_op, the durable root id)` and `commit_min`/`op` are ALL
   /// consistent at the synced point: there is no window where `checkpoint_op` lags a pruned band, so a
-  /// synced replica can never become primary advertising a checkpoint below a pruned committed band. On
-  /// the deferred path it is idempotent against intervening state: `self.op`/`commit_min`/`commit_max`
-  /// are frozen across the STAGE→here window (`advance_commit` is suppressed while `pending_install`, and
-  /// `on_prepare` drops while `sync.is_some()`), so the captured `held_tail` and the monotonic advances
-  /// below are exactly as they would have been at STAGE time.
+  /// synced replica can never become primary advertising a checkpoint below a pruned committed band. It is
+  /// idempotent against intervening state: `self.op`/`commit_min`/`commit_max` are frozen across the
+  /// STAGE→here window (`advance_commit` is suppressed while `pending_install`, and `on_prepare` drops
+  /// while `sync.is_some()`), so the captured `held_tail` and the monotonic advances below are exactly as
+  /// they would have been at STAGE time.
   pub(crate) fn install_sync<W: Wal>(&mut self, wal: &mut W, install: PendingInstall) {
     let PendingInstall {
       checkpoint_op,
@@ -1265,12 +1265,9 @@ impl<S: StateMachine> Endpoint<S> {
     wal.prune(checkpoint_op);
     // NOTE: `self.checkpoint_op` is advanced to the synced op by the CALLER (`on_sb_done`'s sync
     // re-persist arm) — NOT here — because it must move only when the synced checkpoint ROOT is durable.
-    // For the DEFERRED Normal path `install_sync` already runs at root completion, so the caller sets it
-    // immediately after. For the EAGER recovery path `install_sync` runs at flip-to-Normal (root not yet
-    // durable), and advancing `checkpoint_op` here would let a view change in the window persist a
-    // durable-view root naming a `checkpoint_op` whose snapshot is not yet durable (a `checkpoint_op`↔
-    // `checkpoint_id` mismatch); leaving it at the OLD value keeps any such root self-consistent (it
-    // names the prior durable checkpoint) until the
-    // re-persist root lands and the caller advances it.
+    // BOTH paths run `install_sync` at root completion, so the caller advances `checkpoint_op` in the same
+    // arm, immediately after: the durable checkpoint pointer moves in lockstep with the durable root that
+    // justifies it, leaving no window where `checkpoint_op` names a checkpoint whose snapshot is not yet
+    // durable.
   }
 }

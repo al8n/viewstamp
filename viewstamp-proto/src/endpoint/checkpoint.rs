@@ -172,10 +172,23 @@ impl<S: StateMachine> Endpoint<S> {
     sb: &mut B,
     done: SuperblockDone,
   ) {
-    // Recovery checkpoint-read completions route through the recover loop (restore SM + retry).
+    // Recovery checkpoint-READ completions route through the recover loop (restore SM + retry). The ONE
+    // exception while Recovering is a checkpoint-WRITE completion that belongs to a STAGED re-persist: the
+    // recovery peer-fetch (`on_recover_sync_checkpoint`) stages the `SyncRepersist` two-write sequence and
+    // STAYS Recovering, so its `Wrote` completions must reach the `pending_checkpoint` step handling below
+    // (routed by the TYPED `pc.kind`) to install + complete recovery — NOT the recover loop, whose `Wrote`
+    // arm is a defensive no-op. Peel that staged-write case off here so it reaches the typed handler.
     if self.status.is_recovering() || self.status.is_recovering_head() {
-      self.on_recover_sb_done(now, sb, done);
-      return;
+      let staged_step = self.pending_checkpoint.map(|pc| match pc.step {
+        CheckpointStep::AwaitSnapshot(sid) => sid,
+        CheckpointStep::AwaitRoot(rid) => rid,
+      });
+      let is_staged_repersist_write =
+        matches!(done, SuperblockDone::Wrote(id) if staged_step == Some(id));
+      if !is_staged_repersist_write {
+        self.on_recover_sb_done(now, sb, done);
+        return;
+      }
     }
     // State-sync peer side: outside recovery a `CheckpointRead`/`Fault` means a read WE issued to
     // serve a peer's `RequestSync` completed — ship the durable snapshot (or drop the serving entry
@@ -276,24 +289,22 @@ impl<S: StateMachine> Endpoint<S> {
               // prune the WAL (`install_sync` does its own `wal.prune` + `wal.truncate`, so no separate
               // `run_gc` is needed) — all now justified by the durable root just written. After the
               // `checkpoint_op` advance below there is NO window where the band is pruned / the commit
-              // advanced while `checkpoint_op` is stale. The Normal state-sync path DEFERRED its install
-              // to here (`pending_install` is `Some`); the RECOVERY peer-fetch path
-              // (`on_recover_sync_checkpoint`) installed EAGERLY at flip-to-Normal (it must not reach
-              // Normal with an unrestored SM), so its `pending_install` is already taken and this is a
-              // no-op install — only the `checkpoint_op` advance + completion bookkeeping below run.
+              // advanced while `checkpoint_op` is stale. BOTH paths defer the install to here: the Normal
+              // state-sync path (already Normal) and the RECOVERY peer-fetch path
+              // (`on_recover_sync_checkpoint`, which STAGED the re-persist and STAYED Recovering), so
+              // `pending_install` is `Some` and the destructive install runs now, atomically with the
+              // durable root. The recovery path then flips to Normal via `complete_recovery` below.
               if let Some(install) = self.pending_install.take() {
                 self.install_sync(wal, install);
               }
               // Advance the durable checkpoint pointer to the now-durable synced checkpoint — set HERE
-              // (the root is durable) for BOTH paths, NOT inside `install_sync`: the EAGER recovery
-              // install runs before this root lands, and advancing `checkpoint_op` there would risk a
-              // durable-view root (from a view change in the window) naming a checkpoint whose snapshot
-              // is not yet durable. `pc.target_op` is the synced op (== the staged install's
-              // `checkpoint_op`). After this, `checkpoint_op`, the durable root id, and `commit_min`/`op`
-              // all agree at the synced point.
+              // (the root is durable), NOT inside `install_sync`, so the durable checkpoint pointer moves
+              // in lockstep with the durable root that justifies it. `pc.target_op` is the synced op (==
+              // the staged install's `checkpoint_op`). After this, `checkpoint_op`, the durable root id,
+              // and `commit_min`/`op` all agree at the synced point.
               self.advance_checkpoint_op(pc.target_op);
               // Observability: the synced checkpoint is installed AND durable — the sync is complete
-              // (covers both the deferred Normal install and the eager recovery install, which both
+              // (covers both the deferred Normal install and the deferred recovery install, which both
               // finish at exactly this root). Scalar copy only.
               self
                 .events
@@ -314,7 +325,15 @@ impl<S: StateMachine> Endpoint<S> {
               if forced {
                 self.forced_syncs_applied += 1;
               }
-              self.arm_timers(now);
+              // The recovery peer-fetch path STAGED this re-persist and stayed Recovering (deferring its
+              // install + flip to here); the synced state is now durable, so complete recovery — flip to
+              // Normal and abdicate/rebuild/resume — atomically with the `checkpoint_op` advance above. The
+              // Normal deferred-sync path is already Normal, so it just resumes as a backup.
+              if self.status.is_recovering() {
+                self.complete_recovery(now, sb);
+              } else {
+                self.arm_timers(now);
+              }
             }
             CheckpointKind::Ordinary => {
               // ORDINARY checkpoint: advance the in-memory checkpoint_op, then GC the WAL + per-op caches

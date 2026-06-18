@@ -130,9 +130,9 @@ enum CheckpointKind {
   /// An ordinary [`Endpoint::maybe_checkpoint`]: the root completion advances `checkpoint_op` + GCs,
   /// leaving any concurrently-SOLICITED sync intact (this root is not its re-persist).
   Ordinary,
-  /// A STATE-SYNC re-persist staged by [`Endpoint::apply_sync`]:
-  /// the root completion INSTALLS the synced state (or, on the recovery eager-install path, finds it
-  /// already installed) + runs the sync completion bookkeeping.
+  /// A STATE-SYNC re-persist staged by [`Endpoint::apply_sync`]: the root completion INSTALLS the synced
+  /// state + runs the sync completion bookkeeping (and, on the recovery peer-fetch path, then
+  /// `complete_recovery` flips Recovering → Normal).
   SyncRepersist,
 }
 
@@ -1340,10 +1340,12 @@ impl<S> Endpoint<S> {
   fn assert_invariants(&self) {
     // (1) A deferred state-sync install belongs to an OUTSTANDING sync: `apply_sync` stages
     // `pending_install` and `sync` together, and every clear path drops `pending_install` no later than
-    // `sync` (the deferred root completion `take()`s the install before clearing `sync`; the eager
-    // recovery path `take()`s it at flip-to-Normal while `sync` rides on; the view-change resets drop
-    // both). It also implies an in-flight checkpoint re-persist (`pending_checkpoint`) — the same
-    // `apply_sync` submits the two-write checkpoint sequence that carries the install to durability.
+    // `sync` (both the Normal deferred-sync path and the recovery peer-fetch path `take()` the install in
+    // `on_sb_done`'s SyncRepersist arm — before clearing `sync` — when the durable root lands; the
+    // view-change resets drop both). It also implies an in-flight checkpoint re-persist
+    // (`pending_checkpoint`) — the same `apply_sync` submits the two-write checkpoint sequence that
+    // carries the install to durability. (The recovery path STAGES while still `Recovering`, so a set
+    // `pending_install`/`sync`/`pending_checkpoint` is not coupled to Normal status.)
     debug_assert!(
       self.pending_install.is_none() || self.sync.is_some(),
       "pending_install without an outstanding sync"
@@ -1652,17 +1654,19 @@ impl<S> Endpoint<S> {
     self.config.max_client_sessions() as usize + MAX_PIPELINE as usize
   }
 
-  /// True iff this replica may participate AS the primary right now: `Normal`, the primary of its
-  /// view, AND its current view is already DURABLE (no pending superblock view write). The last
-  /// clause is durable-view-before-participate: [`Self::start_view_as_new_primary`]
+  /// True iff this replica may participate AS the primary right now: `Normal`, the primary of its view,
+  /// AND its current view is already DURABLE (no pending superblock view write).
+  ///
+  /// The `pending_sb` clause is durable-view-before-participate: [`Self::start_view_as_new_primary`]
   /// sets `Normal` but DEFERS the StartView broadcast (and the rest of participation) to
   /// [`Self::start_view_participate`] on `on_sb_done`, so until that durable-view write lands the new
   /// view is not yet recoverable — a crash would regress out of it. Acting AS the primary in that
   /// window (answering a delayed/duplicate `GetView` with a `StartView`, a peer's `Recovery` with our
   /// canonical head, or heartbeating/retransmitting on the commit/prepare timers) would assert this
-  /// replica's authority in a view it might never have durably entered → cross-view
-  /// double-participation. Every such outbound PRIMARY path gates on this; the deferred
-  /// `start_view_participate` already runs AFTER the view is durable, so it does not.
+  /// replica's authority in a view it might never have durably entered → cross-view double-participation.
+  ///
+  /// Every such outbound PRIMARY path gates on this; the deferred `start_view_participate` already runs
+  /// AFTER the view is durable, so it does not.
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn participates_as_primary(&self) -> bool {
     self.status.is_normal() && self.is_primary() && self.pending_sb.is_none()

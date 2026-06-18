@@ -3605,14 +3605,15 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
 
 #[test]
 fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
-  // The `abdicate_if_primary` chokepoint, site 3 — `on_recover_sync_checkpoint`. The
-  // peer-checkpoint fetch RESTORES the SM from a peer snapshot but leaves `inflight` (the commit
-  // pipeline) CLEARED while this replica remains the PRIMARY of its view — a wedge if it resumed as
-  // primary (`try_commit` can never advance past commit_min). So a multi-replica primary that completes
-  // recovery via the peer fetch ABDICATES through the SAME deferred-forfeit chokepoint as the two
-  // state-sync sites: it flags `pending_forfeit` (the next `primary_timeouts` re-proposes view + 1)
-  // rather than resume Normal as the established primary. This is the path the existing peer-fetch test
-  // (a BACKUP) does NOT exercise; here the recovering replica IS the primary of view 0.
+  // A recovered PRIMARY steps down on the peer-checkpoint-fetch path. The fetch RESTORES the SM from a
+  // peer snapshot but leaves `inflight` (the commit pipeline) CLEARED while this replica is the PRIMARY of
+  // its view — a wedge if it resumed as primary (`try_commit` can never advance past commit_min). The
+  // re-persist STAGES while still Recovering and, once the SyncRepersist root is durable, `on_sb_done`
+  // installs and `complete_recovery` runs: a recovered primary takes its recovered-primary path and
+  // ABDICATES into a clean view change (view + 1) — the SAME step-down a DISK-recovered primary takes —
+  // rather than resume Normal as the established primary with a torn-down pipeline. This is the path the
+  // existing peer-fetch test (a BACKUP) does NOT exercise; here the recovering replica IS the primary of
+  // view 0.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let now = Instant::ZERO;
   // Durable root at VIEW 0 (so replica 0 is the primary) with a checkpoint at op 2. The scripted
@@ -3653,8 +3654,10 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   );
   while e.poll_message().is_some() {}
 
-  // A peer answers with a VALID SyncCheckpoint (op 2, matching nonce). The recovering PRIMARY restores
-  // the SM via apply_sync, flips Normal — and then the `abdicate_if_primary` chokepoint STEPS IT DOWN.
+  // A peer answers with a VALID SyncCheckpoint (op 2, matching nonce). The recovering PRIMARY stages the
+  // re-persist (staying Recovering); once the SyncRepersist root is durable it installs and
+  // `complete_recovery` STEPS IT DOWN — a recovered primary forces a clean view change rather than resume
+  // as the established primary with a torn-down pipeline.
   let good_snap = CountSm::default().snapshot();
   let good_env =
     Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(2), &BTreeMap::new(), &good_snap);
@@ -3675,21 +3678,33 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
       good_env,
     )),
   );
-  // Drive the staged re-persist to completion.
-  for _ in 0..3 {
+  // Drive the staged re-persist to completion (flush the scripted superblock each round so the two staged
+  // writes surface and `on_sb_done` lands the root, installing + completing recovery).
+  for _ in 0..6 {
     sb.flush();
     e.handle_storage(now, &mut wal, &mut sb);
+    if !e.status().is_recovering() {
+      break;
+    }
   }
-  // The SM was restored (recovery completed at the peer's checkpoint) AND the primary stepped down.
+  // The SM was restored (recovery completed at the peer's checkpoint) AND the primary stepped down — it
+  // ABDICATED into a clean view change (`complete_recovery`'s recovered-primary path), advancing OFF its
+  // own view rather than resuming Normal as the established primary with a torn-down pipeline.
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(2),
     "recovery completed at the peer's checkpoint op"
   );
-  assert!(
-    e.pending_forfeit_for_test(),
-    "the recovered primary abdicated via the abdicate_if_primary chokepoint — it did not \
-     resume Normal as the established primary with a torn-down pipeline"
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "the recovered primary abdicated into a view change — it did not resume Normal as the established \
+     primary with a torn-down pipeline"
+  );
+  assert_eq!(
+    e.view(),
+    View::with(1),
+    "the abdication advanced OFF the recovered primary's own view (view + 1)"
   );
 }
 
@@ -4413,11 +4428,22 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(sync),
   );
-  for _ in 0..3 {
+  // Stage the re-persist (the node stays Recovering), then drive the scripted superblock to land the
+  // SyncRepersist root, which installs + completes recovery.
+  for _ in 0..6 {
     sb.flush();
     e.handle_storage(now, &mut wal, &mut sb);
+    if !e.status().is_recovering() {
+      break;
+    }
   }
-  assert_eq!(e.status(), Status::Normal, "recovery completes (no wedge)");
+  // Recovery COMPLETES (no wedge) — it leaves Recovering. (Member 1 is the primary of the recovered view 1
+  // here, so `complete_recovery` abdicates into a view change; a non-primary backup would resume Normal.
+  // The terminal status is incidental to this test — the subject is the dropped superseded slot below.)
+  assert!(
+    !e.status().is_recovering(),
+    "recovery completes (no wedge) — it leaves Recovering"
+  );
   // THE FIX: the superseded above-commit slot is DROPPED to a peer-repaired hole — NOT kept as a stale
   // Body::Repairing entry whose identity a later `fill_repair` would require the REAL committed body to
   // match (rejecting it, wedging commit_min) and whose header a view change would advertise as canonical.
