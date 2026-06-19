@@ -46,7 +46,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable && rustup component add rustfmt
@@ -65,7 +65,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
@@ -100,7 +100,7 @@ jobs:
           - wasm32-wasip2
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
@@ -129,7 +129,7 @@ jobs:
     name: msrv (1.95)
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Rust 1.95
       run: rustup toolchain install 1.95 --profile minimal && rustup default 1.95
     - name: Check the workspace on the MSRV
@@ -146,7 +146,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Rust
       run: rustup update stable --no-self-update && rustup default stable
     - name: cargo doc viewstamp-proto
@@ -166,7 +166,7 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Rust
       run: rustup update stable --no-self-update && rustup default stable
     - name: Install cargo-deny
@@ -184,7 +184,7 @@ jobs:
     name: no-std (bare-metal + alloc)
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Rust
       run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
     - name: Add bare-metal no_std target
@@ -204,7 +204,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Cache cargo build and registry
       uses: actions/cache@v5
       with:
@@ -240,7 +240,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Cache cargo build and registry
       uses: actions/cache@v5
       with:
@@ -276,7 +276,7 @@ jobs:
       - cross
       - test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install nightly
         uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-tarpaulin
