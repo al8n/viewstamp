@@ -1208,7 +1208,7 @@ impl Cluster {
   }
 
   /// Replica `i`'s DURABLE-root committed frontier (`sb.state().commit()`) — exactly the
-  /// `durable_commit_min` a learner advertises in its [`LearnerStatus`], so the catch-up-then-promote
+  /// `durable_commit_min` a learner advertises in its [`viewstamp_proto::LearnerStatus`], so the catch-up-then-promote
   /// gate on the primary is satisfied once a learner's value here covers the primary's head AND a
   /// report has propagated. Read off the superblock the proto recovers from.
   pub fn replica_durable_commit(&self, i: usize) -> u64 {
