@@ -750,21 +750,29 @@ fn a_stranded_laggard_triggers_the_cross_epoch_peer_fetch_on_an_epoch_ahead_hint
 }
 
 #[test]
-fn a_higher_epoch_commit_from_a_slot_beyond_node_count_now_triggers_catch_up() {
-  // Change #3 — the from-check relaxation. The successor primary's slot can lie BEYOND a laggard's
-  // older/smaller config; the old `< node_count` bound dropped its higher-epoch heartbeat before it
-  // could trigger catch-up. Now the trigger authenticates ONLY by `from` being an active REPLICA member
-  // (any replica peer), so a higher-epoch Commit from slot 5 (>= our node_count 3) DOES trigger.
+fn a_higher_epoch_hint_from_a_non_member_slot_does_not_trigger_catch_up() {
+  // The pre-binding cross-epoch trigger authenticates the SENDER as a CURRENT MEMBER of our config
+  // (`member_at`), mirroring `maybe_answer_lower_epoch`. A higher-epoch Commit from a slot BEYOND our
+  // config (slot 5 >= node_count 3 — a NON-member: a misrouted or forged hint) must NOT arm a crossing.
+  // Otherwise, on an IDLE checkpoint-0 primary it would arm a forced crossing sync no donor can answer
+  // (every checkpoint_op is 0) with no same-epoch authority ingress to clear the stale intent — wedging
+  // writes (`sync.is_some()`) at the old epoch forever. The reliable catch-up signal is the `EpochAhead`
+  // from a RETAINED voter (a member of our config — a single-voter change always retains at least one),
+  // pinned by the sibling tests above; a non-member hint is dropped here BEFORE it can poison.
   let mut e = backup(); // Normal at epoch 0, node_count 3
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
-  assert_eq!(e.membership.node_count(), 3, "slot 5 is beyond our config");
+  assert_eq!(
+    e.membership.node_count(),
+    3,
+    "slot 5 is beyond our config (a non-member)"
+  );
 
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
-    Peer::Replica(ReplicaId::new(5)), // a successor-primary slot beyond our smaller config
+    Peer::Replica(ReplicaId::new(5)), // a NON-member slot beyond our config — misrouted/forged
     Message::Commit(Commit::new(
       View::with(2),
       OpNumber::with(9),
@@ -776,11 +784,10 @@ fn a_higher_epoch_commit_from_a_slot_beyond_node_count_now_triggers_catch_up() {
 
   assert!(
     e.status().is_normal() && !e.awaiting_peer_checkpoint_for_test(),
-    "a higher-epoch Commit from a slot beyond node_count now arms the cross-epoch sync (the NORMAL \
-     laggard stays Normal, not Recovering)"
+    "the NORMAL primary stays Normal — a non-member hint does not drive it Recovering"
   );
   assert!(
-    e.sync_is_forced_for_test() && e.sync_requires_cross_epoch_for_test(),
-    "the crossing-required forced sync is armed"
+    e.sync_target_for_test().is_none() && e.cross_epoch_intent_for_test().is_none(),
+    "a higher-epoch hint from a NON-member slot arms NO crossing sync and pins NO intent — no idle-primary poison"
   );
 }

@@ -1656,6 +1656,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // above its own frontier while never offering it below it. `checkpoint_op` is the staged install op
       // (`self.checkpoint_op` is advanced to it by the caller immediately after, in the same arm).
       self.config_install_op = checkpoint_op;
+      // CONSUME any LOCAL staged swap this crossing SUPERSEDED. A laggard can commit a `Reconfigure` op
+      // and stage `pending_swap` (the successor membership), enter ViewChange before its SwapEpoch root
+      // installs, then get crossed cross-epoch by a higher-epoch heartbeat: `enter_cross_epoch_peer_fetch`
+      // PRESERVES `pending_swap` (`reset_for_view_transition` keeps the committed change), and THIS install
+      // then advances `self.membership` to the synced successor. The staged swap is now STALE — its
+      // successor chained from the OLD (pre-crossing) config that no longer exists here. Left intact, the
+      // caller's `maybe_swap_epoch` (or a commit tail) would re-submit a DUPLICATE SwapEpoch root stamped
+      // with the just-installed config as its OWN predecessor — pushing it into the lineage ring a second
+      // time, emitting a bogus `MembershipChanged`, and evicting legitimate older ancestors. So clear it
+      // here, at the crossing, alongside any in-flight `SwapEpoch` action (belt-and-suspenders: the sync
+      // re-persist is the in-flight write on this path, but a stale `SwapEpoch` action must not outlive the
+      // swap it staged). `maybe_swap_epoch`'s chain-validation is the structural backstop for any other
+      // supersession path; this is the direct cleanup at the cross-epoch crossing. With no staged swap
+      // (the laggard never proposed one) this is a no-op, keeping that path byte-identical.
+      self.pending_swap = None;
+      if matches!(self.pending_sb, Some((_, PendingSbAction::SwapEpoch(_, _)))) {
+        self.pending_sb = None;
+      }
     }
     // NOTE: `self.checkpoint_op` is advanced to the synced op by the CALLER (`on_sb_done`'s sync
     // re-persist arm) — NOT here — because it must move only when the synced checkpoint ROOT is durable.

@@ -1127,13 +1127,21 @@ const RECONFIG_LIVE_SEEDS: u64 = 16;
 /// deterministic baselines, byte-identical to `VOPR_RECONFIG_LIVE=1` runs of the same seeds.
 #[test]
 fn vopr_reconfig_live_sweep_no_violations() {
+  // `VOPR_SEEDS` widens the contiguous count at runtime (the verify gate sets `VOPR_SEEDS=128`), else
+  // the committed default `RECONFIG_LIVE_SEEDS`. The expanded axis seed-CHOOSES the delta (AddLearner /
+  // a low-index RemoveVoter / a slot-shifting PromoteLearner), so a wider range exercises more of the
+  // slot-shift class — each seed still runs the full adversarial schedule + the per-tick safety suite.
+  let seeds = std::env::var("VOPR_SEEDS")
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok())
+    .unwrap_or(RECONFIG_LIVE_SEEDS);
   println!(
-    "VOPR live-reconfig sweep: 0..{RECONFIG_LIVE_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, \
-     live-reconfig axis forced on"
+    "VOPR live-reconfig sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, live-reconfig axis \
+     forced on (delta seed-chosen: AddLearner / low-index RemoveVoter / slot-shifting PromoteLearner)"
   );
   let mut total_proposed = 0u64;
   let mut total_swaps = 0u64;
-  for seed in 0..RECONFIG_LIVE_SEEDS {
+  for seed in 0..seeds {
     // Fail FAST on any safety violation: the per-tick swap-correctness suite panics with its
     // `seed S tick T: <class>: ...` message, surfacing the offending seed directly.
     let r = run_vopr_with_reconfig_live(seed, DEFAULT_TICKS);
@@ -1141,7 +1149,7 @@ fn vopr_reconfig_live_sweep_no_violations() {
     total_swaps += r.live_swaps_observed();
   }
   println!(
-    "=== VOPR live-reconfig sweep 0..{RECONFIG_LIVE_SEEDS}: clean \
+    "=== VOPR live-reconfig sweep 0..{seeds}: clean \
      (live_reconfigs_proposed={total_proposed}, live_swaps_observed={total_swaps}) ==="
   );
   // Non-vacuity: a clean sweep that never actually installed a swap would pass the safety suite

@@ -48,6 +48,13 @@ where
   /// - [`ProposeMembershipError::TargetNotCaughtUp`] for a `PromoteLearner` whose target has not
   ///   durably caught up to the current head (`peer_progress[target] < self.op`, or no report yet) —
   ///   catch-up-then-promote, so the promoted learner provably holds the full E-committed prefix.
+  /// - [`ProposeMembershipError::AddVoterBreaksQuorumIntersection`] for an `AddVoter` whose successor
+  ///   has a one-member view-change quorum (the predecessor is a SINGLE voter): the brand-new voter
+  ///   holds no committed prefix yet could form the E+1 view-change quorum alone and drop the old
+  ///   committed prefix — an XI-b violation. The SAFE way to add a voter to a tiny cluster is
+  ///   `AddLearner` then `PromoteLearner` once the learner durably holds the head (the prefix-held
+  ///   path). For a predecessor of 2+ voters `AddVoter` is admitted (the successor view-change quorum
+  ///   always includes a predecessor write-quorum member).
   ///
   /// [`ProposeMembershipError::TwoVoterJump`] is defined for the capability ladder but is NOT returned
   /// here: a [`SingleVoterDelta`] cannot express a multi-voter jump (every variant moves the voter count
@@ -125,6 +132,28 @@ where
         .is_none_or(|durable| durable.get() < self.op.get())
     {
       return Err(ProposeMembershipError::TargetNotCaughtUp);
+    }
+
+    // XI-b ADMISSION for `AddVoter` (the sibling hazard to the catch-up-then-promote gate above): an
+    // `AddVoter` admits a brand-new member DIRECTLY as a voter with NO durable prefix — unlike
+    // `PromoteLearner`, whose target durably caught up before promotion. A new voter is NOT a
+    // prefix-holder, so a successor VIEW-CHANGE quorum that can be formed WITHOUT any predecessor
+    // WRITE-quorum member breaks the old-write-quorum / new-view-change-quorum intersection (committed-op
+    // loss). The successor's only guaranteed non-prefix-holder is the new voter itself; the structural
+    // overlap lemma `quorum(n) + quorum_view_change(n+1) > n` (XI-b, the spec proof) guarantees that ANY
+    // successor view-change quorum which includes even one predecessor voter intersects every E-committed
+    // write quorum within the retained voters. So the ONLY unsafe case is the one where a successor
+    // view-change quorum can EXCLUDE every predecessor voter — i.e. the new voter ALONE satisfies it:
+    // `quorum_view_change(successor) == 1`. With `quorum()` = `floor(n/2)+1` and `quorum_view_change(n)`
+    // = `n − quorum(n) + 1`, that holds for a grow EXACTLY when the predecessor has ONE voter (successor
+    // 2 → `quorum_view_change(2) == 1`); for every predecessor of 2+ voters `quorum_view_change >= 2`
+    // forces at least one predecessor voter into the quorum, so the lemma preserves the prefix and the
+    // change is admitted. (The single-voter cluster's SAFE way to add a voter is `AddLearner` then
+    // `PromoteLearner` once the learner durably holds the head — the catch-up-held-prefix path above.)
+    if let SingleVoterDelta::AddVoter(_) = &delta
+      && successor.quorum_view_change() == 1
+    {
+      return Err(ProposeMembershipError::AddVoterBreaksQuorumIntersection);
     }
 
     // Pin the PREDECESSOR `config_id` (this proposer's current configuration) into the op: every

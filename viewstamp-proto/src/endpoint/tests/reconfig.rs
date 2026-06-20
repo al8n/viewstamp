@@ -1265,3 +1265,285 @@ fn a_reconfigure_log_entry_carries_the_successor_membership_in_memory() {
     crate::message::Body::Reconfigure(payload).body_checksum(),
   );
 }
+
+// ── peer_checkpoint is keyed by stable MemberId, so a slot-shifting removal cannot poison the floors ──
+//
+// `peer_checkpoint` (the per-peer durable-checkpoint reports feeding the GC prune floor
+// `quorum_checkpoint_op` and the force-sync floor `max_peer_checkpoint_op`) is keyed by stable
+// `MemberId`. A low-index `RemoveVoter` shifts the routing slots of every higher voter; keying by the
+// stable id is what keeps a REMOVED member's stale report out of both floors and a RETAINED voter's
+// report attributed to THAT voter after its slot shifts — never misread as whoever now occupies its old
+// slot. (If `peer_checkpoint` were slot-keyed, `install_membership` would leave the old entries in place
+// and both floors would misattribute them — committed-op loss via premature GC, or a permanent sync
+// wedge to a checkpoint no current donor can serve.)
+
+/// A 5-voter primary (local `MemberId 0` at slot 0) over `NoopSm`, with its own durable checkpoint set
+/// to `own_checkpoint` and the other four voter slots seeded with reports via the production recorder.
+/// `reports[i]` is recorded against slot `i+1` (slots `1..=4`), keyed by the stable id at that slot.
+fn primary5_with_seeded_reports(own_checkpoint: u64, reports: [u64; 4]) -> Endpoint<NoopSm> {
+  let cfg = Config::try_new(0, MemberId::new(0)).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(5), 0, NoopSm);
+  assert!(e.is_primary(), "MemberId 0 at slot 0 is the view-0 primary");
+  e.set_own_checkpoint_for_test(own_checkpoint);
+  for (i, &op) in reports.iter().enumerate() {
+    e.inject_peer_checkpoint_for_test((i + 1) as u8, op);
+  }
+  e
+}
+
+#[test]
+fn a_removed_members_report_does_not_lift_the_force_sync_floor_after_a_slot_shift() {
+  // Seed a HIGH report (999) from the soon-removed low-index voter `MemberId 1` (slot 1) and modest
+  // reports (50) from the retained voters {2,3,4}. Own checkpoint 5.
+  let mut e = primary5_with_seeded_reports(5, [999, 50, 50, 50]);
+  // Pre-swap sanity: the high removed-member report DOES dominate the force-sync floor while it is a
+  // current member — this is the value that MUST disappear once it is removed.
+  assert_eq!(
+    e.max_peer_checkpoint_op(),
+    OpNumber::with(999),
+    "while MemberId 1 is a current voter its report sets the force-sync floor"
+  );
+
+  // Commit-shaped low-index removal: drop `MemberId 1`. Slots close up — {0,2,3,4} now occupy {0,1,2,3}
+  // — so every retained higher voter shifts down one slot. Local `MemberId 0` stays slot 0 (the primary).
+  let successor = e
+    .membership
+    .apply_delta(&crate::SingleVoterDelta::RemoveVoter(MemberId::new(1)))
+    .expect("RemoveVoter(1) on the 5-voter genesis is valid");
+  e.install_membership(Some(OpNumber::with(7)), successor);
+  assert_eq!(e.membership.replica_count(), 4, "shrank to 4 voters");
+  assert_eq!(
+    e.membership.slot_of(MemberId::new(2)),
+    Some(ReplicaId::new(1)),
+    "the retained voter MemberId 2 shifted from slot 2 to slot 1",
+  );
+  assert_eq!(
+    e.membership.slot_of(MemberId::new(1)),
+    None,
+    "MemberId 1 is no longer a member",
+  );
+
+  // The removed member's stale 999 is keyed under `MemberId 1`, which is no longer a current member, so
+  // `max_peer_checkpoint_op` (current-members-only) EXCLUDES it. The floor falls to the max retained
+  // report (50) — no current donor could serve 999, and clearing a repair hole to it would wedge sync.
+  // MUTATION-CHECK: a slot-keyed `peer_checkpoint` iterating `.values()` would still include the stale
+  // 999 (it lives under `ReplicaId 1`) and this assert would FAIL (the floor would read 999).
+  assert_eq!(
+    e.max_peer_checkpoint_op(),
+    OpNumber::with(50),
+    "a removed member's stale report must not lift the force-sync floor after a slot shift",
+  );
+  // The retained voter's report FOLLOWED its stable id across the slot shift (slot 2 → slot 1).
+  assert_eq!(
+    e.peer_checkpoint_by_member_for_test(MemberId::new(2)),
+    50,
+    "the retained voter MemberId 2's report is still attributed to it after its slot shifted",
+  );
+  assert_eq!(
+    e.peer_checkpoint_by_member_for_test(MemberId::new(1)),
+    999,
+    "the removed member's stale entry lingers under its own id (inert — excluded by the floor consumers)",
+  );
+}
+
+#[test]
+fn a_slot_shift_does_not_misattribute_a_retained_voters_quorum_report() {
+  // Own checkpoint 5; the soon-removed low-index voter `MemberId 1` (slot 1) reports a LOW 5, and the
+  // retained voters {2,3,4} report a HIGH 50. Under correct stable-id keying the post-removal quorum
+  // floor (4 voters, quorum 3) is the 3rd-highest of {own 5, m2 50, m3 50, m4 50} = 50.
+  let mut e = primary5_with_seeded_reports(5, [5, 50, 50, 50]);
+
+  let successor = e
+    .membership
+    .apply_delta(&crate::SingleVoterDelta::RemoveVoter(MemberId::new(1)))
+    .expect("RemoveVoter(1) on the 5-voter genesis is valid");
+  e.install_membership(Some(OpNumber::with(7)), successor);
+
+  // The retained voters' reports follow their stable ids across the one-slot shift, so the quorum-th
+  // order statistic over the CURRENT voter set is 50.
+  // MUTATION-CHECK: with a slot-keyed `peer_checkpoint` (no re-key on install), the post-swap loop reads
+  // physical slots 0..3 untranslated — slot 1 now yields the REMOVED member's stale low 5 (misattributed
+  // to the voter that shifted into slot 1), displacing a retained 50 — and the quorum floor collapses to
+  // 5, failing this assert. That premature-low floor is the GC-loss hazard the re-key closes.
+  assert_eq!(
+    e.quorum_checkpoint_op(),
+    OpNumber::with(50),
+    "a retained voter's report must not be misattributed after its slot shifted",
+  );
+  assert_eq!(
+    e.peer_checkpoint_by_member_for_test(MemberId::new(2)),
+    50,
+    "retained voter MemberId 2 still attributed to its own report after shifting slot 2 → slot 1",
+  );
+}
+
+// CONSENSUS-CRITICAL (committed-op loss): the per-op commit-vote bitset `Inflight::oks` is slot-keyed
+// and SURVIVES the in-place commit-first SwapEpoch swap (the still-Normal primary's pipeline is not
+// cleared on the retained-node path). `try_commit` counts `oks.count_ones() >= membership.quorum()`
+// against the NEW (post-swap, possibly SMALLER) voter set — so a REMOVED voter's stale pre-swap ack
+// must NOT count toward the successor commit quorum, or a tail op minted after the Reconfigure op could
+// commit + reply WITHOUT any retained backup holding it, then be lost in the E+1 view change. The swap
+// re-keys `oks` by stable `MemberId` (drop the removed voter's bit), so the tail op must RE-GATHER a
+// current-config quorum.
+#[test]
+fn a_removed_voters_pre_swap_ack_does_not_commit_a_tail_op_after_the_swap() {
+  // 4-voter cluster {0,1,2,3}; local `MemberId 0` at slot 0 is the view-0 primary. We remove the
+  // HIGHEST voter `MemberId 3` (slot 3) so the retained voters {0,1,2} keep their slots — isolating the
+  // "removed voter's stale bit" effect from any slot shift.
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  let mut e = Endpoint::new(cfg, genesis(4), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  assert!(e.is_primary(), "MemberId 0 at slot 0 is the view-0 primary");
+  assert_eq!(e.membership.quorum(), 3, "4 voters → old commit quorum 3");
+
+  // Commit op 1 (a stand-in for the committed reconfigure-prefix) on the OLD quorum of 3 — own vote
+  // (slot 0) + a retained backup (slot 1) + the soon-removed voter (slot 3). This advances commit_min
+  // to 1, so op 2 below is the post-reconfiguration TAIL op (minted strictly after the prefix).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from(std::vec![1u8]),
+    )),
+  );
+  assert_eq!(e.op(), OpNumber::with(1), "op 1 (prefix) is minted");
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb); // the durable own append records the primary's own vote
+  }
+  let id_op1 = crate::storage::prepare_identity(
+    ClientId::new(9),
+    RequestNumber::with(1),
+    crate::storage::fnv1a_128(&[1u8]),
+  );
+  for backup in [1u16, 3] {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(backup)),
+      Message::PrepareOk(PrepareOk::new(
+        View::new(),
+        OpNumber::with(1),
+        ReplicaId::new(backup),
+        OpNumber::new(),
+        id_op1,
+        Epoch::new(0),
+        0,
+      )),
+    );
+  }
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "op 1 commits on the OLD quorum of 3 (own + slot 1 + slot 3)"
+  );
+
+  // Mint the TAIL op 2 (client 9, request 2). Pump storage so the primary's own vote (slot 0) lands.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(2),
+      Bytes::from(std::vec![2u8]),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "op 2 (the post-reconfig tail) is minted"
+  );
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  let id_op2 = crate::storage::prepare_identity(
+    ClientId::new(9),
+    RequestNumber::with(2),
+    crate::storage::fnv1a_128(&[2u8]),
+  );
+  // The tail op gets ONE more ack — from the voter being REMOVED (slot 3). own(slot 0) + slot 3 = 2
+  // bits, still BELOW the old quorum of 3, so it does NOT commit yet.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(2),
+      ReplicaId::new(3),
+      OpNumber::new(),
+      id_op2,
+      Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some((1u64 << 0) | (1u64 << 3)),
+    "pre-swap, the tail op carries own(slot 0) + the removed voter(slot 3)"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the tail op is below the OLD quorum of 3 (2 bits) — not committed pre-swap"
+  );
+
+  // Commit the reconfigure: REMOVE `MemberId 3`. New voter set {0,1,2}, quorum 2. The swap re-keys the
+  // surviving `inflight.oks` by stable MemberId — the removed voter's slot-3 bit is DROPPED, leaving only
+  // the primary's own vote.
+  let successor = e
+    .membership
+    .apply_delta(&crate::SingleVoterDelta::RemoveVoter(MemberId::new(3)))
+    .expect("RemoveVoter(3) on the 4-voter genesis is valid");
+  let (new_epoch, new_config_id) = (successor.epoch(), successor.config_id());
+  e.install_membership(Some(OpNumber::with(1)), successor);
+  assert_eq!(e.membership.quorum(), 2, "3 voters → new commit quorum 2");
+
+  // THE FIX: the removed voter's stale bit was dropped at the swap, so the tail op now carries only the
+  // primary's own vote (1 bit) — BELOW the new quorum of 2. It does NOT commit on the post-swap quorum.
+  // MUTATION-CHECK: delete the `rekey_slot_quorums_for_swap` call in `install_membership` and the stale
+  // slot-3 bit survives; `count_ones() == 2 >= quorum(2)` commits the tail op here (with NO retained
+  // backup holding it — committed-op loss across the E+1 view change), and this assert FAILS.
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some(1u64 << 0),
+    "the swap dropped the removed voter's slot-3 bit — only the primary's own vote remains"
+  );
+  e.try_commit(now, &mut sb);
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the removed voter's stale ack does NOT count toward the new quorum — the tail op stays uncommitted"
+  );
+
+  // A RETAINED current-config backup (`MemberId 1`, still slot 1) acks the tail op at the NEW epoch:
+  // own(slot 0) + slot 1 = 2 bits == the new quorum of 2 → the tail op commits on a CURRENT-config quorum.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(2),
+      ReplicaId::new(1),
+      OpNumber::new(),
+      id_op2,
+      new_epoch,
+      new_config_id,
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "a retained current-config voter's ack forms a current-config quorum → the tail op commits"
+  );
+}

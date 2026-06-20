@@ -2115,11 +2115,22 @@ impl Cluster {
         Target::Replica(idx) => {
           let ri = usize::from(idx);
           if !self.crashed[ri] {
+            // SLOT-SHIFT TRANSLATION (ingress): the proto's `sender_matches` binds `from` as the
+            // sender's SLOT in the RECEIVER's membership, but the network addresses peers by their stable
+            // `MemberId` (== cluster index), so `m.from` carries the sender's MemberId. Re-express it as
+            // that member's slot in the RECEIVER's LIVE membership. Pre-reconfiguration (and for every
+            // node whose slot did not shift) slot == MemberId, so this is the IDENTITY map — the default
+            // schedule is byte-identical; only after a slot-shifting reconfiguration does a retained
+            // sender resolve to a different slot in the receiver's config (the case the cross-epoch
+            // binding handles). A `from` MemberId absent from the receiver's membership (a removed sender,
+            // or a not-yet-installed successor) keeps its raw value — the proto then drops it at the
+            // sender binding exactly as the real transport's unresolved-peer path would.
+            let from = self.translate_from_for_receiver(ri, m.from);
             self.replicas[ri].handle_message(
               now,
               &mut self.wals[ri],
               &mut self.sbs[ri],
-              m.from,
+              from,
               m.msg,
             );
           }
@@ -2254,6 +2265,39 @@ impl Cluster {
     }
   }
 
+  /// Resolve a directed-send TARGET slot (named in SENDER `from`'s live membership) to the cluster
+  /// index (== stable `MemberId`) the network routes to. The cluster index of every replica IS its
+  /// `MemberId` (genesis `MemberId::new(i)` at slot `i`), so the sender's `member_at(slot)` yields the
+  /// routing index directly. Returns the raw slot unchanged when it does not resolve (the sender is
+  /// crashed/absent, or the slot is out of its membership range) — pre-reconfiguration this is the
+  /// identity map, so the default schedule is byte-identical.
+  fn translate_target_from_sender(&self, from: ReplicaId, slot: ReplicaId) -> u16 {
+    let sender = usize::from(from.get());
+    if self.crashed[sender] {
+      return slot.get();
+    }
+    self.replicas[sender]
+      .member_at(slot)
+      .map_or(slot.get(), |mid| mid.get() as u16)
+  }
+
+  /// Re-express an inbound `from` (carrying the SENDER's stable `MemberId` == cluster index) as that
+  /// member's SLOT in RECEIVER `ri`'s live membership — the identity the proto's `sender_matches`
+  /// binds. Pre-reconfiguration (and whenever the sender's slot did not shift) `slot_of(MemberId) ==
+  /// MemberId`, so this is the identity map; only a slot-shifting reconfiguration makes a retained
+  /// sender resolve to a different slot in the receiver's config. A sender absent from the receiver's
+  /// membership keeps its raw id (the proto drops it at the sender binding, as the real transport's
+  /// unresolved-peer path would).
+  fn translate_from_for_receiver(&self, ri: usize, from: Peer) -> Peer {
+    let Peer::Replica(member_id) = from else {
+      return from; // a client `from` carries no slot to translate.
+    };
+    match self.replicas[ri].slot_of(MemberId::new(member_id.get() as u128)) {
+      Some(slot) => Peer::Replica(slot),
+      None => from,
+    }
+  }
+
   /// Expands a `Recipient` into concrete `Target`s and schedules each.
   fn route(&mut self, now: Instant, from: ReplicaId, out: Outgoing) {
     // Belt-and-suspenders: a crashed replica should never be polled, but
@@ -2264,7 +2308,16 @@ impl Cluster {
     let (to, msg) = (out.to(), out.into_msg());
     match to {
       Recipient::To(Peer::Replica(r)) => {
-        self.schedule(now, Peer::Replica(from), Target::Replica(r.get()), msg);
+        // SLOT-SHIFT TRANSLATION (egress, directed): the proto names the TARGET as a SLOT in the
+        // SENDER's membership; the network addresses by stable `MemberId` (== cluster index). Resolve
+        // the slot through the SENDER's LIVE membership to the target MemberId. Pre-reconfiguration slot
+        // == MemberId (the identity map — byte-identical default schedule); a slot-shifting
+        // reconfiguration is the only case it diverges (a retained peer whose slot moved). A slot that
+        // does not resolve (out of the sender's membership range) keeps its raw value, harmlessly
+        // dropped downstream — the broadcast fan-outs below address cluster indices (MemberIds) directly,
+        // so they need no translation.
+        let target = self.translate_target_from_sender(from, r);
+        self.schedule(now, Peer::Replica(from), Target::Replica(target), msg);
       }
       Recipient::To(Peer::Client(c)) => {
         self.schedule(now, Peer::Replica(from), Target::Client(c.get()), msg);
@@ -2290,14 +2343,16 @@ impl Cluster {
   /// exercising the protocol's idempotency / re-ack paths.
   fn schedule(&mut self, now: Instant, from: Peer, target: Target, msg: Message) {
     if let (Peer::Replica(from_r), Target::Replica(to_r)) = (from, target) {
-      // A NON-VOTING learner (id `>= replica_count`) must never emit a COUNTED message: a `PrepareOk`
-      // (a commit-quorum vote), a `StartViewChange` or a `DoViewChange` (active view-change
-      // participation). It applies the committed log and may solicit catch-up, but it is never a voter
-      // and never a prospective primary, so any such emission is a REAL finding (a learner taking part
-      // in consensus). Recorded BEFORE the partition/one-way/frame drops below, so a learner's counted
-      // message trips this even when a fault would later drop it; the recording changes no scheduling
-      // and takes no PRNG draw. Drained by the VOPR driver each tick.
-      if usize::from(from_r.get()) >= self.replica_count as usize
+      // A NON-VOTING learner must never emit a COUNTED message: a `PrepareOk` (a commit-quorum vote), a
+      // `StartViewChange` or a `DoViewChange` (active view-change participation). It applies the committed
+      // log and may solicit catch-up, but it is never a voter and never a prospective primary, so any such
+      // emission is a REAL finding (a learner taking part in consensus). Classified by the emitter's LIVE
+      // voter status (`is_voter`), NOT the static genesis `replica_count`: a `PromoteLearner` makes a
+      // genesis-learner-slot node a VOTER, whose vote is then LEGITIMATE — keying off the static count
+      // would mis-flag it. Recorded BEFORE the partition/one-way/frame drops below, so a learner's counted
+      // message trips this even when a fault would later drop it; the recording changes no scheduling and
+      // takes no PRNG draw. Drained by the VOPR driver each tick.
+      if !self.replicas[usize::from(from_r.get())].is_voter()
         && matches!(
           msg,
           Message::PrepareOk(_) | Message::StartViewChange(_) | Message::DoViewChange(_)

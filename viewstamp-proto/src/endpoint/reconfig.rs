@@ -115,6 +115,21 @@ pub enum ProposeMembershipError {
   /// variant is wired now so the promote gate has its verdict ready.
   #[error("the promotion target has not caught up to the committed frontier")]
   TargetNotCaughtUp,
+  /// An `AddVoter` would admit a brand-new voter — one holding NO committed prefix — into a successor
+  /// whose view-change quorum the new voter alone can satisfy, breaking the XI-b old-write-quorum /
+  /// new-view-change-quorum intersection. This is the single-voter predecessor case: from a 1-voter
+  /// cluster, `AddVoter` yields a 2-voter successor with `quorum_view_change == 1`, so the new voter —
+  /// which never held the old committed prefix — could form the E+1 view-change quorum ALONE, elect
+  /// itself leader with an empty log, and drop the old committed prefix (committed-op loss). Add the
+  /// new voter as a learner first (`AddLearner`), let it durably catch up, then `PromoteLearner` once
+  /// it holds the head — the catch-up-then-promote path that provably preserves the committed prefix.
+  /// For any predecessor of 2+ voters `AddVoter` is admitted: every successor view-change quorum then
+  /// necessarily includes a predecessor write-quorum member, so the intersection holds.
+  #[error(
+    "AddVoter would break the cross-config quorum intersection: a new voter holds no committed \
+     prefix yet could form the successor view-change quorum alone (add as a learner, then promote)"
+  )]
+  AddVoterBreaksQuorumIntersection,
   /// A TRANSIENT op-admission fence is up — the SAME backpressure a client request hits before a new op
   /// is minted: a pending durable-view / state-sync / checkpoint write, a flagged forfeit step-down, or a
   /// committed-but-unapplied prefix (a repair hole). Minting now would advertise an op in a view this node

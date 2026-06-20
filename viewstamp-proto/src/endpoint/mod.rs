@@ -1089,13 +1089,24 @@ pub struct Endpoint<S, R: Reconfig = RestartOnly> {
   /// Deliberately NOT cleared by `reset_for_view_transition` — it is a vouched durable fact about
   /// the cluster, not per-generation in-flight state.
   log_floor: OpNumber,
-  /// Per-replica last-reported `checkpoint_op` (keyed by replica index), filled by the primary from
+  /// Per-member last-reported `checkpoint_op`, keyed by the stable [`MemberId`] (resolved from the
+  /// reporter's slot at ingest, exactly as [`Self::peer_progress`] is), filled by the primary from
   /// incoming `PrepareOk` (and recorded on backups from `Commit`, harmlessly). The primary derives
   /// [`quorum_checkpoint_op`](Self::quorum_checkpoint_op) from this to gate WAL/session GC: it never
-  /// frees an op a `quorum` of replicas has not yet checkpointed. Bounded by `replica_count` (<= 64);
-  /// cleared on every view-change transition (a new generation re-establishes the pipeline, so old
-  /// reports are stale — clearing keeps the primary conservative until fresh `PrepareOk`s arrive).
-  peer_checkpoint: BTreeMap<ReplicaId, OpNumber>,
+  /// frees an op a `quorum` of replicas has not yet checkpointed. Bounded by `node_count` (<= 64
+  /// voters + learners); cleared on every view-change transition (a new generation re-establishes the
+  /// pipeline, so old reports are stale — clearing keeps the primary conservative until fresh
+  /// `PrepareOk`s arrive).
+  ///
+  /// Keyed by the STABLE id, not the routing slot, so a slot-shifting reconfiguration
+  /// ([`Self::install_membership`]) is transparent: a retained voter's report follows its `MemberId`
+  /// across a slot shift (never misattributed to whoever now occupies its old slot), and a REMOVED
+  /// member's report is structurally excluded from the GC / force-sync floors — its `MemberId` is no
+  /// longer a current voter/member, so `compute_quorum_checkpoint_op` (voters-only) and
+  /// `max_peer_checkpoint_op` (current-members-only) skip it. `install_membership` does NOT prune this
+  /// map; the consumers intersect with the CURRENT membership, so a stale removed-member entry is inert
+  /// (it can never lift a floor) and is cleared wholesale by the next view-transition reset.
+  peer_checkpoint: BTreeMap<MemberId, OpNumber>,
   /// CACHED [`Self::quorum_checkpoint_op`] (the quorum-th order statistic over
   /// `self.checkpoint_op` + the `peer_checkpoint` reports). The uncached computation allocates +
   /// sorts per call, and `prune_floor()` reads it on EVERY client request (the WAL-stall check), so
@@ -1583,6 +1594,53 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   /// `select_canonical_log`'s union and is never nack-truncated. The OLD-write-quorum-vs-NEW-view-
   /// change-quorum count bound is not ≥1 for a 3→2 shrink or a 3→4 grow, so this structural gate (not
   /// a count) is the load-bearing invariant; the `cp_overlap_*` reconfigure tests pin it.
+  /// Re-key a slot-indexed voter bitset from this (PREDECESSOR) membership's slot layout to the
+  /// `successor`'s, by stable [`MemberId`]: each set bit at OLD slot `s` is resolved to the member
+  /// `self.membership.member_at(s)` cast it, then re-placed at that member's NEW voter slot
+  /// `successor.slot_of(member)` — but ONLY if the member is still a VOTER under the successor. A bit
+  /// for a member with no successor slot (REMOVED) or a non-voter successor slot (DEMOTED to learner) is
+  /// DROPPED. An out-of-range OLD bit (no member) is also dropped. The result therefore counts ONLY
+  /// votes of current-config voters, placed at their current slots — so a `count_ones()` against the
+  /// successor quorum is sound.
+  fn rekey_slot_bitset(&self, bits: u64, successor: &Membership) -> u64 {
+    let mut remapped = 0u64;
+    let mut rest = bits;
+    while rest != 0 {
+      let old_slot = rest.trailing_zeros() as u16;
+      rest &= rest - 1; // clear the lowest set bit
+      if let Some(member) = self.membership.member_at(ReplicaId::new(old_slot))
+        && let Some(new_slot) = successor.slot_of(member)
+        && successor.is_voter(new_slot)
+      {
+        remapped |= 1u64 << new_slot.get();
+      }
+    }
+    remapped
+  }
+
+  /// Re-key every slot-indexed quorum accumulator that survives an in-place membership swap from this
+  /// (PREDECESSOR) membership's slot layout to the `successor`'s, by stable [`MemberId`] (see
+  /// [`Self::rekey_slot_bitset`]). Called from [`Self::install_membership`] BEFORE `self.membership` is
+  /// replaced, so the OLD slot layout is still available to resolve each bit's caster.
+  ///
+  /// Two accumulators survive the commit-first SwapEpoch landing (a still-Normal primary, no view
+  /// transition, the pipeline NOT cleared): the per-op commit-vote bitsets `inflight.*.oks` (a removed
+  /// voter's stale ack must NOT count toward the successor commit quorum — that is the safety-critical
+  /// case) and the StartViewChange bitset `svc_from` (live in Normal; a stale/misattributed SVC bit must
+  /// not trip a spurious view change). Both become current-config-only after this. The already-committed
+  /// prefix is untouched — only UNCOMMITTED inflight entries hold votes, and re-keying drops/relocates
+  /// bits without changing the op set, so nothing at/below `commit_min` moves.
+  fn rekey_slot_quorums_for_swap(&mut self, successor: &Membership) {
+    let mut inflight = core::mem::take(&mut self.inflight);
+    for inf in inflight.values_mut() {
+      if !inf.committed {
+        inf.oks = self.rekey_slot_bitset(inf.oks, successor);
+      }
+    }
+    self.inflight = inflight;
+    self.svc_from = self.rekey_slot_bitset(self.svc_from, successor);
+  }
+
   fn install_membership(&mut self, reconfigure_op: Option<OpNumber>, successor: Membership) {
     // Capture the abdication precondition (hazard a) against the OLD membership, BEFORE the swap:
     // was this node the primary of its current view? (Robust to an already-absent local member.)
@@ -1591,6 +1649,20 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self.prev_epoch = self.membership.epoch();
     let epoch = successor.epoch();
     let config_id = successor.config_id();
+    // Re-key the slot-indexed quorum accumulators that SURVIVE this in-place swap (the commit-first
+    // SwapEpoch landing runs on the still-Normal primary; `inflight`/`svc_from` are NOT cleared on the
+    // retained-node path) through the predecessor->successor MemberId mapping, BEFORE swapping the
+    // membership in (the re-key needs the OLD slot layout). A vote/SVC bit set under an OLD slot is
+    // resolved to the stable member that cast it and re-placed at that member's NEW voter slot; a
+    // REMOVED member's bit (no new voter slot) is DROPPED, and a slot SHIFT carries a retained voter's
+    // bit to its new index. Without this, `try_commit` (`inflight.oks.count_ones() >= quorum`) would
+    // count a removed voter's stale ack toward the NEW (possibly smaller) commit quorum and commit a
+    // post-reconfiguration tail op WITHOUT a current-config write quorum — committed-op loss across the
+    // E+1 view change. `svc_from` is the liveness sibling (a stale/misattributed StartViewChange bit
+    // could trip a spurious view change); re-keying it the same way closes the whole class at the swap.
+    // Mirrors the `peer_checkpoint` MemberId re-key; with no reconfiguration this never runs, so the
+    // off-axis behavior is byte-identical.
+    self.rekey_slot_quorums_for_swap(&successor);
     self.membership = successor;
     // Push the superseded config_id onto the recent-prior lineage ring (most-recent-first), so
     // `in_lineage` keeps admitting a bounded window of recent ancestors for live cross-epoch catch-up.
@@ -1605,8 +1677,13 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     if let Some(op) = reconfigure_op {
       self.config_install_op = op;
     }
-    // The voter set changed, so the quorum-checkpoint inputs (the voter slots) changed: refresh the
-    // cached order statistic the GC prune floor / force-sync trigger read.
+    // The voter set changed, so the quorum-checkpoint inputs (which member holds each voter slot)
+    // changed: refresh the cached order statistic the GC prune floor / force-sync trigger read. No
+    // explicit prune of `peer_checkpoint` is needed — it is keyed by stable `MemberId`, and both floor
+    // consumers (`compute_quorum_checkpoint_op` voters-only; `max_peer_checkpoint_op`
+    // current-members-only) intersect with the new membership, so a removed member's stale report is
+    // structurally excluded (it lifts no floor) and a retained voter's report follows its id across a
+    // slot shift. The leftover removed-member entry is inert and is cleared by the next view-transition.
     self.recompute_quorum_checkpoint();
     // Removed-node goes silent (hazard a): a swap that drops THIS node from the voter set retires its
     // whole voter timer plane. An ex-primary abdicates its primary cadence (the cluster elects an E+1
@@ -1844,6 +1921,33 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   where
     S: StateMachine,
   {
+    // STALE-SWAP GUARD (correct-by-construction): a staged swap installs ONLY if its successor still
+    // chains from the LIVE configuration. The successor's `config_id` is `hash(successor parts,
+    // predecessor config_id)`, where the pinned predecessor is the configuration this swap was staged
+    // against. Recompute that hash chaining from THIS node's CURRENT `config_id`: it matches iff the
+    // current membership IS still that predecessor. If the membership has ALREADY ADVANCED to this (or a
+    // later) successor — a CROSS-EPOCH state-sync install (`install_membership(None, successor)`) crossed
+    // the epoch boundary while the swap sat staged, or any other path superseded it — the recompute does
+    // NOT match: the staged swap is STALE. Re-submitting it would mint a DUPLICATE SwapEpoch root stamped
+    // with the already-advanced config as its OWN predecessor, push that config into the lineage ring a
+    // second time, emit a bogus `MembershipChanged`, and evict legitimate older ancestors from the
+    // bounded window — stranding laggards. So DROP the stale staged swap (never submit it) and clear it.
+    // A legitimately staged swap that still chains from the live config matches and proceeds unchanged, so
+    // the normal (non-crossed) path — and the off-axis no-reconfiguration path, where `pending_swap` is
+    // always `None` — is byte-identical.
+    if let Some((_, successor)) = self.pending_swap.as_ref() {
+      let chained = Membership::recompute_config_id(
+        successor.epoch(),
+        successor.replica_count(),
+        successor.learner_count(),
+        successor.members_slice(),
+        self.membership.config_id(),
+      );
+      if chained != successor.config_id() {
+        self.pending_swap = None;
+        return;
+      }
+    }
     if !self.status.is_normal() || self.log_view.get() != self.view.get() {
       return; // the view is not settled/durable — a SwapEpoch root must not persist it
     }
@@ -2134,12 +2238,20 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   /// prune floor (`quorum_checkpoint_op`) and the force-sync/forfeit triggers that read it from
   /// moving backward — a regressing floor could spuriously un-fire the force-sync escalation. (T1)
   fn record_peer_checkpoint(&mut self, replica: ReplicaId, reported: OpNumber) {
+    // Resolve the reporter's routing slot to its STABLE `MemberId` at ingest (exactly as
+    // `on_learner_status` keys `peer_progress`), so the report follows the member — not the slot —
+    // across a slot-shifting reconfiguration. The slot is always a current member here (every caller
+    // range-checks it or derives it from `membership.primary`), so the lookup resolves; a slot with no
+    // member (impossible past those checks) records nothing.
+    let Some(member) = self.membership.member_at(replica) else {
+      return;
+    };
     let prev = self
       .peer_checkpoint
-      .get(&replica)
+      .get(&member)
       .copied()
       .unwrap_or_else(OpNumber::new);
-    self.peer_checkpoint.insert(replica, prev.max(reported));
+    self.peer_checkpoint.insert(member, prev.max(reported));
     // A peer report is an input of the cached quorum-th order statistic.
     self.recompute_quorum_checkpoint();
   }
@@ -2180,6 +2292,11 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   /// other voters); on a non-voting member self the seed below is skipped and the iteration covers only
   /// the voters, so a learner — which populates no voter `peer_checkpoint` — computes ~0 (the safe
   /// conservative floor that frees nothing).
+  ///
+  /// `peer_checkpoint` is keyed by stable [`MemberId`], so each voter slot is resolved to the member it
+  /// CURRENTLY holds before its report is read. This is what makes a slot-shifting reconfiguration safe:
+  /// a report stored under a REMOVED member's id never resolves from a current voter slot (so it cannot
+  /// lift the floor), and a retained voter's report follows its id into whatever slot it now occupies.
   fn compute_quorum_checkpoint_op(&self) -> OpNumber {
     let count = self.membership.replica_count();
     let mut cps: std::vec::Vec<u64> = std::vec::Vec::with_capacity(count as usize);
@@ -2187,15 +2304,23 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     // it seeds no own-checkpoint and the loop skips nothing, computing the statistic over exactly the
     // (new) voter set — a removed node correctly contributes nothing to the GC floor.
     let me = self.local_slot_opt();
+    let my_member = self.config.local();
     if me.is_some_and(|slot| self.membership.is_voter(slot)) {
       cps.push(self.checkpoint_op.get()); // a voter counts its own durable checkpoint; a learner/removed does not
     }
     for r in 0..count {
       let rid = ReplicaId::new(u16::from(r));
-      if Some(rid) == me {
-        continue; // a learner/removed `me` is never in `0..count`, so this skips nothing — the seed above gates self
+      // Resolve the CURRENT occupant of this voter slot to its stable id; the `peer_checkpoint` map is
+      // keyed by id, so a slot whose occupant changed reads the NEW voter's report (or 0 if unheard),
+      // never the predecessor's stale entry stored under a different id.
+      let Some(member) = self.membership.member_at(rid) else {
+        cps.push(0);
+        continue;
+      };
+      if member == my_member {
+        continue; // self is counted by the seed above; skip its own peer entry so it is never double-counted
       }
-      cps.push(self.peer_checkpoint.get(&rid).map_or(0, |c| c.get()));
+      cps.push(self.peer_checkpoint.get(&member).map_or(0, |c| c.get()));
     }
     cps.sort_unstable_by(|a, b| b.cmp(a)); // descending
     // On a voter `cps.len() == replica_count`; on a learner `cps.len() == replica_count` too (the seed
@@ -2224,8 +2349,15 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   /// would never fire (the hole is pruned everywhere, so `RequestPrepare` stays futile forever).
   fn max_peer_checkpoint_op(&self) -> OpNumber {
     let mut hi = self.checkpoint_op.max(self.log_floor);
-    for cp in self.peer_checkpoint.values() {
-      hi = hi.max(*cp);
+    // Only a CURRENT member's report names a servable snapshot a donor we can still reach holds. A
+    // report stored under a member that a reconfiguration REMOVED must not lift the floor: no current
+    // donor would serve it, so a hole cleared by it could never be filled (a permanent sync wedge).
+    // `peer_checkpoint` is keyed by stable `MemberId`, so the membership lookup excludes a removed
+    // member's stale entry structurally (a `slot_of` miss); a retained member's report is kept.
+    for (member, cp) in &self.peer_checkpoint {
+      if self.membership.slot_of(*member).is_some() {
+        hi = hi.max(*cp);
+      }
     }
     hi
   }
@@ -2311,6 +2443,17 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn slot_of(&self, who: MemberId) -> Option<ReplicaId> {
     self.membership.slot_of(who)
+  }
+
+  /// Resolve a routing slot in the active [`Membership`] to the stable [`MemberId`] that occupies it,
+  /// if in range — the inverse of [`Self::slot_of`]. A transport that addresses a peer by the slot this
+  /// replica stamped (the slot in THIS replica's membership) reads it to recover the peer's STABLE id,
+  /// so the message routes to that member even after a reconfiguration shifted slots (the slot a sender
+  /// names is in the SENDER's membership; the stable id is the cross-config-invariant address).
+  /// Delegates to [`Membership::member_at`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn member_at(&self, slot: ReplicaId) -> Option<MemberId> {
+    self.membership.member_at(slot)
   }
 
   /// The cluster id this replica was configured for. The QUIC coordinator reads it to single-source
@@ -2536,18 +2679,29 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self.buffer.len()
   }
 
-  /// Test-only: the per-peer recorded checkpoint (0 if unheard). Proves T1 monotonicity directly.
+  /// Test-only: the recorded checkpoint for the member CURRENTLY at `replica` (0 if unheard or the slot
+  /// holds no member). Resolves the slot to its stable id — the map's key — so it reads the same entry
+  /// `inject_peer_checkpoint_for_test`/a real `PrepareOk` at that slot recorded. Proves T1 monotonicity.
   #[cfg(test)]
   fn peer_checkpoint_for_test(&self, replica: u8) -> u64 {
     self
-      .peer_checkpoint
-      .get(&ReplicaId::new(u16::from(replica)))
+      .membership
+      .member_at(ReplicaId::new(u16::from(replica)))
+      .and_then(|m| self.peer_checkpoint.get(&m))
       .map_or(0, |c| c.get())
+  }
+
+  /// Test-only: the recorded checkpoint for a member by its stable id directly (0 if unheard), so a
+  /// reconfiguration test can read a report that followed its member across a slot shift.
+  #[cfg(test)]
+  fn peer_checkpoint_by_member_for_test(&self, member: MemberId) -> u64 {
+    self.peer_checkpoint.get(&member).map_or(0, |c| c.get())
   }
 
   /// Test-only: directly seed a peer's reported checkpoint (bypassing a real PrepareOk/Commit), so a
   /// test can construct a quorum-checkpoint floor without driving full message flows. Goes through the
-  /// MONOTONE recorder, so a lower injection cannot regress a higher recorded value.
+  /// MONOTONE recorder (which resolves the slot to the member's stable id), so a lower injection cannot
+  /// regress a higher recorded value.
   #[cfg(test)]
   fn inject_peer_checkpoint_for_test(&mut self, replica: u8, op: u64) {
     self.record_peer_checkpoint(ReplicaId::new(u16::from(replica)), OpNumber::with(op));
@@ -2743,6 +2897,14 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   #[cfg(test)]
   fn sync_target_for_test(&self) -> Option<u64> {
     self.sync.map(|s| s.target.get())
+  }
+
+  /// Test-only: the raw [`Self::sender_matches`] verdict, so a binding test can prove a message is
+  /// dropped/admitted AT THE SENDER GATE specifically — independent of any later handler (`apply_sync`)
+  /// that might drop it for an orthogonal reason (a false proxy).
+  #[cfg(test)]
+  fn sender_matches_for_test(&self, from: Peer, msg: &Message) -> bool {
+    self.sender_matches(from, msg)
   }
 
   /// Test-only: is the outstanding sync a FORCED sync?
@@ -3151,7 +3313,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   ///     non-voting member must never reach the quorum bitset / vote maps.
   ///   - **Serves and solicitations of committed content** bind to the FULL membership
   ///     (`sender_is_member`): the solicitations `GetView`/`RequestPrepare`/`RequestPrepareRange`/
-  ///     `Recovery`, and the serves `RecoveryResponse`/`SyncCheckpoint`/`SyncCheckpointMeta`/`SyncChunk`.
+  ///     `Recovery`, and the serve `RecoveryResponse`.
   ///     A non-voting member legitimately solicits committed state and
   ///     can serve committed content to others, so these bind to the self `replica()` over the full node
   ///     range — NOT `config.primary(view)`, which would drop an honest backup-originated serve, and not
@@ -3159,7 +3321,9 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   ///     committed CONTENT verified independently (checksum + committed-vouch; checkpoint-id), not quorum
   ///     authority, so a member serving them is safe. The two STATE-SYNC PULLS
   ///     (`RequestSync`/`RequestSyncChunk`) are the same no-authority class but additionally tolerate a
-  ///     SLOT-SHIFTED cross-epoch laggard ([`Self::sender_admits_solicitation`]).
+  ///     SLOT-SHIFTED cross-epoch laggard ([`Self::sender_admits_solicitation`]), and the three
+  ///     STATE-SYNC SERVE REPLIES (`SyncCheckpoint`/`SyncCheckpointMeta`/`SyncChunk`) tolerate a
+  ///     SLOT-SHIFTED DONOR mid-crossing ([`Self::sender_admits_sync_reply`]).
   /// - **Primary-authority broadcasts** (only the primary of the advertised view legitimately sends
   ///   them, and they carry NO self `replica()` to bind to) — bind to
   ///   `from == Peer::Replica(self.membership.primary(msg.view()))`: `Commit` and `StartView`. This also
@@ -3212,9 +3376,10 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       // SERVES and SOLICITATIONS of committed content bind to the FULL membership (`sender_is_member`):
       // a non-voting member legitimately solicits committed state AND can serve committed content to
       // others. They carry no quorum authority; the content is verified independently downstream. The
-      // serves (`RecoveryResponse`/`SyncCheckpoint`/…) carry a self `replica()` AND a `view()` but may
+      // serve (`RecoveryResponse`) carries a self `replica()` AND a `view()` but may
       // come from ANY Normal member (a backup or a learner, not only the primary) — bind to the self id,
-      // not `config.primary(view)`.
+      // not `config.primary(view)`. (The three state-sync serve REPLIES are below, with the cross-epoch
+      // slot-shifted-donor relaxation.)
       Message::GetView(m) => self.sender_is_member(from, m.replica()),
       // `RequestPrepare`/`RequestPrepareRange` are no-authority cross-epoch-tolerant solicitations too (a
       // committed-log-body pull a cross-epoch laggard sends to a current-epoch donor) — same relaxation as
@@ -3232,17 +3397,27 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       // [`Self::sender_admits_solicitation`] for the binding + the no-forgeable-authority proof.
       Message::RequestSync(m) => self.sender_admits_solicitation(from, m.replica(), m.config_id()),
       Message::RecoveryResponse(m) => self.sender_is_member(from, m.replica()),
-      Message::SyncCheckpoint(m) => self.sender_is_member(from, m.replica()),
-      // The chunked state-sync trio all carry a self `replica()`. The announce (`SyncCheckpointMeta`)
-      // and the chunk (`SyncChunk`) are SERVES from ANY Normal donor (like `SyncCheckpoint`), so they
-      // bind STRICTLY to the claimed self id + the full membership range (a donor's own slot does not
-      // shift on the receiver side). The chunk PULL (`RequestSyncChunk`) is a laggard SOLICITATION (the
-      // over-frame analogue of `RequestSync`), so it gets the SAME cross-epoch relaxation.
-      Message::SyncCheckpointMeta(m) => self.sender_is_member(from, m.replica()),
+      // The three state-sync SERVE REPLIES (`SyncCheckpoint` whole + the chunked `SyncCheckpointMeta`
+      // announce + the `SyncChunk`) carry a self `replica()` = the DONOR's CURRENT slot AND a
+      // `config_id`. The strict self-id binding holds for a SAME-config reply (`config_id` == ours), but
+      // a DONOR whose slot SHIFTED across the reconfiguration stamps its CURRENT (E+1) slot + DESCENDANT
+      // `config_id` while the mid-crossing OLD-epoch laggard's transport resolves `from` under the
+      // laggard's OLD (E) membership slot — so strict-binding would DROP the crossing reply before
+      // `apply_sync`. The path-sensitive reply binding ([`Self::sender_admits_sync_reply`]) relaxes ONLY
+      // for a genuine cross-epoch reply (`config_id` != ours) with a sync OUTSTANDING; the reply carries
+      // NO authority and `apply_sync` is the real authenticator (nonce + checkpoint integrity + the
+      // carried successor membership). Passing `m.config_id()` keeps a same-config reply STRICT.
+      Message::SyncCheckpoint(m) => self.sender_admits_sync_reply(from, m.replica(), m.config_id()),
+      // The chunk PULL (`RequestSyncChunk`) is a laggard SOLICITATION (the over-frame analogue of
+      // `RequestSync`), so it gets the SAME cross-epoch SOLICITATION relaxation; the announce + chunk
+      // are donor REPLIES and get the reply relaxation.
+      Message::SyncCheckpointMeta(m) => {
+        self.sender_admits_sync_reply(from, m.replica(), m.config_id())
+      }
       Message::RequestSyncChunk(m) => {
         self.sender_admits_solicitation(from, m.replica(), m.config_id())
       }
-      Message::SyncChunk(m) => self.sender_is_member(from, m.replica()),
+      Message::SyncChunk(m) => self.sender_admits_sync_reply(from, m.replica(), m.config_id()),
       // `LearnerStatus` is a NON-VOTING progress report carrying a self `replica()`. It binds to the
       // FULL membership (`sender_is_member`): the EMITTER is a learner (a non-voting member), and a
       // non-member's id must never record progress in `peer_progress`. It carries no quorum authority
@@ -3382,6 +3557,81 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self.membership.member_at(slot).is_some()
       && self.in_lineage(config_id)
       && config_id != self.membership.config_id()
+  }
+
+  /// The sender binding for the three state-sync SERVE REPLIES (`SyncCheckpoint` whole + the chunked
+  /// `SyncCheckpointMeta` announce + the `SyncChunk`) — the INGRESS mirror of
+  /// [`Self::sender_admits_solicitation`], relaxed for a SLOT-SHIFTED DONOR rather than a slot-shifted
+  /// requester. `claimed` is the donor's self-stamped slot (`local_slot()` in the donor's CURRENT
+  /// configuration); `config_id` is the reply's advertised configuration lineage — what distinguishes a
+  /// genuine cross-epoch reply (a DESCENDANT of ours, eligible for relaxation) from a SAME-config reply
+  /// (equal to ours, which stays strict).
+  ///
+  /// # Why the strict slot binding strands a mid-crossing laggard
+  ///
+  /// A donor stamps its reply with its CURRENT (E+1) slot. The OLD-epoch laggard, mid-crossing, resolves
+  /// `from` by the donor's STABLE `MemberId` under the laggard's OWN (E) membership — the donor's OLD
+  /// slot. After a LOW-INDEX `RemoveVoter`/`PromoteLearner` shifted the donor's slot, the donor's CURRENT
+  /// claimed slot and `from`'s OLD slot DIFFER, so the strict `from == Peer::Replica(claimed)` binding
+  /// ([`Self::sender_is_member`]) DROPS the reply at ingress — BEFORE `apply_sync` can verify the carried
+  /// successor membership and install the crossing. A low-index `RemoveVoter(0)` can shift EVERY surviving
+  /// donor's slot, stranding every retained old-epoch laggard and potentially wedging the successor quorum.
+  ///
+  /// # Why relaxing this is safe — a serve reply carries NO forgeable authority
+  ///
+  /// A reply carries NO view/quorum/vote authority: it is admitted past [`Self::epoch_authority_admits`]
+  /// on `sync.is_some()` (NOT lineage — the reply's `config_id` is a DESCENDANT, not an ancestor, of the
+  /// laggard's), and `apply_sync` authenticates it DOWNSTREAM by the in-flight sync NONCE (`m.nonce() ==
+  /// s.nonce`, an increment the laggard mints and a forger cannot guess), the checkpoint INTEGRITY
+  /// (`checkpoint_id(snapshot) == checkpoint_id`, the bind-checked `bound_op == checkpoint_op`), and — for
+  /// a crossing — the carried successor membership's hash-chain (`to_membership_verified` re-derives
+  /// `config_id` and rejects a forged/corrupt body). So a reply admitted from an authenticated member
+  /// cannot be driven by a forged or unsolicited answer: without an outstanding sync nonce it matches, it
+  /// is dropped at the handler regardless of this binding. Binding by `from` (member identity) rather than
+  /// the donor's shifting claimed slot therefore adds NO forge surface — at worst a misaddressed reply
+  /// from an authenticated member is ignored for a nonce mismatch.
+  ///
+  /// # The binding
+  ///
+  /// - **Strict path** (the common case, byte-identical to [`Self::sender_is_member`]): `from` is the
+  ///   authenticated peer for the claimed slot AND that slot is a current member. Covers same-config and
+  ///   any case where slots did not shift — UNCHANGED.
+  /// - **Cross-epoch reply relaxation** (only when the strict path fails): admit when the reply is a
+  ///   GENUINE cross-epoch reply (`config_id` != our current `config_id` — a descendant the in-flight
+  ///   crossing targets) AND a sync is OUTSTANDING (`self.sync.is_some()` — the laggard is mid-crossing)
+  ///   AND `from` resolves to a CURRENT member of OUR configuration — i.e. an authenticated member
+  ///   answering OUR solicitation under a slot that shifted. `from` is bound (the current slot is valid
+  ///   by construction); the donor's self-claimed (shifted) slot is NOT required to equal it.
+  /// - A SAME-config reply (`config_id` == ours) that fails the strict path is NEVER relaxed: a donor's
+  ///   slot does not shift relative to a same-config receiver, so a self-id mismatch is a forge/misroute,
+  ///   and the strict `sender_is_member` binding is the identity backstop for the ordinary same-epoch
+  ///   sync path. A reply that fails the strict path with NO sync outstanding (a forged/unsolicited
+  ///   answer) is likewise NOT relaxed — the `sync.is_some()` gate excludes it, and the nonce check would
+  ///   reject it downstream regardless.
+  fn sender_admits_sync_reply(&self, from: Peer, claimed: ReplicaId, config_id: u128) -> bool {
+    if self.sender_is_member(from, claimed) {
+      return true; // strict path: same-config / no slot shift — unchanged.
+    }
+    // The relaxation is for a CROSS-EPOCH reply only. A SAME-config reply (`config_id` == our current
+    // `config_id`) must stay STRICT: the donor's slot does not shift relative to a same-config receiver,
+    // so a self-id mismatch is a forge/misroute, and admitting it would weaken the buggy-driver identity
+    // backstop on the ordinary same-epoch sync path. Only a reply whose `config_id` is a DESCENDANT the
+    // in-flight cross-epoch sync is crossing TOWARD (not our current config) can legitimately carry a
+    // donor slot that shifted out from under the mid-crossing laggard.
+    if config_id == self.membership.config_id() {
+      return false;
+    }
+    // Cross-epoch reply relaxation: an authenticated CURRENT member answering OUR outstanding sync under a
+    // slot that shifted across the reconfiguration. Bind by `from`'s current slot, not the donor's stale
+    // claim. Scoped to `sync.is_some()` (the same gate `epoch_authority_admits` uses for these replies):
+    // no outstanding sync ⇒ no crossing in flight, so a strict-mismatched reply is a forge/misroute, NOT a
+    // slot-shifted answer, and stays dropped.
+    if self.sync.is_none() {
+      return false;
+    }
+    from
+      .as_replica()
+      .is_some_and(|slot| self.membership.member_at(slot).is_some())
   }
 
   /// The (epoch, config_id) AUTHORITY gate, layered ON TOP of [`Self::sender_matches`]: it admits a
@@ -3814,9 +4064,12 @@ where
   /// [`Endpoint::propose_membership`](crate::Endpoint::propose_membership).
   ///
   /// The update is MONOTONE: `(*entry).max(reported)`, so a reordered or duplicated lower report under
-  /// network reordering NEVER lowers a recorded value. The reported `durable_commit_min` is the
-  /// sender's DURABLE root frontier (what survives its crash), so the gate can never be satisfied by a
-  /// frontier the learner has not persisted.
+  /// network reordering NEVER lowers a recorded value. The recorded value is the learner's durably-HELD
+  /// committed prefix — `min(durable_commit_min, durable_op)`, the lesser of its durable commit frontier
+  /// and its durable WAL head — NOT `durable_commit_min` alone: a recovered learner can KNOW a high commit
+  /// point while its durable WAL head lags (recovery admits a `commit_max > op` tail-gap), so the
+  /// catch-up-then-promote gate must require the learner to durably HOLD the prefix it will be allowed to
+  /// vote on, not merely know the commit point — both frontiers survive its crash.
   ///
   /// `sender_matches` + `epoch_authority_admits` already bound the sender to a current member of MY
   /// configuration at the claimed slot, so `member_at` resolves; a slot with no member (impossible past
@@ -3825,7 +4078,13 @@ where
     let Some(member) = self.membership.member_at(m.replica()) else {
       return;
     };
-    let reported = m.durable_commit_min();
+    // The learner's durably-HELD committed prefix is the LESSER of its durable commit frontier and its
+    // durable WAL head: a recovered learner can report a high `durable_commit_min` while its `durable_op`
+    // (the ops it actually persisted) lags (recovery admits a `commit_max > op` tail-gap). The catch-up
+    // gate must require the learner to durably HOLD the prefix it will be allowed to vote on, not merely
+    // KNOW the commit point — else a promoted learner enters the successor voter set without the
+    // E-committed prefix the XI-b old-write-quorum / new-view-change intersection relies on.
+    let reported = m.durable_commit_min().min(m.durable_op());
     let entry = self.peer_progress.entry(member).or_default();
     *entry = (*entry).max(reported);
   }

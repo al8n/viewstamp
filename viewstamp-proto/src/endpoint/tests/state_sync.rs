@@ -3995,6 +3995,413 @@ fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
   );
 }
 
+/// The reconfigure op the slot-shifting `RemoveVoter(1)` swap names (the donor's checkpoint embeds it).
+const SLOT_SHIFT_N: u64 = 4;
+
+/// Build a FAR-BEHIND laggard (checkpoint 0) at the PREDECESSOR config `genesis(4) = [m0,m1,m2,m3]` that
+/// has ARMED a FORCED, crossing-required cross-epoch sync toward the E+1 successor produced by a LOW-INDEX
+/// `RemoveVoter(MemberId 1)` (the slot-shifting delta). The successor is `[m0,m2,m3]`, so the surviving
+/// `MemberId 2` SHIFTS from OLD slot 2 (the laggard's E membership) to NEW slot 1 (the donor's E+1
+/// membership) — the slot-shifted DONOR. The laggard itself is `MemberId 3` (retained; it shifts 3->2 in
+/// E+1, but during the crossing it is still at E and resolves peers under its E membership). Returns
+/// `(laggard, wal, sb, successor, predecessor_config_id, nonce)`.
+fn slot_shifted_crossing_laggard() -> (Endpoint<CountSm>, TestWal, TestSb, Membership, u128, u64) {
+  // The laggard is MemberId 3 (slot 3) — retained across the removal, far behind, high checkpoint cadence
+  // so nothing auto-checkpoints it off the bookkeeping below.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(3), 100).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(4), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let predecessor = genesis(4);
+  let predecessor_config_id = e.membership.config_id();
+  // The E+1 successor a LOW-INDEX RemoveVoter derives: removing MemberId 1 from [m0,m1,m2,m3] leaves
+  // [m0,m2,m3], shifting m2 (slot 2 -> 1) and m3 (slot 3 -> 2).
+  let successor = predecessor
+    .apply_delta(&crate::SingleVoterDelta::RemoveVoter(MemberId::new(1)))
+    .expect("RemoveVoter(1) on a 4-voter cluster is valid (leaves 3 voters)");
+  assert_eq!(
+    predecessor.member_at(ReplicaId::new(2)),
+    Some(MemberId::new(2)),
+    "the donor MemberId 2 sits at OLD slot 2 in the laggard's E membership"
+  );
+  assert_eq!(
+    successor.member_at(ReplicaId::new(1)),
+    Some(MemberId::new(2)),
+    "the donor MemberId 2 SHIFTED to NEW slot 1 in the E+1 successor"
+  );
+
+  // ARM the forced cross-epoch sync: a strictly-higher-epoch Commit (E+1) advertising the cluster
+  // checkpoint at N. It is dropped at the authority ingress, but the pre-binding catch-up trigger arms a
+  // FORCED, crossing-required sync. `from` is a RETAINED, BINDABLE voter (MemberId 0 == slot 0 in both
+  // configs) — the laggard need not bind the shifted donor to be triggered.
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(SLOT_SHIFT_N),
+      OpNumber::with(SLOT_SHIFT_N),
+      crate::Epoch::new(1),
+      successor.config_id(),
+    )),
+  );
+  assert!(
+    e.sync_is_forced_for_test() && e.sync_requires_cross_epoch_for_test(),
+    "the laggard armed a FORCED, crossing-required cross-epoch sync"
+  );
+  let nonce = e.sync_nonce_for_test();
+  (e, wal, sb, successor, predecessor_config_id, nonce)
+}
+
+/// The donor's cross-epoch crossing envelope at `SLOT_SHIFT_N`, carrying the E+1 successor membership
+/// chained from `predecessor_config_id`. Returns `(env, id, membership_body)`.
+fn slot_shift_crossing_envelope(
+  successor: &Membership,
+  predecessor_config_id: u128,
+) -> (Bytes, u128, Bytes) {
+  let snap = CountSm::default().snapshot();
+  let env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(SLOT_SHIFT_N), &BTreeMap::new(), &snap);
+  let id = crate::checkpoint_id(&env);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(successor, predecessor_config_id)
+      .encode_body();
+  (env, id, membership_body)
+}
+
+#[test]
+fn a_slot_shifted_donor_whole_sync_checkpoint_reply_is_admitted_and_crosses() {
+  // FINDING (high) — the cross-epoch SERVE-REPLY binding. After a LOW-INDEX RemoveVoter shifts a retained
+  // DONOR's slot, the donor stamps its WHOLE SyncCheckpoint reply with its CURRENT (E+1) slot while the
+  // mid-crossing OLD-epoch laggard resolves `from` under its OLD (E) membership slot — so `from` (E-slot)
+  // != claimed (E+1-slot). The STRICT `sender_is_member` binding would DROP the reply at ingress before
+  // `apply_sync`. The path-sensitive reply binding admits a nonce-bound reply from an authenticated member
+  // while a sync is outstanding; `apply_sync` is the real authenticator (nonce + integrity + the carried
+  // successor membership), so the crossing installs.
+  let (mut e, mut wal, mut sb, successor, predecessor_config_id, nonce) =
+    slot_shifted_crossing_laggard();
+  let now = Instant::ZERO;
+  let (env, id, membership_body) = slot_shift_crossing_envelope(&successor, predecessor_config_id);
+
+  // The slot-shifted donor MemberId 2: `from` = its OLD slot 2 (what the laggard's E transport resolves),
+  // self-stamped `replica()` = its CURRENT slot 1 (the donor's E+1 slot). They DIFFER — the strict binding
+  // would drop this.
+  let donor_old_slot = ReplicaId::new(2); // resolved `from` (laggard's E membership)
+  let donor_current_slot = ReplicaId::new(1); // the donor's self-stamp (its E+1 slot)
+  assert_ne!(
+    donor_old_slot, donor_current_slot,
+    "the donor's E and E+1 slots genuinely differ — a real slot shift"
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(donor_old_slot), // bound under the laggard's OLD membership
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(SLOT_SHIFT_N),
+      id,
+      successor.epoch(),
+      successor.config_id(),
+      donor_current_slot, // the donor self-stamps its CURRENT (E+1) slot
+      nonce,
+      env.clone(),
+      membership_body,
+    )),
+  );
+  // apply_sync staged the durable re-persist (two superblock writes); drive them to install.
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the slot-shifted-donor whole SyncCheckpoint reply was ADMITTED — it reached apply_sync and installed"
+  );
+  assert_eq!(
+    e.membership, successor,
+    "the laggard CROSSED to the E+1 successor membership off the slot-shifted reply"
+  );
+  assert_ne!(
+    e.membership.config_id(),
+    predecessor_config_id,
+    "the config_id advanced off the predecessor"
+  );
+
+  // MUTATION GUARD: with the reply binding reverted to strict (`sender_is_member`), `from` (slot 2) !=
+  // claimed (slot 1) DROPS this reply at ingress and the assertion above FAILS. Confirm the strict path
+  // STILL bites the same-config forge surface: a reply whose claimed slot disagrees with `from` AND whose
+  // config_id is the laggard's CURRENT (predecessor) config — i.e. NOT a cross-epoch answer, just a
+  // mismatched self-id forge — is DROPPED even with a sync outstanding.
+  let (mut e2, mut w2, mut s2, succ2, pred2, nonce2) = slot_shifted_crossing_laggard();
+  let (env2, id2, body2) = slot_shift_crossing_envelope(&succ2, pred2);
+  e2.handle_message(
+    now,
+    &mut w2,
+    &mut s2,
+    Peer::Replica(ReplicaId::new(2)), // from = slot 2
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(SLOT_SHIFT_N),
+      id2,
+      e2.membership.epoch(),     // SAME-config header (the laggard's current E)
+      e2.membership.config_id(), // CURRENT (predecessor) config_id — NOT a cross-epoch answer
+      ReplicaId::new(0),         // claims slot 0 (disagrees with from = slot 2)
+      nonce2,
+      env2,
+      body2,
+    )),
+  );
+  for _ in 0..3 {
+    e2.handle_storage(now, &mut w2, &mut s2);
+  }
+  assert_eq!(
+    e2.state_syncs_applied(),
+    0,
+    "a SAME-config mismatched-self-id reply is still DROPPED by the strict binding (no relaxation)"
+  );
+}
+
+#[test]
+fn a_slot_shifted_donor_sync_checkpoint_meta_announce_is_admitted_and_pins_a_transfer() {
+  // The chunked-announce leg of the same finding. When the donor's crossing checkpoint is OVER-FRAME it
+  // answers with a `SyncCheckpointMeta` stamped with its CURRENT (E+1) slot. Under strict binding the
+  // mid-crossing laggard would DROP it (`from` = OLD slot != claimed E+1 slot) and never pin the transfer,
+  // stranding the over-frame crossing. The reply relaxation admits it — it reaches `on_sync_checkpoint_meta`
+  // and PINS a chunked transfer (then pulls the first chunk).
+  let (mut e, mut wal, mut sb, successor, predecessor_config_id, nonce) =
+    slot_shifted_crossing_laggard();
+  let now = Instant::ZERO;
+  // An over-frame envelope at N (forces the chunked path), carrying the E+1 membership in the announce.
+  let big = crate::message::max_unchunked_snapshot_len() + 4096;
+  let env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(SLOT_SHIFT_N),
+    &BTreeMap::new(),
+    &std::vec![0x5Au8; big],
+  );
+  assert!(
+    env.len() > crate::message::max_unchunked_snapshot_len(),
+    "the envelope exceeds the one-frame budget (forces the chunked serve)"
+  );
+  let id = crate::checkpoint_id(&env);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor, predecessor_config_id)
+      .encode_body();
+
+  let donor_old_slot = ReplicaId::new(2);
+  let donor_current_slot = ReplicaId::new(1);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(donor_old_slot),
+    Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
+      View::new(),
+      OpNumber::with(SLOT_SHIFT_N),
+      id,
+      successor.epoch(),
+      successor.config_id(),
+      env.len() as u64,
+      donor_current_slot, // the donor self-stamps its CURRENT (E+1) slot
+      nonce,
+      membership_body,
+    )),
+  );
+  assert_eq!(
+    e.sync_transfer_donor(),
+    Some(donor_current_slot.get()),
+    "the slot-shifted-donor SyncCheckpointMeta was ADMITTED — it reached on_sync_checkpoint_meta and pinned \
+     a chunked transfer to the donor"
+  );
+  assert!(
+    e.poll_message()
+      .is_some_and(|o| matches!(o.msg_ref(), Message::RequestSyncChunk(_)))
+      || e.sync_transfer_donor().is_some(),
+    "the laggard pulls the first chunk of the pinned transfer"
+  );
+}
+
+#[test]
+fn a_slot_shifted_donor_sync_chunk_reply_is_admitted_and_completes_the_crossing() {
+  // The chunk leg of the same finding, end to end. The slot-shifted-donor `SyncCheckpointMeta` pins the
+  // transfer, then the donor's `SyncChunk` (also stamped with its CURRENT E+1 slot) must be ADMITTED to
+  // `on_sync_chunk` — under strict binding it would be dropped (`from` = OLD slot != claimed E+1 slot) and
+  // the over-frame crossing would never assemble. The reply relaxation admits it; a single completing chunk
+  // reassembles the envelope, re-enters the whole-message install path, and CROSSES.
+  let (mut e, mut wal, mut sb, successor, predecessor_config_id, nonce) =
+    slot_shifted_crossing_laggard();
+  let now = Instant::ZERO;
+  // A small over-frame envelope: header + a payload that splits into exactly two chunks (announce pins,
+  // chunk 0 then chunk 1 completes). Use the real snapshot (so the bind-check + decode pass on assembly).
+  let snap = CountSm::default().snapshot();
+  let env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(SLOT_SHIFT_N), &BTreeMap::new(), &snap);
+  let id = crate::checkpoint_id(&env);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor, predecessor_config_id)
+      .encode_body();
+  let donor_old_slot = ReplicaId::new(2);
+  let donor_current_slot = ReplicaId::new(1);
+  let total_len = env.len() as u64;
+
+  // ANNOUNCE: pin the transfer (slot-shifted, admitted via the reply relaxation).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(donor_old_slot),
+    Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
+      View::new(),
+      OpNumber::with(SLOT_SHIFT_N),
+      id,
+      successor.epoch(),
+      successor.config_id(),
+      total_len,
+      donor_current_slot,
+      nonce,
+      membership_body,
+    )),
+  );
+  assert_eq!(
+    e.sync_transfer_donor(),
+    Some(donor_current_slot.get()),
+    "the announce pinned the chunked transfer"
+  );
+  while e.poll_message().is_some() {}
+
+  // CHUNK: one frame carrying the WHOLE envelope at offset 0 (the announce pinned `total_len`, so a single
+  // chunk spanning it completes the transfer). Stamped with the donor's CURRENT (E+1) slot — admitted via
+  // the reply relaxation, NOT dropped at the binding.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(donor_old_slot),
+    Message::SyncChunk(crate::SyncChunk::new(
+      View::new(),
+      OpNumber::with(SLOT_SHIFT_N),
+      id,
+      successor.config_id(),
+      total_len,
+      0,
+      donor_current_slot, // the donor self-stamps its CURRENT (E+1) slot
+      nonce,
+      env.clone(),
+    )),
+  );
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.sync_chunk_transfers_completed(),
+    1,
+    "the slot-shifted-donor SyncChunk was ADMITTED — it reached on_sync_chunk and completed the transfer"
+  );
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the reassembled crossing reached apply_sync and installed"
+  );
+  assert_eq!(
+    e.membership, successor,
+    "the laggard CROSSED to the E+1 successor membership over the chunked slot-shifted reply path"
+  );
+}
+
+#[test]
+fn a_same_config_sync_reply_with_a_mismatched_self_id_is_dropped_at_the_sender_gate() {
+  // FINDING (medium) — the SAME-config sync reply must be STRICTLY sender-bound. The cross-epoch reply
+  // relaxation (admit a self-id mismatch from a current member while a sync is outstanding) must fire
+  // ONLY for a genuine CROSS-EPOCH reply (a config_id that is a DESCENDANT the in-flight crossing
+  // targets), NEVER for an ORDINARY same-config (same-epoch) sync. Under a same-config sync a donor's
+  // slot does not shift relative to the receiver, so a reply whose claimed self-id disagrees with the
+  // authenticated `from` is a forge/misroute and must be DROPPED at the sender gate — the buggy-driver
+  // identity backstop.
+  //
+  // Asserted DIRECTLY on `sender_matches` (not a downstream side-effect): the prior same-config guard
+  // was a FALSE PROXY — its crossing-required reply was rejected LATER by `apply_sync`, not by the
+  // sender binding, so it never actually exercised this gate. The three reply kinds are covered.
+  let mut e = sync_backup(); // CountSm backup = MemberId 1 at slot 1 in genesis(3); replica() == 1
+  // Arm an ORDINARY same-config sync (forced, NOT crossing-required): sync.is_some() with
+  // require_cross_epoch == false — the exact precondition the relaxation must NOT widen.
+  e.arm_forced_sync_for_test(4);
+  assert!(
+    !e.sync_requires_cross_epoch_for_test(),
+    "setup: the outstanding sync is ORDINARY same-config (not crossing-required)"
+  );
+  assert_eq!(
+    e.membership.config_id(),
+    0,
+    "the genesis fixture's config_id is 0 — the same-config replies below stamp 0"
+  );
+
+  let env = Bytes::from(std::vec![0u8; 8]);
+  let id = crate::checkpoint_id(&env);
+  let nonce = e.sync_nonce_for_test();
+  // `from` is a CURRENT member (slot 2) but the reply self-stamps a DIFFERENT slot (0) — `from` !=
+  // Peer::Replica(m.replica()). All three carry the laggard's CURRENT (same) config_id (0).
+  let from = Peer::Replica(ReplicaId::new(2));
+  let mismatched_self = ReplicaId::new(0);
+  let same_config_checkpoint = Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+    View::new(),
+    OpNumber::with(4),
+    id,
+    crate::Epoch::new(0),
+    0, // same-config
+    mismatched_self,
+    nonce,
+    env.clone(),
+    Bytes::new(),
+  ));
+  let same_config_meta = meta_of(4, id, env.len(), mismatched_self.get(), nonce); // config_id 0
+  let same_config_chunk = chunk_of(4, id, &env, 0..env.len(), mismatched_self.get(), nonce); // config_id 0
+
+  // MUTATION-CHECK: with the same-config guard removed (the relaxation admitting ANY current-member
+  // self-id mismatch once `sync.is_some()`), each of these would PASS the gate — these asserts FAIL.
+  for (kind, msg) in [
+    ("SyncCheckpoint", &same_config_checkpoint),
+    ("SyncCheckpointMeta", &same_config_meta),
+    ("SyncChunk", &same_config_chunk),
+  ] {
+    assert!(
+      !e.sender_matches_for_test(from, msg),
+      "a SAME-config {kind} whose self-id ({}) disagrees with the authenticated from (slot 2) is \
+       DROPPED at the sender gate (strict binding — no cross-epoch relaxation)",
+      mismatched_self.get(),
+    );
+  }
+
+  // POSITIVE CONTROL: the SAME-config reply kinds with a STRICT self-id (claimed == from == slot 2) are
+  // ADMITTED — the strict path is intact, so an ordinary same-config sync reply still flows.
+  let strict_self = ReplicaId::new(2);
+  let strict_checkpoint = Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+    View::new(),
+    OpNumber::with(4),
+    id,
+    crate::Epoch::new(0),
+    0,
+    strict_self,
+    nonce,
+    env.clone(),
+    Bytes::new(),
+  ));
+  let strict_meta = meta_of(4, id, env.len(), strict_self.get(), nonce);
+  let strict_chunk = chunk_of(4, id, &env, 0..env.len(), strict_self.get(), nonce);
+  for (kind, msg) in [
+    ("SyncCheckpoint", &strict_checkpoint),
+    ("SyncCheckpointMeta", &strict_meta),
+    ("SyncChunk", &strict_chunk),
+  ] {
+    assert!(
+      e.sender_matches_for_test(from, msg),
+      "a SAME-config {kind} whose self-id matches the authenticated from (slot 2) is ADMITTED \
+       (the strict path is intact)",
+    );
+  }
+}
+
 #[test]
 fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits() {
   // Change #2 — the CROSSING REQUIREMENT. A forced cross-epoch fetch (`require_cross_epoch`) must NOT

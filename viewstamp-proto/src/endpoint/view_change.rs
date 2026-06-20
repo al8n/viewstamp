@@ -265,10 +265,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // mark in `on_wal_done`.
     self.pending.clear();
     self.appending.clear();
-    // Drop stale per-replica checkpoint reports: the new generation re-establishes the pipeline, so
+    // Drop stale per-member checkpoint reports: the new generation re-establishes the pipeline, so
     // old-view reports must not gate the next primary's GC. A fresh primary rebuilds the map from
     // incoming PrepareOk/Commit, staying conservative (unheard peers count as 0) until then. The
-    // cleared reports are an input of the cached quorum-checkpoint statistic — recompute it.
+    // cleared reports are an input of the cached quorum-checkpoint statistic — recompute it. (This also
+    // sweeps any entry left under a member a reconfiguration removed, though the floor consumers already
+    // intersect with the current membership, so such an entry is inert until the next clear anyway.)
     self.peer_checkpoint.clear();
     self.recompute_quorum_checkpoint();
     // Drop PROVISIONAL client-session rows (`last_op == 0`): accept-time / watermark-backfill rows are

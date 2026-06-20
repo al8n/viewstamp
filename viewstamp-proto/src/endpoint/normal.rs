@@ -321,6 +321,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     _from: Peer,
     r: crate::Request,
   ) {
+    // RESERVED-CLIENT INGRESS FENCE (consensus safety): [`ClientId::RECONFIGURATION`] is the high
+    // sentinel under which the cluster mints its INTERNAL `Body::Reconfigure` membership ops via
+    // `propose_membership`. No real client owns it, so no genuine client `Request` ever carries it.
+    // Reject it here — BEFORE session dedup / admission / minting — so a client-originated `Request`
+    // bearing the reserved id cannot be type-erased into a `Body::Present` op on the primary while
+    // every backup reconstructs the same prepare's bytes as a typed `Body::Reconfigure`
+    // (`log_entry_from_prepare` → `from_committed_body` keys on this id). That would BYPASS
+    // `propose_membership`'s entire admission ladder (the AddVoter XI-b gate, the PromoteLearner
+    // catch-up gate, the single-change gate, the predecessor-delta validation, the single-writer
+    // `reconfigure_inflight` latch) and yield a primary/backup membership SPLIT or a committed-log
+    // divergence (the same committed op typed differently on the primary vs. the backups). Drop it
+    // silently: emit no `Prepare`, mint no op, insert no session row, send no reply (this id is never
+    // a real session, so there is nothing to ack). This guards ONLY the CLIENT `Request` ingress —
+    // the internal reconfiguration mint (`propose_membership`, which legitimately uses the reserved
+    // id and never routes through here) is untouched.
+    if r.client() == ClientId::RECONFIGURATION {
+      return;
+    }
     // The shared op-content-independent admission gate (Normal-primary, no pending durable-view / sync /
     // checkpoint write, no flagged forfeit, no commit gap, pipeline depth, WAL/carrier capacity). It is
     // split across the session dedup below to PRESERVE this path's exact behaviour: the EARLY-state fences
@@ -415,6 +433,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // client this only bumps the watermark so the in-flight request's retransmits dedup.
     let session = self.clients.entry(key).or_default();
     session.request = request;
+    // DEFENSE-IN-DEPTH for the reserved-client ingress fence above: this is the SOLE site that mints a
+    // client `Request` as a `Body::Present` op. The reserved id MUST never reach here — a `Body::Present`
+    // op carrying `ClientId::RECONFIGURATION` would, on every backup, reconstruct from its prepare bytes
+    // as a typed `Body::Reconfigure` (`from_committed_body` keys on this id), typing the SAME committed
+    // op differently on the primary vs. the backups. The early `on_request` fence already guarantees
+    // this; the assert FREEZES the invariant so a future ingress path that reaches the mint without the
+    // fence is caught.
+    debug_assert!(
+      client != ClientId::RECONFIGURATION,
+      "a client Request minting a Body::Present op carried the reserved ClientId::RECONFIGURATION — \
+       the reserved-client ingress fence was bypassed (backups would type this committed op as \
+       Body::Reconfigure)",
+    );
     self.mint_op(
       now,
       wal,
@@ -1412,14 +1443,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       Message::EpochAhead(m) if m.epoch() > self.membership.epoch() => m.checkpoint_op(),
       _ => return,
     };
-    // Authenticate the SENDER lightly — an ACTIVE replica member, by the transport-bound `from` (NOT the
-    // predecessor-primary binding) — and act on NONE of the message's content, only the epoch-ordering
-    // signal. A non-replica / forged peer cannot drive catch-up. We do NOT bound the slot by
-    // `node_count`: a successor primary's slot can lie BEYOND a laggard's older/smaller config, and the
-    // higher-epoch heartbeat / `EpochAhead` hint is the ONLY catch-up signal we get — the crossing fetch
-    // (forced + crossing-required, self-verifying) is what authenticates the state, not the sender slot.
-    if from.as_replica().is_none() {
-      return;
+    // Authenticate the SENDER as a CURRENT MEMBER of OUR config — the transport-bound `from` resolving to a
+    // `member_at` slot, mirroring [`Self::maybe_answer_lower_epoch`] — and act on NONE of the message's
+    // content, only the epoch-ordering signal. A NON-member (a misrouted or forged hint from an
+    // out-of-config slot) must NOT drive catch-up: on an IDLE checkpoint-0 primary it would arm a forced
+    // crossing sync that no donor can ever answer (every `checkpoint_op` is 0) with no same-epoch authority
+    // ingress to clear the stale intent, wedging writes (`sync.is_some()`) at the old epoch forever. The
+    // reliable catch-up signal is the `EpochAhead` from a RETAINED voter — a member of our config, and a
+    // single-voter change always retains at least one; the crossing fetch (forced + crossing-required,
+    // self-verifying) authenticates the STATE, but the trigger still gates the SENDER to a current member.
+    let Some(slot) = from.as_replica() else {
+      return; // a client / non-replica peer cannot drive cross-epoch catch-up.
+    };
+    if self.membership.member_at(slot).is_none() {
+      return; // an out-of-config slot — a misrouted/forged hint, not a current member of OUR config.
     }
     // PIN the PERSISTENT crossing intent: the highest hinted crossing `checkpoint_op` this node must
     // reach. The arm/upgrade below sets the IN-FLIGHT `SyncState`'s `require_cross_epoch`, but that flag
