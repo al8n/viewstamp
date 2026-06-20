@@ -12,6 +12,7 @@
 //! The commit-time epoch swap (installing the successor membership) is a later task; this module owns
 //! only the proposal mint + the single-writer latch.
 
+use super::normal::NewOpReject;
 use super::*;
 use crate::SingleVoterDelta;
 use crate::message::ReconfigurePayload;
@@ -37,7 +38,10 @@ where
   ///
   /// - [`ProposeMembershipError::NotPrimary`] if this replica is not the primary.
   /// - [`ProposeMembershipError::NotNormal`] if its status is not `Normal`.
-  /// - [`ProposeMembershipError::AlreadyInFlight`] if a reconfiguration op is already in flight.
+  /// - [`ProposeMembershipError::AlreadyInFlight`] if a reconfiguration is already in flight — either
+  ///   PROPOSED-but-not-committed (`reconfigure_inflight`) or COMMITTED-but-not-installed (a staged
+  ///   `pending_swap` / an in-flight `SwapEpoch` root). One change is in flight from propose through
+  ///   install, including across a view change that interrupts the swap window.
   /// - [`ProposeMembershipError::Invalid`] if `delta` is structurally invalid for the current
   ///   configuration (an unknown/duplicate member, a non-learner promotion, the last voter removed) —
   ///   carries the underlying [`MembershipError`](crate::MembershipError).
@@ -63,8 +67,38 @@ where
     if !self.status.is_normal() {
       return Err(ProposeMembershipError::NotNormal);
     }
-    if self.reconfigure_inflight.is_some() {
+    // ONE change in flight from propose THROUGH install — gated on the STRUCTURAL truth derived from the
+    // log ([`Endpoint::has_pending_reconfigure`]), not the `reconfigure_inflight` latch alone. The latch
+    // covers the proposed-but-not-committed phase but is CLEARED by a view-change reset, so an uncommitted
+    // `Reconfigure` op carried canonical into a new view would no longer count as in-flight — and a new
+    // primary could mint a SECOND one before the first re-commits, overlapping two changes across the
+    // epoch boundary. `has_pending_reconfigure` instead reads the uncommitted log tail (which carries the
+    // carried op) OR a committed-but-not-installed swap (`swap_in_flight`, which survives a view change),
+    // so the gate holds through a view change that interrupts the proposal window too. If a second change
+    // committed before the first installed, `stage_epoch_swap` would clobber the first's staged successor
+    // and the first `on_sb_done` would clear the second — losing the second committed swap; this gate is
+    // what forecloses that.
+    if self.has_pending_reconfigure() {
       return Err(ProposeMembershipError::AlreadyInFlight);
+    }
+    // The SHARED new-op admission gate — the IDENTICAL backpressure/safety fences a client request hits
+    // in `on_request` before minting, applied here too so a proposal cannot mint straight through a
+    // pending durable-view write (the durable-view-before-participate violation), a state-sync/checkpoint
+    // reset, a flagged forfeit, a commit gap, a full pipeline, or a WAL/carrier-band stall. The explicit
+    // primary/Normal checks above already foreclose `NotNormalPrimary`; every other verdict is TRANSIENT,
+    // mapped to a RETRYABLE `ProposeMembershipError` so the operator/driver retries rather than treating it
+    // as a permanent rejection.
+    match self.check_new_op_admission(wal) {
+      Ok(()) | Err(NewOpReject::NotNormalPrimary) => {}
+      // Capacity backpressure (a full pipeline OR a WAL-ring/carrier-band stall) → `AtCapacity`.
+      Err(NewOpReject::PipelineFull | NewOpReject::AtCapacity) => {
+        return Err(ProposeMembershipError::AtCapacity);
+      }
+      // A transient-state fence (a pending durable-view/sync/checkpoint write, a flagged step-down, or a
+      // committed-but-unapplied prefix) → `Busy`.
+      Err(NewOpReject::Busy | NewOpReject::SteppingDown | NewOpReject::CommitGap) => {
+        return Err(ProposeMembershipError::Busy);
+      }
     }
     // Validate the delta AND derive the successor in one step: `apply_delta` rejects an invalid delta
     // (unknown/duplicate member, non-learner promotion, last-voter removal) and otherwise returns the
@@ -93,7 +127,11 @@ where
       return Err(ProposeMembershipError::TargetNotCaughtUp);
     }
 
-    let payload = ReconfigurePayload::from_membership(&successor);
+    // Pin the PREDECESSOR `config_id` (this proposer's current configuration) into the op: every
+    // committer derives the successor by chaining off this exact predecessor, so the commit-time gate
+    // (`self.membership.config_id() == prev_config_id`) admits the swap exactly once, off the right
+    // configuration, on every replica — never a forked grand-successor from a re-commit at a later epoch.
+    let payload = ReconfigurePayload::from_membership(&successor, self.membership.config_id());
 
     // The reserved reconfiguration identity: the high-sentinel pseudo-client (never a real client, so
     // no client session collides) and a request number equal to the op number (monotone, never reused).

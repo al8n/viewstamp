@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use smol_str::SmolStr;
-use viewstamp_proto::Instant;
+use viewstamp_proto::{Instant, MembershipChanged};
 
 use crate::cluster::{AppliedEvent, Cluster};
 
@@ -36,19 +36,35 @@ impl CheckResult {
 }
 
 /// Checks the M1 safety invariants:
-/// 1. **Contiguity/uniqueness** — each replica's applied ops are `1,2,3,…` (no gap, no duplicate).
+/// 1. **Contiguity/uniqueness** — each replica's applied ops are the `1,2,3,…` op-number sequence
+///    with the committed `Reconfigure` op numbers REMOVED (a `Reconfigure` op is committed + assigned
+///    an op number but is consensus-layer, never applied to the state machine, so its op number is
+///    legitimately absent from `applied()` — every replica skips the SAME numbers, so the applied
+///    sequence stays a gap-free walk of the non-reconfigure op numbers, with no duplicate).
 /// 2. **Agreement** — across replicas, the shorter applied `(op, body)` sequence is a prefix of
-///    the longer (full content comparison, not just op numbers).
+///    the longer (full content comparison, not just op numbers). Reconfigure ops are uniformly absent
+///    on every replica, so the applied sequences still agree element-for-element.
 /// 3. **Client safety** — each client's replies are for strictly increasing request numbers `1..=n`.
 pub fn check_safety(cluster: &Cluster) -> CheckResult {
+  // The committed `Reconfigure` op numbers — absent from every replica's applied stream, so the
+  // expected applied op number at each position SKIPS them. Empty on a run that never reconfigures, so
+  // the contiguity check below reduces to the plain `op == position + 1`.
+  let reconfigure_ops = cluster.committed_reconfigure_ops();
   let mut logs: Vec<Vec<(u64, Bytes)>> = Vec::new();
   for i in 0..cluster.replica_count() {
     let applied: Vec<(u64, Bytes)> = cluster.replica_sm(i).applied().to_vec();
+    // Walk the expected op-number sequence, skipping committed reconfigure op numbers: position `idx`
+    // must carry the `(idx+1)`-th op number that is not a reconfigure op.
+    let mut expected = 0u64;
     for (idx, (op, _)) in applied.iter().enumerate() {
-      if *op != idx as u64 + 1 {
+      expected += 1;
+      while reconfigure_ops.contains(&expected) {
+        expected += 1;
+      }
+      if *op != expected {
         return CheckResult::violation(format!(
-          "replica {i}: applied op {op} at position {idx} (expected {})",
-          idx + 1
+          "replica {i}: applied op {op} at position {idx} (expected {expected}, skipping committed \
+           reconfigure ops {reconfigure_ops:?})"
         ));
       }
     }
@@ -281,7 +297,11 @@ impl AppliedOnceChecker {
   /// invariants, returning the first violation. Pure over its inputs so the invariant logic is
   /// unit-testable without a live `Cluster`; each `streams[i]` must be an append-only extension of
   /// the slice passed previously.
-  fn fold(&mut self, streams: &[&[(u64, AppliedEvent)]]) -> CheckResult {
+  fn fold(
+    &mut self,
+    streams: &[&[(u64, AppliedEvent)]],
+    reconfigure_ops: &HashSet<u64>,
+  ) -> CheckResult {
     for (i, stream) in streams.iter().enumerate() {
       while self.cursor[i] < stream.len() {
         let (incarnation, entry) = &stream[self.cursor[i]];
@@ -314,11 +334,19 @@ impl AppliedOnceChecker {
                    the apply stream re-applied below its frontier"
                 ));
               }
+              // A gap is legitimate ONLY if EVERY op number strictly between `last` and `op` is a
+              // committed `Reconfigure` op — consensus-layer ops that are committed + assigned an op
+              // number but never applied to the state machine, so they never appear in the apply
+              // stream. Any non-reconfigure number in the gap is a genuinely skipped applied op.
               if op > last + 1 {
-                return CheckResult::violation(format!(
-                  "replica {i}: committed-op gap within an incarnation ({last} -> {op}) with no \
-                   completed state-sync between them — an applied op was skipped"
-                ));
+                let unexplained = ((last + 1)..op).any(|o| !reconfigure_ops.contains(&o));
+                if unexplained {
+                  return CheckResult::violation(format!(
+                    "replica {i}: committed-op gap within an incarnation ({last} -> {op}) with no \
+                     completed state-sync or committed reconfiguration between them — an applied op \
+                     was skipped"
+                  ));
+                }
               }
             }
             self.last_op[i] = Some(op);
@@ -371,7 +399,8 @@ impl AppliedOnceChecker {
     let streams: Vec<&[(u64, AppliedEvent)]> = (0..cluster.replica_count())
       .map(|i| cluster.replica_applied_events(i))
       .collect();
-    self.fold(&streams)
+    let reconfigure_ops: HashSet<u64> = cluster.committed_reconfigure_ops().into_iter().collect();
+    self.fold(&streams, &reconfigure_ops)
   }
 
   /// Final applied-once assertion (run post-quiesce): folds any not-yet-observed stream entries,
@@ -975,6 +1004,213 @@ impl BoundednessChecker {
   }
 }
 
+/// Stateful **reconfigure-applied-once** checker: every committed `Reconfigure` op swaps the epoch
+/// **exactly once per replica incarnation** — no double-swap, no skipped swap, and every replica that
+/// swaps a given op converges on the SAME successor `(epoch, config_id)`.
+///
+/// It folds each replica's recorded membership-swap stream
+/// ([`Cluster::replica_membership_swaps`] — one [`MembershipChanged`] per committed `Reconfigure` op
+/// whose durable `SwapEpoch` root landed, tagged with the replica's incarnation at the swap) into two
+/// layers, checked on every [`observe`](Self::observe):
+///
+/// 1. **Per replica, per incarnation** — a `(op, incarnation)` key swaps AT MOST ONCE: a replica
+///    never installs the same committed reconfiguration twice within one incarnation (a double-swap
+///    would double-bump the epoch / re-fire the abdication). Keying by incarnation is load-bearing:
+///    a replica that committed a `Reconfigure` op but crashed BEFORE its `SwapEpoch` root went
+///    durable re-commits + re-installs that op in a LATER incarnation (the durable root was still at
+///    the OLD epoch), which is a legitimate retry, not a double-application.
+/// 2. **Globally, across replicas** — a committed op number swaps to exactly ONE successor: every
+///    replica that installs op `o` records the SAME `(epoch, config_id)`. Divergent successors for
+///    one committed op (two configurations from one reconfiguration) is a split-brain swap. The
+///    installed epoch is also monotone in the op number — a later committed `Reconfigure` op installs
+///    a strictly higher epoch — so the swaps form an increasing ladder.
+///
+/// [`check`](Self::check) folds any not-yet-observed tail. The checker is silent (vacuously `Ok`)
+/// until a live reconfiguration is driven, so every run that never reconfigures passes trivially.
+#[derive(Debug)]
+pub struct ReconfigureAppliedOnceChecker {
+  /// Per-replica count of swap-stream entries already folded (the streams are append-only).
+  cursor: Vec<usize>,
+  /// Per-replica `(op, incarnation)` swaps already seen — the per-replica, per-incarnation
+  /// once-only key. A second occurrence of a key is a double-swap.
+  seen: Vec<HashSet<(u64, u64)>>,
+  /// The global map `op -> (epoch, config_id)`: the single successor every replica that swaps op `o`
+  /// must agree on. A disagreement is a divergent (forked) swap of one committed reconfiguration.
+  successor_of: HashMap<u64, (u64, u128)>,
+}
+
+impl ReconfigureAppliedOnceChecker {
+  /// A reconfigure-applied-once checker for a cluster of `replica_count` replicas.
+  pub fn new(replica_count: usize) -> Self {
+    Self {
+      cursor: vec![0; replica_count],
+      seen: vec![HashSet::new(); replica_count],
+      successor_of: HashMap::new(),
+    }
+  }
+
+  /// Folds each replica's not-yet-seen swap-stream suffix into the per-incarnation once-only key + the
+  /// global successor map, returning the first violation. Pure over its inputs so the invariant logic
+  /// is unit-testable without a live `Cluster`; each `streams[i]` must be an append-only extension of
+  /// the slice passed previously.
+  fn fold(&mut self, streams: &[&[(u64, MembershipChanged)]]) -> CheckResult {
+    for (i, stream) in streams.iter().enumerate() {
+      while self.cursor[i] < stream.len() {
+        let (incarnation, mc) = &stream[self.cursor[i]];
+        self.cursor[i] += 1;
+        let op = mc.op().get();
+        let epoch = mc.epoch().get();
+        let config_id = mc.config_id();
+        // (1) Per replica, per incarnation: this committed reconfiguration installs AT MOST once.
+        if !self.seen[i].insert((op, *incarnation)) {
+          return CheckResult::violation(format!(
+            "replica {i}: committed Reconfigure op {op} swapped TWICE within incarnation \
+             {incarnation} (epoch {epoch}) — a membership swap was applied more than once"
+          ));
+        }
+        // (2) Globally: one committed op swaps to exactly one successor `(epoch, config_id)`.
+        match self.successor_of.get(&op) {
+          Some(&(e2, c2)) if (e2, c2) != (epoch, config_id) => {
+            return CheckResult::violation(format!(
+              "committed Reconfigure op {op} installed two different successors: (epoch {e2}, \
+               config_id {c2:#x}) vs (epoch {epoch}, config_id {config_id:#x}) — a divergent \
+               (forked) membership swap of one committed reconfiguration"
+            ));
+          }
+          Some(_) => {}
+          None => {
+            self.successor_of.insert(op, (epoch, config_id));
+          }
+        }
+      }
+    }
+    CheckResult::Ok
+  }
+
+  /// Sample the cluster: fold every replica's newly recorded membership-swap entries (the streams are
+  /// append-only) and return a violation on a double-swap or a divergent successor. Call every tick.
+  pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
+    let streams: Vec<&[(u64, MembershipChanged)]> = (0..cluster.replica_count())
+      .map(|i| cluster.replica_membership_swaps(i))
+      .collect();
+    self.fold(&streams)
+  }
+
+  /// Final assertion (post-quiesce): folds any not-yet-observed swap entries and re-checks the
+  /// invariants. No additional post-quiesce obligation beyond the per-tick ones — the swap-once
+  /// property is purely structural over the streams.
+  pub fn check(&mut self, cluster: &Cluster) -> CheckResult {
+    self.observe(cluster)
+  }
+}
+
+/// Stateful **config-lineage** checker: the committed `config_id` chain installed by live membership
+/// swaps is a single UNBROKEN line cluster-wide — every committed successor's `config_id` chains from
+/// its committed predecessor, and no two configurations claim the same epoch.
+///
+/// Where [`MembershipMonotonicChecker`] folds the DURABLE-root `(epoch, config_id, prev_epoch)` every
+/// tick, this checker folds the committed-SWAP EVENTS ([`Cluster::replica_membership_swaps`] — the
+/// op-keyed view of which configuration each committed `Reconfigure` op installed). The two are
+/// independent witnesses of the same single-chain property from different vantage points: the durable
+/// root (what is persisted) and the committed swap (what consensus agreed to install). It maintains an
+/// `epoch -> config_id` map and the highest epoch installed so far, and on each
+/// [`observe`](Self::observe) enforces:
+///
+/// - **No fork** — a `config_id` re-observed at a known epoch must MATCH the recorded one (every
+///   replica that installs epoch E carries the same `config_id`, by agreement). A DIFFERENT
+///   `config_id` at a known epoch is two configurations claiming one epoch — a split-brain
+///   reconfiguration.
+/// - **Unbroken chain** — a single voter delta bumps the epoch by exactly one, so a newly installed
+///   epoch must be exactly `current + 1` (it extends the lineage tip). An epoch that skips ahead, or
+///   re-appears at or below the tip with a fresh `config_id`, did not chain off the committed
+///   predecessor.
+///
+/// Vacuously `Ok` until a live reconfiguration installs a swap, so every non-reconfiguring run passes.
+#[derive(Debug)]
+pub struct ConfigLineageChecker {
+  /// Per-replica count of swap-stream entries already folded (append-only).
+  cursor: Vec<usize>,
+  /// The committed lineage observed so far: `epoch -> config_id`. One `config_id` per epoch, ever — a
+  /// second distinct id at a known epoch is a fork.
+  lineage: HashMap<u64, u128>,
+  /// The highest epoch a swap has installed so far — the lineage tip a successor must extend by one.
+  /// `None` until the first swap (the genesis epoch is never a swap; the first swap installs epoch 1).
+  tip: Option<u64>,
+}
+
+impl ConfigLineageChecker {
+  /// A fresh config-lineage checker for a cluster of `replica_count` replicas.
+  pub fn new(replica_count: usize) -> Self {
+    Self {
+      cursor: vec![0; replica_count],
+      lineage: HashMap::new(),
+      tip: None,
+    }
+  }
+
+  /// Fold one committed-swap observation `(epoch, config_id)` into the lineage, returning a violation
+  /// on a FORK or a broken chain. Pure over its inputs so the chaining logic is unit-testable without
+  /// a live `Cluster`.
+  fn note(&mut self, epoch: u64, config_id: u128) -> CheckResult {
+    if let Some(&known) = self.lineage.get(&epoch) {
+      if known != config_id {
+        return CheckResult::violation(format!(
+          "committed configuration fork: epoch {epoch} installed two different config_ids \
+           ({known:#x} vs {config_id:#x}) — two configurations claim the same epoch from one \
+           reconfiguration lineage"
+        ));
+      }
+      return CheckResult::Ok;
+    }
+    // A NEW epoch installed by a swap. The genesis epoch (0) is never installed by a swap, so the
+    // first swap must be epoch 1 chaining off genesis; thereafter each swap extends the tip by one.
+    let expected = self.tip.map_or(1, |t| t + 1);
+    if epoch != expected {
+      return CheckResult::violation(format!(
+        "committed configuration chain broken: a swap installed epoch {epoch} but the lineage tip is \
+         {:?} (a single-voter change bumps the epoch by exactly one, so the next committed epoch must \
+         be {expected}) — the successor did not chain off its committed predecessor",
+        self.tip
+      ));
+    }
+    self.lineage.insert(epoch, config_id);
+    self.tip = Some(epoch);
+    CheckResult::Ok
+  }
+
+  /// Fold each replica's not-yet-seen swap-stream suffix into the lineage. Pure over its inputs so the
+  /// chaining logic is unit-testable; each `streams[i]` must be an append-only extension of the slice
+  /// passed previously. Swaps are folded in stream order across replicas — agreement makes every
+  /// replica installing epoch E carry the same `config_id`, so the per-epoch uniqueness check is the
+  /// fork net regardless of the interleaving.
+  fn fold(&mut self, streams: &[&[(u64, MembershipChanged)]]) -> CheckResult {
+    for (i, stream) in streams.iter().enumerate() {
+      while self.cursor[i] < stream.len() {
+        let (_incarnation, mc) = &stream[self.cursor[i]];
+        self.cursor[i] += 1;
+        if let v @ CheckResult::Violation(_) = self.note(mc.epoch().get(), mc.config_id()) {
+          return v;
+        }
+      }
+    }
+    CheckResult::Ok
+  }
+
+  /// Sample the cluster: fold every replica's newly recorded swap entries into the committed lineage,
+  /// returning a violation on a fork or a broken chain. Call every tick.
+  pub fn observe(&mut self, cluster: &Cluster) -> CheckResult {
+    let streams: Vec<&[(u64, MembershipChanged)]> = (0..cluster.replica_count())
+      .map(|i| cluster.replica_membership_swaps(i))
+      .collect();
+    self.fold(&streams)
+  }
+
+  /// Final assertion (post-quiesce): folds any not-yet-observed swap entries and re-checks the chain.
+  pub fn check(&mut self, cluster: &Cluster) -> CheckResult {
+    self.observe(cluster)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1158,7 +1394,7 @@ mod tests {
       applied(0, 3, 7, 1, b"c"),
     ];
     assert!(
-      once.fold(&[&s0]).is_violation(),
+      once.fold(&[&s0], &HashSet::new()).is_violation(),
       "a request applied at two ops must be flagged"
     );
   }
@@ -1171,7 +1407,7 @@ mod tests {
     let s0 = vec![applied(0, 1, 7, 1, b"a")];
     let s1 = vec![applied(0, 2, 7, 1, b"a")];
     assert!(
-      once.fold(&[&s0, &s1]).is_violation(),
+      once.fold(&[&s0, &s1], &HashSet::new()).is_violation(),
       "one request at two different ops across replicas must be flagged"
     );
   }
@@ -1184,7 +1420,7 @@ mod tests {
     let s0 = vec![applied(0, 5, 1, 1, b"a")];
     let s1 = vec![applied(0, 5, 2, 1, b"a")];
     assert!(
-      once.fold(&[&s0, &s1]).is_violation(),
+      once.fold(&[&s0, &s1], &HashSet::new()).is_violation(),
       "an op number reused for a second request must be flagged"
     );
   }
@@ -1197,7 +1433,7 @@ mod tests {
     let s0 = vec![applied(0, 5, 1, 1, b"a")];
     let s1 = vec![applied(0, 5, 1, 1, b"X")];
     assert!(
-      once.fold(&[&s0, &s1]).is_violation(),
+      once.fold(&[&s0, &s1], &HashSet::new()).is_violation(),
       "divergent replies for one request must be flagged"
     );
   }
@@ -1208,7 +1444,7 @@ mod tests {
     // client-acked committed op was lost. The matching acked reply passes; a divergent one trips.
     let mut once = AppliedOnceChecker::new(1);
     let s0 = vec![applied(0, 1, 7, 1, b"a")];
-    assert!(once.fold(&[&s0]).is_ok());
+    assert!(once.fold(&[&s0], &HashSet::new()).is_ok());
     assert!(
       once
         .check_acked(&[(7, 2, Bytes::from_static(b"b"))], true)
@@ -1257,7 +1493,7 @@ mod tests {
       applied(1, 3, 7, 3, b"c"),
     ];
     assert!(
-      once.fold(&[&s0]).is_ok(),
+      once.fold(&[&s0], &HashSet::new()).is_ok(),
       "re-emission across incarnations is recovery, not double-apply"
     );
   }
@@ -1276,7 +1512,7 @@ mod tests {
       applied(0, 12, 7, 12, b"l"),
     ];
     assert!(
-      once.fold(&[&synced]).is_ok(),
+      once.fold(&[&synced], &HashSet::new()).is_ok(),
       "a synced jump is a rebase, not a skipped apply"
     );
     // A LATE marker (the recovery peer-fetch path installs eagerly, reporting only once the synced
@@ -1290,7 +1526,7 @@ mod tests {
       applied(0, 43, 7, 43, b"c"),
     ];
     assert!(
-      once.fold(&[&late]).is_ok(),
+      once.fold(&[&late], &HashSet::new()).is_ok(),
       "a late sync marker never regresses the frontier"
     );
     // The same jump WITHOUT a sync between is a skipped apply.
@@ -1301,7 +1537,7 @@ mod tests {
       applied(0, 11, 7, 11, b"k"),
     ];
     assert!(
-      once.fold(&[&gap]).is_violation(),
+      once.fold(&[&gap], &HashSet::new()).is_violation(),
       "an op gap with no state-sync between must be flagged"
     );
   }
@@ -1313,7 +1549,7 @@ mod tests {
     let mut once = AppliedOnceChecker::new(1);
     let s0 = vec![applied(0, 5, 7, 5, b"a"), applied(0, 4, 7, 4, b"b")];
     assert!(
-      once.fold(&[&s0]).is_violation(),
+      once.fold(&[&s0], &HashSet::new()).is_violation(),
       "an op regression within an incarnation must be flagged"
     );
   }
@@ -1727,6 +1963,124 @@ mod tests {
     assert!(
       dur.check(&c).is_violation(),
       "with no operational non-removed replica retaining the history the no-loss check must fail"
+    );
+  }
+
+  /// One fabricated membership-swap entry: incarnation `inc` installed the committed `Reconfigure`
+  /// op `op` producing configuration `(epoch, config_id)`.
+  fn swap(inc: u64, op: u64, epoch: u64, config_id: u128) -> (u64, MembershipChanged) {
+    use viewstamp_proto::{Epoch, OpNumber};
+    (
+      inc,
+      MembershipChanged::new(
+        OpNumber::with(op),
+        Epoch::new(epoch),
+        config_id,
+        true,
+        false,
+      ),
+    )
+  }
+
+  #[test]
+  fn reconfigure_applied_once_empty_streams_pass() {
+    // A run that never reconfigures emits no swaps — the checker is vacuously Ok.
+    let mut once = ReconfigureAppliedOnceChecker::new(3);
+    assert!(once.fold(&[&[], &[], &[]]).is_ok());
+  }
+
+  #[test]
+  fn reconfigure_applied_once_one_swap_per_replica_passes() {
+    // Three replicas each install the SAME committed reconfiguration (op 10 -> epoch 1) once — the
+    // convergent, once-per-replica case.
+    let mut once = ReconfigureAppliedOnceChecker::new(3);
+    let s0 = vec![swap(0, 10, 1, 0xAA)];
+    let s1 = vec![swap(0, 10, 1, 0xAA)];
+    let s2 = vec![swap(0, 10, 1, 0xAA)];
+    assert!(
+      once.fold(&[&s0, &s1, &s2]).is_ok(),
+      "every replica installing the same committed swap once is the healthy case"
+    );
+  }
+
+  #[test]
+  fn reconfigure_applied_once_flags_a_double_swap_in_one_incarnation() {
+    // The same committed Reconfigure op installed TWICE within one incarnation — a double application
+    // (the epoch would be double-bumped / abdication re-fired).
+    let mut once = ReconfigureAppliedOnceChecker::new(1);
+    let s0 = vec![swap(0, 10, 1, 0xAA), swap(0, 10, 1, 0xAA)];
+    assert!(
+      once.fold(&[&s0]).is_violation(),
+      "a committed reconfiguration installed twice in one incarnation must be flagged"
+    );
+  }
+
+  #[test]
+  fn reconfigure_applied_once_allows_a_swap_retry_in_a_new_incarnation() {
+    // A replica committed the Reconfigure op but crashed before its SwapEpoch root went durable, so it
+    // re-installs that op in a LATER incarnation — a legitimate retry, NOT a double-swap.
+    let mut once = ReconfigureAppliedOnceChecker::new(1);
+    let s0 = vec![swap(0, 10, 1, 0xAA), swap(1, 10, 1, 0xAA)];
+    assert!(
+      once.fold(&[&s0]).is_ok(),
+      "re-installing a committed swap in a new incarnation is a crash retry, not a double-apply"
+    );
+  }
+
+  #[test]
+  fn reconfigure_applied_once_flags_a_divergent_successor() {
+    // Two replicas install the SAME committed op but record DIFFERENT successors — a forked swap of
+    // one committed reconfiguration (two configurations from one change).
+    let mut once = ReconfigureAppliedOnceChecker::new(2);
+    let s0 = vec![swap(0, 10, 1, 0xAA)];
+    let s1 = vec![swap(0, 10, 1, 0xBB)];
+    assert!(
+      once.fold(&[&s0, &s1]).is_violation(),
+      "one committed op installing two different successors must be flagged"
+    );
+  }
+
+  #[test]
+  fn config_lineage_empty_streams_pass() {
+    let mut lin = ConfigLineageChecker::new(3);
+    assert!(lin.fold(&[&[], &[], &[]]).is_ok());
+  }
+
+  #[test]
+  fn config_lineage_unbroken_chain_passes() {
+    // A 3->4->3 reconfiguration installs epoch 1 then epoch 2, each chaining off the tip — an
+    // unbroken committed lineage cluster-wide (every replica agrees on each epoch's config_id).
+    let mut lin = ConfigLineageChecker::new(2);
+    let s0 = vec![swap(0, 10, 1, 0xA1), swap(0, 20, 2, 0xB2)];
+    let s1 = vec![swap(0, 10, 1, 0xA1), swap(0, 20, 2, 0xB2)];
+    assert!(
+      lin.fold(&[&s0, &s1]).is_ok(),
+      "a one-epoch-at-a-time committed lineage every replica agrees on is unbroken"
+    );
+  }
+
+  #[test]
+  fn config_lineage_flags_a_same_epoch_fork() {
+    // Two replicas install epoch 1 with DIFFERENT config_ids — two configurations claiming one epoch
+    // (the split-brain reconfiguration hazard).
+    let mut lin = ConfigLineageChecker::new(2);
+    let s0 = vec![swap(0, 10, 1, 0xA1)];
+    let s1 = vec![swap(0, 10, 1, 0xFF)];
+    assert!(
+      lin.fold(&[&s0, &s1]).is_violation(),
+      "divergent config_ids at the same committed epoch must be flagged as a fork"
+    );
+  }
+
+  #[test]
+  fn config_lineage_flags_a_broken_chain() {
+    // A swap installs epoch 3 directly after genesis (skipping 1 and 2) — a single-voter change bumps
+    // the epoch by exactly one, so an epoch that skips ahead did not chain off its predecessor.
+    let mut lin = ConfigLineageChecker::new(1);
+    let s0 = vec![swap(0, 10, 3, 0xC3)];
+    assert!(
+      lin.fold(&[&s0]).is_violation(),
+      "a committed epoch that skips the tip+1 successor must be flagged as a broken chain"
     );
   }
 }

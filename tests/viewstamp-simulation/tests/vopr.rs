@@ -151,7 +151,8 @@
 use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
   run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_learners, run_vopr_with_reconfig,
-  run_vopr_with_slow, run_vopr_with_stale_read, run_vopr_with_torn_headers, run_vopr_with_wipe,
+  run_vopr_with_reconfig_live, run_vopr_with_slow, run_vopr_with_stale_read,
+  run_vopr_with_torn_headers, run_vopr_with_wipe,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -239,6 +240,20 @@ fn vopr_sweep_no_violations() {
       r.reconfigs_fired(),
       0,
       "seed {seed}: a coordinated reconfiguration fired off-axis (the reconfig axis is off)"
+    );
+    // Off-axis live-reconfig guard (the byte-identity net): WITHOUT the live-reconfig axis no live
+    // single change is ever proposed, so no `MembershipChanged` fires and no swap is observed — the
+    // run is byte-identical to a no-reconfiguration run. A non-zero count here would mean a live
+    // change fired off-axis (a draw leaked into the default schedule).
+    assert_eq!(
+      r.live_swaps_observed(),
+      0,
+      "seed {seed}: a live membership swap was observed off-axis (the live-reconfig axis is off)"
+    );
+    assert_eq!(
+      r.live_reconfigs_proposed(),
+      0,
+      "seed {seed}: a live reconfiguration was proposed off-axis (the live-reconfig axis is off)"
     );
     total_committed += r.max_committed();
     total_crashes += r.crashes();
@@ -1077,6 +1092,65 @@ fn vopr_reconfig_sweep_no_violations() {
     "VOPR reconfig sweep OK: reconfigs_fired={total_reconfigs} \
      reform_escalations_fired={total_escalations} committed={total_committed} \
      view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The contiguous seed range for the committed LIVE single-change reconfiguration sweep (same budget
+/// rationale as [`HOLD_SEEDS`]).
+const RECONFIG_LIVE_SEEDS: u64 = 16;
+
+/// LIVE single-change reconfiguration GATE: the [`run_vopr_with_reconfig_live`] axis FORCE-ENABLED over
+/// `0..RECONFIG_LIVE_SEEDS`. Each run proposes ONE live single-voter change (an `AddLearner` of a fresh
+/// sentinel id — always valid, no catch-up gate, no voting-quorum perturbation) on the serving primary,
+/// then runs the FULL adversarial schedule (crashes / partitions / disk faults) while the committed
+/// `Reconfigure` op installs its durable epoch swap. The swap-correctness SAFETY suite runs EVERY tick:
+/// agreement (contiguity-aware of the consensus-layer reconfigure ops), no committed op rewritten across
+/// the epoch boundary, applied-once (the op-number-reuse oracle), the two live-reconfig nets (the swap
+/// is applied once per replica with every replica converging on the identical successor; the committed
+/// `config_id` chain is unbroken), and the epoch/view + durable-config monotonicity nets — so any
+/// op-number reuse, double-swap, forked successor, divergent applied prefix, or lost committed op
+/// straddling the swap fails fast with its `seed S tick T:` message.
+///
+/// A live single change CONVERGES cluster-wide and safely: the primary keeps participating at the
+/// predecessor epoch through the SwapEpoch window (an epoch swap leaves `self.view` durable — only a
+/// VIEW change raises the durable-view-before-participate fence), advertising the E-commit so backups
+/// learn the `Reconfigure` op committed and stage their own swap; recovery preserves the op's typed
+/// `Body::Reconfigure` identity; the install names the captured reconfigure op (not an advanced
+/// `commit_min`); and the op pins its predecessor `config_id`, so the successor is derived off the EXACT
+/// predecessor on every replica exactly once (a re-commit at a later configuration is an idempotent
+/// no-op, never a forked grand-successor). This gate asserts that convergence directly: NO seed
+/// violates, and the axis genuinely drove swaps (non-vacuity), so the suite is enforcing real behavior
+/// rather than passing because no swap was reached.
+///
+/// The DEFAULT sweep leaves this axis OFF (no live change is proposed — `live_swaps_observed` stays 0,
+/// the off-axis byte-identity guard in [`vopr_sweep_no_violations`]); live-reconfig runs are their own
+/// deterministic baselines, byte-identical to `VOPR_RECONFIG_LIVE=1` runs of the same seeds.
+#[test]
+fn vopr_reconfig_live_sweep_no_violations() {
+  println!(
+    "VOPR live-reconfig sweep: 0..{RECONFIG_LIVE_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, \
+     live-reconfig axis forced on"
+  );
+  let mut total_proposed = 0u64;
+  let mut total_swaps = 0u64;
+  for seed in 0..RECONFIG_LIVE_SEEDS {
+    // Fail FAST on any safety violation: the per-tick swap-correctness suite panics with its
+    // `seed S tick T: <class>: ...` message, surfacing the offending seed directly.
+    let r = run_vopr_with_reconfig_live(seed, DEFAULT_TICKS);
+    total_proposed += r.live_reconfigs_proposed();
+    total_swaps += r.live_swaps_observed();
+  }
+  println!(
+    "=== VOPR live-reconfig sweep 0..{RECONFIG_LIVE_SEEDS}: clean \
+     (live_reconfigs_proposed={total_proposed}, live_swaps_observed={total_swaps}) ==="
+  );
+  // Non-vacuity: a clean sweep that never actually installed a swap would pass the safety suite
+  // spuriously (the reconfiguration code paths were never reached). The axis genuinely drove the
+  // committed `Reconfigure` op to commit + install its durable epoch swap somewhere across the sweep.
+  assert!(
+    total_swaps > 0,
+    "the live-reconfig axis never installed a swap across the sweep (live_swaps_observed={total_swaps}) \
+     — the gate is vacuous (the proposal never committed + installed under any seed's schedule)"
   );
 }
 

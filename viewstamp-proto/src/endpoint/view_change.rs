@@ -87,16 +87,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // Gate the DVC retransmit on a DURABLE view (durable-view-before-participate in the
     // retransmit path). `enter_view_change` arms `dvc_message` AND submits the SendDoViewChange
-    // durable-view write (so `pending_sb` is set), with the INITIAL DVC deferred to `on_sb_done`. If
-    // the async superblock write is slower than `VC_MESSAGE_RETRANSMIT`, this retransmit would
-    // otherwise fire FIRST and cast the DVC — a VOTE the new primary counts toward forming the view —
+    // durable-view write (so `pending_durable_view()` holds), with the INITIAL DVC deferred to
+    // `on_sb_done`. If the async superblock write is slower than `VC_MESSAGE_RETRANSMIT`, this retransmit
+    // would otherwise fire FIRST and cast the DVC — a VOTE the new primary counts toward forming the view —
     // BEFORE this replica has PERSISTED the view; a crash before the write lands then recovers the OLD
     // view after this replica helped form a quorum for the new one. So skip the send while the view
     // write is pending (the deferred `on_sb_done` casts the initial DVC and the retransmit resumes once
-    // the view is durable). Kept in LOCKSTEP with `serviceable_now(DvcMessage)` (which also gates on
-    // `pending_sb.is_none()`), so a `dvc_message` armed-and-due during `pending_sb` is non-serviceable:
-    // `poll_timeout` filters it out (no spin) and the `handle_timeout` no-orphan-due assert ignores it.
-    if self.pending_sb.is_none() && self.timers.dvc_message.is_some_and(|d| d <= now) {
+    // the view is durable). In ViewChange status the only in-flight `pending_sb` write is this
+    // SendDoViewChange one (a SwapEpoch/Seal is Normal-only), so `!pending_durable_view()` is exactly the
+    // durable-view test here. Kept in LOCKSTEP with `serviceable_now(DvcMessage)` (which gates the same
+    // way), so a `dvc_message` armed-and-due during the view write is non-serviceable: `poll_timeout`
+    // filters it out (no spin) and the `handle_timeout` no-orphan-due assert ignores it.
+    if !self.pending_durable_view() && self.timers.dvc_message.is_some_and(|d| d <= now) {
       self.send_do_view_change(now);
       self.timers.dvc_message = Some(now + VC_MESSAGE_RETRANSMIT);
     }
@@ -281,15 +283,29 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Supersede any in-flight checkpoint: a view change drops it (its stale superblock completion is
     // then ignored in on_sb_done). It re-triggers once Normal resumes — commit_min is preserved.
     self.pending_checkpoint = None;
-    // Supersede any STAGED-but-not-yet-durable epoch swap: a committed `Body::Reconfigure` op staged
-    // its successor here (commit-first), and its SwapEpoch root may be in flight. A view change
-    // supersedes that in-flight root (its stale completion is then ignored in `on_sb_done`), so drop
-    // the staging — exactly as the in-flight checkpoint above — to keep the swap from stranding with
-    // an idle superblock (invariant (7)). The committed reconfiguration op SURVIVES in the durable log;
-    // re-deriving its swap in the new generation (so the epoch still advances after an interrupting view
-    // change) is the view-change/recovery integration task, not this one. The durable-epoch-before-
-    // participate fence holds either way: the membership was never installed off the superseded root.
-    self.pending_swap = None;
+    // Release the PROPOSAL latch: an uncommitted `Reconfigure` op this primary proposed belongs to the
+    // generation a view change ends. If that op rides the canonical log and RE-COMMITS under the new
+    // view, `commit_reconfigure` stages its swap fresh; if it is TRUNCATED (not canonical), it never
+    // commits — and a latch left `Some` here would block a future `propose_membership` FOREVER (the
+    // proposed-but-never-committed deadlock). Either way the proposal phase is over, so release it (the
+    // committed-but-not-installed swap, tracked separately in `pending_swap`, is NOT released — see below).
+    self.reconfigure_inflight = None;
+    // KEEP a committed-but-not-installed epoch swap across the transition. `pending_swap` is set ONLY for
+    // a COMMITTED `Reconfigure` op (`stage_epoch_swap` runs at commit, after `commit_min` advanced past
+    // the op), so the change is durable in the log and MUST still install — dropping it would lose a
+    // committed membership change (the cluster would stay in the old epoch forever, since the new view's
+    // `advance_commit` starts ABOVE the already-committed op and never re-stages it). The successor is
+    // membership-derived and view-INDEPENDENT (a view change changes neither the membership nor the
+    // epoch), so the staged value stays valid across the transition. Its in-flight `SwapEpoch` root (if
+    // any) is superseded on the superblock by the imminent durable-view write (its stale completion is
+    // ignored in `on_sb_done`), but `pending_swap` survives and `maybe_swap_epoch` RE-SUBMITS it once a
+    // superblock slot frees: from `on_sb_done` when the durable-view root lands, and from the commit
+    // tails (`try_commit` / `advance_commit`) for the `catch_up_to_view` path that issues no durable-view
+    // write. The durable-epoch-before-participate fence holds throughout — the membership is installed
+    // only off a durable SwapEpoch root, never the superseded one. (Invariant (7) — "a staged swap always
+    // has a superblock write outstanding" — is momentarily relaxed across this reset: the superseding
+    // durable-view write keeps a write in flight whenever a view change issues one, and the commit-tail
+    // re-submit covers the no-write `catch_up_to_view` path; `assert_invariants` does not run mid-reset.)
     // Abandon any in-flight state-sync: a view change supersedes it (state-sync and view
     // change are mutually exclusive by status — §2.6). The `sync` handshake, its DEFERRED INSTALL
     // (`pending_install`), and any in-progress chunked transfer (`sync_transfer`) are cancelled
@@ -1049,25 +1065,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // This reads `self.commit_min` AT ADOPT TIME, BEFORE the caller advances the commit, so the
     // predicate uses the OLD (pre-adoption) applied frontier — both callers (`adopt_canonical_head`,
     // `start_view_as_new_primary`) run `adopt_log` strictly before their `advance_commit`.
-    // Before dropping the held log, capture the adopter's OWN body bytes for any op the canonical log
-    // carries only HEADER-ONLY (`Repairing`) but the adopter already holds `Present` with a body whose
-    // checksum MATCHES the canonical `body_checksum`. The adopter's body is then the CANONICAL body the
-    // new view still needs (the canonical donor read it back faulty and carried only the header), so it
-    // must NOT be destroyed by overwriting the slot with a body-less `Repairing` entry: a replica that
-    // holds the body is the source the new primary peer-repairs from. The checksum match makes this
-    // safe — only the canonical body is preserved, never a superseded one (a different body fails the
-    // match and is dropped). This makes "Present wins over a matching Repairing" hold on the ADOPT side
-    // too, mirroring the union in `select_canonical_log`.
-    let mut preserved_bodies: BTreeMap<u64, Bytes> = BTreeMap::new();
+    // Before dropping the held log, capture the adopter's OWN BODY-BEARING entry for any op the canonical
+    // log carries only HEADER-ONLY (`Repairing`) but the adopter already holds with a body whose checksum
+    // MATCHES the canonical `body_checksum`. "Body-bearing" is a `Present` client op OR a `Reconfigure`
+    // membership op (both carry wire bytes — see `Body::is_body_bearing`); ONLY a `Repairing` adopter slot
+    // has nothing to preserve. The adopter's body is then the CANONICAL body the new view still needs (the
+    // canonical donor read it back faulty and carried only the header), so it must NOT be destroyed by
+    // overwriting the slot with a body-less `Repairing` entry: a replica that holds the body is the source
+    // the new primary peer-repairs / re-commits from. The checksum match makes this safe — only the
+    // canonical body is preserved, never a superseded one (a different body fails the match and is dropped).
+    // The PRESERVED `Body` is kept TYPED (a `Reconfigure` stays `Reconfigure`, not flattened to `Present`),
+    // or `commit_reconfigure` would miss the carried reconfiguration op at re-commit. This makes "a held
+    // body wins over a matching Repairing" hold on the ADOPT side too, mirroring the union in
+    // `select_canonical_log`. CRITICAL when the new primary is the SOLE quorum-intersection holder of a
+    // carried reconfiguration body: dropping it would leave an unfillable hole instead of a recommit+install.
+    let mut preserved_bodies: BTreeMap<u64, Body> = BTreeMap::new();
     for e in entries {
       if e.is_repairing()
-        && let Some(LogEntry {
-          body: Body::Present(body),
-          ..
-        }) = self.log.get(&e.op().get())
-        && crate::storage::fnv1a_128(body) == e.body_checksum()
+        && let Some(local) = self.log.get(&e.op().get())
+        && local.body.is_body_bearing()
+        && local.body.body_checksum() == e.body_checksum()
       {
-        preserved_bodies.insert(e.op().get(), body.clone());
+        preserved_bodies.insert(e.op().get(), local.body.clone());
       }
     }
     let applied_floor = self.commit_min.get();
@@ -1086,7 +1105,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // commit path HOLDS at it until the body returns. Either way the op exists in `self.log`, so its
       // number is TAKEN and never re-minted.
       let body = match preserved_bodies.remove(&e.op().get()) {
-        Some(bytes) => Body::Present(bytes),
+        Some(body) => body,
         None => e.body_state().clone(),
       };
       let entry = LogEntry {
@@ -1319,8 +1338,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return; // not held — `advance_commit`/`request_repair` recovers a committed gap; nothing to ack
     };
     // A body-`Repairing` entry has no bytes to (re-)append, so it is treated like a not-held op: skip
-    // it and owe no ack — `advance_commit`/`request_repair` recovers its body from a peer.
-    let Body::Present(body) = entry.body else {
+    // it and owe no ack — `advance_commit`/`request_repair` recovers its body from a peer. A
+    // `Body::Reconfigure` op IS body-bearing (`body_bytes()` yields its `encode_body()`): it is the
+    // adopted carried reconfiguration op, and a new primary that is its sole live holder MUST re-append
+    // its successor bytes durably (header over those bytes), or its own vote is owed off an absent body
+    // and the carried change can never re-commit.
+    let Some(body) = entry.body_bytes() else {
       return;
     };
     let header = Header::new(

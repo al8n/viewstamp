@@ -65,14 +65,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn request_repair_run(&mut self, now: Instant, lo: u64) {
     // Walk the contiguous hole band up from `lo`, bounded by the repair window and the known-committed
     // frontier. An op is a HOLE iff it is missing from `self.log` OR held header-only (`Repairing`); a
-    // `Present` op terminates the band (it is filled, not a hole). Capped at `commit_max` — a slot above
-    // it is uncommitted-tail (the `request_tail_gap` ABOVE-head path), never a below-head committed hole.
+    // BODY-BEARING op (`Present` OR `Reconfigure`) terminates the band (it is filled, not a hole — a held
+    // reconfiguration op is NOT a hole and must never be re-requested / dropped). Capped at `commit_max` —
+    // a slot above it is uncommitted-tail (the `request_tail_gap` ABOVE-head path), never a below-head hole.
     let window_top = lo.saturating_add(REPAIR_WINDOW).saturating_sub(1);
     let ceiling = self.commit_max.get().min(window_top).min(self.op.get());
     let mut hi = lo;
     while hi < ceiling {
       let next = hi + 1;
-      let is_hole = !matches!(self.log.get(&next), Some(e) if e.body.is_present());
+      let is_hole = !matches!(self.log.get(&next), Some(e) if e.body.is_body_bearing());
       if !is_hole {
         break;
       }
@@ -336,15 +337,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// progress; the op's content is view-independent, so the requester accepts it regardless of our view.
   pub(crate) fn on_request_prepare(&mut self, _now: Instant, m: crate::RequestPrepare) {
     // Durable-view-before-participate: the served `Prepare` advertises `self.view` (see
-    // below). A replica in its `pending_sb` window (a new primary between `start_view_as_new_primary`
-    // and the `on_sb_done` that makes its view durable — or any replica mid `AdoptedStartView`/
-    // `SendDoViewChange` write) is `Normal` but its view is NOT yet recoverable; serving a repair
-    // `Prepare(self.view)` now would advertise a view a crash could roll back — the same hazard the
-    // primary `Prepare`/`Commit`/`StartView` paths gate on. The served op is committed and its CONTENT
+    // below). A replica in its view-CHANGING `pending_sb` window (a new primary between
+    // `start_view_as_new_primary` and the `on_sb_done` that makes its view durable — or any replica mid
+    // `AdoptedStartView`/`SendDoViewChange` write) is `Normal` but its view is NOT yet recoverable;
+    // serving a repair `Prepare(self.view)` now would advertise a view a crash could roll back — the same
+    // hazard the primary `Prepare`/`Commit`/`StartView` paths gate on. A commit-first SwapEpoch root does
+    // NOT raise this fence (the view is durable through an epoch swap — [`Self::pending_durable_view`]), so
+    // the repair serve keeps answering at the predecessor epoch. The served op is committed and its CONTENT
     // is view-independent, so the requester loses nothing by waiting: it broadcasts the `RequestPrepare`
     // to ALL peers and retries on the repair-retransmit timer, so another Normal+durable peer answers
     // (and we answer once our own view is durable). Negligible liveness cost; consistent with the class.
-    if !self.status.is_normal() || self.pending_sb.is_some() {
+    if !self.status.is_normal() || self.pending_durable_view() {
       return; // only a Normal replica whose view is durable may serve a (view-advertising) repair Prepare
     }
     if m.replica().get() >= self.membership.node_count() {
@@ -353,12 +356,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let op = m.op().get();
     // Serve an op we hold in our log at or below our head (`op <= self.op`). A body-`Repairing` entry
     // holds the op's identity but NOT its bytes (we are ourselves awaiting peer-repair of this body), so
-    // we cannot serve it — stay silent and let a peer that holds the body answer.
+    // we cannot serve it — stay silent and let a peer that holds the body answer. A `Body::Reconfigure`
+    // op IS body-bearing (`body_bytes()` yields its `encode_body()`), so we serve its reconfiguration
+    // bytes exactly like a client op — a peer repairing the carried reconfiguration op fetches it from us.
     let Some(entry) = self.log.get(&op) else {
       return; // we do not hold this op (or it is a hole for us too) — stay silent; another peer answers
     };
-    let Body::Present(body) = &entry.body else {
-      return;
+    let Some(body) = entry.body_bytes() else {
+      return; // header-only (`Repairing`): we hold the identity, not the bytes — a body holder answers
     };
     if op > self.op.get() {
       return; // above our head — not ours to serve
@@ -379,7 +384,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.membership.config_id(),
       entry.client,
       entry.request,
-      body.clone(),
+      body,
     );
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(m.replica())),
@@ -414,8 +419,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the single-entry `RepairBatch` carrier), so the run always makes forward progress.
   pub(crate) fn on_request_prepare_range(&mut self, _now: Instant, m: crate::RequestPrepareRange) {
     // Durable-view-before-participate (identical to `on_request_prepare`): only a Normal replica whose
-    // view is durable may serve a (view-advertising) repair answer.
-    if !self.status.is_normal() || self.pending_sb.is_some() {
+    // view is durable may serve a (view-advertising) repair answer. A commit-first SwapEpoch root does NOT
+    // raise this fence (the view is durable through an epoch swap — [`Self::pending_durable_view`]).
+    if !self.status.is_normal() || self.pending_durable_view() {
       return;
     }
     if m.replica().get() >= self.membership.node_count() {
@@ -438,9 +444,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let mut entries: std::vec::Vec<crate::PreparedEntry> = std::vec::Vec::new();
     // `self.log.range(lo..=hi)`, not the numeric `lo..=hi`: the scan costs only the entries we hold.
     // A `Repairing` (header-only) entry is SKIPPED — we have its identity, not its bytes — exactly as
-    // `on_request_prepare` stays silent on a hole; the requester re-solicits any gap.
+    // `on_request_prepare` stays silent on a hole; the requester re-solicits any gap. A `Body::Reconfigure`
+    // op IS body-bearing (`body_bytes()` yields its `encode_body()`), so it is served like a client op.
     for (&op, entry) in self.log.range(lo..=hi) {
-      let Body::Present(body) = &entry.body else {
+      let Some(body) = entry.body_bytes() else {
         continue;
       };
       let (client, request) = (entry.client, entry.request);
@@ -456,7 +463,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         OpNumber::with(op),
         client,
         request,
-        body.clone(),
+        body,
       ));
     }
     if entries.is_empty() {
@@ -508,13 +515,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     for e in m.into_log() {
       // Reconstruct the per-entry `Prepare` the per-op repair path expects, carrying the batch's
       // `commit` as the committed-vouch (so `fill_repair`'s `commit >= op` gate sees the same signal a
-      // single repair-serve `Prepare` carries). The decoded `Body::Present` bytes are MOVED out of the
-      // owned entry (`into_parts`) — the decode boundary already paid the wire→owned copy, so a second
-      // per-entry copy here would be pure waste on the bulk-repair path. A header-only (`Repairing`)
-      // served entry has no body to fill — skip it (we cannot adopt bytes we were not given); the
-      // requester re-solicits.
+      // single repair-serve `Prepare` carries). The wire body bytes are taken from the served entry —
+      // `body_bytes()` yields a `Present` op's bytes or a `Reconfigure` op's `encode_body()` (both
+      // body-bearing); a header-only (`Repairing`) served entry has no body to fill, so it is SKIPPED (we
+      // cannot adopt bytes we were not given) and the requester re-solicits. `fill_repair` rebuilds the
+      // typed `Body::Reconfigure` from the `RECONFIGURATION` client id, so a reconfiguration body fills
+      // exactly like a client op regardless of the wire entry's tag.
       let (op, client, request, body) = e.into_parts();
-      let Body::Present(body) = body else {
+      let Some(body) = body.body_bytes() else {
         continue;
       };
       let prepare = Prepare::new(

@@ -119,12 +119,17 @@ pub const HEADER_VERSION: u16 = 1;
 /// but the pre-decoupling code led the root with the shared `WIRE_VERSION`, which bumped `1 → 2 → 3` for
 /// MESSAGE-only changes (the `DoViewChange`/`PreparedEntry` Repairing wire, then the `PrepareOk` field).
 /// So that ONE pre-membership root layout exists tagged `1`, `2`, AND `3`. Version `4` is the FIRST real
-/// `VsrState` LAYOUT change: it APPENDS a durable epoch + membership tail after the v3 body.
-/// [`VsrState::decode`] now dispatches on the leading version — `1..=3` parse the pre-membership layout
-/// (bridged to `epoch = 0`, no membership) and `4` parses that body plus the appended tail — so NO
-/// persisted root is stranded and a message-only `WIRE_VERSION` bump still can never invalidate a root.
-/// A future `VsrState` layout change bumps this again and extends that per-version dispatch.
-pub const SUPERBLOCK_VERSION: u16 = 4;
+/// `VsrState` LAYOUT change: it APPENDS a durable epoch + membership tail after the v3 body. Version `5`
+/// APPENDS a further tail — the recent-prior `config_id` lineage (the superseded ancestor ids that widen
+/// cross-epoch catch-up admission) — so a node recovering into a post-reconfiguration epoch RESTORES the
+/// predecessor ids rather than dropping them, and a retained old-epoch laggard's catch-up is still
+/// admitted after the new-epoch donors restart.
+/// [`VsrState::decode`] dispatches on the leading version — `1..=3` parse the pre-membership layout
+/// (bridged to `epoch = 0`, no membership), `4` parses that body plus the epoch/membership tail, and `5`
+/// parses that plus the lineage tail — so NO persisted root is stranded and a message-only `WIRE_VERSION`
+/// bump still can never invalidate a root. A future `VsrState` layout change bumps this again and extends
+/// that per-version dispatch.
+pub const SUPERBLOCK_VERSION: u16 = 5;
 
 /// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
 /// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are
@@ -420,9 +425,20 @@ pub struct VsrState {
   prev_epoch: Epoch,
   /// The active membership (who votes, who leads, the lineage `config_id`). `None` ONLY for a
   /// legacy (v1-3) root that predates membership — `recover` fills it from the caller's `Config`. A
-  /// v4 root always carries `Some`, and when present its [`Membership::epoch`] equals `self.epoch`
+  /// v4/v5 root always carries `Some`, and when present its [`Membership::epoch`] equals `self.epoch`
   /// (enforced by [`Self::try_new_v4`]).
   membership: Option<Membership>,
+  /// The recent-prior `config_id` lineage — the superseded ancestor `config_id`s (most-recent-first)
+  /// that a node retains in-memory to widen cross-epoch catch-up admission (`Endpoint::in_lineage`).
+  /// Persisted in a v5 root so a node recovering into a post-reconfiguration epoch RESTORES these ids
+  /// instead of dropping them: without it, the recovered node would seed its in-memory lineage with only
+  /// the CURRENT `config_id`, so a retained old-epoch laggard whose catch-up still carries the
+  /// predecessor `config_id` would be REJECTED after the new-epoch donors restart — stranding it
+  /// (a liveness loss). A v1-4 root carries none (decoded as empty); for a no-reconfiguration cluster the
+  /// ring is genesis-only, so recovery's seeding is unchanged. The `config_id` is a content hash chained
+  /// from the previous config's id, which a single root cannot recompute — so the lineage MUST be carried
+  /// durably, exactly like the membership's own `config_id`. Bounded by the small in-memory ring.
+  prior_config_ids: Vec<u128>,
 }
 
 impl Default for VsrState {
@@ -492,17 +508,25 @@ impl VsrState {
       epoch: Epoch::new(0),
       prev_epoch: Epoch::new(0),
       membership: None,
+      prior_config_ids: Vec::new(),
     })
   }
 
-  /// Creates a v4 durable root carrying the configuration epoch + the active [`Membership`].
+  /// Creates a v5 durable root carrying the configuration epoch + the active [`Membership`] + the
+  /// recent-prior `config_id` lineage. (Named `try_new_v4` for the membership-carrying root family; the
+  /// emitted root is tagged with the current [`SUPERBLOCK_VERSION`].)
   ///
   /// Validates the same consensus-frontier invariants as [`Self::try_new`] (`log_view <= view`,
   /// `commit >= checkpoint_op`, an in-band strictly-ascending committed-header set) AND the
-  /// epoch-consistency invariant `membership.epoch() == epoch` — a v4 root's scalar epoch and its
+  /// epoch-consistency invariant `membership.epoch() == epoch` — a v4/v5 root's scalar epoch and its
   /// membership's own epoch are two views of one fact and must agree, so a mismatch is a bug, not a
   /// representable state. The committed-header rules are identical to `try_new`; see it for the SPARSE
   /// set's contract.
+  ///
+  /// `prior_config_ids` are the superseded ancestor `config_id`s (most-recent-first) the writer retained
+  /// for cross-epoch catch-up admission; they are carried VERBATIM (a `config_id` is a content hash a
+  /// single root cannot recompute) and restored into the recovered node's in-memory lineage. For a
+  /// no-reconfiguration cluster they are all the genesis id (a harmless self-duplicate).
   #[allow(clippy::too_many_arguments)]
   pub fn try_new_v4(
     view: View,
@@ -514,6 +538,7 @@ impl VsrState {
     epoch: Epoch,
     prev_epoch: Epoch,
     membership: Membership,
+    prior_config_ids: Vec<u128>,
   ) -> Result<Self, VsrStateError> {
     if membership.epoch() != epoch {
       return Err(VsrStateError::MembershipEpochMismatch {
@@ -521,8 +546,8 @@ impl VsrState {
         membership: membership.epoch().get(),
       });
     }
-    // Reuse the scalar/header validation, then attach the epoch + membership tail (the legacy
-    // constructor leaves epoch = 0 / membership = None, so set them on the validated value).
+    // Reuse the scalar/header validation, then attach the epoch + membership + lineage tail (the legacy
+    // constructor leaves epoch = 0 / membership = None / empty lineage, so set them on the validated value).
     let mut state = Self::try_new(
       view,
       log_view,
@@ -534,6 +559,7 @@ impl VsrState {
     state.epoch = epoch;
     state.prev_epoch = prev_epoch;
     state.membership = Some(membership);
+    state.prior_config_ids = prior_config_ids;
     Ok(state)
   }
 
@@ -550,6 +576,7 @@ impl VsrState {
       epoch: Epoch::new(0),
       prev_epoch: Epoch::new(0),
       membership: None,
+      prior_config_ids: Vec::new(),
     }
   }
 
@@ -634,6 +661,15 @@ impl VsrState {
     self.membership.as_ref()
   }
 
+  /// The recent-prior `config_id` lineage (superseded ancestor ids, most-recent-first) carried by a v5
+  /// root. Empty for a v1-4 root (no durable lineage tail) — `recover` then seeds the in-memory ring with
+  /// the current `config_id` (the pre-v5 behaviour). Read by `recover` to restore the in-memory lineage
+  /// so a retained old-epoch laggard's cross-epoch catch-up is still admitted after the donors restart.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn prior_config_ids(&self) -> &[u128] {
+    &self.prior_config_ids
+  }
+
   /// Encodes this durable root to a length-prefixed, versioned byte vector (the superblock
   /// on-disk form). Layout (all scalars big-endian): [`SUPERBLOCK_VERSION`] `u16`,
   /// then `view`/`log_view` (`u64` each), `commit`/`checkpoint_op` (`u64` each), `checkpoint_id`
@@ -641,9 +677,10 @@ impl VsrState {
   /// fixed-size [`Header::encode`] blocks (one [`HEADER_ENCODED_LEN`]-byte block per header). That
   /// is the byte-identical v1-3 body; a v4 root APPENDS the epoch + membership tail after it:
   /// `epoch:u64 | prev_epoch:u64 | membership_present:u8`, then — iff present — `config_id:u128 |
-  /// epoch:u64 | replica_count:u8 | learner_count:u16 | member_count:u32 | members:(u128 each)`. The
-  /// scalar field order matches the [`Self::try_new`] parameter order. Variable-length because the
-  /// header set and the member list are both bounded but not fixed.
+  /// epoch:u64 | replica_count:u8 | learner_count:u16 | member_count:u32 | members:(u128 each)`. A v5 root
+  /// APPENDS one further tail after that — the recent-prior lineage: `prior_config_count:u32 |
+  /// prior_config_ids:(u128 each)`. The scalar field order matches the [`Self::try_new`] parameter order.
+  /// Variable-length because the header set, the member list, and the lineage are all bounded but not fixed.
   pub fn encode(&self) -> Bytes {
     let members_len = self
       .membership
@@ -653,7 +690,9 @@ impl VsrState {
       2 + 8 * 4 + 16 + 4 + self.committed_headers.len() * HEADER_ENCODED_LEN
       // The appended v4 tail: epoch + prev_epoch + present-flag, plus the membership block when present.
         + 8 + 8 + 1
-        + self.membership.as_ref().map_or(0, |_| 16 + 8 + 1 + 2 + 4 + members_len * 16),
+        + self.membership.as_ref().map_or(0, |_| 16 + 8 + 1 + 2 + 4 + members_len * 16)
+      // The appended v5 tail: the lineage count + its ids.
+        + 4 + self.prior_config_ids.len() * 16,
     );
     out.put_u16(SUPERBLOCK_VERSION);
     out.put_u64(self.view.get());
@@ -666,7 +705,7 @@ impl VsrState {
       out.put_slice(&h.encode());
     }
     // The appended v4 tail. `epoch`/`prev_epoch` are always written; the membership is gated by a
-    // present-flag so a legacy-bridged root (membership = None) round-trips as a v4-tagged root.
+    // present-flag so a legacy-bridged root (membership = None) round-trips as a v5-tagged root.
     out.put_u64(self.epoch.get());
     out.put_u64(self.prev_epoch.get());
     match &self.membership {
@@ -682,6 +721,13 @@ impl VsrState {
           out.put_u128(member.get());
         }
       }
+    }
+    // The appended v5 tail: the recent-prior `config_id` lineage (a `u32` count then the ids). Always
+    // written for a v5 root — an empty lineage is a count-0 block, so it round-trips uniformly whether or
+    // not a membership is present.
+    out.put_u32(self.prior_config_ids.len() as u32);
+    for &id in &self.prior_config_ids {
+      out.put_u128(id);
     }
     out.freeze()
   }
@@ -722,8 +768,9 @@ impl VsrState {
     for _ in 0..count {
       committed_headers.push(Header::decode(r.take(HEADER_ENCODED_LEN)?)?);
     }
-    if version < SUPERBLOCK_VERSION {
-      // A legacy (v1-3) root ends after the committed-band headers — there is no epoch/membership tail.
+    if version <= 3 {
+      // A legacy (v1-3) root ends after the committed-band headers — there is no epoch/membership/lineage
+      // tail.
       r.finish()?;
       // Re-validate the invariants (log_view <= view, commit >= checkpoint_op, in-band ascending
       // headers): a corrupt root that breaks them is rejected, not silently constructed.
@@ -736,8 +783,8 @@ impl VsrState {
         committed_headers,
       )?);
     }
-    // v4: the appended tail. `epoch`/`prev_epoch` are always present; the membership is gated by a
-    // present-flag (0 = a legacy-bridged root re-saved as v4; 1 = a real membership block follows).
+    // v4+: the appended epoch/membership tail. `epoch`/`prev_epoch` are always present; the membership is
+    // gated by a present-flag (0 = a legacy-bridged root re-saved as v4/v5; 1 = a real membership block).
     let epoch = Epoch::new(r.u64()?);
     let prev_epoch = Epoch::new(r.u64()?);
     let membership = match r.u8()? {
@@ -767,9 +814,22 @@ impl VsrState {
       }
       other => return Err(CodecError::InvalidMembershipPresent(other)),
     };
+    // v5+: the appended lineage tail (a `u32` count then the superseded ancestor `config_id`s). A v4 root
+    // ends after the membership block — its lineage is empty (recover then seeds from the current id).
+    // Each id is a fixed 16-byte `u128`, so an oversized count is rejected before allocating.
+    let prior_config_ids = if version >= 5 {
+      let lineage_count = r.seq_len(16)?;
+      let mut ids = Vec::with_capacity(lineage_count);
+      for _ in 0..lineage_count {
+        ids.push(r.u128()?);
+      }
+      ids
+    } else {
+      Vec::new()
+    };
     r.finish()?;
     match membership {
-      // A v4 root with a real membership re-validates through `try_new_v4` (which adds the
+      // A v4/v5 root with a real membership re-validates through `try_new_v4` (which adds the
       // epoch-consistency check `membership.epoch() == epoch` on top of the scalar/header invariants).
       Some(membership) => Ok(Self::try_new_v4(
         view,
@@ -781,9 +841,11 @@ impl VsrState {
         epoch,
         prev_epoch,
         membership,
+        prior_config_ids,
       )?),
-      // A v4-tagged root that carries no membership (a legacy root re-saved as v4): scalar/header
-      // re-validation only, with the durable epoch/prev_epoch carried through.
+      // A v4/v5-tagged root that carries no membership (a legacy root re-saved): scalar/header
+      // re-validation only, with the durable epoch/prev_epoch (and any lineage) carried through. A
+      // membership-less root has no config chain, so its lineage is normally empty; carried for fidelity.
       None => {
         let mut state = Self::try_new(
           view,
@@ -795,6 +857,7 @@ impl VsrState {
         )?;
         state.epoch = epoch;
         state.prev_epoch = prev_epoch;
+        state.prior_config_ids = prior_config_ids;
         Ok(state)
       }
     }
@@ -1611,9 +1674,10 @@ mod tests {
 
   #[test]
   fn vsr_state_golden_bytes_pin_the_layout() {
-    // The v4 layout: the byte-identical v1-3 body (version|view|log_view|commit|checkpoint_op|
-    // checkpoint_id|header-count|headers) followed by the appended tail (epoch|prev_epoch|present,
-    // then the membership block when present). The epoch-1 membership matches the root's epoch-1 scalar.
+    // The v5 layout: the byte-identical v1-3 body (version|view|log_view|commit|checkpoint_op|
+    // checkpoint_id|header-count|headers), then the v4 epoch/membership tail (epoch|prev_epoch|present,
+    // then the membership block when present), then the v5 lineage tail (prior_config_count|ids). The
+    // epoch-1 membership matches the root's epoch-1 scalar; the lineage carries two superseded ids.
     let h = mk_header(7, 3, 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, 9, b"body");
     let mem = Membership::genesis(
       2,
@@ -1637,10 +1701,11 @@ mod tests {
       Epoch::new(1),
       Epoch::new(0),
       mem,
+      std::vec![0x1111_2222, 0x3333_4444],
     )
     .unwrap();
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0,
+      0, 5, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0,
       0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 187, 204, 221, 0, 0, 0, 1, 231, 44, 98, 75,
       124, 48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
       0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1650,6 +1715,8 @@ mod tests {
       0, 0, 0, 0, 1, 192, 68, 74, 98, 107, 133, 78, 12, 26, 29, 162, 224, 5, 155, 168, 242, 0, 0,
       0, 0, 0, 0, 0, 1, 2, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0,
       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13,
+      0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11, 0x22, 0x22, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0x33, 0x33, 0x44, 0x44,
     ];
     assert_eq!(st.encode(), expected, "VsrState wire layout is pinned");
     // The pinned golden bytes are a valid decode input too: they round-trip back to the same root.
@@ -1692,6 +1759,8 @@ mod tests {
     )
     .unwrap();
     assert_eq!(mem.epoch(), Epoch::new(1));
+    // The recent-prior lineage (the predecessor genesis id) is carried verbatim and restored.
+    let lineage = std::vec![0xDEAD_BEEFu128, 0xC0FF_EE00u128];
     let s = VsrState::try_new_v4(
       View::with(2),
       View::with(2),
@@ -1702,6 +1771,7 @@ mod tests {
       Epoch::new(1),
       Epoch::new(0),
       mem.clone(),
+      lineage.clone(),
     )
     .unwrap();
     let bytes = s.encode();
@@ -1709,6 +1779,11 @@ mod tests {
     assert_eq!(back.epoch(), Epoch::new(1));
     assert_eq!(back.prev_epoch(), Epoch::new(0));
     assert_eq!(back.membership(), &mem);
+    assert_eq!(
+      back.prior_config_ids(),
+      lineage.as_slice(),
+      "the recent-prior lineage round-trips verbatim"
+    );
     assert_eq!(back, s);
   }
 
@@ -1731,12 +1806,12 @@ mod tests {
     // A version names a disk LAYOUT, and decode dispatches per layout. Versions 1..=3 are ONE
     // pre-membership layout (the pre-decoupling message/disk coupling stamped that single body with 1,
     // 2, AND 3), so a root carrying ANY of them decodes to the SAME legacy-bridged state (epoch 0, no
-    // membership) and none is stranded. Version 4 (= SUPERBLOCK_VERSION) is a SECOND layout: the same
-    // body plus the appended epoch/membership tail. Together with the root carrying its OWN version,
-    // independent of the message WIRE_VERSION, this keeps the decoupling correct-by-construction — a
-    // message-only WIRE_VERSION bump can never invalidate a persisted root.
+    // membership) and none is stranded. Version 4 is a SECOND layout (body + epoch/membership tail), and
+    // version 5 (= SUPERBLOCK_VERSION) a THIRD (that plus the lineage tail). Together with the root
+    // carrying its OWN version, independent of the message WIRE_VERSION, this keeps the decoupling
+    // correct-by-construction — a message-only WIRE_VERSION bump can never invalidate a persisted root.
     //
-    // The pre-membership 1..=3 layout: a true v3 body (NOT a relabelled v4 root, whose appended tail
+    // The pre-membership 1..=3 layout: a true v3 body (NOT a relabelled v4/v5 root, whose appended tails
     // would become trailing bytes under the legacy path) decodes identically under every legacy tag.
     let legacy_v3 = legacy_v3_golden_bytes();
     let bridged = VsrState::decode(&legacy_v3).unwrap();
@@ -1751,9 +1826,9 @@ mod tests {
         "a pre-membership root tagged with legacy version {v} decodes to the same bridged state"
       );
     }
-    // The v4 layout: a NEW root is written with SUPERBLOCK_VERSION (= 4) and round-trips under it.
+    // The v5 layout: a NEW root is written with SUPERBLOCK_VERSION (= 5) and round-trips under it.
     let mem = Membership::genesis(3, 0, (1..=3).map(MemberId::new).collect()).unwrap();
-    let v4 = VsrState::try_new_v4(
+    let v5 = VsrState::try_new_v4(
       View::with(2),
       View::with(1),
       OpNumber::with(5),
@@ -1763,23 +1838,42 @@ mod tests {
       Epoch::new(0),
       Epoch::new(0),
       mem,
+      std::vec![0x9999u128],
     )
     .unwrap();
-    let v4_bytes = v4.encode();
+    let v5_bytes = v5.encode();
     assert_eq!(
-      &v4_bytes[0..2],
+      &v5_bytes[0..2],
       &SUPERBLOCK_VERSION.to_be_bytes(),
       "a new durable root leads with SUPERBLOCK_VERSION"
     );
-    assert_eq!(SUPERBLOCK_VERSION, 4, "the accepted decode range is 1..=4");
+    assert_eq!(SUPERBLOCK_VERSION, 5, "the accepted decode range is 1..=5");
     assert_eq!(
-      VsrState::decode(&v4_bytes).unwrap(),
-      v4,
-      "the v4 root round-trips"
+      VsrState::decode(&v5_bytes).unwrap(),
+      v5,
+      "the v5 root round-trips"
+    );
+    // A v4 root (the membership tail but NO lineage tail) still decodes — it is the same body+membership
+    // bytes ending after the member list, tagged with version 4. Built by truncating the v5 lineage tail
+    // (a count-1 block: its trailing `u32` count + one `u128`) and re-tagging as v4. It decodes with an
+    // EMPTY lineage (recover then seeds from the current id, the pre-v5 behaviour) — so no persisted v4
+    // root is stranded by the bump.
+    let mut v4_bytes = v5_bytes.to_vec();
+    v4_bytes.truncate(v4_bytes.len() - (4 + 16)); // drop the lineage block (count + the one id)
+    v4_bytes[0..2].copy_from_slice(&4u16.to_be_bytes());
+    let v4_decoded = VsrState::decode(&v4_bytes).expect("a v4 root still decodes");
+    assert!(
+      v4_decoded.prior_config_ids().is_empty(),
+      "a v4 root carries no durable lineage (recover seeds from the current id)"
+    );
+    assert_eq!(v4_decoded.epoch(), Epoch::new(0));
+    assert_eq!(
+      v4_decoded.membership_opt().map(|m| m.replica_count()),
+      Some(3)
     );
     // Versions OUTSIDE the accepted range fail CLEAN (never misparse): 0 and one past the high end.
     for bad in [0u16, SUPERBLOCK_VERSION + 1] {
-      let mut wrong = v4_bytes.to_vec();
+      let mut wrong = v5_bytes.to_vec();
       wrong[0..2].copy_from_slice(&bad.to_be_bytes());
       assert!(
         matches!(VsrState::decode(&wrong), Err(CodecError::UnknownVersion(v)) if v == bad),
@@ -1799,9 +1893,9 @@ mod tests {
       std::vec![mk_header(6, 1, 1, 6, b"z")],
     )
     .unwrap();
-    // `st` is built via `try_new`, so it encodes as a v4 root whose membership-present flag is 0 (a
+    // `st` is built via `try_new`, so it encodes as a v5 root whose membership-present flag is 0 (a
     // legacy-bridged shape): version(2) | body | header-count | header | epoch(8) | prev_epoch(8) |
-    // present(1). The corruption probes target that exact layout.
+    // present(1) | lineage_count(4) (= 0, no ids). The corruption probes target that exact layout.
     let good = st.encode();
     // Truncation WITHIN the fixed scalar prefix (before the header count) → Truncated (a scalar
     // read ran off the end). `&[]` likewise fails the very first u16 read.
@@ -1813,8 +1907,8 @@ mod tests {
       VsrState::decode(&[]),
       Err(CodecError::Truncated { .. })
     ));
-    // Dropping the last byte removes the `membership_present` flag, so the v4 tail read runs off the
-    // end after epoch/prev_epoch → Truncated (an honestly-short tail, not an oversized length).
+    // Dropping the last byte truncates the trailing lineage-count u32, so the read runs off the end →
+    // Truncated (an honestly-short tail, not an oversized length).
     assert!(matches!(
       VsrState::decode(&good[..good.len() - 1]),
       Err(CodecError::Truncated { .. })
@@ -1834,13 +1928,23 @@ mod tests {
       VsrState::decode(&huge),
       Err(CodecError::LengthOverflow { .. })
     ));
-    // A `membership_present` flag that is neither 0 nor 1 → InvalidMembershipPresent (the flag is the
-    // final byte of this no-membership v4 root).
+    // A `membership_present` flag that is neither 0 nor 1 → InvalidMembershipPresent. The present byte is
+    // the FIFTH-from-last byte now (the trailing 4 bytes are the lineage count): `good.len() - 5`.
     let mut bad_flag = good.to_vec();
-    *bad_flag.last_mut().unwrap() = 2;
+    let present_off = bad_flag.len() - 5;
+    bad_flag[present_off] = 2;
     assert!(matches!(
       VsrState::decode(&bad_flag),
       Err(CodecError::InvalidMembershipPresent(2))
+    ));
+    // A lineage-count prefix that overruns the buffer → LengthOverflow (the trailing u32, each id a fixed
+    // 16-byte block, so an impossible count is a corrupt length).
+    let mut huge_lineage = good.to_vec();
+    let lineage_off = huge_lineage.len() - 4;
+    huge_lineage[lineage_off..].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    assert!(matches!(
+      VsrState::decode(&huge_lineage),
+      Err(CodecError::LengthOverflow { .. })
     ));
     // Trailing bytes after a fully-decoded root → TrailingBytes.
     let mut over = good.to_vec();
@@ -1851,7 +1955,8 @@ mod tests {
     ));
     // A structurally-valid buffer whose decoded fields break the invariants (log_view > view) is
     // rejected as InvalidVsrState rather than constructing an illegal root. Build it by hand as a
-    // complete v4 root: an empty-header body with log_view = 5 > view = 4, plus the epoch tail.
+    // complete v5 root: an empty-header body with log_view = 5 > view = 4, the epoch tail, and the
+    // empty-lineage tail.
     let mut bad = std::vec::Vec::new();
     bad.extend_from_slice(&SUPERBLOCK_VERSION.to_be_bytes());
     bad.extend_from_slice(&4u64.to_be_bytes()); // view
@@ -1863,6 +1968,7 @@ mod tests {
     bad.extend_from_slice(&0u64.to_be_bytes()); // epoch
     bad.extend_from_slice(&0u64.to_be_bytes()); // prev_epoch
     bad.push(0); // membership_present = absent
+    bad.extend_from_slice(&0u32.to_be_bytes()); // lineage count = 0
     assert!(matches!(
       VsrState::decode(&bad),
       Err(CodecError::InvalidVsrState(_))

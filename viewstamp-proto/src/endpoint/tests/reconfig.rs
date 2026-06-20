@@ -23,6 +23,7 @@ fn v4_root(membership: Membership, commit: u64) -> VsrState {
     epoch,
     epoch,
     membership,
+    std::vec::Vec::new(),
   )
   .expect("valid v4 root")
 }
@@ -163,6 +164,88 @@ fn recover_resolves_a_learner_self_to_active() {
   let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb).expect_active();
   assert_eq!(e.replica(), ReplicaId::new(2), "learner self at slot 2");
   assert!(e.is_learner(), "slot 2 is a learner in 2v+1l");
+}
+
+#[test]
+fn recover_into_a_post_reconfiguration_epoch_restores_the_predecessor_lineage() {
+  // CONSENSUS-LIVENESS: a node recovering into a post-reconfiguration (E+1) membership must RESTORE
+  // the predecessor (E) `config_id` into its in-memory lineage from the durable root — so a retained
+  // OLD-epoch laggard's catch-up (RequestSync/RequestPrepare carrying the E `config_id`) is still
+  // ADMITTED after the E+1 donors restart. Without persisting it, recovery would seed every lineage slot
+  // with only the CURRENT id and REJECT the laggard, stranding it.
+  //
+  // Build a REAL genesis (a hash-chained `config_id`, not the fixture's 0) so the predecessor and forked
+  // ids are genuinely distinct, pre-write the successor root via `prepare_restart` (which now carries the
+  // predecessor `config_id` in the durable lineage), and recover from it.
+  let members = std::vec![MemberId::new(0), MemberId::new(1), MemberId::new(2)];
+  let genesis_mem = Membership::genesis(3, 0, members.clone()).expect("genesis");
+  let predecessor_config_id = genesis_mem.config_id();
+  let successor_mem = genesis_mem
+    .reconfigure(
+      3,
+      0,
+      std::vec![MemberId::new(0), MemberId::new(1), MemberId::new(3)],
+    )
+    .expect("successor");
+  let successor_config_id = successor_mem.config_id();
+  assert_ne!(
+    predecessor_config_id, successor_config_id,
+    "the swap chains the config_id, so E and E+1 differ"
+  );
+
+  // The predecessor (genesis) durable root, then the successor root chained off it via prepare_restart.
+  let cur = VsrState::try_new_v4(
+    View::new(),
+    View::new(),
+    OpNumber::new(),
+    OpNumber::new(),
+    0,
+    std::vec::Vec::new(),
+    genesis_mem.epoch(),
+    genesis_mem.epoch(),
+    genesis_mem,
+    std::vec::Vec::new(), // genesis: no predecessor lineage
+  )
+  .expect("genesis root");
+  let succ_state = crate::endpoint::prepare_restart(
+    &cur,
+    3,
+    0,
+    std::vec![MemberId::new(0), MemberId::new(1), MemberId::new(3)],
+  )
+  .expect("successor root");
+  // The successor root's durable lineage carries the predecessor id (the anti-stranding fix).
+  assert_eq!(
+    succ_state.prior_config_ids().first().copied(),
+    Some(predecessor_config_id),
+    "the successor durable root persists the predecessor config_id in its lineage",
+  );
+
+  let mut wal = TestWal::default();
+  let mut sb = sb_with_state(succ_state);
+  // The local member (MemberId 3) is the newly-added voter in the successor — present → Active.
+  let cfg = Config::try_new(2, MemberId::new(3)).unwrap();
+  let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb).expect_active();
+
+  // The recovered node is at E+1, and its lineage ADMITS both the current and the predecessor config_id,
+  // while REJECTING an unrelated/forked id — exactly the cross-epoch catch-up admission a laggard needs.
+  assert_eq!(
+    e.membership.config_id(),
+    successor_config_id,
+    "recovered into the E+1 successor membership"
+  );
+  assert!(
+    e.in_lineage_for_test(successor_config_id),
+    "the current (E+1) config_id is admitted"
+  );
+  assert!(
+    e.in_lineage_for_test(predecessor_config_id),
+    "the predecessor (E) config_id is admitted — a retained old-epoch laggard's catch-up is accepted",
+  );
+  assert!(
+    !e.in_lineage_for_test(0xDEAD_BEEF_F00D_u128),
+    "an unrelated/forked config_id is rejected (the lineage discriminator still bites)",
+  );
 }
 
 #[test]
@@ -893,6 +976,7 @@ fn sealed_root(commit: u64) -> VsrState {
     epoch,
     epoch,
     genesis,
+    std::vec::Vec::new(),
   )
   .expect("valid sealed v4 root")
 }
@@ -1158,6 +1242,7 @@ fn a_reconfigure_log_entry_carries_the_successor_membership_in_memory() {
       MemberId::new(4),
     ]
     .into_boxed_slice(),
+    0,
   );
   let entry = LogEntry::reconfigure(
     crate::ClientId::new(0x42),
