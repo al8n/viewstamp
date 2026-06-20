@@ -486,6 +486,61 @@ fn a_learner_catch_up_does_not_escalate_to_active_view_change() {
 }
 
 #[test]
+fn a_learner_recovered_mid_view_change_catches_up_and_never_emits_a_dvc() {
+  // A learner can persist a view-ahead-of-log_view durable root (`log_view < view`) exactly like a
+  // voter — it adopts a higher view before installing that view's log. A VOTER recovering from this
+  // shape RE-DRIVES the view change (casts a DoViewChange). A LEARNER must NOT: it is never a
+  // view-change voter or candidate primary, so `complete_recovery` routes it into the CATCH-UP posture
+  // (ViewChange + `catching_up`, soliciting GetView) instead, which re-fetches the canonical head and
+  // restores `log_view == view` WITHOUT ever emitting a counted message. (Regression: a missing voter
+  // gate on the mid-view-change recovery re-drive let a learner enter `enter_view_change_from_recovery`
+  // and emit a DoViewChange — a non-voter taking part in consensus.)
+  let mut wal = wal_in_view(2, 0); // ops 1..=2 stamped view 0 (the not-yet-installed log)
+  let mut sb = sb_with_view(1, 0); // durable root: view 1, log_view 0 → log_view < view
+  let now = Instant::ZERO;
+  // self = learner id 3 (slot 3 of a 3-voter set with 2 learners) — a NON-VOTER.
+  let mut r = Endpoint::recover(
+    Config::try_new(1, MemberId::new(LEARNER as u128)).expect("learner id 3 of a 3-voter set"),
+    genesis_with_learners(3, 2),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+  )
+  .expect_active();
+  for _ in 0..16 {
+    r.handle_storage(now, &mut wal, &mut sb);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert!(
+    r.status().is_view_change() && r.catching_up(),
+    "a learner that crashed mid-view-change CATCHES UP (ViewChange + catching_up), it does NOT re-drive",
+  );
+  assert_eq!(
+    r.view(),
+    View::with(1),
+    "it stays at the durable view and re-fetches THAT view's canonical head (not view+1)",
+  );
+  // It solicits GetView and emits NO counted message — the load-bearing learner invariant.
+  let mut solicited = false;
+  while let Some(out) = r.poll_message() {
+    match out.into_msg() {
+      Message::GetView(_) => solicited = true,
+      Message::DoViewChange(_) | Message::StartViewChange(_) | Message::PrepareOk(_) => {
+        panic!("a recovering learner must never emit a counted message (DVC/SVC/PrepareOk)")
+      }
+      _ => {}
+    }
+  }
+  assert!(
+    solicited,
+    "the learner solicits GetView to re-fetch the canonical head"
+  );
+}
+
+#[test]
 fn a_voter_backup_still_acks_and_proposes_unlike_a_learner() {
   // Positive control: the SAME drive on a VOTER backup (id 1) DOES ack the prepare and DOES propose a
   // view change when the primary goes idle — so the learner exclusions are learner-specific, not a
