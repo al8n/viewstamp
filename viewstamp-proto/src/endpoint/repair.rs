@@ -335,7 +335,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Only a Normal replica answers (a recovering / view-changing replica may itself hold a hole at that
   /// op). The reply's `commit` field carries our commit so the requester can also learn fresh commit
   /// progress; the op's content is view-independent, so the requester accepts it regardless of our view.
-  pub(crate) fn on_request_prepare(&mut self, _now: Instant, m: crate::RequestPrepare) {
+  pub(crate) fn on_request_prepare(&mut self, _now: Instant, from: Peer, m: crate::RequestPrepare) {
     // Durable-view-before-participate: the served `Prepare` advertises `self.view` (see
     // below). A replica in its view-CHANGING `pending_sb` window (a new primary between
     // `start_view_as_new_primary` and the `on_sb_done` that makes its view durable — or any replica mid
@@ -350,7 +350,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if !self.status.is_normal() || self.pending_durable_view() {
       return; // only a Normal replica whose view is durable may serve a (view-advertising) repair Prepare
     }
-    if m.replica().get() >= self.membership.node_count() {
+    // Route the reply by the AUTHENTICATED `from` (the requester's CURRENT slot), never the self-claimed
+    // `m.replica()`: a slot-shifted retained laggard stamps its OLD slot, and `sender_admits_solicitation`
+    // already bound this pull to `from`. A non-replica / out-of-config `from` cannot reach here.
+    let Some(requester) = from.as_replica() else {
+      return;
+    };
+    if requester.get() >= self.membership.node_count() {
       return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     let op = m.op().get();
@@ -387,7 +393,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       body,
     );
     self.emit(Outgoing::new(
-      Recipient::To(Peer::Replica(m.replica())),
+      Recipient::To(Peer::Replica(requester)),
       Message::Prepare(prepare),
     ));
   }
@@ -417,14 +423,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// entry even if its body alone meets the budget edge (a single committed op's body fits a frame by the
   /// `max_request_body_len` bound — see [`crate::message::MAX_REQUEST_BODY_OVERHEAD`], which accounts for
   /// the single-entry `RepairBatch` carrier), so the run always makes forward progress.
-  pub(crate) fn on_request_prepare_range(&mut self, _now: Instant, m: crate::RequestPrepareRange) {
+  pub(crate) fn on_request_prepare_range(
+    &mut self,
+    _now: Instant,
+    from: Peer,
+    m: crate::RequestPrepareRange,
+  ) {
     // Durable-view-before-participate (identical to `on_request_prepare`): only a Normal replica whose
     // view is durable may serve a (view-advertising) repair answer. A commit-first SwapEpoch root does NOT
     // raise this fence (the view is durable through an epoch swap — [`Self::pending_durable_view`]).
     if !self.status.is_normal() || self.pending_durable_view() {
       return;
     }
-    if m.replica().get() >= self.membership.node_count() {
+    // Route the reply by the AUTHENTICATED `from` (the requester's CURRENT slot), never the self-claimed
+    // `m.replica()` — see `on_request_prepare`; `sender_admits_solicitation` already bound this pull.
+    let Some(requester) = from.as_replica() else {
+      return;
+    };
+    if requester.get() >= self.membership.node_count() {
       return; // the requester must be a configured cluster member (in `0..node_count`)
     }
     let lo = m.lo().get();
@@ -473,7 +489,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // path returned above), witnessing the windowed bulk-repair serve.
     self.repair_batches_served += 1;
     self.emit(Outgoing::new(
-      Recipient::To(Peer::Replica(m.replica())),
+      Recipient::To(Peer::Replica(requester)),
       Message::RepairBatch(crate::RepairBatch::new(
         self.view,
         self.commit_min,

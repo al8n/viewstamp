@@ -3606,6 +3606,88 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
 }
 
 #[test]
+fn a_cross_epoch_recovery_peer_fetch_survives_an_old_epoch_same_epoch_commit() {
+  // R7 SCOPE GUARD: `cancel_stale_cross_epoch_sync` must NOT tear down a GENUINE crossing. A NON-Normal
+  // recovery peer-fetch (Recovering, `awaiting_peer_checkpoint`, a `require_cross_epoch` sync — what
+  // `enter_cross_epoch_peer_fetch` arms for a non-Normal laggard crossing the epoch boundary) is a real
+  // crossing in progress. An OLD-EPOCH predecessor-primary `Commit` that still passes sender + epoch
+  // authority reaches the ingress cancel BEFORE the Recovering dispatch drop; without the scope guard it
+  // would CLEAR the sync and WEDGE the node (recovery re-solicit + the higher-epoch trigger both gate on
+  // `awaiting_peer_checkpoint`, leaving no sync to drive). The cancel is scoped to PRE-STAGE NORMAL
+  // speculative crossings (`is_normal()` here is false), so this survives.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let now = Instant::ZERO;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → always faults
+  let mut wal = TestWal {
+    entries: BTreeMap::new(),
+    head: 2,
+    done: VecDeque::new(),
+  };
+  let mut e =
+    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  assert_eq!(e.status(), Status::Recovering);
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "setup: a non-Normal recovery peer-fetch (awaiting a peer checkpoint)"
+  );
+
+  // Escalate the peer-fetch to a CROSS-EPOCH crossing (`require_cross_epoch`) — what a higher-epoch hint to
+  // this non-Normal laggard does via `enter_cross_epoch_peer_fetch`.
+  e.arm_cross_epoch_sync_for_test(9);
+  assert!(
+    e.sync_requires_cross_epoch_for_test() && e.awaiting_peer_checkpoint_for_test(),
+    "setup: a require_cross_epoch recovery peer-fetch (a genuine non-Normal crossing)"
+  );
+  let target_before = e.sync_target_for_test();
+  let nonce_before = e.sync_nonce_for_test();
+
+  // An OLD-EPOCH (predecessor-primary) admissible `Commit` at our epoch (0) — passes sender + epoch
+  // authority in our membership, reaching the ingress cancel before the Recovering dispatch drop.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(2),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "the recovery cross-epoch sync SURVIVES the old-epoch Commit (NOT cancelled — cancelling would wedge it)"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    target_before,
+    "the sync target is unchanged (no cancel, no re-arm)"
+  );
+  assert_eq!(
+    e.sync_nonce_for_test(),
+    nonce_before,
+    "the sync nonce is unchanged (no fresh handshake)"
+  );
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "still awaiting the peer checkpoint — the node did not wedge"
+  );
+}
+
+#[test]
 fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   // A recovered PRIMARY steps down on the peer-checkpoint-fetch path. The fetch RESTORES the SM from a
   // peer snapshot but leaves `inflight` (the commit pipeline) CLEARED while this replica is the PRIMARY of

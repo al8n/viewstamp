@@ -241,6 +241,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         PendingSbAction::SwapEpoch(op, successor) => {
           self.pending_swap = None;
           self.install_membership(Some(op), successor);
+          // This node CROSSED into the new epoch via its OWN committed reconfigure op (not a sync) — so any
+          // owed cross-epoch crossing intent is met. CLEAR it (it re-establishes from a fresh higher-epoch
+          // hint if the cluster is ahead of THIS swap). Without this a node that armed the intent from a
+          // hint, then crossed via its own swap, could re-arm a stale crossing on its next sync completion.
+          self.cross_epoch_intent = None;
           // Force a checkpoint at the current `commit_min` (call it `M`) so the new epoch begins at a
           // checkpoint that EMBEDS the reconfigure op `N` and carries the E+1 membership — making the
           // cross-epoch serve gate `checkpoint_op (M) >= config_install_op (N)` true BY CONSTRUCTION
@@ -297,18 +302,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           // A CROSS-EPOCH state-sync re-persist (`pending_install.successor` is `Some`) must make the
           // SUCCESSOR membership DURABLE in THIS root — not only install it in memory at completion —
           // or a later crash/wipe would recover the OLD epoch off this root and silently revert the
-          // membership install. Stamp the successor exactly as `submit_swap_epoch` does. A same-config
-          // (or non-sync) checkpoint stamps the current membership unchanged.
+          // membership install. Stamp the successor exactly as `submit_swap_epoch` does, carrying the
+          // VERIFIED predecessor `config_id` so the durable lineage ring matches the in-memory crossing
+          // chain (`[verified_prev, own_prior]` on a multi-epoch skip). A same-config (or non-sync)
+          // checkpoint stamps the current membership unchanged.
           let successor = matches!(pc.kind, CheckpointKind::SyncRepersist)
             .then(|| {
-              self
-                .pending_install
-                .as_ref()
-                .and_then(|pi| pi.successor.clone())
+              self.pending_install.as_ref().and_then(|pi| {
+                pi.successor
+                  .clone()
+                  .map(|m| (m, pi.successor_prev_config_id))
+              })
             })
             .flatten();
           let state = match &successor {
-            Some(successor) => self.durable_root_with_successor(
+            Some((successor, successor_prev_config_id)) => self.durable_root_with_successor(
               self.view,
               self.log_view,
               root_commit,
@@ -316,6 +324,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               pc.checkpoint_id,
               headers,
               successor,
+              *successor_prev_config_id,
             ),
             None => self.durable_root(
               self.view,
@@ -400,6 +409,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
                 self.complete_recovery(now, sb);
               } else {
                 self.arm_timers(now);
+              }
+              // RE-ARM the crossing from the PERSISTENT intent. `self.sync` was just cleared (above), but a
+              // higher-epoch trigger that arrived AFTER this sync STAGED its install only rewrote the
+              // (now-gone) `SyncState` — the staged install completed and settled the node WITHOUT crossing.
+              // The intent OUTLIVES the sync: re-arm a crossing sync to it AFRESH here so a non-crossing
+              // install that completed while a crossing was owed immediately re-pins the crossing, instead
+              // of waiting for another trigger to happen to arrive. Fires EXACTLY when the intent is still
+              // owed AND the node is Normal: a crossing install MET the goal and cleared the intent (step 4
+              // in `install_sync`), so it sees `None` here — no double-arm; a recovery completion that
+              // abdicated to ViewChange is not Normal — no re-arm into a transition. `self.sync.is_none()`
+              // holds (just cleared), so the `arm_sync` fresh-arm precondition is satisfied; `arm_sync` only
+              // re-solicits (no re-entry into `on_sb_done`), so this cannot recurse.
+              if self.status.is_normal()
+                && let Some(intent) = self.cross_epoch_intent
+              {
+                self.arm_sync(now, intent, true, true);
               }
             }
             CheckpointKind::Ordinary => {
@@ -933,7 +958,31 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     checkpoint_id: u128,
     committed_headers: std::vec::Vec<Header>,
     successor: &Membership,
+    successor_prev_config_id: Option<u128>,
   ) -> crate::VsrState {
+    // The POST-crossing lineage, from the VERIFIED chain (matching the in-memory `install_sync` push). On
+    // a MULTI-epoch skip the installed config's immediate predecessor is the VERIFIED `prev_config_id`
+    // (the value `to_membership_verified` checked), NOT the laggard's own current `config_id` — so the
+    // ring is `[verified_prev, own_prior, ..]`. On a SINGLE-epoch crossing (`prev == own_prior`) the
+    // verified predecessor IS the own prior, so the plain one-push ring is byte-identical to before.
+    let own_prior = self.membership.config_id();
+    let prior_config_ids = match successor_prev_config_id {
+      Some(verified_prev) if verified_prev != own_prior => {
+        self.lineage_after_crossing_push(own_prior, verified_prev)
+      }
+      _ => self.lineage_after_push(own_prior),
+    };
+    // The VERIFIED predecessor epoch — the backward-link scalar that MUST match the lineage ring above.
+    // The installed config's immediate predecessor is `successor.epoch() - 1` (each reconfiguration is a
+    // single-change-per-step that bumps the epoch by exactly one), NOT the laggard's own stale
+    // `self.membership.epoch()`, which on a MULTI-epoch skip is an EARLIER ancestor. Stamping the stale
+    // scalar would record "E2 chains from E0" while the ring correctly says `[E1, E0]` — a contradiction
+    // a recovered node restores, which the lineage checker then reads as a non-chained successor / fork.
+    // On a SINGLE-epoch crossing `self.membership.epoch() == successor.epoch() - 1` already, so this is a
+    // no-op (the durable root is byte-identical). The in-memory install (`install_sync`) stamps the SAME
+    // value, so a node recovering off this root restores the identical scalar. Saturating to keep it
+    // underflow-free; `apply_sync`'s distance bound already proved `successor.epoch() >= 1` for a crossing.
+    let prev_epoch = crate::Epoch::new(successor.epoch().get().saturating_sub(1));
     crate::VsrState::try_new_v4(
       view,
       log_view,
@@ -942,9 +991,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       checkpoint_id,
       committed_headers,
       successor.epoch(),
-      self.membership.epoch(),
+      prev_epoch,
       successor.clone(),
-      self.lineage_after_push(self.membership.config_id()),
+      prior_config_ids,
       // A cross-epoch sync install has no LOCAL reconfigure op (the laggard synced PAST it), so carry the
       // synced frontier `checkpoint_op` as `config_install_op` — the SAME value `install_sync` sets in
       // memory. The donor attached this successor only because ITS checkpoint reached the reconfigure op

@@ -475,6 +475,164 @@ fn the_durable_swap_forces_a_checkpoint_so_the_cross_epoch_serve_gate_holds() {
 }
 
 #[test]
+fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_flight() {
+  // Finding 1 — the SINGLE-SUPERBLOCK-WRITER fence at the sync-answer ingress. A Normal speculative
+  // cross-epoch sync must NOT stage its `pending_install`/`SyncRepersist` while THIS node's OWN
+  // reconfigure commit has a `SwapEpoch` root in flight: that root's completion (`on_sb_done`'s SwapEpoch
+  // arm) UNCONDITIONALLY forces a checkpoint, which would OVERWRITE the sync's `pending_checkpoint`
+  // tracker and ORPHAN the staged `pending_install` (a permanent outstanding sync). So the sync answer is
+  // DEFERRED while `pending_sb` is set, the sync stays armed (forced + crossing-required + target), and a
+  // re-solicited reply installs the crossing cleanly once the SwapEpoch root + its forced checkpoint land.
+  //
+  // The node's OWN swap goes to E+1; the speculative sync crosses BEYOND it to E+2 (a further
+  // reconfiguration the cluster already ran), so the re-solicited reply genuinely INSTALLS a crossing (to
+  // E+2) rather than being subsumed by the node's own E+1 swap. The node is a BACKUP so the install lands
+  // without a primary step-down.
+  let n1: u64 = 1; // the node's own reconfigure op (E -> E+1)
+  let m2: u64 = 2; // the E+2 cluster crossing checkpoint (> the node's forced E+1 checkpoint at M1 == N1)
+  let genesis_mem = genesis(3);
+  let successor_e1 = genesis_mem
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+  let successor_e2 = successor_e1
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(4)))
+    .expect("a second AddVoter off the E+1 successor is valid (E+2)");
+
+  // A Normal BACKUP (slot 1) that committed its OWN reconfigure op N1 (op == commit_min == N1), checkpoint 0.
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.force_state_for_test(0, n1, n1, 0, &[]);
+
+  // STAGE the node's own E+1 swap → it submits the SwapEpoch durable root (queued on the synchronous
+  // `TestSb`, dispatched only by a later `handle_storage`), so `pending_sb` is the in-flight SwapEpoch root.
+  e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut sb);
+  assert!(
+    e.pending_swap_for_test(),
+    "the node's own E+1 swap is staged awaiting its durable root"
+  );
+  assert!(
+    e.pending_sb_for_test(),
+    "the SwapEpoch root write is in flight on the superblock"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "the durable-epoch-before-participate fence: still the OLD epoch until the root lands"
+  );
+
+  // Arm a speculative cross-epoch sync toward E+2 (target = the E+2 crossing checkpoint M2). Models the
+  // node having heard a higher-epoch (E+2) hint while its own E+1 swap root is still in flight.
+  e.arm_cross_epoch_sync_for_test(m2);
+  let nonce = e.sync_nonce_for_test();
+
+  // --- THE DEFER: an E+2 successor-membership SyncCheckpoint arrives WHILE the SwapEpoch root is in flight. ---
+  let cross_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(m2),
+    &std::collections::BTreeMap::new(),
+    &CountSm::default().snapshot(),
+  );
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    ReconfigurePayload::from_membership(&successor_e2, successor_e1.config_id()).encode_body();
+  let cross_msg = |nonce: u64| {
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(m2),
+      cross_id,
+      successor_e2.epoch(),
+      successor_e2.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      cross_env.clone(),
+      membership_body.clone(),
+    ))
+  };
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    cross_msg(nonce),
+  );
+  assert!(
+    e.pending_install.is_none(),
+    "the sync answer was DEFERRED while the SwapEpoch root is in flight — nothing staged (no orphaned install)"
+  );
+  assert!(
+    e.pending_checkpoint.is_none(),
+    "no SyncRepersist checkpoint was staged either (the defer is BEFORE the two-write submit)"
+  );
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "no sync installed during the defer window"
+  );
+  assert!(
+    e.sync_is_forced_for_test()
+      && e.sync_requires_cross_epoch_for_test()
+      && e.sync_target_for_test() == Some(m2),
+    "the cross-epoch sync stays ARMED (forced + crossing-required + target) for the re-fetch once the root lands"
+  );
+
+  // --- Land the SwapEpoch root → install E+1 → its UNCONDITIONAL forced checkpoint at M1 == N1 lands. ---
+  e.handle_storage(now, &mut wal, &mut sb); // SwapEpoch root → install_membership(N1) + force_checkpoint
+  assert_eq!(
+    e.membership.epoch(),
+    successor_e1.epoch(),
+    "the node's own swap installed E+1"
+  );
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb); // drain the forced checkpoint (snapshot -> root)
+  }
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(n1),
+    "the forced checkpoint landed at M1 == N1 (the SwapEpoch arm's checkpoint), superblock now FREE"
+  );
+  assert!(
+    !e.pending_sb_for_test() && e.pending_checkpoint.is_none(),
+    "no superblock root is in flight after the swap-checkpoint completes"
+  );
+
+  // --- THE RE-SOLICIT: the same crossing reply now installs cleanly — crosses E+1 -> E+2. ---
+  let nonce2 = e.sync_nonce_for_test(); // the still-armed sync's (unchanged) nonce
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    cross_msg(nonce2),
+  );
+  assert!(
+    e.pending_install.is_some(),
+    "with the root cleared, the re-solicited reply STAGED the crossing install (no longer deferred)"
+  );
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb); // the two-write re-persist -> durable root -> install
+  }
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the crossing install completed cleanly — no stuck pending_install"
+  );
+  assert!(
+    e.pending_install.is_none(),
+    "the install drained — no orphaned pending_install survived the defer"
+  );
+  assert_eq!(
+    e.membership, successor_e2,
+    "the laggard CROSSED to E+2 via the speculative sync, beyond its own E+1 swap"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(m2),
+    "the crossing committed through the E+2 crossing checkpoint M2"
+  );
+}
+
+#[test]
 fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   // The restart-survivable half of the swap-checkpoint: a crash BETWEEN the SwapEpoch root and the forced
   // checkpoint leaves a durable root with the E+1 membership AHEAD of the checkpoint — `config_install_op = N` but
@@ -2951,5 +3109,437 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
   assert_eq!(
     e.membership, successor,
     "the successor membership installed"
+  );
+}
+
+/// Build a DONOR at E+1 holding a durable checkpoint, where a RETAINED member's slot SHIFTED across the
+/// swap. Genesis is a 4-voter cluster `[0,1,2,3]` led by `MemberId 0` (slot 0). A `RemoveVoter(MemberId 1)`
+/// commits under E (4 voters, quorum 3), then the swap lands E+1 = `[0,2,3]` (voter slots 0,1,2) and FORCES
+/// a checkpoint embedding the reconfigure op `N`. The donor `MemberId 0` keeps slot 0 (still primary); the
+/// retained `MemberId 2` SHIFTED from old slot 2 to new slot 1 — the cross-epoch slot-shifted laggard.
+/// Returns `(donor, wal, sb, predecessor_config_id, checkpoint_op)`.
+fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, u128, u64)
+{
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  let mut e =
+    Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(4), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let predecessor_config_id = e.membership.config_id();
+
+  // E+1 successor: remove the LOW-indexed MemberId 1, shifting MemberId 2 (slot 2 -> 1) and MemberId 3
+  // (slot 3 -> 2). The donor MemberId 0 keeps slot 0.
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(1)))
+    .expect("RemoveVoter(1) on a 4-voter cluster is valid (leaves 3 voters)");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  // Propose + commit under E (quorum 3 of 4: the primary's own vote + acks from slots 1 and 2).
+  let op = e
+    .propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::RemoveVoter(MemberId::new(1)),
+    )
+    .expect("the primary mints the reconfiguration op");
+  while e.poll_message().is_some() {}
+  e.handle_storage(now, &mut wal, &mut sb); // the primary's own append lands (own vote)
+  for acker in [1u16, 2u16] {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(acker)),
+      reconfigure_ack(op.get(), &payload, acker),
+    );
+  }
+  // Drain the SwapEpoch root + its forced checkpoint (snapshot -> durable root) to completion.
+  for _ in 0..8 {
+    e.handle_storage(now, &mut wal, &mut sb);
+    while e.poll_message().is_some() {}
+  }
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(1),
+    "the donor swapped to E+1"
+  );
+  assert_eq!(e.membership, successor, "the donor installed E+1 = [0,2,3]");
+  assert!(
+    e.checkpoint_op().get() >= op.get() && e.checkpoint_op().get() > 0,
+    "a forced checkpoint embedding the reconfigure op landed (checkpoint_op {} >= N {})",
+    e.checkpoint_op().get(),
+    op.get(),
+  );
+  let checkpoint_op = e.checkpoint_op().get();
+  (e, wal, sb, predecessor_config_id, checkpoint_op)
+}
+
+#[test]
+fn a_slot_shifted_cross_epoch_request_sync_is_served_not_dropped_at_the_sender_binding() {
+  // FINDING 1 — the cross-epoch RequestSync sender binding. After a slot-shifting reconfiguration, a
+  // RETAINED laggard solicits a cross-epoch checkpoint with a RequestSync stamping its OLD slot (its slot
+  // in its own stale membership) and the OLD (predecessor) config_id. The transport binds `from` to the
+  // laggard's CURRENT slot in the DONOR's active membership; the old claimed slot and `from` DIFFER, so the
+  // STRICT self-id binding would DROP the request before `on_request_sync` and the laggard could NEVER
+  // receive the crossing checkpoint. The relaxed binding admits it on `from`'s member identity (the claimed
+  // slot carries no authority — a RequestSync is a pure solicitation answered only by a committed-vouched
+  // checkpoint), and the donor serves the reply ADDRESSED TO `from`'s CURRENT slot so it routes back.
+  let (mut donor, mut wal, mut sb, predecessor_config_id, checkpoint_op) =
+    donor_at_e1_with_shifted_member();
+  let now = Instant::ZERO;
+  assert_ne!(
+    predecessor_config_id,
+    donor.membership.config_id(),
+    "E and E+1 config_ids genuinely differ (a real hash-chained swap)"
+  );
+
+  // The slot-shifted laggard is MemberId 2: OLD slot 2 (what it stamps), CURRENT slot 1 (what `from` binds
+  // to in the donor's E+1 membership [0,2,3]).
+  let old_claimed_slot = ReplicaId::new(2);
+  let current_slot = ReplicaId::new(1);
+  let from = Peer::Replica(current_slot);
+  let request_sync = |slot: ReplicaId, config_id: u128| {
+    Message::RequestSync(crate::RequestSync::new(
+      View::new(),
+      OpNumber::new(), // the laggard is far behind (checkpoint 0), so the donor's checkpoint is in-reach
+      slot,
+      0xBEEF,
+      false,
+      config_id,
+    ))
+  };
+
+  // Deliver the cross-epoch RequestSync: claimed slot = OLD slot 2, config_id = the PREDECESSOR (E) id,
+  // authenticated `from` = the laggard's CURRENT slot 1.
+  donor.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    from,
+    request_sync(old_claimed_slot, predecessor_config_id),
+  );
+  donor.handle_storage(now, &mut wal, &mut sb); // drive the serve-read completion → ship the SyncCheckpoint
+
+  // The donor SERVED it: a SyncCheckpoint (or its over-frame announce) addressed to the laggard's CURRENT
+  // slot, carrying the donor's E+1 membership (the cross-epoch crossing payload). It was NOT dropped at the
+  // sender binding.
+  let mut served_to_current_slot = false;
+  while let Some(out) = donor.poll_message() {
+    match out.msg_ref() {
+      Message::SyncCheckpoint(scp) => {
+        assert_eq!(
+          out.to(),
+          Recipient::To(from),
+          "the SyncCheckpoint routes to the laggard's CURRENT slot (not the stale claimed slot)"
+        );
+        assert_eq!(
+          scp.checkpoint_op().get(),
+          checkpoint_op,
+          "serves the donor's durable checkpoint"
+        );
+        assert!(
+          !scp.membership().is_empty(),
+          "the cross-epoch serve attaches the E+1 successor membership (XI-b gate satisfied by the forced \
+           checkpoint)"
+        );
+        served_to_current_slot = true;
+      }
+      Message::SyncCheckpointMeta(meta) => {
+        assert_eq!(
+          out.to(),
+          Recipient::To(from),
+          "the over-frame announce also routes to the current slot"
+        );
+        assert_eq!(meta.checkpoint_op().get(), checkpoint_op);
+        served_to_current_slot = true;
+      }
+      _ => {}
+    }
+  }
+  assert!(
+    served_to_current_slot,
+    "the slot-shifted cross-epoch RequestSync was admitted to on_request_sync and SERVED — not dropped"
+  );
+
+  // GUARD: the strict binding still bites for the no-shift forge surface. A RequestSync whose claimed slot
+  // DISAGREES with `from` AND whose config_id is the donor's CURRENT (E+1) config — i.e. NOT a cross-epoch
+  // ancestor solicitation, just a mismatched self-id — is DROPPED (no relaxation).
+  let (mut d2, mut w2, mut s2, _pred, _ck) = donor_at_e1_with_shifted_member();
+  let current_config = d2.membership.config_id();
+  d2.handle_message(
+    now,
+    &mut w2,
+    &mut s2,
+    Peer::Replica(ReplicaId::new(2)),                // from = slot 2
+    request_sync(ReplicaId::new(0), current_config), // claims slot 0, CURRENT config (not an ancestor)
+  );
+  d2.handle_storage(now, &mut w2, &mut s2);
+  assert!(
+    !d2.poll_message().is_some_and(|o| matches!(
+      o.msg_ref(),
+      Message::SyncCheckpoint(_) | Message::SyncCheckpointMeta(_)
+    )),
+    "a same-config mismatched-self-id RequestSync is still DROPPED by the strict binding (no relaxation)"
+  );
+}
+
+/// Re-plant `donor`'s durable checkpoint (built by [`donor_at_e1_with_shifted_member`]) with an
+/// OVER-FRAME snapshot at the SAME `checkpoint_op`, PRESERVING its E+1 epoch / membership / lineage /
+/// `config_install_op` — so the donor answers a state-sync solicitation with a `SyncCheckpointMeta`
+/// announce (the chunked path) instead of a single-frame `SyncCheckpoint`, while still attaching the
+/// E+1 successor membership (the XI-b serve gate `checkpoint_op >= config_install_op` holds). Returns
+/// the planted `(env, id)` for the test to feed back as chunks.
+fn replant_over_frame(
+  donor: &mut Endpoint<CountSm, SingleChange>,
+  sb: &mut TestSb,
+) -> (Bytes, u128) {
+  let root = sb.state();
+  let big = crate::message::max_unchunked_snapshot_len() + 4096;
+  let env = Endpoint::<CountSm>::encode_checkpoint(
+    root.checkpoint_op(),
+    &std::collections::BTreeMap::new(),
+    &std::vec![0x5Au8; big],
+  );
+  assert!(
+    env.len() > crate::message::max_unchunked_snapshot_len(),
+    "the re-planted envelope exceeds the one-frame budget (forces the chunked serve)"
+  );
+  let id = crate::checkpoint_id(&env);
+  // Rebuild the durable root with the SAME E+1 scalars, only swapping the checkpoint id to the
+  // over-frame envelope's. `config_install_op` (the reconfigure op) is preserved, so the serve still
+  // attaches the successor membership. The in-memory `checkpoint_op` is unchanged (we re-plant at the
+  // SAME op), so the donor's serve gates (`cr.op() == self.checkpoint_op`, the durable-id match) hold.
+  sb.state = crate::VsrState::try_new_v4(
+    root.view(),
+    root.log_view(),
+    root.commit(),
+    root.checkpoint_op(),
+    id,
+    root.committed_headers_slice().to_vec(),
+    root.epoch(),
+    root.prev_epoch(),
+    root.membership().clone(),
+    root.prior_config_ids().to_vec(),
+    root.config_install_op(),
+  )
+  .expect("the re-planted E+1 root is valid");
+  sb.checkpoint = Some((root.checkpoint_op(), env.clone()));
+  let _ = donor; // the in-memory checkpoint_op is already aligned (re-plant is at the same op).
+  (env, id)
+}
+
+#[test]
+fn a_slot_shifted_cross_epoch_chunk_pull_is_served_and_the_chunk_routes_to_the_current_slot() {
+  // CLASS 1, the CHUNKED leg. When the donor's crossing checkpoint is OVER-FRAME it answers a state-sync
+  // solicitation with a `SyncCheckpointMeta` announce, and the slot-shifted laggard then PULLS the
+  // envelope with `RequestSyncChunk`s — which stamp the SAME stale OLD slot as the initial `RequestSync`.
+  // The strict self-id binding would DROP those chunk pulls before `on_request_sync_chunk` (stranding the
+  // over-frame crossing even though the OFFER pull was admitted), and even if admitted the served chunk
+  // would route to the stale slot. The shared relaxation admits the chunk pull on `from`'s member
+  // identity, and the serve addresses the `SyncChunk` to `from`'s CURRENT slot — so a slot-shifted
+  // laggard can pull, reassemble, and cross over the chunked path. (The reassembly+install half is pinned
+  // by `the_chunked_reassembly_carries_the_same_epoch_and_membership_as_the_single_frame_form`; this pins
+  // the donor-side admit+route that feeds it for a slot-shifted requester.)
+  let (mut donor, mut wal, mut sb, predecessor_config_id, checkpoint_op) =
+    donor_at_e1_with_shifted_member();
+  let now = Instant::ZERO;
+  let (env, id) = replant_over_frame(&mut donor, &mut sb);
+
+  // The slot-shifted laggard is MemberId 2: OLD slot 2 (what it stamps), CURRENT slot 1 (what `from`
+  // binds to in the donor's E+1 membership [0,2,3]).
+  let old_claimed_slot = ReplicaId::new(2);
+  let current_slot = ReplicaId::new(1);
+  let from = Peer::Replica(current_slot);
+
+  // 1) The OFFER pull (RequestSync) with the STALE slot + the predecessor config_id — admitted via the
+  //    shared binding, answered with the over-frame ANNOUNCE routed to the CURRENT slot.
+  donor.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    from,
+    Message::RequestSync(crate::RequestSync::new(
+      View::new(),
+      OpNumber::new(),
+      old_claimed_slot,
+      0xBEEF,
+      false,
+      predecessor_config_id,
+    )),
+  );
+  donor.handle_storage(now, &mut wal, &mut sb); // serve-read completes → announce + warm the cache
+  let mut announced = None;
+  while let Some(out) = donor.poll_message() {
+    if let Message::SyncCheckpointMeta(meta) = out.msg_ref() {
+      assert_eq!(
+        out.to(),
+        Recipient::To(from),
+        "the over-frame announce routes to the laggard's CURRENT slot"
+      );
+      assert_eq!(meta.checkpoint_op().get(), checkpoint_op);
+      assert!(
+        !meta.membership().is_empty(),
+        "the announce carries the E+1 successor membership (XI-b gate satisfied)"
+      );
+      announced = Some(meta.clone());
+    }
+  }
+  let announce =
+    announced.expect("the over-frame donor announces (never ships one oversized frame)");
+  assert!(
+    donor.sync_donating.is_some(),
+    "the verified serve-read warmed the donor cache (chunk pulls are cache slices)"
+  );
+
+  // 2) The CHUNK pulls (RequestSyncChunk) with the SAME stale slot — admitted via the shared relaxation,
+  //    and the SyncChunk serve routes to the CURRENT slot. Collect the whole envelope + confirm it
+  //    reassembles to the announced content (so a slot-shifted laggard genuinely receives a crossable
+  //    envelope).
+  let pull_chunk = |donor: &mut Endpoint<CountSm, SingleChange>,
+                    wal: &mut TestWal,
+                    sb: &mut TestSb,
+                    offset: u64|
+   -> crate::SyncChunk {
+    donor.handle_message(
+      now,
+      wal,
+      sb,
+      from, // authenticated current slot 1
+      Message::RequestSyncChunk(crate::RequestSyncChunk::new(
+        View::new(),
+        announce.checkpoint_op(),
+        id,
+        predecessor_config_id, // the laggard stamps its OLD (ancestor) config_id
+        offset,
+        old_claimed_slot, // and its OLD (stale) slot — the relaxation must admit it
+        0xBEEF,
+      )),
+    );
+    let mut chunk = None;
+    while let Some(out) = donor.poll_message() {
+      if let Message::SyncChunk(c) = out.msg_ref() {
+        assert_eq!(
+          out.to(),
+          Recipient::To(from),
+          "the SyncChunk routes to the laggard's CURRENT slot, NOT the stale claimed slot"
+        );
+        chunk = Some(c.clone());
+      }
+    }
+    chunk.expect("the slot-shifted chunk pull was ADMITTED and served (not dropped at the binding)")
+  };
+  let first = pull_chunk(&mut donor, &mut wal, &mut sb, 0);
+  assert_eq!(first.offset(), 0);
+  let tail_offset = first.bytes().len() as u64;
+  let tail = pull_chunk(&mut donor, &mut wal, &mut sb, tail_offset);
+  assert_eq!(
+    tail_offset + tail.bytes().len() as u64,
+    env.len() as u64,
+    "the two chunks span the whole envelope"
+  );
+  let mut staged = std::vec::Vec::with_capacity(env.len());
+  staged.extend_from_slice(first.bytes());
+  staged.extend_from_slice(tail.bytes());
+  assert_eq!(
+    crate::checkpoint_id(&staged),
+    id,
+    "the slot-shifted-pulled chunks reassemble the exact announced (crossable) envelope"
+  );
+
+  // GUARD: the chunk-pull binding still bites the same-config forge surface. A RequestSyncChunk whose
+  // claimed slot DISAGREES with `from` but whose config_id is the donor's CURRENT (E+1) config — NOT an
+  // ancestor solicitation — is DROPPED (no relaxation), exactly like the same-config RequestSync guard.
+  let current_config = donor.membership.config_id();
+  donor.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)), // from = slot 2
+    Message::RequestSyncChunk(crate::RequestSyncChunk::new(
+      View::new(),
+      announce.checkpoint_op(),
+      id,
+      current_config, // CURRENT config, not an ancestor
+      0,
+      ReplicaId::new(0), // claims slot 0 (disagrees with from)
+      0xBEEF,
+    )),
+  );
+  assert!(
+    !donor
+      .poll_message()
+      .is_some_and(|o| matches!(o.msg_ref(), Message::SyncChunk(_))),
+    "a same-config mismatched-self-id RequestSyncChunk is still DROPPED by the strict binding"
+  );
+}
+
+#[test]
+fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_current_slot() {
+  // CLASS 1, the REPAIR-body leg. A slot-shifted retained laggard pulls a committed log body with
+  // `RequestPrepare` stamped with its OLD slot. The strict self-id binding would DROP it before
+  // `on_request_prepare`, and even if admitted the served `Prepare` would route to the stale slot. The
+  // shared solicitation relaxation admits the pull on `from`'s member identity, and the serve addresses
+  // the `Prepare` to `from`'s CURRENT slot — so a slot-shifted laggard repairs predecessor-log bodies from
+  // current-epoch donors. (The chunked SYNC leg is pinned by
+  // `a_slot_shifted_cross_epoch_chunk_pull_is_served_and_the_chunk_routes_to_the_current_slot`.)
+  let (mut donor, mut wal, mut sb, predecessor_config_id, _checkpoint_op) =
+    donor_at_e1_with_shifted_member();
+  let now = Instant::ZERO;
+  // MemberId 2: OLD slot 2 (what it stamps), CURRENT slot 1 (what `from` binds to in the E+1 [0,2,3]).
+  let old_claimed_slot = ReplicaId::new(2);
+  let current_slot = ReplicaId::new(1);
+  let from = Peer::Replica(current_slot);
+
+  // A `RequestPrepare` for the committed reconfigure op (op 1) with the STALE slot + the predecessor
+  // (ancestor) config_id — admitted via the shared binding, answered with the body routed to CURRENT slot.
+  donor.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    from,
+    Message::RequestPrepare(crate::RequestPrepare::new(
+      View::new(),
+      OpNumber::with(1),
+      old_claimed_slot,
+      predecessor_config_id,
+    )),
+  );
+  let mut served = false;
+  while let Some(out) = donor.poll_message() {
+    if let Message::Prepare(_) = out.msg_ref() {
+      assert_eq!(
+        out.to(),
+        Recipient::To(from),
+        "the repair Prepare routes to the laggard's CURRENT slot, not the stale claimed slot"
+      );
+      served = true;
+    }
+  }
+  assert!(
+    served,
+    "the slot-shifted RequestPrepare was admitted (shared solicitation binding) + served to the current slot"
+  );
+
+  // GUARD: a SAME-config (E+1) RequestPrepare whose claimed self-id MISMATCHES `from` is still DROPPED by
+  // the strict binding — the relaxation is scoped to STRICT-ANCESTOR config solicitations only.
+  let e1_config = donor.membership.config_id();
+  donor.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(current_slot),
+    Message::RequestPrepare(crate::RequestPrepare::new(
+      View::new(),
+      OpNumber::with(1),
+      ReplicaId::new(2), // mismatched self-id, but SAME config (E+1) → strict binding applies
+      e1_config,
+    )),
+  );
+  assert!(
+    !donor
+      .poll_message()
+      .is_some_and(|o| matches!(o.msg_ref(), Message::Prepare(_))),
+    "a same-config mismatched-self-id RequestPrepare is still DROPPED by the strict binding"
   );
 }
