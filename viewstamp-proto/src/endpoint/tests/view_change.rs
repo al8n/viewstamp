@@ -5150,6 +5150,7 @@ fn large_bodied_view_change_carriers_and_repair_serve_fit_the_frame() {
   let now = Instant::ZERO;
   e.on_request_prepare_range(
     now,
+    Peer::Replica(ReplicaId::new(1)),
     crate::RequestPrepareRange::new(
       View::with(1),
       OpNumber::with(1),
@@ -5248,6 +5249,7 @@ fn repair_range_serve_clamps_a_huge_hi_to_the_window_against_a_sparse_high_op_lo
   let now = Instant::ZERO;
   e.on_request_prepare_range(
     now,
+    Peer::Replica(ReplicaId::new(1)),
     crate::RequestPrepareRange::new(
       View::with(1),
       OpNumber::with(lo),

@@ -3526,6 +3526,335 @@ fn a_laggard_keeps_its_membership_when_a_below_n_donor_withholds_then_swaps_once
 }
 
 #[test]
+fn a_direct_e0_to_e2_crossing_stamps_the_verified_chain_so_a_reserve_verifies() {
+  // XI-b LINEAGE HASH-CHAIN (the multi-epoch-skip fix). A retained E0 laggard state-syncs an E2
+  // successor DIRECTLY from an E2 donor (a multi-epoch skip inside the two-prior window): E2's config_id
+  // chains from E1 (`hash(E2_membership, E1) == E2_config_id`), so it VERIFIES. The crossing install must
+  // stamp the lineage from the VERIFIED chain — `[E1, E0]` most-recent-first (the verified immediate
+  // predecessor E1, then the laggard's own prior E0) — NOT `[E0, ..]` re-derived from the laggard's stale
+  // current config. Otherwise a later RE-SERVE of the E2 membership would chain it from E0, recomputing a
+  // config_id NO fresh laggard expects, and that laggard would reject the crossing forever. This drives
+  // the direct E0→E2 install, asserts the `[E1, E0]` ring, then RE-SERVES E2 to a fresh laggard and
+  // asserts its crossing VERIFIES (recomputes E2's config_id) — proving the re-served bytes carry E1.
+  let e0 = genesis(3); // [0,1,2]
+  let e1 = e0
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter(3) on the 3-voter genesis is valid"); // [0,1,2,3], chains from E0
+  let e2 = e1
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(4)))
+    .expect("AddVoter(4) on the 4-voter E1 is valid"); // [0,1,2,3,4], chains from E1
+  assert_eq!(e1.epoch(), crate::Epoch::new(1));
+  assert_eq!(
+    e2.epoch(),
+    crate::Epoch::new(2),
+    "E2 is two epochs above genesis"
+  );
+  assert_ne!(e1.config_id(), e0.config_id());
+  assert_ne!(e2.config_id(), e1.config_id());
+  // The donor serves the E2 membership chained from its VERIFIED predecessor E1.
+  assert_eq!(
+    crate::Membership::recompute_config_id(
+      e2.epoch(),
+      e2.replica_count(),
+      e2.learner_count(),
+      e2.members_slice(),
+      e1.config_id(),
+    ),
+    e2.config_id(),
+    "E2's config_id chains from E1 — so `to_membership_verified` against E1 succeeds"
+  );
+
+  // The laggard starts at E0 (MemberId 1, slot 1 — retained in E2, so it can later re-serve).
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  assert_eq!(
+    e.membership.config_id(),
+    e0.config_id(),
+    "laggard starts at E0"
+  );
+  let now = Instant::ZERO;
+  // A higher-epoch heartbeat arms the (forced, crossing-required) cross-epoch sync.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  // The E2 donor's SyncCheckpoint: header advertises E2, body is the E2 membership chained from E1.
+  let e2_body =
+    crate::message::ReconfigurePayload::from_membership(&e2, e1.config_id()).encode_body();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      e2.epoch(),
+      e2.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      e2_body,
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // two-write persist → durable root → install
+
+  // The crossing installed E2 directly.
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the direct E0→E2 crossing applied"
+  );
+  assert_eq!(
+    e.membership, e2,
+    "the laggard installed the E2 successor directly"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(2),
+    "the laggard crossed to E2"
+  );
+  // THE FIX: the in-memory lineage is the VERIFIED chain `[E1, E0]`, NOT `[E0, ..]`.
+  assert_eq!(
+    e.lineage_ring_for_test(),
+    [e1.config_id(), e0.config_id()],
+    "the crossing stamped the VERIFIED chain (E1 the immediate predecessor, then the laggard's own prior E0)"
+  );
+  assert!(e.in_lineage_for_test(e1.config_id()), "E1 admitted");
+  assert!(
+    e.in_lineage_for_test(e0.config_id()),
+    "E0 admitted (the laggard's own prior, within the two-prior window)"
+  );
+  // THE SCALAR FIX: the LIVE `prev_epoch` is the VERIFIED predecessor E1 (= successor.epoch() - 1), NOT
+  // the laggard's stale own epoch E0. Stamping E0 would record "E2 chains from epoch 0" while the ring
+  // above says `[E1, E0]` — a contradiction the lineage checker reads as a fork.
+  assert_eq!(
+    e.prev_epoch,
+    crate::Epoch::new(1),
+    "the LIVE prev_epoch is the verified predecessor E1 (successor.epoch() - 1), not the stale E0"
+  );
+  // The DURABLE root the crossing staged records the SAME scalar (recovery restores it). `sb.state()` is
+  // the v6 root `durable_root_with_successor` wrote naming the synced checkpoint.
+  assert_eq!(
+    sb.state().prev_epoch(),
+    crate::Epoch::new(1),
+    "the DURABLE sync-successor root stamps prev_epoch = E1 (matches the live scalar by construction)"
+  );
+  assert_eq!(
+    sb.state().epoch(),
+    crate::Epoch::new(2),
+    "the durable root names the crossed-to epoch E2"
+  );
+
+  // RE-SERVE: a fresh E0/E1 laggard (slot 2) solicits; the installed node serves its E2 checkpoint with
+  // the E2 membership chained from `lineage[0]`. A recovery-flagged RequestSync is served at/above our op.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSync(crate::RequestSync::new(
+      e.view(),
+      OpNumber::with(0),
+      ReplicaId::new(2),
+      0xBEEF,
+      true, // recovery peer-fetch — served at/above our checkpoint
+      0,
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the serve-read completes → ship SyncCheckpoint
+  let mut reserved = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::SyncCheckpoint(s) = out.msg_ref() {
+      reserved = Some(s.clone());
+    }
+  }
+  let reserved = reserved.expect("the installed node re-serves a SyncCheckpoint");
+  assert_eq!(reserved.epoch(), e2.epoch(), "the re-serve advertises E2");
+  assert_eq!(
+    reserved.config_id(),
+    e2.config_id(),
+    "the re-serve advertises E2's config_id"
+  );
+  assert!(
+    !reserved.membership().is_empty(),
+    "the re-serve carries the E2 membership (the node's checkpoint reflects it: config_install_op == 4 == checkpoint_op)"
+  );
+  // THE LOAD-BEARING ASSERTION: a FRESH laggard's crossing VERIFIES the re-served bytes — it recomputes
+  // E2's config_id from the carried `(epoch, config_id, membership)`. This succeeds ONLY because the
+  // re-served body chains from E1 (`lineage[0]`), the verified predecessor. Were the install to have
+  // stamped `lineage[0] = E0`, the body would chain from E0 and this verification would FAIL forever.
+  let verified = crate::message::ReconfigurePayload::decode_body(reserved.membership())
+    .expect("the re-served membership body decodes")
+    .to_membership_verified(reserved.epoch(), reserved.config_id())
+    .expect("a fresh laggard's crossing VERIFIES the re-served E2 (recomputes E2's config_id)");
+  assert_eq!(
+    verified, e2,
+    "the re-served bytes reconstruct EXACTLY E2 — the crossing propagates to another laggard"
+  );
+
+  // RECOVER off the durable root the crossing staged: a node restarting after the crossing restores the
+  // IDENTICAL prev_epoch E1 (the in-memory and durable scalars are the same value by construction, so no
+  // contradiction survives a crash). The re-serve above was a read-only serve, so the root's
+  // epoch/prev_epoch/membership are unchanged. The laggard's stable id is MemberId 1 (slot 1), retained in
+  // E2, so it recovers Active.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let recovered = match Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
+  {
+    Recovered::Active(r) => r,
+    Recovered::Retired(_) => panic!("MemberId 1 is retained in E2 → recover Active"),
+  };
+  assert_eq!(
+    recovered.membership.epoch(),
+    crate::Epoch::new(2),
+    "the recovered node comes up at E2 (the durable root's epoch)"
+  );
+  assert_eq!(
+    recovered.prev_epoch,
+    crate::Epoch::new(1),
+    "the RECOVERED prev_epoch is E1 — the durable root's scalar restored unchanged (matches the live + \
+     durable scalars asserted above)"
+  );
+}
+
+#[test]
+fn a_direct_e0_to_e3_crossing_too_deep_for_the_ring_is_rejected_not_mis_installed() {
+  // XI-b LINEAGE DISTANCE BOUND (the deep-skip guard). A retained E0 laggard is offered an E3 successor
+  // DIRECTLY from an E3 donor — an epoch DISTANCE of 3, beyond the two-prior `LINEAGE_RING` window. The
+  // carried payload VERIFIES (E3's config_id chains from E2, `hash(E3_membership, E2) == E3_config_id`),
+  // but a single carried predecessor (E2) cannot prove the missing E2<-E1<-E0 chain, and the ring (two
+  // slots) cannot hold both the verified immediate predecessor E2 AND the laggard's own prior E0 with E2's
+  // real predecessor E1 in between. So `apply_sync`'s distance guard REJECTS it: stage NOTHING, no install,
+  // `sync` stays armed (forced + crossing-required) so the solicit timer re-fetches / a closer-skip donor
+  // is tried — the laggard stays at E0 rather than mis-installing a lineage it cannot represent. (Contrast
+  // the distance-2 E0→E2 crossing above, which the SAME guard ACCEPTS and stamps `[E1, E0]`.)
+  let e0 = genesis(3); // [0,1,2]
+  let e1 = e0
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter(3) on the 3-voter genesis is valid"); // E1, chains from E0
+  let e2 = e1
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(4)))
+    .expect("AddVoter(4) on the 4-voter E1 is valid"); // E2, chains from E1
+  let e3 = e2
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(5)))
+    .expect("AddVoter(5) on the 5-voter E2 is valid"); // E3, chains from E2
+  assert_eq!(
+    e3.epoch(),
+    crate::Epoch::new(3),
+    "E3 is three epochs above genesis"
+  );
+  // The donor serves the E3 membership chained from its VERIFIED predecessor E2 — so the payload would
+  // PASS `to_membership_verified`; ONLY the distance bound rejects it.
+  assert_eq!(
+    crate::Membership::recompute_config_id(
+      e3.epoch(),
+      e3.replica_count(),
+      e3.learner_count(),
+      e3.members_slice(),
+      e2.config_id(),
+    ),
+    e3.config_id(),
+    "E3's config_id chains from E2 — the payload verifies; only the distance-3 bound rejects it"
+  );
+
+  // The laggard starts at E0 (MemberId 1, slot 1).
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  assert_eq!(
+    e.membership.config_id(),
+    e0.config_id(),
+    "laggard starts at E0"
+  );
+  let now = Instant::ZERO;
+  // Arm the sync exactly as the E0→E2 crossing test does: a same-epoch `Commit` advertising the higher
+  // checkpoint op 4 arms an ordinary sync; the CROSSING is driven purely by the reply's higher epoch +
+  // successor membership. The distance guard lives in `apply_sync`'s successor-reconstruction block, which
+  // runs on ANY successor-carrying reply (gated on a differing config_id + non-empty membership), so it
+  // applies here independent of `require_cross_epoch`.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  assert!(e.sync_target_for_test().is_some(), "a sync is armed");
+  // The E3 donor's SyncCheckpoint: header advertises E3, body is the E3 membership chained from E2. The
+  // freshness/monotone gates pass (checkpoint_op 4 > self.checkpoint_op 0), so it REACHES `apply_sync` —
+  // where the distance guard is the load-bearing rejection.
+  let e3_body =
+    crate::message::ReconfigurePayload::from_membership(&e3, e2.config_id()).encode_body();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      e3.epoch(),
+      e3.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      e3_body,
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // nothing was staged → no install drives here
+
+  // REJECTED: no crossing installed, the laggard is STILL at E0, and the sync stays armed for a re-fetch.
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "the too-deep E0→E3 skip was REJECTED — no sync installed"
+  );
+  assert_eq!(
+    e.membership.config_id(),
+    e0.config_id(),
+    "the laggard did NOT cross — still at E0"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "still at epoch E0"
+  );
+  assert_eq!(
+    e.prev_epoch,
+    crate::Epoch::new(0),
+    "prev_epoch unchanged (genesis) — no mis-installed scalar"
+  );
+  assert!(
+    !e.pending_sb_for_test(),
+    "nothing was staged — no pending durable root"
+  );
+  assert!(
+    e.pending_checkpoint_is_sync_for_test().is_none(),
+    "nothing was staged — no pending checkpoint (the reject returned BEFORE submit_write_checkpoint)"
+  );
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "the sync STAYS armed (the solicit timer re-fetches a closer donor) — not mis-installed"
+  );
+}
+
+#[test]
 fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
   // Change #2 — the `op == N` crossing. A Normal laggard APPENDED the reconfigure op N but missed its
   // commit (`op == N`, `commit_min < N`), so the ordinary `maybe_request_sync` trigger (gated
@@ -3801,6 +4130,152 @@ fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits(
     e.forced_syncs_applied(),
     1,
     "exactly one crossing applied (the below-N reply did not)"
+  );
+}
+
+#[test]
+fn a_cross_epoch_fetch_crosses_below_an_unreachable_hinted_target_on_a_verified_successor() {
+  // Change #2 — the VERIFICATION IS THE AUTHORITY, not the unverified hint. The cross-epoch trigger
+  // treats the hint's `checkpoint_op` only as a STICKY SOLICIT FLOOR (`target` raises). A buggy/misrouted
+  // higher-epoch message (an `EpochAhead` hint here) carrying an UNREACHABLE-HIGH `checkpoint_op` must NOT
+  // become a hard crossing bound: the real crossing requirement is installing a VERIFIED successor
+  // membership (the bytes hash-chain to the carried `config_id`), which comes only from a donor whose
+  // checkpoint is at/above the reconfigure op N. So a later VALID successor-membership reply at a LOWER
+  // `checkpoint_op` than the bogus target STILL crosses the laggard. (Were `checkpoint_op >= target` still a
+  // crossing conjunct, the bogus hint would pin the target unreachably high and reject every honest reply
+  // forever — the laggard would never cross.)
+  let n: u64 = 4; // the REAL cluster crossing checkpoint (a donor serves the successor membership at >= N)
+  let bogus_target: u64 = 9_999; // an UNREACHABLE hinted checkpoint_op no honest donor can satisfy
+  // A backup laggard far behind (op 0, checkpoint 0), high checkpoint cadence.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 100).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let predecessor = genesis(3);
+  let successor = predecessor
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid");
+  let laggard_config_id = e.membership.config_id();
+
+  // A higher-epoch `EpochAhead` hint carrying the BOGUS unreachable checkpoint_op → the speculative
+  // crossing fetch arms with that bogus value as its (sticky) target.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::EpochAhead(crate::EpochAhead::new(
+      crate::Epoch::new(1),
+      OpNumber::with(bogus_target),
+    )),
+  );
+  assert!(
+    e.status().is_normal() && !e.awaiting_peer_checkpoint_for_test(),
+    "the NORMAL laggard stays Normal (it armed the speculative sync off the hint, did not go Recovering)"
+  );
+  assert!(
+    e.sync_is_forced_for_test() && e.sync_requires_cross_epoch_for_test(),
+    "the laggard armed a crossing-required forced sync"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(bogus_target),
+    "the (sticky) solicit target latched the BOGUS hinted checkpoint_op — but it is NOT a hard crossing bound"
+  );
+  let nonce = e.sync_nonce_for_test();
+
+  // --- A below-N, EMPTY-membership reply is STILL rejected (the verification, not the target, gates). ---
+  let below: u64 = 1; // below N — a donor in the transient force-checkpoint window, membership withheld
+  let below_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(below),
+    &BTreeMap::new(),
+    &CountSm::default().snapshot(),
+  );
+  let below_id = crate::checkpoint_id(&below_env);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(below),
+      below_id,
+      crate::Epoch::new(1),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      below_env.clone(),
+      Bytes::new(), // WITHHELD (empty) membership — NOT a verified successor
+    )),
+  );
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "the empty-membership reply is REJECTED — the crossing requires a VERIFIED successor, not just a checkpoint"
+  );
+  assert_eq!(
+    e.membership.config_id(),
+    laggard_config_id,
+    "still at the OLD epoch (no crossing off the unverified reply)"
+  );
+
+  // --- A VALID successor-membership reply at checkpoint_op N, FAR BELOW the bogus target — CROSSES. ---
+  let cross_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(n),
+    &BTreeMap::new(),
+    &CountSm::default().snapshot(),
+  );
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
+      .encode_body();
+  let nonce2 = e.sync_nonce_for_test(); // the still-armed sync's nonce
+  assert!(
+    n < bogus_target,
+    "setup: the VALID crossing reply's checkpoint_op (N) is strictly BELOW the bogus hinted target"
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(n),
+      cross_id,
+      successor.epoch(),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce2,
+      cross_env.clone(),
+      membership_body,
+    )),
+  );
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the verified successor reply (below the bogus target) completes the crossing to Normal"
+  );
+  assert_eq!(
+    e.membership, successor,
+    "the laggard CROSSED to the E+1 successor membership — the unreachable hint did not poison the target"
+  );
+  assert_ne!(
+    e.membership.config_id(),
+    laggard_config_id,
+    "the config_id advanced off the predecessor"
+  );
+  assert_eq!(
+    e.forced_syncs_applied(),
+    1,
+    "exactly one crossing applied (the empty-membership reply did not)"
   );
 }
 
@@ -4817,4 +5292,833 @@ fn stale_pinned_chunk_request_yields_a_fresh_offer() {
   let s = offered.expect("a stale pin is answered with a fresh offer of the CURRENT checkpoint");
   assert_eq!(s.checkpoint_op(), OpNumber::with(4));
   assert_eq!(s.nonce(), 0xF00D);
+}
+
+#[test]
+fn a_stale_cross_epoch_hint_does_not_poison_ordinary_same_epoch_state_sync() {
+  // FINDING 2 — the require_cross_epoch DOWNGRADE on the ordinary same-epoch trigger. A speculative
+  // `require_cross_epoch` sync can be armed in Normal by the pre-binding higher-epoch / `EpochAhead` hook
+  // BEFORE any successor checkpoint is verified — gated only on the hint sender being a replica. If that
+  // hint was STALE/misrouted and NO successor checkpoint actually exists, the crossing requirement must NOT
+  // persist into a later LEGITIMATE same-epoch state-sync: `apply_sync` would otherwise REJECT every
+  // same-config reply forever (it demands a successor that never comes), poisoning ordinary catch-up.
+  // The fix: a same-epoch admissible message CANCELS the stale crossing at the ingress, and the node
+  // re-arms a fresh ordinary same-config sync (new nonce) that installs.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+
+  // Arm a STALE cross-epoch sync at a LOW target (a higher-epoch hint that armed before any successor was
+  // verified — and none exists). It is forced + crossing-required.
+  e.arm_cross_epoch_sync_for_test(2);
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "setup: the stale hint armed a crossing-required sync"
+  );
+
+  // An ORDINARY same-epoch Commit advertising a HIGHER cluster checkpoint (op 4 > head 0). The ingress
+  // CANCELS the stale crossing, then `maybe_request_sync` re-arms a fresh ordinary same-config sync at 4.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    !e.sync_requires_cross_epoch_for_test(),
+    "the same-epoch ingress evidence CANCELLED the stale crossing requirement"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(4),
+    "the cancelled crossing re-armed a fresh ordinary same-config sync at the reachable cluster checkpoint"
+  );
+  // Cancelled + re-armed at the ingress, so the nonce advanced — capture the CURRENT one for the reply.
+  let nonce = e.sync_nonce_for_test();
+
+  // Now a LEGITIMATE same-config (epoch 0, empty membership) SyncCheckpoint at op 4 arrives. With the bit
+  // cleared it must PROCEED + INSTALL — not be rejected for lacking a successor membership.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0, // same config_id as the laggard — no successor membership (an ordinary same-epoch sync)
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // drive the durable re-persist → install
+
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the ordinary same-epoch sync INSTALLED (was not poisoned by the stale crossing requirement)"
+  );
+  assert_eq!(e.commit(), OpNumber::with(4));
+  assert_eq!(e.op(), OpNumber::with(4));
+  assert_eq!(e.status(), Status::Normal);
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "the sync completed and cleared (no outstanding, indefinitely-armed sync)"
+  );
+}
+
+#[test]
+fn a_stale_high_target_cross_epoch_hint_does_not_poison_ordinary_same_epoch_state_sync() {
+  // CLASS 2, the WHOLE-CLASS downgrade. The prior per-instance fix cleared `require_cross_epoch` ONLY
+  // when a same-epoch checkpoint RAISED the sync target (`incoming > s.target`). But a STALE/misrouted
+  // higher-epoch hint can pin the speculative cross-epoch sync at an UNREACHABLY-HIGH target. A later
+  // LEGITIMATE same-epoch checkpoint that is ABOVE this replica's head yet BELOW the bogus target then
+  // takes the NON-raise path — so the bit PERSISTED, and `apply_sync` rejected every same-config reply
+  // FOREVER (demanding a successor that never comes). The golden fix CANCELS the stale crossing at the
+  // ingress on ANY same-epoch admissible message (target-independent); the node then re-arms a fresh
+  // ordinary same-config sync at the reachable checkpoint — so the bogus-high target is gone and the
+  // below-bogus reply is no longer dropped at the freshness gate.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+
+  // Arm a STALE cross-epoch sync at an UNREACHABLY-HIGH target (op 1000 — no donor will ever serve it;
+  // no successor exists). It is forced + crossing-required.
+  e.arm_cross_epoch_sync_for_test(1000);
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "setup: the stale hint armed a crossing-required sync"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(1000),
+    "setup: pinned at the bogus unreachable-high target"
+  );
+  // An ORDINARY same-epoch Commit advertising a cluster checkpoint op 4 — ABOVE our head (0) but BELOW
+  // the bogus target (1000). The ingress CANCELS the stale crossing regardless of the bogus target, then
+  // `maybe_request_sync` re-arms a fresh ordinary same-config sync at the reachable op 4.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    !e.sync_requires_cross_epoch_for_test(),
+    "the ingress CANCELLED the stale crossing even though the same-epoch checkpoint was below the bogus target"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(4),
+    "the cancelled crossing re-armed a fresh ordinary same-config sync at the reachable op 4 (bogus 1000 gone)"
+  );
+  // Cancelled + re-armed at the ingress, so the nonce advanced — capture the CURRENT one for the reply.
+  let nonce = e.sync_nonce_for_test();
+
+  // A LEGITIMATE same-config (epoch 0, empty membership) SyncCheckpoint at op 4 arrives. With the bit
+  // cleared AND the target reachable it must PROCEED + INSTALL — not be rejected for lacking a successor
+  // (the require_cross_epoch carve-out) NOR dropped as below-target (the freshness gate).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0, // same config_id — no successor membership (an ordinary same-epoch sync)
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // drive the durable re-persist → install
+
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the ordinary same-epoch sync INSTALLED (the high-target stale hint no longer poisons it)"
+  );
+  assert_eq!(e.commit(), OpNumber::with(4));
+  assert_eq!(e.status(), Status::Normal);
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "the sync completed and cleared (no indefinitely-armed cross-epoch sync left behind)"
+  );
+
+  // GUARD: a GENUINE crossing is NOT stranded — the cross-epoch trigger RE-ARMS afresh. After the
+  // downgrade+install above, a real higher-epoch heartbeat re-establishes the crossing requirement.
+  let (mut e2, mut wal2, mut sb2, _env2, _id2) = sync_apply_harness(4);
+  e2.arm_cross_epoch_sync_for_test(1000);
+  e2.handle_message(
+    now,
+    &mut wal2,
+    &mut sb2,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    !e2.sync_requires_cross_epoch_for_test(),
+    "the stale hint is downgraded by the same-epoch trigger"
+  );
+  // A STRICTLY-HIGHER-epoch heartbeat (the genuine crossing signal) re-arms the crossing requirement.
+  e2.handle_message(
+    now,
+    &mut wal2,
+    &mut sb2,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(7),
+      OpNumber::with(7),
+      crate::Epoch::new(1), // a real higher epoch
+      0,
+    )),
+  );
+  assert!(
+    e2.sync_requires_cross_epoch_for_test(),
+    "a genuine higher-epoch heartbeat RE-ARMS require_cross_epoch — a real crossing is never stranded by the downgrade"
+  );
+}
+
+#[test]
+fn a_stale_cross_epoch_hint_is_cancelled_by_same_epoch_evidence_at_or_below_the_head() {
+  // CLASS 2, the `<= op` GAP. A same-epoch checkpoint AT/BELOW the head takes `maybe_request_sync`'s EARLY
+  // return (`incoming <= self.op`), so the per-trigger downgrade never ran — a stale `require_cross_epoch`
+  // sync PERSISTED, blocking primary op-mint + backup checkpoint reports and rejecting every same-config
+  // reply forever. The ingress cancel fires on ANY same-epoch admissible message regardless of op, so a
+  // same-epoch Commit at/below the head CANCELS the stale crossing outright (we are already caught up
+  // in-epoch — no re-arm, since `maybe_request_sync` early-returns).
+  let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.arm_cross_epoch_sync_for_test(1000);
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "setup: the stale hint armed a crossing-required sync"
+  );
+
+  // A same-epoch Commit advertising a checkpoint AT the head (op 0 == our head) — the `<= op` early-return
+  // path the per-trigger downgrade skipped. The ingress cancel still fires on this same-epoch message.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "the ingress CANCELLED the stale crossing on same-epoch evidence at/below the head (no longer poisoned)"
+  );
+}
+
+#[test]
+fn a_pinned_chunked_cross_epoch_transfer_is_not_cancelled_by_same_epoch_traffic() {
+  // R8 SCOPE GUARD: a Normal crossing that accepted a `SyncCheckpointMeta` and PINNED a `sync_transfer` (a
+  // chunked transfer mid-assembly) is Normal + `pending_install` None + not awaiting — tracked ONLY by the
+  // transfer. It is a GENUINE crossing in progress: cancelling its sync would drop the pinned transfer so
+  // its `SyncChunk`s strand with no sync left to retry. The cancel is scoped to PRE-ANSWER crossings
+  // (`sync_transfer` None), so a pinned chunked transfer SURVIVES a delayed same-epoch message.
+  let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  e.arm_cross_epoch_sync_for_test(9);
+  e.sync_transfer = Some(SyncTransfer {
+    checkpoint_op: OpNumber::with(9),
+    checkpoint_id: 0,
+    total_len: 0,
+    epoch: crate::Epoch::new(0),
+    config_id: 0,
+    membership: Bytes::new(),
+    donor: ReplicaId::new(0),
+    staged: std::vec::Vec::new(),
+  });
+  assert!(
+    e.status().is_normal() && e.pending_install.is_none() && !e.awaiting_peer_checkpoint_for_test(),
+    "setup: a NORMAL pinned chunked transfer — only the sync_transfer arm of the guard excludes the cancel"
+  );
+  let nonce_before = e.sync_nonce_for_test();
+
+  // A same-epoch admissible Commit (epoch 0, at the head).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "the pinned chunked transfer's sync SURVIVES the same-epoch Commit (cancelling would strand its SyncChunks)"
+  );
+  assert!(
+    e.sync_transfer.is_some(),
+    "the pinned sync_transfer is preserved (not dropped by an over-broad cancel)"
+  );
+  assert_eq!(
+    e.sync_nonce_for_test(),
+    nonce_before,
+    "the sync nonce is unchanged (no cancel, no re-arm)"
+  );
+}
+
+#[test]
+fn a_higher_epoch_trigger_upgrades_an_ordinary_sync_to_crossing_even_when_the_target_does_not_increase()
+ {
+  // R9 RE-ARM completeness — the inverse of the cancel: a genuine higher-epoch trigger must PIN the
+  // crossing requirement on an outstanding sync EVEN WHEN the hinted checkpoint does not exceed the current
+  // target. An ordinary same-epoch sync already at/above the hint would otherwise stay ordinary, and a
+  // legitimate below-target successor checkpoint would be rejected by the ordinary `< target` freshness
+  // gate (or an ordinary reply would complete WITHOUT crossing) — stranding the node at the old epoch until
+  // another higher-epoch trigger happens to arrive. `maybe_request_cross_epoch_catchup` now upgrades any
+  // outstanding sync to forced + require_cross_epoch regardless of target monotonicity.
+  let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  // An ORDINARY same-epoch sync already armed at a HIGH target (10), ABOVE the real crossing checkpoint.
+  e.maybe_request_sync(now, OpNumber::with(10));
+  assert!(
+    !e.sync_requires_cross_epoch_for_test() && e.sync_target_for_test() == Some(10),
+    "setup: an ordinary (non-crossing) sync at target 10"
+  );
+  let nonce_before = e.sync_nonce_for_test();
+
+  // A genuine higher-epoch hint whose checkpoint (4) is BELOW the ordinary target (10).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::EpochAhead(crate::EpochAhead::new(
+      crate::Epoch::new(1),
+      OpNumber::with(4),
+    )),
+  );
+
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "the higher-epoch trigger UPGRADED the ordinary sync to crossing-required (even though hint 4 < target 10)"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(10),
+    "the target kept the HIGHER of the two (no regression to the below-target hint)"
+  );
+  assert_eq!(
+    e.sync_nonce_for_test(),
+    nonce_before,
+    "the upgrade preserved the nonce (the in-flight handshake is kept, not re-armed)"
+  );
+}
+
+#[test]
+fn a_staged_same_epoch_install_re_arms_the_crossing_from_the_intent_after_it_completes() {
+  // The PERSISTENT-INTENT lifecycle. The crossing requirement on the in-flight `SyncState` does NOT
+  // survive the sync's install step: if an ORDINARY same-epoch sync has already STAGED its install
+  // (`pending_install` set, `successor` None) and a higher-epoch trigger then arrives before the
+  // `SyncRepersist` root completes, the trigger rewrites the `SyncState` (upgrading it to crossing) but
+  // the staged SAME-epoch install still completes — `on_sb_done` clears `self.sync` — so the node would
+  // settle at the OLD epoch with NO crossing armed, pinning the crossing only if ANOTHER higher-epoch
+  // trigger later happened to arrive. The persistent `cross_epoch_intent` closes this: the trigger SETS
+  // it, and `on_sb_done` RE-ARMS a crossing sync from it the instant a non-crossing install completes.
+  //
+  // MUTATION CHECK: remove the `on_sb_done` re-arm (step 3) and the final assertion FAILS — the node
+  // settles old-epoch with `sync == None`, exactly the defect this intent closes.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+
+  // (1) An ORDINARY same-epoch FORCED sync to the donor checkpoint (op 4), and the matching same-epoch
+  // (epoch 0, empty-membership) reply → `apply_sync` STAGES the install with `successor` None.
+  e.arm_forced_sync_for_test(4);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env,
+      Bytes::new(), // empty membership — a SAME-config (non-crossing) install
+    )),
+  );
+  assert!(
+    e.pending_install.is_some(),
+    "setup: the ordinary same-epoch sync STAGED its install (pending_install set)"
+  );
+  assert!(
+    !e.sync_requires_cross_epoch_for_test(),
+    "setup: the staged sync is ordinary (no crossing requirement yet)"
+  );
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    None,
+    "setup: no crossing is owed before any higher-epoch trigger"
+  );
+
+  // (2) A BELOW-target higher-epoch `EpochAhead` (epoch 1, checkpoint 1 < the ordinary target 4) arrives
+  // from an active member WHILE the install is staged and the `SyncRepersist` root is still in flight. It
+  // PINS the persistent intent (and incidentally upgrades the soon-to-be-cleared `SyncState`).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::EpochAhead(crate::EpochAhead::new(
+      crate::Epoch::new(1),
+      OpNumber::with(1),
+    )),
+  );
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    Some(1),
+    "the higher-epoch trigger pinned the persistent crossing intent to the hinted checkpoint (1)"
+  );
+
+  // (3) Drive the staged `SyncRepersist` to durability → `install_sync` runs the SAME-epoch (successor
+  // None) install, `on_sb_done` clears `self.sync`. WITHOUT the intent the node would settle old-epoch
+  // with no crossing armed; the `on_sb_done` re-arm fires from the still-owed intent instead.
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the staged same-epoch sync completed (its re-persist root landed)"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "the completed install did NOT cross — the node is still at the OLD epoch (same-config install)"
+  );
+
+  // THE GOAL: the node did NOT settle old-epoch with no crossing armed. The non-crossing install that
+  // completed while a crossing was owed immediately RE-PINNED the crossing from the intent.
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "after the non-crossing install, a CROSSING sync (require_cross_epoch) is re-armed from the intent"
+  );
+  assert!(
+    e.sync_is_forced_for_test(),
+    "the re-armed crossing sync is forced (the relaxed apply_sync invariant the crossing needs)"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(1),
+    "the re-armed crossing sync targets the intent's checkpoint (1)"
+  );
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    Some(1),
+    "the intent is STILL owed (no real cross yet) — it is cleared only when a successor actually installs"
+  );
+}
+
+#[test]
+fn a_successful_cross_clears_the_intent_so_on_sb_done_never_re_arms_forever() {
+  // The CLEAR-ON-CROSS half (step 4) of the persistent-intent lifecycle. A crossing install MUST clear
+  // `cross_epoch_intent`, else `on_sb_done`'s re-arm would re-pin a crossing sync FOREVER after the node
+  // has already crossed. Here a Normal speculative crossing armed from a hint installs a genuine E+1
+  // successor; afterwards the intent is None and no crossing sync is left armed.
+  let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  let m = 4u64; // the E+1 crossing checkpoint
+  let successor_e1 = genesis(3)
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+
+  // Arm the speculative crossing AND pin the persistent intent, as the higher-epoch trigger does.
+  e.arm_cross_epoch_sync_for_test(m);
+  e.set_cross_epoch_intent_for_test(m);
+  let nonce = e.sync_nonce_for_test();
+
+  // A verified E+1 successor-membership SyncCheckpoint at op M → `apply_sync` stages a CROSSING install.
+  let cross_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(m),
+    &std::collections::BTreeMap::new(),
+    &CountSm::default().snapshot(),
+  );
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor_e1, genesis(3).config_id())
+      .encode_body();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(m),
+      cross_id,
+      successor_e1.epoch(),
+      successor_e1.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      cross_env,
+      membership_body,
+    )),
+  );
+  assert!(e.pending_install.is_some(), "the crossing install staged");
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.membership, successor_e1,
+    "the node CROSSED into E+1 (the successor membership installed)"
+  );
+  // THE GOAL of the clear: the intent is dropped on a real cross, so the `on_sb_done` re-arm sees None
+  // and does NOT re-arm a crossing sync — no forever-re-arm after the node has already crossed.
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    None,
+    "a successful cross CLEARED the persistent intent (otherwise on_sb_done would re-arm forever)"
+  );
+  assert!(
+    !e.sync_requires_cross_epoch_for_test(),
+    "no crossing sync is re-armed after the node crossed (the intent was cleared, so on_sb_done saw None)"
+  );
+}
+
+#[test]
+fn the_trigger_level_downgrade_clears_the_persistent_intent_so_on_sb_done_never_re_poisons() {
+  // R11: the trigger-level stale downgrade (`downgrade_stale_cross_epoch_sync`) is a SAME-EPOCH evidence
+  // path DISTINCT from the ingress cancel. The REAL production trigger sets BOTH the transient
+  // `require_cross_epoch` bit AND the persistent `cross_epoch_intent`; this downgrade must clear the intent
+  // too, else after the downgraded now-ordinary sync installs, `on_sb_done` would re-arm a crossing from
+  // the still-set intent — re-introducing the stale-hint poison the intent refactor exists to remove.
+  let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  // A REAL higher-epoch trigger sets the intent AND arms a crossing sync (NOT the `_for_test` helper).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::EpochAhead(crate::EpochAhead::new(
+      crate::Epoch::new(1),
+      OpNumber::with(10),
+    )),
+  );
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "setup: the higher-epoch trigger armed a crossing-required sync"
+  );
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    Some(10),
+    "setup: the trigger also SET the persistent intent (the production path, not the test helper)"
+  );
+
+  // Exercise the TRIGGER-LEVEL downgrade (a same-epoch sync trigger learns a reachable same-epoch
+  // checkpoint at 4 > head 0) — NOT the ingress cancel.
+  e.maybe_request_sync(now, OpNumber::with(4));
+  assert!(
+    !e.sync_requires_cross_epoch_for_test(),
+    "the downgrade cleared the crossing bit (the sync is now ordinary, re-targeted to the reachable 4)"
+  );
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    None,
+    "the downgrade ALSO cleared the persistent intent — no leak for on_sb_done to re-poison from"
+  );
+}
+
+#[test]
+fn a_pinned_chunked_crossing_survives_a_same_epoch_sync_trigger_via_the_shared_downgrade_scope() {
+  // R12: the trigger-level downgrade shares the ingress cancel's PRE-ANSWER scope
+  // (`crossing_is_pre_answer_speculative`). A pinned chunked crossing (`sync_transfer` — an in-progress
+  // crossing a donor has begun answering) is NOT a bare hint, so a same-epoch sync trigger above the head
+  // must PRESERVE it — the transfer, the require_cross_epoch bit, AND the persistent intent — never
+  // downgrade it to ordinary and strand its SyncChunks (the ingress cancel already preserves it; the
+  // trigger downgrade must too, or it tears down what the ingress deliberately kept).
+  let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  // A real higher-epoch trigger sets the intent + arms a crossing sync at target 10.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::EpochAhead(crate::EpochAhead::new(
+      crate::Epoch::new(1),
+      OpNumber::with(10),
+    )),
+  );
+  // PIN a chunked transfer (a SyncCheckpointMeta accepted — the crossing is now ANSWER-DERIVED, not bare).
+  e.sync_transfer = Some(SyncTransfer {
+    checkpoint_op: OpNumber::with(10),
+    checkpoint_id: 0,
+    total_len: 0,
+    epoch: crate::Epoch::new(1),
+    config_id: 0,
+    membership: Bytes::new(),
+    donor: ReplicaId::new(0),
+    staged: std::vec::Vec::new(),
+  });
+  assert!(
+    e.sync_requires_cross_epoch_for_test()
+      && e.cross_epoch_intent_for_test() == Some(10)
+      && e.sync_transfer.is_some(),
+    "setup: a pinned chunked crossing (answer-derived, not a bare hint)"
+  );
+
+  // A same-epoch sync trigger above the head (a same-epoch checkpoint at 4 > head 0) — the path that, while
+  // the ingress cancel preserves the pinned crossing (scoped out), reaches the trigger-level downgrade.
+  e.maybe_request_sync(now, OpNumber::with(4));
+
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "the pinned chunked crossing's require_cross_epoch is PRESERVED (the shared pre-answer scope excludes it)"
+  );
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    Some(10),
+    "the persistent intent is PRESERVED (not cleared by a scoped-out downgrade)"
+  );
+  assert!(
+    e.sync_transfer.is_some(),
+    "the pinned sync_transfer is PRESERVED (its SyncChunks can still assemble + install)"
+  );
+}
+
+#[test]
+fn a_same_epoch_message_clears_an_orphaned_cross_epoch_intent() {
+  // R13: the persistent intent is DECOUPLED from the sync, so it can be ORPHANED — a path like
+  // `reset_for_view_transition` clears `sync` (and `sync_transfer`/`pending_install`) without clearing the
+  // intent. If the stale-evidence clear paths keyed only off `self.sync.is_some()`, no later same-epoch
+  // traffic could clear the orphan, and a subsequent ordinary sync's `on_sb_done` would re-pin a bogus
+  // crossing from it — re-introducing the stale-hint poison. The ingress cancel now clears an orphaned
+  // intent on same-epoch evidence even when NO sync remains.
+  let (mut e, mut wal, mut sb, _env, _id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+  // An ORPHANED intent: the persistent crossing goal survives with NO outstanding sync (the post-reset
+  // state a view transition leaves behind for a bare stale hint).
+  e.set_cross_epoch_intent_for_test(10);
+  assert!(
+    e.cross_epoch_intent_for_test() == Some(10) && e.sync_target_for_test().is_none(),
+    "setup: an orphaned intent — the crossing goal survives with the sync cleared"
+  );
+
+  // A same-epoch admissible Commit: the node is operating at its current epoch, so the higher-epoch hint
+  // that set the intent was stale.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    None,
+    "the orphaned intent is CLEARED by same-epoch evidence with NO sync required — on_sb_done can no longer re-poison from it"
+  );
+}
+
+#[test]
+fn an_ordinary_staged_install_does_not_shield_a_stale_intent_from_a_same_epoch_clear() {
+  // The `crossing_is_pre_answer_speculative` SUCCESSOR-awareness. An ORDINARY same-config sync stages
+  // `pending_install` with `successor: None` — that is NOT a crossing. The scope predicate must still
+  // allow a same-epoch clear while such an install is in flight: only a CROSSING install (one carrying a
+  // successor membership) may shield a stale intent. If a `pending_install.is_some()` test shielded ANY
+  // staged install, the ordinary install would complete with the stale intent intact and `on_sb_done`
+  // would re-arm a bogus crossing from it — exactly the poison the intent lifecycle exists to prevent.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+
+  // (1) Stage an ORDINARY same-config install (successor None): a forced same-epoch sync + the matching
+  // same-epoch (epoch 0, empty-membership) SyncCheckpoint → `apply_sync` stages `pending_install` with its
+  // paired SyncRepersist `pending_checkpoint`, root NOT yet durable. (Drive it as the staged-install tests
+  // do, so the `pending_install => SyncRepersist-checkpoint` coupling `assert_invariants` enforces holds.)
+  e.arm_forced_sync_for_test(4);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env,
+      Bytes::new(), // empty membership — an ORDINARY same-config install (successor None)
+    )),
+  );
+  assert!(
+    e.pending_install.is_some(),
+    "setup: the ordinary same-config sync STAGED its install (root not yet durable, in flight)"
+  );
+
+  // (2) A STALE persistent crossing intent — a higher-epoch hint pinned it while the ordinary install is
+  // mid-flight (the orphaned-intent shape the lifecycle must keep clearable).
+  e.set_cross_epoch_intent_for_test(7);
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    Some(7),
+    "setup: a stale crossing intent is pinned WHILE an ordinary (successor None) install is staged"
+  );
+
+  // (3) Same-epoch operating evidence (a Commit at OUR epoch, AT the head so it never re-arms a sync)
+  // arrives BEFORE the root lands. The ingress cancel runs; the ordinary (successor None) staged install
+  // must NOT shield the stale intent — `crossing_is_pre_answer_speculative` is true, so it is cleared.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    None,
+    "the ORDINARY (successor None) staged install did NOT shield the stale intent — same-epoch evidence cleared it"
+  );
+}
+
+#[test]
+fn after_an_ordinary_install_completes_on_sb_done_does_not_re_arm_a_crossing() {
+  // The completion half of the successor-awareness: once the stale intent is cleared (the predicate let the
+  // ordinary install NOT shield it), the ordinary install completing must NOT re-arm a crossing —
+  // `on_sb_done` sees `cross_epoch_intent == None` and re-pins nothing. (Contrast
+  // `a_staged_same_epoch_install_re_arms_the_crossing_from_the_intent_after_it_completes`, where the intent
+  // SURVIVES and `on_sb_done` legitimately re-arms.) This closes the loop: a stale intent shielded by a
+  // mis-scoped predicate would re-poison HERE; a correctly-cleared one cannot.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let now = Instant::ZERO;
+
+  // Reach Test 1's cleared-intent state: stage an ordinary (successor None) install, pin a stale intent,
+  // then clear it with a same-epoch head Commit.
+  e.arm_forced_sync_for_test(4);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env,
+      Bytes::new(),
+    )),
+  );
+  e.set_cross_epoch_intent_for_test(7);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    None,
+    "precondition: the stale intent was cleared by the same-epoch evidence (Test 1's end-state)"
+  );
+
+  // Drive the staged SyncRepersist root to durability → `install_sync` runs the same-config install and
+  // `on_sb_done` clears `self.sync`. With the intent already None, the re-arm sees None and pins NOTHING.
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the ordinary same-config install COMPLETED (its re-persist root landed)"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the install advanced the durable checkpoint (the same-config sync truly installed)"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "the install did NOT cross — still the OLD epoch (a same-config install)"
+  );
+
+  // THE GOAL: completion re-armed NO crossing. `on_sb_done` saw a None intent, so it did not re-pin a
+  // bogus crossing — neither a crossing-required sync nor a re-set intent.
+  assert!(
+    !e.sync_requires_cross_epoch_for_test(),
+    "no crossing sync is re-armed after the ordinary install completes (on_sb_done saw a cleared intent)"
+  );
+  assert_eq!(
+    e.cross_epoch_intent_for_test(),
+    None,
+    "the intent stays None after completion (on_sb_done did not re-pin a bogus crossing)"
+  );
 }

@@ -1421,6 +1421,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if from.as_replica().is_none() {
       return;
     }
+    // PIN the PERSISTENT crossing intent: the highest hinted crossing `checkpoint_op` this node must
+    // reach. The arm/upgrade below sets the IN-FLIGHT `SyncState`'s `require_cross_epoch`, but that flag
+    // is cleared the instant `on_sb_done` clears `self.sync` on a NON-crossing install — so if a sync had
+    // already STAGED its install when this trigger arrived, the staged install completes at the old epoch
+    // and the crossing requirement is lost. The intent OUTLIVES that lifecycle: a non-crossing install
+    // completing while the intent is still `Some` re-arms the crossing afresh (`on_sb_done`). Cleared on a
+    // real cross (`install_sync`) and on stale same-epoch evidence (`cancel_stale_cross_epoch_sync`).
+    self.cross_epoch_intent = Some(
+      self
+        .cross_epoch_intent
+        .map_or(checkpoint, |existing| existing.max(checkpoint)),
+    );
     // A NON-Normal laggard (already off Normal: a `ViewChange` driving a futile old-epoch election, or a
     // `Recovering`/`RecoveringHead` at the superseded epoch) crosses via the recovery peer-fetch — it
     // enters Recovering, FORCED-syncs the cluster checkpoint, and `complete_recovery` lands it Normal at
@@ -1448,22 +1460,29 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // until `apply_sync` INSTALLS the verified crossing checkpoint (which then advances `commit_min` to
     // `M >= N`, installs the successor membership, and discards the stale tail). So a higher-epoch message
     // moves no accumulator; the speculative sync just keeps re-soliciting until a donor's `M >= N` crossing
-    // checkpoint lands (#1 guarantees one exists). Mirror the anti-thrash re-target shape of
-    // `maybe_request_sync`/`maybe_force_sync`: RAISE an outstanding sync's target (keep it forced + pinned
-    // crossing); otherwise fresh-arm.
+    // checkpoint lands (#1 guarantees one exists). UPGRADE an outstanding sync to a forced pinned crossing
+    // (keeping the higher target, anti-thrash on the nonce); otherwise fresh-arm a crossing sync.
     match self.sync {
-      Some(s) if checkpoint.get() > s.target.get() => {
+      Some(s) => {
+        // ANY genuine higher-epoch trigger PINS the crossing requirement on an outstanding sync — even
+        // when the hinted checkpoint does NOT exceed the current target. An ordinary same-epoch sync
+        // already at/above the hint MUST still be upgraded to `forced` + `require_cross_epoch`: otherwise a
+        // legitimate below-target successor checkpoint is rejected by the ordinary `< target` freshness
+        // gate (or an ordinary reply completes WITHOUT crossing), and the laggard never leaves the old
+        // epoch until another higher-epoch trigger happens to arrive. Keep the nonce and the HIGHER of the
+        // two targets (no regression). A raised cross-epoch target does NOT abort a pinned transfer: the
+        // target is only the solicit floor (a possibly-bogus hint), NOT a hard install bound — a legitimate
+        // below-hint crossing transfer survives to install, and a stale same-epoch (empty-membership) one
+        // cannot wrongly install (`apply_sync`'s successor-verification gate rejects it, then the next
+        // solicit re-pins; `drop_transfer_below_forced_target` correctly no-ops for a crossing sync).
         self.sync = Some(SyncState {
-          target: checkpoint,
+          target: s.target.max(checkpoint),
           nonce: s.nonce,
           forced: true,
           require_cross_epoch: true,
         });
-        // A now-forced raised target invalidates a chunked transfer pinned below it.
-        self.drop_transfer_below_forced_target();
         self.send_request_sync(now);
       }
-      Some(_) => self.send_request_sync(now), // a sync to >= target is outstanding — re-solicit (anti-thrash).
       None => self.arm_sync(now, checkpoint, true, true),
     }
   }

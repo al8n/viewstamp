@@ -130,6 +130,7 @@ fn assert_invariants_rejects_pending_install_without_sync() {
     sm_tail: Bytes::new(),
     held_tail: false,
     successor: None,
+    successor_prev_config_id: None,
   });
   // self.sync is None → violates clause (1)
   e.assert_invariants();

@@ -329,6 +329,18 @@ pub(crate) struct PendingInstall {
   /// `SyncRepersist` completion (same side effects as [`Endpoint::install_membership`]). `None` for a
   /// SAME-config sync — the common case stays byte-identical (no membership change).
   successor: Option<Membership>,
+  /// The VERIFIED predecessor `config_id` the carried successor chains from — the `prev_config_id` the
+  /// `ReconfigurePayload` pinned, the value that made `to_membership_verified` succeed
+  /// (`hash(successor_membership, this) == successor.config_id()`). `Some` exactly when `successor` is
+  /// (a crossing install); `None` for a same-config sync. It is LOAD-BEARING for the lineage hash-chain
+  /// across a MULTI-epoch skip: the crossing install + its durable root stamp the recent-prior ring as
+  /// `[this, <laggard's own prior config_id>]` (the VERIFIED chain), NOT `[<laggard's current> , ..]`
+  /// re-derived from the stale current config. So a later re-serve of the successor membership chains
+  /// from THIS id and recomputes the SAME `config_id` a fresh laggard expects — without it, a direct
+  /// E0→E2 crossing would re-serve E2 stamped with E0 as predecessor, and another laggard would reject
+  /// the (mis-chained) crossing forever. For the common single-change E0→E1 case this equals the
+  /// laggard's own current `config_id`, so the install is byte-identical to before.
+  successor_prev_config_id: Option<u128>,
 }
 
 /// The ViewChange-only collection state — reified as `Endpoint::view_change: Option<ViewChangeCollection>`
@@ -1115,6 +1127,27 @@ pub struct Endpoint<S, R: Reconfig = RestartOnly> {
   /// not relied upon to catch up (the needed ops are below the cluster checkpoint and may be pruned);
   /// the `sync_solicit` timer re-broadcasts until a valid `SyncCheckpoint` is applied + made durable.
   sync: Option<SyncState>,
+  /// The PERSISTENT cross-epoch crossing INTENT, decoupled from the transient [`SyncState`]: the
+  /// highest hinted crossing `checkpoint_op` this node still has to REACH (cross the epoch boundary to),
+  /// or `None` when no crossing is owed. Where [`SyncState::require_cross_epoch`] is the IN-FLIGHT
+  /// sync's requirement — cleared the instant `on_sb_done` clears `self.sync` on an install — this is
+  /// the GOAL that OUTLIVES the sync lifecycle: a higher-epoch trigger sets it
+  /// ([`Endpoint::maybe_request_cross_epoch_catchup`]) alongside arming the sync, and a sync completing
+  /// WITHOUT crossing re-arms the crossing AFRESH from it (`on_sb_done`'s sync re-persist arm). Without
+  /// this, a higher-epoch trigger arriving AFTER an ordinary same-epoch sync has already STAGED its
+  /// install (`pending_install` set, `successor` None) only rewrites the doomed `SyncState`: the staged
+  /// same-epoch install still completes and clears `self.sync`, settling the node at the OLD epoch with
+  /// NO crossing armed until ANOTHER trigger happens to arrive. Lifecycle: SET on a higher-epoch trigger
+  /// (`= max(existing, hinted checkpoint)`); RE-ARMS the crossing on a non-crossing install completing
+  /// while it is still `Some`; CLEARED on a SUCCESSFUL cross ([`Endpoint::install_sync`] installs a
+  /// successor and
+  /// advances the epoch — the goal is met) and on STALE same-epoch evidence
+  /// ([`Endpoint::cancel_stale_cross_epoch_sync`] — a same-epoch operating witness proves the hint was
+  /// stale; clearing here is what stops `on_sb_done` from re-arming a crossing for a bogus hint forever).
+  /// IN-MEMORY only — deliberately NOT durable: the recovery checkpoint-debt machine + the cluster's
+  /// higher-epoch heartbeats re-establish it after a crash, so a restarted laggard re-pins the crossing
+  /// from the live signal rather than a stale persisted goal.
+  cross_epoch_intent: Option<OpNumber>,
   /// State-sync deferred install: the staged-but-not-yet-installed
   /// synced checkpoint. `Some` exactly between `apply_sync` STAGING the durable re-persist and the sync
   /// ROOT going durable (`on_sb_done` → `install_sync`); `None` otherwise. While `Some`, the replica
@@ -1382,6 +1415,8 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       recover: None,
       repair: std::collections::BTreeSet::new(),
       sync: None,
+      // No reconfiguration has been hinted: no crossing is owed (re-established by a higher-epoch trigger).
+      cross_epoch_intent: None,
       pending_install: None,
       sync_serving: BTreeMap::new(),
       sync_donating: None,
@@ -1645,6 +1680,32 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     let mut ring = self.lineage;
     ring.copy_within(..LINEAGE_RING - 1, 1);
     ring[0] = superseded;
+    ring.to_vec()
+  }
+
+  /// The recent-prior lineage ring AS IT WOULD BE after a CROSS-EPOCH crossing install that skipped one
+  /// or more epochs, without mutating `self.lineage`. The crossing snapshot carried a successor that
+  /// VERIFIED against `verified_prev` (the `prev_config_id` the `ReconfigurePayload` pinned), so the
+  /// installed configuration's immediate predecessor is `verified_prev` — NOT the laggard's own current
+  /// `config_id`, which on a MULTI-epoch skip is an EARLIER ancestor. So the ring becomes
+  /// `[verified_prev, superseded, ..]` most-recent-first: push the laggard's just-superseded current
+  /// (`superseded`), THEN push the verified immediate predecessor on top. A later re-serve of the
+  /// successor membership thus chains from `verified_prev` and recomputes the SAME `config_id` a fresh
+  /// laggard expects. For a SINGLE-epoch crossing (`verified_prev == superseded`) the extra push would
+  /// duplicate the slot, so the caller takes the plain [`Self::lineage_after_push`] path — keeping the
+  /// common E0→E1 case byte-identical. Used to stamp the SwapEpoch-analogue durable root for a sync
+  /// crossing (the root is written BEFORE `install_sync` runs the live push), so a node recovering off
+  /// that root restores the SAME verified chain the live crossing builds.
+  fn lineage_after_crossing_push(
+    &self,
+    superseded: u128,
+    verified_prev: u128,
+  ) -> std::vec::Vec<u128> {
+    let mut ring = self.lineage;
+    ring.copy_within(..LINEAGE_RING - 1, 1);
+    ring[0] = superseded;
+    ring.copy_within(..LINEAGE_RING - 1, 1);
+    ring[0] = verified_prev;
     ring.to_vec()
   }
 
@@ -1950,9 +2011,19 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       self.pending_install.is_none() || self.sync.is_some(),
       "pending_install without an outstanding sync"
     );
+    // STRONGER than `pending_checkpoint.is_some()`: a staged install's in-flight checkpoint must be the
+    // SyncRepersist that carries IT to durability — never an ORDINARY checkpoint (which `force_checkpoint`
+    // / the cadence path stages). The single-superblock-writer fence at the sync-answer ingress
+    // (`handle_sync_checkpoint` / the Meta + Chunk paths now defer while `pending_sb.is_some() ||
+    // pending_checkpoint.is_some()`) makes this hold BY CONSTRUCTION: a sync can stage its re-persist
+    // only when the superblock is free, so no ordinary `force_checkpoint` (e.g. the SwapEpoch arm's) can
+    // coexist with a staged install and OVERWRITE its tracker — a coexistence would orphan the install.
     debug_assert!(
-      self.pending_install.is_none() || self.pending_checkpoint.is_some(),
-      "pending_install without its in-flight re-persist checkpoint"
+      self.pending_install.is_none()
+        || self
+          .pending_checkpoint
+          .is_some_and(|pc| matches!(pc.kind, CheckpointKind::SyncRepersist)),
+      "pending_install without its in-flight SyncRepersist checkpoint"
     );
     // (1b) A chunked transfer likewise belongs to an OUTSTANDING sync: `on_sync_checkpoint_meta`
     // pins it only under a live nonce-matched `sync`, and every clear path drops it no later than
@@ -2693,6 +2764,19 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self.sync.expect("a sync is outstanding").nonce
   }
 
+  /// Test-only: the PERSISTENT cross-epoch crossing intent target, or `None` when no crossing is owed.
+  #[cfg(test)]
+  fn cross_epoch_intent_for_test(&self) -> Option<u64> {
+    self.cross_epoch_intent.map(|op| op.get())
+  }
+
+  /// Test-only: pin the PERSISTENT cross-epoch crossing intent directly (the value the higher-epoch
+  /// trigger sets), so the clear-on-cross / re-arm lifecycle can be exercised without a full driver.
+  #[cfg(test)]
+  fn set_cross_epoch_intent_for_test(&mut self, target: u64) {
+    self.cross_epoch_intent = Some(OpNumber::with(target));
+  }
+
   /// Test-only: arm a FORCED sync to `target` directly (bypassing the trigger), so the forced
   /// assert-relaxation in `apply_sync` can be exercised in isolation.
   #[cfg(test)]
@@ -2703,6 +2787,21 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       nonce: self.nonce,
       forced: true,
       require_cross_epoch: false,
+    });
+  }
+
+  /// Test-only: arm a FORCED, CROSS-EPOCH-CROSSING sync to `target` directly (the speculative
+  /// Normal-status arm `maybe_request_cross_epoch_catchup` builds), so the single-superblock-writer
+  /// defer (a sync-answer deferred while a SwapEpoch root is in flight) and the verification-is-authority
+  /// crossing admission can be exercised without a full multi-epoch driver.
+  #[cfg(test)]
+  fn arm_cross_epoch_sync_for_test(&mut self, target: u64) {
+    self.nonce = self.nonce.wrapping_add(1);
+    self.sync = Some(SyncState {
+      target: OpNumber::with(target),
+      nonce: self.nonce,
+      forced: true,
+      require_cross_epoch: true,
     });
   }
 
@@ -2909,6 +3008,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       sm_tail: Bytes::new(),
       held_tail: false,
       successor: None,
+      successor_prev_config_id: None,
     });
     self.sync_transfer = Some(SyncTransfer {
       checkpoint_op: self.checkpoint_op,
@@ -2995,6 +3095,13 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self.in_lineage(other)
   }
 
+  /// Test-only: the recent-prior lineage ring (`self.lineage`), most-recent-first, so a regression can
+  /// pin the EXACT post-crossing chain (e.g. a direct E0→E2 install yields `[E1, E0]`).
+  #[cfg(test)]
+  fn lineage_ring_for_test(&self) -> [u128; LINEAGE_RING] {
+    self.lineage
+  }
+
   /// Test-only: the adopted StartViewChange target view (`svc_target`), so a regression can observe
   /// that an admitted SVC raised the target (vs. a stale one dropped at the ingress gate).
   #[cfg(test)]
@@ -3044,13 +3151,15 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   ///     non-voting member must never reach the quorum bitset / vote maps.
   ///   - **Serves and solicitations of committed content** bind to the FULL membership
   ///     (`sender_is_member`): the solicitations `GetView`/`RequestPrepare`/`RequestPrepareRange`/
-  ///     `Recovery`/`RequestSync`/`RequestSyncChunk`, and the serves `RecoveryResponse`/`SyncCheckpoint`/
-  ///     `SyncCheckpointMeta`/`SyncChunk`. A non-voting member legitimately solicits committed state and
+  ///     `Recovery`, and the serves `RecoveryResponse`/`SyncCheckpoint`/`SyncCheckpointMeta`/`SyncChunk`.
+  ///     A non-voting member legitimately solicits committed state and
   ///     can serve committed content to others, so these bind to the self `replica()` over the full node
   ///     range — NOT `config.primary(view)`, which would drop an honest backup-originated serve, and not
   ///     the voting set, which would drop a learner soliciting/serving committed state. They carry
   ///     committed CONTENT verified independently (checksum + committed-vouch; checkpoint-id), not quorum
-  ///     authority, so a member serving them is safe.
+  ///     authority, so a member serving them is safe. The two STATE-SYNC PULLS
+  ///     (`RequestSync`/`RequestSyncChunk`) are the same no-authority class but additionally tolerate a
+  ///     SLOT-SHIFTED cross-epoch laggard ([`Self::sender_admits_solicitation`]).
   /// - **Primary-authority broadcasts** (only the primary of the advertised view legitimately sends
   ///   them, and they carry NO self `replica()` to bind to) — bind to
   ///   `from == Peer::Replica(self.membership.primary(msg.view()))`: `Commit` and `StartView`. This also
@@ -3107,17 +3216,32 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       // come from ANY Normal member (a backup or a learner, not only the primary) — bind to the self id,
       // not `config.primary(view)`.
       Message::GetView(m) => self.sender_is_member(from, m.replica()),
-      Message::RequestPrepare(m) => self.sender_is_member(from, m.replica()),
-      Message::RequestPrepareRange(m) => self.sender_is_member(from, m.replica()),
+      // `RequestPrepare`/`RequestPrepareRange` are no-authority cross-epoch-tolerant solicitations too (a
+      // committed-log-body pull a cross-epoch laggard sends to a current-epoch donor) — same relaxation as
+      // the sync pulls, so a slot-shifted retained laggard's repair solicitations are not dropped.
+      Message::RequestPrepare(m) => {
+        self.sender_admits_solicitation(from, m.replica(), m.config_id())
+      }
+      Message::RequestPrepareRange(m) => {
+        self.sender_admits_solicitation(from, m.replica(), m.config_id())
+      }
       Message::Recovery(m) => self.sender_is_member(from, m.replica()),
-      Message::RequestSync(m) => self.sender_is_member(from, m.replica()),
+      // `RequestSync` and `RequestSyncChunk` are the two NO-AUTHORITY cross-epoch-tolerant
+      // SOLICITATIONS (a checkpoint OFFER pull and an over-frame CHUNK pull): the strict self-id binding
+      // (`sender_is_member`) is RELAXED for a cross-epoch laggard whose claimed slot has SHIFTED. See
+      // [`Self::sender_admits_solicitation`] for the binding + the no-forgeable-authority proof.
+      Message::RequestSync(m) => self.sender_admits_solicitation(from, m.replica(), m.config_id()),
       Message::RecoveryResponse(m) => self.sender_is_member(from, m.replica()),
       Message::SyncCheckpoint(m) => self.sender_is_member(from, m.replica()),
-      // The chunked state-sync trio all carry a self `replica()`: the announce + chunk are serves
-      // from ANY Normal member (like `SyncCheckpoint`); the chunk pull is a solicitation (like
-      // `RequestSync`). All bind to the claimed self id + the full membership range.
+      // The chunked state-sync trio all carry a self `replica()`. The announce (`SyncCheckpointMeta`)
+      // and the chunk (`SyncChunk`) are SERVES from ANY Normal donor (like `SyncCheckpoint`), so they
+      // bind STRICTLY to the claimed self id + the full membership range (a donor's own slot does not
+      // shift on the receiver side). The chunk PULL (`RequestSyncChunk`) is a laggard SOLICITATION (the
+      // over-frame analogue of `RequestSync`), so it gets the SAME cross-epoch relaxation.
       Message::SyncCheckpointMeta(m) => self.sender_is_member(from, m.replica()),
-      Message::RequestSyncChunk(m) => self.sender_is_member(from, m.replica()),
+      Message::RequestSyncChunk(m) => {
+        self.sender_admits_solicitation(from, m.replica(), m.config_id())
+      }
       Message::SyncChunk(m) => self.sender_is_member(from, m.replica()),
       // `LearnerStatus` is a NON-VOTING progress report carrying a self `replica()`. It binds to the
       // FULL membership (`sender_is_member`): the EMITTER is a learner (a non-voting member), and a
@@ -3199,6 +3323,65 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   /// on each handler's own (inconsistent) downstream range check.
   fn sender_is_member(&self, from: Peer, claimed: ReplicaId) -> bool {
     claimed.get() < self.membership.node_count() && from == Peer::Replica(claimed)
+  }
+
+  /// The sender binding shared by the two state-sync PULLS (`RequestSync` + the over-frame
+  /// `RequestSyncChunk`) — the only messages that bind by MEMBER IDENTITY rather than the self-claimed
+  /// slot, to admit a CROSS-EPOCH laggard whose slot has SHIFTED. `claimed` is the requester's
+  /// self-stamped slot; `config_id` is its advertised configuration lineage.
+  ///
+  /// # Why the strict slot binding strands a slot-shifted laggard
+  ///
+  /// A state-sync pull stamps the requester id as the sender's `local_slot()` — for an OLD-epoch laggard,
+  /// its OLD slot in its OWN (stale) membership. The transport binds `from` by resolving the peer's STABLE
+  /// `MemberId` in the DONOR's ACTIVE membership — the laggard's CURRENT slot. After a legal reconfiguration
+  /// that closes/moves slots (`RemoveVoter`, `PromoteLearner`), the laggard's old claimed slot and `from`'s
+  /// current slot DIFFER, so the strict `from == Peer::Replica(claimed)` binding ([`Self::sender_is_member`])
+  /// DROPS the pull before its handler — cross-epoch catch-up strands for any slot-shifting change (the
+  /// laggard is triggered by `EpochAhead` but can never PULL the crossing checkpoint: neither the initial
+  /// `RequestSync` OFFER pull NOR, when the donor's checkpoint is over-frame, the follow-up
+  /// `RequestSyncChunk` chunk pulls would be admitted).
+  ///
+  /// # Why relaxing this is safe — a state-sync pull carries NO forgeable authority
+  ///
+  /// Both pulls are PURE SOLICITATIONS: they carry NO view/quorum/vote authority a forged one could abuse.
+  /// The handlers use the requester id ONLY (a) as a range/membership bound and (b) as the reply RECIPIENT
+  /// — they drive no vote, no view adoption, no quorum bitset, no commit advance. The donor answers ONLY
+  /// its OWN durable, committed-vouched checkpoint (integrity-bound to its durable `checkpoint_id`, and —
+  /// cross-epoch — carrying a hash-chained successor membership the receiver re-verifies in `apply_sync`).
+  /// The reply is harmless even if misaddressed: a recipient installs it ONLY against a matching
+  /// outstanding sync nonce it cannot fabricate. So binding by `from` (member identity) instead of the
+  /// shifting claimed slot adds NO forge surface — at worst a forged pull from an authenticated member
+  /// costs the donor one bounded checkpoint read + ship (a DoS already reachable under the strict binding).
+  /// This is the no-authority shape; every AUTHORITY-bearing message
+  /// (`Prepare`/`Commit`/`PrepareOk`/`StartView`/`SVC`/`DVC`/…) keeps the strict slot binding, and so do
+  /// the donor SERVES (`SyncCheckpoint`/`SyncCheckpointMeta`/`SyncChunk`) — a donor's own slot does not
+  /// shift on the receiver side, so the relaxation is scoped to the laggard's OUTBOUND pulls only.
+  ///
+  /// # The binding
+  ///
+  /// - **Strict path** (the common case, byte-identical to [`Self::sender_is_member`]): `from` is the
+  ///   authenticated peer for the claimed slot AND that slot is a current member. Covers same-config and
+  ///   any case where slots did not shift.
+  /// - **Cross-epoch relaxation** (only when the strict path fails): admit when `from` resolves to a
+  ///   CURRENT member of OUR configuration AND the pull's `config_id` is a STRICT ANCESTOR of ours
+  ///   ([`Self::in_lineage`] true but NOT equal to our current `config_id`) — i.e. an authenticated current
+  ///   member soliciting from an older lineage config, exactly the slot-shifted cross-epoch laggard.
+  ///   `from` is bound (the current slot is valid by construction); the self-claimed (stale) slot is NOT
+  ///   required to equal it. A SAME-config pull that fails the strict path (a forged/misrouted self-id)
+  ///   is NOT relaxed — the ancestor-config gate excludes it.
+  fn sender_admits_solicitation(&self, from: Peer, claimed: ReplicaId, config_id: u128) -> bool {
+    if self.sender_is_member(from, claimed) {
+      return true; // strict path: same-config / no slot shift — unchanged.
+    }
+    // Cross-epoch relaxation: an authenticated CURRENT member soliciting from a STRICT-ANCESTOR config
+    // (its slot shifted across the reconfiguration). Bind by `from`'s current slot, not the stale claim.
+    let Some(slot) = from.as_replica() else {
+      return false; // a client / non-replica never solicits state-sync.
+    };
+    self.membership.member_at(slot).is_some()
+      && self.in_lineage(config_id)
+      && config_id != self.membership.config_id()
   }
 
   /// The (epoch, config_id) AUTHORITY gate, layered ON TOP of [`Self::sender_matches`]: it admits a
@@ -3287,6 +3470,88 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       // already consumed before this gate (and dropped at `sender_matches`). It exercises no authority,
       // so it is never admitted to the dispatch.
       Message::EpochAhead(_) => false,
+    }
+  }
+
+  /// Whether an outstanding `require_cross_epoch` sync (the caller confirms one exists) is a BARE PRE-ANSWER
+  /// speculative crossing — a hint that has accumulated NO answer-derived state, so a same-epoch
+  /// stale-evidence path (the ingress [`Self::cancel_stale_cross_epoch_sync`] OR the trigger-level
+  /// [`Self::downgrade_stale_cross_epoch_sync`]) may safely drop it AND clear the persistent
+  /// `cross_epoch_intent`. Any crossing a donor has begun answering is GENUINE and must complete on its own
+  /// path, never be torn down on same-epoch evidence: a NON-Normal recovery peer-fetch
+  /// (`awaiting_peer_checkpoint`); a STAGED CROSSING install (`pending_install` carrying a successor
+  /// membership — an ordinary same-config install with no successor is NOT a crossing and does not shield);
+  /// or a chunked crossing that PINNED a `sync_transfer`. Tearing any down would WEDGE the node, break the
+  /// `pending_install => sync` coupling, or strand the pinned transfer's `SyncChunk`s with no sync left to retry.
+  fn crossing_is_pre_answer_speculative(&self) -> bool {
+    self.status.is_normal()
+      && !self.awaiting_peer_checkpoint()
+      && self.sync_transfer.is_none()
+      // A staged install shields the crossing ONLY if it is itself a CROSSING install — one carrying a
+      // successor membership (`successor.is_some()`). An ORDINARY same-config install (`successor: None`)
+      // also stages `pending_install` but is NOT a crossing; it must not shield a stale intent from a
+      // same-epoch clear, else the ordinary install completes and `on_sb_done` re-arms a bogus crossing
+      // from the surviving stale intent (the poison the intent lifecycle exists to prevent).
+      && self
+        .pending_install
+        .as_ref()
+        .is_none_or(|pi| pi.successor.is_none())
+  }
+
+  /// Cancels a speculative `require_cross_epoch` sync when `msg` is strict-epoch authority traffic admitted
+  /// at OUR CURRENT epoch — proof we are operating at it, so the crossing was armed by a stale/misrouted
+  /// unverified hint, not a real successor (see the call site in `handle_message_inner`). A node genuinely
+  /// behind a higher epoch gets no such traffic, so it never reaches here and stays armed to cross. The
+  /// agnostic solicitations/answers (incl. a cross-epoch sync ANSWER, which must not cancel its own
+  /// crossing), a foreign-epoch `Prepare`, client traffic, and `EpochAhead` are NOT same-epoch evidence.
+  fn cancel_stale_cross_epoch_sync(&mut self, msg: &Message) {
+    // A crossing requirement is outstanding as a `require_cross_epoch` SYNC and/or a persistent INTENT. The
+    // intent is DECOUPLED from the sync, so it can be ORPHANED — a path like `reset_for_view_transition`
+    // clears `sync` without clearing it — and then NO later same-epoch traffic could clear it if we keyed
+    // only off the sync, so `on_sb_done` could re-poison a crossing from the orphan. Check BOTH, and clear
+    // the orphaned intent on same-epoch evidence even when no sync remains. An ordinary / forced same-epoch
+    // sync is never cancelled here.
+    let crossing_sync = self.sync.is_some_and(|s| s.require_cross_epoch);
+    if self.cross_epoch_intent.is_none() && !crossing_sync {
+      return; // no crossing requirement outstanding (neither a crossing sync nor an intent).
+    }
+    // Scope to a BARE PRE-ANSWER speculative crossing (the shared [`Self::crossing_is_pre_answer_speculative`]
+    // predicate, used identically by the trigger-level downgrade): a crossing a donor has begun answering is
+    // GENUINE and must complete on its own path, never be torn down on same-epoch evidence.
+    if !self.crossing_is_pre_answer_speculative() {
+      return;
+    }
+    let epoch = self.membership.epoch();
+    let same_epoch = match msg {
+      Message::Prepare(m) => m.epoch() == epoch,
+      Message::Commit(m) => m.epoch() == epoch,
+      Message::PrepareOk(m) => m.epoch() == epoch,
+      Message::StartViewChange(m) => m.epoch() == epoch,
+      Message::DoViewChange(m) => m.epoch() == epoch,
+      Message::StartView(m) => m.epoch() == epoch,
+      Message::GetView(m) => m.epoch() == epoch,
+      Message::Recovery(m) => m.epoch() == epoch,
+      Message::RecoveryResponse(m) => m.epoch() == epoch,
+      Message::PrepareBatch(m) => m.epoch() == epoch,
+      Message::LearnerStatus(m) => m.epoch() == epoch,
+      _ => false,
+    };
+    if same_epoch {
+      // Drop the bare crossing SYNC (if one is outstanding — it may already have been cleared, leaving only
+      // an orphaned intent).
+      if crossing_sync {
+        self.sync = None;
+        self.sync_transfer = None;
+      }
+      // A same-epoch operating witness proves the higher-epoch HINT was stale, so drop the PERSISTENT
+      // crossing intent too — not just the in-flight sync. Otherwise `on_sb_done`'s re-arm would re-pin a
+      // crossing for the bogus hint forever (re-introducing the poison this cancel exists to clear). The
+      // scope guard above already confined this to a bare PRE-ANSWER Normal speculative crossing, so a
+      // genuine in-progress crossing (non-Normal / staged `pending_install` / pinned chunked transfer) is
+      // never disturbed — the intent is cleared on exactly the same path the sync is cancelled on. A real
+      // higher epoch still re-establishes the intent on the next higher-epoch trigger (pre-binding, every
+      // message).
+      self.cross_epoch_intent = None;
     }
   }
 }
@@ -3430,6 +3695,14 @@ where
       // drop the (unactable) content.
       return;
     }
+    // Admitted strict-epoch authority traffic at OUR current epoch ⟹ we are operating at it, not crossing
+    // — so cancel any speculative cross-epoch sync a (possibly stale/misrouted) unverified higher-epoch
+    // hint armed. ONE ingress chokepoint, so no same-epoch path can leave a stale `require_cross_epoch`
+    // set (which would otherwise block primary op-mint + backup checkpoint reports and reject every
+    // same-config sync reply indefinitely). A node genuinely behind a higher epoch receives NO same-epoch
+    // admissible authority traffic (its old primary swapped), so it stays armed and crosses; the
+    // cross-epoch trigger re-arms `require_cross_epoch` on the next higher-epoch heartbeat / `EpochAhead`.
+    self.cancel_stale_cross_epoch_sync(&msg);
     // A Recovering replica does NOT process ANY consensus message: it is still draining its own
     // durable storage (the async `handle_storage` loop) and does not even know its true head yet, so
     // it casts no PrepareOk/vote/DVC and adopts no peer's view until it reaches Normal. This also
@@ -3507,19 +3780,19 @@ where
       Message::DoViewChange(m) => self.on_do_view_change(now, wal, sb, m),
       Message::StartView(m) => self.on_start_view(now, wal, sb, m),
       Message::GetView(m) => self.on_get_view(now, m),
-      Message::RequestPrepare(m) => self.on_request_prepare(now, m),
-      Message::RequestPrepareRange(m) => self.on_request_prepare_range(now, m),
+      Message::RequestPrepare(m) => self.on_request_prepare(now, from, m),
+      Message::RequestPrepareRange(m) => self.on_request_prepare_range(now, from, m),
       Message::Recovery(m) => self.on_recovery(now, m),
       Message::RecoveryResponse(m) => self.on_recovery_response(now, wal, sb, m),
       // State-sync: a peer's sync solicitation is answered from our durable checkpoint
       // (`on_request_sync`); a sync response is verified + applied (`on_sync_checkpoint`).
-      Message::RequestSync(m) => self.on_request_sync(now, sb, m),
+      Message::RequestSync(m) => self.on_request_sync(now, sb, from, m),
       Message::SyncCheckpoint(m) => self.on_sync_checkpoint(now, wal, sb, m),
       Message::RepairBatch(m) => self.on_repair_batch(now, wal, sb, m),
       // Chunked state-sync: a peer's chunk pull is served from the donor cache / a cold-cache read;
       // an announce pins (or re-pins) this replica's own transfer; a chunk extends it (the assembled
       // envelope re-enters the `SyncCheckpoint` path above).
-      Message::RequestSyncChunk(m) => self.on_request_sync_chunk(now, sb, m),
+      Message::RequestSyncChunk(m) => self.on_request_sync_chunk(now, sb, from, m),
       Message::SyncCheckpointMeta(m) => self.on_sync_checkpoint_meta(now, m),
       Message::SyncChunk(m) => self.on_sync_chunk(now, wal, sb, m),
       // A learner's NON-VOTING progress report: record the durable frontier in `peer_progress` (touches

@@ -405,6 +405,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       recover: None,
       repair: std::collections::BTreeSet::new(),
       sync: None,
+      // IN-MEMORY only: a crash drops the crossing intent; the recovery checkpoint-debt machine + the
+      // cluster's higher-epoch heartbeats re-establish it after restart, so it starts `None` here.
+      cross_epoch_intent: None,
       pending_install: None,
       sync_serving: BTreeMap::new(),
       sync_donating: None,
@@ -1555,6 +1558,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     if m.nonce() != s.nonce {
       return; // a reply to a prior solicitation / forged — not fresh.
+    }
+    // SINGLE-SUPERBLOCK-WRITER (the same fence the Normal ingress uses): defer the re-persist while a
+    // root is in flight — a `Recovering` peer-fetch can have a recovery-driven durable-view write
+    // (`pending_sb`) outstanding, and staging the two-write re-persist now would put a second
+    // superblock root in flight. `sync` (+ the peer-fetch) stays armed; the solicit timer re-fetches
+    // once the root lands. (`pending_checkpoint` cannot be set on this path — it stages none until
+    // `apply_sync` — but the guard is symmetric with the Normal ingress.)
+    if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
+      return;
     }
     if m.checkpoint_op().get() < self.checkpoint_op.get() {
       return; // does not even reach our (corrupt) checkpoint — cannot subsume it; ignore.
