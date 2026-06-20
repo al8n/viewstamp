@@ -106,18 +106,24 @@ fn live_single_change_swap_is_applied_once_and_chains_under_fault() {
     "the cluster starts at 3 voters"
   );
 
-  // (2) Propose a single-voter GROW (promote the caught-up learner) on the serving primary. Retry each
-  // tick until the proto's exact catch-up gate (peer_progress[3] >= primary head, fed by the learner's
-  // LearnerStatus) is satisfied and the proposal is admitted — a `TargetNotCaughtUp` / `NotPrimary` /
-  // `AlreadyInFlight` rejection just means "not yet". Then keep ticking so the committed `Reconfigure`
-  // op's durable `SwapEpoch` root lands and the swap installs.
+  // (2) Propose a single-voter GROW (promote the caught-up learner) on the serving primary. The
+  // catch-up-then-promote gate is now a PROMOTE-TIME CHALLENGE: the first propose with no fresh proof
+  // emits a `RequestLearnerProof` to the target and returns the RETRYABLE `ProofPending`; the network
+  // delivers that challenge + the target's `LearnerProof` reply over the next few ticks, and a later
+  // re-propose finds the fresh proof (frontier >= head) and mints. The retry is PACED (every
+  // `RETRY_EVERY` ticks) so a challenge's round-trip completes before the next propose re-draws the
+  // nonce — a propose every tick would supersede each outstanding challenge before its reply lands (one
+  // outstanding challenge at a time, by the proto's single-writer reconfigure contract). A
+  // `ProofPending` / `NotPrimary` / `AlreadyInFlight` verdict just means "not yet, retry". Then keep
+  // ticking so the committed `Reconfigure` op's durable `SwapEpoch` root lands and the swap installs.
+  const RETRY_EVERY: u64 = 64;
   let mut proposed = None;
-  let mut saw_caught_up_reject = false;
+  let mut saw_proof_pending = false;
   for t in 0..60_000 {
-    if proposed.is_none() {
+    if proposed.is_none() && t % RETRY_EVERY == 0 {
       match c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner)) {
         Ok(op) => proposed = Some(op),
-        Err(ProposeMembershipError::TargetNotCaughtUp) => saw_caught_up_reject = true,
+        Err(ProposeMembershipError::ProofPending) => saw_proof_pending = true,
         Err(_) => {}
       }
     }
@@ -128,13 +134,14 @@ fn live_single_change_swap_is_applied_once_and_chains_under_fault() {
     }
   }
   assert!(
-    saw_caught_up_reject,
-    "the catch-up-then-promote gate was genuinely exercised (a not-yet-caught-up promote was rejected \
-     before the learner reported a covering frontier) — the gate is load-bearing, not vacuous"
+    saw_proof_pending,
+    "the catch-up-then-promote challenge was genuinely exercised (the first propose solicited a fresh \
+     `RequestLearnerProof` and returned `ProofPending` before the target's `LearnerProof` validated) — \
+     the gate is load-bearing, not vacuous"
   );
   assert!(
     proposed.is_some(),
-    "the caught-up learner promote was eventually admitted"
+    "the caught-up learner promote was eventually admitted (the fresh proof's frontier reached the head)"
   );
 
   // (3) The committed reconfiguration installed its epoch swap: at least one replica observed
@@ -192,8 +199,9 @@ fn live_single_change_swap_is_applied_once_and_chains_under_fault() {
 #[test]
 fn propose_reconfigure_surfaces_the_proto_gate_verdicts() {
   // The driver surfaces the proto's proposal-gate verdicts rather than panicking: an invalid delta is
-  // rejected `Invalid`, and an uncaught-up learner promote is rejected `TargetNotCaughtUp`. A 2-voter
-  // cluster (quorum 2) with a genesis learner.
+  // rejected `Invalid`, and an uncaught-up learner promote returns the retryable `ProofPending` (the
+  // promote-time challenge solicited a fresh `RequestLearnerProof` but no validated proof covers the
+  // head yet). A 2-voter cluster (quorum 2) with a genesis learner.
   let seed = 7u64;
   let mut c = Cluster::with_members(2, 1, 2, 50, seed, 8);
   // Warm up to a serving primary with the head advancing under load.
@@ -215,15 +223,171 @@ fn propose_reconfigure_surfaces_the_proto_gate_verdicts() {
     "promoting a non-learner is an invalid delta"
   );
 
-  // While the head is still advancing under load, the genesis learner's DURABLE frontier lags it, so a
-  // promote is rejected `TargetNotCaughtUp` (the catch-up-then-promote safety gate). Only assert this
-  // when the learner is provably behind (the head moved past its durable frontier).
-  let head = c.primary_head().unwrap_or(0);
-  if c.replica_durable_commit(2) < head {
-    assert_eq!(
-      c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(MemberId::new(2))),
-      Err(ProposeMembershipError::TargetNotCaughtUp),
-      "a learner whose durable frontier lags the head cannot be promoted"
-    );
+  // The first promote of the genesis learner returns the retryable `ProofPending`: the promote-time
+  // challenge has no fresh validated proof yet, so it solicits a `RequestLearnerProof` from the target
+  // and defers the mint (fail-closed). This holds whether or not the learner is already caught up — the
+  // gate re-grounds freshly via the round-trip rather than gating on an accumulated self-report. While
+  // the head is still advancing under load (the learner's durable frontier provably lags) the deferral
+  // is also a genuine catch-up refusal: a `LearnerProof` answered now would report a frontier below the
+  // head, so even a re-propose after the round-trip would not mint until the learner catches up.
+  assert_eq!(
+    c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(MemberId::new(2))),
+    Err(ProposeMembershipError::ProofPending),
+    "the first promote solicits a fresh proof and returns the retryable ProofPending"
+  );
+}
+
+#[test]
+fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
+  // The load-bearing falsifier of the promote-time challenge (the design's "crash between challenge and
+  // reply"): a caught-up learner is challenged, then CRASHES before it can answer — so the
+  // `RequestLearnerProof` is never answered and the gate must FAIL CLOSED (the promotion stalls at
+  // `ProofPending`, no swap installs, the 3-voter cluster never wedges) until the target recovers and
+  // answers a FRESH challenge whose frontier reaches the head. The old monotone-`peer_progress` gate
+  // could promote on a banked self-report here; the challenge cannot, because the proof is re-grounded
+  // in the target's live storage and a crashed target never answers.
+  //
+  // 3 voters (0,1,2) + 1 genesis learner (3); a finite client load drains so the learner reaches the
+  // head in a lull (the gate is satisfiable once the target is up + caught up).
+  let seed = 0x5EED_C2A5;
+  let mut c = Cluster::with_members(3, 1, 2, 30, seed, 10);
+  c.set_faults(Faults {
+    latency: core::time::Duration::from_millis(1),
+    jitter: core::time::Duration::from_millis(2),
+    drop_per_mille: 0,
+    duplicate_per_mille: 0,
+    hold_per_mille: 0,
+  });
+  c.set_storage_faults(StorageFaults::none());
+
+  let mut dur = DurabilityChecker::new(c.replica_count());
+  let mut once = ReconfigureAppliedOnceChecker::new(c.replica_count());
+  let mut lin = ConfigLineageChecker::new(c.replica_count());
+  let learner = MemberId::new(3);
+
+  // (1) Settle: drain the load + let the learner catch the head, so a challenge answered NOW would
+  // report a frontier covering the head (the promote is genuinely admissible — the stall below is the
+  // crash, not a not-yet-caught-up refusal).
+  for t in 0..60_000 {
+    if (0..c.client_count()).all(|i| c.client(i).is_done())
+      && c.serving_primary().is_some()
+      && c.replica_durable_commit(3) >= c.primary_head().unwrap_or(u64::MAX)
+    {
+      break;
+    }
+    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
   }
+  assert!(c.serving_primary().is_some(), "a serving primary exists");
+  assert!(
+    c.replica_is_learner(3),
+    "node 3 starts as a non-voting learner"
+  );
+  let head_at_challenge = c.primary_head().expect("a serving primary");
+
+  // (2) Propose: the challenge is solicited (`ProofPending`) and a `RequestLearnerProof` is queued for
+  // the target. Then CRASH the target before the next tick routes/delivers that challenge — so it is
+  // never delivered and the `LearnerProof` never comes back (a crashed replica is not polled, and its
+  // in-flight storage is discarded). The proof stays `None`.
+  assert_eq!(
+    c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner)),
+    Err(ProposeMembershipError::ProofPending),
+    "the first promote solicits a fresh challenge"
+  );
+  c.crash(3);
+
+  // (3) STALL: keep re-proposing (paced) while the target is down. The promotion must NEVER mint — a
+  // re-challenge to a crashed target is never answered, so the gate fail-closes at `ProofPending` every
+  // time. The 3-voter cluster keeps full quorum (the learner is a non-voter), so it never wedges: it
+  // stays LIVE (a serving primary persists) throughout the stall, and no swap may install.
+  const RETRY_EVERY: u64 = 64;
+  let mut stalled_at_proof_pending = 0u64;
+  for t in 0..8_000 {
+    if t % RETRY_EVERY == 0 {
+      let verdict = c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner));
+      if matches!(verdict, Err(ProposeMembershipError::ProofPending)) {
+        stalled_at_proof_pending += 1;
+      }
+      assert!(
+        matches!(
+          verdict,
+          Err(ProposeMembershipError::ProofPending)
+            | Err(ProposeMembershipError::NotPrimary)
+            | Err(ProposeMembershipError::AlreadyInFlight)
+        ),
+        "while the target is crashed the promote must fail closed (ProofPending), never mint — got \
+         {verdict:?}"
+      );
+    }
+    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+  }
+  // Non-vacuity of the falsifier: the gate genuinely RE-CHALLENGED a serving primary and got
+  // `ProofPending` back (not merely `NotPrimary` the whole window) — a re-challenge to the crashed
+  // target that fail-closes is exactly what is under test.
+  assert!(
+    stalled_at_proof_pending > 0,
+    "the stall window must have re-challenged a serving primary and observed ProofPending (else the \
+     fail-closed property is vacuously satisfied) — got {stalled_at_proof_pending} ProofPending verdicts"
+  );
+  assert_eq!(
+    c.membership_swaps_observed(),
+    0,
+    "NO swap may install while the target is crashed (the unsafe-promote falsifier) — the promotion \
+     stalls fail-closed"
+  );
+  assert!(
+    c.replica_is_learner(3),
+    "the target is still a non-voting learner (never promoted on a crashed/unanswered challenge)"
+  );
+
+  // (4) RECOVER the target and let it catch back up to the head (its durable frontier reaches the head
+  // again in the lull). The cluster stayed live throughout, so the head is unchanged.
+  c.restart(3);
+  for t in 0..60_000 {
+    if c.serving_primary().is_some()
+      && c.replica_durable_commit(3) >= c.primary_head().unwrap_or(u64::MAX)
+    {
+      break;
+    }
+    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+  }
+  assert!(
+    c.replica_durable_commit(3) >= head_at_challenge,
+    "the recovered target caught back up to at least the challenged head"
+  );
+
+  // (5) Re-propose (paced): now the recovered, caught-up target answers a FRESH challenge with a
+  // frontier reaching the head, so the promote MINTS and the swap installs — the gate releases exactly
+  // when (and only when) the live proof covers the head.
+  let mut proposed = None;
+  for t in 0..60_000 {
+    if proposed.is_none()
+      && t % RETRY_EVERY == 0
+      && let Ok(op) = c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner))
+    {
+      proposed = Some(op);
+    }
+    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+    if proposed.is_some() && c.membership_swaps_observed() >= 1 {
+      break;
+    }
+  }
+  assert!(
+    proposed.is_some(),
+    "after the target recovered + caught up, a fresh challenge minted the promote"
+  );
+  assert!(
+    c.membership_swaps_observed() >= 1,
+    "the promotion committed + installed its durable epoch swap once the target answered a fresh \
+     challenge covering the head"
+  );
+  // The whole sequence — stall, recover, mint — preserved every safety invariant.
+  assert!(once.check(&c).is_ok(), "reconfigure-applied-once holds");
+  assert!(
+    lin.check(&c).is_ok(),
+    "the config_id lineage is an unbroken chain"
+  );
+  assert!(
+    dur.check(&c).is_ok(),
+    "no committed op was lost across the change"
+  );
 }

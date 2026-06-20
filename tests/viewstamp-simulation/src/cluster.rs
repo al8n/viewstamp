@@ -1172,9 +1172,10 @@ impl Cluster {
   /// cluster's ORDINARY [`tick`](Self::tick) loop (the adversarial schedule), exactly as a client op
   /// does — this just injects the proposal; it drives nothing inline. Returns the proposed op number
   /// on success, or the proto's [`ProposeMembershipError`] (e.g. `NotPrimary` if no serving primary
-  /// exists this instant, `AlreadyInFlight` if a prior change has not yet committed, or
-  /// `TargetNotCaughtUp` for a `PromoteLearner` whose target has not yet reported a covering
-  /// `LearnerStatus`).
+  /// exists this instant, `AlreadyInFlight` if a prior change has not yet committed, or `ProofPending`
+  /// for a `PromoteLearner` whose promote-time challenge is still outstanding — the proto emitted a
+  /// `RequestLearnerProof` to the target and is awaiting the matching fresh `LearnerProof`; the caller
+  /// re-proposes and the promote mints once the proof's frontier covers the head).
   ///
   /// Unlike [`reconfigure_offline`](Self::reconfigure_offline) (which stops the whole cluster), this
   /// keeps every node UP: it is the Tier B live-change path. The proto's commit-first epoch swap
@@ -1196,10 +1197,11 @@ impl Cluster {
   }
 
   /// The serving primary's current head op (`self.op`) — the frontier a `PromoteLearner`'s target
-  /// must durably cover to pass the proto's exact catch-up gate (`peer_progress[target] >= head`).
-  /// `None` if there is no serving primary this instant. The axis/test compares it against the
-  /// learner's durable commit ([`Self::replica_durable_commit`]) to know when a promote is worth
-  /// attempting (the proto re-validates the gate authoritatively at the proposal).
+  /// must durably cover for the proto's promote-time challenge to mint (the target's fresh
+  /// `LearnerProof` frontier must reach this head). `None` if there is no serving primary this instant.
+  /// The axis/test compares it against the learner's durable commit ([`Self::replica_durable_commit`])
+  /// to know when a promote is worth attempting (the proto re-grounds the gate authoritatively at the
+  /// proposal via the `RequestLearnerProof`/`LearnerProof` round-trip).
   pub fn primary_head(&self) -> Option<u64> {
     let primary = self.serving_primary()?;
     Some(self.replicas[primary].op().get())

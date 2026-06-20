@@ -522,19 +522,27 @@ fn a_voter_backup_still_acks_and_proposes_unlike_a_learner() {
 }
 
 #[test]
-fn a_learner_emits_learner_status_on_its_cadence_with_its_durable_frontier() {
+fn a_learner_emits_learner_status_carrying_its_contiguous_applied_frontier_not_commit_max() {
   // A non-voting learner reports its progress on a cadence: drive its timers past LEARNER_STATUS_CADENCE
-  // and it emits a single `LearnerStatus` to the primary carrying the DURABLE root's frontier
-  // (`sb.state().commit()` + the durable WAL head), NOT the in-memory `commit_min`/`op`. The report is
-  // self-identified by the learner's slot under the current epoch/config.
+  // and it emits a single `LearnerStatus` to the primary. `durable_commit_min` carries the learner's
+  // CONTIGUOUS APPLIED FRONTIER (`commit_min`) — NOT its durable known-committed frontier (`commit_max`,
+  // == `sb.state().commit()`). The two DIFFER for a SPARSE-band recovered learner: it can KNOW a high
+  // commit point while a missing / `Repairing` committed op BELOW the head still blocks apply, leaving
+  // the applied frontier short of `commit_max`. Reporting `commit_max` would let such a repair-holed
+  // learner pass the catch-up-then-promote gate without durably holding the prefix it would vote on; the
+  // honest metric is the hole-free applied frontier.
   let mut e = learner_self();
-  // A durable root vouching commit (the known-committed frontier) == 5, with a durable WAL head of 6
-  // (an op held above the committed frontier). These are what the report MUST carry — the durable
-  // values, so a crash can never make the learner claim more than it persisted.
+  // Model the sparse band on the learner: head op 6, `commit_max == 6` (it KNOWS ops 1..=6 committed),
+  // but a repair hole at op 4 holds the contiguous applied frontier at `commit_min == 3`. `repair=[4,6]`
+  // makes `force_state_for_test` lift `commit_max` to 6 (= the head it knows committed) while the holes
+  // 4,6 are exactly the committed ops it does NOT durably hold.
+  e.force_state_for_test(0, 6, 3, 0, &[4, 6]);
+  // The durable root ALSO vouches `commit_max == 6` (a recovered sparse-band learner persists the
+  // known-committed frontier) — so a reverted emitter reading `sb.state().commit()` would report 6.
   let durable_root = VsrState::try_new(
     View::new(),
     View::new(),
-    OpNumber::with(5),
+    OpNumber::with(6),
     OpNumber::new(),
     0,
     std::vec::Vec::new(),
@@ -578,10 +586,12 @@ fn a_learner_emits_learner_status_on_its_cadence_with_its_durable_frontier() {
     ReplicaId::new(LEARNER),
     "self-identified by the learner's slot"
   );
+  // The load-bearing assertion: the report carries the CONTIGUOUS APPLIED FRONTIER (`commit_min` == 3),
+  // NOT `commit_max` (6). Reverting the emitter to `sb.state().commit()` reports 6 and fails here.
   assert_eq!(
     ls.durable_commit_min(),
-    OpNumber::with(5),
-    "reports the DURABLE root commit (5), not an in-memory frontier",
+    OpNumber::with(3),
+    "reports the contiguous applied frontier (commit_min == 3), NOT commit_max (6) past the hole at 4",
   );
   assert_eq!(
     ls.durable_op(),
@@ -667,5 +677,193 @@ fn learner_status_is_admitted_only_from_a_member_under_strict_epoch_config() {
   assert!(
     !e.epoch_authority_admits(&foreign),
     "a foreign-epoch progress report is not this configuration's to act on",
+  );
+}
+
+#[test]
+fn a_learner_answers_a_proof_challenge_with_its_fresh_contiguous_applied_frontier() {
+  // The learner side of the promote-proof round-trip: a `RequestLearnerProof` from the primary (a
+  // current member) is answered with a `LearnerProof` carrying this node's CONTIGUOUS APPLIED FRONTIER
+  // (`commit()` == `commit_min`) RECOMPUTED FROM DURABLE STATE NOW — NOT a remembered high-water. The
+  // reply self-identifies by the learner's slot, echoes the challenge nonce, and carries the live
+  // (epoch, config_id). The frontier is read fresh: a just-regressed learner answers with its lower
+  // frontier.
+  let mut e = learner_self(); // self = learner slot 3, 3 voters + 2 learners, voter 0 = primary
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  // Model a learner whose head/commit_max cover op 5 but whose contiguous applied frontier is 2 (a
+  // repair hole at op 3 holds apply) — `commit()` returns the hole-free frontier (2), not the head.
+  e.force_state_for_test(0, 5, 2, 0, &[3, 5]);
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "the fresh contiguous applied frontier is 2"
+  );
+
+  // The primary (voter 0) challenges the learner to prove it holds the prefix through op 5.
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::RequestLearnerProof(crate::RequestLearnerProof::new(
+      ReplicaId::new(0), // the soliciting primary's slot
+      OpNumber::with(5), // prove the prefix through op 5
+      0xBEEF,
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+
+  // Exactly one LearnerProof is emitted, addressed to the soliciting primary, carrying the FRESH
+  // frontier (2 — below the challenged head 5, the honest answer), the learner's slot, and the echoed
+  // nonce + live config.
+  let mut replies = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::LearnerProof(p) = out.msg_ref() {
+      assert_eq!(
+        out.to(),
+        crate::Recipient::To(Peer::Replica(ReplicaId::new(0))),
+        "the proof is addressed to the soliciting primary",
+      );
+      replies.push(*p);
+    }
+  }
+  assert_eq!(replies.len(), 1, "exactly one LearnerProof per challenge");
+  let proof = replies[0];
+  assert_eq!(
+    proof.replica(),
+    ReplicaId::new(LEARNER),
+    "the proof self-identifies by the learner's slot",
+  );
+  assert_eq!(proof.nonce(), 0xBEEF, "the challenge nonce is echoed");
+  assert_eq!(
+    proof.frontier(),
+    OpNumber::with(2),
+    "the proof carries the FRESH contiguous applied frontier (commit_min == 2), NOT the challenged head",
+  );
+  assert_eq!(proof.epoch(), crate::Epoch::new(0), "the live epoch");
+  assert_eq!(proof.config_id(), 0, "the live config_id");
+}
+
+#[test]
+fn a_learner_drops_a_cross_epoch_proof_challenge() {
+  // The learner answers ONLY for its live configuration: a `RequestLearnerProof` carrying a foreign
+  // epoch is dropped (no reply). The ingress `epoch_authority_admits` STRICT gate already rejects it,
+  // and the handler re-checks — so a stale-config challenge can never elicit a proof that a later mint
+  // under that stale config could consume.
+  let mut e = learner_self();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  e.force_state_for_test(0, 5, 5, 0, &[]);
+
+  // A foreign-epoch challenge (epoch 1 ≠ this config's epoch 0).
+  let foreign = Message::RequestLearnerProof(crate::RequestLearnerProof::new(
+    ReplicaId::new(0),
+    OpNumber::with(5),
+    0xBEEF,
+    crate::Epoch::new(1),
+    0,
+  ));
+  assert!(
+    !e.epoch_authority_admits(&foreign),
+    "a cross-epoch challenge is inadmissible at ingress",
+  );
+  e.handle_message(Instant::ZERO, &mut wal, &mut sb, primary_peer(), foreign);
+  assert!(
+    !std::iter::from_fn(|| e.poll_message())
+      .any(|out| matches!(out.into_msg(), Message::LearnerProof(_))),
+    "a cross-epoch challenge elicits no proof reply",
+  );
+}
+
+#[test]
+fn proof_challenge_and_reply_bind_to_a_member_under_strict_epoch_config() {
+  // Ingress binding for both new messages: a `RequestLearnerProof` (the primary's solicitation) and a
+  // `LearnerProof` (the learner's reply) are each admitted (`sender_matches` + `epoch_authority_admits`)
+  // ONLY from a current configuration MEMBER under an exact `(epoch, config_id)`. A non-member sender or
+  // a foreign epoch/config is rejected — both gate a reconfiguration and so are STRICT, config-scoped.
+  let e = voter_with_learners(); // self = voter 0 (the primary)
+  let primary = ReplicaId::new(0);
+  let learner = ReplicaId::new(LEARNER);
+
+  // A challenge self-claiming the primary's slot, from the matching peer, under the genesis config.
+  let challenge = Message::RequestLearnerProof(crate::RequestLearnerProof::new(
+    primary,
+    OpNumber::with(2),
+    7,
+    crate::Epoch::new(0),
+    0,
+  ));
+  assert!(
+    e.sender_matches(Peer::Replica(primary), &challenge),
+    "a member sender is bound"
+  );
+  assert!(
+    e.epoch_authority_admits(&challenge),
+    "an exact (epoch, config_id) match is admitted"
+  );
+
+  // A reply self-claiming the learner's slot, from the matching peer, under the genesis config.
+  let reply = Message::LearnerProof(crate::LearnerProof::new(
+    learner,
+    7,
+    OpNumber::with(2),
+    crate::Epoch::new(0),
+    0,
+  ));
+  assert!(
+    e.sender_matches(Peer::Replica(learner), &reply),
+    "a member sender is bound"
+  );
+  assert!(
+    e.epoch_authority_admits(&reply),
+    "an exact (epoch, config_id) match is admitted"
+  );
+
+  // A reply from a NON-MEMBER id (slot 9 of a 5-node cluster) is rejected by the sender binding.
+  let non_member = ReplicaId::new(9);
+  let forged = Message::LearnerProof(crate::LearnerProof::new(
+    non_member,
+    7,
+    OpNumber::with(2),
+    crate::Epoch::new(0),
+    0,
+  ));
+  assert!(
+    !e.sender_matches(Peer::Replica(non_member), &forged),
+    "a non-member proof sender is rejected",
+  );
+
+  // A FOREIGN-epoch challenge + reply are rejected by the strict authority gate.
+  let foreign_challenge = Message::RequestLearnerProof(crate::RequestLearnerProof::new(
+    primary,
+    OpNumber::with(2),
+    7,
+    crate::Epoch::new(1),
+    0,
+  ));
+  let foreign_reply = Message::LearnerProof(crate::LearnerProof::new(
+    learner,
+    7,
+    OpNumber::with(2),
+    crate::Epoch::new(1),
+    0,
+  ));
+  assert!(
+    !e.epoch_authority_admits(&foreign_challenge),
+    "a foreign-epoch challenge is not admitted"
+  );
+  assert!(
+    !e.epoch_authority_admits(&foreign_reply),
+    "a foreign-epoch reply is not admitted"
+  );
+
+  // Neither advertises an authoritative/participatory view — both are config-scoped, no-vote messages.
+  assert!(
+    !challenge.advertises_authoritative_view(),
+    "the challenge claims no participatory view"
+  );
+  assert!(
+    !reply.advertises_authoritative_view(),
+    "the reply claims no participatory view"
   );
 }

@@ -206,6 +206,30 @@ struct SyncState {
   require_cross_epoch: bool,
 }
 
+/// The single outstanding learner-promote-proof challenge the primary issued at
+/// [`PromoteLearner`](crate::SingleVoterDelta) propose time — the FRESH safety input the
+/// catch-up-then-promote gate ([`Endpoint::propose_membership`]) consumes instead of an accumulated
+/// self-report. One at a time (single-writer reconfigure serializes proposals); a new proposal for a
+/// different target/head overwrites it ([`Endpoint::learner_proof`] is set anew, re-drawing `nonce`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LearnerProofState {
+  /// The learner being promoted (the stable [`MemberId`], so the challenge follows the member across a
+  /// slot shift — though the gate re-validates the full `(target, at_op, nonce, epoch, config_id)`
+  /// binding regardless).
+  target: MemberId,
+  /// The head the challenge was issued against (the proposer's `self.op` at challenge time). The mint
+  /// re-validates `at_op >= self.op`: if the head advanced past the proven point the proof is stale and
+  /// the gate re-challenges.
+  at_op: OpNumber,
+  /// The per-incarnation freshness token (a bump of `self.nonce`) binding the matching [`LearnerProof`]
+  /// reply — a replayed old-nonce reply never validates.
+  nonce: u64,
+  /// The validated FRESH frontier the matching reply reported (`Some(f)`), or `None` until a matching
+  /// [`LearnerProof`] lands. The gate mints only on `Some(f)` with `f >= self.op`; a missing reply (a
+  /// crash mid-challenge) leaves this `None` → `ProofPending` persists → no unsafe promotion.
+  proof: Option<OpNumber>,
+}
+
 /// What a completed state-sync serve-read ships to its requester. Recorded per requester in
 /// `sync_serving` at submit time; the completion ([`Endpoint::serve_sync_checkpoint`]) dispatches on
 /// it after the read passes the donor integrity gates (op-match + durable-id match).
@@ -1315,13 +1339,26 @@ pub struct Endpoint<S, R: Reconfig = RestartOnly> {
   /// Per-member DURABLE-frontier progress, keyed by the stable [`MemberId`]: the highest
   /// `durable_commit_min` a member has reported via a [`LearnerStatus`](crate::LearnerStatus). It
   /// carries NO quorum authority — it is NEVER read by any commit/view-change/recovery quorum — and is
-  /// the SOLE state [`Self::on_learner_status`] mutates. Its ONLY consumer is the learner-promote gate
-  /// in [`Endpoint::propose_membership`](crate::Endpoint): a `PromoteLearner` is refused
-  /// (`TargetNotCaughtUp`) until the target's recorded progress covers the prospective Reconfigure op's
-  /// predecessor frontier, so by commit-first the promoted learner provably holds the full E-committed
-  /// prefix. Updated MONOTONE (`(*entry).max(reported)`) so a reordered/stale lower report never lowers
-  /// a recorded value. Private; never hashed/serialized/emitted.
+  /// the SOLE state [`Self::on_learner_status`] mutates. It is a pure LIVENESS HINT, NOT a safety input:
+  /// it indicates when a learner is worth challenging for a promote proof, but the learner-promote gate
+  /// in [`Endpoint::propose_membership`](crate::Endpoint) does NOT gate the mint on it. The mint
+  /// consumes a FRESH `RequestLearnerProof`/[`LearnerProof`] round-trip ([`Self::learner_proof`])
+  /// instead — re-grounded in the learner's durable storage at propose time — because this accumulated
+  /// max is unsound as a safety input: it banks a stale-high value that survives a crash/disk-fault that
+  /// honestly REGRESSED the learner's frontier. Updated MONOTONE (`(*entry).max(reported)`); private,
+  /// never hashed/serialized/emitted.
   peer_progress: BTreeMap<MemberId, OpNumber>,
+  /// The single outstanding learner-promote-proof challenge (the FRESH safety input the
+  /// catch-up-then-promote gate consumes), or `None` when no promotion challenge is outstanding. Set by
+  /// [`Self::propose_membership`] on a `PromoteLearner` with no fresh proof (it draws a `nonce`, emits a
+  /// `RequestLearnerProof`, and returns the retryable `ProofPending`); its `proof` is filled by the
+  /// matching [`LearnerProof`] reply; and it is CONSUMED (set to `None`) at mint. CLEARED on a
+  /// view-change/primacy transition ([`Self::reset_for_view_transition`]) and on an epoch swap
+  /// ([`Self::install_membership`]) — it is transient promote state bound to the proposing generation
+  /// and configuration; the `(epoch, config_id)` reply binding is the backstop. Private; never
+  /// hashed/serialized/emitted, and inert off the reconfig+learner axis (never set on the no-reconfig
+  /// schedule, so the off-axis digest is byte-identical).
+  learner_proof: Option<LearnerProofState>,
   /// The zero-sized reconfiguration capability witness — the [`Reconfig`] type-state the
   /// (later) online-reconfiguration API gates on. `PhantomData<fn() -> R>` rather than
   /// `PhantomData<R>`: it is unconditionally `Send`/`Sync` (and covariant in `R`), so adding the
@@ -1447,6 +1484,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       pending_swap: None,
       paying_checkpoint_debt: false,
       peer_progress: BTreeMap::new(),
+      learner_proof: None,
       _reconfig: core::marker::PhantomData,
     }
   }
@@ -1646,6 +1684,11 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     // was this node the primary of its current view? (Robust to an already-absent local member.)
     let was_primary = self.is_primary();
     let prior_config_id = self.membership.config_id();
+    // Drop any outstanding learner-promote-proof challenge across the epoch swap: it was minted under
+    // the OLD configuration, so a pre-swap reply must never validate a post-swap mint. The reply's
+    // `(epoch, config_id)` binding is the structural backstop (a proof for the predecessor config never
+    // matches the successor); this is the explicit clear at the install boundary.
+    self.learner_proof = None;
     self.prev_epoch = self.membership.epoch();
     let epoch = successor.epoch();
     let config_id = successor.config_id();
@@ -3423,6 +3466,14 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       // non-member's id must never record progress in `peer_progress`. It carries no quorum authority
       // — the durable frontier it reports only gates the promote proposal, never any vote.
       Message::LearnerStatus(m) => self.sender_is_member(from, m.replica()),
+      // The learner-promote-proof challenge + reply carry a self id (the soliciting primary's slot /
+      // the answering learner's slot) and NO quorum authority — a no-authority solicitation and a
+      // no-vote reply. Both bind to the FULL membership (`sender_is_member`): the challenge is a
+      // CURRENT member (the primary) soliciting a learner, and the reply is the target learner (a
+      // non-voting member). They gate ONLY a reconfiguration proposal, never any vote; the gate
+      // re-validates the full `(nonce, target, epoch, config_id)` binding before acting.
+      Message::RequestLearnerProof(m) => self.sender_is_member(from, m.from()),
+      Message::LearnerProof(m) => self.sender_is_member(from, m.replica()),
       // Primary-authority broadcasts (no self id): only the primary of the advertised view sends them.
       Message::Commit(m) => from == Peer::Replica(self.membership.primary(m.view())),
       Message::StartView(m) => from == Peer::Replica(self.membership.primary(m.view())),
@@ -3694,6 +3745,17 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       // configuration, so it is admitted only on an exact `(epoch, config_id)` match. A foreign-config
       // learner's frontier is not this primary's to act on.
       Message::LearnerStatus(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      // STRICT: the learner-promote-proof challenge + reply are CONFIG-SCOPED — they prove/gate a
+      // reconfiguration in MY configuration, so each is admitted only on an exact `(epoch, config_id)`
+      // match. A cross-epoch challenge/reply contributes NOTHING (a learner answers only for its live
+      // config; a proof minted under the old config never validates a later mint) — the `(epoch,
+      // config_id)` binding is the freshness backstop the gate relies on.
+      Message::RequestLearnerProof(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      Message::LearnerProof(m) => {
         m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
       }
       // PATH-SENSITIVE `Prepare`: gate the config_id (common to both arms); the normal arm's epoch
@@ -4046,8 +4108,14 @@ where
       Message::SyncCheckpointMeta(m) => self.on_sync_checkpoint_meta(now, m),
       Message::SyncChunk(m) => self.on_sync_chunk(now, wal, sb, m),
       // A learner's NON-VOTING progress report: record the durable frontier in `peer_progress` (touches
-      // no quorum/vote state). It gates a later `propose_membership(PromoteLearner)`.
+      // no quorum/vote state). It is a liveness HINT for a later `propose_membership(PromoteLearner)`.
       Message::LearnerStatus(m) => self.on_learner_status(m),
+      // The learner-promote-proof challenge: reply with this node's CONTIGUOUS APPLIED FRONTIER
+      // (`commit()`) recomputed from durable state NOW (touches no quorum/vote state).
+      Message::RequestLearnerProof(m) => self.on_request_learner_proof(m),
+      // The target learner's fresh-proof reply: validate against the outstanding challenge and record
+      // the proven frontier (the catch-up-then-promote gate's fresh safety input; no accumulation).
+      Message::LearnerProof(m) => self.on_learner_proof(from, m),
       Message::Reply(_) => {}
       // `EpochAhead` is a pure pre-binding catch-up SIGNAL — fully consumed above by
       // `maybe_request_cross_epoch_catchup` (it never reaches here: `sender_matches` drops it). Acting on
@@ -4064,12 +4132,14 @@ where
   /// [`Endpoint::propose_membership`](crate::Endpoint::propose_membership).
   ///
   /// The update is MONOTONE: `(*entry).max(reported)`, so a reordered or duplicated lower report under
-  /// network reordering NEVER lowers a recorded value. The recorded value is the learner's durably-HELD
-  /// committed prefix — `min(durable_commit_min, durable_op)`, the lesser of its durable commit frontier
-  /// and its durable WAL head — NOT `durable_commit_min` alone: a recovered learner can KNOW a high commit
-  /// point while its durable WAL head lags (recovery admits a `commit_max > op` tail-gap), so the
-  /// catch-up-then-promote gate must require the learner to durably HOLD the prefix it will be allowed to
-  /// vote on, not merely know the commit point — both frontiers survive its crash.
+  /// network reordering NEVER lowers a recorded value. An honest emitter sends its CONTIGUOUS APPLIED
+  /// FRONTIER as `durable_commit_min` (the highest hole-free op it durably holds — see
+  /// `learner_status_timeouts`), which already cannot exceed its durable WAL head; the recorded value
+  /// keeps `min(durable_commit_min, durable_op)` purely as a cheap BACKSTOP that fail-closes a
+  /// buggy/forged emitter (one that over-reports `durable_commit_min` past its durable WAL head, e.g. by
+  /// sending its `commit_max`) — it never raises the metric for an honest emitter, so it cannot loosen
+  /// the gate, only tighten it. The catch-up-then-promote gate must admit the learner only once it
+  /// durably HOLDS the prefix it will be allowed to vote on, not merely knows a commit point.
   ///
   /// `sender_matches` + `epoch_authority_admits` already bound the sender to a current member of MY
   /// configuration at the claimed slot, so `member_at` resolves; a slot with no member (impossible past
@@ -4078,32 +4148,96 @@ where
     let Some(member) = self.membership.member_at(m.replica()) else {
       return;
     };
-    // The learner's durably-HELD committed prefix is the LESSER of its durable commit frontier and its
-    // durable WAL head: a recovered learner can report a high `durable_commit_min` while its `durable_op`
-    // (the ops it actually persisted) lags (recovery admits a `commit_max > op` tail-gap). The catch-up
-    // gate must require the learner to durably HOLD the prefix it will be allowed to vote on, not merely
-    // KNOW the commit point — else a promoted learner enters the successor voter set without the
-    // E-committed prefix the XI-b old-write-quorum / new-view-change intersection relies on.
+    // `durable_commit_min` is the emitter's contiguous applied frontier (hole-free, `<= op_head` by
+    // construction). The `min(durable_op)` is a fail-closed BACKSTOP against a buggy/forged emitter that
+    // over-reports past its durable WAL head: it can only LOWER a dishonest value, never raise an honest
+    // one, so it tightens the gate but cannot loosen it.
     let reported = m.durable_commit_min().min(m.durable_op());
     let entry = self.peer_progress.entry(member).or_default();
     *entry = (*entry).max(reported);
+  }
+
+  /// Answers a primary's [`RequestLearnerProof`](crate::RequestLearnerProof) challenge with a FRESH
+  /// [`LearnerProof`](crate::LearnerProof): this node's CONTIGUOUS APPLIED FRONTIER (`self.commit()` ==
+  /// `commit_min`, the hole-free durably-recoverable prefix) recomputed from durable state NOW.
+  ///
+  /// `sender_matches` already bound the challenge to a CURRENT member (the primary) at the claimed
+  /// slot. Here we additionally require the challenge's `(epoch, config_id)` to match THIS node's live
+  /// configuration — a cross-epoch challenge is DROPPED (the node answers only for its live config), so
+  /// a stale-config proof can never satisfy a later mint. The reply echoes the challenge `nonce` (the
+  /// freshness binding) and self-identifies by `local_slot()`. Computing the frontier fresh is the
+  /// load-bearing property: a just-crashed node answers with its regressed (lower) frontier, and a node
+  /// mid-crash never answers — so no remembered high-water survives the fault.
+  fn on_request_learner_proof(&mut self, m: crate::RequestLearnerProof) {
+    // Cross-epoch challenge: answer only for the live configuration (the `epoch_authority_admits` STRICT
+    // gate already enforces this on ingress; re-checked here so the reply is correct-by-construction
+    // against the live config it stamps).
+    if m.epoch() != self.membership.epoch() || m.config_id() != self.membership.config_id() {
+      return;
+    }
+    let frontier = self.commit();
+    self.emit(Outgoing::new(
+      Recipient::To(Peer::Replica(m.from())),
+      Message::LearnerProof(crate::LearnerProof::new(
+        self.local_slot(),
+        m.nonce(),
+        frontier,
+        self.membership.epoch(),
+        self.membership.config_id(),
+      )),
+    ));
+  }
+
+  /// Records the target learner's fresh [`LearnerProof`](crate::LearnerProof) frontier against the
+  /// outstanding promote challenge ([`Self::learner_proof`]) — the catch-up-then-promote gate's FRESH
+  /// safety input. Validated against the outstanding challenge: it must be `Some`, the `nonce` must
+  /// match, the authenticated `from` must resolve to the challenge `target`, and the reply's
+  /// `(epoch, config_id)` must match this primary's current configuration. On a match, `proof` is set
+  /// to the reported frontier; a stale-nonce / wrong-target / foreign-config reply is DROPPED (no
+  /// accumulation — this is a single-shot token consumed at mint).
+  fn on_learner_proof(&mut self, from: Peer, m: crate::LearnerProof) {
+    let Some(challenge) = self.learner_proof.as_mut() else {
+      return; // no outstanding challenge — an unsolicited / late reply.
+    };
+    if m.nonce() != challenge.nonce {
+      return; // a stale-nonce reply (a replayed / superseded challenge's answer).
+    }
+    // The authenticated sender must be the challenge target. `sender_matches` bound `from` to
+    // `m.replica()` already; resolve that slot to the stable MemberId and require it to be `target`, so
+    // a different member's reply (even one carrying the right nonce) never satisfies the challenge.
+    let resolved = from
+      .as_replica()
+      .and_then(|slot| self.membership.member_at(slot));
+    if resolved != Some(challenge.target) {
+      return; // wrong-target reply.
+    }
+    if m.epoch() != self.membership.epoch() || m.config_id() != self.membership.config_id() {
+      return; // foreign-config reply (the freshness backstop) — never validates a mint here.
+    }
+    challenge.proof = Some(m.frontier());
   }
 
   /// Emits this learner's [`LearnerStatus`](crate::LearnerStatus) progress report when its cadence is
   /// due, then re-arms. Only a non-voting learner reports (gated by `serviceable_now` + the
   /// `handle_timeout` call site), so a voter never reaches here.
   ///
-  /// The reported frontier is the DURABLE root's — `durable_commit_min` from `sb.state().commit()` (the
-  /// known-committed frontier the durable root carries; survives a crash) and `durable_op` from
-  /// `wal.op_head()` (the durable WAL head) — NOT the in-memory `commit_min`/`op`. A learner thus never
-  /// claims more than it persisted: after a crash it recovers to exactly this frontier, so the primary's
-  /// catch-up gate can only be satisfied by ops the learner durably holds.
-  fn learner_status_timeouts<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-  ) {
+  /// `durable_commit_min` carries the CONTIGUOUS APPLIED FRONTIER (`self.commit()` == `commit_min`),
+  /// NOT the durable known-committed frontier `sb.state().commit()` (the durable `commit_max`). The
+  /// distinction is load-bearing for the catch-up-then-promote gate: `commit_max` is the highest op the
+  /// learner KNOWS is committed, which can EXCEED its contiguous applied frontier while a missing /
+  /// `Repairing` committed op BELOW it (a repair hole) still blocks apply. Reporting `commit_max` would
+  /// let a SPARSE-band recovered learner — one holding the primary head yet with a hole below it — pass
+  /// the gate, then enter the successor voter set unable to install the promote op until peer repair
+  /// fills the hole (a non-participating voter → an avoidable view-change wedge). The applied frontier is
+  /// the HONEST metric: apply is sequential and commit-first (`advance_commit` HOLDS at any hole, never
+  /// skips), so EVERY op `1..=commit_min` is applied — hence durably held with a body — hence hole-free
+  /// by construction; and an applied op was durably appended before it could apply (append-before-ack /
+  /// the `Pending::RepairFill` durability barrier) and never pruned (`prune` frees only below
+  /// `checkpoint_op <= commit_min`), so a crash recovers the learner to AT LEAST this frontier. It also
+  /// cannot exceed `op_head` (an op above the head is not yet held, so cannot be applied), so it SUBSUMES
+  /// the `durable_op` tail-gap cap the `on_learner_status` backstop also applies. `durable_op` stays
+  /// `wal.op_head()` (the durable WAL head) for that backstop.
+  fn learner_status_timeouts<W: Wal>(&mut self, now: Instant, wal: &mut W) {
     // Only a non-voting learner reports; a voter participates directly. (The call site already gates on
     // Normal; this gates on learner — together they match `serviceable_now(LearnerStatus)`.)
     if !self.is_learner() {
@@ -4120,7 +4254,9 @@ where
     if deadline > now {
       return;
     }
-    let durable_commit_min = sb.state().commit();
+    // The contiguous applied frontier (hole-free, durably recoverable) — the honest catch-up metric the
+    // promote gate needs; see the rationale on this fn. NOT the durable `commit_max`.
+    let durable_commit_min = self.commit();
     let durable_op = wal.op_head();
     self.emit(Outgoing::new(
       Recipient::To(Peer::Replica(self.membership.primary(self.view))),
@@ -4197,7 +4333,7 @@ where
       self.sync_timeouts(now);
       // Learner progress report likewise runs only in Normal, and only for a non-voting learner — it
       // re-broadcasts its durable frontier so the primary's promote gate sees it catch up.
-      self.learner_status_timeouts(now, wal, sb);
+      self.learner_status_timeouts(now, wal);
     }
     // No-orphan-due invariant: after dispatch, NO serviceable timer may remain armed-and-due
     // (`serviceable_now(kind) && armed(kind) <= now`). `poll_timeout` returns only serviceable timers, so

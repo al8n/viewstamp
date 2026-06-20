@@ -673,11 +673,16 @@ impl EpochAhead {
 /// in the reconfiguration design: a behind new-voter's low-frontier `DoViewChange` could push the
 /// nack-truncation crossing down and truncate a committed-but-not-yet-widely-replicated op).
 ///
-/// `durable_commit_min` / `durable_op` are the DURABLE root's frontier (what survives a crash), not the
-/// in-memory `commit_min`/`op`, so a crash can never make a learner claim more than it persisted. It is
-/// CONFIG-SCOPED progress, carrying the STRICT epoch-policy pair (`epoch` + `config_id`) so it is
-/// admitted only from a member of the SAME configuration (a foreign-config learner's progress is not
-/// this primary's to act on).
+/// `durable_commit_min` is the learner's CONTIGUOUS APPLIED FRONTIER (`commit_min`) — the highest op
+/// below which there is NO hole — NOT its durable known-committed frontier (`commit_max`): a sparse-band
+/// recovered learner can KNOW a high commit point while a missing / `Repairing` committed op below it
+/// still blocks apply, and the promote gate must admit it only once it durably HOLDS the whole prefix
+/// it will vote on. The applied frontier is durably recoverable (every applied op was durably appended
+/// before apply and lives below `commit_max`), so a crash can never make a learner claim more than it
+/// can reconstruct. `durable_op` is the durable WAL head (`op_head`), a backstop the receiver caps the
+/// reported frontier with. It is CONFIG-SCOPED progress, carrying the STRICT epoch-policy pair (`epoch` +
+/// `config_id`) so it is admitted only from a member of the SAME configuration (a foreign-config
+/// learner's progress is not this primary's to act on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LearnerStatus {
   replica: ReplicaId,
@@ -688,10 +693,10 @@ pub struct LearnerStatus {
 }
 
 impl LearnerStatus {
-  /// Creates a learner progress report. `replica` is the sender's own slot; `durable_commit_min` /
-  /// `durable_op` are its DURABLE root's committed frontier and head (NOT the in-memory ones — see the
-  /// type docs); `epoch` + `config_id` are the sender's active configuration (the STRICT epoch-policy
-  /// pair). Carries no vote.
+  /// Creates a learner progress report. `replica` is the sender's own slot; `durable_commit_min` is its
+  /// CONTIGUOUS APPLIED FRONTIER (`commit_min`, not the durable known-committed `commit_max` — see the
+  /// type docs) and `durable_op` is its durable WAL head; `epoch` + `config_id` are the sender's active
+  /// configuration (the STRICT epoch-policy pair). Carries no vote.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     replica: ReplicaId,
@@ -715,8 +720,9 @@ impl LearnerStatus {
     self.replica
   }
 
-  /// The reporting learner's DURABLE applied/committed frontier — the value that survives a crash (the
-  /// durable root's `commit`), so it can never over-claim past what it persisted.
+  /// The reporting learner's CONTIGUOUS APPLIED FRONTIER (`commit_min`) — the highest op below which it
+  /// has NO hole, hence durably holds every op of the prefix and recovers to at least it after a crash.
+  /// NOT the durable known-committed frontier (`commit_max`), which can exceed it past a repair hole.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn durable_commit_min(&self) -> OpNumber {
     self.durable_commit_min
@@ -735,6 +741,161 @@ impl LearnerStatus {
   }
 
   /// The sender's configuration lineage id (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
+  }
+}
+
+/// Primary → a target learner: a FRESH-PROOF SOLICITATION the primary issues at
+/// [`PromoteLearner`](crate::SingleVoterDelta) propose time. It carries NO quorum/vote authority — it
+/// is a request, never a vote — and asks the learner: "prove you durably hold the contiguous committed
+/// prefix through `at_op`, NOW."
+///
+/// The promote gate ([`Endpoint::propose_membership`](crate::Endpoint)) is SAFETY-critical: a learner
+/// it admits into the voting set must already durably hold the full committed prefix it will vote on,
+/// or the successor view-change quorum can drop a committed op. A learner's self-reported frontier
+/// ([`LearnerStatus`]) is unsafe to gate on directly, because a crash/disk-fault honestly REGRESSES
+/// the frontier while a stale-high accumulated value survives. So the gate re-grounds the safety input
+/// in the learner's durable storage AT PROPOSE TIME with this round-trip instead: the primary issues a
+/// challenge bound to `(nonce, at_op, epoch, config_id)`, and only a matching fresh [`LearnerProof`]
+/// reporting a frontier `>= at_op` lets the promotion mint. `at_op` is the primary's current head (the
+/// prospective Reconfigure op's predecessor frontier); `nonce` is a per-incarnation freshness token
+/// binding the reply; `epoch` + `config_id` are the proposer's active configuration (the STRICT
+/// epoch-policy pair), so a learner answers only for its live config and a cross-epoch reply never
+/// satisfies a later mint. `from` is the primary's own slot (the standard sender binding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLearnerProof {
+  from: ReplicaId,
+  at_op: OpNumber,
+  nonce: u64,
+  epoch: Epoch,
+  config_id: u128,
+}
+
+impl RequestLearnerProof {
+  /// Creates a learner-proof challenge. `from` is the soliciting primary's own slot; `at_op` is the
+  /// head the learner must prove it durably holds the contiguous committed prefix through; `nonce` is
+  /// the per-incarnation freshness token; `epoch` + `config_id` are the proposer's active configuration
+  /// (the STRICT epoch-policy pair). Carries no vote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    from: ReplicaId,
+    at_op: OpNumber,
+    nonce: u64,
+    epoch: Epoch,
+    config_id: u128,
+  ) -> Self {
+    Self {
+      from,
+      at_op,
+      nonce,
+      epoch,
+      config_id,
+    }
+  }
+
+  /// The soliciting primary's own slot.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn from(&self) -> ReplicaId {
+    self.from
+  }
+
+  /// The head the learner must prove it durably holds the contiguous committed prefix through.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn at_op(&self) -> OpNumber {
+    self.at_op
+  }
+
+  /// The per-incarnation freshness token binding the matching [`LearnerProof`] reply.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+
+  /// The proposer's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The proposer's configuration lineage id (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
+  }
+}
+
+/// Target learner → the soliciting primary: the FRESH-PROOF REPLY answering a [`RequestLearnerProof`].
+/// It carries NO quorum/vote authority — it is a reply, never a vote — and reports the learner's
+/// contiguous applied frontier (`commit()` == `commit_min`, the hole-free durably-recoverable prefix)
+/// RECOMPUTED FROM DURABLE STATE AT REPLY TIME.
+///
+/// Computing `frontier` fresh is the load-bearing property (see [`RequestLearnerProof`]): a
+/// just-crashed learner answers with its regressed (lower) frontier, and a learner mid-crash never
+/// answers at all — so no remembered high-water survives the fault that invalidated it. `nonce` is
+/// echoed verbatim from the challenge so the primary binds the reply to the exact outstanding
+/// challenge; `epoch` + `config_id` are the learner's active configuration (the STRICT epoch-policy
+/// pair), so a cross-epoch reply never validates against a later mint. `replica` is the learner's own
+/// slot (the standard sender binding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LearnerProof {
+  replica: ReplicaId,
+  nonce: u64,
+  frontier: OpNumber,
+  epoch: Epoch,
+  config_id: u128,
+}
+
+impl LearnerProof {
+  /// Creates a learner-proof reply. `replica` is the answering learner's own slot; `nonce` is echoed
+  /// from the challenge; `frontier` is the learner's CONTIGUOUS APPLIED FRONTIER (`commit_min`)
+  /// recomputed from durable state at reply time; `epoch` + `config_id` are the learner's active
+  /// configuration (the STRICT epoch-policy pair). Carries no vote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    replica: ReplicaId,
+    nonce: u64,
+    frontier: OpNumber,
+    epoch: Epoch,
+    config_id: u128,
+  ) -> Self {
+    Self {
+      replica,
+      nonce,
+      frontier,
+      epoch,
+      config_id,
+    }
+  }
+
+  /// The answering learner's own slot.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// The freshness token echoed from the soliciting [`RequestLearnerProof`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+
+  /// The learner's CONTIGUOUS APPLIED FRONTIER (`commit_min`) recomputed from durable state at reply
+  /// time — the highest op below which it has NO hole, hence durably holds every op of the prefix and
+  /// recovers to at least it after a crash.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn frontier(&self) -> OpNumber {
+    self.frontier
+  }
+
+  /// The learner's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The learner's configuration lineage id (the strict epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn config_id(&self) -> u128 {
     self.config_id
@@ -2532,6 +2693,12 @@ pub enum Message {
   /// checkpoint_op only; no view/vote/op content) — pulls a stranded laggard's catch-up trigger back
   /// from a BINDABLE retained voter.
   EpochAhead(EpochAhead),
+  /// A primary's fresh-proof SOLICITATION to a target learner at `PromoteLearner` propose time ("prove
+  /// you durably hold the committed prefix through `at_op`, now"); no quorum authority.
+  RequestLearnerProof(RequestLearnerProof),
+  /// A target learner's fresh-proof REPLY (its contiguous applied frontier, recomputed from durable
+  /// state at reply time), gating the catch-up-then-promote mint; no quorum authority.
+  LearnerProof(LearnerProof),
 }
 
 impl Message {
@@ -2562,6 +2729,8 @@ impl Message {
       Self::PrepareBatch(_) => "PrepareBatch",
       Self::LearnerStatus(_) => "LearnerStatus",
       Self::EpochAhead(_) => "EpochAhead",
+      Self::RequestLearnerProof(_) => "RequestLearnerProof",
+      Self::LearnerProof(_) => "LearnerProof",
     }
   }
 
@@ -2626,13 +2795,18 @@ impl Message {
       | Self::LearnerStatus(_)
       // A cross-epoch hint carries NO view at all — it is a pure catch-up signal (epoch + checkpoint_op),
       // never an authority claim, so it advertises no participatory view.
-      | Self::EpochAhead(_) => false,
+      | Self::EpochAhead(_)
+      // The learner-proof challenge + reply are CONFIG-scoped, not view-scoped: a no-authority
+      // solicitation and a no-vote reply that gate a reconfiguration proposal, never a view-bearing
+      // vote/lead/serve. They claim no participatory view (emittable while a view write is in flight).
+      | Self::RequestLearnerProof(_)
+      | Self::LearnerProof(_) => false,
     }
   }
 
   /// The stable wire discriminant tag for each variant, matching declaration order. One source of
   /// truth shared by [`Self::encode`] (writes it) and [`Self::decode`] (dispatches on it); the
-  /// `match` is EXHAUSTIVE (no wildcard) so a future 23rd variant fails to compile until it is
+  /// `match` is EXHAUSTIVE (no wildcard) so a future 25th variant fails to compile until it is
   /// assigned a tag here.
   #[cfg_attr(not(tarpaulin), inline)]
   const fn tag(&self) -> u8 {
@@ -2659,6 +2833,8 @@ impl Message {
       Self::PrepareBatch(_) => 19,
       Self::LearnerStatus(_) => 20,
       Self::EpochAhead(_) => 21,
+      Self::RequestLearnerProof(_) => 22,
+      Self::LearnerProof(_) => 23,
     }
   }
 
@@ -2858,6 +3034,20 @@ impl Message {
         out.put_u64(m.epoch.get());
         out.put_u64(m.checkpoint_op.get());
       }
+      Self::RequestLearnerProof(m) => {
+        out.put_u16(m.from.get());
+        out.put_u64(m.at_op.get());
+        out.put_u64(m.nonce);
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
+      }
+      Self::LearnerProof(m) => {
+        out.put_u16(m.replica.get());
+        out.put_u64(m.nonce);
+        out.put_u64(m.frontier.get());
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
+      }
     }
     out.freeze()
   }
@@ -2936,6 +3126,8 @@ impl Message {
       Self::PrepareBatch(m) => U64 + U64 + U64 + U64 + U128 + log(&m.log),
       Self::LearnerStatus(_) => U16 + U64 + U64 + U64 + U128,
       Self::EpochAhead(_) => U64 + U64,
+      Self::RequestLearnerProof(_) => U16 + U64 + U64 + U64 + U128,
+      Self::LearnerProof(_) => U16 + U64 + U64 + U64 + U128,
     };
     HEADER + body
   }
@@ -2947,8 +3139,8 @@ impl Message {
   /// unknown variant tag ([`CodecError::UnknownTag`]), a buffer that ends mid-field
   /// ([`CodecError::Truncated`]), a body/log length prefix exceeding the remaining bytes
   /// ([`CodecError::LengthOverflow`]), or trailing bytes after the variant
-  /// ([`CodecError::TrailingBytes`]). The tag dispatch covers the 22 known tags, with any other
-  /// byte falling through to [`CodecError::UnknownTag`] — adding a 23rd variant means adding its
+  /// ([`CodecError::TrailingBytes`]). The tag dispatch covers the 24 known tags, with any other
+  /// byte falling through to [`CodecError::UnknownTag`] — adding a 25th variant means adding its
   /// discriminant tag + a decode arm here (the encode `match` will not compile until the variant
   /// is handled, preserving the exhaustive-`Message`-match property).
   pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
@@ -3136,6 +3328,20 @@ impl Message {
       21 => Self::EpochAhead(EpochAhead {
         epoch: read_epoch(&mut r)?,
         checkpoint_op: read_op(&mut r)?,
+      }),
+      22 => Self::RequestLearnerProof(RequestLearnerProof {
+        from: read_replica(&mut r)?,
+        at_op: read_op(&mut r)?,
+        nonce: r.u64()?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
+      }),
+      23 => Self::LearnerProof(LearnerProof {
+        replica: read_replica(&mut r)?,
+        nonce: r.u64()?,
+        frontier: read_op(&mut r)?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
       }),
       other => return Err(CodecError::UnknownTag(other)),
     };
@@ -3825,7 +4031,7 @@ mod tests {
   /// variant's codec must handle: an EMPTY body (`Request`), a POPULATED body (`Prepare`/`Reply`/
   /// `SyncCheckpoint`/`SyncChunk`), an EMPTY log slice (`StartView`), a POPULATED multi-entry log
   /// (`DoViewChange`/`RecoveryResponse`), the `recovery` bool both ways, and `u64::MAX`/`u128::MAX`
-  /// edge scalars. Covers all 20 tags so the round-trip + fuzz tests sweep the whole surface.
+  /// edge scalars. Covers all 24 tags so the round-trip + fuzz tests sweep the whole surface.
   fn one_of_each_variant() -> std::vec::Vec<Message> {
     std::vec![
       Message::Request(Request::new(
@@ -4072,6 +4278,20 @@ mod tests {
       Message::EpochAhead(EpochAhead::new(
         crate::Epoch::new(u64::MAX), // edge scalar epoch — round-trips
         OpNumber::with(8),
+      )),
+      Message::RequestLearnerProof(RequestLearnerProof::new(
+        ReplicaId::new(300),      // a slot above a single byte exercises both u16 bytes
+        OpNumber::with(u64::MAX), // edge scalar at_op — round-trips
+        0xBEEF,
+        crate::Epoch::new(0),
+        0,
+      )),
+      Message::LearnerProof(LearnerProof::new(
+        ReplicaId::new(4),
+        0xBEEF,
+        OpNumber::with(u64::MAX), // edge scalar frontier — round-trips
+        crate::Epoch::new(0),
+        0,
       )),
     ]
   }
@@ -4454,7 +4674,7 @@ mod tests {
   #[test]
   fn every_variant_round_trips_through_the_wire_codec() {
     let all = one_of_each_variant();
-    assert_eq!(all.len(), 22, "every Message variant is represented");
+    assert_eq!(all.len(), 24, "every Message variant is represented");
     for m in &all {
       let bytes = m.encode();
       let back = Message::decode(&bytes).expect("round-trip decodes");
@@ -4543,7 +4763,7 @@ mod tests {
 
   #[test]
   fn commit_golden_bytes_pin_the_wire_layout() {
-    // A small STRICT variant pinned exactly: WIRE_VERSION(u16=10) ++ tag 4 ++ view ++ commit ++
+    // A small STRICT variant pinned exactly: WIRE_VERSION(u16=11) ++ tag 4 ++ view ++ commit ++
     // checkpoint_op ++ the strict epoch-policy pair epoch(u64) ++ config_id(u128).
     let c = Message::Commit(Commit::new(
       View::with(4),
@@ -4553,7 +4773,7 @@ mod tests {
       0,
     ));
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 10, 4, // version 10, tag 4 (Commit)
+      0, 11, 4, // version 11, tag 4 (Commit)
       0, 0, 0, 0, 0, 0, 0, 4, // view = 4
       0, 0, 0, 0, 0, 0, 0, 9, // commit = 9
       0, 0, 0, 0, 0, 0, 0, 7, // checkpoint_op = 7
@@ -4565,7 +4785,7 @@ mod tests {
 
   #[test]
   fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
-    // A nested STRICT variant pinned exactly: header (ver 10 + tag 6), scalars (incl. the advertised
+    // A nested STRICT variant pinned exactly: header (ver 11 + tag 6), scalars (incl. the advertised
     // checkpoint floor after the commit, then the strict epoch-policy pair epoch(u64)+config_id(u128)
     // before the u16 replica id), then a 1-entry log slice (count=1, op, client, request, body-state
     // tag 0 = Present, length-prefixed body "hi").
@@ -4588,7 +4808,7 @@ mod tests {
       .with_checkpoint_op(OpNumber::with(3)),
     );
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 10, 6, // version 10, tag 6 (DoViewChange)
+      0, 11, 6, // version 11, tag 6 (DoViewChange)
       0, 0, 0, 0, 0, 0, 0, 3, // view = 3
       0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
       0, 0, 0, 0, 0, 0, 0, 5, // op = 5
@@ -4632,7 +4852,7 @@ mod tests {
       .with_checkpoint_op(OpNumber::with(3)),
     );
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 10, 6, // version 10, tag 6 (DoViewChange)
+      0, 11, 6, // version 11, tag 6 (DoViewChange)
       0, 0, 0, 0, 0, 0, 0, 3, // view = 3
       0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
       0, 0, 0, 0, 0, 0, 0, 5, // op = 5
@@ -4790,7 +5010,7 @@ mod tests {
       .with_checkpoint_op(OpNumber::with(3)),
     );
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 10, 6, // version 10, tag 6 (DoViewChange)
+      0, 11, 6, // version 11, tag 6 (DoViewChange)
       0, 0, 0, 0, 0, 0, 0, 3, // view = 3
       0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
       0, 0, 0, 0, 0, 0, 0, 5, // op = 5

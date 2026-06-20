@@ -1917,12 +1917,52 @@ fn mint_one_client_op(e: &mut Endpoint<CountSm, SingleChange>, wal: &mut TestWal
   while e.poll_message().is_some() {}
 }
 
+/// Drains the primary's outgoing queue and returns the single `RequestLearnerProof` it emitted (the
+/// promote-proof challenge), asserting exactly one was produced and that it is addressed to `slot`.
+/// Panics if none / more than one is found — the gate emits exactly one challenge per `ProofPending`.
+fn take_proof_challenge(
+  e: &mut Endpoint<CountSm, SingleChange>,
+  slot: u16,
+) -> crate::RequestLearnerProof {
+  let mut found = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::RequestLearnerProof(rq) = out.msg_ref() {
+      assert_eq!(
+        out.to(),
+        crate::Recipient::To(Peer::Replica(ReplicaId::new(slot))),
+        "the challenge is addressed to the target learner's slot",
+      );
+      assert!(
+        found.is_none(),
+        "exactly one challenge is emitted per ProofPending"
+      );
+      found = Some(*rq);
+    }
+  }
+  found.expect("the gate emitted a RequestLearnerProof challenge")
+}
+
+/// Builds the target learner's `LearnerProof` reply to `challenge`, reporting a contiguous applied
+/// `frontier` (the value a real learner's `commit()` would return at reply time), self-identifying by
+/// the learner's slot and echoing the challenge nonce + the live (epoch, config_id) so it validates.
+fn answer_proof(challenge: &crate::RequestLearnerProof, slot: u16, frontier: u64) -> Message {
+  Message::LearnerProof(crate::LearnerProof::new(
+    ReplicaId::new(slot),
+    challenge.nonce(),
+    OpNumber::with(frontier),
+    challenge.epoch(),
+    challenge.config_id(),
+  ))
+}
+
 #[test]
 fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() {
   // A `LearnerStatus` is a NON-VOTING progress report: `on_learner_status` records the durable frontier
   // into `peer_progress` (keyed by the stable MemberId) and touches NOTHING else — no inflight vote
   // tracker, no DVC/SVC map, no quorum bitset. And the update is MONOTONE: a reordered LOWER report
-  // never lowers a recorded value.
+  // never lowers a recorded value. `peer_progress` is now a pure LIVENESS HINT (when a learner is worth
+  // challenging), NOT the safety input — the promote gate consumes a FRESH proof round-trip instead — so
+  // this test pins the accumulation + the no-vote-state property, not any gating decision.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let learner = MemberId::new(3);
@@ -1988,11 +2028,12 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
 }
 
 #[test]
-fn promote_learner_is_rejected_target_not_caught_up_until_a_status_covers_the_head() {
-  // The catch-up-then-promote gate: `propose_membership(PromoteLearner(behind))` is refused with
-  // `TargetNotCaughtUp` while the target has no report (or one below the head); once a `LearnerStatus`
-  // reports the learner covering the prospective Reconfigure op's predecessor frontier (the head), the
-  // promotion SUCCEEDS and mints the op.
+fn promote_learner_happy_path_challenge_then_fresh_proof_mints_the_op() {
+  // The two-phase catch-up-then-promote gate, happy path: the first `propose_membership(PromoteLearner)`
+  // has NO fresh proof, so it EMITS a `RequestLearnerProof` challenge and returns the retryable
+  // `ProofPending`; delivering a fresh `LearnerProof` whose frontier covers the head fills the proof; and
+  // the retry MINTS the Reconfigure op. By commit-first, the learner that durably commits it then holds
+  // the entire E-committed prefix.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let learner = MemberId::new(3);
@@ -2001,54 +2042,47 @@ fn promote_learner_is_rejected_target_not_caught_up_until_a_status_covers_the_he
   mint_one_client_op(&mut e, &mut wal, &mut sb);
   assert_eq!(e.op(), OpNumber::with(1), "the head advanced to op 1");
 
-  // (a) No report at all → the learner has never proven any durable frontier → rejected.
+  // Phase 2: no fresh proof → ProofPending + a challenge emitted; nothing minted.
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::PromoteLearner(learner)
     ),
-    Err(ProposeMembershipError::TargetNotCaughtUp),
-    "an unreported learner is not caught up",
+    Err(ProposeMembershipError::ProofPending),
+    "the first propose with no fresh proof solicits one and returns ProofPending",
   );
   assert_eq!(e.reconfigure_inflight, None, "no op was minted");
   assert_eq!(e.op(), OpNumber::with(1), "the head did not advance");
-
-  // (b) A report BELOW the head (durable frontier 0 < head 1) → still rejected.
-  e.handle_message(
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    Peer::Replica(ReplicaId::new(3)),
-    learner_status(3, 0),
+  let challenge = take_proof_challenge(&mut e, 3);
+  assert_eq!(
+    challenge.at_op(),
+    OpNumber::with(1),
+    "the challenge pins the head"
   );
   assert_eq!(
-    e.propose_membership(
-      Instant::ZERO,
-      &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
-    ),
-    Err(ProposeMembershipError::TargetNotCaughtUp),
-    "a learner below the head is not caught up",
+    challenge.from(),
+    ReplicaId::new(0),
+    "the challenge carries the soliciting primary's slot",
   );
-  assert_eq!(e.reconfigure_inflight, None, "still no op minted");
 
-  // (c) A report COVERING the head (durable frontier 1 == head) → the promotion mints the op. By
-  // commit-first, the learner that durably committed the Reconfigure op then holds the full prefix.
+  // Deliver a FRESH proof covering the head (frontier 1 == head). The proof now validates.
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(3)),
-    learner_status(3, 1),
+    answer_proof(&challenge, 3, 1),
   );
+
+  // The retry mints the op (Phase 1 consumes the fresh proof).
   let op = e
     .propose_membership(
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::PromoteLearner(learner),
     )
-    .expect("a caught-up learner is promotable — the op mints");
+    .expect("a caught-up learner with a fresh proof is promotable — the op mints");
   assert_eq!(
     op,
     OpNumber::with(2),
@@ -2059,7 +2093,6 @@ fn promote_learner_is_rejected_target_not_caught_up_until_a_status_covers_the_he
     Some(op),
     "the single-writer latch holds the minted promote op",
   );
-  // The minted op carries the successor membership where member 3 is now a voter (4 voters).
   let entry = e.log.get(&op.get()).expect("the promote op is in the log");
   let payload = entry.body.as_reconfigure().expect("a Body::Reconfigure op");
   assert_eq!(
@@ -2070,32 +2103,498 @@ fn promote_learner_is_rejected_target_not_caught_up_until_a_status_covers_the_he
 }
 
 #[test]
-fn promote_learner_rejects_a_tail_gap_learner_whose_durable_op_lags_its_durable_commit() {
-  // The catch-up-then-promote gate must require the durably-HELD prefix, not just commit KNOWLEDGE. A
-  // recovered learner can report a high `durable_commit_min` while its `durable_op` (the ops it actually
-  // persisted) lags — recovery admits a `commit_max > op` tail-gap. `on_learner_status` records
-  // `min(durable_commit_min, durable_op)`, so such a learner is NOT promotable: promoting it would enter
-  // the successor voter set without the E-committed prefix the XI-b old-write-quorum / new-view-change
-  // intersection relies on, risking committed-op loss or a view-change wedge in E+1.
+fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_converges() {
+  // The challenge is IDEMPOTENT in its head: a re-propose issued while a reply is still in flight
+  // REUSES the outstanding challenge's nonce (retransmit) rather than superseding it. Without this, a
+  // caller retrying faster than the round-trip re-draws the nonce on every call, so the in-flight
+  // `LearnerProof` always arrives stale-nonce and is dropped — the promote never converges. Here a
+  // SECOND propose precedes the reply; it must reuse the first nonce, and a reply answering that
+  // (reused) nonce then mints.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let learner = MemberId::new(3);
   mint_one_client_op(&mut e, &mut wal, &mut sb);
   assert_eq!(e.op(), OpNumber::with(1), "the head advanced to op 1");
 
-  // A TAIL-GAP report: durable_commit_min = 1 (COVERS the head) but durable_op = 0 (the learner has NOT
-  // durably persisted op 1) — the recovered `commit_max > op` shape.
+  // First propose: a challenge is emitted (nonce N1), ProofPending.
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+  );
+  let first = take_proof_challenge(&mut e, 3);
+
+  // Re-propose BEFORE the reply lands (unpaced) — it must REUSE the same nonce (retransmit), not
+  // supersede its own outstanding challenge.
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+  );
+  let second = take_proof_challenge(&mut e, 3);
+  assert_eq!(
+    second.nonce(),
+    first.nonce(),
+    "an in-flight re-propose reuses the outstanding challenge's nonce — it does not supersede",
+  );
+
+  // The learner's reply answers the (reused) first challenge → validates against the still-outstanding
+  // nonce. Had the second propose re-drawn, this reply would arrive stale-nonce and be dropped.
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(3)),
-    Message::LearnerStatus(crate::LearnerStatus::new(
-      ReplicaId::new(3),
-      OpNumber::with(1), // durable_commit_min COVERS the head
-      OpNumber::new(),   // durable_op = 0 — does NOT durably hold the prefix
+    answer_proof(&first, 3, 1),
+  );
+
+  // The retry mints — the reply was not dropped, because the unpaced re-propose did not re-draw.
+  let op = e
+    .propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner),
+    )
+    .expect("the in-flight reply validated against the reused nonce — the promote mints");
+  assert_eq!(
+    op,
+    OpNumber::with(2),
+    "the Reconfigure op minted at head + 1"
+  );
+}
+
+#[test]
+fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint() {
+  // THE R24 FALSIFIER, now closed by the fresh-proof challenge. A learner reports covering the head
+  // (banking a stale-high `peer_progress`), then its contiguous applied frontier honestly REGRESSES
+  // below the head (a crash + recover reconstructs it lower). With the OLD monotone-`peer_progress`
+  // gate the banked stale-high value would mint the promotion — and the learner, now a voter below a
+  // repair hole, could not install the promote op (successor quorum wedge). With the fresh-proof gate
+  // the primary re-solicits at propose time and the learner answers with its REGRESSED frontier, so the
+  // gate refuses to mint.
+  let mut e = single_change_primary_with_learner();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let learner = MemberId::new(3);
+
+  // Advance the head to op 2 so the regressed frontier (1) is strictly below it.
+  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(2),
+      Bytes::from(std::vec![2u8]),
+    )),
+  );
+  while e.poll_message().is_some() {}
+  assert_eq!(e.op(), OpNumber::with(2), "the head advanced to op 2");
+
+  // The learner once reported covering the head — the stale-high accumulator the OLD gate trusted.
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    learner_status(3, 2),
+  );
+  assert_eq!(
+    e.peer_progress.get(&learner),
+    Some(&OpNumber::with(2)),
+    "peer_progress banks the stale-high pre-crash frontier (now only a hint)",
+  );
+
+  // Propose: the gate IGNORES the stale-high peer_progress and solicits a fresh proof instead.
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "the gate solicits a fresh proof rather than minting off the banked stale-high peer_progress",
+  );
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "no op minted off the stale-high hint"
+  );
+  let challenge = take_proof_challenge(&mut e, 3);
+
+  // The learner crashed and recovered BELOW the head: its fresh contiguous applied frontier is now 1.
+  // It answers the challenge with that REGRESSED frontier (what a real learner's `commit()` returns).
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    answer_proof(&challenge, 3, 1),
+  );
+
+  // The retry STILL does not mint: the fresh frontier (1) is below the head (2) — fail-closed.
+  // MUTATION CHECK: a gate that read the stale-high peer_progress (2 >= head 2) would mint here.
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "a fresh proof carrying the REGRESSED frontier does not mint — the stale-high accumulator is moot",
+  );
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "no promote op was minted for a regressed learner (no successor wedge)",
+  );
+}
+
+#[test]
+fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_until_repaired() {
+  // THE COMMIT-FIRST GATE — the decisive defense over the finding's EXACT window (the falsifier above
+  // covers only a learner that REPORTS a low frontier; this covers an HONEST HIGH proof followed by a
+  // regression in the proof->commit/install gap). The primary already minted the `PromoteLearner`
+  // Reconfigure op `N` off a fresh proof covering the head, and that op reaches this learner. But the
+  // learner then crashed/storage-faulted and recovered REGRESSED: a committed op BELOW `N` read back
+  // body-faulty, so it is held header-only as a `Body::Repairing` hole (the durable-header carry). The
+  // load-bearing claim: a learner becomes a successor VOTER only by INSTALLING the swap, and the swap
+  // installs only after committing op `N` IN SEQUENCE — the commit loop HOLDS at the hole below `N`
+  // (`advance_commit` / `commit_op` peer-repair the hole and `break`, never skipping to `N`). So a
+  // regressed learner NEVER stages the SwapEpoch, NEVER stamps E+1, and `is_voter()` stays false: it
+  // cannot acquire successor view-change-quorum authority below the proven prefix. The hole's repair is
+  // the SOLE unblock — only then does commit reach `N`, stage the swap, and install the voter.
+  //
+  // Shape (the promoted-learner slot): self is the learner member 3 at slot 3 of a 3-voter + 1-learner
+  // cluster (`replica_count == 3`, so slot 3 is NON-voting). `PromoteLearner(member 3)` yields a 4-voter
+  // successor in which slot 3 IS a voter — so `is_voter()` flips false->true EXACTLY at the install, and
+  // observing it stay false witnesses the gate. The log holds op 1 as a committed `Body::Repairing` hole
+  // (the regression) and op 2 as the typed `Body::Reconfigure` promote op `N`. (Log shape mirrors
+  // `commit_holds_at_a_body_repairing_entry_and_solicits_the_body`; the commit+install path mirrors
+  // `a_backup_committing_the_same_reconfigure_installs_the_identical_successor`.)
+  let cfg =
+    Config::try_new(0, MemberId::new(3)).expect("learner member 3 of a 3-voter + 1-learner set");
+  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+    cfg,
+    genesis_with_learners(3, 1),
+    0,
+    CountSm::default(),
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+
+  // The promote op `N == 2` promotes member 3 (this learner). Build its successor membership exactly as
+  // the proposer did (chained off the genesis predecessor, `prev_config_id == 0`), so a commit that
+  // REACHED op 2 would stage+install THIS successor — the only thing standing in the way is the hole.
+  let promote = MemberId::new(3);
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::PromoteLearner(promote))
+    .expect("promoting the learner member 3 yields a 4-voter successor");
+  assert_eq!(
+    successor.replica_count(),
+    4,
+    "the successor promotes the learner into a 4-voter set",
+  );
+  assert!(
+    successor.is_voter(ReplicaId::new(3)),
+    "in the successor, this node's slot 3 is a VOTER (so is_voter flips only at install)",
+  );
+  let payload = ReconfigurePayload::from_membership(&successor, e.membership.config_id());
+
+  // Precondition: as a learner under the predecessor configuration, this node is NOT a voter.
+  assert!(
+    !e.is_voter(),
+    "precondition: a learner (slot 3 >= replica_count 3) is not a voter",
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "precondition: at the predecessor epoch E",
+  );
+
+  // The regressed log: op 1 is a COMMITTED op whose body read back faulty on recover — kept header-only
+  // as a `Body::Repairing` hole (existence + durable body_checksum preserved). Op 2 is the typed
+  // `Body::Reconfigure` promote op `N`. Head is op 2; nothing applied yet (commit_min 0).
+  e.op = OpNumber::with(2);
+  e.log.insert(
+    1,
+    super::super::LogEntry {
+      client: ClientId::new(7),
+      request: RequestNumber::with(1),
+      body: Body::Repairing(crate::storage::fnv1a_128(&[1u8])),
+    },
+  );
+  e.log.insert(
+    2,
+    super::super::LogEntry {
+      client: ClientId::RECONFIGURATION,
+      request: RequestNumber::with(2),
+      body: Body::Reconfigure(payload.clone()),
+    },
+  );
+
+  // The primary announces commit == 2 (op N committed cluster-wide). `on_commit` -> `advance_commit(2)`
+  // walks ops in order from commit_min: it reaches op 1 FIRST, finds its body absent, and must HOLD —
+  // peer-repair the hole and stop — so it NEVER reaches op 2 to commit+stage the swap.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::new(),
       crate::Epoch::new(0),
       0,
+    )),
+  );
+
+  // THE LOAD-BEARING ASSERTIONS. The commit is held at the hole, so the promote op never installed:
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(0),
+    "the commit is HELD at the body-Repairing hole (op 1) — it never reached the promote op (op 2)",
+  );
+  assert!(
+    e.has_repair_hole_for_test(1),
+    "op 1 is registered for peer fault-repair (the hole below N is solicited, not skipped)",
+  );
+  assert!(
+    !e.pending_swap_for_test(),
+    "no SwapEpoch is staged — a held commit never reached the Reconfigure op to stage the swap",
+  );
+  // ...and so this node has NOT acquired successor voter authority:
+  assert!(
+    !e.is_voter(),
+    "the regressed learner stays NON-voting — it cannot install the swap below the repair hole",
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "the epoch stays E — no E+1 stamp without the install (durable-epoch-before-participate)",
+  );
+  assert_eq!(
+    e.membership.replica_count(),
+    3,
+    "the membership is still the predecessor (3 voters); slot 3 is still >= replica_count (non-voting)",
+  );
+  assert!(
+    !e.membership.is_voter(ReplicaId::new(3)),
+    "this node's own slot is still a learner slot — not a successor voter",
+  );
+
+  // THE UNBLOCK: repair op 1's body (the canonical Prepare a peer serves). Now the commit can advance
+  // PAST op 1, reach op 2, commit the Reconfigure, stage the SwapEpoch root, and (landing it) install —
+  // so `is_voter()` flips to true ONLY here, proving the gate was the hole, not some unrelated block.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::with(2), // commit >= op: a committed-vouching fill for the hole
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::new(7),
+      RequestNumber::with(1),
+      Bytes::copy_from_slice(&[1u8]),
+    )),
+  );
+  // Drive storage to settle the repair append + the commit advance + the staged SwapEpoch root install.
+  for _ in 0..8 {
+    e.handle_storage(now, &mut wal, &mut sb);
+    while e.poll_message().is_some() {}
+  }
+  assert!(
+    !e.has_repair_hole_for_test(1),
+    "op 1's body was repaired — the hole cleared",
+  );
+  assert_eq!(
+    e.membership, successor,
+    "with the hole repaired, the commit reached op N, staged + installed the IDENTICAL successor",
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(1),
+    "the install stamped E+1 (the swap landed)",
+  );
+  assert!(
+    e.is_voter(),
+    "ONLY after repairing the hole and installing the swap does the promoted node become a voter",
+  );
+}
+
+#[test]
+fn a_promoted_learner_voters_committed_repairing_op_rides_the_dvc_and_is_not_truncated() {
+  // THE DURABLE-HEADER NO-TRUNCATION BACKSTOP (the SECOND-line defense behind the commit-first gate
+  // above). Suppose the learner DID install (it applied through the Reconfigure op `N` cleanly and is
+  // now an ordinary voter), and THEN a fault drops a committed op's body (the durable-header window). The
+  // op is kept header-only as `Body::Repairing` (its existence + durable identity survive), so it rides the
+  // promoted voter's `DoViewChange` as a header-only entry. The property the promoted voter relies on:
+  // `select_canonical_log` keeps that committed op in the band (`commit* >= it`, `op_head >= it`) and the
+  // body-aware nack scan NEVER truncates it — even when collected alongside a laggard nack quorum that
+  // does not hold it — because the committed-frontier DVC vouches it committed. So no committed op is
+  // lost and its number is never re-minted; it is REPAIRED, not cut.
+  //
+  // This pins the invariant in the POST-PROMOTION voting band (4 voters; slot 3 is the FORMER learner,
+  // now a voter — the membership the gate test above installs). The canonical-log selection is
+  // provenance-agnostic: once installed, a promoted learner is an ordinary voter, so this exercises the
+  // SAME `select_canonical_log` path the existing voter durable-header tests cover
+  // (`view_change::committed_repairing_op_survives_a_second_view_change_before_repair`,
+  // `view_change::c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_grace`, and
+  // the reconfigure-band `header_only_adoption_preserves_the_new_primarys_local_reconfigure_body`),
+  // asserted here for the promoted-learner band the finding cares about.
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+
+  // The committed donor is the PROMOTED EX-LEARNER (slot 3 of the 4-voter post-promotion set): head op 2,
+  // commit 2 — op 1 a real body, op 2 COMMITTED but carried HEADER-ONLY (`Body::Repairing`, the body it
+  // acked before the fault). This is the DVC a promoted learner emits after a recover-time body loss.
+  let promoted_voter_dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(3),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        op2_checksum,
+      ),
+    ],
+  );
+
+  // The selector is voter slot 0 (new primary of view 1) of the 4-voter post-promotion cluster.
+  let mut selector = Endpoint::new(
+    Config::try_new(1, MemberId::new(0)).expect("voter 0 of the 4-voter post-promotion set"),
+    genesis(4),
+    0,
+    NoopSm,
+  );
+  // For n=4, quorum_view_change == quorum_nack_prepare == 2. Collect the committed donor (slot 3) plus
+  // TWO laggards (head op 1) that would form a nack quorum on op 2 — the real truncation threat the
+  // committed frontier must defeat.
+  selector
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(3), promoted_voter_dvc);
+  selector
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(1), dvc(1, 0, 1, 1)); // laggard, head op 1, nacks op 2
+  selector
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(2), dvc(2, 0, 1, 1)); // laggard, head op 1, nacks op 2
+
+  let (log, op_head, commit_star, _) = selector.select_canonical_log();
+
+  // THE BACKSTOP ASSERTIONS: the committed op stays in the band and in the canonical log — never cut by
+  // the laggard nack quorum, because the promoted voter's DVC vouches it committed (commit* >= 2).
+  assert!(
+    commit_star >= 2 && op_head >= 2,
+    "the promoted voter's committed op 2 stays in the band (commit* {commit_star}, op_head {op_head}) — \
+     the laggard nack quorum cannot truncate a committed-frontier-vouched op",
+  );
+  assert!(
+    log.iter().any(|e| e.op() == OpNumber::with(2)),
+    "the committed header-only op 2 is in the canonical log (TAKEN for repair, NOT truncated/re-minted)",
+  );
+  // It rides as the durable HEADER (the body is peer-repaired after adoption), not fabricated — existence
+  // preserved, exactly the durable-header carry the promoted learner depends on.
+  let carried = log
+    .iter()
+    .find(|e| e.op() == OpNumber::with(2))
+    .expect("op 2 is carried in the canonical log");
+  assert!(
+    carried.is_repairing(),
+    "op 2 rides header-only (Body::Repairing) — its existence is preserved and the body is repaired, not lost",
+  );
+}
+
+#[test]
+fn promote_learner_crash_mid_challenge_no_proof_arrives_keeps_proof_pending() {
+  // A crash BETWEEN challenge and reply: the learner never answers, so the proof stays `None`,
+  // `ProofPending` persists, and no promotion ever mints (fail-closed). Re-proposing just re-challenges
+  // (a fresh nonce); it never silently promotes.
+  let mut e = single_change_primary_with_learner();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let learner = MemberId::new(3);
+  mint_one_client_op(&mut e, &mut wal, &mut sb);
+
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "the first propose solicits a proof",
+  );
+  let _ = take_proof_challenge(&mut e, 3);
+
+  // No LearnerProof arrives (the learner is mid-crash). Re-propose: still ProofPending, still no mint.
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "with no reply the proof stays None — ProofPending persists",
+  );
+  assert_eq!(e.reconfigure_inflight, None, "no op was minted");
+}
+
+#[test]
+fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
+  // The STALE-PROOF GUARDS on the primary's `on_learner_proof`: a `LearnerProof` with a wrong NONCE, a
+  // wrong TARGET slot, or a foreign `(epoch, config_id)` is DROPPED — `proof` stays `None`, so the retry
+  // still returns `ProofPending` and never mints. Only the exactly-matching fresh proof validates.
+  let mut e = single_change_primary_with_learner();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let learner = MemberId::new(3);
+  mint_one_client_op(&mut e, &mut wal, &mut sb);
+
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "the first propose solicits a proof",
+  );
+  let challenge = take_proof_challenge(&mut e, 3);
+
+  // (a) WRONG NONCE: a reply for a different/replayed challenge (covering the head) is dropped.
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    Message::LearnerProof(crate::LearnerProof::new(
+      ReplicaId::new(3),
+      challenge.nonce().wrapping_add(1), // a non-matching nonce
+      OpNumber::with(1),                 // would cover the head if it validated
+      challenge.epoch(),
+      challenge.config_id(),
     )),
   );
   assert_eq!(
@@ -2104,29 +2603,76 @@ fn promote_learner_rejects_a_tail_gap_learner_whose_durable_op_lags_its_durable_
       &mut wal,
       SingleVoterDelta::PromoteLearner(learner)
     ),
-    Err(ProposeMembershipError::TargetNotCaughtUp),
-    "a tail-gap learner (durable commit covers the head but durable_op lags) is NOT caught up — \
-     min(durable_commit_min, durable_op) = 0 < head 1",
+    Err(ProposeMembershipError::ProofPending),
+    "a wrong-nonce proof is dropped — proof stays None",
+  );
+  // The previous propose re-challenged (a fresh nonce); take it and continue against the live nonce.
+  let challenge = take_proof_challenge(&mut e, 3);
+
+  // (b) WRONG TARGET SLOT: a proof self-identifying a DIFFERENT member's slot is dropped. Slot 1 is a
+  // voter (a current member, so `sender_matches` admits the binding) but is NOT the challenge target.
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::LearnerProof(crate::LearnerProof::new(
+      ReplicaId::new(1), // a member, but not the target (slot 3)
+      challenge.nonce(),
+      OpNumber::with(1),
+      challenge.epoch(),
+      challenge.config_id(),
+    )),
   );
   assert_eq!(
-    e.reconfigure_inflight, None,
-    "no op was minted for a tail-gap learner"
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "a wrong-target proof is dropped — proof stays None",
   );
+  let challenge = take_proof_challenge(&mut e, 3);
 
-  // Positive control: once durable_op ALSO covers the head, the learner durably HOLDS the full prefix →
-  // promotable (the monotone update raises the recorded frontier to 1).
+  // (c) FOREIGN CONFIG: a proof carrying a different `config_id` is dropped (the freshness backstop). A
+  // foreign-config proof is dropped at ingress (`epoch_authority_admits`) before it can fill the proof.
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
     Peer::Replica(ReplicaId::new(3)),
-    Message::LearnerStatus(crate::LearnerStatus::new(
+    Message::LearnerProof(crate::LearnerProof::new(
       ReplicaId::new(3),
+      challenge.nonce(),
       OpNumber::with(1),
-      OpNumber::with(1), // durable_op now COVERS the head
-      crate::Epoch::new(0),
-      0,
+      challenge.epoch(),
+      0xDEAD_BEEF, // a foreign config_id (not in this primary's lineage)
     )),
+  );
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "a foreign-config proof is dropped — proof stays None",
+  );
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "no stale/wrong proof ever minted the op"
+  );
+
+  // Positive control: the exactly-matching fresh proof (live nonce, right slot, live config, frontier
+  // covering the head) validates and the retry mints.
+  let challenge = take_proof_challenge(&mut e, 3);
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    answer_proof(&challenge, 3, 1),
   );
   assert!(
     e.propose_membership(
@@ -2135,7 +2681,199 @@ fn promote_learner_rejects_a_tail_gap_learner_whose_durable_op_lags_its_durable_
       SingleVoterDelta::PromoteLearner(learner)
     )
     .is_ok(),
-    "once the learner durably holds the full prefix (durable_op == head), the promotion mints the op",
+    "the exactly-matching fresh proof mints the op",
+  );
+}
+
+#[test]
+fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof() {
+  // A proof for an OLDER `at_op` after the head advanced must NOT mint: the proof proved an old head, so
+  // it is stale for the new head. The gate re-validates `at_op >= self.op` at mint and falls through to
+  // re-challenge against the new head — a fresh proof covering the NEW head then mints.
+  let mut e = single_change_primary_with_learner();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let learner = MemberId::new(3);
+  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  assert_eq!(e.op(), OpNumber::with(1), "head at op 1");
+
+  // Challenge at head 1; the learner answers covering head 1 (frontier 1).
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "challenge at head 1",
+  );
+  let challenge = take_proof_challenge(&mut e, 3);
+  assert_eq!(
+    challenge.at_op(),
+    OpNumber::with(1),
+    "the challenge pinned head 1"
+  );
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    answer_proof(&challenge, 3, 1),
+  );
+
+  // The head ADVANCES to op 2 before the promote retry — the validated proof (for head 1) is now stale.
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(2),
+      Bytes::from(std::vec![2u8]),
+    )),
+  );
+  while e.poll_message().is_some() {}
+  assert_eq!(e.op(), OpNumber::with(2), "the head advanced to op 2");
+
+  // The retry does NOT mint off the head-1 proof: it re-challenges against head 2.
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "a proof for an older head does not mint — the gate re-challenges against the advanced head",
+  );
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "no op minted off the stale (head-1) proof"
+  );
+  let challenge = take_proof_challenge(&mut e, 3);
+  assert_eq!(
+    challenge.at_op(),
+    OpNumber::with(2),
+    "the re-challenge pins the NEW head (op 2)"
+  );
+
+  // A fresh proof covering the NEW head (frontier 2) mints.
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    answer_proof(&challenge, 3, 2),
+  );
+  assert!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    )
+    .is_ok(),
+    "a fresh proof covering the advanced head mints the op",
+  );
+}
+
+#[test]
+fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
+  // VIEW-TRANSITION MID-CHALLENGE: `learner_proof` is transient promote state cleared by
+  // `reset_for_view_transition`, so a pre-transition reply never validates a post-transition mint. After
+  // a forced reset the challenge is gone, and re-proposing starts a fresh challenge (a fresh nonce), so a
+  // reply minted against the OLD challenge cannot satisfy the new one.
+  let mut e = single_change_primary_with_learner();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let learner = MemberId::new(3);
+  mint_one_client_op(&mut e, &mut wal, &mut sb);
+
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "the first propose solicits a proof",
+  );
+  let stale_challenge = take_proof_challenge(&mut e, 3);
+  assert!(e.learner_proof.is_some(), "a challenge is outstanding");
+
+  // A view transition clears the outstanding challenge.
+  e.reset_for_view_transition();
+  assert!(
+    e.learner_proof.is_none(),
+    "reset_for_view_transition clears the outstanding learner-promote challenge",
+  );
+
+  // A reply carrying the PRE-transition challenge's nonce no longer validates anything (the challenge is
+  // gone). Re-establish the proposing state and re-propose to issue a FRESH challenge.
+  e.force_state_for_test(0, 1, 1, 0, &[]);
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    answer_proof(&stale_challenge, 3, 1), // the OLD nonce
+  );
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::ProofPending),
+    "a pre-transition reply never validates the fresh challenge — ProofPending, no mint",
+  );
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "no op minted off a pre-transition reply"
+  );
+}
+
+#[test]
+fn an_epoch_swap_clears_an_outstanding_promote_challenge() {
+  // EPOCH-SWAP MID-CHALLENGE: a learner-promote challenge minted under the OLD configuration is CLEARED
+  // when a `SwapEpoch` root installs the successor (`install_membership`), so a pre-swap reply never
+  // validates a post-swap mint. Arm a challenge directly, then drive an AddLearner reconfiguration on a
+  // sole-voter cluster through commit + the durable SwapEpoch install, and assert the swap cleared it.
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  let mut e =
+    Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(1), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+
+  // Arm an outstanding promote challenge under the CURRENT configuration (any target/nonce — the swap
+  // clears it regardless; the `(epoch, config_id)` reply binding is the structural backstop).
+  e.learner_proof = Some(super::super::LearnerProofState {
+    target: MemberId::new(9),
+    at_op: OpNumber::new(),
+    nonce: 0xABCD,
+    proof: None,
+  });
+  assert!(
+    e.learner_proof.is_some(),
+    "a challenge is outstanding pre-swap"
+  );
+
+  // Drive an AddLearner reconfiguration to commit + install (the sole voter is the whole quorum, so its
+  // own durable append commits the op; landing the SwapEpoch root installs the successor epoch).
+  e.propose_membership(
+    Instant::ZERO,
+    &mut wal,
+    SingleVoterDelta::AddLearner(MemberId::new(1)),
+  )
+  .expect("AddLearner on a single-voter cluster is admitted");
+  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // own append durable → own vote → commit
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // land the SwapEpoch root → install_membership
+  assert_eq!(
+    e.membership.learner_count(),
+    1,
+    "the successor epoch is installed (the AddLearner swap landed)",
+  );
+  assert!(
+    e.learner_proof.is_none(),
+    "the epoch swap (install_membership) cleared the outstanding promote challenge",
   );
 }
 
@@ -2289,33 +3027,33 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
   let head = e.op();
   assert!(head.get() >= 1, "the head advanced");
 
-  // (2) PromoteLearner is REFUSED until the learner reports a durable frontier covering the head.
+  // (2) PromoteLearner solicits a fresh proof and returns ProofPending until the learner answers with a
+  // frontier covering the head. The challenge carries the endpoint's CURRENT (post-AddLearner-swap)
+  // epoch/config_id, so the reply must echo them to validate.
   assert_eq!(
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::PromoteLearner(newcomer)
     ),
-    Err(ProposeMembershipError::TargetNotCaughtUp),
-    "the learner has not yet reported durable catch-up",
+    Err(ProposeMembershipError::ProofPending),
+    "the learner has not yet proven a fresh durable catch-up",
+  );
+  let challenge = take_proof_challenge(&mut e, learner_slot.get());
+  assert_eq!(
+    challenge.epoch(),
+    e.membership.epoch(),
+    "the challenge carries the post-AddLearner-swap epoch",
   );
 
-  // (3) The learner reports `peer_progress` covering the head → PromoteLearner SUCCEEDS. By
-  // commit-first, the learner that durably commits the promote op then holds the entire prefix. The
-  // report carries the endpoint's CURRENT (post-AddLearner-swap) epoch/config_id so the strict ingress
-  // gate admits it (the cluster has advanced to E+1, unlike the genesis `learner_status` fixture).
+  // (3) The learner answers with a fresh frontier covering the head → PromoteLearner SUCCEEDS. By
+  // commit-first, the learner that durably commits the promote op then holds the entire prefix.
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
     Peer::Replica(learner_slot),
-    Message::LearnerStatus(crate::LearnerStatus::new(
-      learner_slot,
-      head,
-      head,
-      e.membership.epoch(),
-      e.membership.config_id(),
-    )),
+    answer_proof(&challenge, learner_slot.get(), head.get()),
   );
   let promote_op = e
     .propose_membership(
