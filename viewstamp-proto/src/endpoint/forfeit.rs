@@ -1,6 +1,6 @@
 use super::*;
 
-impl<S: StateMachine> Endpoint<S> {
+impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// The forfeit gate. A `Normal` primary that is genuinely STUCK steps down (via a view
   /// change) so a caught-up replica leads, rather than wedge the cluster (clients whose requests sit
   /// above its stalled commit never finish). Two independent stuck-conditions, both grace-timed:

@@ -47,6 +47,22 @@ pub enum MembershipError {
   /// Two slots resolved to the same [`MemberId`]; member ids must be unique.
   #[error("duplicate member id")]
   DuplicateMember,
+  /// A membership delta tried to add a [`MemberId`] already present in the configuration (as a voter
+  /// or a learner).
+  #[error("member already present")]
+  AlreadyAMember,
+  /// A membership delta referenced a [`MemberId`] absent from the configuration (a remove or a
+  /// learner-promotion of an id that is not a member).
+  #[error("member not present")]
+  UnknownMember,
+  /// A `PromoteLearner` delta named a [`MemberId`] that is a voter, not a learner; only a learner can
+  /// be promoted into the voting set.
+  #[error("member is not a learner")]
+  NotALearner,
+  /// A `RemoveVoter` delta would drop `replica_count` to zero; a configuration needs at least one
+  /// voter.
+  #[error("removing the voter would leave no voters")]
+  WouldRemoveLastVoter,
 }
 
 /// An epoch-versioned cluster configuration. Immutable once built; a change
@@ -300,6 +316,171 @@ impl Membership {
   pub const fn is_learner(&self, id: ReplicaId) -> bool {
     id.get() >= self.replica_count as u16 && id.get() < self.node_count()
   }
+
+  /// Whether `who` already occupies a slot (voter or learner) in this configuration.
+  fn contains(&self, who: MemberId) -> bool {
+    self.members.contains(&who)
+  }
+
+  /// Applies a single-voter membership delta, returning the successor configuration (epoch bumped,
+  /// `config_id` chained from `self` via [`Self::reconfigure`]) or a [`MembershipError`] if the delta
+  /// is invalid for this configuration.
+  ///
+  /// The successor's member-slot layout preserves the partition voters occupy `[0, replica_count')`
+  /// and learners occupy `[replica_count', node_count')`: an added voter is appended to the end of the
+  /// voter range (just before the learners), an added learner to the end of the learner range, a
+  /// removed member's slot is closed up, and a promoted learner is moved from the learner range to the
+  /// end of the voter range. Every delta changes the voter count by at most one — Add/Remove/Promote
+  /// voter by exactly ±1, Add/RemoveLearner by 0 — which holds by construction here.
+  pub fn apply_delta(&self, d: &SingleVoterDelta) -> Result<Self, MembershipError> {
+    let voters = self.replica_count as usize;
+    // The members split cleanly into the voter prefix and the learner suffix.
+    let (current_voters, current_learners) = self.members.split_at(voters);
+
+    let (replica_count, learner_count, members) = match d {
+      SingleVoterDelta::AddVoter(who) => {
+        if self.contains(*who) {
+          return Err(MembershipError::AlreadyAMember);
+        }
+        // Append the new voter at the end of the voter range, before the learners.
+        let mut members = Vec::with_capacity(self.members.len() + 1);
+        members.extend_from_slice(current_voters);
+        members.push(*who);
+        members.extend_from_slice(current_learners);
+        (self.replica_count + 1, self.learner_count, members)
+      }
+      SingleVoterDelta::RemoveVoter(who) => {
+        let slot = self.slot_of(*who).ok_or(MembershipError::UnknownMember)?;
+        if !self.is_voter(slot) {
+          // Present, but a learner — removing it does not change the voter count.
+          return Err(MembershipError::NotALearner);
+        }
+        if self.replica_count == 1 {
+          return Err(MembershipError::WouldRemoveLastVoter);
+        }
+        let members = self
+          .members
+          .iter()
+          .copied()
+          .filter(|&m| m != *who)
+          .collect();
+        (self.replica_count - 1, self.learner_count, members)
+      }
+      SingleVoterDelta::PromoteLearner(who) => {
+        let slot = self.slot_of(*who).ok_or(MembershipError::UnknownMember)?;
+        if !self.is_learner(slot) {
+          return Err(MembershipError::NotALearner);
+        }
+        // Move the learner to the end of the voter range: the voter prefix grows by one, the learner
+        // suffix loses the promoted id.
+        let mut members = Vec::with_capacity(self.members.len());
+        members.extend_from_slice(current_voters);
+        members.push(*who);
+        members.extend(current_learners.iter().copied().filter(|&m| m != *who));
+        (self.replica_count + 1, self.learner_count - 1, members)
+      }
+      SingleVoterDelta::AddLearner(who) => {
+        if self.contains(*who) {
+          return Err(MembershipError::AlreadyAMember);
+        }
+        // Append the new learner at the end of the learner range; the voter range is untouched.
+        let mut members = Vec::with_capacity(self.members.len() + 1);
+        members.extend_from_slice(&self.members);
+        members.push(*who);
+        (self.replica_count, self.learner_count + 1, members)
+      }
+      SingleVoterDelta::RemoveLearner(who) => {
+        let slot = self.slot_of(*who).ok_or(MembershipError::UnknownMember)?;
+        if !self.is_learner(slot) {
+          // Present, but a voter — use RemoveVoter; this delta must not change the voter count.
+          return Err(MembershipError::NotALearner);
+        }
+        let members = self
+          .members
+          .iter()
+          .copied()
+          .filter(|&m| m != *who)
+          .collect();
+        (self.replica_count, self.learner_count - 1, members)
+      }
+    };
+
+    self.reconfigure(replica_count, learner_count, members)
+  }
+}
+
+/// A single-step change to the voting set, applied to a [`Membership`] via [`Membership::apply_delta`]
+/// to produce the successor configuration. Each variant moves the voter count by at most one: an
+/// add/remove/promote of a voter by exactly ±1, an add/remove of a learner by 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SingleVoterDelta {
+  /// Add a brand-new [`MemberId`] as a voter.
+  AddVoter(MemberId),
+  /// Remove a voting [`MemberId`] from the configuration.
+  RemoveVoter(MemberId),
+  /// Promote an existing learner [`MemberId`] into the voting set.
+  PromoteLearner(MemberId),
+  /// Add a brand-new [`MemberId`] as a non-voting learner.
+  AddLearner(MemberId),
+  /// Remove a learner [`MemberId`] from the configuration.
+  RemoveLearner(MemberId),
+}
+
+impl SingleVoterDelta {
+  /// The stable string name of this delta (snake_case, serialization-stable).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::AddVoter(_) => "add_voter",
+      Self::RemoveVoter(_) => "remove_voter",
+      Self::PromoteLearner(_) => "promote_learner",
+      Self::AddLearner(_) => "add_learner",
+      Self::RemoveLearner(_) => "remove_learner",
+    }
+  }
+
+  /// The [`MemberId`] this delta acts on.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn member(&self) -> MemberId {
+    match self {
+      Self::AddVoter(m)
+      | Self::RemoveVoter(m)
+      | Self::PromoteLearner(m)
+      | Self::AddLearner(m)
+      | Self::RemoveLearner(m) => *m,
+    }
+  }
+
+  /// True iff this is [`Self::AddVoter`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_add_voter(&self) -> bool {
+    matches!(self, Self::AddVoter(_))
+  }
+
+  /// True iff this is [`Self::RemoveVoter`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_remove_voter(&self) -> bool {
+    matches!(self, Self::RemoveVoter(_))
+  }
+
+  /// True iff this is [`Self::PromoteLearner`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_promote_learner(&self) -> bool {
+    matches!(self, Self::PromoteLearner(_))
+  }
+
+  /// True iff this is [`Self::AddLearner`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_add_learner(&self) -> bool {
+    matches!(self, Self::AddLearner(_))
+  }
+
+  /// True iff this is [`Self::RemoveLearner`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_remove_learner(&self) -> bool {
+    matches!(self, Self::RemoveLearner(_))
+  }
 }
 
 #[cfg(test)]
@@ -504,5 +685,235 @@ mod tests {
     );
     // The epoch is high-order: the successor's epoch strictly exceeds its predecessor's.
     assert!(m1.epoch() > m0.epoch());
+  }
+
+  /// A 3-voter, 1-learner base membership: voter slots `0..3` hold members 1..3, the learner slot 3
+  /// holds member 10.
+  fn base_3v_1l() -> Membership {
+    Membership::genesis(
+      3,
+      1,
+      std::vec![
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+        MemberId::new(10),
+      ],
+    )
+    .unwrap()
+  }
+
+  #[test]
+  fn single_voter_delta_predicates_and_accessors() {
+    let add = SingleVoterDelta::AddVoter(MemberId::new(7));
+    assert!(add.is_add_voter());
+    assert!(!add.is_remove_voter());
+    assert_eq!(add.member(), MemberId::new(7));
+    assert_eq!(add.as_str(), "add_voter");
+
+    let rm = SingleVoterDelta::RemoveVoter(MemberId::new(2));
+    assert!(rm.is_remove_voter());
+    assert_eq!(rm.member(), MemberId::new(2));
+    assert_eq!(rm.as_str(), "remove_voter");
+
+    let promote = SingleVoterDelta::PromoteLearner(MemberId::new(10));
+    assert!(promote.is_promote_learner());
+    assert_eq!(promote.as_str(), "promote_learner");
+
+    let add_l = SingleVoterDelta::AddLearner(MemberId::new(11));
+    assert!(add_l.is_add_learner());
+    assert_eq!(add_l.as_str(), "add_learner");
+
+    let rm_l = SingleVoterDelta::RemoveLearner(MemberId::new(10));
+    assert!(rm_l.is_remove_learner());
+    assert_eq!(rm_l.as_str(), "remove_learner");
+  }
+
+  #[test]
+  fn add_voter_grows_replica_count_bumps_epoch_chains_config_id() {
+    let m0 = base_3v_1l();
+    let m1 = m0
+      .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(7)))
+      .unwrap();
+
+    // The voter count grows by one; the learner count is untouched.
+    assert_eq!(m1.replica_count(), m0.replica_count() + 1);
+    assert_eq!(m1.learner_count(), m0.learner_count());
+    // The epoch bumps by exactly one.
+    assert_eq!(m1.epoch(), Epoch::new(m0.epoch().get() + 1));
+    // The lineage id chains: it differs from the predecessor.
+    assert_ne!(m1.config_id(), m0.config_id());
+
+    // The new voter occupies a voter slot, ahead of the learners; the prior learner is still a learner.
+    assert!(m1.is_voter(m1.slot_of(MemberId::new(7)).unwrap()));
+    assert!(m1.is_learner(m1.slot_of(MemberId::new(10)).unwrap()));
+
+    // `apply_delta` chains exactly as a `reconfigure` to the same successor members would: a new voter
+    // is appended after the existing voters, before the learners.
+    let expected = m0
+      .reconfigure(
+        4,
+        1,
+        std::vec![
+          MemberId::new(1),
+          MemberId::new(2),
+          MemberId::new(3),
+          MemberId::new(7),
+          MemberId::new(10),
+        ],
+      )
+      .unwrap();
+    assert_eq!(m1.config_id(), expected.config_id());
+    assert_eq!(m1.members_slice(), expected.members_slice());
+  }
+
+  #[test]
+  fn remove_voter_shrinks_replica_count() {
+    let m0 = base_3v_1l();
+    let m1 = m0
+      .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(2)))
+      .unwrap();
+    assert_eq!(m1.replica_count(), m0.replica_count() - 1);
+    assert_eq!(m1.learner_count(), m0.learner_count());
+    assert_eq!(m1.epoch(), Epoch::new(m0.epoch().get() + 1));
+    assert_ne!(m1.config_id(), m0.config_id());
+    // The removed member is gone; the surviving voters keep their relative order and stay voters.
+    assert_eq!(m1.slot_of(MemberId::new(2)), None);
+    assert!(m1.is_voter(m1.slot_of(MemberId::new(1)).unwrap()));
+    assert!(m1.is_voter(m1.slot_of(MemberId::new(3)).unwrap()));
+    // The learner remains a learner in the shrunk configuration.
+    assert!(m1.is_learner(m1.slot_of(MemberId::new(10)).unwrap()));
+  }
+
+  #[test]
+  fn promote_learner_moves_id_from_learner_range_into_voter_range() {
+    let m0 = base_3v_1l();
+    assert!(m0.is_learner(m0.slot_of(MemberId::new(10)).unwrap()));
+
+    let m1 = m0
+      .apply_delta(&SingleVoterDelta::PromoteLearner(MemberId::new(10)))
+      .unwrap();
+    // replica_count + 1, learner_count − 1.
+    assert_eq!(m1.replica_count(), m0.replica_count() + 1);
+    assert_eq!(m1.learner_count(), m0.learner_count() - 1);
+    assert_eq!(m1.epoch(), Epoch::new(m0.epoch().get() + 1));
+    assert_ne!(m1.config_id(), m0.config_id());
+    // The promoted id is now a voter, occupying a slot in the voter range.
+    let slot = m1.slot_of(MemberId::new(10)).unwrap();
+    assert!(m1.is_voter(slot));
+    assert!(!m1.is_learner(slot));
+  }
+
+  #[test]
+  fn add_learner_grows_learner_count_keeps_replica_count() {
+    let m0 = base_3v_1l();
+    let m1 = m0
+      .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(11)))
+      .unwrap();
+    assert_eq!(m1.replica_count(), m0.replica_count());
+    assert_eq!(m1.learner_count(), m0.learner_count() + 1);
+    assert_eq!(m1.epoch(), Epoch::new(m0.epoch().get() + 1));
+    assert_ne!(m1.config_id(), m0.config_id());
+    // The new learner sits in the learner range, after the existing learners.
+    assert!(m1.is_learner(m1.slot_of(MemberId::new(11)).unwrap()));
+    // Existing voters/learners keep their kind.
+    assert!(m1.is_voter(m1.slot_of(MemberId::new(1)).unwrap()));
+    assert!(m1.is_learner(m1.slot_of(MemberId::new(10)).unwrap()));
+  }
+
+  #[test]
+  fn remove_learner_shrinks_learner_count() {
+    let m0 = base_3v_1l();
+    let m1 = m0
+      .apply_delta(&SingleVoterDelta::RemoveLearner(MemberId::new(10)))
+      .unwrap();
+    assert_eq!(m1.replica_count(), m0.replica_count());
+    assert_eq!(m1.learner_count(), m0.learner_count() - 1);
+    assert_eq!(m1.epoch(), Epoch::new(m0.epoch().get() + 1));
+    assert_ne!(m1.config_id(), m0.config_id());
+    assert_eq!(m1.slot_of(MemberId::new(10)), None);
+  }
+
+  #[test]
+  fn apply_delta_rejects_removing_the_last_voter() {
+    // A single-voter configuration: removing its sole voter would leave a zero-voter cluster.
+    let m = Membership::genesis(1, 0, std::vec![MemberId::new(1)]).unwrap();
+    assert!(matches!(
+      m.apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(1))),
+      Err(MembershipError::WouldRemoveLastVoter)
+    ));
+  }
+
+  #[test]
+  fn apply_delta_rejects_unknown_member_for_removals_and_promotion() {
+    let m = base_3v_1l();
+    assert!(matches!(
+      m.apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(99))),
+      Err(MembershipError::UnknownMember)
+    ));
+    assert!(matches!(
+      m.apply_delta(&SingleVoterDelta::RemoveLearner(MemberId::new(99))),
+      Err(MembershipError::UnknownMember)
+    ));
+    assert!(matches!(
+      m.apply_delta(&SingleVoterDelta::PromoteLearner(MemberId::new(99))),
+      Err(MembershipError::UnknownMember)
+    ));
+  }
+
+  #[test]
+  fn apply_delta_rejects_promoting_an_existing_voter() {
+    let m = base_3v_1l();
+    // Member 1 is already a voter; promoting it is not a learner→voter move.
+    assert!(matches!(
+      m.apply_delta(&SingleVoterDelta::PromoteLearner(MemberId::new(1))),
+      Err(MembershipError::NotALearner)
+    ));
+  }
+
+  #[test]
+  fn apply_delta_rejects_adding_a_duplicate() {
+    let m = base_3v_1l();
+    // Member 2 is already a voter; member 10 is already a learner.
+    assert!(matches!(
+      m.apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(2))),
+      Err(MembershipError::AlreadyAMember)
+    ));
+    assert!(matches!(
+      m.apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(10))),
+      Err(MembershipError::AlreadyAMember)
+    ));
+    assert!(matches!(
+      m.apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(10))),
+      Err(MembershipError::AlreadyAMember)
+    ));
+    assert!(matches!(
+      m.apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(1))),
+      Err(MembershipError::AlreadyAMember)
+    ));
+  }
+
+  #[test]
+  fn apply_delta_changes_voter_count_by_at_most_one() {
+    // For every successful delta variant, the voter count moves by at most one. AddLearner /
+    // RemoveLearner leave it unchanged; Add/Remove/Promote voter move it by exactly one.
+    let m = base_3v_1l();
+    let deltas = std::vec![
+      SingleVoterDelta::AddVoter(MemberId::new(7)),
+      SingleVoterDelta::RemoveVoter(MemberId::new(2)),
+      SingleVoterDelta::PromoteLearner(MemberId::new(10)),
+      SingleVoterDelta::AddLearner(MemberId::new(11)),
+      SingleVoterDelta::RemoveLearner(MemberId::new(10)),
+    ];
+    for d in &deltas {
+      let next = m.apply_delta(d).unwrap();
+      let before = i32::from(m.replica_count());
+      let after = i32::from(next.replica_count());
+      assert!(
+        (after - before).abs() <= 1,
+        "delta {} moved the voter count by more than one ({before} -> {after})",
+        d.as_str(),
+      );
+    }
   }
 }

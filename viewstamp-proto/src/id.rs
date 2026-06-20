@@ -97,6 +97,15 @@ impl core::fmt::Display for Epoch {
 pub struct ClientId(u128);
 
 impl ClientId {
+  /// The reserved pseudo-client a primary mints CONSENSUS-internal operations under — today the
+  /// `Body::Reconfigure` membership-change op. A reconfiguration op needs a `(client, request)`
+  /// identity for content-addressing/dedup exactly like a client op, but it originates from the
+  /// primary (the operator's intent), not from any real client session. This id (`u128::MAX`) is the
+  /// reserved high sentinel: it is never assigned to a real client, so a reconfiguration op cannot
+  /// collide with or evict a genuine client session, and a reconfiguration op's identity is
+  /// distinguished from every client op's at the content-address level.
+  pub const RECONFIGURATION: Self = Self(u128::MAX);
+
   /// Creates a client id.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(id: u128) -> Self {

@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::{ClientId, OpNumber, RequestNumber, Status, View};
+use crate::{ClientId, Epoch, OpNumber, RequestNumber, Status, View};
 
 /// A committed operation that was applied to the state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +109,71 @@ impl RepairStarted {
   }
 }
 
+/// A committed reconfiguration whose epoch swap became DURABLE (the payload of
+/// [`Event::MembershipChanged`]). Emitted by `install_membership` when the `SwapEpoch` durable root
+/// lands — never eagerly at commit — so an observer learns of the new configuration only once the
+/// node can durably prove it (the durable-epoch-before-participate fence). Minimal here (op + new
+/// epoch + new config_id) plus THIS node's role under the new configuration (`self_is_voter` /
+/// `self_is_learner`, both false for a removed node) — learned purely from the committed membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipChanged {
+  op: OpNumber,
+  epoch: Epoch,
+  config_id: u128,
+  self_is_voter: bool,
+  self_is_learner: bool,
+}
+
+impl MembershipChanged {
+  /// Creates a membership-changed record.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    op: OpNumber,
+    epoch: Epoch,
+    config_id: u128,
+    self_is_voter: bool,
+    self_is_learner: bool,
+  ) -> Self {
+    Self {
+      op,
+      epoch,
+      config_id,
+      self_is_voter,
+      self_is_learner,
+    }
+  }
+
+  /// The committed `Body::Reconfigure` op whose durable swap installed the new configuration.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op(&self) -> OpNumber {
+    self.op
+  }
+
+  /// The new configuration epoch (the predecessor's epoch + 1).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The new configuration's lineage hash (`config_id`), chained from the predecessor.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
+  }
+
+  /// Whether THIS node is a voter in the new configuration (false if it was removed).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn self_is_voter(&self) -> bool {
+    self.self_is_voter
+  }
+
+  /// Whether THIS node is a (non-voting) learner in the new configuration (false if it was removed).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn self_is_learner(&self) -> bool {
+    self.self_is_learner
+  }
+}
+
 /// An application-facing event emitted by an `Endpoint`, drained via `poll_event`.
 ///
 /// Observability only: every variant copies a few scalars at its emission chokepoint (no formatting,
@@ -136,4 +201,7 @@ pub enum Event {
   RepairStarted(RepairStarted),
   /// A checkpoint's root write landed: the checkpoint at the payload op is durable.
   CheckpointDurable(OpNumber),
+  /// A committed reconfiguration's epoch swap became durable: the node now participates under the new
+  /// configuration (epoch, voter set, quorums). Emitted at the durable `SwapEpoch` root, not at commit.
+  MembershipChanged(MembershipChanged),
 }

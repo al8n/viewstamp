@@ -1,6 +1,6 @@
 use super::*;
 
-impl<S: StateMachine> Endpoint<S> {
+impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_wal_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -209,11 +209,12 @@ impl<S: StateMachine> Endpoint<S> {
         return;
       }
     };
-    // Durable-view write? (matched first; its OpId never aliases a checkpoint write's.)
-    if let Some((pending_id, action)) = self.pending_sb
-      && pending_id == id
-    {
-      self.pending_sb = None;
+    // Durable-view write? (matched first; its OpId never aliases a checkpoint write's.) `take()` —
+    // not a by-ref match — because `PendingSbAction::SwapEpoch` carries the (non-`Copy`) successor
+    // membership the install moves out; for the unit variants it is equivalent to the prior
+    // read-then-clear. Guard the id-match first so a superseded (older) completion is left intact.
+    if self.pending_sb.as_ref().is_some_and(|(pid, _)| *pid == id) {
+      let (_, action) = self.pending_sb.take().expect("just matched Some");
       match action {
         PendingSbAction::SendDoViewChange => self.send_do_view_change(now),
         PendingSbAction::StartViewAsPrimary => self.start_view_participate(now, sb),
@@ -221,7 +222,20 @@ impl<S: StateMachine> Endpoint<S> {
         // A frontier seal has no follow-up: the durable root now carries `commit_max`, which is all
         // the operator awaited before deriving an offline-restart successor.
         PendingSbAction::Seal => {}
+        // The commit-first epoch swap's durable root landed → INSTALL the successor membership (the
+        // node now participates under the new epoch/voter-set, justified by this durable root) and
+        // clear the staging latch. `pending_swap` and this action carry the IDENTICAL successor; clear
+        // the latch FIRST so `install_membership` (and any re-entrant `maybe_swap_epoch`) sees no
+        // residual staging.
+        PendingSbAction::SwapEpoch(successor) => {
+          self.pending_swap = None;
+          self.install_membership(successor);
+        }
       }
+      // A swap that committed while this write was in flight WAITED its turn (`maybe_swap_epoch`
+      // deferred it); the superblock is free again now, so give it its slot. No-op when nothing is
+      // staged (the common case) or when THIS completion was itself the SwapEpoch (just cleared).
+      self.maybe_swap_epoch(sb);
       return;
     }
     // Checkpoint write? Distinguish the two steps by their own minted OpIds.
@@ -355,6 +369,11 @@ impl<S: StateMachine> Endpoint<S> {
         _ => {} // a stale/superseded completion (e.g. from before a view change) — ignore
       }
     }
+    // A checkpoint root completing (the `AwaitRoot` arm above cleared `pending_checkpoint`) frees the
+    // superblock — so a reconfiguration that committed while the checkpoint was in flight, and whose
+    // SwapEpoch root `maybe_swap_epoch` deferred behind it, now gets its slot. No-op when no swap is
+    // staged (the common case) or a write is still in flight.
+    self.maybe_swap_epoch(sb);
   }
 
   /// If `commit_min` has reached the next checkpoint boundary and no superblock write is pending,
@@ -637,7 +656,7 @@ impl<S: StateMachine> Endpoint<S> {
   /// The reconstructed `Header` carries the current root `view`; only its [`Header::body_checksum`] is
   /// load-bearing for the recovery cross-check (it is `fnv1a_128(body)`, view-independent), so the view
   /// field is informational. Empty when no held op lies in the band.
-  fn committed_band_headers(&self, checkpoint_floor: OpNumber) -> std::vec::Vec<Header> {
+  pub(crate) fn committed_band_headers(&self, checkpoint_floor: OpNumber) -> std::vec::Vec<Header> {
     let lo = checkpoint_floor.get().saturating_add(1);
     // Reach the known-committed frontier but never past the head: `self.log` holds nothing above
     // `self.op`, so capping here drops no held op and keeps a bogus huge learned `commit_max` from

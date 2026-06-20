@@ -93,10 +93,10 @@ fn classify_committed_slot(
 /// recover (the same reason [`Result`] does not box its `Ok`).
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum Recovered<S> {
+pub enum Recovered<S, R: Reconfig = RestartOnly> {
   /// This node occupies a slot in the recovered membership — a recovering [`Endpoint`] resuming the
   /// durable view in [`Status::Recovering`].
-  Active(Endpoint<S>),
+  Active(Endpoint<S, R>),
   /// This node is absent from the recovered membership (removed by a reconfiguration) — a terminal
   /// [`Retired`] handle that does not participate.
   Retired(Retired),
@@ -113,11 +113,11 @@ pub struct Retired {
   epoch: Epoch,
 }
 
-impl<S> Recovered<S> {
+impl<S, R: Reconfig> Recovered<S, R> {
   /// Unwraps the [`Recovered::Active`] endpoint, panicking on [`Recovered::Retired`]. Test-only: the
   /// fixtures always recover a present member, so they assert presence by construction.
   #[cfg(test)]
-  pub(crate) fn expect_active(self) -> Endpoint<S> {
+  pub(crate) fn expect_active(self) -> Endpoint<S, R> {
     match self {
       Recovered::Active(endpoint) => endpoint,
       Recovered::Retired(retired) => {
@@ -146,10 +146,29 @@ impl Retired {
   }
 }
 
-impl<S: StateMachine> Endpoint<S> {
-  /// Reconstructs an endpoint from durable storage after a restart — a **metadata-only constructor**
-  /// that enters [`Status::Recovering`] and defers all fallible reads to an async `handle_storage`
-  /// loop (faults-as-data; spec §2/§6). It does NOT return in `Normal`.
+impl<S: StateMachine> Endpoint<S, RestartOnly> {
+  /// Reconstructs an endpoint from durable storage after a restart — the ergonomic [`RestartOnly`]
+  /// recover (the DEFAULT capability), so a bare un-annotated `Endpoint::recover(..)` resolves to
+  /// [`Recovered`]`<S, RestartOnly>`. A stronger capability is opted into explicitly via
+  /// [`Self::recover_with_reconfig`]. See that method for the full Phase-1/Phase-2 recovery contract.
+  pub fn recover<W: Wal, B: Superblock>(
+    config: Config,
+    membership: Membership,
+    seed: u64,
+    sm: S,
+    wal: &mut W,
+    sb: &mut B,
+  ) -> Recovered<S, RestartOnly> {
+    Self::recover_with_reconfig(config, membership, seed, sm, wal, sb)
+  }
+}
+
+impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
+  /// Reconstructs an endpoint under an EXPLICIT reconfiguration capability marker `R` from durable
+  /// storage after a restart — a **metadata-only constructor** that enters [`Status::Recovering`] and
+  /// defers all fallible reads to an async `handle_storage` loop (faults-as-data; spec §2/§6). It does
+  /// NOT return in `Normal`. The ergonomic [`Self::recover`] is the [`RestartOnly`] entry point and
+  /// defers here, so every bare `Endpoint::recover(..)` call resolves unannotated.
   ///
   /// **Phase 1 (here, sync + infallible).** Reads only synchronous trait metadata — the superblock
   /// root via `sb.state()` for `(view, log_view, checkpoint_op, checkpoint_id)` and `wal.op_head()` /
@@ -218,14 +237,14 @@ impl<S: StateMachine> Endpoint<S> {
   /// randomness, a persisted boot counter, or any value that cannot repeat across restarts of the
   /// same replica. (The deterministic simulation does this with its seeded PRNG, drawing a distinct
   /// value per replica incarnation.)
-  pub fn recover<W: Wal, B: Superblock>(
+  pub fn recover_with_reconfig<W: Wal, B: Superblock>(
     config: Config,
     membership: Membership,
     seed: u64,
     sm: S,
     wal: &mut W,
     sb: &mut B,
-  ) -> Recovered<S> {
+  ) -> Recovered<S, R> {
     let state = sb.state();
     // The EFFECTIVE membership: a v4 root's OWN membership is authoritative (the durable config wins,
     // so an offline reconfiguration pre-written into the root takes effect here); a legacy (v1-3) root
@@ -293,6 +312,10 @@ impl<S: StateMachine> Endpoint<S> {
     // Computed before `membership` is moved into the struct below (it is not `Copy`).
     let seed_own_checkpoint = membership.quorum() == 1 && membership.is_voter(local_slot);
 
+    // The recent-prior `config_id` ring is an IN-MEMORY live-catch-up aid (it widens `in_lineage`),
+    // not durable state: a restarted node re-establishes its CURRENT config and re-accumulates prior
+    // ids only as it observes live swaps, so seed every slot with the recovered (current) config_id.
+    let lineage = [membership.config_id(); LINEAGE_RING];
     let mut endpoint = Self {
       config,
       membership,
@@ -301,6 +324,7 @@ impl<S: StateMachine> Endpoint<S> {
       // epoch — so this is correct for both, and every durable-root write this incarnation makes
       // re-persists the membership as a v4 root carrying it.
       prev_epoch: state.prev_epoch(),
+      lineage,
       status: Status::Recovering,
       view: state.view(),
       op: OpNumber::with(op),
@@ -379,6 +403,10 @@ impl<S: StateMachine> Endpoint<S> {
       header_only_carriers_emitted: 0,
       sessions_evicted: 0,
       pending_forfeit: false,
+      reconfigure_inflight: None,
+      pending_swap: None,
+      peer_progress: BTreeMap::new(),
+      _reconfig: core::marker::PhantomData,
     };
 
     // Phase 1: build the dense header cache (bodies empty) and submit the tail + checkpoint reads.

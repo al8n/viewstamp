@@ -12,12 +12,15 @@ mod checkpoint;
 mod forfeit;
 mod normal;
 mod reconfig;
+mod reconfigure;
 mod recovery;
 mod repair;
 mod state_sync;
 mod view_change;
 
-pub use reconfig::{Reconfig, ReconfigError, RestartOnly, prepare_restart};
+pub use reconfig::{
+  ProposeMembershipError, Reconfig, ReconfigError, RestartOnly, SingleChange, prepare_restart,
+};
 pub use recovery::{Recovered, Retired};
 
 /// What the endpoint does when a submitted WAL append completes. Append-before-ack: the vote/ack a
@@ -89,11 +92,15 @@ impl Pending {
   }
 }
 
-/// What the endpoint does once its pending durable-view (superblock) write completes.
-/// Private + unit-only: a transition records the participation to run *after* the new view is
-/// durable. Keyed by the minted `OpId` in `pending_sb`; a superseded (older-view) completion is
-/// ignored. Mirrors `Pending`/`on_wal_done` (append-before-ack).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the endpoint does once its pending durable-view (superblock) write completes. A transition
+/// records the participation to run *after* the new view is durable. Keyed by the minted `OpId` in
+/// `pending_sb`; a superseded (older-view) completion is ignored. Mirrors `Pending`/`on_wal_done`
+/// (append-before-ack).
+///
+/// NOT `Copy`: the [`Self::SwapEpoch`] variant carries the (boxed-member) successor [`Membership`] —
+/// the new configuration a committed `Body::Reconfigure` op produced — so the durable root that
+/// proves the swap and the in-memory install are driven from ONE staged value.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingSbAction {
   SendDoViewChange,
   StartViewAsPrimary,
@@ -101,6 +108,13 @@ pub(crate) enum PendingSbAction {
   /// An operator-requested frontier seal ([`Endpoint::seal_committed_frontier`]): the write persists
   /// the current `commit_max` + committed-band headers and has no follow-up participation.
   Seal,
+  /// A commit-first epoch swap: a `Body::Reconfigure` op committed under the OLD epoch, and this
+  /// durable root carries the SUCCESSOR membership (NOT yet installed in memory). On completion
+  /// `on_sb_done` calls [`Endpoint::install_membership`] — so the node advertises the new
+  /// quorum/voter-set only AFTER a durable root proves the swap (the
+  /// durable-epoch-before-participate fence). The successor is held here, not in `self.membership`,
+  /// for exactly the STAGE→durable-root window.
+  SwapEpoch(Membership),
 }
 
 /// Which of a checkpoint's two superblock writes is outstanding. Kept SEPARATE from
@@ -378,6 +392,14 @@ const REPAIR_OR_TRUNCATE_GRACE: core::time::Duration = core::time::Duration::fro
 /// before a redundant idle-driven view change escalates. A primary that catches up within the grace
 /// window disarms and never forfeits (a transient lag cannot trigger it).
 const FORFEIT_GRACE: core::time::Duration = core::time::Duration::from_millis(300);
+/// The number of superseded `config_id`s retained in the recent-prior lineage ring
+/// (`Endpoint::lineage`), which widens [`Endpoint::in_lineage`] to admit a bounded window of recent
+/// ancestors. A live single-change commits ONE epoch at a time, so a legitimate replica that missed
+/// the last reconfiguration lags by one epoch; two covers a node that also missed the one before. Past
+/// this bound a config_id is treated as long-stale/forked and rejected — the AGNOSTIC catch-up
+/// messages (`RequestSync`/`SyncCheckpoint`/repair serves) it would gate are bounded, not unlimited.
+/// Two is the realistic single-change window; a larger window is a Tier-A/joint concern.
+const LINEAGE_RING: usize = 2;
 /// Recovery (`Status::Recovering`): how often the recover-read timer re-submits any still
 /// pending/faulty WAL-tail reads. Covers a real async driver that drops a completion, and the
 /// transient-clears-on-retry case where a `Fault` only resolves on a later read.
@@ -408,6 +430,12 @@ const REPAIR_RETRANSMIT: core::time::Duration = core::time::Duration::from_milli
 /// solicitation while awaiting a `SyncCheckpoint` (and while the adopted checkpoint is being made
 /// durable). Mirrors the other solicitation cadences; cleared once the synced checkpoint is durable.
 const SYNC_SOLICIT: core::time::Duration = core::time::Duration::from_millis(100);
+/// Learner progress (`Status::Normal` LEARNER): how often a non-voting learner re-broadcasts its
+/// [`LearnerStatus`](crate::LearnerStatus) durable-frontier report to the cluster, so the primary's
+/// catch-up-then-promote gate sees the learner advance. A status report carries no quorum authority and
+/// is cheap; this cadence is the same order as the commit heartbeat (the learner reports about as often
+/// as the primary heartbeats), so a promotion proposal sees a fresh frontier within a heartbeat or two.
+const LEARNER_STATUS_CADENCE: core::time::Duration = core::time::Duration::from_millis(100);
 /// Peer fault-repair tail-gap (`Status::Normal` backup): the maximum number of `RequestPrepare`s
 /// [`Endpoint::request_tail_gap`] emits per call — the size of the catch-up window it solicits above
 /// its head toward `commit_max`. Bounds the work per heartbeat: `request_tail_gap` runs on every
@@ -575,7 +603,7 @@ pub(crate) use crate::message::Body;
 /// One entry in the in-memory log (persistence arrives in a later milestone). Its [`Body`] is either
 /// `Present` (the bytes) or `Repairing` (only the durable `body_checksum`, awaiting peer-repair).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LogEntry {
+pub(crate) struct LogEntry {
   client: ClientId,
   request: RequestNumber,
   body: Body,
@@ -590,6 +618,25 @@ impl LogEntry {
       client,
       request,
       body: Body::Present(body),
+    }
+  }
+
+  /// A consensus-layer reconfiguration log entry carrying the full successor membership. Wraps
+  /// `payload` as [`Body::Reconfigure`]; the op keeps a `(client, request)` identity for
+  /// dedup/content-addressing, minted by the proposing primary like any op. The proposing primary
+  /// (`propose_membership`) builds it on its side; a backup rebuilds it from a
+  /// [`ClientId::RECONFIGURATION`] prepare's decoded body (`log_entry_from_prepare`), so both hold the
+  /// identical typed entry the commit-first epoch swap recognizes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn reconfigure(
+    client: ClientId,
+    request: RequestNumber,
+    payload: crate::message::ReconfigurePayload,
+  ) -> Self {
+    Self {
+      client,
+      request,
+      body: Body::Reconfigure(payload),
     }
   }
 }
@@ -659,6 +706,11 @@ struct Timers {
   /// read back permanently faulty). Armed only while `repair` is non-empty; cleared when the last
   /// hole is filled. Active in BOTH primary and backup roles — either may hold a hole after recovery.
   repair_retry: Option<Instant>,
+  /// Normal LEARNER: re-broadcast the [`LearnerStatus`](crate::LearnerStatus) progress report on a
+  /// cadence so the primary learns how far this learner has durably caught up (the input to the
+  /// catch-up-then-promote gate). Armed ONLY for a non-voting learner (`is_learner()`); a voter never
+  /// reports progress (it participates directly). Idle-timer-style: re-armed every tick it fires.
+  learner_status: Option<Instant>,
   /// Normal (state-sync): re-broadcast `RequestSync` while a sync is outstanding (awaiting a
   /// `SyncCheckpoint` or persisting the adopted one); with a chunked transfer pinned it doubles as
   /// the stop-and-wait ARQ (re-send the one outstanding chunk pull first, then re-broadcast). Armed
@@ -717,13 +769,17 @@ enum TimerKind {
   /// `commit`/`prepare`/`forfeit_armed`, on `participates_as_primary() && !pending_forfeit` (it must
   /// not truncate while the view write is in flight or the primary is stepping down).
   RepairOrTruncate,
+  /// The learner progress-report cadence ([`Timers::learner_status`]), serviced (via
+  /// [`Endpoint::learner_status_timeouts`]) on the Normal-LEARNER path — only a non-voting learner ever
+  /// arms or services it.
+  LearnerStatus,
 }
 
 impl TimerKind {
   /// Every timer kind, so `poll_timeout`'s filter and `handle_timeout`'s no-orphan assert iterate the
   /// complete set (a new timer added to [`Timers`] must be added here, to `arm`-edness, and to
   /// `serviceable_now`).
-  const ALL: [TimerKind; 13] = [
+  const ALL: [TimerKind; 14] = [
     TimerKind::Prepare,
     TimerKind::Commit,
     TimerKind::PrimaryIdle,
@@ -737,6 +793,7 @@ impl TimerKind {
     TimerKind::SyncSolicit,
     TimerKind::ForfeitArmed,
     TimerKind::RepairOrTruncate,
+    TimerKind::LearnerStatus,
   ];
 
   /// A stable name for the no-orphan-due `debug_assert` diagnostic in `handle_timeout`.
@@ -755,6 +812,7 @@ impl TimerKind {
       TimerKind::SyncSolicit => "sync_solicit",
       TimerKind::ForfeitArmed => "forfeit_armed",
       TimerKind::RepairOrTruncate => "repair_or_truncate",
+      TimerKind::LearnerStatus => "learner_status",
     }
   }
 }
@@ -794,7 +852,7 @@ impl TimerKind {
 /// The exit-time `assert_invariants` backstops the `(status × sub-state-flag)` coupling that these
 /// members assume, so any future drift trips deterministically across the suite + the VOPR sweep.
 #[derive(Debug)]
-pub struct Endpoint<S> {
+pub struct Endpoint<S, R: Reconfig = RestartOnly> {
   config: Config,
   /// The active, epoch-versioned cluster configuration: who votes, who leads, the quorum sizes, and
   /// this node's slot. The single source of truth for quorum/primary/voter decisions (the static
@@ -807,6 +865,17 @@ pub struct Endpoint<S> {
   /// root's own `prev_epoch`, or the membership epoch for a legacy bridge); at genesis it equals the
   /// membership epoch. Fixed per incarnation (the offline-restart capability changes the configuration only across a restart).
   prev_epoch: Epoch,
+  /// The bounded RECENT-PRIOR `config_id` ring — the superseded `config_id`s of the last
+  /// [`LINEAGE_RING`] live single-changes, MOST-RECENT-FIRST, pushed by [`Self::install_membership`].
+  /// It widens [`Self::in_lineage`] (which otherwise admits only the current `config_id`) to ALSO admit
+  /// these recent ancestors, so a legitimate replica lagging the cluster by a bounded number of live
+  /// reconfigurations can still be served the committed-content/state-sync messages that let it catch
+  /// up ACROSS the epoch boundary — while a long-stale or FORKED `config_id` (never in this node's
+  /// chain) stays rejected (config_id is the lineage discriminator). Single-change commits one epoch at
+  /// a time, so the realistic catch-up window is 1-2 epochs; the ring is sized for that. Pre-genesis
+  /// slots hold the genesis `config_id` (a harmless duplicate of the current id at genesis, admitting
+  /// nothing extra). Private; never hashed/serialized/emitted.
+  lineage: [u128; LINEAGE_RING],
   status: Status,
   view: View,
   /// Head op (most recently prepared locally).
@@ -1075,10 +1144,44 @@ pub struct Endpoint<S> {
   /// `forfeit_armed`) so a stale flag never carries into a fresh generation. A backup leaves this
   /// `false` and force-syncs as before. Private; never crosses the API boundary.
   pending_forfeit: bool,
+  /// The single-writer reconfiguration latch: `Some(op)` while a `Body::Reconfigure` op the primary
+  /// minted is in flight (proposed, not yet committed), else `None`. A [`SingleChange`] primary mints
+  /// at most ONE membership change at a time — `propose_membership` refuses a second proposal while
+  /// this is `Some` — so the cluster never has two overlapping configuration changes racing to commit.
+  /// Set by `propose_membership` on a successful mint; cleared once the change commits/aborts (a later
+  /// task). Private; never hashed/serialized/emitted.
+  reconfigure_inflight: Option<OpNumber>,
+  /// A committed `Body::Reconfigure` op's SUCCESSOR membership, awaiting its durable `SwapEpoch` root.
+  /// `Some` exactly across the commit→durable-root window: commit recognizes the Reconfigure op and
+  /// latches the successor here (NOT in `self.membership` — the durable-epoch-before-participate
+  /// fence), and the actual `submit_swap_epoch` durable-root write waits its turn behind any in-flight
+  /// superblock write ([`Self::maybe_swap_epoch`], the same single-writer exclusion `maybe_checkpoint`
+  /// uses). Cleared when the SwapEpoch root lands and `install_membership` runs. The successor is
+  /// identical on every replica (all commit at the identical OLD membership), so this is the
+  /// pre-install staging of a convergent value; private, never hashed/serialized/emitted.
+  pending_swap: Option<Membership>,
+  /// Per-member DURABLE-frontier progress, keyed by the stable [`MemberId`]: the highest
+  /// `durable_commit_min` a member has reported via a [`LearnerStatus`](crate::LearnerStatus). It
+  /// carries NO quorum authority — it is NEVER read by any commit/view-change/recovery quorum — and is
+  /// the SOLE state [`Self::on_learner_status`] mutates. Its ONLY consumer is the learner-promote gate
+  /// in [`Endpoint::propose_membership`](crate::Endpoint): a `PromoteLearner` is refused
+  /// (`TargetNotCaughtUp`) until the target's recorded progress covers the prospective Reconfigure op's
+  /// predecessor frontier, so by commit-first the promoted learner provably holds the full E-committed
+  /// prefix. Updated MONOTONE (`(*entry).max(reported)`) so a reordered/stale lower report never lowers
+  /// a recorded value. Private; never hashed/serialized/emitted.
+  peer_progress: BTreeMap<MemberId, OpNumber>,
+  /// The zero-sized reconfiguration capability witness — the [`Reconfig`] type-state the
+  /// (later) online-reconfiguration API gates on. `PhantomData<fn() -> R>` rather than
+  /// `PhantomData<R>`: it is unconditionally `Send`/`Sync` (and covariant in `R`), so adding the
+  /// marker can never alter `Endpoint`'s existing auto-traits whatever a future `R` becomes.
+  _reconfig: core::marker::PhantomData<fn() -> R>,
 }
 
-impl<S> Endpoint<S> {
-  /// Creates a fresh endpoint in `Status::Normal`, view 0, for the genesis `membership`.
+impl<S> Endpoint<S, RestartOnly> {
+  /// Creates a fresh endpoint in `Status::Normal`, view 0, for the genesis `membership` — the
+  /// ergonomic [`RestartOnly`] constructor (the DEFAULT capability), so a bare un-annotated
+  /// `Endpoint::new(..)` resolves to `Endpoint<S, RestartOnly>`. A stronger capability is opted into
+  /// explicitly via [`Self::with_reconfig`] (`Endpoint::<S, SingleChange>::with_reconfig(..)`).
   ///
   /// The static per-node parameters come from `config`; the active cluster configuration (the
   /// quorum/primary/voter logic + this node's slot) comes from `membership`. The local member
@@ -1089,6 +1192,28 @@ impl<S> Endpoint<S> {
   /// nonce and a delayed response to the previous incarnation passes the freshness checks. See
   /// [`Self::recover`] (where the hazard is concrete) for the full contract.
   pub fn new(config: Config, membership: Membership, seed: u64, sm: S) -> Self {
+    Self::with_reconfig(config, membership, seed, sm)
+  }
+}
+
+impl<S, R: Reconfig> Endpoint<S, R> {
+  /// Creates a fresh endpoint under an EXPLICIT reconfiguration capability marker `R`, in
+  /// `Status::Normal`, view 0, for the genesis `membership`.
+  ///
+  /// The capability marker is part of the call (`Endpoint::<S, SingleChange>::with_reconfig(..)`),
+  /// because a struct default type parameter does not participate in inference of an associated
+  /// function's return type. The ergonomic [`Self::new`] is the [`RestartOnly`] entry point and
+  /// defers here with `R = RestartOnly`, so every bare `Endpoint::new(..)` call resolves unannotated.
+  ///
+  /// The static per-node parameters come from `config`; the active cluster configuration (the
+  /// quorum/primary/voter logic + this node's slot) comes from `membership`. The local member
+  /// ([`Config::local`]) MUST occupy a slot in `membership` — asserted at construction (release too).
+  ///
+  /// **`seed` must carry fresh entropy per incarnation**: the solicitation-freshness nonce is
+  /// derived deterministically from it, so a process restarted with a reused seed re-mints the same
+  /// nonce and a delayed response to the previous incarnation passes the freshness checks. See
+  /// [`Self::recover`] (where the hazard is concrete) for the full contract.
+  pub fn with_reconfig(config: Config, membership: Membership, seed: u64, sm: S) -> Self {
     // A construction PRECONDITION enforced in RELEASE too (not merely debug): a fresh endpoint's local
     // member MUST occupy a slot in its own membership. `local_slot()` — used by `replica()`, the
     // timers, the ingress path, and the coordinator pump — resolves it via `slot_of` and would
@@ -1103,12 +1228,16 @@ impl<S> Endpoint<S> {
       config.local(),
     );
     let nonce = Prng::new(seed).next_u64();
-    // Genesis: the lineage has no predecessor, so prev_epoch == the (genesis) epoch.
+    // Genesis: the lineage has no predecessor, so prev_epoch == the (genesis) epoch and the prior-id
+    // ring is seeded with the genesis config_id (a harmless duplicate of the current id — admitting
+    // nothing extra until a real swap pushes a superseded id).
     let prev_epoch = membership.epoch();
+    let lineage = [membership.config_id(); LINEAGE_RING];
     Self {
       config,
       membership,
       prev_epoch,
+      lineage,
       status: Status::Normal,
       view: View::new(),
       op: OpNumber::new(),
@@ -1156,6 +1285,10 @@ impl<S> Endpoint<S> {
       header_only_carriers_emitted: 0,
       sessions_evicted: 0,
       pending_forfeit: false,
+      reconfigure_inflight: None,
+      pending_swap: None,
+      peer_progress: BTreeMap::new(),
+      _reconfig: core::marker::PhantomData,
     }
   }
 
@@ -1242,6 +1375,194 @@ impl<S> Endpoint<S> {
       self.commit_min.get(),
     );
     self.commit_min = to;
+  }
+
+  /// Install a committed reconfiguration's SUCCESSOR membership — the DESTRUCTIVE half of the
+  /// commit-first epoch swap, run ONLY from [`Self::on_sb_done`]'s `SwapEpoch` arm once the durable
+  /// root carrying `successor` has landed (the durable-epoch-before-participate fence — mirroring
+  /// `start_view_participate` for the durable-view fence and `install_sync` for the durable-sync
+  /// fence). After this the node advertises the NEW quorum/voter-set, justified by a durable root.
+  ///
+  /// The successor's `epoch` is the predecessor's `epoch + 1` and its `config_id` chains from the
+  /// predecessor (both derived at commit via `self.membership.reconfigure`); `prev_epoch` becomes the
+  /// OLD epoch — the durable backward link of the lineage that every future durable-root write
+  /// persists. Recomputing the cached quorum-checkpoint floor is load-bearing: the membership feeds
+  /// `compute_quorum_checkpoint_op` (it reads the voter slots `0..replica_count`), so a changed voter
+  /// set must refresh the cache or the cached value drifts from the recomputed one (the
+  /// `quorum_checkpoint_op` cache-coherence assert would fire). Emits [`Event::MembershipChanged`].
+  ///
+  /// **Lineage ring (hazard b).** The predecessor's `config_id` is pushed onto the bounded recent-prior
+  /// ring ([`Self::lineage`], most-recent-first), so [`Self::in_lineage`] keeps admitting the
+  /// AGNOSTIC catch-up traffic of a replica lagging by up to [`LINEAGE_RING`] live single-changes while
+  /// still rejecting a forked/long-stale `config_id`.
+  ///
+  /// **Removed-leader abdication (hazard a).** Captured BEFORE the swap: was this node the primary of
+  /// its view under the OLD membership? If so AND it is NOT a voter under the NEW membership (removed
+  /// entirely, so its slot is absent, or — not expressible by a single delta but handled uniformly —
+  /// demoted to a learner), it must go SILENT as primary: RETIRE the Normal-primary cadence (the commit
+  /// heartbeat + the prepare retransmit + the forfeit grace) and CLEAR the deferred-forfeit latch.
+  /// `abdicate_if_primary` does not suffice here — under the NEW membership `is_primary()` is already
+  /// false (the node has no voter slot), so it early-returns; the cadence is retired directly. The
+  /// cluster then elects an E+1 primary from the new voter set via the surviving backups' idle timers.
+  /// Clearing the forfeit sub-states is also load-bearing for the `assert_invariants` coupling (both
+  /// imply a Normal PRIMARY): a removed node is no longer the primary, so a leftover set flag would
+  /// fire. A removed live node never durably participates again (its slot is gone); `recover` resolves
+  /// an absent member to [`Recovered::Retired`] on a subsequent restart.
+  ///
+  /// This is the SOLE runtime mutator of `self.membership`, and that is what makes the XI-b CP overlap
+  /// (exact-durable-catch-up) hold WITHOUT any extra per-emission gate. Every strict E+1 message
+  /// (`Prepare`/`PrepareOk`/`Commit`/`DoViewChange`/`StartView`/`StartViewChange`) stamps
+  /// `self.membership.epoch()` / `config_id()`, so a node stamps E+1 only AFTER this install — i.e.
+  /// only after its durable SwapEpoch root proved the `Reconfigure` op committed, which (commit-first)
+  /// means it holds the FULL E-committed prefix `<=` that op. So EVERY E+1 view-change-quorum member
+  /// — retained or newly added — holds every E-committed op `o`, hence `o` rides
+  /// `select_canonical_log`'s union and is never nack-truncated. The OLD-write-quorum-vs-NEW-view-
+  /// change-quorum count bound is not ≥1 for a 3→2 shrink or a 3→4 grow, so this structural gate (not
+  /// a count) is the load-bearing invariant; the `cp_overlap_*` reconfigure tests pin it.
+  fn install_membership(&mut self, successor: Membership) {
+    let op = self.reconfigure_installing_op();
+    // Capture the abdication precondition (hazard a) against the OLD membership, BEFORE the swap:
+    // was this node the primary of its current view? (Robust to an already-absent local member.)
+    let was_primary = self.is_primary();
+    let prior_config_id = self.membership.config_id();
+    self.prev_epoch = self.membership.epoch();
+    let epoch = successor.epoch();
+    let config_id = successor.config_id();
+    self.membership = successor;
+    // Push the superseded config_id onto the recent-prior lineage ring (most-recent-first), so
+    // `in_lineage` keeps admitting a bounded window of recent ancestors for live cross-epoch catch-up.
+    self.push_lineage(prior_config_id);
+    // The voter set changed, so the quorum-checkpoint inputs (the voter slots) changed: refresh the
+    // cached order statistic the GC prune floor / force-sync trigger read.
+    self.recompute_quorum_checkpoint();
+    // Removed-leader abdication (hazard a): an ex-primary that the swap dropped from the voter set goes
+    // SILENT as primary — retire the cadence + clear the forfeit latch (the cluster elects an E+1
+    // primary from the new voter set via the surviving backups' idle timers). `local_slot_opt()` is
+    // `None` when removed entirely; a learner slot is `>= replica_count`. Either way `is_voter` is false.
+    let still_voter = self
+      .local_slot_opt()
+      .is_some_and(|slot| self.membership.is_voter(slot));
+    if was_primary && !still_voter {
+      self.retire_primary_cadence();
+    }
+    // The observer learns THIS node's role under the new configuration purely from the committed
+    // membership — a voter, a (non-voting) learner, or removed (neither).
+    let self_is_learner = self
+      .local_slot_opt()
+      .is_some_and(|slot| self.membership.is_learner(slot));
+    self
+      .events
+      .push_back(Event::MembershipChanged(crate::MembershipChanged::new(
+        op,
+        epoch,
+        config_id,
+        still_voter,
+        self_is_learner,
+      )));
+  }
+
+  /// The op number a `MembershipChanged` event names — the committed `Body::Reconfigure` op whose
+  /// durable swap is installing. It is `commit_min` (the swap is staged the instant the op commits, so
+  /// `commit_min` is exactly at it when the root lands; no later commit advances past a staged swap,
+  /// because a committed reconfiguration is the head's frontier at stage time). A minimal accessor so
+  /// the event payload reads the same value on the primary and on a backup.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn reconfigure_installing_op(&self) -> OpNumber {
+    self.commit_min
+  }
+
+  /// Push a just-superseded `config_id` onto the recent-prior lineage ring (most-recent-first): shift
+  /// every retained id down one and drop the oldest, so the ring always holds the [`LINEAGE_RING`] most
+  /// recent ancestors. Read by [`Self::in_lineage`] to widen AGNOSTIC-message admission across a small
+  /// epoch gap. (A fixed-size shift, not a heap ring — [`LINEAGE_RING`] is tiny and `no_std`-friendly.)
+  fn push_lineage(&mut self, superseded: u128) {
+    self.lineage.copy_within(..LINEAGE_RING - 1, 1);
+    self.lineage[0] = superseded;
+  }
+
+  /// Retire the Normal-primary CADENCE — the commit heartbeat, the prepare retransmit, and the forfeit
+  /// grace timer — and clear the deferred-forfeit latch. The removed-leader abdication
+  /// ([`Self::install_membership`]) calls it when a swap drops this ex-primary from the voter set: it
+  /// must go silent as primary so the surviving voters' idle timers elect an E+1 primary. This is the
+  /// same timer-level effect the `primary_timeouts` `pending_forfeit`/`pending_sb` branches and
+  /// `arm_timers`'s reset have, here driven by losing the primacy itself rather than by stepping down
+  /// within the same configuration. Clearing the forfeit sub-states keeps the `assert_invariants`
+  /// coupling (a set forfeit flag ⟹ a Normal PRIMARY) intact now that this node is no longer primary.
+  fn retire_primary_cadence(&mut self) {
+    self.timers.commit = None;
+    self.timers.prepare = None;
+    self.timers.forfeit_armed = None;
+    self.pending_forfeit = false;
+  }
+
+  /// Stage the SUCCESSOR membership of a just-committed `Body::Reconfigure` op for its durable epoch
+  /// swap, the COMMIT-FIRST half of the swap. Latches `successor` in `pending_swap` (NOT in
+  /// `self.membership` — the fence) and clears the single-writer reconfiguration latch, then tries to
+  /// submit the SwapEpoch durable root immediately. Called from both apply sites
+  /// ([`Self::commit_op`] on the primary, [`Self::advance_commit`] on a backup) the instant the op
+  /// commits. The op is NOT applied to the state machine (it is consensus-layer) and the epoch is NOT
+  /// advanced in memory yet.
+  fn stage_epoch_swap(&mut self, successor: Membership, sb: &mut impl Superblock)
+  where
+    S: StateMachine,
+  {
+    self.reconfigure_inflight = None;
+    self.pending_swap = Some(successor);
+    self.maybe_swap_epoch(sb);
+  }
+
+  /// Submit the staged SwapEpoch durable root IF the superblock is free — the single-writer
+  /// sequencing that keeps a SwapEpoch behind any in-flight superblock write (a concurrent checkpoint
+  /// root, a durable-view write), the SAME exclusion `maybe_checkpoint` enforces. A SwapEpoch that
+  /// commits while a checkpoint root is in flight WAITS its turn: `pending_swap` stays latched and the
+  /// next free superblock slot — re-checked at the commit tails (alongside `maybe_checkpoint`) and from
+  /// `on_sb_done` when any write completes — submits it. No-op if nothing is staged or a write is
+  /// already in flight. The successor is CLONED into the pending action so `pending_swap` survives a
+  /// supersession of the root write (a view-change durable-view write cannot overwrite a SwapEpoch
+  /// here, because the exclusion blocks issuing either while the other is pending).
+  fn maybe_swap_epoch(&mut self, sb: &mut impl Superblock)
+  where
+    S: StateMachine,
+  {
+    if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
+      return; // a superblock write is in flight — the swap waits its turn
+    }
+    let Some(successor) = self.pending_swap.clone() else {
+      return; // nothing staged
+    };
+    self.submit_swap_epoch(successor, sb);
+  }
+
+  /// Mint the SwapEpoch durable root carrying `successor` — a v4 root whose scalar epoch is the
+  /// successor's epoch, whose `prev_epoch` is the CURRENT (predecessor) epoch, and whose membership is
+  /// the successor — and arm the deferred install (`PendingSbAction::SwapEpoch`). Unlike
+  /// [`Self::durable_root`] (which stamps `self.membership`, the predecessor, still active here), this
+  /// stamps the SUCCESSOR explicitly: the root proves the NEW configuration before it is installed in
+  /// memory. The consensus frontier (`view`/`log_view`/`commit_max`/`checkpoint_op`/`checkpoint_id` +
+  /// the committed-band headers) is carried UNCHANGED — a reconfiguration changes ONLY the
+  /// configuration, never the replicated log.
+  fn submit_swap_epoch(&mut self, successor: Membership, sb: &mut impl Superblock)
+  where
+    S: StateMachine,
+  {
+    let checkpoint_id = sb.state().checkpoint_id();
+    let state = crate::VsrState::try_new_v4(
+      self.view,
+      self.log_view,
+      self.commit_max,
+      self.checkpoint_op,
+      checkpoint_id,
+      self.committed_band_headers(self.checkpoint_op),
+      successor.epoch(),
+      self.membership.epoch(),
+      successor.clone(),
+    )
+    .expect(
+      "SwapEpoch root: log_view <= view, commit >= checkpoint_op, membership epoch consistent",
+    );
+    let id = self.mint_op_id();
+    sb.submit_write(id, state);
+    self.pending_sb = Some((id, PendingSbAction::SwapEpoch(successor)));
   }
 
   /// Cancel an outstanding FORCED sync once repair/commit has SATISFIED its target. A forced sync
@@ -1434,6 +1755,18 @@ impl<S> Endpoint<S> {
       !self.awaiting_peer_checkpoint() || self.status.is_recovering(),
       "awaiting_peer_checkpoint outside Recovering"
     );
+    // (7) A staged epoch swap (`pending_swap`) ALWAYS has a superblock write outstanding: the
+    // commit-first stage either issued its SwapEpoch root immediately (so `pending_sb` is the
+    // `SwapEpoch` action) or queued it behind an in-flight checkpoint/durable-view write (so
+    // `pending_sb`/`pending_checkpoint` is already set) — and `on_sb_done` clears `pending_swap` no
+    // later than it installs the durable root. So a staged swap is NEVER stuck with the superblock
+    // idle (which would never re-trigger `maybe_swap_epoch`, stranding the swap). The
+    // durable-epoch-before-participate fence: the new membership is installed only at the SwapEpoch
+    // root, so while staged the epoch is still the predecessor's.
+    debug_assert!(
+      self.pending_swap.is_none() || self.pending_sb.is_some() || self.pending_checkpoint.is_some(),
+      "a staged epoch swap with no superblock write in flight would never be submitted"
+    );
   }
 
   /// Record a peer's reported `checkpoint_op` MONOTONICALLY: a peer's durable checkpoint never
@@ -1491,14 +1824,17 @@ impl<S> Endpoint<S> {
   fn compute_quorum_checkpoint_op(&self) -> OpNumber {
     let count = self.membership.replica_count();
     let mut cps: std::vec::Vec<u64> = std::vec::Vec::with_capacity(count as usize);
-    let me = self.local_slot();
-    if self.membership.is_voter(me) {
-      cps.push(self.checkpoint_op.get()); // a voter counts its own durable checkpoint; a learner does not
+    // `me` is `None` when this node was REMOVED from the configuration (the removed-leader case): then
+    // it seeds no own-checkpoint and the loop skips nothing, computing the statistic over exactly the
+    // (new) voter set — a removed node correctly contributes nothing to the GC floor.
+    let me = self.local_slot_opt();
+    if me.is_some_and(|slot| self.membership.is_voter(slot)) {
+      cps.push(self.checkpoint_op.get()); // a voter counts its own durable checkpoint; a learner/removed does not
     }
     for r in 0..count {
       let rid = ReplicaId::new(u16::from(r));
-      if rid == me {
-        continue; // a learner `me` is never in `0..count`, so this skips nothing — the seed above is what gates self
+      if Some(rid) == me {
+        continue; // a learner/removed `me` is never in `0..count`, so this skips nothing — the seed above gates self
       }
       cps.push(self.peer_checkpoint.get(&rid).map_or(0, |c| c.get()));
     }
@@ -1572,6 +1908,18 @@ impl<S> Endpoint<S> {
       .expect("local member is in its own membership")
   }
 
+  /// This replica's slot in the active membership, or `None` if its stable [`MemberId`] is ABSENT — a
+  /// reconfiguration REMOVED it from the configuration entirely. Unlike [`Self::local_slot`] (infallible,
+  /// for the consensus paths that only run on a still-member node) this is the robust form the
+  /// post-swap observers use: the removed-leader abdication ([`Self::install_membership`]) and the
+  /// role predicates ([`Self::is_primary`]/[`Self::is_learner`]) must tolerate a just-removed local
+  /// member without panicking (a removed node is neither primary nor learner). A removed live node does
+  /// not durably participate — `recover` resolves an absent member to [`Recovered::Retired`] on restart.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn local_slot_opt(&self) -> Option<ReplicaId> {
+    self.membership.slot_of(self.config.local())
+  }
+
   /// This node's stable [`MemberId`] ([`Config::local`]). The QUIC coordinator reads it to attest its
   /// own identity in the handshake preface and to self-reject a peer claiming this node's identity —
   /// both keyed on the stable member id, not the slot it currently occupies.
@@ -1618,30 +1966,38 @@ impl<S> Endpoint<S> {
   /// vote/lead authority — its content is verified independently downstream — so it is admitted from
   /// any config in the chain, letting a node catch up across an epoch boundary.
   ///
-  /// PR1 retains only the CURRENT `config_id`, so same-`config_id` IS the lineage check: under an offline restart,
-  /// every live node shares one configuration at any instant. The
-  /// multi-epoch lineage chain (carrying superseded `config_id`s to admit live cross-epoch catch-up)
-  /// is a later milestone.
+  /// The chain is the CURRENT `config_id` OR one of the bounded recent-prior ids retained in the
+  /// [`Self::lineage`] ring ([`LINEAGE_RING`] of them, pushed on each [`Self::install_membership`]). So
+  /// a legitimate replica lagging the cluster by a small number of live single-changes is still served
+  /// the catch-up traffic that lets it cross the epoch boundary, while a long-stale (older than the
+  /// ring) or FORKED `config_id` — one never in this node's chain — stays rejected. `config_id` is the
+  /// lineage discriminator: a divergent configuration hashes to an id absent from both the current id
+  /// and the ring, so it never matches.
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn in_lineage(&self, other: u128) -> bool {
-    other == self.membership.config_id()
+    other == self.membership.config_id() || self.lineage.contains(&other)
   }
 
   /// True iff THIS replica is a non-voting learner (its own slot is `>= replica_count`). A learner
   /// applies the committed log but never acknowledges a prepare, never casts a view-change vote, and
   /// is never primary — it follows the cluster via the primary's broadcasts and catches up by
-  /// soliciting state, exactly like a TigerBeetle standby.
+  /// soliciting state, exactly like a TigerBeetle standby. `false` if the local member was REMOVED
+  /// (absent from the configuration): a removed node is neither a voter nor a learner.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn is_learner(&self) -> bool {
-    self.membership.is_learner(self.local_slot())
+    self
+      .local_slot_opt()
+      .is_some_and(|slot| self.membership.is_learner(slot))
   }
 
-  /// Whether this replica is the primary of the current view.
+  /// Whether this replica is the primary of the current view. `false` if the local member was REMOVED
+  /// (absent from the configuration) — a removed node is not the primary, so the removed-leader
+  /// abdication ([`Self::install_membership`]) leaves it cleanly non-primary (it no longer heartbeats).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn is_primary(&self) -> bool {
     self
-      .membership
-      .is_primary_slot(self.local_slot(), self.view)
+      .local_slot_opt()
+      .is_some_and(|slot| self.membership.is_primary_slot(slot, self.view))
   }
 
   /// The HARD bound on the raw session-table size at accept-time admission: the applied-session cap
@@ -1819,6 +2175,22 @@ impl<S> Endpoint<S> {
   #[cfg(test)]
   fn pending_sb_for_test(&self) -> bool {
     self.pending_sb.is_some()
+  }
+
+  /// Test-only: is a committed reconfiguration's successor membership staged awaiting its durable
+  /// `SwapEpoch` root (`pending_swap` armed)? True exactly in the commit→durable-root window of the
+  /// commit-first epoch swap — after `stage_epoch_swap` latches the successor but before `on_sb_done`
+  /// installs it. Lets a test assert the durable-epoch-before-participate fence directly.
+  #[cfg(test)]
+  fn pending_swap_for_test(&self) -> bool {
+    self.pending_swap.is_some()
+  }
+
+  /// Test-only: a shared reference to the state machine, so a test can assert exactly which ops
+  /// reached `S::apply` (e.g. that a consensus-layer `Body::Reconfigure` op was NEVER applied).
+  #[cfg(test)]
+  fn sm_for_test(&self) -> &S {
+    &self.sm
   }
 
   /// Test-only: stage a `pending_checkpoint` (bypassing the trigger), so the `on_request` defense guard
@@ -2214,6 +2586,29 @@ impl<S> Endpoint<S> {
     self.view_change = Some(ViewChangeCollection::entering(true));
   }
 
+  /// Test-only: is EITHER Normal-primary cadence timer (the commit heartbeat or the prepare
+  /// retransmit) armed? The removed-leader abdication ([`Self::install_membership`]) retires both, so a
+  /// regression can assert the cadence is silent after a swap that drops this node from the voter set.
+  #[cfg(test)]
+  fn commit_or_prepare_timer_armed_for_test(&self) -> bool {
+    self.timers.commit.is_some() || self.timers.prepare.is_some()
+  }
+
+  /// Test-only: the in-lineage admission test ([`Self::in_lineage`]) — admits `other` iff it is the
+  /// current `config_id` or a retained recent-prior one, so a regression can pin the bounded lineage
+  /// ring (a small laggard catches up; a forked/long-stale config_id is rejected).
+  #[cfg(test)]
+  fn in_lineage_for_test(&self, other: u128) -> bool {
+    self.in_lineage(other)
+  }
+
+  /// Test-only: the adopted StartViewChange target view (`svc_target`), so a regression can observe
+  /// that an admitted SVC raised the target (vs. a stale one dropped at the ingress gate).
+  #[cfg(test)]
+  fn svc_target_for_test(&self) -> View {
+    self.svc_target
+  }
+
   /// Mint a fresh storage correlation id.
   fn mint_op_id(&mut self) -> crate::OpId {
     let id = self.next_op_id;
@@ -2331,6 +2726,11 @@ impl<S> Endpoint<S> {
       Message::SyncCheckpointMeta(m) => self.sender_is_member(from, m.replica()),
       Message::RequestSyncChunk(m) => self.sender_is_member(from, m.replica()),
       Message::SyncChunk(m) => self.sender_is_member(from, m.replica()),
+      // `LearnerStatus` is a NON-VOTING progress report carrying a self `replica()`. It binds to the
+      // FULL membership (`sender_is_member`): the EMITTER is a learner (a non-voting member), and a
+      // non-member's id must never record progress in `peer_progress`. It carries no quorum authority
+      // — the durable frontier it reports only gates the promote proposal, never any vote.
+      Message::LearnerStatus(m) => self.sender_is_member(from, m.replica()),
       // Primary-authority broadcasts (no self id): only the primary of the advertised view sends them.
       Message::Commit(m) => from == Peer::Replica(self.membership.primary(m.view())),
       Message::StartView(m) => from == Peer::Replica(self.membership.primary(m.view())),
@@ -2412,11 +2812,12 @@ impl<S> Endpoint<S> {
   ///
   /// The matrix (the message's vote/lead/serve authority):
   /// - **STRICT** — `Prepare`(normal head-advancing arm), `PrepareOk`, `Commit`, `StartViewChange`,
-  ///   `DoViewChange`, `StartView`, `GetView`, `Recovery`, `RecoveryResponse`, `PrepareBatch`: the
-  ///   message drives an APPEND / VOTE / VIEW-ADOPTION in MY configuration, so it is admitted only on
-  ///   an exact `(epoch, config_id)` match. A foreign-epoch / foreign-config message contributes
-  ///   NOTHING (dropped for authority) — a peer in a different configuration neither votes in mine nor
-  ///   makes me adopt its view.
+  ///   `DoViewChange`, `StartView`, `GetView`, `Recovery`, `RecoveryResponse`, `PrepareBatch`,
+  ///   `LearnerStatus`: the message drives an APPEND / VOTE / VIEW-ADOPTION (or, for `LearnerStatus`,
+  ///   GATES a reconfiguration proposal) in MY configuration, so it is admitted only on an exact
+  ///   `(epoch, config_id)` match. A foreign-epoch / foreign-config message contributes NOTHING
+  ///   (dropped for authority) — a peer in a different configuration neither votes in mine, makes me
+  ///   adopt its view, nor reports a frontier I act on.
   /// - **AGNOSTIC** — `RequestPrepare`, `RequestPrepareRange`, `RepairBatch`, `RequestSync`,
   ///   `RequestSyncChunk`, `SyncCheckpoint`, `SyncCheckpointMeta`, `SyncChunk`: committed,
   ///   view-independent content carrying NO vote/lead authority (verified independently downstream —
@@ -2459,6 +2860,12 @@ impl<S> Endpoint<S> {
       Message::PrepareBatch(m) => {
         m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
       }
+      // STRICT: a learner's progress report is CONFIG-SCOPED — it gates a reconfiguration proposal in MY
+      // configuration, so it is admitted only on an exact `(epoch, config_id)` match. A foreign-config
+      // learner's frontier is not this primary's to act on.
+      Message::LearnerStatus(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
       // PATH-SENSITIVE `Prepare`: gate the config_id (common to both arms); the normal arm's epoch
       // check is branched inside `on_prepare`. A foreign-lineage Prepare is dead on BOTH arms.
       Message::Prepare(m) => self.in_lineage(m.config_id()),
@@ -2481,9 +2888,10 @@ impl<S> Endpoint<S> {
 /// poll/timer machinery they reach. These transitively invoke `S::apply`/`snapshot`/`restore` (via the
 /// submodule consensus methods), so — per the method-local-bounds rule — they carry `S: StateMachine`
 /// here, while the pure accessors/observers above stay unconstrained (callable on any `Endpoint<S>`).
-impl<S> Endpoint<S>
+impl<S, R> Endpoint<S, R>
 where
   S: StateMachine,
+  R: Reconfig,
 {
   /// Feeds an incoming protocol message. Runs `assert_invariants` at exit (TigerBeetle's `assert_main`)
   /// so the `(status × sub-state-flag)` coupling is re-checked after EVERY ingress, across all of
@@ -2624,8 +3032,81 @@ where
       Message::RequestSyncChunk(m) => self.on_request_sync_chunk(now, sb, m),
       Message::SyncCheckpointMeta(m) => self.on_sync_checkpoint_meta(now, m),
       Message::SyncChunk(m) => self.on_sync_chunk(now, wal, sb, m),
+      // A learner's NON-VOTING progress report: record the durable frontier in `peer_progress` (touches
+      // no quorum/vote state). It gates a later `propose_membership(PromoteLearner)`.
+      Message::LearnerStatus(m) => self.on_learner_status(m),
       Message::Reply(_) => {}
     }
+  }
+
+  /// Records a learner's NON-VOTING durable-frontier report into `peer_progress`, keyed by the sender's
+  /// STABLE [`MemberId`] (resolved from its slot, stable across reconfiguration). This touches ONLY
+  /// `peer_progress` — never `inflight`, the DVC/SVC vote maps, or any quorum bitset — so a
+  /// `LearnerStatus` can never contribute to a commit / view-change / recovery quorum; it is purely the
+  /// input to the catch-up-then-promote gate in
+  /// [`Endpoint::propose_membership`](crate::Endpoint::propose_membership).
+  ///
+  /// The update is MONOTONE: `(*entry).max(reported)`, so a reordered or duplicated lower report under
+  /// network reordering NEVER lowers a recorded value. The reported `durable_commit_min` is the
+  /// sender's DURABLE root frontier (what survives its crash), so the gate can never be satisfied by a
+  /// frontier the learner has not persisted.
+  ///
+  /// `sender_matches` + `epoch_authority_admits` already bound the sender to a current member of MY
+  /// configuration at the claimed slot, so `member_at` resolves; a slot with no member (impossible past
+  /// those gates) is ignored.
+  fn on_learner_status(&mut self, m: crate::LearnerStatus) {
+    let Some(member) = self.membership.member_at(m.replica()) else {
+      return;
+    };
+    let reported = m.durable_commit_min();
+    let entry = self.peer_progress.entry(member).or_default();
+    *entry = (*entry).max(reported);
+  }
+
+  /// Emits this learner's [`LearnerStatus`](crate::LearnerStatus) progress report when its cadence is
+  /// due, then re-arms. Only a non-voting learner reports (gated by `serviceable_now` + the
+  /// `handle_timeout` call site), so a voter never reaches here.
+  ///
+  /// The reported frontier is the DURABLE root's — `durable_commit_min` from `sb.state().commit()` (the
+  /// known-committed frontier the durable root carries; survives a crash) and `durable_op` from
+  /// `wal.op_head()` (the durable WAL head) — NOT the in-memory `commit_min`/`op`. A learner thus never
+  /// claims more than it persisted: after a crash it recovers to exactly this frontier, so the primary's
+  /// catch-up gate can only be satisfied by ops the learner durably holds.
+  fn learner_status_timeouts<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+  ) {
+    // Only a non-voting learner reports; a voter participates directly. (The call site already gates on
+    // Normal; this gates on learner — together they match `serviceable_now(LearnerStatus)`.)
+    if !self.is_learner() {
+      self.timers.learner_status = None;
+      return;
+    }
+    // Self-bootstrap the cadence: an idle learner has no other arm site (it never mints / proposes), so
+    // arm on the first tick it is seen as a Normal learner, then emit on each subsequent due tick. This
+    // is the idle-timer pattern — the learner ticks this cadence the way a backup ticks `primary_idle`.
+    let Some(deadline) = self.timers.learner_status else {
+      self.timers.learner_status = Some(now + LEARNER_STATUS_CADENCE);
+      return;
+    };
+    if deadline > now {
+      return;
+    }
+    let durable_commit_min = sb.state().commit();
+    let durable_op = wal.op_head();
+    self.emit(Outgoing::new(
+      Recipient::To(Peer::Replica(self.membership.primary(self.view))),
+      Message::LearnerStatus(crate::LearnerStatus::new(
+        self.local_slot(),
+        durable_commit_min,
+        durable_op,
+        self.membership.epoch(),
+        self.membership.config_id(),
+      )),
+    ));
+    self.timers.learner_status = Some(now + LEARNER_STATUS_CADENCE);
   }
 
   /// Fires any timers due at `now`, dispatching by status/role.
@@ -2686,6 +3167,9 @@ where
       // State-sync re-solicitation likewise runs only in Normal: re-broadcast RequestSync while a
       // sync is outstanding (awaiting a SyncCheckpoint or persisting the adopted one).
       self.sync_timeouts(now);
+      // Learner progress report likewise runs only in Normal, and only for a non-voting learner — it
+      // re-broadcasts its durable frontier so the primary's promote gate sees it catch up.
+      self.learner_status_timeouts(now, wal, sb);
     }
     // No-orphan-due invariant: after dispatch, NO serviceable timer may remain armed-and-due
     // (`serviceable_now(kind) && armed(kind) <= now`). `poll_timeout` returns only serviceable timers, so
@@ -2777,9 +3261,16 @@ where
     // any non-recovering status clears both (this reset, with neither arm below re-setting them).
     let prior_recover_retry = self.timers.recover_retry;
     let prior_recover_head = self.timers.recover_head;
+    // PRESERVE the learner progress cadence across the role-timer reset (like `forfeit_armed` /
+    // `repair_or_truncate`): a following learner ends in `arm_timers` on every `note_primary_contact`,
+    // so re-zeroing the cadence would slide it forward forever and the learner would never report. Its
+    // lifecycle is owned solely by `learner_status_timeouts` (self-bootstrap / emit-and-re-arm / clear
+    // when no longer a learner), never by this role re-arm.
+    let learner_status = self.timers.learner_status;
     self.timers = Timers::default();
     self.timers.forfeit_armed = forfeit_armed;
     self.timers.repair_or_truncate = repair_or_truncate;
+    self.timers.learner_status = learner_status;
     match self.status {
       Status::Normal if self.is_primary() => {
         let commit = now + COMMIT_HEARTBEAT;
@@ -2845,6 +3336,12 @@ where
     if self.sync.is_some() {
       self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
     }
+    // The learner progress cadence (`learner_status`) is PRESERVED across this role-timer reset (it was
+    // saved before `Timers::default()` and restored below), not re-armed here: its lifecycle is owned
+    // solely by `learner_status_timeouts` (self-bootstrap on the first Normal-learner tick, re-arm on
+    // each emit, clear when no longer a learner). Re-zeroing it here would let a learner that receives a
+    // steady Prepare/Commit stream (each ending in `arm_timers` via `note_primary_contact`) perpetually
+    // slide the cadence forward and never report — the same slide hazard `commit`/`prepare` avoid.
   }
 
   /// The single outbound-emission chokepoint. EVERY replica-originated message goes through here so the
@@ -2898,6 +3395,7 @@ where
       TimerKind::SyncSolicit => self.timers.sync_solicit,
       TimerKind::ForfeitArmed => self.timers.forfeit_armed,
       TimerKind::RepairOrTruncate => self.timers.repair_or_truncate,
+      TimerKind::LearnerStatus => self.timers.learner_status,
     }
   }
 
@@ -2985,6 +3483,9 @@ where
       TimerKind::RecoverHead => self.status.is_recovering_head(),
       // `handle_timeout` runs `repair_timeouts`/`sync_timeouts` only while Normal.
       TimerKind::RepairRetry | TimerKind::SyncSolicit => self.status.is_normal(),
+      // Only a non-voting learner emits a progress report, and only while Normal — `handle_timeout`
+      // runs `learner_status_timeouts` under exactly this gate.
+      TimerKind::LearnerStatus => self.status.is_normal() && self.is_learner(),
     }
   }
 

@@ -1,6 +1,6 @@
 use super::*;
 
-impl<S: StateMachine> Endpoint<S> {
+impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn primary_timeouts<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // Deferred forfeit: a primary that hit the force-sync strand
     // ([`Self::maybe_force_sync`]) flagged a step-down rather than reset its `op` (which would let it
@@ -360,13 +360,50 @@ impl<S: StateMachine> Endpoint<S> {
     // client this only bumps the watermark so the in-flight request's retransmits dedup.
     let session = self.clients.entry(key).or_default();
     session.request = request;
+    self.mint_op(
+      now,
+      wal,
+      client,
+      request,
+      body_bytes.clone(),
+      Body::Present(body_bytes),
+    );
+  }
+
+  /// The shared op-mint tail: assign `self.op + 1`, submit the WAL append, cache the entry, seed the
+  /// inflight vote tracker (content-addressed by the operation identity), record the pending ack, and
+  /// broadcast the `Prepare`. The SINGLE source of the append-before-ack append + Prepare emission, so
+  /// the client-request path ([`Self::on_request`]) and the reconfiguration-proposal path
+  /// ([`Endpoint::propose_membership`](crate::Endpoint::propose_membership)) cannot drift.
+  ///
+  /// `body_bytes` is the canonical wire body the WAL stores and the `Prepare` carries — the client
+  /// bytes for a client op, the encoded successor membership for a `Body::Reconfigure` op (whose
+  /// canonical `body_checksum` equals `fnv1a_128(body_bytes)` by construction). `body` is the
+  /// in-memory log entry's [`Body`] (it distinguishes a client op from a reconfiguration op), wrapped
+  /// under the same `(client, request)` identity passed here.
+  ///
+  /// Callers own the admission gating and any per-path bookkeeping (the client path's session row, the
+  /// reconfiguration path's single-writer latch) BEFORE calling — this mints unconditionally.
+  pub(crate) fn mint_op<W: Wal>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    client: ClientId,
+    request: RequestNumber,
+    body_bytes: Bytes,
+    body: Body,
+  ) {
     self.op = self.op.next();
-    let header = Header::new(self.op, self.view, client, request, r.body());
+    let header = Header::new(self.op, self.view, client, request, &body_bytes);
     let id = self.mint_op_id();
     wal.submit_append(id, self.op, header, body_bytes.clone());
     self.log.insert(
       self.op.get(),
-      LogEntry::present(client, request, body_bytes.clone()),
+      LogEntry {
+        client,
+        request,
+        body,
+      },
     );
     self.inflight.insert(
       self.op.get(),
@@ -430,14 +467,17 @@ impl<S: StateMachine> Endpoint<S> {
       // `commit_op` HOLDS the commit (returns false without advancing) if `next`'s body read back
       // permanently faulty and must be peer-repaired — never skip a hole. Stop the loop; the repair
       // timer re-fetches it and a later try_commit resumes from exactly here.
-      if !self.commit_op(now, next) {
+      if !self.commit_op(now, sb, next) {
         break;
       }
       advanced = true;
     }
     self.commit_max = OpNumber::with(self.commit_max.get().max(self.commit_min.get()));
-    if advanced {
-      // Tell backups the commit advanced (also serves as a heartbeat).
+    if advanced && self.pending_sb.is_none() {
+      // Tell backups the commit advanced (also serves as a heartbeat). Suppressed while a durable-view or
+      // SwapEpoch root is in flight (`pending_sb`): advertising the commit there would assert authority in a
+      // view/epoch not yet durable — the durable-view-before-participate fence the `emit` chokepoint
+      // enforces. The next commit tick or heartbeat re-advertises once the root lands.
       self.emit(Outgoing::new(
         Recipient::Backups,
         Message::Commit(Commit::new(
@@ -459,11 +499,12 @@ impl<S: StateMachine> Endpoint<S> {
   }
 
   /// Applies op `op` on the primary, caches + sends the reply, emits the event. Returns `true` if it
-  /// applied; `false` if the body is missing (read back permanently faulty) — in which case it
-  /// registers the op for peer fault-repair and does NOT advance `commit_min`, so the caller HOLDS
-  /// the commit at the hole until a peer supplies the op.
+  /// applied (or recognized + staged a consensus-layer reconfiguration); `false` if the body is
+  /// missing (read back permanently faulty) — in which case it registers the op for peer fault-repair
+  /// and does NOT advance `commit_min`, so the caller HOLDS the commit at the hole until a peer
+  /// supplies the op.
   #[must_use]
-  fn commit_op(&mut self, now: Instant, op: u64) -> bool {
+  fn commit_op<B: Superblock>(&mut self, now: Instant, sb: &mut B, op: u64) -> bool {
     // Faults-as-data (peer fault-repair): a committed op whose body read back
     // permanently faulty (bit-rot / torn) is ABSENT from the dense `log` cache (the recover loop
     // dropped it rather than adopt a wrong/empty body), OR is present as a body-`Repairing` HOLE (the
@@ -475,6 +516,15 @@ impl<S: StateMachine> Endpoint<S> {
       self.request_repair_run(now, op);
       return false;
     };
+    // Consensus-layer reconfiguration: a `Body::Reconfigure` op is NOT applied to the state machine —
+    // at commit it triggers the COMMIT-FIRST epoch swap (stage the successor + a durable SwapEpoch
+    // root; the in-memory swap is deferred to the durable root). Recognized BEFORE the `as_present`
+    // hole check below (a `Reconfigure` body is `as_present() == None`, which would otherwise route it
+    // to peer-repair). Returns committed — the op IS committed; only its EFFECT is the epoch swap, not
+    // an `sm.apply`.
+    if self.commit_reconfigure(op, &entry.body, sb) {
+      return true;
+    }
     let Some(body) = entry.body.as_present() else {
       // A body-absent (`Repairing`) hole: handled EXACTLY like a wholly-missing slot above — hold the
       // commit and peer-repair the contiguous hole run.
@@ -518,6 +568,48 @@ impl<S: StateMachine> Endpoint<S> {
         entry.request,
         reply_body,
       )));
+    true
+  }
+
+  /// The SINGLE recognition+routing of a committed `Body::Reconfigure` op, shared by the primary's
+  /// [`Self::commit_op`] and the backup's [`Self::advance_commit`] so the two apply loops cannot drift
+  /// on what a committed reconfiguration does. Returns `true` (and performs the swap staging) iff
+  /// `body` is `Body::Reconfigure`; `false` for an ordinary client op (the caller applies it normally).
+  ///
+  /// On a reconfiguration it: (1) marks the op committed and advances `commit_min` past it — the op IS
+  /// committed at the consensus layer, so the applied frontier moves even though no `sm.apply` runs;
+  /// (2) computes the SUCCESSOR membership by chaining off the CURRENT (predecessor) membership via
+  /// [`Membership::reconfigure`](crate::Membership) — the SAME chain `Membership::apply_delta` used at
+  /// propose, single-sourced so the successor `epoch`/`config_id` are byte-identical to the proposer's
+  /// (and to every other committing replica's, since all commit at the identical predecessor); and
+  /// (3) STAGES the epoch swap ([`Self::stage_epoch_swap`]) — latch the successor, clear the
+  /// single-writer latch, and submit (or queue) the durable SwapEpoch root. The epoch is NOT advanced
+  /// in memory here (the durable-epoch-before-participate fence — install runs only at the durable
+  /// root). The op is NOT delivered to `S::apply` and no client `Reply`/`Committed` event is emitted
+  /// (it carries no client request).
+  fn commit_reconfigure<B: Superblock>(&mut self, op: u64, body: &Body, sb: &mut B) -> bool {
+    let Some(payload) = body.as_reconfigure() else {
+      return false;
+    };
+    // Chain the successor off the predecessor membership — the single source of the `(epoch,
+    // config_id)` derivation (identical on every replica, which all commit at this same predecessor).
+    // A committed reconfiguration's payload was validated at propose AND re-validated when the wire
+    // body decoded into `Body::Reconfigure`, so `reconfigure`'s structural re-check cannot fail here.
+    let successor = self
+      .membership
+      .reconfigure(
+        payload.replica_count(),
+        payload.learner_count(),
+        payload.members().to_vec(),
+      )
+      .expect("a committed reconfiguration op carries a structurally valid successor membership");
+    // The op is committed: advance the applied frontier past it (no `sm.apply`) and mark it committed
+    // for the primary's inflight tracker (a backup holds no inflight entry — the `if let` is a no-op).
+    self.set_commit_min(OpNumber::with(op));
+    if let Some(inflight) = self.inflight.get_mut(&op) {
+      inflight.committed = true;
+    }
+    self.stage_epoch_swap(successor, sb);
     true
   }
 
@@ -801,6 +893,37 @@ impl<S: StateMachine> Endpoint<S> {
         >= crate::message::MAX_HEADER_ONLY_BAND_DEPTH as u64
   }
 
+  /// Build the in-memory [`LogEntry`] for a backup appending `p`, choosing ONE typed representation
+  /// so a committed `Body::Reconfigure` op is recognized uniformly on the primary AND every backup
+  /// (decision (a) — a single representation everywhere avoids a decode-at-commit footgun). A
+  /// [`ClientId::RECONFIGURATION`] prepare's flat wire `body` is the canonical successor-membership
+  /// encoding: decode it back to a typed `Body::Reconfigure`; every other prepare is a `Body::Present`
+  /// client op carrying the raw bytes. The WAL still stores the body BYTES regardless (the caller's
+  /// `submit_append` already ran) — only the in-memory `LogEntry::body` distinguishes the two.
+  ///
+  /// A RECONFIGURATION prepare from the legitimate primary always carries `encode_body()` output,
+  /// which always decodes (the non-Byzantine sender contract; framing checksums catch corruption
+  /// first). A decode failure is therefore a bug — asserted in debug — and degrades in release to a
+  /// `Body::Present` entry (the op still appends + acks, so the head never stalls; commit then treats
+  /// it as an opaque op and stages NO epoch swap, never panicking on the bytes).
+  pub(crate) fn log_entry_from_prepare(&self, p: &Prepare) -> LogEntry {
+    if p.client() == ClientId::RECONFIGURATION {
+      match crate::message::ReconfigurePayload::decode_body(p.body()) {
+        Ok(payload) => return LogEntry::reconfigure(p.client(), p.request(), payload),
+        Err(_e) => {
+          debug_assert!(
+            false,
+            "a RECONFIGURATION prepare for op {} carried an undecodable reconfigure body \
+             ({:?}) — the non-Byzantine primary always sends encode_body() output",
+            p.op().get(),
+            _e,
+          );
+        }
+      }
+    }
+    LogEntry::present(p.client(), p.request(), p.body_bytes())
+  }
+
   fn append_prepare<W: Wal>(&mut self, wal: &mut W, p: Prepare) {
     // the backup-overflow guard ([`Self::maybe_sync_below_ring_window`]) runs in
     // `on_prepare` BEFORE every head-extend append (the new-op branch + each buffered-prepare drain), so
@@ -822,10 +945,8 @@ impl<S: StateMachine> Endpoint<S> {
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
     let id = self.mint_op_id();
     wal.submit_append(id, p.op(), header, p.body_bytes());
-    self.log.insert(
-      p.op().get(),
-      LogEntry::present(p.client(), p.request(), p.body_bytes()),
-    );
+    let entry = self.log_entry_from_prepare(&p);
+    self.log.insert(p.op().get(), entry);
     self.pending.insert(id.get(), Pending::Ack(p.op()));
     // Append-before-ack: mark op in-flight so neither this op's deferred ack NOR a
     // retransmit-driven re-ack (`on_prepare`'s `pop <= self.op` branch) can emit a PrepareOk before
@@ -846,10 +967,8 @@ impl<S: StateMachine> Endpoint<S> {
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
     let id = self.mint_op_id();
     wal.submit_append(id, p.op(), header, p.body_bytes());
-    self.log.insert(
-      p.op().get(),
-      LogEntry::present(p.client(), p.request(), p.body_bytes()),
-    );
+    let entry = self.log_entry_from_prepare(p);
+    self.log.insert(p.op().get(), entry);
     self.pending.insert(id.get(), Pending::Ack(p.op()));
     // Mark in-flight so a further retransmit-driven re-ack defers to `on_wal_done` (which clears it +
     // sends the single PrepareOk once the canonical append is durable). NO head rewind: `self.op` stays.
@@ -950,6 +1069,15 @@ impl<S: StateMachine> Endpoint<S> {
         self.request_repair_run(now, op);
         break;
       };
+      // Consensus-layer reconfiguration: a `Body::Reconfigure` op is NOT applied to the SM — at commit
+      // it stages the COMMIT-FIRST epoch swap (the durable swap install is deferred to its SwapEpoch
+      // root). Recognized BEFORE the `as_present` hole check below (a `Reconfigure` body is
+      // `as_present() == None`, which would otherwise route it to peer-repair). The op IS committed, so
+      // `commit_min` advances past it; the loop then continues to any further committed ops. Identical
+      // recognition to the primary's `commit_op`, so primary and backup install the SAME successor.
+      if self.commit_reconfigure(op, &entry.body, sb) {
+        continue;
+      }
       let Some(body) = entry.body.as_present() else {
         // A body-absent (`Repairing`) hole: handled EXACTLY like a wholly-missing slot above — hold the
         // commit and peer-repair the contiguous hole run.
