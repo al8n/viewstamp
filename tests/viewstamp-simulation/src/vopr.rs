@@ -1125,7 +1125,12 @@ pub fn run_vopr_with_reconfig(seed: u64, ticks: u64) -> VoprReport {
 /// byte-identical to the default schedule (the live-reconfig draws are conditional on the axis). This
 /// is the entry point for the committed live-reconfig sweep.
 pub fn run_vopr_with_reconfig_live(seed: u64, ticks: u64) -> VoprReport {
-  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  // FORCE the learner topology ON for this axis (independent of `VOPR_LEARNER`): the expanded
+  // live-reconfig axis seed-chooses among `AddLearner` / a LOW-INDEX `RemoveVoter` / a slot-shifting
+  // `PromoteLearner`, and the promote needs a GENESIS LEARNER to promote. Learners only GROW the
+  // membership (a separate per-seed draw, the action stream unperturbed) and never touch the off-axis
+  // (`run_vopr`) schedule, so the standing byte-identity guard is unaffected.
+  let mut v = Vopr::new(seed, true);
   v.live_reconfig_axis = true;
   run_seeded(v, ticks)
 }
@@ -1345,6 +1350,21 @@ const LIVE_RECONFIG_BUDGET: u64 = 1;
 /// unchanged, only the epoch and `config_id` advance.
 const LIVE_RECONFIG_MEMBER: u128 = 0xFFFF_0000_0000_0000;
 
+/// The seed-mix for the live-reconfig DELTA-KIND choice — a distinct local stream (NOT the action
+/// stream `self.prng`), so seed-choosing among `AddLearner` / `RemoveVoter` / `PromoteLearner` does not
+/// shift the chaos schedule's draw positions (the cadence + every other action stay where they were);
+/// the kind is a pure deterministic function of the seed. Must not collide with any other `_MAGIC`.
+const RECONFIG_DELTA_MAGIC: u64 = 0xD17A_5E11_C04F_1235;
+
+/// The per-client request budget the LIVE-RECONFIG axis uses (vs the much larger `requests_per_client`
+/// of the other lanes): FINITE and small enough to DRAIN within the tick budget, so the cluster reaches
+/// a lull where the genesis learner's durable frontier catches the head and the proto's
+/// catch-up-then-promote gate is satisfiable — i.e. the slot-shifting `PromoteLearner` actually COMMITS
+/// instead of being perpetually `TargetNotCaughtUp` under sustained load. Large enough to cross several
+/// checkpoints first (the swap straddles real committed history). Only this axis uses it (a separate
+/// build path), so every other lane's load — and the off-axis byte-identity — is unchanged.
+const RECONFIG_LIVE_REQUESTS_PER_CLIENT: u64 = 40;
+
 /// The magic mixed into the seed for the learner-count PRNG. A distinct local stream (NOT the action
 /// stream `self.prng`), so when the learner axis is OFF no learner draw happens and `node_count`
 /// equals `voting_count`, leaving the default per-seed schedule byte-identical; when ON, the learner
@@ -1450,8 +1470,17 @@ impl Vopr {
   fn build_cluster(&mut self) -> Cluster {
     let clients = self.report.clients as u32;
     // Each client issues many requests; with a few thousand ticks and faults, the run rarely drains
-    // them, so there is almost always pending load to commit (keeps the liveness check non-vacuous).
-    let requests_per_client = 1_000;
+    // them, so there is almost always pending load to commit (keeps the liveness check non-vacuous). The
+    // LIVE-RECONFIG axis is the exception: it uses a FINITE, DRAINABLE budget so the cluster reaches a
+    // lull where the genesis learner catches the head and a slot-shifting `PromoteLearner` can pass the
+    // catch-up gate + COMMIT (see `RECONFIG_LIVE_REQUESTS_PER_CLIENT`). This is a CONSTANT swap — it
+    // consumes no PRNG — so it perturbs no draw position; only this axis's own deterministic baseline
+    // moves, and the off-axis (`run_vopr`) schedule + byte-identity are untouched.
+    let requests_per_client = if self.live_reconfig_axis {
+      RECONFIG_LIVE_REQUESTS_PER_CLIENT
+    } else {
+      1_000
+    };
     // Checkpoint interval. MOST seeds use a SMALL interval (4..=12) so a few-thousand-tick run crosses
     // several checkpoints (exercising checkpoint + GC + checkpoint-based recovery repeatedly). But a
     // small interval keeps the durable `checkpoint_op` always close behind the WAL head, so the recover
@@ -1855,9 +1884,10 @@ impl Vopr {
        but `live_swaps_observed` is 0 — the non-vacuity witness disagrees",
       self.seed
     );
-    // Every non-crashed, non-retired VOTER must have installed the successor: after a fully-healed
-    // drain a voter still on the predecessor epoch is a reconfiguration that did not converge. The
-    // drain already ticked until this holds (see `run_final_quiesce`); this re-asserts it for the record.
+    // Every non-crashed, non-retired SUCCESSOR VOTER must have installed the successor: after a
+    // fully-healed drain a voter still on the predecessor epoch is a reconfiguration that did not
+    // converge. The drain already ticked until this holds (see `run_final_quiesce`); this re-asserts it
+    // for the record.
     for i in 0..c.voting_count() {
       if c.is_crashed(i) || c.is_retired(i) {
         continue;
@@ -2383,33 +2413,98 @@ impl Vopr {
     // live change CONVERGES cluster-wide (every backup commits the `Reconfigure` op and installs the
     // successor epoch), so this axis runs the full liveness/convergence suite — the calm-window
     // livelock + final-convergence oracle + the per-voter install assertion — like every other lane.
+    //
+    // EXPANDED AXIS: the delta is SEED-CHOSEN so the SLOT-SHIFT class is exercised BY CONSTRUCTION across
+    // the seed range rather than only the non-shifting `AddLearner` (so the cross-epoch reply/solicitation
+    // binding is covered in the SYSTEM sim, not only the proto unit regressions): a slot-shifting
+    // `PromoteLearner` (the slot↔`MemberId` routing translation in `Cluster` keeps every shifted member
+    // addressable) or `AddLearner` (the no-shift case + fallback). See `choose_live_reconfig_delta` for the
+    // shift mechanics and why `RemoveVoter` is out of scope here (its removed-node reply is unroutable in
+    // a slot-addressed sim, and a voting-set shrink would need a reconfiguration-aware durability SAFETY
+    // oracle).
+    //
+    // The kind is drawn from a SEPARATE per-seed PRNG (`seed ^ RECONFIG_DELTA_MAGIC`), so the action
+    // stream `self.prng` keeps its exact draw positions (the cadence + every other action unchanged). The
+    // budget (`live_reconfig_actions`) is consumed only on an ACCEPTED proposal, so a `PromoteLearner`
+    // momentarily refused by the catch-up gate RETRIES on the next cadence tick rather than burning the
+    // budget on a not-yet-caught-up refusal — keeping the swap NON-VACUOUS. A seed with no genesis learner
+    // falls back to `AddLearner`, so the budget is never wasted and the cross-seed `live_swaps_observed >
+    // 0` non-vacuity holds.
     if self.live_reconfig_axis
       && self.prng.chance(1, 200)
       && self.live_reconfig_actions < LIVE_RECONFIG_BUDGET
       && c.serving_primary().is_some()
     {
-      self.live_reconfig_actions += 1;
-      match c.propose_reconfigure_single_change(SingleVoterDelta::AddLearner(MemberId::new(
-        LIVE_RECONFIG_MEMBER,
-      ))) {
+      let delta = self.choose_live_reconfig_delta();
+      match c.propose_reconfigure_single_change(delta.clone()) {
         Ok(op) => {
+          self.live_reconfig_actions += 1;
           self.report.live_reconfigs_proposed += 1;
+          // The driven deltas (`PromoteLearner` / `AddLearner`) only GROW the voting set, so the
+          // successor's fault tolerance is >= the current `minority_budget` — the chaos budget already
+          // fits and is left unchanged. (A voting-set SHRINK would need the budget recomputed to the
+          // successor's tolerance; `RemoveVoter` is not driven — see `choose_live_reconfig_delta`.)
           if trace {
             eprintln!(
-              "tick {tick}: LIVE-RECONFIG proposed AddLearner op={}",
+              "tick {tick}: LIVE-RECONFIG proposed {} op={}",
+              delta.as_str(),
               op.get()
             );
           }
         }
         Err(e) => {
-          // The proposal can be momentarily refused (e.g. a view change races the serving-primary
-          // check, or a prior change is still latched); the budget is still consumed so the action
-          // schedule stays a pure function of the seed (mirroring the wipe/churn action accounting).
+          // Momentarily refused (a view change races the serving-primary check, a prior change is still
+          // latched, or a `PromoteLearner`'s target is not yet caught up). The budget is NOT consumed, so
+          // the cadence retries until the change commits — keeping the swap NON-VACUOUS.
           if trace {
-            eprintln!("tick {tick}: LIVE-RECONFIG proposal refused: {e:?}");
+            eprintln!(
+              "tick {tick}: LIVE-RECONFIG {} refused: {e:?}",
+              delta.as_str()
+            );
           }
         }
       }
+    }
+  }
+
+  /// Seed-choose the live single-change delta the axis drives this run (a pure deterministic function of
+  /// the seed, drawn from a dedicated stream so the action schedule is unperturbed): a SLOT-SHIFTING
+  /// `PromoteLearner` of the last genesis learner, else the non-shifting `AddLearner(sentinel)` (also the
+  /// fallback when no genesis learner exists). So half the applicable seeds exercise a surviving-member
+  /// SLOT SHIFT end-to-end under the full adversarial schedule, covering the cross-epoch reply +
+  /// solicitation binding in the SYSTEM sim (not only the proto unit regressions).
+  ///
+  /// `PromoteLearner` is the SOUND slot-shift driver here because it only GROWS the voting set: every
+  /// derived quorum only RISES, so NO safety oracle (durability quorum, agreement) is perturbed, and
+  /// EVERY member stays addressable (the promoted member moves slot `node_count-1`→`voting_count`, the
+  /// surviving learners shift — and the slot↔`MemberId` routing translation in `Cluster` resolves all of
+  /// them). The live-reconfig axis runs a FINITE, DRAINABLE client load (see `build_cluster`), so the
+  /// genesis learner's durable frontier reaches the head in a lull and the proto's catch-up-then-promote
+  /// gate is satisfiable — the promote COMMITS rather than being perpetually `TargetNotCaughtUp`.
+  ///
+  /// `RemoveVoter` is DELIBERATELY NOT driven: a removed voter cannot be ROUTED its catch-up reply in this
+  /// slot-addressed simulator (it is absent from every survivor's successor membership, so a donor has no
+  /// slot to address its `SyncCheckpoint`/`EpochAhead` back to it — the real transport replies over the
+  /// CONNECTION, a back-channel the message-VOPR lacks), AND a voting-set SHRINK lowers the durable quorum
+  /// while the `DurabilityChecker` (a SAFETY oracle) is fixed at the predecessor's quorum — so driving it
+  /// would require making that safety oracle reconfiguration-aware, which risks MASKING a real
+  /// committed-op loss. Both are out of scope for a generator extension (a `RemoveVoter` lane would be a
+  /// dedicated effort with reconfiguration-aware safety checkers). The proto-level slot-shift regressions
+  /// in `viewstamp-proto` cover a low-index removal's reply + solicitation binding directly.
+  fn choose_live_reconfig_delta(&self) -> SingleVoterDelta {
+    let add_learner = SingleVoterDelta::AddLearner(MemberId::new(LIVE_RECONFIG_MEMBER));
+    let learner_count = self.node_count.saturating_sub(self.voting_count);
+    match Prng::new(self.seed ^ RECONFIG_DELTA_MAGIC).below(2) {
+      // A slot-shifting promote — only when a genesis learner exists (this axis forces learners on, so one
+      // always does). Promote the LAST learner (`MemberId node_count-1`): it moves into the voter range
+      // (slot `node_count-1`→`voting_count`), shifting the surviving learners' slots — the slot shift,
+      // with every member still addressable.
+      0 if learner_count >= 1 => {
+        SingleVoterDelta::PromoteLearner(MemberId::new(self.node_count as u128 - 1))
+      }
+      // The always-valid no-slot-shift case (the original behavior) + the fallback when no genesis learner
+      // exists — so the budget is never wasted and the cross-seed swap non-vacuity holds.
+      _ => add_learner,
     }
   }
 
@@ -2696,13 +2791,15 @@ impl Vopr {
     if let Violation(why) = bound.observe(c) {
       panic!("vopr seed {} tick {tick}: boundedness: {why}", self.seed);
     }
-    // Never-primary: NO learner id (`i >= voting_count`) is ever the primary of its view. The
-    // proto's `primary(view) = view % replica_count` can only name a VOTER, so a learner-as-primary
-    // would be a modulus break that misroutes every client request and prepare. Checked every tick,
-    // unconditionally — cheap and on every lane (a learner range is non-empty only under the axis, so
-    // off-axis this loop is empty). A violation here is a REAL finding.
+    // Never-primary: NO non-voting learner is ever the primary of its view. The proto's
+    // `primary(view) = view % replica_count` can only name a VOTER, so a learner-as-primary would be a
+    // modulus break that misroutes every client request and prepare. Classified by the node's LIVE voter
+    // status in its durable membership (`replica_is_voter`), NOT the static genesis range: a
+    // `PromoteLearner` makes a genesis-learner-slot node a VOTER that CAN legitimately be primary. Checked
+    // every tick over the genesis learner range (non-empty only under the axis, so off-axis this loop is
+    // empty); a CURRENT learner acting as primary is a REAL finding.
     for i in self.voting_count..self.node_count {
-      if c.replica_is_primary(i) {
+      if !c.replica_is_voter(i) && c.replica_is_primary(i) {
         panic!(
           "vopr seed {} tick {tick}: learner {i} is acting as PRIMARY (view {}) — a non-voting \
            learner must never be primary (primary(view) = view % voting_count names only a voter)",

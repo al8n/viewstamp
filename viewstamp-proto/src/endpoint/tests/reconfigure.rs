@@ -633,6 +633,172 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
 }
 
 #[test]
+fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fires() {
+  // DURABLE-LINEAGE-CORRUPTION regression. A replica can COMMIT its OWN `Reconfigure` op N (E0->E1) and
+  // stage `pending_swap` (the E1 successor), then enter a non-Normal state BEFORE its SwapEpoch root
+  // installs. A higher-epoch heartbeat in that state routes through `enter_cross_epoch_peer_fetch`, which
+  // PRESERVES `pending_swap` (`reset_for_view_transition` keeps the committed change). The verified
+  // cross-epoch `SyncCheckpoint` then installs the SAME successor HERE via `install_membership(None, E1)`
+  // (the crossing), advancing `self.membership` to E1 while the stale E0->E1 `pending_swap` sits intact.
+  //
+  // The BUG: after the sync root completes, `on_sb_done`'s tail `maybe_swap_epoch` would re-submit that
+  // STALE SwapEpoch against the now-already-E1 membership — minting a DUPLICATE SwapEpoch root stamped
+  // with the live E1 config as its OWN predecessor, pushing E1's predecessor (genesis) into the lineage
+  // ring a SECOND time, emitting a bogus `MembershipChanged`, and evicting legitimate older ancestors.
+  //
+  // The FIX is two complementary parts: (1) `maybe_swap_epoch` validates the staged successor still
+  // CHAINS from the live config (`recompute_config_id(.., self.membership.config_id()) ==
+  // successor.config_id()`) and DROPS a stale swap; (2) the crossing install CONSUMES `pending_swap`
+  // directly. This test pins that the crossing leaves NO second SwapEpoch root, NO double lineage push,
+  // NO bogus `MembershipChanged`, and the legitimate ancestors are retained.
+  let n1: u64 = 2; // the node's OWN reconfigure op N (E0 -> E1); committed band is ops (0 .. N].
+  let genesis_mem = genesis(3);
+  let successor_e1 = genesis_mem
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+  let genesis_config_id = genesis_mem.config_id();
+
+  // A BACKUP (slot 1) at E0, Normal, that committed its own reconfigure op N (op == commit_min == N),
+  // checkpoint 0 — the commit-first window where the SwapEpoch root has NOT yet installed.
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.force_state_for_test(0, n1, n1, 0, &[]);
+
+  // STAGE the node's OWN E0->E1 swap (submits the SwapEpoch root; `pending_swap` latched).
+  e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut sb);
+  assert!(
+    e.pending_swap_for_test(),
+    "the node's own E1 swap is staged"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "the durable-epoch-before-participate fence: still E0 until the root lands"
+  );
+  // The genesis lineage ring is seeded with the genesis id in every slot (the `with_reconfig` seed).
+  assert_eq!(
+    e.lineage_ring_for_test(),
+    [genesis_config_id; crate::endpoint::LINEAGE_RING],
+    "pre-crossing: the genesis lineage ring",
+  );
+
+  // A higher-epoch heartbeat in a non-Normal state routes the laggard into the cross-epoch peer-fetch.
+  // `enter_cross_epoch_peer_fetch` clears the in-flight SwapEpoch root (its stale completion is ignored)
+  // but PRESERVES `pending_swap` via `reset_for_view_transition` — the exact precondition of the bug.
+  e.enter_cross_epoch_peer_fetch(now, OpNumber::with(n1));
+  assert!(
+    e.pending_swap_for_test(),
+    "the cross-epoch peer-fetch PRESERVES the staged swap (reset_for_view_transition keeps it)",
+  );
+  assert!(
+    !e.pending_sb_for_test(),
+    "the in-flight SwapEpoch root was cleared by the peer-fetch entry",
+  );
+  assert!(
+    e.status() == Status::Recovering && e.sync_requires_cross_epoch_for_test(),
+    "the laggard is Recovering with a forced crossing-required sync armed",
+  );
+
+  // The verified crossing SyncCheckpoint: the E1 successor (the SAME one the staged swap holds),
+  // chained off the genesis predecessor (config_id 0), at the crossing op N. `apply_sync` reconstructs
+  // + VERIFIES it (the config_id hash-chain), so this is the cross-epoch crossing install.
+  let nonce = e.sync_nonce_for_test();
+  let cross_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(n1),
+    &std::collections::BTreeMap::new(),
+    &CountSm::default().snapshot(),
+  );
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    ReconfigurePayload::from_membership(&successor_e1, genesis_config_id).encode_body();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(n1),
+      cross_id,
+      successor_e1.epoch(),
+      successor_e1.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      cross_env.clone(),
+      membership_body.clone(),
+    )),
+  );
+  assert!(
+    e.pending_install.is_some(),
+    "the crossing reply STAGED the install (a forced crossing-required sync admits it)",
+  );
+
+  // Drive the two-write re-persist to its durable root → `install_sync` runs `install_membership(None,
+  // E1)` (the crossing) and (the FIX) consumes the stale `pending_swap`; then `on_sb_done`'s tail
+  // `maybe_swap_epoch` runs against the now-E1 membership.
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+
+  // The crossing landed: E1 is installed, the sync completed exactly once.
+  assert_eq!(
+    e.membership, successor_e1,
+    "the laggard CROSSED to E1 via the verified sync",
+  );
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the crossing install completed exactly once",
+  );
+
+  // (1) NO stale staged swap survives the crossing — the staged E0->E1 swap was consumed.
+  assert!(
+    !e.pending_swap_for_test(),
+    "the crossing CONSUMED the stale staged swap — none remains to re-fire",
+  );
+  // (2) NO second SwapEpoch root: with the swap consumed, the superblock is idle — no write in flight.
+  assert!(
+    !e.pending_sb_for_test() && e.pending_checkpoint.is_none(),
+    "no SwapEpoch (nor any) root is in flight after the crossing — the stale swap did NOT re-submit",
+  );
+  // (3) The genesis (E1's predecessor) is pushed into the lineage ring EXACTLY ONCE (by the crossing
+  // install), NOT a second time by a re-fired stale swap. A double push would shift genesis into a
+  // SECOND ring slot, evicting an older ancestor. The post-crossing ring keeps genesis at slot 0 and
+  // the retained genesis tail below it (the seed) — never two distinct pushes of the same predecessor.
+  assert_eq!(
+    e.lineage_ring_for_test(),
+    [genesis_config_id; crate::endpoint::LINEAGE_RING],
+    "the lineage ring is pushed once (genesis -> slot 0); no second stale-swap push evicts an ancestor",
+  );
+  assert!(
+    e.in_lineage_for_test(genesis_config_id),
+    "the legitimate genesis ancestor is still admissible (no eviction)",
+  );
+
+  // (4) NO bogus `MembershipChanged`: a cross-epoch crossing install emits none (the laggard synced PAST
+  // the Reconfigure op), and the consumed stale swap emits none either. Only `StateSyncCompleted`.
+  let mut saw_membership_changed = false;
+  let mut saw_state_sync_completed = false;
+  while let Some(ev) = e.poll_event() {
+    match ev {
+      Event::MembershipChanged(_) => saw_membership_changed = true,
+      Event::StateSyncCompleted(_) => saw_state_sync_completed = true,
+      _ => {}
+    }
+  }
+  assert!(
+    !saw_membership_changed,
+    "NO MembershipChanged: the crossing install names no local op, and the stale swap did not re-fire",
+  );
+  assert!(
+    saw_state_sync_completed,
+    "the crossing is observable via StateSyncCompleted (the legitimate signal)",
+  );
+}
+
+#[test]
 fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   // The restart-survivable half of the swap-checkpoint: a crash BETWEEN the SwapEpoch root and the forced
   // checkpoint leaves a durable root with the E+1 membership AHEAD of the checkpoint — `config_install_op = N` but
@@ -1029,6 +1195,141 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   assert!(
     admitted.is_ok(),
     "after the durable-view write lands and the prefix applies, the proposal is admitted: {admitted:?}",
+  );
+}
+
+#[test]
+fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingress() {
+  // CONSENSUS-SAFETY (the reserved-client ingress fence): [`ClientId::RECONFIGURATION`] is the high
+  // sentinel under which the cluster mints its INTERNAL `Body::Reconfigure` ops via `propose_membership`.
+  // Nothing makes it a real client, so no genuine client `Request` ever carries it. If `on_request`
+  // accepted one, the primary would mint it as an ordinary `Body::Present` op and broadcast a `Prepare`
+  // under the reserved id; every backup would reconstruct that prepare's bytes via `from_committed_body`
+  // (which keys on this id) as a typed `Body::Reconfigure` and, on commit, STAGE a membership change —
+  // while the primary applied the same op as a state-machine command. That BYPASSES `propose_membership`
+  // entirely (the AddVoter XI-b gate, the PromoteLearner catch-up gate, the single-change gate, the
+  // predecessor-delta validation, the single-writer latch) and forks the committed log (the same op typed
+  // `Present` on the primary and `Reconfigure` on the backups). The fence DROPS it at ingress.
+  //
+  // The body is a VALID `ReconfigurePayload` encoding (the worst case: were it accepted and type-erased,
+  // backups would decode it cleanly into a real membership swap), so the test exercises the genuine
+  // hazard, not a malformed-body short-circuit.
+  let mut e = single_change_primary();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+
+  // A decodable reconfigure body (the AddVoter(3) successor, chained off the current config — exactly
+  // what `propose_membership` would encode), wrapped in a client `Request` under the reserved id.
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter is a valid delta on a 3-voter cluster");
+  let payload = ReconfigurePayload::from_membership(&successor, e.membership.config_id());
+  let reserved_body = payload.encode_body();
+
+  let head_before = e.op();
+  let epoch_before = e.membership.epoch();
+  let config_id_before = e.membership.config_id();
+  assert!(
+    e.is_primary() && e.status().is_normal(),
+    "precondition: Normal primary that would mint"
+  );
+
+  // (1) DIRECT client path: a client sends the reserved-id request straight to the primary.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::RECONFIGURATION),
+    Message::Request(Request::new(
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      reserved_body.clone(),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    head_before,
+    "the reserved-id request minted NO op (the head did not advance)"
+  );
+  assert!(
+    e.poll_message().is_none(),
+    "no Prepare and no Reply is emitted for a reserved-id client request"
+  );
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "no single-writer reconfiguration latch was set (propose_membership was bypassed)"
+  );
+  assert!(
+    e.session_request_for_test(ClientId::RECONFIGURATION.get())
+      .is_none(),
+    "no session row was minted under the reserved client id"
+  );
+
+  // (2) REPLICA-RELAYED client path: a voting replica forwards the same reserved-id request (the
+  // mesh-relay ingress, tagged with the relaying replica's id, not the client's). Same drop.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Request(Request::new(
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      reserved_body,
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    head_before,
+    "the relayed reserved-id request minted NO op either"
+  );
+  assert!(
+    e.poll_message().is_none(),
+    "no Prepare and no Reply for the relayed reserved-id request"
+  );
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "still no reconfiguration latch"
+  );
+
+  // No membership change was committed OR staged from either request: the epoch/config_id are unchanged
+  // and the committed log holds no Reconfigure op (drive any queued storage first so a would-be staged
+  // swap would have surfaced).
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.membership.epoch(),
+    epoch_before,
+    "the membership epoch is unchanged — no reconfiguration installed"
+  );
+  assert_eq!(
+    e.membership.config_id(),
+    config_id_before,
+    "the config_id is unchanged — no reconfiguration installed"
+  );
+  assert!(
+    e.committed_reconfigure_op_numbers().is_empty(),
+    "no Reconfigure op was committed from a reserved-id client request"
+  );
+
+  // PROOF the fence is the cause, not a coincidentally-empty primary: the SAME endpoint still mints a
+  // genuine client op (a non-reserved id) — so the drop is specific to the reserved sentinel, not a
+  // wedged/closed mint path.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(1),
+      Bytes::from(std::vec![1u8]),
+    )),
+  );
+  assert!(
+    e.op().get() > head_before.get(),
+    "a genuine (non-reserved) client request DOES mint — the fence is specific to the reserved id"
   );
 }
 
@@ -1769,6 +2070,76 @@ fn promote_learner_is_rejected_target_not_caught_up_until_a_status_covers_the_he
 }
 
 #[test]
+fn promote_learner_rejects_a_tail_gap_learner_whose_durable_op_lags_its_durable_commit() {
+  // The catch-up-then-promote gate must require the durably-HELD prefix, not just commit KNOWLEDGE. A
+  // recovered learner can report a high `durable_commit_min` while its `durable_op` (the ops it actually
+  // persisted) lags — recovery admits a `commit_max > op` tail-gap. `on_learner_status` records
+  // `min(durable_commit_min, durable_op)`, so such a learner is NOT promotable: promoting it would enter
+  // the successor voter set without the E-committed prefix the XI-b old-write-quorum / new-view-change
+  // intersection relies on, risking committed-op loss or a view-change wedge in E+1.
+  let mut e = single_change_primary_with_learner();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let learner = MemberId::new(3);
+  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  assert_eq!(e.op(), OpNumber::with(1), "the head advanced to op 1");
+
+  // A TAIL-GAP report: durable_commit_min = 1 (COVERS the head) but durable_op = 0 (the learner has NOT
+  // durably persisted op 1) — the recovered `commit_max > op` shape.
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    Message::LearnerStatus(crate::LearnerStatus::new(
+      ReplicaId::new(3),
+      OpNumber::with(1), // durable_commit_min COVERS the head
+      OpNumber::new(),   // durable_op = 0 — does NOT durably hold the prefix
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    ),
+    Err(ProposeMembershipError::TargetNotCaughtUp),
+    "a tail-gap learner (durable commit covers the head but durable_op lags) is NOT caught up — \
+     min(durable_commit_min, durable_op) = 0 < head 1",
+  );
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "no op was minted for a tail-gap learner"
+  );
+
+  // Positive control: once durable_op ALSO covers the head, the learner durably HOLDS the full prefix →
+  // promotable (the monotone update raises the recorded frontier to 1).
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(3)),
+    Message::LearnerStatus(crate::LearnerStatus::new(
+      ReplicaId::new(3),
+      OpNumber::with(1),
+      OpNumber::with(1), // durable_op now COVERS the head
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner)
+    )
+    .is_ok(),
+    "once the learner durably holds the full prefix (durable_op == head), the promotion mints the op",
+  );
+}
+
+#[test]
 fn a_non_promote_delta_is_unaffected_by_the_catch_up_gate() {
   // The gate is `PromoteLearner`-specific: an `AddVoter` (a brand-new voter, not a promotion) mints
   // WITHOUT any `peer_progress` entry — there is no learner to have caught up. (The new voter's own
@@ -1784,6 +2155,185 @@ fn a_non_promote_delta_is_unaffected_by_the_catch_up_gate() {
     )
     .expect("AddVoter is unaffected by the promote gate");
   assert_eq!(e.reconfigure_inflight, Some(op), "the AddVoter op minted");
+}
+
+// === the AddVoter XI-b admission gate (the sibling of the catch-up-then-promote gate) ===
+
+/// A 1-voter `SingleChange` endpoint whose sole member is slot 0 — the primary of view 0. The only
+/// voter is the whole write quorum AND the whole view-change quorum, so a direct `AddVoter` here would
+/// produce a 2-voter successor with `quorum_view_change == 1`.
+fn single_change_primary_solo() -> Endpoint<CountSm, SingleChange> {
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(1), 0, CountSm::default())
+}
+
+/// An `n`-voter `SingleChange` endpoint whose local member is slot 0 — the primary of view 0.
+fn single_change_primary_n(n: u8) -> Endpoint<CountSm, SingleChange> {
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(n), 0, CountSm::default())
+}
+
+#[test]
+fn add_voter_from_a_single_voter_cluster_is_rejected_breaks_quorum_intersection() {
+  // The XI-b safety gate: a DIRECT 1->2 `AddVoter` from a single-voter cluster is REFUSED. The new
+  // voter holds NO committed prefix, and the 2-voter successor's view-change quorum is 1, so the new
+  // voter could form an E+1 view-change quorum ALONE (electing itself leader with an empty log) and
+  // drop the old committed prefix — committed-op loss. (Contrast `PromoteLearner`, whose target durably
+  // caught up before promotion.)
+  let mut e = single_change_primary_solo();
+  let mut wal = TestWal::default();
+  assert_eq!(
+    e.membership.replica_count(),
+    1,
+    "the cluster is a single voter"
+  );
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::AddVoter(MemberId::new(1)),
+    ),
+    Err(ProposeMembershipError::AddVoterBreaksQuorumIntersection),
+    "a brand-new voter that alone satisfies the successor view-change quorum is refused",
+  );
+  assert_eq!(e.reconfigure_inflight, None, "no op was minted");
+  assert_eq!(e.op(), OpNumber::new(), "the head did not advance");
+}
+
+#[test]
+fn add_voter_from_two_or_more_voters_is_admitted() {
+  // For any predecessor of 2+ voters the change is SAFE: the successor view-change quorum
+  // (`quorum_view_change >= 2`) necessarily includes a predecessor voter, and the overlap lemma
+  // `quorum(n) + quorum_view_change(n+1) > n` makes that predecessor contingent intersect every
+  // E-committed write quorum — so the committed prefix is preserved. Confirm 2->3, and at least one
+  // larger (3->4), mint.
+  for n in [2u8, 3] {
+    let mut e = single_change_primary_n(n);
+    let mut wal = TestWal::default();
+    assert!(
+      e.membership
+        .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(u128::from(n))))
+        .expect("the successor is structurally valid")
+        .quorum_view_change()
+        >= 2,
+      "the {}->{} successor has a view-change quorum of at least 2",
+      n,
+      n + 1,
+    );
+    let op = e
+      .propose_membership(
+        Instant::ZERO,
+        &mut wal,
+        SingleVoterDelta::AddVoter(MemberId::new(u128::from(n))),
+      )
+      .unwrap_or_else(|e| panic!("AddVoter from {n} voters is admitted, got {e:?}"));
+    assert_eq!(
+      e.reconfigure_inflight,
+      Some(op),
+      "the {n}-voter AddVoter op minted",
+    );
+  }
+}
+
+#[test]
+fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
+  // The SAFE way to add a voter to a single-voter cluster (the path the rejected direct `AddVoter`
+  // points the operator to): `AddLearner` the new node, let it durably catch up to the head, THEN
+  // `PromoteLearner`. The learner holds the full E-committed prefix before it ever becomes a voter, so
+  // the XI-b intersection is preserved by construction (the catch-up-then-promote gate, not the
+  // empty-log direct admission).
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  let mut e =
+    Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(1), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let newcomer = MemberId::new(1);
+
+  // (1) AddLearner is admitted (no voter-count change, no catch-up gate) and mints the op.
+  let add_learner_op = e
+    .propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::AddLearner(newcomer),
+    )
+    .expect("AddLearner on a single-voter cluster is admitted");
+  assert_eq!(
+    e.reconfigure_inflight,
+    Some(add_learner_op),
+    "the AddLearner op is latched in flight",
+  );
+
+  // Commit + install the AddLearner so the new node is an actual learner under the successor epoch.
+  // The sole voter (slot 0, this primary) is the whole commit quorum, so its own durable append
+  // commits the op; landing the SwapEpoch root installs the successor (now 1 voter + 1 learner).
+  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // own append durable → own vote → commit
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // land the SwapEpoch root → install
+  assert_eq!(
+    e.membership.learner_count(),
+    1,
+    "the newcomer is now a learner under the successor epoch",
+  );
+  assert_eq!(
+    e.membership.replica_count(),
+    1,
+    "the voting set is still a single voter (a learner is non-voting)",
+  );
+  let learner_slot = e
+    .membership
+    .slot_of(newcomer)
+    .expect("the learner occupies a slot");
+
+  // Advance the head so the catch-up gate's threshold is a non-trivial value.
+  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  let head = e.op();
+  assert!(head.get() >= 1, "the head advanced");
+
+  // (2) PromoteLearner is REFUSED until the learner reports a durable frontier covering the head.
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(newcomer)
+    ),
+    Err(ProposeMembershipError::TargetNotCaughtUp),
+    "the learner has not yet reported durable catch-up",
+  );
+
+  // (3) The learner reports `peer_progress` covering the head → PromoteLearner SUCCEEDS. By
+  // commit-first, the learner that durably commits the promote op then holds the entire prefix. The
+  // report carries the endpoint's CURRENT (post-AddLearner-swap) epoch/config_id so the strict ingress
+  // gate admits it (the cluster has advanced to E+1, unlike the genesis `learner_status` fixture).
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(learner_slot),
+    Message::LearnerStatus(crate::LearnerStatus::new(
+      learner_slot,
+      head,
+      head,
+      e.membership.epoch(),
+      e.membership.config_id(),
+    )),
+  );
+  let promote_op = e
+    .propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(newcomer),
+    )
+    .expect("a caught-up learner is promotable — the safe path grows the cluster to 2 voters");
+  let entry = e
+    .log
+    .get(&promote_op.get())
+    .expect("the promote op is logged");
+  let payload = entry.body.as_reconfigure().expect("a Body::Reconfigure op");
+  assert_eq!(
+    payload.replica_count(),
+    2,
+    "the safe path grew the single-voter cluster to 2 voters via catch-up-then-promote",
+  );
 }
 
 // === the four Raft §6 single-change reconfiguration hazards ===
