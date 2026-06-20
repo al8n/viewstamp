@@ -54,6 +54,7 @@ mod invariants;
 mod learner_membership;
 mod normal;
 mod reconfig;
+mod reconfigure;
 mod recovery;
 mod repair;
 mod sender_binding;

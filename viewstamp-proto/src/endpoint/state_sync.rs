@@ -1,6 +1,6 @@
 use super::*;
 
-impl<S: StateMachine> Endpoint<S> {
+impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   // ── State-sync: the trigger + the lagging replica's solicitation ──
 
   /// The state-sync TRIGGER. A replica enters state-sync iff it is `Normal` AND it learns of a cluster

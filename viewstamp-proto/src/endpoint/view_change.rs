@@ -1,6 +1,6 @@
 use super::*;
 
-impl<S: StateMachine> Endpoint<S> {
+impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Set this replica's own vote bit on `op`'s inflight entry (no-op if the entry is gone). Used by
   /// the primary's normal-path own append (`Pending::Ack`) and the view-change adoption append
   /// (`Pending::AdoptVote`) — both record the own vote ONLY once the op's WAL append is durable.
@@ -281,6 +281,15 @@ impl<S: StateMachine> Endpoint<S> {
     // Supersede any in-flight checkpoint: a view change drops it (its stale superblock completion is
     // then ignored in on_sb_done). It re-triggers once Normal resumes — commit_min is preserved.
     self.pending_checkpoint = None;
+    // Supersede any STAGED-but-not-yet-durable epoch swap: a committed `Body::Reconfigure` op staged
+    // its successor here (commit-first), and its SwapEpoch root may be in flight. A view change
+    // supersedes that in-flight root (its stale completion is then ignored in `on_sb_done`), so drop
+    // the staging — exactly as the in-flight checkpoint above — to keep the swap from stranding with
+    // an idle superblock (invariant (7)). The committed reconfiguration op SURVIVES in the durable log;
+    // re-deriving its swap in the new generation (so the epoch still advances after an interrupting view
+    // change) is the view-change/recovery integration task, not this one. The durable-epoch-before-
+    // participate fence holds either way: the membership was never installed off the superseded root.
+    self.pending_swap = None;
     // Abandon any in-flight state-sync: a view change supersedes it (state-sync and view
     // change are mutually exclusive by status — §2.6). The `sync` handshake, its DEFERRED INSTALL
     // (`pending_install`), and any in-progress chunked transfer (`sync_transfer`) are cancelled

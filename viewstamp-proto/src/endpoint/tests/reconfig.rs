@@ -1101,3 +1101,79 @@ fn unsealed_successor_strands_a_committed_op_above_the_window() {
     "the stranded committed op K is NOT in the recovered cache — its slot is free to be overwritten"
   );
 }
+
+#[test]
+fn endpoint_constructs_under_the_single_change_marker() {
+  // The reconfiguration capability is a COMPILE-TIME type-state: `Endpoint<S, R: Reconfig>` carries a
+  // zero-sized `R` marker, so a `SingleChange` endpoint constructs by naming the marker explicitly via
+  // the generic `with_reconfig` constructor. It behaves identically to a default endpoint — the marker
+  // gates only the (later) reconfiguration API surface, never the consensus state — so a freshly-built
+  // one is Normal at view 0. (The bare `new` is the ergonomic `RestartOnly` entry point; the explicit
+  // marker rides `with_reconfig` because a struct default type parameter cannot be inferred for an
+  // associated function's return type.)
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let e = Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(3), 0, CountSm::default());
+  assert_eq!(e.status(), Status::Normal, "a fresh endpoint is Normal");
+  assert_eq!(e.view(), View::new(), "a fresh endpoint is at view 0");
+  assert_eq!(
+    e.replica(),
+    ReplicaId::new(1),
+    "MemberId(1) occupies slot 1 of genesis(3)",
+  );
+}
+
+#[test]
+fn the_default_reconfig_marker_is_restart_only() {
+  // The default type parameter `R = RestartOnly` keeps the bare `Endpoint<S>` spelling resolving:
+  // every existing call site (drivers, simulation, the rest of these tests) constructs `Endpoint<S>`
+  // via the bare `new`/`recover` and must compile and behave UNCHANGED. The two spellings are the SAME
+  // type, so a `RestartOnly` endpoint built via the generic `with_reconfig` and a defaulted one built
+  // via `new` are interchangeable, and both observe the same fresh state.
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let defaulted = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let cfg2 = Config::try_new(1, MemberId::new(1)).unwrap();
+  let explicit =
+    Endpoint::<CountSm, RestartOnly>::with_reconfig(cfg2, genesis(3), 0, CountSm::default());
+  // `Endpoint<S>` IS `Endpoint<S, RestartOnly>`: this assignment type-checks only if the bare `new`
+  // produced `Endpoint<CountSm, RestartOnly>` (the default) and the explicit marker is the same type.
+  let _same_type: Endpoint<CountSm> = explicit;
+  let _also_default: Endpoint<CountSm> = defaulted;
+  assert_eq!(_also_default.status(), Status::Normal);
+  assert_eq!(_also_default.view(), View::new());
+  assert_eq!(_also_default.op(), OpNumber::new());
+}
+
+#[test]
+fn a_reconfigure_log_entry_carries_the_successor_membership_in_memory() {
+  // The in-memory `LogEntry` for a reconfiguration op keeps the proposing primary's `(client,
+  // request)` identity and wraps the successor membership as a `Body::Reconfigure`, mirroring the wire
+  // `PreparedEntry`. The proposing path (a later task) mints these; this pins the in-memory shape.
+  let payload = crate::message::ReconfigurePayload::new(
+    3,
+    1,
+    std::vec![
+      MemberId::new(1),
+      MemberId::new(2),
+      MemberId::new(3),
+      MemberId::new(4),
+    ]
+    .into_boxed_slice(),
+  );
+  let entry = LogEntry::reconfigure(
+    crate::ClientId::new(0x42),
+    crate::RequestNumber::with(7),
+    payload.clone(),
+  );
+  assert_eq!(entry.client, crate::ClientId::new(0x42));
+  assert_eq!(entry.request, crate::RequestNumber::with(7));
+  assert_eq!(
+    entry.body.as_reconfigure(),
+    Some(&payload),
+    "the in-memory body is the successor membership"
+  );
+  // The op's content address folds the successor membership in, exactly as the wire entry's does.
+  assert_eq!(
+    entry.body.body_checksum(),
+    crate::message::Body::Reconfigure(payload).body_checksum(),
+  );
+}

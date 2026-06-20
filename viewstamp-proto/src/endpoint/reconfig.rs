@@ -2,10 +2,14 @@
 //!
 //! Offline reconfiguration is OPERATOR-COORDINATED: the whole cluster is stopped, a
 //! successor durable root is pre-written on every node by [`prepare_restart`], and the cluster is
-//! restarted into the new [`Membership`](crate::Membership). There is no online consensus on the change — that is the
-//! later `SingleChange`/`Joint` work — so the only capability marker this milestone defines is
-//! [`RestartOnly`], and the [`Endpoint`](crate::Endpoint)`<S, R: Reconfig>` type-state is NOT wired
-//! yet (a generic would gate nothing while `RestartOnly` is the sole variant).
+//! restarted into the new [`Membership`](crate::Membership). There is no online consensus on the
+//! change at [`RestartOnly`] — that is the [`SingleChange`] (and later `Joint`) work.
+//!
+//! The capability is a COMPILE-TIME type-state: [`Endpoint`](crate::Endpoint)`<S, R: Reconfig>`
+//! carries a zero-sized `R` marker so a future online-reconfiguration API surface gates on it
+//! statically. The marker DEFAULTS to [`RestartOnly`], so the bare `Endpoint<S>` spelling keeps
+//! resolving and every existing call site compiles unchanged. The variants ([`RestartOnly`],
+//! [`SingleChange`]) form a capability ladder; a stronger marker subsumes a weaker one's surface.
 
 use std::vec::Vec;
 
@@ -19,21 +23,33 @@ mod sealed {
   pub trait Sealed {}
 }
 
-/// The reconfiguration capability marker; [`RestartOnly`] is the offline-restart base.
-/// `SingleChange` and `Joint` join in later milestones, and the
-/// [`Endpoint`](crate::Endpoint)`<S, R: Reconfig>` type-state is wired then.
+/// The reconfiguration capability marker selecting an [`Endpoint`](crate::Endpoint)'s membership-change
+/// surface at compile time. [`RestartOnly`] is the offline-restart base; [`SingleChange`] adds the
+/// online single-member-delta surface; `Joint` follows.
 ///
-/// Sealed: implementable only inside this crate (a private `Sealed` supertrait).
+/// Sealed: implementable only inside this crate (a private `Sealed` supertrait), so a downstream
+/// crate cannot mint its own capability marker.
 pub trait Reconfig: sealed::Sealed {}
 
 /// The offline-restart reconfiguration capability: the cluster is stopped, a successor
 /// durable root is pre-written by [`prepare_restart`], and every node restarts into the new
-/// configuration. The only [`Reconfig`] variant this milestone defines.
+/// configuration. The base [`Reconfig`] variant and the DEFAULT marker on
+/// [`Endpoint`](crate::Endpoint) — so `Endpoint<S>` is `Endpoint<S, RestartOnly>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RestartOnly;
 
 impl sealed::Sealed for RestartOnly {}
 impl Reconfig for RestartOnly {}
+
+/// The online single-member-change reconfiguration capability: one voter/learner is added or
+/// removed per change while the cluster stays up, the change driven through consensus. An
+/// [`Endpoint`](crate::Endpoint)`<S, SingleChange>` opts into that surface; it subsumes
+/// [`RestartOnly`]'s offline-restart capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SingleChange;
+
+impl sealed::Sealed for SingleChange {}
+impl Reconfig for SingleChange {}
 
 /// An error building the offline-restart successor durable root in [`prepare_restart`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -58,6 +74,47 @@ pub enum ReconfigError {
   /// matches by construction); surfaced rather than panicked so a corrupt `cur` degrades cleanly.
   #[error("successor durable root is invalid: {0}")]
   State(#[from] VsrStateError),
+}
+
+/// An error rejecting a live single-member reconfiguration proposal in
+/// [`Endpoint::propose_membership`](crate::Endpoint::propose_membership).
+///
+/// The proposal is single-writer: only the primary, only while `Normal`, and only one change in
+/// flight at a time. `Invalid` carries the underlying [`MembershipError`] from validating the delta.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProposeMembershipError {
+  /// This replica is not the primary; only the primary proposes a reconfiguration (the client/operator
+  /// retries against the primary).
+  #[error("not the primary: only the primary proposes a reconfiguration")]
+  NotPrimary,
+  /// This replica's status is not `Normal` (it is mid-view-change or recovering); a reconfiguration op
+  /// can only be minted from a `Normal` primary.
+  #[error("not in the Normal status: a reconfiguration is proposed only while Normal")]
+  NotNormal,
+  /// A reconfiguration op is already in flight (uncommitted). Only one membership change is in flight
+  /// at a time — the single-writer latch — so the proposer awaits the in-flight change's commit before
+  /// proposing the next.
+  #[error("a reconfiguration is already in flight")]
+  AlreadyInFlight,
+  /// The single-voter delta was invalid for the current configuration (an unknown/duplicate member, a
+  /// promotion of a non-learner, or the removal of the last voter). Carries the underlying
+  /// [`MembershipError`].
+  #[error("the membership delta is invalid: {0}")]
+  Invalid(#[from] MembershipError),
+  /// The delta would move the voting set by more than one voter in a single step. UNREACHABLE for a
+  /// [`SingleVoterDelta`](crate::SingleVoterDelta) — every variant moves the voter count by at most one
+  /// by construction (`Membership::apply_delta`), proven exhaustively in the membership tests — so this
+  /// is the defensive verdict reserved for a future delta variant that could express a multi-voter
+  /// jump. No proposal path returns it today.
+  #[error("the delta is a multi-voter jump (at most one voter may change per step)")]
+  TwoVoterJump,
+  /// The target of a learner-promotion is not yet caught up to the cluster's committed frontier, so
+  /// promoting it into the voting set would shrink the live quorum below what the survivors can form.
+  /// Returned by the learner-promote gate (a later task), not by the bare proposal-mint path; the
+  /// variant is wired now so the promote gate has its verdict ready.
+  #[error("the promotion target has not caught up to the committed frontier")]
+  TargetNotCaughtUp,
 }
 
 /// Builds the SUCCESSOR durable root for an offline, operator-coordinated restart.

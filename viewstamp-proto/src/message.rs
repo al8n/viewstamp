@@ -4,23 +4,27 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::vec::Vec;
 
 use crate::{
-  ClientId, Epoch, OpNumber, Recipient, ReplicaId, RequestNumber, View, WIRE_VERSION,
+  ClientId, Epoch, MemberId, Membership, MembershipError, OpNumber, Recipient, ReplicaId,
+  RequestNumber, View, WIRE_VERSION,
   codec::{CodecError, Reader, write_bytes_u32},
 };
 
 /// The minimum encoded length of one [`PreparedEntry`] in a log slice: `op` (`u64`) + `client`
 /// (`u128`) + `request` (`u64`) + a body-state tag (`u8`) + the cheapest body-state payload. The
 /// cheapest is a `Present` empty body (a `u32` length prefix = `4`, total `8 + 16 + 8 + 1 + 4`),
-/// which is smaller than a `Repairing` 16-byte checksum, so this is the floor used to reject a hostile
-/// log-slice element count before parsing (see [`Reader::seq_len`]).
+/// which is smaller than a `Repairing` 16-byte checksum and than a `Reconfigure` payload (`replica_count`
+/// `u8` + `learner_count` `u16` + a `u32` member-count prefix = `7`, before any members), so this is the
+/// floor used to reject a hostile log-slice element count before parsing (see [`Reader::seq_len`]).
 const PREPARED_ENTRY_MIN_LEN: usize = 8 + 16 + 8 + 1 + 4;
 
 /// Wire body-state discriminant for a [`PreparedEntry`] in a log slice: `0` = [`Body::Present`] (a
 /// `u32`-length-prefixed body follows), `1` = [`Body::Repairing`] (a 16-byte `u128` `body_checksum`
-/// follows, no bytes). One source of truth shared by [`write_log`] (writes it) and [`read_log`]
+/// follows, no bytes), `2` = [`Body::Reconfigure`] (a [`ReconfigurePayload`] — the successor
+/// membership — follows). One source of truth shared by [`write_log`] (writes it) and [`read_log`]
 /// (dispatches on it).
 const BODY_TAG_PRESENT: u8 = 0;
 const BODY_TAG_REPAIRING: u8 = 1;
+const BODY_TAG_RECONFIGURE: u8 = 2;
 
 /// The maximum encoded message length the transport framing admits (16 MiB). The single source of
 /// truth for the frame cap: the (feature-gated) transport re-exports this as
@@ -598,16 +602,217 @@ impl Commit {
   }
 }
 
-/// A log entry's body is either `Present` (the bytes are held) or `Repairing` (only the durable
-/// canonical `body_checksum` is known; the bytes must be peer-repaired).
+/// Learner → current configuration members: a NON-VOTING progress report of the learner's DURABLE
+/// frontier. It carries NO quorum/vote authority — it is never counted toward any commit, view-change,
+/// or recovery quorum; it only lets the primary learn how far a learner has durably caught up so the
+/// learner-promote gate ([`Endpoint::propose_membership`](crate::Endpoint)) can require an exact
+/// catch-up before minting the `PromoteLearner` Reconfigure op (catch-up-then-promote, the safety gate
+/// in the reconfiguration design: a behind new-voter's low-frontier `DoViewChange` could push the
+/// nack-truncation crossing down and truncate a committed-but-not-yet-widely-replicated op).
+///
+/// `durable_commit_min` / `durable_op` are the DURABLE root's frontier (what survives a crash), not the
+/// in-memory `commit_min`/`op`, so a crash can never make a learner claim more than it persisted. It is
+/// CONFIG-SCOPED progress, carrying the STRICT epoch-policy pair (`epoch` + `config_id`) so it is
+/// admitted only from a member of the SAME configuration (a foreign-config learner's progress is not
+/// this primary's to act on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LearnerStatus {
+  replica: ReplicaId,
+  durable_commit_min: OpNumber,
+  durable_op: OpNumber,
+  epoch: Epoch,
+  config_id: u128,
+}
+
+impl LearnerStatus {
+  /// Creates a learner progress report. `replica` is the sender's own slot; `durable_commit_min` /
+  /// `durable_op` are its DURABLE root's committed frontier and head (NOT the in-memory ones — see the
+  /// type docs); `epoch` + `config_id` are the sender's active configuration (the STRICT epoch-policy
+  /// pair). Carries no vote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    replica: ReplicaId,
+    durable_commit_min: OpNumber,
+    durable_op: OpNumber,
+    epoch: Epoch,
+    config_id: u128,
+  ) -> Self {
+    Self {
+      replica,
+      durable_commit_min,
+      durable_op,
+      epoch,
+      config_id,
+    }
+  }
+
+  /// The reporting learner's slot.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// The reporting learner's DURABLE applied/committed frontier — the value that survives a crash (the
+  /// durable root's `commit`), so it can never over-claim past what it persisted.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn durable_commit_min(&self) -> OpNumber {
+    self.durable_commit_min
+  }
+
+  /// The reporting learner's DURABLE head op (its durable WAL head).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn durable_op(&self) -> OpNumber {
+    self.durable_op
+  }
+
+  /// The sender's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The sender's configuration lineage id (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
+  }
+}
+
+/// The successor membership carried by a consensus-layer `Body::Reconfigure` op: the full member
+/// list plus the voting/learner split (`replica_count` + `learner_count`). The proposing primary
+/// computes the successor once (via [`Membership::apply_delta`](crate::Membership)) at propose time
+/// and encodes the RESULT here, so every replica installs the IDENTICAL successor at commit with no
+/// re-computation — divergence is impossible even if replicas hold differing inputs.
+///
+/// The `epoch` and `config_id` are DELIBERATELY NOT carried: at commit each replica chains them from
+/// ITS OWN current (predecessor) membership — every replica commits the op under the identical
+/// predecessor, so the locally-derived successor `epoch`/`config_id` are identical everywhere. Carrying
+/// them on the wire would be redundant and could only introduce a mismatch. Use [`Self::to_membership`]
+/// at install time, supplying the predecessor-derived `epoch` and `config_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconfigurePayload {
+  replica_count: u8,
+  learner_count: u16,
+  members: Box<[MemberId]>,
+}
+
+impl ReconfigurePayload {
+  /// Creates a payload from the raw successor parts (the voting count, the learner count, and the
+  /// full member list). The structural invariants are NOT re-validated here — the proposing primary
+  /// builds this from a [`Membership`](crate::Membership) the [`apply_delta`](crate::Membership::apply_delta)
+  /// path already validated, and the decode boundary re-checks them via [`Self::to_membership`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn new(replica_count: u8, learner_count: u16, members: Box<[MemberId]>) -> Self {
+    Self {
+      replica_count,
+      learner_count,
+      members,
+    }
+  }
+
+  /// Captures the successor membership's voting/learner split and member list from a built
+  /// [`Membership`](crate::Membership). The `epoch`/`config_id` are intentionally dropped — see the
+  /// type docs — and re-derived from the predecessor at install time.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn from_membership(m: &Membership) -> Self {
+    Self {
+      replica_count: m.replica_count(),
+      learner_count: m.learner_count(),
+      members: m.members_slice().into(),
+    }
+  }
+
+  /// The number of voting replicas in the successor configuration.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica_count(&self) -> u8 {
+    self.replica_count
+  }
+
+  /// The number of non-voting learner replicas in the successor configuration.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn learner_count(&self) -> u16 {
+    self.learner_count
+  }
+
+  /// The successor member list, indexed by [`ReplicaId`](crate::ReplicaId) slot.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn members(&self) -> &[MemberId] {
+    &self.members
+  }
+
+  /// Rebuilds the full successor [`Membership`](crate::Membership), supplying the `epoch` and
+  /// `config_id` the committing replica derives from its predecessor configuration (the payload itself
+  /// carries neither — see the type docs). Re-validates the structural invariants (non-zero
+  /// `replica_count`, the 64-voter cap, member-count agreement, no duplicate members), returning a
+  /// [`MembershipError`](crate::MembershipError) if the decoded successor is structurally invalid.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn to_membership(
+    &self,
+    epoch: Epoch,
+    config_id: u128,
+  ) -> Result<Membership, MembershipError> {
+    Membership::from_durable_parts(
+      epoch,
+      self.replica_count,
+      self.learner_count,
+      self.members.to_vec(),
+      config_id,
+    )
+  }
+
+  /// The canonical wire encoding of this payload (`replica_count`, `learner_count`, then the member
+  /// list) as owned [`Bytes`] — the body a proposing primary stores in the WAL and carries in the
+  /// `Prepare` for a `Body::Reconfigure` op. Identical to what [`write_reconfigure`] emits, so the
+  /// op's `body_checksum` (an `fnv1a_128` over the same bytes) matches `fnv1a_128(encode_body())` by
+  /// construction.
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub(crate) fn encode_body(&self) -> Bytes {
+    let mut buf = Vec::with_capacity(1 + 2 + 4 + self.members.len() * 16);
+    write_reconfigure(&mut buf, self);
+    Bytes::from(buf)
+  }
+
+  /// Decodes the canonical wire body [`Self::encode_body`] produced back into a `ReconfigurePayload`.
+  /// The backup-side `on_prepare` recognizes a [`ClientId::RECONFIGURATION`](crate::ClientId)
+  /// `Prepare` and round-trips its flat `body` bytes through here to store a typed `Body::Reconfigure`
+  /// log entry — so the committed op carries ONE representation (`Body::Reconfigure`) on the primary
+  /// AND every backup, and commit-time recognition is a `match`, never a re-decode. The member-count
+  /// prefix is validated against the remaining bytes before any allocation (a hostile count cannot
+  /// drive an unbounded pre-allocation), and any trailing bytes are rejected (`finish`).
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub(crate) fn decode_body(bytes: &[u8]) -> Result<Self, CodecError> {
+    let mut r = Reader::new(bytes);
+    let payload = read_reconfigure(&mut r)?;
+    r.finish()?;
+    Ok(payload)
+  }
+
+  /// The canonical `body_checksum` of this Reconfigure op: an `fnv1a_128` over the payload's canonical
+  /// encoding (`replica_count`, `learner_count`, then the member list), so two DISTINCT successor
+  /// memberships content-address differently and a Reconfigure op folds into
+  /// [`prepare_identity`](crate::storage) like any op.
+  #[cfg_attr(not(tarpaulin), inline)]
+  fn body_checksum(&self) -> u128 {
+    crate::storage::fnv1a_128(&self.encode_body())
+  }
+}
+
+/// A log entry's body is `Present` (the bytes are held), `Repairing` (only the durable canonical
+/// `body_checksum` is known; the bytes must be peer-repaired), or `Reconfigure` (a consensus-layer
+/// membership-change op carrying the full successor membership).
 ///
 /// Body-independent durable headers let a committed op's EXISTENCE survive a torn-body storage
 /// fault: the op stays in the log as a `Repairing` slot carrying just its canonical `body_checksum`,
 /// and the commit path holds at it (soliciting the body from a peer) exactly as it does for a
 /// wholly-missing slot. This ONE type is shared by the endpoint's in-memory `LogEntry` and the wire
 /// [`PreparedEntry`], so a `Repairing` op carried through a `DoViewChange`/`StartView` is adopted
-/// repair-pending — its op number is taken (never re-minted) and its body is fetched from a peer. Not
-/// `Copy` — `Present` carries a [`Bytes`].
+/// repair-pending — its op number is taken (never re-minted) and its body is fetched from a peer.
+///
+/// A `Reconfigure` body rides the replicated log like a client op (committed under the OLD epoch; the
+/// epoch swap fires at commit), but its content is the successor [`ReconfigurePayload`] rather than an
+/// opaque client body — so it carries no client bytes (`as_present` is `None`) and its
+/// `body_checksum` folds the successor membership into the operation identity. Not `Copy` — `Present`
+/// carries a [`Bytes`] and `Reconfigure` a boxed member list.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
@@ -623,26 +828,41 @@ pub enum Body {
   /// — durable header, torn/rotted body — is retained header-only as this hole, so its existence
   /// survives the fault and the commit path peer-repairs the body on demand).
   Repairing(u128),
+  /// A consensus-layer reconfiguration op carrying the full successor membership. Replicated and
+  /// committed under the old epoch like a client op; at commit it triggers the epoch swap. Carries no
+  /// client bytes — its content is the [`ReconfigurePayload`].
+  Reconfigure(ReconfigurePayload),
 }
 
 impl Body {
   /// The body bytes when [`Present`](Body::Present), else `None` (a `Repairing` slot has no bytes
-  /// yet).
+  /// yet, and a `Reconfigure` op carries a membership, not client bytes).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn as_present(&self) -> Option<&[u8]> {
     match self {
       Body::Present(bytes) => Some(bytes),
-      Body::Repairing(_) => None,
+      Body::Repairing(_) | Body::Reconfigure(_) => None,
+    }
+  }
+
+  /// The successor membership when [`Reconfigure`](Body::Reconfigure), else `None`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn as_reconfigure(&self) -> Option<&ReconfigurePayload> {
+    match self {
+      Body::Reconfigure(payload) => Some(payload),
+      Body::Present(_) | Body::Repairing(_) => None,
     }
   }
 
   /// The canonical `body_checksum` of this op — total: computed from the bytes when
-  /// [`Present`](Body::Present), or the stored durable checksum when [`Repairing`](Body::Repairing).
+  /// [`Present`](Body::Present), the stored durable checksum when [`Repairing`](Body::Repairing), or
+  /// derived from the successor membership when [`Reconfigure`](Body::Reconfigure).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn body_checksum(&self) -> u128 {
     match self {
       Body::Present(bytes) => crate::storage::fnv1a_128(bytes),
       Body::Repairing(checksum) => *checksum,
+      Body::Reconfigure(payload) => payload.body_checksum(),
     }
   }
 }
@@ -690,6 +910,24 @@ impl PreparedEntry {
     }
   }
 
+  /// Creates a consensus-layer reconfiguration prepared-log entry (`Body::Reconfigure`) carrying the
+  /// full successor membership. The op keeps a `(client, request)` identity — minted by the proposing
+  /// primary for dedup/content-addressing — like any op.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn reconfigure(
+    op: OpNumber,
+    client: ClientId,
+    request: RequestNumber,
+    payload: ReconfigurePayload,
+  ) -> Self {
+    Self {
+      op,
+      client,
+      request,
+      body: Body::Reconfigure(payload),
+    }
+  }
+
   /// The op number.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn op(&self) -> OpNumber {
@@ -719,6 +957,12 @@ impl PreparedEntry {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_repairing(&self) -> bool {
     self.body.is_repairing()
+  }
+
+  /// `true` iff this entry is a consensus-layer reconfiguration op (`Body::Reconfigure`).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_reconfigure(&self) -> bool {
+    self.body.is_reconfigure()
   }
 
   /// The opaque application payload as a slice when the body is `Present`, else
@@ -2054,6 +2298,9 @@ pub enum Message {
   /// Retransmit a byte-bounded batch of the primary's first un-acked prepares (one frame, not one
   /// `Prepare` per op).
   PrepareBatch(PrepareBatch),
+  /// A learner's NON-VOTING durable-frontier progress report (drives the catch-up-then-promote gate;
+  /// counted toward no quorum).
+  LearnerStatus(LearnerStatus),
 }
 
 impl Message {
@@ -2082,6 +2329,7 @@ impl Message {
       Self::RequestSyncChunk(_) => "RequestSyncChunk",
       Self::SyncChunk(_) => "SyncChunk",
       Self::PrepareBatch(_) => "PrepareBatch",
+      Self::LearnerStatus(_) => "LearnerStatus",
     }
   }
 
@@ -2140,13 +2388,16 @@ impl Message {
       | Self::Recovery(_)
       | Self::RequestSync(_)
       // The chunk pull is a solicitation, exactly like the `RequestSync` it follows.
-      | Self::RequestSyncChunk(_) => false,
+      | Self::RequestSyncChunk(_)
+      // A learner's progress report carries NO vote/lead authority — it advertises no participatory
+      // view, so it may be emitted while a view write is in flight (it is config-scoped, not view-scoped).
+      | Self::LearnerStatus(_) => false,
     }
   }
 
   /// The stable wire discriminant tag for each variant, matching declaration order. One source of
   /// truth shared by [`Self::encode`] (writes it) and [`Self::decode`] (dispatches on it); the
-  /// `match` is EXHAUSTIVE (no wildcard) so a future 21st variant fails to compile until it is
+  /// `match` is EXHAUSTIVE (no wildcard) so a future 22nd variant fails to compile until it is
   /// assigned a tag here.
   #[cfg_attr(not(tarpaulin), inline)]
   const fn tag(&self) -> u8 {
@@ -2171,6 +2422,7 @@ impl Message {
       Self::RequestSyncChunk(_) => 17,
       Self::SyncChunk(_) => 18,
       Self::PrepareBatch(_) => 19,
+      Self::LearnerStatus(_) => 20,
     }
   }
 
@@ -2355,6 +2607,13 @@ impl Message {
         out.put_u128(m.config_id);
         write_log(&mut out, &m.log);
       }
+      Self::LearnerStatus(m) => {
+        out.put_u16(m.replica.get());
+        out.put_u64(m.durable_commit_min.get());
+        out.put_u64(m.durable_op.get());
+        out.put_u64(m.epoch.get());
+        out.put_u128(m.config_id);
+      }
     }
     out.freeze()
   }
@@ -2378,14 +2637,16 @@ impl Message {
       4 + len
     }
     // A `write_log` slice is a u32 count plus, per entry, op(u64) + client(u128) + request(u64), a
-    // body-state tag (u8), and its payload — a length-prefixed body (Present) or a u128 checksum
-    // (Repairing).
+    // body-state tag (u8), and its payload — a length-prefixed body (Present), a u128 checksum
+    // (Repairing), or a Reconfigure payload (replica_count u8 + learner_count u16 + a u32-count-prefixed
+    // member list of 16-byte ids).
     fn log(log: &[PreparedEntry]) -> usize {
       let mut n = 4;
       for e in log {
         let body = match &e.body {
           Body::Present(body) => bytes_u32(body.len()),
           Body::Repairing(_) => U128,
+          Body::Reconfigure(p) => U8 + U16 + 4 + p.members().len() * U128,
         };
         n += U64 + U128 + U64 + U8 + body;
       }
@@ -2417,6 +2678,7 @@ impl Message {
         U64 + U64 + U128 + U128 + U64 + U64 + U16 + U64 + bytes_u32(m.bytes.len())
       }
       Self::PrepareBatch(m) => U64 + U64 + U64 + U64 + U128 + log(&m.log),
+      Self::LearnerStatus(_) => U16 + U64 + U64 + U64 + U128,
     };
     HEADER + body
   }
@@ -2428,8 +2690,8 @@ impl Message {
   /// unknown variant tag ([`CodecError::UnknownTag`]), a buffer that ends mid-field
   /// ([`CodecError::Truncated`]), a body/log length prefix exceeding the remaining bytes
   /// ([`CodecError::LengthOverflow`]), or trailing bytes after the variant
-  /// ([`CodecError::TrailingBytes`]). The tag dispatch covers the 20 known tags, with any other
-  /// byte falling through to [`CodecError::UnknownTag`] — adding a 21st variant means adding its
+  /// ([`CodecError::TrailingBytes`]). The tag dispatch covers the 21 known tags, with any other
+  /// byte falling through to [`CodecError::UnknownTag`] — adding a 22nd variant means adding its
   /// discriminant tag + a decode arm here (the encode `match` will not compile until the variant
   /// is handled, preserving the exhaustive-`Message`-match property).
   pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
@@ -2603,6 +2865,13 @@ impl Message {
         config_id: r.u128()?,
         log: read_log(&mut r)?,
       }),
+      20 => Self::LearnerStatus(LearnerStatus {
+        replica: read_replica(&mut r)?,
+        durable_commit_min: read_op(&mut r)?,
+        durable_op: read_op(&mut r)?,
+        epoch: read_epoch(&mut r)?,
+        config_id: r.u128()?,
+      }),
       other => return Err(CodecError::UnknownTag(other)),
     };
     r.finish()?;
@@ -2652,11 +2921,43 @@ fn read_body(r: &mut Reader<'_>) -> Result<Bytes, CodecError> {
   Ok(Bytes::copy_from_slice(r.bytes_u32()?))
 }
 
+/// Writes a [`ReconfigurePayload`] in canonical form: `replica_count` (`u8`), `learner_count` (`u16`),
+/// then a `u32`-count-prefixed member list (each [`MemberId`] a 16-byte big-endian `u128`). One source
+/// of truth for both the wire encoding ([`write_log`]'s `Reconfigure` arm) and the payload's
+/// `body_checksum`, so a Reconfigure op's identity is exactly its on-wire content.
+fn write_reconfigure(out: &mut impl BufMut, payload: &ReconfigurePayload) {
+  out.put_u8(payload.replica_count);
+  out.put_u16(payload.learner_count);
+  out.put_u32(payload.members.len() as u32);
+  for m in payload.members.iter() {
+    out.put_u128(m.get());
+  }
+}
+
+/// Reads a [`ReconfigurePayload`] written by [`write_reconfigure`]. The member-count prefix is
+/// validated against the remaining bytes ([`Reader::seq_len`] with a 16-byte element size) before any
+/// allocation, so a hostile count cannot drive an unbounded pre-allocation.
+fn read_reconfigure(r: &mut Reader<'_>) -> Result<ReconfigurePayload, CodecError> {
+  let replica_count = r.u8()?;
+  let learner_count = r.u16()?;
+  let count = r.seq_len(16)?;
+  let mut members = Vec::with_capacity(count);
+  for _ in 0..count {
+    members.push(MemberId::new(r.u128()?));
+  }
+  Ok(ReconfigurePayload::new(
+    replica_count,
+    learner_count,
+    members.into_boxed_slice(),
+  ))
+}
+
 /// Writes a `Vec<PreparedEntry>` log slice: a `u32` element count, then each entry as
 /// `op`(u64) `client`(u128) `request`(u64) + a body-state tag (u8) + its payload — a
-/// length-prefixed body for [`Body::Present`], or a 16-byte `body_checksum` for [`Body::Repairing`]
-/// (no bytes). A `Repairing` entry carries a body-faulty committed op's existence through a view
-/// change so its op number is never re-minted.
+/// length-prefixed body for [`Body::Present`], a 16-byte `body_checksum` for [`Body::Repairing`]
+/// (no bytes), or a [`ReconfigurePayload`] for [`Body::Reconfigure`] (the successor membership). A
+/// `Repairing` entry carries a body-faulty committed op's existence through a view change so its op
+/// number is never re-minted; a `Reconfigure` entry carries a membership-change op.
 fn write_log(out: &mut impl BufMut, log: &[PreparedEntry]) {
   out.put_u32(log.len() as u32);
   for e in log {
@@ -2672,6 +2973,10 @@ fn write_log(out: &mut impl BufMut, log: &[PreparedEntry]) {
         out.put_u8(BODY_TAG_REPAIRING);
         out.put_u128(*checksum);
       }
+      Body::Reconfigure(payload) => {
+        out.put_u8(BODY_TAG_RECONFIGURE);
+        write_reconfigure(out, payload);
+      }
     }
   }
 }
@@ -2679,8 +2984,9 @@ fn write_log(out: &mut impl BufMut, log: &[PreparedEntry]) {
 /// Reads a `Vec<PreparedEntry>` log slice written by [`write_log`]. The element count is validated
 /// against the remaining bytes ([`Reader::seq_len`] with [`PREPARED_ENTRY_MIN_LEN`]) before any
 /// allocation, so a hostile count cannot drive an unbounded pre-allocation; each entry's body-state
-/// tag selects a `u32`-length-prefixed body ([`Body::Present`], length-checked individually) or a
-/// 16-byte checksum ([`Body::Repairing`]). An unknown body-state tag is rejected as
+/// tag selects a `u32`-length-prefixed body ([`Body::Present`], length-checked individually), a
+/// 16-byte checksum ([`Body::Repairing`]), or a [`ReconfigurePayload`] ([`Body::Reconfigure`], whose
+/// member count is length-checked). An unknown body-state tag is rejected as
 /// [`CodecError::UnknownTag`].
 fn read_log(r: &mut Reader<'_>) -> Result<Vec<PreparedEntry>, CodecError> {
   let count = r.seq_len(PREPARED_ENTRY_MIN_LEN)?;
@@ -2692,6 +2998,7 @@ fn read_log(r: &mut Reader<'_>) -> Result<Vec<PreparedEntry>, CodecError> {
     let body = match r.u8()? {
       BODY_TAG_PRESENT => Body::Present(read_body(r)?),
       BODY_TAG_REPAIRING => Body::Repairing(r.u128()?),
+      BODY_TAG_RECONFIGURE => Body::Reconfigure(read_reconfigure(r)?),
       other => return Err(CodecError::UnknownTag(other)),
     };
     log.push(PreparedEntry {
@@ -2787,6 +3094,34 @@ mod tests {
     let p = back.unwrap_prepare_ok();
     assert_eq!(p.prepare_checksum(), u128::MAX);
     assert_eq!(p.op(), OpNumber::with(9));
+  }
+
+  #[test]
+  fn learner_status_round_trips_through_the_wire_codec_and_carries_no_vote() {
+    // The learner's durable-frontier report survives encode→decode unchanged (edge scalars), and
+    // carries its sender slot + the STRICT epoch-policy pair — but NO content-addressed vote field
+    // (`prepare_checksum`): it is a progress report, never counted toward any quorum.
+    let m = Message::LearnerStatus(LearnerStatus::new(
+      ReplicaId::new(300), // a slot above a single byte exercises both u16 bytes
+      OpNumber::with(u64::MAX),
+      OpNumber::with(42),
+      crate::Epoch::new(9),
+      0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00,
+    ));
+    let back = Message::decode(&m.encode()).expect("round-trips");
+    assert_eq!(back, m, "decode(encode(m)) == m");
+    let ls = back.unwrap_learner_status();
+    assert_eq!(ls.replica(), ReplicaId::new(300));
+    assert_eq!(ls.durable_commit_min(), OpNumber::with(u64::MAX));
+    assert_eq!(ls.durable_op(), OpNumber::with(42));
+    assert_eq!(ls.epoch(), crate::Epoch::new(9));
+    assert_eq!(ls.config_id(), 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00);
+    // It advertises NO authoritative/participatory view — it carries no vote/lead authority, so the
+    // emit chokepoint never blocks it on an in-flight view write.
+    assert!(
+      !m.advertises_authoritative_view(),
+      "a learner progress report claims no participatory view",
+    );
   }
 
   #[test]
@@ -3351,8 +3686,9 @@ mod tests {
         OpNumber::with(9),
         OpNumber::with(7),
         0,
-        // Populated: an empty-body Present entry, a populated Present entry, AND a header-only
-        // Repairing entry — exercises both body-state wire tags inside the batch log slice.
+        // Populated: an empty-body Present entry, a populated Present entry, a header-only Repairing
+        // entry, AND a Reconfigure entry — exercises all THREE body-state wire tags inside the batch
+        // log slice.
         std::vec![
           entry(7, b""),
           entry(8, b"hi"),
@@ -3361,6 +3697,22 @@ mod tests {
             ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
             RequestNumber::with(9),
             0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
+          ),
+          PreparedEntry::reconfigure(
+            OpNumber::with(10),
+            ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+            RequestNumber::with(10),
+            ReconfigurePayload::new(
+              3,
+              1,
+              std::vec![
+                crate::MemberId::new(1),
+                crate::MemberId::new(2),
+                crate::MemberId::new(3),
+                crate::MemberId::new(4),
+              ]
+              .into_boxed_slice(),
+            ),
           ),
         ],
       )),
@@ -3409,6 +3761,13 @@ mod tests {
             0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
           ),
         ],
+      )),
+      Message::LearnerStatus(LearnerStatus::new(
+        ReplicaId::new(4),
+        OpNumber::with(u64::MAX), // edge scalar durable_commit_min — round-trips
+        OpNumber::with(7),
+        crate::Epoch::new(0),
+        0,
       )),
     ]
   }
@@ -3782,7 +4141,7 @@ mod tests {
   #[test]
   fn every_variant_round_trips_through_the_wire_codec() {
     let all = one_of_each_variant();
-    assert_eq!(all.len(), 20, "every Message variant is represented");
+    assert_eq!(all.len(), 21, "every Message variant is represented");
     for m in &all {
       let bytes = m.encode();
       let back = Message::decode(&bytes).expect("round-trip decodes");
@@ -3871,7 +4230,7 @@ mod tests {
 
   #[test]
   fn commit_golden_bytes_pin_the_wire_layout() {
-    // A small STRICT variant pinned exactly: WIRE_VERSION(u16=5) ++ tag 4 ++ view ++ commit ++
+    // A small STRICT variant pinned exactly: WIRE_VERSION(u16=7) ++ tag 4 ++ view ++ commit ++
     // checkpoint_op ++ the strict epoch-policy pair epoch(u64) ++ config_id(u128).
     let c = Message::Commit(Commit::new(
       View::with(4),
@@ -3881,7 +4240,7 @@ mod tests {
       0,
     ));
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 5, 4, // version 5, tag 4 (Commit)
+      0, 7, 4, // version 7, tag 4 (Commit)
       0, 0, 0, 0, 0, 0, 0, 4, // view = 4
       0, 0, 0, 0, 0, 0, 0, 9, // commit = 9
       0, 0, 0, 0, 0, 0, 0, 7, // checkpoint_op = 7
@@ -3893,7 +4252,7 @@ mod tests {
 
   #[test]
   fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
-    // A nested STRICT variant pinned exactly: header (ver 5 + tag 6), scalars (incl. the advertised
+    // A nested STRICT variant pinned exactly: header (ver 7 + tag 6), scalars (incl. the advertised
     // checkpoint floor after the commit, then the strict epoch-policy pair epoch(u64)+config_id(u128)
     // before the u16 replica id), then a 1-entry log slice (count=1, op, client, request, body-state
     // tag 0 = Present, length-prefixed body "hi").
@@ -3916,7 +4275,7 @@ mod tests {
       .with_checkpoint_op(OpNumber::with(3)),
     );
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 5, 6, // version 5, tag 6 (DoViewChange)
+      0, 7, 6, // version 7, tag 6 (DoViewChange)
       0, 0, 0, 0, 0, 0, 0, 3, // view = 3
       0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
       0, 0, 0, 0, 0, 0, 0, 5, // op = 5
@@ -3960,7 +4319,7 @@ mod tests {
       .with_checkpoint_op(OpNumber::with(3)),
     );
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 5, 6, // version 5, tag 6 (DoViewChange)
+      0, 7, 6, // version 7, tag 6 (DoViewChange)
       0, 0, 0, 0, 0, 0, 0, 3, // view = 3
       0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
       0, 0, 0, 0, 0, 0, 0, 5, // op = 5
@@ -3993,6 +4352,209 @@ mod tests {
     assert_eq!(e.request(), RequestNumber::with(9));
     assert_eq!(e.body(), None, "a Repairing entry carries no bytes");
     assert_eq!(e.body_checksum(), 0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20);
+  }
+
+  /// Builds a [`MemberId`] list `[1, 2, ..., n]` for a payload of `n` members.
+  fn member_ids(n: usize) -> std::vec::Vec<crate::MemberId> {
+    (1..=n as u128).map(crate::MemberId::new).collect()
+  }
+
+  #[test]
+  fn reconfigure_body_round_trips_through_the_wire_codec() {
+    // A Reconfigure body rides the log slice like any op; its successor membership
+    // (replica_count, learner_count, and the full member list) must survive encode→decode unchanged.
+    let payload = ReconfigurePayload::new(3, 2, member_ids(5).into_boxed_slice());
+    let dvc = Message::DoViewChange(DoViewChange::new(
+      View::with(3),
+      View::with(2),
+      OpNumber::with(5),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(6),
+      std::vec![PreparedEntry::reconfigure(
+        OpNumber::with(5),
+        ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+        RequestNumber::with(9),
+        payload.clone(),
+      )],
+    ));
+    let back = Message::decode(&dvc.encode()).expect("round-trips");
+    let e = &back.unwrap_do_view_change().into_log()[0];
+    assert!(e.is_reconfigure(), "decoded back as a Reconfigure entry");
+    assert_eq!(e.op(), OpNumber::with(5));
+    assert_eq!(
+      e.client(),
+      ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10)
+    );
+    assert_eq!(e.request(), RequestNumber::with(9));
+    assert_eq!(
+      e.body(),
+      None,
+      "a Reconfigure entry carries no client bytes"
+    );
+    let decoded = e
+      .body_state()
+      .as_reconfigure()
+      .expect("the decoded body is a Reconfigure payload");
+    assert_eq!(decoded, &payload, "the successor membership survives");
+    assert_eq!(decoded.replica_count(), 3);
+    assert_eq!(decoded.learner_count(), 2);
+    assert_eq!(decoded.members(), member_ids(5).as_slice());
+  }
+
+  #[test]
+  fn a_reconfigure_body_is_not_mistaken_for_present_or_repairing() {
+    // The three body-state wire tags are distinct: a Reconfigure body decodes as a Reconfigure,
+    // never as a Present (client bytes) or a Repairing (header-only) entry.
+    let payload = ReconfigurePayload::new(1, 0, member_ids(1).into_boxed_slice());
+    let rb = Message::RepairBatch(RepairBatch::new(
+      View::with(4),
+      OpNumber::with(9),
+      OpNumber::with(7),
+      0,
+      std::vec![
+        entry(7, b"client-bytes"),
+        PreparedEntry::repairing(
+          OpNumber::with(8),
+          ClientId::new(0xAA),
+          RequestNumber::with(8),
+          0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
+        ),
+        PreparedEntry::reconfigure(
+          OpNumber::with(9),
+          ClientId::new(0xBB),
+          RequestNumber::with(9),
+          payload.clone(),
+        ),
+      ],
+    ));
+    let log = Message::decode(&rb.encode())
+      .expect("round-trips")
+      .unwrap_repair_batch()
+      .into_log();
+    assert!(log[0].body_state().is_present(), "entry 0 is Present");
+    assert!(log[1].body_state().is_repairing(), "entry 1 is Repairing");
+    assert!(log[2].is_reconfigure(), "entry 2 is Reconfigure");
+    assert!(!log[2].body_state().is_present(), "not Present");
+    assert!(!log[2].is_repairing(), "not Repairing");
+    assert_eq!(log[2].body_state().as_reconfigure(), Some(&payload));
+  }
+
+  #[test]
+  fn reconfigure_body_golden_bytes_pin_the_wire_layout() {
+    // The Reconfigure entry layout pinned exactly: same scalars as the other DoViewChange goldens,
+    // then body-state tag 2 = Reconfigure, followed by replica_count(u8) learner_count(u16) and a
+    // u32-count-prefixed member list (each MemberId a 16-byte big-endian u128).
+    let payload = ReconfigurePayload::new(
+      2,
+      1,
+      std::vec![
+        crate::MemberId::new(0x0000_0000_0000_0000_0000_0000_0000_00AA),
+        crate::MemberId::new(0x0000_0000_0000_0000_0000_0000_0000_00BB),
+        crate::MemberId::new(0x0000_0000_0000_0000_0000_0000_0000_00CC),
+      ]
+      .into_boxed_slice(),
+    );
+    let dvc = Message::DoViewChange(
+      DoViewChange::new(
+        View::with(3),
+        View::with(2),
+        OpNumber::with(5),
+        OpNumber::with(4),
+        crate::Epoch::new(0),
+        0,
+        ReplicaId::new(6),
+        std::vec![PreparedEntry::reconfigure(
+          OpNumber::with(5),
+          ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+          RequestNumber::with(9),
+          payload,
+        )],
+      )
+      .with_checkpoint_op(OpNumber::with(3)),
+    );
+    let expected: std::vec::Vec<u8> = std::vec![
+      0, 7, 6, // version 7, tag 6 (DoViewChange)
+      0, 0, 0, 0, 0, 0, 0, 3, // view = 3
+      0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
+      0, 0, 0, 0, 0, 0, 0, 5, // op = 5
+      0, 0, 0, 0, 0, 0, 0, 4, // commit = 4
+      0, 0, 0, 0, 0, 0, 0, 3, // checkpoint_op = 3
+      0, 0, 0, 0, 0, 0, 0, 0, // epoch = 0
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // config_id = 0 (u128)
+      0, 6, // replica = 6 (u16)
+      0, 0, 0, 1, // log count = 1
+      0, 0, 0, 0, 0, 0, 0, 5, // entry op = 5
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // entry client (u128)
+      0, 0, 0, 0, 0, 0, 0, 9, // entry request = 9
+      2, // body-state tag 2 = Reconfigure
+      2, // replica_count = 2 (u8)
+      0, 1, // learner_count = 1 (u16)
+      0, 0, 0, 3, // member count = 3
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA, // member 0
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xBB, // member 1
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xCC, // member 2
+    ];
+    assert_eq!(
+      dvc.encode(),
+      expected,
+      "DoViewChange Reconfigure-entry wire layout is pinned"
+    );
+  }
+
+  #[test]
+  fn reconfigure_encoded_len_matches_encode_and_respects_the_frame_cap() {
+    // The full-voting-set successor membership (64 voters) is the worst case for one Reconfigure
+    // entry; its preflight size matches encode and stays well under the frame cap.
+    let payload = ReconfigurePayload::new(64, 0, member_ids(64).into_boxed_slice());
+    let rb = Message::RepairBatch(RepairBatch::new(
+      View::with(4),
+      OpNumber::with(9),
+      OpNumber::with(7),
+      0,
+      std::vec![PreparedEntry::reconfigure(
+        OpNumber::with(9),
+        ClientId::new(0xBB),
+        RequestNumber::with(9),
+        payload,
+      )],
+    ));
+    let encoded = rb.encode();
+    assert_eq!(
+      rb.encoded_len(),
+      encoded.len(),
+      "encoded_len preflight matches the actual encoding"
+    );
+    assert!(
+      (encoded.len() as u32) < MAX_FRAME_LEN,
+      "a max-membership Reconfigure entry fits the frame cap"
+    );
+  }
+
+  #[test]
+  fn distinct_reconfigure_successors_have_distinct_operation_identities() {
+    // A Reconfigure op is content-addressed like any op: its body folds into prepare_identity via the
+    // body_checksum, so two entries with DIFFERENT successor memberships have DIFFERENT identities.
+    let a = ReconfigurePayload::new(3, 0, member_ids(3).into_boxed_slice());
+    let b = ReconfigurePayload::new(3, 1, member_ids(4).into_boxed_slice());
+    let client = ClientId::new(0x1234);
+    let request = RequestNumber::with(7);
+    let id_a = crate::storage::prepare_identity(
+      client,
+      request,
+      Body::Reconfigure(a.clone()).body_checksum(),
+    );
+    let id_b =
+      crate::storage::prepare_identity(client, request, Body::Reconfigure(b).body_checksum());
+    assert_ne!(
+      id_a, id_b,
+      "different successor memberships content-address differently"
+    );
+    // The same successor under the same (client, request) is stable.
+    let id_a2 =
+      crate::storage::prepare_identity(client, request, Body::Reconfigure(a).body_checksum());
+    assert_eq!(id_a, id_a2, "a Reconfigure identity is deterministic");
   }
 
   #[test]

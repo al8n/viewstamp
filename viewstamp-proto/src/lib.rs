@@ -60,17 +60,18 @@ pub use config::{
   MAX_SYNC_ENVELOPE_LEN,
 };
 pub use endpoint::{
-  Endpoint, Reconfig, ReconfigError, Recovered, RestartOnly, Retired, prepare_restart,
+  Endpoint, ProposeMembershipError, Reconfig, ReconfigError, Recovered, RestartOnly, Retired,
+  SingleChange, prepare_restart,
 };
-pub use event::{Committed, Event, RepairStarted, ViewChanged};
+pub use event::{Committed, Event, MembershipChanged, RepairStarted, ViewChanged};
 pub use id::{ClientId, Epoch, MemberId, Peer, Recipient, ReplicaId};
-pub use membership::{Membership, MembershipError};
+pub use membership::{Membership, MembershipError, SingleVoterDelta};
 pub use message::{
-  Commit, DoViewChange, GetView, Message, Outgoing, Prepare, PrepareBatch, PrepareOk,
-  PreparedEntry, REPLY_ENCODE_OVERHEAD, Recovery, RecoveryResponse, RepairBatch, Reply, Request,
-  RequestPrepare, RequestPrepareRange, RequestSync, RequestSyncChunk, SYNC_CHUNK_LEN, StartView,
-  StartViewChange, SyncCheckpoint, SyncCheckpointMeta, SyncChunk, max_reply_body_len,
-  max_unchunked_snapshot_len,
+  Commit, DoViewChange, GetView, LearnerStatus, Message, Outgoing, Prepare, PrepareBatch,
+  PrepareOk, PreparedEntry, REPLY_ENCODE_OVERHEAD, ReconfigurePayload, Recovery, RecoveryResponse,
+  RepairBatch, Reply, Request, RequestPrepare, RequestPrepareRange, RequestSync, RequestSyncChunk,
+  SYNC_CHUNK_LEN, StartView, StartViewChange, SyncCheckpoint, SyncCheckpointMeta, SyncChunk,
+  max_reply_body_len, max_unchunked_snapshot_len,
 };
 pub use number::{OpNumber, RequestNumber, View};
 pub use prng::Prng;

@@ -1,6 +1,6 @@
 use super::*;
 
-impl<S: StateMachine> Endpoint<S> {
+impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Register op `op` for peer fault-repair: its committed body read back permanently faulty, so
   /// we drop any stale (header-only / wrong) cache entry, record the hole, immediately solicit the op
   /// from peers, and arm the repair-retry timer. The COMMIT IS HELD below `op` by the apply loops
@@ -622,7 +622,14 @@ impl<S: StateMachine> Endpoint<S> {
     // commit only once `WalDone::Appended` lands. The hole stays OPEN here (commit held, op not exposed)
     // and `op` is marked `appending` so the durable-status oracle treats it as in-flight (and a
     // duplicate repair Prepare hits the early `appending` guard above instead of double-appending).
-    let entry = LogEntry::present(p.client(), p.request(), p.body_bytes());
+    // Build the in-memory entry via the SHARED typed reconstruction (`log_entry_from_prepare`), NOT a
+    // bare `LogEntry::present`: a RECONFIGURATION-client body must be rebuilt as a typed
+    // `Body::Reconfigure`, exactly as the normal-prepare append path does. A `Body::Reconfigure` op
+    // carried HEADER-ONLY through a view change (every real DVC carries its log as `Repairing` headers —
+    // see `log_entries`) arrives here as the canonical body to fill; storing it as an opaque
+    // `Body::Present` would make `commit_reconfigure` fail to recognize it at commit — the epoch swap
+    // would silently never fire and the membership bytes would be mis-applied to the state machine.
+    let entry = self.log_entry_from_prepare(p);
     let id = self.mint_op_id();
     wal.submit_append(id, p.op(), header, p.body_bytes());
     // This append owes NO PrepareOk/own-vote (peer repair is not a vote), but unlike the OLD bare write

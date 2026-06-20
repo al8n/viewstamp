@@ -520,3 +520,152 @@ fn a_voter_backup_still_acks_and_proposes_unlike_a_learner() {
     "a voter backup proposes a view change when the primary goes idle",
   );
 }
+
+#[test]
+fn a_learner_emits_learner_status_on_its_cadence_with_its_durable_frontier() {
+  // A non-voting learner reports its progress on a cadence: drive its timers past LEARNER_STATUS_CADENCE
+  // and it emits a single `LearnerStatus` to the primary carrying the DURABLE root's frontier
+  // (`sb.state().commit()` + the durable WAL head), NOT the in-memory `commit_min`/`op`. The report is
+  // self-identified by the learner's slot under the current epoch/config.
+  let mut e = learner_self();
+  // A durable root vouching commit (the known-committed frontier) == 5, with a durable WAL head of 6
+  // (an op held above the committed frontier). These are what the report MUST carry — the durable
+  // values, so a crash can never make the learner claim more than it persisted.
+  let durable_root = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(5),
+    OpNumber::new(),
+    0,
+    std::vec::Vec::new(),
+  )
+  .expect("a valid durable root");
+  let mut sb = TestSb {
+    state: durable_root,
+    ..Default::default()
+  };
+  let mut wal = TestWal {
+    head: 6,
+    ..Default::default()
+  };
+
+  let now = Instant::ZERO;
+  // Bootstrap the cadence (the first `handle_timeout` arms it), then advance past it and fire.
+  e.handle_timeout(now, &mut wal, &mut sb);
+  let later = now + core::time::Duration::from_millis(10_000);
+  e.handle_timeout(later, &mut wal, &mut sb);
+
+  let mut reports = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::LearnerStatus(ls) = out.msg_ref() {
+      // It is addressed to the primary of the current view (voter 0 leads view 0).
+      assert_eq!(
+        out.to(),
+        crate::Recipient::To(Peer::Replica(ReplicaId::new(0))),
+        "the learner reports to the current primary",
+      );
+      reports.push(*ls);
+    }
+  }
+  assert_eq!(
+    reports.len(),
+    1,
+    "exactly one LearnerStatus per cadence tick"
+  );
+  let ls = reports[0];
+  assert_eq!(
+    ls.replica(),
+    ReplicaId::new(LEARNER),
+    "self-identified by the learner's slot"
+  );
+  assert_eq!(
+    ls.durable_commit_min(),
+    OpNumber::with(5),
+    "reports the DURABLE root commit (5), not an in-memory frontier",
+  );
+  assert_eq!(
+    ls.durable_op(),
+    OpNumber::with(6),
+    "reports the DURABLE WAL head (6)",
+  );
+  assert_eq!(ls.epoch(), crate::Epoch::new(0), "the current epoch");
+  assert_eq!(ls.config_id(), 0, "the current config_id");
+}
+
+#[test]
+fn a_voter_never_emits_learner_status() {
+  // The progress report is learner-specific: a VOTING backup participates directly (its votes carry its
+  // frontier), so it never arms or fires the learner-status cadence. The same drive on a voter emits NO
+  // `LearnerStatus`.
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(1)).expect("voter 1 backup + 2 learners"),
+    genesis_with_learners(3, 2),
+    0,
+    NoopSm,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(now, &mut wal, &mut sb);
+  let later = now + core::time::Duration::from_millis(10_000);
+  e.handle_timeout(later, &mut wal, &mut sb);
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.into_msg(), Message::LearnerStatus(_)),
+      "a voter never emits a learner progress report",
+    );
+  }
+}
+
+#[test]
+fn learner_status_is_admitted_only_from_a_member_under_strict_epoch_config() {
+  // Ingress: a `LearnerStatus` is admitted (`sender_matches` + `epoch_authority_admits`) ONLY from a
+  // current configuration MEMBER under an exact `(epoch, config_id)`. A non-member sender, or a
+  // foreign epoch/config, is rejected — it carries config-scoped progress this primary must not record.
+  let e = voter_with_learners(); // self = voter 0 (the primary), 3 voters + 2 learners
+  let learner = ReplicaId::new(LEARNER);
+
+  // From the learner member (slot 3), matching `from`, under the genesis epoch/config: ADMITTED.
+  let ok = Message::LearnerStatus(crate::LearnerStatus::new(
+    learner,
+    OpNumber::with(2),
+    OpNumber::with(2),
+    crate::Epoch::new(0),
+    0,
+  ));
+  assert!(
+    e.sender_matches(Peer::Replica(learner), &ok),
+    "a member sender at the claimed slot is bound",
+  );
+  assert!(
+    e.epoch_authority_admits(&ok),
+    "an exact (epoch, config_id) match is admitted",
+  );
+
+  // A self-consistent report from a NON-MEMBER id (slot 9, out of a 5-node cluster) is rejected by the
+  // sender binding (it is not a configured member).
+  let non_member = ReplicaId::new(9);
+  let forged = Message::LearnerStatus(crate::LearnerStatus::new(
+    non_member,
+    OpNumber::with(2),
+    OpNumber::with(2),
+    crate::Epoch::new(0),
+    0,
+  ));
+  assert!(
+    !e.sender_matches(Peer::Replica(non_member), &forged),
+    "a non-member sender is rejected — its progress is never recorded",
+  );
+
+  // A FOREIGN-epoch report (epoch 1 ≠ this config's epoch 0) is rejected by the strict authority gate.
+  let foreign = Message::LearnerStatus(crate::LearnerStatus::new(
+    learner,
+    OpNumber::with(2),
+    OpNumber::with(2),
+    crate::Epoch::new(1),
+    0,
+  ));
+  assert!(
+    !e.epoch_authority_admits(&foreign),
+    "a foreign-epoch progress report is not this configuration's to act on",
+  );
+}
