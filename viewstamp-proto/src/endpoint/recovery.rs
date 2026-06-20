@@ -335,6 +335,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // re-persists the membership as a v4 root carrying it.
       prev_epoch: state.prev_epoch(),
       lineage,
+      // RESTORE the cross-epoch serve gate: the op that produced the recovered membership. A v6 root
+      // carries it durably (the SwapEpoch / checkpoint / sync-successor / offline-restart writer threaded
+      // it); a pre-v6 root defaults it to its own `checkpoint_op` in `decode`. Without restoring it a donor
+      // recovered into a swapped-but-not-yet-checkpointed window would re-attach its E+1 membership to a
+      // checkpoint BELOW the reconfigure op, letting a laggard install E+1 without the committed prefix
+      // through it.
+      config_install_op: state.config_install_op(),
       status: Status::Recovering,
       view: state.view(),
       op: OpNumber::with(op),
@@ -415,6 +422,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       pending_forfeit: false,
       reconfigure_inflight: None,
       pending_swap: None,
+      paying_checkpoint_debt: false,
       peer_progress: BTreeMap::new(),
       _reconfig: core::marker::PhantomData,
     };
@@ -862,19 +870,31 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
-  /// Escalate a permanently-unreadable own checkpoint to a PEER FETCH. Stops local checkpoint
-  /// retries, arms a FORCED state-sync targeting our own `checkpoint_op` (so a peer holding a
-  /// checkpoint `>= ours` answers), broadcasts the `RequestSync`, and marks `awaiting_peer_checkpoint`
-  /// so the recovery stays open (never completes to Normal with an unrestored SM) and `handle_message`
-  /// accepts the answering `SyncCheckpoint`. Idempotent: if already escalated, it just (re-)solicits.
-  fn escalate_checkpoint_to_peer_fetch(&mut self, now: Instant) {
+  /// Escalate to a PEER FETCH: stop local checkpoint retries, arm a FORCED state-sync to `target` (so a
+  /// peer holding a checkpoint `>= target` answers), broadcast the `RequestSync`, and mark
+  /// `awaiting_peer_checkpoint` so the recovery stays open (never completes to Normal with an unrestored
+  /// SM) and `handle_message` accepts the answering `SyncCheckpoint`. Idempotent: if already escalated, it
+  /// just (re-)solicits.
+  ///
+  /// Two callers, distinguished by `target` + `require_cross_epoch`:
+  /// - the permanently-unreadable own-checkpoint recovery (`target = self.checkpoint_op`,
+  ///   `require_cross_epoch = false`): any peer at/above our corrupt checkpoint subsumes it.
+  /// - the cross-epoch crossing fetch ([`Self::enter_cross_epoch_peer_fetch`]) (`target` = the advertised
+  ///   cluster checkpoint, `require_cross_epoch = true`): the fetch MUST cross into E+1 — `apply_sync`
+  ///   rejects any non-crossing reply (see [`SyncState::require_cross_epoch`]).
+  fn escalate_checkpoint_to_peer_fetch(
+    &mut self,
+    now: Instant,
+    target: OpNumber,
+    require_cross_epoch: bool,
+  ) {
     // Stop local checkpoint reads and latch the awaiting-peer state.
     if let Some(rec) = self.recover.as_mut() {
       rec.checkpoint = None;
       rec.awaiting_peer_checkpoint = true;
     }
-    // Arm a FORCED sync to our own (corrupt) checkpoint_op: any peer whose durable checkpoint is at or
-    // above it can serve a snapshot that subsumes ours. `forced` selects `apply_sync`'s relaxed
+    // Arm a FORCED sync to `target`: any peer whose durable checkpoint is at or above it can serve a
+    // snapshot that subsumes ours. `forced` selects `apply_sync`'s relaxed
     // (never-rewind-the-applied-frontier) assert — correct here, where the synced op `>= checkpoint_op
     // == commit_min`. Only arm if not already syncing (anti-thrash; the fresh-arm chokepoint
     // `arm_sync` broadcasts the solicitation itself); an already-armed sync just re-broadcasts.
@@ -882,11 +902,98 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // while `awaiting_peer_checkpoint` holds (the Normal-only `sync_timeouts` does not run during
     // recovery).
     if self.sync.is_none() {
-      self.arm_sync(now, self.checkpoint_op, true);
+      self.arm_sync(now, target, true, require_cross_epoch);
     } else {
       self.send_request_sync(now);
     }
     self.arm_timers(now);
+  }
+
+  /// Route a NON-NORMAL laggard stranded at the OLD epoch into the RECOVERY peer-fetch — the cross-epoch
+  /// catch-up for a replica whose status is not `Normal` (a `ViewChange` driving a now-futile old-epoch
+  /// election, or a `Recovering`/`RecoveringHead` whose own durable state is at the superseded epoch).
+  /// Such a replica cannot state-sync directly (the sync trigger/serve are `Normal`-gated) and its
+  /// old-epoch view-change/recovery is epoch-inadmissible from the swapped cluster, so it would strand
+  /// forever; the Normal-path cross-epoch catch-up ([`Self::maybe_request_cross_epoch_catchup`]) does not
+  /// apply. The ONE clean "rebuild from the cluster, end Normal" mechanism is the recovery peer-fetch
+  /// (`awaiting_peer_checkpoint`): it solicits a `SyncCheckpoint` (which carries the E+1 successor
+  /// membership), `apply_sync` installs it cross-epoch, and `complete_recovery` lands the replica `Normal`
+  /// at the new epoch. This abandons the futile old-epoch view-change/recovery and enters that path.
+  ///
+  /// Triggered off a STRICTLY-higher-epoch `Prepare`/`Commit` (the same committed-vouched signal the
+  /// Normal path uses) — we act on NONE of its content, only on learning a configuration ahead of ours
+  /// exists; the SyncCheckpoint we fetch is self-verifying (its `checkpoint_id` + the successor's
+  /// `config_id` hash-chain are checked in `apply_sync`), so a forged higher-epoch heartbeat cannot
+  /// install unvouched state. Safety fences, in order:
+  ///
+  /// - **Idempotent**: already awaiting a peer checkpoint ⇒ the `recover_retry` cadence re-solicits;
+  ///   nothing to re-enter.
+  /// - **Never disturb LOCAL recovery progress**: a `Recovering` replica still draining its own durable
+  ///   tail/checkpoint reads (`rec.pending` non-empty or `rec.checkpoint` outstanding) may yet recover
+  ///   from its own disk to its (old-epoch) durable state — let it; a later higher-epoch heartbeat
+  ///   re-triggers this from the settled status.
+  /// - **Never abandon an in-flight DURABLE-VIEW write** (`pending_durable_view` — a `ViewChange`'s
+  ///   `SendDoViewChange`, or an `AdoptedStartView`, write not yet landed): tearing it down mid-write
+  ///   could regress a view the replica is vouching for. Defer; the next heartbeat re-triggers once the
+  ///   write settles. (A committed-first `SwapEpoch` root does NOT raise this fence, but a non-Normal
+  ///   laggard never holds one.) We keep `self.view`/`self.log_view` — the cross-epoch sync does not
+  ///   regress them; the post-recovery Normal path catches the view up via `catch_up_to_view`.
+  /// - **Never abandon an in-flight ORDINARY checkpoint** (`pending_checkpoint` — a Normal laggard can
+  ///   have a snapshot two-write persist underway when the cross-epoch trigger arrives): the teardown's
+  ///   `reset_for_view_transition` clears `pending_checkpoint`, and abandoning it mid-persist is a
+  ///   durable-sequencing hazard. Defer; the trigger is sticky (re-fires on each higher-epoch heartbeat /
+  ///   `EpochAhead`), so we re-enter cleanly once the ordinary checkpoint completes.
+  ///
+  /// `checkpoint` is the advertised cluster checkpoint (the higher-epoch trigger's `checkpoint_op`) — the
+  /// crossing TARGET. The forced sync REQUIRES crossing (`require_cross_epoch`): `apply_sync` rejects any
+  /// reply that is not a strictly-higher epoch carrying the successor membership, so the fetch can ONLY
+  /// complete by installing E+1 (it never exits Recovering at the old epoch off a below-`N`/empty reply).
+  ///
+  /// On entry: tear down the old-generation in-flight state ([`Self::reset_for_view_transition`] — the
+  /// in-flight sync + its deferred install, the pipeline-adjacent submissions, the forfeit sub-state),
+  /// drop the pipeline/buffer + the `ViewChange` collection + any prior-view `pending_sb` (so the status
+  /// flip to `Recovering` keeps the `view_change.is_some() == is_view_change()` coupling and no stale
+  /// completion fires), enter `Recovering` with a FRESH `RecoverState` latched at `awaiting_peer_checkpoint`
+  /// (no local reads — the WAL/SM are consistent at the stale point, just hopelessly behind the pruned
+  /// cluster), and arm the FORCED peer-fetch exactly as the checkpoint-exhaustion escalation does.
+  pub(crate) fn enter_cross_epoch_peer_fetch(&mut self, now: Instant, checkpoint: OpNumber) {
+    if self.awaiting_peer_checkpoint() {
+      return; // already fetching — `recover_timeouts` re-solicits on its cadence.
+    }
+    if let Some(rec) = self.recover.as_ref()
+      && (!rec.pending.is_empty() || rec.checkpoint.is_some())
+    {
+      return; // still draining local recovery reads — may recover from own disk first.
+    }
+    if self.pending_durable_view() {
+      return; // a durable-view write is in flight — do not abandon it mid-write.
+    }
+    if self.pending_checkpoint.is_some() {
+      return; // an ordinary checkpoint is persisting — do not abandon it; the sticky trigger re-fires.
+    }
+    // Tear down the futile old-generation in-flight state (sync + deferred install, in-flight appends,
+    // peer-checkpoint reports, in-flight checkpoint, forfeit sub-state) in the shared chokepoint, then the
+    // pieces it deliberately leaves to the call site: the primary pipeline + backup reorder buffer, the
+    // `ViewChange`-only collection (so the imminent `Recovering` status keeps the
+    // `view_change.is_some() == is_view_change()` coupling), and any prior-view `pending_sb` (a stale
+    // completion is then ignored in `on_sb_done`, the `catch_up_to_view` shape).
+    self.reset_for_view_transition();
+    self.inflight.clear();
+    self.buffer.clear();
+    self.view_change = None;
+    self.pending_sb = None;
+    // Enter Recovering with a fresh, read-free RecoverState: the WAL/SM are already consistent at our
+    // (stale) durable point, so there is no local tail/checkpoint read to drain — we go straight to the
+    // peer fetch. The FORCED sync targets `max(checkpoint, self.checkpoint_op)`: at/above the advertised
+    // cluster crossing point AND at/above our own checkpoint, so the only satisfiable reply is the donor's
+    // `M >= N` crossing checkpoint (`apply_sync`'s forced path never rewinds the applied frontier — the
+    // synced op `>= checkpoint_op == commit_min`). The recovery `RequestSync` is admitted at the E+1
+    // server (our predecessor `config_id` is an ANCESTOR in its lineage ring; its E+1 answer is admitted
+    // here via `sync.is_some()`). `require_cross_epoch = true` pins the crossing requirement in `apply_sync`.
+    self.set_status(Status::Recovering);
+    self.recover = Some(RecoverState::default());
+    let target = OpNumber::with(checkpoint.get().max(self.checkpoint_op.get()));
+    self.escalate_checkpoint_to_peer_fetch(now, target, true);
   }
 
   /// Drop every permanently-faulty committed-band slot's EMPTY placeholder from the dense `log` cache,
@@ -1130,6 +1237,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       } else {
         self.arm_timers(now);
       }
+      // A crash in the swap-checkpoint window left a durable root whose E+1 membership is AHEAD of the
+      // checkpoint (`config_install_op > checkpoint_op`). Pay that debt off the recovered root NOW —
+      // BEFORE any traffic — driving the committed band to `>= config_install_op` and forcing the owed
+      // checkpoint, so a freshly-restarted quiescent donor still converges to a servable E+1 checkpoint
+      // with zero heartbeats. No-op when no debt is owed (the common recovery). The primary/mid-view-
+      // change branches above do NOT call this: they re-enter a transition and pay once they next settle
+      // Normal (the debt is sticky — re-checked from the commit-advance tails).
+      self.maybe_pay_checkpoint_debt(now, sb);
     }
   }
 
@@ -1252,7 +1367,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (bit-rot/torn write in this replica's single durable copy), unrecoverable from local disk.
     if want_checkpoint.is_some() {
       if checkpoint_retries == 0 {
-        self.escalate_checkpoint_to_peer_fetch(now);
+        // Permanently-unreadable OWN checkpoint: any peer at/above it subsumes ours — NOT a cross-epoch
+        // crossing (no epoch target to pin), so target our own `checkpoint_op` with the requirement off.
+        self.escalate_checkpoint_to_peer_fetch(now, self.checkpoint_op, false);
       } else {
         let new_id = self.mint_op_id();
         if let Some(rec) = self.recover.as_mut() {
@@ -1537,13 +1654,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `complete_recovery` flips to Normal and abdicates/rebuilds/resumes — atomically, with the durable
     // root already caught up to the synced frontier.
     self.apply_sync(now, sb, &m);
-    // The recovery READ phase is done (the peer snapshot is fetched + staged); the re-persist is now
-    // storage-driven, so abandon local recovery bookkeeping and retire the recovery/solicit timers — the
-    // node waits for `on_sb_done`, not a timer (a still-armed recover-retry / sync-solicit would spin a
-    // poll_timeout-driven driver, neither serviced while Recovering with a staged sync).
-    self.recover = None;
-    self.timers.recover_retry = None;
-    self.timers.sync_solicit = None;
+    // `apply_sync` STAGES a `pending_checkpoint` (+ `pending_install`) iff it accepted the reply; it stages
+    // NOTHING on a reject (a corrupt membership, or — the cross-epoch crossing requirement — a below-target
+    // / empty-membership reply that does not cross). ONLY when it staged is the recovery READ phase done:
+    // abandon local recovery bookkeeping and retire the recovery/solicit timers (the node waits for
+    // `on_sb_done`, not a timer; a still-armed recover-retry / sync-solicit would spin a poll_timeout-driven
+    // driver, neither serviced while Recovering with a staged sync). On a REJECT we must KEEP the peer-fetch
+    // armed (`recover` + `awaiting_peer_checkpoint` + the solicit timer) so it re-fetches from another donor
+    // — tearing `recover` down here would silently end the fetch at the old epoch.
+    if self.pending_checkpoint.is_some() {
+      self.recover = None;
+      self.timers.recover_retry = None;
+      self.timers.sync_solicit = None;
+    }
   }
 
   /// Higher-view rule: a newer primary already exists (we saw its Prepare/Commit/PrepareOk) and we

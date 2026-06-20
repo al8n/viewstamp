@@ -129,6 +129,7 @@ fn assert_invariants_rejects_pending_install_without_sync() {
     sessions: BTreeMap::new(),
     sm_tail: Bytes::new(),
     held_tail: false,
+    successor: None,
   });
   // self.sync is None → violates clause (1)
   e.assert_invariants();

@@ -214,6 +214,12 @@ pub fn prepare_restart(
     prev_epoch,
     successor,
     prior_config_ids,
+    // An OFFLINE reconfiguration: the successor membership takes effect as of `cur`'s checkpoint, so carry
+    // `cur.checkpoint_op()` as `config_install_op`. The operator guarantees the committed prefix through the
+    // checkpoint is durable at restart, so `checkpoint_op >= config_install_op` holds with equality and a
+    // node restarted off this root may serve the new membership immediately (the gate withholds only the
+    // LIVE swap window where the checkpoint genuinely trails the reconfigure op).
+    cur.checkpoint_op(),
   )?;
   Ok(state)
 }

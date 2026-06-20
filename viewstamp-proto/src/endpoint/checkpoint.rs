@@ -13,6 +13,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.on_recover_wal_done(now, wal, sb, done);
       return;
     }
+    // A Retired (removed) replica is no longer a cluster member: drop any straggling WAL completion (a
+    // pre-removal append landing after the swap retired this node), so the consensus dispatch below —
+    // which casts votes and reads `local_slot()` — is unreachable. This is the STORAGE-path twin of the
+    // ingress + timer Retired drops: a removed node participates in NOTHING at EVERY driver entry point
+    // by construction (`install_membership` cleared the in-flight bookkeeping, so nothing is owed).
+    if self.status.is_retired() {
+      return;
+    }
     let id = match done {
       WalDone::Appended(id) => id,
       // DEFENSIVE: a `Fault` completion whose OpId matches a pending APPEND. The `Wal` contract
@@ -232,7 +240,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // residual staging. The carried `op` is the reconfigure op number captured at stage time.
         PendingSbAction::SwapEpoch(op, successor) => {
           self.pending_swap = None;
-          self.install_membership(op, successor);
+          self.install_membership(Some(op), successor);
+          // Force a checkpoint at the current `commit_min` (call it `M`) so the new epoch begins at a
+          // checkpoint that EMBEDS the reconfigure op `N` and carries the E+1 membership — making the
+          // cross-epoch serve gate `checkpoint_op (M) >= config_install_op (N)` true BY CONSTRUCTION
+          // rather than an edge a quiescent donor's lagging checkpoint could withhold forever. The
+          // preconditions hold: the SwapEpoch root just landed (the superblock is FREE and
+          // `pending_checkpoint` is None — `maybe_swap_epoch` submitted this root only when both were),
+          // and the arm runs ONLY when no view change intervened (a transition supersedes the SwapEpoch
+          // id on `pending_sb`, so this completion would not have matched), so `log_view == view` still
+          // holds. Commit-first ordering gives `M = commit_min >= N` (the swap committed `N`; `commit_min`
+          // may have advanced past it before the root landed). GATED on still-Normal: `install_membership`
+          // RETIRES this node (status → `Retired`) when the swap removed it from the configuration — a
+          // removed node owns no checkpoint. A demotion to learner keeps Normal (a learner still serves /
+          // can donate), so it still forces. A swap queued behind this one stays deferred: `maybe_swap_epoch`
+          // below re-checks `pending_checkpoint.is_none()`, so this forced checkpoint holds it back.
+          if self.status.is_normal() {
+            self.force_checkpoint(sb);
+          }
         }
       }
       // A swap that committed while this write was in flight WAITED its turn (`maybe_swap_epoch`
@@ -268,19 +293,44 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           // max(commit_max, target_op)]` are then empty for a sync (the snapshot subsumes the prefix; any
           // forced-sync held tail is still uncommitted here, so `commit_max < target_op` ⇒ empty band).
           let root_commit = OpNumber::with(self.commit_max.get().max(pc.target_op.get()));
-          let state = self.durable_root(
-            self.view,
-            self.log_view,
-            root_commit,
-            pc.target_op,
-            pc.checkpoint_id,
-            // SPARSE band headers over `(target_op .. min(commit_max, op)]` — bounded by the ACTUAL
-            // known-committed frontier `commit_max` (NOT the lifted `root_commit`), so for a sync
-            // re-persist (where `commit_max <= target_op`) the band is empty: every op `<= target_op`
-            // lives in the snapshot, and any forced-sync held tail above is not yet committed. The
-            // root permits a header list SHORTER than `commit` (the prefix is vouched by the snapshot id).
-            self.committed_band_headers(pc.target_op),
-          );
+          let headers = self.committed_band_headers(pc.target_op);
+          // A CROSS-EPOCH state-sync re-persist (`pending_install.successor` is `Some`) must make the
+          // SUCCESSOR membership DURABLE in THIS root — not only install it in memory at completion —
+          // or a later crash/wipe would recover the OLD epoch off this root and silently revert the
+          // membership install. Stamp the successor exactly as `submit_swap_epoch` does. A same-config
+          // (or non-sync) checkpoint stamps the current membership unchanged.
+          let successor = matches!(pc.kind, CheckpointKind::SyncRepersist)
+            .then(|| {
+              self
+                .pending_install
+                .as_ref()
+                .and_then(|pi| pi.successor.clone())
+            })
+            .flatten();
+          let state = match &successor {
+            Some(successor) => self.durable_root_with_successor(
+              self.view,
+              self.log_view,
+              root_commit,
+              pc.target_op,
+              pc.checkpoint_id,
+              headers,
+              successor,
+            ),
+            None => self.durable_root(
+              self.view,
+              self.log_view,
+              root_commit,
+              pc.target_op,
+              pc.checkpoint_id,
+              // SPARSE band headers over `(target_op .. min(commit_max, op)]` — bounded by the ACTUAL
+              // known-committed frontier `commit_max` (NOT the lifted `root_commit`), so for a sync
+              // re-persist (where `commit_max <= target_op`) the band is empty: every op `<= target_op`
+              // lives in the snapshot, and any forced-sync held tail above is not yet committed. The
+              // root permits a header list SHORTER than `commit` (the prefix is vouched by the snapshot id).
+              headers,
+            ),
+          };
           sb.submit_write(root_id, state);
           self.pending_checkpoint = Some(PendingCheckpoint {
             step: CheckpointStep::AwaitRoot(root_id),
@@ -409,6 +459,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.commit_min.get() < boundary {
       return;
     }
+    self.force_checkpoint(sb);
+  }
+
+  /// Begin an ORDINARY checkpoint at `commit_min` UNCONDITIONALLY — the post-cadence-gate body of
+  /// [`Self::maybe_checkpoint`] with the three guards (status/`log_view`, in-flight exclusion, cadence)
+  /// STRIPPED. The caller owns the preconditions: status Normal with `log_view == view` and a FREE
+  /// superblock (`pending_sb.is_none() && pending_checkpoint.is_none()`).
+  ///
+  /// Two callers force a checkpoint OFF the cadence — both at a point where the reconfigure op `N` must
+  /// become checkpoint-covered so the cross-epoch sync serve gate (`checkpoint_op >= config_install_op`)
+  /// holds: the [`Self::on_sb_done`] `SwapEpoch` arm (the live swap, just after the durable swap root
+  /// landed and `install_membership` ran) and [`Self::maybe_pay_checkpoint_debt`] (a crash between the
+  /// swap root and this checkpoint left a durable root with `config_install_op = N > checkpoint_op`, and
+  /// recovery drives the band to `>= N` then forces the owed checkpoint). The ordinary cadence path is
+  /// byte-identical to the prior inline body.
+  pub(crate) fn force_checkpoint<B: Superblock>(&mut self, sb: &mut B) {
     // Checkpoint at `commit_min` (a committed+applied boundary), not at the raw `boundary` op:
     // `commit_min` may have jumped past `boundary` in a batch commit, and the SM has applied through
     // `commit_min` (apply is forward-only) — so the snapshot reflects state through `commit_min`.
@@ -429,6 +495,68 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       step: CheckpointStep::AwaitSnapshot(id),
       kind: CheckpointKind::Ordinary, // not a state-sync re-persist
     });
+  }
+
+  /// Pay down the self-describing CHECKPOINT DEBT a crash in the swap-checkpoint window leaves.
+  ///
+  /// The live epoch swap writes the SwapEpoch durable root (`config_install_op = N`) and THEN, as a
+  /// SEPARATE write, forces a checkpoint at `M >= N` (the [`Self::on_sb_done`] `SwapEpoch` arm). A crash
+  /// BETWEEN those two writes leaves a durable root with the E+1 membership AHEAD of the checkpoint:
+  /// `config_install_op = N` but `checkpoint_op < N`. That inequality IS the debt — already durable in
+  /// the superblock v6 root, needing no new field — and a donor in that state withholds the E+1
+  /// membership from a cross-epoch laggard (the `checkpoint_op >= config_install_op` XI-b serve gate
+  /// fails), so it MUST converge to `checkpoint_op >= config_install_op` on its own.
+  ///
+  /// Crucially this must DRIVE ITSELF with NO traffic: a freshly-recovered quiescent backup sits at
+  /// `commit_min == checkpoint_op < N` with no incoming Commit heartbeat to advance it, so it would
+  /// withhold the membership forever. So this routine, gated to a settled-Normal node with a free
+  /// superblock and an OWED debt, (a) PROACTIVELY drives the committed band forward —
+  /// `advance_commit(commit_max)` applies the held band and repairs any hole via the existing peer-repair
+  /// path — so `commit_min` climbs toward `config_install_op` without a heartbeat; then (b) once
+  /// `commit_min >= config_install_op`, forces the owed checkpoint at `commit_min`. The forced
+  /// checkpoint's root landing advances `checkpoint_op` (the existing [`Self::on_sb_done`] completion),
+  /// clearing the debt — `checkpoint_op >= config_install_op` becomes durable.
+  ///
+  /// Sticky by construction: it is called from [`Self::complete_recovery`] (the no-traffic kick) AND from
+  /// every commit-advance tail (`try_commit` / `advance_commit`), so a debt that could NOT be paid at
+  /// recovery (a band hole awaiting peer-repair held `commit_min` below `N`) re-checks and pays the
+  /// instant the repair fill carries commit through `N`. It also survives a view change / a recovering-
+  /// primary abdication: the debt is implicit in the durable root, so it is simply re-evaluated whenever
+  /// the node next settles Normal and commit advances.
+  ///
+  /// The proactive `advance_commit` is RE-ENTRANCY-guarded ([`Self::paying_checkpoint_debt`]): reached
+  /// FROM a commit-advance tail it would otherwise re-enter `advance_commit` without bound; the flag makes
+  /// the inner advance a no-op (the outer advance already drove commit as far as the held log permits).
+  pub(crate) fn maybe_pay_checkpoint_debt<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+    // No debt unless the durable root names a membership AHEAD of the checkpoint.
+    if self.config_install_op.get() <= self.checkpoint_op.get() {
+      return;
+    }
+    // Settled-Normal with a free superblock — the same fence `maybe_checkpoint`/`maybe_swap_epoch` use,
+    // so the forced checkpoint never races a durable-view or in-flight-checkpoint write. A non-Normal /
+    // mid-transition node re-checks here once it next resumes Normal and commit advances (sticky).
+    if !self.status.is_normal() || self.log_view.get() != self.view.get() {
+      return;
+    }
+    if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
+      return;
+    }
+    // (a) Drive the committed band forward with NO traffic so a quiescent recovered node still climbs
+    // `commit_min` toward `config_install_op` (any hole repairs on the existing peer-repair path, and a
+    // later advance — after the fill lands — re-enters here and resumes). Guarded against the
+    // commit-advance-tail re-entry: the outer advance already moved commit as far as the held log allows.
+    if !self.paying_checkpoint_debt {
+      self.paying_checkpoint_debt = true;
+      self.advance_commit(now, sb, self.commit_max.get());
+      self.paying_checkpoint_debt = false;
+    }
+    // (b) Once the band reached the reconfigure op, force the owed checkpoint at `commit_min` (>= N), so
+    // its durable root advances `checkpoint_op` to `>= config_install_op` and clears the debt. Re-check
+    // `pending_checkpoint.is_none()`: a nested debt-pay (reached via the proactive `advance_commit`'s own
+    // tail) may have already forced it — never submit a second concurrent checkpoint.
+    if self.commit_min.get() >= self.config_install_op.get() && self.pending_checkpoint.is_none() {
+      self.force_checkpoint(sb);
+    }
   }
 
   // Physical bounded-WAL slot reuse + stall-before-wrap (the `Wal` exposes a capacity; the
@@ -775,7 +903,57 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // node recovering off this root restores the superseded-ancestor ids and keeps admitting a retained
       // laggard's cross-epoch catch-up.
       self.lineage.to_vec(),
+      // The op that produced the CURRENT membership (this root stamps `self.membership`), so a recovered
+      // donor restores the cross-epoch serve gate. Once a checkpoint advances PAST a prior swap's
+      // reconfigure op, the next `durable_root` carries the same `config_install_op` with a higher
+      // `checkpoint_op`, so the gate flips from withhold to serve at exactly the right checkpoint.
+      self.config_install_op,
     )
     .expect("durable root: log_view <= view, commit >= checkpoint_op, membership epoch consistent")
+  }
+
+  /// Mint a durable root that stamps a CROSS-EPOCH state-sync's SUCCESSOR membership — the analogue of
+  /// [`Self::submit_swap_epoch`]'s successor-carrying root, but for the state-sync re-persist path. A
+  /// laggard that cross-epoch state-syncs (its synced snapshot reflects a configuration ahead of its
+  /// own) must make the new configuration DURABLE in the SAME root that records the synced checkpoint,
+  /// not only install it in memory — otherwise a later crash/wipe recovers the OLD epoch off this root
+  /// and silently REVERTS the membership install (re-stranding the replica at the old epoch). So this
+  /// stamps the SUCCESSOR's `epoch`/membership and the predecessor's epoch as `prev_epoch`, and writes
+  /// the POST-swap lineage ring (the superseded predecessor `config_id` shifted in — exactly what
+  /// [`Endpoint::install_membership`]'s `push_lineage` builds), mirroring `submit_swap_epoch`. The
+  /// consensus frontier (`view`/`log_view`/`commit`/`checkpoint_op`/`checkpoint_id` + the band headers)
+  /// is the synced one, carried unchanged.
+  #[allow(clippy::too_many_arguments)]
+  fn durable_root_with_successor(
+    &self,
+    view: View,
+    log_view: View,
+    commit: OpNumber,
+    checkpoint_op: OpNumber,
+    checkpoint_id: u128,
+    committed_headers: std::vec::Vec<Header>,
+    successor: &Membership,
+  ) -> crate::VsrState {
+    crate::VsrState::try_new_v4(
+      view,
+      log_view,
+      commit,
+      checkpoint_op,
+      checkpoint_id,
+      committed_headers,
+      successor.epoch(),
+      self.membership.epoch(),
+      successor.clone(),
+      self.lineage_after_push(self.membership.config_id()),
+      // A cross-epoch sync install has no LOCAL reconfigure op (the laggard synced PAST it), so carry the
+      // synced frontier `checkpoint_op` as `config_install_op` — the SAME value `install_sync` sets in
+      // memory. The donor attached this successor only because ITS checkpoint reached the reconfigure op
+      // `N`, and this `checkpoint_op` equals that donor checkpoint, so `checkpoint_op >= N`: a safe,
+      // restart-survivable lower bound for the gate on this node (now a potential re-donor).
+      checkpoint_op,
+    )
+    .expect(
+      "sync-successor root: log_view <= view, commit >= checkpoint_op, membership epoch consistent",
+    )
   }
 }

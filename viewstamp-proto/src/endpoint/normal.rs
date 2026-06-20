@@ -553,6 +553,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.cancel_forced_sync_if_satisfied();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(sb);
+    // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
+    // advanced, so if it reached the reconfigure op force the owed checkpoint (the re-entrancy guard makes
+    // this routine's own `advance_commit` a no-op here). No-op when no debt is owed.
+    self.maybe_pay_checkpoint_debt(now, sb);
     // Re-submit a staged epoch swap that is waiting for a free superblock slot — chiefly a `pending_swap`
     // that SURVIVED a view change whose new generation issued no durable-view write (a `catch_up_to_view`):
     // there is no `on_sb_done` re-trigger on that path, so the commit tail is the re-submit point. No-op
@@ -758,7 +762,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // While a sync is outstanding we will catch up via the snapshot, not by tail-apply: drop the
     // prepare (do not buffer ops we can never reach below the cluster checkpoint). The synced
     // checkpoint's apply rebuilds the head; the primary's next Prepare/Commit then extends the tail.
-    if self.sync.is_some() {
+    //
+    // EXCEPTION: a NORMAL-STATUS speculative CROSS-EPOCH sync ([`Self::cross_epoch_speculative_sync`]) is
+    // TRANSPARENT here. That laggard is behind-but-OPERATIONAL in its OWN epoch: this SAME-epoch
+    // head-extending `Prepare` is a legitimate op within reach (op+1), NOT below an out-of-reach cluster
+    // checkpoint, so dropping it would freeze an operational replica out of its own epoch (the strict
+    // ingress witness). It keeps appending + acking same-epoch ops; the cross-epoch sync sits armed (it may
+    // never even get a reply) and crosses only when `apply_sync` installs the verified crossing checkpoint,
+    // which then DISCARDS this same-epoch tail (the crossing install forces `held_tail = false`).
+    if self.sync.is_some() && !self.cross_epoch_speculative_sync() {
       return;
     }
     // Durable-view-before-participate: a pending view-CHANGING superblock write means status==Normal
@@ -1197,6 +1209,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.cancel_forced_sync_if_satisfied();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(sb);
+    // Pay any swap-checkpoint DEBT (`config_install_op > checkpoint_op` on a recovered root): commit just
+    // advanced, so if it reached the reconfigure op force the owed checkpoint. The re-entrancy guard makes
+    // this routine's own `advance_commit` a no-op here (the loop above already drove commit). No-op when
+    // no debt is owed (the common path).
+    self.maybe_pay_checkpoint_debt(now, sb);
     // Re-submit a staged epoch swap waiting for a free superblock slot (mirrors `try_commit`'s tail) —
     // chiefly a `pending_swap` that survived a `catch_up_to_view` view change (no durable-view write, so
     // no `on_sb_done` re-trigger). No-op unless a swap is staged and the superblock is free.
@@ -1312,7 +1329,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// raises the head, sliding the window up — so a bogus huge `commit_max` can no longer flood the
   /// Sans-I/O core, while a genuinely far-behind backup catches up via state-sync, not tail-gap.
   fn request_tail_gap(&mut self) {
-    if !self.status.is_normal() || self.is_primary() || self.sync.is_some() {
+    // A NORMAL-STATUS speculative cross-epoch sync ([`Self::cross_epoch_speculative_sync`]) is transparent
+    // here too: the operational laggard still tail-gap-repairs the SAME-epoch committed band above its head
+    // (those ops are in reach, NOT below the cluster checkpoint), staying caught up in its own epoch until
+    // the crossing checkpoint lands. An ordinary / forced sync still suppresses tail-gap (futile — the gap
+    // is below the cluster checkpoint, state-sync territory).
+    if !self.status.is_normal()
+      || self.is_primary()
+      || (self.sync.is_some() && !self.cross_epoch_speculative_sync())
+    {
       return;
     }
     let lo = self.op.get().max(self.checkpoint_op.get()) + 1;
@@ -1325,6 +1350,121 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       .min(lo.saturating_add(TAIL_GAP_WINDOW).saturating_sub(1));
     for op in lo..=hi {
       self.send_request_prepare(op);
+    }
+  }
+
+  /// Cross-epoch catch-up trigger. A `Prepare`/`Commit` (or a minimal `EpochAhead` hint) from a STRICTLY
+  /// HIGHER epoch than ours is inadmissible at the central ingress (its descendant `config_id` is absent
+  /// from our ancestor lineage, and we must not act on a not-yet-reached configuration's content). But it
+  /// is the catch-up HEARTBEAT we otherwise lost: once the cluster swapped epochs, the primary's
+  /// heartbeats became epoch-inadmissible, so the periodic catch-up that `on_commit` drives never
+  /// re-fires — and a voter that lagged at the reconfigure commit strands at the OLD epoch. We trust NONE
+  /// of this message's content; we act only on the epoch-ordering signal that a configuration ahead of
+  /// ours exists, and the catch-up state we fetch is self-verifying.
+  ///
+  /// The `EpochAhead` shape is the SYMMETRIC pull (the epoch-mismatch response in `handle_message_inner`):
+  /// a slot-shifted laggard that cannot bind the new primary keeps sending FUTILE old-epoch traffic to the
+  /// RETAINED voters it CAN bind; one of those ANSWERS with this minimal higher-epoch hint, so the laggard
+  /// triggers the SAME forced peer-fetch from a bindable peer it already knows — it never needs to bind the
+  /// new primary. The hint carries NO quorum authority a forged one could abuse (the crossing fetch
+  /// authenticates the state, not the hint).
+  ///
+  /// Both laggard shapes UNIFY at the CROSSING REQUIREMENT (a FORCED, crossing-required sync to the
+  /// advertised cluster checkpoint that completes ONLY on a strictly-higher-epoch successor-membership
+  /// checkpoint at/above target) — but NOT at the STATUS transition:
+  ///
+  /// - **non-Normal** (a `ViewChange`/`Recovering` laggard, already off Normal): crosses via the recovery
+  ///   peer-fetch ([`Self::enter_cross_epoch_peer_fetch`] — enter `Recovering`, FORCED-sync, then
+  ///   `complete_recovery` lands it `Normal` at E+1). There is no Normal state to preserve.
+  /// - **Normal** (a behind-but-OPERATIONAL voter): arms a NORMAL-STATUS crossing-required sync and STAYS
+  ///   Normal. A single higher-epoch message from a configured member must NOT knock an operational laggard
+  ///   out of Normal — doing so would make it DROP subsequent LEGITIMATE same-epoch traffic (the strict
+  ///   ingress witness). It transitions to E+1 ONLY when `apply_sync` installs the verified crossing
+  ///   checkpoint (which advances `commit_min` to `M >= N`, installs the successor membership, and discards
+  ///   the stale tail) — so the speculative arm itself moves no accumulator (`op`/`commit`/`view` are
+  ///   untouched until install). A higher-epoch message no longer disrupts the strict-epoch lane.
+  ///
+  /// The forced sync is NOT `> op`-gated, so it crosses even when `op == N` (the laggard appended the
+  /// reconfigure op but missed its commit). The SyncCheckpoint we fetch is self-verifying (its
+  /// `checkpoint_id` + the successor's `config_id` hash-chain are checked in `apply_sync`), so a forged
+  /// higher-epoch heartbeat cannot install unvouched state.
+  ///
+  /// The triggering message is still DROPPED by the caller (we acted on no E+1 content).
+  pub(crate) fn maybe_request_cross_epoch_catchup(
+    &mut self,
+    now: Instant,
+    from: Peer,
+    msg: &Message,
+  ) {
+    // The trigger is a STRICTLY-higher-epoch `Prepare`/`Commit`, regardless of our status. The
+    // `checkpoint_op` it advertises is the cluster checkpoint a Normal laggard syncs toward. Run this
+    // BEFORE `sender_matches`'s predecessor-primary binding: a live removal can change the primary slot,
+    // so the honest E+1 primary is a DIFFERENT retained voter the laggard does not yet expect for its
+    // view — its heartbeat would otherwise be dropped at the sender binding before reaching here.
+    let checkpoint = match msg {
+      Message::Prepare(m) if m.epoch() > self.membership.epoch() => m.checkpoint_op(),
+      Message::Commit(m) if m.epoch() > self.membership.epoch() => m.checkpoint_op(),
+      // The SYMMETRIC pull: a stranded laggard whose own futile old-epoch traffic elicited a minimal
+      // higher-epoch hint from a BINDABLE retained voter (the epoch-mismatch response below). It carries
+      // NO quorum content — only the epoch-ordering signal + the cluster checkpoint to cross to — so it
+      // drives the SAME forced peer-fetch as a higher-epoch heartbeat, from `from` (a retained voter in
+      // OUR config), needing no new-primary binding.
+      Message::EpochAhead(m) if m.epoch() > self.membership.epoch() => m.checkpoint_op(),
+      _ => return,
+    };
+    // Authenticate the SENDER lightly — an ACTIVE replica member, by the transport-bound `from` (NOT the
+    // predecessor-primary binding) — and act on NONE of the message's content, only the epoch-ordering
+    // signal. A non-replica / forged peer cannot drive catch-up. We do NOT bound the slot by
+    // `node_count`: a successor primary's slot can lie BEYOND a laggard's older/smaller config, and the
+    // higher-epoch heartbeat / `EpochAhead` hint is the ONLY catch-up signal we get — the crossing fetch
+    // (forced + crossing-required, self-verifying) is what authenticates the state, not the sender slot.
+    if from.as_replica().is_none() {
+      return;
+    }
+    // A NON-Normal laggard (already off Normal: a `ViewChange` driving a futile old-epoch election, or a
+    // `Recovering`/`RecoveringHead` at the superseded epoch) crosses via the recovery peer-fetch — it
+    // enters Recovering, FORCED-syncs the cluster checkpoint, and `complete_recovery` lands it Normal at
+    // E+1. There is no Normal state to preserve, so the status transition is free.
+    if !self.status.is_normal() {
+      self.enter_cross_epoch_peer_fetch(now, checkpoint);
+      return;
+    }
+    // A NORMAL laggard arms a NORMAL-STATUS crossing-required sync and STAYS Normal — it must keep
+    // processing legitimate same-epoch traffic until a real crossing checkpoint lands. We deliberately do
+    // NOT use `maybe_request_sync`: that is gated `incoming_checkpoint > self.op`, so a laggard that
+    // APPENDED op `N` but missed its commit (`op == N`, `commit_min < N`) sees a checkpoint at `M == N == op`
+    // and would NOT sync, stranding at the old epoch. Instead arm directly through the `arm_sync` chokepoint:
+    //
+    // - `target = checkpoint` (the advertised cluster crossing point, `>= N` via #1) — the cross-epoch
+    //   crossing checkpoint a donor serves at `M >= N`.
+    // - `forced = true` — so `apply_sync`'s discard-direction assert uses the relaxed `checkpoint_op >=
+    //   commit_min` invariant (needed for the `op == N` case, where the synced checkpoint sits at/below the
+    //   head); the arm is NOT `> op`-gated, so `op == N` still crosses.
+    // - `require_cross_epoch = true` — the crossing requirement: `apply_sync` completes this sync ONLY on a
+    //   strictly-higher-epoch successor-membership checkpoint at/above target, never an early exit at the
+    //   old epoch off a below-`N` / empty-membership reply.
+    //
+    // Arming a sync does NOT reset `op` and does NOT change status — `op`/`commit`/`view` stay untouched
+    // until `apply_sync` INSTALLS the verified crossing checkpoint (which then advances `commit_min` to
+    // `M >= N`, installs the successor membership, and discards the stale tail). So a higher-epoch message
+    // moves no accumulator; the speculative sync just keeps re-soliciting until a donor's `M >= N` crossing
+    // checkpoint lands (#1 guarantees one exists). Mirror the anti-thrash re-target shape of
+    // `maybe_request_sync`/`maybe_force_sync`: RAISE an outstanding sync's target (keep it forced + pinned
+    // crossing); otherwise fresh-arm.
+    match self.sync {
+      Some(s) if checkpoint.get() > s.target.get() => {
+        self.sync = Some(SyncState {
+          target: checkpoint,
+          nonce: s.nonce,
+          forced: true,
+          require_cross_epoch: true,
+        });
+        // A now-forced raised target invalidates a chunked transfer pinned below it.
+        self.drop_transfer_below_forced_target();
+        self.send_request_sync(now);
+      }
+      Some(_) => self.send_request_sync(now), // a sync to >= target is outstanding — re-solicit (anti-thrash).
+      None => self.arm_sync(now, checkpoint, true, true),
     }
   }
 

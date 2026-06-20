@@ -24,6 +24,7 @@ fn v4_root(membership: Membership, commit: u64) -> VsrState {
     epoch,
     membership,
     std::vec::Vec::new(),
+    OpNumber::new(),
   )
   .expect("valid v4 root")
 }
@@ -205,6 +206,7 @@ fn recover_into_a_post_reconfiguration_epoch_restores_the_predecessor_lineage() 
     genesis_mem.epoch(),
     genesis_mem,
     std::vec::Vec::new(), // genesis: no predecessor lineage
+    OpNumber::new(),      // genesis: no reconfigure has installed the membership
   )
   .expect("genesis root");
   let succ_state = crate::endpoint::prepare_restart(
@@ -977,6 +979,7 @@ fn sealed_root(commit: u64) -> VsrState {
     epoch,
     genesis,
     std::vec::Vec::new(),
+    OpNumber::new(),
   )
   .expect("valid sealed v4 root")
 }

@@ -15,6 +15,14 @@ pub enum Status {
   /// Recovering at startup with corrupt persistent state; cannot vote until a
   /// `StartView` re-establishes the head.
   RecoveringHead,
+  /// Removed from the configuration by a reconfiguration — the local member holds neither a voting
+  /// nor a learner slot. A Retired replica is no longer a cluster member: it participates in NOTHING
+  /// (the central ingress drops every consensus message, it services no timer, it casts no vote and
+  /// serves no request), mirroring the recovery-time `Recovered::Retired` outcome for a node that
+  /// discovers its own removal on restart. The structural close for the removed-member class: a
+  /// removed node cannot reach any voter path (nor a panicking `local_slot()`) by construction. The
+  /// embedder, observing the `MembershipChanged` that removed it, shuts the node down.
+  Retired,
 }
 
 impl Status {
@@ -26,6 +34,7 @@ impl Status {
       Self::ViewChange => "view_change",
       Self::Recovering => "recovering",
       Self::RecoveringHead => "recovering_head",
+      Self::Retired => "retired",
     }
   }
 
@@ -51,6 +60,12 @@ impl Status {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_recovering_head(&self) -> bool {
     matches!(self, Self::RecoveringHead)
+  }
+
+  /// True iff `self == Status::Retired` — removed from the configuration; no longer a cluster member.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_retired(&self) -> bool {
+    matches!(self, Self::Retired)
   }
 }
 

@@ -578,11 +578,21 @@ impl Cluster {
   /// stream, creating a legitimate gap in the applied op-number sequence. The safety contiguity check
   /// reads this to EXPECT exactly those gaps. Empty on every run that never reconfigures.
   pub fn committed_reconfigure_ops(&self) -> std::collections::BTreeSet<u64> {
-    self
+    // Swap-INSTALLED reconfigure ops (from `MembershipChanged`, permanent even after the op prunes
+    // below a checkpoint) UNIONED with reconfigure ops that are COMMITTED but not yet swap-installed
+    // (still carried in a replica's log above its checkpoint). The second source closes the
+    // commit->install window: a `Reconfigure` op advances `commit_min` (so the contiguity oracle sees
+    // the applied-stream gap) the moment it commits, but its `MembershipChanged` only fires later when
+    // the durable `SwapEpoch` root lands — so reading only the swap stream false-positives in between.
+    let mut ops: std::collections::BTreeSet<u64> = self
       .membership_swaps
       .iter()
       .flat_map(|stream| stream.iter().map(|(_, mc)| mc.op().get()))
-      .collect()
+      .collect();
+    for r in &self.replicas {
+      ops.extend(r.committed_reconfigure_op_numbers());
+    }
+    ops
   }
 
   /// Whether replica `i` is currently a VOTER in its DURABLE membership (occupies a voting slot). A
@@ -2869,10 +2879,12 @@ mod tests {
         viewstamp_proto::View::with(1), // above the durable view 0
         OpNumber::with(4),
         0,
+        viewstamp_proto::Epoch::new(0),
         0,
         ReplicaId::new(0),
         0xD18F,
         bytes::Bytes::from_static(b"snapshot"),
+        Bytes::new(),
       )),
     );
     c.record_durable_view_violation(0, &serve);
@@ -2890,10 +2902,12 @@ mod tests {
         viewstamp_proto::View::with(0), // == durable view 0
         OpNumber::with(4),
         0,
+        viewstamp_proto::Epoch::new(0),
         0,
         ReplicaId::new(0),
         0xD18F,
         bytes::Bytes::from_static(b"snapshot"),
+        Bytes::new(),
       )),
     );
     c.record_durable_view_violation(0, &ok_serve);
@@ -3040,10 +3054,12 @@ mod tests {
       View::with(1),
       OpNumber::with(8),
       0xFEED,
+      viewstamp_proto::Epoch::new(0),
       0,
       ReplicaId::new(0),
       7,
       env.clone(),
+      Bytes::new(),
     ));
     assert!(
       whole.encoded_len() > MAX_FRAME_LEN as usize,

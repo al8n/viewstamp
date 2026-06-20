@@ -170,10 +170,12 @@ mod tests {
       view(1),
       op(1),
       0,
+      crate::Epoch::new(0),
       0,
       replica(),
       99,
       snapshot,
+      Bytes::new(),
     ))
   }
 

@@ -3566,10 +3566,12 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
       View::new(),
       OpNumber::with(2),
       good_id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       good_env.clone(),
+      Bytes::new(),
     )),
   );
   // apply_sync staged the durable re-persist (two superblock writes); drive them to completion.
@@ -3672,10 +3674,12 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
       View::new(),
       OpNumber::with(2),
       good_id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(1),
       nonce,
       good_env,
+      Bytes::new(),
     )),
   );
   // Drive the staged re-persist to completion (flush the scripted superblock each round so the two staged
@@ -3782,10 +3786,12 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
       View::new(),
       OpNumber::with(2),
       good_id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       good_env.clone(),
+      Bytes::new(),
     )),
   );
   for _ in 0..3 {
@@ -3920,10 +3926,12 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
       View::new(),
       OpNumber::with(1),
       peer_id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       peer_env,
+      Bytes::new(),
     )),
   );
   // Drive the durable re-persist (two superblock writes) to completion → Normal.
@@ -4135,10 +4143,12 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
     View::new(),
     OpNumber::with(1),
     peer_id,
+    crate::Epoch::new(0),
     0,
     ReplicaId::new(0),
     nonce,
     peer_env,
+    Bytes::new(),
   );
 
   // Re-mark committed op 2 as an IN-FLIGHT tail read holding only a `Present(empty)` placeholder — the
@@ -4266,10 +4276,12 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     View::new(),
     OpNumber::with(1),
     peer_id,
+    crate::Epoch::new(0),
     0,
     ReplicaId::new(0),
     nonce,
     peer_env,
+    Bytes::new(),
   );
   // Re-mark UNCOMMITTED op 3 (== commit_max + 1) as an in-flight tail read with a `Present(empty)` placeholder.
   e.log.insert(
@@ -4406,10 +4418,12 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     View::with(1),
     OpNumber::with(1),
     peer_id,
+    crate::Epoch::new(0),
     0,
     ReplicaId::new(0),
     nonce,
     peer_env,
+    Bytes::new(),
   );
   // Re-mark the SUPERSEDED op 3 as an in-flight tail read with a `Present(empty)` placeholder.
   e.log.insert(

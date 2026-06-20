@@ -676,10 +676,12 @@ fn sync_checkpoint_restores_and_resumes_at_the_synced_point() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env.clone(),
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb); // drive the durable re-persist (TestSb synchronous)
@@ -774,10 +776,12 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env.clone(),
+      Bytes::new(),
     )),
   );
   // STAGE only: the snapshot write is in flight (not yet flushed). NOTHING may have installed.
@@ -915,10 +919,12 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   // Advance step 1 (snapshot durable → root submitted) but withhold the ROOT (it stays in flight).
@@ -1146,10 +1152,12 @@ fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
       View::new(),
       OpNumber::with(6),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -1230,10 +1238,12 @@ fn a_recovery_peer_fetch_stays_recovering_until_the_sync_root_is_durable() {
       View::new(),
       OpNumber::with(6),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(1),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   // THE CRUX: AFTER delivery but BEFORE driving storage, the node has NOT eagerly flipped/installed. It
@@ -1313,10 +1323,12 @@ fn sync_checkpoint_with_mismatched_id_is_rejected_not_restored() {
       View::new(),
       OpNumber::with(4),
       advertised,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       bad_env,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -1384,10 +1396,12 @@ fn sync_checkpoint_with_op_not_bound_to_the_snapshot_is_rejected_not_restored() 
       View::new(),
       OpNumber::with(4), // OVERSTATED — does not match the op bound (2) inside the snapshot
       real_id,
+      crate::Epoch::new(0),
       0, // matches checkpoint_id(stale_env), so the integrity gate PASSES
       ReplicaId::new(0),
       nonce,
       stale_env,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb); // (no re-persist should have been staged)
@@ -1451,10 +1465,12 @@ fn stale_nonce_sync_checkpoint_is_ignored() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce.wrapping_add(1),
       env,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -1501,10 +1517,12 @@ fn sync_checkpoint_below_target_is_ignored() {
       View::new(),
       OpNumber::with(4),
       id4,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env4,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -1539,10 +1557,12 @@ fn sync_checkpoint_without_an_outstanding_sync_is_ignored() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       0xABCD,
       env,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -1585,10 +1605,12 @@ fn lower_sync_checkpoint_is_ignored_after_a_higher_one() {
       View::new(),
       OpNumber::with(4),
       id4,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env4,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -1604,10 +1626,12 @@ fn lower_sync_checkpoint_is_ignored_after_a_higher_one() {
       View::new(),
       OpNumber::with(2),
       id2,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env2,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -1657,10 +1681,12 @@ fn sync_checkpoint_clears_a_pending_repair_hole_below_the_synced_point() {
       View::new(),
       OpNumber::with(6),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -1907,10 +1933,12 @@ fn forced_sync_preserves_a_held_tail_above_the_checkpoint_without_panic() {
       View::new(),
       OpNumber::with(3),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   ep.handle_storage(Instant::ZERO, &mut wal, &mut sb); // drive the durable re-persist
@@ -2054,11 +2082,13 @@ fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_targ
       View::new(),
       OpNumber::with(2),
       crate::checkpoint_id(&env),
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       // a nonce that would have matched the cancelled forced sync (it is gone, so this is moot)
       7,
       env,
+      Bytes::new(),
     )),
   );
   ep.handle_storage(now, &mut wal, &mut sb);
@@ -2114,10 +2144,12 @@ fn apply_sync_drops_a_stale_forced_sync_checkpoint_below_the_applied_frontier() 
       View::new(),
       OpNumber::with(2),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   ep.handle_storage(now, &mut wal, &mut sb);
@@ -2352,10 +2384,12 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -2436,10 +2470,12 @@ fn synced_replica_reports_its_checkpoint_in_view_change() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -2737,7 +2773,7 @@ fn over_frame_checkpoint_is_announced_and_chunks_reassemble_it() {
   let mut whole = false;
   while let Some(out) = e.poll_message() {
     match out.msg_ref() {
-      Message::SyncCheckpointMeta(m) => meta = Some((out.to(), *m)),
+      Message::SyncCheckpointMeta(m) => meta = Some((out.to(), m.clone())),
       Message::SyncCheckpoint(_) => whole = true,
       _ => {}
     }
@@ -2936,16 +2972,19 @@ fn cold_cache_chunk_request_rereads_and_ships() {
 
 // ── Chunked state-sync transfer: the receiver pull loop ──
 
-/// A `SyncCheckpointMeta` announcing the `(op, id)` envelope of `total` bytes from `donor`.
+/// A `SyncCheckpointMeta` announcing the `(op, id)` envelope of `total` bytes from `donor`. Same-config
+/// (epoch 0, empty membership) — the cross-epoch carry is exercised by its own dedicated test.
 fn meta_of(op: u64, id: u128, total: usize, donor: u16, nonce: u64) -> Message {
   Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
     View::new(),
     OpNumber::with(op),
     id,
+    crate::Epoch::new(0),
     0,
     total as u64,
     ReplicaId::new(donor),
     nonce,
+    Bytes::new(),
   ))
 }
 
@@ -3095,6 +3134,740 @@ fn chunked_transfer_assembles_in_order_and_installs_via_the_whole_message_path()
 }
 
 #[test]
+fn the_chunked_reassembly_carries_the_same_epoch_and_membership_as_the_single_frame_form() {
+  // ANTI-DRIFT GUARD: the single-frame `SyncCheckpoint` and the chunked `SyncCheckpointMeta` MUST
+  // carry the IDENTICAL cross-epoch header `(epoch, membership)`, so the verified chunk reassembly
+  // rebuilds a `SyncCheckpoint` byte-equal in those fields to a one-frame arrival. Were the two to
+  // drift again (the chunked path dropping the membership, as it once did with an `Epoch::new(0)` +
+  // empty placeholder), a cross-epoch laggard whose post-swap snapshot is over-frame would never
+  // install the successor configuration and stay stranded. This pins the two headers EQUAL at the
+  // message level AND drives the chunked path end to end to assert the successor genuinely installs.
+
+  // A successor chained off genesis (config_id 0) exactly as a real swap derives it — its epoch is E+1
+  // and its config_id hash-chains from the predecessor, so `to_membership_verified` accepts it.
+  let predecessor = genesis(3);
+  let successor = predecessor
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid");
+  assert_eq!(
+    successor.epoch(),
+    crate::Epoch::new(1),
+    "the successor is E+1"
+  );
+  assert_ne!(
+    successor.config_id(),
+    predecessor.config_id(),
+    "the successor chained a fresh config_id"
+  );
+  // The canonical wire body the donor serves — IDENTICAL bytes on both the whole and chunked paths.
+  let membership =
+    crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
+      .encode_body();
+
+  // The same checkpoint expressed BOTH ways: the single-frame `SyncCheckpoint` and the chunked
+  // announce. The donor builds the two from the SAME `self.membership`, so the header fields the
+  // announce carries must equal the whole form's. (A synthetic envelope is fine here — this layer
+  // compares only the carried `(epoch, membership)`, which never decode the snapshot.)
+  let synth_env = Bytes::from(std::vec![0xC3u8; 64]);
+  let synth_id = crate::checkpoint_id(&synth_env);
+  let single_frame = crate::SyncCheckpoint::new(
+    View::new(),
+    OpNumber::with(4),
+    synth_id,
+    successor.epoch(),
+    successor.config_id(),
+    ReplicaId::new(0),
+    0xCAFE,
+    synth_env.clone(),
+    membership.clone(),
+  );
+  let announce = crate::SyncCheckpointMeta::new(
+    View::new(),
+    OpNumber::with(4),
+    synth_id,
+    successor.epoch(),
+    successor.config_id(),
+    synth_env.len() as u64,
+    ReplicaId::new(0),
+    0xCAFE,
+    membership.clone(),
+  );
+  // THE DRIFT GUARD: the announce's cross-epoch header equals the single-frame form's, field for field.
+  assert_eq!(
+    announce.epoch(),
+    single_frame.epoch(),
+    "the chunked announce carries the SAME epoch as the single-frame SyncCheckpoint"
+  );
+  assert_eq!(
+    announce.membership(),
+    single_frame.membership(),
+    "the chunked announce carries the SAME membership as the single-frame SyncCheckpoint"
+  );
+
+  // End to end: a laggard at the PREDECESSOR config pins a cross-epoch announce of a REAL (decodable)
+  // checkpoint envelope, pulls it chunk by chunk, and the verified reassembly re-enters the
+  // SyncCheckpoint path — which must install the SUCCESSOR exactly as a single-frame cross-epoch
+  // arrival would (the membership is carried through reassembly, not dropped to an empty placeholder).
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  assert_eq!(
+    e.membership.config_id(),
+    predecessor.config_id(),
+    "the laggard starts at the predecessor config"
+  );
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  // Pin the cross-epoch announce (re-stamped with the laggard's live nonce) and pull from 0.
+  let cross_meta = crate::SyncCheckpointMeta::new(
+    View::new(),
+    OpNumber::with(4),
+    id,
+    successor.epoch(),
+    successor.config_id(),
+    env.len() as u64,
+    ReplicaId::new(0),
+    nonce,
+    membership.clone(),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpointMeta(cross_meta),
+  );
+  let (_, pull) = drain_chunk_pull(&mut e).expect("the cross-epoch announce pins + pulls");
+  assert_eq!(pull.offset(), 0);
+  // The chunks carry the successor's config_id (the agnostic field the chunk also stamps).
+  let split = 24usize;
+  let chunk = |range: core::ops::Range<usize>| {
+    Message::SyncChunk(crate::SyncChunk::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      successor.config_id(),
+      env.len() as u64,
+      range.start as u64,
+      ReplicaId::new(0),
+      nonce,
+      env.slice(range),
+    ))
+  };
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), chunk(0..split));
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    chunk(split..env.len()),
+  );
+  assert_eq!(
+    e.sync_chunk_transfers_completed(),
+    1,
+    "the cross-epoch chunked transfer assembled + verified"
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the two-write persist → durable root → install
+  // THE PAYOFF: the reassembled checkpoint installed the SUCCESSOR config (it was NOT dropped to an
+  // empty/placeholder membership) — the laggard converged across the epoch boundary via the chunked path.
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the cross-epoch sync fully applied via the chunked path"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    successor.epoch(),
+    "the chunked reassembly installed the SUCCESSOR epoch (the membership was carried, not lost)"
+  );
+  assert_eq!(
+    e.membership.config_id(),
+    successor.config_id(),
+    "the chunked reassembly installed the SUCCESSOR config_id — identical to a single-frame install"
+  );
+  assert_eq!(
+    e.membership, successor,
+    "the laggard installed the exact successor configuration the over-frame snapshot reflected"
+  );
+}
+
+/// Capture the `SyncCheckpoint` a donor ships in answer to a `RequestSync` from replica 2 (draining
+/// the rest of the outbound queue).
+fn serve_request_sync(
+  e: &mut Endpoint<CountSm>,
+  wal: &mut TestWal,
+  sb: &mut TestSb,
+) -> crate::SyncCheckpoint {
+  let now = Instant::ZERO;
+  while e.poll_message().is_some() {} // drain warm-up / membership-change emissions
+  e.handle_message(
+    now,
+    wal,
+    sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::RequestSync(crate::RequestSync::new(
+      e.view(),
+      OpNumber::with(0),
+      ReplicaId::new(2),
+      0xCAFE,
+      false,
+      0,
+    )),
+  );
+  e.handle_storage(now, wal, sb); // the checkpoint read completes → ship SyncCheckpoint
+  let mut shipped = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::SyncCheckpoint(s) = out.msg_ref() {
+      shipped = Some(s.clone());
+    }
+  }
+  shipped.expect("the donor ships a SyncCheckpoint")
+}
+
+#[test]
+fn a_swapped_donor_below_its_reconfigure_op_withholds_the_cross_epoch_membership() {
+  // XI-b SERVE GATE (the CP-safety fix): a donor that has committed-first SWAPPED to E+1 at reconfigure
+  // op N, but whose durable checkpoint is still BELOW N, must NOT attach its E+1 membership to a sync
+  // answer — else a laggard would install E+1 at the served frontier `M < N`, i.e. at E+1 WITHOUT the
+  // committed prefix through the reconfigure op, and could vote in E+1 unsafely. The donor instead serves
+  // an EMPTY membership; once its checkpoint advances PAST N it serves the real E+1 membership.
+  let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
+  // SWAP to E+1 exactly as a commit-first swap does (AddVoter keeps replica 0 a voter, so it stays the
+  // primary), naming reconfigure op N = 5 — ABOVE the donor's durable checkpoint (op 2). This is the
+  // commit-first window: the swap is in memory (epoch = E+1) but the checkpoint does not yet reflect it.
+  let successor = e
+    .membership
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid");
+  let predecessor_config_id = e.membership.config_id();
+  e.install_membership(Some(OpNumber::with(5)), successor.clone());
+  assert_eq!(
+    e.config_install_op,
+    OpNumber::with(5),
+    "install_membership(Some(N)) records the reconfigure op as config_install_op"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(1),
+    "the donor is at E+1"
+  );
+  assert!(
+    e.checkpoint_op().get() < e.config_install_op.get(),
+    "the donor's checkpoint (2) is BELOW its reconfigure op (5) — the commit-first window"
+  );
+
+  // SERVE while below N: the header advertises E+1 (the donor's epoch/config_id), but the membership BODY
+  // is WITHHELD (empty) — so a cross-epoch laggard cannot install E+1 from this below-N checkpoint.
+  let shipped = serve_request_sync(&mut e, &mut wal, &mut sb);
+  assert_eq!(shipped.checkpoint_op(), OpNumber::with(2));
+  assert_eq!(
+    shipped.epoch(),
+    crate::Epoch::new(1),
+    "the answer still advertises the donor's E+1 epoch in its header"
+  );
+  assert_ne!(
+    shipped.config_id(),
+    predecessor_config_id,
+    "the header carries the E+1 config_id"
+  );
+  assert!(
+    shipped.membership().is_empty(),
+    "BELOW the reconfigure op the donor WITHHOLDS the cross-epoch membership (empty body)"
+  );
+
+  // The donor now CHECKPOINTS PAST N: model it by lowering config_install_op to at/below the checkpoint
+  // (equivalently, the checkpoint advanced to/over N). The gate flips to SERVE the real E+1 membership.
+  e.config_install_op = OpNumber::with(2);
+  let shipped = serve_request_sync(&mut e, &mut wal, &mut sb);
+  assert!(
+    !shipped.membership().is_empty(),
+    "once the checkpoint reflects the reconfigure op the donor SERVES the E+1 membership"
+  );
+  // The served body is the canonical E+1 membership, chained off its predecessor — it reconstructs +
+  // verifies to exactly the successor a laggard would install.
+  let served = crate::message::ReconfigurePayload::decode_body(shipped.membership())
+    .expect("the served membership body decodes")
+    .to_membership_verified(shipped.epoch(), shipped.config_id())
+    .expect("the served membership verifies against its carried (epoch, config_id)");
+  assert_eq!(
+    served, successor,
+    "the served membership is the exact E+1 successor"
+  );
+}
+
+#[test]
+fn a_laggard_keeps_its_membership_when_a_below_n_donor_withholds_then_swaps_once_served() {
+  // End to end: a laggard at the PREDECESSOR config receives a cross-epoch answer with an EMPTY membership
+  // (a donor below its reconfigure op). It must NOT install E+1 — it installs the SM frontier but KEEPS
+  // its current membership. Then, given a cross-epoch answer that DOES carry the membership (the donor has
+  // since checkpointed past N), it installs the successor.
+  let predecessor = genesis(3);
+  let successor = predecessor
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid");
+
+  // --- Phase 1: the WITHHELD (empty) cross-epoch answer keeps the laggard's membership. ---
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let laggard_config_id = e.membership.config_id();
+  assert_eq!(
+    laggard_config_id,
+    predecessor.config_id(),
+    "the laggard starts at the predecessor config"
+  );
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  // A cross-epoch SyncCheckpoint: the header advertises E+1, but the membership body is EMPTY (the donor
+  // withheld it — its checkpoint is below the reconfigure op).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      successor.epoch(),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(), // WITHHELD cross-epoch membership
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the two-write persist → durable root → install
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the laggard still installs the SM frontier off the below-N checkpoint"
+  );
+  assert_eq!(
+    e.membership.config_id(),
+    laggard_config_id,
+    "the laggard KEEPS its membership — it did NOT install E+1 from the withheld (empty) answer"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "the laggard is still at its old epoch (E), to catch the band up to N via the commit-first path"
+  );
+
+  // --- Phase 2: a cross-epoch answer that CARRIES the membership installs the successor. ---
+  let (mut e2, mut wal2, mut sb2, env2, id2) = sync_apply_harness(4);
+  e2.handle_message(
+    now,
+    &mut wal2,
+    &mut sb2,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce2 = captured_sync_nonce(&mut e2);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
+      .encode_body();
+  e2.handle_message(
+    now,
+    &mut wal2,
+    &mut sb2,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id2,
+      successor.epoch(),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce2,
+      env2.clone(),
+      membership_body,
+    )),
+  );
+  e2.handle_storage(now, &mut wal2, &mut sb2);
+  assert_eq!(
+    e2.state_syncs_applied(),
+    1,
+    "the carried-membership sync applies"
+  );
+  assert_eq!(
+    e2.membership, successor,
+    "a cross-epoch answer that CARRIES the membership installs the E+1 successor"
+  );
+}
+
+#[test]
+fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
+  // Change #2 — the `op == N` crossing. A Normal laggard APPENDED the reconfigure op N but missed its
+  // commit (`op == N`, `commit_min < N`), so the ordinary `maybe_request_sync` trigger (gated
+  // `incoming_checkpoint > self.op`) would do NOTHING for a checkpoint at `M == N == op` and the laggard
+  // would strand at the OLD epoch. The unified forced peer-fetch is NOT `> op`-gated: a higher-epoch
+  // heartbeat routes the laggard into Recovering + a FORCED, crossing-required sync, and a donor
+  // checkpoint at `M >= N` carrying the successor membership crosses it to E+1 (committing N).
+  let n: u64 = 2;
+  // A backup over CountSm (replica 1 of 3) with a high checkpoint cadence — so driving it to head op N
+  // does NOT auto-checkpoint (its `checkpoint_op` stays 0, leaving `op == N`, `commit_min < N`).
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 100).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  // Append ops 1..=N with commit 0 (the laggard appended the reconfigure op N but never saw its commit).
+  for op in 1..=n {
+    e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare_ck(op, 0, 0));
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.op(),
+    OpNumber::with(n),
+    "the laggard head is at the reconfigure op N"
+  );
+  assert!(
+    e.commit().get() < n,
+    "but its commit frontier is below N (it missed N's commit)"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::new(),
+    "and it has not checkpointed — a checkpoint at M == N == op is NOT > op, so the ordinary sync would no-op"
+  );
+  assert!(e.sync_target_for_test().is_none(), "no sync is armed yet");
+
+  // The successor a real swap derives off genesis (AddVoter keeps the lineage valid; epoch is E+1).
+  let predecessor = genesis(3);
+  let successor = predecessor
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid");
+  let laggard_config_id = e.membership.config_id();
+
+  // A STRICTLY-higher-epoch Commit (E+1) advertising the cluster checkpoint at N. Dropped at the
+  // authority ingress, but it is the cross-epoch catch-up signal: the laggard enters the FORCED
+  // peer-fetch (NOT the no-op `maybe_request_sync` path) targeting the crossing checkpoint.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(n),
+      OpNumber::with(n),
+      crate::Epoch::new(1),
+      successor.config_id(),
+    )),
+  );
+  assert!(
+    e.status().is_normal() && !e.awaiting_peer_checkpoint_for_test(),
+    "the NORMAL op == N laggard STAYS Normal (it does not strand at the old epoch, NOR go Recovering — \
+     the speculative arm keeps it operational)"
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(n),
+    "the speculative arm did NOT rewind op — it is untouched until the crossing checkpoint installs"
+  );
+  assert!(
+    e.commit().get() < n,
+    "and commit is still below N (the arm moves no accumulator)"
+  );
+  assert!(
+    e.sync_is_forced_for_test() && e.sync_requires_cross_epoch_for_test(),
+    "but it ARMED a FORCED, crossing-required cross-epoch sync"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(n),
+    "the forced sync targets the advertised cluster crossing checkpoint (N) — NOT `> op`-gated, so \
+     `op == N` still arms"
+  );
+  let nonce = e.sync_nonce_for_test();
+
+  // A donor at checkpoint M == N answers with a cross-epoch SyncCheckpoint CARRYING the successor
+  // membership. (A default-SM snapshot encoded at op N binds op N — the bind check passes.)
+  let snap = CountSm::default().snapshot();
+  let env = Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(n), &BTreeMap::new(), &snap);
+  let id = crate::checkpoint_id(&env);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
+      .encode_body();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(n),
+      id,
+      successor.epoch(),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      membership_body,
+    )),
+  );
+  // apply_sync staged the durable re-persist (two superblock writes) + STAYED Normal; drive them.
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the crossing SyncCheckpoint install lands the laggard Normal at E+1 (it was Normal throughout)"
+  );
+  assert_eq!(
+    e.membership, successor,
+    "the laggard CROSSED to the E+1 successor membership"
+  );
+  assert_ne!(
+    e.membership.config_id(),
+    laggard_config_id,
+    "the config_id advanced off the predecessor"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(n),
+    "the crossing committed the reconfigure op N (commit_min advanced to M >= N)"
+  );
+  assert_eq!(
+    e.forced_syncs_applied(),
+    1,
+    "the crossing routed through apply_sync as a FORCED sync"
+  );
+}
+
+#[test]
+fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits() {
+  // Change #2 — the CROSSING REQUIREMENT. A forced cross-epoch fetch (`require_cross_epoch`) must NOT
+  // settle for a below-target / empty-membership reply (a donor in the transient force-checkpoint window
+  // serving its `M < N` checkpoint): installing it with `successor = None` would EXIT Recovering STILL at
+  // the old epoch — a fetch that does not cross. The fetch REJECTS such a reply (sync stays armed, no
+  // install, still old epoch) and re-solicits, completing ONLY on the `M >= N` successor-membership reply.
+  let n: u64 = 5;
+  let target: u64 = n; // the advertised cluster crossing checkpoint
+  // A backup laggard far behind (op 0, checkpoint 0), high checkpoint cadence.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 100).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let predecessor = genesis(3);
+  let successor = predecessor
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid");
+  let laggard_config_id = e.membership.config_id();
+  // A higher-epoch Commit advertising the cluster checkpoint at N → the forced crossing fetch.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(target),
+      OpNumber::with(target),
+      crate::Epoch::new(1),
+      successor.config_id(),
+    )),
+  );
+  assert!(
+    e.status().is_normal() && !e.awaiting_peer_checkpoint_for_test(),
+    "the NORMAL laggard stays Normal (it armed the speculative sync, did not go Recovering)"
+  );
+  assert!(
+    e.sync_is_forced_for_test() && e.sync_requires_cross_epoch_for_test(),
+    "the laggard armed a crossing-required forced sync"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    Some(target),
+    "targeting the cluster crossing checkpoint N"
+  );
+  let nonce = e.sync_nonce_for_test();
+
+  // --- A BELOW-N, EMPTY-membership reply (a donor whose checkpoint is still `< N`) — REJECTED. ---
+  let below: u64 = 2; // < target (N)
+  let below_snap = CountSm::default().snapshot();
+  let below_env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(below), &BTreeMap::new(), &below_snap);
+  let below_id = crate::checkpoint_id(&below_env);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(below),
+      below_id,
+      crate::Epoch::new(1),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      below_env.clone(),
+      Bytes::new(), // WITHHELD (empty) membership — the donor is below N
+    )),
+  );
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "the below-N empty-membership reply was REJECTED — nothing installed"
+  );
+  assert!(
+    e.status().is_normal() && e.sync_target_for_test() == Some(target),
+    "the sync stays armed (still Normal, still targeting N) — it did not exit / install at the old epoch"
+  );
+  assert!(
+    e.sync_requires_cross_epoch_for_test(),
+    "the crossing requirement is still pinned so the solicit timer re-fetches"
+  );
+  assert_eq!(
+    e.membership.config_id(),
+    laggard_config_id,
+    "still at the OLD epoch (no crossing off the withheld reply)"
+  );
+
+  // --- A later `M >= N` reply CARRYING the successor membership — crosses. ---
+  let cross_snap = CountSm::default().snapshot();
+  let cross_env =
+    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(n), &BTreeMap::new(), &cross_snap);
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
+      .encode_body();
+  let nonce2 = e.sync_nonce_for_test(); // the still-armed sync's nonce
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(n),
+      cross_id,
+      successor.epoch(),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce2,
+      cross_env.clone(),
+      membership_body,
+    )),
+  );
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the M >= N crossing reply completes recovery to Normal"
+  );
+  assert_eq!(
+    e.membership, successor,
+    "and CROSSES to the E+1 successor membership"
+  );
+  assert_eq!(
+    e.forced_syncs_applied(),
+    1,
+    "exactly one crossing applied (the below-N reply did not)"
+  );
+}
+
+#[test]
+fn a_recovered_swapped_donor_restores_config_install_op_so_the_gate_still_holds() {
+  // DURABILITY of the gate: a donor that has swapped to E+1 with its checkpoint still BELOW the reconfigure
+  // op N must, after a CRASH + recover, RESTORE config_install_op = N — so it keeps withholding the E+1
+  // membership until its checkpoint crosses N. The SwapEpoch durable root carries N (config_install_op),
+  // and recover reads it back.
+  let genesis_mem = genesis(3);
+  let successor = genesis_mem
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter is valid");
+  // A REAL checkpoint envelope at op 2 (so recover's decode + bind + id checks all pass).
+  let (_d, _dw, dsb) = donor_primary_at_checkpoint(2);
+  let (env, env_id) = donor_envelope(&dsb);
+  // The durable SwapEpoch root the donor wrote at swap time: the SUCCESSOR membership at checkpoint_op = 2,
+  // carrying config_install_op = N = 5 (ABOVE the checkpoint — the commit-first window made durable).
+  let swap_root = VsrState::try_new_v4(
+    View::new(),
+    View::new(),
+    OpNumber::with(2), // commit
+    OpNumber::with(2), // checkpoint_op — BELOW N
+    env_id,
+    std::vec::Vec::new(),
+    successor.epoch(),
+    genesis_mem.epoch(),
+    successor.clone(),
+    std::vec![genesis_mem.config_id()],
+    OpNumber::with(5), // config_install_op = N, ABOVE the checkpoint
+  )
+  .expect("a SwapEpoch root carrying config_install_op above its checkpoint is valid");
+  assert_eq!(
+    swap_root.config_install_op(),
+    OpNumber::with(5),
+    "the durable root carries config_install_op = N"
+  );
+
+  // Recover replica 0 (a voter in the successor) off that root. A state-synced shape: the snapshot owns
+  // the prefix [1..=checkpoint_op] and the WAL tail above the checkpoint is EMPTY (head 0 < checkpoint 2),
+  // so no WAL entries are needed — recover restores the SM from the snapshot and the metadata from the root.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb {
+    state: swap_root,
+    done: VecDeque::new(),
+    checkpoint: Some((OpNumber::with(2), env)),
+  };
+  let mut e =
+    Endpoint::recover(cfg, genesis_mem, 9, CountSm::default(), &mut wal, &mut sb).expect_active();
+  // Drive the recovery storage to completion (the checkpoint read restores the SM + sessions).
+  let now = Instant::ZERO;
+  for _ in 0..8 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert_eq!(
+    e.config_install_op,
+    OpNumber::with(5),
+    "recover RESTORES config_install_op = N from the durable root"
+  );
+  assert!(
+    e.checkpoint_op().get() < e.config_install_op.get(),
+    "the recovered donor is still in the swapped-but-below-N window, so the gate must withhold"
+  );
+}
+
+#[test]
 fn overflowing_or_empty_chunk_aborts_the_transfer_but_keeps_the_sync_armed() {
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
   let now = Instant::ZERO;
@@ -3220,10 +3993,12 @@ fn oversized_meta_announce_is_ignored_and_the_sync_stays_armed() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       u64::MAX,
       ReplicaId::new(0),
       nonce,
+      Bytes::new(),
     )),
   );
   assert!(e.sync_transfer.is_none(), "the claim is never pinned");
@@ -3246,10 +4021,12 @@ fn oversized_meta_announce_is_ignored_and_the_sync_stays_armed() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       crate::MAX_SYNC_ENVELOPE_LEN + 1,
       ReplicaId::new(0),
       nonce,
+      Bytes::new(),
     )),
   );
   assert!(e.sync_transfer.is_none(), "an over-cap claim is ignored");
@@ -3318,10 +4095,12 @@ fn oversized_meta_announce_never_displaces_a_pinned_transfer() {
       View::new(),
       OpNumber::with(8),
       0xBAD,
+      crate::Epoch::new(0),
       0,
       u64::MAX,
       ReplicaId::new(0),
       nonce,
+      Bytes::new(),
     )),
   );
   let t = e.sync_transfer.as_ref().expect("the live pin survives");
@@ -3393,10 +4172,12 @@ fn unallocatable_meta_announce_is_ignored_and_the_sync_stays_armed() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       u64::MAX,
       ReplicaId::new(0),
       nonce,
+      Bytes::new(),
     )),
   );
   assert!(
@@ -3919,10 +4700,12 @@ fn recovery_peer_fetch_ignores_an_oversized_meta_announce() {
       View::new(),
       OpNumber::with(2),
       0xFEED,
+      crate::Epoch::new(0),
       0,
       u64::MAX,
       ReplicaId::new(0),
       req.nonce(),
+      Bytes::new(),
     )),
   );
   assert!(e.sync_transfer.is_none(), "the claim is never pinned");

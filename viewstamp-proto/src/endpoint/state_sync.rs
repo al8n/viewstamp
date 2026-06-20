@@ -35,6 +35,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           // Preserve the in-flight sync's forced-ness when only raising the target (an ordinary
           // higher checkpoint does not downgrade an outstanding forced sync's assert-relaxation).
           forced: s.forced,
+          // Preserve the crossing requirement too: this Normal-path target-raise never touches a
+          // cross-epoch fetch (that one is armed only in Recovering), so this is always `false`,
+          // but carrying it forward keeps the invariant local to the source-of-truth field.
+          require_cross_epoch: s.require_cross_epoch,
         });
         // A FORCED target raised past a pinned chunked transfer invalidates it (the strict
         // `>= target` gate is load-bearing there); an ordinary raise keeps the pin (it completes
@@ -44,7 +48,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     // Fresh trigger: arm + solicit through the single fresh-arm chokepoint.
-    self.arm_sync(now, incoming_checkpoint, false);
+    self.arm_sync(now, incoming_checkpoint, false, false);
   }
 
   /// The SINGLE fresh-arm chokepoint for a state-sync handshake: bump the freshness nonce
@@ -55,13 +59,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// arms a sync from `None` routes here (`maybe_request_sync`, `maybe_force_sync`,
   /// `maybe_sync_below_ring_window`, the recovery peer-fetch escalation); target RAISES on an
   /// outstanding sync stay at their sites (they re-target the same handshake, not a fresh arm).
-  pub(crate) fn arm_sync(&mut self, now: Instant, target: OpNumber, forced: bool) {
+  pub(crate) fn arm_sync(
+    &mut self,
+    now: Instant,
+    target: OpNumber,
+    forced: bool,
+    require_cross_epoch: bool,
+  ) {
     debug_assert!(self.sync.is_none(), "arm_sync is the FRESH-arm path only");
     self.nonce = self.nonce.wrapping_add(1);
     self.sync = Some(SyncState {
       target,
       nonce: self.nonce,
       forced,
+      require_cross_epoch,
     });
     self.events.push_back(Event::StateSyncStarted(target));
     self.send_request_sync(now);
@@ -186,12 +197,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
             target,
             nonce: s.nonce,
             forced: true,
+            // A below-ring-window sync is never the cross-epoch crossing fetch; preserve the field.
+            require_cross_epoch: s.require_cross_epoch,
           });
           // The now-forced raised target invalidates a chunked transfer pinned below it.
           self.drop_transfer_below_forced_target();
         }
         Some(_) => {} // a sync to >= target is already outstanding — let it run (anti-thrash).
-        None => self.arm_sync(now, target, true),
+        None => self.arm_sync(now, target, true, false),
       }
     }
     // Either way the overflowing prepare is dropped (the un-pruned slot is preserved); if no sync was
@@ -288,12 +301,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           target: floor,
           nonce: s.nonce,
           forced: true,
+          // The peer-checkpoint-floor force-sync is never the cross-epoch crossing fetch; preserve it.
+          require_cross_epoch: s.require_cross_epoch,
         });
         // The now-forced raised target invalidates a chunked transfer pinned below it.
         self.drop_transfer_below_forced_target();
       }
       Some(_) => {} // a sync to >= floor is already outstanding — let it run (anti-thrash).
-      None => self.arm_sync(now, floor, true),
+      None => self.arm_sync(now, floor, true, false),
     }
   }
 
@@ -379,7 +394,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// over. An ORDINARY sync's raise deliberately does NOT abort: its target is a freshness floor and
   /// the pinned transfer still installs below it (strict progress — see the assembled carve-out in
   /// `handle_sync_checkpoint`); the next trigger then chases the newer checkpoint.
-  fn drop_transfer_below_forced_target(&mut self) {
+  pub(crate) fn drop_transfer_below_forced_target(&mut self) {
     let Some(s) = self.sync else {
       return;
     };
@@ -545,36 +560,70 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       checkpoint_id: id,
       snapshot: snapshot.clone(),
     });
+    // Serve the SUCCESSOR membership the snapshot reflects: the canonical `ReconfigurePayload` of our
+    // CURRENT configuration, chained from its predecessor (`self.lineage[0]` — the immediate-predecessor
+    // `config_id`, == our own at genesis), so a CROSS-EPOCH laggard can reconstruct + VERIFY it from the
+    // carried `(epoch, config_id, membership)`. A same-epoch requester leaves it unread.
+    //
+    // XI-b SERVE GATE (CP-safety): attach the membership ONLY when the served checkpoint REFLECTS it —
+    // `checkpoint_op >= config_install_op`, where `config_install_op` is the op of the last reconfigure that
+    // produced our current membership. A donor that has swapped to E+1 but whose checkpoint is still BELOW
+    // the reconfigure op `N` (the commit-first window) serves an EMPTY membership: the laggard then installs
+    // the SM frontier (op `M < N`) but KEEPS its current membership and catches the band up THROUGH `N`
+    // via the commit-first path — so it reaches E+1 only once it durably holds the committed prefix through
+    // `N`, exactly the premise the NORMAL path enforces. Without this gate the donor would attach its
+    // CURRENT (E+1) membership to a checkpoint at `M < N`, and the laggard would install E+1 at frontier `M`
+    // WITHOUT that prefix and could vote in E+1 unsafely. A same-config sync already serves empty (the
+    // `apply_sync` cross-epoch branch only fires when `config_id` differs); this additionally withholds a
+    // cross-epoch membership the donor's checkpoint does not yet reflect. The gate reads `self.checkpoint_op`
+    // (== `cr.op()`, pinned above) and the restored-on-recover `self.config_install_op`.
+    let membership = if self.checkpoint_op.get() >= self.config_install_op.get() {
+      crate::message::ReconfigurePayload::from_membership(&self.membership, self.lineage[0])
+        .encode_body()
+    } else {
+      Bytes::new()
+    };
     match kind {
       ServeKind::Offer => {
-        if snapshot.len() <= crate::message::max_unchunked_snapshot_len() {
-          // The unchunked fast path: the whole envelope fits one frame — ship it whole.
+        // The membership rides the SAME frame as the snapshot, so the unchunked budget is reduced by
+        // its length: ship whole only when snapshot + membership + framing all fit one frame.
+        if snapshot.len()
+          <= crate::message::max_unchunked_snapshot_len_with_membership(membership.len())
+        {
+          // The unchunked fast path: the whole envelope + membership fit one frame — ship it whole.
           self.emit(Outgoing::new(
             Recipient::To(Peer::Replica(to)),
             Message::SyncCheckpoint(crate::SyncCheckpoint::new(
               self.view,
               cr.op(),
               id,
+              self.membership.epoch(),
               self.membership.config_id(),
               self.local_slot(),
               nonce,
               snapshot,
+              membership,
             )),
           ));
         } else {
           // Too large for one frame: announce it (op, content id, total length) and let the
           // requester pull chunks. `total_len` descends from this VERIFIED read, so the receiver can
-          // size its reassembly buffer to exactly the envelope it will verify.
+          // size its reassembly buffer to exactly the envelope it will verify. Carry the SAME
+          // `(epoch, config_id, membership)` header as the single-frame `SyncCheckpoint` so the
+          // verified reassembly rebuilds an IDENTICAL checkpoint — a cross-epoch laggard whose
+          // post-swap snapshot is over-frame still installs the successor configuration.
           self.emit(Outgoing::new(
             Recipient::To(Peer::Replica(to)),
             Message::SyncCheckpointMeta(crate::SyncCheckpointMeta::new(
               self.view,
               cr.op(),
               id,
+              self.membership.epoch(),
               self.membership.config_id(),
               snapshot.len() as u64,
               self.local_slot(),
               nonce,
+              membership,
             )),
           ));
         }
@@ -911,6 +960,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       checkpoint_op: m.checkpoint_op(),
       checkpoint_id: m.checkpoint_id(),
       total_len: m.total_len(),
+      epoch: m.epoch(),
+      config_id: m.config_id(),
+      membership: m.membership_bytes(),
       donor: m.replica(),
       staged,
     });
@@ -989,18 +1041,25 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     self.sync_chunk_transfers_completed += 1;
     // Re-enter the EXISTING whole-message path bit-identically: every gate, the decode, the op
-    // bind-check, the staged two-write persist, and the durable-root install barrier run exactly
-    // as they would for a `SyncCheckpoint` that arrived in one frame.
+    // bind-check, the staged two-write persist, and the durable-root install barrier run exactly as
+    // they would for a `SyncCheckpoint` that arrived in one frame. The `SyncCheckpointMeta` announce
+    // carried the SAME `(epoch, config_id, membership)` header as the whole form (pinned into the
+    // transfer), so a CROSS-EPOCH sync that fell to the chunked path — a large post-swap snapshot —
+    // installs the successor configuration exactly as a one-frame arrival would; a same-config sync
+    // carries an empty membership that is simply left unread.
     let assembled = crate::SyncCheckpoint::new(
       m.view(),
       t.checkpoint_op,
       t.checkpoint_id,
-      // The reassembled whole-message form carries the chunk's `config_id` so it re-enters the
-      // existing `SyncCheckpoint` receive path byte-identically to one that arrived in one frame.
-      m.config_id(),
+      t.epoch,
+      // The PINNED config id (from the announce), NOT this final `SyncChunk`'s donor-current id — a
+      // donor reconfiguration/failover mid-transfer would otherwise splice a later config id onto the
+      // announce's membership and fail the `(membership, config_id)` verification.
+      t.config_id,
       m.replica(),
       s.nonce,
       Bytes::from(t.staged),
+      t.membership,
     );
     if recovering {
       self.on_recover_sync_checkpoint(now, wal, sb, assembled);
@@ -1143,9 +1202,77 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // decision is stable until install. Own an OWNED zero-copy slice of the SM-tail bytes (the
     // `decode_checkpoint` borrow into the wire envelope does not outlive `m`), so the install restores
     // without re-decoding.
-    let held_tail = checkpoint_op.get() < self.op.get();
+    //
+    // OVERRIDDEN below for a CROSSING install (`successor.is_some()`): a cross-epoch crossing snapshot is
+    // authoritative for E+1, so EVERY op the laggard holds above the crossing checkpoint must be discarded
+    // — they were appended in the OLD epoch's lineage (the cluster swapped at `N <= M == checkpoint_op`) and
+    // are NOT valid E+1 ops. The held-tail preservation argument ("the cluster may have committed them off
+    // our vote") holds only for a SAME-epoch forced sync; a NORMAL-status speculative laggard
+    // ([`Self::cross_epoch_speculative_sync`]) may have appended such an old-epoch tail above `M` while the
+    // sync was armed, so crossing MUST force `held_tail = false`.
+    let mut held_tail = checkpoint_op.get() < self.op.get();
     let tail_offset = m.snapshot().len() - sm_tail.len();
     let sm_tail = m.snapshot_bytes().slice(tail_offset..);
+    // CROSS-EPOCH catch-up: the served snapshot reflects a configuration AHEAD of ours (its `config_id`
+    // differs from our active one). How we handle it depends on whether the donor ATTACHED its successor
+    // membership — which (post-XI-b-serve-gate) it does ONLY when its checkpoint REFLECTS that membership
+    // (`checkpoint_op >= config_install_op`, i.e. at/above the reconfigure op `N`):
+    //
+    // - NON-EMPTY membership ⟹ the donor's checkpoint is at/above `N`, so this snapshot frontier IS in E+1.
+    //   Reconstruct + VERIFY the successor from the carried `(epoch, config_id, membership)` (the bytes
+    //   hash-chain to the carried `config_id` — `to_membership_verified` recomputes `hash(membership,
+    //   prev_config_id)` and rejects a mismatch, so a forged/corrupt membership cannot install) and install
+    //   it ATOMICALLY with the frontier. A non-empty membership that does NOT verify is corrupt/forged —
+    //   DROP the whole sync (stage NOTHING; `sync` stays armed so the solicit timer re-fetches), since
+    //   advancing the frontier into an epoch whose configuration we cannot reconstruct would strand us.
+    //
+    // - EMPTY membership ⟹ the donor WITHHELD it (its checkpoint `M < N`, the commit-first swap window):
+    //   this snapshot frontier is BELOW the reconfigure op, so it is still an E-prefix. Install the SM
+    //   frontier but KEEP our current membership (`successor = None`) and catch the band `(M .. N]` up via
+    //   the ordinary repair/commit path — swapping to E+1 only at `N` through the commit-first path (XI-b:
+    //   the committed prefix through `N` is held before E+1 is reached). Installing here (rather than
+    //   dropping) lets a laggard whose needed ops are pruned everywhere still make progress off the donor's
+    //   below-`N` checkpoint. (Under the crash-fault threat model an empty cross-epoch membership comes
+    //   only from this honest withhold; a same-config sync also serves empty and likewise keeps `successor
+    //   = None`, byte-identical to the pre-reconfiguration behavior.)
+    let successor = if m.config_id() != self.membership.config_id() && !m.membership().is_empty() {
+      match crate::message::ReconfigurePayload::decode_body(m.membership())
+        .ok()
+        .and_then(|p| p.to_membership_verified(m.epoch(), m.config_id()).ok())
+      {
+        Some(successor) => Some(successor),
+        None => return,
+      }
+    } else {
+      None
+    };
+    // CROSSING discards the old-epoch tail. A snapshot that installs the SUCCESSOR membership crosses us
+    // into E+1, where every op we hold above the crossing checkpoint `M` is a stale OLD-epoch entry (the
+    // cluster swapped at `N <= M`): force `held_tail = false` so the install truncates to `M`, never
+    // preserving a tail that is not in E+1's lineage. (For a SAME-config sync `successor == None` and the
+    // held-tail preservation is unchanged — byte-identical.)
+    if successor.is_some() {
+      held_tail = false;
+    }
+    // CROSSING REQUIREMENT (the cross-epoch crossing fetch — [`SyncState::require_cross_epoch`]). A laggard
+    // stranded at the OLD epoch fetching to cross into E+1 MUST install a strictly-higher epoch carrying the
+    // successor membership; it can NOT settle for a reply that would install with `successor = None` and exit
+    // Recovering STILL at the old epoch. `successor.is_some()` already captures the real crossing (different
+    // `config_id` AND non-empty membership AND it verifies); additionally require `checkpoint_op >= target`
+    // (the advertised cluster crossing point — the Recovering ingress gates only on `>= self.checkpoint_op`,
+    // so the freshness floor is enforced here). A below-target, same-config, or empty-membership reply (a
+    // donor in the transient force-checkpoint window serving its `M < N` checkpoint) is REJECTED: stage
+    // NOTHING and return, leaving `sync`/`pending_install` consistent (identical to the corrupt-membership
+    // `None => return` drop above) so the solicit timer re-fetches until a donor's `M >= N` crossing
+    // checkpoint lands (#1 guarantees one exists, restart-survivably). An ordinary / non-cross-epoch sync
+    // (`require_cross_epoch == false`) skips this and keeps the empty-membership `successor = None` behavior
+    // byte-identical.
+    if let Some(s) = self.sync
+      && s.require_cross_epoch
+      && !(successor.is_some() && checkpoint_op.get() >= s.target.get())
+    {
+      return;
+    }
     // Stage the durable re-persist, reusing the checkpoint two-write sequence so a crash recovers to
     // the synced point (not the stale one) ONLY once the root lands. Step 1: write the snapshot under
     // our own superblock; step 2 (in `on_sb_done`) writes the new VsrState root naming it, which then
@@ -1169,6 +1296,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       sessions,
       sm_tail,
       held_tail,
+      successor,
     });
     // A snapshot is chosen and persisting: any in-progress chunked transfer is superseded (a
     // single-frame `SyncCheckpoint` racing a pinned transfer landed first — its staged bytes are
@@ -1199,6 +1327,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       sessions,
       sm_tail,
       held_tail,
+      successor,
     } = install;
     // Defensive monotonicity (never rewind the applied frontier): `commit_min` is frozen below the
     // doomed hole on the forced path (the hole `<= checkpoint_op` blocks `advance_commit`) and is `<
@@ -1265,6 +1394,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // different prune FLOOR. Only the in-memory log trim above is common ([`Self::trim_log_to_checkpoint`]).
     wal.truncate(self.op);
     wal.prune(checkpoint_op);
+    // CROSS-EPOCH catch-up: install the SUCCESSOR membership the synced snapshot reflects, atomically with
+    // the rest of this durable-root-justified install. `apply_sync` already reconstructed + VERIFIED it
+    // from the carried `(epoch, config_id, membership)` (the `config_id` hash-chain check), so this is a
+    // checked configuration; `install_membership` performs the SAME side effects as the commit-first epoch
+    // swap (set `self.membership`/`self.prev_epoch`, `push_lineage`, `recompute_quorum_checkpoint`, the
+    // removed-leader abdication). A SAME-config sync (`successor == None`) skips this entirely —
+    // byte-identical to the pre-reconfiguration install. Pass `None` for the reconfigure op: a cross-epoch
+    // sync install emits NO `MembershipChanged` — the laggard synced PAST the Reconfigure op and cannot
+    // name it, so naming the sync frontier (a client op) would misreport the consensus-layer applied gap;
+    // the swap is observed via the sync completion + the installed membership, and the replicas that
+    // committed the Reconfigure op directly report its number.
+    if let Some(successor) = successor {
+      self.install_membership(None, successor);
+      // `install_membership(None, ..)` does not set `config_install_op` (a cross-epoch sync has no LOCAL
+      // reconfigure op — the laggard synced PAST it). Set it to the synced frontier `checkpoint_op`: the
+      // donor attached this successor only because ITS checkpoint reached the reconfigure op `N`, and the
+      // laggard's synced `checkpoint_op` equals that donor checkpoint, so `checkpoint_op >= N`. This is a
+      // safe, restart-survivable lower bound that lets this node (now a potential donor) re-serve E+1 at or
+      // above its own frontier while never offering it below it. `checkpoint_op` is the staged install op
+      // (`self.checkpoint_op` is advanced to it by the caller immediately after, in the same arm).
+      self.config_install_op = checkpoint_op;
+    }
     // NOTE: `self.checkpoint_op` is advanced to the synced op by the CALLER (`on_sb_done`'s sync
     // re-persist arm) — NOT here — because it must move only when the synced checkpoint ROOT is durable.
     // BOTH paths run `install_sync` at root completion, so the caller advances `checkpoint_op` in the same

@@ -14,16 +14,16 @@
 //!
 //! The proto's commit-first epoch swap installs the new configuration on a replica only once that
 //! replica has DURABLY committed the `Reconfigure` op (the durable-epoch-before-participate fence). The
-//! proposing primary commits + swaps first. This lane verifies the swap MECHANICS and the
-//! swap-correctness invariants on every swap that occurs (applied exactly once per replica, an unbroken
-//! `config_id` chain, no committed-op loss across the epoch boundary) — the load-bearing SAFETY
-//! properties of the change. It deliberately does NOT assert that EVERY node converges the swap within
-//! a bounded window: cluster-wide convergence of a live single change is a LIVENESS property that the
-//! proto's autonomous message flow does not currently drive to completion in a running multi-replica
-//! cluster (the proposing primary's commit advertisement is suppressed while its `SwapEpoch` root is in
-//! flight, then it is epoch-gated from the still-old-epoch backups — see the crate-level report). This
-//! lane therefore asserts only what holds — the swap is correct wherever it lands — rather than a
-//! convergence the proto does not yet provide.
+//! proposing primary commits + swaps first; it then keeps participating at its current epoch through
+//! the swap window, so every backup commits the `Reconfigure` op and installs the successor epoch — a
+//! live single change CONVERGES cluster-wide. This focused test verifies the swap MECHANICS and the
+//! swap-correctness invariants on the FIRST installed swap (applied exactly once per replica, an
+//! unbroken `config_id` chain, no committed-op loss across the epoch boundary) — the load-bearing
+//! SAFETY properties of the change — stopping once the proposing primary has swapped. The cluster-wide
+//! CONVERGENCE of a live single change (every non-crashed voter installs the successor under an
+//! adversarial schedule) is driven and asserted by the live-reconfig VOPR axis (`VOPR_RECONFIG_LIVE` /
+//! `run_vopr_with_reconfig_live`), which runs the full liveness/convergence suite plus a per-voter
+//! install check at end-of-run.
 
 use viewstamp_proto::{MemberId, ProposeMembershipError, SingleVoterDelta};
 use viewstamp_simulation::{

@@ -433,6 +433,139 @@ fn on_the_durable_root_the_epoch_swaps_and_membership_changed_is_emitted() {
 }
 
 #[test]
+fn the_durable_swap_forces_a_checkpoint_so_the_cross_epoch_serve_gate_holds() {
+  // The live epoch swap FORCES a checkpoint at the first post-swap `commit_min` (M >= N), so the new
+  // epoch begins at a checkpoint that EMBEDS the reconfigure op N and carries the E+1 membership. That
+  // makes the cross-epoch state-sync serve gate `checkpoint_op (M) >= config_install_op (N)` true BY
+  // CONSTRUCTION — a quiescent donor can never withhold the E+1 membership from a cross-epoch laggard.
+  let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let now = Instant::ZERO;
+
+  // No checkpoint precedes the swap: the lone reconfigure op (op 1) sits far below the default cadence
+  // boundary, so any checkpoint that lands is the FORCED one.
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::new(),
+    "no ordinary-cadence checkpoint has fired yet"
+  );
+
+  // Land the SwapEpoch root → `install_membership` sets `config_install_op = N`, then `force_checkpoint`
+  // submits the owed checkpoint at `commit_min` (== N here).
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert_eq!(
+    e.config_install_op, op,
+    "the install recorded the reconfigure op as config_install_op = N"
+  );
+  // Drain the two-write forced checkpoint (snapshot → durable root) to completion.
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+
+  assert!(
+    e.checkpoint_op() >= e.config_install_op,
+    "a forced checkpoint landed at the reconfigure op: checkpoint_op {} >= config_install_op {}",
+    e.checkpoint_op().get(),
+    e.config_install_op.get(),
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    op,
+    "the forced checkpoint is at M == N (commit_min at swap time)"
+  );
+}
+
+#[test]
+fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
+  // The restart-survivable half of the swap-checkpoint: a crash BETWEEN the SwapEpoch root and the forced
+  // checkpoint leaves a durable root with the E+1 membership AHEAD of the checkpoint — `config_install_op = N` but
+  // `checkpoint_op < N`. That self-describing DEBT must DRIVE ITSELF to closure on recover with ZERO
+  // subsequent traffic (a quiescent recovered donor has no Commit heartbeat to advance it), or it
+  // withholds the E+1 membership forever. `recover` (a) drives the committed band to `>= N`, then (b)
+  // forces the owed checkpoint, so `checkpoint_op >= config_install_op` becomes durable unassisted.
+  let n = 2u64; // the reconfigure op N — the committed band is ops (0 .. N].
+  let genesis_mem = genesis(3);
+  let successor = genesis_mem
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter is a valid delta on a 3-voter cluster");
+
+  // The committed-band headers the durable root names — ops 1..=N, matching the WAL bodies `[op]` that
+  // `ScriptedWal::with_entries` writes (so recovery's band cross-check passes and the bodies fill).
+  let mk_header = |op: u64| {
+    crate::Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  // The durable SwapEpoch root captured in the crash window: the SUCCESSOR membership is active
+  // (epoch 1), `config_install_op = N`, but `checkpoint_op = 0` — the checkpoint is BELOW N (the debt).
+  // `commit = N` records that the band through N is committed, so recovery carries the frontier and
+  // re-applies the band.
+  let swap_root = crate::VsrState::try_new_v4(
+    View::new(),
+    View::new(),
+    OpNumber::with(n), // commit — the band through N is known committed
+    OpNumber::new(),   // checkpoint_op = 0 — BELOW N: the debt
+    0,                 // genesis checkpoint id (no snapshot to read)
+    std::vec![mk_header(1), mk_header(2)],
+    successor.epoch(),
+    genesis_mem.epoch(),
+    successor.clone(),
+    std::vec![genesis_mem.config_id()],
+    OpNumber::with(n), // config_install_op = N, ABOVE the checkpoint
+  )
+  .expect("a SwapEpoch root carrying config_install_op above its checkpoint is valid");
+
+  // Recover replica 1 — a BACKUP of view 0 in the successor (slot 0 leads), so `complete_recovery`
+  // resumes Normal (NOT the abdicate-to-view-change primary branch) and pays the debt immediately.
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut wal = ScriptedWal::with_entries(n); // ops 1..=N held, clean reads
+  let mut sb = TestSb {
+    state: swap_root,
+    done: std::collections::VecDeque::new(),
+    checkpoint: None, // checkpoint_op == 0 → no snapshot; recover restores the genesis SM
+  };
+  let now = Instant::ZERO;
+  let mut e =
+    Endpoint::<CountSm>::recover(cfg, genesis_mem, 9, CountSm::default(), &mut wal, &mut sb)
+      .expect_active();
+
+  // The recovered node is in the debt window: at the successor epoch, gate owed.
+  assert_eq!(
+    e.config_install_op,
+    OpNumber::with(n),
+    "recover restores config_install_op = N from the durable root"
+  );
+
+  // Drive the recovery reads to completion — this reaches Normal AND runs `maybe_pay_checkpoint_debt`
+  // from `complete_recovery`, which proactively advances the band and forces the owed checkpoint. After
+  // this point there is NO further traffic: ONLY recovery storage completions are pumped.
+  drive_recovery(&mut e, &mut wal, &mut sb, now);
+  assert_eq!(e.status(), Status::Normal, "the backup resumed Normal");
+
+  // With ZERO messages/heartbeats, the band was driven to >= N (the debt-pay's proactive advance_commit).
+  assert!(
+    e.commit().get() >= n,
+    "the debt drove commit_min to >= N ({}) with no traffic",
+    e.commit().get()
+  );
+
+  // Pump the forced checkpoint's two superblock writes (snapshot → root) to durability — still NO
+  // messages. The debt clears the instant `checkpoint_op >= config_install_op` is durable.
+  for _ in 0..6 {
+    e.handle_storage(now, &mut wal, &mut sb);
+  }
+  assert!(
+    e.checkpoint_op() >= e.config_install_op,
+    "the debt is PAID with no traffic: checkpoint_op {} >= config_install_op {} (a donor can now serve E+1)",
+    e.checkpoint_op().get(),
+    e.config_install_op.get(),
+  );
+}
+
+#[test]
 fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight() {
   // The single-change-at-a-time contract spans propose THROUGH install, not just propose-through-commit.
   // After the first reconfiguration COMMITS, `stage_epoch_swap` clears `reconfigure_inflight` — but the
@@ -1636,6 +1769,153 @@ fn a_surviving_voter_elects_a_new_primary_without_the_removed_node() {
   assert!(
     saw_svc,
     "a surviving voter's idle timer elects a new primary once the removed primary goes silent",
+  );
+}
+
+/// A 3-voter `SingleChange` BACKUP (slot 2, member 2 — a backup under view 0, NOT the primary) that
+/// learns + commits `RemoveVoter(member 2)` from the primary and installs the E+1 2-voter successor in
+/// which member 2 is absent. Modeled on the backup-install path (`on_prepare` of the Reconfigure op,
+/// then the primary's `Commit`, then the backup's own durable `SwapEpoch` root). On return the backup's
+/// `self.membership` is the successor; the removed BACKUP must now go silent on its WHOLE voter timer
+/// plane (the `retire_backup_cadence` half of the removed-node abdication), the case distinct from the
+/// removed-PRIMARY case (`removed_self_primary`, which retires the primary cadence).
+fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
+  let cfg = Config::try_new(2, MemberId::new(2)).expect("slot 2 backup of the 3-voter set");
+  let mut e =
+    Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(3), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+
+  // Remove member 2 (the HIGHEST-slot voter, so the retained voters keep their slots {0,1}); the local
+  // node is member 2, so the successor drops it entirely (`slot_of(2) == None`).
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(2)))
+    .expect("removing one of three voters is valid");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let op = 1u64;
+
+  // The primary's Prepare for the Reconfigure op (flat wire body = the encoded successor) → the backup
+  // stores a typed Body::Reconfigure and arms its backup timer plane (the idle/vote timers the swap
+  // must retire).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(op),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(op),
+      payload.encode_body(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the backup's append lands (deferred PrepareOk)
+  while e.poll_message().is_some() {}
+
+  // The primary's Commit advances the backup's commit to the Reconfigure op → it commits + stages its
+  // own SwapEpoch root (still at the OLD epoch — the fence holds on the backup).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(op),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    e.pending_swap_for_test(),
+    "the backup staged its own SwapEpoch root"
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // land the backup's SwapEpoch root → install the successor
+  (e, wal, sb, successor)
+}
+
+#[test]
+fn a_removed_backup_voter_stays_silent_on_the_primary_idle_plane() {
+  // A `RemoveVoter` of a BACKUP voter (not the primary): after the swap the removed backup is a NON-VOTER
+  // (absent from the configuration), so the voter timer plane gated on `is_voter()` — `primary_idle`
+  // foremost — must be retired and stay non-serviceable. The removed node must NOT arm or service
+  // `PrimaryIdle`, must NOT propose/enter a view change when the primary goes quiet, and must NOT panic
+  // on a `local_slot()` that no longer exists (the bug the `is_voter()` gate fixed: `!is_learner()` is
+  // wrongly TRUE for an absent member, which would let it arm a consensus timer and then panic).
+  let (mut e, mut wal, mut sb, successor) = removed_self_backup();
+
+  // The swap installed the 2-voter successor in which member 2 (this node) is absent.
+  assert_eq!(
+    e.membership, successor,
+    "the E+1 successor (member 2 removed) is active"
+  );
+  assert_eq!(e.membership.epoch(), crate::Epoch::new(1), "swapped to E+1");
+  assert_eq!(e.membership.replica_count(), 2, "E+1 is a 2-voter config");
+  assert!(
+    e.membership.slot_of(MemberId::new(2)).is_none(),
+    "the removed backup has no slot in the successor",
+  );
+
+  // It is a NON-VOTER now (the single-source predicate the timer plane reads), and never the primary —
+  // both robustly false for an absent local member, NOT a panic on `local_slot()`.
+  assert!(
+    !e.is_voter(),
+    "a removed backup is not a voter (no slot in the successor)"
+  );
+  assert!(!e.is_primary(), "a removed backup is not the primary");
+
+  // The removal site retired the backup voter timer plane: the `primary_idle` deadline (and the
+  // vote/escalation timers) is cleared, so no armed consensus deadline lingers on a removed node.
+  assert!(
+    !e.primary_idle_armed_for_test(),
+    "the removed backup holds NO armed primary_idle deadline (retire_backup_cadence ran)",
+  );
+
+  // A fully-removed node transitions to the structural `Retired` state: it arms/services no timer and
+  // its ingress drops every message, so it reaches no voter path (nor any panicking `local_slot()`) by
+  // construction. Advance FAR past PRIMARY_IDLE and tick: `handle_timeout`'s Retired arm is a no-op —
+  // no view change, no StartViewChange, no panic.
+  assert_eq!(
+    e.status(),
+    Status::Retired,
+    "a fully-removed node is Retired"
+  );
+  let view_before = e.view();
+  let later = Instant::ZERO + core::time::Duration::from_millis(10_000);
+  e.handle_timeout(later, &mut wal, &mut sb); // far past PRIMARY_IDLE — must not arm/fire a VC, must not panic
+  assert_eq!(
+    e.status(),
+    Status::Retired,
+    "the removed node stays Retired — it proposes no view change",
+  );
+  assert_eq!(
+    e.view(),
+    view_before,
+    "the removed backup's view is unchanged (it entered no view change)",
+  );
+  assert!(
+    !e.primary_idle_armed_for_test(),
+    "ticking far past PRIMARY_IDLE re-armed NOTHING — the idle plane stays retired on the non-voter",
+  );
+  let mut saw_svc = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(
+      out.into_msg(),
+      Message::StartViewChange(_) | Message::DoViewChange(_)
+    ) {
+      saw_svc = true;
+    }
+  }
+  assert!(
+    !saw_svc,
+    "a removed backup broadcasts NO StartViewChange/DoViewChange — it is silent on the voter timer plane",
   );
 }
 

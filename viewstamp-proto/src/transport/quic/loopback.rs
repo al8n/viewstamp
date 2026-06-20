@@ -451,10 +451,12 @@ fn an_oversized_outbound_message_is_surfaced_through_the_public_coordinator_coun
     View::with(1),
     OpNumber::with(1),
     0,
+    crate::Epoch::new(0),
     0,
     ReplicaId::new(0),
     0,
     snapshot,
+    Bytes::new(),
   ));
   assert!(
     huge.encoded_len() > MAX_FRAME_LEN as usize,

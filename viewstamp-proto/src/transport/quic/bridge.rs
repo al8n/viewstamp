@@ -5434,10 +5434,12 @@ mod tests {
       View::with(1),
       OpNumber::with(1),
       0,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       0,
       snapshot,
+      bytes::Bytes::new(),
     ));
     assert!(
       huge.encoded_len() > MAX_FRAME_LEN as usize,
