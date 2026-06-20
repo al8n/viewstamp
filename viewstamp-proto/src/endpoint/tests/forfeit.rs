@@ -65,10 +65,12 @@ fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
       View::new(),
       OpNumber::with(6),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   assert!(

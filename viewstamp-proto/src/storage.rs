@@ -123,13 +123,18 @@ pub const HEADER_VERSION: u16 = 1;
 /// APPENDS a further tail — the recent-prior `config_id` lineage (the superseded ancestor ids that widen
 /// cross-epoch catch-up admission) — so a node recovering into a post-reconfiguration epoch RESTORES the
 /// predecessor ids rather than dropping them, and a retained old-epoch laggard's catch-up is still
-/// admitted after the new-epoch donors restart.
+/// admitted after the new-epoch donors restart. Version `6` APPENDS one final scalar — `config_install_op`,
+/// the op of the last reconfigure that produced this root's membership — so a recovered donor restores it
+/// and the cross-epoch state-sync SERVE gate (`checkpoint_op >= config_install_op`) survives a restart:
+/// without it a donor that recovered into a swapped-but-not-yet-checkpointed window would re-attach its
+/// successor membership to a checkpoint BELOW the reconfigure op, letting a laggard install the new epoch
+/// without the committed prefix through that op.
 /// [`VsrState::decode`] dispatches on the leading version — `1..=3` parse the pre-membership layout
-/// (bridged to `epoch = 0`, no membership), `4` parses that body plus the epoch/membership tail, and `5`
-/// parses that plus the lineage tail — so NO persisted root is stranded and a message-only `WIRE_VERSION`
-/// bump still can never invalidate a root. A future `VsrState` layout change bumps this again and extends
-/// that per-version dispatch.
-pub const SUPERBLOCK_VERSION: u16 = 5;
+/// (bridged to `epoch = 0`, no membership), `4` parses that body plus the epoch/membership tail, `5`
+/// parses that plus the lineage tail, and `6` parses that plus the `config_install_op` scalar — so NO
+/// persisted root is stranded and a message-only `WIRE_VERSION` bump still can never invalidate a root. A
+/// future `VsrState` layout change bumps this again and extends that per-version dispatch.
+pub const SUPERBLOCK_VERSION: u16 = 6;
 
 /// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
 /// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are
@@ -439,6 +444,18 @@ pub struct VsrState {
   /// from the previous config's id, which a single root cannot recompute — so the lineage MUST be carried
   /// durably, exactly like the membership's own `config_id`. Bounded by the small in-memory ring.
   prior_config_ids: Vec<u128>,
+  /// The op of the last reconfigure that produced this root's [`Membership`] — the commit-first SwapEpoch
+  /// root for a live single-change, or the offline-restart point for an offline reconfiguration; genesis
+  /// (`0`) when no reconfiguration has occurred. A recovered donor restores it so the cross-epoch
+  /// state-sync SERVE gate — attach the successor membership to a sync answer ONLY when
+  /// `checkpoint_op >= config_install_op` — holds across a restart. Without it a donor recovered into a
+  /// swapped-but-not-yet-checkpointed window (its checkpoint is BELOW the reconfigure op) would re-attach
+  /// its E+1 membership to a checkpoint at op `M < N`, letting a laggard install E+1 at frontier `M`
+  /// WITHOUT the committed prefix through the reconfigure op `N` (an XI-b violation, the same premise the
+  /// NORMAL commit-first path enforces). A v1-5 root has no durable `config_install_op` and decodes to the
+  /// root's own `checkpoint_op` (so the gate is trivially satisfied — the pre-fix serve behaviour); for a
+  /// no-reconfiguration cluster it is genesis, unchanged.
+  config_install_op: OpNumber,
 }
 
 impl Default for VsrState {
@@ -509,6 +526,12 @@ impl VsrState {
       prev_epoch: Epoch::new(0),
       membership: None,
       prior_config_ids: Vec::new(),
+      // A legacy / membership-less root has no reconfiguration of its own; default `config_install_op` to
+      // its `checkpoint_op` (the membership it carries — if any — is reflected as of this checkpoint), so
+      // the cross-epoch serve gate `checkpoint_op >= config_install_op` is trivially satisfied. A v4/v5
+      // root decoded WITHOUT the v6 tail re-validates through here / `try_new_v4` and so inherits the same
+      // `checkpoint_op` default (the pre-fix serve behaviour, never withholding a v4/v5 donor's membership).
+      config_install_op: checkpoint_op,
     })
   }
 
@@ -527,6 +550,13 @@ impl VsrState {
   /// for cross-epoch catch-up admission; they are carried VERBATIM (a `config_id` is a content hash a
   /// single root cannot recompute) and restored into the recovered node's in-memory lineage. For a
   /// no-reconfiguration cluster they are all the genesis id (a harmless self-duplicate).
+  ///
+  /// `config_install_op` is the op of the last reconfigure that produced `membership` (the commit-first
+  /// SwapEpoch root's reconfigure op for a live single-change, the offline-restart point for an offline
+  /// reconfiguration, genesis `0` when none). It is carried durably so a recovered donor restores the
+  /// cross-epoch serve gate (`checkpoint_op >= config_install_op`); it is NOT cross-checked against the
+  /// consensus frontier (a swapped-but-not-yet-checkpointed root legitimately has `config_install_op`
+  /// ABOVE its `checkpoint_op` — that is the exact window the gate protects).
   #[allow(clippy::too_many_arguments)]
   pub fn try_new_v4(
     view: View,
@@ -539,6 +569,7 @@ impl VsrState {
     prev_epoch: Epoch,
     membership: Membership,
     prior_config_ids: Vec<u128>,
+    config_install_op: OpNumber,
   ) -> Result<Self, VsrStateError> {
     if membership.epoch() != epoch {
       return Err(VsrStateError::MembershipEpochMismatch {
@@ -560,6 +591,7 @@ impl VsrState {
     state.prev_epoch = prev_epoch;
     state.membership = Some(membership);
     state.prior_config_ids = prior_config_ids;
+    state.config_install_op = config_install_op;
     Ok(state)
   }
 
@@ -577,6 +609,7 @@ impl VsrState {
       prev_epoch: Epoch::new(0),
       membership: None,
       prior_config_ids: Vec::new(),
+      config_install_op: OpNumber::new(),
     }
   }
 
@@ -670,6 +703,15 @@ impl VsrState {
     &self.prior_config_ids
   }
 
+  /// The op of the last reconfigure that produced this root's [`Membership`] (genesis `0` when none). A
+  /// recovered donor restores it so the cross-epoch state-sync serve gate (`checkpoint_op >=
+  /// config_install_op`) holds across a restart. A v1-5 root has no durable value and reads its own
+  /// `checkpoint_op` (the pre-v6 serve behaviour).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_install_op(&self) -> OpNumber {
+    self.config_install_op
+  }
+
   /// Encodes this durable root to a length-prefixed, versioned byte vector (the superblock
   /// on-disk form). Layout (all scalars big-endian): [`SUPERBLOCK_VERSION`] `u16`,
   /// then `view`/`log_view` (`u64` each), `commit`/`checkpoint_op` (`u64` each), `checkpoint_id`
@@ -679,8 +721,10 @@ impl VsrState {
   /// `epoch:u64 | prev_epoch:u64 | membership_present:u8`, then — iff present — `config_id:u128 |
   /// epoch:u64 | replica_count:u8 | learner_count:u16 | member_count:u32 | members:(u128 each)`. A v5 root
   /// APPENDS one further tail after that — the recent-prior lineage: `prior_config_count:u32 |
-  /// prior_config_ids:(u128 each)`. The scalar field order matches the [`Self::try_new`] parameter order.
-  /// Variable-length because the header set, the member list, and the lineage are all bounded but not fixed.
+  /// prior_config_ids:(u128 each)`. A v6 root APPENDS one final scalar after that — `config_install_op:u64`
+  /// (the op that produced this root's membership). The scalar field order matches the [`Self::try_new`] /
+  /// [`Self::try_new_v4`] parameter order. Variable-length because the header set, the member list, and the
+  /// lineage are all bounded but not fixed.
   pub fn encode(&self) -> Bytes {
     let members_len = self
       .membership
@@ -691,8 +735,9 @@ impl VsrState {
       // The appended v4 tail: epoch + prev_epoch + present-flag, plus the membership block when present.
         + 8 + 8 + 1
         + self.membership.as_ref().map_or(0, |_| 16 + 8 + 1 + 2 + 4 + members_len * 16)
-      // The appended v5 tail: the lineage count + its ids.
-        + 4 + self.prior_config_ids.len() * 16,
+      // The appended v5 tail: the lineage count + its ids; then the v6 tail: config_install_op (u64).
+        + 4 + self.prior_config_ids.len() * 16
+        + 8,
     );
     out.put_u16(SUPERBLOCK_VERSION);
     out.put_u64(self.view.get());
@@ -729,6 +774,10 @@ impl VsrState {
     for &id in &self.prior_config_ids {
       out.put_u128(id);
     }
+    // The appended v6 tail: `config_install_op` (the op that produced this root's membership). Always
+    // written for a v6 root — a fixed `u64` so it round-trips uniformly whether or not a membership is
+    // present.
+    out.put_u64(self.config_install_op.get());
     out.freeze()
   }
 
@@ -736,7 +785,8 @@ impl VsrState {
   /// truncated / corrupt / adversarial input.
   ///
   /// Dispatches on the leading version: `1..=3` parse the pre-membership layout (bridged to
-  /// `epoch = 0`, no membership); `4` parses that body plus the appended epoch/membership tail.
+  /// `epoch = 0`, no membership); `4` parses that body plus the appended epoch/membership tail; `5` adds
+  /// the lineage tail; `6` adds the `config_install_op` scalar.
   /// Rejects (never panics): a short buffer ([`CodecError::Truncated`]), an unknown leading version
   /// ([`CodecError::UnknownVersion`]), a header-count / member-count prefix that overruns the buffer
   /// ([`CodecError::LengthOverflow`]), a `membership_present` flag that is neither 0 nor 1
@@ -827,9 +877,18 @@ impl VsrState {
     } else {
       Vec::new()
     };
+    // v6+: the appended `config_install_op` scalar (the op that produced this root's membership). A v1-5
+    // root has none — default to `checkpoint_op` so the cross-epoch serve gate `checkpoint_op >=
+    // config_install_op` is trivially satisfied (the pre-v6 serve behaviour: a recovered v4/v5 donor never
+    // withholds its membership). Reading it AFTER the lineage keeps the per-version dispatch additive.
+    let config_install_op = if version >= 6 {
+      OpNumber::with(r.u64()?)
+    } else {
+      checkpoint_op
+    };
     r.finish()?;
     match membership {
-      // A v4/v5 root with a real membership re-validates through `try_new_v4` (which adds the
+      // A v4/v5/v6 root with a real membership re-validates through `try_new_v4` (which adds the
       // epoch-consistency check `membership.epoch() == epoch` on top of the scalar/header invariants).
       Some(membership) => Ok(Self::try_new_v4(
         view,
@@ -842,10 +901,12 @@ impl VsrState {
         prev_epoch,
         membership,
         prior_config_ids,
+        config_install_op,
       )?),
-      // A v4/v5-tagged root that carries no membership (a legacy root re-saved): scalar/header
-      // re-validation only, with the durable epoch/prev_epoch (and any lineage) carried through. A
-      // membership-less root has no config chain, so its lineage is normally empty; carried for fidelity.
+      // A v4/v5/v6-tagged root that carries no membership (a legacy root re-saved): scalar/header
+      // re-validation only, with the durable epoch/prev_epoch (and any lineage + config_install_op) carried
+      // through. A membership-less root has no config chain, so its lineage is normally empty; carried for
+      // fidelity.
       None => {
         let mut state = Self::try_new(
           view,
@@ -858,6 +919,7 @@ impl VsrState {
         state.epoch = epoch;
         state.prev_epoch = prev_epoch;
         state.prior_config_ids = prior_config_ids;
+        state.config_install_op = config_install_op;
         Ok(state)
       }
     }
@@ -1674,10 +1736,11 @@ mod tests {
 
   #[test]
   fn vsr_state_golden_bytes_pin_the_layout() {
-    // The v5 layout: the byte-identical v1-3 body (version|view|log_view|commit|checkpoint_op|
+    // The v6 layout: the byte-identical v1-3 body (version|view|log_view|commit|checkpoint_op|
     // checkpoint_id|header-count|headers), then the v4 epoch/membership tail (epoch|prev_epoch|present,
-    // then the membership block when present), then the v5 lineage tail (prior_config_count|ids). The
-    // epoch-1 membership matches the root's epoch-1 scalar; the lineage carries two superseded ids.
+    // then the membership block when present), then the v5 lineage tail (prior_config_count|ids), then the
+    // v6 `config_install_op` scalar (u64). The epoch-1 membership matches the root's epoch-1 scalar; the
+    // lineage carries two superseded ids; `config_install_op = 7` is the reconfigure op (appended last).
     let h = mk_header(7, 3, 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, 9, b"body");
     let mem = Membership::genesis(
       2,
@@ -1702,10 +1765,11 @@ mod tests {
       Epoch::new(0),
       mem,
       std::vec![0x1111_2222, 0x3333_4444],
+      OpNumber::with(7),
     )
     .unwrap();
     let expected: std::vec::Vec<u8> = std::vec![
-      0, 5, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0,
+      0, 6, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0,
       0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 187, 204, 221, 0, 0, 0, 1, 231, 44, 98, 75,
       124, 48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
       0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1716,7 +1780,7 @@ mod tests {
       0, 0, 0, 0, 0, 1, 2, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0,
       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13,
       0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11, 0x22, 0x22, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0x33, 0x33, 0x44, 0x44,
+      0, 0, 0, 0, 0, 0x33, 0x33, 0x44, 0x44, 0, 0, 0, 0, 0, 0, 0, 7,
     ];
     assert_eq!(st.encode(), expected, "VsrState wire layout is pinned");
     // The pinned golden bytes are a valid decode input too: they round-trip back to the same root.
@@ -1772,6 +1836,7 @@ mod tests {
       Epoch::new(0),
       mem.clone(),
       lineage.clone(),
+      OpNumber::with(6),
     )
     .unwrap();
     let bytes = s.encode();
@@ -1783,6 +1848,11 @@ mod tests {
       back.prior_config_ids(),
       lineage.as_slice(),
       "the recent-prior lineage round-trips verbatim"
+    );
+    assert_eq!(
+      back.config_install_op(),
+      OpNumber::with(6),
+      "config_install_op round-trips verbatim"
     );
     assert_eq!(back, s);
   }
@@ -1806,12 +1876,13 @@ mod tests {
     // A version names a disk LAYOUT, and decode dispatches per layout. Versions 1..=3 are ONE
     // pre-membership layout (the pre-decoupling message/disk coupling stamped that single body with 1,
     // 2, AND 3), so a root carrying ANY of them decodes to the SAME legacy-bridged state (epoch 0, no
-    // membership) and none is stranded. Version 4 is a SECOND layout (body + epoch/membership tail), and
-    // version 5 (= SUPERBLOCK_VERSION) a THIRD (that plus the lineage tail). Together with the root
-    // carrying its OWN version, independent of the message WIRE_VERSION, this keeps the decoupling
-    // correct-by-construction — a message-only WIRE_VERSION bump can never invalidate a persisted root.
+    // membership) and none is stranded. Version 4 is a SECOND layout (body + epoch/membership tail),
+    // version 5 a THIRD (that plus the lineage tail), and version 6 (= SUPERBLOCK_VERSION) a FOURTH (that
+    // plus the `config_install_op` scalar). Together with the root carrying its OWN version, independent of
+    // the message WIRE_VERSION, this keeps the decoupling correct-by-construction — a message-only
+    // WIRE_VERSION bump can never invalidate a persisted root.
     //
-    // The pre-membership 1..=3 layout: a true v3 body (NOT a relabelled v4/v5 root, whose appended tails
+    // The pre-membership 1..=3 layout: a true v3 body (NOT a relabelled v4/v5/v6 root, whose appended tails
     // would become trailing bytes under the legacy path) decodes identically under every legacy tag.
     let legacy_v3 = legacy_v3_golden_bytes();
     let bridged = VsrState::decode(&legacy_v3).unwrap();
@@ -1826,9 +1897,9 @@ mod tests {
         "a pre-membership root tagged with legacy version {v} decodes to the same bridged state"
       );
     }
-    // The v5 layout: a NEW root is written with SUPERBLOCK_VERSION (= 5) and round-trips under it.
+    // The v6 layout: a NEW root is written with SUPERBLOCK_VERSION (= 6) and round-trips under it.
     let mem = Membership::genesis(3, 0, (1..=3).map(MemberId::new).collect()).unwrap();
-    let v5 = VsrState::try_new_v4(
+    let v6 = VsrState::try_new_v4(
       View::with(2),
       View::with(1),
       OpNumber::with(5),
@@ -1839,32 +1910,56 @@ mod tests {
       Epoch::new(0),
       mem,
       std::vec![0x9999u128],
+      OpNumber::with(3),
     )
     .unwrap();
-    let v5_bytes = v5.encode();
+    let v6_bytes = v6.encode();
     assert_eq!(
-      &v5_bytes[0..2],
+      &v6_bytes[0..2],
       &SUPERBLOCK_VERSION.to_be_bytes(),
       "a new durable root leads with SUPERBLOCK_VERSION"
     );
-    assert_eq!(SUPERBLOCK_VERSION, 5, "the accepted decode range is 1..=5");
+    assert_eq!(SUPERBLOCK_VERSION, 6, "the accepted decode range is 1..=6");
     assert_eq!(
-      VsrState::decode(&v5_bytes).unwrap(),
-      v5,
-      "the v5 root round-trips"
+      VsrState::decode(&v6_bytes).unwrap(),
+      v6,
+      "the v6 root round-trips"
     );
-    // A v4 root (the membership tail but NO lineage tail) still decodes — it is the same body+membership
-    // bytes ending after the member list, tagged with version 4. Built by truncating the v5 lineage tail
-    // (a count-1 block: its trailing `u32` count + one `u128`) and re-tagging as v4. It decodes with an
-    // EMPTY lineage (recover then seeds from the current id, the pre-v5 behaviour) — so no persisted v4
-    // root is stranded by the bump.
-    let mut v4_bytes = v5_bytes.to_vec();
-    v4_bytes.truncate(v4_bytes.len() - (4 + 16)); // drop the lineage block (count + the one id)
+    // A v5 root (the lineage tail but NO config_install_op tail) still decodes — built by truncating the
+    // v6 `config_install_op` scalar (a trailing `u64`) and re-tagging as v5. It decodes with
+    // `config_install_op` DEFAULTED to its `checkpoint_op` (the pre-v6 serve behaviour) — so no persisted
+    // v5 root is stranded by the bump.
+    let mut v5_bytes = v6_bytes.to_vec();
+    v5_bytes.truncate(v5_bytes.len() - 8); // drop the config_install_op scalar
+    v5_bytes[0..2].copy_from_slice(&5u16.to_be_bytes());
+    let v5_decoded = VsrState::decode(&v5_bytes).expect("a v5 root still decodes");
+    assert_eq!(
+      v5_decoded.config_install_op(),
+      OpNumber::with(4),
+      "a v5 root defaults config_install_op to its checkpoint_op"
+    );
+    assert_eq!(
+      v5_decoded.prior_config_ids(),
+      &[0x9999u128],
+      "a v5 root keeps its lineage"
+    );
+    // A v4 root (the membership tail but NO lineage NOR config_install_op tail) still decodes — built by
+    // dropping BOTH the config_install_op scalar (u64) and the lineage block (a count-1 block: its trailing
+    // `u32` count + one `u128`) and re-tagging as v4. It decodes with an EMPTY lineage and a defaulted
+    // config_install_op (recover seeds the lineage from the current id, the pre-v5 behaviour) — so no
+    // persisted v4 root is stranded by the bump.
+    let mut v4_bytes = v6_bytes.to_vec();
+    v4_bytes.truncate(v4_bytes.len() - 8 - (4 + 16)); // drop config_install_op + the lineage block
     v4_bytes[0..2].copy_from_slice(&4u16.to_be_bytes());
     let v4_decoded = VsrState::decode(&v4_bytes).expect("a v4 root still decodes");
     assert!(
       v4_decoded.prior_config_ids().is_empty(),
       "a v4 root carries no durable lineage (recover seeds from the current id)"
+    );
+    assert_eq!(
+      v4_decoded.config_install_op(),
+      OpNumber::with(4),
+      "a v4 root defaults config_install_op to its checkpoint_op"
     );
     assert_eq!(v4_decoded.epoch(), Epoch::new(0));
     assert_eq!(
@@ -1873,7 +1968,7 @@ mod tests {
     );
     // Versions OUTSIDE the accepted range fail CLEAN (never misparse): 0 and one past the high end.
     for bad in [0u16, SUPERBLOCK_VERSION + 1] {
-      let mut wrong = v5_bytes.to_vec();
+      let mut wrong = v6_bytes.to_vec();
       wrong[0..2].copy_from_slice(&bad.to_be_bytes());
       assert!(
         matches!(VsrState::decode(&wrong), Err(CodecError::UnknownVersion(v)) if v == bad),
@@ -1893,9 +1988,10 @@ mod tests {
       std::vec![mk_header(6, 1, 1, 6, b"z")],
     )
     .unwrap();
-    // `st` is built via `try_new`, so it encodes as a v5 root whose membership-present flag is 0 (a
+    // `st` is built via `try_new`, so it encodes as a v6 root whose membership-present flag is 0 (a
     // legacy-bridged shape): version(2) | body | header-count | header | epoch(8) | prev_epoch(8) |
-    // present(1) | lineage_count(4) (= 0, no ids). The corruption probes target that exact layout.
+    // present(1) | lineage_count(4) (= 0, no ids) | config_install_op(8). The corruption probes target that
+    // exact layout.
     let good = st.encode();
     // Truncation WITHIN the fixed scalar prefix (before the header count) → Truncated (a scalar
     // read ran off the end). `&[]` likewise fails the very first u16 read.
@@ -1907,18 +2003,24 @@ mod tests {
       VsrState::decode(&[]),
       Err(CodecError::Truncated { .. })
     ));
-    // Dropping the last byte truncates the trailing lineage-count u32, so the read runs off the end →
+    // Dropping the last byte truncates the trailing config_install_op u64, so the read runs off the end →
     // Truncated (an honestly-short tail, not an oversized length).
     assert!(matches!(
       VsrState::decode(&good[..good.len() - 1]),
       Err(CodecError::Truncated { .. })
     ));
+    // Dropping the whole trailing config_install_op scalar (8 bytes) ALSO truncates — a v6 root MUST carry
+    // it (the read runs off the end after the empty lineage tail).
+    assert!(matches!(
+      VsrState::decode(&good[..good.len() - 8]),
+      Err(CodecError::Truncated { .. })
+    ));
     // Bad leading version → UnknownVersion.
     let mut badver = good.to_vec();
-    badver[1] = 7;
+    badver[1] = 8;
     assert!(matches!(
       VsrState::decode(&badver),
-      Err(CodecError::UnknownVersion(7))
+      Err(CodecError::UnknownVersion(8))
     ));
     // A header-count prefix that overruns the buffer → LengthOverflow (not an OOB slice). The
     // count u32 sits at offset 2+8+8+8+8+16 = 50.
@@ -1929,19 +2031,21 @@ mod tests {
       Err(CodecError::LengthOverflow { .. })
     ));
     // A `membership_present` flag that is neither 0 nor 1 → InvalidMembershipPresent. The present byte is
-    // the FIFTH-from-last byte now (the trailing 4 bytes are the lineage count): `good.len() - 5`.
+    // the THIRTEENTH-from-last byte now (the trailing bytes are lineage_count(4) + config_install_op(8)):
+    // `good.len() - 13`.
     let mut bad_flag = good.to_vec();
-    let present_off = bad_flag.len() - 5;
+    let present_off = bad_flag.len() - 13;
     bad_flag[present_off] = 2;
     assert!(matches!(
       VsrState::decode(&bad_flag),
       Err(CodecError::InvalidMembershipPresent(2))
     ));
-    // A lineage-count prefix that overruns the buffer → LengthOverflow (the trailing u32, each id a fixed
-    // 16-byte block, so an impossible count is a corrupt length).
+    // A lineage-count prefix that overruns the buffer → LengthOverflow (each id a fixed 16-byte block, so
+    // an impossible count is a corrupt length). The lineage-count u32 sits just BEFORE the trailing
+    // config_install_op(8): `good.len() - 12 .. good.len() - 8`.
     let mut huge_lineage = good.to_vec();
-    let lineage_off = huge_lineage.len() - 4;
-    huge_lineage[lineage_off..].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    let lineage_off = huge_lineage.len() - 12;
+    huge_lineage[lineage_off..lineage_off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
     assert!(matches!(
       VsrState::decode(&huge_lineage),
       Err(CodecError::LengthOverflow { .. })
@@ -1955,8 +2059,8 @@ mod tests {
     ));
     // A structurally-valid buffer whose decoded fields break the invariants (log_view > view) is
     // rejected as InvalidVsrState rather than constructing an illegal root. Build it by hand as a
-    // complete v5 root: an empty-header body with log_view = 5 > view = 4, the epoch tail, and the
-    // empty-lineage tail.
+    // complete v6 root: an empty-header body with log_view = 5 > view = 4, the epoch tail, the
+    // empty-lineage tail, and the config_install_op scalar.
     let mut bad = std::vec::Vec::new();
     bad.extend_from_slice(&SUPERBLOCK_VERSION.to_be_bytes());
     bad.extend_from_slice(&4u64.to_be_bytes()); // view
@@ -1969,6 +2073,7 @@ mod tests {
     bad.extend_from_slice(&0u64.to_be_bytes()); // prev_epoch
     bad.push(0); // membership_present = absent
     bad.extend_from_slice(&0u32.to_be_bytes()); // lineage count = 0
+    bad.extend_from_slice(&0u64.to_be_bytes()); // config_install_op
     assert!(matches!(
       VsrState::decode(&bad),
       Err(CodecError::InvalidVsrState(_))

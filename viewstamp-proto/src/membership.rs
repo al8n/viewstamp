@@ -63,6 +63,11 @@ pub enum MembershipError {
   /// voter.
   #[error("removing the voter would leave no voters")]
   WouldRemoveLastVoter,
+  /// A peer-carried successor configuration (a cross-epoch state-sync answer) did NOT hash to the
+  /// `config_id` it claims: the recomputed `hash(membership, prev_config_id)` differs from the carried
+  /// id, so it is a forged / corrupt / wrong-lineage configuration and MUST NOT be installed.
+  #[error("reconstructed config_id does not match the claimed lineage id")]
+  ForkedConfigId,
 }
 
 /// An epoch-versioned cluster configuration. Immutable once built; a change
@@ -199,6 +204,23 @@ impl Membership {
       }
     }
     Ok(members.into_boxed_slice())
+  }
+
+  /// Recompute the canonical lineage hash `config_id(K) = hash(membership_K, config_id(K-1))` from a
+  /// successor's parts and its predecessor's `config_id`. Used by the cross-epoch state-sync install
+  /// path ([`ReconfigurePayload::to_membership_verified`](crate::message::ReconfigurePayload)) to VERIFY
+  /// a peer-carried `(epoch, config_id, membership)` reconstructs to the SAME `config_id` it claims —
+  /// the "never install an unverifiable configuration" gate. (The durable-root decode path deliberately
+  /// does NOT recompute — its bytes are already checksum-protected by the superblock envelope.)
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub(crate) fn recompute_config_id(
+    epoch: Epoch,
+    replica_count: u8,
+    learner_count: u16,
+    members: &[MemberId],
+    prev_config_id: u128,
+  ) -> u128 {
+    Self::compute_config_id(epoch, replica_count, learner_count, members, prev_config_id)
   }
 
   fn compute_config_id(

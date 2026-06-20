@@ -188,6 +188,22 @@ struct SyncState {
   /// release-active assert from `checkpoint_op > self.op` to the true safety invariant
   /// `checkpoint_op >= commit_min` (never rewind the applied frontier).
   forced: bool,
+  /// `true` when this sync is the CROSS-EPOCH crossing fetch: a laggard behind at the OLD epoch fetching the
+  /// cluster checkpoint to cross into E+1. Armed by either of the two unified crossing armers
+  /// ([`Endpoint::maybe_request_cross_epoch_catchup`]):
+  /// - the NON-Normal recovery peer-fetch ([`Endpoint::enter_cross_epoch_peer_fetch`] — `Recovering`); or
+  /// - the NORMAL-status SPECULATIVE arm (a behind-but-operational voter stays `Normal` and keeps processing
+  ///   same-epoch traffic until the crossing lands — see [`Endpoint::cross_epoch_speculative_sync`]).
+  ///
+  /// Either way the fetch MUST complete by installing a strictly-higher epoch carrying the successor
+  /// membership — it can NOT settle for a below-`target`, same-config, or empty-membership reply (which
+  /// `apply_sync` would otherwise install with `successor = None`, exiting STILL at the old epoch). When
+  /// set, `apply_sync` REJECTS any non-crossing reply (leaving `sync` armed so the solicit timer
+  /// re-fetches), completing only on the `M >= N` successor-membership checkpoint that #1 guarantees
+  /// exists; and the crossing install forces `held_tail = false` (the old-epoch tail above `M` is not in
+  /// E+1's lineage). An ordinary / non-cross-epoch sync (`false`) keeps the existing empty-membership
+  /// `successor = None` behavior byte-identical.
+  require_cross_epoch: bool,
 }
 
 /// What a completed state-sync serve-read ships to its requester. Recorded per requester in
@@ -263,6 +279,21 @@ struct SyncTransfer {
   checkpoint_id: u128,
   /// The announced envelope length; `staged` grows append-only to exactly this.
   total_len: u64,
+  /// The configuration epoch the announce carried (mirrors [`SyncCheckpoint::epoch`](crate::SyncCheckpoint)).
+  /// Pinned WITH the content (a same-`(op, id)` re-announce carries the same committed-config header),
+  /// so the verified reassembly rebuilds a `SyncCheckpoint` IDENTICAL to a single-frame arrival —
+  /// including the cross-epoch successor a large post-swap snapshot must install.
+  epoch: Epoch,
+  /// The configuration id the announce carried (mirrors [`SyncCheckpoint::config_id`]). Pinned WITH the
+  /// content so the reassembly rebuilds the `SyncCheckpoint` with the ANNOUNCED config id — NOT a later
+  /// `SyncChunk`'s donor-current id, which a donor reconfiguration/failover mid-transfer would otherwise
+  /// splice in, producing a `(membership, config_id)` mismatch that fails verification and re-solicits.
+  config_id: u128,
+  /// The canonical successor-membership encoding the announce carried (mirrors
+  /// [`SyncCheckpoint::membership`](crate::SyncCheckpoint)); empty for a same-config sync. Carried
+  /// through reassembly so the rebuilt checkpoint installs the configuration the envelope reflects,
+  /// rather than the former empty/placeholder that stranded a cross-epoch chunked laggard.
+  membership: Bytes,
   /// The peer the next chunk pull is addressed to (re-pinned on announce/chunk — the freshest
   /// live server).
   donor: ReplicaId,
@@ -292,6 +323,12 @@ pub(crate) struct PendingInstall {
   /// `self.op` is frozen across the window (`on_prepare` drops while `sync.is_some()`), so this decision
   /// is identical at install time.
   held_tail: bool,
+  /// The successor `Membership` to install when this is a CROSS-EPOCH state-sync (the synced `config_id`
+  /// differs from the local one): reconstructed + VERIFIED in [`Endpoint::apply_sync`] from the carried
+  /// `(epoch, config_id, membership)`, installed atomically with the durable sync root in the
+  /// `SyncRepersist` completion (same side effects as [`Endpoint::install_membership`]). `None` for a
+  /// SAME-config sync — the common case stays byte-identical (no membership change).
+  successor: Option<Membership>,
 }
 
 /// The ViewChange-only collection state — reified as `Endpoint::view_change: Option<ViewChangeCollection>`
@@ -919,6 +956,19 @@ pub struct Endpoint<S, R: Reconfig = RestartOnly> {
   /// slots hold the genesis `config_id` (a harmless duplicate of the current id at genesis, admitting
   /// nothing extra). Private; never hashed/serialized/emitted.
   lineage: [u128; LINEAGE_RING],
+  /// The op of the last reconfigure that produced [`Self::membership`] — the committed `Reconfigure` op a
+  /// live single-change swaps at (the commit-first SwapEpoch root names it), the offline-restart point for
+  /// an offline reconfiguration, or genesis (`0`) when no reconfiguration has occurred. Set by
+  /// [`Self::install_membership`] when it carries a reconfigure op, and to the synced frontier by a
+  /// cross-epoch state-sync install. It GATES the cross-epoch state-sync serve: a donor attaches its
+  /// successor membership to a sync answer ONLY when `checkpoint_op >= config_install_op` — so a donor that
+  /// has swapped to E+1 but whose checkpoint is still BELOW the reconfigure op `N` serves an EMPTY
+  /// membership, and the laggard installs the SM frontier (op `M < N`) while KEEPING its current membership
+  /// and catching the band up through `N` via the commit-first path (XI-b: a node reaches E+1 only once it
+  /// durably holds the committed prefix THROUGH `N`). Persisted in the v6 durable root so a RECOVERED donor
+  /// restores the gate. Fixed per incarnation under [`RestartOnly`]; advanced live under
+  /// [`SingleChange`]/[`Joint`].
+  config_install_op: OpNumber,
   status: Status,
   view: View,
   /// Head op (most recently prepared locally).
@@ -1210,6 +1260,14 @@ pub struct Endpoint<S, R: Reconfig = RestartOnly> {
   /// at the identical OLD membership), so this is the pre-install staging of a convergent value; private,
   /// never hashed/serialized/emitted.
   pending_swap: Option<(OpNumber, Membership)>,
+  /// Re-entrancy guard for [`Self::maybe_pay_checkpoint_debt`]: `true` only WHILE that routine's own
+  /// proactive `advance_commit` is on the stack. The debt routine is called from the commit-advance
+  /// tails (`try_commit` / `advance_commit`) so the checkpoint debt re-checks every time commit moves;
+  /// it itself calls `advance_commit` (to drive the committed band forward with NO traffic), which would
+  /// re-enter the tail and recurse without bound. This flag makes the proactive advance a NO-OP while one
+  /// is already in progress — the outer advance covers it. NOT a durable fact (it is always `false`
+  /// between deliveries); private, never hashed/serialized/emitted.
+  paying_checkpoint_debt: bool,
   /// Per-member DURABLE-frontier progress, keyed by the stable [`MemberId`]: the highest
   /// `durable_commit_min` a member has reported via a [`LearnerStatus`](crate::LearnerStatus). It
   /// carries NO quorum authority — it is NEVER read by any commit/view-change/recovery quorum — and is
@@ -1288,6 +1346,10 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       membership,
       prev_epoch,
       lineage,
+      // Genesis: no reconfiguration has produced the membership yet, so the cross-epoch serve gate
+      // (`checkpoint_op >= config_install_op`) is trivially satisfied — the genesis membership is always
+      // safe to serve.
+      config_install_op: OpNumber::new(),
       status: Status::Normal,
       view: View::new(),
       op: OpNumber::new(),
@@ -1337,6 +1399,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       pending_forfeit: false,
       reconfigure_inflight: None,
       pending_swap: None,
+      paying_checkpoint_debt: false,
       peer_progress: BTreeMap::new(),
       _reconfig: core::marker::PhantomData,
     }
@@ -1370,6 +1433,22 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn commit_max(&self) -> OpNumber {
     self.commit_max
+  }
+
+  /// The op numbers of `Reconfigure` ops in this replica's COMMITTED log (`op <= commit`) still
+  /// carried in the log (committed but above the checkpoint). A consensus-layer `Reconfigure` op is
+  /// committed and numbered but NEVER applied to the state machine (it carries no client request), so
+  /// an observer reconciling the committed op-number sequence against the applied stream must account
+  /// for it from COMMIT — not only once its durable swap installs ([`Event::MembershipChanged`]).
+  /// Empty unless a reconfiguration committed on this replica. Op numbers are the raw `u64` log keys.
+  pub fn committed_reconfigure_op_numbers(&self) -> std::vec::Vec<u64> {
+    let commit = self.commit_min.get();
+    self
+      .log
+      .iter()
+      .filter(|(op, e)| **op <= commit && matches!(e.body, Body::Reconfigure(_)))
+      .map(|(op, _)| *op)
+      .collect()
   }
 
   /// The op number of this replica's latest durable checkpoint.
@@ -1469,7 +1548,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   /// `select_canonical_log`'s union and is never nack-truncated. The OLD-write-quorum-vs-NEW-view-
   /// change-quorum count bound is not ≥1 for a 3→2 shrink or a 3→4 grow, so this structural gate (not
   /// a count) is the load-bearing invariant; the `cp_overlap_*` reconfigure tests pin it.
-  fn install_membership(&mut self, op: OpNumber, successor: Membership) {
+  fn install_membership(&mut self, reconfigure_op: Option<OpNumber>, successor: Membership) {
     // Capture the abdication precondition (hazard a) against the OLD membership, BEFORE the swap:
     // was this node the primary of its current view? (Robust to an already-absent local member.)
     let was_primary = self.is_primary();
@@ -1481,33 +1560,70 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     // Push the superseded config_id onto the recent-prior lineage ring (most-recent-first), so
     // `in_lineage` keeps admitting a bounded window of recent ancestors for live cross-epoch catch-up.
     self.push_lineage(prior_config_id);
+    // Record the op that produced THIS membership so the cross-epoch state-sync serve gate
+    // (`checkpoint_op >= config_install_op`) holds. A commit-first swap (`Some(op)`) names its committed
+    // `Reconfigure` op `N` — until this node's checkpoint reaches `N` it must NOT serve E+1 to a laggard
+    // (the laggard would install E+1 below `N`, without the committed prefix through `N`). A cross-epoch
+    // state-sync install (`None`) sets it to the synced frontier separately in `install_sync` — that
+    // frontier is at/above the donor's `N` (the donor served it only because its own checkpoint reached
+    // `N`), so it is a safe, restart-survivable lower bound.
+    if let Some(op) = reconfigure_op {
+      self.config_install_op = op;
+    }
     // The voter set changed, so the quorum-checkpoint inputs (the voter slots) changed: refresh the
     // cached order statistic the GC prune floor / force-sync trigger read.
     self.recompute_quorum_checkpoint();
-    // Removed-leader abdication (hazard a): an ex-primary that the swap dropped from the voter set goes
-    // SILENT as primary — retire the cadence + clear the forfeit latch (the cluster elects an E+1
-    // primary from the new voter set via the surviving backups' idle timers). `local_slot_opt()` is
-    // `None` when removed entirely; a learner slot is `>= replica_count`. Either way `is_voter` is false.
+    // Removed-node goes silent (hazard a): a swap that drops THIS node from the voter set retires its
+    // whole voter timer plane. An ex-primary abdicates its primary cadence (the cluster elects an E+1
+    // primary from the new voter set via the surviving backups' idle timers); EVERY removed node (ex-
+    // primary or ex-backup) also retires the backup idle/view-change plane. `local_slot_opt()` is `None`
+    // when removed entirely; a learner slot is `>= replica_count`. Either way `is_voter` is false, and
+    // `serviceable_now` already blocks servicing — this clears the armed deadlines for cleanliness.
     let still_voter = self
       .local_slot_opt()
       .is_some_and(|slot| self.membership.is_voter(slot));
-    if was_primary && !still_voter {
-      self.retire_primary_cadence();
+    if !still_voter {
+      if was_primary {
+        self.retire_primary_cadence();
+      }
+      self.retire_backup_cadence();
+      // A node fully REMOVED from the configuration (no slot at all — not merely demoted to a learner,
+      // which keeps a slot and stays a non-voting participant) transitions to the structural `Retired`
+      // state: the central ingress drops all its messages and it arms/services no timer, so it reaches
+      // no voter path (nor any panicking `local_slot()`) by construction — the removed-member class
+      // closed structurally rather than by per-gate patches.
+      if self.local_slot_opt().is_none() {
+        // Abandon the in-flight consensus pipeline before retiring: a removed node owes no ack/vote and
+        // appends no more ops, so clear the pending WAL appends, their append-before-ack marks, and the
+        // inflight vote bitsets. A straggling WAL completion then finds nothing and is dropped by the
+        // `on_wal_done` Retired guard, so `has_inflight_storage()` settles (a graceful shutdown completes)
+        // and no stale completion can reach `local_slot()`.
+        self.pending.clear();
+        self.appending.clear();
+        self.inflight.clear();
+        self.set_status(Status::Retired);
+      }
     }
-    // The observer learns THIS node's role under the new configuration purely from the committed
-    // membership — a voter, a (non-voting) learner, or removed (neither).
-    let self_is_learner = self
-      .local_slot_opt()
-      .is_some_and(|slot| self.membership.is_learner(slot));
-    self
-      .events
-      .push_back(Event::MembershipChanged(crate::MembershipChanged::new(
-        op,
-        epoch,
-        config_id,
-        still_voter,
-        self_is_learner,
-      )));
+    // Emit MembershipChanged only for a commit-first swap (`Some` reconfigure op). A cross-epoch
+    // state-sync install (`None`) has no LOCAL Reconfigure op to name — the laggard synced PAST it — so
+    // naming the sync frontier (a client op) would misreport the consensus-layer applied gap to an
+    // observer; the swap is observable via the sync completion + the installed membership, and the real
+    // Reconfigure op is reported by the replicas that committed it directly. The observer still learns
+    // THIS node's role under the new configuration purely from the committed membership.
+    if let Some(op) = reconfigure_op {
+      let self_is_learner = self
+        .local_slot_opt()
+        .is_some_and(|slot| self.membership.is_learner(slot));
+      self
+        .events
+        .push_back(Event::MembershipChanged(crate::MembershipChanged::new(
+          op,
+          epoch,
+          config_id,
+          still_voter,
+          self_is_learner,
+        )));
+    }
   }
 
   /// Push a just-superseded `config_id` onto the recent-prior lineage ring (most-recent-first): shift
@@ -1545,6 +1661,18 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self.timers.prepare = None;
     self.timers.forfeit_armed = None;
     self.pending_forfeit = false;
+  }
+
+  /// Retire the backup voter timer plane — the idle timer and the view-change vote/escalation timers a
+  /// removed node must no longer service. Paired with `retire_primary_cadence` at the removal site so a
+  /// node dropped from the voter set holds NO armed consensus deadline. `serviceable_now` already gates
+  /// each on `is_voter()` (so a stale armed deadline would be non-serviceable, not a panic), but clearing
+  /// them keeps the removed node's timer set empty — the removed-node-goes-silent invariant.
+  fn retire_backup_cadence(&mut self) {
+    self.timers.primary_idle = None;
+    self.timers.svc_message = None;
+    self.timers.dvc_message = None;
+    self.timers.view_change_status = None;
   }
 
   /// Stage the SUCCESSOR membership of a just-committed `Body::Reconfigure` op for its durable epoch
@@ -1701,6 +1829,12 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       self.membership.epoch(),
       successor.clone(),
       prior_config_ids,
+      // This root installs the NEW successor membership, so it carries the NEW reconfigure op `N` (NOT the
+      // writer's current `config_install_op` — that named the PREDECESSOR membership). A node recovering off
+      // this SwapEpoch root then restores `config_install_op = N`, so it withholds the new membership from a
+      // laggard until its checkpoint reaches `N` — the gate is restart-survivable from the moment of swap,
+      // even though the checkpoint here is still BELOW `N` (the commit-first window the gate exists for).
+      reconfigure_op,
     )
     .expect(
       "SwapEpoch root: log_view <= view, commit >= checkpoint_op, membership epoch consistent",
@@ -2034,6 +2168,23 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       .is_some_and(|r| r.awaiting_peer_checkpoint)
   }
 
+  /// Whether the ONLY outstanding sync is a NORMAL-STATUS speculative cross-epoch crossing arm — a
+  /// behind-but-OPERATIONAL voter that learned of a higher epoch and armed a `require_cross_epoch` sync
+  /// ([`Self::maybe_request_cross_epoch_catchup`]) while STAYING `Normal`. Such a sync is SPECULATIVE: it
+  /// may never get a crossing reply (no donor holds the `M >= N` checkpoint yet), and the laggard must
+  /// keep processing legitimate SAME-epoch traffic in the meantime — so it is TRANSPARENT to the
+  /// same-epoch tail-apply gates ([`Self::on_prepare`]'s sync-drop, [`Self::request_tail_gap`],
+  /// [`Self::report_checkpoint_to_primary`]) that exist to halt FUTILE buffering during an ordinary
+  /// below-head sync. It crosses (and discards the stale same-epoch tail) only when `apply_sync` installs
+  /// the verified crossing checkpoint. A `require_cross_epoch` sync in RECOVERING is the recovery
+  /// peer-fetch ([`Self::enter_cross_epoch_peer_fetch`]) — NOT speculative (that laggard genuinely cannot
+  /// make same-epoch progress, and is non-Normal anyway), so this is `false` there. An ordinary / forced
+  /// (non-cross-epoch) sync is `false` (it DOES halt tail-apply — the cluster checkpoint is above the head,
+  /// so buffering same-epoch ops is futile).
+  fn cross_epoch_speculative_sync(&self) -> bool {
+    self.status.is_normal() && self.sync.is_some_and(|s| s.require_cross_epoch)
+  }
+
   /// The latest view in which this replica changed its head log.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn log_view(&self) -> View {
@@ -2142,6 +2293,19 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self
       .local_slot_opt()
       .is_some_and(|slot| self.membership.is_learner(slot))
+  }
+
+  /// True iff THIS replica is a VOTING member of the current configuration (occupies a voting slot
+  /// `< replica_count`). The correct SINGLE-SOURCE predicate for voter participation: `false` for a
+  /// learner AND for a REMOVED node (absent from the configuration). Every voter-only gate (the backup
+  /// idle timer, the view-change-status cadence, vote paths) reads this — NOT `!is_learner()`, which is
+  /// wrongly TRUE for an absent member and would let a removed node arm consensus timers and panic on a
+  /// `local_slot()` that no longer exists.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn is_voter(&self) -> bool {
+    self
+      .local_slot_opt()
+      .is_some_and(|slot| self.membership.is_voter(slot))
   }
 
   /// Whether this replica is the primary of the current view. `false` if the local member was REMOVED
@@ -2516,6 +2680,13 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self.sync.is_some_and(|s| s.forced)
   }
 
+  /// Test-only: does the outstanding sync REQUIRE a cross-epoch crossing (the unified forced-sync
+  /// crossing fetch)? `false` when no sync is outstanding.
+  #[cfg(test)]
+  fn sync_requires_cross_epoch_for_test(&self) -> bool {
+    self.sync.is_some_and(|s| s.require_cross_epoch)
+  }
+
   /// Test-only: the outstanding sync's nonce (panics if none) — to build a matching SyncCheckpoint.
   #[cfg(test)]
   fn sync_nonce_for_test(&self) -> u64 {
@@ -2531,6 +2702,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       target: OpNumber::with(target),
       nonce: self.nonce,
       forced: true,
+      require_cross_epoch: false,
     });
   }
 
@@ -2729,17 +2901,22 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       target: self.checkpoint_op,
       nonce: 0,
       forced: false,
+      require_cross_epoch: false,
     });
     self.pending_install = Some(PendingInstall {
       checkpoint_op: self.checkpoint_op,
       sessions: BTreeMap::new(),
       sm_tail: Bytes::new(),
       held_tail: false,
+      successor: None,
     });
     self.sync_transfer = Some(SyncTransfer {
       checkpoint_op: self.checkpoint_op,
       checkpoint_id: 0,
       total_len: 1,
+      epoch: crate::Epoch::new(0),
+      config_id: 0,
+      membership: Bytes::new(),
       donor: ReplicaId::new(0),
       staged: std::vec::Vec::new(),
     });
@@ -2799,6 +2976,15 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   #[cfg(test)]
   fn commit_or_prepare_timer_armed_for_test(&self) -> bool {
     self.timers.commit.is_some() || self.timers.prepare.is_some()
+  }
+
+  /// Test-only: is the backup `primary_idle` deadline armed? `arm_primary_idle` is `is_voter()`-gated and
+  /// the removed-node abdication ([`Self::install_membership`]) calls `retire_backup_cadence`, so a
+  /// regression can assert a removed (non-voter) backup holds NO idle deadline — it never proposes a
+  /// view change on an idle primary.
+  #[cfg(test)]
+  fn primary_idle_armed_for_test(&self) -> bool {
+    self.timers.primary_idle.is_some()
   }
 
   /// Test-only: the in-lineage admission test ([`Self::in_lineage`]) — admits `other` iff it is the
@@ -2984,6 +3170,10 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       }
       // `Reply` is ignored by replicas (dropped in the dispatch) — no-op.
       Message::Reply(_) => true,
+      // `EpochAhead` is a pre-binding catch-up SIGNAL: `maybe_request_cross_epoch_catchup` already
+      // consumed it (it carries no self-id to bind and no content to dispatch), so DROP it here — it must
+      // not reach the dispatch. Returning `false` is the ingress analogue of "already handled".
+      Message::EpochAhead(_) => false,
     }
   }
 
@@ -3082,11 +3272,21 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       Message::RepairBatch(m) => self.in_lineage(m.config_id()),
       Message::RequestSync(m) => self.in_lineage(m.config_id()),
       Message::RequestSyncChunk(m) => self.in_lineage(m.config_id()),
-      Message::SyncCheckpoint(m) => self.in_lineage(m.config_id()),
-      Message::SyncCheckpointMeta(m) => self.in_lineage(m.config_id()),
-      Message::SyncChunk(m) => self.in_lineage(m.config_id()),
+      // A SyncCheckpoint/Meta/Chunk answering an OUTSTANDING sync is admitted even from a higher
+      // (descendant) config not yet in our lineage: it is the cross-epoch catch-up answer to OUR own
+      // solicitation, and the serving peer stamps it with its CURRENT (post-swap) config, which a
+      // lagging solicitor could not otherwise admit. The handler authenticates it by the in-flight sync
+      // nonce and verifies the checkpoint's integrity before installing, so admitting it on
+      // `sync.is_some()` cannot be driven by an unsolicited or forged answer.
+      Message::SyncCheckpoint(m) => self.in_lineage(m.config_id()) || self.sync.is_some(),
+      Message::SyncCheckpointMeta(m) => self.in_lineage(m.config_id()) || self.sync.is_some(),
+      Message::SyncChunk(m) => self.in_lineage(m.config_id()) || self.sync.is_some(),
       // NEITHER: client-facing, no (epoch, config_id) to check.
       Message::Request(_) | Message::Reply(_) => true,
+      // `EpochAhead` carries NO (epoch, config_id) authority pair to admit — it is a pre-binding hint
+      // already consumed before this gate (and dropped at `sender_matches`). It exercises no authority,
+      // so it is never admitted to the dispatch.
+      Message::EpochAhead(_) => false,
     }
   }
 }
@@ -3116,6 +3316,59 @@ where
     self.assert_invariants();
   }
 
+  /// The epoch-mismatch RESPONSE: the egress half of the symmetric pre-`sender_matches` pair. When a
+  /// strictly-LOWER-epoch vote/lead message (`Prepare`/`Commit`/`StartViewChange`/`DoViewChange` — a
+  /// stranded laggard's old-epoch traffic) arrives from an ACTIVE replica member, emit a minimal
+  /// `EpochAhead{epoch, checkpoint_op}` hint back to it, so a slot-shifted laggard that cannot bind the
+  /// new primary still gets the catch-up trigger from a BINDABLE retained voter (us). We act on NONE of
+  /// the stale message's content — it is still dropped at `sender_matches` / `epoch_authority_admits`
+  /// exactly as before; this is a pure egress side-effect.
+  ///
+  /// The hint carries no authority (no view, no vote/quorum, no op/commit content) a forged one could
+  /// abuse: the laggard treats it ONLY as a rate-limited sync trigger, and the forced cross-epoch
+  /// peer-fetch it drives is crossing-required + self-verifying. No storm: ONLY a SETTLED member answers
+  /// (`is_normal()` + a valid local slot — a Retired/Recovering node must not), and the response is
+  /// bounded by the laggard's own timer-bounded stale traffic (one hint per inbound stale message). A
+  /// lower-epoch message that is NOT from an active member elicits nothing.
+  fn maybe_answer_lower_epoch(&mut self, from: Peer, msg: &Message) {
+    // Only a SETTLED cluster member answers: Normal, and present in its own active membership (a Retired
+    // node — removed by a reconfiguration — has no local slot and must stay silent; a Recovering /
+    // ViewChange node is not in a position to vouch the cluster's current epoch).
+    if !self.status.is_normal() || self.local_slot_opt().is_none() {
+      return;
+    }
+    // The trigger set is the lower-epoch shape of a stranded laggard's vote/lead traffic. Read only the
+    // sender's claimed epoch (NOT any view/op/commit content). `LearnerStatus` is excluded: a non-voting
+    // learner is not a stranded VOTER laggard and crosses by its own catch-up, not this pull.
+    let msg_epoch = match msg {
+      Message::Prepare(m) => m.epoch(),
+      Message::Commit(m) => m.epoch(),
+      Message::StartViewChange(m) => m.epoch(),
+      Message::DoViewChange(m) => m.epoch(),
+      _ => return,
+    };
+    if msg_epoch >= self.membership.epoch() {
+      return;
+    }
+    // Authenticate `from` as an ACTIVE replica member of OUR configuration (its slot resolves to a
+    // current member): a non-replica / out-of-config peer elicits no hint. We do not need the message's
+    // self-id to match — the hint carries no authority, so binding `from` to the configured-member set is
+    // the full check.
+    let Some(slot) = from.as_replica() else {
+      return;
+    };
+    if self.membership.member_at(slot).is_none() {
+      return;
+    }
+    self.emit(Outgoing::new(
+      Recipient::To(from),
+      Message::EpochAhead(crate::EpochAhead::new(
+        self.membership.epoch(),
+        self.checkpoint_op,
+      )),
+    ));
+  }
+
   /// The body of [`Self::handle_message`]; see it for the exit-time invariant check that wraps this.
   fn handle_message_inner<W: Wal, B: Superblock>(
     &mut self,
@@ -3125,6 +3378,33 @@ where
     from: Peer,
     msg: Message,
   ) {
+    // A Retired replica was removed from the configuration by a reconfiguration — it is no longer a
+    // cluster member, so it processes NO incoming message: casts no vote, serves no request, adopts no
+    // view, triggers no catch-up. This is the STRUCTURAL close for the removed-member class — a removed
+    // node reaches no voter path (nor any panicking `local_slot()`) by construction, regardless of how
+    // many entry paths exist. The embedder shuts it down on the `MembershipChanged` that removed it.
+    if self.status.is_retired() {
+      return;
+    }
+    // Cross-epoch catch-up TRIGGER — run BEFORE the sender binding below. `sender_matches` validates a
+    // `Commit`/normal `Prepare` against OUR predecessor-primary for the view; but a live removal can
+    // change the primary slot, so the honest E+1 primary is a DIFFERENT retained voter — its higher-epoch
+    // heartbeat would be dropped at the sender binding before it could signal us to catch up. Recognize a
+    // strictly-higher-epoch `Prepare`/`Commit` from a configured member (`from`) here, re-arm the
+    // committed-vouched catch-up, and act on NONE of the content. (A non-trigger message no-ops.)
+    self.maybe_request_cross_epoch_catchup(now, from, &msg);
+    // Epoch-mismatch RESPONSE — the SYMMETRIC pre-binding hook, also BEFORE the sender binding. A
+    // reconfiguration that removes the old primary / shifts slots can make the honest E+1 primary a
+    // DIFFERENT retained voter a stranded laggard cannot bind (its `MemberId` is absent from the
+    // laggard's old membership) — so the laggard never hears the higher-epoch trigger above. But the
+    // laggard CAN still bind the RETAINED voters; its futile old-epoch traffic reaches us here (and is
+    // dropped at `sender_matches` / `epoch_authority_admits` below, exactly as before). So when a
+    // strictly-LOWER-epoch message arrives from an active member, we answer it with a minimal
+    // higher-epoch `EpochAhead` hint, pulling the laggard's catch-up trigger back from a bindable peer.
+    // It acts on NONE of the stale message's content; it is rate-limited by construction (one hint per
+    // inbound stale message; the laggard's stale traffic is timer-bounded) and self-terminating (the
+    // laggard crosses and stops emitting stale traffic).
+    self.maybe_answer_lower_epoch(from, &msg);
     // Sender-binding backstop: drop any message whose self-claimed identity disagrees
     // with the authenticated `from`. Placed at the TOP — BEFORE the Recovering/RecoveringHead
     // early-returns — so it ALSO guards those states' message exceptions (a RecoveringHead adopting a
@@ -3145,6 +3425,9 @@ where
     // check is branched inside `on_prepare` (the repair-serve arm stays AGNOSTIC). See
     // [`Self::epoch_authority_admits`].
     if !self.epoch_authority_admits(&msg) {
+      // Inadmissible. The cross-epoch catch-up trigger ran ABOVE (before the sender binding), so a
+      // higher-epoch heartbeat from a successor primary has already re-armed our catch-up; here we just
+      // drop the (unactable) content.
       return;
     }
     // A Recovering replica does NOT process ANY consensus message: it is still draining its own
@@ -3243,6 +3526,10 @@ where
       // no quorum/vote state). It gates a later `propose_membership(PromoteLearner)`.
       Message::LearnerStatus(m) => self.on_learner_status(m),
       Message::Reply(_) => {}
+      // `EpochAhead` is a pure pre-binding catch-up SIGNAL — fully consumed above by
+      // `maybe_request_cross_epoch_catchup` (it never reaches here: `sender_matches` drops it). Acting on
+      // no content, it is a dispatch no-op.
+      Message::EpochAhead(_) => {}
     }
   }
 
@@ -3366,6 +3653,8 @@ where
       // solicitation until a peer hands it the canonical head.
       Status::Recovering => self.recover_timeouts(now, wal, sb),
       Status::RecoveringHead => self.recover_head_timeouts(now, sb),
+      // A Retired (removed) replica fires NO timer — it is no longer a cluster member.
+      Status::Retired => {}
     }
     // Peer fault-repair retransmit runs only in Normal (the only status that can solicit/serve a hole
     // and adopt the reply). It re-solicits every unrepaired committed-op hole until each is filled.
@@ -3419,9 +3708,10 @@ where
   /// Arms the `primary_idle` deadline — but never for a non-voting learner, which has no view-change
   /// vote to cast and so never proposes a view change on an idle primary. Centralizing the arm here
   /// keeps every site that defers the idle timeout (`note_primary_contact`, the `handle_timeout`
-  /// bootstrap/re-arm, the `arm_timers` Normal-backup role arm) learner-aware through one predicate.
+  /// bootstrap/re-arm, the `arm_timers` Normal-backup role arm) voter-aware through one predicate — a
+  /// learner AND a removed (absent) member both leave the backup idle timer disarmed.
   fn arm_primary_idle(&mut self, now: Instant) {
-    if !self.is_learner() {
+    if self.is_voter() {
       self.timers.primary_idle = Some(now + PRIMARY_IDLE);
     }
   }
@@ -3496,7 +3786,7 @@ where
         // `view_change_status`, the timer whose expiry ESCALATES a stalled catch-up into actively
         // driving the next view. A learner never escalates — it stays catching up until it adopts a
         // StartView — so it leaves `view_change_status` disarmed and follows the voters' change.
-        if !self.is_learner() {
+        if self.is_voter() {
           self.timers.view_change_status = Some(now + VIEW_CHANGE_STATUS);
         }
       }
@@ -3522,6 +3812,8 @@ where
         self.timers.recover_head =
           Some(prior_recover_head.map_or(recover_head, |d| d.min(recover_head)));
       }
+      // A Retired (removed) replica arms NO role timer — it is no longer a cluster member.
+      Status::Retired => {}
     }
     // Peer fault-repair runs alongside the role timers: while a committed-op hole is outstanding AND we
     // are Normal, keep the repair-retry timer armed. The `is_normal()` gate MUST match `handle_timeout`'s
@@ -3656,15 +3948,18 @@ where
       | TimerKind::Prepare
       | TimerKind::ForfeitArmed
       | TimerKind::RepairOrTruncate => self.participates_as_primary() && !self.pending_forfeit,
-      // A non-voting learner never proposes or escalates a view change, so the whole vote/idle timer
-      // plane (`primary_idle`, `svc_message`, `dvc_message`, `view_change_status`) is non-serviceable
-      // for it — it never arms them, and this keeps the no-orphan-due assert satisfied if a stale
-      // deadline ever lingered. Its only view-change timer is `get_view_message` (the catch-up re-solicit).
-      TimerKind::PrimaryIdle => self.status.is_normal() && !self.is_primary() && !self.is_learner(),
+      // A NON-VOTER — a learner OR a REMOVED member (absent from the configuration) — never proposes or
+      // escalates a view change, so the whole vote/idle timer plane (`primary_idle`, `svc_message`,
+      // `dvc_message`, `view_change_status`) is non-serviceable for it; it never arms them, and this keeps
+      // the no-orphan-due assert satisfied if a stale deadline ever lingered. Gated on `is_voter()`, NOT
+      // `!is_learner()` (which is wrongly true for a removed member, letting it arm a consensus timer and
+      // panic on a `local_slot()` that no longer exists). A learner's only view-change timer is
+      // `get_view_message` (the catch-up re-solicit).
+      TimerKind::PrimaryIdle => self.status.is_normal() && !self.is_primary() && self.is_voter(),
       // Three disjoint servicers (see the doc): forfeit re-propose, backup retransmit, or the
       // active view-change driver.
       TimerKind::SvcMessage => {
-        !self.is_learner()
+        self.is_voter()
           && ((self.status.is_normal() && self.is_primary() && self.pending_forfeit)
             || (self.status.is_normal() && !self.is_primary())
             || (self.status.is_view_change() && !self.catching_up()))
@@ -3684,12 +3979,12 @@ where
       // `get_view_message` is a catch-up READ that (by the `catching_up` discriminant) never coexists with
       // the SendDoViewChange durable-view window.
       TimerKind::DvcMessage => {
-        !self.is_learner()
+        self.is_voter()
           && self.status.is_view_change()
           && !self.catching_up()
           && !self.pending_durable_view()
       }
-      TimerKind::ViewChangeStatus => self.status.is_view_change() && !self.is_learner(),
+      TimerKind::ViewChangeStatus => self.status.is_view_change() && self.is_voter(),
       TimerKind::GetViewMessage => self.status.is_view_change() && self.catching_up(),
       TimerKind::RecoverRetry => self.status.is_recovering(),
       TimerKind::RecoverHead => self.status.is_recovering_head(),

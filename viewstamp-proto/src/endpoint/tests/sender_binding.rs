@@ -536,10 +536,12 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(5), // non-member self-claim
       nonce,
       env.clone(),
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);
@@ -563,10 +565,12 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
       View::new(),
       OpNumber::with(4),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env.clone(),
+      Bytes::new(),
     )),
   );
   e.handle_storage(now, &mut wal, &mut sb);

@@ -241,10 +241,12 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
       View::new(),
       OpNumber::with(6),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   assert!(
@@ -470,10 +472,12 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
       View::new(),
       OpNumber::with(6),
       id,
+      crate::Epoch::new(0),
       0,
       ReplicaId::new(0),
       nonce,
       env,
+      Bytes::new(),
     )),
   );
   assert!(
@@ -637,10 +641,12 @@ fn poll_timeout_only_returns_serviceable_timers() {
         View::new(),
         OpNumber::with(6),
         id,
+        crate::Epoch::new(0),
         0,
         ReplicaId::new(0),
         nonce,
         env,
+        Bytes::new(),
       )),
     );
     assert!(e.pending_forfeit_for_test());

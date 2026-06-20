@@ -67,11 +67,12 @@ pub use event::{Committed, Event, MembershipChanged, RepairStarted, ViewChanged}
 pub use id::{ClientId, Epoch, MemberId, Peer, Recipient, ReplicaId};
 pub use membership::{Membership, MembershipError, SingleVoterDelta};
 pub use message::{
-  Commit, DoViewChange, GetView, LearnerStatus, Message, Outgoing, Prepare, PrepareBatch,
-  PrepareOk, PreparedEntry, REPLY_ENCODE_OVERHEAD, ReconfigurePayload, Recovery, RecoveryResponse,
-  RepairBatch, Reply, Request, RequestPrepare, RequestPrepareRange, RequestSync, RequestSyncChunk,
-  SYNC_CHUNK_LEN, StartView, StartViewChange, SyncCheckpoint, SyncCheckpointMeta, SyncChunk,
-  max_reply_body_len, max_unchunked_snapshot_len,
+  Commit, DoViewChange, EpochAhead, GetView, LearnerStatus, Message, Outgoing, Prepare,
+  PrepareBatch, PrepareOk, PreparedEntry, REPLY_ENCODE_OVERHEAD, ReconfigurePayload, Recovery,
+  RecoveryResponse, RepairBatch, Reply, Request, RequestPrepare, RequestPrepareRange, RequestSync,
+  RequestSyncChunk, SYNC_CHUNK_LEN, StartView, StartViewChange, SyncCheckpoint, SyncCheckpointMeta,
+  SyncChunk, max_reply_body_len, max_unchunked_snapshot_len,
+  max_unchunked_snapshot_len_with_membership,
 };
 pub use number::{OpNumber, RequestNumber, View};
 pub use prng::Prng;
