@@ -45,9 +45,13 @@ where
   /// - [`ProposeMembershipError::Invalid`] if `delta` is structurally invalid for the current
   ///   configuration (an unknown/duplicate member, a non-learner promotion, the last voter removed) —
   ///   carries the underlying [`MembershipError`](crate::MembershipError).
-  /// - [`ProposeMembershipError::TargetNotCaughtUp`] for a `PromoteLearner` whose target has not
-  ///   durably caught up to the current head (`peer_progress[target] < self.op`, or no report yet) —
-  ///   catch-up-then-promote, so the promoted learner provably holds the full E-committed prefix.
+  /// - [`ProposeMembershipError::ProofPending`] for a `PromoteLearner` with no fresh validated proof
+  ///   yet — the gate solicits a `RequestLearnerProof` from the target and returns this RETRYABLE
+  ///   verdict; the caller retries, and once the matching `LearnerProof` reports a frontier covering the
+  ///   head the retry mints the op (catch-up-then-promote, so the promoted learner provably holds the
+  ///   full E-committed prefix). A regressed / stale / cross-epoch / missing reply keeps the gate
+  ///   returning `ProofPending` (fail-closed). The freshness re-grounds the safety input in the
+  ///   learner's durable storage at propose time rather than trusting an accumulated self-report.
   /// - [`ProposeMembershipError::AddVoterBreaksQuorumIntersection`] for an `AddVoter` whose successor
   ///   has a one-member view-change quorum (the predecessor is a SINGLE voter): the brand-new voter
   ///   holds no committed prefix yet could form the E+1 view-change quorum alone and drop the old
@@ -114,24 +118,85 @@ where
     // here — no ±1 check is performed (it could only ever pass).
     let successor = self.membership.apply_delta(&delta)?;
 
-    // CATCH-UP-THEN-PROMOTE (a SAFETY gate, not merely liveness): a `PromoteLearner` is refused until
-    // the target learner has DURABLY caught up. The Reconfigure op this proposal mints will occupy
-    // `self.op + 1`, so the full E-committed prefix it sits on is `[1..=self.op]` (the current head).
-    // Require the target's recorded durable frontier (`peer_progress`, fed only by its non-voting
-    // `LearnerStatus`) to COVER `self.op`: then by commit-first, once the learner durably commits the
-    // Reconfigure op to become a voter it provably holds the ENTIRE E-committed prefix — closing the
-    // hazard where a behind new-voter's low-frontier `DoViewChange` pushes the nack-truncation crossing
-    // down and truncates a committed-but-not-widely-replicated op at the next view change. The gate is
-    // EXACT (no lag bound): a lag bound would leave a window where the new voter is in a DVC quorum
-    // WITHOUT some committed op `o`, re-opening committed-loss. Absent (`None`, the learner never
-    // reported) OR below the head → `TargetNotCaughtUp`.
-    if let SingleVoterDelta::PromoteLearner(target) = &delta
-      && self
-        .peer_progress
-        .get(target)
-        .is_none_or(|durable| durable.get() < self.op.get())
-    {
-      return Err(ProposeMembershipError::TargetNotCaughtUp);
+    // CATCH-UP-THEN-PROMOTE (a SAFETY gate, not merely liveness): a `PromoteLearner` is admitted only on
+    // a FRESH proof the primary solicits at propose time, NOT on the target's accumulated self-report.
+    // The Reconfigure op this proposal mints will occupy `self.op + 1`, so the full E-committed prefix it
+    // sits on is `[1..=self.op]` (the current head); the promoted learner must DURABLY hold that whole
+    // prefix, or once it becomes a voter its low-frontier `DoViewChange` pushes the nack-truncation
+    // crossing down and truncates a committed-but-not-widely-replicated op at the next view change. The
+    // accumulated `peer_progress` is UNSOUND as this safety input: it banks a stale-high value that
+    // survives a crash/disk-fault that honestly REGRESSED the learner's frontier. So instead of reading
+    // it, this is a TWO-PHASE, Sans-I/O, non-blocking gate:
+    //
+    //   Phase 1 (a fresh validated proof is present) — `learner_proof` is `Some` for THIS `target` with
+    //     `at_op >= self.op` (the proof is for at least the current head) and `proof == Some(f)` with
+    //     `f >= self.op` (the learner's freshly-recomputed frontier covers the head): CONSUME the proof
+    //     (set `learner_proof = None`) and fall through to the mint. By commit-first, once the learner
+    //     durably commits the Reconfigure op to become a voter it provably holds the ENTIRE E-committed
+    //     prefix. The gate is EXACT (no lag bound): a lag bound would leave a window where the new voter
+    //     is in a DVC quorum WITHOUT some committed op `o`, re-opening committed-loss. Re-validating
+    //     `at_op >= self.op` here closes the head-advanced-past-the-proof race (the proof proved an older
+    //     head) — it falls through to Phase 2 to re-challenge.
+    //
+    //   Phase 2 (no fresh proof) — EMIT a `RequestLearnerProof{at_op: self.op, nonce, epoch,
+    //     config_id}` to the target's slot and return the RETRYABLE `ProofPending`. The driver/operator
+    //     retries; the matching `LearnerProof` fills `proof`, and the retry takes Phase 1. The challenge
+    //     is IDEMPOTENT in its head: while a reply is still IN FLIGHT (an outstanding challenge for THIS
+    //     target + head with `proof == None`), a re-propose REUSES the same `nonce` and merely
+    //     retransmits — it does NOT re-draw, which would supersede its own challenge and drop the in-flight
+    //     reply, so a caller retrying faster than the round-trip would never converge. A NEW target, an
+    //     ADVANCED head, or an already-arrived (stale, below-head) reply draws a FRESH `nonce` to
+    //     re-solicit a current frontier. A crash between challenge and reply leaves `proof = None` →
+    //     `ProofPending` persists → no unsafe promotion (fail-closed). The `(epoch, config_id)` reply
+    //     binding + the per-challenge `nonce` are the freshness backstops (a replayed / cross-epoch /
+    //     wrong-target reply never validates).
+    if let SingleVoterDelta::PromoteLearner(target) = &delta {
+      let fresh = self.learner_proof.is_some_and(|c| {
+        c.target == *target
+          && c.at_op.get() >= self.op.get()
+          && c.proof.is_some_and(|f| f.get() >= self.op.get())
+      });
+      if fresh {
+        // Consume the single-shot proof token; the mint below proceeds.
+        self.learner_proof = None;
+      } else {
+        // `apply_delta` already validated `target` is a current learner, so its slot resolves.
+        let slot = self
+          .membership
+          .slot_of(*target)
+          .expect("a validated PromoteLearner target occupies a slot");
+        // Reuse an IN-FLIGHT challenge (same target + head, no reply yet) so an unpaced re-propose
+        // retransmits the same `nonce` instead of superseding its own outstanding challenge.
+        let reuse = self.learner_proof.is_some_and(|c| {
+          c.target == *target && c.at_op.get() == self.op.get() && c.proof.is_none()
+        });
+        let nonce = if reuse {
+          self
+            .learner_proof
+            .expect("reuse implies an outstanding challenge")
+            .nonce
+        } else {
+          self.nonce = self.nonce.wrapping_add(1);
+          self.learner_proof = Some(LearnerProofState {
+            target: *target,
+            at_op: self.op,
+            nonce: self.nonce,
+            proof: None,
+          });
+          self.nonce
+        };
+        self.emit(Outgoing::new(
+          Recipient::To(Peer::Replica(slot)),
+          Message::RequestLearnerProof(crate::RequestLearnerProof::new(
+            self.local_slot(),
+            self.op,
+            nonce,
+            self.membership.epoch(),
+            self.membership.config_id(),
+          )),
+        ));
+        return Err(ProposeMembershipError::ProofPending);
+      }
     }
 
     // XI-b ADMISSION for `AddVoter` (the sibling hazard to the catch-up-then-promote gate above): an

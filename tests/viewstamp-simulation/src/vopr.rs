@@ -1359,8 +1359,9 @@ const RECONFIG_DELTA_MAGIC: u64 = 0xD17A_5E11_C04F_1235;
 /// The per-client request budget the LIVE-RECONFIG axis uses (vs the much larger `requests_per_client`
 /// of the other lanes): FINITE and small enough to DRAIN within the tick budget, so the cluster reaches
 /// a lull where the genesis learner's durable frontier catches the head and the proto's
-/// catch-up-then-promote gate is satisfiable — i.e. the slot-shifting `PromoteLearner` actually COMMITS
-/// instead of being perpetually `TargetNotCaughtUp` under sustained load. Large enough to cross several
+/// catch-up-then-promote gate is satisfiable — i.e. the slot-shifting `PromoteLearner`'s promote-time
+/// challenge gets a fresh proof covering the head, so it actually COMMITS instead of stalling at
+/// `ProofPending` under sustained load (the head outrunning the proof). Large enough to cross several
 /// checkpoints first (the swap straddles real committed history). Only this axis uses it (a separate
 /// build path), so every other lane's load — and the off-axis byte-identity — is unchanged.
 const RECONFIG_LIVE_REQUESTS_PER_CLIENT: u64 = 40;
@@ -1472,8 +1473,9 @@ impl Vopr {
     // Each client issues many requests; with a few thousand ticks and faults, the run rarely drains
     // them, so there is almost always pending load to commit (keeps the liveness check non-vacuous). The
     // LIVE-RECONFIG axis is the exception: it uses a FINITE, DRAINABLE budget so the cluster reaches a
-    // lull where the genesis learner catches the head and a slot-shifting `PromoteLearner` can pass the
-    // catch-up gate + COMMIT (see `RECONFIG_LIVE_REQUESTS_PER_CLIENT`). This is a CONSTANT swap — it
+    // lull where the genesis learner catches the head and a slot-shifting `PromoteLearner` can satisfy the
+    // promote-time challenge (its fresh `LearnerProof` frontier reaches the head) + COMMIT (see
+    // `RECONFIG_LIVE_REQUESTS_PER_CLIENT`). This is a CONSTANT swap — it
     // consumes no PRNG — so it perturbs no draw position; only this axis's own deterministic baseline
     // moves, and the off-axis (`run_vopr`) schedule + byte-identity are untouched.
     let requests_per_client = if self.live_reconfig_axis {
@@ -2425,11 +2427,16 @@ impl Vopr {
     //
     // The kind is drawn from a SEPARATE per-seed PRNG (`seed ^ RECONFIG_DELTA_MAGIC`), so the action
     // stream `self.prng` keeps its exact draw positions (the cadence + every other action unchanged). The
-    // budget (`live_reconfig_actions`) is consumed only on an ACCEPTED proposal, so a `PromoteLearner`
-    // momentarily refused by the catch-up gate RETRIES on the next cadence tick rather than burning the
-    // budget on a not-yet-caught-up refusal — keeping the swap NON-VACUOUS. A seed with no genesis learner
-    // falls back to `AddLearner`, so the budget is never wasted and the cross-seed `live_swaps_observed >
-    // 0` non-vacuity holds.
+    // budget (`live_reconfig_actions`) is consumed only on an ACCEPTED proposal (a mint), so a
+    // `PromoteLearner` not yet minted RETRIES on the next cadence tick rather than burning the budget —
+    // keeping the swap NON-VACUOUS. The catch-up-then-promote gate is now a PROMOTE-TIME CHALLENGE: the
+    // first propose with no fresh proof emits a `RequestLearnerProof` to the target and returns the
+    // RETRYABLE `ProofPending`; the sim network delivers that challenge + the target's `LearnerProof` reply
+    // generically (both flow like any other directed message — no per-variant plumbing), and a later
+    // cadence re-propose finds the fresh proof (frontier >= head) and MINTS. So the retry loop here drives
+    // the full challenge round-trip: `ProofPending` (and a transient `NotPrimary`/`Busy`) is just "not yet,
+    // retry", never a failure. A seed with no genesis learner falls back to `AddLearner`, so the budget is
+    // never wasted and the cross-seed `live_swaps_observed > 0` non-vacuity holds.
     if self.live_reconfig_axis
       && self.prng.chance(1, 200)
       && self.live_reconfig_actions < LIVE_RECONFIG_BUDGET
@@ -2453,9 +2460,11 @@ impl Vopr {
           }
         }
         Err(e) => {
-          // Momentarily refused (a view change races the serving-primary check, a prior change is still
-          // latched, or a `PromoteLearner`'s target is not yet caught up). The budget is NOT consumed, so
-          // the cadence retries until the change commits — keeping the swap NON-VACUOUS.
+          // Not yet minted (a view change races the serving-primary check, a prior change is still
+          // latched, or a `PromoteLearner` is mid-challenge — `ProofPending` while the
+          // `RequestLearnerProof`/`LearnerProof` round-trip is in flight). The budget is NOT consumed, so
+          // the cadence retries until the change commits — keeping the swap NON-VACUOUS. The retry is what
+          // re-proposes after the fresh `LearnerProof` lands, so the promote mints on a later tick.
           if trace {
             eprintln!(
               "tick {tick}: LIVE-RECONFIG {} refused: {e:?}",
@@ -2480,7 +2489,11 @@ impl Vopr {
   /// surviving learners shift — and the slot↔`MemberId` routing translation in `Cluster` resolves all of
   /// them). The live-reconfig axis runs a FINITE, DRAINABLE client load (see `build_cluster`), so the
   /// genesis learner's durable frontier reaches the head in a lull and the proto's catch-up-then-promote
-  /// gate is satisfiable — the promote COMMITS rather than being perpetually `TargetNotCaughtUp`.
+  /// gate is satisfiable — the promote COMMITS rather than being perpetually refused. The gate is a
+  /// promote-time CHALLENGE: the propose loop in `apply_actions` re-proposes across the
+  /// `RequestLearnerProof`/`LearnerProof` round-trip (the `ProofPending` retry), and once the target's
+  /// fresh proof covers the head the promote mints — the challenge is driven entirely over the existing
+  /// sim network (both new variants flow like any directed message).
   ///
   /// `RemoveVoter` is DELIBERATELY NOT driven: a removed voter cannot be ROUTED its catch-up reply in this
   /// slot-addressed simulator (it is absent from every survivor's successor membership, so a donor has no

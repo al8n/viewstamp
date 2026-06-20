@@ -111,10 +111,23 @@ pub enum ProposeMembershipError {
   TwoVoterJump,
   /// The target of a learner-promotion is not yet caught up to the cluster's committed frontier, so
   /// promoting it into the voting set would shrink the live quorum below what the survivors can form.
-  /// Returned by the learner-promote gate (a later task), not by the bare proposal-mint path; the
-  /// variant is wired now so the promote gate has its verdict ready.
+  /// The catch-up-then-promote gate now re-grounds this freshly per propose via a
+  /// `RequestLearnerProof`/`LearnerProof` round-trip and returns [`Self::ProofPending`] while the proof
+  /// is outstanding, so the live `propose_membership` path no longer returns this variant; it is kept
+  /// for the capability ladder (a definitive "not caught up" verdict a future path may surface).
   #[error("the promotion target has not caught up to the committed frontier")]
   TargetNotCaughtUp,
+  /// A `PromoteLearner` has NO fresh validated catch-up proof yet: the gate solicited a
+  /// `RequestLearnerProof` from the target (or is awaiting the matching `LearnerProof`), so it cannot
+  /// safely mint the promotion this turn. RETRYABLE — exactly the existing transient-retry contract of
+  /// [`Self::Busy`]/[`Self::AtCapacity`]: the caller retries, and once the learner's fresh
+  /// `LearnerProof` reports a contiguous applied frontier covering the head the retry mints the op. A
+  /// regressed / stale-nonce / cross-epoch / missing reply keeps the gate returning this (fail-closed),
+  /// so a learner that honestly fell below a repair hole across a crash is never promoted on a banked
+  /// stale-high self-report. The safety input is the FRESH proof re-grounded in the learner's durable
+  /// storage at propose time, never an accumulated frontier.
+  #[error("the learner-promotion proof is pending: a fresh catch-up proof was solicited — retry")]
+  ProofPending,
   /// An `AddVoter` would admit a brand-new voter — one holding NO committed prefix — into a successor
   /// whose view-change quorum the new voter alone can satisfy, breaking the XI-b old-write-quorum /
   /// new-view-change-quorum intersection. This is the single-voter predecessor case: from a 1-voter

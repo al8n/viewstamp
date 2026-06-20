@@ -292,6 +292,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // proposed-but-never-committed deadlock). Either way the proposal phase is over, so release it (the
     // committed-but-not-installed swap, tracked separately in `pending_swap`, is NOT released — see below).
     self.reconfigure_inflight = None;
+    // Drop any outstanding learner-promote-proof challenge: it is TRANSIENT promote state bound to the
+    // proposing generation a view change ends. A new primary re-challenges fresh on its own
+    // `propose_membership`; carrying a stale challenge across would let a pre-transition reply (or a
+    // reply meant for the old generation) satisfy a post-transition mint. (The `(epoch, config_id)`
+    // reply binding is the backstop; this is the primary clear.)
+    self.learner_proof = None;
     // KEEP a committed-but-not-installed epoch swap across the transition. `pending_swap` is set ONLY for
     // a COMMITTED `Reconfigure` op (`stage_epoch_swap` runs at commit, after `commit_min` advanced past
     // the op), so the change is durable in the log and MUST still install — dropping it would lose a
