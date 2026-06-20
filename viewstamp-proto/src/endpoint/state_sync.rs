@@ -496,18 +496,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     self.sync_serving.remove(&to);
     // Durable-view-before-participate: the shipped `SyncCheckpoint` advertises
-    // `self.view` (see below). A replica in its `pending_sb` window (a new primary between
+    // `self.view` (see below). A replica in its view-CHANGING `pending_sb` window (a new primary between
     // `start_view_as_new_primary` and the `on_sb_done` that makes its view durable — or any replica mid
     // `AdoptedStartView`/`SendDoViewChange` write) is `Normal` but its view is NOT yet recoverable;
     // serving a `SyncCheckpoint(self.view)` now would advertise a view a crash could roll back — the
-    // same hazard the `Prepare`/`Commit`/`StartView`/`RecoveryResponse` paths gate on. The served
-    // checkpoint is committed and its CONTENT is view-independent, so the requester loses nothing by
-    // waiting: it re-solicits on its `sync_solicit` timer and a Normal+durable peer answers (and we
-    // answer once our own view is durable). Negligible liveness cost; consistent with the class — the
-    // same shape as the `on_request_prepare` drop. (The submit side, `on_request_sync`, also
-    // gates on status, but this SHIP-time gate is the load-bearing one: the view may have advanced
-    // between the read submit and its completion.)
-    if !self.status.is_normal() || self.pending_sb.is_some() {
+    // same hazard the `Prepare`/`Commit`/`StartView`/`RecoveryResponse` paths gate on. A commit-first
+    // SwapEpoch root does NOT raise this fence (the view is durable through an epoch swap —
+    // [`Self::pending_durable_view`]). The served checkpoint is committed and its CONTENT is
+    // view-independent, so the requester loses nothing by waiting: it re-solicits on its `sync_solicit`
+    // timer and a Normal+durable peer answers (and we answer once our own view is durable). Negligible
+    // liveness cost; consistent with the class — the same shape as the `on_request_prepare` drop. (The
+    // submit side, `on_request_sync`, also gates on status, but this SHIP-time gate is the load-bearing
+    // one: the view may have advanced between the read submit and its completion.)
+    if !self.status.is_normal() || self.pending_durable_view() {
       return; // no longer a trustworthy server, or our view is not yet durable — drop.
     }
     if to.get() >= self.membership.node_count() {
@@ -649,9 +650,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // Durable-view-before-participate at the DIRECT-ship gate: a cache-hit chunk is emitted from
     // this handler (no read completion re-gates it), and a `SyncChunk` advertises `self.view` — so
-    // drop while a durable-view write is in flight, exactly as `serve_sync_checkpoint` does at ship
-    // time. The requester re-solicits; we answer once the view is durable.
-    if self.pending_sb.is_some() {
+    // drop while a view-CHANGING write is in flight, exactly as `serve_sync_checkpoint` does at ship
+    // time. A commit-first SwapEpoch root does NOT raise this fence (the view is durable through an epoch
+    // swap — [`Self::pending_durable_view`]). The requester re-solicits; we answer once the view is durable.
+    if self.pending_durable_view() {
       return;
     }
     if let Some(d) = &self.sync_donating

@@ -5,7 +5,8 @@ use smol_str::SmolStr;
 
 use viewstamp_proto::{
   Committed, Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, MemberId, Membership,
-  Message, OpNumber, Outgoing, Peer, Prng, Recipient, Recovered, ReplicaId, Wal, prepare_restart,
+  MembershipChanged, Message, OpNumber, Outgoing, Peer, Prng, ProposeMembershipError, Recipient,
+  Recovered, ReplicaId, SingleChange, SingleVoterDelta, Wal, prepare_restart,
 };
 
 use crate::{
@@ -69,9 +70,18 @@ impl OfflineReconfig {
   }
 }
 
-/// A deterministic single-thread cluster of `Endpoint<SimSm>` replicas + clients.
+/// A deterministic single-thread cluster of `Endpoint<SimSm, SingleChange>` replicas + clients.
+///
+/// The replicas carry the [`SingleChange`] reconfiguration capability marker unconditionally. The
+/// marker is a zero-sized `PhantomData<fn() -> R>` witness with NO runtime representation — every
+/// runtime method (`tick`/`handle_message`/`handle_storage`/`handle_timeout`/`recover`) lives on
+/// `impl<S, R: Reconfig>` and behaves identically regardless of `R`, so building every replica as
+/// `SingleChange` rather than the default `RestartOnly` is byte-identical at runtime (it adds no
+/// field, no branch, no allocation). It simply makes [`Endpoint::propose_membership`] reachable so the
+/// cluster can drive a LIVE single-member reconfiguration; a cluster that never proposes one runs
+/// exactly as a `RestartOnly` cluster would.
 pub struct Cluster {
-  replicas: Vec<Endpoint<SimSm>>,
+  replicas: Vec<Endpoint<SimSm, SingleChange>>,
   /// Per-replica write-ahead logs (persist across crashes; see `crash`).
   wals: Vec<InMemoryWal>,
   /// Per-replica superblocks (persist across crashes; see `crash`).
@@ -221,6 +231,15 @@ pub struct Cluster {
   /// bookkeeping for the applied-once checker: capturing events the endpoint already produced takes
   /// no PRNG draw, sends no message, and writes no storage.
   applied_streams: Vec<Vec<(u64, AppliedEvent)>>,
+  /// Per-replica recorded MEMBERSHIP-SWAP stream: every [`Event::MembershipChanged`] drained from the
+  /// endpoint (one per committed `Reconfigure` op whose durable `SwapEpoch` root landed on this
+  /// replica), tagged with the replica's incarnation at the swap. Filled by the per-tick event drain
+  /// in [`record_applied_events`](Self::record_applied_events). Observation-only bookkeeping for the
+  /// live-reconfiguration checkers (the applied-once swap oracle + the config-lineage chain): capturing
+  /// an event the endpoint already produced takes no PRNG draw, sends no message, and writes no storage,
+  /// so it leaves every schedule byte-identical. Empty on every run that never proposes a live
+  /// reconfiguration (the default sweep + the offline-reconfig axis never emit `MembershipChanged`).
+  membership_swaps: Vec<Vec<(u64, MembershipChanged)>>,
   /// Per-replica INCARNATION counter: 0 from construction, +1 per [`restart`](Self::restart) /
   /// [`wipe_and_restart`](Self::wipe_and_restart) (and per pre-run endpoint rebuild —
   /// [`set_max_client_sessions`](Self::set_max_client_sessions) /
@@ -312,13 +331,16 @@ impl Cluster {
   ) -> Self {
     let node_count = replica_count as u16 + learner_count;
     let membership = Self::genesis_membership(replica_count, learner_count);
-    let replica_set: Vec<Endpoint<SimSm>> = (0..node_count)
+    let replica_set: Vec<Endpoint<SimSm, SingleChange>> = (0..node_count)
       .map(|i| {
         // `MemberId::new(i)` occupies slot `i` in the genesis membership, so every node's local slot
         // equals its old replica index — quorum/primary/voter logic is byte-identical at epoch 0.
         let cfg = Config::with_checkpoint_ops(1, MemberId::new(i as u128), checkpoint_ops)
           .expect("valid cluster config");
-        Endpoint::new(
+        // `with_reconfig` opts into the `SingleChange` capability; it constructs IDENTICAL state to the
+        // `RestartOnly` `Endpoint::new` (the latter delegates here with `R = RestartOnly`), so the
+        // capability marker changes no runtime byte — it only makes `propose_membership` reachable.
+        Endpoint::<SimSm, SingleChange>::with_reconfig(
           cfg,
           membership.clone(),
           seed ^ (i as u64).wrapping_mul(0x1234_5678),
@@ -365,6 +387,7 @@ impl Cluster {
       slow_delays_applied: 0,
       stale_read_probes_fired: 0,
       applied_streams: vec![Vec::new(); n],
+      membership_swaps: vec![Vec::new(); n],
       incarnations: vec![0; n],
       was_recovering_head: vec![false; n],
       was_recovering_head_inc: vec![0; n],
@@ -529,6 +552,81 @@ impl Cluster {
   /// stream is append-only across the cluster's lifetime.
   pub fn replica_applied_events(&self, i: usize) -> &[(u64, AppliedEvent)] {
     &self.applied_streams[i]
+  }
+
+  /// Replica `i`'s recorded MEMBERSHIP-SWAP stream (for the live-reconfiguration checkers): every
+  /// [`Event::MembershipChanged`] it emitted — one per committed `Reconfigure` op whose durable
+  /// `SwapEpoch` root landed on this replica, in swap order — each tagged with the incarnation (see
+  /// [`Self::replica_incarnation`]) it swapped in. The stream is append-only across the cluster's
+  /// lifetime. Empty unless a live single-change reconfiguration was driven (the default sweep + the
+  /// offline-reconfig axis never emit `MembershipChanged`).
+  pub fn replica_membership_swaps(&self, i: usize) -> &[(u64, MembershipChanged)] {
+    &self.membership_swaps[i]
+  }
+
+  /// The total number of live membership swaps observed across all replicas so far — the
+  /// non-vacuity witness that a live single-change reconfiguration genuinely committed and installed
+  /// its durable epoch swap on the cluster. `0` on every run that never proposes one.
+  pub fn membership_swaps_observed(&self) -> usize {
+    self.membership_swaps.iter().map(Vec::len).sum()
+  }
+
+  /// The set of committed `Reconfigure` op NUMBERS observed across all replicas' swap streams (each
+  /// `MembershipChanged` names the committed op whose durable swap installed). A `Reconfigure` op is a
+  /// CONSENSUS-LAYER op — committed and assigned an op number, but NOT applied to the state machine
+  /// (it carries no client request) — so its op number is ABSENT from every replica's `applied()`
+  /// stream, creating a legitimate gap in the applied op-number sequence. The safety contiguity check
+  /// reads this to EXPECT exactly those gaps. Empty on every run that never reconfigures.
+  pub fn committed_reconfigure_ops(&self) -> std::collections::BTreeSet<u64> {
+    self
+      .membership_swaps
+      .iter()
+      .flat_map(|stream| stream.iter().map(|(_, mc)| mc.op().get()))
+      .collect()
+  }
+
+  /// Whether replica `i` is currently a VOTER in its DURABLE membership (occupies a voting slot). A
+  /// promoted learner reads `true` once its swap root is durable; a removed node reads `false`. Read
+  /// off the superblock so it reflects the committed-and-durable configuration the node acts under.
+  pub fn replica_is_voter(&self, i: usize) -> bool {
+    use viewstamp_proto::Superblock;
+    let state = self.sbs[i].state();
+    state.membership_opt().is_some_and(|m| {
+      m.slot_of(MemberId::new(i as u128))
+        .is_some_and(|slot| m.is_voter(slot))
+    })
+  }
+
+  /// Whether replica `i` is currently a non-voting LEARNER in its DURABLE membership. A genesis
+  /// learner reads `true` until it is promoted; a voter reads `false`.
+  pub fn replica_is_learner(&self, i: usize) -> bool {
+    use viewstamp_proto::Superblock;
+    let state = self.sbs[i].state();
+    state.membership_opt().is_some_and(|m| {
+      m.slot_of(MemberId::new(i as u128))
+        .is_some_and(|slot| m.is_learner(slot))
+    })
+  }
+
+  /// Whether replica `i` is currently a MEMBER of its DURABLE membership at all (voter or learner). A
+  /// node a reconfiguration removed reads `false` (its stable id resolves to no slot). A node on a
+  /// legacy (pre-membership) root reads `false` too — but a v4 cluster always carries a membership.
+  pub fn replica_is_member(&self, i: usize) -> bool {
+    use viewstamp_proto::Superblock;
+    let state = self.sbs[i].state();
+    state
+      .membership_opt()
+      .is_some_and(|m| m.slot_of(MemberId::new(i as u128)).is_some())
+  }
+
+  /// The number of VOTERS in replica `i`'s DURABLE membership (`replica_count`), or `None` on a
+  /// legacy root. The live voting-set size the reconfiguration grows/shrinks.
+  pub fn replica_voter_count(&self, i: usize) -> Option<u8> {
+    use viewstamp_proto::Superblock;
+    self.sbs[i]
+      .state()
+      .membership_opt()
+      .map(|m| m.replica_count())
   }
 
   /// Replica `i`'s current INCARNATION (for the applied-once checker): 0 from construction, +1 on
@@ -994,7 +1092,10 @@ impl Cluster {
     // voting/learner split so a same-epoch legacy bridge still resolves every node.
     let membership = Self::genesis_membership(self.replica_count, self.learner_count);
     let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
-    match Endpoint::recover(
+    // `recover_with_reconfig` reconstructs the endpoint under the `SingleChange` marker; it runs the
+    // IDENTICAL recovery path as the `RestartOnly` `Endpoint::recover` (which delegates here with
+    // `R = RestartOnly`), so the marker changes no recovered byte.
+    match Endpoint::<SimSm, SingleChange>::recover_with_reconfig(
       cfg,
       membership,
       seed,
@@ -1053,6 +1154,54 @@ impl Cluster {
       None => InMemorySuperblock::with_faults(self.storage_faults, s),
     };
     self.restart(i);
+  }
+
+  /// Propose a LIVE single-member reconfiguration on the cluster's current serving primary: validate
+  /// `delta` against the primary's configuration, mint the `Body::Reconfigure` op, and latch the
+  /// single-writer in-flight change. The op then replicates + commits + swaps the epoch under the
+  /// cluster's ORDINARY [`tick`](Self::tick) loop (the adversarial schedule), exactly as a client op
+  /// does — this just injects the proposal; it drives nothing inline. Returns the proposed op number
+  /// on success, or the proto's [`ProposeMembershipError`] (e.g. `NotPrimary` if no serving primary
+  /// exists this instant, `AlreadyInFlight` if a prior change has not yet committed, or
+  /// `TargetNotCaughtUp` for a `PromoteLearner` whose target has not yet reported a covering
+  /// `LearnerStatus`).
+  ///
+  /// Unlike [`reconfigure_offline`](Self::reconfigure_offline) (which stops the whole cluster), this
+  /// keeps every node UP: it is the Tier B live-change path. The proto's commit-first epoch swap
+  /// installs the successor membership only once each committing replica's durable `SwapEpoch` root
+  /// lands, firing [`Event::MembershipChanged`] — which the cluster captures into
+  /// [`replica_membership_swaps`](Self::replica_membership_swaps) for the live-reconfiguration
+  /// checkers. `None` of the cluster's per-replica vectors are resized: a live change moves members
+  /// WITHIN the genesis node set (a genesis learner promoted to voter, a voter removed), so every
+  /// member that ever participates already has a running endpoint.
+  pub fn propose_reconfigure_single_change(
+    &mut self,
+    delta: SingleVoterDelta,
+  ) -> Result<OpNumber, ProposeMembershipError> {
+    let now = self.clock.now();
+    let Some(primary) = self.serving_primary() else {
+      return Err(ProposeMembershipError::NotPrimary);
+    };
+    self.replicas[primary].propose_membership(now, &mut self.wals[primary], delta)
+  }
+
+  /// The serving primary's current head op (`self.op`) — the frontier a `PromoteLearner`'s target
+  /// must durably cover to pass the proto's exact catch-up gate (`peer_progress[target] >= head`).
+  /// `None` if there is no serving primary this instant. The axis/test compares it against the
+  /// learner's durable commit ([`Self::replica_durable_commit`]) to know when a promote is worth
+  /// attempting (the proto re-validates the gate authoritatively at the proposal).
+  pub fn primary_head(&self) -> Option<u64> {
+    let primary = self.serving_primary()?;
+    Some(self.replicas[primary].op().get())
+  }
+
+  /// Replica `i`'s DURABLE-root committed frontier (`sb.state().commit()`) — exactly the
+  /// `durable_commit_min` a learner advertises in its [`LearnerStatus`], so the catch-up-then-promote
+  /// gate on the primary is satisfied once a learner's value here covers the primary's head AND a
+  /// report has propagated. Read off the superblock the proto recovers from.
+  pub fn replica_durable_commit(&self, i: usize) -> u64 {
+    use viewstamp_proto::Superblock;
+    self.sbs[i].state().commit().get()
   }
 
   /// A coordinated offline reconfiguration that DELIBERATELY drives the
@@ -1458,7 +1607,12 @@ impl Cluster {
     for i in 0..self.replicas.len() as u16 {
       let cfg = self.replica_config(i);
       let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
-      self.replicas[i as usize] = Endpoint::new(cfg, membership.clone(), seed, self.make_sm());
+      self.replicas[i as usize] = Endpoint::<SimSm, SingleChange>::with_reconfig(
+        cfg,
+        membership.clone(),
+        seed,
+        self.make_sm(),
+      );
       self.incarnations[i as usize] += 1;
     }
   }
@@ -2012,6 +2166,23 @@ impl Cluster {
       self.replicas[ri].handle_storage(now, &mut self.wals[ri], &mut self.sbs[ri]);
     }
 
+    // Drain the apply/swap events this second pump produced BEFORE the per-tick invariant check reads the
+    // state. The state machine applies synchronously inside `handle_*` (so `replica_sm().applied()` shows
+    // the gap a committed `Reconfigure` op leaves the instant it commits), but the matching
+    // `Event::MembershipChanged` — which `committed_reconfigure_ops()` reads to EXPECT that gap — sits in
+    // the proto out-queue until drained. A swap whose durable `SwapEpoch` root lands in THIS pump (the
+    // new primary that preserved + recommitted a carried reconfigure body installs here) would otherwise
+    // be visible as the applied gap one full tick before its op number entered the reconfigure-op set,
+    // tripping the contiguity oracle on a benign drain-lag. Draining here keeps the two observations in
+    // step. Observation-only (drains the out-queue; no PRNG draw / message / storage write), so off-axis
+    // schedules stay byte-identical.
+    for ri in 0..self.replicas.len() {
+      if self.crashed[ri] {
+        continue;
+      }
+      self.record_applied_events(ri);
+    }
+
     // Per-tick re-formation observer — pure observation (no PRNG draw, message, or storage write), so
     // off-axis schedules stay byte-identical. A crashed node is skipped (its state and incarnation are
     // frozen until it restarts); this runs at the one point every tick passes through, so an escalation
@@ -2060,6 +2231,13 @@ impl Cluster {
         }
         Event::StateSyncCompleted(op) => {
           self.applied_streams[ri].push((self.incarnations[ri], AppliedEvent::SyncPoint(op)));
+        }
+        // A committed `Reconfigure` op's durable `SwapEpoch` root landed: the live-reconfiguration
+        // checkers fold this per-replica stream (the applied-once swap oracle + the config-lineage
+        // chain). Tagged with the incarnation so a crash-restart that re-installs a swap is keyed
+        // distinctly from the first install.
+        Event::MembershipChanged(mc) => {
+          self.membership_swaps[ri].push((self.incarnations[ri], mc));
         }
         _ => {}
       }

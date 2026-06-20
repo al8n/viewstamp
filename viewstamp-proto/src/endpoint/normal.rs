@@ -1,5 +1,33 @@
 use super::*;
 
+/// Why a NEW op cannot be minted right now — the shared, op-content-INDEPENDENT admission verdict that
+/// fences BOTH the client-request path ([`Endpoint::on_request`]) and the reconfiguration-proposal path
+/// ([`Endpoint::propose_membership`](crate::Endpoint::propose_membership)). It enumerates EXACTLY the
+/// preconditions `on_request` checks before minting that do not depend on the client/session identity
+/// (the session dedup + the session-table cap stay in `on_request`, being client-op-specific). Every
+/// variant is TRANSIENT — it self-releases as the cluster makes progress — so a proposer maps it to a
+/// RETRYABLE error rather than treating it as a permanent rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NewOpReject {
+  /// Not a `Normal` primary (a backup, or mid-view-change/recovery) — only a `Normal` primary mints.
+  NotNormalPrimary,
+  /// A view-CHANGING durable-view write is pending OR a state-sync / checkpoint-persist is in flight:
+  /// minting now would advertise an op in a view this node may roll back, or reuse an op number a
+  /// `self.op` reset is about to free. The whole `pending_sb` / `sync` / `pending_checkpoint` guard.
+  Busy,
+  /// A forfeit/step-down is flagged (`pending_forfeit`): this primary has decided to abdicate and reset
+  /// `self.op` below a value the cluster moved past, so a new op would reuse a committed op number.
+  SteppingDown,
+  /// The committed prefix is not yet applied (`commit_max > commit_min`, or a repair hole): a fresh op
+  /// on a stale session table could double-execute a retry once the gap fills. Catch up first.
+  CommitGap,
+  /// The accepted-but-uncommitted pipeline `(commit_min, op]` is at [`MAX_PIPELINE`] depth.
+  PipelineFull,
+  /// Minting the next op would overflow the bounded WAL ring OR push the header-only view-change-carrier
+  /// band past its frame-fit depth ([`Endpoint::band_at_capacity`]) — physical back-pressure.
+  AtCapacity,
+}
+
 impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn primary_timeouts<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // Deferred forfeit: a primary that hit the force-sync strand
@@ -69,11 +97,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // heartbeat (`Commit`) nor retransmit prepares (`Prepare`) in a view it could regress out of on
     // crash — those assert this replica's authority in the not-yet-durable view (the same hazard the
     // `on_get_view`/`on_recovery` gates close on the message side). Skip the whole heartbeat /
-    // retransmit / forfeit-evaluation tick while the write is pending; `start_view_participate` (run
-    // from `on_sb_done` once the view IS durable) arms the timers and begins committing, after which
+    // retransmit / forfeit-evaluation tick while a VIEW-CHANGING write is pending; `start_view_participate`
+    // (run from `on_sb_done` once the view IS durable) arms the timers and begins committing, after which
     // ordinary ticks resume. The deferred forfeit above is exempt: it is a STEP-DOWN (it proposes a
     // higher view via `propose_next_view`), not participation as this view's primary.
-    if self.pending_sb.is_some() {
+    //
+    // A commit-first SwapEpoch root in flight is NOT gated here ([`Self::pending_durable_view`] excludes
+    // it): the view stays durable through an epoch swap, so the primary MUST keep heartbeating + committing
+    // AT the predecessor epoch through the stage→durable-root window — that advertised commit is what lets
+    // backups commit the `Reconfigure` op, stage their own swap, and converge. The successor epoch is still
+    // un-installed in this window (the install runs only at `on_sb_done`), so this is participation at E,
+    // the durable view + epoch, exactly as before the swap was staged.
+    if self.pending_durable_view() {
       // RETIRE every cadence timer for this window — the SAME
       // timer-level wedge as the forfeit branch above. `start_view_as_new_primary` flips status to
       // Normal-primary but DEFERS `arm_timers` to `start_view_participate` (on `on_sb_done`), so the
@@ -85,7 +120,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // superblock completion that begins participation, wedging the new primary. This window is driven
       // SOLELY by that superblock completion (no timer), so clearing them is correct: `poll_timeout()`
       // then yields `None` until `on_sb_done` → `start_view_participate` arms the real Normal-primary
-      // timers. Idempotent (once None they stay None; nothing re-arms them while `pending_sb` holds).
+      // timers. Idempotent (once None they stay None; nothing re-arms them while the view write holds).
       self.timers.commit = None;
       self.timers.prepare = None;
       self.timers.svc_message = None;
@@ -149,14 +184,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // hold such holes inside the un-acked window — a view-change adoption installs header-only
         // entries for ops whose bodies no donor shipped (the log carriers are header-only) — and the
         // windowed repair channel (`RequestPrepareRange` → `RepairBatch`) owns filling them; this
-        // primary is itself soliciting those bodies, so there is nothing to push. Treated like an op
-        // the log is missing — the `if let Some(..)` already skips those.
-        if let Some(LogEntry {
-          client,
-          request,
-          body: Body::Present(body),
-        }) = self.log.get(&op).cloned()
+        // primary is itself soliciting those bodies, so there is nothing to push. A `Body::Reconfigure`
+        // op IS body-bearing (`body_bytes()` yields its `encode_body()`) and MUST be retransmitted like a
+        // client op — else a dropped initial reconfiguration `Prepare` is never resent, the op sits in
+        // `(commit_min, op]` blocking later proposals (`has_pending_reconfigure`), and ordered commit
+        // stalls behind it until a view change happens to truncate it. The retransmitted entry carries the
+        // flat wire bytes; the receiver replays it through `on_prepare`, which rebuilds the typed
+        // `Body::Reconfigure` from the `RECONFIGURATION` client id (so the wire form is uniform).
+        if let Some(entry) = self.log.get(&op).cloned()
+          && let Some(body) = entry.body_bytes()
         {
+          let (client, request) = (entry.client, entry.request);
           let cost = crate::message::present_entry_encoded_len(body.len());
           // Adding this entry would push the batch past the frame budget — flush what accumulated
           // and start the next batch with it. The FIRST entry of a batch is always included (an
@@ -215,6 +253,67 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.maybe_forfeit(now, sb);
   }
 
+  /// The shared NEW-op admission gate: EVERY op-content-independent precondition `on_request` enforces
+  /// before minting a client op, so the reconfiguration-proposal path
+  /// ([`Endpoint::propose_membership`](crate::Endpoint::propose_membership)) honours the IDENTICAL
+  /// fences rather than mirroring NONE of them and minting straight through a pending durable-view write
+  /// (the durable-view-before-participate violation). Read-only; the caller owns any per-path bookkeeping
+  /// (the `wal_stalls` observability bump on `AtCapacity`, the client session row) and the actual mint.
+  ///
+  /// `on_request` additionally applies the client-op-specific session dedup + session-table cap, which
+  /// are NOT here (a reconfiguration uses the reserved sentinel client and no session row). Mapping these
+  /// transient verdicts back: `on_request` drops the request silently (the client retransmits);
+  /// `propose_membership` returns a retryable [`ProposeMembershipError`](crate::ProposeMembershipError).
+  pub(crate) fn check_new_op_admission<W: Wal>(&self, wal: &W) -> Result<(), NewOpReject> {
+    if !self.status.is_normal() || !self.is_primary() {
+      return Err(NewOpReject::NotNormalPrimary);
+    }
+    // Durable-view-before-participate: a pending superblock view-change write means status==Normal
+    // but our view is not yet persisted. Minting now would create+commit an op in a view we could regress
+    // out of on crash. ALSO refuse while a state-sync OR a checkpoint-persist is in flight: both can RESET
+    // `self.op` (a sync to the checkpoint via `apply_sync`; a checkpoint completion advances
+    // `checkpoint_op` and GCs), so assigning a new op now risks reusing an op number a backup still holds
+    // under different bytes (the op-reuse divergence `maybe_force_sync`'s primary step-down guards against).
+    if self.pending_sb.is_some() || self.sync.is_some() || self.pending_checkpoint.is_some() {
+      return Err(NewOpReject::Busy);
+    }
+    // A primary that has FLAGGED a forfeit (a step-down — `maybe_force_sync`'s primary guard, or the
+    // recovery-peer-fetch / state-sync apply that reset `self.op` back to a checkpoint) must NOT assign
+    // new ops: it has reset `self.op` below a value the cluster moved PAST (a newer view's primary already
+    // committed ops at those numbers), so a new op reuses a committed op number with DIFFERENT bytes.
+    if self.pending_forfeit {
+      return Err(NewOpReject::SteppingDown);
+    }
+    // Do not mint while our committed prefix is not yet applied (`commit_max > commit_min` — a committed
+    // op known but not applied, e.g. held by a repair hole): the session table is stale for the unapplied
+    // ops, and a fresh op assigned to a retry of one would double-execute it once the gap fills (the apply
+    // loop has no dedup). `!self.repair.is_empty()` is subsumed (a hole implies the gap) but stated for intent.
+    if self.commit_max.get() > self.commit_min.get() || !self.repair.is_empty() {
+      return Err(NewOpReject::CommitGap);
+    }
+    // Pipeline-cap: never let the accepted-but-uncommitted window `(commit_min, op]` exceed [`MAX_PIPELINE`].
+    // Releases as commits advance `commit_min`; bounds the prepare-retransmit working set and the bodies a
+    // slow quorum can pin above the commit frontier.
+    if self.op.get().saturating_sub(self.commit_min.get()) >= MAX_PIPELINE {
+      return Err(NewOpReject::PipelineFull);
+    }
+    // Physical bounded-WAL stall-before-wrap: never assign an op whose ring slot still holds an un-pruned
+    // op (one not yet checkpoint-subsumed on a quorum). The un-pruned window `(floor, op]` must fit in the
+    // WAL's `capacity()` slots; minting the next op makes it `next_op - floor` wide, so if THAT exceeds
+    // `capacity()` we STALL. The unbounded WAL (`capacity() == u64::MAX`) never overflows. ALSO the
+    // header-only view-change-carrier band frame-fit bound ([`Self::band_at_capacity`]) — the floor that
+    // still holds for an unbounded WAL. Both self-release as `quorum_checkpoint_op` rises and `run_gc`
+    // frees slots / shrinks the band.
+    let next_op = self.op.get().saturating_add(1);
+    let unpruned_window = next_op.saturating_sub(self.prune_floor().get());
+    let wal_would_overflow = unpruned_window > wal.capacity();
+    let band_would_overflow = self.band_at_capacity();
+    if wal_would_overflow || band_would_overflow {
+      return Err(NewOpReject::AtCapacity);
+    }
+    Ok(())
+  }
+
   pub(crate) fn on_request<W: Wal>(
     &mut self,
     now: Instant,
@@ -222,42 +321,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     _from: Peer,
     r: crate::Request,
   ) {
-    if !self.status.is_normal() || !self.is_primary() {
-      return; // backups ignore; the client retries to the primary
-    }
-    // Durable-view-before-participate: a pending superblock view-change write means status==Normal
-    // but our view is not yet persisted. Serving a request now would create+commit an op in a view
-    // we could regress out of on crash. Drop it — the client retries once the view is durable.
-    //
-    // DEFENSE: also drop while a state-sync OR a checkpoint-persist is in flight. Both
-    // can RESET `self.op` (a sync to the checkpoint via `apply_sync`; a checkpoint completion advances
-    // `checkpoint_op` and GCs) — assigning a new client request an op now risks reusing an op number a
-    // backup still holds under different bytes (the op-reuse divergence `maybe_force_sync`'s primary
-    // step-down guards against). A primary should never be syncing in steady state, so this only ever
-    // drops a request during an abnormal in-flight reset; the client retries once it settles.
-    if self.pending_sb.is_some() || self.sync.is_some() || self.pending_checkpoint.is_some() {
-      return;
-    }
-    // A primary that has FLAGGED a forfeit (it has
-    // decided to step down — `maybe_force_sync`'s primary guard, or the recovery-peer-fetch /
-    // state-sync apply that reset this replica's `op` back to a checkpoint) must NOT assign new ops. It
-    // has just RESET `self.op` to (a checkpoint at or below) a value the cluster has moved PAST — under
-    // a NEWER view a fresh primary already committed ops at those numbers. Accepting a client request
-    // now reuses a committed op number with DIFFERENT bytes (the stale-primary op-reuse divergence).
-    // The forfeit is latched and acted on by the next `primary_timeouts` tick, but a client
-    // request can arrive (via `handle_message`) BEFORE that tick — so the op-assignment gate, not just
-    // the timer, must honour the abdication. Drop the request; once the view change completes a
-    // caught-up primary serves it.
-    if self.pending_forfeit {
-      return;
-    }
-    // do not serve clients while our committed prefix is not yet applied. If commit_max >
-    // commit_min (a committed op is known but not yet applied — e.g. held by a repair hole), the client
-    // session table is stale for the unapplied ops; assigning a fresh op to a retry of one of them would
-    // double-execute it once the gap fills (the apply loop has no dedup). Make the primary catch up first;
-    // the client retries. (A healthy steady-state primary has commit_max == commit_min, so this never fires
-    // then.) `!self.repair.is_empty()` is subsumed (a hole implies commit_max > commit_min) but stated for intent.
-    if self.commit_max.get() > self.commit_min.get() || !self.repair.is_empty() {
+    // The shared op-content-independent admission gate (Normal-primary, no pending durable-view / sync /
+    // checkpoint write, no flagged forfeit, no commit gap, pipeline depth, WAL/carrier capacity). It is
+    // split across the session dedup below to PRESERVE this path's exact behaviour: the EARLY-state fences
+    // (not-primary / busy / stepping-down / commit-gap) drop the request BEFORE dedup, while the LATE
+    // CAPACITY fences (pipeline / WAL / band) are applied AFTER dedup — so a stale/duplicate request still
+    // gets its cached-reply RESEND (the dedup mints no op, and a capacity stall gates only a would-be NEW
+    // op, never a reply resend), exactly as the in-line order did before the extraction. `propose_membership`
+    // applies the whole gate up front (it has no session/dedup to interleave).
+    let admission = self.check_new_op_admission(wal);
+    if matches!(
+      admission,
+      Err(
+        NewOpReject::NotNormalPrimary
+          | NewOpReject::Busy
+          | NewOpReject::SteppingDown
+          | NewOpReject::CommitGap
+      )
+    ) {
       return;
     }
     // Dedup against an EXISTING session (clients send one request at a time, numbered 1..). An
@@ -311,43 +392,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       }
     }
 
-    // Pipeline-cap admission: never let the accepted-but-uncommitted window `(commit_min, op]` exceed
-    // [`MAX_PIPELINE`] — the sibling of the WAL-ring/carrier stalls below (drop this request WITHOUT
-    // advancing the watermark or minting the op; the client retransmits). Releases as commits advance
-    // `commit_min`. Bounds the prepare-retransmit working set ([`PREPARE_RETRANSMIT_WINDOW`]) and the
-    // bodies a slow quorum can pin in `self.log`/WAL above the commit frontier.
-    if self.op.get().saturating_sub(self.commit_min.get()) >= MAX_PIPELINE {
-      return;
-    }
-
-    // Physical bounded-WAL stall-before-wrap: never assign an op whose ring slot still holds an
-    // un-pruned op (one not yet checkpoint-subsumed on a quorum). The un-pruned window `(floor, op]`
-    // must fit in the WAL's `capacity()` slots; minting the next op would make it `next_op - floor`
-    // wide, so if THAT exceeds `capacity()` we STALL (drop this request — the client retransmits),
-    // applying back-pressure until the quorum checkpoints forward and `run_gc` frees slots. A stale /
-    // duplicate request (which mints no op) already got its cached-reply resend above, so the stall
-    // gates only a would-be NEW op. The unbounded WAL (`capacity() == u64::MAX`) never overflows, so
-    // the default never stalls. Requires `capacity > checkpoint_ops + pipeline headroom` or the stall
-    // would never release (documented on [`Self::prune_floor`] / the `Wal` capacity contract); a
-    // sub-interval ring would wedge here.
-    let next_op = self.op.get().saturating_add(1);
-    let unpruned_window = next_op.saturating_sub(self.prune_floor().get());
-    let wal_would_overflow = unpruned_window > wal.capacity();
-    // Header-only view-change-carrier backpressure — the frame-fit closure for an UNBOUNDED-WAL
-    // embedder, where `wal_would_overflow` never fires. Minting the next op grows both the retained
-    // `self.log` (the carrier-entry count) and the head span; [`Self::band_at_capacity`] documents the
-    // two-clause bound and why it gates the ACTUAL log, not the `next_op - prune_floor()` proxy.
-    let band_would_overflow = self.band_at_capacity();
-    // Op-admission backpressure: drop this NEW request — WITHOUT advancing `session.request` (so the
-    // client's retransmit is still the canonical next request, not seen as a gap) and WITHOUT minting
-    // the op — when minting the next op would EITHER overflow the WAL ring (its slot still holds an op
-    // the quorum has not yet checkpoint-subsumed) OR push the header-only view-change-carrier band past
-    // the frame-fit depth. Both self-release as `quorum_checkpoint_op` rises and `run_gc` frees slots /
-    // shrinks the band. An unbounded WAL never trips `wal_would_overflow`; the band bound is the
-    // frame-fit floor that still holds for it.
-    if wal_would_overflow || band_would_overflow {
-      self.wal_stalls += 1; // observability: prove the admission stall genuinely engaged
-      return;
+    // The LATE CAPACITY fences (pipeline depth / WAL-ring / carrier-band), applied here — AFTER the dedup
+    // resend above — so a would-be NEW op is dropped under back-pressure WITHOUT advancing the session
+    // watermark or minting, while a duplicate already got its reply resend. `AtCapacity` bumps the
+    // back-pressure observability counter exactly as the in-line stall did.
+    match admission {
+      Err(NewOpReject::AtCapacity) => {
+        self.wal_stalls += 1; // observability: prove the admission stall genuinely engaged
+        return;
+      }
+      Err(NewOpReject::PipelineFull) => return,
+      _ => {}
     }
 
     // Accept: assign the next op, submit to WAL, cache, broadcast Prepare.
@@ -473,11 +528,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       advanced = true;
     }
     self.commit_max = OpNumber::with(self.commit_max.get().max(self.commit_min.get()));
-    if advanced && self.pending_sb.is_none() {
-      // Tell backups the commit advanced (also serves as a heartbeat). Suppressed while a durable-view or
-      // SwapEpoch root is in flight (`pending_sb`): advertising the commit there would assert authority in a
-      // view/epoch not yet durable — the durable-view-before-participate fence the `emit` chokepoint
-      // enforces. The next commit tick or heartbeat re-advertises once the root lands.
+    if advanced && !self.pending_durable_view() {
+      // Tell backups the commit advanced (also serves as a heartbeat). Suppressed only while a view-CHANGING
+      // durable-view write is in flight (`pending_durable_view`): advertising the commit there would assert
+      // authority in a view not yet durable — the durable-view-before-participate fence the `emit` chokepoint
+      // enforces. A commit-first SwapEpoch root does NOT suppress it (the view is durable through an epoch
+      // swap), which is exactly what lets a backup learn the `Reconfigure` op committed, stage its own swap,
+      // and converge. The next commit tick or heartbeat re-advertises once any pending root lands.
       self.emit(Outgoing::new(
         Recipient::Backups,
         Message::Commit(Commit::new(
@@ -496,6 +553,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.cancel_forced_sync_if_satisfied();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(sb);
+    // Re-submit a staged epoch swap that is waiting for a free superblock slot — chiefly a `pending_swap`
+    // that SURVIVED a view change whose new generation issued no durable-view write (a `catch_up_to_view`):
+    // there is no `on_sb_done` re-trigger on that path, so the commit tail is the re-submit point. No-op
+    // unless a swap is staged AND the superblock is free (the same exclusion `maybe_checkpoint` enforces;
+    // a checkpoint queued just above keeps the swap waiting its turn, re-submitted from `on_sb_done`).
+    self.maybe_swap_epoch(sb);
   }
 
   /// Applies op `op` on the primary, caches + sends the reply, emits the event. Returns `true` if it
@@ -591,25 +654,53 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let Some(payload) = body.as_reconfigure() else {
       return false;
     };
-    // Chain the successor off the predecessor membership — the single source of the `(epoch,
-    // config_id)` derivation (identical on every replica, which all commit at this same predecessor).
-    // A committed reconfiguration's payload was validated at propose AND re-validated when the wire
-    // body decoded into `Body::Reconfigure`, so `reconfigure`'s structural re-check cannot fail here.
-    let successor = self
-      .membership
-      .reconfigure(
-        payload.replica_count(),
-        payload.learner_count(),
-        payload.members().to_vec(),
-      )
-      .expect("a committed reconfiguration op carries a structurally valid successor membership");
-    // The op is committed: advance the applied frontier past it (no `sm.apply`) and mark it committed
-    // for the primary's inflight tracker (a backup holds no inflight entry — the `if let` is a no-op).
+    // The op is committed at the consensus layer regardless of whether THIS node stages the swap: advance
+    // the applied frontier past it (no `sm.apply`) and mark it committed for the primary's inflight
+    // tracker (a backup holds no inflight entry — the `if let` is a no-op).
     self.set_commit_min(OpNumber::with(op));
+    // Lift the KNOWN-committed frontier to cover this op BEFORE staging the swap. On the PRIMARY commit
+    // path (`commit_op` ← `try_commit`) `commit_max` is raised to `commit_min` only AFTER the commit
+    // loop, but the SwapEpoch root is staged HERE, mid-loop: `submit_swap_epoch` reads `self.commit_max`
+    // as the root's durable `commit`, and `committed_band_headers` is bounded by `commit_max` — so a
+    // stale `commit_max` would mint a root recording the just-committed reconfigure op as NOT committed
+    // (commit < op, its band header omitted). A node recovering an E+1 membership off that root reads
+    // back a `commit_max` below the op (committed-loss; durable-epoch-before-participate + exact-catch-up
+    // violated). The op IS committed by construction here, so lifting `commit_max` to `commit_min` is
+    // honest, keeps the `commit_max >= commit_min` invariant intact across the stage, and makes the root
+    // durably prove the op committed. (The backup path's `advance_commit` already raised `commit_max` to
+    // its target before the loop, so this `.max` is a no-op there.)
+    self.commit_max = OpNumber::with(self.commit_max.get().max(self.commit_min.get()));
     if let Some(inflight) = self.inflight.get_mut(&op) {
       inflight.committed = true;
     }
-    self.stage_epoch_swap(successor, sb);
+    // PREDECESSOR-PINNED swap staging (the anti-fork gate). The successor `(epoch, config_id)` is derived
+    // by CHAINING off a predecessor (`epoch+1`, `config_id = hash(.., prev_config_id)`), so it is correct
+    // ONLY when chained from the EXACT predecessor the op was proposed against — pinned in the op as
+    // `prev_config_id`. Stage the swap iff this node's CURRENT configuration IS that predecessor:
+    // - match ⇒ this is the first time we cross this reconfiguration at its predecessor; chain + stage.
+    // - mismatch ⇒ we are NOT at the pinned predecessor: either we ALREADY installed this op's swap and
+    //   our `commit_min` later regressed below it (a state-sync / recovery install reset the applied
+    //   frontier while the durable membership stayed the post-swap one) and re-reached it, OR we are a
+    //   laggard not yet advanced to the predecessor. Either way re-deriving here would chain off the WRONG
+    //   configuration and FORK a grand-successor — so SKIP staging; the op stays committed (commit_min
+    //   advanced above) and the swap that already happened (or will, once we reach the predecessor) stands.
+    if self.membership.config_id() == payload.prev_config_id() {
+      // Chain the successor off the (now proven-correct) predecessor membership. A committed
+      // reconfiguration's payload was validated at propose AND re-validated when the wire body decoded
+      // into `Body::Reconfigure`, so `reconfigure`'s structural re-check cannot fail here.
+      let successor = self
+        .membership
+        .reconfigure(
+          payload.replica_count(),
+          payload.learner_count(),
+          payload.members().to_vec(),
+        )
+        .expect("a committed reconfiguration op carries a structurally valid successor membership");
+      // Capture the reconfigure op NUMBER for the install-time `MembershipChanged` — `commit_min` is at
+      // it NOW but may advance past it before the durable root lands (the primary keeps committing
+      // through the SwapEpoch window), so the install must name THIS op, not `commit_min` then.
+      self.stage_epoch_swap(OpNumber::with(op), successor, sb);
+    }
     true
   }
 
@@ -670,10 +761,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.sync.is_some() {
       return;
     }
-    // Durable-view-before-participate: a pending superblock view-change write means status==Normal
+    // Durable-view-before-participate: a pending view-CHANGING superblock write means status==Normal
     // but our view is not yet persisted. Acking a prepare now would cast a vote in a view we could
     // regress out of on crash → cross-view double-vote. Drop it; the primary retransmits the prepare.
-    if self.pending_sb.is_some() {
+    // A backup's OWN commit-first SwapEpoch root in flight is NOT gated here ([`Self::pending_durable_view`]
+    // excludes it): the view is durable through an epoch swap, so the `PrepareOk` vote (which carries
+    // `self.view`, not the epoch) is sound — and continuing to ack keeps op-assignment live through the
+    // swap window rather than stalling it on the backup's own root write.
+    if self.pending_durable_view() {
       return;
     }
     // Learn the primary's commit (apply anything we already have).
@@ -708,14 +803,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // is NOT a dropped-stale slot, so it keeps the durability-gated re-ack (re-appending below the prune
       // floor would be wrong). In practice a primary never retransmits such an op (it is below the
       // primary's `commit_min`), so this fall-through is for a stray/buffered Prepare.
-      // A body-`Repairing` entry does NOT hold the canonical body (only its checksum), so
-      // `as_present()` is `None` and the identity match fails — this op falls through to the re-append
-      // path (it is itself awaiting the canonical body), never re-acked off an absent body.
+      // A body-`Repairing` entry does NOT hold the canonical body (only its checksum), so its
+      // `body_bytes()` is `None` and the identity match fails — this op falls through to the re-append
+      // path (it is itself awaiting the canonical body), never re-acked off an absent body. A
+      // `Body::Reconfigure` op IS body-bearing — its `body_bytes()` is the `encode_body()` the
+      // `RECONFIGURATION` `Prepare` carries, so a re-acked reconfiguration op matches by its wire bytes
+      // exactly like a client op (the comparison is over the wire body, not the typed in-memory form).
       let canonical_held = pop <= self.checkpoint_op.get()
         || self.log.get(&pop).is_some_and(|entry| {
           entry.client == p.client()
             && entry.request == p.request()
-            && entry.body.as_present() == Some(p.body())
+            && entry.body_bytes().as_deref() == Some(p.body())
         });
       if canonical_held {
         // We hold the canonical body (in `self.log` above the checkpoint, or in the snapshot at/below it).
@@ -828,11 +926,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       m.config_id(),
     );
     for e in m.into_log() {
-      // The decoded `Body::Present` bytes are MOVED out of the owned entry (`into_parts`) — the
-      // decode boundary already paid the wire→owned copy, so a per-entry re-copy here would be pure
-      // waste on the retransmit path (the same move `on_repair_batch` does).
+      // The wire body bytes are taken from the entry via `body_bytes()` — a `Present` op's bytes or a
+      // `Reconfigure` op's `encode_body()` (both body-bearing); a header-only (`Repairing`) entry has no
+      // body and is SKIPPED (the sender never batches its own holes). The reconstructed per-op `Prepare`
+      // carries the flat bytes; `on_prepare` rebuilds the typed `Body::Reconfigure` from the
+      // `RECONFIGURATION` client id, so a batched reconfiguration op un-batches identically to a client op.
       let (op, client, request, body) = e.into_parts();
-      let Body::Present(body) = body else {
+      let Some(body) = body.body_bytes() else {
         continue;
       };
       self.on_prepare(
@@ -895,33 +995,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
 
   /// Build the in-memory [`LogEntry`] for a backup appending `p`, choosing ONE typed representation
   /// so a committed `Body::Reconfigure` op is recognized uniformly on the primary AND every backup
-  /// (decision (a) — a single representation everywhere avoids a decode-at-commit footgun). A
-  /// [`ClientId::RECONFIGURATION`] prepare's flat wire `body` is the canonical successor-membership
-  /// encoding: decode it back to a typed `Body::Reconfigure`; every other prepare is a `Body::Present`
-  /// client op carrying the raw bytes. The WAL still stores the body BYTES regardless (the caller's
-  /// `submit_append` already ran) — only the in-memory `LogEntry::body` distinguishes the two.
-  ///
-  /// A RECONFIGURATION prepare from the legitimate primary always carries `encode_body()` output,
-  /// which always decodes (the non-Byzantine sender contract; framing checksums catch corruption
-  /// first). A decode failure is therefore a bug — asserted in debug — and degrades in release to a
-  /// `Body::Present` entry (the op still appends + acks, so the head never stalls; commit then treats
-  /// it as an opaque op and stages NO epoch swap, never panicking on the bytes).
+  /// (decision (a) — a single representation everywhere avoids a decode-at-commit footgun). Delegates to
+  /// the shared [`LogEntry::from_committed_body`] reconstruction: a [`ClientId::RECONFIGURATION`]
+  /// prepare's flat wire `body` decodes back to a typed `Body::Reconfigure`; every other prepare is a
+  /// `Body::Present` client op carrying the raw bytes. The WAL still stores the body BYTES regardless
+  /// (the caller's `submit_append` already ran) — only the in-memory `LogEntry::body` distinguishes the
+  /// two. The repair-fill and recovery WAL-read paths reconstruct through the SAME helper, so a
+  /// RECONFIGURATION op is never type-erased into a `Present` op on any ingress path.
   pub(crate) fn log_entry_from_prepare(&self, p: &Prepare) -> LogEntry {
-    if p.client() == ClientId::RECONFIGURATION {
-      match crate::message::ReconfigurePayload::decode_body(p.body()) {
-        Ok(payload) => return LogEntry::reconfigure(p.client(), p.request(), payload),
-        Err(_e) => {
-          debug_assert!(
-            false,
-            "a RECONFIGURATION prepare for op {} carried an undecodable reconfigure body \
-             ({:?}) — the non-Byzantine primary always sends encode_body() output",
-            p.op().get(),
-            _e,
-          );
-        }
-      }
-    }
-    LogEntry::present(p.client(), p.request(), p.body_bytes())
+    LogEntry::from_committed_body(p.client(), p.request(), p.body_bytes())
   }
 
   fn append_prepare<W: Wal>(&mut self, wal: &mut W, p: Prepare) {
@@ -1115,6 +1197,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.cancel_forced_sync_if_satisfied();
     // commit_min may have advanced past a checkpoint boundary — take a checkpoint if due.
     self.maybe_checkpoint(sb);
+    // Re-submit a staged epoch swap waiting for a free superblock slot (mirrors `try_commit`'s tail) —
+    // chiefly a `pending_swap` that survived a `catch_up_to_view` view change (no durable-view write, so
+    // no `on_sb_done` re-trigger). No-op unless a swap is staged and the superblock is free.
+    self.maybe_swap_epoch(sb);
   }
 
   /// The SINGLE apply-time client-session update, shared by the primary's [`Self::commit_op`] and the
@@ -1260,21 +1346,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// vouch for: it is at/below the applied frontier, so it is durable + committed and the
   /// `on_prepare_ok` side-effects are inert — it re-ORs an already-pruned `inflight` bit (a no-op,
   /// `run_gc` freed it) and `try_commit` advances nothing; ONLY `record_peer_checkpoint` (the report)
-  /// takes effect. Gated like every other backup participation: skip while a durable-view write is
-  /// pending (`pending_sb` — the durable-view-before-participate rule, enforced at the `emit`
-  /// chokepoint), while syncing, or before anything is checkpointed (`checkpoint_op == 0` — the floor is
+  /// takes effect. Gated like every other backup participation: skip while a view-CHANGING durable-view
+  /// write is pending (`pending_durable_view` — the durable-view-before-participate rule, enforced at the
+  /// `emit` chokepoint; a commit-first SwapEpoch root does NOT raise it, the view being durable through an
+  /// epoch swap), while syncing, or before anything is checkpointed (`checkpoint_op == 0` — the floor is
   /// already 0, nothing to un-stall). The append-before-ack guard is EXPLICIT here (`!appending`): even
   /// the checkpoint-boundary slot can be transiently IN FLIGHT — a state-sync install / recovery keeps
   /// the WAL slot AT `checkpoint_op` and may re-append it (staged), marking it `appending` — and
   /// `send_prepare_ok` MUST NOT vouch for an op whose append has not completed (it `debug_assert!`s this).
   /// No-op for the primary. None of these skips harm stall-release liveness: the stall
-  /// only needs fresh reports during STEADY operation (when `pending_sb`/`sync`/the boundary re-append
+  /// only needs fresh reports during STEADY operation (when the view write/`sync`/the boundary re-append
   /// are all clear), which is exactly when this fires.
   fn report_checkpoint_to_primary(&mut self) {
     if !self.status.is_normal()
       || self.is_primary()
       || self.sync.is_some()
-      || self.pending_sb.is_some()
+      || self.pending_durable_view()
       || self.checkpoint_op.get() == 0
       || self.appending.contains(&self.checkpoint_op.get())
     {

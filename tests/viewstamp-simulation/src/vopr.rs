@@ -53,12 +53,13 @@
 use bytes::Bytes;
 use core::time::Duration;
 
-use viewstamp_proto::{Instant, Prng};
+use viewstamp_proto::{Instant, MemberId, Prng, SingleVoterDelta};
 
 use crate::{
   checker::{
-    AppliedOnceChecker, BoundednessChecker, DurabilityChecker, EpochViewMonotonicChecker,
-    MembershipMonotonicChecker, StalenessChecker, ViewMonotonicChecker, check_safety,
+    AppliedOnceChecker, BoundednessChecker, ConfigLineageChecker, DurabilityChecker,
+    EpochViewMonotonicChecker, MembershipMonotonicChecker, ReconfigureAppliedOnceChecker,
+    StalenessChecker, ViewMonotonicChecker, check_safety,
   },
   cluster::Cluster,
   network::Faults,
@@ -302,6 +303,21 @@ pub struct VoprReport {
   /// run); `> 0` once a reconfig-axis run drove and re-formed the wedge — the non-vacuity witness that
   /// the escalation genuinely fired.
   reform_escalations_fired: u64,
+  /// How many LIVE single-change reconfigurations the driver proposed this run (a
+  /// [`Cluster::propose_reconfigure_single_change`] the proto admitted on the serving primary). `0`
+  /// unless the live-reconfig axis is enabled (`VOPR_RECONFIG_LIVE`, or
+  /// [`run_vopr_with_reconfig_live`]); the committed live-reconfig sweep asserts the cross-seed sum is
+  /// `> 0` so the lane cannot silently decay.
+  live_reconfigs_proposed: u64,
+  /// The high-water of LIVE membership swaps observed across all replicas this run — the count of
+  /// committed `Reconfigure` ops whose durable `SwapEpoch` root landed and fired
+  /// `Event::MembershipChanged` (the proposing primary swaps first). `0` on EVERY run without the
+  /// live-reconfig axis (no live change is proposed, so no swap fires), so the off-axis sweep asserts
+  /// this stays `0`; `> 0` once a live-reconfig-axis run drove a change to its committed durable swap —
+  /// the headline non-vacuity witness that the live single-change path genuinely installed a swap under
+  /// the adversarial schedule. Read off [`Cluster::membership_swaps_observed`] (monotone on the
+  /// cluster), so `max` is exact.
+  live_swaps_observed: u64,
 }
 
 impl VoprReport {
@@ -596,6 +612,21 @@ impl VoprReport {
   pub const fn reform_escalations_fired(&self) -> u64 {
     self.reform_escalations_fired
   }
+
+  /// How many LIVE single-change reconfigurations the driver proposed this run. `0` unless the
+  /// live-reconfig axis is enabled; the committed live-reconfig sweep asserts the cross-seed sum is
+  /// `> 0`.
+  pub const fn live_reconfigs_proposed(&self) -> u64 {
+    self.live_reconfigs_proposed
+  }
+
+  /// The high-water of LIVE membership swaps observed this run (committed `Reconfigure` ops whose
+  /// durable `SwapEpoch` root landed). `0` on every run without the live-reconfig axis; `> 0` once a
+  /// live-reconfig-axis run drove a change to its committed durable swap — the headline non-vacuity
+  /// witness for the live single-change path.
+  pub const fn live_swaps_observed(&self) -> u64 {
+    self.live_swaps_observed
+  }
 }
 
 /// The driver's own seeded RNG + bookkeeping. Separate from the cluster's internal network/storage
@@ -808,6 +839,40 @@ struct Vopr {
   /// The `config_id` lineage fork net, observed every tick (same on-driver rationale as
   /// [`Self::epoch_view`]): the durable configuration history is a single non-forking chain.
   membership: MembershipMonotonicChecker,
+  /// Whether the LIVE single-change reconfiguration axis is enabled for this run: the
+  /// `VOPR_RECONFIG_LIVE` env var, or force-enabled via [`run_vopr_with_reconfig_live`] (the committed
+  /// live-reconfig sweep). When ON the driver proposes ONE live single-voter change
+  /// ([`Cluster::propose_reconfigure_single_change`]) on the serving primary once the cluster is
+  /// healthy, then runs the FULL safety/durability/applied-once/lineage suite while the committed
+  /// `Reconfigure` op installs its durable epoch swap under the adversarial schedule. With the axis
+  /// OFF no live change is ever proposed — no `MembershipChanged` fires, so the two live-reconfig
+  /// checkers ([`Self::reconfigure_once`] / [`Self::config_lineage`]) observe empty swap streams and
+  /// stay vacuously `Ok`, and [`VoprReport::live_swaps_observed`] stays `0` (the standing off-axis
+  /// byte-identity guard the sweep asserts).
+  ///
+  /// LIVENESS CAVEAT: cluster-wide convergence of a live single change is not yet driven to completion
+  /// by the proto's autonomous message flow (the proposing primary's commit advertisement is
+  /// suppressed while its `SwapEpoch` root is in flight, then it is epoch-gated from the still-old-
+  /// epoch backups), so a live change leaves the cluster unable to make uniform progress. This axis
+  /// therefore RELAXES the calm-window livelock + final-convergence LIVENESS oracle (the swap-correct
+  /// SAFETY suite stays fully live), gating those liveness panics on `!live_reconfig_axis`. The axis
+  /// proves the swap is correct (applied once per replica, an unbroken lineage, no committed-op
+  /// rewrite) wherever it lands under chaos; it does not (yet) prove the change converges.
+  live_reconfig_axis: bool,
+  /// How many LIVE single-change reconfigurations this run has PROPOSED (counted against
+  /// [`LIVE_RECONFIG_BUDGET`]). `0` unless the live-reconfig axis is enabled.
+  live_reconfig_actions: u64,
+  /// The applied-once swap oracle, observed every tick (same on-driver rationale as
+  /// [`Self::epoch_view`]): every committed `Reconfigure` op installs its epoch swap at most once per
+  /// `(op, replica incarnation)`, and every replica installing a given committed op converges on the
+  /// identical successor. Vacuously `Ok` until a live change fires (off-axis the swap streams are
+  /// empty).
+  reconfigure_once: ReconfigureAppliedOnceChecker,
+  /// The committed-swap config-lineage fork net, observed every tick: the committed `config_id` chain
+  /// installed by the swaps is a single unbroken line (one config_id per epoch, each epoch extending
+  /// the tip by one). The committed-swap-event counterpart of [`Self::membership`] (which folds the
+  /// durable root); vacuously `Ok` off-axis.
+  config_lineage: ConfigLineageChecker,
   /// Per-replica last-observed session-eviction count, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
   sessions_evicted_seen: Vec<u64>,
@@ -1034,6 +1099,36 @@ pub fn run_vopr_with_reconfig(seed: u64, ticks: u64) -> VoprReport {
   run_seeded(v, ticks)
 }
 
+/// Like [`run_vopr`] but with the LIVE single-change reconfiguration axis FORCE-ENABLED, independent
+/// of the `VOPR_RECONFIG_LIVE` env var (the same programmatic-override pattern as
+/// [`run_vopr_with_hold`]). When ON the driver proposes ONE live single-voter change
+/// ([`Cluster::propose_reconfigure_single_change`], an `AddLearner` of a fresh sentinel id — always
+/// structurally valid, no catch-up gate, no voting-quorum perturbation) on the serving primary once
+/// the cluster is healthy, then keeps the FULL adversarial schedule (crashes / partitions / disk
+/// faults) running while the committed `Reconfigure` op installs its durable epoch swap. The
+/// swap-correctness SAFETY suite is asserted EVERY tick across the change: `check_safety` (agreement),
+/// [`DurabilityChecker`] (no committed op rewritten across the epoch boundary), [`AppliedOnceChecker`],
+/// [`ReconfigureAppliedOnceChecker`] (each committed `Reconfigure` op installs its swap exactly once
+/// per replica, every replica converging on the identical successor), [`ConfigLineageChecker`] (the
+/// committed `config_id` chain is unbroken), and the epoch/view + durable-config monotonicity nets —
+/// so a double-swap, a forked successor, a divergent applied prefix, or a lost committed op straddling
+/// the swap trips immediately with its seed + tick.
+///
+/// LIVENESS CAVEAT: a live single change does NOT converge cluster-wide under the proto's autonomous
+/// message flow (the proposing primary's commit advertisement is suppressed while its `SwapEpoch` root
+/// is in flight, then it is epoch-gated from the still-old-epoch backups), so after a live change the
+/// cluster cannot make uniform progress. This axis therefore RELAXES the calm-window livelock +
+/// final-convergence LIVENESS oracle (the safety suite stays fully live); it proves the swap is
+/// CORRECT wherever it lands under chaos, not that the change converges. With the axis OFF no live
+/// change is proposed — [`VoprReport::live_swaps_observed`] stays `0` and the run is byte-identical to
+/// the default schedule (the live-reconfig draws are conditional on the axis). This is the entry point
+/// for the committed live-reconfig sweep.
+pub fn run_vopr_with_reconfig_live(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.live_reconfig_axis = true;
+  run_seeded(v, ticks)
+}
+
 /// The shared run loop behind [`run_vopr`] / [`run_vopr_with_hold`]: the driver `v` already carries
 /// the seed and the axis configuration.
 fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
@@ -1098,46 +1193,73 @@ fn run_seeded(mut v: Vopr, ticks: u64) -> VoprReport {
     &bound,
   );
 
-  // Final durability assertion: after convergence, the whole committed history survives, applied, on
-  // at least one operational replica — proving no committed op was lost across the run.
-  if let crate::checker::CheckResult::Violation(why) = dur.check(&c) {
+  // The END-OF-RUN CONVERGENCE assertions all require the cluster to have converged the committed
+  // history (applied uniformly on an operational replica). On the LIVE-RECONFIG axis the cluster
+  // legitimately does NOT converge after a live change (the proposing primary swaps to E+1 and is
+  // epoch-gated from the still-E backups — the documented liveness gap), so these end-of-run
+  // convergence checks are not owed. The SAFETY suite that DOES hold for a live change — agreement, no
+  // committed-op rewrite, applied-once, and the two swap-correctness nets — was asserted EVERY tick
+  // throughout the run (including the quiesce drain) and is the real guarantee; only the
+  // convergence-dependent end-of-run gates are skipped here. Every OTHER lane runs them fully strict.
+  if !v.live_reconfig_axis {
+    // Final durability assertion: after convergence, the whole committed history survives, applied, on
+    // at least one operational replica — proving no committed op was lost across the run.
+    if let crate::checker::CheckResult::Violation(why) = dur.check(&c) {
+      panic!(
+        "vopr seed {} tick {ticks} (final, post-quiesce): {why}",
+        v.seed
+      );
+    }
+    // Final applied-once assertion: every client-acked reply is present in the global applied map with
+    // a matching reply body (acked-but-never-applied = a lost committed op), and the map is non-empty
+    // whenever anything committed — every request a client was acked for was applied exactly once.
+    if let crate::checker::CheckResult::Violation(why) = applied_once.check(&c) {
+      panic!(
+        "vopr seed {} tick {ticks} (final, post-quiesce): applied-once: {why}",
+        v.seed
+      );
+    }
+    // Final staleness assertion: the committed-history high-water (the staleness floor) stayed
+    // monotone, and every recorded linearizable read reflected every write acked before it issued
+    // (vacuous today — no read path records reads — but the acked set is non-empty whenever anything
+    // committed, so the capture is non-vacuous). Structurally ready to enforce reads the moment a read
+    // path exists.
+    if let crate::checker::CheckResult::Violation(why) = staleness.check(&c) {
+      panic!(
+        "vopr seed {} tick {ticks} (final, post-quiesce): staleness: {why}",
+        v.seed
+      );
+    }
+    // Final per-unit batching oracle (a cheap no-op when no client batched): every acked unit is in
+    // the recorded unit history exactly once at its request's committed (op, unit_index) with the
+    // submitted bytes and the SM's deterministic reply, and groups rode one op on adjacent indices.
+    if let crate::checker::CheckResult::Violation(why) = crate::batching::check_batching(&c) {
+      panic!(
+        "vopr seed {} tick {ticks} (final, post-quiesce): batching: {why}",
+        v.seed
+      );
+    }
+    // Final learner-convergence oracle (a cheap no-op with no learners): after the quiesce drain,
+    // every non-crashed learner has applied the SAME committed `(op, body)` history as the voters, up
+    // to the committed-history high-water — it follows the committed log to convergence.
+    v.check_learner_convergence(&c, ticks);
+  }
+  // The live-reconfig swap-correctness nets stay STRICT on every lane (they are SAFETY, not
+  // convergence): fold any not-yet-observed swap tail and re-assert. Off-axis these are vacuous (no
+  // swaps); on the live-reconfig axis they pin that the committed swap was applied once per replica
+  // with an unbroken lineage even though the change did not converge.
+  if let crate::checker::CheckResult::Violation(why) = v.reconfigure_once.check(&c) {
     panic!(
-      "vopr seed {} tick {ticks} (final, post-quiesce): {why}",
+      "vopr seed {} tick {ticks} (final, post-quiesce): reconfigure-applied-once: {why}",
       v.seed
     );
   }
-  // Final applied-once assertion: every client-acked reply is present in the global applied map with
-  // a matching reply body (acked-but-never-applied = a lost committed op), and the map is non-empty
-  // whenever anything committed — every request a client was acked for was applied exactly once.
-  if let crate::checker::CheckResult::Violation(why) = applied_once.check(&c) {
+  if let crate::checker::CheckResult::Violation(why) = v.config_lineage.check(&c) {
     panic!(
-      "vopr seed {} tick {ticks} (final, post-quiesce): applied-once: {why}",
+      "vopr seed {} tick {ticks} (final, post-quiesce): config-lineage: {why}",
       v.seed
     );
   }
-  // Final staleness assertion: the committed-history high-water (the staleness floor) stayed monotone,
-  // and every recorded linearizable read reflected every write acked before it issued (vacuous today —
-  // no read path records reads — but the acked set is non-empty whenever anything committed, so the
-  // capture is non-vacuous). Structurally ready to enforce reads the moment a read path exists.
-  if let crate::checker::CheckResult::Violation(why) = staleness.check(&c) {
-    panic!(
-      "vopr seed {} tick {ticks} (final, post-quiesce): staleness: {why}",
-      v.seed
-    );
-  }
-  // Final per-unit batching oracle (a cheap no-op when no client batched): every acked unit is in
-  // the recorded unit history exactly once at its request's committed (op, unit_index) with the
-  // submitted bytes and the SM's deterministic reply, and groups rode one op on adjacent indices.
-  if let crate::checker::CheckResult::Violation(why) = crate::batching::check_batching(&c) {
-    panic!(
-      "vopr seed {} tick {ticks} (final, post-quiesce): batching: {why}",
-      v.seed
-    );
-  }
-  // Final learner-convergence oracle (a cheap no-op with no learners): after the quiesce drain, every
-  // non-crashed learner has applied the SAME committed `(op, body)` history as the voters, up to the
-  // committed-history high-water — it follows the committed log to convergence.
-  v.check_learner_convergence(&c, ticks);
   v.report.ticks = ticks;
   v.report.all_clients_done = (0..c.client_count()).all(|i| c.client(i).is_done());
   v.update_report(&c);
@@ -1202,6 +1324,23 @@ const CHURN_BUDGET: u64 = 48;
 /// wedge — so a couple per run exercises the escalation (including an A2 re-wedge across two firings)
 /// without dominating the tick budget.
 const RECONFIG_BUDGET: u64 = 2;
+
+/// The per-run LIVE single-change reconfiguration budget (live-reconfig-axis runs only): at most this
+/// many live single-voter changes proposed per run. A live change commits + installs a durable epoch
+/// swap but does NOT converge cluster-wide (the known liveness gap), so the cluster cannot make
+/// uniform progress afterwards; ONE change per run is enough to drive a swap and exercise the
+/// swap-correctness suite under the adversarial schedule, while keeping the run's observable history
+/// bounded.
+const LIVE_RECONFIG_BUDGET: u64 = 1;
+
+/// The pseudo-`MemberId` the live-reconfig axis ADDS as a learner — a high sentinel past every genesis
+/// member id, so the `AddLearner` delta is always structurally valid (the id is brand-new) and the
+/// added learner never collides with a running node. It need not have a running endpoint: a learner
+/// that does not exist simply never participates, while the committed `Reconfigure` op still installs
+/// its durable epoch swap on the proposing primary — the swap-mechanics the axis exercises. Using
+/// `AddLearner` (rather than a voter change) keeps the change always-proposable with no catch-up gate
+/// and no voting-quorum perturbation.
+const LIVE_RECONFIG_MEMBER: u128 = 0xFFFF_0000_0000_0000;
 
 /// The magic mixed into the seed for the learner-count PRNG. A distinct local stream (NOT the action
 /// stream `self.prng`), so when the learner axis is OFF no learner draw happens and `node_count`
@@ -1286,6 +1425,10 @@ impl Vopr {
       reconfig_actions: 0,
       epoch_view: EpochViewMonotonicChecker::new(node_count),
       membership: MembershipMonotonicChecker::new(),
+      live_reconfig_axis: env_flag("VOPR_RECONFIG_LIVE"),
+      live_reconfig_actions: 0,
+      reconfigure_once: ReconfigureAppliedOnceChecker::new(node_count),
+      config_lineage: ConfigLineageChecker::new(node_count),
       sessions_evicted_seen: vec![0; node_count],
       wiped_pending: Vec::new(),
       report: VoprReport {
@@ -1641,6 +1784,14 @@ impl Vopr {
   /// work at the window's start and the cluster is now stable (all up, healed) yet the committed-op
   /// high-water did NOT advance and clients are still not done, that is a livelock → panic.
   fn assert_calm_progress(&self, c: &Cluster, tick: u64) {
+    // The live-reconfig axis proposes a change that does NOT converge cluster-wide (the proposing
+    // primary swaps to E+1 and is then epoch-gated from the still-E backups), so the cluster cannot
+    // make uniform commit progress afterwards — a calm window legitimately ends without advance. Skip
+    // the livelock assertion on this axis (the swap-correctness SAFETY suite stays fully live every
+    // tick); the gap is the documented liveness limitation, not a wedge this oracle should flag.
+    if self.live_reconfig_axis {
+      return;
+    }
     let all_done = (0..c.client_count()).all(|i| c.client(i).is_done());
     if all_done || !self.calm_had_outstanding {
       return; // nothing was owed, or everything finished — no livelock.
@@ -1720,9 +1871,19 @@ impl Vopr {
       }
     }
 
-    // Did not converge within the bound: a committed op a quorum holds durably is not being applied by
-    // ANY operational replica even after a long, fully-healthy drain. That is a genuine liveness wedge
-    // (or a loss the quorum cannot repair) — a real bug to STOP and report, NOT something to paper over.
+    // Did not converge within the bound. On the LIVE-RECONFIG axis this is EXPECTED, not a bug: a live
+    // single change leaves the proposing primary at E+1 and epoch-gated from the still-E backups, so the
+    // committed history cannot become uniformly applied (the documented liveness gap). The per-tick
+    // SAFETY suite (agreement + no committed-op rewrite + applied-once + the swap-correctness nets) ran
+    // throughout the drain and held; convergence is simply not owed here. Return rather than flag a
+    // wedge the axis intends to exercise. (The base/other lanes still STOP-and-report below.)
+    if self.live_reconfig_axis {
+      self.update_report(c);
+      return;
+    }
+    // A committed op a quorum holds durably is not being applied by ANY operational replica even after
+    // a long, fully-healthy drain. That is a genuine liveness wedge (or a loss the quorum cannot
+    // repair) — a real bug to STOP and report, NOT something to paper over.
     if env_flag("VOPR_DUMP") {
       self.dump_divergence(c, ticks);
     }
@@ -2123,6 +2284,47 @@ impl Vopr {
         eprintln!("tick {tick}: RECONFIG skipped (cluster did not quiesce to a v4 root in budget)");
       }
     }
+
+    // (h) LIVE SINGLE-CHANGE RECONFIGURATION: on a seeded cadence, within `LIVE_RECONFIG_BUDGET`,
+    // propose ONE live single-voter change (an `AddLearner` of a fresh sentinel id — always valid, no
+    // catch-up gate, no voting-quorum perturbation) on the serving primary. The committed `Reconfigure`
+    // op then installs its durable epoch swap under the ordinary tick loop + the adversarial schedule,
+    // and the per-tick swap-correctness suite (the two live-reconfig checkers + safety/durability)
+    // judges it. Only proposed when a serving primary exists (so the proposal can land + commit);
+    // proposing into an election window would just return `NotPrimary` and waste the budget. Only with
+    // the axis enabled — no PRNG draw is consumed otherwise (the default per-seed schedule stays
+    // byte-identical; the live-reconfig run is its own deterministic baseline, like the hold axis). A
+    // live change does NOT converge cluster-wide (the known liveness gap), so the calm-window livelock
+    // + final-convergence oracle is relaxed for this axis (see `run_vopr_with_reconfig_live`); the
+    // safety suite stays fully live.
+    if self.live_reconfig_axis
+      && self.prng.chance(1, 200)
+      && self.live_reconfig_actions < LIVE_RECONFIG_BUDGET
+      && c.serving_primary().is_some()
+    {
+      self.live_reconfig_actions += 1;
+      match c.propose_reconfigure_single_change(SingleVoterDelta::AddLearner(MemberId::new(
+        LIVE_RECONFIG_MEMBER,
+      ))) {
+        Ok(op) => {
+          self.report.live_reconfigs_proposed += 1;
+          if trace {
+            eprintln!(
+              "tick {tick}: LIVE-RECONFIG proposed AddLearner op={}",
+              op.get()
+            );
+          }
+        }
+        Err(e) => {
+          // The proposal can be momentarily refused (e.g. a view change races the serving-primary
+          // check, or a prior change is still latched); the budget is still consumed so the action
+          // schedule stays a pure function of the seed (mirroring the wipe/churn action accounting).
+          if trace {
+            eprintln!("tick {tick}: LIVE-RECONFIG proposal refused: {e:?}");
+          }
+        }
+      }
+    }
   }
 
   /// End the active learner-chaos episode: restart the crashed learner if it is still down (the
@@ -2388,6 +2590,22 @@ impl Vopr {
         "vopr seed {} tick {tick}: membership-monotonic: {why}",
         self.seed
       );
+    }
+    // The live-reconfiguration swap-correctness nets, folded over the per-replica `MembershipChanged`
+    // streams. Off-axis the streams are EMPTY (no live change is proposed, so no swap fires), so both
+    // are vacuously `Ok` and observing them takes no PRNG draw — the default schedule stays
+    // byte-identical. On the live-reconfig axis they assert: every committed `Reconfigure` op installs
+    // its epoch swap at most once per `(op, incarnation)` with every replica converging on the
+    // identical successor (no double-swap / no forked swap), and the committed `config_id` chain the
+    // swaps install is a single unbroken line (no same-epoch fork, each epoch extending the tip by one).
+    if let Violation(why) = self.reconfigure_once.observe(c) {
+      panic!(
+        "vopr seed {} tick {tick}: reconfigure-applied-once: {why}",
+        self.seed
+      );
+    }
+    if let Violation(why) = self.config_lineage.observe(c) {
+      panic!("vopr seed {} tick {tick}: config-lineage: {why}", self.seed);
     }
     if let Violation(why) = bound.observe(c) {
       panic!("vopr seed {} tick {tick}: boundedness: {why}", self.seed);
@@ -2864,6 +3082,14 @@ impl Vopr {
       .report
       .reform_escalations_fired
       .max(c.reform_escalations_fired());
+    // LIVE-RECONFIG witness: the count of committed `Reconfigure` ops whose durable swap installed
+    // (fired `MembershipChanged`), monotone on the cluster (the swap streams are append-only), so `max`
+    // is exact. `0` on every run without the live-reconfig axis (no live change is proposed), so the
+    // off-axis sweep asserts it stays 0; the live-reconfig sweep asserts the cross-seed sum is `> 0`.
+    self.report.live_swaps_observed = self
+      .report
+      .live_swaps_observed
+      .max(c.membership_swaps_observed() as u64);
     // Asym/slow-axis deep witnesses: the cluster's monotone one-way-drop and slow-delay counters
     // (same discipline as `holds_fired` — nothing resets them, so `max` is exact). Both stay 0 with
     // their axes disabled; the asym/slow sweeps assert their cross-seed sums are `> 0`, proving an

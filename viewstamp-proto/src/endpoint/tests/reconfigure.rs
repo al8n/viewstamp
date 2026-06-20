@@ -43,7 +43,7 @@ fn propose_membership_on_the_primary_mints_a_reconfigure_op_and_latches_inflight
     .membership
     .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
     .expect("AddVoter is a valid delta on a 3-voter cluster");
-  let expected_payload = ReconfigurePayload::from_membership(&successor);
+  let expected_payload = ReconfigurePayload::from_membership(&successor, 0);
 
   let before_op = e.op();
   let op = e
@@ -226,7 +226,7 @@ fn proposed_and_committed_swap() -> (
     .membership
     .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
     .expect("AddVoter is a valid delta on a 3-voter cluster");
-  let payload = ReconfigurePayload::from_membership(&successor);
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   let op = e
     .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
@@ -252,7 +252,7 @@ fn reconfigure_payload_body_round_trips_through_decode() {
   let successor = genesis(3)
     .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(7)))
     .unwrap();
-  let payload = ReconfigurePayload::from_membership(&successor);
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
   let bytes = payload.encode_body();
   let decoded = ReconfigurePayload::decode_body(&bytes).expect("the canonical body decodes");
   assert_eq!(
@@ -300,6 +300,65 @@ fn at_commit_the_swap_is_staged_but_the_epoch_is_not_yet_swapped() {
     e.prev_epoch,
     crate::Epoch::new(0),
     "prev_epoch not yet moved"
+  );
+}
+
+#[test]
+fn the_swap_epoch_root_durably_records_the_reconfigure_op_as_committed() {
+  // The durable SwapEpoch root MUST record the committed `Reconfigure` op as committed: a node that
+  // recovers an E+1 membership from this root reads `state.commit()` as its `commit_max`, and the
+  // durable-epoch-before-participate + exact-catch-up premise demand that a node advertising E+1
+  // durably proves the reconfigure op committed. On the PRIMARY commit path `commit_max` is raised
+  // only AFTER the `try_commit` loop, but the swap stages DURING the loop — so the root's `commit`
+  // must be lifted to cover the just-committed op at stage time.
+  let (_e, _wal, sb, op, _successor, _payload) = proposed_and_committed_swap();
+  // The synchronous `TestSb` publishes the SwapEpoch root state at `submit_write`, so `sb.state()` IS
+  // the durable root the primary just minted. Its `commit` proves the reconfigure op committed.
+  assert!(
+    sb.state().commit() >= op,
+    "the durable SwapEpoch root records the reconfigure op (op {}) as committed, but its commit is {}",
+    op.get(),
+    sb.state().commit().get(),
+  );
+  // And the root's committed-band headers reach the reconfigure op: a recovering node cross-checks the
+  // band against its WAL, so an omitted header would leave the committed reconfigure op unproven.
+  assert!(
+    sb.state()
+      .committed_headers_slice()
+      .iter()
+      .any(|h| h.op() == op),
+    "the SwapEpoch root's committed-band headers include the reconfigure op (op {})",
+    op.get(),
+  );
+}
+
+#[test]
+fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
+  // End-to-end: after the primary stages+writes the SwapEpoch root (but BEFORE it installs in memory),
+  // a crash+recover off that durable root must read the reconfigure op as committed (`commit_max`).
+  // The recovered node holds the predecessor membership (the swap was never installed), and the
+  // committed reconfigure op sits durably in its log — so re-reaching it re-stages the swap. The
+  // load-bearing property here is that the recovered `commit_max` covers the op (no committed-loss).
+  let (_e, wal, sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  let (mut rwal, mut rsb) = (wal, sb);
+  let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut rwal,
+    &mut rsb,
+  );
+  let r = match recovered {
+    Recovered::Active(e) => e,
+    Recovered::Retired(_) => panic!("the proposer is still in the recovered membership → Active"),
+  };
+  assert!(
+    r.commit_max() >= op,
+    "recovery reads the reconfigure op (op {}) as committed (commit_max {}), so it is never lost",
+    op.get(),
+    r.commit_max().get(),
   );
 }
 
@@ -374,6 +433,383 @@ fn on_the_durable_root_the_epoch_swaps_and_membership_changed_is_emitted() {
 }
 
 #[test]
+fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight() {
+  // The single-change-at-a-time contract spans propose THROUGH install, not just propose-through-commit.
+  // After the first reconfiguration COMMITS, `stage_epoch_swap` clears `reconfigure_inflight` — but the
+  // staged `pending_swap` (and its in-flight SwapEpoch root) are still outstanding. A second proposal
+  // here must STILL be refused: if it committed before the first installed, `stage_epoch_swap` would
+  // overwrite the first's staged successor and the first `on_sb_done` would clear the second — losing
+  // the second committed swap across the epoch boundary.
+  let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
+  let now = Instant::ZERO;
+
+  // The first change committed + staged its swap; the proposal latch is already clear, but the
+  // committed-but-not-installed swap is outstanding (the SwapEpoch root is in flight).
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "the proposal latch cleared at commit"
+  );
+  assert!(
+    e.pending_swap_for_test(),
+    "a committed-but-not-installed swap is outstanding"
+  );
+
+  // A second proposal in this window is refused — the swap window keeps the single change in flight.
+  assert_eq!(
+    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(4))),
+    Err(ProposeMembershipError::AlreadyInFlight),
+    "a second reconfiguration is refused while the first's swap is committed-but-not-installed",
+  );
+
+  // Once the swap INSTALLS (the SwapEpoch root lands), the window closes and a new proposal succeeds.
+  e.handle_storage(now, &mut wal, &mut sb); // land the SwapEpoch root → install
+  assert!(
+    !e.pending_swap_for_test(),
+    "the swap installed — the window is closed"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(1),
+    "the first change installed (E+1)"
+  );
+  // A fresh single change is now proposable. (Member 4 is a fresh voter id on the new 4-voter config.)
+  let next = e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(4)));
+  assert!(
+    next.is_ok(),
+    "after the first swap installs, a new reconfiguration is admitted: {next:?}",
+  );
+}
+
+#[test]
+fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change() {
+  // CONSENSUS-SAFETY: an uncommitted `Reconfigure` op that rides the canonical log into a NEW view
+  // must keep blocking a second reconfiguration until it re-commits. `reset_for_view_transition` clears
+  // the `reconfigure_inflight` latch, and `start_view_as_new_primary` rebuilds the uncommitted-tail
+  // `inflight` WITHOUT re-latching a carried `Reconfigure` op — so a latch-only gate would let the new
+  // primary mint a SECOND reconfiguration before the first re-commits, overlapping two changes across the
+  // epoch boundary. The structural gate (`has_pending_reconfigure`, which reads the uncommitted log tail)
+  // is what forecloses it. Here replica 1 becomes primary of view 1 and adopts an uncommitted `Reconfigure`
+  // op (op 2) carried ONLY by replica 2's DVC; replica 1's own DVC holds op 0, so op 2 is peer-learned.
+  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    CountSm::default(),
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+
+  // The carried op's successor membership, chained off the genesis config (config_id 0 in the fixture) —
+  // exactly what the original proposer pinned. The DVC carries this as a typed `Body::Reconfigure` entry.
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter is a valid delta on a 3-voter cluster");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  // (1) Drive replica 1 into ViewChange(1): its idle timer proposes, one peer's SVC reaches the SVC
+  // quorum (2 of 3).
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+
+  // (2) A DVC from replica 2 carries op 1 (committed) + op 2 (the uncommitted `Reconfigure`). commit* = 1,
+  // so op 2 is adopted as the uncommitted tail. The new primary forms its view carrying the Reconfigure.
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::reconfigure(
+        OpNumber::with(2),
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(2),
+        payload.clone(),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  assert!(e.is_primary(), "replica 1 is now the primary of view 1");
+  assert_eq!(e.op(), OpNumber::with(2), "the Reconfigure op was adopted");
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "op 1 applied; the carried Reconfigure op 2 is still uncommitted"
+  );
+
+  // THE LATCH IS GONE (the hazard's precondition): `reset_for_view_transition` cleared it and the adoption path did
+  // not re-latch a carried Reconfigure. A latch-only gate would now (wrongly) admit a second proposal.
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "the proposal latch did NOT survive the view change (the hazard's precondition)"
+  );
+  assert!(
+    !e.pending_swap_for_test(),
+    "no committed-but-not-installed swap exists (the carried op never committed)"
+  );
+  // The STRUCTURAL truth still holds: the uncommitted log tail carries the Reconfigure op.
+  assert!(
+    e.has_pending_reconfigure_for_test(),
+    "the carried uncommitted Reconfigure is recognized as in-flight from the log, not the latch"
+  );
+  assert_eq!(
+    e.log
+      .get(&2)
+      .expect("op 2 is in the new primary's log")
+      .body,
+    Body::Reconfigure(payload),
+    "the carried op rode the canonical log as a typed Body::Reconfigure",
+  );
+
+  // Drain the new-primary storage so it is a settled Normal primary (the durable-view write lands), then
+  // a fresh proposal MUST be refused — the carried change is still in flight (TODAY this wrongly succeeds).
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  assert!(e.is_primary() && e.status().is_normal());
+  assert_eq!(
+    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(4))),
+    Err(ProposeMembershipError::AlreadyInFlight),
+    "a second reconfiguration is refused while a carried uncommitted Reconfigure rides the new view",
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "the refused proposal minted no op (the head did not advance)"
+  );
+}
+
+/// A `SingleChange` new primary of view 1 (replica 1 of 3) left in the DURABLE-VIEW-before-participate
+/// window: status `Normal`, primary, but its `StartViewAsPrimary` superblock write is STILL in flight
+/// (the `StepSb` has not flushed it), so `pending_durable_view()` holds. The op-2 AdoptVote WAL append
+/// has completed (storage pumped) so only the view write keeps the window open. Mirrors the non-reconfig
+/// `primed_new_primary_in_pending_view_window`, with the `SingleChange` capability so `propose_membership`
+/// is in scope.
+fn single_change_primed_new_primary_pending_view()
+-> (Endpoint<CountSm, SingleChange>, TestWal, StepSb) {
+  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    CountSm::default(),
+  );
+  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"a"),
+      ),
+      PreparedEntry::new(
+        OpNumber::with(2),
+        ClientId::new(7),
+        RequestNumber::with(2),
+        bytes::Bytes::from_static(b"b"),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // op-2 AdoptVote append completes; the view write stays inflight
+  while e.poll_message().is_some() {}
+  assert_eq!(e.status(), Status::Normal);
+  assert!(e.is_primary());
+  assert!(
+    e.pending_durable_view_for_test(),
+    "the durable-view write is still pending (the window is open)"
+  );
+  (e, wal, sb)
+}
+
+#[test]
+fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy() {
+  // CONSENSUS-SAFETY: `propose_membership` must honour the SAME op-admission fences `on_request`
+  // does — here the durable-view-before-participate fence. A proposal that minted straight through a
+  // pending view-CHANGING superblock write would advertise a `Prepare` for a view this node has not yet
+  // durably entered (and could roll back on crash) — the exact violation the fence exists to prevent.
+  // The verdict is RETRYABLE (`Busy`), so the caller retries once the view is durable, NOT a permanent
+  // rejection. (Op 2 is an uncommitted plain client op here, NOT a reconfiguration, so the refusal is the
+  // admission fence — not `AlreadyInFlight`.)
+  let (mut e, mut wal, mut sb) = single_change_primed_new_primary_pending_view();
+  let now = Instant::ZERO;
+  let head_before = e.op();
+
+  assert_eq!(
+    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3))),
+    Err(ProposeMembershipError::Busy),
+    "a proposal during the durable-view window is refused retryably, not minted",
+  );
+  assert_eq!(
+    e.op(),
+    head_before,
+    "no op was minted (the head did not advance)"
+  );
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "the proposal was refused before any latch was set"
+  );
+
+  // Once the durable-view write LANDS (the window closes), a fresh proposal is admitted — proving the
+  // `Busy` verdict was a transient retry signal, not a permanent rejection. Flush the SB then drain.
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  assert!(
+    !e.pending_durable_view_for_test(),
+    "the durable-view write landed — the window is closed"
+  );
+  // The committed prefix must be applied for the proposal to pass `on_request`'s commit-gap fence too;
+  // drive op 2 to commit (a backup ack) so the proposal is unambiguously admitted on the open path.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    client_ack(2, 2),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  let admitted = e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)));
+  assert!(
+    admitted.is_ok(),
+    "after the durable-view write lands and the prefix applies, the proposal is admitted: {admitted:?}",
+  );
+}
+
+/// A WAL that reports ZERO ring capacity — so minting ANY op above the prune floor trips the
+/// stall-before-wrap admission fence (`unpruned_window > capacity()`). Appends still land (the test only
+/// needs the capacity verdict), mirroring `RingWal` with a degenerate capacity.
+#[derive(Default)]
+struct ZeroCapWal {
+  inner: TestWal,
+}
+impl Wal for ZeroCapWal {
+  fn op_head(&self) -> OpNumber {
+    self.inner.op_head()
+  }
+  fn capacity(&self) -> u64 {
+    0
+  }
+  fn header(&self, op: OpNumber) -> Option<Header> {
+    self.inner.header(op)
+  }
+  fn status(&self, op: OpNumber) -> SlotStatus {
+    self.inner.status(op)
+  }
+  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+    self.inner.submit_append(id, op, header, body)
+  }
+  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+    self.inner.submit_read(id, op)
+  }
+  fn truncate(&mut self, above: OpNumber) {
+    self.inner.truncate(above)
+  }
+  fn prune(&mut self, below: OpNumber) {
+    self.inner.prune(below)
+  }
+  fn poll(&mut self) -> Option<WalDone> {
+    self.inner.poll()
+  }
+}
+
+#[test]
+fn propose_membership_at_wal_capacity_is_a_retryable_at_capacity() {
+  // CONSENSUS-SAFETY: `propose_membership` honours the WAL stall-before-wrap admission fence too.
+  // A fresh primary minting op 1 onto a ZERO-capacity ring would overflow it (`unpruned_window 1 >
+  // capacity 0`), so the proposal is refused — RETRYABLY (`AtCapacity`), since the stall self-releases as
+  // the quorum checkpoints forward. A bare mint would have ignored this back-pressure entirely.
+  let mut e = single_change_primary();
+  let mut wal = ZeroCapWal::default();
+  let now = Instant::ZERO;
+
+  assert_eq!(
+    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3))),
+    Err(ProposeMembershipError::AtCapacity),
+    "a proposal that would overflow the WAL ring is refused retryably, not minted",
+  );
+  assert_eq!(e.op(), OpNumber::new(), "no op was minted");
+  assert_eq!(e.reconfigure_inflight, None, "no latch was set");
+  // The admission gate ran BEFORE delta validation, so even with capacity free the same proposal is fine
+  // — proving the refusal was the capacity fence, not the delta. (An unbounded WAL has room for op 1.)
+  let mut roomy = TestWal::default();
+  assert!(
+    e.propose_membership(
+      now,
+      &mut roomy,
+      SingleVoterDelta::AddVoter(MemberId::new(3))
+    )
+    .is_ok(),
+    "with WAL capacity, the identical proposal is admitted",
+  );
+}
+
+#[test]
 fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
   // A backup recognizes a RECONFIGURATION-client Prepare, stores a typed `Body::Reconfigure`, commits
   // it via the backup apply loop, and installs the IDENTICAL successor (same epoch, same config_id) at
@@ -386,7 +822,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
     .membership
     .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
     .unwrap();
-  let payload = ReconfigurePayload::from_membership(&successor);
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = 1u64;
 
   // The primary's Prepare for the Reconfigure op (flat wire body = the encoded successor), commit 0.
@@ -451,6 +887,116 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
     e.sm_for_test().applied().is_empty(),
     "the backup never applied the Reconfigure op"
   );
+}
+
+#[test]
+fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a_backup_converges()
+{
+  // CONVERGENCE: a commit-first SwapEpoch is an EPOCH change, NOT a view change — `self.view` stays
+  // durable through it. So the durable-view-before-participate fence MUST NOT suppress the primary
+  // while its `SwapEpoch` root is in flight: the primary keeps participating AT the predecessor epoch,
+  // advertising the committed Reconfigure op on its `Commit` heartbeat, which is exactly what lets a
+  // still-old-epoch backup commit that op, stage its OWN swap, and converge. (Before the fence was
+  // decoupled from the SwapEpoch, that heartbeat was suppressed — the backup never learned the op
+  // committed, and a later failover re-minted its op number as a client op: op-number reuse.)
+  let (mut primary, mut pwal, mut psb, op, successor, payload) = proposed_and_committed_swap();
+  let now = Instant::ZERO;
+
+  // The primary committed the Reconfigure op and is now in the SwapEpoch window: a SwapEpoch root is in
+  // flight (`pending_sb`) and the successor is staged (`pending_swap`) — but this is an EPOCH write, so
+  // it does NOT raise the durable-view fence. The view is still durable; the primary may participate.
+  assert!(
+    primary.pending_swap_for_test(),
+    "the primary staged its SwapEpoch successor at commit"
+  );
+  assert!(
+    primary.pending_sb_for_test(),
+    "the SwapEpoch root write is in flight on the superblock"
+  );
+  assert!(
+    !primary.pending_durable_view_for_test(),
+    "a SwapEpoch root must NOT raise the durable-view fence (the view is durable through an epoch swap)"
+  );
+  assert_eq!(
+    primary.membership.epoch(),
+    crate::Epoch::new(0),
+    "the epoch is still the predecessor's (the install is deferred to the durable root)"
+  );
+
+  // Fire the primary's heartbeat tick WHILE the SwapEpoch root is still in flight. The fence no longer
+  // gates `primary_timeouts`/`try_commit` on this epoch write, so the primary emits its commit-advertise
+  // `Commit` AT epoch E carrying the committed Reconfigure op — the message a backup needs.
+  while primary.poll_message().is_some() {} // clear any residue
+  primary.handle_timeout(now + COMMIT_HEARTBEAT, &mut pwal, &mut psb);
+  let commit_msg = core::iter::from_fn(|| primary.poll_message())
+    .map(|out| out.into_msg())
+    .find(|m| matches!(m, Message::Commit(_)))
+    .expect(
+      "the primary advertises its commit through the SwapEpoch window (the fence is decoupled)",
+    );
+  let Message::Commit(commit) = &commit_msg else {
+    unreachable!("filtered to Commit above")
+  };
+  assert!(
+    commit.commit() >= op,
+    "the advertised Commit reaches the committed Reconfigure op {} (got commit {})",
+    op.get(),
+    commit.commit().get()
+  );
+  assert_eq!(
+    commit.epoch(),
+    crate::Epoch::new(0),
+    "the heartbeat advertises the PREDECESSOR epoch (the primary participates at E through the swap)"
+  );
+
+  // A fresh backup that already holds the Reconfigure op in its log (via the primary's earlier Prepare)
+  // receives that exact `Commit` — and converges: it commits the op and stages its OWN SwapEpoch.
+  let mut backup = single_change_backup();
+  let (mut bwal, mut bsb) = (TestWal::default(), TestSb::default());
+  backup.handle_message(
+    now,
+    &mut bwal,
+    &mut bsb,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      op,
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(op.get()),
+      payload.encode_body(),
+    )),
+  );
+  backup.handle_storage(now, &mut bwal, &mut bsb); // the backup's append lands
+  while backup.poll_message().is_some() {}
+
+  // Deliver the PRIMARY'S OWN heartbeat Commit (not a hand-rolled one) — the convergence signal.
+  backup.handle_message(now, &mut bwal, &mut bsb, primary_peer(), commit_msg);
+  assert_eq!(
+    backup.commit(),
+    op,
+    "the backup committed the Reconfigure op off the primary's swap-window heartbeat"
+  );
+  assert!(
+    backup.pending_swap_for_test(),
+    "the backup staged its OWN SwapEpoch — convergence reached the still-old-epoch backup"
+  );
+  assert_eq!(
+    backup.membership.epoch(),
+    crate::Epoch::new(0),
+    "the backup's epoch is still the predecessor's until its own root lands (the fence holds per node)"
+  );
+
+  // Land the backup's SwapEpoch root → it installs the IDENTICAL successor the primary staged.
+  backup.handle_storage(now, &mut bwal, &mut bsb);
+  assert_eq!(
+    backup.membership, successor,
+    "the backup installed the identical successor — the live single change converges cluster-wide"
+  );
+  assert_eq!(backup.membership.epoch(), crate::Epoch::new(1));
 }
 
 // === the XI-b CP overlap (exact durable catch-up) ===
@@ -556,7 +1102,7 @@ fn committed_op_then_swapped(
     .membership
     .apply_delta(&delta)
     .expect("a valid single-voter delta on the 3-voter cluster");
-  let payload = ReconfigurePayload::from_membership(&successor);
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
   let r = e
     .propose_membership(now, &mut wal, delta)
     .expect("the primary mints the reconfiguration op");
@@ -973,7 +1519,7 @@ fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
     .membership
     .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(0)))
     .expect("removing one of three voters is valid");
-  let payload = ReconfigurePayload::from_membership(&successor);
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = e
     .propose_membership(
       now,
@@ -1135,7 +1681,7 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
     .membership
     .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(1)))
     .expect("removing a voter from the 4-voter E=1 config is valid");
-  let payload2 = ReconfigurePayload::from_membership(&succ2);
+  let payload2 = ReconfigurePayload::from_membership(&succ2, e.membership.config_id());
   let op2 = e
     .propose_membership(
       now,
@@ -1263,7 +1809,7 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
     .membership
     .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
     .unwrap();
-  let payload = ReconfigurePayload::from_membership(&successor);
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = e
     .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
     .expect("the primary mints the Reconfigure op");
@@ -1331,6 +1877,63 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
   );
 }
 
+#[test]
+fn a_view_change_truncating_an_uncommitted_proposal_releases_the_in_flight_latch() {
+  // A proposing primary latches `reconfigure_inflight` at propose. If its uncommitted `Reconfigure` op
+  // never commits because a view change deposes it, the latch MUST release — otherwise a future
+  // `propose_membership` (after the node regains primacy) is blocked `AlreadyInFlight` FOREVER on a
+  // proposal that never committed (the proposed-but-never-committed deadlock). `stage_epoch_swap` (which
+  // clears the latch) only runs at COMMIT, so the release must come from `reset_for_view_transition`.
+  let mut e = single_change_primary();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+
+  // Propose on the view-0 primary → the latch is set on the uncommitted op (it is NOT driven to commit).
+  let op = e
+    .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the primary mints the Reconfigure op");
+  assert_eq!(
+    e.reconfigure_inflight,
+    Some(op),
+    "the latch holds the uncommitted proposal"
+  );
+  assert!(
+    !e.pending_swap_for_test(),
+    "no swap is staged — the op has not committed"
+  );
+  while e.poll_message().is_some() {}
+
+  // A higher-view `Commit` (view 1) deposes the proposer: `catch_up_to_view` runs the view-transition
+  // reset. The uncommitted op is abandoned with the old generation.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Commit(Commit::new(
+      View::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    !e.status().is_normal(),
+    "the proposer left Normal on the higher-view Commit"
+  );
+  // THE PROPERTY: the proposal latch was RELEASED by the view transition (the op never committed, so it
+  // must not block forever).
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "the in-flight latch is released when a view change abandons the uncommitted proposal",
+  );
+  assert!(
+    !e.pending_swap_for_test(),
+    "no committed-but-not-installed swap exists (the op never committed)"
+  );
+}
+
 // (d) VIEW-CHANGE-DURING-CHANGE. A Reconfigure op uncommitted when a view change fires rides
 // `select_canonical_log` like any entry: truncated if uncommitted-and-not-canonical, carried if on
 // the canonical DVC quorum and re-driven by the new primary (whose commit then fires the swap).
@@ -1357,7 +1960,7 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
     .membership
     .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
     .unwrap();
-  let payload = ReconfigurePayload::from_membership(&successor);
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
   e.handle_message(
     now,
     &mut wal,
@@ -1458,7 +2061,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
   let successor = genesis(3)
     .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
     .unwrap();
-  let payload = ReconfigurePayload::from_membership(&successor);
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
   let reconfig_checksum = Body::Reconfigure(payload.clone()).body_checksum();
 
   // Drive slot 1 into ViewChange as primary of view 1 via the real SVC path (its own DVC carries op 0
@@ -1593,5 +2196,480 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
   assert_eq!(
     e.membership, successor,
     "the successor membership is installed"
+  );
+}
+
+#[test]
+fn a_committed_swap_survives_a_view_change_and_still_installs() {
+  // F2 — a view change DURING the COMMITTED swap window must NOT cancel the swap. A node commits the
+  // `Reconfigure` op (so `commit_min` advances PAST it and `commit_reconfigure` will never run for it
+  // again), stages `pending_swap`, but its `SwapEpoch` root is still in flight when a view change fires.
+  // Because the op is already committed, the new view's `advance_commit` starts ABOVE it — there is NO
+  // re-commit to re-stage the swap. So the staged successor MUST survive the transition and install once
+  // the view's durable root lands, or the committed membership change is lost forever (the cluster stays
+  // in the old epoch after a committed reconfiguration). Distinct from
+  // `a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_recommitted`, where the op
+  // rode the view change UNCOMMITTED and re-committed under the new view.
+  //
+  // Driven over an ASYNC superblock (`StepSb`) so the `SwapEpoch` root stays in flight across the
+  // transition: the backup (slot 1) commits + stages, then becomes the new primary of view 1.
+  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+    Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
+    genesis(3),
+    0,
+    CountSm::default(),
+  );
+  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let now = Instant::ZERO;
+
+  let successor = genesis(3)
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .unwrap();
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let op = 1u64;
+
+  // (1) The view-0 primary's Prepare for the Reconfigure op (flat wire body = encoded successor).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(op),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(op),
+      payload.encode_body(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // the backup's append lands
+  sb.flush(); // the append is durable
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+
+  // (2) The primary's Commit advances the backup's commit to the Reconfigure op → it commits (commit_min
+  // moves PAST it) + stages the swap. The `SwapEpoch` root is submitted but NOT yet flushed — it is in
+  // flight across the view change to come.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(op),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(op),
+    "the Reconfigure op committed (commit_min advanced to it)"
+  );
+  assert!(
+    e.pending_swap_for_test(),
+    "the backup staged its swap (committed, not yet installed)"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "the fence: the epoch is NOT swapped yet (the root is in flight)"
+  );
+
+  // (3) A view change to view 1 fires DURING the committed swap window (slot 1 is primary of view 1).
+  // Drive it via the real SVC path so status + the catching_up discriminant are set correctly; the
+  // SendDoViewChange durable-view root SUPERSEDES the in-flight SwapEpoch root on the superblock.
+  let later = now + core::time::Duration::from_millis(300);
+  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1, own SVC bit
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(2),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "slot 1 collects DVCs as primary of view 1"
+  );
+  // THE F2 PROPERTY (part 1): the committed swap SURVIVED the view-transition reset — it was NOT
+  // cancelled (the committed change is not lost).
+  assert!(
+    e.pending_swap_for_test(),
+    "the committed-but-not-installed swap survives the view transition (it is not cancelled)",
+  );
+  while e.poll_message().is_some() {}
+
+  // (4) A peer DVC for view 1 carrying the committed prefix `[1..=1]` reaches the 2-of-3 quorum (the new
+  // primary's own DVC is auto-inserted) → formation. The DVC's view is the CURRENT view (1), its log_view
+  // 0, op 1, commit 1 — the committed Reconfigure op rides as a `Present` entry.
+  let peer_dvc = crate::DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(1),
+    OpNumber::with(1),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(2),
+    std::vec![crate::PreparedEntry::new(
+      OpNumber::with(1),
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.encode_body(),
+    )],
+  );
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(peer_dvc),
+  );
+  assert!(e.is_primary(), "slot 1 formed view 1 as the new primary");
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "slot 1 formed view 1 (Normal primary)"
+  );
+  assert_eq!(e.view(), View::with(1));
+  // The swap is STILL staged — it has not yet re-submitted (the durable-view root is in flight).
+  assert!(
+    e.pending_swap_for_test(),
+    "the swap is still staged through formation (awaiting the durable-view root)"
+  );
+
+  // (5) Drain storage: the SendDoViewChange / StartViewAsPrimary durable-view root lands, `on_sb_done`
+  // re-submits the staged SwapEpoch (`maybe_swap_epoch`), and that root then installs the successor.
+  for _ in 0..8 {
+    sb.flush();
+    e.handle_storage(later, &mut wal, &mut sb);
+    while e.poll_message().is_some() {}
+    if !e.pending_swap_for_test() {
+      break;
+    }
+  }
+
+  // THE F2 PROPERTY (part 2): after the view change completes and storage drains, the epoch DID swap —
+  // the committed reconfiguration installed despite the interrupting view change.
+  assert!(
+    !e.pending_swap_for_test(),
+    "the staged swap was consumed by the install after the view change"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(1),
+    "the epoch swapped to E+1 after the interrupting view change (the committed change is not lost)",
+  );
+  assert_eq!(
+    e.membership, successor,
+    "the successor membership installed post-view-change"
+  );
+}
+
+#[test]
+fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
+  // CONSENSUS-LIVENESS: a `Reconfigure` op rides the prepare-retransmit channel like a client op. The
+  // primary mints the change, the one-shot `Prepare` is DROPPED (no backup hears it), and the op then
+  // sits uncommitted in `(commit_min, op]` — blocking every later proposal via `has_pending_reconfigure`.
+  // The retransmit tick MUST re-ship it (with its reconfiguration body) or the change stalls forever
+  // until a view change happens to truncate it. The body the retransmit carries must content-address the
+  // successor membership, so a backup replaying it through `on_prepare` rebuilds a typed `Body::Reconfigure`.
+  let mut e = single_change_primary();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter is a valid delta on a 3-voter cluster");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  let op = e
+    .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the primary mints the reconfiguration op");
+  // DROP the one-shot broadcast Prepare: no backup ever hears the initial transmission.
+  while e.poll_message().is_some() {}
+  // The primary's own append lands (its own vote), but with the Prepare dropped no quorum forms — the
+  // Reconfigure op is stuck uncommitted in the un-acked window.
+  e.handle_storage(now, &mut wal, &mut sb);
+  assert!(
+    e.commit() < op,
+    "the Reconfigure op is uncommitted (its only Prepare was dropped, so no quorum acked it)"
+  );
+
+  // Fire the prepare-retransmit tick: it MUST re-ship the Reconfigure op (TODAY it skips the op because
+  // its body is `Body::Reconfigure`, not `Body::Present` — the op is never resent and the change stalls).
+  e.handle_timeout(now + super::super::PREPARE_RETRANSMIT, &mut wal, &mut sb);
+  let mut retransmitted_body: Option<bytes::Bytes> = None;
+  while let Some(out) = e.poll_message() {
+    match out.into_msg() {
+      Message::PrepareBatch(b) => {
+        for entry in b.log_slice() {
+          if entry.op() == op {
+            assert_eq!(
+              entry.client(),
+              ClientId::RECONFIGURATION,
+              "the retransmitted op is the reconfiguration op"
+            );
+            retransmitted_body = entry.body().map(bytes::Bytes::copy_from_slice);
+          }
+        }
+      }
+      Message::Prepare(p) if p.op() == op => {
+        retransmitted_body = Some(p.body_bytes());
+      }
+      _ => {}
+    }
+  }
+  let body = retransmitted_body
+    .expect("the dropped reconfiguration Prepare is re-shipped on the retransmit tick");
+  assert_eq!(
+    crate::storage::fnv1a_128(&body),
+    Body::Reconfigure(payload.clone()).body_checksum(),
+    "the retransmitted body content-addresses the successor membership (a backup rebuilds Body::Reconfigure)",
+  );
+
+  // The re-shipped Prepare is now received by a backup quorum: feed the primary the resulting acks so the
+  // change commits + stages its swap (the retransmit actually unblocks ordered commit, not just re-emits).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    reconfigure_ack(op.get(), &payload, 1),
+  );
+  assert_eq!(
+    e.commit(),
+    op,
+    "the Reconfigure op committed once the retransmit reached a quorum"
+  );
+  assert!(
+    e.pending_swap_for_test(),
+    "the commit-first swap staged — the retransmitted reconfiguration op was recognized at commit"
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // land the SwapEpoch root → install
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(1),
+    "the epoch swapped to E+1 — the once-dropped reconfiguration installed via the retransmit",
+  );
+  assert_eq!(
+    e.membership, successor,
+    "the successor membership installed"
+  );
+}
+
+#[test]
+fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
+  // CONSENSUS-SAFETY: a new primary that is the SOLE holder of a carried (uncommitted) reconfiguration
+  // body must PRESERVE its local `Body::Reconfigure` when the canonical DVC/StartView carrier is
+  // header-only (`Body::Repairing` — every real view-change carrier is). `adopt_log` preserves a matching
+  // LOCAL body when the incoming entry is header-only; if that preservation recognizes only `Body::Present`,
+  // a replica holding the op as `Body::Reconfigure` has its local payload IGNORED and overwritten by the
+  // incoming `Repairing` — an unfillable hole instead of recommit+install, the only live payload dropped.
+  //
+  // Replica 1 becomes the primary of view 1. It holds op 2 LOCALLY as `Body::Reconfigure` (it received the
+  // view-0 Prepare for it). The canonical log of view 1 carries op 2 HEADER-ONLY (its own DVC, built by
+  // `log_entries()`, is all `Repairing`). Adoption must keep replica 1's local reconfiguration body.
+  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+    Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
+    genesis(3),
+    0,
+    CountSm::default(),
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter is a valid delta on a 3-voter cluster");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  // (1) Replica 1 (a view-0 backup) receives the view-0 primary's Prepares: a client op at op 1, then the
+  // reconfiguration op at op 2. It now holds op 2 LOCALLY as a typed `Body::Reconfigure`.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::new(7),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"a"),
+    )),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(2),
+      payload.encode_body(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.log.get(&2).expect("op 2 is held locally").body,
+    Body::Reconfigure(payload.clone()),
+    "replica 1 holds the reconfiguration op LOCALLY as a typed Body::Reconfigure",
+  );
+
+  // (2) Drive replica 1 into ViewChange(1): its idle timer proposes a view change, one peer's SVC reaches
+  // the 2-of-3 SVC quorum.
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+
+  // (3) Two DVCs reach the new primary. Replica 1's OWN DVC (folded in) carries op 2 header-only
+  // (`log_entries()` is all `Repairing`). Replica 2's DVC carries op 1 + op 2 ALSO header-only — it is the
+  // canonical carrier but, like every real carrier, body-less. So no incoming entry carries the
+  // reconfiguration BODY: only replica 1's LOCAL `Body::Reconfigure` has it. `commit* = 1`, so op 2 is the
+  // uncommitted tail (not nack-truncated: replica 2 vouches `op == 2`, no nack quorum below it).
+  let dvc = DoViewChange::new(
+    View::with(1),
+    View::with(0),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(2),
+    std::vec![
+      PreparedEntry::repairing(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        Body::Present(bytes::Bytes::from_static(b"a")).body_checksum(),
+      ),
+      PreparedEntry::repairing(
+        OpNumber::with(2),
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(2),
+        Body::Reconfigure(payload.clone()).body_checksum(),
+      ),
+    ],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(dvc),
+  );
+  assert!(e.is_primary(), "replica 1 is now the primary of view 1");
+  assert_eq!(
+    e.op(),
+    OpNumber::with(2),
+    "the reconfiguration op was adopted"
+  );
+
+  // THE BUG: adoption must NOT overwrite replica 1's local `Body::Reconfigure` with the incoming
+  // header-only `Repairing` (TODAY the preserve only recognizes `Body::Present`, so op 2 becomes an
+  // unfillable hole). Replica 1 is the only live holder of the reconfiguration body — it must keep it.
+  assert_eq!(
+    e.log
+      .get(&2)
+      .expect("op 2 is in the new primary's log")
+      .body,
+    Body::Reconfigure(payload.clone()),
+    "header-only adoption PRESERVED the new primary's local Body::Reconfigure (not overwritten to a hole)",
+  );
+  assert!(
+    e.has_pending_reconfigure_for_test(),
+    "the carried uncommitted reconfiguration is recognized as in-flight from the preserved log entry"
+  );
+
+  // (4) Drive the new primary to settle + recommit the carried reconfiguration: drain its durable-view
+  // write, then feed it the acks for op 2 under view 1 so it commits + stages the swap, and install.
+  for _ in 0..8 {
+    e.handle_storage(now, &mut wal, &mut sb);
+    while e.poll_message().is_some() {}
+    if e.commit() >= OpNumber::with(2) {
+      break;
+    }
+    // The new primary re-commits op 2 once a quorum re-acks it under view 1.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::PrepareOk(crate::PrepareOk::new(
+        View::with(1),
+        OpNumber::with(2),
+        ReplicaId::new(2),
+        OpNumber::new(),
+        crate::storage::prepare_identity(
+          ClientId::RECONFIGURATION,
+          RequestNumber::with(2),
+          Body::Reconfigure(payload.clone()).body_checksum(),
+        ),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+  }
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(2),
+    "the carried reconfiguration op re-committed under the new view (its preserved body let it commit)"
+  );
+  for _ in 0..8 {
+    e.handle_storage(now, &mut wal, &mut sb);
+    while e.poll_message().is_some() {}
+    if !e.pending_swap_for_test() {
+      break;
+    }
+  }
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(1),
+    "the epoch swapped to E+1 — the preserved reconfiguration installed (no unfillable hole)",
+  );
+  assert_eq!(
+    e.membership, successor,
+    "the successor membership installed"
   );
 }

@@ -115,6 +115,38 @@ pub enum ProposeMembershipError {
   /// variant is wired now so the promote gate has its verdict ready.
   #[error("the promotion target has not caught up to the committed frontier")]
   TargetNotCaughtUp,
+  /// A TRANSIENT op-admission fence is up — the SAME backpressure a client request hits before a new op
+  /// is minted: a pending durable-view / state-sync / checkpoint write, a flagged forfeit step-down, or a
+  /// committed-but-unapplied prefix (a repair hole). Minting now would advertise an op in a view this node
+  /// may roll back, reuse an op number a reset is about to free, or double-execute a retry. RETRYABLE: the
+  /// proposer retries once the in-flight work settles (it is not a permanent rejection). The catch-all for
+  /// the non-capacity transient fences (capacity backpressure is the separate [`Self::AtCapacity`]).
+  #[error(
+    "a transient op-admission fence is up (a pending write, a step-down, or a commit gap) — retry"
+  )]
+  Busy,
+  /// The accepted-but-uncommitted pipeline OR the bounded WAL / view-change-carrier band is at capacity:
+  /// minting the next op would overflow the WAL ring or push the carrier band past its frame-fit depth —
+  /// the SAME physical back-pressure the client-request path applies. RETRYABLE: it self-releases as the
+  /// quorum checkpoints forward and the GC frees slots, so the proposer retries.
+  #[error("the op pipeline / WAL is at capacity — retry once the cluster checkpoints forward")]
+  AtCapacity,
+}
+
+/// Push a just-superseded `config_id` onto a recent-prior lineage `ring` (most-recent-first), bounded to
+/// the [`LINEAGE_RING`](super::LINEAGE_RING) width — the durable-root analogue of the endpoint's in-memory
+/// `push_lineage`, operating on the decoded `prior_config_ids` of a durable root. The result is the
+/// successor's lineage: `superseded` first, then the most-recent retained ids, truncated to the ring width.
+fn push_lineage_ring(ring: &[u128], superseded: u128) -> Vec<u128> {
+  let mut out = Vec::with_capacity(super::LINEAGE_RING);
+  out.push(superseded);
+  out.extend(
+    ring
+      .iter()
+      .copied()
+      .take(super::LINEAGE_RING.saturating_sub(1)),
+  );
+  out
 }
 
 /// Builds the SUCCESSOR durable root for an offline, operator-coordinated restart.
@@ -166,6 +198,11 @@ pub fn prepare_restart(
   let successor = current.reconfigure(replica_count, learner_count, members)?;
   let prev_epoch: Epoch = cur.epoch();
   let epoch = successor.epoch();
+  // The successor's recent-prior lineage: the predecessor (`cur`'s) `config_id` shifted onto the front of
+  // `cur`'s retained lineage, bounded to the same ring width — so a node restarted off this root restores
+  // the post-swap lineage and still admits a retained old-epoch laggard's cross-epoch catch-up. `cur` may
+  // be a v4 root with an empty lineage (a pre-v5 root); then the ring is just the predecessor id.
+  let prior_config_ids = push_lineage_ring(cur.prior_config_ids(), current.config_id());
   let state = VsrState::try_new_v4(
     cur.view(),
     cur.log_view(),
@@ -176,6 +213,7 @@ pub fn prepare_restart(
     epoch,
     prev_epoch,
     successor,
+    prior_config_ids,
   )?;
   Ok(state)
 }

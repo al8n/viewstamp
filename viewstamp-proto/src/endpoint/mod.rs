@@ -109,12 +109,13 @@ pub(crate) enum PendingSbAction {
   /// the current `commit_max` + committed-band headers and has no follow-up participation.
   Seal,
   /// A commit-first epoch swap: a `Body::Reconfigure` op committed under the OLD epoch, and this
-  /// durable root carries the SUCCESSOR membership (NOT yet installed in memory). On completion
-  /// `on_sb_done` calls [`Endpoint::install_membership`] — so the node advertises the new
-  /// quorum/voter-set only AFTER a durable root proves the swap (the
-  /// durable-epoch-before-participate fence). The successor is held here, not in `self.membership`,
-  /// for exactly the STAGE→durable-root window.
-  SwapEpoch(Membership),
+  /// durable root carries the `(reconfigure op number, SUCCESSOR membership)` (NOT yet installed in
+  /// memory). On completion `on_sb_done` calls [`Endpoint::install_membership`] — so the node advertises
+  /// the new quorum/voter-set only AFTER a durable root proves the swap (the durable-epoch-before-
+  /// participate fence). The op number + successor are held here, not in `self.membership`, for exactly
+  /// the STAGE→durable-root window — and the op number is the captured reconfigure op (NOT `commit_min`,
+  /// which advances past it while the primary keeps committing through this window).
+  SwapEpoch(OpNumber, Membership),
 }
 
 /// Which of a checkpoint's two superblock writes is outstanding. Kept SEPARATE from
@@ -639,6 +640,48 @@ impl LogEntry {
       body: Body::Reconfigure(payload),
     }
   }
+
+  /// Build the in-memory entry for a committed op's `(client, request, body)` bytes, choosing the ONE
+  /// typed representation every replica must hold (decision (a): a single representation everywhere). A
+  /// [`ClientId::RECONFIGURATION`] body is the canonical successor-membership encoding — decode it back
+  /// to a typed [`Body::Reconfigure`] so the commit-first epoch swap recognizes it; every other body is
+  /// an opaque [`Body::Present`] client op. This is the SOLE reconstruction-from-bytes helper, shared by
+  /// the normal-prepare append (`log_entry_from_prepare`), the repair fill, AND the recovery WAL read —
+  /// so a RECONFIGURATION op never type-erases into a `Present` op on ANY ingress path (which would make
+  /// `commit_reconfigure` miss it: the epoch swap silently never fires and the membership bytes are
+  /// mis-applied to the state machine, re-minting / mis-typing the op number — a consensus divergence).
+  ///
+  /// A RECONFIGURATION body from a legitimate source always carries `encode_body()` output, which always
+  /// decodes (the non-Byzantine contract; framing/durability checksums catch corruption first). A decode
+  /// failure is therefore a bug — asserted in debug — and degrades in release to a `Body::Present` entry
+  /// (the op is still held + acked, so the head never stalls; commit then treats it as an opaque op and
+  /// stages NO epoch swap, never panicking on the bytes).
+  #[cfg_attr(not(tarpaulin), inline)]
+  fn from_committed_body(client: ClientId, request: RequestNumber, body: Bytes) -> Self {
+    if client == ClientId::RECONFIGURATION {
+      match crate::message::ReconfigurePayload::decode_body(&body) {
+        Ok(payload) => return Self::reconfigure(client, request, payload),
+        Err(_e) => {
+          debug_assert!(
+            false,
+            "a RECONFIGURATION op carried an undecodable reconfigure body ({_e:?}) — a \
+             non-Byzantine source always supplies encode_body() output",
+          );
+        }
+      }
+    }
+    Self::present(client, request, body)
+  }
+
+  /// The canonical WIRE body bytes when this entry is BODY-BEARING (`Present` bytes, or a `Reconfigure`
+  /// op's `encode_body()`), else `None` for a header-only `Repairing` hole. The SINGLE accessor every
+  /// body-transport / storage path on a held `LogEntry` routes through (prepare retransmit, repair serve,
+  /// adopted-tail re-append, the header-only-adoption preserve, faulted-append retry) so a `Body::Reconfigure`
+  /// op is transmitted/stored exactly like a client op — see [`Body::body_bytes`](crate::message::Body::body_bytes).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn body_bytes(&self) -> Option<Bytes> {
+    self.body.body_bytes()
+  }
 }
 
 /// Primary-side tracking of an in-flight prepare awaiting a prepare_ok quorum.
@@ -1144,22 +1187,29 @@ pub struct Endpoint<S, R: Reconfig = RestartOnly> {
   /// `forfeit_armed`) so a stale flag never carries into a fresh generation. A backup leaves this
   /// `false` and force-syncs as before. Private; never crosses the API boundary.
   pending_forfeit: bool,
-  /// The single-writer reconfiguration latch: `Some(op)` while a `Body::Reconfigure` op the primary
-  /// minted is in flight (proposed, not yet committed), else `None`. A [`SingleChange`] primary mints
-  /// at most ONE membership change at a time — `propose_membership` refuses a second proposal while
-  /// this is `Some` — so the cluster never has two overlapping configuration changes racing to commit.
-  /// Set by `propose_membership` on a successful mint; cleared once the change commits/aborts (a later
-  /// task). Private; never hashed/serialized/emitted.
+  /// The single-writer reconfiguration latch for the PROPOSED-but-not-committed phase: `Some(op)` while
+  /// a `Body::Reconfigure` op the primary minted is proposed but not yet committed, else `None`. Set by
+  /// `propose_membership` on a successful mint; cleared at commit by `stage_epoch_swap` (the swap then
+  /// rides `pending_swap` through install) OR by `reset_for_view_transition` when a view change abandons
+  /// the proposing generation (an uncommitted proposal that gets truncated never commits, so the latch
+  /// MUST release or a future propose is blocked forever). A [`SingleChange`] primary keeps at most ONE
+  /// membership change in flight from propose THROUGH install: `propose_membership` refuses a second
+  /// while this is `Some` OR a committed-but-not-installed swap is outstanding ([`Self::swap_in_flight`]).
+  /// Private; never hashed/serialized/emitted.
   reconfigure_inflight: Option<OpNumber>,
-  /// A committed `Body::Reconfigure` op's SUCCESSOR membership, awaiting its durable `SwapEpoch` root.
-  /// `Some` exactly across the commit→durable-root window: commit recognizes the Reconfigure op and
-  /// latches the successor here (NOT in `self.membership` — the durable-epoch-before-participate
-  /// fence), and the actual `submit_swap_epoch` durable-root write waits its turn behind any in-flight
-  /// superblock write ([`Self::maybe_swap_epoch`], the same single-writer exclusion `maybe_checkpoint`
-  /// uses). Cleared when the SwapEpoch root lands and `install_membership` runs. The successor is
-  /// identical on every replica (all commit at the identical OLD membership), so this is the
-  /// pre-install staging of a convergent value; private, never hashed/serialized/emitted.
-  pending_swap: Option<Membership>,
+  /// A committed `Body::Reconfigure` op's `(op number, SUCCESSOR membership)`, awaiting its durable
+  /// `SwapEpoch` root. `Some` exactly across the commit→durable-root window: commit recognizes the
+  /// Reconfigure op and latches the successor here (NOT in `self.membership` — the durable-epoch-before-
+  /// participate fence), and the actual `submit_swap_epoch` durable-root write waits its turn behind any
+  /// in-flight superblock write ([`Self::maybe_swap_epoch`], the same single-writer exclusion
+  /// `maybe_checkpoint` uses). Cleared when the SwapEpoch root lands and `install_membership` runs. The
+  /// CAPTURED op number is the reconfigure op itself — recorded at stage time, NOT re-derived from
+  /// `commit_min` at install time, because the primary keeps committing client ops through the SwapEpoch
+  /// window (the view stays durable through an epoch swap), so `commit_min` may have advanced PAST the
+  /// reconfigure op by the time the root lands. The successor is identical on every replica (all commit
+  /// at the identical OLD membership), so this is the pre-install staging of a convergent value; private,
+  /// never hashed/serialized/emitted.
+  pending_swap: Option<(OpNumber, Membership)>,
   /// Per-member DURABLE-frontier progress, keyed by the stable [`MemberId`]: the highest
   /// `durable_commit_min` a member has reported via a [`LearnerStatus`](crate::LearnerStatus). It
   /// carries NO quorum authority — it is NEVER read by any commit/view-change/recovery quorum — and is
@@ -1419,8 +1469,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   /// `select_canonical_log`'s union and is never nack-truncated. The OLD-write-quorum-vs-NEW-view-
   /// change-quorum count bound is not ≥1 for a 3→2 shrink or a 3→4 grow, so this structural gate (not
   /// a count) is the load-bearing invariant; the `cp_overlap_*` reconfigure tests pin it.
-  fn install_membership(&mut self, successor: Membership) {
-    let op = self.reconfigure_installing_op();
+  fn install_membership(&mut self, op: OpNumber, successor: Membership) {
     // Capture the abdication precondition (hazard a) against the OLD membership, BEFORE the swap:
     // was this node the primary of its current view? (Robust to an already-absent local member.)
     let was_primary = self.is_primary();
@@ -1461,16 +1510,6 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       )));
   }
 
-  /// The op number a `MembershipChanged` event names — the committed `Body::Reconfigure` op whose
-  /// durable swap is installing. It is `commit_min` (the swap is staged the instant the op commits, so
-  /// `commit_min` is exactly at it when the root lands; no later commit advances past a staged swap,
-  /// because a committed reconfiguration is the head's frontier at stage time). A minimal accessor so
-  /// the event payload reads the same value on the primary and on a backup.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  fn reconfigure_installing_op(&self) -> OpNumber {
-    self.commit_min
-  }
-
   /// Push a just-superseded `config_id` onto the recent-prior lineage ring (most-recent-first): shift
   /// every retained id down one and drop the oldest, so the ring always holds the [`LINEAGE_RING`] most
   /// recent ancestors. Read by [`Self::in_lineage`] to widen AGNOSTIC-message admission across a small
@@ -1478,6 +1517,19 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   fn push_lineage(&mut self, superseded: u128) {
     self.lineage.copy_within(..LINEAGE_RING - 1, 1);
     self.lineage[0] = superseded;
+  }
+
+  /// The recent-prior lineage ring AS IT WOULD BE after pushing `superseded` (most-recent-first), without
+  /// mutating `self.lineage`. Used to stamp a SwapEpoch durable root — which carries the SUCCESSOR
+  /// membership but is written BEFORE `install_membership` runs the real `push_lineage` at `on_sb_done` —
+  /// with the lineage that MATCHES the successor it carries (the just-superseded predecessor id shifted
+  /// in), so a node recovering off that root restores the post-swap lineage exactly as the live install
+  /// would have built it.
+  fn lineage_after_push(&self, superseded: u128) -> std::vec::Vec<u128> {
+    let mut ring = self.lineage;
+    ring.copy_within(..LINEAGE_RING - 1, 1);
+    ring[0] = superseded;
+    ring.to_vec()
   }
 
   /// Retire the Normal-primary CADENCE — the commit heartbeat, the prepare retransmit, and the forfeit
@@ -1496,56 +1548,148 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   }
 
   /// Stage the SUCCESSOR membership of a just-committed `Body::Reconfigure` op for its durable epoch
-  /// swap, the COMMIT-FIRST half of the swap. Latches `successor` in `pending_swap` (NOT in
-  /// `self.membership` — the fence) and clears the single-writer reconfiguration latch, then tries to
-  /// submit the SwapEpoch durable root immediately. Called from both apply sites
+  /// swap, the COMMIT-FIRST half of the swap. Latches `(reconfigure_op, successor)` in `pending_swap`
+  /// (NOT in `self.membership` — the fence) and clears the single-writer reconfiguration latch, then
+  /// tries to submit the SwapEpoch durable root immediately. Called from both apply sites
   /// ([`Self::commit_op`] on the primary, [`Self::advance_commit`] on a backup) the instant the op
   /// commits. The op is NOT applied to the state machine (it is consensus-layer) and the epoch is NOT
-  /// advanced in memory yet.
-  fn stage_epoch_swap(&mut self, successor: Membership, sb: &mut impl Superblock)
-  where
+  /// advanced in memory yet. `reconfigure_op` is captured here (where `commit_min` is exactly at it) so
+  /// the install-time `MembershipChanged` names the reconfigure op even after `commit_min` advances past
+  /// it through the SwapEpoch window.
+  fn stage_epoch_swap(
+    &mut self,
+    reconfigure_op: OpNumber,
+    successor: Membership,
+    sb: &mut impl Superblock,
+  ) where
     S: StateMachine,
   {
+    // DEFENSE IN DEPTH, ENFORCED IN RELEASE: never overwrite an already-staged successor. `propose_membership`
+    // refuses a second change while a swap is outstanding (`has_pending_reconfigure`), so the
+    // single-change-at-a-time contract guarantees at most ONE committed-but-not-installed reconfiguration.
+    // A staged `pending_swap` here would mean a second reconfiguration committed before the first
+    // installed — overwriting it would CLOBBER the first's staged successor and lose it on the first
+    // `on_sb_done`. So KEEP the existing staged swap and refuse the overwrite in RELEASE too (a debug-only
+    // assert vanishes in production, leaving the clobber live): the first swap still installs, and the
+    // second op stays committed in the log — it re-stages off its pinned predecessor once the first's
+    // install advances `self.membership` to that predecessor (`commit_reconfigure`'s predecessor gate).
+    // (A laggard re-reaching an ALREADY-staged op is impossible: `commit_min` is monotone and
+    // `stage_epoch_swap` runs once as `commit_min` crosses the op.)
+    debug_assert!(
+      self.pending_swap.is_none(),
+      "stage_epoch_swap would overwrite a staged successor for op {:?} with op {}",
+      self.pending_swap.as_ref().map(|(o, _)| o.get()),
+      reconfigure_op.get(),
+    );
+    if self.pending_swap.is_some() {
+      return;
+    }
     self.reconfigure_inflight = None;
-    self.pending_swap = Some(successor);
+    self.pending_swap = Some((reconfigure_op, successor));
     self.maybe_swap_epoch(sb);
   }
 
-  /// Submit the staged SwapEpoch durable root IF the superblock is free — the single-writer
-  /// sequencing that keeps a SwapEpoch behind any in-flight superblock write (a concurrent checkpoint
-  /// root, a durable-view write), the SAME exclusion `maybe_checkpoint` enforces. A SwapEpoch that
-  /// commits while a checkpoint root is in flight WAITS its turn: `pending_swap` stays latched and the
-  /// next free superblock slot — re-checked at the commit tails (alongside `maybe_checkpoint`) and from
-  /// `on_sb_done` when any write completes — submits it. No-op if nothing is staged or a write is
-  /// already in flight. The successor is CLONED into the pending action so `pending_swap` survives a
-  /// supersession of the root write (a view-change durable-view write cannot overwrite a SwapEpoch
-  /// here, because the exclusion blocks issuing either while the other is pending).
+  /// Is a committed-but-not-installed epoch swap outstanding — the COMMIT→INSTALL window of a live
+  /// reconfiguration? `pending_swap` is `Some` for exactly that window (set when the `Reconfigure` op
+  /// commits, cleared when its durable `SwapEpoch` root installs the successor), and it SURVIVES a view
+  /// change (the committed change is not lost). The in-flight `SwapEpoch` root is a strict SUBSET of this
+  /// window, so `pending_swap.is_some()` alone captures it; the explicit `pending_sb` SwapEpoch-action
+  /// check is belt-and-suspenders for the single-change-at-a-time gate. Read by `propose_membership` so a
+  /// second reconfiguration cannot be proposed across the epoch boundary while the first is installing.
+  fn swap_in_flight(&self) -> bool {
+    self.pending_swap.is_some()
+      || matches!(self.pending_sb, Some((_, PendingSbAction::SwapEpoch(_, _))))
+  }
+
+  /// Is ANY membership change in flight — proposed-but-not-committed OR committed-but-not-installed —
+  /// derived STRUCTURALLY from the log, the source of truth, not from the `reconfigure_inflight` latch
+  /// that a view change clears. True iff EITHER:
+  ///
+  /// - a committed-but-not-installed swap is outstanding ([`Self::swap_in_flight`]: the `Reconfigure`
+  ///   op committed and its `SwapEpoch` root is staged / in flight but not yet installed); OR
+  /// - an UNCOMMITTED `Body::Reconfigure` entry sits in the log's tail `(commit_min, op]` — covering
+  ///   both a normally-proposed-but-not-yet-committed reconfiguration AND one CARRIED canonical into a
+  ///   new view by `start_view_as_new_primary` (where it rides the adopted log but has not re-committed,
+  ///   so the latch is `None`). The proposal latch (`reconfigure_inflight`) is a fast-path BOOKKEEPING
+  ///   hint that does not survive a view-change reset, so it is NOT the authority here — the log is.
+  ///
+  /// `propose_membership` rejects (`AlreadyInFlight`) whenever this holds, so the cluster never has two
+  /// overlapping configuration changes racing across the epoch boundary even after a view change carries
+  /// the first uncommitted change forward. The tail scan is bounded by the uncommitted-tail width
+  /// `op - commit_min` (the pipeline depth, small), not the whole log.
+  fn has_pending_reconfigure(&self) -> bool {
+    if self.swap_in_flight() {
+      return true;
+    }
+    let lo = self.commit_min.get() + 1;
+    let hi = self.op.get();
+    (lo..=hi).any(|op| {
+      self
+        .log
+        .get(&op)
+        .is_some_and(|entry| entry.body.as_reconfigure().is_some())
+    })
+  }
+
+  /// Submit the staged SwapEpoch durable root IF the view is durable AND the superblock is free — the
+  /// single-writer sequencing that keeps a SwapEpoch behind any in-flight superblock write (a concurrent
+  /// checkpoint root, a durable-view write), the SAME exclusion `maybe_checkpoint` enforces. A SwapEpoch
+  /// that commits while a checkpoint root is in flight WAITS its turn: `pending_swap` stays latched and
+  /// the next free superblock slot — re-checked at the commit tails (alongside `maybe_checkpoint`) and
+  /// from `on_sb_done` when any write completes — submits it. No-op if nothing is staged or a write is
+  /// already in flight. The `(op, successor)` is CLONED into the pending action so `pending_swap` survives
+  /// a supersession of the root write.
+  ///
+  /// DURABLE-VIEW GATE (`is_normal() && log_view == view`, exactly `maybe_checkpoint`'s gate): the
+  /// SwapEpoch root persists `self.view` / `self.log_view`, so it must be minted only when that view is
+  /// SETTLED and durable. A view change leaves `pending_swap` staged (the committed change is not lost —
+  /// see `reset_for_view_transition`) but advances `self.view` ahead of `log_view`; submitting a SwapEpoch
+  /// root THEN would persist a not-yet-durable view through the wrong path (bypassing the
+  /// SendDoViewChange/StartView durable-view sequence the fence relies on). So the staged swap WAITS for
+  /// the view to settle: it re-submits from `on_sb_done` once the durable-view root lands (status already
+  /// Normal, `log_view == view`) and from the commit tails on the `catch_up_to_view` path that issues no
+  /// durable-view write. This also covers the `start_view_as_new_primary` formation, where `advance_commit`
+  /// can re-commit a carried `Reconfigure` op while status is still ViewChange — the swap defers here and
+  /// fires once the new view is durable.
   fn maybe_swap_epoch(&mut self, sb: &mut impl Superblock)
   where
     S: StateMachine,
   {
+    if !self.status.is_normal() || self.log_view.get() != self.view.get() {
+      return; // the view is not settled/durable — a SwapEpoch root must not persist it
+    }
     if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
       return; // a superblock write is in flight — the swap waits its turn
     }
-    let Some(successor) = self.pending_swap.clone() else {
+    let Some((reconfigure_op, successor)) = self.pending_swap.clone() else {
       return; // nothing staged
     };
-    self.submit_swap_epoch(successor, sb);
+    self.submit_swap_epoch(reconfigure_op, successor, sb);
   }
 
   /// Mint the SwapEpoch durable root carrying `successor` — a v4 root whose scalar epoch is the
   /// successor's epoch, whose `prev_epoch` is the CURRENT (predecessor) epoch, and whose membership is
-  /// the successor — and arm the deferred install (`PendingSbAction::SwapEpoch`). Unlike
-  /// [`Self::durable_root`] (which stamps `self.membership`, the predecessor, still active here), this
-  /// stamps the SUCCESSOR explicitly: the root proves the NEW configuration before it is installed in
-  /// memory. The consensus frontier (`view`/`log_view`/`commit_max`/`checkpoint_op`/`checkpoint_id` +
-  /// the committed-band headers) is carried UNCHANGED — a reconfiguration changes ONLY the
-  /// configuration, never the replicated log.
-  fn submit_swap_epoch(&mut self, successor: Membership, sb: &mut impl Superblock)
-  where
+  /// the successor — and arm the deferred install (`PendingSbAction::SwapEpoch`), carrying the
+  /// `reconfigure_op` it will name. Unlike [`Self::durable_root`] (which stamps `self.membership`, the
+  /// predecessor, still active here), this stamps the SUCCESSOR explicitly: the root proves the NEW
+  /// configuration before it is installed in memory. The consensus frontier
+  /// (`view`/`log_view`/`commit_max`/`checkpoint_op`/`checkpoint_id` + the committed-band headers) is
+  /// carried UNCHANGED — a reconfiguration changes ONLY the configuration, never the replicated log.
+  fn submit_swap_epoch(
+    &mut self,
+    reconfigure_op: OpNumber,
+    successor: Membership,
+    sb: &mut impl Superblock,
+  ) where
     S: StateMachine,
   {
     let checkpoint_id = sb.state().checkpoint_id();
+    // The lineage this root carries is the POST-swap ring: the predecessor `config_id` (the current
+    // membership, which the successor chains off) shifted onto the front of the current ring — exactly
+    // what `install_membership`'s `push_lineage` will build at `on_sb_done`. So a node recovering off this
+    // SwapEpoch root restores the same lineage the live install would have, keeping a retained old-epoch
+    // laggard's cross-epoch catch-up admissible after the new-epoch donors restart.
+    let prior_config_ids = self.lineage_after_push(self.membership.config_id());
     let state = crate::VsrState::try_new_v4(
       self.view,
       self.log_view,
@@ -1556,13 +1700,14 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       successor.epoch(),
       self.membership.epoch(),
       successor.clone(),
+      prior_config_ids,
     )
     .expect(
       "SwapEpoch root: log_view <= view, commit >= checkpoint_op, membership epoch consistent",
     );
     let id = self.mint_op_id();
     sb.submit_write(id, state);
-    self.pending_sb = Some((id, PendingSbAction::SwapEpoch(successor)));
+    self.pending_sb = Some((id, PendingSbAction::SwapEpoch(reconfigure_op, successor)));
   }
 
   /// Cancel an outstanding FORCED sync once repair/commit has SATISFIED its target. A forced sync
@@ -1755,17 +1900,26 @@ impl<S, R: Reconfig> Endpoint<S, R> {
       !self.awaiting_peer_checkpoint() || self.status.is_recovering(),
       "awaiting_peer_checkpoint outside Recovering"
     );
-    // (7) A staged epoch swap (`pending_swap`) ALWAYS has a superblock write outstanding: the
-    // commit-first stage either issued its SwapEpoch root immediately (so `pending_sb` is the
-    // `SwapEpoch` action) or queued it behind an in-flight checkpoint/durable-view write (so
-    // `pending_sb`/`pending_checkpoint` is already set) — and `on_sb_done` clears `pending_swap` no
-    // later than it installs the durable root. So a staged swap is NEVER stuck with the superblock
-    // idle (which would never re-trigger `maybe_swap_epoch`, stranding the swap). The
-    // durable-epoch-before-participate fence: the new membership is installed only at the SwapEpoch
-    // root, so while staged the epoch is still the predecessor's.
+    // (7) A staged epoch swap (`pending_swap`) in a SETTLED, durable view ALWAYS has a superblock write
+    // outstanding: in steady Normal (`log_view == view`) the commit-first stage either issued its
+    // SwapEpoch root immediately (so `pending_sb` is the `SwapEpoch` action) or queued it behind an
+    // in-flight checkpoint/durable-view write — and `on_sb_done` clears `pending_swap` no later than it
+    // installs the durable root. So a settled-view staged swap is NEVER stuck with the superblock idle
+    // (which would never re-trigger `maybe_swap_epoch`, stranding the swap). The exception is an UNSETTLED
+    // view (a view change in progress: `!is_normal()` or `log_view != view`): a `pending_swap` SURVIVES
+    // the transition (the committed change is not lost — `reset_for_view_transition`), but `maybe_swap_epoch`
+    // is GATED on the durable view, so the swap WAITS — with possibly no write outstanding — until the
+    // view settles, at which point the durable-view root's `on_sb_done` (or a commit tail on the
+    // `catch_up_to_view` path) re-submits it. So the "write outstanding" obligation only binds in a settled
+    // view. The durable-epoch-before-participate fence holds throughout: the membership installs only at a
+    // durable SwapEpoch root, so while staged the epoch is still the predecessor's.
     debug_assert!(
-      self.pending_swap.is_none() || self.pending_sb.is_some() || self.pending_checkpoint.is_some(),
-      "a staged epoch swap with no superblock write in flight would never be submitted"
+      self.pending_swap.is_none()
+        || self.pending_sb.is_some()
+        || self.pending_checkpoint.is_some()
+        || !self.status.is_normal()
+        || self.log_view.get() != self.view.get(),
+      "a staged epoch swap in a settled view with no superblock write in flight would never be submitted"
     );
   }
 
@@ -1992,7 +2146,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
 
   /// Whether this replica is the primary of the current view. `false` if the local member was REMOVED
   /// (absent from the configuration) — a removed node is not the primary, so the removed-leader
-  /// abdication ([`Self::install_membership`]) leaves it cleanly non-primary (it no longer heartbeats).
+  /// abdication (`install_membership`) leaves it cleanly non-primary (it no longer heartbeats).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn is_primary(&self) -> bool {
     self
@@ -2010,22 +2164,59 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self.config.max_client_sessions() as usize + MAX_PIPELINE as usize
   }
 
-  /// True iff this replica may participate AS the primary right now: `Normal`, the primary of its view,
-  /// AND its current view is already DURABLE (no pending superblock view write).
+  /// True iff a VIEW-CHANGING durable-view write is in flight — i.e. `self.view` may not yet be durable
+  /// on this replica's own superblock and a crash would roll it back. This is the precise predicate the
+  /// durable-view-before-participate fence guards on: a replica must not advertise authority/participation
+  /// in a view it has not yet durably entered.
   ///
-  /// The `pending_sb` clause is durable-view-before-participate: [`Self::start_view_as_new_primary`]
-  /// sets `Normal` but DEFERS the StartView broadcast (and the rest of participation) to
-  /// [`Self::start_view_participate`] on `on_sb_done`, so until that durable-view write lands the new
-  /// view is not yet recoverable — a crash would regress out of it. Acting AS the primary in that
-  /// window (answering a delayed/duplicate `GetView` with a `StartView`, a peer's `Recovery` with our
+  /// It is NOT every `pending_sb` write. `pending_sb` also carries EPOCH/frontier writes through which
+  /// `self.view` stays durable:
+  /// - [`PendingSbAction::SwapEpoch`] is a commit-first EPOCH swap — it changes the membership/epoch, never
+  ///   the view (`self.view` is carried unchanged into the SwapEpoch root). The durable-view hazard does
+  ///   not apply, so a SwapEpoch must NOT suppress the primary's participation: the primary must keep
+  ///   committing + heartbeating AT the predecessor epoch through the stage→durable-root window, so backups
+  ///   learn the `Reconfigure` op committed, stage their OWN swap, and converge. Durable-EPOCH-before-
+  ///   participate is preserved separately and structurally — [`Self::install_membership`] (the swap to the
+  ///   successor) runs ONLY at `on_sb_done` once the durable root lands, so no node ever participates at the
+  ///   new epoch without its durable proof.
+  /// - [`PendingSbAction::Seal`] persists `commit_max` + committed-band headers; the view is durable through
+  ///   it too, and the Tier C protocol has already quiesced the primary, so excluding it is inert.
+  ///
+  /// Only the three VIEW-CHANGING actions ([`PendingSbAction::SendDoViewChange`] /
+  /// [`PendingSbAction::StartViewAsPrimary`] / [`PendingSbAction::AdoptedStartView`]) leave `self.view`
+  /// not-yet-durable, so only they raise this fence.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn pending_durable_view(&self) -> bool {
+    matches!(
+      self.pending_sb,
+      Some((
+        _,
+        PendingSbAction::SendDoViewChange
+          | PendingSbAction::StartViewAsPrimary
+          | PendingSbAction::AdoptedStartView
+      ))
+    )
+  }
+
+  /// True iff this replica may participate AS the primary right now: `Normal`, the primary of its view,
+  /// AND its current view is already DURABLE (no pending view-CHANGING superblock write).
+  ///
+  /// The fence is durable-view-before-participate ([`Self::pending_durable_view`]):
+  /// [`Self::start_view_as_new_primary`] sets `Normal` but DEFERS the StartView broadcast (and the rest of
+  /// participation) to [`Self::start_view_participate`] on `on_sb_done`, so until that durable-VIEW write
+  /// lands the new view is not yet recoverable — a crash would regress out of it. Acting AS the primary in
+  /// that window (answering a delayed/duplicate `GetView` with a `StartView`, a peer's `Recovery` with our
   /// canonical head, or heartbeating/retransmitting on the commit/prepare timers) would assert this
   /// replica's authority in a view it might never have durably entered → cross-view double-participation.
+  /// A commit-first SwapEpoch root in flight does NOT raise this fence (the view is durable through it — see
+  /// [`Self::pending_durable_view`]), so the primary keeps participating at the predecessor epoch and backups
+  /// converge on the committed `Reconfigure` op.
   ///
   /// Every such outbound PRIMARY path gates on this; the deferred `start_view_participate` already runs
   /// AFTER the view is durable, so it does not.
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn participates_as_primary(&self) -> bool {
-    self.status.is_normal() && self.is_primary() && self.pending_sb.is_none()
+    self.status.is_normal() && self.is_primary() && !self.pending_durable_view()
   }
 
   /// Read access to the state machine (for tests / observers).
@@ -2184,6 +2375,22 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   #[cfg(test)]
   fn pending_swap_for_test(&self) -> bool {
     self.pending_swap.is_some()
+  }
+
+  /// Test-only: the structural in-flight-reconfiguration predicate ([`Self::has_pending_reconfigure`]),
+  /// so a regression can pin that an uncommitted `Reconfigure` op carried canonical into a new view is
+  /// still recognized as in-flight even after a view-change reset cleared `reconfigure_inflight`.
+  #[cfg(test)]
+  fn has_pending_reconfigure_for_test(&self) -> bool {
+    self.has_pending_reconfigure()
+  }
+
+  /// Test-only: does a VIEW-CHANGING durable-view write currently raise the durable-view-before-
+  /// participate fence ([`Self::pending_durable_view`])? Lets a test assert that a commit-first SwapEpoch
+  /// window does NOT (the view stays durable through an epoch swap), so the primary keeps participating.
+  #[cfg(test)]
+  fn pending_durable_view_for_test(&self) -> bool {
+    self.pending_durable_view()
   }
 
   /// Test-only: a shared reference to the state machine, so a test can assert exactly which ops
@@ -3347,18 +3554,20 @@ where
   /// The single outbound-emission chokepoint. EVERY replica-originated message goes through here so the
   /// durable-view-before-participate invariant is enforced in ONE place: a view-advertising
   /// AUTHORITY / participation message (the gated set — [`Message::advertises_authoritative_view`]) must
-  /// never be emitted while a durable-view write is in flight (`pending_sb.is_some()`), because
-  /// `self.view` is then not yet durable and a crash rolls it back. This is the proto-side analogue of
-  /// the VOPR durable-view checker, and the STRUCTURAL close of the class: a NEW emission site cannot
+  /// never be emitted while a view-CHANGING durable-view write is in flight ([`Self::pending_durable_view`]),
+  /// because `self.view` is then not yet durable and a crash rolls it back. This is the proto-side analogue
+  /// of the VOPR durable-view checker, and the STRUCTURAL close of the class: a NEW emission site cannot
   /// bypass the per-site gates because it routes here. The `debug_assert!` is detection (it fails fast
   /// in every test/sim at the emission site, with zero release cost) — the per-site gates
   /// (`participates_as_primary`, the dvc gate, the
   /// `on_request_prepare` / `on_recovery` / `serve_sync_checkpoint` `pending_sb` drops) remain the
-  /// PREVENTION; this assert proves they are COMPLETE.
+  /// PREVENTION; this assert proves they are COMPLETE. A SwapEpoch/Seal root in flight does NOT raise the
+  /// fence (the view is durable through an epoch swap — see [`Self::pending_durable_view`]): the primary
+  /// keeps advertising its authoritative view AT the predecessor epoch through the swap window.
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn emit(&mut self, out: Outgoing) {
     debug_assert!(
-      !out.msg_ref().advertises_authoritative_view() || self.pending_sb.is_none(),
+      !out.msg_ref().advertises_authoritative_view() || !self.pending_durable_view(),
       "durable-view-before-participate: emitted {} while a durable-view write is pending",
       out.msg_ref().kind_str(),
     );
@@ -3412,14 +3621,15 @@ where
   /// The table (each clause verified against the handler that services the timer):
   /// - `commit` / `prepare` / `forfeit_armed`: the Normal-primary HEARTBEAT path
   ///   (`primary_timeouts`) reaches the heartbeat/retransmit/`maybe_forfeit` ONLY when NOT stepping
-  ///   down (`!pending_forfeit`) and the view IS durable (`pending_sb.is_none()`); both early-return
+  ///   down (`!pending_forfeit`) and the view IS durable (`!pending_durable_view()`); both early-return
   ///   branches RETIRE these timers, so they are serviceable exactly on `participates_as_primary() &&
-  ///   !pending_forfeit`.
+  ///   !pending_forfeit`. A commit-first SwapEpoch root does NOT retire them (the view is durable through
+  ///   an epoch swap), so the primary keeps heartbeating at the predecessor epoch through the swap window.
   /// - `primary_idle`: the Normal-BACKUP branch.
   /// - `svc_message`: re-broadcast by the Normal-primary forfeit re-propose (`pending_forfeit`), by the
   ///   Normal-BACKUP idle-SVC retransmit, and by `view_change_timeouts` while not catching up.
   /// - `dvc_message`: `view_change_timeouts`, not catching up, AND the view is durable
-  ///   (`pending_sb.is_none()`) — the DVC is a vote, so it must not be (re)cast before the view is
+  ///   (`!pending_durable_view()`) — the DVC is a vote, so it must not be (re)cast before the view is
   ///   recoverable (durable-view-before-participate in the retransmit path).
   /// - `view_change_status`: `view_change_timeouts` (armed + serviced in BOTH catch-up and not).
   /// - `get_view_message`: `view_change_timeouts`, catching up.
@@ -3462,20 +3672,22 @@ where
       // The DVC retransmit is a VOTE the new primary counts toward forming the view, so it is
       // serviceable only once this replica's view is DURABLE — durable-view-before-participate in the
       // retransmit path. `enter_view_change` arms `dvc_message` AND submits the
-      // SendDoViewChange durable-view write (`pending_sb`), and the INITIAL DVC is sent by `on_sb_done`
-      // when that write lands; gating the retransmit on `pending_sb.is_none()` keeps a slow async
-      // superblock write from letting the retransmit cast the vote first (before the view is
-      // recoverable). Kept in lockstep with the `view_change_timeouts` handler so the no-orphan-due
-      // assert holds (an armed-and-due `dvc_message` during `pending_sb` is now non-serviceable, so the
-      // assert ignores it and `poll_timeout` filters it out — no spin, no premature vote). The other
-      // ViewChange retransmit timers stay ungated: `svc_message`/`view_change_status` re-broadcast a
-      // *request-to-change* (an SVC), not a vote, and `get_view_message` is a catch-up READ that (by the
-      // `catching_up` discriminant) never coexists with the SendDoViewChange `pending_sb` window.
+      // SendDoViewChange durable-view write (`pending_durable_view`), and the INITIAL DVC is sent by
+      // `on_sb_done` when that write lands; gating the retransmit on `!pending_durable_view()` keeps a slow
+      // async superblock write from letting the retransmit cast the vote first (before the view is
+      // recoverable). In ViewChange status the only in-flight `pending_sb` write is that SendDoViewChange
+      // one (a SwapEpoch/Seal is Normal-only), so this is exactly the durable-view test. Kept in lockstep
+      // with the `view_change_timeouts` handler so the no-orphan-due assert holds (an armed-and-due
+      // `dvc_message` during the view write is non-serviceable, so the assert ignores it and `poll_timeout`
+      // filters it out — no spin, no premature vote). The other ViewChange retransmit timers stay ungated:
+      // `svc_message`/`view_change_status` re-broadcast a *request-to-change* (an SVC), not a vote, and
+      // `get_view_message` is a catch-up READ that (by the `catching_up` discriminant) never coexists with
+      // the SendDoViewChange durable-view window.
       TimerKind::DvcMessage => {
         !self.is_learner()
           && self.status.is_view_change()
           && !self.catching_up()
-          && self.pending_sb.is_none()
+          && !self.pending_durable_view()
       }
       TimerKind::ViewChangeStatus => self.status.is_view_change() && !self.is_learner(),
       TimerKind::GetViewMessage => self.status.is_view_change() && self.catching_up(),

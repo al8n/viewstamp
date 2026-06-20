@@ -155,9 +155,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         (entry, kind)
       }
     };
-    let Body::Present(body) = entry.body else {
+    let Some(body) = entry.body_bytes() else {
       return; // header-only: no bytes to re-append (peer-repair supplies the canonical body)
     };
+    // `body_bytes()` yields a `Present` op's bytes or a `Reconfigure` op's `encode_body()` — a faulted
+    // re-append of a body-bearing op (incl. a carried reconfiguration op) re-submits its canonical bytes
+    // with the header over them, so the deferred ack/vote/fill it owes is retried, never leaked.
     let header = Header::new(op, self.view, entry.client, entry.request, &body);
     let id = self.mint_op_id();
     wal.submit_append(id, op, header, body);
@@ -224,12 +227,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         PendingSbAction::Seal => {}
         // The commit-first epoch swap's durable root landed → INSTALL the successor membership (the
         // node now participates under the new epoch/voter-set, justified by this durable root) and
-        // clear the staging latch. `pending_swap` and this action carry the IDENTICAL successor; clear
-        // the latch FIRST so `install_membership` (and any re-entrant `maybe_swap_epoch`) sees no
-        // residual staging.
-        PendingSbAction::SwapEpoch(successor) => {
+        // clear the staging latch. `pending_swap` and this action carry the IDENTICAL `(op, successor)`;
+        // clear the latch FIRST so `install_membership` (and any re-entrant `maybe_swap_epoch`) sees no
+        // residual staging. The carried `op` is the reconfigure op number captured at stage time.
+        PendingSbAction::SwapEpoch(op, successor) => {
           self.pending_swap = None;
-          self.install_membership(successor);
+          self.install_membership(op, successor);
         }
       }
       // A swap that committed while this write was in flight WAITED its turn (`maybe_swap_epoch`
@@ -768,6 +771,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.membership.epoch(),
       self.prev_epoch,
       self.membership.clone(),
+      // The CURRENT recent-prior lineage ring (the membership written here is the current one), so a
+      // node recovering off this root restores the superseded-ancestor ids and keeps admitting a retained
+      // laggard's cross-epoch catch-up.
+      self.lineage.to_vec(),
     )
     .expect("durable root: log_view <= view, commit >= checkpoint_op, membership epoch consistent")
   }

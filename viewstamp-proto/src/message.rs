@@ -679,46 +679,67 @@ impl LearnerStatus {
 }
 
 /// The successor membership carried by a consensus-layer `Body::Reconfigure` op: the full member
-/// list plus the voting/learner split (`replica_count` + `learner_count`). The proposing primary
-/// computes the successor once (via [`Membership::apply_delta`](crate::Membership)) at propose time
-/// and encodes the RESULT here, so every replica installs the IDENTICAL successor at commit with no
-/// re-computation — divergence is impossible even if replicas hold differing inputs.
+/// list plus the voting/learner split (`replica_count` + `learner_count`), PLUS the `config_id` of the
+/// PREDECESSOR configuration the successor chains from. The proposing primary computes the successor
+/// once (via [`Membership::apply_delta`](crate::Membership)) at propose time and encodes the RESULT
+/// here, so every replica installs the IDENTICAL successor at commit with no re-computation.
 ///
-/// The `epoch` and `config_id` are DELIBERATELY NOT carried: at commit each replica chains them from
-/// ITS OWN current (predecessor) membership — every replica commits the op under the identical
-/// predecessor, so the locally-derived successor `epoch`/`config_id` are identical everywhere. Carrying
-/// them on the wire would be redundant and could only introduce a mismatch. Use [`Self::to_membership`]
-/// at install time, supplying the predecessor-derived `epoch` and `config_id`.
+/// The successor's own `epoch`/`config_id` are NOT carried — each committer chains them from the
+/// predecessor via [`Self::to_membership`]. But the PREDECESSOR `config_id` IS carried (`prev_config_id`)
+/// and is LOAD-BEARING for consensus safety: the successor `(epoch, config_id)` derivation chains off
+/// the predecessor (`epoch+1`, `config_id = hash(.., prev_config_id)`), so it is correct ONLY when the
+/// committer chains from the EXACT predecessor this op was proposed against. A committer at a DIFFERENT
+/// configuration (e.g. one that already installed this op's swap, then had its `commit_min` regress
+/// below the op via a state-sync/recovery install and re-reached it) would otherwise chain off the WRONG
+/// (already-successor) configuration and derive a FORKED grand-successor — a divergent membership swap of
+/// the one committed reconfiguration. Pinning `prev_config_id` lets the commit path GATE the swap on
+/// `self.membership.config_id() == prev_config_id`, so it stages exactly once, off the right predecessor,
+/// on every replica.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconfigurePayload {
   replica_count: u8,
   learner_count: u16,
   members: Box<[MemberId]>,
+  /// The `config_id` of the predecessor configuration this successor chains from — the proposer's
+  /// current `config_id` at propose time. Identifies the EXACT predecessor (it hashes the predecessor's
+  /// epoch + members + its own predecessor), so the commit-time gate `self.membership.config_id() ==
+  /// prev_config_id` admits the swap only off that one configuration.
+  prev_config_id: u128,
 }
 
 impl ReconfigurePayload {
-  /// Creates a payload from the raw successor parts (the voting count, the learner count, and the
-  /// full member list). The structural invariants are NOT re-validated here — the proposing primary
-  /// builds this from a [`Membership`](crate::Membership) the [`apply_delta`](crate::Membership::apply_delta)
-  /// path already validated, and the decode boundary re-checks them via [`Self::to_membership`].
+  /// Creates a payload from the raw successor parts (the voting count, the learner count, the full
+  /// member list) and the predecessor `config_id` the successor chains from. The structural invariants
+  /// are NOT re-validated here — the proposing primary builds this from a
+  /// [`Membership`](crate::Membership) the [`apply_delta`](crate::Membership::apply_delta) path already
+  /// validated, and the decode boundary re-checks them via [`Self::to_membership`].
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(replica_count: u8, learner_count: u16, members: Box<[MemberId]>) -> Self {
+  pub fn new(
+    replica_count: u8,
+    learner_count: u16,
+    members: Box<[MemberId]>,
+    prev_config_id: u128,
+  ) -> Self {
     Self {
       replica_count,
       learner_count,
       members,
+      prev_config_id,
     }
   }
 
   /// Captures the successor membership's voting/learner split and member list from a built
-  /// [`Membership`](crate::Membership). The `epoch`/`config_id` are intentionally dropped — see the
-  /// type docs — and re-derived from the predecessor at install time.
+  /// [`Membership`](crate::Membership), plus the `prev_config_id` of the predecessor it chains from
+  /// (the proposer's current `config_id`). The successor's own `epoch`/`config_id` are re-derived from
+  /// the predecessor at install time; the predecessor id is pinned so every committer chains off the
+  /// SAME predecessor (see the type docs).
   #[cfg_attr(not(tarpaulin), inline)]
-  pub fn from_membership(m: &Membership) -> Self {
+  pub fn from_membership(m: &Membership, prev_config_id: u128) -> Self {
     Self {
       replica_count: m.replica_count(),
       learner_count: m.learner_count(),
       members: m.members_slice().into(),
+      prev_config_id,
     }
   }
 
@@ -738,6 +759,14 @@ impl ReconfigurePayload {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn members(&self) -> &[MemberId] {
     &self.members
+  }
+
+  /// The `config_id` of the predecessor configuration this successor chains from — pinned at propose
+  /// time so every committer derives the successor off the SAME predecessor (see the type docs). The
+  /// commit path gates the swap on `self.membership.config_id() == prev_config_id`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn prev_config_id(&self) -> u128 {
+    self.prev_config_id
   }
 
   /// Rebuilds the full successor [`Membership`](crate::Membership), supplying the `epoch` and
@@ -767,7 +796,7 @@ impl ReconfigurePayload {
   /// construction.
   #[cfg_attr(not(tarpaulin), inline)]
   pub(crate) fn encode_body(&self) -> Bytes {
-    let mut buf = Vec::with_capacity(1 + 2 + 4 + self.members.len() * 16);
+    let mut buf = Vec::with_capacity(1 + 2 + 4 + self.members.len() * 16 + 16);
     write_reconfigure(&mut buf, self);
     Bytes::from(buf)
   }
@@ -852,6 +881,38 @@ impl Body {
       Body::Reconfigure(payload) => Some(payload),
       Body::Present(_) | Body::Repairing(_) => None,
     }
+  }
+
+  /// The canonical WIRE body bytes of this entry when it is BODY-BEARING — the held bytes when
+  /// [`Present`](Body::Present), the `encode_body()` of the successor membership when
+  /// [`Reconfigure`](Body::Reconfigure) — else `None` for a header-only [`Repairing`](Body::Repairing)
+  /// slot (which carries only its `body_checksum`).
+  ///
+  /// This is the SINGLE abstraction every body-transport / storage path routes through (prepare
+  /// retransmit, repair serve, the new-primary adopted-tail re-append, the header-only-adoption local-body
+  /// preserve, the faulted-append retry): a `Reconfigure` op is body-bearing exactly like a client op — its
+  /// successor-membership bytes are what the WAL stores and a `Prepare` carries, and
+  /// `fnv1a_128(body_bytes())` equals [`body_checksum`](Self::body_checksum) by construction, so a peer
+  /// reconstructing a [`ClientId::RECONFIGURATION`](crate::ClientId) prepare from these bytes rebuilds the
+  /// identical typed `Body::Reconfigure`. Pattern-matching only `Body::Present` on such a path would treat
+  /// a `Reconfigure` entry as carrying no body — dropping or failing to transmit the reconfiguration
+  /// payload. ONLY `Repairing` is body-less (it is itself awaiting peer-repair).
+  #[cfg_attr(not(tarpaulin), inline)]
+  pub fn body_bytes(&self) -> Option<Bytes> {
+    match self {
+      Body::Present(bytes) => Some(bytes.clone()),
+      Body::Reconfigure(payload) => Some(payload.encode_body()),
+      Body::Repairing(_) => None,
+    }
+  }
+
+  /// `true` iff this entry is BODY-BEARING — it has wire body bytes to transmit / store
+  /// ([`Present`](Body::Present) or [`Reconfigure`](Body::Reconfigure)); `false` for a header-only
+  /// [`Repairing`](Body::Repairing) slot. The predicate companion of [`body_bytes`](Self::body_bytes) for
+  /// the call sites that only need to SKIP a header-only hole, not extract its bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn is_body_bearing(&self) -> bool {
+    !self.is_repairing()
   }
 
   /// The canonical `body_checksum` of this op — total: computed from the bytes when
@@ -2639,14 +2700,14 @@ impl Message {
     // A `write_log` slice is a u32 count plus, per entry, op(u64) + client(u128) + request(u64), a
     // body-state tag (u8), and its payload — a length-prefixed body (Present), a u128 checksum
     // (Repairing), or a Reconfigure payload (replica_count u8 + learner_count u16 + a u32-count-prefixed
-    // member list of 16-byte ids).
+    // member list of 16-byte ids + the trailing prev_config_id u128).
     fn log(log: &[PreparedEntry]) -> usize {
       let mut n = 4;
       for e in log {
         let body = match &e.body {
           Body::Present(body) => bytes_u32(body.len()),
           Body::Repairing(_) => U128,
-          Body::Reconfigure(p) => U8 + U16 + 4 + p.members().len() * U128,
+          Body::Reconfigure(p) => U8 + U16 + 4 + p.members().len() * U128 + U128,
         };
         n += U64 + U128 + U64 + U8 + body;
       }
@@ -2932,11 +2993,13 @@ fn write_reconfigure(out: &mut impl BufMut, payload: &ReconfigurePayload) {
   for m in payload.members.iter() {
     out.put_u128(m.get());
   }
+  out.put_u128(payload.prev_config_id);
 }
 
 /// Reads a [`ReconfigurePayload`] written by [`write_reconfigure`]. The member-count prefix is
 /// validated against the remaining bytes ([`Reader::seq_len`] with a 16-byte element size) before any
-/// allocation, so a hostile count cannot drive an unbounded pre-allocation.
+/// allocation, so a hostile count cannot drive an unbounded pre-allocation. The trailing
+/// `prev_config_id` (the pinned predecessor) follows the member list.
 fn read_reconfigure(r: &mut Reader<'_>) -> Result<ReconfigurePayload, CodecError> {
   let replica_count = r.u8()?;
   let learner_count = r.u16()?;
@@ -2945,10 +3008,12 @@ fn read_reconfigure(r: &mut Reader<'_>) -> Result<ReconfigurePayload, CodecError
   for _ in 0..count {
     members.push(MemberId::new(r.u128()?));
   }
+  let prev_config_id = r.u128()?;
   Ok(ReconfigurePayload::new(
     replica_count,
     learner_count,
     members.into_boxed_slice(),
+    prev_config_id,
   ))
 }
 
@@ -3712,6 +3777,7 @@ mod tests {
                 crate::MemberId::new(4),
               ]
               .into_boxed_slice(),
+              0,
             ),
           ),
         ],
@@ -4363,7 +4429,7 @@ mod tests {
   fn reconfigure_body_round_trips_through_the_wire_codec() {
     // A Reconfigure body rides the log slice like any op; its successor membership
     // (replica_count, learner_count, and the full member list) must survive encode→decode unchanged.
-    let payload = ReconfigurePayload::new(3, 2, member_ids(5).into_boxed_slice());
+    let payload = ReconfigurePayload::new(3, 2, member_ids(5).into_boxed_slice(), 0);
     let dvc = Message::DoViewChange(DoViewChange::new(
       View::with(3),
       View::with(2),
@@ -4407,7 +4473,7 @@ mod tests {
   fn a_reconfigure_body_is_not_mistaken_for_present_or_repairing() {
     // The three body-state wire tags are distinct: a Reconfigure body decodes as a Reconfigure,
     // never as a Present (client bytes) or a Repairing (header-only) entry.
-    let payload = ReconfigurePayload::new(1, 0, member_ids(1).into_boxed_slice());
+    let payload = ReconfigurePayload::new(1, 0, member_ids(1).into_boxed_slice(), 0);
     let rb = Message::RepairBatch(RepairBatch::new(
       View::with(4),
       OpNumber::with(9),
@@ -4444,8 +4510,9 @@ mod tests {
   #[test]
   fn reconfigure_body_golden_bytes_pin_the_wire_layout() {
     // The Reconfigure entry layout pinned exactly: same scalars as the other DoViewChange goldens,
-    // then body-state tag 2 = Reconfigure, followed by replica_count(u8) learner_count(u16) and a
-    // u32-count-prefixed member list (each MemberId a 16-byte big-endian u128).
+    // then body-state tag 2 = Reconfigure, followed by replica_count(u8) learner_count(u16), a
+    // u32-count-prefixed member list (each MemberId a 16-byte big-endian u128), and the trailing
+    // prev_config_id(u128) pinning the predecessor the successor chains from.
     let payload = ReconfigurePayload::new(
       2,
       1,
@@ -4455,6 +4522,7 @@ mod tests {
         crate::MemberId::new(0x0000_0000_0000_0000_0000_0000_0000_00CC),
       ]
       .into_boxed_slice(),
+      0x0000_0000_0000_0000_0000_0000_0000_00DD,
     );
     let dvc = Message::DoViewChange(
       DoViewChange::new(
@@ -4495,6 +4563,7 @@ mod tests {
       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA, // member 0
       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xBB, // member 1
       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xCC, // member 2
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xDD, // prev_config_id (u128)
     ];
     assert_eq!(
       dvc.encode(),
@@ -4507,7 +4576,7 @@ mod tests {
   fn reconfigure_encoded_len_matches_encode_and_respects_the_frame_cap() {
     // The full-voting-set successor membership (64 voters) is the worst case for one Reconfigure
     // entry; its preflight size matches encode and stays well under the frame cap.
-    let payload = ReconfigurePayload::new(64, 0, member_ids(64).into_boxed_slice());
+    let payload = ReconfigurePayload::new(64, 0, member_ids(64).into_boxed_slice(), 0);
     let rb = Message::RepairBatch(RepairBatch::new(
       View::with(4),
       OpNumber::with(9),
@@ -4536,8 +4605,8 @@ mod tests {
   fn distinct_reconfigure_successors_have_distinct_operation_identities() {
     // A Reconfigure op is content-addressed like any op: its body folds into prepare_identity via the
     // body_checksum, so two entries with DIFFERENT successor memberships have DIFFERENT identities.
-    let a = ReconfigurePayload::new(3, 0, member_ids(3).into_boxed_slice());
-    let b = ReconfigurePayload::new(3, 1, member_ids(4).into_boxed_slice());
+    let a = ReconfigurePayload::new(3, 0, member_ids(3).into_boxed_slice(), 0);
+    let b = ReconfigurePayload::new(3, 1, member_ids(4).into_boxed_slice(), 0);
     let client = ClientId::new(0x1234);
     let request = RequestNumber::with(7);
     let id_a = crate::storage::prepare_identity(

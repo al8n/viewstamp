@@ -312,10 +312,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Computed before `membership` is moved into the struct below (it is not `Copy`).
     let seed_own_checkpoint = membership.quorum() == 1 && membership.is_voter(local_slot);
 
-    // The recent-prior `config_id` ring is an IN-MEMORY live-catch-up aid (it widens `in_lineage`),
-    // not durable state: a restarted node re-establishes its CURRENT config and re-accumulates prior
-    // ids only as it observes live swaps, so seed every slot with the recovered (current) config_id.
-    let lineage = [membership.config_id(); LINEAGE_RING];
+    // RESTORE the recent-prior `config_id` ring from the durable root (a v5 root persists the superseded
+    // ancestor ids). The ring widens `in_lineage` so a retained OLD-epoch laggard's cross-epoch catch-up
+    // (RequestSync/RequestPrepare carrying the predecessor `config_id`) is still ADMITTED after a
+    // reconfiguration. Without restoring it, a node that recovers into a post-reconfiguration epoch would
+    // seed every slot with only the CURRENT id, so once the new-epoch donors restart the laggard's
+    // predecessor-`config_id` catch-up is rejected and it is stranded (a liveness loss). Each restored slot
+    // takes the durable id; any slot the root did not record (an empty/short lineage — a v4 or pre-swap
+    // root) falls back to the current `config_id` (the pre-v5 behaviour, a harmless self-duplicate that
+    // admits nothing extra). For a no-reconfiguration cluster the durable lineage is genesis-only, so this
+    // is byte-identical to the old `[config_id; LINEAGE_RING]` seeding.
+    let mut lineage = [membership.config_id(); LINEAGE_RING];
+    for (slot, id) in lineage.iter_mut().zip(state.prior_config_ids()) {
+      *slot = *id;
+    }
     let mut endpoint = Self {
       config,
       membership,
@@ -638,10 +648,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // Replace the FULL identity from the verified read (client, request, body) — `insert` overwrites
         // any existing placeholder or seeds a fresh one, both with the verified identity. NOT a partial
         // body-only overwrite that could strand a Phase-1 placeholder's stale (client, request) beside the
-        // new body (a mixed identity whose reply would route to the wrong client/request).
+        // new body (a mixed identity whose reply would route to the wrong client/request). Reconstruct via
+        // the SHARED typed helper (`from_committed_body`), NOT a bare `LogEntry::present`: a recovered
+        // RECONFIGURATION op's body must be rebuilt as a typed `Body::Reconfigure` exactly as the
+        // normal-prepare and repair-fill paths do — storing it as an opaque `Body::Present` would make
+        // `commit_reconfigure` miss it at commit, mis-applying the membership bytes to the state machine
+        // and re-typing the committed op number (the live-reconfiguration op-reuse divergence).
         self
           .log
-          .insert(op, LogEntry::present(client, request, body));
+          .insert(op, LogEntry::from_committed_body(client, request, body));
       }
       Outcome::KeepRepairing(client, request, body_checksum) => {
         // KEEP the op header-only as a `Body::Repairing` hole, retiring this read. Its existence +
@@ -1607,11 +1622,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
 
   pub(crate) fn on_get_view(&mut self, _now: Instant, m: crate::GetView) {
     // Only a Normal primary at the requested view (or higher) can answer authoritatively — AND only
-    // once its view is DURABLE: `participates_as_primary` adds the `pending_sb.is_none()`
+    // once its view is DURABLE: `participates_as_primary` adds the `!pending_durable_view()`
     // clause, so a primary that just adopted its view but has not yet persisted it does NOT hand out a
     // `StartView` for that not-yet-recoverable view (it would, on crash, regress out of a view it had
-    // already vouched for to a soliciting peer). The deferred `start_view_participate` broadcasts the
-    // StartView once the view is durable, and a later `GetView` is then answered normally.
+    // already vouched for to a soliciting peer). A commit-first SwapEpoch root does NOT block it (the view
+    // is durable through an epoch swap). The deferred `start_view_participate` broadcasts the StartView
+    // once the view is durable, and a later `GetView` is then answered normally.
     if self.participates_as_primary() && self.view.get() >= m.view().get() {
       // Advertise the KNOWN-committed frontier `commit_max`, not the APPLIED frontier `commit_min`
       // (which stalls below an unrepaired committed `Repairing` hole) — see `start_view_participate`.
@@ -1651,15 +1667,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if !self.status.is_normal() {
       return; // only a Normal replica has a trustworthy view/head to report
     }
-    // Durable-view-before-participate: while a view-change/adoption superblock write is
+    // Durable-view-before-participate: while a view-CHANGING/adoption superblock write is
     // pending, status is Normal but the current view is NOT yet durable. A primary answering here with
     // its canonical `(op, commit, log)` — and even a Normal backup answering with its (non-durable)
     // view + echoed nonce — reports authority in a view a crash could regress out of, the same
-    // cross-view hazard `on_get_view`'s StartView gate closes. Gate the WHOLE handler: a recovering
-    // peer simply re-solicits (its `recover_head` timer retransmits the `Recovery`) until our view is
-    // durable, at which point we answer normally. (Backups have no canonical head anyway; the strict
-    // gate keeps both branches from reporting a not-yet-recoverable view.)
-    if self.pending_sb.is_some() {
+    // cross-view hazard `on_get_view`'s StartView gate closes. A commit-first SwapEpoch root does NOT
+    // raise this fence (the view is durable through an epoch swap — [`Self::pending_durable_view`]). Gate
+    // the WHOLE handler: a recovering peer simply re-solicits (its `recover_head` timer retransmits the
+    // `Recovery`) until our view is durable, at which point we answer normally. (Backups have no canonical
+    // head anyway; the strict gate keeps both branches from reporting a not-yet-recoverable view.)
+    if self.pending_durable_view() {
       return;
     }
     if m.replica().get() >= self.membership.node_count() {

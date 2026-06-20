@@ -267,6 +267,42 @@ fn checkpoint_envelope_stays_well_under_unchunked_cap() {
   );
 }
 
+/// Pinned baseline `(applied, report)` digests for the first few seeds, captured on `main` BEFORE the
+/// live-reconfiguration axis landed. The opt-in live-reconfig axis (and its always-on checker
+/// plumbing + `MembershipChanged` capture) must be byte-identical to `main` when OFF — the cluster's
+/// replicas now carry the `SingleChange` capability marker (a zero-sized runtime-inert witness), the
+/// per-tick swap-correctness checkers observe an EMPTY swap stream off-axis (no PRNG draw, no
+/// mutation), and the live-reconfig firing is conditional on the axis (no draw consumed off-axis). So
+/// the default-schedule applied history AND the report counters are unchanged. This is the committed
+/// in-process guard for that: a future change that perturbs the off-axis schedule (an extra draw, a
+/// reordered action, a captured-but-mutating observer) breaks one of these and fails here with the
+/// exact seed. (The `#[ignore]`d [`vopr_digest_sweep`] above is the wider cross-checkout diff tool.)
+const BASELINE_DIGESTS: &[(u64, u64, u64)] = &[
+  (0, 0x3011_cd95_7970_09d6, 0xe7a7_437d_c5ea_01b9),
+  (1, 0x8180_484c_aaf2_15a4, 0xfc32_3922_0e6d_17a0),
+  (2, 0x27fd_ef6b_3b83_c631, 0x1e70_2256_c5fe_7b39),
+  (3, 0x94d1_3cab_40a7_0dc2, 0x70da_f20a_75a6_ef44),
+];
+
+#[test]
+fn off_axis_digest_is_byte_identical_to_the_pre_reconfig_baseline() {
+  for &(seed, want_applied, want_report) in BASELINE_DIGESTS {
+    let got_applied = applied_digest(seed);
+    assert_eq!(
+      got_applied, want_applied,
+      "seed {seed}: the default-schedule APPLIED-history digest changed ({got_applied:#018x} vs \
+       baseline {want_applied:#018x}) — the live-reconfig axis (or its off-axis plumbing) perturbed \
+       the default schedule; it must be byte-identical when OFF"
+    );
+    let got_report = report_digest(&run_vopr(seed, DEFAULT_TICKS));
+    assert_eq!(
+      got_report, want_report,
+      "seed {seed}: the default-schedule REPORT digest changed ({got_report:#018x} vs baseline \
+       {want_report:#018x}) — an extra PRNG draw or schedule perturbation leaked into the default run"
+    );
+  }
+}
+
 #[test]
 #[ignore = "digest sweep: prints one stable line per seed for cross-checkout byte-identity diffing"]
 fn vopr_digest_sweep() {
