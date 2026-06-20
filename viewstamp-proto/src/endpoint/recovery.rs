@@ -1218,8 +1218,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn complete_recovery<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     self.recover = None;
     if self.log_view.get() < self.view.get() {
-      // Crashed mid-view-change (durable view advanced, new log not yet installed): re-drive VC(view).
-      self.enter_view_change_from_recovery(now, sb, self.view);
+      // Crashed mid-view-change (the durable view advanced past `log_view` — the new view's log was not
+      // yet installed). A learner persists this same view-ahead-of-log_view shape as a voter does (it
+      // adopts the new view before installing its log), but the RE-ESTABLISHMENT differs by role:
+      //
+      // - VOTER → re-drive `VC(view)` (`enter_view_change_from_recovery`): it casts its DoViewChange so
+      //   the in-progress change completes and the new primary's StartView reinstalls its log.
+      // - NON-VOTING LEARNER → catch-up posture at the CURRENT view (`enter_catch_up_posture`), NOT a
+      //   re-drive: a learner is never a view-change voter or candidate primary, so it must NOT emit a
+      //   DoViewChange. It instead solicits GetView and adopts the (same-view) StartView, which restores
+      //   `log_view == view` and returns it to Normal — exactly the catching-up lane a learner uses when
+      //   it falls behind in view (`view_change_status` is voter-only, so it never escalates to active).
+      if self.is_voter() {
+        self.enter_view_change_from_recovery(now, sb, self.view);
+      } else {
+        self.enter_catch_up_posture(now);
+      }
     } else if self.membership.replica_count() > 1
       && self
         .membership
@@ -1703,15 +1717,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       "catch-up target must be strictly newer than our view"
     );
     self.view = view;
+    self.enter_catch_up_posture(now);
+  }
+
+  /// Enter the catching-up `ViewChange` posture AT the current `self.view`: reset old-generation
+  /// in-flight state, install a `catching_up = true` collection, and solicit `GetView`. It sends NO
+  /// StartViewChange / DoViewChange (the `view_change_status` escalation that would emit one is
+  /// voter-only), so a non-voting learner can use it to re-fetch the canonical head without ever casting a
+  /// view-change vote — adopting the (same-or-newer-view) StartView restores `log_view == view` and returns it to
+  /// Normal. The two callers establish `self.view` themselves: [`Self::catch_up_to_view`] advances it to
+  /// a strictly-higher advertised view first; the learner recovery re-establishment
+  /// ([`Self::complete_recovery`]) leaves it at the current view (re-fetching THIS view's installed log
+  /// after a crash left `log_view < view`).
+  fn enter_catch_up_posture(&mut self, now: Instant) {
     self.set_status(Status::ViewChange);
-    self.svc_target = view;
+    self.svc_target = self.view;
     // Tear down ALL old-generation in-flight state in one place: SVC bits, in-flight
     // appends, peer-checkpoint reports, in-flight checkpoint, in-flight sync + its deferred install
     // (cancelled together — durable-before-install leaves the old state intact), and the
     // forfeit sub-state. See [`Self::reset_for_view_transition`] for the per-field rationale.
     self.reset_for_view_transition();
-    // ViewChange ENTRY (the higher-view catch-up): install a fresh collection with `catching_up = true`
-    // — this entry sends GetView, not SVC/DVC. (`is_some() == is_view_change()` coupling.)
+    // ViewChange ENTRY (the catch-up): install a fresh collection with `catching_up = true` — this entry
+    // sends GetView, not SVC/DVC. (`is_some() == is_view_change()` coupling.)
     self.view_change = Some(ViewChangeCollection::entering(true));
     // The primary pipeline + backup reorder buffer are dropped on this catch-up (kept OUT of the shared
     // reset because `adopt_canonical_head` preserves a live primary pipeline).

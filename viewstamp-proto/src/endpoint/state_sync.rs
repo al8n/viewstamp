@@ -973,7 +973,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // primary. No committed op is lost (the synced snapshot is never discarded — it is simply re-fetched
     // as a backup; `commit_min` never rewinds). This is the same invariant `complete_recovery` enforces
     // for a restarted primary (abdicate rather than resume with a torn-down pipeline).
-    if self.abdicate_if_primary(now) {
+    //
+    // EXCEPTION — a CROSSING sync (`require_cross_epoch`) must APPLY in place even on a primary, NOT
+    // abdicate-and-drop. The abdicate rule guards a SAME-epoch in-place sync that KEEPS the retained tail
+    // `(commit_min .. op]` and would wedge the un-rebuilt pipeline; a crossing forces `held_tail = false`
+    // (the old-epoch tail above the crossing checkpoint is DISCARDED — it is not valid in E+1), so
+    // `apply_sync` lands `commit_min == op == checkpoint_op` with NO retained tail and the wedge cannot
+    // arise. And the abdication itself is FUTILE here: a STALE-epoch primary (a voter stranded at the OLD
+    // epoch when the reconfiguration committed, still naming itself primary of its old view) has no
+    // surviving same-epoch quorum to elect a successor, so the deferred forfeit never completes — it would
+    // re-arm + re-drop the crossing forever, wedging the cluster short of convergence. Crossing is the
+    // legitimate convergence path: `apply_sync` installs the verified successor membership, after which
+    // this node operates in E+1 (its primacy re-derived there) and `catch_up_to_view` converges its view
+    // off the new primary's now-same-epoch heartbeats.
+    if !s.require_cross_epoch && self.abdicate_if_primary(now) {
       self.sync = None;
       self.sync_transfer = None;
       self.timers.sync_solicit = None;
@@ -1070,8 +1083,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           return;
         }
         // A PRIMARY must not pull a transfer it could never apply (`handle_sync_checkpoint` steps
-        // down at the APPLY site): abdicate at transfer START instead, before any chunk flows.
-        if self.abdicate_if_primary(now) {
+        // down at the APPLY site): abdicate at transfer START instead, before any chunk flows. EXCEPT a
+        // CROSSING transfer (`require_cross_epoch`), which `handle_sync_checkpoint` APPLIES in place on a
+        // primary (the crossing discards the old-epoch tail, so no pipeline wedge — and a stale-epoch
+        // primary's abdication is futile); so it must PIN + pull here too rather than abdicate-and-drop,
+        // matching the apply-site carve-out.
+        if !s.require_cross_epoch && self.abdicate_if_primary(now) {
           self.sync = None;
           self.sync_transfer = None;
           self.timers.sync_solicit = None;
