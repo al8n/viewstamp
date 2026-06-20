@@ -824,7 +824,7 @@ fn a_learner_drops_a_cross_epoch_proof_challenge() {
   );
   e.handle_message(Instant::ZERO, &mut wal, &mut sb, primary_peer(), foreign);
   assert!(
-    !std::iter::from_fn(|| e.poll_message())
+    !core::iter::from_fn(|| e.poll_message())
       .any(|out| matches!(out.into_msg(), Message::LearnerProof(_))),
     "a cross-epoch challenge elicits no proof reply",
   );
