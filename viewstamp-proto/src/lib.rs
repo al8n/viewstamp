@@ -43,6 +43,7 @@ mod membership;
 mod message;
 mod number;
 mod prng;
+mod reconfigure_plan;
 mod state_machine;
 mod status;
 mod storage;
@@ -76,6 +77,9 @@ pub use message::{
 };
 pub use number::{OpNumber, RequestNumber, View};
 pub use prng::Prng;
+pub use reconfigure_plan::{
+  MembershipTarget, PlanError, plan_next_step, plan_reconfiguration, shrink_candidates,
+};
 pub use state_machine::StateMachine;
 pub use status::Status;
 pub use storage::{
