@@ -8,11 +8,12 @@ use std::{
   future::Future,
   pin::Pin,
   sync::{Arc, Mutex},
+  time::Duration,
   vec::Vec,
 };
 
 use viewstamp_proto::{
-  Epoch, MemberId, Membership, MembershipTarget, OpNumber, PlanError, ProposeMembershipError,
+  Instant, MemberId, Membership, MembershipTarget, OpNumber, PlanError, ProposeMembershipError,
   SingleVoterDelta,
 };
 
@@ -61,8 +62,6 @@ impl ReconfigureProgress {
   /// A deadline/oscillation STALL with a still-valid, NON-EMPTY remaining plan (`reason: None`). The caller
   /// passes the plan it already validated this iteration; this never re-plans, so it cannot swallow a fresh
   /// `PlanError` into a defaulted-empty Vec.
-  // wired by chunk C (advance_reconfigure helper in the concrete drivers)
-  #[allow(dead_code)]
   pub(crate) fn stall(live: Membership, remaining: Vec<SingleVoterDelta>) -> Self {
     debug_assert!(
       !remaining.is_empty(),
@@ -77,8 +76,6 @@ impl ReconfigureProgress {
 
   /// A post-start PLANNING FAILURE: no valid remaining plan exists from `live`, so carry `None` + the
   /// reason (do NOT re-invoke the failing planner nor fabricate a plan).
-  // wired by chunk C (advance_reconfigure helper in the concrete drivers)
-  #[allow(dead_code)]
   pub(crate) fn failed(live: Membership, reason: PlanError) -> Self {
     Self {
       live,
@@ -125,8 +122,6 @@ pub enum ReconfigureError {
 
 /// The I/O surface the executor loop needs, behind a trait so the loop is testable over a mock proto +
 /// mock clock without a real runtime. The real driver task implements it against the owned `Endpoint`.
-// wired by chunk C (concrete-driver LoopBackend impl)
-#[allow(dead_code)]
 // `async fn` in public trait: all implementations are crate-internal; Send bounds are irrelevant here.
 #[allow(async_fn_in_trait)]
 pub trait ReconfigureBackend {
@@ -153,8 +148,6 @@ pub trait ReconfigureBackend {
 /// removing an `X` that is apparently down (in `known_down`, or absent from both `known_up` and
 /// `responsive`). `None` (→ STALL fail-closed) when NO candidate's successor has a positively-confirmed
 /// quorum — never a removal on a guess.
-// wired by chunk C via run_reconfigure (called transitively once LoopBackend is used)
-#[allow(dead_code)]
 fn pick_fresh_quorum_preserving_removal(
   live: &Membership,
   candidates: &[SingleVoterDelta],
@@ -195,8 +188,6 @@ fn pick_fresh_quorum_preserving_removal(
 ///
 /// PRECONDITIONS: SOLE-DRIVER + every target member ABSENT from `live` MUST be a FRESH, reachable node.
 /// The `members_seen` rule (passive observation) refuses to re-add an OBSERVED-then-removed member.
-// wired by chunk C (ReconfigureJob::start boxes this future)
-#[allow(dead_code)]
 pub async fn run_reconfigure<B: ReconfigureBackend>(
   backend: B,
   target: MembershipTarget,
@@ -328,7 +319,6 @@ pub async fn run_reconfigure<B: ReconfigureBackend>(
 
 /// The type carried in the one-slot proposal channel: the delta to propose plus the completion
 /// channel the driver uses to answer the backend with a [`StepOutcome`].
-// wired by chunk C via take_proposal
 type ProposalSlot = Arc<
   Mutex<
     Option<(
@@ -348,8 +338,6 @@ type ProposalSlot = Arc<
 ///   `AtCapacity`); the backend backs off via `backoff().await` then re-posts the same delta.
 /// - `Failed(e)` — a non-retryable terminal error; the backend propagates it as `Err(e)` and the
 ///   job resolves with that error.
-// wired by chunk C (advance_reconfigure sends this to the parked LoopBackend future)
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum StepOutcome {
   /// The epoch swap is confirmed; the step is installed.
@@ -362,8 +350,6 @@ pub enum StepOutcome {
 
 /// The snapshot the driver loop writes and `LoopBackend` reads. `Arc<Mutex<>>` so the boxed
 /// `run_reconfigure` future is `Send` (the reactor driver spawns it on a multi-thread runtime).
-// wired by chunk C via LoopBackend::new_pair and ReconfigureJob::start
-#[allow(dead_code)]
 struct Snapshot {
   live: Membership,
   acked: BTreeSet<MemberId>,
@@ -372,8 +358,6 @@ struct Snapshot {
 
 /// The shared tick state. Bundled in one `Mutex` so that `tick()` can atomically install the
 /// receiver AND wake any parked `backoff()` without a TOCTOU gap.
-// wired by chunk C via LoopBackend::new_pair
-#[allow(dead_code)]
 struct TickState {
   /// A resolved oneshot receiver the backoff future consumes on the next poll.
   rx: Option<futures_channel::oneshot::Receiver<()>>,
@@ -386,8 +370,6 @@ struct TickState {
 ///
 /// `Send + Sync` because the shared state uses `Arc<Mutex<>>` (not `Rc<RefCell<>>`), which means
 /// the boxed `run_reconfigure` future is `Send` and is spawnable on the reactor's multi-thread runtime.
-// wired by chunk C via ReconfigureJob::start
-#[allow(dead_code)]
 pub struct LoopBackend {
   snapshot: Arc<Mutex<Snapshot>>,
   /// One-slot proposal channel: the backend posts `(delta, reply_tx)` here, the controller drains it.
@@ -400,8 +382,6 @@ pub struct LoopBackend {
 
 /// The controller half — owned by the driver loop. The driver calls its methods once per iteration
 /// to feed the `LoopBackend` with fresh state and drain any pending proposal.
-// wired by chunk C (stored in ReconfigureJob, used by advance_reconfigure)
-#[allow(dead_code)]
 pub struct LoopController {
   snapshot: Arc<Mutex<Snapshot>>,
   proposal: ProposalSlot,
@@ -410,8 +390,6 @@ pub struct LoopController {
 
 impl LoopBackend {
   /// Construct a matched `(LoopBackend, LoopController)` pair.
-  // wired by chunk C via ReconfigureJob::start
-  #[allow(dead_code)]
   fn new_pair(initial: Snapshot) -> (Self, LoopController) {
     let snapshot = Arc::new(Mutex::new(initial));
     let proposal = Arc::new(Mutex::new(None));
@@ -546,8 +524,6 @@ impl ReconfigureBackend for LoopBackend {
   }
 }
 
-// wired by chunk C (advance_reconfigure calls refresh/take_proposal/tick each iteration)
-#[allow(dead_code)]
 impl LoopController {
   /// Overwrite the snapshot with the latest state from the driver's `Endpoint`. Called once per
   /// driver-loop iteration, BEFORE polling the future.
@@ -606,8 +582,6 @@ impl LoopController {
 ///
 /// The `fut` field is the boxed `run_reconfigure` future driven by the driver loop via `poll`.
 /// `Send` bound is satisfied because `LoopBackend` uses `Arc<Mutex<>>` (not `Rc`).
-// wired by chunk C (stored as `reconfigure: Option<ReconfigureJob>` in each concrete driver)
-#[allow(dead_code)]
 pub struct ReconfigureJob {
   /// The boxed executor future, driven by the driver's poll-once-per-iteration strategy.
   pub fut: Pin<Box<dyn Future<Output = Result<(), ReconfigureError>> + Send>>,
@@ -615,16 +589,25 @@ pub struct ReconfigureJob {
   pub controller: LoopController,
   /// Completion channel: the driver sends the `run_reconfigure` result here when the future resolves.
   pub reply: futures_channel::oneshot::Sender<Result<(), ReconfigureError>>,
-  /// The op number of the in-flight `propose_membership` call, set once the driver issues it.
-  /// `None` when no proposal is outstanding. Used to detect the epoch swap (the commit of the op
-  /// whose number matches this triggers `StepOutcome::Installed`).
+  /// The op number of the in-flight `propose_membership` call, set once the driver issues it; `None`
+  /// when no proposal is outstanding. Carried for the operator-visible diagnostic of which op the
+  /// step minted; the install is detected by `expected_config_id`, not this.
   pub pending_op: Option<OpNumber>,
-  /// The epoch active at the moment the current proposal was issued. Together with
-  /// `endpoint().membership().epoch() > start_epoch` it detects the epoch-swap install.
-  pub start_epoch: Epoch,
-  /// The reply channel from `take_proposal`: the driver holds this until the epoch swap is
-  /// confirmed, then sends `StepOutcome::Installed`.
+  /// The config_id the outstanding proposal's successor membership WILL carry once installed, or
+  /// `None` when no proposal is outstanding. It is a deterministic function of the predecessor + the
+  /// proposed delta (`predecessor.apply_delta(step).config_id()`), so matching the live membership's
+  /// `config_id` against it detects the EXACT successor's install — precise where an epoch-advance
+  /// check is not (a cross-epoch state-sync install bumps the epoch without installing THIS step).
+  pub expected_config_id: Option<u128>,
+  /// The reply channel from `take_proposal`: the driver holds this until the successor's epoch swap
+  /// is confirmed (its `config_id` becomes live), then sends `StepOutcome::Installed`.
   pub pending_step_reply: Option<futures_channel::oneshot::Sender<StepOutcome>>,
+  /// The deadline this job's cap fires at: armed `reconfigure_timeout` ahead of the FIRST advance
+  /// (`None` until then). Each advance feeds `now >= deadline` to the executor as `cap_exhausted`, so
+  /// a stalled plan resolves `Timeout` carrying its durable partial progress rather than spinning.
+  pub deadline: Option<Instant>,
+  /// The configured per-call deadline band, used to arm `deadline` on the first advance.
+  reconfigure_timeout: Duration,
 }
 
 /// Outcome of one [`ReconfigureJob::advance`] call.
@@ -642,22 +625,37 @@ impl ReconfigureJob {
   /// the coordinator is read first, then this method holds `&mut self`). `propose` is a closure
   /// that calls `coord.propose_membership(now, wal, delta)`. Returns [`AdvanceOutcome::InFlight`]
   /// while running, [`AdvanceOutcome::Done`] when the reply has been sent.
+  ///
+  /// `now` arms the per-call deadline on the first advance and drives the executor's `cap_exhausted`
+  /// signal (`now >= deadline`), so a plan that cannot make progress resolves `Timeout` rather than
+  /// spinning forever.
   pub fn advance(
     &mut self,
+    now: Instant,
     live: Membership,
     acked: std::collections::BTreeSet<MemberId>,
-    cap_exhausted: bool,
     propose: &mut impl FnMut(SingleVoterDelta) -> Result<OpNumber, ProposeMembershipError>,
   ) -> AdvanceOutcome {
     use std::task::Poll;
 
-    // Capture the live epoch before moving `live` into refresh so we can use it for the install
-    // detection and for recording `start_epoch` when a proposal succeeds.
-    let live_epoch = live.epoch();
+    // Arm the deadline on the FIRST advance (not at `start`: the wall clock the job is paced against
+    // is the driver's, threaded in here as `now`). From then on the cap fires once it elapses.
+    let deadline = *self
+      .deadline
+      .get_or_insert_with(|| now + self.reconfigure_timeout);
+    let cap_exhausted = now >= deadline;
 
-    // 1. Install detection: if an epoch advance was observed since we issued the proposal, the
-    //    step committed. Signal the backend so it advances to the next planned step.
-    if self.pending_op.is_some() && live_epoch > self.start_epoch {
+    // Capture the live config_id before moving `live` into refresh: the install check below compares
+    // it against the successor config_id the outstanding proposal is awaiting.
+    let live_config_id = live.config_id();
+
+    // 1. Install detection: the outstanding step committed once the live membership's config_id
+    //    equals the successor's predicted id. This is EXACT — an epoch advance alone is not (a
+    //    cross-epoch state-sync install bumps the epoch without installing THIS step's successor).
+    if let Some(expected) = self.expected_config_id
+      && live_config_id == expected
+    {
+      self.expected_config_id = None;
       self.pending_op = None;
       if let Some(sr) = self.pending_step_reply.take() {
         let _ = sr.send(StepOutcome::Installed);
@@ -665,7 +663,7 @@ impl ReconfigureJob {
     }
 
     // 2. Refresh the controller snapshot with the latest state.
-    self.controller.refresh(live, acked, cap_exhausted);
+    self.controller.refresh(live.clone(), acked, cap_exhausted);
 
     // 3. Poll the future once with a noop waker (the driver loop's timer cadence re-polls at the
     //    50ms fallback, which is the natural reconfigure advancement cadence). We construct the
@@ -691,10 +689,15 @@ impl ReconfigureJob {
 
     // 4. Drain any proposal the future posted during the poll and act on it.
     if let Some((delta, step_reply)) = self.controller.take_proposal() {
+      // The future planned this delta from the snapshot just refreshed (`live`), so `live` is the
+      // predecessor: predict the successor's config_id (a deterministic function of predecessor +
+      // delta) for the EXACT install detection above. A delta the predecessor rejects yields `None`,
+      // and the proto's propose gate then surfaces the same rejection as the proposal verdict.
+      let expected = live.apply_delta(&delta).ok().map(|m| m.config_id());
       match propose(delta) {
         Ok(op) => {
           self.pending_op = Some(op);
-          self.start_epoch = live_epoch;
+          self.expected_config_id = expected;
           self.pending_step_reply = Some(step_reply);
         }
         Err(
@@ -706,7 +709,6 @@ impl ReconfigureJob {
         ) => {
           // Transient: signal the backend to back off and re-post on the next iteration.
           let _ = step_reply.send(StepOutcome::Retry);
-          self.controller.tick();
         }
         Err(ProposeMembershipError::NotPrimary) => {
           let _ = step_reply.send(StepOutcome::Failed(ReconfigureError::NotPrimary));
@@ -717,30 +719,36 @@ impl ReconfigureJob {
       }
     }
 
+    // Advance the executor's backoff every iteration: when it parks on `backoff().await` — whether
+    // after a retryable proposal OR a fail-closed shrink stall (no witness, no proposal posted) — the
+    // tick is what re-polls it so its loop re-checks `cap_exhausted`. Without a per-iteration tick a
+    // stall would park forever and never observe the deadline, so the `Timeout` path would be dead.
+    // The pacing is the driver loop's own cadence (one advance per wake), not a blocking backoff.
+    self.controller.tick();
+
     AdvanceOutcome::InFlight
   }
-}
 
-// wired by chunk C (Command::Reconfigure arm calls ReconfigureJob::start)
-#[allow(dead_code)]
-impl ReconfigureJob {
   /// Build a `ReconfigureJob` for `target`. Boxes `run_reconfigure` into a `Send` pinned future,
-  /// initialises the controller with a zero-state snapshot (the driver must call
-  /// `controller.refresh(...)` before the first poll), and stores `reply` for the job's completion.
+  /// initialises the controller with the initial snapshot (the driver still calls
+  /// `controller.refresh(...)` before each poll), and stores `reply` for the job's completion.
+  ///
+  /// The deadline is not armed here — it is armed `reconfigure_timeout` ahead of the FIRST advance,
+  /// against the driver's clock threaded in as `now` — so the initial snapshot's `cap_exhausted` is
+  /// `false`.
   pub fn start(
     target: MembershipTarget,
     health: HealthHint,
     ack_window: u64,
+    reconfigure_timeout: Duration,
     reply: futures_channel::oneshot::Sender<Result<(), ReconfigureError>>,
     initial_live: Membership,
     initial_acked: BTreeSet<MemberId>,
-    initial_cap_exhausted: bool,
   ) -> Self {
-    let initial_epoch = initial_live.epoch();
     let (backend, controller) = LoopBackend::new_pair(Snapshot {
       live: initial_live,
       acked: initial_acked,
-      cap_exhausted: initial_cap_exhausted,
+      cap_exhausted: false,
     });
     let fut: Pin<Box<dyn Future<Output = Result<(), ReconfigureError>> + Send>> =
       Box::pin(run_reconfigure(backend, target, health, ack_window));
@@ -749,8 +757,10 @@ impl ReconfigureJob {
       controller,
       reply,
       pending_op: None,
-      start_epoch: initial_epoch,
+      expected_config_id: None,
       pending_step_reply: None,
+      deadline: None,
+      reconfigure_timeout,
     }
   }
 }
@@ -1143,11 +1153,11 @@ mod tests {
     assert!(matches!(r, Ok(())));
   }
 
-  // ── T7: LoopBackend / LoopController / ReconfigureJob protocol tests ─────────
+  // ── LoopBackend / LoopController / ReconfigureJob protocol tests ─────────────
   //
   // These validate the shared-memory backend protocol WITHOUT a real driver or runtime.
   // The "mock driver loop" polls the future manually, calls controller.refresh/take_proposal/tick,
-  // and answers StepOutcome in a tight synchronous spin — matching how chunk C will wire it.
+  // and answers StepOutcome in a tight synchronous spin — the same protocol the concrete drivers run.
 
   /// A tiny genesis membership with one learner to promote. `replica_count` = number of voters;
   /// the learner sits in slot `replica_count`.
@@ -1285,10 +1295,10 @@ mod tests {
         ..HealthHint::default()
       },
       64,
+      Duration::from_secs(30),
       reply_tx,
       live.clone(),
       acked.clone(),
-      false,
     );
 
     let waker = futures_util::task::noop_waker();
@@ -1313,7 +1323,7 @@ mod tests {
       "expected PromoteLearner or AddLearner for new voter 2, got {step:?}"
     );
 
-    // Store the step reply in the job (as chunk C would: pending_step_reply = Some(step_reply)).
+    // Hold the step reply the way the driver loop does between propose and the install detection.
     job.pending_step_reply = Some(step_reply);
 
     // Simulate epoch advance: apply the step to get a new membership, refresh.
@@ -1385,10 +1395,10 @@ mod tests {
         ..HealthHint::default()
       },
       64,
+      Duration::from_secs(30),
       reply_tx,
       live.clone(),
       acked.clone(),
-      false,
     );
 
     let waker = futures_util::task::noop_waker();

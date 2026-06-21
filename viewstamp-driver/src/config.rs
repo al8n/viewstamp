@@ -42,6 +42,18 @@ pub(crate) const MAX_CONNS: usize = 1024;
 /// converge the shrink faster but risk false-missing a merely-idle voter.
 pub const ACK_WINDOW: u64 = 64;
 
+/// Default deadline for one `reconfigure_to` call: once this much wall-clock elapses without the plan
+/// converging, the executor's cap fires and the call resolves
+/// [`ReconfigureError::Timeout`](crate::ReconfigureError::Timeout) carrying the durable partial
+/// progress (resumable by re-issuing the same target). Sized at `30 * REQUEST_TIMEOUT` (7.5 s at the
+/// default 250 ms): a single change is multiple consensus round-trips — a learner promote also waits
+/// out a catch-up-then-promote proof round-trip — and a multi-step plan sequences several of those, so
+/// the band must clear many round-trips on a healthy cluster while still bounding a genuine stall (a
+/// fail-closed shrink with no live witness, or a learner that never catches up). Raise it for
+/// geo-replicated clusters or long learner catch-ups; the operator's `HealthHint` is the faster lever
+/// for an intentional shrink.
+pub const RECONFIGURE_TIMEOUT: Duration = Duration::from_millis(30 * 250);
+
 /// Tunable operational parameters for both drivers (the QUIC driver and the stream driver), with
 /// `Default` = the constants the drivers pin without an override (each default constant carries
 /// the sizing rationale). Pass a non-default config through the drivers' `with_config`
@@ -83,6 +95,11 @@ pub struct DriverConfig {
   /// scans for recent voter acks as a liveness signal. Passed to `ReconfigureJob::start` and
   /// forwarded to `recently_acked_voters` each driver-loop iteration.
   ack_window: u64,
+  /// Deadline for one `reconfigure_to` call before its cap fires and it resolves
+  /// [`ReconfigureError::Timeout`](crate::ReconfigureError::Timeout). The driver arms the deadline
+  /// `reconfigure_timeout` ahead of the job's first advance and feeds `now >= deadline` to the
+  /// executor as its `cap_exhausted` signal.
+  reconfigure_timeout: Duration,
 }
 
 impl DriverConfig {
@@ -100,6 +117,7 @@ impl DriverConfig {
       events_cap: EVENTS_CAP,
       max_conns: MAX_CONNS,
       ack_window: ACK_WINDOW,
+      reconfigure_timeout: RECONFIGURE_TIMEOUT,
     }
   }
 
@@ -166,6 +184,15 @@ impl DriverConfig {
   #[inline(always)]
   pub const fn ack_window(&self) -> u64 {
     self.ack_window
+  }
+
+  /// Deadline for one `reconfigure_to` call (the `RECONFIGURE_TIMEOUT` default). The driver arms it
+  /// `reconfigure_timeout` ahead of the job's first advance; on expiry the executor's cap fires and
+  /// the call resolves [`ReconfigureError::Timeout`](crate::ReconfigureError::Timeout) with the
+  /// durable partial progress.
+  #[inline(always)]
+  pub const fn reconfigure_timeout(&self) -> Duration {
+    self.reconfigure_timeout
   }
 
   /// Capacity of the bounded command channel, DERIVED as `max_inflight + 1` (not a knob): at least
@@ -260,6 +287,15 @@ impl DriverConfig {
     self.ack_window = window;
     self
   }
+
+  /// Override the `reconfigure_to` deadline. Raise it for geo-replicated clusters or long learner
+  /// catch-ups (so a healthy-but-slow change is not cut short with `Timeout`); lower it to fail-fast
+  /// an intentionally-fail-closed change (e.g. a shrink with no live witness) sooner.
+  #[must_use]
+  pub const fn with_reconfigure_timeout(mut self, timeout: Duration) -> Self {
+    self.reconfigure_timeout = timeout;
+    self
+  }
 }
 
 impl Default for DriverConfig {
@@ -287,6 +323,7 @@ mod tests {
     assert_eq!(c.events_cap(), 1024);
     assert_eq!(c.max_conns(), 1024);
     assert_eq!(c.ack_window(), 64);
+    assert_eq!(c.reconfigure_timeout(), Duration::from_millis(30 * 250));
     assert_eq!(
       c.cmd_cap(),
       4096 + 1,
@@ -322,5 +359,8 @@ mod tests {
     assert_eq!(w.ack_window(), 128);
     let w0 = DriverConfig::new().with_ack_window(0);
     assert_eq!(w0.ack_window(), 0, "ack_window accepts 0 without clamping");
+
+    let rc = DriverConfig::new().with_reconfigure_timeout(Duration::from_secs(2));
+    assert_eq!(rc.reconfigure_timeout(), Duration::from_secs(2));
   }
 }

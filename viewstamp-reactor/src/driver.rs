@@ -560,10 +560,10 @@ where
             target,
             health,
             self.cfg.ack_window(),
+            self.cfg.reconfigure_timeout(),
             reply,
             live,
             acked,
-            false,
           ));
         }
         false
@@ -580,7 +580,7 @@ where
     };
     let live = self.coord.live_membership();
     let acked = self.coord.recently_acked_voters(self.cfg.ack_window());
-    let outcome = job.advance(live, acked, false, &mut |delta| {
+    let outcome = job.advance(now, live, acked, &mut |delta| {
       self.coord.propose_membership(now, &mut self.wal, delta)
     });
     if !matches!(outcome, viewstamp_driver::AdvanceOutcome::Done) {

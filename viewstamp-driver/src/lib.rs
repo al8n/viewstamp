@@ -32,7 +32,9 @@ pub use session::ReservationGuard;
 #[doc(hidden)]
 pub use clock::jittered;
 #[doc(hidden)]
-pub use config::{ACK_WINDOW, AUTH_DEADLINE, REDIAL_BACKOFF_BASE, REDIAL_BACKOFF_CAP};
+pub use config::{
+  ACK_WINDOW, AUTH_DEADLINE, RECONFIGURE_TIMEOUT, REDIAL_BACKOFF_BASE, REDIAL_BACKOFF_CAP,
+};
 #[doc(hidden)]
 pub use session::{
   EVENTS_CAP, InflightBudget, MAX_INFLIGHT, MAX_PENDING_BYTES, Pending, PendingMap,
