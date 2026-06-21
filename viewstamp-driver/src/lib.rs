@@ -13,6 +13,7 @@ mod aggregate;
 mod clock;
 mod config;
 mod handle;
+mod reconfigure;
 mod session;
 
 pub use aggregate::{
@@ -22,6 +23,7 @@ pub use aggregate::{
 pub use clock::Clock;
 pub use config::DriverConfig;
 pub use handle::{Command, Handle, Reply};
+pub use reconfigure::{HealthHint, ReconfigureError, ReconfigureProgress};
 pub use session::ReservationGuard;
 
 #[doc(hidden)]
