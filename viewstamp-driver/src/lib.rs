@@ -23,7 +23,10 @@ pub use aggregate::{
 pub use clock::Clock;
 pub use config::DriverConfig;
 pub use handle::{Command, Handle, Reply};
-pub use reconfigure::{HealthHint, ReconfigureError, ReconfigureProgress};
+pub use reconfigure::{
+  HealthHint, LoopBackend, LoopController, ReconfigureBackend, ReconfigureError, ReconfigureJob,
+  ReconfigureProgress, StepOutcome, run_reconfigure,
+};
 pub use session::ReservationGuard;
 
 #[doc(hidden)]
