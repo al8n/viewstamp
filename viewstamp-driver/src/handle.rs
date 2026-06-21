@@ -44,6 +44,14 @@ pub enum Command {
     /// The completion channel.
     reply: futures_channel::oneshot::Sender<Result<(), crate::reconfigure::ReconfigureError>>,
   },
+  /// Register a peer's network address in the driver's address book; dialed when this member appears
+  /// in a future membership rebuild. Best-effort: dropped if the driver is shutting down.
+  AddPeer {
+    /// The stable identity of the peer.
+    member_id: viewstamp_proto::MemberId,
+    /// The network address the peer listens on.
+    addr: std::net::SocketAddr,
+  },
 }
 
 /// A cheaply-cloneable handle to submit client requests and observe committed events.
@@ -238,6 +246,18 @@ impl Handle {
   #[must_use]
   pub fn events(&self) -> flume::Receiver<Event> {
     self.events.clone()
+  }
+
+  /// Register the network address for `member_id` in the driver's peer address book.
+  ///
+  /// The driver dials this address when `member_id` appears at a new slot in the active membership
+  /// after a configuration change. Call this before any membership change that adds the member so the
+  /// driver has the address ready when it rebuilds its peer list. Best-effort and non-async: the
+  /// command is dropped without error if the driver is already shutting down.
+  pub fn add_peer(&self, member_id: viewstamp_proto::MemberId, addr: std::net::SocketAddr) {
+    let _ = self
+      .commands()
+      .try_send(Command::AddPeer { member_id, addr });
   }
 }
 

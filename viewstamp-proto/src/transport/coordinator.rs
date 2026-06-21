@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::collections::BTreeSet;
 
 use crate::{
-  Endpoint, Event, Instant, MemberId, Membership, Message, OpNumber, Outgoing, Peer, Recipient,
+  Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
   SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal, endpoint::ProposeMembershipError,
   message::Request,
 };
@@ -84,11 +84,6 @@ where
     delta: SingleVoterDelta,
   ) -> Result<OpNumber, ProposeMembershipError> {
     self.endpoint.propose_membership(now, wal, delta)
-  }
-
-  /// A clone of the endpoint's currently-installed membership.
-  pub fn live_membership(&self) -> Membership {
-    self.endpoint.membership().clone()
   }
 
   /// The set of voter [`MemberId`]s that acknowledged an in-flight prepare within the last
@@ -309,6 +304,29 @@ where
   /// Whether a conn has been validated (driver redial-vs-give-up signal).
   pub fn is_conn_validated(&self, id: ConnId) -> bool {
     self.router.is_validated(id)
+  }
+
+  /// The `config_id` of the currently active membership — a cheap scalar read, no clone required.
+  pub fn membership_config_id(&self) -> u128 {
+    self.endpoint.config_id()
+  }
+
+  /// A clone of the endpoint's currently-installed membership. Called at most once per config
+  /// change in `rekey_peers`; the hot path uses `membership_config_id()` to detect whether a
+  /// clone is needed at all.
+  pub fn live_membership(&self) -> crate::Membership {
+    self.endpoint.membership_clone()
+  }
+
+  /// Close the authoritative connection for `Peer::Replica(slot)` if one exists, so the peer can
+  /// reconnect after a membership shift moves a member to a different slot. A no-op when no
+  /// authoritative conn is bound for that slot.
+  pub fn close_peer_by_slot(&mut self, slot: crate::ReplicaId) {
+    if let Some(id) = self.router.authoritative(crate::Peer::Replica(slot))
+      && let Some(conn) = self.router.conn_mut(id)
+    {
+      conn.abort(CloseCause::IdentityRejected);
+    }
   }
 
   /// The number of outgoing protocol messages the transport refused to send because their encoded

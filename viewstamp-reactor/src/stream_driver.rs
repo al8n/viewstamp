@@ -18,8 +18,9 @@ use viewstamp_proto::Instant;
 // The proto's transport `Conn<T>` is aliased `TransportConn` here so the bare name `Conn` belongs to
 // the driver's owned per-connection unit (`crate::bridge::Conn`).
 use viewstamp_proto::{
-  ClientId, CloseCause, Config, Conn as TransportConn, ConnId, Membership, Peer, ReplicaId,
-  Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock, Wal,
+  ClientId, CloseCause, Config, Conn as TransportConn, ConnId, MemberId, Membership, Peer,
+  ReplicaId, Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock,
+  Wal,
 };
 
 use viewstamp_driver::{
@@ -137,6 +138,13 @@ pub struct ReactorStreamDriver<R: Runtime, S, T, W, B> {
   /// driver already counted is filtered by the conn no longer being in `conns`.
   close_counts: [u64; CloseCause::COUNT],
   peer_addrs: HashMap<ReplicaId, SocketAddr>,
+  /// Peer address book: maps each peer's stable [`MemberId`] to its network address, populated via
+  /// [`Command::AddPeer`] and seeded from the initial peer list at construction. The slot-keyed
+  /// `peer_addrs` is derived from this book plus the active membership on each config change.
+  peer_book: HashMap<MemberId, SocketAddr>,
+  /// The `config_id` last seen in `pump_outputs`; a change triggers slot-keyed peer reconciliation
+  /// via `rekey_peers`.
+  last_known_config_id: u128,
   dialer: DialerFactory<T>,
   acceptor: AcceptorFactory<T>,
   /// Bounded `futures_channel::mpsc::channel(cfg.cmd_cap())`: a refused send surfaces as `Busy`
@@ -285,6 +293,15 @@ where
       .map_err(DriverError::Bind)?;
     let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
     let coord = StreamCoordinator::new(endpoint);
+    // Seed the peer_book from the initial (slot -> addr) peers using the coordinator's membership
+    // to resolve each slot to its stable MemberId.
+    let mut peer_book: HashMap<MemberId, SocketAddr> = HashMap::new();
+    for &(id, addr) in &peers {
+      if let Some(member_id) = coord.endpoint().member_at(id) {
+        peer_book.insert(member_id, addr);
+      }
+    }
+    let last_known_config_id = coord.endpoint().config_id();
     // Bounded command channel: a partitioned/slow driver (not draining commands) can't grow it
     // without bound; a refused send surfaces as `DriverError::Busy` (see `Handle::submit`). Sized
     // `cmd_cap` (= max_inflight + 1) so the in-flight budget, not this queue, is the binding submit
@@ -319,6 +336,8 @@ where
       conns: HashMap::new(),
       close_counts: [0; CloseCause::COUNT],
       peer_addrs: peers.into_iter().collect(),
+      peer_book,
+      last_known_config_id,
       dialer,
       acceptor,
       commands: commands_rx,
@@ -815,6 +834,10 @@ where
         }
         false
       }
+      Command::AddPeer { member_id, addr } => {
+        self.peer_book.insert(member_id, addr);
+        false
+      }
     }
   }
 
@@ -1126,6 +1149,13 @@ where
   /// are collected during the borrow of `self.conns` and closed after, because `close_conn` takes
   /// `&mut self`; `close_conn` is idempotent so a duplicated id is harmless.
   async fn pump_outputs(&mut self, now: Instant) {
+    // Detect a membership config change and rebuild the peer table before processing any outputs
+    // this iteration, so new-config routing applies to the outputs we're about to drain.
+    let current_config_id = self.coord.membership_config_id();
+    if current_config_id != self.last_known_config_id {
+      self.rekey_peers(now);
+      self.last_known_config_id = current_config_id;
+    }
     // The per-conn wire-byte ACCUMULATION threshold the driver tolerates before declaring a stalled
     // socket, OWNED by the proto (2x the router's per-conn staging cap). It is NOT a per-chunk size and
     // NOT the out-queue peak — a single chunk is always admitted at/under it, so the peak is
@@ -1174,6 +1204,37 @@ where
         break;
       }
     }
+  }
+
+  /// Reconcile `peer_addrs` against the new membership after a config change. For each slot in the
+  /// new membership, if the occupying member's address differs from the current entry (meaning the
+  /// slot now holds a different member), close the old connection and dial the new address. Slots
+  /// whose address is absent from the address book are skipped until `AddPeer` supplies it.
+  fn rekey_peers(&mut self, _now: Instant) {
+    let m = self.coord.live_membership();
+    let local = self.coord.endpoint().local();
+    let base_backoff = self.cfg.redial_backoff_base();
+    let mut new_peer_addrs: HashMap<ReplicaId, SocketAddr> = HashMap::new();
+    for slot_u16 in 0..m.node_count() {
+      let slot = ReplicaId::new(slot_u16);
+      let Some(member_id) = m.member_at(slot) else {
+        continue;
+      };
+      if member_id == local {
+        continue; // skip self
+      }
+      let Some(&addr) = self.peer_book.get(&member_id) else {
+        continue; // no address known yet
+      };
+      // If the slot's address changed, the member occupying it changed: close the stale conn and
+      // re-dial so the connection reconnects under the new identity.
+      if self.peer_addrs.get(&slot) != Some(&addr) {
+        self.coord.close_peer_by_slot(slot);
+        self.dial_peer(slot, addr, Duration::ZERO, base_backoff);
+      }
+      new_peer_addrs.insert(slot, addr);
+    }
+    self.peer_addrs = new_peer_addrs;
   }
 }
 

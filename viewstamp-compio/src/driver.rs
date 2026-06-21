@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use compio::net::UdpSocket;
 use viewstamp_proto::{
-  ClientId, Config, Event, IdentityConfig, Instant, Membership, Peer, ProvidedIdentity,
+  ClientId, Config, Event, IdentityConfig, Instant, MemberId, Membership, Peer, ProvidedIdentity,
   QuicCoordinator, QuicOptions, ReplicaId, Request, RequestNumber, StateMachine, Superblock, Wal,
 };
 
@@ -73,6 +73,9 @@ async fn recv_datagrams(socket: UdpSocket, inbound: flume::Sender<(Vec<u8>, Sock
 /// retransmits to no bound conn forever.
 struct PeerLink {
   id: ReplicaId,
+  /// The stable member identity currently occupying this slot; used by `rekey_peers` to detect
+  /// when a slot's occupant has changed across a config swap and the old connection must be closed.
+  member_id: MemberId,
   addr: SocketAddr,
   /// Delay before the next redial once the link is observed unbound; doubles per attempt up to the
   /// configured redial cap, reset to the configured base whenever the link binds. The base also
@@ -108,6 +111,12 @@ pub struct CompioQuicDriver<S, W, B, I> {
   /// The configured peer mesh with per-peer redial backoff state (see [`PeerLink`]); reconciled
   /// against the coordinator's bound-connection table every loop iteration.
   peers: Vec<PeerLink>,
+  /// Peer address book: maps each peer's stable [`MemberId`] to its network address, populated via
+  /// [`Command::AddPeer`] and seeded from the initial peer list at construction.
+  peer_book: std::collections::HashMap<MemberId, SocketAddr>,
+  /// The `config_id` last seen in `pump_outputs`; a change triggers a slot-keyed peer
+  /// reconciliation via `rekey_peers`.
+  last_known_config_id: u128,
   /// A clone of the shared in-flight submit budget, retained for test observability only. Production
   /// release is by construction: the `Handle` reserves a [`ReservationGuard`] per submit, the guard
   /// rides the `Command::Submit` then the `Pending` entry, and dropping that entry (commit,
@@ -244,21 +253,32 @@ where
 
     let now = clock.now();
     let mut peer_links = Vec::with_capacity(peers.len());
+    let mut peer_book = std::collections::HashMap::new();
     for (id, addr) in peers {
       coord
         .connect(now, addr, Peer::Replica(id))
         .map_err(|_| DriverError::Connect {
           peer: Peer::Replica(id),
         })?;
+      // Resolve the initial slot to its MemberId so `rekey_peers` can detect slot shifts.
+      let member_id = coord
+        .endpoint()
+        .member_at(id)
+        .unwrap_or(MemberId::new(u128::MAX));
+      if member_id.get() != u128::MAX {
+        peer_book.insert(member_id, addr);
+      }
       // Retain the configured target: the run loop's reconcile redials it if this connection (or
       // any later one) is lost.
       peer_links.push(PeerLink {
         id,
+        member_id,
         addr,
         backoff: cfg.redial_backoff_base(),
         next_dial: None,
       });
     }
+    let last_known_config_id = coord.endpoint().config_id();
 
     // Bounded command channel: a partitioned/slow driver (not draining commands) can't grow it
     // without bound; a refused send surfaces as `DriverError::Busy` (see `Handle::submit`). Sized
@@ -284,6 +304,8 @@ where
       pending: PendingMap::new(),
       next_pending_scan: Instant::ZERO,
       peers: peer_links,
+      peer_book,
+      last_known_config_id,
       #[cfg(test)]
       budget: budget.clone(),
       commands: commands_rx,
@@ -578,6 +600,10 @@ where
         }
         false
       }
+      Command::AddPeer { member_id, addr } => {
+        self.peer_book.insert(member_id, addr);
+        false
+      }
     }
   }
 
@@ -704,6 +730,13 @@ where
 
   /// Drain storage completions + outputs until the coordinator stops producing.
   async fn pump_outputs(&mut self, now: Instant) {
+    // Detect a membership config change and rebuild the peer list before processing any outputs
+    // this iteration, so new-config routing applies to the outputs we're about to drain.
+    let current_config_id = self.coord.membership_config_id();
+    if current_config_id != self.last_known_config_id {
+      self.rekey_peers(now);
+      self.last_known_config_id = current_config_id;
+    }
     loop {
       self.coord.handle_storage(now, &mut self.wal, &mut self.sb);
       let mut produced = false;
@@ -732,6 +765,50 @@ where
         break;
       }
     }
+  }
+
+  /// Reconcile the peer list against the current membership after a config change. Closes any slot
+  /// whose occupant has changed (so the connection reconnects under the new routing identity) and
+  /// rebuilds `self.peers` from the new membership plus the address book. The full membership clone
+  /// happens only here — once per config change — never on the hot loop path.
+  fn rekey_peers(&mut self, now: Instant) {
+    let m = self.coord.live_membership();
+    // Close any slot whose member shifted to a different MemberId so it reconnects clean.
+    for link in &self.peers {
+      if m.member_at(link.id) != Some(link.member_id) {
+        self.coord.close_peer_by_slot(now, link.id);
+      }
+    }
+    let local = self.coord.endpoint().local();
+    let base_backoff = self.cfg.redial_backoff_base();
+    let mut new_peers: Vec<PeerLink> = Vec::new();
+    for slot_u16 in 0..m.node_count() {
+      let slot = ReplicaId::new(slot_u16);
+      let Some(member_id) = m.member_at(slot) else {
+        continue;
+      };
+      if member_id == local {
+        continue; // skip self
+      }
+      let Some(&addr) = self.peer_book.get(&member_id) else {
+        continue; // no address known yet; AddPeer will supply it later
+      };
+      // Preserve existing backoff state when this slot's identity is unchanged.
+      let backoff = self
+        .peers
+        .iter()
+        .find(|l| l.id == slot && l.member_id == member_id)
+        .map(|l| l.backoff)
+        .unwrap_or(base_backoff);
+      new_peers.push(PeerLink {
+        id: slot,
+        member_id,
+        addr,
+        backoff,
+        next_dial: None,
+      });
+    }
+    self.peers = new_peers;
   }
 }
 

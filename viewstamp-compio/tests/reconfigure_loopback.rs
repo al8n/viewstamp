@@ -1,25 +1,23 @@
-//! The reconfiguration gate: a real single-node driver drives a membership change through its own
-//! run loop to convergence (`reconfigure_to` → `Ok(())`), and a fail-closed shrink with no live
-//! witness times out within its deadline (the regression for the deadline-driven `cap_exhausted`).
+//! Reconfiguration and peer address book tests for the compio QUIC driver.
 //!
-//! These run a single-voter driver — its own primary at view 0, so `propose_membership` is admitted,
-//! and the write quorum is 1, so it self-commits its own proposals once its WAL append is durable —
-//! over real loopback UDP. A learner PROMOTE is deliberately NOT tested here: the proto's
-//! catch-up-then-promote gate solicits a fresh `LearnerProof` from the target learner over the
-//! network, which a single-node driver (no learner peer) can never answer, so a promote would stall
-//! at `ProofPending` by design. The single-node-convergeable change is an `AddLearner`/`RemoveLearner`
-//! (no proof gate, no quorum-intersection constraint); the promote path's end-to-end convergence is
-//! covered by the `reconfig_live` simulation lane, which injects the learner's proof.
+//! Reconfiguration gate: a real single-node driver drives a membership change through its own
+//! run loop to convergence (`reconfigure_to` → `Ok(())`), and a fail-closed shrink with no live
+//! witness times out within its deadline.
+//!
+//! Address book gate: a driver that receives `AddPeer` commands continues to commit work correctly,
+//! and the address book accepts registrations at any point without panicking.
 
 use std::{net::SocketAddr, time::Duration};
 
+use bytes::Bytes;
 use rustls::{
   RootCertStore,
   pki_types::{CertificateDer, PrivateKeyDer},
 };
 use viewstamp_driver::{HealthHint, ReconfigureError};
 use viewstamp_proto::{
-  Event, IdentityConfig, MemberId, Membership, MembershipTarget, QuicOptions, Superblock, Wal,
+  ClusterTls, Event, IdentityConfig, MemberId, Membership, MembershipTarget, QuicOptions,
+  ReplicaId, Superblock, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
@@ -215,6 +213,40 @@ async fn build_driver(
   .expect("driver builds")
 }
 
+/// Build a driver for a multi-node cluster node, dialing the given peers.
+async fn build_cluster_driver(
+  ca: &TestCa,
+  id: u8,
+  bind: SocketAddr,
+  peers: Vec<(ReplicaId, SocketAddr)>,
+  membership: Membership,
+) -> (GateDriver, viewstamp_compio::Handle) {
+  let (chain, key) = ca.issue(id);
+  let opts: QuicOptions = ClusterTls::new(ca.roots(), chain, key).build();
+  let config =
+    viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(u128::from(id))).unwrap();
+  let (ready_tx, ready_rx) = flume::unbounded();
+  let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
+  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  viewstamp_compio::CompioQuicDriver::new(
+    config,
+    membership,
+    viewstamp_simulation::sm::LogSm::default(),
+    wal,
+    sb,
+    viewstamp_proto::ClientId::new(u128::from(id) + 1),
+    0,
+    opts,
+    IdentityConfig::Hello { cluster: CLUSTER },
+    Some([id; 32]),
+    bind,
+    peers,
+    ready_rx,
+  )
+  .await
+  .expect("driver builds")
+}
+
 /// CONVERGENCE: a single-node driver drives a real membership change to completion through its own
 /// run loop. Genesis is one voter (slot 0) plus a learner; the target adds a SECOND learner, so the
 /// plan is a single `AddLearner` — admitted on the primary, self-committed at quorum 1, and installed
@@ -303,4 +335,92 @@ async fn single_node_shrink_with_no_witness_times_out() {
   );
 
   let _ = handle.shutdown().await;
+}
+
+/// ADDRESS BOOK DOES NOT DISRUPT NORMAL COMMITS: a 3-node cluster with `add_peer` called for each
+/// peer's address before the cluster starts (simulating the embedder pre-registering addresses for
+/// future membership changes) continues to commit client requests normally. The `add_peer` commands
+/// populate the peer_book but leave the initial `peers` mesh unchanged; the cluster commits one
+/// request, proving no regression in the hot path.
+#[compio::test]
+async fn add_peer_does_not_disrupt_a_running_cluster() {
+  let ca = TestCa::new();
+  let addrs: Vec<SocketAddr> = (0..3)
+    .map(|i: u16| format!("127.0.0.1:{}", 41600 + i).parse().unwrap())
+    .collect();
+  let rid = |i: u8| ReplicaId::new(i as u16);
+  let mid = |i: u8| MemberId::new(i as u128);
+
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (rid(p), addrs[p as usize]))
+      .collect();
+    let (driver, handle) =
+      build_cluster_driver(&ca, id, addrs[id as usize], peers, genesis(3, 0)).await;
+    // Pre-register all peer addresses in the address book before the cluster is fully up.
+    // This simulates an embedder that calls add_peer for every potential future member.
+    for peer_id in 0u8..3 {
+      if peer_id != id {
+        handle.add_peer(mid(peer_id), addrs[peer_id as usize]);
+      }
+    }
+    compio::runtime::spawn(driver.run()).detach();
+    handles.push(handle);
+  }
+
+  // Commit one request through the view-0 primary (replica 0).
+  let reply = compio::time::timeout(
+    std::time::Duration::from_secs(10),
+    handles[0].submit(Bytes::from_static(b"after-add-peer")),
+  )
+  .await
+  .expect("commit within 10s after add_peer calls")
+  .expect("a committed reply");
+  // LogSm::apply returns the post-apply count as 8 big-endian bytes; first op = 1.
+  assert_eq!(&reply[..], &1u64.to_be_bytes());
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}
+
+/// ADDRESS BOOK ACCEPTS REGISTRATIONS BEFORE THE DRIVER IS UP AND AFTER: `add_peer` is non-blocking
+/// and idempotent from the caller's side — it must not panic or return an error regardless of when
+/// it is called (before the driver loop drains it, during a live run, or even if the driver has
+/// already shut down). This test builds a single-node driver (never commits, no peers), calls
+/// `add_peer` both before and after the driver starts, then shuts down cleanly. The absence of a
+/// panic or a hung shutdown is the assertion.
+#[compio::test]
+async fn add_peer_is_non_blocking_and_does_not_panic() {
+  let ca = TestCa::new();
+  let bind: SocketAddr = "127.0.0.1:41630".parse().unwrap();
+  // No initial peers: single-node, never forms a quorum.
+  let (driver, handle) =
+    build_driver(&ca, bind, genesis(1, 0), viewstamp_compio::DriverConfig::new()).await;
+
+  // Call add_peer before the driver loop starts: the command sits in the channel buffer until the
+  // run loop drains it.
+  handle.add_peer(MemberId::new(1), "127.0.0.1:41631".parse().unwrap());
+  handle.add_peer(MemberId::new(2), "127.0.0.1:41632".parse().unwrap());
+  // Duplicate add_peer for the same member — must be idempotent (last write wins in the book).
+  handle.add_peer(MemberId::new(1), "127.0.0.1:41633".parse().unwrap());
+
+  compio::runtime::spawn(driver.run()).detach();
+
+  // Call add_peer while the driver is live.
+  handle.add_peer(MemberId::new(3), "127.0.0.1:41634".parse().unwrap());
+
+  compio::time::timeout(
+    std::time::Duration::from_secs(5),
+    handle.shutdown(),
+  )
+  .await
+  .expect("shutdown acks within 5s")
+  .expect("driver acks shutdown");
+
+  // After the driver has stopped, add_peer must not panic (the send is best-effort; the closed
+  // channel causes a silent drop, not a crash).
+  handle.add_peer(MemberId::new(4), "127.0.0.1:41635".parse().unwrap());
 }
