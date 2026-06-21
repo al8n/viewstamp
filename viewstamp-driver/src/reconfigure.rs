@@ -146,13 +146,16 @@ pub trait ReconfigureBackend {
 /// it is NOT in `known_down` AND it has a POSITIVE witness (in `known_up` OR in the `responsive` recent-ack
 /// set). NEGATIVE-only `known_down` can never CONFIRM the quorum (absence is not a positive witness). Prefer
 /// removing an `X` that is apparently down (in `known_down`, or absent from both `known_up` and
-/// `responsive`). `None` (→ STALL fail-closed) when NO candidate's successor has a positively-confirmed
-/// quorum — never a removal on a guess.
+/// `responsive`). Self (`local_member`) is ranked LAST among candidates at equal liveness: removing the
+/// local driver node mid-plan terminates the driver, so a peer removal is always preferred when available.
+/// `None` (→ STALL fail-closed) when NO candidate's successor has a positively-confirmed quorum — never a
+/// removal on a guess.
 fn pick_fresh_quorum_preserving_removal(
   live: &Membership,
   candidates: &[SingleVoterDelta],
   health: &HealthHint,
   responsive: &BTreeSet<MemberId>,
+  local_member: MemberId,
 ) -> Option<SingleVoterDelta> {
   let live_voters: BTreeSet<MemberId> = {
     let n = live.replica_count() as usize;
@@ -161,12 +164,13 @@ fn pick_fresh_quorum_preserving_removal(
   let is_alive = |m: &MemberId| -> bool {
     !health.known_down.contains(m) && (health.known_up.contains(m) || responsive.contains(m))
   };
-  // Prefer apparently-DOWN departing voters first (then any) so a dead voter is shed before a live one.
+  // Rank: apparently-DOWN first, then self LAST (removing the local driver node mid-plan terminates
+  // the driver, so a peer removal is always preferred), then ascending id for determinism.
   let mut ordered: Vec<&SingleVoterDelta> = candidates.iter().collect();
   ordered.sort_by_key(|d| {
     let m = d.member();
     let apparently_down = health.known_down.contains(&m) || !is_alive(&m);
-    (!apparently_down, m.get()) // down-first, then ascending id for determinism
+    (!apparently_down, m == local_member, m.get())
   });
   for cand in ordered {
     let x = cand.member();
@@ -193,6 +197,7 @@ pub async fn run_reconfigure<B: ReconfigureBackend>(
   target: MembershipTarget,
   health: HealthHint,
   ack_window: u64,
+  local_member: MemberId,
 ) -> Result<(), ReconfigureError> {
   use viewstamp_proto::{plan_reconfiguration, shrink_candidates};
 
@@ -300,7 +305,13 @@ pub async fn run_reconfigure<B: ReconfigureBackend>(
           continue;
         }
         let acked = backend.recently_acked_voters(ack_window);
-        match pick_fresh_quorum_preserving_removal(&live, &candidates, &health, &acked) {
+        match pick_fresh_quorum_preserving_removal(
+          &live,
+          &candidates,
+          &health,
+          &acked,
+          local_member,
+        ) {
           Some(rm) => {
             backend.propose_and_await_install(rm).await?;
             committed_any = true;
@@ -608,6 +619,9 @@ pub struct ReconfigureJob {
   pub deadline: Option<Instant>,
   /// The configured per-call deadline band, used to arm `deadline` on the first advance.
   reconfigure_timeout: Duration,
+  /// The reconfiguration goal, stored so the advance-level Timeout path can re-plan and build
+  /// accurate `ReconfigureProgress` without re-entering the executor future.
+  target: MembershipTarget,
 }
 
 /// Outcome of one [`ReconfigureJob::advance`] call.
@@ -644,6 +658,31 @@ impl ReconfigureJob {
       .deadline
       .get_or_insert_with(|| now + self.reconfigure_timeout);
     let cap_exhausted = now >= deadline;
+
+    // Hard-cancel at the advance level BEFORE polling the future. The executor future's own
+    // `cap_exhausted` check fires only at the TOP of its loop — if it is parked inside
+    // `propose_and_await_install` (waiting on a Retry backoff) or inside `backoff().await` the
+    // deadline never fires via the inner path alone. Resolving here guarantees the Timeout is
+    // delivered regardless of where the future is parked.
+    if cap_exhausted {
+      use viewstamp_proto::plan_reconfiguration;
+      let progress = match plan_reconfiguration(&live, &self.target) {
+        Ok(remaining) if !remaining.is_empty() => ReconfigureProgress::stall(live, remaining),
+        Ok(_) => {
+          // The re-plan says the target is already reached — race between the cap and the last
+          // install completing. Surface Ok(()) rather than a spurious Timeout.
+          let (dummy_tx, _dummy_rx) = futures_channel::oneshot::channel();
+          let reply = std::mem::replace(&mut self.reply, dummy_tx);
+          let _ = reply.send(Ok(()));
+          return AdvanceOutcome::Done;
+        }
+        Err(e) => ReconfigureProgress::failed(live, e),
+      };
+      let (dummy_tx, _dummy_rx) = futures_channel::oneshot::channel();
+      let reply = std::mem::replace(&mut self.reply, dummy_tx);
+      let _ = reply.send(Err(ReconfigureError::Timeout(progress)));
+      return AdvanceOutcome::Done;
+    }
 
     // Capture the live config_id before moving `live` into refresh: the install check below compares
     // it against the successor config_id the outstanding proposal is awaiting.
@@ -744,14 +783,16 @@ impl ReconfigureJob {
     reply: futures_channel::oneshot::Sender<Result<(), ReconfigureError>>,
     initial_live: Membership,
     initial_acked: BTreeSet<MemberId>,
+    local_member: MemberId,
   ) -> Self {
     let (backend, controller) = LoopBackend::new_pair(Snapshot {
       live: initial_live,
       acked: initial_acked,
       cap_exhausted: false,
     });
-    let fut: Pin<Box<dyn Future<Output = Result<(), ReconfigureError>> + Send>> =
-      Box::pin(run_reconfigure(backend, target, health, ack_window));
+    let fut: Pin<Box<dyn Future<Output = Result<(), ReconfigureError>> + Send>> = Box::pin(
+      run_reconfigure(backend, target.clone(), health, ack_window, local_member),
+    );
     ReconfigureJob {
       fut,
       controller,
@@ -761,6 +802,7 @@ impl ReconfigureJob {
       pending_step_reply: None,
       deadline: None,
       reconfigure_timeout,
+      target,
     }
   }
 }
@@ -970,6 +1012,7 @@ mod tests {
       target,
       HealthHint::default(),
       64,
+      MemberId::new(1),
     ));
     assert!(r.is_ok());
     assert_eq!(
@@ -990,7 +1033,13 @@ mod tests {
       known_down: member_set(&[3]),
       known_up: member_set(&[1, 2]),
     };
-    let r = block_on(run_reconfigure(backend.clone(), target, health, 64));
+    let r = block_on(run_reconfigure(
+      backend.clone(),
+      target,
+      health,
+      64,
+      MemberId::new(1),
+    ));
     assert!(r.is_ok());
     let issued = backend.0.borrow();
     let rm3 = issued
@@ -1017,6 +1066,7 @@ mod tests {
       target,
       HealthHint::default(),
       8,
+      MemberId::new(1),
     ));
     match r {
       Err(ReconfigureError::Timeout(p)) => {
@@ -1042,7 +1092,13 @@ mod tests {
       known_down: member_set(&[3]),
       known_up: BTreeSet::new(),
     };
-    let r = block_on(run_reconfigure(backend.clone(), target, health, 8));
+    let r = block_on(run_reconfigure(
+      backend.clone(),
+      target,
+      health,
+      8,
+      MemberId::new(1),
+    ));
     assert!(matches!(r, Err(ReconfigureError::Timeout(_))));
     assert!(backend.0.borrow().issued.is_empty());
   }
@@ -1061,6 +1117,7 @@ mod tests {
       target,
       HealthHint::default(),
       64,
+      MemberId::new(1),
     ));
     match r {
       Err(ReconfigureError::PlanConflict(p)) => {
@@ -1096,6 +1153,7 @@ mod tests {
       target,
       HealthHint::default(),
       16,
+      MemberId::new(1),
     ));
     assert!(
       matches!(
@@ -1120,6 +1178,7 @@ mod tests {
       target,
       HealthHint::default(),
       16,
+      MemberId::new(1),
     ));
     match r {
       Err(ReconfigureError::Timeout(p)) => {
@@ -1149,6 +1208,7 @@ mod tests {
       target,
       HealthHint::default(),
       64,
+      MemberId::new(1),
     ));
     assert!(matches!(r, Ok(())));
   }
@@ -1299,6 +1359,7 @@ mod tests {
       reply_tx,
       live.clone(),
       acked.clone(),
+      MemberId::new(1),
     );
 
     let waker = futures_util::task::noop_waker();
@@ -1399,6 +1460,7 @@ mod tests {
       reply_tx,
       live.clone(),
       acked.clone(),
+      MemberId::new(1),
     );
 
     let waker = futures_util::task::noop_waker();
@@ -1433,6 +1495,146 @@ mod tests {
         Ok(Some(Err(ReconfigureError::NotPrimary)))
       ),
       "reply receives the terminal error"
+    );
+  }
+
+  // ── FIX 1 tests: advance-level deadline hard-cancel ──────────────────────
+
+  /// The deadline hard-cancels at the advance level even when the executor future is stuck in a
+  /// Retry loop. With `reconfigure_timeout = Duration::ZERO` the deadline fires on the FIRST
+  /// advance call (deadline = now + 0 = now; cap_exhausted = now >= now = true), before the future
+  /// is ever polled.
+  #[test]
+  fn advance_deadline_fires_when_future_parked_in_retry_loop() {
+    let live = membership_of(&[1, 2, 3]);
+    let acked = member_set(&[1, 2, 3]);
+    let target = MembershipTarget::new(member_set(&[1, 2]), BTreeSet::new());
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+
+    // Zero timeout: deadline = now + 0 = now; cap_exhausted = now >= now = true on the first advance.
+    let mut job = ReconfigureJob::start(
+      target,
+      HealthHint {
+        known_up: member_set(&[1, 2]),
+        ..HealthHint::default()
+      },
+      64,
+      Duration::ZERO,
+      reply_tx,
+      live.clone(),
+      acked.clone(),
+      MemberId::new(1),
+    );
+
+    // The propose closure always returns ProofPending (simulates executor stuck on Retry).
+    let mut propose = |_: SingleVoterDelta| -> Result<OpNumber, ProposeMembershipError> {
+      Err(ProposeMembershipError::ProofPending)
+    };
+
+    let outcome = job.advance(Instant::ZERO, live, acked, &mut propose);
+
+    assert!(
+      matches!(outcome, AdvanceOutcome::Done),
+      "advance must return Done when the deadline fires immediately"
+    );
+    assert!(
+      matches!(
+        reply_rx.try_recv(),
+        Ok(Some(Err(ReconfigureError::Timeout(_))))
+      ),
+      "reply must carry Timeout when the deadline fires before any proposal"
+    );
+  }
+
+  /// When the install never arrives (stuck install scenario), a second advance call with `now` past
+  /// the deadline resolves Timeout before polling the future again.
+  #[test]
+  fn advance_deadline_fires_when_install_never_arrives() {
+    let live = membership_of(&[1, 2, 3]);
+    let acked = member_set(&[1, 2, 3]);
+    let target = MembershipTarget::new(member_set(&[1, 2]), BTreeSet::new());
+    let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+
+    // 5-second timeout: first advance at ZERO arms deadline = ZERO + 5s, not yet exhausted.
+    let mut job = ReconfigureJob::start(
+      target,
+      HealthHint {
+        known_up: member_set(&[1, 2]),
+        ..HealthHint::default()
+      },
+      64,
+      Duration::from_secs(5),
+      reply_tx,
+      live.clone(),
+      acked.clone(),
+      MemberId::new(1),
+    );
+
+    // First advance: not yet exhausted. The propose closure succeeds; we capture the step reply
+    // but deliberately never send Installed, simulating a stuck install.
+    let mut propose =
+      |_: SingleVoterDelta| -> Result<OpNumber, ProposeMembershipError> { Ok(OpNumber::new()) };
+    let outcome1 = job.advance(Instant::ZERO, live.clone(), acked.clone(), &mut propose);
+    assert!(
+      matches!(outcome1, AdvanceOutcome::InFlight),
+      "first advance before deadline is InFlight"
+    );
+    // Drain the proposal so the slot is empty; drop the step reply without answering (simulates
+    // the install never arriving — the driver task would normally wait for the config_id match).
+    drop(job.controller.take_proposal());
+
+    // Second advance at t = ZERO + 10s, past the 5s deadline — must fire the advance-level Timeout.
+    let t1 = Instant::ZERO + Duration::from_secs(10);
+    let mut propose2 =
+      |_: SingleVoterDelta| -> Result<OpNumber, ProposeMembershipError> { Ok(OpNumber::new()) };
+    let outcome2 = job.advance(t1, live, acked, &mut propose2);
+    assert!(
+      matches!(outcome2, AdvanceOutcome::Done),
+      "advance past deadline must return Done"
+    );
+    assert!(
+      matches!(
+        reply_rx.try_recv(),
+        Ok(Some(Err(ReconfigureError::Timeout(_))))
+      ),
+      "reply must carry Timeout when deadline fires with install outstanding"
+    );
+  }
+
+  // ── FIX 2 test: self-removal ranked last ─────────────────────────────────
+
+  /// When both the local node and a peer are valid removal candidates (both have surviving
+  /// confirmed quorums after their removal), the peer is picked first. This prevents the driver
+  /// from retiring itself mid-plan when another safe removal exists.
+  #[test]
+  fn self_removal_is_ranked_last_when_another_safe_removal_exists() {
+    // live = {1, 2, 3}, target = {2}: must remove both 1 and 3.
+    // local_member = 1 (the local driver node is a removal candidate).
+    // known_up = {1, 2, 3}: all three confirmed alive, so liveness is equal for all candidates;
+    // the self-last tie-break alone must distinguish them.
+    // Removing 1 → successor {2, 3}, quorum = 1, confirmed = 2 ✓
+    // Removing 3 → successor {1, 2}, quorum = 1, confirmed = 2 ✓
+    // Without self-last: ascending-id order picks 1 first. With self-last: 3 is picked first.
+    let live = membership_of(&[1, 2, 3]);
+    let health = HealthHint {
+      known_up: member_set(&[1, 2, 3]),
+      known_down: BTreeSet::new(),
+    };
+    let responsive = member_set(&[1, 2, 3]);
+    let local_member = MemberId::new(1);
+
+    let candidates = std::vec![
+      SingleVoterDelta::RemoveVoter(MemberId::new(1)),
+      SingleVoterDelta::RemoveVoter(MemberId::new(3)),
+    ];
+
+    let result =
+      pick_fresh_quorum_preserving_removal(&live, &candidates, &health, &responsive, local_member);
+
+    assert_eq!(
+      result,
+      Some(SingleVoterDelta::RemoveVoter(MemberId::new(3))),
+      "RemoveVoter(3) must be chosen before RemoveVoter(1) (self) even though id 1 < 3"
     );
   }
 }

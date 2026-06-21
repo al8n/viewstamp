@@ -2,12 +2,13 @@
 //! `config_id` lineage chain. The single source of truth for who votes and who
 //! leads in the current epoch; carried durably in the superblock `VsrState`.
 
-use std::boxed::Box;
-use std::vec::Vec;
+use std::{boxed::Box, vec::Vec};
 
-use crate::View;
-use crate::id::{Epoch, MemberId, ReplicaId};
-use crate::storage::fnv1a_128;
+use crate::{
+  View,
+  id::{Epoch, MemberId, ReplicaId},
+  storage::fnv1a_128,
+};
 
 /// The voting-set cap (the prepare-ok quorum uses a u64 bitset). Matches the
 /// existing `ConfigError::TooManyReplicas` bound in `config.rs`.
