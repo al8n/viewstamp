@@ -2619,7 +2619,9 @@ impl<S, R: Reconfig> Endpoint<S, R> {
         let slot = bits.trailing_zeros() as u16;
         bits &= bits - 1;
         let id = ReplicaId::new(slot);
-        if self.membership.is_voter(id) && let Some(m) = self.membership.member_at(id) {
+        if self.membership.is_voter(id)
+          && let Some(m) = self.membership.member_at(id)
+        {
           out.insert(m);
         }
       }

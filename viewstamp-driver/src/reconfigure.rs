@@ -3,8 +3,7 @@
 //! from the live membership each step, with a health-aware fail-closed shrink ordering. Adds ZERO proto
 //! consensus surface.
 
-use std::collections::BTreeSet;
-use std::vec::Vec;
+use std::{collections::BTreeSet, vec::Vec};
 
 use viewstamp_proto::{
   MemberId, Membership, MembershipTarget, PlanError, ProposeMembershipError, SingleVoterDelta,
@@ -317,8 +316,7 @@ pub(crate) async fn run_reconfigure<B: ReconfigureBackend>(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::cell::RefCell;
-  use std::rc::Rc;
+  use std::{cell::RefCell, rc::Rc};
 
   // ── helpers ──────────────────────────────────────────────────────────────
 

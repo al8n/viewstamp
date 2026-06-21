@@ -3,11 +3,12 @@
 //! consensus state; it constructs no op, touches no durable state, sends no wire message. Per-step
 //! safety is inherited from Tier B unchanged.
 
-use std::collections::BTreeSet;
-use std::vec::Vec;
+use std::{collections::BTreeSet, vec::Vec};
 
-use crate::id::MemberId;
-use crate::membership::{Membership, SingleVoterDelta};
+use crate::{
+  id::MemberId,
+  membership::{Membership, SingleVoterDelta},
+};
 
 /// The SET-only reconfiguration goal: WHO votes and WHO learns, as two `MemberId` sets. NOT a full
 /// [`Membership`] — the slot order, `epoch`, and `config_id` are DERIVED by `apply_delta` and are not an
