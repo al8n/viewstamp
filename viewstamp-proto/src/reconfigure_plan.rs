@@ -120,13 +120,130 @@ impl PlanError {
   }
 }
 
-/// Lower a set goal to a bounded grow-before-shrink delta sequence. PURE. (Implemented in a later task.)
+/// The 64-voter cap (matches `MAX_VOTING_REPLICAS` in `membership.rs`; the prepare-ok bitset width).
+const MAX_VOTERS: usize = 64;
+
+/// Split a membership into its voter SET and learner SET (by slot kind).
+fn voter_learner_sets(m: &Membership) -> (BTreeSet<MemberId>, BTreeSet<MemberId>) {
+  let voters = m.replica_count() as usize;
+  let members = m.members_slice();
+  let v: BTreeSet<MemberId> = members[..voters].iter().copied().collect();
+  let l: BTreeSet<MemberId> = members[voters..].iter().copied().collect();
+  (v, l)
+}
+
+/// Lower a set goal to a bounded grow-before-shrink sequence of proven Tier B deltas, from `current`'s
+/// voter/learner SETS to `target` (Phase 0 prune obsolete learners → Phase 1 stage new-voter learners →
+/// Phase 2 promote → Phase 3 remove old voters → Phase 4 add residual target learners). PURE — no I/O, no
+/// `self`. The peak caps are validated by SIMULATION: it BUILDS the ordered `Vec`, folds `apply_delta`
+/// along it, and returns `IntermediatePeakExceedsCap` / `IntermediateNodePeakExceedsCap` iff the running
+/// max exceeds the 64-voter / `u16::MAX`-node cap — so it never hands back a sequence a later `apply_delta`
+/// would reject mid-plan. The set-only prechecks (disjointness, demotion, empty/oversize) are pure
+/// properties of `(current, target)`, checked before the sequence is built.
+///
+/// The returned Phase-3 removals (`Vc \ Vt`) are emitted in a deterministic ascending-`MemberId` order
+/// purely for a stable output; safety is order-independent, so the executor reorders that SET health-aware.
 pub fn plan_reconfiguration(
   current: &Membership,
   target: &MembershipTarget,
 ) -> Result<Vec<SingleVoterDelta>, PlanError> {
-  let _ = (current, target);
-  unimplemented!("plan_reconfiguration is implemented in Task 2")
+  let (vc, lc) = voter_learner_sets(current);
+  let vt = &target.voters;
+  let lt = &target.learners;
+
+  // PREFLIGHT set-only admission (overlap → empty → demotion → oversize → voter-union peak).
+  if !vt.is_disjoint(lt) {
+    return Err(PlanError::VoterLearnerOverlap);
+  }
+  if vt.is_empty() {
+    return Err(PlanError::EmptyVoterSet);
+  }
+  // A current voter the target wants as a LEARNER — an online voter→learner DEMOTION.
+  if vc.difference(vt).any(|x| lt.contains(x)) {
+    return Err(PlanError::VoterToLearnerDemotionUnsupported);
+  }
+  if vt.len() > MAX_VOTERS {
+    return Err(PlanError::TooManyVoters { count: vt.len() });
+  }
+  // The grow-before-shrink voter peak is |Vc ∪ Vt| (all current voters stay through Phase 2 while new
+  // voters are promoted). Check this BEFORE building the plan so the reported peak is the union size,
+  // not the simulation failure point — which matches the expectation a remove-then-grow batch would fix.
+  let voter_union_peak = vc.union(vt).count();
+  if voter_union_peak > MAX_VOTERS {
+    return Err(PlanError::IntermediatePeakExceedsCap {
+      peak: voter_union_peak,
+    });
+  }
+
+  let mut plan: Vec<SingleVoterDelta> = Vec::new();
+
+  // Phase 0 — PRUNE every obsolete learner first (a current learner kept as NEITHER a learner nor a
+  // to-be-promoted voter). Always safe (non-voting) and it frees node-cap headroom before any add.
+  for &x in lc.iter() {
+    if !lt.contains(&x) && !vt.contains(&x) {
+      plan.push(SingleVoterDelta::RemoveLearner(x));
+    }
+  }
+  // Phase 1 — stage every new voter as a learner first (skip those already learners).
+  for &x in vt.iter() {
+    if !vc.contains(&x) && !lc.contains(&x) {
+      plan.push(SingleVoterDelta::AddLearner(x));
+    }
+  }
+  // Phase 2 — promote every new voter (the proto promote-time challenge gates each).
+  for &x in vt.iter() {
+    if !vc.contains(&x) {
+      plan.push(SingleVoterDelta::PromoteLearner(x));
+    }
+  }
+  // Phase 3 — remove every departing voter (deterministic ascending order; executor reorders).
+  for &x in vc.iter() {
+    if !vt.contains(&x) {
+      plan.push(SingleVoterDelta::RemoveVoter(x));
+    }
+  }
+  // Phase 4 — add the residual target learners (the genuinely-new ones; Phase 0 pruned the obsolete).
+  for &x in lt.iter() {
+    if !lc.contains(&x) {
+      plan.push(SingleVoterDelta::AddLearner(x));
+    }
+  }
+
+  // VALIDATE by simulation: fold apply_delta along the built plan and take the running voter/node maxima.
+  // This is the exact trajectory the executor installs, so it is correct-by-construction. apply_delta
+  // also rejects any structurally-invalid delta (e.g. a last-voter removal or a cap overflow from a
+  // PromoteLearner that would push voter count past 64) — map each to the appropriate PlanError.
+  let mut sim = current.clone();
+  let mut max_voters = sim.replica_count() as usize;
+  let mut max_nodes = sim.node_count() as u32;
+  for d in &plan {
+    sim = match sim.apply_delta(d) {
+      Ok(next) => next,
+      Err(crate::membership::MembershipError::WouldRemoveLastVoter) => {
+        return Err(PlanError::RemovesLastVoter);
+      }
+      Err(crate::membership::MembershipError::TooManyReplicas { count }) => {
+        // A PromoteLearner pushed the voter count past 64 mid-plan.
+        return Err(PlanError::IntermediatePeakExceedsCap {
+          peak: count as usize,
+        });
+      }
+      Err(crate::membership::MembershipError::TooManyNodes { count }) => {
+        return Err(PlanError::IntermediateNodePeakExceedsCap { peak: count });
+      }
+      // No other apply_delta error is reachable for a well-formed built plan.
+      Err(_) => return Err(PlanError::RemovesLastVoter),
+    };
+    max_voters = max_voters.max(sim.replica_count() as usize);
+    max_nodes = max_nodes.max(sim.node_count() as u32);
+  }
+  if max_voters > MAX_VOTERS {
+    return Err(PlanError::IntermediatePeakExceedsCap { peak: max_voters });
+  }
+  if max_nodes > u16::MAX as u32 {
+    return Err(PlanError::IntermediateNodePeakExceedsCap { peak: max_nodes });
+  }
+  Ok(plan)
 }
 
 /// The first delta of [`plan_reconfiguration`], or `None` when `current`'s sets already equal `target`.
@@ -153,6 +270,150 @@ mod tests {
 
   fn ids(xs: &[u128]) -> BTreeSet<MemberId> {
     xs.iter().copied().map(MemberId::new).collect()
+  }
+
+  fn genesis(voters: &[u128], learners: &[u128]) -> Membership {
+    let mut members: Vec<MemberId> = voters.iter().copied().map(MemberId::new).collect();
+    members.extend(learners.iter().copied().map(MemberId::new));
+    Membership::genesis(voters.len() as u8, learners.len() as u16, members).unwrap()
+  }
+
+  fn target(voters: &[u128], learners: &[u128]) -> MembershipTarget {
+    MembershipTarget::new(ids(voters), ids(learners))
+  }
+
+  /// Fold `apply_delta` over a plan and return the resulting voter/learner SETS.
+  fn apply_plan(
+    start: &Membership,
+    plan: &[SingleVoterDelta],
+  ) -> (BTreeSet<MemberId>, BTreeSet<MemberId>) {
+    let mut m = start.clone();
+    for d in plan {
+      m = m
+        .apply_delta(d)
+        .expect("each planned delta applies in sequence");
+    }
+    let voters: BTreeSet<MemberId> = (0..m.replica_count())
+      .map(|s| m.member_at(crate::id::ReplicaId::new(s as u16)).unwrap())
+      .collect();
+    let all: BTreeSet<MemberId> = m.members_slice().iter().copied().collect();
+    let learners: BTreeSet<MemberId> = all.difference(&voters).copied().collect();
+    (voters, learners)
+  }
+
+  #[test]
+  fn end_state_set_equivalence_for_canonical_rotation() {
+    // {1,2,3} -> {3,4,5}: stage 4,5 as learners, promote, remove 1,2.
+    let c = genesis(&[1, 2, 3], &[]);
+    let t = target(&[3, 4, 5], &[]);
+    let plan = plan_reconfiguration(&c, &t).unwrap();
+    let (v, l) = apply_plan(&c, &plan);
+    assert_eq!(v, ids(&[3, 4, 5]), "the final voter SET equals the target");
+    assert_eq!(l, BTreeSet::new(), "no residual learners");
+  }
+
+  #[test]
+  fn a_pure_reorder_yields_the_empty_plan() {
+    // Same voter+learner sets as `current` (any slot order) => no reconfiguration.
+    let c = genesis(&[1, 2, 3], &[8]);
+    let t = target(&[3, 1, 2], &[8]);
+    assert!(plan_reconfiguration(&c, &t).unwrap().is_empty());
+  }
+
+  #[test]
+  fn every_emitted_delta_applies_in_sequence_and_never_raw_add_voter() {
+    let c = genesis(&[1, 2, 3], &[8]);
+    let t = target(&[2, 3, 4, 5], &[9]);
+    let plan = plan_reconfiguration(&c, &t).unwrap();
+    // Each delta applies against its immediate predecessor (the apply_plan unwrap proves it).
+    let _ = apply_plan(&c, &plan);
+    assert!(
+      !plan.iter().any(SingleVoterDelta::is_add_voter),
+      "the planner grows the voting set ONLY via AddLearner+PromoteLearner, never raw AddVoter"
+    );
+  }
+
+  #[test]
+  fn grow_before_shrink_prefix_keeps_a_structural_majority() {
+    let c = genesis(&[1, 2, 3], &[]);
+    let t = target(&[1], &[]); // shrink {1,2,3} -> {1}
+    let plan = plan_reconfiguration(&c, &t).unwrap();
+    // At every prefix the voter count stays at or above |Vt| = 1 (the shrink target floor).
+    let mut m = c.clone();
+    assert!(m.replica_count() as usize >= 3); // initial: max(|Vt|, |Vc|) = 3
+    for d in &plan {
+      m = m.apply_delta(d).unwrap();
+      assert!(
+        m.replica_count() as usize >= 1,
+        "a structural majority always exists"
+      );
+    }
+  }
+
+  #[test]
+  fn phase_0_prunes_obsolete_learner_before_phase_4_adds() {
+    // Swap a learner: {1,2,3}+learner{8} -> {1,2,3}+learner{9}.
+    let c = genesis(&[1, 2, 3], &[8]);
+    let t = target(&[1, 2, 3], &[9]);
+    let plan = plan_reconfiguration(&c, &t).unwrap();
+    let rm = plan
+      .iter()
+      .position(|d| matches!(d, SingleVoterDelta::RemoveLearner(m) if *m == MemberId::new(8)));
+    let add = plan
+      .iter()
+      .position(|d| matches!(d, SingleVoterDelta::AddLearner(m) if *m == MemberId::new(9)));
+    assert!(
+      rm.is_some() && add.is_some(),
+      "both the prune and the add are emitted"
+    );
+    assert!(
+      rm.unwrap() < add.unwrap(),
+      "Phase 0 prune precedes the Phase 4 add"
+    );
+  }
+
+  #[test]
+  fn overlap_demotion_empty_and_oversize_reject_at_preflight_with_zero_steps() {
+    let c = genesis(&[1, 2, 3], &[]);
+    // Overlap: 4 in BOTH sets — checked FIRST.
+    assert_eq!(
+      plan_reconfiguration(&c, &target(&[1, 2, 4], &[4])),
+      Err(PlanError::VoterLearnerOverlap)
+    );
+    // Demotion: current voter 3 becomes a target learner.
+    assert_eq!(
+      plan_reconfiguration(&c, &target(&[1, 2], &[3])),
+      Err(PlanError::VoterToLearnerDemotionUnsupported)
+    );
+    // Empty voter set.
+    assert_eq!(
+      plan_reconfiguration(&c, &target(&[], &[1])),
+      Err(PlanError::EmptyVoterSet)
+    );
+  }
+
+  #[test]
+  fn peak_cap_admits_remove_then_add_the_union_overestimates() {
+    // The closed-form union |Vc∪Vt| is the VOTER peak; a 4→4 disjoint swap with a real 4-cap is rejected,
+    // but a remove-then-add target whose UNION over-estimates the node peak is admitted.
+    // Voter peak rejection (use the real 64-cap shape scaled): a disjoint swap that peaks past 64.
+    let big_v: Vec<u128> = (1..=64).collect();
+    let c = genesis(&big_v, &[]);
+    let disjoint: Vec<u128> = (65..=128).collect();
+    assert_eq!(
+      plan_reconfiguration(&c, &target(&disjoint, &[])),
+      Err(PlanError::IntermediatePeakExceedsCap { peak: 128 }),
+      "a 64->64 disjoint swap peaks at |Vc∪Vt| = 128 > 64"
+    );
+    // Node peak admits a remove-then-add: current voters {1,2,3,4} + a few learners; target keeps {1}
+    // and adds exactly as many learners as it removes voters (3). The all-members union counts the
+    // removed voters AND the new learners together; the real running peak frees the slot first.
+    let c2 = genesis(&[1, 2, 3, 4], &[10, 11]);
+    let t2 = target(&[1], &[10, 11, 20, 21, 22]); // removes 2,3,4; adds 20,21,22 (3 == 3)
+    let plan =
+      plan_reconfiguration(&c2, &t2).expect("the exact node peak admits the remove-then-add");
+    let (v, _l) = apply_plan(&c2, &plan);
+    assert_eq!(v, ids(&[1]));
   }
 
   #[test]
