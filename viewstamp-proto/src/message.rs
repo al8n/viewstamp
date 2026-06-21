@@ -1,8 +1,7 @@
 //! Wire message types for the Viewstamped Replication protocol.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use std::boxed::Box;
-use std::vec::Vec;
+use std::{boxed::Box, vec::Vec};
 
 use crate::{
   ClientId, Epoch, MemberId, Membership, MembershipError, OpNumber, Recipient, ReplicaId,
