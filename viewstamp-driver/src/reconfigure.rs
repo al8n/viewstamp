@@ -775,6 +775,7 @@ impl ReconfigureJob {
   /// The deadline is not armed here — it is armed `reconfigure_timeout` ahead of the FIRST advance,
   /// against the driver's clock threaded in as `now` — so the initial snapshot's `cap_exhausted` is
   /// `false`.
+  #[allow(clippy::too_many_arguments)] // all params are load-bearing; a builder struct adds indirection without clarity
   pub fn start(
     target: MembershipTarget,
     health: HealthHint,
