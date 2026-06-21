@@ -38,7 +38,7 @@ use std::{
 use bytes::Bytes;
 use viewstamp_proto::{
   ClientId, Config, Endpoint, Event, Instant, Membership, Recovered, Request, RequestNumber,
-  StateMachine, Superblock, VsrState, Wal,
+  SingleChange, StateMachine, Superblock, VsrState, Wal,
 };
 
 use crate::DriverError;
@@ -82,7 +82,7 @@ pub fn build_endpoint<S, W, B>(
   sm: S,
   wal: &mut W,
   sb: &mut B,
-) -> Result<Endpoint<S>, DriverError>
+) -> Result<Endpoint<S, SingleChange>, DriverError>
 where
   S: StateMachine,
   W: Wal,
@@ -97,12 +97,18 @@ where
     .map_or(0, |d| d.as_nanos() as u64);
   let seed = wall ^ ((config.local().get() as u64).wrapping_add(1)).rotate_left(48);
   if sb.state() == VsrState::new() && wal.op_head().get() == 0 {
-    Ok(Endpoint::new(config, membership, seed, sm))
+    // `SingleChange` is a zero-sized PhantomData witness with no runtime representation; the driver
+    // always carries the capability so the coordinators can call `propose_membership` without the
+    // embedder opting in per-instance. The bytes are identical to a `RestartOnly` endpoint.
+    Ok(Endpoint::<S, SingleChange>::with_reconfig(
+      config, membership, seed, sm,
+    ))
   } else {
     // The recover path resolves THIS node against the DURABLE root's membership: a v4 root that no
     // longer lists it (an offline reconfiguration removed it) yields `Recovered::Retired`, which the
     // driver surfaces as a hard error — a retired node has no replica loop to run.
-    match Endpoint::recover(config, membership, seed, sm, wal, sb) {
+    match Endpoint::<S, SingleChange>::recover_with_reconfig(config, membership, seed, sm, wal, sb)
+    {
       Recovered::Active(endpoint) => Ok(endpoint),
       Recovered::Retired(retired) => Err(DriverError::Retired {
         local: retired.local(),

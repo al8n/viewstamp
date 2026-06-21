@@ -1153,7 +1153,7 @@ mod tests {
   use crate::bridge::{BridgeOut, Conn as BridgeConn, ConnTask};
   use viewstamp_proto::{
     ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled, MemberId, Membership,
-    OpNumber, Passthrough, Peer, ReplicaId, StreamCoordinator, View,
+    OpNumber, Passthrough, Peer, ReplicaId, SingleChange, StreamCoordinator, View,
   };
   use viewstamp_simulation::sm::LogSm;
 
@@ -1382,7 +1382,8 @@ mod tests {
     let mut driver = test_driver().await;
     const CLUSTER: u128 = 0x7777;
     let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
-    let endpoint = Endpoint::new(config, genesis(3), 1, LogSm::default());
+    let endpoint =
+      Endpoint::<_, SingleChange>::with_reconfig(config, genesis(3), 1, LogSm::default());
     driver.coord = StreamCoordinator::with_outbound_cap(endpoint, cap);
     driver
   }
@@ -1575,8 +1576,12 @@ mod tests {
     // The remote replica (id 1): a stand-alone coordinator that accepts our conn and answers the
     // `Labeled` handshake.
     let peer_config = Config::try_new(CLUSTER, MemberId::new(1_u128)).unwrap();
-    let mut peer =
-      StreamCoordinator::new(Endpoint::new(peer_config, genesis(3), 2, LogSm::default()));
+    let mut peer = StreamCoordinator::new(Endpoint::<_, SingleChange>::with_reconfig(
+      peer_config,
+      genesis(3),
+      2,
+      LogSm::default(),
+    ));
     let peer_conn = Conn::from_parts(Labeled::acceptor(
       Passthrough::new(),
       &LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(1))),
