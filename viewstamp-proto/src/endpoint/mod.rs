@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
 
@@ -2573,6 +2573,58 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self
       .local_slot_opt()
       .is_some_and(|slot| self.membership.is_primary_slot(slot, self.view))
+  }
+
+  /// The live active [`Membership`] of this replica — a read-only snapshot the driver's
+  /// reconfiguration executor re-reads each step to plan from the THEN-LIVE configuration.
+  /// Adds no consensus surface.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn membership(&self) -> &Membership {
+    &self.membership
+  }
+
+  /// The set of current voters whose slot bit is set in some UNCOMMITTED in-flight prepare's ack
+  /// bitset — a best-effort responsiveness oracle the driver's shrink phase reads as POSITIVE
+  /// liveness evidence.
+  ///
+  /// It reads ONLY the truly-fresh, current-round, current-layout acks: an op with
+  /// `commit_min < op <= self.op` (the live in-flight tail) AND `!inflight[op].committed`. Committed
+  /// entries are skipped — a retained committed entry's ack bits are in the predecessor slot layout
+  /// after a membership swap (only UNCOMMITTED entries are rekeyed), so reading them would be stale
+  /// and mislaid. Filtering on `!committed` sidesteps both. Each set bit's slot is resolved to its
+  /// stable [`MemberId`] via [`Membership::member_at`] and kept only if that slot is a current voter.
+  ///
+  /// When the cluster holds NO uncommitted prepare (idle, or every in-flight op already committed)
+  /// the set is EMPTY — no oracle evidence, which the fail-closed shrink rule turns into a safe
+  /// stall, NOT a guess. This is a pure read of existing state: no new wire message, no durable
+  /// field, no safety surface. Like peer progress it is a LIVENESS hint only, never a safety input.
+  ///
+  /// `window` bounds the freshness band to the last `window` ops intersected with the uncommitted
+  /// tail; a `window` at least the pipeline depth (or `u64::MAX`) considers the whole uncommitted
+  /// tail `(commit_min .. self.op]`.
+  pub fn recently_acked_voters(&self, window: u64) -> BTreeSet<MemberId> {
+    let head = self.op.get();
+    let floor = head.saturating_sub(window).max(self.commit_min.get());
+    // When floor >= head there is no uncommitted tail to inspect.
+    if floor >= head {
+      return BTreeSet::new();
+    }
+    let mut out = BTreeSet::new();
+    for (_, inf) in self.inflight.range((floor + 1)..=head) {
+      if inf.committed {
+        continue;
+      }
+      let mut bits = inf.oks;
+      while bits != 0 {
+        let slot = bits.trailing_zeros() as u16;
+        bits &= bits - 1;
+        let id = ReplicaId::new(slot);
+        if self.membership.is_voter(id) && let Some(m) = self.membership.member_at(id) {
+          out.insert(m);
+        }
+      }
+    }
+    out
   }
 
   /// The HARD bound on the raw session-table size at accept-time admission: the applied-session cap

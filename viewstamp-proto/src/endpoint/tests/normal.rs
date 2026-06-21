@@ -1876,3 +1876,131 @@ fn prepare_batch_skips_a_repairing_entry_and_processes_the_rest() {
   }
   assert_eq!(acked, std::vec![1], "exactly the Present head-extend acked");
 }
+
+#[test]
+fn recently_acked_voters_reads_only_the_uncommitted_inflight_tail() {
+  // 3-voter cluster, primary at slot 0.
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+
+  // Idle: no uncommitted in-flight entries → empty oracle.
+  assert!(
+    e.recently_acked_voters(64).is_empty(),
+    "an idle cluster yields no oracle evidence"
+  );
+
+  // Submit op 1 (client 7, request 1): primary appends, sends Prepare to backups, oks=0.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    client_request(1),
+  );
+  // Pump WAL: the primary's own append is now durable → record_own_vote sets bit 0 → oks = 0b001.
+  e.handle_storage(now, &mut wal, &mut sb);
+  while e.poll_message().is_some() {} // drain the Prepare broadcast
+
+  // Op 1 is in-flight and uncommitted; slot 0 (primary) has acked.
+  let member_slot0 = MemberId::new(0); // genesis: MemberId::new(i) == slot i
+  let member_slot1 = MemberId::new(1);
+  let acked_before_backup = e.recently_acked_voters(64);
+  assert!(
+    acked_before_backup.contains(&member_slot0),
+    "slot 0 (primary, own vote) must appear in the uncommitted tail"
+  );
+  assert!(
+    !acked_before_backup.contains(&member_slot1),
+    "slot 1 has not acked yet"
+  );
+
+  // Deliver PrepareOk from slot 1 for op 1 (content-addressed, so checksum must match).
+  let checksum = crate::storage::prepare_identity(
+    ClientId::new(7),
+    RequestNumber::with(1),
+    crate::storage::fnv1a_128(&[1u8]),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      OpNumber::new(),
+      checksum,
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  // Op 1 is still uncommitted (quorum for a 3-voter cluster is 2; we now have 2 acks but
+  // try_commit fires and COMMITS here — so we need to verify the oracle BEFORE commit triggers,
+  // OR test that the committed entry is excluded. Let's verify by checking the post-commit state.
+  // After delivering slot-1's PrepareOk, try_commit fires: oks has bits 0+1 = 2 ≥ quorum(2),
+  // so op 1 is committed (inflight[1].committed = true). The oracle must return empty.
+  assert!(
+    e.recently_acked_voters(64).is_empty(),
+    "after op 1 commits (inflight entry stays but committed=true) the oracle returns empty — \
+     only uncommitted entries are fresh"
+  );
+}
+
+#[test]
+fn recently_acked_voters_uncommitted_op_visible_before_quorum() {
+  // A 3-voter cluster where one backup has NOT acked yet: only the primary's own ack is in the
+  // bitset, so the oracle sees exactly the primary's member (slot 0). This proves the oracle reads
+  // partial progress on uncommitted entries, not only fully-acked ops.
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, NoopSm);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    Peer::Client(ClientId::new(7)),
+    client_request(1),
+  );
+  e.handle_storage(now, &mut wal, &mut sb); // primary's own WAL append → own oks bit set
+  while e.poll_message().is_some() {}
+  // Only the primary's own ack: op 1 uncommitted, one ack, oracle returns {MemberId(0)}.
+  let acked = e.recently_acked_voters(64);
+  assert_eq!(
+    acked.len(),
+    1,
+    "exactly one voter acked so far (the primary)"
+  );
+  assert!(
+    acked.contains(&MemberId::new(0)),
+    "the primary (slot 0, MemberId 0) is the sole acked voter"
+  );
+}
+
+#[test]
+fn membership_accessor_returns_live_snapshot() {
+  // The membership() accessor returns the live Membership: its replica_count and member_at match
+  // the values from the individual accessor methods (replica_count, member_at) — proving it is the
+  // SAME struct, not a copy with diverging state.
+  let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
+  let e = Endpoint::new(cfg, genesis(3), 0, NoopSm);
+  let m = e.membership();
+  assert_eq!(
+    m.replica_count(),
+    e.replica_count(),
+    "membership().replica_count() matches the direct accessor"
+  );
+  assert_eq!(
+    m.member_at(ReplicaId::new(0)),
+    e.member_at(ReplicaId::new(0)),
+    "membership().member_at(slot) matches the direct accessor"
+  );
+  assert_eq!(
+    m.member_at(ReplicaId::new(1)),
+    Some(MemberId::new(1)),
+    "genesis slot 1 holds MemberId 1"
+  );
+}
