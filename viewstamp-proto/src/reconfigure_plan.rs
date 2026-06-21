@@ -246,22 +246,45 @@ pub fn plan_reconfiguration(
   Ok(plan)
 }
 
-/// The first delta of [`plan_reconfiguration`], or `None` when `current`'s sets already equal `target`.
+/// The FIRST delta of [`plan_reconfiguration`], or `None` when `current`'s SETS already equal `target`
+/// (the plan is empty / done). PURE. The executor calls this each iteration so it always plans from the
+/// LIVE membership; it is exactly `plan_reconfiguration(..)?.first().cloned()`, so the loop driver and the
+/// whole-plan testable core cannot diverge.
 pub fn plan_next_step(
   current: &Membership,
   target: &MembershipTarget,
 ) -> Result<Option<SingleVoterDelta>, PlanError> {
-  let _ = (current, target);
-  unimplemented!("plan_next_step is implemented in Task 3")
+  Ok(plan_reconfiguration(current, target)?.first().cloned())
 }
 
-/// The Phase-3 removal SET for the live config (the departing voters), unordered. PURE.
+/// The Phase-3 removal SET for the live config: the departing voters `voters(current) \ target.voters`,
+/// each as a `RemoveVoter`, as an UNORDERED set (a stable ascending order for testing). EMPTY until all of
+/// `target.voters` is present (the grow/promote prefix is not yet done, so no removal is due) and when the
+/// voter set already equals `target.voters`. PURE — the executor orders the result health-aware. Exists so
+/// the executor's health-aware ordering and the pure planner share one definition of "which voters leave".
 pub fn shrink_candidates(
   current: &Membership,
   target: &MembershipTarget,
 ) -> Result<Vec<SingleVoterDelta>, PlanError> {
-  let _ = (current, target);
-  unimplemented!("shrink_candidates is implemented in Task 3")
+  let plan = plan_reconfiguration(current, target)?;
+  // A removal is due only once the grow/promote PREFIX is exhausted: if any AddLearner or PromoteLearner
+  // appears before the first RemoveVoter, the grow phase is still pending for this live config.
+  let first_remove = plan.iter().position(SingleVoterDelta::is_remove_voter);
+  let Some(first_remove) = first_remove else {
+    return Ok(Vec::new()); // no voter removals in this plan at all
+  };
+  let grow_before_remove = plan[..first_remove]
+    .iter()
+    .any(|d| d.is_add_learner() || d.is_promote_learner());
+  if grow_before_remove {
+    return Ok(Vec::new());
+  }
+  Ok(
+    plan
+      .into_iter()
+      .filter(SingleVoterDelta::is_remove_voter)
+      .collect(),
+  )
 }
 
 #[cfg(test)]
@@ -466,5 +489,65 @@ mod tests {
     // thiserror `#[error("…")]` renders for every variant (no empty/`{:?}`-only message).
     let e = PlanError::TooManyVoters { count: 65 };
     assert!(!std::format!("{e}").is_empty());
+  }
+
+  #[test]
+  fn plan_next_step_equals_first_element_for_random_shapes() {
+    let cases = [
+      (genesis(&[1, 2, 3], &[]), target(&[3, 4, 5], &[])),
+      (genesis(&[1, 2, 3], &[8]), target(&[1, 2, 3], &[9])),
+      (genesis(&[1, 2, 3, 4], &[]), target(&[1, 2, 3], &[])),
+      (genesis(&[1, 2, 3], &[]), target(&[1, 2, 3], &[])), // done
+    ];
+    for (c, t) in &cases {
+      let whole = plan_reconfiguration(c, t).unwrap();
+      assert_eq!(plan_next_step(c, t).unwrap(), whole.first().cloned());
+    }
+  }
+
+  #[test]
+  fn plan_next_step_propagates_preflight_errors() {
+    let c = genesis(&[1, 2, 3], &[]);
+    assert_eq!(
+      plan_next_step(&c, &target(&[1, 2], &[3])),
+      Err(PlanError::VoterToLearnerDemotionUnsupported)
+    );
+  }
+
+  #[test]
+  fn shrink_candidates_is_empty_until_the_grow_prefix_is_done() {
+    // Replace a dead node: {1,2,3} -> {1,2,4}. Before 4 is promoted there is still a grow step, so the
+    // shrink set is empty; only once all of Vt is present is the RemoveVoter(3) due.
+    let c = genesis(&[1, 2, 3], &[]);
+    let t = target(&[1, 2, 4], &[]);
+    assert!(
+      shrink_candidates(&c, &t).unwrap().is_empty(),
+      "no removal is due while 4 still needs staging+promoting"
+    );
+    // Once 4 is a voter (simulate the grow prefix), the departing voter 3 is the candidate.
+    let grown = c
+      .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(4)))
+      .unwrap()
+      .apply_delta(&SingleVoterDelta::PromoteLearner(MemberId::new(4)))
+      .unwrap();
+    assert_eq!(
+      shrink_candidates(&grown, &t).unwrap(),
+      std::vec![SingleVoterDelta::RemoveVoter(MemberId::new(3))]
+    );
+  }
+
+  #[test]
+  fn shrink_candidates_returns_the_full_phase3_set_when_all_of_vt_present() {
+    // {1,2,3,4,5} -> {1,2}: all of Vt present, so the candidates are RemoveVoter(3),(4),(5) ascending.
+    let c = genesis(&[1, 2, 3, 4, 5], &[]);
+    let t = target(&[1, 2], &[]);
+    assert_eq!(
+      shrink_candidates(&c, &t).unwrap(),
+      std::vec![
+        SingleVoterDelta::RemoveVoter(MemberId::new(3)),
+        SingleVoterDelta::RemoveVoter(MemberId::new(4)),
+        SingleVoterDelta::RemoveVoter(MemberId::new(5)),
+      ]
+    );
   }
 }
