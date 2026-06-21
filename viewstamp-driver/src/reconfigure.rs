@@ -146,8 +146,9 @@ pub trait ReconfigureBackend {
 /// it is NOT in `known_down` AND it has a POSITIVE witness (in `known_up` OR in the `responsive` recent-ack
 /// set). NEGATIVE-only `known_down` can never CONFIRM the quorum (absence is not a positive witness). Prefer
 /// removing an `X` that is apparently down (in `known_down`, or absent from both `known_up` and
-/// `responsive`). Self (`local_member`) is ranked LAST among candidates at equal liveness: removing the
-/// local driver node mid-plan terminates the driver, so a peer removal is always preferred when available.
+/// `responsive`). Self (`local_member`) is ranked LAST unconditionally — not merely as a tie-break within
+/// the same liveness bucket — because a local node without positive evidence would otherwise sort before
+/// peers that ARE known_up, retiring the driver while peers still need removing.
 /// `None` (→ STALL fail-closed) when NO candidate's successor has a positively-confirmed quorum — never a
 /// removal on a guess.
 fn pick_fresh_quorum_preserving_removal(
@@ -164,13 +165,16 @@ fn pick_fresh_quorum_preserving_removal(
   let is_alive = |m: &MemberId| -> bool {
     !health.known_down.contains(m) && (health.known_up.contains(m) || responsive.contains(m))
   };
-  // Rank: apparently-DOWN first, then self LAST (removing the local driver node mid-plan terminates
-  // the driver, so a peer removal is always preferred), then ascending id for determinism.
+  // Rank: self LAST (primary sort key — retiring the local driver mid-plan ends the plan),
+  // then apparently-DOWN before live (remove unresponsive peers before live ones), then
+  // ascending id for determinism.  The self-last key is unconditional: it must not be
+  // subordinate to liveness, because otherwise a local node that has no positive evidence
+  // (apparently_down) sorts BEFORE peers that ARE known_up and would be retired first.
   let mut ordered: Vec<&SingleVoterDelta> = candidates.iter().collect();
   ordered.sort_by_key(|d| {
     let m = d.member();
     let apparently_down = health.known_down.contains(&m) || !is_alive(&m);
-    (!apparently_down, m == local_member, m.get())
+    (m == local_member, !apparently_down, m.get())
   });
   for cand in ordered {
     let x = cand.member();
@@ -1636,6 +1640,45 @@ mod tests {
       result,
       Some(SingleVoterDelta::RemoveVoter(MemberId::new(3))),
       "RemoveVoter(3) must be chosen before RemoveVoter(1) (self) even though id 1 < 3"
+    );
+  }
+
+  /// The self-last ordering is unconditional: it must hold even when the local node has NO
+  /// positive evidence (apparently_down) and a peer IS known_up.  Under the old key
+  /// `(!apparently_down, m == local_member, m.get())`, local (1) and peer (3) both land in the
+  /// apparently_down bucket (local=not-witnessed, peer=not-witnessed), so the secondary key
+  /// `m == local_member` would fire: local=true > peer=false → local wins the descending sort
+  /// and is removed first, retiring the driver.  Under the correct key `(m == local_member, ...)`
+  /// local always sorts last regardless of its liveness.
+  ///
+  /// live = {1,2,3,4,5}, local_member = 1, candidates = RemoveVoter(1) + RemoveVoter(3).
+  /// known_up = {2,4,5}; local (1) and candidate (3) are BOTH absent → both apparently_down.
+  /// Removing 3 → successor {1,2,4,5}, len=4, quorum=3, confirmed={2,4,5}=3 ≥ 3 ✓
+  /// Removing 1 → successor {2,3,4,5}, len=4, quorum=3, confirmed={2,4,5}=3 ≥ 3 ✓
+  /// Both pass the fail-closed gate; self-last must select RemoveVoter(3) even though local is
+  /// apparently_down (same liveness bucket).
+  #[test]
+  fn self_removal_is_ranked_last_even_when_local_has_no_positive_evidence() {
+    let live = membership_of(&[1, 2, 3, 4, 5]);
+    let health = HealthHint {
+      known_up: member_set(&[2, 4, 5]), // local (1) and peer (3) both absent from known_up
+      known_down: BTreeSet::new(),
+    };
+    let responsive = BTreeSet::new(); // no recent acks — neither local nor peer is witnessed
+    let local_member = MemberId::new(1);
+
+    let candidates = std::vec![
+      SingleVoterDelta::RemoveVoter(MemberId::new(1)),
+      SingleVoterDelta::RemoveVoter(MemberId::new(3)),
+    ];
+
+    let result =
+      pick_fresh_quorum_preserving_removal(&live, &candidates, &health, &responsive, local_member);
+
+    assert_eq!(
+      result,
+      Some(SingleVoterDelta::RemoveVoter(MemberId::new(3))),
+      "RemoveVoter(3) must be chosen before RemoveVoter(1) (self) even when both are apparently_down"
     );
   }
 }
