@@ -35,6 +35,15 @@ pub enum Command {
     /// immediately rebindable when the ack arrives.
     ack: futures_channel::oneshot::Sender<()>,
   },
+  /// Drive an arbitrary-target reconfiguration to convergence (a per-step plan loop in the driver task).
+  Reconfigure {
+    /// The set goal.
+    target: viewstamp_proto::MembershipTarget,
+    /// The optional operator shrink-phase health hint.
+    health: crate::reconfigure::HealthHint,
+    /// The completion channel.
+    reply: futures_channel::oneshot::Sender<Result<(), crate::reconfigure::ReconfigureError>>,
+  },
 }
 
 /// A cheaply-cloneable handle to submit client requests and observe committed events.
@@ -179,6 +188,42 @@ impl Handle {
       return Err(DriverError::DriverGone);
     }
     rx.await.map_err(|_| DriverError::ReplyDropped)
+  }
+
+  /// Drive the cluster to `target` by sequencing proven Tier B single-member changes. The driver task runs
+  /// the per-step replanning loop; this method submits the goal and awaits convergence. SOLE-DRIVER: it is
+  /// the only reconfiguration driver for the cluster (a driver-level plan guard serializes two calls on the
+  /// same driver). See [`crate::reconfigure::ReconfigureError`] for the bounded-loop outcomes.
+  ///
+  /// # Errors
+  /// [`crate::reconfigure::ReconfigureError::Propose`] with
+  /// [`viewstamp_proto::ProposeMembershipError::Busy`] if the command channel is full (retryable);
+  /// [`crate::reconfigure::ReconfigureError::DriverGone`] if the channel is closed or the reply is
+  /// dropped (terminal — the driver is gone, do not retry this handle); all other outcomes propagate
+  /// from the driver-task executor loop.
+  pub async fn reconfigure_to(
+    &self,
+    target: viewstamp_proto::MembershipTarget,
+    health: crate::reconfigure::HealthHint,
+  ) -> Result<(), crate::reconfigure::ReconfigureError> {
+    let (reply, rx) = futures_channel::oneshot::channel();
+    // Mirror `submit`: `try_send` never blocks. A FULL channel is backpressure — retryable Busy.
+    // A CLOSED channel means the driver is gone — terminal DriverGone (never retry a dead handle).
+    let sent = self.commands().try_send(Command::Reconfigure {
+      target,
+      health,
+      reply,
+    });
+    if let Err(ref err) = sent {
+      return Err(if err.is_full() {
+        crate::reconfigure::ReconfigureError::Propose(viewstamp_proto::ProposeMembershipError::Busy)
+      } else {
+        crate::reconfigure::ReconfigureError::DriverGone
+      });
+    }
+    // A dropped reply also means the driver exited before answering — terminal.
+    rx.await
+      .map_err(|_| crate::reconfigure::ReconfigureError::DriverGone)?
   }
 
   /// A receiver of consensus events — every [`Event`] the replica emits ([`Event::Committed`] plus
@@ -367,5 +412,33 @@ mod tests {
       "a refused reservation rolls back: the count never exceeds the cap"
     );
     drop(guards);
+  }
+
+  /// `reconfigure_to` on a CLOSED command channel returns `DriverGone`, not the retryable `Busy`.
+  /// A conscientious caller must not livelock against a dead driver.
+  #[test]
+  fn reconfigure_to_on_closed_channel_yields_driver_gone() {
+    use crate::reconfigure::{HealthHint, ReconfigureError};
+    use std::collections::BTreeSet;
+    use viewstamp_proto::{MemberId, MembershipTarget};
+
+    let (tx, rx) = futures_channel::mpsc::channel::<Command>(8);
+    let (_events_tx, events_rx) = flume::unbounded();
+    let handle = Handle::new(
+      tx,
+      events_rx,
+      InflightBudget::new(MAX_INFLIGHT, MAX_PENDING_BYTES),
+    );
+    // Drop the receiver so the channel is closed from the driver side.
+    drop(rx);
+
+    let target = MembershipTarget::new(BTreeSet::from([MemberId::new(1)]), BTreeSet::new());
+    let fut = handle.reconfigure_to(target, HealthHint::default());
+    futures_util::pin_mut!(fut);
+    let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+    match std::future::Future::poll(fut, &mut cx) {
+      std::task::Poll::Ready(Err(ReconfigureError::DriverGone)) => {}
+      other => panic!("expected Ready(Err(DriverGone)) on a closed channel, got {other:?}"),
+    }
   }
 }
