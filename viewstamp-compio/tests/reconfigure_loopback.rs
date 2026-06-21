@@ -223,8 +223,7 @@ async fn build_cluster_driver(
 ) -> (GateDriver, viewstamp_compio::Handle) {
   let (chain, key) = ca.issue(id);
   let opts: QuicOptions = ClusterTls::new(ca.roots(), chain, key).build();
-  let config =
-    viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(u128::from(id))).unwrap();
+  let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(u128::from(id))).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
@@ -397,8 +396,13 @@ async fn add_peer_is_non_blocking_and_does_not_panic() {
   let ca = TestCa::new();
   let bind: SocketAddr = "127.0.0.1:41630".parse().unwrap();
   // No initial peers: single-node, never forms a quorum.
-  let (driver, handle) =
-    build_driver(&ca, bind, genesis(1, 0), viewstamp_compio::DriverConfig::new()).await;
+  let (driver, handle) = build_driver(
+    &ca,
+    bind,
+    genesis(1, 0),
+    viewstamp_compio::DriverConfig::new(),
+  )
+  .await;
 
   // Call add_peer before the driver loop starts: the command sits in the channel buffer until the
   // run loop drains it.
@@ -412,13 +416,10 @@ async fn add_peer_is_non_blocking_and_does_not_panic() {
   // Call add_peer while the driver is live.
   handle.add_peer(MemberId::new(3), "127.0.0.1:41634".parse().unwrap());
 
-  compio::time::timeout(
-    std::time::Duration::from_secs(5),
-    handle.shutdown(),
-  )
-  .await
-  .expect("shutdown acks within 5s")
-  .expect("driver acks shutdown");
+  compio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+    .await
+    .expect("shutdown acks within 5s")
+    .expect("driver acks shutdown");
 
   // After the driver has stopped, add_peer must not panic (the send is best-effort; the closed
   // channel causes a silent drop, not a crash).
