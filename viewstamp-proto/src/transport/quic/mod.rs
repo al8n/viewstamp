@@ -32,7 +32,7 @@ use layout::StreamClass;
 use std::collections::BTreeSet;
 
 use crate::{
-  Endpoint, Event, Instant, MemberId, Membership, Message, OpNumber, Outgoing, Peer, Recipient,
+  Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
   ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
   endpoint::ProposeMembershipError,
 };
@@ -239,11 +239,6 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     self.endpoint.propose_membership(now, wal, delta)
   }
 
-  /// A clone of the endpoint's currently-installed membership.
-  pub fn live_membership(&self) -> Membership {
-    self.endpoint.membership().clone()
-  }
-
   /// The set of voter [`MemberId`]s that acknowledged an in-flight prepare within the last
   /// `window` ops, as a liveness hint for the reconfiguration executor.
   pub fn recently_acked_voters(&self, window: u64) -> BTreeSet<MemberId> {
@@ -379,6 +374,31 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// rather than treat every `false` as dead-link proof.
   pub fn has_bound_conn(&self, peer: Peer) -> bool {
     self.bridge.handle_for(peer).is_some()
+  }
+
+  /// Close the connection bound under `Peer::Replica(slot)` if one exists, so the peer can
+  /// reconnect under its new slot identity after a membership shift moves a member to a different
+  /// slot. The slot routing index holds the OLD slot key; tearing it down lets the redial path
+  /// re-establish under the new slot. A no-op if no connection is bound for that slot.
+  pub fn close_peer_by_slot(&mut self, now: Instant, slot: ReplicaId) {
+    if let Some(h) = self.bridge.handle_for(Peer::Replica(slot)) {
+      let std_now = self.quinn_now(now);
+      self.bridge.close_local(std_now, h);
+    }
+  }
+
+  /// The `config_id` of the currently active membership — a cheap scalar read, no clone required.
+  /// Drivers compare this against a stored last-known value to detect a membership swap without
+  /// cloning the full `Membership` on every loop iteration.
+  pub fn membership_config_id(&self) -> u128 {
+    self.endpoint.config_id()
+  }
+
+  /// A clone of the endpoint's currently-installed membership. Called at most once per config
+  /// change in `rekey_peers`; the hot path uses `membership_config_id()` to detect whether a
+  /// clone is needed at all.
+  pub fn live_membership(&self) -> crate::Membership {
+    self.endpoint.membership_clone()
   }
 
   /// The number of outgoing protocol messages this coordinator refused to send because their encoded

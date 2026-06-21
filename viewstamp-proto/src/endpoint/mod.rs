@@ -2506,6 +2506,14 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     self.config.cluster()
   }
 
+  /// The `config_id` of the currently active membership: the hash-chained identifier that changes
+  /// with every epoch swap. A driver can compare this cheaply (scalar equality, no clone) against a
+  /// stored value to detect that a membership change was installed without walking the full membership.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.membership.config_id()
+  }
+
   /// The number of voting replicas in the active membership. The QUIC coordinator reads it to
   /// single-source the configured membership: it rejects binding a peer whose attested replica index
   /// is outside `0..replica_count`, and it sizes the connection cap to the mutual-dial mesh — both
@@ -2520,6 +2528,14 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn node_count(&self) -> u16 {
     self.membership.node_count()
+  }
+
+  /// A clone of the currently active membership. Called at most once per config change in
+  /// `rekey_peers`; the hot path uses `config_id()` (a scalar equality) to detect whether a clone
+  /// is needed at all.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn membership_clone(&self) -> Membership {
+    self.membership.clone()
   }
 
   /// True iff `other` is a `config_id` in THIS replica's configuration lineage — the in-lineage
