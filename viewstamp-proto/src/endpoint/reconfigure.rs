@@ -12,10 +12,8 @@
 //! The commit-time epoch swap (installing the successor membership) is a later task; this module owns
 //! only the proposal mint + the single-writer latch.
 
-use super::normal::NewOpReject;
-use super::*;
-use crate::SingleVoterDelta;
-use crate::message::ReconfigurePayload;
+use super::{normal::NewOpReject, *};
+use crate::{SingleVoterDelta, message::ReconfigurePayload};
 
 impl<S> Endpoint<S, SingleChange>
 where
@@ -59,10 +57,6 @@ where
   ///   `AddLearner` then `PromoteLearner` once the learner durably holds the head (the prefix-held
   ///   path). For a predecessor of 2+ voters `AddVoter` is admitted (the successor view-change quorum
   ///   always includes a predecessor write-quorum member).
-  ///
-  /// [`ProposeMembershipError::TwoVoterJump`] is defined for the capability ladder but is NOT returned
-  /// here: a [`SingleVoterDelta`] cannot express a multi-voter jump (every variant moves the voter count
-  /// by at most one).
   pub fn propose_membership<W>(
     &mut self,
     now: Instant,
@@ -112,10 +106,8 @@ where
       }
     }
     // Validate the delta AND derive the successor in one step: `apply_delta` rejects an invalid delta
-    // (unknown/duplicate member, non-learner promotion, last-voter removal) and otherwise returns the
-    // successor configuration whose membership the op replicates. A `SingleVoterDelta` moves the voter
-    // count by at most one by construction, so the defensive `TwoVoterJump` verdict is unreachable from
-    // here — no ±1 check is performed (it could only ever pass).
+    // (unknown/duplicate member, non-learner promotion, last-voter removal) and returns the successor
+    // configuration whose membership the op replicates.
     let successor = self.membership.apply_delta(&delta)?;
 
     // CATCH-UP-THEN-PROMOTE (a SAFETY gate, not merely liveness): a `PromoteLearner` is admitted only on
