@@ -639,6 +639,29 @@ impl Cluster {
       .map(|m| m.replica_count())
   }
 
+  /// The [`MemberId`] occupying voting slot `slot` in replica `i`'s DURABLE membership, or `None`
+  /// if `slot` is out of range. Voting slots are `0..replica_voter_count(i)`; learner slots follow.
+  pub fn replica_member_at(&self, i: usize, slot: u8) -> Option<MemberId> {
+    use viewstamp_proto::Superblock;
+    self.sbs[i]
+      .state()
+      .membership_opt()
+      .and_then(|m| m.member_at(ReplicaId::new(slot as u16)))
+  }
+
+  /// The serving primary's DURABLE membership snapshot. Falls back to replica 0 if no primary is
+  /// currently serving, so callers always receive a valid config. The live membership on a healthy
+  /// cluster is the same on every replica once each durable epoch root lands.
+  pub fn serving_primary_membership(&self) -> Membership {
+    use viewstamp_proto::Superblock;
+    let i = self.serving_primary().unwrap_or(0);
+    self.sbs[i]
+      .state()
+      .membership_opt()
+      .expect("a v4 root always carries a membership")
+      .clone()
+  }
+
   /// Replica `i`'s current INCARNATION (for the applied-once checker): 0 from construction, +1 on
   /// every [`restart`](Self::restart) / [`wipe_and_restart`](Self::wipe_and_restart) and every
   /// pre-run endpoint rebuild. A new
