@@ -9,8 +9,8 @@ use bytes::Bytes;
 use std::collections::BTreeSet;
 
 use crate::{
-  Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
-  SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal, endpoint::ProposeMembershipError,
+  Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient, SingleChange,
+  SingleVoterDelta, StateMachine, Superblock, Wal, endpoint::ProposeMembershipError,
   message::Request,
 };
 

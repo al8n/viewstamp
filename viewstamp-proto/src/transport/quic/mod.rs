@@ -32,8 +32,8 @@ use layout::StreamClass;
 use std::collections::BTreeSet;
 
 use crate::{
-  Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
-  ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
+  Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient, ReplicaId,
+  Request, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
   endpoint::ProposeMembershipError,
 };
 
