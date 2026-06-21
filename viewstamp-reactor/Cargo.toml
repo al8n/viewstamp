@@ -46,6 +46,10 @@ required-features = ["tokio"]
 name = "batching_loopback"
 required-features = ["tokio"]
 
+[[test]]
+name = "reconfigure_loopback"
+required-features = ["tokio"]
+
 [[example]]
 name = "three_node"
 required-features = ["tokio"]
