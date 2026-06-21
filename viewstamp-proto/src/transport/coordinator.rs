@@ -6,8 +6,11 @@ use std::vec::Vec;
 
 use bytes::Bytes;
 
+use std::collections::BTreeSet;
+
 use crate::{
-  Endpoint, Event, Instant, Message, Outgoing, Peer, Recipient, StateMachine, Superblock, Wal,
+  Endpoint, Event, Instant, MemberId, Membership, Message, OpNumber, Outgoing, Peer, Recipient,
+  SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal, endpoint::ProposeMembershipError,
   message::Request,
 };
 
@@ -23,7 +26,7 @@ use super::{
 /// through the endpoint and routes the endpoint's outgoing messages back out. Transport (`R`) and
 /// storage (`W`/`B`, external) are independent axes.
 pub struct StreamCoordinator<S, R> {
-  endpoint: Endpoint<S>,
+  endpoint: Endpoint<S, SingleChange>,
   router: PeerRouter<R>,
 }
 
@@ -35,7 +38,7 @@ impl<S, R> core::fmt::Debug for StreamCoordinator<S, R> {
 
 impl<S, R> StreamCoordinator<S, R> {
   /// Creates a coordinator around a (driver-built) endpoint, with an empty conn table.
-  pub fn new(endpoint: Endpoint<S>) -> Self {
+  pub fn new(endpoint: Endpoint<S, SingleChange>) -> Self {
     Self {
       endpoint,
       router: PeerRouter::new(),
@@ -52,7 +55,7 @@ impl<S, R> StreamCoordinator<S, R> {
   /// staging cap). Below `SEND_LIMIT` the fixed record-layer chunk dominates the peak. Exists so
   /// cross-crate tests can drive the backlog logic with a tiny cap.
   #[doc(hidden)]
-  pub fn with_outbound_cap(endpoint: Endpoint<S>, cap: usize) -> Self {
+  pub fn with_outbound_cap(endpoint: Endpoint<S, SingleChange>, cap: usize) -> Self {
     Self {
       endpoint,
       router: PeerRouter::with_outbound_cap(cap),
@@ -61,8 +64,37 @@ impl<S, R> StreamCoordinator<S, R> {
 
   /// A reference to the underlying endpoint (status/view/etc.).
   #[cfg_attr(not(tarpaulin), inline)]
-  pub const fn endpoint(&self) -> &Endpoint<S> {
+  pub const fn endpoint(&self) -> &Endpoint<S, SingleChange> {
     &self.endpoint
+  }
+}
+
+impl<S, R> StreamCoordinator<S, R>
+where
+  S: StateMachine,
+{
+  /// Proposes a single-member reconfiguration to the consensus endpoint.
+  ///
+  /// Delegates directly to [`Endpoint::propose_membership`]. The coordinator owns `&mut self.endpoint`
+  /// so the call is sequenced after any in-progress pump — no concurrent borrow is possible.
+  pub fn propose_membership<W: Wal>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    delta: SingleVoterDelta,
+  ) -> Result<OpNumber, ProposeMembershipError> {
+    self.endpoint.propose_membership(now, wal, delta)
+  }
+
+  /// A clone of the endpoint's currently-installed membership.
+  pub fn live_membership(&self) -> Membership {
+    self.endpoint.membership().clone()
+  }
+
+  /// The set of voter [`MemberId`]s that acknowledged an in-flight prepare within the last
+  /// `window` ops, as a liveness hint for the reconfiguration executor.
+  pub fn recently_acked_voters(&self, window: u64) -> BTreeSet<MemberId> {
+    self.endpoint.recently_acked_voters(window)
   }
 }
 
@@ -318,7 +350,7 @@ mod tests {
 
   use super::*;
   use crate::{
-    ClientId, Config, LabelOptions, Labeled, MemberId, ReplicaId, RequestNumber,
+    ClientId, Config, LabelOptions, Labeled, MemberId, ReplicaId, RequestNumber, SingleChange,
     message::Request,
     transport::{
       Passthrough,
@@ -352,12 +384,9 @@ mod tests {
     let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap(); // replica 0 = primary of view 0
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
     // A raw Passthrough has no handshake identity; registration validates it immediately (it trusts
     // the registered peer), so each backup conn is a routing target without any extra nudge.
     coord.register_dialed(Peer::Replica(ReplicaId::new(1)), conn());
@@ -402,12 +431,9 @@ mod tests {
     let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
     // Two raw Passthrough backups (validated on register), so a served Prepare HAS somewhere to route —
     // proving the over-max case routes NOTHING, not merely that no conn was available.
     coord.register_dialed(Peer::Replica(ReplicaId::new(1)), conn());
@@ -496,12 +522,9 @@ mod tests {
     let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
     // A raw Passthrough validates on register; inbound decodes are tagged with the bound peer.
     let id = coord.register_dialed(Peer::Replica(ReplicaId::new(1)), conn());
     // Build more than one 64 KiB STAGE_CHUNK worth of framed messages so the read spans chunks.
@@ -523,12 +546,9 @@ mod tests {
   #[test]
   fn max_outbound_backlog_is_twice_the_router_outbound_cap() {
     let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-    let coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let coord = StreamCoordinator::<CountSm, Passthrough>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
     const DEFAULT_CAP: usize = 64 * 1024 * 1024;
     assert_eq!(
       coord.max_outbound_backlog(),
@@ -544,12 +564,10 @@ mod tests {
     let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let mut coord =
+      StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
+        Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+      );
     let id = coord.register_accepted(
       Peer::Replica(ReplicaId::new(1)),
       labeled_conn(0xAAAA, 0, true),
@@ -578,12 +596,10 @@ mod tests {
     let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let mut coord =
+      StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
+        Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+      );
     // Nothing reaped yet on a fresh table.
     assert_eq!(coord.poll_conn_closed(), None, "no closed conn initially");
     let id = coord.register_accepted(
@@ -622,12 +638,9 @@ mod tests {
     let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
     // A raw Passthrough validates on register, so the garbage frame reaches the decode stage.
     let id = coord.register_dialed(Peer::Replica(ReplicaId::new(1)), conn());
     assert_eq!(coord.poll_conn_closed(), None, "no closed conn initially");
@@ -654,12 +667,10 @@ mod tests {
     let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let mut coord =
+      StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
+        Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+      );
     let p = Peer::Replica(ReplicaId::new(1));
     let a = coord.register_dialed(p, labeled_conn(0xABCD, 0, false));
     // Close A with a wrong-cluster inbound, which reaps it.
@@ -689,12 +700,10 @@ mod tests {
     let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let mut coord =
+      StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
+        Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+      );
     // The only backup conn is an acceptor that has NOT yet validated an inbound hello -> handshaking.
     coord.register_accepted(
       Peer::Replica(ReplicaId::new(1)),
@@ -735,12 +744,9 @@ mod tests {
     let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
-    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::new(
-      cfg,
-      genesis(3),
-      1,
-      CountSm::default(),
-    ));
+    let mut coord = StreamCoordinator::<CountSm, Passthrough>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
     let peer = Peer::Replica(ReplicaId::new(1));
     // Two raw Passthrough conns for the same peer: the first becomes a live standby, the second (last
     // established) is authoritative. A raw conn validates on register, so both are routing-eligible.

@@ -29,9 +29,12 @@ use quinn_proto::{ConnectionHandle, EcnCodepoint};
 use bridge::Bridge;
 use layout::StreamClass;
 
+use std::collections::BTreeSet;
+
 use crate::{
-  Endpoint, Event, Instant, Message, Outgoing, Peer, Recipient, ReplicaId, Request, StateMachine,
-  Superblock, Wal,
+  Endpoint, Event, Instant, MemberId, Membership, Message, OpNumber, Outgoing, Peer, Recipient,
+  ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
+  endpoint::ProposeMembershipError,
 };
 
 /// Derive the SNI server-name a dial presents for `expected` in `cluster`, matching the per-replica
@@ -73,7 +76,7 @@ fn sni_for(expected: Peer, cluster: u128) -> String {
 /// [`Instant`] (matching the consensus endpoint), converting to [`std::time::Instant`] at every
 /// quinn boundary.
 pub struct QuicCoordinator<S, I> {
-  endpoint: Endpoint<S>,
+  endpoint: Endpoint<S, SingleChange>,
   bridge: Bridge,
   /// The identity source: extracts the candidate peer the coordinator's binding policy then checks.
   identity: I,
@@ -136,7 +139,7 @@ impl<S: StateMachine> QuicCoordinator<S, ProvidedIdentity> {
   /// wrong, and every peer would reject it). The equality is a construction-time invariant, not a
   /// runtime condition, so it is asserted here rather than surfaced as a fallible result.
   pub fn with_identity(
-    endpoint: Endpoint<S>,
+    endpoint: Endpoint<S, SingleChange>,
     opts: QuicOptions,
     rng_seed: Option<[u8; 32]>,
     config: IdentityConfig,
@@ -178,7 +181,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// cluster): a source that mis-derives the candidate OR mis-reports the cluster can bind the wrong
   /// peer. Prefer [`Self::with_identity`] unless a custom scheme is genuinely required.
   pub fn dangerous_custom_identity(
-    endpoint: Endpoint<S>,
+    endpoint: Endpoint<S, SingleChange>,
     opts: QuicOptions,
     rng_seed: Option<[u8; 32]>,
     src: I,
@@ -198,7 +201,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// `2*(N-1)` plus reconnect headroom). The cap still bounds an untrusted-network flood; it is just
   /// sized to the full membership (voters plus non-voting members) rather than a fixed constant.
   fn build(
-    endpoint: Endpoint<S>,
+    endpoint: Endpoint<S, SingleChange>,
     opts: QuicOptions,
     rng_seed: Option<[u8; 32]>,
     identity: I,
@@ -219,8 +222,32 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   }
 
   /// A reference to the underlying consensus endpoint (status / view / state-machine observers).
-  pub const fn endpoint(&self) -> &Endpoint<S> {
+  pub const fn endpoint(&self) -> &Endpoint<S, SingleChange> {
     &self.endpoint
+  }
+
+  /// Proposes a single-member reconfiguration to the consensus endpoint.
+  ///
+  /// Delegates directly to [`Endpoint::propose_membership`]. The coordinator owns `&mut self.endpoint`
+  /// so the call is sequenced after any in-progress pump — no concurrent borrow is possible.
+  pub fn propose_membership<W: Wal>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    delta: SingleVoterDelta,
+  ) -> Result<OpNumber, ProposeMembershipError> {
+    self.endpoint.propose_membership(now, wal, delta)
+  }
+
+  /// A clone of the endpoint's currently-installed membership.
+  pub fn live_membership(&self) -> Membership {
+    self.endpoint.membership().clone()
+  }
+
+  /// The set of voter [`MemberId`]s that acknowledged an in-flight prepare within the last
+  /// `window` ops, as a liveness hint for the reconfiguration executor.
+  pub fn recently_acked_voters(&self, window: u64) -> BTreeSet<MemberId> {
+    self.endpoint.recently_acked_voters(window)
   }
 
   /// The cluster id this coordinator authenticates for, single-sourced from the consensus endpoint's
@@ -833,7 +860,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
 mod tests {
   use super::*;
   use crate::{
-    Config, Endpoint, Instant, MemberId, Peer, ReplicaId,
+    Config, Endpoint, Instant, MemberId, Peer, ReplicaId, SingleChange,
     transport::{
       quic::{crypto::test_ca, testutil::addr},
       testutil::{CountSm, genesis},
@@ -855,7 +882,7 @@ mod tests {
     let cluster = 0x5151;
     let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
       mtls_opts(cluster),
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -895,7 +922,7 @@ mod tests {
     let cluster = 0x5151;
     let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
       // Explicit `1` is floored up to the mutual-dial-mesh minimum; read the effective cap below.
       mtls_opts(cluster).with_max_connections(1),
       Some([0u8; 32]),
@@ -962,7 +989,7 @@ mod tests {
     let cluster = 0x5151;
     let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
       // Explicit `1` is floored up to the mutual-dial-mesh minimum; read the effective cap below.
       mtls_opts(cluster).with_max_connections(1),
       Some([0u8; 32]),
@@ -1016,7 +1043,7 @@ mod tests {
     let cluster = 0x5151;
     let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
       mtls_opts(cluster),
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -1067,7 +1094,7 @@ mod tests {
     // `accept_any_for_test` builds a server WITHOUT client auth (`requires_client_auth() == false`):
     // the provided-identity invariant forbids it on the safe path.
     let _ = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
       QuicOptions::accept_any_for_test(),
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -1088,7 +1115,7 @@ mod tests {
     let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
     // Must not panic: the safe provided-identity path accepts a mandatory-mTLS options bundle.
     let c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, genesis(2), 1, CountSm::default()),
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
       opts,
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -1110,7 +1137,12 @@ mod tests {
       opts = opts.with_max_connections(cap);
     }
     let c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, genesis(replica_count), 1, CountSm::default()),
+      Endpoint::<_, SingleChange>::with_reconfig(
+        cfg,
+        genesis(replica_count),
+        1,
+        CountSm::default(),
+      ),
       opts,
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
@@ -1195,7 +1227,7 @@ mod tests {
     let mut wal = TestWal::default();
     let mut sb = TestSb::default();
     let mut c = QuicCoordinator::with_identity(
-      Endpoint::new(cfg, genesis(3), 1, CountSm::default()),
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
       mtls_opts(cluster),
       Some([0u8; 32]),
       IdentityConfig::Hello { cluster },
