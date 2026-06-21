@@ -35,6 +35,13 @@ pub const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 /// cluster), so this never refuses a legitimate peer while still bounding an accept flood.
 pub(crate) const MAX_CONNS: usize = 1024;
 
+/// Default acknowledgement look-back window for the reconfiguration executor: how many ops back the
+/// driver scans for recent voter acks as a liveness signal when choosing which voter to remove in a
+/// shrink step. 64 is generous — it spans multiple heartbeat rounds in a quiescent cluster — so a
+/// transiently-quiet-but-healthy voter is not incorrectly treated as unresponsive. Smaller values
+/// converge the shrink faster but risk false-missing a merely-idle voter.
+pub const ACK_WINDOW: u64 = 64;
+
 /// Tunable operational parameters for both drivers (the QUIC driver and the stream driver), with
 /// `Default` = the constants the drivers pin without an override (each default constant carries
 /// the sizing rationale). Pass a non-default config through the drivers' `with_config`
@@ -72,6 +79,10 @@ pub struct DriverConfig {
   events_cap: usize,
   /// Global live-connection cap (stream driver only).
   max_conns: usize,
+  /// Reconfiguration executor acknowledgement look-back window: the number of ops back the driver
+  /// scans for recent voter acks as a liveness signal. Passed to `ReconfigureJob::start` and
+  /// forwarded to `recently_acked_voters` each driver-loop iteration.
+  ack_window: u64,
 }
 
 impl DriverConfig {
@@ -88,6 +99,7 @@ impl DriverConfig {
       max_pending_bytes: MAX_PENDING_BYTES,
       events_cap: EVENTS_CAP,
       max_conns: MAX_CONNS,
+      ack_window: ACK_WINDOW,
     }
   }
 
@@ -147,6 +159,13 @@ impl DriverConfig {
   #[inline(always)]
   pub const fn max_conns(&self) -> usize {
     self.max_conns
+  }
+
+  /// Reconfiguration executor acknowledgement look-back window (the `ACK_WINDOW` default). Passed
+  /// to `ReconfigureJob::start` and forwarded to `recently_acked_voters` each driver-loop iteration.
+  #[inline(always)]
+  pub const fn ack_window(&self) -> u64 {
+    self.ack_window
   }
 
   /// Capacity of the bounded command channel, DERIVED as `max_inflight + 1` (not a knob): at least
@@ -232,6 +251,15 @@ impl DriverConfig {
     self.max_conns = if max == 0 { 1 } else { max };
     self
   }
+
+  /// Override the reconfiguration executor acknowledgement look-back window. 0 is valid (means
+  /// "most recent op only"; the executor will only see the very last ack). Raise it for clusters
+  /// with a longer heartbeat interval or to tolerate more transient quiescence.
+  #[must_use]
+  pub const fn with_ack_window(mut self, window: u64) -> Self {
+    self.ack_window = window;
+    self
+  }
 }
 
 impl Default for DriverConfig {
@@ -258,6 +286,7 @@ mod tests {
     assert_eq!(c.max_pending_bytes(), 128 * 1024 * 1024);
     assert_eq!(c.events_cap(), 1024);
     assert_eq!(c.max_conns(), 1024);
+    assert_eq!(c.ack_window(), 64);
     assert_eq!(
       c.cmd_cap(),
       4096 + 1,
@@ -287,5 +316,11 @@ mod tests {
     assert_eq!(clamped.max_pending_bytes(), 1);
     assert_eq!(clamped.events_cap(), 1);
     assert_eq!(clamped.max_conns(), 1);
+
+    // ack_window has no zero-clamp (0 is valid: "most recent op only").
+    let w = DriverConfig::new().with_ack_window(128);
+    assert_eq!(w.ack_window(), 128);
+    let w0 = DriverConfig::new().with_ack_window(0);
+    assert_eq!(w0.ack_window(), 0, "ack_window accepts 0 without clamping");
   }
 }

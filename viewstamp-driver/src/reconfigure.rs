@@ -627,6 +627,100 @@ pub struct ReconfigureJob {
   pub pending_step_reply: Option<futures_channel::oneshot::Sender<StepOutcome>>,
 }
 
+/// Outcome of one [`ReconfigureJob::advance`] call.
+pub enum AdvanceOutcome {
+  /// The job is still in progress; continue on the next loop iteration.
+  InFlight,
+  /// The job completed (ok or err). The reply has already been sent; drop the job.
+  Done,
+}
+
+impl ReconfigureJob {
+  /// Drive one iteration of the reconfiguration loop. Call after `pump_outputs` each iteration.
+  ///
+  /// `live` and `acked` are snapshotted from the coordinator BEFORE this call (disjoint borrow:
+  /// the coordinator is read first, then this method holds `&mut self`). `propose` is a closure
+  /// that calls `coord.propose_membership(now, wal, delta)`. Returns [`AdvanceOutcome::InFlight`]
+  /// while running, [`AdvanceOutcome::Done`] when the reply has been sent.
+  pub fn advance(
+    &mut self,
+    live: Membership,
+    acked: std::collections::BTreeSet<MemberId>,
+    cap_exhausted: bool,
+    propose: &mut impl FnMut(SingleVoterDelta) -> Result<OpNumber, ProposeMembershipError>,
+  ) -> AdvanceOutcome {
+    use std::task::Poll;
+
+    // Capture the live epoch before moving `live` into refresh so we can use it for the install
+    // detection and for recording `start_epoch` when a proposal succeeds.
+    let live_epoch = live.epoch();
+
+    // 1. Install detection: if an epoch advance was observed since we issued the proposal, the
+    //    step committed. Signal the backend so it advances to the next planned step.
+    if self.pending_op.is_some() && live_epoch > self.start_epoch {
+      self.pending_op = None;
+      if let Some(sr) = self.pending_step_reply.take() {
+        let _ = sr.send(StepOutcome::Installed);
+      }
+    }
+
+    // 2. Refresh the controller snapshot with the latest state.
+    self.controller.refresh(live, acked, cap_exhausted);
+
+    // 3. Poll the future once with a noop waker (the driver loop's timer cadence re-polls at the
+    //    50ms fallback, which is the natural reconfigure advancement cadence). We construct the
+    //    noop waker manually to avoid a dependency on `futures-util` in this non-dev context.
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+    const NOOP_VTABLE: RawWakerVTable =
+      RawWakerVTable::new(|p| RawWaker::new(p, &NOOP_VTABLE), |_| {}, |_| {}, |_| {});
+    // SAFETY: the vtable no-ops are correct for a waker that never actually wakes anything; the
+    // data pointer is never dereferenced by these fns.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) };
+    let mut cx = std::task::Context::from_waker(&waker);
+    match self.fut.as_mut().poll(&mut cx) {
+      Poll::Ready(result) => {
+        // Consume `reply` by swapping in a dummy inert sender (its receiver is dropped immediately
+        // so the send has no observable effect) and sending on the real one.
+        let (dummy_tx, _dummy_rx) = futures_channel::oneshot::channel();
+        let reply = std::mem::replace(&mut self.reply, dummy_tx);
+        let _ = reply.send(result); // receiver may already be gone; ignore
+        return AdvanceOutcome::Done;
+      }
+      Poll::Pending => {}
+    }
+
+    // 4. Drain any proposal the future posted during the poll and act on it.
+    if let Some((delta, step_reply)) = self.controller.take_proposal() {
+      match propose(delta) {
+        Ok(op) => {
+          self.pending_op = Some(op);
+          self.start_epoch = live_epoch;
+          self.pending_step_reply = Some(step_reply);
+        }
+        Err(
+          ProposeMembershipError::ProofPending
+          | ProposeMembershipError::AlreadyInFlight
+          | ProposeMembershipError::Busy
+          | ProposeMembershipError::AtCapacity
+          | ProposeMembershipError::NotNormal,
+        ) => {
+          // Transient: signal the backend to back off and re-post on the next iteration.
+          let _ = step_reply.send(StepOutcome::Retry);
+          self.controller.tick();
+        }
+        Err(ProposeMembershipError::NotPrimary) => {
+          let _ = step_reply.send(StepOutcome::Failed(ReconfigureError::NotPrimary));
+        }
+        Err(e) => {
+          let _ = step_reply.send(StepOutcome::Failed(ReconfigureError::Propose(e)));
+        }
+      }
+    }
+
+    AdvanceOutcome::InFlight
+  }
+}
+
 // wired by chunk C (Command::Reconfigure arm calls ReconfigureJob::start)
 #[allow(dead_code)]
 impl ReconfigureJob {

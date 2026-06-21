@@ -24,15 +24,15 @@ pub use clock::Clock;
 pub use config::DriverConfig;
 pub use handle::{Command, Handle, Reply};
 pub use reconfigure::{
-  HealthHint, LoopBackend, LoopController, ReconfigureBackend, ReconfigureError, ReconfigureJob,
-  ReconfigureProgress, StepOutcome, run_reconfigure,
+  AdvanceOutcome, HealthHint, LoopBackend, LoopController, ReconfigureBackend, ReconfigureError,
+  ReconfigureJob, ReconfigureProgress, StepOutcome, run_reconfigure,
 };
 pub use session::ReservationGuard;
 
 #[doc(hidden)]
 pub use clock::jittered;
 #[doc(hidden)]
-pub use config::{AUTH_DEADLINE, REDIAL_BACKOFF_BASE, REDIAL_BACKOFF_CAP};
+pub use config::{ACK_WINDOW, AUTH_DEADLINE, REDIAL_BACKOFF_BASE, REDIAL_BACKOFF_CAP};
 #[doc(hidden)]
 pub use session::{
   EVENTS_CAP, InflightBudget, MAX_INFLIGHT, MAX_PENDING_BYTES, Pending, PendingMap,

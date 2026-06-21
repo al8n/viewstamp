@@ -168,6 +168,9 @@ pub struct ReactorStreamDriver<R: Runtime, S, T, W, B> {
   /// `recv_async` immediately (and forever), so without it the dead channel would turn the storage
   /// arm into an always-ready select winner and the loop into a hot spin that never parks.
   storage_notifier_closed: bool,
+  /// In-flight reconfiguration job, or `None`. At most one job at a time; a second
+  /// `Command::Reconfigure` while `Some` is rejected immediately.
+  reconfigure: Option<viewstamp_driver::ReconfigureJob>,
 }
 
 impl<R, S, T, W, B> ReactorStreamDriver<R, S, T, W, B>
@@ -326,6 +329,7 @@ where
       dial_ready_rx: dr_rx,
       storage_ready,
       storage_notifier_closed: false,
+      reconfigure: None,
     };
     let handle = Handle::new(commands_tx, events_rx, budget);
     Ok((driver, handle))
@@ -442,6 +446,7 @@ where
       }
       self.retransmit_stale(now);
       self.pump_outputs(now).await;
+      self.advance_reconfigure(now);
       // Reconcile conns the coordinator closed internally (bad frame / failed identity / cap
       // overflow): tear down the still-open socket + redial a dialed peer, else it's a silent
       // partition. Idempotent with the driver's own EOF/Error/out-full closes (see helper).
@@ -785,6 +790,47 @@ where
         *shutdown_ack = Some(ack);
         true
       }
+      Command::Reconfigure {
+        target,
+        health,
+        reply,
+      } => {
+        if self.reconfigure.is_some() {
+          let _ = reply.send(Err(viewstamp_driver::ReconfigureError::Propose(
+            viewstamp_proto::ProposeMembershipError::AlreadyInFlight,
+          )));
+        } else {
+          let live = self.coord.live_membership();
+          let acked = self.coord.recently_acked_voters(self.cfg.ack_window());
+          self.reconfigure = Some(viewstamp_driver::ReconfigureJob::start(
+            target,
+            health,
+            self.cfg.ack_window(),
+            reply,
+            live,
+            acked,
+            false,
+          ));
+        }
+        false
+      }
+    }
+  }
+
+  /// Advance the in-flight reconfiguration job by one iteration, if any. Reads the live membership
+  /// and acked set from the coordinator (disjoint borrow: coordinator is read first, then the job
+  /// takes `&mut self`), then calls `job.advance` with a closure that proposes a delta.
+  fn advance_reconfigure(&mut self, now: Instant) {
+    let Some(mut job) = self.reconfigure.take() else {
+      return;
+    };
+    let live = self.coord.live_membership();
+    let acked = self.coord.recently_acked_voters(self.cfg.ack_window());
+    let outcome = job.advance(live, acked, false, &mut |delta| {
+      self.coord.propose_membership(now, &mut self.wal, delta)
+    });
+    if !matches!(outcome, viewstamp_driver::AdvanceOutcome::Done) {
+      self.reconfigure = Some(job);
     }
   }
 
@@ -1014,7 +1060,13 @@ where
       .min()
       .map(|d| self.clock.to_std(d));
     let scan = (!self.pending.is_empty()).then(|| self.clock.to_std(self.next_pending_scan));
-    [consensus, auth, scan, self.accept_backoff_until]
+    // When a reconfiguration job is in flight, fold a 50ms-from-now wake so the job advances on
+    // the natural driver cadence even if all other deadlines are quiescent.
+    let reconfig = self
+      .reconfigure
+      .as_ref()
+      .map(|_| std::time::Instant::now() + std::time::Duration::from_millis(50));
+    [consensus, auth, scan, self.accept_backoff_until, reconfig]
       .into_iter()
       .flatten()
       .fold(fallback, std::time::Instant::min)
