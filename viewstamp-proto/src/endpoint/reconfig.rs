@@ -3,7 +3,8 @@
 //! Offline reconfiguration is OPERATOR-COORDINATED: the whole cluster is stopped, a
 //! successor durable root is pre-written on every node by [`prepare_restart`], and the cluster is
 //! restarted into the new [`Membership`](crate::Membership). There is no online consensus on the
-//! change at [`RestartOnly`] — that is the [`SingleChange`] (and later `Joint`) work.
+//! change at [`RestartOnly`] — that is the [`SingleChange`] work, over which a driver-level
+//! decompose planner delivers arbitrary-target reconfiguration by sequencing single-member deltas.
 //!
 //! The capability is a COMPILE-TIME type-state: [`Endpoint`](crate::Endpoint)`<S, R: Reconfig>`
 //! carries a zero-sized `R` marker so a future online-reconfiguration API surface gates on it
@@ -13,9 +14,11 @@
 
 use std::vec::Vec;
 
-use crate::id::{Epoch, MemberId};
-use crate::membership::MembershipError;
-use crate::storage::{VsrState, VsrStateError};
+use crate::{
+  id::{Epoch, MemberId},
+  membership::MembershipError,
+  storage::{VsrState, VsrStateError},
+};
 
 mod sealed {
   /// Seals [`super::Reconfig`]: only the types in this crate that implement this private supertrait
@@ -25,7 +28,8 @@ mod sealed {
 
 /// The reconfiguration capability marker selecting an [`Endpoint`](crate::Endpoint)'s membership-change
 /// surface at compile time. [`RestartOnly`] is the offline-restart base; [`SingleChange`] adds the
-/// online single-member-delta surface; `Joint` follows.
+/// online single-member-delta surface. The capability ladder is two consensus rungs (RestartOnly ⊂
+/// SingleChange); arbitrary membership change is a pure-policy planner over SingleChange, not a third rung.
 ///
 /// Sealed: implementable only inside this crate (a private `Sealed` supertrait), so a downstream
 /// crate cannot mint its own capability marker.
@@ -102,21 +106,6 @@ pub enum ProposeMembershipError {
   /// [`MembershipError`].
   #[error("the membership delta is invalid: {0}")]
   Invalid(#[from] MembershipError),
-  /// The delta would move the voting set by more than one voter in a single step. UNREACHABLE for a
-  /// [`SingleVoterDelta`](crate::SingleVoterDelta) — every variant moves the voter count by at most one
-  /// by construction (`Membership::apply_delta`), proven exhaustively in the membership tests — so this
-  /// is the defensive verdict reserved for a future delta variant that could express a multi-voter
-  /// jump. No proposal path returns it today.
-  #[error("the delta is a multi-voter jump (at most one voter may change per step)")]
-  TwoVoterJump,
-  /// The target of a learner-promotion is not yet caught up to the cluster's committed frontier, so
-  /// promoting it into the voting set would shrink the live quorum below what the survivors can form.
-  /// The catch-up-then-promote gate now re-grounds this freshly per propose via a
-  /// `RequestLearnerProof`/`LearnerProof` round-trip and returns [`Self::ProofPending`] while the proof
-  /// is outstanding, so the live `propose_membership` path no longer returns this variant; it is kept
-  /// for the capability ladder (a definitive "not caught up" verdict a future path may surface).
-  #[error("the promotion target has not caught up to the committed frontier")]
-  TargetNotCaughtUp,
   /// A `PromoteLearner` has NO fresh validated catch-up proof yet: the gate solicited a
   /// `RequestLearnerProof` from the target (or is awaiting the matching `LearnerProof`), so it cannot
   /// safely mint the promotion this turn. RETRYABLE — exactly the existing transient-retry contract of

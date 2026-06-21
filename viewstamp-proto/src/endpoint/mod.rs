@@ -1003,7 +1003,7 @@ pub struct Endpoint<S, R: Reconfig = RestartOnly> {
   /// and catching the band up through `N` via the commit-first path (XI-b: a node reaches E+1 only once it
   /// durably holds the committed prefix THROUGH `N`). Persisted in the v6 durable root so a RECOVERED donor
   /// restores the gate. Fixed per incarnation under [`RestartOnly`]; advanced live under
-  /// [`SingleChange`]/[`Joint`].
+  /// [`SingleChange`] (advanced live as each single-member change installs).
   config_install_op: OpNumber,
   status: Status,
   view: View,
