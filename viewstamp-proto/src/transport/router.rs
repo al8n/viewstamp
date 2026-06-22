@@ -289,6 +289,15 @@ impl<R: StreamTransport> PeerRouter<R> {
       // Raw transport (no handshake identity): trust the registered peer.
       (None, _) => expected,
     };
+    // Peer::Replica and Peer::Member identities are NOT auto-validated here.
+    // - Peer::Replica: a raw slot claim carries no stable MemberId; the coordinator seal
+    //   (try_note_established_member) classifies and aborts it as Peer::Replica | None.
+    // - Peer::Member: a handshake-attested stable id is NEVER a routing key; the coordinator
+    //   resolves it to Peer::Replica(slot) via note_established_member (slot_of lookup).
+    // Only Peer::Client falls through and is bound normally here.
+    if matches!(identity, Peer::Replica(_) | Peer::Member(_)) {
+      return;
+    }
     if let Some(e) = self.conns.get_mut(&id) {
       e.peer = identity;
       e.conn.mark_validated(identity);
@@ -513,11 +522,19 @@ mod tests {
     Conn::from_parts(crate::Passthrough::new())
   }
 
-  /// Registers a raw `Passthrough` conn (which reports `is_handshaking()==false` and no handshake
-  /// identity) and drives `note_established`, which validates it against the registered identity.
+  /// Registers a raw `Passthrough` conn and validates it. For `Peer::Replica` identities, uses
+  /// `note_established_member` (raw slot auto-validation is blocked at the router level); for all
+  /// other identities, `note_established` suffices (clients, Member-bearing conns).
   fn established(r: &mut PeerRouter<crate::Passthrough>, identity: Peer) -> ConnId {
     let id = r.register_dialed(identity, conn());
-    r.note_established(id);
+    match identity {
+      Peer::Replica(slot) => {
+        r.note_established_member(id, crate::MemberId::new(slot.get() as u128), slot);
+      }
+      _ => {
+        r.note_established(id);
+      }
+    }
     id
   }
 
@@ -811,10 +828,13 @@ mod tests {
 
   #[test]
   fn accepted_conn_adopts_its_authenticated_identity() {
-    use crate::transport::testutil::MockRecords;
+    // note_established adopts the handshake-authenticated identity for non-Replica peers (Replica
+    // identities are deferred to note_established_member, so this test uses a Client identity).
+    use crate::{ClientId, transport::testutil::MockRecords};
     let mut r = PeerRouter::<MockRecords>::new();
-    let placeholder = Peer::Replica(ReplicaId::new(9));
-    let real = Peer::Replica(ReplicaId::new(2));
+    let cid = ClientId::new(0xCAFE);
+    let placeholder = Peer::Client(ClientId::new(0));
+    let real = Peer::Client(cid);
     let id = r.register_accepted(
       placeholder,
       Conn::from_parts(MockRecords::new(false, Some(real))),
@@ -852,12 +872,14 @@ mod tests {
 
   #[test]
   fn a_redial_does_not_steal_a_live_conn() {
-    // The redial uses a still-handshaking conn (a raw conn would validate on register), so it is
-    // registered but not yet authoritative while `old` is live and validated.
+    // The first conn is validated via note_established_member (Peer::Replica requires it); the
+    // redial is still-handshaking, so it is registered but not yet authoritative while `old` is live.
     use crate::transport::testutil::MockRecords;
     let mut r = PeerRouter::<MockRecords>::new();
-    let peer = Peer::Replica(ReplicaId::new(1));
+    let slot = ReplicaId::new(1);
+    let peer = Peer::Replica(slot);
     let old = r.register_dialed(peer, Conn::from_parts(MockRecords::new(false, Some(peer))));
+    r.note_established_member(old, crate::MemberId::new(1), slot);
     assert_eq!(r.authoritative(peer), Some(old), "the settled conn is live");
     let _new = r.register_dialed(peer, Conn::from_parts(MockRecords::new(true, None)));
     assert_eq!(
@@ -997,9 +1019,9 @@ mod tests {
     );
   }
 
-  /// Registers a `MockRecords` conn validated for `identity` (it is not handshaking and bears the
-  /// identity, so `note_established` adopts it), with a settable write cap so a test can drive the
-  /// record-layer short-write path past the router's per-conn cap check.
+  /// Registers a `MockRecords` conn validated for `identity`. For `Peer::Replica` identities,
+  /// uses `note_established_member` (raw slot auto-validation is blocked at the router level);
+  /// other identities go through `note_established`. Settable write cap drives the short-write path.
   fn established_mock(
     r: &mut PeerRouter<crate::transport::testutil::MockRecords>,
     identity: Peer,
@@ -1008,7 +1030,14 @@ mod tests {
     use crate::transport::testutil::MockRecords;
     let records = MockRecords::new(false, Some(identity)).with_write_cap(write_cap);
     let id = r.register_dialed(identity, Conn::from_parts(records));
-    r.note_established(id);
+    match identity {
+      Peer::Replica(slot) => {
+        r.note_established_member(id, crate::MemberId::new(slot.get() as u128), slot);
+      }
+      _ => {
+        r.note_established(id);
+      }
+    }
     id
   }
 

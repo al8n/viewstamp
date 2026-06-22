@@ -109,16 +109,6 @@ impl<R: StreamTransport> Conn<R> {
     self.state = State::Closed(CloseCause::PeerClosed);
   }
 
-  /// Resets a previously-validated conn back to the `Handshaking` state, without touching the
-  /// record layer. This lets a coordinator test bypass the auto-validate-on-register path and drive
-  /// `try_note_established_member` directly on a settled-record-layer conn whose handshake identity
-  /// the test wants to inspect.
-  #[cfg(test)]
-  pub(crate) fn reset_validated_for_test(&mut self) {
-    self.state = State::Handshaking;
-    self.from = None;
-  }
-
   /// Feeds one inbound transport read: advances the record layer and buffers decrypted plaintext.
   /// Does NOT decode application frames (that is `poll_decoded`, gated on `Validated`). A closed
   /// conn consumes nothing. `eof` is the driver's `read == 0`. Returns `Ok(peer_finished)`; an `Err`

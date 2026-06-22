@@ -152,18 +152,23 @@ fn public_submit_client_request_over_tcp_converges() {
   assert_converged(&r0, &r1, converged, b"x");
 }
 
-// A raw Passthrough (no handshake) converges without any test-only validation nudge: registration
-// validates each conn immediately, so a primary that emits before any inbound read is not
-// black-holed.
+// Two replicas converge over Labeled<Passthrough>: the cluster+identity handshake validates each
+// conn via try_note_established_member so a primary that emits after the initial exchange is not
+// black-holed. Uses Peer::Member identities so the loopback mirrors the production TCP path.
 #[test]
 fn two_replicas_commit_over_raw_passthrough() {
-  fn raw() -> Conn<Passthrough> {
-    Conn::from_parts(Passthrough::new())
+  fn dialer(me: u16) -> Conn<Labeled<Passthrough>> {
+    let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(me as u128)));
+    Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
   }
-  let (mut r0, mut wal0, mut sb0) = replica::<Passthrough>(0);
-  let (mut r1, mut wal1, mut sb1) = replica::<Passthrough>(1);
-  let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), raw());
-  let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), raw());
+  fn acceptor(me: u16) -> Conn<Labeled<Passthrough>> {
+    let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(me as u128)));
+    Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+  }
+  let (mut r0, mut wal0, mut sb0) = replica::<Labeled<Passthrough>>(0);
+  let (mut r1, mut wal1, mut sb1) = replica::<Labeled<Passthrough>>(1);
+  let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0));
+  let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1));
   r0.inject_message_for_test(
     Instant::ZERO,
     &mut wal0,
