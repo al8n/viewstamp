@@ -114,9 +114,9 @@ pub struct CompioQuicDriver<S, W, B, I> {
   /// Peer address book: maps each peer's stable [`MemberId`] to its network address, populated via
   /// [`Command::AddPeer`] and seeded from the initial peer list at construction.
   peer_book: std::collections::HashMap<MemberId, SocketAddr>,
-  /// The `config_id` last seen in `pump_outputs`; a change triggers a slot-keyed peer
-  /// reconciliation via `rekey_peers`.
-  last_known_config_id: u128,
+  /// Membership config gate: detects when the live config_id changes so `rekey_peers` runs exactly
+  /// once per install, even when `pump_outputs` loops or `handle_timeout` triggers an install.
+  reconciler: viewstamp_driver::MembershipReconciler,
   /// A clone of the shared in-flight submit budget, retained for test observability only. Production
   /// release is by construction: the `Handle` reserves a [`ReservationGuard`] per submit, the guard
   /// rides the `Command::Submit` then the `Pending` entry, and dropping that entry (commit,
@@ -278,7 +278,7 @@ where
         next_dial: None,
       });
     }
-    let last_known_config_id = coord.endpoint().config_id();
+    let reconciler = viewstamp_driver::MembershipReconciler::new(coord.endpoint().config_id());
 
     // Bounded command channel: a partitioned/slow driver (not draining commands) can't grow it
     // without bound; a refused send surfaces as `DriverError::Busy` (see `Handle::submit`). Sized
@@ -305,7 +305,7 @@ where
       next_pending_scan: Instant::ZERO,
       peers: peer_links,
       peer_book,
-      last_known_config_id,
+      reconciler,
       #[cfg(test)]
       budget: budget.clone(),
       commands: commands_rx,
@@ -402,6 +402,7 @@ where
         .is_some_and(|d| d <= std::time::Instant::now())
       {
         self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self.rekey_if_needed(now);
       }
       self.retransmit_stale(now);
       // Redial any configured peer with no bound connection (iter-top, like the stream driver's
@@ -473,6 +474,7 @@ where
       }
       if fire_timeout {
         self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self.rekey_if_needed(now);
       }
       if let Some(cmd) = command
         && self.handle_command(now, cmd, &mut shutdown_ack)
@@ -741,15 +743,13 @@ where
 
   /// Drain storage completions + outputs until the coordinator stops producing.
   async fn pump_outputs(&mut self, now: Instant) {
-    // Detect a membership config change and rebuild the peer list before processing any outputs
-    // this iteration, so new-config routing applies to the outputs we're about to drain.
-    let current_config_id = self.coord.membership_config_id();
-    if current_config_id != self.last_known_config_id {
-      self.rekey_peers(now);
-      self.last_known_config_id = current_config_id;
-    }
+    // Refresh the dial-map before the first output pass, then after each storage poll: a
+    // `handle_storage` completion can itself install a new membership, so the projection must be
+    // current before any subsequent dial/route/close decision.
+    self.rekey_if_needed(now);
     loop {
       self.coord.handle_storage(now, &mut self.wal, &mut self.sb);
+      self.rekey_if_needed(now);
       let mut produced = false;
       // Drain the pass's datagrams, then submit them as ONE batch of concurrent `send_to`s: compio
       // is a proactor, so N in-flight submissions overlap in the kernel instead of serializing N
@@ -775,6 +775,15 @@ where
       if !produced {
         break;
       }
+    }
+  }
+
+  /// Run `rekey_peers` iff the live config_id has changed since the last call. O(1) on the
+  /// no-change path; called after every endpoint-advancing call so dial/route/close decisions
+  /// always see the current membership projection.
+  fn rekey_if_needed(&mut self, now: Instant) {
+    if self.reconciler.check(self.coord.membership_config_id()) {
+      self.rekey_peers(now);
     }
   }
 
