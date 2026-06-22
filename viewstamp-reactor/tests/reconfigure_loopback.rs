@@ -418,3 +418,144 @@ async fn add_peer_is_non_blocking_and_does_not_panic() {
   // After the driver has stopped, add_peer must not panic (silent drop on closed channel).
   handle.add_peer(MemberId::new(4), "127.0.0.1:41735".parse().unwrap());
 }
+
+/// SLOT-SHIFT REGRESSION (TCP/TLS stream transport): a real 4-voter cluster over `Labeled<Passthrough>`
+/// commits a baseline request, then removes a voter whose departure SHIFTS the surviving members to new
+/// slots, and must still commit a post-reconfiguration request THROUGH a shifted node.
+///
+/// The `Labeled` handshake now attests each peer by its stable [`MemberId`] (the full u128), not by its
+/// SLOT, so a conn keeps its stable identity across a reconfiguration that renumbers slots; the
+/// coordinator's `reconcile_routing` re-resolves each conn's attested member to its NEW slot and closes
+/// only the conns whose member genuinely moved (which then re-bind under the new slot on the next
+/// handshake). Genesis is voters {0,1,2,3} at slots {0,1,2,3}; the primary (member 0) proposes
+/// `RemoveVoter(1)`, leaving voters {0,2,3} at slots {0,1,2} — members 2 and 3 each shift DOWN one slot.
+/// The post-reconfiguration commit is submitted at the primary (member 0): committing it requires a
+/// PrepareOk quorum from the SHIFTED successor voter set, so its success proves the primary's mesh conns
+/// to the shifted backups re-resolved to their NEW slots — exactly the stable-id routing the handshake
+/// redesign provides. A regression to slot-attestation routing strands the shifted conns and the second
+/// commit times out. (The compio gate submits the post-shift op at the shifted backup itself, the
+/// stronger reply-to-shifted-backup direction.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_cluster_survives_slot_shift() {
+  use std::{collections::BTreeSet, sync::Arc};
+
+  use viewstamp_proto::{Conn, LabelOptions, Labeled, Passthrough, Peer};
+
+  const STREAM_CLUSTER: u128 = 0x5252;
+
+  // Self-attesting factories: each node announces its OWN stable MemberId in the `Labeled` handshake
+  // (matching its `Config::member`), so a peer binds it by stable id and the coordinator resolves that
+  // id to whatever slot the member currently occupies.
+  let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
+    Arc::new(move |_peer| {
+      let opts = LabelOptions::new(STREAM_CLUSTER, Peer::Member(MemberId::new(me as u128)));
+      Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+    })
+  };
+  let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
+    Arc::new(move || {
+      let opts = LabelOptions::new(STREAM_CLUSTER, Peer::Member(MemberId::new(me as u128)));
+      Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+    })
+  };
+
+  let base_port: u16 = 47100;
+  let addrs: Vec<SocketAddr> = (0..4)
+    .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+    .collect();
+
+  let mut handles = Vec::new();
+  for id in 0u8..4 {
+    let peers: Vec<_> = (0u8..4)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let config =
+      viewstamp_proto::Config::try_new(STREAM_CLUSTER, MemberId::new(id as u128)).unwrap();
+    let (ready_tx, ready_rx) = flume::unbounded();
+    let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
+    let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let (driver, handle) = viewstamp_reactor::ReactorStreamDriver::<
+      agnostic::tokio::TokioRuntime,
+      viewstamp_simulation::sm::LogSm,
+      Labeled<Passthrough>,
+      Notifying<InMemoryWal>,
+      Notifying<InMemorySuperblock>,
+    >::new(
+      config,
+      genesis(4, 0),
+      viewstamp_simulation::sm::LogSm::default(),
+      wal,
+      sb,
+      viewstamp_proto::ClientId::new(u128::from(id) + 1),
+      0,
+      addrs[id as usize],
+      peers,
+      mk_dialer(id),
+      mk_acceptor(id),
+      ready_rx,
+    )
+    .await
+    .expect("stream driver builds");
+    // The dropped JoinHandle DETACHES the task (a tokio drop never cancels), so each node's run loop
+    // keeps driving on its own.
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+
+  // BASELINE: a committed request through member 0 (the view-0 primary at slot 0) proves the 4-voter
+  // mesh formed and converges over real TCP before any reconfiguration.
+  let reply = tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].submit(Bytes::from_static(b"pre-shift")),
+  )
+  .await
+  .expect("the baseline commit lands within 20s")
+  .expect("a baseline reply");
+  assert_eq!(
+    &reply[..],
+    &1u64.to_be_bytes(),
+    "the first committed op replies the post-apply count 1"
+  );
+
+  // RECONFIGURE: the primary (member 0) drives the removal of voter 1, leaving voters {0,2,3} at slots
+  // {0,1,2}. `known_up = {0,2,3}` is the operator's positive witness that the successor quorum is live,
+  // so the quorum-preserving removal picker confirms it rather than fail-closed stalling.
+  let target = MembershipTarget::new(
+    BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
+    BTreeSet::new(),
+  );
+  let health = HealthHint {
+    known_up: BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
+    known_down: BTreeSet::new(),
+  };
+  tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].reconfigure_to(target, health),
+  )
+  .await
+  .expect("the reconfiguration converges within 20s")
+  .expect("reconfigure_to resolves Ok once voter 1 is removed and the slots shift");
+
+  // POST-SHIFT: a request committed at the primary (member 0) must reach a PrepareOk quorum from the
+  // SHIFTED successor voter set {0,2,3} (members 2,3 now at slots 1,2). Its success proves the primary's
+  // mesh conns to the shifted backups re-resolved to their NEW slots; under slot-attestation routing the
+  // shifted conns would strand and the prepare could never reach a quorum, so this would time out. The
+  // reply is the post-apply count 2 (the second committed op).
+  let reply = tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].submit(Bytes::from_static(b"post-shift")),
+  )
+  .await
+  .expect("the post-shift commit lands within 20s after the slot shift")
+  .expect("a post-shift reply");
+  assert_eq!(
+    &reply[..],
+    &2u64.to_be_bytes(),
+    "the second committed op replies the post-apply count 2 (routing survived the slot shift)"
+  );
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}
