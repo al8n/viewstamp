@@ -461,14 +461,7 @@ where
 
       let now = self.clock.now();
       if let Some((len, from)) = inbound {
-        self.coord.handle_udp(
-          now,
-          from,
-          None,
-          &self.recv_buf[..len],
-          &mut self.wal,
-          &mut self.sb,
-        );
+        self.handle_inbound_datagram(now, len, from);
       }
       if recv_err {
         // A receive error is transient for an unconnected UDP socket (anything lost under it is
@@ -679,6 +672,26 @@ where
     .into_iter()
     .flatten()
     .fold(fallback, std::time::Instant::min)
+  }
+
+  /// Feed one inbound datagram (the leading `len` bytes of `recv_buf`) to the coordinator, then
+  /// refresh the dial-map.
+  ///
+  /// The datagram can install a new membership; rekeying IMMEDIATELY after the feed (before the next
+  /// iteration's `reconcile_peer_links` dial pass and the pump's close drains) keeps the dial
+  /// projection current, so a removed or slot-shifted member is never reopened by a dial that read a
+  /// stale map. `rekey_if_needed` is config_id-gated, so a datagram that does not change the
+  /// membership costs only a scalar compare.
+  fn handle_inbound_datagram(&mut self, now: Instant, len: usize, from: SocketAddr) {
+    self.coord.handle_udp(
+      now,
+      from,
+      None,
+      &self.recv_buf[..len],
+      &mut self.wal,
+      &mut self.sb,
+    );
+    self.rekey_if_needed(now);
   }
 
   /// Redial every configured peer that has NO bound (identity-validated) connection in the

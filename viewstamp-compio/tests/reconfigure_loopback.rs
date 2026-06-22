@@ -365,7 +365,9 @@ async fn late_add_peer_dials_an_already_present_member() {
 
   // The late registration: member 1 is already in the membership, so this must trigger an immediate
   // dial of member 1 from node 0, forming the mesh edge a 2-voter quorum needs.
-  handle0.add_peer(MemberId::new(1), addr1);
+  handle0
+    .add_peer(MemberId::new(1), addr1)
+    .expect("the address update enqueues on a live driver");
 
   // A commit at the primary (member 0) requires quorum 2, which can only be reached once node 0 dials
   // member 1 in response to the `add_peer`. Convergence within the deadline IS the assertion.
@@ -412,7 +414,9 @@ async fn add_peer_does_not_disrupt_a_running_cluster() {
     // This simulates an embedder that calls add_peer for every potential future member.
     for peer_id in 0u8..3 {
       if peer_id != id {
-        handle.add_peer(mid(peer_id), addrs[peer_id as usize]);
+        handle
+          .add_peer(mid(peer_id), addrs[peer_id as usize])
+          .expect("the address update enqueues on a fresh driver");
       }
     }
     compio::runtime::spawn(driver.run()).detach();
@@ -436,11 +440,13 @@ async fn add_peer_does_not_disrupt_a_running_cluster() {
 }
 
 /// ADDRESS BOOK ACCEPTS REGISTRATIONS BEFORE THE DRIVER IS UP AND AFTER: `add_peer` is non-blocking
-/// and idempotent from the caller's side — it must not panic or return an error regardless of when
-/// it is called (before the driver loop drains it, during a live run, or even if the driver has
-/// already shut down). This test builds a single-node driver (never commits, no peers), calls
-/// `add_peer` both before and after the driver starts, then shuts down cleanly. The absence of a
-/// panic or a hung shutdown is the assertion.
+/// and idempotent from the caller's side — it must not panic regardless of when it is called (before
+/// the driver loop drains it, during a live run, or even after the driver has shut down). While the
+/// driver is live (buffer not yet drained, or running) the update enqueues `Ok`; once the driver has
+/// stopped the channel is closed and `add_peer` REPORTS `DriverGone` rather than dropping silently,
+/// so a caller learns the update did not land. This test builds a single-node driver (never commits,
+/// no peers), calls `add_peer` before and after the driver starts, then shuts down cleanly and
+/// asserts the post-shutdown call surfaces the closed-channel error.
 #[compio::test]
 async fn add_peer_is_non_blocking_and_does_not_panic() {
   let ca = TestCa::new();
@@ -455,25 +461,36 @@ async fn add_peer_is_non_blocking_and_does_not_panic() {
   .await;
 
   // Call add_peer before the driver loop starts: the command sits in the channel buffer until the
-  // run loop drains it.
-  handle.add_peer(MemberId::new(1), "127.0.0.1:41631".parse().unwrap());
-  handle.add_peer(MemberId::new(2), "127.0.0.1:41632".parse().unwrap());
+  // run loop drains it, so the enqueue succeeds.
+  handle
+    .add_peer(MemberId::new(1), "127.0.0.1:41631".parse().unwrap())
+    .expect("enqueues into the channel buffer before the loop drains it");
+  handle
+    .add_peer(MemberId::new(2), "127.0.0.1:41632".parse().unwrap())
+    .expect("a second pre-start registration enqueues");
   // Duplicate add_peer for the same member — must be idempotent (last write wins in the book).
-  handle.add_peer(MemberId::new(1), "127.0.0.1:41633".parse().unwrap());
+  handle
+    .add_peer(MemberId::new(1), "127.0.0.1:41633".parse().unwrap())
+    .expect("a duplicate registration enqueues (last write wins in the book)");
 
   compio::runtime::spawn(driver.run()).detach();
 
   // Call add_peer while the driver is live.
-  handle.add_peer(MemberId::new(3), "127.0.0.1:41634".parse().unwrap());
+  handle
+    .add_peer(MemberId::new(3), "127.0.0.1:41634".parse().unwrap())
+    .expect("a registration on a live driver enqueues");
 
   compio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
     .await
     .expect("shutdown acks within 5s")
     .expect("driver acks shutdown");
 
-  // After the driver has stopped, add_peer must not panic (the send is best-effort; the closed
-  // channel causes a silent drop, not a crash).
-  handle.add_peer(MemberId::new(4), "127.0.0.1:41635".parse().unwrap());
+  // After the driver has stopped, add_peer must not panic — and the closed channel is now REPORTED
+  // as DriverGone (the update did not land), not dropped silently.
+  match handle.add_peer(MemberId::new(4), "127.0.0.1:41635".parse().unwrap()) {
+    Err(viewstamp_driver::DriverError::DriverGone) => {}
+    other => panic!("expected DriverGone after shutdown, got {other:?}"),
+  }
 }
 
 /// SLOT-SHIFT REGRESSION (TCP/TLS stream transport): a real 4-voter cluster over `Labeled<Passthrough>`

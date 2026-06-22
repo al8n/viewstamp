@@ -252,12 +252,36 @@ impl Handle {
   ///
   /// The driver dials this address when `member_id` appears at a new slot in the active membership
   /// after a configuration change. Call this before any membership change that adds the member so the
-  /// driver has the address ready when it rebuilds its peer list. Best-effort and non-async: the
-  /// command is dropped without error if the driver is already shutting down.
-  pub fn add_peer(&self, member_id: viewstamp_proto::MemberId, addr: std::net::SocketAddr) {
-    let _ = self
+  /// driver has the address ready when it rebuilds its peer list. Non-async: the address update is
+  /// enqueued without blocking.
+  ///
+  /// The update must not be lost silently: a member that is already live but absent from the
+  /// driver's address book stays UNDIALED until an `AddPeer` for it lands, so a dropped update would
+  /// strand that member with no caller signal. The send is therefore reported, mirroring
+  /// [`Self::submit`] / [`Self::reconfigure_to`] backpressure: retry on [`DriverError::Busy`], and
+  /// treat [`DriverError::DriverGone`] as terminal.
+  ///
+  /// # Errors
+  /// [`DriverError::Busy`] if the command channel is full — the update was not enqueued; retry once
+  /// the driver drains; [`DriverError::DriverGone`] if the driver task has stopped (the channel is
+  /// closed) — terminal, do not retry this handle.
+  pub fn add_peer(
+    &self,
+    member_id: viewstamp_proto::MemberId,
+    addr: std::net::SocketAddr,
+  ) -> Result<(), DriverError> {
+    // Mirror `submit`/`reconfigure_to`: `try_send` never blocks. A FULL channel is backpressure —
+    // retryable Busy. A CLOSED channel means the driver is gone — terminal DriverGone.
+    self
       .commands()
-      .try_send(Command::AddPeer { member_id, addr });
+      .try_send(Command::AddPeer { member_id, addr })
+      .map_err(|err| {
+        if err.is_full() {
+          DriverError::Busy
+        } else {
+          DriverError::DriverGone
+        }
+      })
   }
 }
 
@@ -459,6 +483,64 @@ mod tests {
     match std::future::Future::poll(fut, &mut cx) {
       std::task::Poll::Ready(Err(ReconfigureError::DriverGone)) => {}
       other => panic!("expected Ready(Err(DriverGone)) on a closed channel, got {other:?}"),
+    }
+  }
+
+  /// `add_peer` on a FULL command channel reports `Busy` rather than dropping the address update
+  /// silently. A lost update would strand an already-live member with no address — permanently
+  /// undialed, with no caller signal — so the caller must learn to retry. The channel admits its
+  /// buffer plus one in-flight command per live sender (one `Handle` here), so a 1-slot buffer takes
+  /// TWO sends and the THIRD is refused.
+  #[test]
+  fn add_peer_on_a_full_command_channel_is_busy() {
+    use std::net::SocketAddr;
+    use viewstamp_proto::MemberId;
+
+    let (tx, _rx) = futures_channel::mpsc::channel::<Command>(1);
+    let (_events_tx, events_rx) = flume::unbounded();
+    let handle = Handle::new(
+      tx,
+      events_rx,
+      InflightBudget::new(MAX_INFLIGHT, MAX_PENDING_BYTES),
+    );
+    let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+    // Fill the 1-slot buffer, then the sender's guaranteed slot: both updates enqueue.
+    handle
+      .add_peer(MemberId::new(1), addr)
+      .expect("the first update fills the buffer slot");
+    handle
+      .add_peer(MemberId::new(2), addr)
+      .expect("the second update fills the sender's guaranteed slot");
+
+    // The channel now refuses this sender: a live-member address update is BUSY, not silently lost.
+    match handle.add_peer(MemberId::new(3), addr) {
+      Err(DriverError::Busy) => {}
+      other => panic!("expected Err(Busy) on a full command channel, got {other:?}"),
+    }
+  }
+
+  /// `add_peer` on a CLOSED command channel reports `DriverGone`, not the retryable `Busy` — a
+  /// conscientious caller must not livelock registering addresses against a dead driver.
+  #[test]
+  fn add_peer_on_a_closed_command_channel_yields_driver_gone() {
+    use std::net::SocketAddr;
+    use viewstamp_proto::MemberId;
+
+    let (tx, rx) = futures_channel::mpsc::channel::<Command>(8);
+    let (_events_tx, events_rx) = flume::unbounded();
+    let handle = Handle::new(
+      tx,
+      events_rx,
+      InflightBudget::new(MAX_INFLIGHT, MAX_PENDING_BYTES),
+    );
+    // Drop the receiver so the channel is closed from the driver side.
+    drop(rx);
+
+    let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    match handle.add_peer(MemberId::new(1), addr) {
+      Err(DriverError::DriverGone) => {}
+      other => panic!("expected Err(DriverGone) on a closed channel, got {other:?}"),
     }
   }
 }
