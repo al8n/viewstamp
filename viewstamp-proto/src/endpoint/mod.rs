@@ -2467,7 +2467,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   /// member without panicking (a removed node is neither primary nor learner). A removed live node does
   /// not durably participate — `recover` resolves an absent member to [`Recovered::Retired`] on restart.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  fn local_slot_opt(&self) -> Option<ReplicaId> {
+  pub(crate) fn local_slot_opt(&self) -> Option<ReplicaId> {
     self.membership.slot_of(self.config.local())
   }
 

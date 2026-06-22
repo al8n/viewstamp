@@ -489,7 +489,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     if request.body().len() > crate::transport::frame::max_request_body_len() {
       return;
     }
-    let self_id = self.endpoint.replica();
+    // A removed local member owns no slot; route nothing (graceful no-op, not a panic).
+    let Some(self_id) = self.endpoint.local_slot_opt() else {
+      return;
+    };
     self.endpoint.handle_message(
       now,
       wal,
@@ -770,10 +773,12 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     while let Some(o) = self.endpoint.poll_message() {
       outgoing.push(o);
     }
-    let self_id = self.endpoint.replica();
     let std_now = self.quinn_now(now);
-    for o in outgoing {
-      self.route(std_now, o.to(), o.msg_ref(), self_id);
+    // A removed local member owns no slot; route nothing, but still service the bridge below.
+    if let Some(self_id) = self.endpoint.local_slot_opt() {
+      for o in outgoing {
+        self.route(std_now, o.to(), o.msg_ref(), self_id);
+      }
     }
     // The single correct-by-construction wakeup: collect into `out` every frame ANY mutation this pass
     // queued (see the doc above), so none is stranded in quinn until unrelated traffic wakes the driver.

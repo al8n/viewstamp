@@ -210,7 +210,10 @@ where
     if request.body().len() > super::frame::max_request_body_len() {
       return;
     }
-    let self_id = self.endpoint.replica();
+    // A removed local member owns no slot; route nothing (graceful no-op, not a panic).
+    let Some(self_id) = self.endpoint.local_slot_opt() else {
+      return;
+    };
     self.endpoint.handle_message(
       now,
       wal,
@@ -285,7 +288,10 @@ where
     while let Some(o) = self.endpoint.poll_message() {
       outgoing.push(o);
     }
-    let self_id = self.endpoint.replica();
+    // A removed local member owns no slot; route nothing (graceful no-op, not a panic).
+    let Some(self_id) = self.endpoint.local_slot_opt() else {
+      return;
+    };
     for o in outgoing {
       self.router.route(o.to(), o.msg_ref(), self_id);
     }
