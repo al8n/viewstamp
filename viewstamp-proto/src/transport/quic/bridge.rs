@@ -65,7 +65,7 @@ use super::{
   table::ConnTable,
 };
 use crate::{
-  Message, Peer,
+  MemberId, Message, Peer,
   transport::frame::{FrameDecoder, MAX_FRAME_LEN, STAGE_CHUNK, encode_frame},
 };
 
@@ -1170,6 +1170,22 @@ impl Bridge {
   /// connection's decoded consensus message to the endpoint.
   pub(crate) fn bound_peer_of(&mut self, h: ConnectionHandle) -> Option<Peer> {
     self.table.entry(h).and_then(|e| e.peer)
+  }
+
+  /// Record the attested STABLE [`MemberId`] the coordinator's binding policy resolved for connection
+  /// `h`, alongside the slot-keyed [`bind_validated`](Self::bind_validated) routing bind. The two are
+  /// set together at validation: the slot is the routing key, the member id is the cross-config
+  /// invariant the membership-reconcile re-resolves. A no-op if the entry is gone.
+  pub(crate) fn set_attested_member(&mut self, h: ConnectionHandle, member: MemberId) {
+    if let Some(e) = self.table.entry(h) {
+      e.member = Some(member);
+    }
+  }
+
+  /// Snapshot of `(handle, attested member, bound routing peer)` for every VALIDATED connection,
+  /// for the membership-reconcile pass. See [`ConnTable::validated_member_conns`].
+  pub(crate) fn validated_member_conns(&self) -> Vec<(ConnectionHandle, MemberId, Peer)> {
+    self.table.validated_member_conns()
   }
 
   /// Whether connection `h` is in the `Authenticating` phase (QUIC handshake done, identity not yet
