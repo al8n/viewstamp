@@ -37,19 +37,24 @@ use crate::{
   endpoint::ProposeMembershipError,
 };
 
-/// Derive the SNI server-name a dial presents for `expected` in `cluster`, matching the per-replica
-/// cert SAN minted by `ClusterTls`' issuer (`replica-<idx>.<cluster-hex>.viewstamp`). The stock
-/// `WebPkiServerVerifier` validates this against the server cert's SAN, so it is part of the
-/// cluster-separation guarantee, not cosmetic. A client target (never dialed by a replica
-/// coordinator) gets an analogous `client-<id-hex>.<cluster-hex>.viewstamp` form for totality.
-fn sni_for(expected: Peer, cluster: u128) -> String {
-  match expected {
+/// Derive the SNI server-name a dial presents for `peer` in `cluster`.
+///
+/// The cert SAN minted by `ClusterTls`' issuer is keyed to the STABLE `MemberId`
+/// (`replica-<MemberId>.<cluster-hex>.viewstamp`), so the dial MUST present the stable-id form.
+/// The `Peer::Member` arm is therefore the normal dial path: `connect` resolves the dialed slot to
+/// its stable `MemberId` and passes `Peer::Member(m)` here. The `Peer::Replica` arm is a fallback
+/// for the initial dial before membership is installed (where slot == MemberId by genesis
+/// convention) and for internal test helpers where the same property holds by construction. The
+/// stock `WebPkiServerVerifier` validates the SNI against the server cert's SAN, so the cluster +
+/// member binding is the per-connection cluster-separation guarantee.
+fn sni_for(peer: Peer, cluster: u128) -> String {
+  match peer {
+    // Stable-id form: the cert SAN and this SNI agree on `MemberId`.
+    Peer::Member(m) => format!("replica-{}.{:032x}.viewstamp", m.get(), cluster),
+    // Slot-keyed fallback: valid only when slot == MemberId (genesis / no shift yet). Used by
+    // internal test helpers that construct a coordinator directly and dial before a config change.
     Peer::Replica(r) => format!("replica-{}.{:032x}.viewstamp", r.get(), cluster),
     Peer::Client(c) => format!("client-{:032x}.{:032x}.viewstamp", c.get(), cluster),
-    // QUIC dials by the resolved routing slot (`Peer::Replica`), never by a stable `Peer::Member`,
-    // so this arm is unreachable on the dial path; for totality it formats the same per-replica SAN
-    // keyed by the member's raw index.
-    Peer::Member(m) => format!("replica-{}.{:032x}.viewstamp", m.get(), cluster),
   }
 }
 
@@ -292,11 +297,15 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   }
 
   /// Dial the replica `expected` at `remote`. The dial records `expected` as the connection's
-  /// expectation (the binding policy later requires the authenticated identity to match it) and
-  /// derives the SNI server-name from `expected` + the cluster so the dialer's stock
-  /// `WebPkiServerVerifier` matches it against the server cert's SAN (the B1
-  /// `replica-<idx>.<cluster-hex>.viewstamp` form). On success the handshake Initial is queued for the
-  /// next [`Self::poll_transmit`].
+  /// expectation (the binding policy later requires the authenticated identity to match it).
+  ///
+  /// The SNI is derived from the dialed peer's STABLE `MemberId` (resolved from the slot via the
+  /// active membership), not the routing slot. The cert SAN is minted per stable identity
+  /// (`replica-<MemberId>.<cluster-hex>.viewstamp`), so a slot-keyed SNI fails TLS verification
+  /// after any reconfiguration that shifts a member to a different slot. When the slot resolves to
+  /// a `MemberId` in the active membership, `Peer::Member(id)` is used for the SNI; when it does
+  /// not (only possible for a dial before the first membership install, where genesis convention
+  /// makes slot == MemberId), `Peer::Replica(slot)` is the fallback — identical result by genesis.
   ///
   /// Returns [`DialError`] when the dial is refused — the typed reason is SURFACED, not swallowed, so
   /// a caller can back off, report saturation, or test the cap at this boundary. [`DialError::AtCapacity`]
@@ -311,7 +320,17 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     remote: SocketAddr,
     expected: Peer,
   ) -> Result<(), DialError> {
-    let server_name = sni_for(expected, self.cluster());
+    // Derive SNI from the stable MemberId, not the routing slot. When `expected` is a replica
+    // slot, resolve it to the stable MemberId via the active membership so the SNI matches the
+    // cert SAN even after a reconfiguration that renumbers slots.
+    let sni_peer = match expected {
+      Peer::Replica(slot) => match self.endpoint.member_at(slot) {
+        Some(m) => Peer::Member(m),
+        None => Peer::Replica(slot),
+      },
+      other => other,
+    };
+    let server_name = sni_for(sni_peer, self.cluster());
     let std_now = self.quinn_now(now);
     self
       .bridge
@@ -986,8 +1005,14 @@ mod tests {
 
   #[test]
   fn sni_for_matches_the_replica_cert_san_form() {
-    // The dialer's SNI must equal the SAN the ClusterTls issuer mints (B1), so the stock
-    // WebPkiServerVerifier matches it.
+    // The cert SAN is minted per stable MemberId, so the SNI must use `Peer::Member` to match.
+    // `Peer::Member(m)` formats as `replica-<MemberId>.<cluster-hex>.viewstamp`, which is the
+    // same form the ClusterTls issuer writes into the SAN field that WebPkiServerVerifier checks.
+    assert_eq!(
+      sni_for(Peer::Member(MemberId::new(1)), 0x5151),
+      "replica-1.00000000000000000000000000005151.viewstamp"
+    );
+    // The `Peer::Replica` arm must produce the identical string when slot == MemberId (genesis).
     assert_eq!(
       sni_for(Peer::Replica(ReplicaId::new(1)), 0x5151),
       "replica-1.00000000000000000000000000005151.viewstamp"
