@@ -126,6 +126,12 @@ pub enum Peer {
   Replica(ReplicaId),
   /// A client.
   Client(ClientId),
+  /// A replica peer addressed by its stable cross-reconfiguration identity — the handshake
+  /// self-claim and the coordinator's attested identity for a validated stream conn. DISTINCT from
+  /// `Replica(slot)`: `Member` is the handshake-attested stable id; `Replica` is the routing key
+  /// the coordinator resolves it to. A `Member` id is NEVER a routing target in the router's
+  /// `peers` map — only `Replica(slot)` conns are routed.
+  Member(MemberId),
 }
 
 impl Peer {
@@ -141,12 +147,18 @@ impl Peer {
     matches!(self, Self::Client(_))
   }
 
+  /// True iff this is a `Member` peer (stable handshake-attested identity, not a routing slot).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_member(&self) -> bool {
+    matches!(self, Self::Member(_))
+  }
+
   /// The replica id, if this is a replica peer.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn as_replica(&self) -> Option<ReplicaId> {
     match self {
       Self::Replica(r) => Some(*r),
-      Self::Client(_) => None,
+      _ => None,
     }
   }
 
@@ -155,7 +167,16 @@ impl Peer {
   pub const fn as_client(&self) -> Option<ClientId> {
     match self {
       Self::Client(c) => Some(*c),
-      Self::Replica(_) => None,
+      _ => None,
+    }
+  }
+
+  /// The stable member id, if this is a `Member` peer.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_member(&self) -> Option<MemberId> {
+    match self {
+      Self::Member(m) => Some(*m),
+      _ => None,
     }
   }
 }

@@ -46,6 +46,10 @@ fn sni_for(expected: Peer, cluster: u128) -> String {
   match expected {
     Peer::Replica(r) => format!("replica-{}.{:032x}.viewstamp", r.get(), cluster),
     Peer::Client(c) => format!("client-{:032x}.{:032x}.viewstamp", c.get(), cluster),
+    // QUIC dials by the resolved routing slot (`Peer::Replica`), never by a stable `Peer::Member`,
+    // so this arm is unreachable on the dial path; for totality it formats the same per-replica SAN
+    // keyed by the member's raw index.
+    Peer::Member(m) => format!("replica-{}.{:032x}.viewstamp", m.get(), cluster),
   }
 }
 

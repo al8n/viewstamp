@@ -2360,6 +2360,10 @@ impl Cluster {
           self.schedule(now, Peer::Replica(from), Target::Replica(idx), msg.clone());
         }
       }
+      // `Peer::Member` is a transport handshake-attestation identity, never a routing target the
+      // consensus endpoint emits (it produces `Peer::Replica` slots and `Peer::Client` ids only), so
+      // this arm is unreachable by construction; drop it defensively rather than route a phantom.
+      Recipient::To(Peer::Member(_)) => {}
     }
   }
 

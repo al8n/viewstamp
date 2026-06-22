@@ -3,7 +3,7 @@
 #[cfg(not(feature = "std"))]
 use std::vec::Vec;
 
-use crate::{ClientId, Instant, Peer, ReplicaId};
+use crate::{ClientId, Instant, MemberId, Peer};
 
 use super::stream::{Intake, RecordIo, StreamTransport};
 
@@ -51,12 +51,11 @@ impl LabelOptions {
 }
 
 /// The identity a hello attests, in the codec's own slot-agnostic vocabulary: a replica's claim is a
-/// raw 16-byte id and a client's is a [`ClientId`]. The codec is shared by two transports that
-/// interpret the replica id differently — the QUIC identity layer reads it as a stable
-/// [`MemberId`](crate::MemberId) (the full u128), while the TCP [`Labeled`] decorator maps it back to a
-/// [`ReplicaId`] slot (rejecting an id that does not fit u16). Keeping the codec free of either type
-/// lets `labeled` stay quic-feature-independent while still carrying the full u128 either consumer
-/// needs.
+/// raw 16-byte id and a client's is a [`ClientId`]. BOTH transports now read the replica id as a
+/// stable [`MemberId`](crate::MemberId) (the full u128): the QUIC identity layer and the TCP
+/// [`Labeled`] decorator each surface a [`Peer::Member`](crate::Peer::Member) and resolve it to a
+/// routing slot against the active membership. Keeping the codec free of either typed id lets
+/// `labeled` stay quic-feature-independent while still carrying the full u128 either consumer needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HelloId {
   /// A replica's attested identity as a raw 16-byte id (the QUIC layer reads it as a `MemberId`).
@@ -66,10 +65,14 @@ pub(crate) enum HelloId {
 }
 
 impl HelloId {
-  /// The replica id from a [`Peer`] is its slot widened to the 16-byte field (the TCP slot domain).
+  /// The replica claim from a [`Peer`] is the FULL 16-byte id: a [`Peer::Member`] carries its stable
+  /// [`MemberId`] verbatim (the TCP transport now attests by stable id, mirroring QUIC), while a legacy
+  /// [`Peer::Replica`] slot is widened to the same field. Both encode the identical wire byte pattern,
+  /// so the [`encode_hello`] codec is unchanged.
   #[cfg_attr(not(tarpaulin), inline)]
   pub(crate) fn from_peer(who: Peer) -> Self {
     match who {
+      Peer::Member(m) => Self::Replica(m.get()),
       Peer::Replica(r) => Self::Replica(u128::from(r.get())),
       Peer::Client(c) => Self::Client(c),
     }
@@ -254,15 +257,10 @@ impl<R: StreamTransport> Labeled<R> {
     let leftover = &surfaced[take..];
     match classify_hello(&self.inbound_raw, self.cluster) {
       HelloOutcome::Accepted(claimed, consumed) => {
-        // The TCP transport routes by SLOT: map the codec's raw replica id back to a `ReplicaId`,
-        // rejecting an id that does not fit u16. A TCP hello always encodes a slot (its `who` widened),
-        // so a >u16 id is a malformed/foreign peer for this slot-based path, not a stable `MemberId` to
-        // resolve (that resolution is the QUIC identity layer's job, against an active membership).
+        // The TCP transport now attests by stable MemberId: keep the full u128, no slot narrowing.
+        // The coordinator resolves MemberId→slot via endpoint.slot_of() at binding.
         let peer = match claimed {
-          HelloId::Replica(m) => match u16::try_from(m) {
-            Ok(slot) => Peer::Replica(ReplicaId::new(slot)),
-            Err(_) => return Err(()),
-          },
+          HelloId::Replica(m) => Peer::Member(MemberId::new(m)),
           HelloId::Client(c) => Peer::Client(c),
         };
         let mut tail = self.inbound_raw.split_off(consumed);
@@ -381,7 +379,7 @@ impl<R: StreamTransport> RecordIo for Labeled<R> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{ClientId, Instant, Peer, ReplicaId};
+  use crate::{ClientId, Instant, MemberId, Peer, ReplicaId};
 
   const CLUSTER: u128 = 0xABCD;
 
@@ -403,8 +401,8 @@ mod tests {
 
   #[test]
   fn handshake_settles_identity_both_directions() {
-    let d_id = Peer::Replica(ReplicaId::new(1));
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let d_id = Peer::Member(MemberId::new(1));
+    let a_id = Peer::Member(MemberId::new(0));
     let mut dialer: Labeled<crate::Passthrough> =
       Labeled::dialer(crate::Passthrough::new(), &opts(d_id));
     let mut acceptor: Labeled<crate::Passthrough> =
@@ -430,10 +428,10 @@ mod tests {
     // Once settled, a side queues its hello prefix and then a message; the peer receives both in ONE
     // handle_transport_data. Driven on the acceptor: it queues its hello when it validates the dialer
     // and is then settled, so a following app write rides out in the same segment as the prefix.
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let a_id = Peer::Member(MemberId::new(0));
     let mut dialer: Labeled<crate::Passthrough> = Labeled::dialer(
       crate::Passthrough::new(),
-      &opts(Peer::Replica(ReplicaId::new(1))),
+      &opts(Peer::Member(MemberId::new(1))),
     );
     let mut acceptor: Labeled<crate::Passthrough> =
       Labeled::acceptor(crate::Passthrough::new(), &opts(a_id));
@@ -456,11 +454,11 @@ mod tests {
   fn wrong_cluster_is_rejected() {
     let mut dialer: Labeled<crate::Passthrough> = Labeled::dialer(
       crate::Passthrough::new(),
-      &LabelOptions::new(0x1111, Peer::Replica(ReplicaId::new(1))),
+      &LabelOptions::new(0x1111, Peer::Member(MemberId::new(1))),
     );
     let mut acceptor: Labeled<crate::Passthrough> = Labeled::acceptor(
       crate::Passthrough::new(),
-      &LabelOptions::new(0x2222, Peer::Replica(ReplicaId::new(0))),
+      &LabelOptions::new(0x2222, Peer::Member(MemberId::new(0))),
     );
     let mut wire = Vec::new();
     dialer.poll_transport_transmit(&mut wire);
@@ -477,7 +475,7 @@ mod tests {
       Labeled::dialer(crate::Passthrough::new(), &opts(c));
     let mut acceptor: Labeled<crate::Passthrough> = Labeled::acceptor(
       crate::Passthrough::new(),
-      &opts(Peer::Replica(ReplicaId::new(0))),
+      &opts(Peer::Member(MemberId::new(0))),
     );
     pump(&mut dialer, &mut acceptor);
     assert_eq!(acceptor.peer_identity(), Some(c));
@@ -509,15 +507,20 @@ mod tests {
       classify_hello(&hello[..hello.len() - 1], CLUSTER),
       HelloOutcome::Incomplete
     ));
-    // And it round-trips end-to-end through the dialer/acceptor pump.
+    // And it round-trips end-to-end through the dialer/acceptor pump. The dialer announces a legacy
+    // `Peer::Replica(300)` (widened to the 16-byte field); the acceptor now attests by stable id, so
+    // it surfaces the same bit pattern as `Peer::Member(MemberId::new(300))`.
     let mut dialer: Labeled<crate::Passthrough> =
       Labeled::dialer(crate::Passthrough::new(), &opts(r));
     let mut acceptor: Labeled<crate::Passthrough> = Labeled::acceptor(
       crate::Passthrough::new(),
-      &opts(Peer::Replica(ReplicaId::new(0))),
+      &opts(Peer::Member(MemberId::new(0))),
     );
     pump(&mut dialer, &mut acceptor);
-    assert_eq!(acceptor.peer_identity(), Some(r));
+    assert_eq!(
+      acceptor.peer_identity(),
+      Some(Peer::Member(MemberId::new(300)))
+    );
   }
 
   #[test]
@@ -527,8 +530,8 @@ mod tests {
 
   #[test]
   fn dialer_is_handshaking_until_it_learns_the_peer() {
-    let d_id = Peer::Replica(ReplicaId::new(1));
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let d_id = Peer::Member(MemberId::new(1));
+    let a_id = Peer::Member(MemberId::new(0));
     let mut dialer: Labeled<crate::Passthrough> =
       Labeled::dialer(crate::Passthrough::new(), &opts(d_id));
     let mut acceptor: Labeled<crate::Passthrough> =
@@ -553,14 +556,14 @@ mod tests {
     // An acceptor whose inner accepts no plaintext (write_cap 0), so the local hello prefix can
     // never flush. The inner is NOT handshaking and a valid remote hello validates the peer, yet
     // the conn must stay handshaking until our own identity has actually reached the wire.
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let a_id = Peer::Member(MemberId::new(0));
     let opts = LabelOptions::new(CLUSTER, a_id);
     let mut acceptor: Labeled<MockRecords> =
       Labeled::acceptor(MockRecords::new(false, None), &opts);
     // Reinstall the inner with a zero write cap (the default acceptor inner has no cap).
     acceptor.inner = MockRecords::new(false, None).with_write_cap(0);
 
-    let d_id = Peer::Replica(ReplicaId::new(1));
+    let d_id = Peer::Member(MemberId::new(1));
     let mut hello = Vec::new();
     encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
@@ -592,7 +595,7 @@ mod tests {
     // A dialer queues its hello into the inner layer eagerly at construction, so the inner's
     // buffered-outbound count (which the router's cap reads) already reflects the hello — it is not
     // an off-the-books prefix that escapes the cap accounting.
-    let d_id = Peer::Replica(ReplicaId::new(1));
+    let d_id = Peer::Member(MemberId::new(1));
     let dialer: Labeled<crate::Passthrough> =
       Labeled::dialer(crate::Passthrough::new(), &opts(d_id));
     let mut hello = Vec::new();
@@ -607,7 +610,7 @@ mod tests {
   fn a_huge_invalid_handshake_segment_is_rejected_bounded() {
     let mut acceptor: Labeled<crate::Passthrough> = Labeled::acceptor(
       crate::Passthrough::new(),
-      &opts(Peer::Replica(ReplicaId::new(0))),
+      &opts(Peer::Member(MemberId::new(0))),
     );
     // A first segment far larger than MAX_HELLO_LEN that does not start a valid hello.
     let junk = std::vec![0xABu8; 100 * 1024];
@@ -623,7 +626,7 @@ mod tests {
     // rejected and the inner buffers nothing — poll_transport_transmit could emit no app bytes ahead
     // of the identity prefix. Once a valid remote hello settles it, the local hello is already queued
     // and a subsequent app write is accepted in full.
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let a_id = Peer::Member(MemberId::new(0));
     let mut acceptor: Labeled<crate::Passthrough> =
       Labeled::acceptor(crate::Passthrough::new(), &opts(a_id));
     assert!(acceptor.is_handshaking());
@@ -638,7 +641,7 @@ mod tests {
       "nothing is queued ahead of the hello"
     );
 
-    let d_id = Peer::Replica(ReplicaId::new(1));
+    let d_id = Peer::Member(MemberId::new(1));
     let mut hello = Vec::new();
     encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
@@ -664,13 +667,13 @@ mod tests {
     // Clearing the outbound discards the queued local hello. The layer must then become terminal: it
     // can never report settled, accept application plaintext, or emit any wire byte — otherwise a
     // direct caller could clear the hello yet still have app bytes ride out with no identity prefix.
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let a_id = Peer::Member(MemberId::new(0));
     let mut acceptor: Labeled<crate::Passthrough> =
       Labeled::acceptor(crate::Passthrough::new(), &opts(a_id));
 
     // Settle the acceptor: a valid remote hello sets `peer`, queues + flushes the local hello, and
     // drops `is_handshaking()`.
-    let d_id = Peer::Replica(ReplicaId::new(1));
+    let d_id = Peer::Member(MemberId::new(1));
     let mut hello = Vec::new();
     encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
@@ -713,13 +716,13 @@ mod tests {
     // surface plaintext and no staged inbound bytes survive. A direct caller could otherwise clear the
     // layer, then feed a fresh valid hello plus an application tail and still have read_plaintext
     // surface that tail past the now-terminal layer.
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let a_id = Peer::Member(MemberId::new(0));
     let mut acceptor: Labeled<crate::Passthrough> =
       Labeled::acceptor(crate::Passthrough::new(), &opts(a_id));
 
     // Settle the acceptor via a valid remote hello, then stage some post-settle app plaintext that has
     // arrived but not yet been drained — clear_outbound must drop it too.
-    let d_id = Peer::Replica(ReplicaId::new(1));
+    let d_id = Peer::Member(MemberId::new(1));
     let mut hello = Vec::new();
     encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
@@ -762,7 +765,7 @@ mod tests {
     // together, so a direct caller that ignores the Failed cannot afterwards surface inner-staged
     // plaintext or do any I/O. Here an acceptor is fed a byte that is not a valid hello header, so
     // consume_inbound rejects and handle_transport_data routes through fail().
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let a_id = Peer::Member(MemberId::new(0));
     let mut acceptor: Labeled<crate::Passthrough> =
       Labeled::acceptor(crate::Passthrough::new(), &opts(a_id));
     assert_eq!(
@@ -800,7 +803,7 @@ mod tests {
     use crate::transport::testutil::MockRecords;
     // When the inner record layer fails, Labeled must itself become terminal, not merely forward the
     // Failed: a direct caller ignoring it must not be able to drain inner-staged plaintext afterwards.
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let a_id = Peer::Member(MemberId::new(0));
     let mut acceptor: Labeled<MockRecords> =
       Labeled::acceptor(MockRecords::new(false, None), &opts(a_id));
     acceptor.inner = MockRecords::new(false, None).failing();
@@ -830,7 +833,7 @@ mod tests {
     // while the acceptor is handshaking, the local hello always writes into an empty inner buffer.
     // So immediately after settling, with no prior accepted app write, the full hello is queued and
     // present — never truncated behind app bytes.
-    let a_id = Peer::Replica(ReplicaId::new(0));
+    let a_id = Peer::Member(MemberId::new(0));
     let mut acceptor: Labeled<crate::Passthrough> =
       Labeled::acceptor(crate::Passthrough::new(), &opts(a_id));
     assert_eq!(
@@ -839,7 +842,7 @@ mod tests {
       "the pre-settle app write is rejected, so it cannot pre-fill the inner"
     );
 
-    let d_id = Peer::Replica(ReplicaId::new(1));
+    let d_id = Peer::Member(MemberId::new(1));
     let mut hello = Vec::new();
     encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
     assert_ne!(
