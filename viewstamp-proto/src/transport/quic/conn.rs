@@ -6,7 +6,7 @@ use quinn_proto::{Connection, StreamId};
 
 use super::layout::{StreamClass, StreamLayout};
 use crate::{
-  Peer,
+  MemberId, Peer,
   transport::{
     frame::{FrameDecoder, MAX_FRAME_LEN},
     labeled::MAX_HELLO_LEN,
@@ -112,6 +112,14 @@ pub(crate) struct ConnEntry {
   /// The authenticated, coordinator-bound peer. `None` until the identity-binding step promotes the
   /// connection to [`Phase::Validated`]; routing and frame surfacing key off this being `Some`.
   pub(crate) peer: Option<Peer>,
+  /// The attested STABLE [`MemberId`] the binding policy resolved from the handshake (the cross-config
+  /// invariant identity), recorded ALONGSIDE the slot-keyed [`Self::peer`]. `peer` holds the routing
+  /// slot the member occupied IN THE MEMBERSHIP AT BIND TIME; a reconfiguration that shifts that
+  /// member to a different slot leaves `peer` stale. Retaining the member id is what lets
+  /// [`reconcile_routing`](super::super::quic::QuicCoordinator::reconcile_routing) re-resolve each
+  /// validated connection against the NEW membership and close the ones whose member was removed or
+  /// shifted — routing key by slot, reconcile by member id. `None` until `Validated`.
+  pub(crate) member: Option<MemberId>,
   /// Whether this side's control-stream preface frame has been written. The preface is the FIRST
   /// frame on the Control send stream; consensus frames are gated behind it (and behind `Validated`).
   pub(crate) preface_done: bool,
@@ -164,6 +172,7 @@ impl ConnEntry {
       phase: Phase::Handshaking,
       dialed_expectation,
       peer: None,
+      member: None,
       preface_done: false,
       layout,
       // The recv decoders start at the pre-authentication caps (`Handshaking` is not `Validated`):

@@ -28,6 +28,15 @@ use super::{
 pub struct StreamCoordinator<S, R> {
   endpoint: Endpoint<S, SingleChange>,
   router: PeerRouter<R>,
+  /// The `config_id` the routing table was last reconciled against — the cheap scalar gate on
+  /// [`Self::reconcile_routing`] (a no-op unless the membership actually changed). Seeded from the
+  /// endpoint's `config_id` at construction.
+  last_reconciled_config_id: u128,
+  /// The membership snapshot the routing table was last reconciled against. A stream conn attests only
+  /// its SLOT (the `Labeled` handshake encodes `Peer::Replica(slot)`), not a stable member id, so the
+  /// reconcile diffs each bound slot's OCCUPANT between this snapshot and the new membership to decide
+  /// which slots became stale (removed / shifted / became local). Seeded with the genesis membership.
+  last_reconciled_membership: crate::Membership,
 }
 
 impl<S, R> core::fmt::Debug for StreamCoordinator<S, R> {
@@ -39,9 +48,13 @@ impl<S, R> core::fmt::Debug for StreamCoordinator<S, R> {
 impl<S, R> StreamCoordinator<S, R> {
   /// Creates a coordinator around a (driver-built) endpoint, with an empty conn table.
   pub fn new(endpoint: Endpoint<S, SingleChange>) -> Self {
+    let last_reconciled_config_id = endpoint.config_id();
+    let last_reconciled_membership = endpoint.membership_clone();
     Self {
       endpoint,
       router: PeerRouter::new(),
+      last_reconciled_config_id,
+      last_reconciled_membership,
     }
   }
 
@@ -56,9 +69,13 @@ impl<S, R> StreamCoordinator<S, R> {
   /// cross-crate tests can drive the backlog logic with a tiny cap.
   #[doc(hidden)]
   pub fn with_outbound_cap(endpoint: Endpoint<S, SingleChange>, cap: usize) -> Self {
+    let last_reconciled_config_id = endpoint.config_id();
+    let last_reconciled_membership = endpoint.membership_clone();
     Self {
       endpoint,
       router: PeerRouter::with_outbound_cap(cap),
+      last_reconciled_config_id,
+      last_reconciled_membership,
     }
   }
 
@@ -155,6 +172,10 @@ where
       if peer_finished && let Some(conn) = self.router.conn_mut(id) {
         let _ = conn.finalize();
       }
+      // A frame this chunk delivered may have installed a new membership; reconcile routing against it
+      // BEFORE the pump routes the chunk's responses, so they never ride a stale slot table. Cheap when
+      // unchanged (a scalar config_id compare), so running it per chunk costs nothing in the steady case.
+      self.reconcile_routing();
       // Pump after each chunk so the endpoint's outgoing backlog, drained into a transient Vec by
       // pump, is bounded to one chunk's responses rather than the whole read.
       self.pump();
@@ -234,12 +255,18 @@ where
   /// Drives timers, then pumps.
   pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     self.endpoint.handle_timeout(now, wal, sb);
+    // A timeout-driven advance may have installed a new membership; reconcile routing against it
+    // BEFORE the pump, so no current-config output rides a stale slot table.
+    self.reconcile_routing();
     self.pump();
   }
 
   /// Drives storage completions, then pumps.
   pub fn handle_storage<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     self.endpoint.handle_storage(now, wal, sb);
+    // A storage-completion advance (e.g. a reconfig op becoming durable) may have installed a new
+    // membership; reconcile routing against it BEFORE the pump.
+    self.reconcile_routing();
     self.pump();
   }
 
@@ -316,6 +343,43 @@ where
   /// clone is needed at all.
   pub fn live_membership(&self) -> crate::Membership {
     self.endpoint.membership_clone()
+  }
+
+  /// Reconcile the routing table against the currently-installed membership, closing every bound slot
+  /// whose OCCUPANT changed (a member removed, shifted to a different slot, or replaced — including a
+  /// slot that became this node's own / fell out of range). Called inside every endpoint-advancing
+  /// entry (`handle_conn_data` / `handle_timeout` / `handle_storage`) AFTER the advance — which may have
+  /// installed a `MembershipChanged` or a cross-epoch sync membership — and BEFORE the pump, so no
+  /// current-config output is ever routed on a stale slot table.
+  ///
+  /// Cheap by default: a scalar `config_id` compare short-circuits when the membership is unchanged, so
+  /// the slot walk runs only on the rare pass that installed a new config. A stream conn attests only
+  /// its SLOT (the `Labeled` handshake carries `Peer::Replica(slot)`), not a stable member id, so the
+  /// reconcile compares each bound slot's occupant in the LAST-reconciled membership against the new
+  /// one: any slot whose `member_at(slot)` differs is closed via [`Self::close_peer_by_slot`]. That
+  /// closes EVERY stale slot — removed (now `None`), shifted (a different member id), or became-local —
+  /// rather than only the slots whose dial ADDRESS happened to differ, so a disappeared / became-local /
+  /// skipped slot can no longer leak a stale connection. The reconnecting peer re-binds under its new
+  /// slot on the next handshake.
+  ///
+  /// Safety is unchanged: this retires only ROUTING. A stale-epoch frame arriving on a not-yet-closed
+  /// conn is still dropped by the endpoint's `sender_matches` / `epoch_authority_admits` ingress gates.
+  pub fn reconcile_routing(&mut self) {
+    let current = self.endpoint.config_id();
+    if current == self.last_reconciled_config_id {
+      return;
+    }
+    let new_membership = self.endpoint.membership_clone();
+    for slot in self.router.bound_replica_slots() {
+      // The slot's occupant changed iff the member at that slot differs between the membership the
+      // routing was last reconciled against and the new one — covering removal (`None`), a slot shift
+      // (a different member id), and a slot that became local or out of range (`None`).
+      if self.last_reconciled_membership.member_at(slot) != new_membership.member_at(slot) {
+        self.close_peer_by_slot(slot);
+      }
+    }
+    self.last_reconciled_membership = new_membership;
+    self.last_reconciled_config_id = current;
   }
 
   /// Close the authoritative connection for `Peer::Replica(slot)` if one exists, so the peer can

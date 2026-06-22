@@ -767,18 +767,16 @@ where
     }
   }
 
-  /// Reconcile the peer list against the current membership after a config change. Closes any slot
-  /// whose occupant has changed (so the connection reconnects under the new routing identity) and
-  /// rebuilds `self.peers` from the new membership plus the address book. The full membership clone
-  /// happens only here — once per config change — never on the hot loop path.
+  /// Rebuild the DIAL list against the current membership after a config change — the DIAL-of-added
+  /// half of the re-key. CLOSING a stale slot is the COORDINATOR's job now (`reconcile_routing` runs
+  /// inside the endpoint-advancing handlers, right after the install, before any output is routed), so
+  /// this only rebuilds `self.peers` from the new membership plus the address book: a member dropped
+  /// from the membership loses its `PeerLink` (so it is never redialed), and a freshly-ADDED member
+  /// gains one (armed to dial this iteration). Dialing an added member is not timing-critical — it
+  /// connects, then the coordinator's routing picks it up on the validating handshake. The full
+  /// membership clone happens only here — once per config change — never on the hot loop path.
   fn rekey_peers(&mut self, now: Instant) {
     let m = self.coord.live_membership();
-    // Close any slot whose member shifted to a different MemberId so it reconnects clean.
-    for link in &self.peers {
-      if m.member_at(link.id) != Some(link.member_id) {
-        self.coord.close_peer_by_slot(now, link.id);
-      }
-    }
     let local = self.coord.endpoint().local();
     let base_backoff = self.cfg.redial_backoff_base();
     let mut new_peers: Vec<PeerLink> = Vec::new();
@@ -793,19 +791,24 @@ where
       let Some(&addr) = self.peer_book.get(&member_id) else {
         continue; // no address known yet; AddPeer will supply it later
       };
-      // Preserve existing backoff state when this slot's identity is unchanged.
-      let backoff = self
+      // Preserve the backoff + dial schedule of an UNCHANGED slot+member link (so a retained member is
+      // not redialed on a re-key it was unaffected by); a freshly-added member has no prior link, so it
+      // is armed to dial this iteration (`next_dial = Some(now)`), letting `reconcile_peer_links` issue
+      // its first dial without waiting for the redial backoff to arm.
+      let prior = self
         .peers
         .iter()
-        .find(|l| l.id == slot && l.member_id == member_id)
-        .map(|l| l.backoff)
-        .unwrap_or(base_backoff);
+        .find(|l| l.id == slot && l.member_id == member_id);
+      let (backoff, next_dial) = match prior {
+        Some(l) => (l.backoff, l.next_dial),
+        None => (base_backoff, Some(now)),
+      };
       new_peers.push(PeerLink {
         id: slot,
         member_id,
         addr,
         backoff,
-        next_dial: None,
+        next_dial,
       });
     }
     self.peers = new_peers;

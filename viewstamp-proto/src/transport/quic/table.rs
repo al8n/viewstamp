@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use quinn_proto::ConnectionHandle;
 
 use super::conn::ConnEntry;
-use crate::Peer;
+use crate::{MemberId, Peer};
 
 /// In-memory pool of active QUIC connections, keyed by `quinn_proto::ConnectionHandle`.
 ///
@@ -272,6 +272,21 @@ impl ConnTable {
   /// whole map borrowed).
   pub(crate) fn handles(&self) -> Vec<ConnectionHandle> {
     self.conns.keys().copied().collect()
+  }
+
+  /// Snapshot of every VALIDATED connection that has an attested member id, as
+  /// `(handle, attested member, bound routing peer)`. The membership-reconcile pass iterates this to
+  /// re-resolve each connection's stable member against the new membership; collected owned so the
+  /// caller can take a disjoint per-handle borrow (a `close_local`) inside the loop. Every connection
+  /// the mutual-dial pair holds for a member is included (not just the authoritative one), so a
+  /// removed/shifted member's stale connections are ALL closed, not only its routing target.
+  pub(crate) fn validated_member_conns(&self) -> Vec<(ConnectionHandle, MemberId, Peer)> {
+    self
+      .conns
+      .iter()
+      .filter(|(_, e)| e.phase.is_validated())
+      .filter_map(|(h, e)| Some((*h, e.member?, e.peer?)))
+      .collect()
   }
 
   /// The number of live connection entries (dialed + accepted). The bridge consults this against its

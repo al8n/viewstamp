@@ -144,6 +144,20 @@ impl<R> PeerRouter<R> {
     self.peers.get(&peer).copied()
   }
 
+  /// Every replica SLOT that currently has an authoritative (validated, routable) conn — the membership
+  /// reconcile pass's source set. Collected owned so the caller can close a slot's conn (a disjoint
+  /// `&mut` borrow) inside the iteration.
+  pub fn bound_replica_slots(&self) -> Vec<ReplicaId> {
+    self
+      .peers
+      .keys()
+      .filter_map(|p| match p {
+        Peer::Replica(r) => Some(*r),
+        _ => None,
+      })
+      .collect()
+  }
+
   /// A shared reference to a conn by handle.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn conn(&self, id: ConnId) -> Option<&Conn<R>> {

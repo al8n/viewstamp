@@ -1216,10 +1216,15 @@ where
     }
   }
 
-  /// Reconcile `peer_addrs` against the new membership after a config change. For each slot in the
-  /// new membership, if the occupying member's address differs from the current entry (meaning the
-  /// slot now holds a different member), close the old connection and dial the new address. Slots
-  /// whose address is absent from the address book are skipped until `AddPeer` supplies it.
+  /// Rebuild `peer_addrs` against the new membership after a config change — the DIAL-of-added half of
+  /// the re-key. CLOSING a stale slot is the COORDINATOR's job now (`reconcile_routing` runs inside the
+  /// endpoint-advancing handlers, right after the install, before any output is routed), so this only
+  /// rebuilds the slot→addr table and DIALS each slot whose (slot → addr) assignment is new or changed:
+  /// an added member, or a slot whose occupant shifted to a member at a different address. The dial
+  /// re-establishes the connection under the new slot; a stale dialed conn the coordinator closed
+  /// redials toward its OLD slot and is cleanly rejected at the peer's handshake (its attested slot no
+  /// longer matches), so it self-corrects. Slots whose address is absent from the book are skipped
+  /// until `AddPeer` supplies it.
   fn rekey_peers(&mut self, _now: Instant) {
     let m = self.coord.live_membership();
     let local = self.coord.endpoint().local();
@@ -1236,10 +1241,9 @@ where
       let Some(&addr) = self.peer_book.get(&member_id) else {
         continue; // no address known yet
       };
-      // If the slot's address changed, the member occupying it changed: close the stale conn and
-      // re-dial so the connection reconnects under the new identity.
+      // A new or changed (slot → addr) means this slot needs a connection to the member now at it:
+      // dial it under the new slot. The coordinator already closed any stale conn for the slot.
       if self.peer_addrs.get(&slot) != Some(&addr) {
-        self.coord.close_peer_by_slot(slot);
         self.dial_peer(slot, addr, Duration::ZERO, base_backoff);
       }
       new_peer_addrs.insert(slot, addr);

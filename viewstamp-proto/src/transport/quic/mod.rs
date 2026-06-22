@@ -99,6 +99,14 @@ pub struct QuicCoordinator<S, I> {
   /// handshake-retransmit / auth-reap / close-drain timers. Identity-anchoring makes
   /// `quinn_now(first_now) == std_base`.
   clock_anchor: Option<(Instant, std::time::Instant)>,
+  /// The `config_id` the routing table was last reconciled against. A membership INSTALL happens
+  /// INSIDE a `handle_*` pass (the endpoint advance can install a `MembershipChanged` or a cross-epoch
+  /// sync membership), so [`Self::reconcile_routing`] runs after the advance and before the pump on
+  /// every entry; comparing the endpoint's current `config_id` against this scalar makes that check a
+  /// no-op unless the membership actually changed. Seeded from the endpoint's `config_id` at
+  /// construction (the genesis config is already reconciled by construction — every bound peer was
+  /// dialed/accepted under it).
+  last_reconciled_config_id: u128,
   /// Test-only: count of consensus frames `drain_bridge` decoded and fed to the endpoint. The
   /// per-pump receive-pacing test reads this before/after each pump to assert ONE budget's worth is
   /// delivered per pump and that the whole burst eventually arrives.
@@ -210,12 +218,14 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     let mesh_floor = crypto::mesh_connection_floor(endpoint.node_count());
     let effective_cap = opts.max_connections().max(mesh_floor);
     let opts = opts.with_max_connections(effective_cap);
+    let last_reconciled_config_id = endpoint.config_id();
     Self {
       endpoint,
       bridge: Bridge::new(&opts, rng_seed),
       identity,
       layout,
       clock_anchor: None,
+      last_reconciled_config_id,
       #[cfg(test)]
       consensus_frames_delivered: 0,
     }
@@ -320,6 +330,9 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     let std_now = self.quinn_now(now);
     self.bridge.handle_datagram(std_now, remote, ecn, data);
     self.drain_bridge(now, wal, sb);
+    // The just-completed drain may have delivered a frame that INSTALLED a new membership; reconcile
+    // routing against it BEFORE the pump routes this pass's outputs, so they never ride a stale slot.
+    self.reconcile_routing(now);
     self.pump(now);
   }
 
@@ -329,6 +342,9 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     self.bridge.handle_timeout(std_now);
     self.endpoint.handle_timeout(now, wal, sb);
     self.drain_bridge(now, wal, sb);
+    // A timeout-driven advance (or a frame the drain delivered) may have installed a new membership;
+    // reconcile routing against it BEFORE the pump, so no current-config output rides a stale slot.
+    self.reconcile_routing(now);
     self.pump(now);
   }
 
@@ -336,6 +352,9 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   pub fn handle_storage<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     self.endpoint.handle_storage(now, wal, sb);
     self.drain_bridge(now, wal, sb);
+    // A storage-completion advance (e.g. a reconfig op becoming durable) may have installed a new
+    // membership; reconcile routing against it BEFORE the pump, so this pass's outputs use new slots.
+    self.reconcile_routing(now);
     self.pump(now);
   }
 
@@ -376,15 +395,49 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     self.bridge.handle_for(peer).is_some()
   }
 
-  /// Close the connection bound under `Peer::Replica(slot)` if one exists, so the peer can
-  /// reconnect under its new slot identity after a membership shift moves a member to a different
-  /// slot. The slot routing index holds the OLD slot key; tearing it down lets the redial path
-  /// re-establish under the new slot. A no-op if no connection is bound for that slot.
-  pub fn close_peer_by_slot(&mut self, now: Instant, slot: ReplicaId) {
-    if let Some(h) = self.bridge.handle_for(Peer::Replica(slot)) {
-      let std_now = self.quinn_now(now);
-      self.bridge.close_local(std_now, h);
+  /// Reconcile the routing table against the currently-installed membership, closing every validated
+  /// connection whose attested member was REMOVED or SHIFTED to a different slot. Called inside every
+  /// endpoint-advancing entry (`handle_udp` / `handle_timeout` / `handle_storage`) AFTER the advance
+  /// (which may have installed a `MembershipChanged` or a cross-epoch sync membership) and BEFORE the
+  /// pump, so no current-config output is ever routed on a stale slot table.
+  ///
+  /// Cheap by default: a scalar `config_id` compare short-circuits when the membership is unchanged, so
+  /// this runs the connection walk only on the rare pass that installed a new config. When it does run,
+  /// each VALIDATED connection's attested STABLE member id is re-resolved against the NEW membership:
+  ///
+  /// - the member is NO LONGER present (removed, or this connection is for a member outside the new
+  ///   config) → CLOSE the connection. `close_local` clears its `by_peer` routing slot, so it leaves the
+  ///   `Backups`/`AllReplicas` fanout AT ONCE; the driver's dial-of-added-members rebuild will not redial
+  ///   it (it is not in the new membership), so its redial is suppressed by construction.
+  /// - the member's slot CHANGED → CLOSE so the connection re-handshakes; `apply_outcome` then resolves
+  ///   the member's NEW slot via `slot_of` (against the already-installed membership) and re-binds under
+  ///   `Peer::Replica(new_slot)`. The mutual-dial sibling reconnects under the new slot too.
+  /// - the member's slot is UNCHANGED → leave it bound (the steady case for a retained member whose slot
+  ///   did not move).
+  ///
+  /// This closes EVERY stale connection a removed/shifted member holds (the walk is over ALL validated
+  /// connections, not just the authoritative routing target), so the slot table never routes to a
+  /// removed old slot or misses a retained member's new slot. Safety is unchanged: the close only
+  /// retires ROUTING — `sender_matches` / `epoch_authority_admits` still drop any stale-epoch frame.
+  pub fn reconcile_routing(&mut self, now: Instant) {
+    let current = self.endpoint.config_id();
+    if current == self.last_reconciled_config_id {
+      return;
     }
+    let std_now = self.quinn_now(now);
+    for (h, member, bound_peer) in self.bridge.validated_member_conns() {
+      match self.endpoint.slot_of(member) {
+        // Removed (or for a member outside the new config): close + drop routing; redial suppressed.
+        None => self.bridge.close_local(std_now, h),
+        // Shifted to a different slot: close so it reconnects and re-binds under the new slot.
+        Some(new_slot) if Peer::Replica(new_slot) != bound_peer => {
+          self.bridge.close_local(std_now, h);
+        }
+        // Slot unchanged: keep the connection bound (no churn for an unmoved retained member).
+        Some(_) => {}
+      }
+    }
+    self.last_reconciled_config_id = current;
   }
 
   /// The `config_id` of the currently active membership — a cheap scalar read, no clone required.
@@ -684,6 +737,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       _ => {}
     }
     self.bridge.bind_validated(std_now, h, routing_peer);
+    // Record the attested STABLE member id alongside the slot bind: the slot is the routing key, the
+    // member id is the cross-config invariant `reconcile_routing` re-resolves after a membership shift
+    // moves this member to a different slot (or removes it). Set only after a successful bind.
+    self.bridge.set_attested_member(h, member_id);
   }
 
   /// Drain the endpoint's outgoing backlog into an owned `Vec` (releasing the endpoint borrow),
