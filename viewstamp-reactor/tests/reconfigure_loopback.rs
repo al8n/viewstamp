@@ -575,3 +575,181 @@ async fn stream_cluster_survives_slot_shift() {
     let _ = h.shutdown().await;
   }
 }
+
+/// QUIC TLS SNI SLOT-SHIFT REGRESSION (reactor variant): a 4-voter cluster over real mTLS QUIC
+/// removes a low-slot voter so retained members shift slots, then commits a second request THROUGH
+/// a shifted member.
+///
+/// Genesis is voters {0,1,2,3} at slots {0,1,2,3}. The primary (member 0) proposes `RemoveVoter(1)`,
+/// leaving voters {0,2,3} at slots {0,1,2} — members 2 and 3 each shift DOWN one slot. The
+/// post-reconfiguration commit is submitted at the primary (member 0): a PrepareOk quorum from the
+/// SHIFTED successor voter set {0,2,3} is required, proving the primary's mesh reconnected to the
+/// shifted backups with the corrected SNI.
+///
+/// Before the `sni_for` fix, `connect` derived the SNI from the routing slot (`replica-1`) while
+/// member 2's cert SAN was minted per stable identity (`replica-2`). The stock `WebPkiServerVerifier`
+/// rejected the mismatch BEFORE the `CertOid` attestation ran, so the shifted member could never
+/// reconnect and the commit timed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_cluster_survives_slot_shift() {
+  use std::collections::BTreeSet;
+
+  const QUIC_CLUSTER: u128 = 0x5454;
+  let base_port: u16 = 47200;
+
+  struct QuicTestCa {
+    ca_cert: rcgen::Certificate,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+  }
+  impl QuicTestCa {
+    fn new() -> Self {
+      let mut params = rcgen::CertificateParams::new(vec![]).expect("empty SAN for CA is valid");
+      params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+      params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+      params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::DigitalSignature);
+      let ca_key = rcgen::KeyPair::generate().expect("CA key pair generation succeeds");
+      let ca_cert = params
+        .self_signed(&ca_key)
+        .expect("self-signed CA cert generation succeeds");
+      let issuer = rcgen::Issuer::new(params, ca_key);
+      Self { ca_cert, issuer }
+    }
+    fn roots(&self) -> rustls::RootCertStore {
+      let mut store = rustls::RootCertStore::empty();
+      store
+        .add(rustls::pki_types::CertificateDer::from(
+          self.ca_cert.der().to_vec(),
+        ))
+        .expect("CA cert parses as a trust anchor");
+      store
+    }
+    /// Issue a cert whose SAN is keyed to the STABLE member id (not the slot), matching the form
+    /// `ClusterTls` uses: `replica-<member_id>.<cluster-hex>.viewstamp`.
+    fn issue(
+      &self,
+      member_id: u8,
+    ) -> (
+      Vec<rustls::pki_types::CertificateDer<'static>>,
+      rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
+      let san = format!("replica-{member_id}.{QUIC_CLUSTER:032x}.viewstamp");
+      let mut params =
+        rcgen::CertificateParams::new(vec![san]).expect("valid DNS SAN for replica cert");
+      params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::DigitalSignature);
+      params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+      params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+      let leaf_key = rcgen::KeyPair::generate().expect("key pair generation succeeds");
+      let cert = params
+        .signed_by(&leaf_key, &self.issuer)
+        .expect("leaf cert signed by cluster CA");
+      let chain = vec![rustls::pki_types::CertificateDer::from(cert.der().to_vec())];
+      let key = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der())
+        .expect("leaf key serialises as a valid private key DER");
+      (chain, key)
+    }
+  }
+
+  let qca = QuicTestCa::new();
+  let addrs: Vec<SocketAddr> = (0..4)
+    .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+    .collect();
+
+  let mut handles = Vec::new();
+  for id in 0u8..4 {
+    let peers: Vec<_> = (0u8..4)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let (chain, key) = qca.issue(id);
+    let opts: QuicOptions = ClusterTls::new(qca.roots(), chain, key).build();
+    let config = viewstamp_proto::Config::try_new(QUIC_CLUSTER, MemberId::new(id as u128)).unwrap();
+    let (ready_tx, ready_rx) = flume::unbounded();
+    let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
+    let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let (driver, handle) = viewstamp_reactor::ReactorQuicDriver::<
+      agnostic::tokio::TokioRuntime,
+      _,
+      _,
+      _,
+      viewstamp_proto::ProvidedIdentity,
+    >::new(
+      config,
+      genesis(4, 0),
+      viewstamp_simulation::sm::LogSm::default(),
+      wal,
+      sb,
+      viewstamp_proto::ClientId::new(u128::from(id) + 1),
+      0,
+      opts,
+      viewstamp_proto::IdentityConfig::Hello {
+        cluster: QUIC_CLUSTER,
+      },
+      Some([id; 32]),
+      addrs[id as usize],
+      peers,
+      ready_rx,
+    )
+    .await
+    .expect("QUIC driver builds");
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+
+  // BASELINE: prove the 4-voter QUIC mesh formed and converges over real mTLS.
+  let reply = tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].submit(Bytes::from_static(b"pre-shift")),
+  )
+  .await
+  .expect("the baseline commit lands within 20s")
+  .expect("a baseline reply");
+  assert_eq!(
+    &reply[..],
+    &1u64.to_be_bytes(),
+    "the first committed op replies the post-apply count 1"
+  );
+
+  // RECONFIGURE: remove voter 1, shifting members 2→slot 1 and 3→slot 2.
+  let target = MembershipTarget::new(
+    BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
+    BTreeSet::new(),
+  );
+  let health = HealthHint {
+    known_up: BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
+    known_down: BTreeSet::new(),
+  };
+  tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].reconfigure_to(target, health),
+  )
+  .await
+  .expect("the reconfiguration converges within 20s")
+  .expect("reconfigure_to resolves Ok once voter 1 is removed and slots shift");
+
+  // POST-SHIFT: submit at the primary (member 0). A PrepareOk quorum from the SHIFTED survivor set
+  // {0,2,3} (members 2,3 at new slots 1,2) is required, proving mesh reconnected with stable SNI.
+  let reply = tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].submit(Bytes::from_static(b"post-shift")),
+  )
+  .await
+  .expect("the post-shift QUIC commit lands within 20s")
+  .expect("a post-shift reply");
+  assert_eq!(
+    &reply[..],
+    &2u64.to_be_bytes(),
+    "the second committed op replies the post-apply count 2 (QUIC mTLS survived the slot shift)"
+  );
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}
