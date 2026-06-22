@@ -142,9 +142,9 @@ pub struct ReactorStreamDriver<R: Runtime, S, T, W, B> {
   /// [`Command::AddPeer`] and seeded from the initial peer list at construction. The slot-keyed
   /// `peer_addrs` is derived from this book plus the active membership on each config change.
   peer_book: HashMap<MemberId, SocketAddr>,
-  /// The `config_id` last seen in `pump_outputs`; a change triggers slot-keyed peer reconciliation
-  /// via `rekey_peers`.
-  last_known_config_id: u128,
+  /// Membership config gate: detects when the live config_id changes so `rekey_peers` runs exactly
+  /// once per install, even when `pump_outputs` loops or `handle_timeout` triggers an install.
+  reconciler: viewstamp_driver::MembershipReconciler,
   dialer: DialerFactory<T>,
   acceptor: AcceptorFactory<T>,
   /// Bounded `futures_channel::mpsc::channel(cfg.cmd_cap())`: a refused send surfaces as `Busy`
@@ -301,7 +301,7 @@ where
         peer_book.insert(member_id, addr);
       }
     }
-    let last_known_config_id = coord.endpoint().config_id();
+    let reconciler = viewstamp_driver::MembershipReconciler::new(coord.endpoint().config_id());
     // Bounded command channel: a partitioned/slow driver (not draining commands) can't grow it
     // without bound; a refused send surfaces as `DriverError::Busy` (see `Handle::submit`). Sized
     // `cmd_cap` (= max_inflight + 1) so the in-flight budget, not this queue, is the binding submit
@@ -337,7 +337,7 @@ where
       close_counts: [0; CloseCause::COUNT],
       peer_addrs: peers.into_iter().collect(),
       peer_book,
-      last_known_config_id,
+      reconciler,
       dialer,
       acceptor,
       commands: commands_rx,
@@ -462,6 +462,7 @@ where
         .is_some_and(|d| self.clock.to_std(d) <= std::time::Instant::now())
       {
         self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self.rekey_if_needed(now);
       }
       self.retransmit_stale(now);
       self.pump_outputs(now).await;
@@ -1173,13 +1174,10 @@ where
   /// are collected during the borrow of `self.conns` and closed after, because `close_conn` takes
   /// `&mut self`; `close_conn` is idempotent so a duplicated id is harmless.
   async fn pump_outputs(&mut self, now: Instant) {
-    // Detect a membership config change and rebuild the peer table before processing any outputs
-    // this iteration, so new-config routing applies to the outputs we're about to drain.
-    let current_config_id = self.coord.membership_config_id();
-    if current_config_id != self.last_known_config_id {
-      self.rekey_peers(now);
-      self.last_known_config_id = current_config_id;
-    }
+    // Refresh the dial-map before the first output pass, then after each storage poll: a
+    // `handle_storage` completion can itself install a new membership, so the projection must be
+    // current before any subsequent dial/route/close decision.
+    self.rekey_if_needed(now);
     // The per-conn wire-byte ACCUMULATION threshold the driver tolerates before declaring a stalled
     // socket, OWNED by the proto (2x the router's per-conn staging cap). It is NOT a per-chunk size and
     // NOT the out-queue peak — a single chunk is always admitted at/under it, so the peak is
@@ -1189,6 +1187,7 @@ where
 
     loop {
       self.coord.handle_storage(now, &mut self.wal, &mut self.sb);
+      self.rekey_if_needed(now);
       let mut produced = false;
       let mut to_close: Vec<(ConnId, CloseCause)> = Vec::new();
       while let Some((id, bytes)) = self.coord.poll_conn_transmit() {
@@ -1227,6 +1226,15 @@ where
       if !produced {
         break;
       }
+    }
+  }
+
+  /// Run `rekey_peers` iff the live config_id has changed since the last call. O(1) on the
+  /// no-change path; called after every endpoint-advancing call so dial/route/close decisions
+  /// always see the current membership projection.
+  fn rekey_if_needed(&mut self, now: Instant) {
+    if self.reconciler.check(self.coord.membership_config_id()) {
+      self.rekey_peers(now);
     }
   }
 
