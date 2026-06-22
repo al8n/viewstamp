@@ -336,6 +336,56 @@ async fn single_node_shrink_with_no_witness_times_out() {
   let _ = handle.shutdown().await;
 }
 
+/// LATE `add_peer` DIALS AN ALREADY-PRESENT MEMBER: a 2-voter genesis where member 1 is in the
+/// membership from the start, but neither node knows the other's address at construction (both are
+/// built with an EMPTY initial peer list). With no peers and no membership change, neither node ever
+/// dials, so the mesh never forms and the 2-voter cluster cannot reach quorum — a commit at the
+/// primary (member 0) would hang forever.
+///
+/// The only thing that can break the deadlock is the late `add_peer(member 1, addr1)` at node 0:
+/// because member 1 is ALREADY in the live membership, the driver must rebuild its dial list against
+/// the CURRENT config immediately (not wait for some later, unrelated membership change) so it dials
+/// member 1 now. node 1 accepts that dial, the mutual mesh edge forms, quorum-2 is reached, and the
+/// commit lands. Before the fix, `add_peer` only populated the address book and node 0 never dialed,
+/// so this commit would time out.
+#[compio::test]
+async fn late_add_peer_dials_an_already_present_member() {
+  let ca = TestCa::new();
+  let addr0: SocketAddr = "127.0.0.1:41700".parse().unwrap();
+  let addr1: SocketAddr = "127.0.0.1:41701".parse().unwrap();
+
+  // Both nodes start with NO peers: member 1 is in genesis(2,0) but its address is unknown to node 0
+  // (and node 0's is unknown to node 1), so nothing is dialed at startup and the mesh is absent.
+  let (driver0, handle0) = build_cluster_driver(&ca, 0, addr0, Vec::new(), genesis(2, 0)).await;
+  // Keep node 1's handle alive for the whole test: dropping the last handle ends its run loop (the
+  // command channel closes), which would kill the peer the quorum depends on.
+  let (driver1, handle1) = build_cluster_driver(&ca, 1, addr1, Vec::new(), genesis(2, 0)).await;
+  compio::runtime::spawn(driver0.run()).detach();
+  compio::runtime::spawn(driver1.run()).detach();
+
+  // The late registration: member 1 is already in the membership, so this must trigger an immediate
+  // dial of member 1 from node 0, forming the mesh edge a 2-voter quorum needs.
+  handle0.add_peer(MemberId::new(1), addr1);
+
+  // A commit at the primary (member 0) requires quorum 2, which can only be reached once node 0 dials
+  // member 1 in response to the `add_peer`. Convergence within the deadline IS the assertion.
+  let reply = compio::time::timeout(
+    Duration::from_secs(20),
+    handle0.submit(Bytes::from_static(b"late-add-peer")),
+  )
+  .await
+  .expect("the commit lands within 20s once the late add_peer dials member 1 and quorum forms")
+  .expect("a committed reply");
+  assert_eq!(
+    &reply[..],
+    &1u64.to_be_bytes(),
+    "the first committed op replies the post-apply count 1 (the mesh formed via the late dial)"
+  );
+
+  let _ = handle0.shutdown().await;
+  let _ = handle1.shutdown().await;
+}
+
 /// ADDRESS BOOK DOES NOT DISRUPT NORMAL COMMITS: a 3-node cluster with `add_peer` called for each
 /// peer's address before the cluster starts (simulating the embedder pre-registering addresses for
 /// future membership changes) continues to commit client requests normally. The `add_peer` commands
