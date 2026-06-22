@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
 
-use crate::{Message, Peer, Recipient, ReplicaId};
+use crate::{MemberId, Message, Peer, Recipient, ReplicaId};
 
 use super::{
   CloseCause,
@@ -43,6 +43,10 @@ struct Entry<R> {
   peer: Peer,
   /// Whether this node dialed the conn (as opposed to accepting it).
   dialed: bool,
+  /// The stable [`MemberId`] the handshake attested for this conn, set by the coordinator after
+  /// `note_established_member` validates the identity. The router stores it opaquely for the
+  /// membership-reconcile pass; only the coordinator (which owns the endpoint) resolves it.
+  attested_member: Option<MemberId>,
 }
 
 /// Default per-conn outbound byte cap. MUST be ≥ `MAX_FRAME_LEN` (16 MiB) so a single legitimate
@@ -158,6 +162,24 @@ impl<R> PeerRouter<R> {
       .collect()
   }
 
+  /// Snapshot of `(routing slot, attested member)` for every VALIDATED conn that has a stored
+  /// attested member — the membership-reconcile pass's source set. Collected owned so the caller
+  /// can close a slot's conn (a disjoint `&mut` borrow) inside the iteration.
+  pub fn bound_validated_members(&self) -> Vec<(ReplicaId, MemberId)> {
+    self
+      .peers
+      .iter()
+      .filter_map(|(peer, conn_id)| {
+        let slot = match peer {
+          Peer::Replica(r) => *r,
+          _ => return None,
+        };
+        let member = self.conns.get(conn_id)?.attested_member?;
+        Some((slot, member))
+      })
+      .collect()
+  }
+
   /// A shared reference to a conn by handle.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn conn(&self, id: ConnId) -> Option<&Conn<R>> {
@@ -215,6 +237,7 @@ impl<R: StreamTransport> PeerRouter<R> {
         conn,
         peer,
         dialed: true,
+        attested_member: None,
       },
     );
     // Validate immediately: a raw / already-settled conn becomes authoritative on connect; a
@@ -234,6 +257,7 @@ impl<R: StreamTransport> PeerRouter<R> {
         conn,
         peer,
         dialed: false,
+        attested_member: None,
       },
     );
     // Validate immediately: a raw / already-settled conn becomes authoritative on connect; a
@@ -288,6 +312,48 @@ impl<R: StreamTransport> PeerRouter<R> {
       e.conn.mark_validated(identity);
     }
     self.peers.insert(identity, id);
+  }
+
+  /// Coordinator-level establishment for a conn whose handshake attested a stable [`MemberId`].
+  /// Resolves the routing slot externally (the coordinator owns the endpoint and calls `slot_of`)
+  /// and passes it here alongside the attested member; the router binds the routing key as
+  /// `Peer::Replica(resolved_slot)` and records `member` for the reconcile pass.
+  ///
+  /// Behaves like [`Self::note_established`] for the dialed-identity-mismatch / already-validated /
+  /// not-yet-settled guards; the identity mismatch check compares `Peer::Replica(resolved_slot)`
+  /// against the REGISTERED peer (which is the DIALED slot for a dialed conn).
+  pub fn note_established_member(
+    &mut self,
+    id: ConnId,
+    member: MemberId,
+    resolved_slot: ReplicaId,
+  ) {
+    let (record_settled, expected, dialed, closed, validated) = match self.conns.get(&id) {
+      Some(e) => (
+        !e.conn.is_handshaking(),
+        e.peer,
+        e.dialed,
+        e.conn.is_closed(),
+        e.conn.is_validated(),
+      ),
+      None => return,
+    };
+    if closed || validated || !record_settled {
+      return;
+    }
+    let routing_peer = Peer::Replica(resolved_slot);
+    if dialed && routing_peer != expected {
+      if let Some(e) = self.conns.get_mut(&id) {
+        e.conn.abort(CloseCause::IdentityRejected);
+      }
+      return;
+    }
+    if let Some(e) = self.conns.get_mut(&id) {
+      e.peer = routing_peer;
+      e.attested_member = Some(member);
+      e.conn.mark_validated(routing_peer);
+    }
+    self.peers.insert(routing_peer, id);
   }
 
   /// Whether a conn has been validated (its identity confirmed and bound). The driver uses this to
@@ -441,8 +507,8 @@ impl<R: StreamTransport> PeerRouter<R> {
 mod tests {
   use super::*;
   use crate::{
-    LabelOptions, Labeled, Message, OpNumber, Peer, Recipient, ReplicaId, View, message::Commit,
-    transport::stream::RecordIo,
+    LabelOptions, Labeled, MemberId, Message, OpNumber, Peer, Recipient, ReplicaId, View,
+    message::Commit, transport::stream::RecordIo,
   };
 
   fn conn() -> Conn<crate::Passthrough> {
@@ -592,42 +658,49 @@ mod tests {
     );
   }
 
-  /// Establishes an accepting `Labeled<Passthrough>` conn for `dialer_id` by feeding it the dialer's
-  /// hello, so it validates the remote, queues its own hello into the inner layer, and becomes a
-  /// routing target whose `buffered_outbound` already holds the hello.
+  /// Establishes an accepting `Labeled<Passthrough>` conn for `dialer_member` by feeding it the
+  /// dialer's hello, so it validates the remote, queues its own hello into the inner layer, and
+  /// becomes a routing target (bound to `Peer::Replica(slot)`) whose `buffered_outbound` already
+  /// holds the hello. Mirrors the production order — register the still-handshaking acceptor, drive
+  /// its handshake, THEN bind via `note_established_member` — so the register-time auto-establish
+  /// (which would adopt the raw `Peer::Member` handshake identity) is a no-op on the handshaking conn.
   fn established_labeled(
     r: &mut PeerRouter<Labeled<crate::Passthrough>>,
-    local_id: Peer,
-    dialer_id: Peer,
+    local_member: MemberId,
+    dialer_member: MemberId,
   ) -> ConnId {
-    let opts = LabelOptions::new(0xABCD, local_id);
+    let opts = LabelOptions::new(0xABCD, Peer::Member(local_member));
     let dialer_wire = {
       let mut dialer: Labeled<crate::Passthrough> = Labeled::dialer(
         crate::Passthrough::new(),
-        &LabelOptions::new(0xABCD, dialer_id),
+        &LabelOptions::new(0xABCD, Peer::Member(dialer_member)),
       );
       let mut wire = Vec::new();
       dialer.poll_transport_transmit(&mut wire);
       wire
     };
-    let mut conn = Conn::from_parts(Labeled::acceptor(crate::Passthrough::new(), &opts));
-    conn
+    let dialer_slot = ReplicaId::new(dialer_member.get() as u16);
+    let conn = Conn::from_parts(Labeled::acceptor(crate::Passthrough::new(), &opts));
+    let id = r.register_accepted(Peer::Replica(dialer_slot), conn);
+    r.conn_mut(id)
+      .unwrap()
       .handle_data(&dialer_wire, false, crate::Instant::ZERO)
       .unwrap();
-    let id = r.register_accepted(dialer_id, conn);
-    r.note_established(id);
+    r.note_established_member(id, dialer_member, dialer_slot);
     id
   }
 
   #[test]
   fn the_cap_accounts_for_the_queued_handshake_hello() {
+    // The dialer attests `MemberId(1)`, which resolves to routing slot 1; the routing key the test
+    // sends to is therefore `Peer::Replica(slot 1)`.
     let dialer_id = Peer::Replica(ReplicaId::new(1));
     // Probe the hello length and a single framed message length, then size a small cap so exactly
     // one application frame fits ALONGSIDE the queued hello.
     let hello_len = {
       let probe: Labeled<crate::Passthrough> = Labeled::dialer(
         crate::Passthrough::new(),
-        &LabelOptions::new(0xABCD, Peer::Replica(ReplicaId::new(0))),
+        &LabelOptions::new(0xABCD, Peer::Member(MemberId::new(0))),
       );
       probe.buffered_outbound()
     };
@@ -638,7 +711,7 @@ mod tests {
     };
     let cap = hello_len + framed_len;
     let mut r = PeerRouter::<Labeled<crate::Passthrough>>::with_outbound_cap(cap);
-    let c = established_labeled(&mut r, Peer::Replica(ReplicaId::new(0)), dialer_id);
+    let c = established_labeled(&mut r, MemberId::new(0), MemberId::new(1));
     assert!(
       r.conn(c).unwrap().queued_outbound() >= hello_len,
       "the established acceptor has its hello queued in the outbound buffer"

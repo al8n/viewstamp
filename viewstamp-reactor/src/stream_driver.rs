@@ -1320,7 +1320,7 @@ mod tests {
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     });
     let acceptor: super::AcceptorFactory<Labeled<Passthrough>> = Arc::new(|| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(0)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(0)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     });
     let (_ready_tx, ready_rx) = flume::unbounded();
@@ -1353,7 +1353,7 @@ mod tests {
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     });
     let acceptor: super::AcceptorFactory<Labeled<Passthrough>> = Arc::new(|| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(0)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(0)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     });
     let (_ready_tx, ready_rx) = flume::unbounded();
@@ -1392,7 +1392,7 @@ mod tests {
     };
     let mk_acceptor = || -> super::AcceptorFactory<Labeled<Passthrough>> {
       Arc::new(|| {
-        let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(0)));
+        let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(0)));
         Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
       })
     };
@@ -1456,7 +1456,7 @@ mod tests {
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     });
     let acceptor: super::AcceptorFactory<Labeled<Passthrough>> = Arc::new(|| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(0)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(0)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     });
     let (_ready_tx, ready_rx) = flume::unbounded();
@@ -1511,7 +1511,7 @@ mod tests {
     Arc<AtomicUsize>,
   ) {
     const CLUSTER: u128 = 0x7777;
-    let opts = LabelOptions::new(CLUSTER, Peer::Replica(peer));
+    let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(peer.get() as u128)));
     let conn = Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts));
     let id = driver.coord.register_dialed(Peer::Replica(peer), conn);
     let (out_tx, out_rx) = flume::unbounded();
@@ -1647,11 +1647,11 @@ mod tests {
     // The dialer must announce SELF (replica 0) for the peer to validate it — the loopback wiring;
     // `test_driver`'s factory announces the dialed target instead, fine only where nothing validates.
     let dialer: super::DialerFactory<Labeled<Passthrough>> = Arc::new(|_peer| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(0)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(0)));
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     });
     let acceptor: super::AcceptorFactory<Labeled<Passthrough>> = Arc::new(|| {
-      let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(0)));
+      let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(0)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     });
     let (_ready_tx, ready_rx) = flume::unbounded();
@@ -1692,7 +1692,7 @@ mod tests {
     ));
     let peer_conn = Conn::from_parts(Labeled::acceptor(
       Passthrough::new(),
-      &LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(1))),
+      &LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(1))),
     ));
     let pid = peer.register_accepted(Peer::Replica(ReplicaId::new(0)), peer_conn);
     let (mut pwal, mut psb) = (InMemoryWal::new(), InMemorySuperblock::new());
@@ -1832,7 +1832,7 @@ mod tests {
       Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
     });
     let acceptor: super::AcceptorFactory<Labeled<Passthrough>> = Arc::new(|| {
-      let opts = LabelOptions::new(0x7777, Peer::Replica(ReplicaId::new(0)));
+      let opts = LabelOptions::new(0x7777, Peer::Member(MemberId::new(0)));
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     });
     let (_ready_tx, ready_rx) = flume::unbounded();
