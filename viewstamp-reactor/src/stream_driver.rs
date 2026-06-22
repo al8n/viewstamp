@@ -701,6 +701,11 @@ where
         self
           .coord
           .handle_conn_data(id, &bytes, false, now, &mut self.wal, &mut self.sb);
+        // An inbound frame can install a new membership; refresh the dial-map immediately so a
+        // close/redial that follows this feed (this iteration's `reconcile_closed_conns` /
+        // `reconcile_auth_deadlines`, or a `close_conn`) reads the current projection, never a
+        // stale one that could reopen a removed or slot-shifted member.
+        self.rekey_if_needed(now);
       }
       BridgeInbound::Eof { id } | BridgeInbound::Error { id } => {
         self.close_conn(id, now);

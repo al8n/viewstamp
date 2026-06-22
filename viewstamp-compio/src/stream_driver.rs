@@ -712,6 +712,11 @@ where
         self
           .coord
           .handle_conn_data(id, &bytes, false, now, &mut self.wal, &mut self.sb);
+        // An inbound frame can install a new membership; refresh the dial-map immediately so a
+        // close/redial that follows this feed (this iteration's `reconcile_closed_conns` /
+        // `reconcile_auth_deadlines`, or a `close_conn`) reads the current projection, never a
+        // stale one that could reopen a removed or slot-shifted member.
+        self.rekey_if_needed(now);
       }
       BridgeInbound::Eof { id } | BridgeInbound::Error { id } => {
         self.close_conn(id, now);
@@ -1300,7 +1305,7 @@ mod tests {
   use super::CompioStreamDriver;
   use viewstamp_driver::{DriverError, REQUEST_TIMEOUT};
 
-  use crate::bridge::{BridgeOut, Conn as BridgeConn, ConnTask};
+  use crate::bridge::{BridgeInbound, BridgeOut, Conn as BridgeConn, ConnTask};
   use viewstamp_proto::{
     ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled, MemberId, Membership,
     OpNumber, Passthrough, Peer, ReplicaId, SingleChange, StreamCoordinator, View,
@@ -2807,6 +2812,64 @@ mod tests {
     assert_eq!(
       surviving_redial.addr, new_addr,
       "the surviving dial targets the new address"
+    );
+  }
+
+  /// INBOUND-ADVANCE REKEY ORDERING (stream): an inbound frame that advances the membership must
+  /// refresh the dial-map IMMEDIATELY — inside `handle_inbound`, before the iteration's
+  /// `reconcile_closed_conns` / `close_conn` runs — so a close that follows the feed reads the fresh
+  /// projection, not the stale one. Without the in-`handle_inbound` `rekey_if_needed`, `peer_addrs`
+  /// would still hold the removed slot when `close_conn` runs and the slot would be redialed,
+  /// re-opening a member the install dropped.
+  ///
+  /// The install is modeled by an advanced config_id (the inbound feed makes the reconciler observe
+  /// a new config) plus a `peer_book` the live projection no longer supports for the slot (an empty
+  /// book here, as a removed member leaves), so `rekey_peers` rebuilds `peer_addrs` WITHOUT the slot.
+  #[compio::test]
+  async fn inbound_feed_rekeys_before_a_following_close_suppresses_stale_redial() {
+    let mut driver = test_driver().await;
+    let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+    // A live dialed conn for slot 1, with `peer_addrs` still mapping the slot (the pre-removal
+    // state). `peer_book` is empty, so the live membership projection has no address for the slot —
+    // a rekey will drop it, exactly as a removal would.
+    driver.dial_peer(
+      ReplicaId::new(1),
+      addr,
+      Duration::ZERO,
+      viewstamp_driver::REDIAL_BACKOFF_BASE,
+    );
+    let id = *driver.conns.keys().next().expect("one dialed conn");
+    driver.peer_addrs.insert(ReplicaId::new(1), addr);
+
+    // Force the reconciler to see a config change on the next check, modeling the new membership the
+    // inbound frame installs. The real config_id is unchanged here (no multi-node round in a unit
+    // test), so seed a stale prior id; `handle_inbound` -> `rekey_if_needed` then rebuilds the map.
+    driver.reconciler = viewstamp_driver::MembershipReconciler::new(u128::MAX);
+
+    // Feed an inbound frame through the production inbound entry point. The bytes target a conn id the
+    // router does not hold, so the feed is a coordinator no-op (it does not perturb the slot-1 conn) —
+    // what matters is that `handle_inbound` now runs `rekey_if_needed` after the feed.
+    driver.handle_inbound(
+      viewstamp_proto::Instant::ZERO,
+      BridgeInbound::Bytes {
+        id: viewstamp_proto::ConnId::new(9999),
+        bytes: vec![0u8, 0u8],
+      },
+    );
+
+    // The inbound feed refreshed the dial-map: slot 1 is gone (the projection no longer supports it).
+    assert!(
+      !driver.peer_addrs.contains_key(&ReplicaId::new(1)),
+      "the inbound feed rekeyed: the unsupported slot was dropped from peer_addrs"
+    );
+
+    // A close that follows the feed (this iteration's reconcile) now reads the fresh map and
+    // suppresses the redial — the dropped member is NOT re-opened.
+    driver.close_conn(id, viewstamp_proto::Instant::ZERO);
+    assert!(
+      driver.conns.is_empty(),
+      "no redial was issued: the inbound-feed rekey emptied the slot before the close"
     );
   }
 }

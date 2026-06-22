@@ -361,7 +361,9 @@ async fn add_peer_does_not_disrupt_a_running_cluster() {
     // Pre-register all peer addresses in the address book.
     for peer_id in 0u8..3 {
       if peer_id != id {
-        handle.add_peer(mid(peer_id), addrs[peer_id as usize]);
+        handle
+          .add_peer(mid(peer_id), addrs[peer_id as usize])
+          .expect("the address update enqueues on a fresh driver");
       }
     }
     // The dropped JoinHandle DETACHES the task (tokio drop never cancels).
@@ -384,9 +386,11 @@ async fn add_peer_does_not_disrupt_a_running_cluster() {
 }
 
 /// ADDRESS BOOK ACCEPTS REGISTRATIONS BEFORE AND AFTER THE DRIVER RUNS (reactor variant): `add_peer`
-/// is non-blocking and idempotent from the caller's side — it must not panic or return an error
-/// regardless of timing. A single-node driver receives `add_peer` commands before, during, and after
-/// its run loop; the shutdown ack proves no regression in the teardown path.
+/// is non-blocking and idempotent from the caller's side — it must not panic regardless of timing.
+/// While the driver is live the update enqueues `Ok`; once it has stopped the closed channel is
+/// REPORTED as `DriverGone` (the update did not land), not dropped silently. A single-node driver
+/// receives `add_peer` commands before, during, and after its run loop; the shutdown ack proves no
+/// regression in the teardown path, and the post-shutdown call surfaces the closed-channel error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn add_peer_is_non_blocking_and_does_not_panic() {
   let ca = TestCa::new();
@@ -400,23 +404,35 @@ async fn add_peer_is_non_blocking_and_does_not_panic() {
   .await;
 
   // Register peers before the loop starts.
-  handle.add_peer(MemberId::new(1), "127.0.0.1:41731".parse().unwrap());
-  handle.add_peer(MemberId::new(2), "127.0.0.1:41732".parse().unwrap());
+  handle
+    .add_peer(MemberId::new(1), "127.0.0.1:41731".parse().unwrap())
+    .expect("enqueues into the channel buffer before the loop drains it");
+  handle
+    .add_peer(MemberId::new(2), "127.0.0.1:41732".parse().unwrap())
+    .expect("a second pre-start registration enqueues");
   // Duplicate: last write wins in the book.
-  handle.add_peer(MemberId::new(1), "127.0.0.1:41733".parse().unwrap());
+  handle
+    .add_peer(MemberId::new(1), "127.0.0.1:41733".parse().unwrap())
+    .expect("a duplicate registration enqueues (last write wins in the book)");
 
   drop(tokio::spawn(driver.run()));
 
   // Register a peer while the driver is live.
-  handle.add_peer(MemberId::new(3), "127.0.0.1:41734".parse().unwrap());
+  handle
+    .add_peer(MemberId::new(3), "127.0.0.1:41734".parse().unwrap())
+    .expect("a registration on a live driver enqueues");
 
   tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
     .await
     .expect("shutdown acks within 5s")
     .expect("driver acks shutdown");
 
-  // After the driver has stopped, add_peer must not panic (silent drop on closed channel).
-  handle.add_peer(MemberId::new(4), "127.0.0.1:41735".parse().unwrap());
+  // After the driver has stopped, add_peer must not panic — and the closed channel is now REPORTED
+  // as DriverGone (the update did not land), not dropped silently.
+  match handle.add_peer(MemberId::new(4), "127.0.0.1:41735".parse().unwrap()) {
+    Err(viewstamp_driver::DriverError::DriverGone) => {}
+    other => panic!("expected DriverGone after shutdown, got {other:?}"),
+  }
 }
 
 /// SLOT-SHIFT REGRESSION (TCP/TLS stream transport): a real 4-voter cluster over `Labeled<Passthrough>`

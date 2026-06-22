@@ -468,9 +468,7 @@ where
 
       let now = self.clock.now();
       if let Some((datagram, from)) = inbound {
-        self
-          .coord
-          .handle_udp(now, from, None, &datagram, &mut self.wal, &mut self.sb);
+        self.handle_inbound_datagram(now, &datagram, from);
       }
       if fire_timeout {
         self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
@@ -681,6 +679,20 @@ where
       .into_iter()
       .flatten()
       .fold(fallback, std::time::Instant::min)
+  }
+
+  /// Feed one inbound datagram to the coordinator, then refresh the dial-map.
+  ///
+  /// The datagram can install a new membership; rekeying IMMEDIATELY after the feed (before the next
+  /// iteration's `reconcile_peer_links` dial pass and the pump's close drains) keeps the dial
+  /// projection current, so a removed or slot-shifted member is never reopened by a dial that read a
+  /// stale map. `rekey_if_needed` is config_id-gated, so a datagram that does not change the
+  /// membership costs only a scalar compare.
+  fn handle_inbound_datagram(&mut self, now: Instant, datagram: &[u8], from: SocketAddr) {
+    self
+      .coord
+      .handle_udp(now, from, None, datagram, &mut self.wal, &mut self.sb);
+    self.rekey_if_needed(now);
   }
 
   /// Redial every configured peer that has NO bound (identity-validated) connection in the
@@ -1580,5 +1592,63 @@ mod tests {
     );
     drop(survivor);
     drop(handle);
+  }
+
+  /// INBOUND-ADVANCE REKEY ORDERING (QUIC): a datagram that advances the membership must refresh the
+  /// dial-map IMMEDIATELY — inside `handle_inbound_datagram`, before the next `reconcile_peer_links`
+  /// dial pass — so the dial pass reads the fresh projection. Without the rekey in the inbound
+  /// helper, `self.peers` would still hold the removed slot's `PeerLink` and `reconcile_peer_links`
+  /// would dial it, re-opening a member the install dropped.
+  ///
+  /// The install is modeled by an advanced config_id (the feed makes the reconciler observe a new
+  /// config) plus a `peer_book` the live projection no longer supports for the slot (an empty book,
+  /// as a removed member leaves), so `rekey_peers` rebuilds `self.peers` WITHOUT the slot.
+  #[compio::test]
+  async fn inbound_datagram_rekeys_so_the_dial_pass_drops_a_removed_slot() {
+    let (mut driver, _handle) = test_quic_driver_with_handle().await;
+    let stale_addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+    // A stale dial-map entry for slot 1 (a `PeerLink` as an earlier config left it). `peer_book` is
+    // empty, so the live membership projection has no address for the slot — a rekey will drop it,
+    // exactly as a removal would.
+    driver.peers.push(super::PeerLink {
+      id: viewstamp_proto::ReplicaId::new(1),
+      member_id: MemberId::new(1),
+      addr: stale_addr,
+      backoff: viewstamp_driver::REDIAL_BACKOFF_BASE,
+      next_dial: Some(viewstamp_proto::Instant::ZERO),
+    });
+
+    // Force the reconciler to see a config change on the next check, modeling the membership the
+    // datagram installs (no multi-node round runs in a unit test, so the real config_id is
+    // unchanged); the inbound helper's `rekey_if_needed` then rebuilds the dial-map.
+    driver.reconciler = viewstamp_driver::MembershipReconciler::new(u128::MAX);
+
+    // Feed a datagram through the production inbound helper. The bytes are not a valid QUIC packet,
+    // so the coordinator drops them — what matters is that the helper rekeys after the feed.
+    driver.handle_inbound_datagram(
+      viewstamp_proto::Instant::ZERO,
+      &[0u8, 0u8, 0u8, 0u8],
+      stale_addr,
+    );
+
+    // The inbound feed refreshed the dial-map: the removed slot is gone from `self.peers`, so the
+    // following `reconcile_peer_links` dial pass cannot reopen it.
+    assert!(
+      !driver
+        .peers
+        .iter()
+        .any(|l| l.id == viewstamp_proto::ReplicaId::new(1)),
+      "the inbound feed rekeyed: the unsupported slot was dropped from the dial list"
+    );
+
+    // The dial pass that follows the feed dials nothing for the dropped slot — it has no link.
+    driver.reconcile_peer_links(viewstamp_proto::Instant::ZERO);
+    assert!(
+      !driver.coord.has_bound_conn(viewstamp_proto::Peer::Replica(
+        viewstamp_proto::ReplicaId::new(1)
+      )),
+      "no conn was dialed for the removed slot after the inbound-feed rekey"
+    );
   }
 }
