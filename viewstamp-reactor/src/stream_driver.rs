@@ -2724,9 +2724,8 @@ mod tests {
   /// the `peer_addrs` gate in `close_conn`: after `rekey_peers` rebuilds the dial table without the
   /// removed slot, the slot is absent from `peer_addrs`, so the gate suppresses the redial.
   ///
-  /// This is the regression for the R6 transport-reconciliation class: the unconditional redial
-  /// let a removed member's conn be re-opened after the coordinator closed it, defeating
-  /// `reconcile_routing`.
+  /// Regression: the unconditional redial path let a removed member's conn be re-opened after
+  /// the coordinator closed it, defeating `reconcile_routing`.
   #[tokio::test]
   async fn removed_member_is_not_redialed_after_coordinator_close() {
     let mut driver = test_driver().await;
