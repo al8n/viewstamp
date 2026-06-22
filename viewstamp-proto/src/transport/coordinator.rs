@@ -178,12 +178,18 @@ where
   }
 
   /// Drives the identity-validation step after a transport-data advance: if the conn is now
-  /// settled and not yet validated, check whether it attested a stable `MemberId` (the
-  /// `Peer::Member` case from the `Labeled` handshake). If so, resolve the member to a slot via
-  /// `endpoint.slot_of`; if the member is not in the active membership, abort the conn; otherwise
-  /// bind via `router.note_established_member`. For non-`Member` handshake identities (raw
-  /// transports or a `Peer::Replica` slot claim), fall back to the router's transport-neutral
-  /// `note_established`.
+  /// settled and not yet validated, classify the handshake identity into one of three cases:
+  ///
+  /// - `Some(Peer::Member(m))` — resolve `m` to a slot via `endpoint.slot_of`; abort with
+  ///   `IdentityRejected` if the member is not in the active membership, otherwise bind via
+  ///   `router.note_established_member` (stores the stable `MemberId` for the reconcile pass).
+  /// - `Some(Peer::Client(_))` — fall through to the router's transport-neutral `note_established`;
+  ///   clients are not membership-tracked and must not be rejected here.
+  /// - `Some(Peer::Replica(_)) | None` — abort with `IdentityRejected`. A raw slot claim carries no
+  ///   stable `MemberId`, so the coordinator cannot reconcile it across a membership change: after a
+  ///   slot shift the stale binding would remain routable and bypass the reconciler entirely. A
+  ///   reconfiguration-capable coordinator therefore requires every replica conn to attest a stable
+  ///   `MemberId`; a slot-only claim is invalid at this level.
   fn try_note_established_member(&mut self, id: ConnId) {
     let (settled, hs_identity, validated, closed) = match self.router.conn(id) {
       Some(conn) => (
@@ -208,8 +214,13 @@ where
           self.router.note_established_member(id, m, slot);
         }
       },
-      _ => {
+      Some(Peer::Client(_)) => {
         self.router.note_established(id);
+      }
+      Some(Peer::Replica(_)) | None => {
+        if let Some(conn) = self.router.conn_mut(id) {
+          conn.abort(CloseCause::IdentityRejected);
+        }
       }
     }
   }
@@ -449,6 +460,21 @@ where
   #[cfg(test)]
   pub(crate) fn router_ref(&self) -> &PeerRouter<R> {
     &self.router
+  }
+
+  /// Mutable access to a single conn by id, for identity-seal tests that need to reset a
+  /// previously-validated conn back to the unvalidated/Handshaking state before driving
+  /// `try_note_established_member` directly.
+  #[cfg(test)]
+  pub(crate) fn conn_mut_for_test(&mut self, id: ConnId) -> Option<&mut Conn<R>> {
+    self.router.conn_mut(id)
+  }
+
+  /// Drives `try_note_established_member` directly for unit tests that need to exercise the
+  /// identity-seal logic without going through the full `handle_conn_data` decode path.
+  #[cfg(test)]
+  pub(crate) fn try_note_established_for_test(&mut self, id: ConnId) {
+    self.try_note_established_member(id);
   }
 
   /// Feeds one message through the inbound ingress (`deliver_inbound`, so the deliverable-body gate
@@ -918,6 +944,130 @@ mod tests {
       drained.map(|(id, _)| id),
       Some(standby),
       "poll_conn_transmit drains the response from the promoted standby"
+    );
+  }
+
+  // A settled conn whose handshake_identity is Peer::Replica(slot) is rejected with IdentityRejected
+  // and does NOT become a routing target. The coordinator requires every replica conn to attest a
+  // stable MemberId (via Peer::Member from the Labeled handshake) so the reconcile pass can close
+  // stale bindings on membership changes; a raw slot claim carries no stable id and bypasses that
+  // reconciliation.
+  #[test]
+  fn a_settled_replica_slot_claim_is_rejected_with_identity_rejected() {
+    use crate::transport::testutil::MockRecords;
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+    let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
+    let slot = ReplicaId::new(1);
+    // A settled MockRecords that reports Peer::Replica(slot) as its handshake identity.
+    // register_dialed auto-validates it via note_established (trusted as the registered peer), so
+    // reset it to unvalidated before calling try_note_established_member directly.
+    let id = coord.register_dialed(
+      Peer::Replica(slot),
+      Conn::from_parts(MockRecords::new(false, Some(Peer::Replica(slot)))),
+    );
+    assert!(
+      coord.is_conn_validated(id),
+      "auto-validated on register (raw settled conn)"
+    );
+    // Reset to unvalidated so try_note_established_member will re-classify the identity.
+    coord
+      .conn_mut_for_test(id)
+      .unwrap()
+      .reset_validated_for_test();
+    assert!(
+      !coord.is_conn_validated(id),
+      "reset to unvalidated before driving try_note_established_member"
+    );
+    // Drive the identity-seal: a Peer::Replica claim must be rejected.
+    coord.try_note_established_for_test(id);
+    assert!(
+      coord
+        .router_ref()
+        .conn(id)
+        .map(|c| c.is_closed())
+        .unwrap_or(true),
+      "a settled Peer::Replica claim is aborted by try_note_established_member"
+    );
+    assert!(
+      !coord.is_conn_validated(id),
+      "an aborted Peer::Replica conn is not validated (not a routing target)"
+    );
+  }
+
+  // A settled conn whose handshake_identity is None (raw transport, no identity claim) is also
+  // rejected by try_note_established_member — the coordinator-level seal, not the router's
+  // transport-neutral note_established, requires a stable MemberId for every replica conn.
+  #[test]
+  fn a_settled_none_identity_is_rejected_with_identity_rejected() {
+    use crate::transport::testutil::MockRecords;
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+    let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
+    let slot = ReplicaId::new(2);
+    // MockRecords with identity=None: register_accepted trusts the registered peer and auto-validates
+    // as Peer::Replica(slot). Reset to unvalidated so try_note_established_member re-classifies.
+    let id = coord.register_accepted(
+      Peer::Replica(slot),
+      Conn::from_parts(MockRecords::new(false, None)),
+    );
+    assert!(coord.is_conn_validated(id), "auto-validated on register");
+    coord
+      .conn_mut_for_test(id)
+      .unwrap()
+      .reset_validated_for_test();
+    coord.try_note_established_for_test(id);
+    assert!(
+      coord
+        .router_ref()
+        .conn(id)
+        .map(|c| c.is_closed())
+        .unwrap_or(true),
+      "a settled None-identity conn is aborted by try_note_established_member"
+    );
+    assert!(
+      !coord.is_conn_validated(id),
+      "an aborted None-identity conn is not validated (not a routing target)"
+    );
+  }
+
+  // A settled conn whose handshake_identity is Peer::Client is NOT rejected: clients are not
+  // membership-tracked and the transport-neutral note_established bind must be preserved. The conn
+  // is validated and becomes a routing target.
+  #[test]
+  fn a_settled_client_identity_is_preserved_and_not_rejected() {
+    use crate::transport::testutil::MockRecords;
+    let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+    let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
+    let cid = ClientId::new(0xDEAD_BEEF);
+    // A settled MockRecords that reports Peer::Client as its handshake identity.
+    let id = coord.register_accepted(
+      Peer::Client(cid),
+      Conn::from_parts(MockRecords::new(false, Some(Peer::Client(cid)))),
+    );
+    assert!(coord.is_conn_validated(id), "auto-validated on register");
+    // Reset to unvalidated and re-drive: the Client arm must NOT reject the conn.
+    coord
+      .conn_mut_for_test(id)
+      .unwrap()
+      .reset_validated_for_test();
+    coord.try_note_established_for_test(id);
+    // The conn must be validated (the Client arm calls note_established, not abort).
+    assert!(
+      coord.is_conn_validated(id),
+      "a Peer::Client conn is not rejected by try_note_established_member"
+    );
+    assert!(
+      coord
+        .router_ref()
+        .conn(id)
+        .map(|c| !c.is_closed())
+        .unwrap_or(false),
+      "a Peer::Client conn stays open after try_note_established_member"
     );
   }
 }
