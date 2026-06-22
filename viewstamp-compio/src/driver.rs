@@ -602,6 +602,17 @@ where
       }
       Command::AddPeer { member_id, addr } => {
         self.peer_book.insert(member_id, addr);
+        // If the added member is ALREADY in the live membership, the config install was observed
+        // before its address arrived, so `rekey_peers` skipped it (no address) and advanced
+        // `last_known_config_id`. Without forcing a rebuild here it would stay undialed until some
+        // later, unrelated membership change. Rebuild the dial list against the current config now —
+        // now that its address is known — so the now-present member is dialed immediately. Skipped for
+        // a member not yet in the membership (its dial is armed when the install lands) and for self.
+        if member_id != self.coord.endpoint().local()
+          && self.coord.endpoint().slot_of(member_id).is_some()
+        {
+          self.rekey_peers(now);
+        }
         false
       }
     }
