@@ -162,24 +162,6 @@ impl<R> PeerRouter<R> {
       .collect()
   }
 
-  /// Snapshot of `(routing slot, attested member)` for every VALIDATED conn that has a stored
-  /// attested member — the membership-reconcile pass's source set. Collected owned so the caller
-  /// can close a slot's conn (a disjoint `&mut` borrow) inside the iteration.
-  pub fn bound_validated_members(&self) -> Vec<(ReplicaId, MemberId)> {
-    self
-      .peers
-      .iter()
-      .filter_map(|(peer, conn_id)| {
-        let slot = match peer {
-          Peer::Replica(r) => *r,
-          _ => return None,
-        };
-        let member = self.conns.get(conn_id)?.attested_member?;
-        Some((slot, member))
-      })
-      .collect()
-  }
-
   /// A shared reference to a conn by handle.
   #[cfg_attr(not(tarpaulin), inline)]
   pub fn conn(&self, id: ConnId) -> Option<&Conn<R>> {
@@ -360,6 +342,22 @@ impl<R: StreamTransport> PeerRouter<R> {
   /// decide redial-vs-give-up.
   pub fn is_validated(&self, id: ConnId) -> bool {
     self.conns.get(&id).is_some_and(|e| e.conn.is_validated())
+  }
+
+  /// Snapshot of `(conn id, attested member, current bound routing peer)` for EVERY validated conn
+  /// that has a stored attested member — the membership-reconcile pass's source set. The walk is over
+  /// ALL conns, not just the authoritative routing target per slot, so a same-peer STANDBY (a second
+  /// validated conn last-established-wins had displaced) is included alongside the authoritative one.
+  /// The reconcile pass closes a stale/shifted member's conns BY ID, so a standby cannot be promoted
+  /// under the old slot after the authoritative one is reaped. Collected owned so the caller can close
+  /// a conn (a disjoint `&mut` borrow) inside the iteration.
+  pub fn validated_member_conns(&self) -> Vec<(ConnId, MemberId, Peer)> {
+    self
+      .conns
+      .iter()
+      .filter(|(_, e)| e.conn.is_validated())
+      .filter_map(|(id, e)| Some((*id, e.attested_member?, e.peer)))
+      .collect()
   }
 
   /// Routes one outgoing message. Encodes + frames it ONCE, then fans the shared bytes to each
@@ -688,6 +686,68 @@ mod tests {
       .unwrap();
     r.note_established_member(id, dialer_member, dialer_slot);
     id
+  }
+
+  #[test]
+  fn reconcile_closes_a_displaced_standby_by_id_so_it_cannot_be_promoted_stale() {
+    // Two validated conns for the SAME member (MemberId 1, bound at slot 1): the second to establish
+    // is authoritative, the first is a live STANDBY the last-established-wins rule displaced. This is
+    // exactly the standby-promotion hazard the membership reconcile must defeat.
+    let member = MemberId::new(1);
+    let mut r = PeerRouter::<Labeled<crate::Passthrough>>::new();
+    let standby = established_labeled(&mut r, MemberId::new(0), member);
+    let authoritative = established_labeled(&mut r, MemberId::new(0), member);
+    let slot1 = Peer::Replica(ReplicaId::new(1));
+    assert_eq!(
+      r.authoritative(slot1),
+      Some(authoritative),
+      "last-established wins; the first conn is a live standby"
+    );
+
+    // The reconcile snapshot walks EVERY validated conn (not just the authoritative one), so BOTH the
+    // authoritative conn and the displaced standby appear — keyed by their conn id, with the member
+    // and the slot they are currently bound to.
+    let snapshot = r.validated_member_conns();
+    assert_eq!(
+      snapshot.len(),
+      2,
+      "both validated conns are in the snapshot"
+    );
+    assert!(
+      snapshot
+        .iter()
+        .all(|(_, m, peer)| *m == member && *peer == slot1),
+      "both conns carry the same attested member and current slot-1 binding"
+    );
+
+    // Drive the coordinator's reconcile decision: member 1 SHIFTED from slot 1 to slot 2. The
+    // coordinator closes each conn whose bound slot != the member's new slot — BY ID, so the standby
+    // is closed too, not just the authoritative conn.
+    let new_slot = ReplicaId::new(2);
+    for (id, _m, bound_peer) in snapshot {
+      if Peer::Replica(new_slot) != bound_peer
+        && let Some(conn) = r.conn_mut(id)
+      {
+        conn.abort(CloseCause::IdentityRejected);
+      }
+    }
+    // The next pump reaps the closed conns. Because BOTH were closed, reap cannot promote the standby
+    // back under the stale slot 1 — the bug a close-only-the-authoritative reconcile would leave open.
+    r.reap_closed();
+    assert!(
+      r.conn(authoritative).is_none(),
+      "the authoritative conn is closed and reaped"
+    );
+    assert!(
+      r.conn(standby).is_none(),
+      "the displaced standby is also closed and reaped — it cannot be promoted under the stale slot"
+    );
+    assert_eq!(
+      r.authoritative(slot1),
+      None,
+      "no validated conn survives for the stale slot 1, so routing recovers (the member re-binds at \
+       slot 2 on its next handshake)"
+    );
   }
 
   #[test]

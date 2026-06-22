@@ -387,15 +387,22 @@ where
   /// stale slot table.
   ///
   /// Cheap by default: a scalar `config_id` compare short-circuits when the membership is unchanged, so
-  /// the member walk runs only on the rare pass that installed a new config. A stream conn now attests
+  /// the conn walk runs only on the rare pass that installed a new config. A stream conn now attests
   /// its STABLE [`MemberId`](crate::MemberId) (the `Labeled` handshake carries `Peer::Member`, which the
   /// coordinator bound to a slot via `endpoint.slot_of` at establishment), so the reconcile re-resolves
-  /// each bound conn's attested member against the NEW membership: a member that is gone (`slot_of`
-  /// returns `None`) or now lives at a DIFFERENT slot has its stale conn closed via
-  /// [`Self::close_peer_by_slot`]. Resolving the stable id is exact across a slot shift — the conn that
+  /// each VALIDATED conn's attested member against the NEW membership: a member that is gone (`slot_of`
+  /// returns `None`) or now lives at a DIFFERENT slot than the conn is bound to has THAT conn closed via
+  /// [`Self::close_conn_by_id`]. Resolving the stable id is exact across a slot shift — a conn that
   /// stays at the same slot is left untouched, and a member that merely moved is closed so it re-binds
   /// under its new slot on the next handshake — rather than diffing slot occupants between two
   /// membership snapshots.
+  ///
+  /// The walk is over EVERY validated conn (`router.validated_member_conns`), NOT just the authoritative
+  /// routing target per slot, so a same-peer STANDBY (a second validated conn the last-established-wins
+  /// rule had displaced) is closed too. Closing it by ID is load-bearing: closing only the authoritative
+  /// conn would leave a stale standby that the next pump's `reap` could PROMOTE under the old slot —
+  /// without rechecking its attested member, and with `last_reconciled_config_id` already advanced — so
+  /// it would stay routable for the current config and blackhole `To(slot)`/fanout after a slot shift.
   ///
   /// Safety is unchanged: this retires only ROUTING. A stale-epoch frame arriving on a not-yet-closed
   /// conn is still dropped by the endpoint's `sender_matches` / `epoch_authority_admits` ingress gates.
@@ -404,23 +411,25 @@ where
     if current == self.last_reconciled_config_id {
       return;
     }
-    for (bound_slot, member) in self.router.bound_validated_members() {
+    for (id, member, bound_peer) in self.router.validated_member_conns() {
       match self.endpoint.slot_of(member) {
-        None => self.close_peer_by_slot(bound_slot),
-        Some(new_slot) if new_slot != bound_slot => self.close_peer_by_slot(bound_slot),
+        // Removed (or for a member outside the new config): close this conn so it leaves routing.
+        None => self.close_conn_by_id(id),
+        // Shifted to a different slot than this conn is bound to: close so it re-binds under the new
+        // slot on its next handshake (and so a displaced standby cannot be promoted under the old slot).
+        Some(new_slot) if crate::Peer::Replica(new_slot) != bound_peer => self.close_conn_by_id(id),
+        // Slot unchanged: leave the conn bound (no churn for an unmoved retained member).
         Some(_) => {}
       }
     }
     self.last_reconciled_config_id = current;
   }
 
-  /// Close the authoritative connection for `Peer::Replica(slot)` if one exists, so the peer can
-  /// reconnect after a membership shift moves a member to a different slot. A no-op when no
-  /// authoritative conn is bound for that slot.
-  pub fn close_peer_by_slot(&mut self, slot: crate::ReplicaId) {
-    if let Some(id) = self.router.authoritative(crate::Peer::Replica(slot))
-      && let Some(conn) = self.router.conn_mut(id)
-    {
+  /// Close a specific conn by [`ConnId`], so a stale/shifted member's conn — authoritative OR a
+  /// displaced same-peer standby — leaves routing and cannot be promoted under its old slot. A no-op
+  /// when the id is unknown.
+  pub fn close_conn_by_id(&mut self, id: ConnId) {
+    if let Some(conn) = self.router.conn_mut(id) {
       conn.abort(CloseCause::IdentityRejected);
     }
   }
