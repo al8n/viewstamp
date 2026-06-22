@@ -296,6 +296,19 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     std_base + Duration::from_nanos(now.saturating_duration_since(vsr_base).as_nanos() as u64)
   }
 
+  /// Resolve the SNI server name for dialing `slot`: the cert SAN is keyed to the stable
+  /// [`MemberId`], so the dial MUST present that id, not the routing slot. When `slot` resolves to
+  /// a `MemberId` in the active membership, `Peer::Member(id)` is passed to [`sni_for`]; when it
+  /// does not (a dial before the first membership install, where genesis makes slot == MemberId),
+  /// `Peer::Replica(slot)` is the fallback — the two produce identical output by genesis convention.
+  fn sni_for_slot(&self, slot: ReplicaId) -> String {
+    let peer = match self.endpoint.member_at(slot) {
+      Some(m) => Peer::Member(m),
+      None => Peer::Replica(slot),
+    };
+    sni_for(peer, self.cluster())
+  }
+
   /// Dial the replica `expected` at `remote`. The dial records `expected` as the connection's
   /// expectation (the binding policy later requires the authenticated identity to match it).
   ///
@@ -320,22 +333,25 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     remote: SocketAddr,
     expected: Peer,
   ) -> Result<(), DialError> {
-    // Derive SNI from the stable MemberId, not the routing slot. When `expected` is a replica
-    // slot, resolve it to the stable MemberId via the active membership so the SNI matches the
-    // cert SAN even after a reconfiguration that renumbers slots.
-    let sni_peer = match expected {
-      Peer::Replica(slot) => match self.endpoint.member_at(slot) {
-        Some(m) => Peer::Member(m),
-        None => Peer::Replica(slot),
-      },
-      other => other,
+    let server_name = match expected {
+      Peer::Replica(slot) => self.sni_for_slot(slot),
+      other => sni_for(other, self.cluster()),
     };
-    let server_name = sni_for(sni_peer, self.cluster());
     let std_now = self.quinn_now(now);
     self
       .bridge
       .connect(std_now, remote, &server_name, expected)?;
     Ok(())
+  }
+
+  /// The SNI server name `connect` would present for `slot` — the stable-MemberId form
+  /// (`replica-<MemberId>.<cluster-hex>.viewstamp`) when the slot resolves in the active
+  /// membership, or the slot-keyed form for a pre-install dial where slot == MemberId by genesis.
+  /// Test-only: used by the dial-SNI regression to assert the correct form without performing a
+  /// real dial.
+  #[cfg(test)]
+  pub(crate) fn dial_sni_for_slot_for_test(&self, slot: ReplicaId) -> String {
+    self.sni_for_slot(slot)
   }
 
   /// Feed one inbound UDP datagram from `remote` into the QUIC stack, then drain the bridge's
@@ -1402,6 +1418,65 @@ mod tests {
       c.endpoint().op().get(),
       1,
       "and it IS served: one op appended (the gate admits exactly the max)"
+    );
+  }
+
+  /// `connect` derives the QUIC SNI from the dialed slot's STABLE `MemberId`, not the slot number
+  /// itself. The cert SAN is `replica-<MemberId>.<cluster-hex>.viewstamp`; if the SNI were
+  /// slot-keyed (`replica-<slot>.<cluster-hex>.viewstamp`) then any reconfiguration that shifts a
+  /// retained member to a new slot would produce a mismatch between the dial's SNI and the server's
+  /// SAN, causing TLS verification to fail.
+  ///
+  /// This test constructs a membership where `MemberId(2)` occupies slot 1 (member 1 was removed
+  /// and member 2 filled the vacated slot), then reads the SNI `connect` would present for slot 1
+  /// through `dial_sni_for_slot_for_test`.
+  ///
+  /// PRE-FIX FAILURE CONFIRMATION: the old slot-keyed path would call
+  /// `sni_for(Peer::Replica(slot), cluster)`, producing `replica-1.<cluster-hex>.viewstamp`.
+  /// The test asserts this string is NOT what the fixed code returns, demonstrating it would have
+  /// mismatch the `replica-2.<cluster-hex>.viewstamp` SAN on the server cert and been rejected by
+  /// TLS. The fixed code's output, `replica-2.<cluster-hex>.viewstamp`, matches the cert SAN.
+  #[test]
+  fn dial_sni_is_keyed_to_the_stable_member_id_not_the_routing_slot() {
+    use crate::{Epoch, Membership};
+
+    let cluster = 0x1234_5678_u128;
+
+    // A 2-voter membership after a slot shift: MemberId(0) at slot 0, MemberId(2) at slot 1.
+    // Member 1 was removed; member 2 filled the vacated slot 1. config_id = 0 (test convention).
+    let shifted_membership = Membership::from_durable_parts(
+      Epoch::new(1),
+      2,
+      0,
+      vec![MemberId::new(0), MemberId::new(2)],
+      0,
+    )
+    .expect("valid 2-voter membership");
+
+    let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
+    let c = QuicCoordinator::with_identity(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, shifted_membership, 1, CountSm::default()),
+      mtls_opts(cluster),
+      Some([0u8; 32]),
+      IdentityConfig::Hello { cluster },
+    );
+
+    // The SNI the fixed `connect` presents for slot 1: stable MemberId(2) form.
+    let fixed_sni = c.dial_sni_for_slot_for_test(ReplicaId::new(1));
+    let expected_sni = format!("replica-2.{cluster:032x}.viewstamp");
+    assert_eq!(
+      fixed_sni, expected_sni,
+      "the dial SNI for slot 1 must use the stable MemberId(2), not the slot number 1"
+    );
+
+    // PRE-FIX: the slot-keyed SNI the old code would have sent. The cert SAN is
+    // `replica-2.<cluster>.viewstamp`; this slot-keyed form does not match it, so TLS would reject
+    // the connection. The two strings being different is the proof that the fix matters.
+    let pre_fix_sni = sni_for(Peer::Replica(ReplicaId::new(1)), cluster);
+    assert_ne!(
+      fixed_sni, pre_fix_sni,
+      "the fixed (MemberId-keyed) SNI must differ from the pre-fix (slot-keyed) SNI after a slot \
+       shift: the pre-fix SNI would mismatch the cert SAN and be rejected by TLS"
     );
   }
 }
