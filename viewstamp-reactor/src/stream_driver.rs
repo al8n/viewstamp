@@ -941,7 +941,14 @@ where
   /// Tear down a connection the proto/socket/queue has lost: one `remove` drops the [`Conn`], whose
   /// [`AbortOnDrop`] handle(s) abort its live task(s) (the dial task OR both bridge halves) and
   /// whose `out_tx` drops; then reap it in the coordinator (eof) and, if it was a DIALED conn,
-  /// redial the peer/addr held in [`Conn::redial`].
+  /// redial the peer/addr held in [`Conn::redial`] — but ONLY when `peer_addrs` still maps the slot
+  /// to the same address, meaning the member is still present at that slot in the live membership.
+  ///
+  /// The `peer_addrs` gate is the membership-change safety property: `rekey_peers` rebuilds
+  /// `peer_addrs` from the live membership on every config install, so after a removal the slot is
+  /// absent and after an address shift the old address no longer matches. A redial suppressed here
+  /// is not lost — `rekey_peers` already issued the new-slot dial for a shifted member, and a
+  /// removed member must not be redialed at all.
   ///
   /// Shared by the bridge-EOF/Error path (the signalling half has already exited; the drop aborts the
   /// other half and discards the finished task's handle), the dial-failure path (drops the finished
@@ -962,18 +969,24 @@ where
       ..
     }) = removed
     {
-      // Exponential per-peer redial backoff: this redial waits the lost conn's carried (jittered)
-      // backoff, and the replacement conn carries the doubled value (capped) for the NEXT loss — so
-      // an unreachable/RST-fast peer is probed at a decaying cadence (200ms → … → 5s) instead of a
-      // fixed-rate hammer, and the jitter decorrelates dialers after a common-mode loss. Validation
-      // resets the base (see `reconcile_auth_deadlines`); retries never stop, because a configured
-      // consensus peer may always return.
-      self.dial_peer(
-        redial.peer,
-        redial.addr,
-        jittered(redial.backoff),
-        (redial.backoff * 2).min(self.cfg.redial_backoff_cap()),
-      );
+      // Gate on the live dial table: only redial when `peer_addrs` still maps this slot to the
+      // same address. A removed member's slot is absent after `rekey_peers`; a shifted member's
+      // slot has a new address (its new-slot dial was already issued by `rekey_peers`). Either way,
+      // suppressing here stops stale redials from outliving membership changes.
+      if self.peer_addrs.get(&redial.peer) == Some(&redial.addr) {
+        // Exponential per-peer redial backoff: this redial waits the lost conn's carried (jittered)
+        // backoff, and the replacement conn carries the doubled value (capped) for the NEXT loss — so
+        // an unreachable/RST-fast peer is probed at a decaying cadence (200ms → … → 5s) instead of a
+        // fixed-rate hammer, and the jitter decorrelates dialers after a common-mode loss. Validation
+        // resets the base (see `reconcile_auth_deadlines`); retries never stop, because a configured
+        // consensus peer may always return.
+        self.dial_peer(
+          redial.peer,
+          redial.addr,
+          jittered(redial.backoff),
+          (redial.backoff * 2).min(self.cfg.redial_backoff_cap()),
+        );
+      }
     }
   }
 
@@ -1608,6 +1621,9 @@ mod tests {
   async fn consecutive_redials_back_off_exponentially_to_the_cap() {
     let mut driver = test_driver().await;
     let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    // Seed `peer_addrs` so the `close_conn` gate sees slot 1 as live (the backoff schedule must
+    // not be suppressed by the membership gate — we're testing a RETAINED, active peer).
+    driver.peer_addrs.insert(ReplicaId::new(1), addr);
     driver.dial_peer(
       ReplicaId::new(1),
       addr,
@@ -2688,5 +2704,105 @@ mod tests {
     }
     handle.shutdown().await.expect("driver acks shutdown");
     task.await.expect("run() returns after the ack");
+  }
+
+  /// REMOVED-MEMBER REDIAL SUPPRESSION: when a member is removed from the membership and the
+  /// coordinator closes its stale dialed conn, `close_conn` must NOT redial it. The mechanism is
+  /// the `peer_addrs` gate in `close_conn`: after `rekey_peers` rebuilds the dial table without the
+  /// removed slot, the slot is absent from `peer_addrs`, so the gate suppresses the redial.
+  ///
+  /// This is the regression for the R6 transport-reconciliation class: the unconditional redial
+  /// let a removed member's conn be re-opened after the coordinator closed it, defeating
+  /// `reconcile_routing`.
+  #[tokio::test]
+  async fn removed_member_is_not_redialed_after_coordinator_close() {
+    let mut driver = test_driver().await;
+    let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+    // Simulate the state right after a config install that removed slot 1: `peer_addrs` no
+    // longer contains the slot (as `rekey_peers` would leave it), but there is a live dialed
+    // conn for slot 1 with a `Redial` entry (as there would be from an earlier dial).
+    driver.dial_peer(
+      ReplicaId::new(1),
+      addr,
+      Duration::ZERO,
+      viewstamp_driver::REDIAL_BACKOFF_BASE,
+    );
+    let id = *driver.conns.keys().next().expect("one dialed conn");
+
+    // Remove the slot from `peer_addrs` as `rekey_peers` would after a membership change that
+    // dropped slot 1.
+    driver.peer_addrs.remove(&ReplicaId::new(1));
+
+    // The coordinator closes the stale conn (the reconcile path).
+    driver.close_conn(id, viewstamp_proto::Instant::ZERO);
+
+    // The conn was torn down.
+    assert!(
+      !driver.conns.contains_key(&id),
+      "the closed conn is removed from conns"
+    );
+    // No redial was issued: `peer_addrs` was empty for that slot, so `close_conn` suppressed it.
+    assert!(
+      driver.conns.is_empty(),
+      "no new dialed conn was created — the removed member is not redialed"
+    );
+  }
+
+  /// SHIFTED-MEMBER REDIAL SUPPRESSION: when a member's address changes (slot shift / re-key),
+  /// `close_conn` on the OLD-address conn must NOT redial the old address. The `peer_addrs` gate
+  /// sees the slot mapped to the NEW address, which does not match the stored `Redial::addr`, so
+  /// the redial is suppressed. The new-slot dial was already issued by `rekey_peers`.
+  #[tokio::test]
+  async fn shifted_member_old_address_is_not_redialed_after_coordinator_close() {
+    let mut driver = test_driver().await;
+    let old_addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let new_addr: std::net::SocketAddr = "127.0.0.2:9".parse().unwrap();
+
+    // A dialed conn to slot 1 at the OLD address.
+    driver.dial_peer(
+      ReplicaId::new(1),
+      old_addr,
+      Duration::ZERO,
+      viewstamp_driver::REDIAL_BACKOFF_BASE,
+    );
+    let old_id = *driver.conns.keys().next().expect("one dialed conn");
+
+    // `rekey_peers` ran and already issued a dial to slot 1 at the NEW address.
+    driver.dial_peer(
+      ReplicaId::new(1),
+      new_addr,
+      Duration::ZERO,
+      viewstamp_driver::REDIAL_BACKOFF_BASE,
+    );
+    // `peer_addrs` now records the NEW address for the slot (as `rekey_peers` would leave it).
+    driver.peer_addrs.insert(ReplicaId::new(1), new_addr);
+
+    assert_eq!(driver.conns.len(), 2, "two dialed conns: old and new slot");
+
+    // The coordinator closes the old-address conn.
+    driver.close_conn(old_id, viewstamp_proto::Instant::ZERO);
+
+    // The old conn was torn down and no THIRD conn was added (the old address was not redialed).
+    assert!(
+      !driver.conns.contains_key(&old_id),
+      "the old-address conn is removed"
+    );
+    assert_eq!(
+      driver.conns.len(),
+      1,
+      "exactly one conn remains (the new-address dial); the old address was NOT redialed"
+    );
+    // The surviving conn is the new-address one.
+    let surviving_redial = driver
+      .conns
+      .values()
+      .next()
+      .and_then(|c| c.redial)
+      .expect("the surviving conn has a redial entry");
+    assert_eq!(
+      surviving_redial.addr, new_addr,
+      "the surviving dial targets the new address"
+    );
   }
 }
