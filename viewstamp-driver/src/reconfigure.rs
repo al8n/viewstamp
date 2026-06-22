@@ -462,7 +462,7 @@ impl ReconfigureBackend for LoopBackend {
       let (tx, rx) = futures_channel::oneshot::channel();
       {
         // One critical section: assert the slot is drained, then post.
-        // A chunk-C driver that polls without first calling take_proposal() would
+        // A driver that polls without first calling take_proposal() would
         // silently overwrite and orphan the prior oneshot; this catches that in debug.
         let mut slot = self.proposal.lock().unwrap_or_else(|e| e.into_inner());
         debug_assert!(
@@ -957,7 +957,7 @@ mod tests {
     })
   }
 
-  // ── T5 regression tests (pre-existing) ───────────────────────────────────
+  // ── progress and error type tests ───────────────────────────────────
 
   #[test]
   fn health_hint_default_is_empty() {
@@ -1005,7 +1005,7 @@ mod tests {
     }
   }
 
-  // ── T6 executor tests ─────────────────────────────────────────────────────
+  // ── executor convergence tests ─────────────────────────────────────────────────────
 
   #[test]
   fn grow_converges_add_one_replica() {
@@ -1503,7 +1503,7 @@ mod tests {
     );
   }
 
-  // ── FIX 1 tests: advance-level deadline hard-cancel ──────────────────────
+  // ── advance-level deadline hard-cancel tests ──────────────────────
 
   /// The deadline hard-cancels at the advance level even when the executor future is stuck in a
   /// Retry loop. With `reconfigure_timeout = Duration::ZERO` the deadline fires on the FIRST
@@ -1606,7 +1606,7 @@ mod tests {
     );
   }
 
-  // ── FIX 2 test: self-removal ranked last ─────────────────────────────────
+  // ── self-removal ranked-last test ─────────────────────────────────
 
   /// When both the local node and a peer are valid removal candidates (both have surviving
   /// confirmed quorums after their removal), the peer is picked first. This prevents the driver

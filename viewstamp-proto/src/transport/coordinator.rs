@@ -971,8 +971,8 @@ mod tests {
   }
 
   // A settled conn whose handshake_identity is Peer::Replica(slot) is NOT auto-validated on
-  // register and is rejected by try_note_established_member. The seal requires every replica conn to
-  // attest a stable MemberId (via Peer::Member) so reconcile_routing can close stale bindings on
+  // register and is rejected by try_note_established_member. The coordinator requires every replica
+  // conn to attest a stable MemberId (via Peer::Member) so reconcile_routing can close stale bindings on
   // membership changes; a raw slot claim carries no stable id and would bypass reconciliation.
   // This test drives the production shape WITHOUT reset_validated_for_test: the conn is never
   // auto-validated because note_established blocks Peer::Replica identities at the router level.
@@ -1120,7 +1120,7 @@ mod tests {
       !coord.is_conn_validated(id),
       "a Peer::Member conn is not auto-validated on register (handshake identity, not a routing key)"
     );
-    // Drive the seal: the local-member guard must abort before slot_of is called.
+    // Drive validation: the local-member guard must abort before slot_of is called.
     coord.try_note_established_for_test(id);
     assert!(
       coord
