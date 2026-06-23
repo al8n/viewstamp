@@ -50,9 +50,9 @@
 //! HOL-isolation property would require a bandwidth / window-pressure model in the virtual network,
 //! which is out of scope for a behavioral convergence sim and left as a documented gap.
 
-use core::time::Duration;
+use core::{net::SocketAddr, time::Duration};
 
-use std::{collections::VecDeque, net::SocketAddr};
+use std::collections::VecDeque;
 
 use bytes::Bytes;
 

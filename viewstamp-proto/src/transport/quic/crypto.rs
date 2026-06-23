@@ -25,7 +25,9 @@
 //! [`ClusterTls::tuning`]; the security-relevant construction (roots, mTLS,
 //! TLS 1.3, ALPN) is not tunable.
 
-use std::{sync::Arc, time::Duration};
+use core::time::Duration;
+
+use std::sync::Arc;
 
 use quinn_proto::{
   ClientConfig, EndpointConfig, IdleTimeout, ServerConfig, TransportConfig, VarInt,
