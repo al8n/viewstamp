@@ -32,7 +32,7 @@ jobs:
     name: vopr (release, wide seed sweep)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
@@ -60,7 +60,7 @@ jobs:
     name: simulation suite (release, full)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
@@ -80,7 +80,7 @@ jobs:
     name: vopr (release, wide seed sweep, hold axis on)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
