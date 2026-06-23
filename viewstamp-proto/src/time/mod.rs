@@ -48,11 +48,16 @@ impl Instant {
     }
   }
 
-  /// `self + d`, or `None` on overflow of the underlying [`Duration`].
+  /// `self + d`, or `None` if the result would exceed `u64::MAX` nanoseconds
+  /// since the epoch (the representable range — the same ceiling the prior
+  /// `u64`-nanosecond representation enforced).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checked_add(self, d: Duration) -> Option<Self> {
     match self.0.checked_add(d) {
-      Some(d) => Some(Self(d)),
+      Some(sum) => match sum.as_nanos() > u64::MAX as u128 {
+        true => None,
+        false => Some(Self(sum)),
+      },
       None => None,
     }
   }
@@ -61,10 +66,15 @@ impl Instant {
 impl core::ops::Add<Duration> for Instant {
   type Output = Self;
 
-  /// Saturating add (never panics; clamps at [`Duration::MAX`]).
+  /// Saturating add (never panics; clamps at `u64::MAX` nanoseconds since the
+  /// epoch — the same ceiling the prior `u64`-nanosecond representation enforced).
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn add(self, d: Duration) -> Self {
-    Self(self.0.saturating_add(d))
+    let sum = self.0.saturating_add(d);
+    match sum.as_nanos() > u64::MAX as u128 {
+      true => Self(Duration::from_nanos(u64::MAX)),
+      false => Self(sum),
+    }
   }
 }
 
