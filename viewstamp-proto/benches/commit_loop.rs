@@ -309,6 +309,11 @@ where
                 }
               }
             }
+            Recipient::To(Peer::Member(_)) => {
+              unreachable!(
+                "the endpoint routes by Replica slot; Member is a transport-layer identity"
+              )
+            }
             Recipient::Backups => {
               for t in 0..REPLICAS {
                 if t != i {
