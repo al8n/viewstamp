@@ -93,7 +93,7 @@ fn classify_committed_slot(
 /// recover (the same reason [`Result`] does not box its `Ok`).
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum Recovered<S, R: Reconfig = RestartOnly> {
+pub enum Recovered<S, R = RestartOnly> {
   /// This node occupies a slot in the recovered membership — a recovering [`Endpoint`] resuming the
   /// durable view in [`Status::Recovering`].
   Active(Endpoint<S, R>),
@@ -113,7 +113,7 @@ pub struct Retired {
   epoch: Epoch,
 }
 
-impl<S, R: Reconfig> Recovered<S, R> {
+impl<S, R> Recovered<S, R> {
   /// Unwraps the [`Recovered::Active`] endpoint, panicking on [`Recovered::Retired`]. Test-only: the
   /// fixtures always recover a present member, so they assert presence by construction.
   #[cfg(test)]

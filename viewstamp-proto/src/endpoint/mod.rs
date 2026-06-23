@@ -968,7 +968,7 @@ impl TimerKind {
 /// The exit-time `assert_invariants` backstops the `(status × sub-state-flag)` coupling that these
 /// members assume, so any future drift trips deterministically across the suite + the VOPR sweep.
 #[derive(Debug)]
-pub struct Endpoint<S, R: Reconfig = RestartOnly> {
+pub struct Endpoint<S, R = RestartOnly> {
   config: Config,
   /// The active, epoch-versioned cluster configuration: who votes, who leads, the quorum sizes, and
   /// this node's slot. The single source of truth for quorum/primary/voter decisions (the static
@@ -1385,7 +1385,7 @@ impl<S> Endpoint<S, RestartOnly> {
   }
 }
 
-impl<S, R: Reconfig> Endpoint<S, R> {
+impl<S, R> Endpoint<S, R> {
   /// Creates a fresh endpoint under an EXPLICIT reconfiguration capability marker `R`, in
   /// `Status::Normal`, view 0, for the genesis `membership`.
   ///
@@ -1872,6 +1872,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     sb: &mut impl Superblock,
   ) where
     S: StateMachine,
+    R: Reconfig,
   {
     // DEFENSE IN DEPTH, ENFORCED IN RELEASE: never overwrite an already-staged successor. `propose_membership`
     // refuses a second change while a swap is outstanding (`has_pending_reconfigure`), so the
@@ -1963,6 +1964,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
   fn maybe_swap_epoch(&mut self, sb: &mut impl Superblock)
   where
     S: StateMachine,
+    R: Reconfig,
   {
     // STALE-SWAP GUARD (correct-by-construction): a staged swap installs ONLY if its successor still
     // chains from the LIVE configuration. The successor's `config_id` is `hash(successor parts,
@@ -2018,6 +2020,7 @@ impl<S, R: Reconfig> Endpoint<S, R> {
     sb: &mut impl Superblock,
   ) where
     S: StateMachine,
+    R: Reconfig,
   {
     let checkpoint_id = sb.state().checkpoint_id();
     // The lineage this root carries is the POST-swap ring: the predecessor `config_id` (the current
@@ -3941,7 +3944,8 @@ impl<S, R: Reconfig> Endpoint<S, R> {
 /// The state-machine-driving operations: the `handle_*` ingress/timeout/storage entry points and the
 /// poll/timer machinery they reach. These transitively invoke `S::apply`/`snapshot`/`restore` (via the
 /// submodule consensus methods), so — per the method-local-bounds rule — they carry `S: StateMachine`
-/// here, while the pure accessors/observers above stay unconstrained (callable on any `Endpoint<S>`).
+/// and `R: Reconfig` here, while the pure accessors/observers above are unconstrained (callable on
+/// any `Endpoint<S, R>`).
 impl<S, R> Endpoint<S, R>
 where
   S: StateMachine,
