@@ -46,11 +46,9 @@
 //! The `Bridge` works natively in [`std::time::Instant`] — quinn's time
 //! currency. The viewstamp-time adapter lives one layer up (the coordinator).
 
-use std::{
-  collections::VecDeque,
-  net::SocketAddr,
-  time::{Duration, Instant},
-};
+use core::{net::SocketAddr, time::Duration};
+
+use std::{collections::VecDeque, time::Instant};
 
 use quinn_proto::{
   ClientConfig, ConnectError, ConnectionHandle, DatagramEvent, Dir, EcnCodepoint, Endpoint,
@@ -2345,8 +2343,8 @@ mod tests {
       },
     },
   };
+  use core::time::Duration;
   use quinn_proto::{Dir, StreamId};
-  use std::time::Duration;
 
   /// `transmit_segments` reproduces quinn's GSO segment layout exactly: full `segment_size` chunks
   /// with one possibly-shorter tail, a single chunk when `segment_size >= len`, no chunks for empty

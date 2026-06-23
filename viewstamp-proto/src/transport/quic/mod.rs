@@ -22,7 +22,7 @@ pub use identity::{
 };
 pub use layout::StreamLayout;
 
-use std::{net::SocketAddr, time::Duration};
+use core::{net::SocketAddr, time::Duration};
 
 use quinn_proto::{ConnectionHandle, EcnCodepoint};
 
