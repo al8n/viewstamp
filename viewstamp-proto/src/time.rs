@@ -2,14 +2,13 @@
 
 use core::time::Duration;
 
-/// A monotonic instant, measured in nanoseconds since a driver-chosen epoch.
+/// A monotonic instant, held as a [`Duration`] since a driver-chosen epoch.
 ///
 /// The Sans-I/O core never reads a clock; the driver supplies `now` and converts
-/// to/from its real clock at the boundary. `u64` nanoseconds spans ~584 years —
-/// ample for monotonic elapsed time — and serializes compactly onto the wire.
+/// to/from its real clock at the boundary. Wrapping a [`core::time::Duration`]
+/// (rather than a `std::time::Instant`) keeps the type usable on `no_std` targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct Instant(u64);
+pub struct Instant(Duration);
 
 impl Default for Instant {
   /// The zero instant (epoch) — delegates to [`Instant::ZERO`].
@@ -21,36 +20,40 @@ impl Default for Instant {
 
 impl Instant {
   /// The zero instant (epoch).
-  pub const ZERO: Self = Self(0);
+  pub const ZERO: Self = Self(Duration::ZERO);
 
   /// Creates an instant from nanoseconds since the epoch.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn from_nanos(nanos: u64) -> Self {
-    Self(nanos)
+    Self(Duration::from_nanos(nanos))
   }
 
-  /// Nanoseconds since the epoch.
+  /// Nanoseconds since the epoch, saturating at `u64::MAX`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn as_nanos(self) -> u64 {
-    self.0
+    let nanos = self.0.as_nanos();
+    match nanos > u64::MAX as u128 {
+      true => u64::MAX,
+      false => nanos as u64,
+    }
   }
 
   /// The duration elapsed from `earlier` to `self`, saturating at zero if
   /// `earlier` is later than `self`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn saturating_duration_since(self, earlier: Self) -> Duration {
-    Duration::from_nanos(self.0.saturating_sub(earlier.0))
+    match self.0.checked_sub(earlier.0) {
+      Some(d) => d,
+      None => Duration::ZERO,
+    }
   }
 
-  /// `self + d`, or `None` on overflow.
+  /// `self + d`, or `None` on overflow of the underlying [`Duration`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checked_add(self, d: Duration) -> Option<Self> {
-    match d.as_nanos() > (u64::MAX as u128) {
-      true => None,
-      false => match self.0.checked_add(d.as_nanos() as u64) {
-        Some(n) => Some(Self(n)),
-        None => None,
-      },
+    match self.0.checked_add(d) {
+      Some(d) => Some(Self(d)),
+      None => None,
     }
   }
 }
@@ -58,11 +61,10 @@ impl Instant {
 impl core::ops::Add<Duration> for Instant {
   type Output = Self;
 
-  /// Saturating add (never panics; clamps at `u64::MAX` nanos).
+  /// Saturating add (never panics; clamps at [`Duration::MAX`]).
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn add(self, d: Duration) -> Self {
-    let add = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-    Self(self.0.saturating_add(add))
+    Self(self.0.saturating_add(d))
   }
 }
 
