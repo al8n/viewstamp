@@ -1402,7 +1402,10 @@ impl<S, R> Endpoint<S, R> {
   /// derived deterministically from it, so a process restarted with a reused seed re-mints the same
   /// nonce and a delayed response to the previous incarnation passes the freshness checks. See
   /// [`Self::recover`] (where the hazard is concrete) for the full contract.
-  pub fn with_reconfig(config: Config, membership: Membership, seed: u64, sm: S) -> Self {
+  pub fn with_reconfig(config: Config, membership: Membership, seed: u64, sm: S) -> Self
+  where
+    R: Reconfig,
+  {
     // A construction PRECONDITION enforced in RELEASE too (not merely debug): a fresh endpoint's local
     // member MUST occupy a slot in its own membership. `local_slot()` — used by `replica()`, the
     // timers, the ingress path, and the coordinator pump — resolves it via `slot_of` and would
