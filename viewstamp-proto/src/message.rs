@@ -1164,7 +1164,7 @@ impl Body {
   /// [`Repairing`](Body::Repairing) slot. The predicate companion of [`body_bytes`](Self::body_bytes) for
   /// the call sites that only need to SKIP a header-only hole, not extract its bytes.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn is_body_bearing(&self) -> bool {
+  pub const fn is_body_bearing(&self) -> bool {
     !self.is_repairing()
   }
 
