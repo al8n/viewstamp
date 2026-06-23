@@ -468,7 +468,7 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
         .filter_map(|s| c.replica_member_at(p, s))
         .collect()
     };
-    if live_voters == target.voters {
+    if live_voters == *target.voters() {
       break 'outer;
     }
     let plan = plan_reconfiguration(&c.serving_primary_membership(), &target)

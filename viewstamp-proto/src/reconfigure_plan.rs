@@ -29,15 +29,25 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipTarget {
   /// The target VOTING set.
-  pub voters: BTreeSet<MemberId>,
+  voters: BTreeSet<MemberId>,
   /// The target non-voting LEARNER set. MUST be disjoint from `voters`.
-  pub learners: BTreeSet<MemberId>,
+  learners: BTreeSet<MemberId>,
 }
 
 impl MembershipTarget {
   /// A target from its voter and learner sets.
   pub fn new(voters: BTreeSet<MemberId>, learners: BTreeSet<MemberId>) -> Self {
     Self { voters, learners }
+  }
+
+  /// The target VOTING set.
+  pub const fn voters(&self) -> &BTreeSet<MemberId> {
+    &self.voters
+  }
+
+  /// The target non-voting LEARNER set.
+  pub const fn learners(&self) -> &BTreeSet<MemberId> {
+    &self.learners
   }
 
   /// Whether `voters` and `learners` are disjoint — the structural well-formedness an overlapping
@@ -149,8 +159,8 @@ pub fn plan_reconfiguration(
   target: &MembershipTarget,
 ) -> Result<Vec<SingleVoterDelta>, PlanError> {
   let (vc, lc) = voter_learner_sets(current);
-  let vt = &target.voters;
-  let lt = &target.learners;
+  let vt = target.voters();
+  let lt = target.learners();
 
   // PREFLIGHT set-only admission (overlap → empty → demotion → oversize → voter-union peak).
   if !vt.is_disjoint(lt) {
