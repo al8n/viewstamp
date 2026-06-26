@@ -34,10 +34,30 @@ use std::{net::SocketAddr, rc::Rc};
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Config, Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer,
-  ReplicaId, Superblock, Wal,
+  BlockAddress, BlockStore, ClientId, Config, Conn, LabelOptions, Labeled, MemberId, Membership,
+  Passthrough, Peer, ReplicaId, Superblock, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
+
+/// A throwaway in-memory [`BlockStore`] for the example: the proto's own `MemBlockStore` is
+/// crate-private, so each driver instance owns one of these for its state-machine checkpoint blocks
+/// (one per replica, persisting for that replica's lifetime, parallel to its superblock). A
+/// production store must be PERSISTENT with a real `flush` (`fsync`/barrier) — the default `flush` is
+/// `Ok(())`, fine here because in-memory blocks are durable for a process that never crashes.
+#[derive(Default)]
+struct MemBlocks(std::collections::HashMap<BlockAddress, Bytes>);
+
+impl BlockStore for MemBlocks {
+  fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+    self.0.get(&addr).cloned()
+  }
+  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+    self.0.insert(addr, block);
+  }
+  fn has_block(&self, addr: BlockAddress) -> bool {
+    self.0.contains_key(&addr)
+  }
+}
 
 /// The cluster id every node (and the `Labeled` handshake) must agree on. Pick one per cluster;
 /// a node presenting a different id is rejected at the handshake.
@@ -196,6 +216,8 @@ async fn main() {
     // restarted process must either persist its last request number (passing it as
     // `first_request`) or use a fresh `ClientId` — this example starts fresh at 0.
     let session = ClientId::new(u128::from(id) + 1);
+    // EMBEDDER OBLIGATION — the content-addressed block store for state-machine checkpoints.
+    let blocks = MemBlocks::default();
 
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
       config,
@@ -203,6 +225,7 @@ async fn main() {
       LogSm::default(), // EMBEDDER OBLIGATION — the deterministic state machine.
       wal,
       sb,
+      blocks,
       session,
       0, // first_request: fresh session, so the first minted request is 1.
       addrs[id as usize],

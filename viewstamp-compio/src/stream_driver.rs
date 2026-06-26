@@ -16,9 +16,9 @@ use viewstamp_proto::Instant;
 // The proto's transport `Conn<R>` is aliased `TransportConn` here so the bare name `Conn` belongs to
 // the driver's owned per-connection unit (`crate::bridge::Conn`).
 use viewstamp_proto::{
-  ClientId, CloseCause, Config, Conn as TransportConn, ConnId, MemberId, Membership, Peer,
-  ReplicaId, Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock,
-  Wal,
+  BlockStore, ClientId, CloseCause, Config, Conn as TransportConn, ConnId, MemberId, Membership,
+  Peer, ReplicaId, Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport,
+  Superblock, Wal,
 };
 
 use viewstamp_driver::{
@@ -119,10 +119,14 @@ pub(crate) type AcceptorFactory<R> = Rc<dyn Fn() -> TransportConn<R>>;
 /// `JoinHandle` by `run()`) feeds it accepted sockets, and each peer connection is one owned `Conn`
 /// unit whose live task(s) (the connect task, then the two independent bridge halves) the driver
 /// holds, so dropping the `Conn` is the connection's single complete teardown.
-pub struct CompioStreamDriver<S, R, W, B> {
+pub struct CompioStreamDriver<S, R, W, B, L> {
   coord: StreamCoordinator<S, R>,
   wal: W,
   sb: B,
+  /// Embedder-provided content-addressed block store, the peer of `wal`/`sb` in the node's durable
+  /// store: large bodies (state-sync chunks, snapshots) are addressed by content hash here while the
+  /// WAL/superblock hold the consensus log and durable root.
+  blocks: L,
   listener: TcpListener,
   clock: Clock,
   /// The operational tuning this driver was constructed with ([`DriverConfig::new`] via
@@ -207,12 +211,13 @@ pub struct CompioStreamDriver<S, R, W, B> {
   reconfigure: Option<viewstamp_driver::ReconfigureJob>,
 }
 
-impl<S, R, W, B> CompioStreamDriver<S, R, W, B>
+impl<S, R, W, B, L> CompioStreamDriver<S, R, W, B, L>
 where
   S: StateMachine,
   R: StreamTransport,
   W: Wal,
   B: Superblock,
+  L: BlockStore,
 {
   /// Build the driver: bind the listener, build the coordinator, set up the connection table +
   /// channels, and return a `Handle`. Configured peer dials are issued at `run()` start.
@@ -249,6 +254,7 @@ where
     state_machine: S,
     wal: W,
     sb: B,
+    blocks: L,
     client: ClientId,
     first_request: u64,
     bind_addr: SocketAddr,
@@ -263,6 +269,7 @@ where
       state_machine,
       wal,
       sb,
+      blocks,
       client,
       first_request,
       bind_addr,
@@ -290,6 +297,7 @@ where
     state_machine: S,
     mut wal: W,
     mut sb: B,
+    mut blocks: L,
     client: ClientId,
     first_request: u64,
     bind_addr: SocketAddr,
@@ -316,7 +324,14 @@ where
     let listener = TcpListener::bind(bind_addr)
       .await
       .map_err(DriverError::Bind)?;
-    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
+    let endpoint = build_endpoint(
+      config,
+      membership,
+      state_machine,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    )?;
     let coord = StreamCoordinator::new(endpoint);
     // Seed the peer_book from the initial (slot -> addr) peers using the coordinator's membership
     // to resolve each slot to its stable MemberId.
@@ -348,6 +363,7 @@ where
       coord,
       wal,
       sb,
+      blocks,
       listener,
       clock,
       cfg,
@@ -379,12 +395,13 @@ where
   }
 }
 
-impl<S, R, W, B> CompioStreamDriver<S, R, W, B>
+impl<S, R, W, B, L> CompioStreamDriver<S, R, W, B, L>
 where
   S: StateMachine,
   R: StreamTransport,
   W: Wal,
   B: Superblock,
+  L: BlockStore,
 {
   /// Run the driver to completion. Returns on a `Shutdown` command or when all `Handle` clones drop.
   ///
@@ -492,7 +509,9 @@ where
         .poll_timeout()
         .is_some_and(|d| self.clock.to_std(d) <= std::time::Instant::now())
       {
-        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self
+          .coord
+          .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
         self.rekey_if_needed(now);
       }
       self.retransmit_stale(now);
@@ -709,9 +728,15 @@ where
   fn handle_inbound(&mut self, now: Instant, inb: BridgeInbound) {
     match inb {
       BridgeInbound::Bytes { id, bytes } => {
-        self
-          .coord
-          .handle_conn_data(id, &bytes, false, now, &mut self.wal, &mut self.sb);
+        self.coord.handle_conn_data(
+          id,
+          &bytes,
+          false,
+          now,
+          &mut self.wal,
+          &mut self.sb,
+          &mut self.blocks,
+        );
         // An inbound frame can install a new membership; refresh the dial-map immediately so a
         // close/redial that follows this feed (this iteration's `reconcile_closed_conns` /
         // `reconcile_auth_deadlines`, or a `close_conn`) reads the current projection, never a
@@ -817,9 +842,13 @@ where
             reservation,
           },
         );
-        self
-          .coord
-          .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        self.coord.submit_client_request(
+          now,
+          &mut self.wal,
+          &mut self.sb,
+          &mut self.blocks,
+          request,
+        );
         false
       }
       Command::Shutdown { ack } => {
@@ -977,9 +1006,15 @@ where
   /// `handle_conn_data(.., true, ..)` is a no-op.
   fn close_conn(&mut self, id: ConnId, now: Instant) {
     let removed = self.conns.remove(&id); // drop cancels the task(s) (connect or both halves) + out_tx
-    self
-      .coord
-      .handle_conn_data(id, &[], true, now, &mut self.wal, &mut self.sb); // reap in coordinator
+    self.coord.handle_conn_data(
+      id,
+      &[],
+      true,
+      now,
+      &mut self.wal,
+      &mut self.sb,
+      &mut self.blocks,
+    ); // reap in coordinator
     if let Some(Conn {
       redial: Some(redial),
       ..
@@ -1157,7 +1192,7 @@ where
     for request in stale {
       self
         .coord
-        .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        .submit_client_request(now, &mut self.wal, &mut self.sb, &mut self.blocks, request);
     }
   }
 
@@ -1201,7 +1236,9 @@ where
     let backlog_cap = self.coord.max_outbound_backlog();
 
     loop {
-      self.coord.handle_storage(now, &mut self.wal, &mut self.sb);
+      self
+        .coord
+        .handle_storage(now, &mut self.wal, &mut self.sb, &mut self.blocks);
       self.rekey_if_needed(now);
       let mut produced = false;
       let mut to_close: Vec<(ConnId, CloseCause)> = Vec::new();
@@ -1307,10 +1344,30 @@ mod tests {
 
   use crate::bridge::{BridgeInbound, BridgeOut, Conn as BridgeConn, ConnTask};
   use viewstamp_proto::{
-    ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled, MemberId, Membership,
-    OpNumber, Passthrough, Peer, ReplicaId, SingleChange, StreamCoordinator, View,
+    BlockAddress, BlockStore, ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled,
+    MemberId, Membership, OpNumber, Passthrough, Peer, ReplicaId, SingleChange, StreamCoordinator,
+    View,
   };
   use viewstamp_simulation::sm::LogSm;
+
+  /// A throwaway in-memory [`BlockStore`] for the driver tests: the proto's own `MemBlockStore` is
+  /// crate-private, so each driver/coordinator instance owns one of these for its state-machine
+  /// checkpoint blocks (one per instance, persisting for that instance's lifetime, parallel to its
+  /// superblock).
+  #[derive(Default)]
+  struct MemBlocks(std::collections::HashMap<BlockAddress, Bytes>);
+
+  impl BlockStore for MemBlocks {
+    fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+      self.0.get(&addr).cloned()
+    }
+    fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+      self.0.insert(addr, block);
+    }
+    fn has_block(&self, addr: BlockAddress) -> bool {
+      self.0.contains_key(&addr)
+    }
+  }
 
   /// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`, so each
   /// node's local slot equals its old replica index (byte-identical at epoch 0).
@@ -1343,7 +1400,7 @@ mod tests {
   /// Build a driver bound on an ephemeral loopback port with no configured peers, so no dials fire
   /// until the test drives `dial_peer` itself. `R = Labeled<Passthrough>` (the loopback transport).
   async fn test_driver()
-  -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock> {
+  -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks> {
     test_driver_with_storage(InMemoryWal::new(), InMemorySuperblock::new()).await
   }
 
@@ -1352,7 +1409,8 @@ mod tests {
   async fn test_driver_with_storage(
     wal: InMemoryWal,
     sb: InMemorySuperblock,
-  ) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock> {
+  ) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks>
+  {
     const CLUSTER: u128 = 0x7777;
     let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
     let dialer: super::DialerFactory<Labeled<Passthrough>> = Rc::new(|peer| {
@@ -1364,12 +1422,14 @@ mod tests {
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     });
     let (_ready_tx, ready_rx) = flume::unbounded();
+    let blocks = MemBlocks::default();
     let (driver, _handle) = CompioStreamDriver::new(
       config,
       genesis(3),
       LogSm::default(),
       wal,
       sb,
+      blocks,
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -1387,7 +1447,8 @@ mod tests {
   /// drive a non-default [`crate::DriverConfig`] through the production path.
   async fn test_driver_with_config(
     cfg: crate::DriverConfig,
-  ) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock> {
+  ) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks>
+  {
     const CLUSTER: u128 = 0x7777;
     let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
     let dialer: super::DialerFactory<Labeled<Passthrough>> = Rc::new(|peer| {
@@ -1405,6 +1466,7 @@ mod tests {
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
+      MemBlocks::default(),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -1452,6 +1514,7 @@ mod tests {
         LogSm::default(),
         InMemoryWal::new(),
         InMemorySuperblock::new(),
+        MemBlocks::default(),
         ClientId::new(1),
         0,
         "127.0.0.1:0".parse().unwrap(),
@@ -1491,7 +1554,7 @@ mod tests {
   /// driver's REAL `handle_command`/`deliver_event`/`retransmit_stale`. No peers are configured, so
   /// nothing ever commits on its own — exactly the partitioned/slow case the submit budget must bound.
   async fn test_driver_with_handle() -> (
-    CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>,
+    CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks>,
     crate::Handle,
   ) {
     const CLUSTER: u128 = 0x7777;
@@ -1511,6 +1574,7 @@ mod tests {
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
+      MemBlocks::default(),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -1533,7 +1597,8 @@ mod tests {
   /// [`StreamCoordinator::with_outbound_cap`] (the public `new` always uses the default cap).
   async fn test_driver_small_cap(
     cap: usize,
-  ) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock> {
+  ) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks>
+  {
     let mut driver = test_driver().await;
     const CLUSTER: u128 = 0x7777;
     let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
@@ -1550,7 +1615,13 @@ mod tests {
   /// asserts the queued bytes / channel directly, never driving a real bridge), so dropping them on a
   /// close cancels nothing live. The held `out_rx` observes what `pump_outputs` admitted.
   fn register_handshaking_conn(
-    driver: &mut CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>,
+    driver: &mut CompioStreamDriver<
+      LogSm,
+      Labeled<Passthrough>,
+      InMemoryWal,
+      InMemorySuperblock,
+      MemBlocks,
+    >,
     peer: ReplicaId,
   ) -> (
     viewstamp_proto::ConnId,
@@ -1711,6 +1782,7 @@ mod tests {
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
+      MemBlocks::default(),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -1746,6 +1818,7 @@ mod tests {
     ));
     let pid = peer.register_accepted(Peer::Replica(ReplicaId::new(0)), peer_conn);
     let (mut pwal, mut psb) = (InMemoryWal::new(), InMemorySuperblock::new());
+    let mut pblocks = MemBlocks::default();
 
     // Shuttle the handshake bytes both ways until the driver's conn validates.
     let now = Instant::ZERO;
@@ -1755,14 +1828,20 @@ mod tests {
       }
       while let Some((cid, bytes)) = driver.coord.poll_conn_transmit() {
         if cid == id {
-          peer.handle_conn_data(pid, &bytes, false, now, &mut pwal, &mut psb);
+          peer.handle_conn_data(pid, &bytes, false, now, &mut pwal, &mut psb, &mut pblocks);
         }
       }
       while let Some((cid, bytes)) = peer.poll_conn_transmit() {
         if cid == pid {
-          driver
-            .coord
-            .handle_conn_data(id, &bytes, false, now, &mut driver.wal, &mut driver.sb);
+          driver.coord.handle_conn_data(
+            id,
+            &bytes,
+            false,
+            now,
+            &mut driver.wal,
+            &mut driver.sb,
+            &mut driver.blocks,
+          );
         }
       }
     }
@@ -1895,6 +1974,7 @@ mod tests {
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
+      MemBlocks::default(),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -2220,7 +2300,13 @@ mod tests {
   /// made by `Handle::submit`; this completes the Handle->driver crossing the run loop would do. A
   /// `Submit` is never a shutdown, so `handle_command` returns `false` here.
   fn drain_one_command(
-    driver: &mut CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>,
+    driver: &mut CompioStreamDriver<
+      LogSm,
+      Labeled<Passthrough>,
+      InMemoryWal,
+      InMemorySuperblock,
+      MemBlocks,
+    >,
   ) {
     let cmd = driver.commands.try_recv().expect("a command was enqueued");
     let mut ack = None;

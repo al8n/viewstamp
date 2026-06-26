@@ -7,8 +7,9 @@ use std::collections::{BTreeMap, VecDeque};
 use bytes::Bytes;
 
 use crate::{
-  CheckpointRead, Header, Instant, MemberId, Membership, OpId, OpNumber, Peer, ReadOk, SlotStatus,
-  StateMachine, Superblock, SuperblockDone, VsrState, Wal, WalDone,
+  BlockAddress, BlockStore, CheckpointRead, Header, Instant, MemberId, Membership, OpId, OpNumber,
+  Peer, ReadOk, SlotStatus, StateMachine, Superblock, SuperblockDone, VsrState, Wal, WalDone,
+  block_address,
   transport::stream::{Intake, RecordIo},
 };
 
@@ -122,12 +123,6 @@ impl CountSm {
   pub(crate) fn applied(&self) -> &[(u64, std::vec::Vec<u8>)] {
     &self.applied
   }
-}
-impl StateMachine for CountSm {
-  fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
-    self.applied.push((op.get(), body.to_vec()));
-    Bytes::copy_from_slice(body)
-  }
   fn snapshot(&self) -> Bytes {
     let mut out = std::vec::Vec::new();
     out.extend_from_slice(&(self.applied.len() as u64).to_be_bytes());
@@ -138,7 +133,7 @@ impl StateMachine for CountSm {
     }
     Bytes::from(out)
   }
-  fn restore(&mut self, snapshot: &[u8]) {
+  fn restore_bytes(&mut self, snapshot: &[u8]) {
     let mut applied = std::vec::Vec::new();
     let mut i = 0usize;
     let count = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap());
@@ -152,6 +147,29 @@ impl StateMachine for CountSm {
       i += len;
     }
     self.applied = applied;
+  }
+}
+impl StateMachine for CountSm {
+  fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
+    self.applied.push((op.get(), body.to_vec()));
+    Bytes::copy_from_slice(body)
+  }
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    let block = self.snapshot();
+    let addr = block_address(&block);
+    store.write_block(addr, block);
+    addr
+  }
+  fn restore(
+    &mut self,
+    root: BlockAddress,
+    store: &dyn BlockStore,
+  ) -> Result<(), crate::RestoreError> {
+    let block = store
+      .read_block(root)
+      .ok_or(crate::RestoreError::new(root))?;
+    self.restore_bytes(&block);
+    Ok(())
   }
 }
 

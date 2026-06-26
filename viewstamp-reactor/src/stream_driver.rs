@@ -18,9 +18,9 @@ use viewstamp_proto::Instant;
 // The proto's transport `Conn<T>` is aliased `TransportConn` here so the bare name `Conn` belongs to
 // the driver's owned per-connection unit (`crate::bridge::Conn`).
 use viewstamp_proto::{
-  ClientId, CloseCause, Config, Conn as TransportConn, ConnId, MemberId, Membership, Peer,
-  ReplicaId, Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport, Superblock,
-  Wal,
+  BlockStore, ClientId, CloseCause, Config, Conn as TransportConn, ConnId, MemberId, Membership,
+  Peer, ReplicaId, Request, RequestNumber, StateMachine, StreamCoordinator, StreamTransport,
+  Superblock, Wal,
 };
 
 use viewstamp_driver::{
@@ -86,10 +86,14 @@ pub(crate) type AcceptorFactory<T> = Arc<dyn Fn() -> TransportConn<T> + Send + S
 /// listener clone exists. Each peer connection is one owned `Conn` unit whose live task(s) (the
 /// dial task, then the two independent bridge halves) the driver holds as abort-on-drop handles,
 /// so dropping the `Conn` is the connection's single complete teardown on every runtime.
-pub struct ReactorStreamDriver<R: Runtime, S, T, W, B> {
+pub struct ReactorStreamDriver<R: Runtime, S, T, W, B, L> {
   coord: StreamCoordinator<S, T>,
   wal: W,
   sb: B,
+  /// Embedder-provided content-addressed block store, the peer of `wal`/`sb` in the node's durable
+  /// store: large bodies (state-sync chunks, snapshots) are addressed by content hash here while the
+  /// WAL/superblock hold the consensus log and durable root.
+  blocks: L,
   listener: <R::Net as Net>::TcpListener,
   /// While `Some`, the most recent `accept()` failed and the accept arm is disabled until this
   /// deadline passes (see [`ACCEPT_ERROR_BACKOFF`]). Folded into [`Self::next_deadline`] so the
@@ -181,13 +185,14 @@ pub struct ReactorStreamDriver<R: Runtime, S, T, W, B> {
   reconfigure: Option<viewstamp_driver::ReconfigureJob>,
 }
 
-impl<R, S, T, W, B> ReactorStreamDriver<R, S, T, W, B>
+impl<R, S, T, W, B, L> ReactorStreamDriver<R, S, T, W, B, L>
 where
   R: Runtime,
   S: StateMachine,
   T: StreamTransport,
   W: Wal,
   B: Superblock,
+  L: BlockStore,
 {
   /// Build the driver: bind the listener, build the coordinator, set up the connection table +
   /// channels, and return a `Handle`. Configured peer dials are issued at `run()` start.
@@ -224,6 +229,7 @@ where
     state_machine: S,
     wal: W,
     sb: B,
+    blocks: L,
     client: ClientId,
     first_request: u64,
     bind_addr: SocketAddr,
@@ -238,6 +244,7 @@ where
       state_machine,
       wal,
       sb,
+      blocks,
       client,
       first_request,
       bind_addr,
@@ -265,6 +272,7 @@ where
     state_machine: S,
     mut wal: W,
     mut sb: B,
+    mut blocks: L,
     client: ClientId,
     first_request: u64,
     bind_addr: SocketAddr,
@@ -291,7 +299,14 @@ where
     let listener = <R::Net as Net>::TcpListener::bind(bind_addr)
       .await
       .map_err(DriverError::Bind)?;
-    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
+    let endpoint = build_endpoint(
+      config,
+      membership,
+      state_machine,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    )?;
     let coord = StreamCoordinator::new(endpoint);
     // Seed the peer_book from the initial (slot -> addr) peers using the coordinator's membership
     // to resolve each slot to its stable MemberId.
@@ -323,6 +338,7 @@ where
       coord,
       wal,
       sb,
+      blocks,
       listener,
       accept_backoff_until: None,
       clock,
@@ -355,13 +371,14 @@ where
   }
 }
 
-impl<R, S, T, W, B> ReactorStreamDriver<R, S, T, W, B>
+impl<R, S, T, W, B, L> ReactorStreamDriver<R, S, T, W, B, L>
 where
   R: Runtime,
   S: StateMachine,
   T: StreamTransport,
   W: Wal,
   B: Superblock,
+  L: BlockStore,
 {
   /// Run the driver to completion. Returns on a `Shutdown` command or when all `Handle` clones drop.
   ///
@@ -461,7 +478,9 @@ where
         .poll_timeout()
         .is_some_and(|d| self.clock.to_std(d) <= std::time::Instant::now())
       {
-        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self
+          .coord
+          .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
         self.rekey_if_needed(now);
       }
       self.retransmit_stale(now);
@@ -698,9 +717,15 @@ where
   fn handle_inbound(&mut self, now: Instant, inb: BridgeInbound) {
     match inb {
       BridgeInbound::Bytes { id, bytes } => {
-        self
-          .coord
-          .handle_conn_data(id, &bytes, false, now, &mut self.wal, &mut self.sb);
+        self.coord.handle_conn_data(
+          id,
+          &bytes,
+          false,
+          now,
+          &mut self.wal,
+          &mut self.sb,
+          &mut self.blocks,
+        );
         // An inbound frame can install a new membership; refresh the dial-map immediately so a
         // close/redial that follows this feed (this iteration's `reconcile_closed_conns` /
         // `reconcile_auth_deadlines`, or a `close_conn`) reads the current projection, never a
@@ -806,9 +831,13 @@ where
             reservation,
           },
         );
-        self
-          .coord
-          .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        self.coord.submit_client_request(
+          now,
+          &mut self.wal,
+          &mut self.sb,
+          &mut self.blocks,
+          request,
+        );
         false
       }
       Command::Shutdown { ack } => {
@@ -967,9 +996,15 @@ where
   /// double-abort/redial) and `handle_conn_data(.., true, ..)` is a no-op.
   fn close_conn(&mut self, id: ConnId, now: Instant) {
     let removed = self.conns.remove(&id); // drop aborts the task(s) (dial or both halves) + out_tx
-    self
-      .coord
-      .handle_conn_data(id, &[], true, now, &mut self.wal, &mut self.sb); // reap in coordinator
+    self.coord.handle_conn_data(
+      id,
+      &[],
+      true,
+      now,
+      &mut self.wal,
+      &mut self.sb,
+      &mut self.blocks,
+    ); // reap in coordinator
     if let Some(Conn {
       redial: Some(redial),
       ..
@@ -1147,7 +1182,7 @@ where
     for request in stale {
       self
         .coord
-        .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        .submit_client_request(now, &mut self.wal, &mut self.sb, &mut self.blocks, request);
     }
   }
 
@@ -1191,7 +1226,9 @@ where
     let backlog_cap = self.coord.max_outbound_backlog();
 
     loop {
-      self.coord.handle_storage(now, &mut self.wal, &mut self.sb);
+      self
+        .coord
+        .handle_storage(now, &mut self.wal, &mut self.sb, &mut self.blocks);
       self.rekey_if_needed(now);
       let mut produced = false;
       let mut to_close: Vec<(ConnId, CloseCause)> = Vec::new();
@@ -1303,10 +1340,30 @@ mod tests {
     task::AbortOnDrop,
   };
   use viewstamp_proto::{
-    ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled, MemberId, Membership,
-    OpNumber, Passthrough, Peer, ReplicaId, SingleChange, StreamCoordinator, View,
+    BlockAddress, BlockStore, ClientId, Config, Conn, Endpoint, Instant, LabelOptions, Labeled,
+    MemberId, Membership, OpNumber, Passthrough, Peer, ReplicaId, SingleChange, StreamCoordinator,
+    View,
   };
   use viewstamp_simulation::sm::LogSm;
+
+  /// A throwaway in-memory [`BlockStore`] for the driver tests: the proto's own `MemBlockStore` is
+  /// crate-private, so each driver/coordinator instance owns one of these for its state-machine
+  /// checkpoint blocks (one per instance, persisting for that instance's lifetime, parallel to its
+  /// superblock).
+  #[derive(Default)]
+  struct MemBlocks(std::collections::HashMap<BlockAddress, Bytes>);
+
+  impl BlockStore for MemBlocks {
+    fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+      self.0.get(&addr).cloned()
+    }
+    fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+      self.0.insert(addr, block);
+    }
+    fn has_block(&self, addr: BlockAddress) -> bool {
+      self.0.contains_key(&addr)
+    }
+  }
 
   /// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`.
   ///
@@ -1331,8 +1388,14 @@ mod tests {
   type TestRt = agnostic::tokio::TokioRuntime;
   type TestListener = <<TestRt as Runtime>::Net as Net>::TcpListener;
   type TestStream = <<TestRt as Runtime>::Net as Net>::TcpStream;
-  type TestStreamDriver =
-    ReactorStreamDriver<TestRt, LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock>;
+  type TestStreamDriver = ReactorStreamDriver<
+    TestRt,
+    LogSm,
+    Labeled<Passthrough>,
+    InMemoryWal,
+    InMemorySuperblock,
+    MemBlocks,
+  >;
 
   #[test]
   fn stream_driver_type_resolves() {
@@ -1361,12 +1424,14 @@ mod tests {
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     });
     let (_ready_tx, ready_rx) = flume::unbounded();
+    let blocks = MemBlocks::default();
     let (driver, _handle) = ReactorStreamDriver::new(
       config,
       genesis(3),
       LogSm::default(),
       wal,
       sb,
+      blocks,
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -1400,6 +1465,7 @@ mod tests {
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
+      MemBlocks::default(),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -1447,6 +1513,7 @@ mod tests {
         LogSm::default(),
         InMemoryWal::new(),
         InMemorySuperblock::new(),
+        MemBlocks::default(),
         ClientId::new(1),
         0,
         "127.0.0.1:0".parse().unwrap(),
@@ -1503,6 +1570,7 @@ mod tests {
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
+      MemBlocks::default(),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -1695,12 +1763,13 @@ mod tests {
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     });
     let (_ready_tx, ready_rx) = flume::unbounded();
-    let (mut driver, _handle) = ReactorStreamDriver::<TestRt, _, _, _, _>::new(
+    let (mut driver, _handle) = ReactorStreamDriver::<TestRt, _, _, _, _, _>::new(
       Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap(),
       genesis(3),
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
+      MemBlocks::default(),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),
@@ -1736,6 +1805,7 @@ mod tests {
     ));
     let pid = peer.register_accepted(Peer::Replica(ReplicaId::new(0)), peer_conn);
     let (mut pwal, mut psb) = (InMemoryWal::new(), InMemorySuperblock::new());
+    let mut pblocks = MemBlocks::default();
 
     // Shuttle the handshake bytes both ways until the driver's conn validates.
     let now = Instant::ZERO;
@@ -1745,14 +1815,20 @@ mod tests {
       }
       while let Some((cid, bytes)) = driver.coord.poll_conn_transmit() {
         if cid == id {
-          peer.handle_conn_data(pid, &bytes, false, now, &mut pwal, &mut psb);
+          peer.handle_conn_data(pid, &bytes, false, now, &mut pwal, &mut psb, &mut pblocks);
         }
       }
       while let Some((cid, bytes)) = peer.poll_conn_transmit() {
         if cid == pid {
-          driver
-            .coord
-            .handle_conn_data(id, &bytes, false, now, &mut driver.wal, &mut driver.sb);
+          driver.coord.handle_conn_data(
+            id,
+            &bytes,
+            false,
+            now,
+            &mut driver.wal,
+            &mut driver.sb,
+            &mut driver.blocks,
+          );
         }
       }
     }
@@ -1879,12 +1955,13 @@ mod tests {
     // 203.0.113.0/24 (TEST-NET-3) is reserved + unrouteable, so the connect never completes within
     // the test window — the dial task is genuinely in flight when the Handle drops.
     let unreachable: std::net::SocketAddr = "203.0.113.1:9".parse().unwrap();
-    let (driver, handle) = ReactorStreamDriver::<TestRt, _, _, _, _>::new(
+    let (driver, handle) = ReactorStreamDriver::<TestRt, _, _, _, _, _>::new(
       config,
       genesis(3),
       LogSm::default(),
       InMemoryWal::new(),
       InMemorySuperblock::new(),
+      MemBlocks::default(),
       ClientId::new(1),
       0,
       "127.0.0.1:0".parse().unwrap(),

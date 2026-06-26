@@ -32,8 +32,8 @@ use layout::StreamClass;
 use std::collections::BTreeSet;
 
 use crate::{
-  Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient, ReplicaId,
-  Request, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
+  BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
+  ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
   endpoint::ProposeMembershipError,
 };
 
@@ -357,6 +357,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// Feed one inbound UDP datagram from `remote` into the QUIC stack, then drain the bridge's
   /// connection events (bind newly-connected peers, decode readable streams into consensus
   /// messages) and pump the endpoint's resulting outgoing messages back out over the streams.
+  #[allow(clippy::too_many_arguments)]
   pub fn handle_udp<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
@@ -365,10 +366,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     data: &[u8],
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
   ) {
     let std_now = self.quinn_now(now);
     self.bridge.handle_datagram(std_now, remote, ecn, data);
-    self.drain_bridge(now, wal, sb);
+    self.drain_bridge(now, wal, sb, blocks);
     // The just-completed drain may have delivered a frame that INSTALLED a new membership; reconcile
     // routing against it BEFORE the pump routes this pass's outputs, so they never ride a stale slot.
     self.reconcile_routing(now);
@@ -376,11 +378,17 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   }
 
   /// Fire all QUIC + consensus timers at `now`, then drain the bridge and pump.
-  pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
+  pub fn handle_timeout<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
     let std_now = self.quinn_now(now);
     self.bridge.handle_timeout(std_now);
-    self.endpoint.handle_timeout(now, wal, sb);
-    self.drain_bridge(now, wal, sb);
+    self.endpoint.handle_timeout(now, wal, sb, blocks);
+    self.drain_bridge(now, wal, sb, blocks);
     // A timeout-driven advance (or a frame the drain delivered) may have installed a new membership;
     // reconcile routing against it BEFORE the pump, so no current-config output rides a stale slot.
     self.reconcile_routing(now);
@@ -388,9 +396,15 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   }
 
   /// Drive storage completions through the consensus endpoint, then pump its resulting messages.
-  pub fn handle_storage<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
-    self.endpoint.handle_storage(now, wal, sb);
-    self.drain_bridge(now, wal, sb);
+  pub fn handle_storage<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
+    self.endpoint.handle_storage(now, wal, sb, blocks);
+    self.drain_bridge(now, wal, sb, blocks);
     // A storage-completion advance (e.g. a reconfig op becoming durable) may have installed a new
     // membership; reconcile routing against it BEFORE the pump, so this pass's outputs use new slots.
     self.reconcile_routing(now);
@@ -523,6 +537,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
     request: Request,
   ) {
     if request.body().len() > crate::transport::frame::max_request_body_len() {
@@ -536,6 +551,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       now,
       wal,
       sb,
+      blocks,
       Peer::Client(request.client()),
       Message::Request(request.clone()),
     );
@@ -564,7 +580,13 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   ///   stream bytes still readable defers the connection to the NEXT pump, so a buffered receive window
   ///   drains one budget per pump rather than all at once;
   /// - `lost` → reap the closed connection.
-  fn drain_bridge<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
+  fn drain_bridge<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
     let std_now = self.quinn_now(now);
     while let Some(h) = self.bridge.take_connected() {
       // Open the send stream and write our control preface as frame-0. `Hello` writes the hello
@@ -626,7 +648,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
           // A validated connection: the frame is a consensus message. A frame that fails to decode
           // is dropped (the consensus layer retransmits); keep draining the rest of the batch.
           if let (Some(from), Ok(msg)) = (self.bridge.bound_peer_of(h), Message::decode(&payload)) {
-            self.deliver_decoded(now, wal, sb, from, msg);
+            self.deliver_decoded(now, wal, sb, blocks, from, msg);
           }
         } else {
           // `Closed` (or otherwise no longer routable): drop the remaining frames.
@@ -640,7 +662,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       if self.bridge.is_validated(h) {
         while let Some(payload) = self.bridge.next_frame(h, StreamClass::Bulk) {
           if let (Some(from), Ok(msg)) = (self.bridge.bound_peer_of(h), Message::decode(&payload)) {
-            self.deliver_decoded(now, wal, sb, from, msg);
+            self.deliver_decoded(now, wal, sb, blocks, from, msg);
           }
         }
       }
@@ -681,6 +703,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
@@ -689,7 +712,9 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     {
       return;
     }
-    self.endpoint.handle_message(now, wal, sb, from, msg);
+    self
+      .endpoint
+      .handle_message(now, wal, sb, blocks, from, msg);
     #[cfg(test)]
     {
       self.consensus_frames_delivered += 1;
@@ -875,10 +900,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
-    self.deliver_decoded(now, wal, sb, from, msg);
+    self.deliver_decoded(now, wal, sb, blocks, from, msg);
     self.pump(now);
   }
 
@@ -941,8 +967,9 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
   ) {
-    self.drain_bridge(now, wal, sb);
+    self.drain_bridge(now, wal, sb, blocks);
     self.pump(now);
   }
 

@@ -367,6 +367,7 @@ fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() 
   let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut c = QuicCoordinator::with_identity(
     Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
     mtls_opts(cluster),
@@ -392,6 +393,7 @@ fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() 
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     over,
   );
@@ -420,6 +422,7 @@ fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() 
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     at_max,
   );

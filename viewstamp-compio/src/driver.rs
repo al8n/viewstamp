@@ -2,8 +2,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use compio::net::UdpSocket;
 use viewstamp_proto::{
-  ClientId, Config, Event, IdentityConfig, Instant, MemberId, Membership, Peer, ProvidedIdentity,
-  QuicCoordinator, QuicOptions, ReplicaId, Request, RequestNumber, StateMachine, Superblock, Wal,
+  BlockStore, ClientId, Config, Event, IdentityConfig, Instant, MemberId, Membership, Peer,
+  ProvidedIdentity, QuicCoordinator, QuicOptions, ReplicaId, Request, RequestNumber, StateMachine,
+  Superblock, Wal,
 };
 
 use viewstamp_driver::{
@@ -90,10 +91,21 @@ struct PeerLink {
 /// The compio (proactor) QUIC driver. Owns the coordinator + storage + socket on one task; a
 /// persistent same-thread recv task (holding a clone of the socket, owned via its `JoinHandle` by
 /// `run()`) feeds it inbound datagrams.
-pub struct CompioQuicDriver<S, W, B, I> {
+pub struct CompioQuicDriver<S, W, B, L, I> {
   coord: QuicCoordinator<S, I>,
   wal: W,
   sb: B,
+  /// Embedder-provided content-addressed block store, the peer of `wal`/`sb` in the node's durable
+  /// store: large bodies (state-sync chunks, snapshots) are addressed by content hash here while the
+  /// WAL/superblock hold the consensus log and durable root.
+  ///
+  /// A PRODUCTION block store MUST be PERSISTENT, and its blocks MUST be durable before the checkpoint
+  /// that references them: the proto writes a checkpoint's blocks, then calls
+  /// [`BlockStore::flush`](viewstamp_proto::BlockStore::flush) and only advances the durable checkpoint
+  /// pointer once the flush returns `Ok` — so a real `flush` must `fsync`/barrier its pending writes and
+  /// report a failure as `Err`. The in-memory store the driver tests use is durable-enough for a process
+  /// that never crashes, but loses its blocks on restart and is NOT suitable for production.
+  blocks: L,
   socket: UdpSocket,
   clock: Clock,
   /// The operational tuning this driver was constructed with ([`DriverConfig::new`] via
@@ -147,11 +159,12 @@ pub struct CompioQuicDriver<S, W, B, I> {
   reconfigure: Option<viewstamp_driver::ReconfigureJob>,
 }
 
-impl<S, W, B> CompioQuicDriver<S, W, B, ProvidedIdentity>
+impl<S, W, B, L> CompioQuicDriver<S, W, B, L, ProvidedIdentity>
 where
   S: StateMachine,
   W: Wal,
   B: Superblock,
+  L: BlockStore,
 {
   /// Construct the driver over the sealed identity (`with_identity`) path and return a `Handle`.
   ///
@@ -192,6 +205,7 @@ where
     state_machine: S,
     wal: W,
     sb: B,
+    blocks: L,
     client: ClientId,
     first_request: u64,
     opts: QuicOptions,
@@ -207,6 +221,7 @@ where
       state_machine,
       wal,
       sb,
+      blocks,
       client,
       first_request,
       opts,
@@ -233,6 +248,7 @@ where
     state_machine: S,
     mut wal: W,
     mut sb: B,
+    mut blocks: L,
     client: ClientId,
     first_request: u64,
     opts: QuicOptions,
@@ -248,7 +264,14 @@ where
       .await
       .map_err(DriverError::Bind)?;
 
-    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
+    let endpoint = build_endpoint(
+      config,
+      membership,
+      state_machine,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    )?;
     let mut coord = QuicCoordinator::with_identity(endpoint, opts, rng_seed, identity);
 
     let now = clock.now();
@@ -296,6 +319,7 @@ where
       coord,
       wal,
       sb,
+      blocks,
       socket,
       clock,
       cfg,
@@ -319,11 +343,12 @@ where
   }
 }
 
-impl<S, W, B, I> CompioQuicDriver<S, W, B, I>
+impl<S, W, B, L, I> CompioQuicDriver<S, W, B, L, I>
 where
   S: StateMachine,
   W: Wal,
   B: Superblock,
+  L: BlockStore,
   I: viewstamp_proto::IdentitySource,
 {
   /// Run the driver to completion. Returns on a `Shutdown` command or when all `Handle` clones drop.
@@ -401,7 +426,9 @@ where
         .earliest_deadline()
         .is_some_and(|d| d <= std::time::Instant::now())
       {
-        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self
+          .coord
+          .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
         self.rekey_if_needed(now);
       }
       self.retransmit_stale(now);
@@ -471,7 +498,9 @@ where
         self.handle_inbound_datagram(now, &datagram, from);
       }
       if fire_timeout {
-        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self
+          .coord
+          .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
         self.rekey_if_needed(now);
       }
       if let Some(cmd) = command
@@ -566,9 +595,13 @@ where
             reservation,
           },
         );
-        self
-          .coord
-          .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        self.coord.submit_client_request(
+          now,
+          &mut self.wal,
+          &mut self.sb,
+          &mut self.blocks,
+          request,
+        );
         false
       }
       Command::Shutdown { ack } => {
@@ -689,9 +722,15 @@ where
   /// stale map. `rekey_if_needed` is config_id-gated, so a datagram that does not change the
   /// membership costs only a scalar compare.
   fn handle_inbound_datagram(&mut self, now: Instant, datagram: &[u8], from: SocketAddr) {
-    self
-      .coord
-      .handle_udp(now, from, None, datagram, &mut self.wal, &mut self.sb);
+    self.coord.handle_udp(
+      now,
+      from,
+      None,
+      datagram,
+      &mut self.wal,
+      &mut self.sb,
+      &mut self.blocks,
+    );
     self.rekey_if_needed(now);
   }
 
@@ -749,7 +788,7 @@ where
     for request in stale {
       self
         .coord
-        .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        .submit_client_request(now, &mut self.wal, &mut self.sb, &mut self.blocks, request);
     }
   }
 
@@ -760,7 +799,9 @@ where
     // current before any subsequent dial/route/close decision.
     self.rekey_if_needed(now);
     loop {
-      self.coord.handle_storage(now, &mut self.wal, &mut self.sb);
+      self
+        .coord
+        .handle_storage(now, &mut self.wal, &mut self.sb, &mut self.blocks);
       self.rekey_if_needed(now);
       let mut produced = false;
       // Drain the pass's datagrams, then submit them as ONE batch of concurrent `send_to`s: compio
@@ -854,10 +895,30 @@ mod tests {
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
   };
-  use viewstamp_proto::{ClusterTls, Config, IdentityConfig, MemberId, Membership, QuicOptions};
+  use viewstamp_proto::{
+    BlockAddress, BlockStore, ClusterTls, Config, IdentityConfig, MemberId, Membership, QuicOptions,
+  };
   use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
 
   use super::CompioQuicDriver;
+
+  /// A throwaway in-memory [`BlockStore`] for the driver tests: the proto's own `MemBlockStore` is
+  /// crate-private, so each driver instance owns one of these for its state-machine checkpoint
+  /// blocks (one per driver, persisting for that driver's lifetime, parallel to its superblock).
+  #[derive(Default)]
+  struct MemBlocks(std::collections::HashMap<BlockAddress, Bytes>);
+
+  impl BlockStore for MemBlocks {
+    fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+      self.0.get(&addr).cloned()
+    }
+    fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+      self.0.insert(addr, block);
+    }
+    fn has_block(&self, addr: BlockAddress) -> bool {
+      self.0.contains_key(&addr)
+    }
+  }
 
   /// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`.
   ///
@@ -878,8 +939,13 @@ mod tests {
 
   const CLUSTER: u128 = 0x5151;
 
-  type TestQuicDriver =
-    CompioQuicDriver<LogSm, InMemoryWal, InMemorySuperblock, viewstamp_proto::ProvidedIdentity>;
+  type TestQuicDriver = CompioQuicDriver<
+    LogSm,
+    InMemoryWal,
+    InMemorySuperblock,
+    MemBlocks,
+    viewstamp_proto::ProvidedIdentity,
+  >;
 
   /// A type-erased in-flight `submit` future, lifetime-bound to the borrowed `Handle` it ran from.
   type SubmitFut<'a> = dyn std::future::Future<Output = Result<crate::Reply, DriverError>> + 'a;
@@ -969,6 +1035,7 @@ mod tests {
       LogSm::default(),
       wal,
       sb,
+      MemBlocks::default(),
       viewstamp_proto::ClientId::new(1),
       0,
       opts,

@@ -37,8 +37,8 @@ use std::{
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Config, Endpoint, Event, Instant, Membership, Recovered, Request, RequestNumber,
-  SingleChange, StateMachine, Superblock, VsrState, Wal,
+  BlockStore, ClientId, Config, Endpoint, Event, Instant, Membership, Recovered, Request,
+  RequestNumber, SingleChange, StateMachine, Superblock, VsrState, Wal,
 };
 
 use crate::DriverError;
@@ -82,6 +82,7 @@ pub fn build_endpoint<S, W, B>(
   sm: S,
   wal: &mut W,
   sb: &mut B,
+  blocks: &mut dyn BlockStore,
 ) -> Result<Endpoint<S, SingleChange>, DriverError>
 where
   S: StateMachine,
@@ -107,8 +108,9 @@ where
     // The recover path resolves THIS node against the DURABLE root's membership: a v4 root that no
     // longer lists it (an offline reconfiguration removed it) yields `Recovered::Retired`, which the
     // driver surfaces as a hard error — a retired node has no replica loop to run.
-    match Endpoint::<S, SingleChange>::recover_with_reconfig(config, membership, seed, sm, wal, sb)
-    {
+    match Endpoint::<S, SingleChange>::recover_with_reconfig(
+      config, membership, seed, sm, wal, sb, blocks,
+    ) {
       Recovered::Active(endpoint) => Ok(endpoint),
       Recovered::Retired(retired) => Err(DriverError::Retired {
         local: retired.local(),

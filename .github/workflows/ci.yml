@@ -22,7 +22,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
+  RUSTFLAGS: -Dwarnings --cfg vsrr_internal_testkit
   RUST_BACKTRACE: 1
   nightly: nightly
   stable: stable
@@ -295,7 +295,7 @@ jobs:
           key: ${{ runner.os }}-coverage-cargo-build-target
       - name: Run tarpaulin
         env:
-          RUSTFLAGS: "--cfg tarpaulin"
+          RUSTFLAGS: "--cfg tarpaulin --cfg vsrr_internal_testkit -Dwarnings"
         run: cargo tarpaulin -p viewstamp-proto --features tls-rustls-ring --run-types tests --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7

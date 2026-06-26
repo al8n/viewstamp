@@ -15,8 +15,8 @@ use std::{
 use bytes::Bytes;
 use viewstamp_driver::{BatchConfig, aggregator, aggregator_with_stall};
 use viewstamp_proto::{
-  Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer, ReplicaId, StateMachine,
-  Superblock, Wal,
+  BlockAddress, BlockStore, Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer,
+  ReplicaId, StateMachine, Superblock, Wal,
 };
 use viewstamp_simulation::{
   InMemorySuperblock, InMemoryWal,
@@ -24,6 +24,24 @@ use viewstamp_simulation::{
 };
 
 const CLUSTER: u128 = 0x5151;
+
+/// A throwaway in-memory [`BlockStore`] for the driver tests: the proto's own `MemBlockStore` is
+/// crate-private, so each driver instance owns one of these for its state-machine checkpoint blocks
+/// (one per replica, persisting for that replica's lifetime, parallel to its superblock).
+#[derive(Default)]
+struct MemBlocks(std::collections::HashMap<BlockAddress, Bytes>);
+
+impl BlockStore for MemBlocks {
+  fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+    self.0.get(&addr).cloned()
+  }
+  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+    self.0.insert(addr, block);
+  }
+  fn has_block(&self, addr: BlockAddress) -> bool {
+    self.0.contains_key(&addr)
+  }
+}
 
 /// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`, so each
 /// node's local slot equals its old replica index (byte-identical quorum/primary/voter at epoch 0).
@@ -137,11 +155,14 @@ impl StateMachine for SharedSm {
   fn apply(&mut self, op: viewstamp_proto::OpNumber, body: &[u8]) -> Bytes {
     self.0.lock().unwrap().apply(op, body)
   }
-  fn snapshot(&self) -> Bytes {
-    self.0.lock().unwrap().snapshot()
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    self.0.lock().unwrap().checkpoint(store)
   }
-  fn restore(&mut self, snapshot: &[u8]) {
-    self.0.lock().unwrap().restore(snapshot)
+  fn block_references(block: &[u8]) -> std::vec::Vec<BlockAddress> {
+    BatchSm::block_references(block)
+  }
+  fn restore(&mut self, root: BlockAddress, store: &dyn BlockStore) {
+    self.0.lock().unwrap().restore(root, store)
   }
 }
 
@@ -154,6 +175,7 @@ type GateDriver = viewstamp_reactor::ReactorStreamDriver<
   Labeled<Passthrough>,
   Notifying<InMemoryWal>,
   Notifying<InMemorySuperblock>,
+  MemBlocks,
 >;
 
 fn mk_dialer(me: u8) -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
@@ -192,6 +214,7 @@ async fn spawn_cluster(
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let blocks = MemBlocks::default();
     let (sm, recorder) = SharedSm::new();
     let (driver, handle) = GateDriver::new(
       config,
@@ -199,6 +222,7 @@ async fn spawn_cluster(
       sm,
       wal,
       sb,
+      blocks,
       viewstamp_proto::ClientId::new(u128::from(id) + 1),
       0,
       addrs[id as usize],
