@@ -1625,6 +1625,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // MONOTONE: a reordered older report must never lower the recorded value (the GC floor and the
     // force-sync trigger that read it must not regress under reordering/partitions).
     self.record_peer_checkpoint(ok.replica(), ok.checkpoint_op());
+    // A peer's reported checkpoint is proof its checkpointed prefix is committed (a replica checkpoints
+    // only an already-committed op), so a primary whose own commit lags the highest peer checkpoint is
+    // behind a provably-durable committed frontier — adopt it and apply the ops we already hold. This
+    // recovers a crash-restarted primary that recovered its HEAD (the offset tail holds the bodies) but
+    // not its full committed prefix, while an ahead sub-quorum GC-pruned the gap past its own checkpoint
+    // and so can no longer re-ack it: without this the primary wedges — it cannot re-commit the gap (no
+    // quorum can re-ack a pruned op), cannot state-sync (it already holds the bodies, so the
+    // checkpoint-above-head sync trigger below stays dormant), and cannot forfeit (the checkpoint-FLOOR
+    // lag `maybe_forfeit` reads is zero — it sits AT the quorum floor). Keying on a single peer's
+    // checkpoint is the same trust `maybe_force_sync` already extends. The commit-side complement of
+    // `maybe_request_sync` below, which covers the same evidence ABOVE our head (no bodies held → sync).
+    let peer_checkpoint = self.max_peer_checkpoint_op();
+    if peer_checkpoint.get() > self.commit_max.get() {
+      self.advance_commit(now, sb, blocks, peer_checkpoint.get());
+    }
     // State-sync trigger (symmetric): a backup reporting a checkpoint above our head means we are the
     // laggard (e.g. a partition-healed old primary). The `> self.op` gate keeps this a no-op normally.
     self.maybe_request_sync(now, ok.checkpoint_op());
