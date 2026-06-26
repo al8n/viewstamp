@@ -49,31 +49,6 @@ pub const MAX_CHECKPOINT_OPS: u64 = 1 << 15;
 /// depends on every replica enforcing the same cap).
 pub const MAX_CLIENT_SESSIONS: u32 = 4096;
 
-/// Default cap (bytes) on the checkpoint envelope a state-sync RECEIVER admits from a donor's
-/// chunked-transfer announce (`SyncCheckpointMeta.total_len`): 4 GiB.
-///
-/// **Why a receiver-side cap.** An honest donor derives `total_len` from a VERIFIED read of its own
-/// durable checkpoint, but the announce itself is a small wire frame carrying an unproven claim: the
-/// receiver sizes its reassembly staging from that claim BEFORE any chunk or hash evidence exists, so
-/// a buggy (in-model, crash-fault) peer could claim an absurd length and drive an unbounded
-/// allocation. This cap bounds the staging by CONFIGURATION instead of by the wire: an announce above
-/// it is IGNORED — never pinned, never displacing a live pin — leaving the sync solicitation armed so
-/// a sane donor's next announce proceeds.
-///
-/// **Why 4 GiB.** The envelope is the bound op (8 bytes) + the client-session table + the SM
-/// snapshot. At the default [`MAX_CLIENT_SESSIONS`] (4096) the session prefix reaches the low GiBs
-/// only under wildly outsized cached replies (every session holding a near-frame-cap reply), and a
-/// state-machine snapshot beyond a few GiB is past what a single stop-and-wait chunked transfer is
-/// designed to move. 4 GiB therefore dominates any sane checkpoint while still refusing the
-/// pathological claims (up to `u64::MAX`) this gate exists for.
-///
-/// Tunable per receiver via [`Config::with_max_sync_envelope_len`]. Unlike `max_client_sessions`
-/// this is an ADMISSION bound, not a determinism input: replicas may disagree without a safety risk.
-/// A receiver whose cap is below the cluster's real checkpoint envelope merely refuses every chunked
-/// transfer (its sync stays armed and unsatisfiable until the cap is raised) — it never installs
-/// different state.
-pub const MAX_SYNC_ENVELOPE_LEN: u64 = 4 * 1024 * 1024 * 1024;
-
 /// Error constructing a [`Config`].
 ///
 /// The cluster-shape invariants (voting count, learner count, member uniqueness) moved to
@@ -94,10 +69,6 @@ pub enum ConfigError {
   /// `max_client_sessions` was zero (a zero cap would evict every session at first apply).
   #[error("max_client_sessions must be > 0")]
   ZeroMaxClientSessions,
-  /// `max_sync_envelope_len` was zero (no checkpoint envelope is empty, so a zero cap would refuse
-  /// every chunked state-sync transfer).
-  #[error("max_sync_envelope_len must be > 0")]
-  ZeroMaxSyncEnvelopeLen,
 }
 
 /// The static, per-node parameters for one replica: the cluster id, this node's stable
@@ -113,7 +84,6 @@ pub struct Config {
   local: MemberId,
   checkpoint_ops: u64,
   max_client_sessions: u32,
-  max_sync_envelope_len: u64,
 }
 
 impl Config {
@@ -131,7 +101,6 @@ impl Config {
       local,
       checkpoint_ops: DEFAULT_CHECKPOINT_OPS,
       max_client_sessions: MAX_CLIENT_SESSIONS,
-      max_sync_envelope_len: MAX_SYNC_ENVELOPE_LEN,
     })
   }
 
@@ -158,7 +127,6 @@ impl Config {
       local,
       checkpoint_ops,
       max_client_sessions: MAX_CLIENT_SESSIONS,
-      max_sync_envelope_len: MAX_SYNC_ENVELOPE_LEN,
     })
   }
 
@@ -174,24 +142,6 @@ impl Config {
     }
     Ok(Self {
       max_client_sessions: max,
-      ..self
-    })
-  }
-
-  /// Returns this configuration with the state-sync envelope admission cap replaced (chainable;
-  /// consumes the copy). A `SyncCheckpointMeta` announcing a `total_len` above the cap is ignored,
-  /// so the cap must be at least the cluster's real checkpoint envelope size or every chunked
-  /// transfer is refused — see [`MAX_SYNC_ENVELOPE_LEN`] for the sizing rationale (a too-small cap
-  /// only refuses transfers; it cannot corrupt state).
-  ///
-  /// # Errors
-  /// [`ConfigError::ZeroMaxSyncEnvelopeLen`] if `max == 0`.
-  pub const fn with_max_sync_envelope_len(self, max: u64) -> Result<Self, ConfigError> {
-    if max == 0 {
-      return Err(ConfigError::ZeroMaxSyncEnvelopeLen);
-    }
-    Ok(Self {
-      max_sync_envelope_len: max,
       ..self
     })
   }
@@ -244,14 +194,6 @@ impl Config {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn max_client_sessions(&self) -> u32 {
     self.max_client_sessions
-  }
-
-  /// The state-sync envelope admission cap (bytes): a donor announce (`SyncCheckpointMeta`)
-  /// claiming a `total_len` above this is ignored rather than staged. Defaults to
-  /// [`MAX_SYNC_ENVELOPE_LEN`]; see that constant for the bound's rationale.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn max_sync_envelope_len(&self) -> u64 {
-    self.max_sync_envelope_len
   }
 
   /// The checkpoint lag (in ops) at which a `Normal` primary FORFEITS primacy and steps down via a
