@@ -5,8 +5,9 @@ use agnostic::{
   net::{Net, UdpSocket},
 };
 use viewstamp_proto::{
-  ClientId, Config, Event, IdentityConfig, Instant, MemberId, Membership, Peer, ProvidedIdentity,
-  QuicCoordinator, QuicOptions, ReplicaId, Request, RequestNumber, StateMachine, Superblock, Wal,
+  BlockStore, ClientId, Config, Event, IdentityConfig, Instant, MemberId, Membership, Peer,
+  ProvidedIdentity, QuicCoordinator, QuicOptions, ReplicaId, Request, RequestNumber, StateMachine,
+  Superblock, Wal,
 };
 
 use viewstamp_driver::{
@@ -48,10 +49,21 @@ struct PeerLink {
 /// coordinator + storage + socket on one task; the run loop's recv arm reads the socket directly —
 /// a readiness `recv_from` borrows the driver's one receive buffer and consumes nothing when a
 /// losing select arm drops it — so no helper task or socket clone exists.
-pub struct ReactorQuicDriver<R: Runtime, S, W, B, I> {
+pub struct ReactorQuicDriver<R: Runtime, S, W, B, L, I> {
   coord: QuicCoordinator<S, I>,
   wal: W,
   sb: B,
+  /// Embedder-provided content-addressed block store, the peer of `wal`/`sb` in the node's durable
+  /// store: large bodies (state-sync chunks, snapshots) are addressed by content hash here while the
+  /// WAL/superblock hold the consensus log and durable root.
+  ///
+  /// A PRODUCTION block store MUST be PERSISTENT, and its blocks MUST be durable before the checkpoint
+  /// that references them: the proto writes a checkpoint's blocks, then calls
+  /// [`BlockStore::flush`](viewstamp_proto::BlockStore::flush) and only advances the durable checkpoint
+  /// pointer once the flush returns `Ok` — so a real `flush` must `fsync`/barrier its pending writes and
+  /// report a failure as `Err`. The in-memory store the driver tests use is durable-enough for a process
+  /// that never crashes, but loses its blocks on restart and is NOT suitable for production.
+  blocks: L,
   socket: <R::Net as Net>::UdpSocket,
   /// The recv arm's driver-lifetime receive buffer ([`RECV_BUF_LEN`]). There is no user-space
   /// inbound queue: the run loop receives at most one datagram per iteration, and further
@@ -114,12 +126,13 @@ pub struct ReactorQuicDriver<R: Runtime, S, W, B, I> {
   reconfigure: Option<viewstamp_driver::ReconfigureJob>,
 }
 
-impl<R, S, W, B> ReactorQuicDriver<R, S, W, B, ProvidedIdentity>
+impl<R, S, W, B, L> ReactorQuicDriver<R, S, W, B, L, ProvidedIdentity>
 where
   R: Runtime,
   S: StateMachine,
   W: Wal,
   B: Superblock,
+  L: BlockStore,
 {
   /// Construct the driver over the sealed identity (`with_identity`) path and return a `Handle`.
   ///
@@ -160,6 +173,7 @@ where
     state_machine: S,
     wal: W,
     sb: B,
+    blocks: L,
     client: ClientId,
     first_request: u64,
     opts: QuicOptions,
@@ -175,6 +189,7 @@ where
       state_machine,
       wal,
       sb,
+      blocks,
       client,
       first_request,
       opts,
@@ -201,6 +216,7 @@ where
     state_machine: S,
     mut wal: W,
     mut sb: B,
+    mut blocks: L,
     client: ClientId,
     first_request: u64,
     opts: QuicOptions,
@@ -216,7 +232,14 @@ where
       .await
       .map_err(DriverError::Bind)?;
 
-    let endpoint = build_endpoint(config, membership, state_machine, &mut wal, &mut sb)?;
+    let endpoint = build_endpoint(
+      config,
+      membership,
+      state_machine,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    )?;
     let mut coord = QuicCoordinator::with_identity(endpoint, opts, rng_seed, identity);
 
     let now = clock.now();
@@ -264,6 +287,7 @@ where
       coord,
       wal,
       sb,
+      blocks,
       socket,
       recv_buf: vec![0u8; RECV_BUF_LEN].into_boxed_slice(),
       recv_backoff_until: None,
@@ -289,12 +313,13 @@ where
   }
 }
 
-impl<R, S, W, B, I> ReactorQuicDriver<R, S, W, B, I>
+impl<R, S, W, B, L, I> ReactorQuicDriver<R, S, W, B, L, I>
 where
   R: Runtime,
   S: StateMachine,
   W: Wal,
   B: Superblock,
+  L: BlockStore,
   I: viewstamp_proto::IdentitySource,
 {
   /// Run the driver to completion. Returns on a `Shutdown` command or when all `Handle` clones drop.
@@ -363,7 +388,9 @@ where
         .earliest_deadline()
         .is_some_and(|d| d <= std::time::Instant::now())
       {
-        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self
+          .coord
+          .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
         self.rekey_if_needed(now);
       }
       self.retransmit_stale(now);
@@ -471,7 +498,9 @@ where
         self.recv_backoff_until = Some(std::time::Instant::now() + RECV_ERROR_BACKOFF);
       }
       if fire_timeout {
-        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self
+          .coord
+          .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
         self.rekey_if_needed(now);
       }
       if let Some(cmd) = command
@@ -552,9 +581,13 @@ where
             reservation,
           },
         );
-        self
-          .coord
-          .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        self.coord.submit_client_request(
+          now,
+          &mut self.wal,
+          &mut self.sb,
+          &mut self.blocks,
+          request,
+        );
         false
       }
       Command::Shutdown { ack } => {
@@ -690,6 +723,7 @@ where
       &self.recv_buf[..len],
       &mut self.wal,
       &mut self.sb,
+      &mut self.blocks,
     );
     self.rekey_if_needed(now);
   }
@@ -748,7 +782,7 @@ where
     for request in stale {
       self
         .coord
-        .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        .submit_client_request(now, &mut self.wal, &mut self.sb, &mut self.blocks, request);
     }
   }
 
@@ -759,7 +793,9 @@ where
     // current before any subsequent dial/route/close decision.
     self.rekey_if_needed(now);
     loop {
-      self.coord.handle_storage(now, &mut self.wal, &mut self.sb);
+      self
+        .coord
+        .handle_storage(now, &mut self.wal, &mut self.sb, &mut self.blocks);
       self.rekey_if_needed(now);
       let mut produced = false;
       // Drain the pass's datagrams, then send them SEQUENTIALLY: a readiness `send_to` on an
@@ -850,8 +886,28 @@ mod tests {
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
   };
-  use viewstamp_proto::{ClusterTls, Config, IdentityConfig, MemberId, Membership, QuicOptions};
+  use viewstamp_proto::{
+    BlockAddress, BlockStore, ClusterTls, Config, IdentityConfig, MemberId, Membership, QuicOptions,
+  };
   use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
+
+  /// A throwaway in-memory [`BlockStore`] for the driver tests: the proto's own `MemBlockStore` is
+  /// crate-private, so each driver instance owns one of these for its state-machine checkpoint
+  /// blocks (one per driver, persisting for that driver's lifetime, parallel to its superblock).
+  #[derive(Default)]
+  struct MemBlocks(std::collections::HashMap<BlockAddress, Bytes>);
+
+  impl BlockStore for MemBlocks {
+    fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+      self.0.get(&addr).cloned()
+    }
+    fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+      self.0.insert(addr, block);
+    }
+    fn has_block(&self, addr: BlockAddress) -> bool {
+      self.0.contains_key(&addr)
+    }
+  }
 
   /// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`.
   ///
@@ -879,6 +935,7 @@ mod tests {
     LogSm,
     InMemoryWal,
     InMemorySuperblock,
+    MemBlocks,
     viewstamp_proto::ProvidedIdentity,
   >;
 
@@ -970,6 +1027,7 @@ mod tests {
       LogSm::default(),
       wal,
       sb,
+      MemBlocks::default(),
       viewstamp_proto::ClientId::new(1),
       0,
       opts,

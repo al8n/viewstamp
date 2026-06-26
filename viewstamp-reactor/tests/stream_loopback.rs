@@ -10,12 +10,30 @@ use std::{
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer, ReplicaId, StreamTransport,
-  Superblock, Wal,
+  BlockAddress, BlockStore, Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer,
+  ReplicaId, StreamTransport, Superblock, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 const CLUSTER: u128 = 0x5151;
+
+/// A throwaway in-memory [`BlockStore`] for the driver tests: the proto's own `MemBlockStore` is
+/// crate-private, so each driver instance owns one of these for its state-machine checkpoint blocks
+/// (one per replica, persisting for that replica's lifetime, parallel to its superblock).
+#[derive(Default)]
+struct MemBlocks(std::collections::HashMap<BlockAddress, Bytes>);
+
+impl BlockStore for MemBlocks {
+  fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+    self.0.get(&addr).cloned()
+  }
+  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+    self.0.insert(addr, block);
+  }
+  fn has_block(&self, addr: BlockAddress) -> bool {
+    self.0.contains_key(&addr)
+  }
+}
 
 /// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`, so each
 /// node's local slot equals its old replica index (byte-identical quorum/primary/voter at epoch 0).
@@ -205,6 +223,7 @@ type GateDriver<R> = viewstamp_reactor::ReactorStreamDriver<
   R,
   Notifying<InMemoryWal>,
   Notifying<InMemorySuperblock>,
+  MemBlocks,
 >;
 
 /// [`GateDriver`] over [`Shared`] storage, for the restart gate (the durable store outlives its
@@ -215,6 +234,7 @@ type RestartDriver = viewstamp_reactor::ReactorStreamDriver<
   Labeled<Passthrough>,
   Shared<InMemoryWal>,
   Shared<InMemorySuperblock>,
+  MemBlocks,
 >;
 
 /// Bind a fresh 3-node cluster on `127.0.0.1` TCP ports starting at `base_port`, each on its own
@@ -246,12 +266,14 @@ where
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let blocks = MemBlocks::default();
     let (driver, handle) = GateDriver::new(
       config,
       genesis(3),
       viewstamp_simulation::sm::LogSm::default(),
       wal,
       sb,
+      blocks,
       viewstamp_proto::ClientId::new(u128::from(id) + 1),
       0,
       addrs[id as usize],
@@ -372,12 +394,14 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Shared::new(wals[id as usize].clone(), ready_tx.clone());
     let sb = Shared::new(sbs[id as usize].clone(), ready_tx);
+    let blocks = MemBlocks::default();
     let (driver, handle) = RestartDriver::new(
       config,
       genesis(3),
       viewstamp_simulation::sm::LogSm::default(),
       wal,
       sb,
+      blocks,
       viewstamp_proto::ClientId::new(u128::from(id) + 1),
       0,
       addrs[id as usize],
@@ -443,12 +467,14 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Shared::new(wals[2].clone(), ready_tx.clone());
   let sb = Shared::new(sbs[2].clone(), ready_tx);
+  let blocks = MemBlocks::default();
   let (driver, restarted) = RestartDriver::new(
     viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(2_u128)).unwrap(),
     genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
+    blocks,
     viewstamp_proto::ClientId::new(99),
     0,
     addrs[2],
@@ -521,6 +547,7 @@ async fn stream_driver_exits_when_all_handles_dropped() {
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let blocks = MemBlocks::default();
   let bind: SocketAddr = "127.0.0.1:45200".parse().unwrap();
   let (driver, handle) = GateDriver::new(
     config,
@@ -528,6 +555,7 @@ async fn stream_driver_exits_when_all_handles_dropped() {
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
+    blocks,
     viewstamp_proto::ClientId::new(1),
     0,
     bind,
@@ -584,12 +612,14 @@ async fn shutdown_ack_frees_the_address_for_immediate_rebind_stream() {
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let blocks = MemBlocks::default();
     let (driver, handle) = GateDriver::new(
       config,
       genesis(3),
       viewstamp_simulation::sm::LogSm::default(),
       wal,
       sb,
+      blocks,
       viewstamp_proto::ClientId::new(1),
       0,
       bind,
@@ -648,12 +678,14 @@ async fn shutdown_releases_a_queued_dial_completion() {
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let blocks = MemBlocks::default();
   let (driver, handle) = GateDriver::new(
     config,
     genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
+    blocks,
     viewstamp_proto::ClientId::new(1),
     0,
     "127.0.0.1:45620".parse().unwrap(),
@@ -727,12 +759,14 @@ async fn stalled_unvalidated_accept_is_reaped_at_the_auth_deadline() {
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let blocks = MemBlocks::default();
   let (driver, handle) = GateDriver::new(
     config,
     genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
+    blocks,
     viewstamp_proto::ClientId::new(1),
     0,
     bind,
@@ -809,12 +843,14 @@ async fn stalled_dialed_conn_is_reaped_at_the_auth_deadline_and_redials() {
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let blocks = MemBlocks::default();
   let (driver, handle) = GateDriver::new(
     config,
     genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
+    blocks,
     viewstamp_proto::ClientId::new(1),
     0,
     bind,
@@ -989,12 +1025,14 @@ async fn a_full_cap_evicts_the_oldest_unvalidated_accept_for_a_fresh_one() {
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let blocks = MemBlocks::default();
   let (driver, handle) = GateDriver::with_config(
     config,
     genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
+    blocks,
     viewstamp_proto::ClientId::new(1),
     0,
     bind,

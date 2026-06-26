@@ -1,0 +1,7 @@
+[build]
+rustflags = ["--cfg", "vsrr_internal_testkit"]
+
+# Mirror the flag for all named targets so it is not silenced when a
+# per-target rustflags entry in a higher-priority config file is present.
+[target.'cfg(all())']
+rustflags = ["--cfg", "vsrr_internal_testkit"]

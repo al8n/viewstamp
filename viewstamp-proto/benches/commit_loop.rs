@@ -51,10 +51,11 @@ use std::{
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use viewstamp_proto::{
-  BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchView, CheckpointRead, ClientId,
-  Config, Endpoint, Header, Instant, MemberId, Membership, Message, OpId, OpNumber, Peer,
-  Recipient, ReplicaId, ReplyBuilder, Request, RequestNumber, SlotStatus, StateMachine, Superblock,
-  SuperblockDone, VsrState, Wal, WalDone, max_reply_body_len,
+  BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchView, BlockAddress, BlockStore,
+  CheckpointRead, ClientId, Config, Endpoint, Header, Instant, MemberId, Membership, Message, OpId,
+  OpNumber, Peer, Recipient, ReplicaId, ReplyBuilder, Request, RequestNumber, SlotStatus,
+  StateMachine, Superblock, SuperblockDone, VsrState, Wal, WalDone, block_address,
+  max_reply_body_len,
 };
 
 const REPLICAS: usize = 3;
@@ -159,16 +160,33 @@ struct CounterSm {
   applied: u64,
 }
 
+impl CounterSm {
+  fn snapshot(&self) -> Bytes {
+    Bytes::copy_from_slice(&self.applied.to_be_bytes())
+  }
+}
+
 impl StateMachine for CounterSm {
   fn apply(&mut self, _op: OpNumber, _body: &[u8]) -> Bytes {
     self.applied += 1;
     Bytes::new()
   }
-  fn snapshot(&self) -> Bytes {
-    Bytes::copy_from_slice(&self.applied.to_be_bytes())
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    let block = self.snapshot();
+    let addr = block_address(&block);
+    store.write_block(addr, block);
+    addr
   }
-  fn restore(&mut self, snapshot: &[u8]) {
-    self.applied = u64::from_be_bytes(snapshot.try_into().expect("an 8-byte counter snapshot"));
+  fn restore(
+    &mut self,
+    root: BlockAddress,
+    store: &dyn BlockStore,
+  ) -> Result<(), viewstamp_proto::RestoreError> {
+    let block = store
+      .read_block(root)
+      .ok_or(viewstamp_proto::RestoreError::new(root))?;
+    self.applied = u64::from_be_bytes(block[..].try_into().expect("an 8-byte counter snapshot"));
+    Ok(())
   }
 }
 
@@ -196,12 +214,48 @@ impl StateMachine for BatchCounterSm {
       .finish()
       .expect("a parsed batch carries at least one unit")
   }
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    let block = self.snapshot();
+    let addr = block_address(&block);
+    store.write_block(addr, block);
+    addr
+  }
+  fn restore(
+    &mut self,
+    root: BlockAddress,
+    store: &dyn BlockStore,
+  ) -> Result<(), viewstamp_proto::RestoreError> {
+    let block = store
+      .read_block(root)
+      .ok_or(viewstamp_proto::RestoreError::new(root))?;
+    self.applied_units =
+      u64::from_be_bytes(block[..].try_into().expect("an 8-byte counter snapshot"));
+    Ok(())
+  }
+}
+
+impl BatchCounterSm {
   fn snapshot(&self) -> Bytes {
     Bytes::copy_from_slice(&self.applied_units.to_be_bytes())
   }
-  fn restore(&mut self, snapshot: &[u8]) {
-    self.applied_units =
-      u64::from_be_bytes(snapshot.try_into().expect("an 8-byte counter snapshot"));
+}
+
+/// A synchronous in-memory [`BlockStore`] for the bench: checkpoints write content-addressed blocks
+/// into a `BTreeMap` and reads return them, so the SM's `checkpoint`/`restore` path runs without any
+/// storage cost contaminating the protocol measurement.
+#[derive(Default)]
+struct BenchBlocks {
+  blocks: BTreeMap<BlockAddress, Bytes>,
+}
+impl BlockStore for BenchBlocks {
+  fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+    self.blocks.get(&addr).cloned()
+  }
+  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+    self.blocks.insert(addr, block);
+  }
+  fn has_block(&self, addr: BlockAddress) -> bool {
+    self.blocks.contains_key(&addr)
   }
 }
 
@@ -209,6 +263,7 @@ struct Replica<S> {
   ep: Endpoint<S>,
   wal: BenchWal,
   sb: BenchSb,
+  blocks: BenchBlocks,
 }
 
 /// One closed-loop client: at most one request in flight; the next is minted as
@@ -244,6 +299,7 @@ where
       ),
       wal: BenchWal::default(),
       sb: BenchSb::default(),
+      blocks: BenchBlocks::default(),
     })
     .collect();
   let mut clients: Vec<Client> = (1..=CLIENTS)
@@ -279,6 +335,7 @@ where
           now,
           &mut r.wal,
           &mut r.sb,
+          &mut r.blocks,
           Peer::Client(cl.id),
           Message::Request(req),
         );
@@ -332,10 +389,12 @@ where
       while let Some((to, from, msg)) = inbox.pop_front() {
         moved = true;
         let r = &mut reps[to];
-        r.ep.handle_message(now, &mut r.wal, &mut r.sb, from, msg);
+        r.ep
+          .handle_message(now, &mut r.wal, &mut r.sb, &mut r.blocks, from, msg);
       }
       for r in &mut reps {
-        r.ep.handle_storage(now, &mut r.wal, &mut r.sb);
+        r.ep
+          .handle_storage(now, &mut r.wal, &mut r.sb, &mut r.blocks);
         while r.ep.poll_event().is_some() {}
       }
       if !moved {
@@ -346,7 +405,8 @@ where
     // Fire timers at the advanced instant (heartbeat / retransmit cadence), as a
     // real driver would each tick.
     for r in &mut reps {
-      r.ep.handle_timeout(now, &mut r.wal, &mut r.sb);
+      r.ep
+        .handle_timeout(now, &mut r.wal, &mut r.sb, &mut r.blocks);
     }
   }
 

@@ -16,12 +16,30 @@ use rustls::{
 };
 use viewstamp_driver::{HealthHint, ReconfigureError};
 use viewstamp_proto::{
-  ClusterTls, Event, IdentityConfig, MemberId, Membership, MembershipTarget, QuicOptions,
-  ReplicaId, Superblock, Wal,
+  BlockAddress, BlockStore, ClusterTls, Event, IdentityConfig, MemberId, Membership,
+  MembershipTarget, QuicOptions, ReplicaId, Superblock, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 const CLUSTER: u128 = 0x5151;
+
+/// A throwaway in-memory [`BlockStore`] for the driver tests: the proto's own `MemBlockStore` is
+/// crate-private, so each driver instance owns one of these for its state-machine checkpoint blocks
+/// (one per replica, persisting for that replica's lifetime, parallel to its superblock).
+#[derive(Default)]
+struct MemBlocks(std::collections::HashMap<BlockAddress, Bytes>);
+
+impl BlockStore for MemBlocks {
+  fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+    self.0.get(&addr).cloned()
+  }
+  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+    self.0.insert(addr, block);
+  }
+  fn has_block(&self, addr: BlockAddress) -> bool {
+    self.0.contains_key(&addr)
+  }
+}
 
 /// A genesis configuration with `replica_count` voters (`MemberId::new(0..replica_count)`) and
 /// `learner_count` learners (the next ids), at `config_id = 0` so it mirrors the loopback harness.
@@ -177,6 +195,7 @@ type GateDriver = viewstamp_reactor::ReactorQuicDriver<
   viewstamp_simulation::sm::LogSm,
   Notifying<InMemoryWal>,
   Notifying<InMemorySuperblock>,
+  MemBlocks,
   viewstamp_proto::ProvidedIdentity,
 >;
 
@@ -194,12 +213,14 @@ async fn build_driver(
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let blocks = MemBlocks::default();
   GateDriver::with_config(
     config,
     membership,
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
+    blocks,
     viewstamp_proto::ClientId::new(1),
     0,
     opts,
@@ -228,12 +249,14 @@ async fn build_cluster_driver(
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let blocks = MemBlocks::default();
   GateDriver::new(
     config,
     membership,
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
+    blocks,
     viewstamp_proto::ClientId::new(u128::from(id) + 1),
     0,
     opts,
@@ -491,18 +514,21 @@ async fn stream_cluster_survives_slot_shift() {
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let blocks = MemBlocks::default();
     let (driver, handle) = viewstamp_reactor::ReactorStreamDriver::<
       agnostic::tokio::TokioRuntime,
       viewstamp_simulation::sm::LogSm,
       Labeled<Passthrough>,
       Notifying<InMemoryWal>,
       Notifying<InMemorySuperblock>,
+      MemBlocks,
     >::new(
       config,
       genesis(4, 0),
       viewstamp_simulation::sm::LogSm::default(),
       wal,
       sb,
+      blocks,
       viewstamp_proto::ClientId::new(u128::from(id) + 1),
       0,
       addrs[id as usize],
@@ -674,8 +700,10 @@ async fn quic_cluster_survives_slot_shift() {
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
     let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let blocks = MemBlocks::default();
     let (driver, handle) = viewstamp_reactor::ReactorQuicDriver::<
       agnostic::tokio::TokioRuntime,
+      _,
       _,
       _,
       _,
@@ -686,6 +714,7 @@ async fn quic_cluster_survives_slot_shift() {
       viewstamp_simulation::sm::LogSm::default(),
       wal,
       sb,
+      blocks,
       viewstamp_proto::ClientId::new(u128::from(id) + 1),
       0,
       opts,

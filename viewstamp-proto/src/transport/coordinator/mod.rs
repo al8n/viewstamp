@@ -9,8 +9,8 @@ use bytes::Bytes;
 use std::collections::BTreeSet;
 
 use crate::{
-  Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient, SingleChange,
-  SingleVoterDelta, StateMachine, Superblock, Wal, endpoint::ProposeMembershipError,
+  BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
+  SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal, endpoint::ProposeMembershipError,
   message::Request,
 };
 
@@ -119,6 +119,7 @@ where
   /// frame can never decode before identity validation. Drives the endpoint, then pumps out. The
   /// driver should hand in reasonably-sized reads, but the transport bounds its own intake staging
   /// regardless of how much arrives in a single read.
+  #[allow(clippy::too_many_arguments)]
   pub fn handle_conn_data<W: Wal, B: Superblock>(
     &mut self,
     id: ConnId,
@@ -127,6 +128,7 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
   ) {
     // Feed the driver read in bounded chunks, decoding and draining between each, so the transport's
     // per-conn intake memory (record staging, the frame decoder's complete-frame queue) stays
@@ -150,7 +152,7 @@ where
         let _ = conn.poll_decoded(&mut decoded);
       }
       for (from, msg) in decoded {
-        self.deliver_inbound(now, wal, sb, from, msg);
+        self.deliver_inbound(now, wal, sb, blocks, from, msg);
       }
       // Finalize a peer-finished conn BEFORE pumping the output its final frames produced. A final
       // chunk can carry a complete request AND EOF; the endpoint's response to that request is now in
@@ -257,6 +259,7 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
     request: Request,
   ) {
     if request.body().len() > super::frame::max_request_body_len() {
@@ -270,6 +273,7 @@ where
       now,
       wal,
       sb,
+      blocks,
       Peer::Client(request.client()),
       Message::Request(request.clone()),
     );
@@ -296,6 +300,7 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
@@ -304,12 +309,20 @@ where
     {
       return;
     }
-    self.endpoint.handle_message(now, wal, sb, from, msg);
+    self
+      .endpoint
+      .handle_message(now, wal, sb, blocks, from, msg);
   }
 
   /// Drives timers, then pumps.
-  pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
-    self.endpoint.handle_timeout(now, wal, sb);
+  pub fn handle_timeout<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
+    self.endpoint.handle_timeout(now, wal, sb, blocks);
     // A timeout-driven advance may have installed a new membership; reconcile routing against it
     // BEFORE the pump, so no current-config output rides a stale slot table.
     self.reconcile_routing();
@@ -317,8 +330,14 @@ where
   }
 
   /// Drives storage completions, then pumps.
-  pub fn handle_storage<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
-    self.endpoint.handle_storage(now, wal, sb);
+  pub fn handle_storage<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
+    self.endpoint.handle_storage(now, wal, sb, blocks);
     // A storage-completion advance (e.g. a reconfig op becoming durable) may have installed a new
     // membership; reconcile routing against it BEFORE the pump.
     self.reconcile_routing();
@@ -490,10 +509,11 @@ where
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
-    self.deliver_inbound(now, wal, sb, from, msg);
+    self.deliver_inbound(now, wal, sb, blocks, from, msg);
     self.pump();
   }
 }

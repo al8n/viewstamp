@@ -384,12 +384,12 @@ impl<R: StreamTransport> PeerRouter<R> {
     // than it would accept inbound, so a message whose frame would exceed MAX_FRAME_LEN is refused
     // here WITHOUT paying for a full encode + copy of an oversized buffer the peer would only
     // reject as FrameTooLong. EVERY protocol message is bounded under the cap by construction —
-    // header-only view-change carriers, the byte-bounded RepairBatch serve, and chunked state-sync
-    // (an over-frame checkpoint travels as SyncCheckpointMeta + SyncChunk pulls, never one frame) —
-    // so a refusal here is a REAL bug; it is counted visibly (the oversized-dropped counter) rather
-    // than emitting a doomed frame or silently swallowing the send and wedging liveness. VSR
-    // retransmission covers a refused send. `encoded_len()` is the exact length `encode()` would
-    // produce.
+    // header-only view-change carriers, the byte-bounded RepairBatch serve, and the state-sync
+    // checkpoint (bounded to [`max_unchunked_snapshot_len`] before shipping; over-frame checkpoints
+    // are fetched block-by-block, never shipped as one oversized frame) — so a refusal here is a
+    // REAL bug; it is counted visibly (the oversized-dropped counter) rather than emitting a doomed
+    // frame or silently swallowing the send and wedging liveness. VSR retransmission covers a
+    // refused send. `encoded_len()` is the exact length `encode()` would produce.
     if msg.encoded_len() > MAX_FRAME_LEN as usize {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
       return 0;

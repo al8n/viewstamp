@@ -7,10 +7,30 @@ use rustls::{
   RootCertStore,
   pki_types::{CertificateDer, PrivateKeyDer},
 };
-use viewstamp_proto::{ClusterTls, IdentityConfig, QuicOptions, Superblock, Wal};
+use viewstamp_proto::{
+  BlockAddress, BlockStore, ClusterTls, IdentityConfig, QuicOptions, Superblock, Wal,
+};
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
 const CLUSTER: u128 = 0x5151;
+
+/// A throwaway in-memory [`BlockStore`] for the driver tests: the proto's own `MemBlockStore` is
+/// crate-private, so each driver instance owns one of these for its state-machine checkpoint blocks
+/// (one per replica, persisting for that replica's lifetime, parallel to its superblock).
+#[derive(Default)]
+struct MemBlocks(std::collections::HashMap<BlockAddress, Bytes>);
+
+impl BlockStore for MemBlocks {
+  fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+    self.0.get(&addr).cloned()
+  }
+  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+    self.0.insert(addr, block);
+  }
+  fn has_block(&self, addr: BlockAddress) -> bool {
+    self.0.contains_key(&addr)
+  }
+}
 
 /// The genesis membership for an `n`-voter cluster: `MemberId::new(i)` occupies slot `i`, so each
 /// node's local slot equals its old replica index (byte-identical quorum/primary/voter at epoch 0).
@@ -168,6 +188,7 @@ type GateDriver = viewstamp_compio::CompioQuicDriver<
   viewstamp_simulation::sm::LogSm,
   Notifying<InMemoryWal>,
   Notifying<InMemorySuperblock>,
+  MemBlocks,
   viewstamp_proto::ProvidedIdentity,
 >;
 
@@ -185,12 +206,14 @@ async fn build_driver(
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let blocks = MemBlocks::default();
   viewstamp_compio::CompioQuicDriver::new(
     config,
     genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
     wal,
     sb,
+    blocks,
     viewstamp_proto::ClientId::new(u128::from(id) + 1),
     0,
     opts,
@@ -406,6 +429,7 @@ async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
     viewstamp_simulation::sm::LogSm::default(),
     InMemoryWal::new(),
     InMemorySuperblock::new(),
+    MemBlocks::default(),
     viewstamp_proto::ClientId::new(1),
     0,
     opts,
