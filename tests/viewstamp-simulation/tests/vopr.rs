@@ -86,6 +86,16 @@
 //! NO quorum cannot be repaired from a non-existent source, so the drain never converges it and the phase
 //! reports a liveness/non-convergence wedge instead of passing.
 //!
+//! Seed **85** was a consensus LIVELOCK from a 2-2 checkpoint split (the block-DAG checkpoint can leave a
+//! sub-quorum at a LOWER durable checkpoint than the rest, where the prior synchronous inline snapshot
+//! kept them aligned): a crash-restarted PRIMARY recovered its head but not its full committed prefix,
+//! while the ahead sub-quorum had checkpointed + GC-pruned past the gap. The primary could then neither
+//! re-commit the gap (no quorum can re-ack a pruned op), state-sync (it already held the bodies in its
+//! offset tail), nor forfeit (its checkpoint sat AT the quorum floor, so the forfeit lag was zero) — a
+//! stable wedge through a fault-free window. FIXED in `on_prepare_ok`: a primary whose commit lags the
+//! highest peer-reported checkpoint adopts it (a peer checkpoints only a committed op) and applies the
+//! held ops — the commit-side complement of the above-head state-sync trigger.
+//!
 //! Every bug this sweep found has been fixed:
 //! - **append-before-ack re-ack hole** — the `appending` set is not a durability oracle; the
 //!   re-ack now consults the WAL's durable status directly;
@@ -175,12 +185,31 @@ fn sweep_seed_count() -> u64 {
     .unwrap_or(SEEDS)
 }
 
+/// The base seed this run's contiguous band starts at: `VOPR_SEED_START` if set and parseable, else 0.
+/// A sharded deep sweep gives each runner a DISJOINT slice by setting `VOPR_SEED_START` to the slice
+/// base and `VOPR_SEEDS` to the slice width, so the shards together cover one wide band with no overlap.
+fn sweep_seed_start() -> u64 {
+  std::env::var("VOPR_SEED_START")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(0)
+}
+
+/// The per-run tick budget to sweep with: `VOPR_TICKS` if set and parseable, else [`DEFAULT_TICKS`].
+/// A deep sweep raises it to drive each seed's schedule deeper (longer-horizon churn/repair bugs).
+fn sweep_ticks() -> u64 {
+  std::env::var("VOPR_TICKS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(DEFAULT_TICKS)
+}
+
 /// Seeds that historically caught a real bug, pinned as regression protection even above the contiguous
 /// `0..SEEDS` range. All pass with the async-superblock mode on; these guard against any of those
 /// specific divergences/wedges ever returning. The `vsr_headers` recovery fix is also covered
 /// by the contiguous range, but stays pinned here as an explicit named guard against its return.
 const REGRESSION_SEEDS: &[u64] = &[
-  21, 52, 84, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622, 774,
+  21, 52, 84, 85, 89, 90, 103, 120, 131, 151, 164, 197, 253, 299, 313, 335, 464, 622, 774,
 ];
 
 #[test]
@@ -218,13 +247,21 @@ fn vopr_sweep_no_violations() {
   let mut total_repair_batches = 0u64;
   let mut total_prepare_batches = 0u64;
   let mut total_unions_floored = 0u64;
+  let start = sweep_seed_start();
   let contiguous = sweep_seed_count();
+  let ticks = sweep_ticks();
+  let band_end = start + contiguous;
+  // A sharded sweep gives each runner a DISJOINT contiguous slice (`VOPR_SEED_START` + `VOPR_SEEDS`),
+  // so the pinned regression seeds ride ONLY the base shard (`start == 0`): re-running the full list on
+  // every shard would waste budget and double-count those seeds. A non-sharded run starts at 0, so it
+  // still always covers them.
+  let regression: &[u64] = if start == 0 { REGRESSION_SEEDS } else { &[] };
   println!(
-    "VOPR sweep: 0..{contiguous} contiguous + {} pinned regression seeds, {DEFAULT_TICKS} ticks each",
-    REGRESSION_SEEDS.len()
+    "VOPR sweep: {start}..{band_end} contiguous + {} pinned regression seeds, {ticks} ticks each",
+    regression.len()
   );
-  for seed in (0..contiguous).chain(REGRESSION_SEEDS.iter().copied()) {
-    let r = run_vopr(seed, DEFAULT_TICKS);
+  for seed in (start..band_end).chain(regression.iter().copied()) {
+    let r = run_vopr(seed, ticks);
     // Off-axis re-formation guard (the standing byte-identity net): WITHOUT the reconfig axis the
     // re-formation escalation is off-axis-unsatisfiable (`epoch > prev_epoch` is false absent a
     // reconfiguration), so NO voter ever escalates out of `RecoveringHead` and NO reconfiguration
