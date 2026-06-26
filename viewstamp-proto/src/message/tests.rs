@@ -354,31 +354,6 @@ fn advertises_authoritative_view_is_exactly_the_gated_set() {
       0,
       std::vec![entry()],
     )),
-    // The chunked state-sync serves advertise `self.view` exactly like the whole SyncCheckpoint, and
-    // carry the same epoch + membership header (a non-empty membership round-trips the length-prefixed
-    // field).
-    Message::SyncCheckpointMeta(SyncCheckpointMeta::new(
-      View::with(1),
-      OpNumber::with(2),
-      0,
-      crate::Epoch::new(0),
-      0,
-      64,
-      ReplicaId::new(0),
-      0,
-      Bytes::from_static(b"chunked-membership"),
-    )),
-    Message::SyncChunk(SyncChunk::new(
-      View::with(1),
-      OpNumber::with(2),
-      0,
-      0,
-      64,
-      0,
-      ReplicaId::new(0),
-      0,
-      body.clone()
-    )),
   ];
   for m in &gated {
     assert!(
@@ -435,16 +410,6 @@ fn advertises_authoritative_view_is_exactly_the_gated_set() {
       ReplicaId::new(2),
       0
     )),
-    // The chunk pull is a solicitation, like the RequestSync it follows.
-    Message::RequestSyncChunk(RequestSyncChunk::new(
-      View::with(1),
-      OpNumber::with(2),
-      0,
-      0,
-      0,
-      ReplicaId::new(2),
-      0
-    )),
   ];
   for m in &ungated {
     assert!(
@@ -456,8 +421,8 @@ fn advertises_authoritative_view_is_exactly_the_gated_set() {
   // Every variant is covered exactly once across the two sets (no Message kind missed).
   assert_eq!(
     gated.len() + ungated.len(),
-    20,
-    "all 20 Message variants are classified"
+    17,
+    "all 17 classified Message variants are covered"
   );
   assert_eq!(
     Message::Commit(Commit::new(
@@ -506,7 +471,7 @@ fn entry(op: u64, body: &[u8]) -> PreparedEntry {
 
 /// One representative [`Message`] per variant, deliberately exercising the edge cases each
 /// variant's codec must handle: an EMPTY body (`Request`), a POPULATED body (`Prepare`/`Reply`/
-/// `SyncCheckpoint`/`SyncChunk`), an EMPTY log slice (`StartView`), a POPULATED multi-entry log
+/// `SyncCheckpoint`/`BlockResponse`), an EMPTY log slice (`StartView`), a POPULATED multi-entry log
 /// (`DoViewChange`/`RecoveryResponse`), the `recovery` bool both ways, and `u64::MAX`/`u128::MAX`
 /// edge scalars. Covers all 24 tags so the round-trip + fuzz tests sweep the whole surface.
 fn one_of_each_variant() -> std::vec::Vec<Message> {
@@ -697,37 +662,6 @@ fn one_of_each_variant() -> std::vec::Vec<Message> {
         ),
       ],
     )),
-    Message::SyncCheckpointMeta(SyncCheckpointMeta::new(
-      View::with(4),
-      OpNumber::with(8),
-      u128::MAX,
-      crate::Epoch::new(7),
-      0,
-      u64::MAX, // edge scalar total_len — round-trips
-      ReplicaId::new(0),
-      0xBEEF,
-      Bytes::from_static(b"meta-membership"),
-    )),
-    Message::RequestSyncChunk(RequestSyncChunk::new(
-      View::with(4),
-      OpNumber::with(8),
-      u128::MAX,
-      0,
-      u64::MAX, // edge scalar offset — round-trips
-      ReplicaId::new(3),
-      0xBEEF,
-    )),
-    Message::SyncChunk(SyncChunk::new(
-      View::with(4),
-      OpNumber::with(8),
-      u128::MAX,
-      0,
-      17,
-      0,
-      ReplicaId::new(0),
-      0xBEEF,
-      Bytes::from_static(b"snapshot-envelope"),
-    )),
     Message::PrepareBatch(PrepareBatch::new(
       View::with(4),
       OpNumber::with(9),
@@ -769,6 +703,11 @@ fn one_of_each_variant() -> std::vec::Vec<Message> {
       OpNumber::with(u64::MAX), // edge scalar frontier — round-trips
       crate::Epoch::new(0),
       0,
+    )),
+    Message::RequestBlock(crate::block_store::block_address(b"test-block")),
+    Message::BlockResponse(BlockResponse::new(
+      crate::block_store::block_address(b"test-block"),
+      Some(Bytes::from_static(b"test-block")),
     )),
   ]
 }
@@ -827,96 +766,6 @@ fn max_reply_body_len_is_tight_against_the_reply_carrier() {
   // request 8 + body length prefix 4).
   assert_eq!(REPLY_ENCODE_OVERHEAD, 39);
   assert_eq!(reply_of(0).encode().len(), REPLY_ENCODE_OVERHEAD);
-}
-
-#[test]
-fn chunked_sync_carriers_are_tight_against_the_frame_cap() {
-  // The chunked-transfer frame arithmetic, pinned by REAL encodings (not just the modelled
-  // consts): a max-fill SyncChunk lands EXACTLY on MAX_FRAME_LEN (so the chunked path can never
-  // produce an oversized frame, and the chunk size wastes nothing), one byte more exceeds it, and
-  // the unchunked threshold is byte-tight on the SyncCheckpoint carrier (an envelope of exactly
-  // `max_unchunked_snapshot_len()` ships whole at exactly the cap; one more byte forces chunking).
-  let cap = MAX_FRAME_LEN as usize;
-  let chunk_of = |len: usize| {
-    Message::SyncChunk(SyncChunk::new(
-      View::with(1),
-      OpNumber::with(8),
-      0xFEED,
-      0,
-      len as u64,
-      0,
-      ReplicaId::new(0),
-      0xBEEF,
-      Bytes::from(std::vec![0u8; len]),
-    ))
-  };
-  assert_eq!(SYNC_CHUNK_CARRIER_OVERHEAD, 81); // +16 for the agnostic config_id
-  assert_eq!(chunk_of(0).encode().len(), SYNC_CHUNK_CARRIER_OVERHEAD);
-  assert_eq!(
-    chunk_of(SYNC_CHUNK_LEN).encode().len(),
-    cap,
-    "a max-fill SyncChunk lands exactly on MAX_FRAME_LEN"
-  );
-  assert!(
-    chunk_of(SYNC_CHUNK_LEN + 1).encode().len() > cap,
-    "one byte over the chunk size exceeds the frame cap"
-  );
-
-  // The unchunked threshold is measured with an EMPTY membership (the same-config common case): the
-  // 4-byte membership length prefix is folded into the carrier overhead, so a max-fill envelope plus an
-  // empty membership still lands exactly on the cap.
-  let checkpoint_of = |len: usize| {
-    Message::SyncCheckpoint(SyncCheckpoint::new(
-      View::with(1),
-      OpNumber::with(8),
-      0xFEED,
-      crate::Epoch::new(0),
-      0,
-      ReplicaId::new(0),
-      0xBEEF,
-      Bytes::from(std::vec![0u8; len]),
-      Bytes::new(),
-    ))
-  };
-  assert_eq!(
-    checkpoint_of(max_unchunked_snapshot_len()).encode().len(),
-    cap,
-    "an envelope of exactly the unchunked threshold ships whole at exactly the cap"
-  );
-  assert!(
-    checkpoint_of(max_unchunked_snapshot_len() + 1)
-      .encode()
-      .len()
-      > cap,
-    "one byte over the threshold cannot ship whole — the donor must chunk it"
-  );
-
-  // The chunked-transfer pull is a small fixed constant (69 bytes: 53 + 16 for the agnostic
-  // config_id). The announce is 81 with an EMPTY membership — 69 + 8 (epoch) + 4 (the membership
-  // length prefix) — and grows by the membership bytes for a cross-epoch successor; either way it is
-  // far under the frame cap (the snapshot is what chunks, never this header).
-  let meta = Message::SyncCheckpointMeta(SyncCheckpointMeta::new(
-    View::with(1),
-    OpNumber::with(8),
-    0xFEED,
-    crate::Epoch::new(0),
-    0,
-    1,
-    ReplicaId::new(0),
-    0xBEEF,
-    Bytes::new(),
-  ));
-  let pull = Message::RequestSyncChunk(RequestSyncChunk::new(
-    View::with(1),
-    OpNumber::with(8),
-    0xFEED,
-    0,
-    0,
-    ReplicaId::new(2),
-    0xBEEF,
-  ));
-  assert_eq!(meta.encode().len(), 81);
-  assert_eq!(pull.encode().len(), 69);
 }
 
 #[test]
@@ -1151,7 +1000,7 @@ fn max_request_body_len_is_tight_against_every_body_carrier() {
 #[test]
 fn every_variant_round_trips_through_the_wire_codec() {
   let all = one_of_each_variant();
-  assert_eq!(all.len(), 24, "every Message variant is represented");
+  assert_eq!(all.len(), 23, "every Message variant is represented");
   for m in &all {
     let bytes = m.encode();
     let back = Message::decode(&bytes).expect("round-trip decodes");
@@ -1212,17 +1061,6 @@ fn a_replica_id_above_a_byte_round_trips_through_the_wire_codec() {
       std::vec![entry(5, b"hi")],
     )),
     Message::Recovery(Recovery::new(id, 0xABCD, crate::Epoch::new(0), 0)),
-    Message::SyncChunk(SyncChunk::new(
-      View::with(1),
-      OpNumber::with(8),
-      0xFEED,
-      0,
-      4,
-      0,
-      id,
-      0xBEEF,
-      Bytes::from_static(b"abc"),
-    )),
   ];
   for m in &carriers {
     let back = Message::decode(&m.encode()).expect("round-trips");
@@ -1240,7 +1078,7 @@ fn a_replica_id_above_a_byte_round_trips_through_the_wire_codec() {
 
 #[test]
 fn commit_golden_bytes_pin_the_wire_layout() {
-  // A small STRICT variant pinned exactly: WIRE_VERSION(u16=11) ++ tag 4 ++ view ++ commit ++
+  // A small STRICT variant pinned exactly: WIRE_VERSION(u16=12) ++ tag 4 ++ view ++ commit ++
   // checkpoint_op ++ the strict epoch-policy pair epoch(u64) ++ config_id(u128).
   let c = Message::Commit(Commit::new(
     View::with(4),
@@ -1250,7 +1088,7 @@ fn commit_golden_bytes_pin_the_wire_layout() {
     0,
   ));
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 11, 4, // version 11, tag 4 (Commit)
+    0, 13, 4, // version 13, tag 4 (Commit)
     0, 0, 0, 0, 0, 0, 0, 4, // view = 4
     0, 0, 0, 0, 0, 0, 0, 9, // commit = 9
     0, 0, 0, 0, 0, 0, 0, 7, // checkpoint_op = 7
@@ -1285,7 +1123,7 @@ fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
     .with_checkpoint_op(OpNumber::with(3)),
   );
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 11, 6, // version 11, tag 6 (DoViewChange)
+    0, 13, 6, // version 13, tag 6 (DoViewChange)
     0, 0, 0, 0, 0, 0, 0, 3, // view = 3
     0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
     0, 0, 0, 0, 0, 0, 0, 5, // op = 5
@@ -1329,7 +1167,7 @@ fn do_view_change_golden_bytes_pin_a_repairing_entry() {
     .with_checkpoint_op(OpNumber::with(3)),
   );
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 11, 6, // version 11, tag 6 (DoViewChange)
+    0, 13, 6, // version 13, tag 6 (DoViewChange)
     0, 0, 0, 0, 0, 0, 0, 3, // view = 3
     0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
     0, 0, 0, 0, 0, 0, 0, 5, // op = 5
@@ -1487,7 +1325,7 @@ fn reconfigure_body_golden_bytes_pin_the_wire_layout() {
     .with_checkpoint_op(OpNumber::with(3)),
   );
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 11, 6, // version 11, tag 6 (DoViewChange)
+    0, 13, 6, // version 13, tag 6 (DoViewChange)
     0, 0, 0, 0, 0, 0, 0, 3, // view = 3
     0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
     0, 0, 0, 0, 0, 0, 0, 5, // op = 5
@@ -1690,4 +1528,47 @@ fn decode_never_panics_on_truncations_or_random_bytes() {
     }
     let _ = Message::decode(&v); // must not panic
   }
+}
+
+#[test]
+fn request_block_and_block_response_round_trip_through_the_wire_codec() {
+  let addr = crate::block_store::block_address(b"some-block-bytes");
+
+  // RequestBlock: a fixed 16-byte payload carrying the content address.
+  let req = Message::RequestBlock(addr);
+  let back = Message::decode(&req.encode()).expect("RequestBlock round-trips");
+  assert_eq!(back, req, "decode(encode(RequestBlock)) == RequestBlock");
+  assert!(
+    !req.advertises_authoritative_view(),
+    "a block solicitation carries no view authority",
+  );
+
+  // BlockResponse with a present block.
+  let block_bytes = Bytes::from_static(b"some-block-bytes");
+  let present = Message::BlockResponse(BlockResponse::new(addr, Some(block_bytes.clone())));
+  let back = Message::decode(&present.encode()).expect("BlockResponse(Some) round-trips");
+  assert_eq!(
+    back, present,
+    "decode(encode(BlockResponse(Some))) == present"
+  );
+  let br = back.unwrap_block_response();
+  assert_eq!(br.addr(), addr);
+  assert_eq!(br.block(), Some(block_bytes.as_ref()));
+
+  // BlockResponse with an absent block (donor does not hold this address).
+  let absent = Message::BlockResponse(BlockResponse::new(addr, None));
+  let back = Message::decode(&absent.encode()).expect("BlockResponse(None) round-trips");
+  assert_eq!(
+    back, absent,
+    "decode(encode(BlockResponse(None))) == absent"
+  );
+  let br = back.unwrap_block_response();
+  assert_eq!(br.addr(), addr);
+  assert_eq!(br.block(), None);
+  assert!(br.is_absent(), "None block is absent");
+  assert!(!br.is_present(), "None block is not present");
+
+  // encoded_len matches encode().len() for both shapes.
+  assert_eq!(present.encoded_len(), present.encode().len());
+  assert_eq!(absent.encoded_len(), absent.encode().len());
 }
