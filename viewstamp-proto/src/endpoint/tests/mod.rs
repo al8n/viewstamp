@@ -5,9 +5,10 @@
 
 use super::*;
 use crate::{
-  CheckpointRead, ClientId, Config, DoViewChange, Header, MemberId, Membership, OpId, OpNumber,
-  Prepare, PreparedEntry, ReadOk, ReplicaId, Request, RequestNumber, SlotStatus, StartViewChange,
-  Superblock, SuperblockDone, View, VsrState, Wal, WalDone,
+  BlockAddress, BlockStore, CheckpointRead, ClientId, Config, DoViewChange, Header, MemberId,
+  Membership, OpId, OpNumber, Prepare, PreparedEntry, ReadOk, ReplicaId, Request, RequestNumber,
+  SlotStatus, StartViewChange, Superblock, SuperblockDone, View, VsrState, Wal, WalDone,
+  block_address,
 };
 use std::collections::VecDeque;
 
@@ -68,11 +69,23 @@ impl StateMachine for NoopSm {
     Bytes::new()
   }
 
-  fn snapshot(&self) -> Bytes {
-    Bytes::new()
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    let block = Bytes::new();
+    let addr = block_address(&block);
+    store.write_block(addr, block);
+    addr
   }
 
-  fn restore(&mut self, _snapshot: &[u8]) {}
+  fn restore(
+    &mut self,
+    root: BlockAddress,
+    store: &dyn BlockStore,
+  ) -> Result<(), crate::RestoreError> {
+    store
+      .read_block(root)
+      .map(|_| ())
+      .ok_or(crate::RestoreError::new(root))
+  }
 }
 
 /// Echoes the request body as its reply, so a test can observe exactly which bytes were applied
@@ -83,16 +96,29 @@ impl StateMachine for EchoSm {
     Bytes::copy_from_slice(body)
   }
 
-  fn snapshot(&self) -> Bytes {
-    Bytes::new()
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    let block = Bytes::new();
+    let addr = block_address(&block);
+    store.write_block(addr, block);
+    addr
   }
 
-  fn restore(&mut self, _snapshot: &[u8]) {}
+  fn restore(
+    &mut self,
+    root: BlockAddress,
+    store: &dyn BlockStore,
+  ) -> Result<(), crate::RestoreError> {
+    store
+      .read_block(root)
+      .map(|_| ())
+      .ok_or(crate::RestoreError::new(root))
+  }
 }
 
-/// Records every applied `(op, body)` and round-trips them through `snapshot`/`restore`
-/// (mirrors the sim's `LogSm`). Used to prove `recover` restores the SM from the durable
-/// checkpoint snapshot (a fresh SM has 0 applied; a restored one reflects the checkpoint).
+/// Records every applied `(op, body)` and round-trips them through a single-block `checkpoint` /
+/// `restore` (mirrors the sim's `LogSm`). Used to prove `recover` restores the SM from the durable
+/// checkpoint (a fresh SM has 0 applied; a restored one reflects the checkpoint). The inherent
+/// `snapshot`/`restore_bytes` helpers carry the leaf serialization the block round-trip uses.
 #[derive(Default)]
 struct CountSm {
   applied: std::vec::Vec<(u64, std::vec::Vec<u8>)>,
@@ -100,12 +126,6 @@ struct CountSm {
 impl CountSm {
   fn applied(&self) -> &[(u64, std::vec::Vec<u8>)] {
     &self.applied
-  }
-}
-impl StateMachine for CountSm {
-  fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
-    self.applied.push((op.get(), body.to_vec()));
-    Bytes::copy_from_slice(body)
   }
 
   fn snapshot(&self) -> Bytes {
@@ -119,7 +139,7 @@ impl StateMachine for CountSm {
     Bytes::from(out)
   }
 
-  fn restore(&mut self, snapshot: &[u8]) {
+  fn restore_bytes(&mut self, snapshot: &[u8]) {
     let mut applied = std::vec::Vec::new();
     let mut i = 0usize;
     let count = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap());
@@ -133,6 +153,140 @@ impl StateMachine for CountSm {
       i += len;
     }
     self.applied = applied;
+  }
+}
+impl StateMachine for CountSm {
+  fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
+    self.applied.push((op.get(), body.to_vec()));
+    Bytes::copy_from_slice(body)
+  }
+
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    let block = self.snapshot();
+    let addr = block_address(&block);
+    store.write_block(addr, block);
+    addr
+  }
+
+  fn restore(
+    &mut self,
+    root: BlockAddress,
+    store: &dyn BlockStore,
+  ) -> Result<(), crate::RestoreError> {
+    let block = store
+      .read_block(root)
+      .ok_or(crate::RestoreError::new(root))?;
+    self.restore_bytes(&block);
+    Ok(())
+  }
+}
+
+/// A `CountSm` whose checkpoint is a MULTI-block DAG — a root block referencing two distinct leaves
+/// (`leaf-x` = the first half of the applied ops, `leaf-y` = the second half). Two leaves let a test
+/// fault DIFFERENT (complementary) blocks on two replicas: replica A corrupts `leaf-x` but holds clean
+/// `leaf-y`, replica B corrupts `leaf-y` but holds clean `leaf-x`. The block format mirrors the
+/// `block_sync` tests: a 1-byte tag then a sequence of 16-byte child addresses, which `block_references`
+/// parses (leaves carry no addresses). `restore` walks the DAG through the VERIFY-ON-READ `store`, so a
+/// corrupt leaf reads back absent and surfaces a [`RestoreError`] — exactly the post-root SM-reconstruct
+/// fault the obligation-failover paths recover from.
+#[derive(Default)]
+struct TwoLeafSm {
+  applied: std::vec::Vec<(u64, std::vec::Vec<u8>)>,
+}
+impl TwoLeafSm {
+  fn applied(&self) -> &[(u64, std::vec::Vec<u8>)] {
+    &self.applied
+  }
+
+  fn leaf_bytes(tag: u8, ops: &[(u64, std::vec::Vec<u8>)]) -> Bytes {
+    let mut out = std::vec::Vec::new();
+    out.push(tag); // a leaf tag (no trailing addresses) — `block_references` yields none.
+    out.extend_from_slice(&(ops.len() as u64).to_be_bytes());
+    for (op, body) in ops {
+      out.extend_from_slice(&op.to_be_bytes());
+      out.extend_from_slice(&(body.len() as u64).to_be_bytes());
+      out.extend_from_slice(body);
+    }
+    Bytes::from(out)
+  }
+
+  fn decode_leaf(block: &[u8], out: &mut std::vec::Vec<(u64, std::vec::Vec<u8>)>) {
+    let mut i = 1usize; // skip the tag byte
+    let count = u64::from_be_bytes(block[i..i + 8].try_into().unwrap());
+    i += 8;
+    for _ in 0..count {
+      let op = u64::from_be_bytes(block[i..i + 8].try_into().unwrap());
+      i += 8;
+      let len = u64::from_be_bytes(block[i..i + 8].try_into().unwrap()) as usize;
+      i += 8;
+      out.push((op, block[i..i + len].to_vec()));
+      i += len;
+    }
+  }
+
+  /// The two leaf splits: the first `len/2` applied ops in `leaf-x`, the rest in `leaf-y`.
+  fn leaves(&self) -> (Bytes, Bytes) {
+    let mid = self.applied.len() / 2;
+    (
+      Self::leaf_bytes(b'x', &self.applied[..mid]),
+      Self::leaf_bytes(b'y', &self.applied[mid..]),
+    )
+  }
+}
+impl StateMachine for TwoLeafSm {
+  fn apply(&mut self, op: OpNumber, body: &[u8]) -> Bytes {
+    self.applied.push((op.get(), body.to_vec()));
+    Bytes::copy_from_slice(body)
+  }
+
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    let (leaf_x, leaf_y) = self.leaves();
+    let xa = block_address(&leaf_x);
+    let ya = block_address(&leaf_y);
+    store.write_block(xa, leaf_x);
+    store.write_block(ya, leaf_y);
+    let mut root = std::vec::Vec::new();
+    root.push(b'R');
+    root.extend_from_slice(xa.as_bytes());
+    root.extend_from_slice(ya.as_bytes());
+    let root = Bytes::from(root);
+    let roota = block_address(&root);
+    store.write_block(roota, root);
+    roota
+  }
+
+  fn restore(
+    &mut self,
+    root: BlockAddress,
+    store: &dyn BlockStore,
+  ) -> Result<(), crate::RestoreError> {
+    let root_block = store
+      .read_block(root)
+      .ok_or(crate::RestoreError::new(root))?;
+    let mut applied = std::vec::Vec::new();
+    for child in Self::block_references(&root_block) {
+      let leaf = store
+        .read_block(child)
+        .ok_or(crate::RestoreError::new(child))?;
+      Self::decode_leaf(&leaf, &mut applied);
+    }
+    self.applied = applied;
+    Ok(())
+  }
+
+  fn block_references(block: &[u8]) -> std::vec::Vec<BlockAddress> {
+    let payload = match block.split_first() {
+      Some((b'R', rest)) => rest, // only the root tag carries child addresses; leaves carry none.
+      _ => return std::vec::Vec::new(),
+    };
+    payload
+      .chunks_exact(16)
+      .map(|c| {
+        let mut a = [0u8; 16];
+        a.copy_from_slice(c);
+        BlockAddress::from_bytes(a)
+      })
+      .collect()
   }
 }
 
@@ -556,6 +710,7 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
   let mut wal = ScriptedWal::with_entries(head);
   wal.script_read_fault(OpNumber::with(faulty_op), u8::MAX); // permanent: never clears on disk
   let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
@@ -564,9 +719,10 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
     CountSm::default(),
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   (r, wal, sb)
 }
 
@@ -582,6 +738,7 @@ fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
   r: &mut Endpoint<S>,
   wal: &mut W,
   sb: &mut B,
+  blocks: &mut dyn BlockStore,
   now: Instant,
 ) {
   // Drive on a LOCAL advancing clock `t` so the recover-retry timer actually fires across the budget;
@@ -589,13 +746,13 @@ fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
   // fire per step is enough to count a pending op's budget down to its exhaustion resolution.
   let mut t = now;
   for _ in 0..(RECOVER_READ_RETRIES as usize + 4) {
-    r.handle_storage(t, wal, sb);
+    r.handle_storage(t, wal, sb, blocks);
     if !r.status().is_recovering() {
       break;
     }
     if let Some(deadline) = r.poll_timeout() {
       t = deadline;
-      r.handle_timeout(t, wal, sb);
+      r.handle_timeout(t, wal, sb, blocks);
     }
   }
   // Re-baseline every timer to the caller's `now`, so the terminal state is observably identical to a
@@ -611,6 +768,7 @@ fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
   let mut wal = ScriptedWal::with_entries(head);
   wal.script_read_fault(OpNumber::with(head), u8::MAX); // head read never clears → permanently faulty
   let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
@@ -619,9 +777,10 @@ fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -694,17 +853,20 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // Drive into ViewChange(view 1) (replica 1 is primary of view 1): own SVC + replica 0's SVC.
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -743,13 +905,14 @@ fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, St
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
   // Now Normal primary of view 1, op 2 — but the durable-view write is inflight (StepSb has not
   // flushed it). Pump the WAL (so the op-2 AdoptVote append completes) WITHOUT flushing the SB, so
   // the window stays open. Discard anything emitted by the transition itself.
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
@@ -834,18 +997,19 @@ fn drive_recovery_scripted_sb<S: StateMachine, W: Wal>(
   r: &mut Endpoint<S>,
   wal: &mut W,
   sb: &mut ScriptedCheckpointSb,
+  blocks: &mut dyn BlockStore,
   now: Instant,
 ) {
   let mut t = now;
   for _ in 0..(RECOVER_READ_RETRIES as usize + 8) {
     sb.flush();
-    r.handle_storage(t, wal, sb);
+    r.handle_storage(t, wal, sb, blocks);
     if !r.status().is_recovering() && !r.status().is_recovering_head() {
       break;
     }
     if let Some(deadline) = r.poll_timeout() {
       t = deadline;
-      r.handle_timeout(t, wal, sb);
+      r.handle_timeout(t, wal, sb, blocks);
     }
   }
 }
@@ -857,6 +1021,7 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
   let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let req = |rn: u64| {
     Message::Request(Request::new(
@@ -870,14 +1035,16 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Client(ClientId::new(7)),
       req(rn),
     );
-    e.handle_storage(now, &mut wal, &mut sb); // primary's own append durable (own vote)
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable (own vote)
     e.handle_message(
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Replica(ReplicaId::new(1)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -893,7 +1060,7 @@ fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb
         0,
       )),
     );
-    e.handle_storage(now, &mut wal, &mut sb); // drain checkpoint writes
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain checkpoint writes
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -948,6 +1115,59 @@ fn sync_apply_harness(checkpoint_op: u64) -> (Endpoint<CountSm>, TestWal, TestSb
   let wal = TestWal::default();
   let sb = TestSb::default();
   (e, wal, sb, env, id)
+}
+
+/// Seed `blocks` with BOTH content-addressed DAGs a `donor_primary_at_checkpoint(ckpt)` /
+/// `sync_apply_harness(ckpt)` donor produced — the SM checkpoint DAG AND the client-session-table DAG —
+/// so a laggard that delivers that donor's `SyncCheckpoint` installs immediately, both block-fetch
+/// frontiers draining against the local store with no `RequestBlock` round trip. Re-runs the donor's
+/// exact checkpoint sequence into `blocks`, so every block its `force_checkpoint` wrote (the SM leaf
+/// plus the session-table DAG, whose root the envelope names) lands under the exact content addresses the
+/// envelope references.
+fn seed_donor_blocks(blocks: &mut crate::block_store::MemBlockStore, ckpt: u64) {
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
+  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let now = Instant::ZERO;
+  let req = |rn: u64| {
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(rn),
+      Bytes::from(std::vec![rn as u8]),
+    ))
+  };
+  for rn in 1..=ckpt {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      blocks,
+      Peer::Client(ClientId::new(7)),
+      req(rn),
+    );
+    e.handle_storage(now, &mut wal, &mut sb, blocks);
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      blocks,
+      Peer::Replica(ReplicaId::new(1)),
+      Message::PrepareOk(PrepareOk::new(
+        View::new(),
+        OpNumber::with(rn),
+        ReplicaId::new(1),
+        OpNumber::new(),
+        crate::storage::prepare_identity(
+          ClientId::new(7),
+          RequestNumber::with(rn),
+          crate::storage::fnv1a_128(&[rn as u8]),
+        ),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb, blocks);
+  }
 }
 
 /// A DVC whose dense log starts at `floor+1` (a state-synced donor, checkpoint at `floor`), head

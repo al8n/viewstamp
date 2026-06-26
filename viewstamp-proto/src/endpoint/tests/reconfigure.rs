@@ -220,6 +220,7 @@ fn proposed_and_committed_swap() -> (
 ) {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -233,12 +234,13 @@ fn proposed_and_committed_swap() -> (
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {} // drop the broadcast Prepare
   // The primary's own WAL append lands → its own vote is recorded (1 of 3).
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   // One backup ack reaches the 2-of-3 commit quorum → the op commits and stages SwapEpoch.
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(op.get(), &payload, 1),
   );
@@ -342,6 +344,7 @@ fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
   let (_e, wal, sb, op, _successor, _payload) = proposed_and_committed_swap();
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
   let (mut rwal, mut rsb) = (wal, sb);
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
     cfg,
     genesis(3),
@@ -349,6 +352,7 @@ fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
     CountSm::default(),
     &mut rwal,
     &mut rsb,
+    &mut blocks,
   );
   let r = match recovered {
     Recovered::Active(e) => e,
@@ -367,7 +371,8 @@ fn the_reconfigure_op_is_never_delivered_to_the_state_machine() {
   // A Reconfigure op is consensus-layer: it must NOT reach `S::apply`. Drive it to commit AND make
   // the SwapEpoch root durable, then assert the CountSm applied NOTHING for it.
   let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
-  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // land the SwapEpoch root → install
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
   assert!(
     e.sm_for_test().applied().is_empty(),
     "the Reconfigure op was never applied to the state machine"
@@ -379,10 +384,11 @@ fn on_the_durable_root_the_epoch_swaps_and_membership_changed_is_emitted() {
   // Once the SwapEpoch root lands, `install_membership` runs: epoch == old+1, prev_epoch == old, the
   // successor membership is active, and a `MembershipChanged` event is emitted.
   let (mut e, mut wal, mut sb, op, successor, _payload) = proposed_and_committed_swap();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   // Drain any pre-swap events (the committed-op band, etc.) so the swap event is observable cleanly.
   while e.poll_event().is_some() {}
 
-  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // land the SwapEpoch root
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root
 
   assert_eq!(
     e.membership.epoch(),
@@ -439,6 +445,7 @@ fn the_durable_swap_forces_a_checkpoint_so_the_cross_epoch_serve_gate_holds() {
   // makes the cross-epoch state-sync serve gate `checkpoint_op (M) >= config_install_op (N)` true BY
   // CONSTRUCTION — a quiescent donor can never withhold the E+1 membership from a cross-epoch laggard.
   let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // No checkpoint precedes the swap: the lone reconfigure op (op 1) sits far below the default cadence
@@ -451,14 +458,14 @@ fn the_durable_swap_forces_a_checkpoint_so_the_cross_epoch_serve_gate_holds() {
 
   // Land the SwapEpoch root → `install_membership` sets `config_install_op = N`, then `force_checkpoint`
   // submits the owed checkpoint at `commit_min` (== N here).
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.config_install_op, op,
     "the install recorded the reconfigure op as config_install_op = N"
   );
   // Drain the two-write forced checkpoint (snapshot → durable root) to completion.
   for _ in 0..4 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
 
   assert!(
@@ -471,6 +478,76 @@ fn the_durable_swap_forces_a_checkpoint_so_the_cross_epoch_serve_gate_holds() {
     e.checkpoint_op(),
     op,
     "the forced checkpoint is at M == N (commit_min at swap time)"
+  );
+}
+
+#[test]
+fn a_swap_forced_checkpoint_flush_fault_is_self_retried_by_the_primary_heartbeat_with_no_client_commits()
+ {
+  // The SwapEpoch arm forces a post-swap checkpoint at M >= N; if its block-store flush faults TRANSIENTLY
+  // the checkpoint is NOT submitted, leaving `config_install_op (N) > checkpoint_op` — the debt that makes
+  // a donor WITHHOLD the successor membership from a cross-epoch laggard. A QUIESCENT new-epoch primary
+  // (no client traffic) has no commit-advance tail to re-force it, so it must SELF-HEAL off its heartbeat:
+  // the debt-pay path is armed from the primary timer, and once the flush recovers it re-forces the owed
+  // checkpoint, opening the cross-epoch serve gate — with NO subsequent client commit or restart.
+  let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  // The SwapEpoch arm's forced checkpoint hits a flush fault (1 fault, then durable).
+  blocks.script_flush_fault(1);
+  let now = Instant::ZERO;
+
+  // Land the SwapEpoch root: `install_membership` sets `config_install_op = N`, then `force_checkpoint`
+  // FAILS the flush → no checkpoint is submitted and the debt is owed.
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    e.config_install_op, op,
+    "the install recorded the reconfigure op as config_install_op = N"
+  );
+  // Drain any in-flight storage. The forced checkpoint never staged (the flush faulted), so the durable
+  // checkpoint stays at 0 and the debt (`config_install_op N > checkpoint_op 0`) is owed + WITHHELD.
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::new(),
+    "the flush fault held the SwapEpoch forced checkpoint back — no durable checkpoint"
+  );
+  assert!(
+    e.config_install_op > e.checkpoint_op(),
+    "the SwapEpoch debt is owed (config_install_op {} > checkpoint_op {}) → the successor membership is \
+     withheld from a cross-epoch laggard",
+    e.config_install_op.get(),
+    e.checkpoint_op().get(),
+  );
+
+  // QUIESCENT: deliver NO client message ever again. Drive ONLY the primary heartbeat timer (and the
+  // synchronous storage it stages) forward. The flush has recovered, so the heartbeat-armed debt-pay
+  // re-forces the owed checkpoint and its two-write root drains to durability.
+  let mut later = now;
+  for _ in 0..8 {
+    later = later + core::time::Duration::from_millis(60);
+    e.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
+    e.handle_storage(later, &mut wal, &mut sb, &mut blocks);
+  }
+
+  // The debt is paid with no client commit: the checkpoint now embeds N and the serve gate holds.
+  assert!(
+    e.checkpoint_op() >= e.config_install_op,
+    "the primary self-healed the SwapEpoch debt off its heartbeat: checkpoint_op {} >= config_install_op \
+     {} (cross-epoch serve gate now open)",
+    e.checkpoint_op().get(),
+    e.config_install_op.get(),
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    op,
+    "the self-retried forced checkpoint landed at M == N"
+  );
+  assert_eq!(
+    sb.state().checkpoint_op(),
+    op,
+    "the self-retried forced checkpoint is durable"
   );
 }
 
@@ -502,6 +579,7 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
   let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, n1, n1, 0, &[]);
 
@@ -528,11 +606,15 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   let nonce = e.sync_nonce_for_test();
 
   // --- THE DEFER: an E+2 successor-membership SyncCheckpoint arrives WHILE the SwapEpoch root is in flight. ---
+  let cross_snap = CountSm::default().snapshot();
   let cross_env = Endpoint::<CountSm>::encode_checkpoint(
     OpNumber::with(m2),
-    &std::collections::BTreeMap::new(),
-    &CountSm::default().snapshot(),
+    crate::block_address(&cross_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
   );
+  // Seed the crossing checkpoint's single leaf so the install frontier drains with no RequestBlock round
+  // trip (the small envelope now names the SM root by address, not inline bytes).
+  blocks.write_verified(cross_snap.clone());
   let cross_id = crate::checkpoint_id(&cross_env);
   let membership_body =
     ReconfigurePayload::from_membership(&successor_e2, successor_e1.config_id()).encode_body();
@@ -553,6 +635,7 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     cross_msg(nonce),
   );
@@ -577,14 +660,14 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   );
 
   // --- Land the SwapEpoch root → install E+1 → its UNCONDITIONAL forced checkpoint at M1 == N1 lands. ---
-  e.handle_storage(now, &mut wal, &mut sb); // SwapEpoch root → install_membership(N1) + force_checkpoint
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // SwapEpoch root → install_membership(N1) + force_checkpoint
   assert_eq!(
     e.membership.epoch(),
     successor_e1.epoch(),
     "the node's own swap installed E+1"
   );
   for _ in 0..4 {
-    e.handle_storage(now, &mut wal, &mut sb); // drain the forced checkpoint (snapshot -> root)
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain the forced checkpoint (snapshot -> root)
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -602,6 +685,7 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     cross_msg(nonce2),
   );
@@ -610,7 +694,7 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
     "with the root cleared, the re-solicited reply STAGED the crossing install (no longer deferred)"
   );
   for _ in 0..3 {
-    e.handle_storage(now, &mut wal, &mut sb); // the two-write re-persist -> durable root -> install
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the two-write re-persist -> durable root -> install
   }
   assert_eq!(
     e.state_syncs_applied(),
@@ -663,6 +747,7 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
   let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.force_state_for_test(0, n1, n1, 0, &[]);
 
@@ -705,11 +790,15 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
   // chained off the genesis predecessor (config_id 0), at the crossing op N. `apply_sync` reconstructs
   // + VERIFIES it (the config_id hash-chain), so this is the cross-epoch crossing install.
   let nonce = e.sync_nonce_for_test();
+  let cross_snap = CountSm::default().snapshot();
   let cross_env = Endpoint::<CountSm>::encode_checkpoint(
     OpNumber::with(n1),
-    &std::collections::BTreeMap::new(),
-    &CountSm::default().snapshot(),
+    crate::block_address(&cross_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
   );
+  // Seed the crossing checkpoint's single leaf so the install frontier drains with no RequestBlock round
+  // trip (the small envelope names the SM root by address, not inline bytes).
+  blocks.write_verified(cross_snap.clone());
   let cross_id = crate::checkpoint_id(&cross_env);
   let membership_body =
     ReconfigurePayload::from_membership(&successor_e1, genesis_config_id).encode_body();
@@ -717,6 +806,7 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -739,7 +829,7 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
   // E1)` (the crossing) and (the FIX) consumes the stale `pending_swap`; then `on_sb_done`'s tail
   // `maybe_swap_epoch` runs against the now-E1 membership.
   for _ in 0..4 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
 
   // The crossing landed: E1 is installed, the sync completed exactly once.
@@ -799,6 +889,174 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
 }
 
 #[test]
+fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_stranding() {
+  // The RECOVERY peer-fetch restore-error retry must stay SERVICEABLE while Recovering. A laggard on the
+  // recovery peer-fetch path (`enter_cross_epoch_peer_fetch` → Recovering, `awaiting_peer_checkpoint`)
+  // stages the synced re-persist via `apply_sync`, which CLEARS `recover` + `recover_retry` and stays
+  // Recovering. If a local checkpoint block CORRUPTS between the frontier draining and the destructive
+  // `install_sync` (run when the durable root lands), the restore returns an error WITH NOTHING MUTATED.
+  // The retry must NOT lean on `sync_solicit` — that timer is serviced ONLY while Normal, so a recovery
+  // install error would strand the node Recovering with no serviced re-fetch path. It must re-create the
+  // peer-fetch (`awaiting_peer_checkpoint`) and re-arm the recovery cadence (`recover_retry`, serviced by
+  // `recover_timeouts`), and it must NOT hold `pending_install` while `pending_checkpoint` is clear (the
+  // `pending_install ⟹ in-flight SyncRepersist` sub-state invariant). Once the clean block is re-fetched,
+  // the install retries and recovery completes to Normal — the `assert_invariants` at every handler exit
+  // would PANIC if the sub-state invariant were violated, so reaching the end proves it held throughout.
+  let n1: u64 = 2; // the node's OWN reconfigure op N (E0 -> E1); committed band is ops (0 .. N].
+  let genesis_mem = genesis(3);
+  let successor_e1 = genesis_mem
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+  let genesis_config_id = genesis_mem.config_id();
+
+  // A BACKUP (slot 1) at E0, Normal, that committed its own reconfigure op N (op == commit_min == N),
+  // checkpoint 0 — the commit-first window before the SwapEpoch root installs.
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  e.force_state_for_test(0, n1, n1, 0, &[]);
+  e.stage_epoch_swap(OpNumber::with(n1), successor_e1.clone(), &mut sb);
+
+  // A higher-epoch heartbeat routes the non-Normal laggard into the recovery peer-fetch.
+  e.enter_cross_epoch_peer_fetch(now, OpNumber::with(n1));
+  assert!(
+    e.status() == Status::Recovering
+      && e.awaiting_peer_checkpoint_for_test()
+      && e.sync_requires_cross_epoch_for_test(),
+    "setup: a Recovering peer-fetch with a forced crossing-required sync"
+  );
+
+  // The crossing checkpoint: the E1 successor chained off genesis at op N. The SM root IS seeded (valid),
+  // so the frontier drains in one shot when the SyncCheckpoint arrives → `apply_sync` STAGES the re-persist.
+  let nonce = e.sync_nonce_for_test();
+  let cross_snap = CountSm::default().snapshot();
+  let sm_root_addr = crate::block_address(&cross_snap);
+  let cross_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(n1),
+    sm_root_addr,
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  blocks.write_verified(cross_snap.clone());
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    ReconfigurePayload::from_membership(&successor_e1, genesis_config_id).encode_body();
+  let cross_msg = |nonce: u64| {
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(n1),
+      cross_id,
+      successor_e1.epoch(),
+      successor_e1.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      cross_env.clone(),
+      membership_body.clone(),
+    ))
+  };
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    cross_msg(nonce),
+  );
+  assert!(
+    e.pending_install.is_some(),
+    "the crossing reply STAGED the re-persist install (frontier drained, root not yet durable)"
+  );
+
+  // --- CORRUPT the SM-root block in the window AFTER the drain, BEFORE the destructive install. ---
+  // Write garbage under the root address: it no longer hashes to `sm_root_addr`, so the verify-on-read
+  // restore view reports it ABSENT and `install_sync`'s restore returns an error (nothing mutated).
+  blocks.write_block(sm_root_addr, Bytes::copy_from_slice(b"corrupt-root-bytes"));
+
+  // Drive the two-write re-persist → durable root → `install_sync` (which fails on the corrupt block).
+  // `handle_storage` runs `assert_invariants` at exit — a `pending_install` held without an in-flight
+  // SyncRepersist would PANIC here.
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+
+  // The install FAILED, but the node did NOT strand and the sub-state invariant holds:
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "the install error did NOT complete the sync (the corrupt block blocked the restore)"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "the node stays Recovering after the install error (no false flip to Normal)"
+  );
+  // The frontier ADVANCED to M (the crossing installed, in lockstep with the durable root) and the SM-
+  // reconstruct obligation is owed — there is no `pending_install` to keep (it was consumed at the root
+  // completion). The invariant holds because the obligation re-arms `block_fetch` but starts no new
+  // `SyncRepersist` write.
+  assert!(
+    e.sm_reconstruct_owed(),
+    "the SM-reconstruct obligation is owed after the restore fault — the SM is not yet M"
+  );
+  assert!(
+    e.pending_install.is_none(),
+    "the PRE-ROOT staging was consumed at the root completion (it is now the obligation)"
+  );
+  assert!(
+    e.awaiting_peer_checkpoint_for_test() && e.sync_requires_cross_epoch_for_test(),
+    "the recovery peer-fetch was RE-CREATED — a SERVICED re-fetch path (not an orphaned sync_solicit)"
+  );
+
+  // --- The recovery cadence re-solicits; the donor re-pulls the CLEAN block (overwriting the corrupt
+  // bytes), and the re-served SyncCheckpoint re-stages + completes the install. ---
+  blocks.write_verified(cross_snap.clone()); // the re-fetched clean block overwrites the corrupt bytes
+  // The recovery cadence (`recover_timeouts`, driven by `recover_retry`) is the SERVICED ARQ while
+  // Recovering — fire it to confirm it re-broadcasts the solicitation (it would be a no-op / spin if the
+  // retry had stranded on `sync_solicit`).
+  e.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
+  let nonce2 = e.sync_nonce_for_test(); // the still-armed sync's (unchanged) nonce
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    cross_msg(nonce2),
+  );
+  // The re-solicited reply (at M) re-pulled M's DAG via the obligation (donor failover), NOT a re-stage.
+  // The clean block was already re-fetched into the store, so the retry reconstructs the SM SYNCHRONOUSLY
+  // here and the obligation clears — no second `SyncRepersist` write was started.
+  assert!(
+    !e.sm_reconstruct_owed(),
+    "the obligation reconstructed the SM from the repaired DAG (donor failover, no re-stage)"
+  );
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+
+  // Recovery COMPLETED — the clean block was re-fetched, the install succeeded, the node is Normal at E1.
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the install retried against the repaired store and completed exactly once"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "recovery completed to Normal (complete_recovery ran after the install landed)"
+  );
+  assert!(
+    e.pending_install.is_none(),
+    "no orphaned pending_install survives the completed install"
+  );
+  assert_eq!(
+    e.membership, successor_e1,
+    "the laggard CROSSED to E1 via the re-fetched crossing checkpoint"
+  );
+}
+
+#[test]
 fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   // The restart-survivable half of the swap-checkpoint: a crash BETWEEN the SwapEpoch root and the forced
   // checkpoint leaves a durable root with the E+1 membership AHEAD of the checkpoint — `config_install_op = N` but
@@ -851,10 +1109,18 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
     done: std::collections::VecDeque::new(),
     checkpoint: None, // checkpoint_op == 0 → no snapshot; recover restores the genesis SM
   };
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
-  let mut e =
-    Endpoint::<CountSm>::recover(cfg, genesis_mem, 9, CountSm::default(), &mut wal, &mut sb)
-      .expect_active();
+  let mut e = Endpoint::<CountSm>::recover(
+    cfg,
+    genesis_mem,
+    9,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
 
   // The recovered node is in the debt window: at the successor epoch, gate owed.
   assert_eq!(
@@ -866,7 +1132,7 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   // Drive the recovery reads to completion — this reaches Normal AND runs `maybe_pay_checkpoint_debt`
   // from `complete_recovery`, which proactively advances the band and forces the owed checkpoint. After
   // this point there is NO further traffic: ONLY recovery storage completions are pumped.
-  drive_recovery(&mut e, &mut wal, &mut sb, now);
+  drive_recovery(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(e.status(), Status::Normal, "the backup resumed Normal");
 
   // With ZERO messages/heartbeats, the band was driven to >= N (the debt-pay's proactive advance_commit).
@@ -879,7 +1145,7 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   // Pump the forced checkpoint's two superblock writes (snapshot → root) to durability — still NO
   // messages. The debt clears the instant `checkpoint_op >= config_install_op` is durable.
   for _ in 0..6 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert!(
     e.checkpoint_op() >= e.config_install_op,
@@ -898,6 +1164,7 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
   // overwrite the first's staged successor and the first `on_sb_done` would clear the second — losing
   // the second committed swap across the epoch boundary.
   let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // The first change committed + staged its swap; the proposal latch is already clear, but the
@@ -919,7 +1186,7 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
   );
 
   // Once the swap INSTALLS (the SwapEpoch root lands), the window closes and a new proposal succeeds.
-  e.handle_storage(now, &mut wal, &mut sb); // land the SwapEpoch root → install
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
   assert!(
     !e.pending_swap_for_test(),
     "the swap installed — the window is closed"
@@ -954,6 +1221,7 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
     CountSm::default(),
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // The carried op's successor membership, chained off the genesis config (config_id 0 in the fixture) —
@@ -970,11 +1238,13 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -1015,6 +1285,7 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -1052,7 +1323,7 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
 
   // Drain the new-primary storage so it is a settled Normal primary (the durable-view write lands), then
   // a fresh proposal MUST be refused — the carried change is still in flight (TODAY this wrongly succeeds).
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   assert!(e.is_primary() && e.status().is_normal());
   assert_eq!(
@@ -1082,16 +1353,19 @@ fn single_change_primed_new_primary_pending_view()
     CountSm::default(),
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -1129,10 +1403,11 @@ fn single_change_primed_new_primary_pending_view()
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // op-2 AdoptVote append completes; the view write stays inflight
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // op-2 AdoptVote append completes; the view write stays inflight
   while e.poll_message().is_some() {}
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
@@ -1153,6 +1428,7 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   // rejection. (Op 2 is an uncommitted plain client op here, NOT a reconfiguration, so the refusal is the
   // admission fence — not `AlreadyInFlight`.)
   let (mut e, mut wal, mut sb) = single_change_primed_new_primary_pending_view();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let head_before = e.op();
 
@@ -1174,7 +1450,7 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   // Once the durable-view write LANDS (the window closes), a fresh proposal is admitted — proving the
   // `Busy` verdict was a transient retry signal, not a permanent rejection. Flush the SB then drain.
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   assert!(
     !e.pending_durable_view_for_test(),
@@ -1186,10 +1462,11 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     client_ack(2, 2),
   );
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   let admitted = e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)));
   assert!(
@@ -1216,6 +1493,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   // hazard, not a malformed-body short-circuit.
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // A decodable reconfigure body (the AddVoter(3) successor, chained off the current config — exactly
@@ -1240,6 +1518,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::RECONFIGURATION),
     Message::Request(Request::new(
       ClientId::RECONFIGURATION,
@@ -1272,6 +1551,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::Request(Request::new(
       ClientId::RECONFIGURATION,
@@ -1296,7 +1576,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   // No membership change was committed OR staged from either request: the epoch/config_id are unchanged
   // and the committed log holds no Reconfigure op (drive any queued storage first so a would-be staged
   // swap would have surfaced).
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   assert_eq!(
     e.membership.epoch(),
@@ -1320,6 +1600,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -1408,6 +1689,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
   // its OWN durable root — convergence, since every replica chains from the identical OLD membership.
   let mut e = single_change_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -1422,6 +1704,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -1441,7 +1724,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
     Body::Reconfigure(payload.clone()),
     "the backup stores a typed Body::Reconfigure, not Body::Present",
   );
-  e.handle_storage(now, &mut wal, &mut sb); // the backup's append lands (deferred PrepareOk)
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the backup's append lands (deferred PrepareOk)
   while e.poll_message().is_some() {}
 
   // The primary's Commit advances the backup's commit to the Reconfigure op → it commits + stages
@@ -1450,6 +1733,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -1469,7 +1753,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
     "the backup staged its own SwapEpoch root"
   );
 
-  e.handle_storage(now, &mut wal, &mut sb); // land the backup's SwapEpoch root → install
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the backup's SwapEpoch root → install
   assert_eq!(
     e.membership, successor,
     "the backup installed the IDENTICAL successor (same epoch + config_id) as the primary"
@@ -1492,6 +1776,7 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   // decoupled from the SwapEpoch, that heartbeat was suppressed — the backup never learned the op
   // committed, and a later failover re-minted its op number as a client op: op-number reuse.)
   let (mut primary, mut pwal, mut psb, op, successor, payload) = proposed_and_committed_swap();
+  let mut pblocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // The primary committed the Reconfigure op and is now in the SwapEpoch window: a SwapEpoch root is in
@@ -1519,7 +1804,7 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   // gates `primary_timeouts`/`try_commit` on this epoch write, so the primary emits its commit-advertise
   // `Commit` AT epoch E carrying the committed Reconfigure op — the message a backup needs.
   while primary.poll_message().is_some() {} // clear any residue
-  primary.handle_timeout(now + COMMIT_HEARTBEAT, &mut pwal, &mut psb);
+  primary.handle_timeout(now + COMMIT_HEARTBEAT, &mut pwal, &mut psb, &mut pblocks);
   let commit_msg = core::iter::from_fn(|| primary.poll_message())
     .map(|out| out.into_msg())
     .find(|m| matches!(m, Message::Commit(_)))
@@ -1545,10 +1830,12 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   // receives that exact `Commit` — and converges: it commits the op and stages its OWN SwapEpoch.
   let mut backup = single_change_backup();
   let (mut bwal, mut bsb) = (TestWal::default(), TestSb::default());
+  let mut bblocks = crate::block_store::MemBlockStore::new();
   backup.handle_message(
     now,
     &mut bwal,
     &mut bsb,
+    &mut bblocks,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -1562,11 +1849,18 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
       payload.encode_body(),
     )),
   );
-  backup.handle_storage(now, &mut bwal, &mut bsb); // the backup's append lands
+  backup.handle_storage(now, &mut bwal, &mut bsb, &mut bblocks); // the backup's append lands
   while backup.poll_message().is_some() {}
 
   // Deliver the PRIMARY'S OWN heartbeat Commit (not a hand-rolled one) — the convergence signal.
-  backup.handle_message(now, &mut bwal, &mut bsb, primary_peer(), commit_msg);
+  backup.handle_message(
+    now,
+    &mut bwal,
+    &mut bsb,
+    &mut bblocks,
+    primary_peer(),
+    commit_msg,
+  );
   assert_eq!(
     backup.commit(),
     op,
@@ -1583,7 +1877,7 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
   );
 
   // Land the backup's SwapEpoch root → it installs the IDENTICAL successor the primary staged.
-  backup.handle_storage(now, &mut bwal, &mut bsb);
+  backup.handle_storage(now, &mut bwal, &mut bsb, &mut bblocks);
   assert_eq!(
     backup.membership, successor,
     "the backup installed the identical successor — the live single change converges cluster-wide"
@@ -1656,6 +1950,7 @@ fn committed_op_then_swapped(
 ) -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, u64) {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let o = 1u64;
 
@@ -1664,6 +1959,7 @@ fn committed_op_then_swapped(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -1672,11 +1968,12 @@ fn committed_op_then_swapped(
     )),
   );
   while e.poll_message().is_some() {} // drop the broadcast Prepare
-  e.handle_storage(now, &mut wal, &mut sb); // primary's own append durable → own vote
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable → own vote
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(ack_backup)),
     client_ack(o, ack_backup),
   );
@@ -1685,7 +1982,7 @@ fn committed_op_then_swapped(
     OpNumber::with(o),
     "the client op committed under E=0"
   );
-  e.handle_storage(now, &mut wal, &mut sb); // drain any commit-tail superblock work
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain any commit-tail superblock work
   while e.poll_message().is_some() {}
 
   // (2) Propose + commit + durably-swap the reconfiguration (op r == 2). The successor is chained off
@@ -1699,17 +1996,18 @@ fn committed_op_then_swapped(
     .propose_membership(now, &mut wal, delta)
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {} // drop the broadcast Prepare
-  e.handle_storage(now, &mut wal, &mut sb); // primary's own append durable → own vote
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable → own vote
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(ack_backup)),
     reconfigure_ack(r.get(), &payload, ack_backup),
   );
   assert_eq!(e.commit(), r, "the Reconfigure op committed under E=0");
   // Make the SwapEpoch root durable → install the successor. `self.membership` is now E+1.
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.membership, successor, "the E+1 successor is installed");
   assert!(!e.pending_swap_for_test(), "the staged swap was consumed");
   while e.poll_event().is_some() {}
@@ -1902,11 +2200,17 @@ fn learner_status(replica: u16, durable_commit_min: u64) -> Message {
 /// Mint one client op on the primary so its head advances to `op == 1` (the proposal-time head the
 /// promote gate measures the learner's frontier against). The op need not commit — `mint_op` advances
 /// `self.op` on append.
-fn mint_one_client_op(e: &mut Endpoint<CountSm, SingleChange>, wal: &mut TestWal, sb: &mut TestSb) {
+fn mint_one_client_op(
+  e: &mut Endpoint<CountSm, SingleChange>,
+  wal: &mut TestWal,
+  sb: &mut TestSb,
+  blocks: &mut dyn BlockStore,
+) {
   e.handle_message(
     Instant::ZERO,
     wal,
     sb,
+    blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -1965,6 +2269,7 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
   // this test pins the accumulation + the no-vote-state property, not any gating decision.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let learner = MemberId::new(3);
 
   assert!(
@@ -1977,6 +2282,7 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     learner_status(3, 5),
   );
@@ -2003,6 +2309,7 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     learner_status(3, 2),
   );
@@ -2017,6 +2324,7 @@ fn on_learner_status_records_peer_progress_monotone_and_touches_no_vote_state() 
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     learner_status(3, 7),
   );
@@ -2036,10 +2344,11 @@ fn promote_learner_happy_path_challenge_then_fresh_proof_mints_the_op() {
   // the entire E-committed prefix.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let learner = MemberId::new(3);
 
   // Advance the head to op 1 so the gate's threshold (`>= self.op`) is a non-trivial 1.
-  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1), "the head advanced to op 1");
 
   // Phase 2: no fresh proof → ProofPending + a challenge emitted; nothing minted.
@@ -2071,6 +2380,7 @@ fn promote_learner_happy_path_challenge_then_fresh_proof_mints_the_op() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 1),
   );
@@ -2112,8 +2422,9 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
   // (reused) nonce then mints.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1), "the head advanced to op 1");
 
   // First propose: a challenge is emitted (nonce N1), ProofPending.
@@ -2150,6 +2461,7 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&first, 3, 1),
   );
@@ -2180,14 +2492,16 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
   // gate refuses to mint.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let learner = MemberId::new(3);
 
   // Advance the head to op 2 so the regressed frontier (1) is strictly below it.
-  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -2203,6 +2517,7 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     learner_status(3, 2),
   );
@@ -2234,6 +2549,7 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 1),
   );
@@ -2286,6 +2602,7 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
     CountSm::default(),
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // The promote op `N == 2` promotes member 3 (this learner). Build its successor membership exactly as
@@ -2346,6 +2663,7 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2397,6 +2715,7 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -2412,7 +2731,7 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
   );
   // Drive storage to settle the repair append + the commit advance + the staged SwapEpoch root install.
   for _ in 0..8 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     while e.poll_message().is_some() {}
   }
   assert!(
@@ -2535,8 +2854,9 @@ fn promote_learner_crash_mid_challenge_no_proof_arrives_keeps_proof_pending() {
   // (a fresh nonce); it never silently promotes.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
 
   assert_eq!(
     e.propose_membership(
@@ -2569,8 +2889,9 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
   // still returns `ProofPending` and never mints. Only the exactly-matching fresh proof validates.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
 
   assert_eq!(
     e.propose_membership(
@@ -2588,6 +2909,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     Message::LearnerProof(crate::LearnerProof::new(
       ReplicaId::new(3),
@@ -2615,6 +2937,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::LearnerProof(crate::LearnerProof::new(
       ReplicaId::new(1), // a member, but not the target (slot 3)
@@ -2641,6 +2964,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     Message::LearnerProof(crate::LearnerProof::new(
       ReplicaId::new(3),
@@ -2671,6 +2995,7 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 1),
   );
@@ -2692,8 +3017,9 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
   // re-challenge against the new head — a fresh proof covering the NEW head then mints.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1), "head at op 1");
 
   // Challenge at head 1; the learner answers covering head 1 (frontier 1).
@@ -2716,6 +3042,7 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 1),
   );
@@ -2725,6 +3052,7 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -2761,6 +3089,7 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&challenge, 3, 2),
   );
@@ -2783,8 +3112,9 @@ fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
   // reply minted against the OLD challenge cannot satisfy the new one.
   let mut e = single_change_primary_with_learner();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let learner = MemberId::new(3);
-  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
 
   assert_eq!(
     e.propose_membership(
@@ -2799,7 +3129,7 @@ fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
   assert!(e.learner_proof.is_some(), "a challenge is outstanding");
 
   // A view transition clears the outstanding challenge.
-  e.reset_for_view_transition();
+  e.reset_for_view_transition(Instant::ZERO);
   assert!(
     e.learner_proof.is_none(),
     "reset_for_view_transition clears the outstanding learner-promote challenge",
@@ -2812,6 +3142,7 @@ fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     answer_proof(&stale_challenge, 3, 1), // the OLD nonce
   );
@@ -2840,6 +3171,7 @@ fn an_epoch_swap_clears_an_outstanding_promote_challenge() {
   let mut e =
     Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(1), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
 
   // Arm an outstanding promote challenge under the CURRENT configuration (any target/nonce — the swap
   // clears it regardless; the `(epoch, config_id)` reply binding is the structural backstop).
@@ -2862,10 +3194,10 @@ fn an_epoch_swap_clears_an_outstanding_promote_challenge() {
     SingleVoterDelta::AddLearner(MemberId::new(1)),
   )
   .expect("AddLearner on a single-voter cluster is admitted");
-  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
-  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // own append durable → own vote → commit
-  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // land the SwapEpoch root → install_membership
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // own append durable → own vote → commit
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install_membership
   assert_eq!(
     e.membership.learner_count(),
     1,
@@ -2984,6 +3316,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
   let mut e =
     Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(1), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let newcomer = MemberId::new(1);
 
   // (1) AddLearner is admitted (no voter-count change, no catch-up gate) and mints the op.
@@ -3003,10 +3336,10 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
   // Commit + install the AddLearner so the new node is an actual learner under the successor epoch.
   // The sole voter (slot 0, this primary) is the whole commit quorum, so its own durable append
   // commits the op; landing the SwapEpoch root installs the successor (now 1 voter + 1 learner).
-  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
+  e.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
-  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // own append durable → own vote → commit
-  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // land the SwapEpoch root → install
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // own append durable → own vote → commit
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
   assert_eq!(
     e.membership.learner_count(),
     1,
@@ -3023,7 +3356,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
     .expect("the learner occupies a slot");
 
   // Advance the head so the catch-up gate's threshold is a non-trivial value.
-  mint_one_client_op(&mut e, &mut wal, &mut sb);
+  mint_one_client_op(&mut e, &mut wal, &mut sb, &mut blocks);
   let head = e.op();
   assert!(head.get() >= 1, "the head advanced");
 
@@ -3052,6 +3385,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(learner_slot),
     answer_proof(&challenge, learner_slot.get(), head.get()),
   );
@@ -3092,6 +3426,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
 fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -3108,13 +3443,14 @@ fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
     .expect("the primary mints the self-removal Reconfigure op");
   // Drive the commit/prepare cadence once so the Normal-primary timers are armed (the thing the
   // abdication must retire). `handle_timeout` on a Normal primary bootstraps + arms `commit`.
-  e.handle_timeout(now, &mut wal, &mut sb);
+  e.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
-  e.handle_storage(now, &mut wal, &mut sb); // own append durable → own vote
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own append durable → own vote
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(op.get(), &payload, 1),
   );
@@ -3127,7 +3463,7 @@ fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
     e.commit_or_prepare_timer_armed_for_test(),
     "the Normal-primary cadence is armed before the swap (the abdication must retire it)",
   );
-  e.handle_storage(now, &mut wal, &mut sb); // land the SwapEpoch root → install the successor
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install the successor
   (e, wal, sb, successor)
 }
 
@@ -3188,6 +3524,7 @@ fn a_surviving_voter_elects_a_new_primary_without_the_removed_node() {
     CountSm::default(),
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
 
   // It starts Normal as a backup; its idle timer has not yet fired.
   assert_eq!(survivor.status(), Status::Normal);
@@ -3195,9 +3532,9 @@ fn a_surviving_voter_elects_a_new_primary_without_the_removed_node() {
     !survivor.is_primary(),
     "member 2 (slot 1) is a backup under view 0"
   );
-  survivor.handle_timeout(Instant::ZERO, &mut wal, &mut sb); // bootstrap primary_idle (not yet due)
+  survivor.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // bootstrap primary_idle (not yet due)
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
-  survivor.handle_timeout(later, &mut wal, &mut sb); // idle due → propose view 1, broadcast SVC
+  survivor.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // idle due → propose view 1, broadcast SVC
 
   // The survivor broadcast a StartViewChange for the next view — the election the silent removed
   // primary no longer suppresses.
@@ -3230,6 +3567,7 @@ fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, M
   let mut e =
     Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(3), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // Remove member 2 (the HIGHEST-slot voter, so the retained voters keep their slots {0,1}); the local
@@ -3248,6 +3586,7 @@ fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, M
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -3261,7 +3600,7 @@ fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, M
       payload.encode_body(),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // the backup's append lands (deferred PrepareOk)
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the backup's append lands (deferred PrepareOk)
   while e.poll_message().is_some() {}
 
   // The primary's Commit advances the backup's commit to the Reconfigure op → it commits + stages its
@@ -3270,6 +3609,7 @@ fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, M
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -3283,7 +3623,7 @@ fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, M
     e.pending_swap_for_test(),
     "the backup staged its own SwapEpoch root"
   );
-  e.handle_storage(now, &mut wal, &mut sb); // land the backup's SwapEpoch root → install the successor
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the backup's SwapEpoch root → install the successor
   (e, wal, sb, successor)
 }
 
@@ -3296,6 +3636,7 @@ fn a_removed_backup_voter_stays_silent_on_the_primary_idle_plane() {
   // on a `local_slot()` that no longer exists (the bug the `is_voter()` gate fixed: `!is_learner()` is
   // wrongly TRUE for an absent member, which would let it arm a consensus timer and then panic).
   let (mut e, mut wal, mut sb, successor) = removed_self_backup();
+  let mut blocks = crate::block_store::MemBlockStore::new();
 
   // The swap installed the 2-voter successor in which member 2 (this node) is absent.
   assert_eq!(
@@ -3335,7 +3676,7 @@ fn a_removed_backup_voter_stays_silent_on_the_primary_idle_plane() {
   );
   let view_before = e.view();
   let later = Instant::ZERO + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(later, &mut wal, &mut sb); // far past PRIMARY_IDLE — must not arm/fire a VC, must not panic
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // far past PRIMARY_IDLE — must not arm/fire a VC, must not panic
   assert_eq!(
     e.status(),
     Status::Retired,
@@ -3378,8 +3719,9 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
   // config_ids. `in_lineage` admits the current id AND the retained prior ids; a forked/unknown id is
   // rejected (config_id is the lineage discriminator).
   let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let genesis_config_id = 0u128; // the fixture genesis carries config_id 0 (see the `genesis` helper)
-  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // land swap #1 → E=1 install
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land swap #1 → E=1 install
   let config_1 = e.membership.config_id();
   assert_ne!(
     config_1, genesis_config_id,
@@ -3416,7 +3758,7 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
     )
     .expect("the primary mints the second Reconfigure op");
   while e.poll_message().is_some() {}
-  e.handle_storage(now, &mut wal, &mut sb); // own append → own vote
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own append → own vote
   // Commit with a quorum of the E=1 4-voter config (quorum 3): the primary (slot 0) + acks from slots
   // 2 and 3 (slot 1 is the one being removed). The acks must be stamped E=1 / config_1 — the primary's
   // CURRENT configuration — or the strict ingress gate drops them.
@@ -3425,6 +3767,7 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Replica(ReplicaId::new(r)),
       reconfigure_ack_at(op2.get(), &payload2, r, crate::Epoch::new(1), config_1),
     );
@@ -3434,7 +3777,7 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
     op2,
     "the second Reconfigure op committed under E=1"
   );
-  e.handle_storage(now, &mut wal, &mut sb); // land swap #2 → E=2 install
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land swap #2 → E=2 install
   let config_2 = e.membership.config_id();
   assert_eq!(e.membership.epoch(), crate::Epoch::new(2), "swapped to E=2");
 
@@ -3462,7 +3805,8 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
   // change. The same SVC at the survivor's CURRENT epoch DOES register (proving the drop is the epoch
   // gate, not some other guard).
   let (mut e, mut wal, mut sb, _op, _successor, _payload) = proposed_and_committed_swap();
-  e.handle_storage(Instant::ZERO, &mut wal, &mut sb); // land the swap → the survivor is now at E=1
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the swap → the survivor is now at E=1
   assert_eq!(
     e.membership.epoch(),
     crate::Epoch::new(1),
@@ -3484,6 +3828,7 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -3503,6 +3848,7 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -3528,6 +3874,7 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
 fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(e.reconfigure_inflight, None, "no change in flight at rest");
 
@@ -3561,11 +3908,12 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
   // Drive the first op to commit → `stage_epoch_swap` CLEARS the latch (before the durable root even
   // lands — the swap is staged the instant the op commits).
   while e.poll_message().is_some() {}
-  e.handle_storage(now, &mut wal, &mut sb); // own append → own vote
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own append → own vote
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(op.get(), &payload, 1),
   );
@@ -3581,7 +3929,7 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
 
   // Land the SwapEpoch root so the swap installs and the superblock is free again (a mint cannot emit
   // a Prepare while a durable root write is in flight — the durable-view-before-participate fence).
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(!e.pending_swap_for_test(), "the swap installed");
   assert_eq!(
     e.membership.epoch(),
@@ -3612,6 +3960,7 @@ fn a_view_change_truncating_an_uncommitted_proposal_releases_the_in_flight_latch
   // clears the latch) only runs at COMMIT, so the release must come from `reset_for_view_transition`.
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // Propose on the view-0 primary → the latch is set on the uncommitted op (it is NOT driven to commit).
@@ -3635,6 +3984,7 @@ fn a_view_change_truncating_an_uncommitted_proposal_releases_the_in_flight_latch
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::Commit(Commit::new(
       View::with(1),
@@ -3678,6 +4028,7 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
     CountSm::default(),
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // Seed an uncommitted Reconfigure op at op 1 (a RECONFIGURATION-client Prepare from the view-0
@@ -3691,6 +4042,7 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -3704,7 +4056,7 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
       payload.encode_body(),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // the append lands
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the append lands
   assert_eq!(
     e.op(),
     OpNumber::with(1),
@@ -3720,11 +4072,12 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
   // the catching_up discriminant are set correctly. Inject a DVC quorum whose canonical generation
   // reports commit 0 / op 0 — NONE carry op 1 — so the nack-truncation drops it.
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1, own SVC bit
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // primary_idle → propose view 1, own SVC bit
   e.handle_message(
     later,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -3782,6 +4135,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     CountSm::default(),
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = genesis(3)
@@ -3796,11 +4150,12 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
   // vouching commit 0 (uncommitted tail — it re-commits under the new view). With the new primary's
   // own DVC, the 2-of-3 quorum forms and the canonical generation (log_view 0) unions in op 1.
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1, own SVC bit
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // primary_idle → propose view 1, own SVC bit
   e.handle_message(
     later,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -3825,6 +4180,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(crate::DoViewChange::new(
       View::with(1),
@@ -3849,7 +4205,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     e.has_repair_hole_for_test(1),
     "the header-only Reconfigure op is a repair hole awaiting its body",
   );
-  e.handle_storage(now, &mut wal, &mut sb); // land the durable-view write → start_view_participate
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the durable-view write → start_view_participate
   while e.poll_message().is_some() {}
 
   // Answer the new primary's RequestPrepare for op 1 with the canonical RECONFIGURATION body (a holder
@@ -3858,6 +4214,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::Prepare(Prepare::new(
       View::with(1),
@@ -3871,7 +4228,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
       payload.encode_body(),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // the RepairFill append lands → the body is in the log
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the RepairFill append lands → the body is in the log
   assert!(
     e.log.get(&1).expect("op 1 is filled").body.is_reconfigure(),
     "the repaired RECONFIGURATION op is rebuilt as a typed Body::Reconfigure (not an opaque Present)",
@@ -3884,6 +4241,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(crate::PrepareOk::new(
       View::with(1),
@@ -3913,7 +4271,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
     e.sm_for_test().applied().is_empty(),
     "the re-committed Reconfigure op was not applied to the state machine",
   );
-  e.handle_storage(now, &mut wal, &mut sb); // land the SwapEpoch root → install
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
   assert_eq!(
     e.membership.epoch(),
     crate::Epoch::new(1),
@@ -3946,6 +4304,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
     CountSm::default(),
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = genesis(3)
@@ -3959,6 +4318,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -3972,9 +4332,9 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
       payload.encode_body(),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // the backup's append lands
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the backup's append lands
   sb.flush(); // the append is durable
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
 
   // (2) The primary's Commit advances the backup's commit to the Reconfigure op → it commits (commit_min
@@ -3984,6 +4344,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -4012,11 +4373,12 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   // Drive it via the real SVC path so status + the catching_up discriminant are set correctly; the
   // SendDoViewChange durable-view root SUPERSEDES the in-flight SwapEpoch root on the superblock.
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1, own SVC bit
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // primary_idle → propose view 1, own SVC bit
   e.handle_message(
     later,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -4060,6 +4422,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
     later,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(peer_dvc),
   );
@@ -4080,7 +4443,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   // re-submits the staged SwapEpoch (`maybe_swap_epoch`), and that root then installs the successor.
   for _ in 0..8 {
     sb.flush();
-    e.handle_storage(later, &mut wal, &mut sb);
+    e.handle_storage(later, &mut wal, &mut sb, &mut blocks);
     while e.poll_message().is_some() {}
     if !e.pending_swap_for_test() {
       break;
@@ -4114,6 +4477,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
   // successor membership, so a backup replaying it through `on_prepare` rebuilds a typed `Body::Reconfigure`.
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -4129,7 +4493,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
   while e.poll_message().is_some() {}
   // The primary's own append lands (its own vote), but with the Prepare dropped no quorum forms — the
   // Reconfigure op is stuck uncommitted in the un-acked window.
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     e.commit() < op,
     "the Reconfigure op is uncommitted (its only Prepare was dropped, so no quorum acked it)"
@@ -4137,7 +4501,12 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
 
   // Fire the prepare-retransmit tick: it MUST re-ship the Reconfigure op (TODAY it skips the op because
   // its body is `Body::Reconfigure`, not `Body::Present` — the op is never resent and the change stalls).
-  e.handle_timeout(now + super::super::PREPARE_RETRANSMIT, &mut wal, &mut sb);
+  e.handle_timeout(
+    now + super::super::PREPARE_RETRANSMIT,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
   let mut retransmitted_body: Option<bytes::Bytes> = None;
   while let Some(out) = e.poll_message() {
     match out.into_msg() {
@@ -4173,6 +4542,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(op.get(), &payload, 1),
   );
@@ -4185,7 +4555,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
     e.pending_swap_for_test(),
     "the commit-first swap staged — the retransmitted reconfiguration op was recognized at commit"
   );
-  e.handle_storage(now, &mut wal, &mut sb); // land the SwapEpoch root → install
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
   assert_eq!(
     e.membership.epoch(),
     crate::Epoch::new(1),
@@ -4216,6 +4586,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     CountSm::default(),
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   let successor = e
@@ -4230,6 +4601,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -4247,6 +4619,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -4260,7 +4633,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
       payload.encode_body(),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   assert_eq!(
     e.log.get(&2).expect("op 2 is held locally").body,
@@ -4274,11 +4647,13 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(crate::StartViewChange::new(
       View::with(1),
@@ -4322,6 +4697,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -4351,7 +4727,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
   // (4) Drive the new primary to settle + recommit the carried reconfiguration: drain its durable-view
   // write, then feed it the acks for op 2 under view 1 so it commits + stages the swap, and install.
   for _ in 0..8 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     while e.poll_message().is_some() {}
     if e.commit() >= OpNumber::with(2) {
       break;
@@ -4361,6 +4737,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Replica(ReplicaId::new(2)),
       Message::PrepareOk(crate::PrepareOk::new(
         View::with(1),
@@ -4383,7 +4760,7 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
     "the carried reconfiguration op re-committed under the new view (its preserved body let it commit)"
   );
   for _ in 0..8 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     while e.poll_message().is_some() {}
     if !e.pending_swap_for_test() {
       break;
@@ -4412,6 +4789,7 @@ fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWa
   let mut e =
     Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(4), 0, CountSm::default());
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let predecessor_config_id = e.membership.config_id();
 
@@ -4432,19 +4810,20 @@ fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWa
     )
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {}
-  e.handle_storage(now, &mut wal, &mut sb); // the primary's own append lands (own vote)
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the primary's own append lands (own vote)
   for acker in [1u16, 2u16] {
     e.handle_message(
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Replica(ReplicaId::new(acker)),
       reconfigure_ack(op.get(), &payload, acker),
     );
   }
   // Drain the SwapEpoch root + its forced checkpoint (snapshot -> durable root) to completion.
   for _ in 0..8 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     while e.poll_message().is_some() {}
   }
   assert_eq!(
@@ -4475,6 +4854,7 @@ fn a_slot_shifted_cross_epoch_request_sync_is_served_not_dropped_at_the_sender_b
   // checkpoint), and the donor serves the reply ADDRESSED TO `from`'s CURRENT slot so it routes back.
   let (mut donor, mut wal, mut sb, predecessor_config_id, checkpoint_op) =
     donor_at_e1_with_shifted_member();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   assert_ne!(
     predecessor_config_id,
@@ -4504,45 +4884,34 @@ fn a_slot_shifted_cross_epoch_request_sync_is_served_not_dropped_at_the_sender_b
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     from,
     request_sync(old_claimed_slot, predecessor_config_id),
   );
-  donor.handle_storage(now, &mut wal, &mut sb); // drive the serve-read completion → ship the SyncCheckpoint
+  donor.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drive the serve-read completion → ship the SyncCheckpoint
 
   // The donor SERVED it: a SyncCheckpoint (or its over-frame announce) addressed to the laggard's CURRENT
   // slot, carrying the donor's E+1 membership (the cross-epoch crossing payload). It was NOT dropped at the
   // sender binding.
   let mut served_to_current_slot = false;
   while let Some(out) = donor.poll_message() {
-    match out.msg_ref() {
-      Message::SyncCheckpoint(scp) => {
-        assert_eq!(
-          out.to(),
-          Recipient::To(from),
-          "the SyncCheckpoint routes to the laggard's CURRENT slot (not the stale claimed slot)"
-        );
-        assert_eq!(
-          scp.checkpoint_op().get(),
-          checkpoint_op,
-          "serves the donor's durable checkpoint"
-        );
-        assert!(
-          !scp.membership().is_empty(),
-          "the cross-epoch serve attaches the E+1 successor membership (XI-b gate satisfied by the forced \
-           checkpoint)"
-        );
-        served_to_current_slot = true;
-      }
-      Message::SyncCheckpointMeta(meta) => {
-        assert_eq!(
-          out.to(),
-          Recipient::To(from),
-          "the over-frame announce also routes to the current slot"
-        );
-        assert_eq!(meta.checkpoint_op().get(), checkpoint_op);
-        served_to_current_slot = true;
-      }
-      _ => {}
+    if let Message::SyncCheckpoint(scp) = out.msg_ref() {
+      assert_eq!(
+        out.to(),
+        Recipient::To(from),
+        "the SyncCheckpoint routes to the laggard's CURRENT slot (not the stale claimed slot)"
+      );
+      assert_eq!(
+        scp.checkpoint_op().get(),
+        checkpoint_op,
+        "serves the donor's durable checkpoint"
+      );
+      assert!(
+        !scp.membership().is_empty(),
+        "the cross-epoch serve attaches the E+1 successor membership (XI-b gate satisfied by the forced \
+         checkpoint)"
+      );
+      served_to_current_slot = true;
     }
   }
   assert!(
@@ -4554,211 +4923,149 @@ fn a_slot_shifted_cross_epoch_request_sync_is_served_not_dropped_at_the_sender_b
   // DISAGREES with `from` AND whose config_id is the donor's CURRENT (E+1) config — i.e. NOT a cross-epoch
   // ancestor solicitation, just a mismatched self-id — is DROPPED (no relaxation).
   let (mut d2, mut w2, mut s2, _pred, _ck) = donor_at_e1_with_shifted_member();
+  let mut s2blocks = crate::block_store::MemBlockStore::new();
   let current_config = d2.membership.config_id();
   d2.handle_message(
     now,
     &mut w2,
     &mut s2,
+    &mut s2blocks,
     Peer::Replica(ReplicaId::new(2)),                // from = slot 2
     request_sync(ReplicaId::new(0), current_config), // claims slot 0, CURRENT config (not an ancestor)
   );
-  d2.handle_storage(now, &mut w2, &mut s2);
+  d2.handle_storage(now, &mut w2, &mut s2, &mut s2blocks);
   assert!(
-    !d2.poll_message().is_some_and(|o| matches!(
-      o.msg_ref(),
-      Message::SyncCheckpoint(_) | Message::SyncCheckpointMeta(_)
-    )),
+    !d2
+      .poll_message()
+      .is_some_and(|o| matches!(o.msg_ref(), Message::SyncCheckpoint(_))),
     "a same-config mismatched-self-id RequestSync is still DROPPED by the strict binding (no relaxation)"
   );
 }
 
-/// Re-plant `donor`'s durable checkpoint (built by [`donor_at_e1_with_shifted_member`]) with an
-/// OVER-FRAME snapshot at the SAME `checkpoint_op`, PRESERVING its E+1 epoch / membership / lineage /
-/// `config_install_op` — so the donor answers a state-sync solicitation with a `SyncCheckpointMeta`
-/// announce (the chunked path) instead of a single-frame `SyncCheckpoint`, while still attaching the
-/// E+1 successor membership (the XI-b serve gate `checkpoint_op >= config_install_op` holds). Returns
-/// the planted `(env, id)` for the test to feed back as chunks.
-fn replant_over_frame(
-  donor: &mut Endpoint<CountSm, SingleChange>,
-  sb: &mut TestSb,
-) -> (Bytes, u128) {
-  let root = sb.state();
-  let big = crate::message::max_unchunked_snapshot_len() + 4096;
-  let env = Endpoint::<CountSm>::encode_checkpoint(
-    root.checkpoint_op(),
-    &std::collections::BTreeMap::new(),
-    &std::vec![0x5Au8; big],
-  );
-  assert!(
-    env.len() > crate::message::max_unchunked_snapshot_len(),
-    "the re-planted envelope exceeds the one-frame budget (forces the chunked serve)"
-  );
-  let id = crate::checkpoint_id(&env);
-  // Rebuild the durable root with the SAME E+1 scalars, only swapping the checkpoint id to the
-  // over-frame envelope's. `config_install_op` (the reconfigure op) is preserved, so the serve still
-  // attaches the successor membership. The in-memory `checkpoint_op` is unchanged (we re-plant at the
-  // SAME op), so the donor's serve gates (`cr.op() == self.checkpoint_op`, the durable-id match) hold.
-  sb.state = crate::VsrState::try_new_v4(
-    root.view(),
-    root.log_view(),
-    root.commit(),
-    root.checkpoint_op(),
-    id,
-    root.committed_headers_slice().to_vec(),
-    root.epoch(),
-    root.prev_epoch(),
-    root.membership().clone(),
-    root.prior_config_ids().to_vec(),
-    root.config_install_op(),
-  )
-  .expect("the re-planted E+1 root is valid");
-  sb.checkpoint = Some((root.checkpoint_op(), env.clone()));
-  let _ = donor; // the in-memory checkpoint_op is already aligned (re-plant is at the same op).
-  (env, id)
-}
-
 #[test]
-fn a_slot_shifted_cross_epoch_chunk_pull_is_served_and_the_chunk_routes_to_the_current_slot() {
-  // CLASS 1, the CHUNKED leg. When the donor's crossing checkpoint is OVER-FRAME it answers a state-sync
-  // solicitation with a `SyncCheckpointMeta` announce, and the slot-shifted laggard then PULLS the
-  // envelope with `RequestSyncChunk`s — which stamp the SAME stale OLD slot as the initial `RequestSync`.
-  // The strict self-id binding would DROP those chunk pulls before `on_request_sync_chunk` (stranding the
-  // over-frame crossing even though the OFFER pull was admitted), and even if admitted the served chunk
-  // would route to the stale slot. The shared relaxation admits the chunk pull on `from`'s member
-  // identity, and the serve addresses the `SyncChunk` to `from`'s CURRENT slot — so a slot-shifted
-  // laggard can pull, reassemble, and cross over the chunked path. (The reassembly+install half is pinned
-  // by `the_chunked_reassembly_carries_the_same_epoch_and_membership_as_the_single_frame_form`; this pins
-  // the donor-side admit+route that feeds it for a slot-shifted requester.)
-  let (mut donor, mut wal, mut sb, predecessor_config_id, checkpoint_op) =
-    donor_at_e1_with_shifted_member();
+fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authenticated_from_slot() {
+  // The cross-epoch BLOCK-FETCH donor pin (the laggard side). A retained OLD-epoch laggard armed a
+  // cross-epoch crossing sync; a donor whose slot SHIFTED across the reconfiguration answers with a
+  // `SyncCheckpoint` stamping its SUCCESSOR-epoch (shifted) slot in `replica()`, while the authenticated
+  // `from` is the slot the laggard ACTUALLY routes to in its own (old) membership — the slot the
+  // relaxed sender-binding admitted the reply on. The crossing checkpoint's SM DAG is NOT local, so the
+  // laggard must FETCH it. The follow-up `RequestBlock` MUST be addressed to `from`'s routeable slot (the
+  // real donor), NOT `replica()`'s shifted slot — which routes to a DIFFERENT member (or nobody) in the
+  // laggard's old-epoch routing, never fetching the blocks → wedge.
+  let m2: u64 = 2; // the E+1 crossing checkpoint op the laggard is crossing to
+  let genesis_mem = genesis(3);
+  let successor_e1 = genesis_mem
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+
+  // A Normal BACKUP (slot 1) at the OLD epoch (E0, the genesis lineage), op == commit_min == 0, checkpoint 0.
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
-  let (env, id) = replant_over_frame(&mut donor, &mut sb);
+  e.force_state_for_test(0, 0, 0, 0, &[]);
 
-  // The slot-shifted laggard is MemberId 2: OLD slot 2 (what it stamps), CURRENT slot 1 (what `from`
-  // binds to in the donor's E+1 membership [0,2,3]).
-  let old_claimed_slot = ReplicaId::new(2);
-  let current_slot = ReplicaId::new(1);
-  let from = Peer::Replica(current_slot);
+  // Arm a forced cross-epoch crossing sync toward the E+1 crossing checkpoint M2 (the laggard heard a
+  // higher-epoch hint and armed the crossing while staying Normal).
+  e.arm_cross_epoch_sync_for_test(m2);
+  let nonce = e.sync_nonce_for_test();
 
-  // 1) The OFFER pull (RequestSync) with the STALE slot + the predecessor config_id — admitted via the
-  //    shared binding, answered with the over-frame ANNOUNCE routed to the CURRENT slot.
-  donor.handle_message(
+  // The crossing checkpoint's SM root — DELIBERATELY NOT seeded into the laggard's store, so the install
+  // frontier does NOT drain locally and the laggard must emit a `RequestBlock` to the donor.
+  let cross_snap = CountSm::default().snapshot();
+  let cross_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(m2),
+    crate::block_address(&cross_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    ReconfigurePayload::from_membership(&successor_e1, genesis_mem.config_id()).encode_body();
+
+  // The donor self-claims the SHIFTED slot 2 (its successor-epoch slot), but the authenticated `from` is
+  // slot 1 — a CURRENT member of the laggard's (genesis) membership, the slot the laggard routes to. The
+  // two DIFFER, exactly the slot-shifted cross-epoch donor.
+  let shifted_claimed_slot = ReplicaId::new(2);
+  let routeable_from_slot = ReplicaId::new(1);
+  assert_ne!(
+    shifted_claimed_slot, routeable_from_slot,
+    "the donor's self-claimed (shifted) slot DIFFERS from the slot the laggard routes to"
+  );
+  e.handle_message(
     now,
     &mut wal,
     &mut sb,
-    from,
-    Message::RequestSync(crate::RequestSync::new(
+    &mut blocks,
+    Peer::Replica(routeable_from_slot),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
-      OpNumber::new(),
-      old_claimed_slot,
-      0xBEEF,
-      false,
-      predecessor_config_id,
+      OpNumber::with(m2),
+      cross_id,
+      successor_e1.epoch(),
+      successor_e1.config_id(), // a DESCENDANT of the laggard's genesis config — the crossing reply
+      shifted_claimed_slot,     // the donor's self-claimed SUCCESSOR-epoch (shifted) slot
+      nonce,
+      cross_env.clone(),
+      membership_body.clone(),
     )),
   );
-  donor.handle_storage(now, &mut wal, &mut sb); // serve-read completes → announce + warm the cache
-  let mut announced = None;
-  while let Some(out) = donor.poll_message() {
-    if let Message::SyncCheckpointMeta(meta) = out.msg_ref() {
+
+  // The block-fetch is pinned to the AUTHENTICATED `from` slot (the routeable donor), NOT the shifted
+  // self-claimed slot.
+  assert_eq!(
+    e.block_fetch_donor(),
+    Some(routeable_from_slot.get()),
+    "the block-fetch donor is pinned to the authenticated `from` slot, not the shifted `replica()`"
+  );
+
+  // The emitted `RequestBlock` routes to `from`'s slot (the real donor) — never the shifted slot.
+  let mut requested_from_routeable = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.msg_ref(), Message::RequestBlock(_)) {
       assert_eq!(
         out.to(),
-        Recipient::To(from),
-        "the over-frame announce routes to the laggard's CURRENT slot"
+        Recipient::To(Peer::Replica(routeable_from_slot)),
+        "the RequestBlock is addressed to the authenticated `from` slot (the real donor)"
       );
-      assert_eq!(meta.checkpoint_op().get(), checkpoint_op);
-      assert!(
-        !meta.membership().is_empty(),
-        "the announce carries the E+1 successor membership (XI-b gate satisfied)"
+      assert_ne!(
+        out.to(),
+        Recipient::To(Peer::Replica(shifted_claimed_slot)),
+        "the RequestBlock is NOT addressed to the donor's shifted self-claimed slot"
       );
-      announced = Some(meta.clone());
+      requested_from_routeable = true;
     }
   }
-  let announce =
-    announced.expect("the over-frame donor announces (never ships one oversized frame)");
   assert!(
-    donor.sync_donating.is_some(),
-    "the verified serve-read warmed the donor cache (chunk pulls are cache slices)"
+    requested_from_routeable,
+    "the laggard emitted a RequestBlock for the non-local crossing DAG, addressed to the real donor"
   );
 
-  // 2) The CHUNK pulls (RequestSyncChunk) with the SAME stale slot — admitted via the shared relaxation,
-  //    and the SyncChunk serve routes to the CURRENT slot. Collect the whole envelope + confirm it
-  //    reassembles to the announced content (so a slot-shifted laggard genuinely receives a crossable
-  //    envelope).
-  let pull_chunk = |donor: &mut Endpoint<CountSm, SingleChange>,
-                    wal: &mut TestWal,
-                    sb: &mut TestSb,
-                    offset: u64|
-   -> crate::SyncChunk {
-    donor.handle_message(
-      now,
-      wal,
-      sb,
-      from, // authenticated current slot 1
-      Message::RequestSyncChunk(crate::RequestSyncChunk::new(
-        View::new(),
-        announce.checkpoint_op(),
-        id,
-        predecessor_config_id, // the laggard stamps its OLD (ancestor) config_id
-        offset,
-        old_claimed_slot, // and its OLD (stale) slot — the relaxation must admit it
-        0xBEEF,
-      )),
-    );
-    let mut chunk = None;
-    while let Some(out) = donor.poll_message() {
-      if let Message::SyncChunk(c) = out.msg_ref() {
-        assert_eq!(
-          out.to(),
-          Recipient::To(from),
-          "the SyncChunk routes to the laggard's CURRENT slot, NOT the stale claimed slot"
-        );
-        chunk = Some(c.clone());
-      }
-    }
-    chunk.expect("the slot-shifted chunk pull was ADMITTED and served (not dropped at the binding)")
-  };
-  let first = pull_chunk(&mut donor, &mut wal, &mut sb, 0);
-  assert_eq!(first.offset(), 0);
-  let tail_offset = first.bytes().len() as u64;
-  let tail = pull_chunk(&mut donor, &mut wal, &mut sb, tail_offset);
-  assert_eq!(
-    tail_offset + tail.bytes().len() as u64,
-    env.len() as u64,
-    "the two chunks span the whole envelope"
-  );
-  let mut staged = std::vec::Vec::with_capacity(env.len());
-  staged.extend_from_slice(first.bytes());
-  staged.extend_from_slice(tail.bytes());
-  assert_eq!(
-    crate::checkpoint_id(&staged),
-    id,
-    "the slot-shifted-pulled chunks reassemble the exact announced (crossable) envelope"
-  );
-
-  // GUARD: the chunk-pull binding still bites the same-config forge surface. A RequestSyncChunk whose
-  // claimed slot DISAGREES with `from` but whose config_id is the donor's CURRENT (E+1) config — NOT an
-  // ancestor solicitation — is DROPPED (no relaxation), exactly like the same-config RequestSync guard.
-  let current_config = donor.membership.config_id();
-  donor.handle_message(
+  // Drive the fetch+crossing to completion: the donor (at `from`'s slot) answers the RequestBlock with the
+  // crossing block; the frontier drains and the crossing install completes.
+  blocks.write_verified(cross_snap.clone()); // the donor's BlockResponse lands the block
+  e.handle_message(
     now,
     &mut wal,
     &mut sb,
-    Peer::Replica(ReplicaId::new(2)), // from = slot 2
-    Message::RequestSyncChunk(crate::RequestSyncChunk::new(
-      View::new(),
-      announce.checkpoint_op(),
-      id,
-      current_config, // CURRENT config, not an ancestor
-      0,
-      ReplicaId::new(0), // claims slot 0 (disagrees with from)
-      0xBEEF,
+    &mut blocks,
+    Peer::Replica(routeable_from_slot),
+    Message::BlockResponse(crate::BlockResponse::new(
+      crate::block_address(&cross_snap),
+      Some(cross_snap.clone()),
     )),
   );
-  assert!(
-    !donor
-      .poll_message()
-      .is_some_and(|o| matches!(o.msg_ref(), Message::SyncChunk(_))),
-    "a same-config mismatched-self-id RequestSyncChunk is still DROPPED by the strict binding"
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // two-write re-persist -> durable root -> install
+  }
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "the fetch+crossing completed (the blocks were fetched from the real donor and installed)"
+  );
+  assert_eq!(
+    e.membership, successor_e1,
+    "the laggard CROSSED to E+1 via the fetched crossing checkpoint"
   );
 }
 
@@ -4773,6 +5080,7 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
   // `a_slot_shifted_cross_epoch_chunk_pull_is_served_and_the_chunk_routes_to_the_current_slot`.)
   let (mut donor, mut wal, mut sb, predecessor_config_id, _checkpoint_op) =
     donor_at_e1_with_shifted_member();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // MemberId 2: OLD slot 2 (what it stamps), CURRENT slot 1 (what `from` binds to in the E+1 [0,2,3]).
   let old_claimed_slot = ReplicaId::new(2);
@@ -4785,6 +5093,7 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     from,
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -4816,6 +5125,7 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(current_slot),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
