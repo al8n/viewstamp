@@ -1,0 +1,114 @@
+name: VOPR Deep Sweep
+
+# Exhaustive, fault-injecting fuzz of the consensus core (`viewstamp_simulation::run_vopr`) across a
+# WIDE band of deterministic seeds at a DEEP tick budget — composed crash + partition + lossy-network
+# + disk-fault + bounded-WAL schedules, with the per-tick safety/durability/liveness oracle suite
+# asserting on EVERY tick. This is far too slow for the per-commit gate (that lives in `ci.yml`, whose
+# `test` job runs the fast default `0..64` band in debug across the feature powerset); the deep sweep
+# runs on a schedule + on demand, SHARDED across 16 runners so the wall-clock stays reasonable.
+#
+# Determinism: every `run_vopr(seed, ticks)` is a pure function of `(seed, ticks)` with no wall-clock,
+# no RNG seeded off the environment, and no hash-iteration-order dependence — so it is reproducible
+# across platforms and opt levels. A failure panics with `seed=<S>` (and the tick); reproduce it
+# ANYWHERE with `VOPR_SEED_START=<S> VOPR_SEEDS=1 VOPR_TICKS=<ticks> cargo test --release -p
+# viewstamp-simulation --test vopr vopr_sweep_no_violations -- --exact --nocapture`, or via the
+# `#[ignore]` `replay_single_seed` test — exactly what a developer runs locally to debug.
+#
+# Schedule ROTATION: a scheduled run shifts its band by `run_number * total_seeds`, so successive runs
+# sweep an ever-advancing window ([0,N), [N,2N), [2N,3N), …) — continuous coverage of NEW seeds instead
+# of re-running the same low band forever. A manual dispatch keeps the [0, total_seeds) band, a
+# reproducible regression sweep. The pinned `REGRESSION_SEEDS` ride only the base shard (the slice
+# whose `VOPR_SEED_START` is 0), so they are swept exactly once per run, never duplicated per shard.
+# (The per-commit `ci.yml` covers the low `0..64` band on every push.)
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_seeds:
+        description: "Sweep seeds 0..total_seeds, split across 16 shards (try 1024 or 2048)"
+        default: "1024"
+        required: false
+      ticks:
+        description: "Ticks per run (depth — deeper finds longer-horizon churn/repair bugs)"
+        default: "4000"
+        required: false
+  schedule:
+    # Weekly: Monday 04:17 UTC (offset from the top of the hour to dodge the scheduler stampede).
+    - cron: "17 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sweep:
+    name: shard ${{ matrix.shard }}/16
+    timeout-minutes: 120
+    strategy:
+      # Never cancel sibling shards on a failure — we want the FULL landscape of failing seeds in one
+      # run, not just the first.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-vopr-deep-sweep-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-vopr-deep-sweep-
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Compute this shard's seed slice and run the sweep
+        env:
+          TOTAL: ${{ github.event.inputs.total_seeds || '1024' }}
+          TICKS: ${{ github.event.inputs.ticks || '4000' }}
+          SHARDS: "16"
+          SHARD: ${{ matrix.shard }}
+          EVENT: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          # SCHEDULE band ROTATION: a scheduled run advances the seed frontier by a fresh TOTAL each run
+          # (run_number * TOTAL), so successive runs sweep [0,TOTAL), [TOTAL,2·TOTAL), … rather than the
+          # same low band forever. Every other event (manual dispatch) keeps the [0, TOTAL) regression
+          # band. The 16 shards then split THIS run's band [BASE, BASE+TOTAL).
+          if [ "$EVENT" = "schedule" ]; then
+            BASE=$(( RUN_NUMBER * TOTAL ))
+          else
+            BASE=0
+          fi
+          BAND_END=$(( BASE + TOTAL ))
+          # Ceil division so 16 shards always cover the band; the tail shard takes the remainder.
+          PER=$(( (TOTAL + SHARDS - 1) / SHARDS ))
+          START=$(( BASE + SHARD * PER ))
+          END=$(( START + PER ))
+          [ "$END" -gt "$BAND_END" ] && END=$BAND_END || true
+          if [ "$START" -ge "$END" ]; then
+            echo "::notice title=shard ${SHARD}::empty slice (START=${START} >= band end ${BAND_END}) — skipping"
+            exit 0
+          fi
+          COUNT=$(( END - START ))
+          echo "::notice title=shard ${SHARD}::sweeping seeds [${START}, ${END}) (${COUNT} seeds) @ ${TICKS} ticks (band base ${BASE})"
+          # Release build: the sweep is compute-bound; release is ~5-10x faster and finds the SAME
+          # bugs (the proto logic is opt-level independent). vsrr's VOPR counts a CONTIGUOUS band from a
+          # base, so this shard's disjoint slice [START, END) is `VOPR_SEED_START=START` +
+          # `VOPR_SEEDS=END-START`; `VOPR_TICKS` deepens each run's schedule. The pinned REGRESSION_SEEDS
+          # are appended only when START == 0 (the base shard), so they are swept once, not per shard.
+          VOPR_SEED_START="$START" VOPR_SEEDS="$COUNT" VOPR_TICKS="$TICKS" \
+            cargo test --release -p viewstamp-simulation --test vopr vopr_sweep_no_violations -- --exact --nocapture
+
+  # Single aggregate status: green iff EVERY shard passed (a failed shard leaves `sweep` failed, so
+  # this job is skipped and the workflow reports failure). Gives one check to gate on / watch.
+  sweep-result:
+    name: deep-sweep result
+    needs: sweep
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All VOPR deep-sweep shards passed."
