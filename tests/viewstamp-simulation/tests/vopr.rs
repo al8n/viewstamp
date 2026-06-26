@@ -1360,7 +1360,7 @@ fn replay_single_seed() {
   println!(
     "vopr seed {} OK: ticks={} replicas={} clients={} max_committed={} crashes={} restarts={} \
      partitions={} heals={} calm_windows={} max_view={} all_clients_done={} \
-     wal_capacity={:?} wal_stalls={} below_ring_window_syncs={} sync_chunk_transfers={} \
+     wal_capacity={:?} wal_stalls={} below_ring_window_syncs={} \
      bounded_seed_wrapped={} large_bodies={} oversized_dropped={}",
     r.seed(),
     r.ticks(),
@@ -1377,7 +1377,6 @@ fn replay_single_seed() {
     r.wal_capacity(),
     r.wal_stalls(),
     r.below_ring_window_syncs(),
-    r.sync_chunk_transfers(),
     r.bounded_seed_wrapped(),
     r.large_bodies_sent(),
     r.oversized_dropped(),
