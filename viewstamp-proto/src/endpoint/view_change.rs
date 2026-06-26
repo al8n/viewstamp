@@ -250,7 +250,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// retires it); the forward `arm_timers(now)` re-arm; and `log_floor` (a MONOTONE vouched fact
   /// about durable cluster checkpoints, not per-generation in-flight state — clearing it would
   /// un-learn the floor the force-sync escalation needs after `peer_checkpoint` is dropped here).
-  pub(crate) fn reset_for_view_transition(&mut self) {
+  pub(crate) fn reset_for_view_transition(&mut self, now: Instant) {
     // SVC-collection bits for the OLD view (these stay flat — live in Normal too, see the struct
     // fields). The ViewChange-only DVC collection + catch-up discriminant are NOT touched here: they
     // live behind `self.view_change`, which each transition site sets (the two ViewChange entries) or
@@ -314,21 +314,37 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // has a superblock write outstanding" — is momentarily relaxed across this reset: the superseding
     // durable-view write keeps a write in flight whenever a view change issues one, and the commit-tail
     // re-submit covers the no-write `catch_up_to_view` path; `assert_invariants` does not run mid-reset.)
-    // Abandon any in-flight state-sync: a view change supersedes it (state-sync and view
-    // change are mutually exclusive by status — §2.6). The `sync` handshake, its DEFERRED INSTALL
-    // (`pending_install`), and any in-progress chunked transfer (`sync_transfer`) are cancelled
-    // TOGETHER: with durable-before-install the STAGE
-    // never restored the SM, advanced `commit_min`/`op`, nor pruned the WAL, so this finds the OLD
-    // (consistent, if stale) state intact — there is NO pruned-but-stale window. Dropping
-    // `pending_install` here also releases the staged snapshot bytes (and the transfer drop its
-    // partially-assembled ones) — and, gated by the
-    // `sync.is_some()` cleared alongside, the `on_sb_done` install arm can never fire against this
-    // cancelled sync (the `assert_invariants` `pending_install ⟹ sync` + `sync_transfer ⟹ sync`
-    // clauses guard this pairing).
-    self.sync = None;
+    // Abandon any PRE-ROOT in-flight state-sync: a view change supersedes it (state-sync and view
+    // change are mutually exclusive by status — §2.6). The `sync` handshake, its PRE-ROOT staging
+    // (`pending_install`), and any in-progress block-DAG transfer (`transfer`) are cancelled TOGETHER:
+    // with durable-before-install the STAGE never restored the SM, advanced `commit_min`/`op`, nor pruned
+    // the WAL, so this finds the OLD (consistent, if stale) state intact — there is NO pruned-but-stale
+    // window. Dropping `pending_install` here releases the staged snapshot bytes — and, gated by the
+    // `sync.is_some()` cleared alongside, the `on_sb_done` install arm can never fire against a cancelled
+    // sync (the `assert_invariants` `pending_install ⟹ sync` + `transfer ⟹ sync` clauses guard this).
+    //
+    // EXCEPTION — an SM-RECONSTRUCT obligation survives the transition. Once a synced checkpoint `M`'s
+    // re-persist root is durable, `self.checkpoint_op == M` IN LOCKSTEP with the durable root: there is NO
+    // pointer to rewind (in-memory already equals durable), so this is kept ONLY for LIVENESS — to keep the
+    // SM-content retry alive. KEEP `sync` + `block_fetch` (a live fetch, kept whole under the kept sync) +
+    // `sm_reconstruct` + the serviced ARQ across the transition; `pending_install` (a pre-root staging a
+    // superseding sync may have started) is still cleared — the obligation, not that staging, is the
+    // durable truth. The retry resumes the instant the node returns to Normal/Recovering; a durable-view
+    // write meanwhile reads the already-correct `self.checkpoint_op == M` and cannot rewind.
     self.pending_install = None;
-    self.sync_transfer = None;
-    self.timers.sync_solicit = None;
+    if !self.sm_reconstruct_owed() {
+      self.sync = None;
+      self.block_fetch = None;
+      self.timers.sync_solicit = None;
+    } else if self.status.is_normal() {
+      // The obligation survives; re-arm its serviced ARQ for the status this transition is LANDING in. The
+      // callers set `self.status` before this reset, so a Normal landing (`adopt_canonical_head`, or a
+      // primary start) re-arms `sync_solicit` — the path that re-pulls M's DAG and retries the restore. A
+      // ViewChange landing leaves it (no ARQ is serviced there) until the node next reaches Normal and this
+      // reset re-arms it; a Recovering landing (`on_recover_*`) rebuilds its own `recover`/`recover_retry`
+      // right after this reset, which re-drives the peer-fetch under the kept obligation.
+      self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+    }
     // A view change ends this primary generation: clear any forfeit grace timer AND any
     // deferred-forfeit flag (the safety step-down — see `maybe_force_sync`). The new generation
     // re-evaluates from scratch once it resumes Normal as primary, so neither a stale grace deadline
@@ -355,7 +371,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Tear down ALL old-generation in-flight state in one place: SVC bits, in-flight
     // appends, peer-checkpoint reports, in-flight checkpoint, in-flight sync + its deferred install, and
     // the forfeit sub-state.
-    self.reset_for_view_transition();
+    self.reset_for_view_transition(now);
     // ViewChange ENTRY: install a fresh ViewChange-only collection — `catching_up = false` (a real,
     // self-driven change, not the higher-view catch-up). (`is_some() == is_view_change()` coupling.)
     self.view_change = Some(ViewChangeCollection::entering(false));
@@ -459,6 +475,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
     m: crate::DoViewChange,
   ) {
     // NOTE (deferred to a later milestone): we do not yet validate incoming DVC well-formedness
@@ -518,7 +535,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.dvc_from_mut().insert(m.replica(), m);
     }
     if self.dvc_from().len() >= self.membership.quorum_view_change() {
-      self.start_view_as_new_primary(now, wal, sb);
+      self.start_view_as_new_primary(now, wal, sb, blocks);
     }
   }
 
@@ -747,6 +764,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
   ) {
     // A checkpoint is never logically armed when forming a new primary's view: `maybe_checkpoint`
     // is gated on Normal status, and entering ViewChange dropped `pending_checkpoint`. (A physically
@@ -780,7 +798,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // status is still ViewChange here, so the maybe_checkpoint at advance_commit's tail is a no-op
     // (checkpoints only start in Normal) — a checkpoint must not race the StartViewAsPrimary
     // durable-view write submitted below.
-    self.advance_commit(now, sb, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
+    self.advance_commit(now, sb, blocks, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
 
     // truncate the uncommitted suffix at the FIRST interior gap above commit*. The
     // adopted canonical log is the offset-union `(min_floor .. op_head]` and may still have an interior
@@ -986,7 +1004,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   /// Runs once the new-primary superblock write is durable: broadcast StartView + begin committing.
-  pub(crate) fn start_view_participate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn start_view_participate<B: Superblock>(
+    &mut self,
+    now: Instant,
+    sb: &mut B,
+    blocks: &mut dyn BlockStore,
+  ) {
     // Broadcast the canonical log to all backups, advertising the KNOWN-committed frontier
     // `commit_max` — NOT the APPLIED frontier `commit_min`. The two diverge when this new primary
     // adopted a committed header-only (`Repairing`) op: `advance_commit(commit_star)` raised
@@ -1020,7 +1043,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     ));
 
     self.arm_timers(now);
-    self.try_commit(now, sb);
+    self.try_commit(now, sb, blocks);
   }
 
   /// Adopt the canonical (`entries`) log for a view whose committed frontier is `commit`, floored at
@@ -1130,6 +1153,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
     m: crate::StartView,
   ) {
     // Adopt only a strictly newer view, or the current view while we have not yet returned to Normal
@@ -1147,6 +1171,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.adopt_canonical_head(
       now,
       sb,
+      blocks,
       m.view(),
       m.op(),
       m.commit(),
@@ -1207,6 +1232,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     &mut self,
     now: Instant,
     sb: &mut B,
+    blocks: &mut dyn BlockStore,
     view: View,
     op: OpNumber,
     commit: OpNumber,
@@ -1250,7 +1276,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // status is still ViewChange/RecoveringHead here, so the maybe_checkpoint at advance_commit's
     // tail is a no-op (checkpoints only start in Normal) — a checkpoint must not race the
     // AdoptedStartView durable-view write submitted below.
-    self.advance_commit(now, sb, commit.get());
+    self.advance_commit(now, sb, blocks, commit.get());
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = view;
     self.set_status(Status::Normal);
@@ -1272,7 +1298,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // a Normal primary can reach here via a higher-view `on_start_view` holding a live pipeline, so —
     // unlike the two ViewChange entries — adoption preserves it (this is the real per-site asymmetry
     // the shared reset keeps out).
-    self.reset_for_view_transition();
+    self.reset_for_view_transition(now);
     // Record a NON-ZERO carried floor as the sending primary's checkpoint report, mirroring
     // `on_commit`'s recording of the primary's `Commit.checkpoint_op` (monotone; the caller verified
     // the sender IS `config.primary(view)`). AFTER the shared reset — which just cleared

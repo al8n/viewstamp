@@ -46,22 +46,6 @@ fn max_client_sessions_is_validated_and_accessible() {
 }
 
 #[test]
-fn max_sync_envelope_len_is_validated_and_accessible() {
-  let c = Config::try_new(0, MemberId::new(0)).unwrap();
-  assert_eq!(c.max_sync_envelope_len(), MAX_SYNC_ENVELOPE_LEN); // the default cap
-  let c2 = c.with_max_sync_envelope_len(1 << 20).unwrap();
-  assert_eq!(c2.max_sync_envelope_len(), 1 << 20);
-  // the other fields are preserved by the chainable setter
-  assert_eq!(c2.local(), MemberId::new(0));
-  assert_eq!(c2.max_client_sessions(), c.max_client_sessions());
-  // a zero cap is rejected (it would refuse every chunked transfer)
-  assert_eq!(
-    c.with_max_sync_envelope_len(0),
-    Err(ConfigError::ZeroMaxSyncEnvelopeLen)
-  );
-}
-
-#[test]
 fn with_checkpoint_interval_chains_onto_the_default() {
   // A config built via `try_new` (the default interval) takes a non-default interval via the
   // chainable setter, preserving the other static params.
