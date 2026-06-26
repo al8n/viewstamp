@@ -34,6 +34,7 @@ extern crate alloc as std;
 extern crate std;
 
 mod batch;
+mod block_store;
 mod codec;
 mod config;
 mod endpoint;
@@ -55,10 +56,10 @@ pub use batch::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchFull, BatchMalformed, BatchUnits,
   BatchView, EmptyBatch, ReplyBuilder, ReplyPushError, ReplyView,
 };
+pub use block_store::{BlockAddress, BlockDagWalk, BlockStore, BlockStoreError, block_address};
 pub use codec::{CodecError, WIRE_VERSION};
 pub use config::{
   Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS, MAX_CLIENT_SESSIONS,
-  MAX_SYNC_ENVELOPE_LEN,
 };
 pub use endpoint::{
   Endpoint, ProposeMembershipError, Reconfig, ReconfigError, Recovered, RestartOnly, Retired,
@@ -68,19 +69,18 @@ pub use event::{Committed, Event, MembershipChanged, RepairStarted, ViewChanged}
 pub use id::{ClientId, Epoch, MemberId, Peer, Recipient, ReplicaId};
 pub use membership::{Membership, MembershipError, SingleVoterDelta};
 pub use message::{
-  Commit, DoViewChange, EpochAhead, GetView, LearnerProof, LearnerStatus, Message, Outgoing,
-  Prepare, PrepareBatch, PrepareOk, PreparedEntry, REPLY_ENCODE_OVERHEAD, ReconfigurePayload,
-  Recovery, RecoveryResponse, RepairBatch, Reply, Request, RequestLearnerProof, RequestPrepare,
-  RequestPrepareRange, RequestSync, RequestSyncChunk, SYNC_CHUNK_LEN, StartView, StartViewChange,
-  SyncCheckpoint, SyncCheckpointMeta, SyncChunk, max_reply_body_len, max_unchunked_snapshot_len,
-  max_unchunked_snapshot_len_with_membership,
+  BlockResponse, Commit, DoViewChange, EpochAhead, GetView, LearnerProof, LearnerStatus, Message,
+  Outgoing, Prepare, PrepareBatch, PrepareOk, PreparedEntry, REPLY_ENCODE_OVERHEAD,
+  ReconfigurePayload, Recovery, RecoveryResponse, RepairBatch, Reply, Request, RequestLearnerProof,
+  RequestPrepare, RequestPrepareRange, RequestSync, StartView, StartViewChange, SyncCheckpoint,
+  max_reply_body_len,
 };
 pub use number::{OpNumber, RequestNumber, View};
 pub use prng::Prng;
 pub use reconfigure_plan::{
   MembershipTarget, PlanError, plan_next_step, plan_reconfiguration, shrink_candidates,
 };
-pub use state_machine::StateMachine;
+pub use state_machine::{RestoreError, StateMachine};
 pub use status::Status;
 pub use storage::{
   BodyFaulty, CheckpointRead, HEADER_ENCODED_LEN, HEADER_VERSION, Header, OpId, ReadOk,

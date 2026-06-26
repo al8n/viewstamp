@@ -137,56 +137,6 @@ pub(crate) const PREPARE_BATCH_CARRIER_OVERHEAD: usize =
 /// [`MAX_REQUEST_BODY_OVERHEAD`], leaving the bound unchanged.
 const PREPARE_BATCH_BODY_OVERHEAD: usize = PREPARE_BATCH_CARRIER_OVERHEAD + LOG_ENTRY_BODY_OVERHEAD;
 
-/// FIXED bytes a [`SyncCheckpoint`] encoding wraps around its checkpoint envelope AND its carried
-/// membership encoding: the [`ENCODE_HEADER_LEN`] message header, then `view` + `checkpoint_op` (two
-/// `u64`s) + `checkpoint_id` (`u128`) + the agnostic `epoch` (`u64`) + `config_id` (`u128`) + `replica`
-/// (`u16`) + `nonce` (`u64`), then TWO [`BYTES_LEN_PREFIX`]es — one for the envelope, one for the
-/// membership. Derived from the exact widths [`Message::encode`]/[`Message::encoded_len`] write for the
-/// [`Message::SyncCheckpoint`] arm. The state-sync serve branches on the budget this leaves AFTER the
-/// (variable-length) membership ([`max_unchunked_snapshot_len`]): an envelope at/under it ships as ONE
-/// `SyncCheckpoint` (the unchunked fast path, byte-tight against the frame cap), a larger one ships
-/// chunked ([`SyncCheckpointMeta`] → [`RequestSyncChunk`] → [`SyncChunk`]) so no serve can ever exceed
-/// the frame cap.
-pub(crate) const SYNC_CHECKPOINT_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 16 + 8 + 16 + 2 + 8 + BYTES_LEN_PREFIX + BYTES_LEN_PREFIX;
-
-/// The largest checkpoint envelope that ships UNCHUNKED — as one [`SyncCheckpoint`] of exactly
-/// `MAX_FRAME_LEN` at this size — given a carried membership of `membership_len` bytes. The carrier
-/// also ships the membership IN THE SAME FRAME, so the envelope budget is the frame cap MINUS the fixed
-/// carrier overhead MINUS the membership length. The state-sync donor branches here: an envelope
-/// at/under this length is served whole (the single-message fast path); a larger one is announced with
-/// a [`SyncCheckpointMeta`] and pulled chunk-by-chunk ([`RequestSyncChunk`] → [`SyncChunk`]), so a
-/// snapshot of any size remains state-sync-servable. Not a tunable: derived entirely from the frame
-/// cap, the carried membership length, and the `SyncCheckpoint` carrier framing. (Saturating: a
-/// membership larger than the residual budget yields `0`, forcing the chunked path.)
-pub const fn max_unchunked_snapshot_len_with_membership(membership_len: usize) -> usize {
-  (MAX_FRAME_LEN as usize)
-    .saturating_sub(SYNC_CHECKPOINT_CARRIER_OVERHEAD)
-    .saturating_sub(membership_len)
-}
-
-/// The largest checkpoint envelope that ships UNCHUNKED when NO membership is carried (a same-config
-/// state-sync — the common case ships an empty membership). Equivalent to
-/// [`max_unchunked_snapshot_len_with_membership(0)`](max_unchunked_snapshot_len_with_membership).
-pub const fn max_unchunked_snapshot_len() -> usize {
-  max_unchunked_snapshot_len_with_membership(0)
-}
-
-/// Fixed bytes a [`SyncChunk`] encoding wraps around its chunk payload: the [`ENCODE_HEADER_LEN`]
-/// message header, then `view` + `checkpoint_op` (two `u64`s) + `checkpoint_id` (`u128`) +
-/// `total_len` + `offset` (two `u64`s) + the agnostic `config_id` (`u128`) + `replica` (`u16`) +
-/// `nonce` (`u64`), then the payload's [`BYTES_LEN_PREFIX`] — 81 bytes. Derived from the exact widths
-/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::SyncChunk`] arm.
-pub(crate) const SYNC_CHUNK_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 16 + 8 + 8 + 16 + 2 + 8 + BYTES_LEN_PREFIX;
-
-/// The chunk size of the chunked state-sync transfer: the largest payload a [`SyncChunk`] can carry
-/// with its encoding landing exactly on `MAX_FRAME_LEN` (max-fill, pinned exact by test). Every
-/// chunk but the last carries exactly this many bytes, so a transfer of `total_len` bytes completes
-/// in `ceil(total_len / SYNC_CHUNK_LEN)` stop-and-wait round trips. Not a tunable: derived entirely
-/// from the frame cap and the `SyncChunk` carrier framing.
-pub const SYNC_CHUNK_LEN: usize = MAX_FRAME_LEN as usize - SYNC_CHUNK_CARRIER_OVERHEAD;
-
 /// The exact number of bytes one [`Body::Present`] [`PreparedEntry`] of `body_len` body bytes
 /// contributes to a `write_log` slice: the per-entry framing [`LOG_ENTRY_BODY_OVERHEAD`] plus the body
 /// bytes themselves. Used by the byte-bounded repair serve to accumulate a served prefix without
@@ -2117,11 +2067,9 @@ pub struct RequestSync {
 
 impl RequestSync {
   /// Creates a RequestSync advertising the requester's current (stale) `checkpoint_op`. `recovery` is
-  /// set only on the recovery peer-fetch escalation (a replica whose OWN durable checkpoint snapshot
-  /// read back permanently corrupt) — there a peer at the SAME `checkpoint_op` must still serve, since
-  /// the requester's local bytes are unusable; ordinary state-sync leaves it `false` (a peer answers
-  /// only with something strictly newer). `config_id` is the sender's active configuration lineage (the
-  /// AGNOSTIC epoch-policy field).
+  /// the EQUAL-CHECKPOINT block-repair flag (see [`recovery`](Self::recovery)); ordinary state-sync
+  /// leaves it `false`. `config_id` is the sender's active configuration lineage (the AGNOSTIC
+  /// epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     view: View,
@@ -2171,10 +2119,11 @@ impl RequestSync {
     self.nonce
   }
 
-  /// `true` iff this is a RECOVERY peer-fetch (the requester's own durable checkpoint snapshot is
-  /// permanently unreadable). A peer at an EQUAL `checkpoint_op` serves a recovery request (the
-  /// requester needs the snapshot bytes even at the same op); an ordinary (`false`) state-sync request
-  /// is served only by a strictly-newer checkpoint.
+  /// `true` iff this is an EQUAL-CHECKPOINT block-repair request — the requester's own copy of
+  /// `checkpoint_op`'s block DAG is unusable (a recovery peer-fetch whose durable snapshot read back
+  /// corrupt, or an owed SM-reconstruct re-pulling a synced checkpoint's faulted DAG). A peer at an
+  /// EQUAL `checkpoint_op` serves such a request (the requester needs the clean blocks even at the same
+  /// op); an ordinary (`false`) state-sync request is served only by a strictly-newer checkpoint.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn recovery(&self) -> bool {
     self.recovery
@@ -2182,13 +2131,11 @@ impl RequestSync {
 }
 
 /// Peer → lagging replica (state-sync response): the latest durable checkpoint — its op, its content
-/// id, and the opaque snapshot envelope (the client-session table + `sm.snapshot()` produced by the
-/// proto's `encode_checkpoint`, modelled as one `Bytes`). Ships whole only when the envelope fits one
-/// frame (at most [`max_unchunked_snapshot_len`] bytes); a larger envelope travels chunked
-/// ([`SyncCheckpointMeta`] → [`RequestSyncChunk`] → [`SyncChunk`]) and the verified reassembly
-/// re-enters the receive path as exactly this message. The requester MUST verify
-/// `checkpoint_id == checkpoint_id(snapshot)` (a content hash) BEFORE
-/// restoring — never restore a corrupt/mismatched checkpoint — then `sm.restore` + restore the session
+/// id, and the small frame-bounded envelope produced by the proto's `encode_checkpoint` (the bound op
+/// plus the SM and session-table DAG roots, as one `Bytes`). The envelope is ALWAYS within one frame;
+/// the SM state and session table it names are fetched block-by-block over the content-addressed
+/// `RequestBlock`/`BlockResponse` path. The requester MUST verify `checkpoint_id ==
+/// checkpoint_id(snapshot)` (a content hash) BEFORE restoring, then `sm.restore` + restore the session
 /// table + set `commit_min == commit_max == checkpoint_op`. `nonce` echoes the soliciting
 /// [`RequestSync`] (a stale reply is dropped). Not `Copy` (it carries owned `Bytes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2310,327 +2257,48 @@ impl SyncCheckpoint {
   }
 }
 
-/// Donor → lagging replica (the chunked state-sync announce): the donor's latest durable checkpoint
-/// is TOO LARGE to ship as one [`SyncCheckpoint`] (its envelope exceeds
-/// [`max_unchunked_snapshot_len`]), so the donor announces it — op, content id, and the envelope's
-/// `total_len` — and the requester PULLS it chunk-by-chunk ([`RequestSyncChunk`] → [`SyncChunk`]).
-/// `total_len` descends from a VERIFIED checkpoint read (the donor hashes the read bytes against its
-/// durable root before announcing), so the receiver can size its reassembly buffer to exactly the
-/// envelope it will verify. `nonce` echoes the soliciting `RequestSync` (a stale announce is
-/// dropped); `view` is routing/freshness only — committed checkpoint content is view-independent.
+/// The donor's answer to a [`Message::RequestBlock`]: either the block bytes are present or the
+/// donor does not hold the block at that address.
 ///
-/// Carries `epoch` and `membership` mirroring [`SyncCheckpoint`] (the single-frame form), so the
-/// verified chunk reassembly rebuilds a `SyncCheckpoint` IDENTICAL to a one-frame arrival — a
-/// cross-epoch laggard whose post-swap snapshot is large enough to FORCE chunking still reconstructs
-/// and installs the successor configuration from the carried `(epoch, config_id, membership)`. Not
-/// `Copy` (it carries owned `Bytes`).
+/// Wire encoding: `addr` (16 bytes, big-endian), a 1-byte presence flag (`1` = present, `0` = absent),
+/// then — present only — a `u32`-length-prefixed block payload. The `Option<Bytes>` shape is the
+/// canonical wire exception for an unambiguous absent-vs-present distinction: `None` is not the same as
+/// `Some(Bytes::new())`, so the presence flag carries it explicitly rather than overloading length 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncCheckpointMeta {
-  view: View,
-  checkpoint_op: OpNumber,
-  checkpoint_id: u128,
-  epoch: Epoch,
-  config_id: u128,
-  total_len: u64,
-  replica: ReplicaId,
-  nonce: u64,
-  membership: Bytes,
+pub struct BlockResponse {
+  addr: crate::BlockAddress,
+  block: Option<Bytes>,
 }
 
-impl SyncCheckpointMeta {
-  /// Creates a chunked-transfer announce for the checkpoint `(checkpoint_op, checkpoint_id)` whose
-  /// envelope is `total_len` bytes. `config_id` is the sender's active configuration lineage (the
-  /// AGNOSTIC epoch-policy field), `epoch` its configuration version, and `membership` the canonical
-  /// `ReconfigurePayload::encode_body` of the sender's CURRENT configuration — IDENTICAL to the
-  /// single-frame [`SyncCheckpoint`], so the reassembled checkpoint installs the successor config the
-  /// chunked envelope reflects.
+impl BlockResponse {
+  /// Constructs a block-response carrying `addr` and an optional block payload (`None` = absent).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  #[allow(clippy::too_many_arguments)]
-  pub fn new(
-    view: View,
-    checkpoint_op: OpNumber,
-    checkpoint_id: u128,
-    epoch: Epoch,
-    config_id: u128,
-    total_len: u64,
-    replica: ReplicaId,
-    nonce: u64,
-    membership: Bytes,
-  ) -> Self {
-    Self {
-      view,
-      checkpoint_op,
-      checkpoint_id,
-      epoch,
-      config_id,
-      total_len,
-      replica,
-      nonce,
-      membership,
-    }
+  pub fn new(addr: crate::BlockAddress, block: Option<Bytes>) -> Self {
+    Self { addr, block }
   }
 
-  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  /// The content address the requester named.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn config_id(&self) -> u128 {
-    self.config_id
+  pub fn addr(&self) -> crate::BlockAddress {
+    self.addr
   }
 
-  /// The sender's configuration version (the epoch the carried [`Self::membership`] installs at).
-  /// Paired with `config_id`, it lets a cross-epoch laggard reconstruct the successor `Membership` the
-  /// chunked snapshot reflects — IDENTICAL to [`SyncCheckpoint::epoch`].
+  /// The block bytes when the donor holds them, or `None` when absent.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn epoch(&self) -> Epoch {
-    self.epoch
+  pub fn block(&self) -> Option<&[u8]> {
+    self.block.as_deref()
   }
 
-  /// The donor's current view (routing/freshness; the checkpoint content is view-independent).
+  /// `true` when the donor holds the block (`block` is `Some`).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn view(&self) -> View {
-    self.view
+  pub fn is_present(&self) -> bool {
+    self.block.is_some()
   }
 
-  /// The op number at which the announced checkpoint was taken.
+  /// `true` when the donor does not hold the block (`block` is `None`).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn checkpoint_op(&self) -> OpNumber {
-    self.checkpoint_op
-  }
-
-  /// The content id of the announced envelope — the transfer is PINNED by `(checkpoint_op, this)`,
-  /// and the assembled bytes must hash to it before anything reaches the install path.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn checkpoint_id(&self) -> u128 {
-    self.checkpoint_id
-  }
-
-  /// The announced envelope's total length in bytes (from a VERIFIED donor read).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn total_len(&self) -> u64 {
-    self.total_len
-  }
-
-  /// The announcing replica (chunk requests are addressed to it).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn replica(&self) -> ReplicaId {
-    self.replica
-  }
-
-  /// The freshness nonce echoed from the soliciting `RequestSync`.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn nonce(&self) -> u64 {
-    self.nonce
-  }
-
-  /// The canonical `ReconfigurePayload::encode_body` of the sender's configuration (the one the
-  /// announced snapshot reflects), as a slice — IDENTICAL to [`SyncCheckpoint::membership`]. A
-  /// cross-epoch laggard decodes it via `ReconfigurePayload::decode_body` and reconstructs the
-  /// successor `Membership` via [`ReconfigurePayload::to_membership`]; a same-config sync leaves it
-  /// unread.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn membership(&self) -> &[u8] {
-    &self.membership
-  }
-
-  /// The carried membership encoding as a cloned [`Bytes`] handle.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn membership_bytes(&self) -> Bytes {
-    self.membership.clone()
-  }
-}
-
-/// Lagging replica → donor (the chunked state-sync pull): request the chunk of the pinned checkpoint
-/// envelope starting at `offset`. One outstanding request at a time (stop-and-wait, self-clocked:
-/// the next request is sent on chunk accept); the `sync_solicit` timer re-sends the current request
-/// as the ARQ. `(checkpoint_op, checkpoint_id)` pin the exact content being pulled, so a donor whose
-/// checkpoint has since advanced can keep serving the pinned (immutable, committed) envelope from
-/// its cache, and chunks from DIFFERENT donors of the same pinned content are interchangeable.
-/// `nonce` is the requester's live sync nonce, echoed in the [`SyncChunk`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestSyncChunk {
-  view: View,
-  checkpoint_op: OpNumber,
-  checkpoint_id: u128,
-  config_id: u128,
-  offset: u64,
-  replica: ReplicaId,
-  nonce: u64,
-}
-
-impl RequestSyncChunk {
-  /// Creates a chunk request for the pinned checkpoint `(checkpoint_op, checkpoint_id)` at `offset`.
-  /// `config_id` is the sender's active configuration lineage (the AGNOSTIC epoch-policy field).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(
-    view: View,
-    checkpoint_op: OpNumber,
-    checkpoint_id: u128,
-    config_id: u128,
-    offset: u64,
-    replica: ReplicaId,
-    nonce: u64,
-  ) -> Self {
-    Self {
-      view,
-      checkpoint_op,
-      checkpoint_id,
-      config_id,
-      offset,
-      replica,
-      nonce,
-    }
-  }
-
-  /// The sender's configuration lineage id (the agnostic epoch-policy field).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn config_id(&self) -> u128 {
-    self.config_id
-  }
-
-  /// The requester's current view.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn view(&self) -> View {
-    self.view
-  }
-
-  /// The pinned checkpoint op being pulled.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn checkpoint_op(&self) -> OpNumber {
-    self.checkpoint_op
-  }
-
-  /// The pinned envelope content id being pulled.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn checkpoint_id(&self) -> u128 {
-    self.checkpoint_id
-  }
-
-  /// The byte offset into the envelope this request asks the donor to serve from.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn offset(&self) -> u64 {
-    self.offset
-  }
-
-  /// The requesting replica (the [`SyncChunk`] reply is addressed back to it).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn replica(&self) -> ReplicaId {
-    self.replica
-  }
-
-  /// The requester's live sync nonce, echoed in the [`SyncChunk`].
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn nonce(&self) -> u64 {
-    self.nonce
-  }
-}
-
-/// Donor → lagging replica (the chunked state-sync payload): one chunk of the pinned checkpoint
-/// envelope, answering a [`RequestSyncChunk`]. Every chunk repeats `(checkpoint_op, checkpoint_id,
-/// total_len)` so it is statelessly self-describing — the receiver rejects any chunk that does not
-/// match its pinned transfer, and a dup/reordered chunk (its `offset` is not the staged frontier) is
-/// inert. The payload is at most [`SYNC_CHUNK_LEN`] bytes by construction (a max-fill chunk encodes
-/// to exactly the frame cap), so the chunked path can never produce an oversized frame. Not `Copy`
-/// (it carries owned `Bytes`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncChunk {
-  view: View,
-  checkpoint_op: OpNumber,
-  checkpoint_id: u128,
-  config_id: u128,
-  total_len: u64,
-  offset: u64,
-  replica: ReplicaId,
-  nonce: u64,
-  bytes: Bytes,
-}
-
-impl SyncChunk {
-  /// Creates a chunk of the pinned checkpoint `(checkpoint_op, checkpoint_id)`: the envelope bytes
-  /// at `offset .. offset + bytes.len()` of a `total_len`-byte envelope. `config_id` is the sender's
-  /// active configuration lineage (the AGNOSTIC epoch-policy field).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  #[allow(clippy::too_many_arguments)] // the wire layout, in canonical field order
-  pub const fn new(
-    view: View,
-    checkpoint_op: OpNumber,
-    checkpoint_id: u128,
-    config_id: u128,
-    total_len: u64,
-    offset: u64,
-    replica: ReplicaId,
-    nonce: u64,
-    bytes: Bytes,
-  ) -> Self {
-    Self {
-      view,
-      checkpoint_op,
-      checkpoint_id,
-      config_id,
-      total_len,
-      offset,
-      replica,
-      nonce,
-      bytes,
-    }
-  }
-
-  /// The sender's configuration lineage id (the agnostic epoch-policy field).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn config_id(&self) -> u128 {
-    self.config_id
-  }
-
-  /// The donor's current view (routing/freshness; the chunk content is view-independent).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn view(&self) -> View {
-    self.view
-  }
-
-  /// The pinned checkpoint op this chunk belongs to.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn checkpoint_op(&self) -> OpNumber {
-    self.checkpoint_op
-  }
-
-  /// The pinned envelope content id this chunk belongs to.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn checkpoint_id(&self) -> u128 {
-    self.checkpoint_id
-  }
-
-  /// The envelope's total length (repeated on every chunk — statelessly self-describing).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn total_len(&self) -> u64 {
-    self.total_len
-  }
-
-  /// The byte offset of this chunk within the envelope.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn offset(&self) -> u64 {
-    self.offset
-  }
-
-  /// The serving replica.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn replica(&self) -> ReplicaId {
-    self.replica
-  }
-
-  /// The freshness nonce echoed from the soliciting [`RequestSyncChunk`].
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn nonce(&self) -> u64 {
-    self.nonce
-  }
-
-  /// The chunk payload as a slice.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn bytes(&self) -> &[u8] {
-    &self.bytes
-  }
-
-  /// The chunk payload as a cloned [`Bytes`] handle.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn bytes_owned(&self) -> Bytes {
-    self.bytes.clone()
+  pub fn is_absent(&self) -> bool {
+    self.block.is_none()
   }
 }
 
@@ -2677,12 +2345,6 @@ pub enum Message {
   RequestPrepareRange(RequestPrepareRange),
   /// Answer a `RequestPrepareRange` with a byte-bounded prefix of the solicited run.
   RepairBatch(RepairBatch),
-  /// Announce an over-frame checkpoint for chunked transfer (op, content id, total length).
-  SyncCheckpointMeta(SyncCheckpointMeta),
-  /// Solicit one chunk of an announced checkpoint envelope at a byte offset.
-  RequestSyncChunk(RequestSyncChunk),
-  /// Answer a `RequestSyncChunk` with one chunk of the pinned checkpoint envelope.
-  SyncChunk(SyncChunk),
   /// Retransmit a byte-bounded batch of the primary's first un-acked prepares (one frame, not one
   /// `Prepare` per op).
   PrepareBatch(PrepareBatch),
@@ -2699,6 +2361,11 @@ pub enum Message {
   /// A target learner's fresh-proof REPLY (its contiguous applied frontier, recomputed from durable
   /// state at reply time), gating the catch-up-then-promote mint; no quorum authority.
   LearnerProof(LearnerProof),
+  /// Solicit the block at a content address from a peer that holds the block store.
+  RequestBlock(crate::BlockAddress),
+  /// Answer a `RequestBlock`: either the block bytes or an absent signal (the donor does not hold
+  /// this address).
+  BlockResponse(BlockResponse),
 }
 
 impl Message {
@@ -2723,14 +2390,13 @@ impl Message {
       Self::SyncCheckpoint(_) => "SyncCheckpoint",
       Self::RequestPrepareRange(_) => "RequestPrepareRange",
       Self::RepairBatch(_) => "RepairBatch",
-      Self::SyncCheckpointMeta(_) => "SyncCheckpointMeta",
-      Self::RequestSyncChunk(_) => "RequestSyncChunk",
-      Self::SyncChunk(_) => "SyncChunk",
       Self::PrepareBatch(_) => "PrepareBatch",
       Self::LearnerStatus(_) => "LearnerStatus",
       Self::EpochAhead(_) => "EpochAhead",
       Self::RequestLearnerProof(_) => "RequestLearnerProof",
       Self::LearnerProof(_) => "LearnerProof",
+      Self::RequestBlock(_) => "RequestBlock",
+      Self::BlockResponse(_) => "BlockResponse",
     }
   }
 
@@ -2764,11 +2430,6 @@ impl Message {
       | Self::RecoveryResponse(_)
       // The state-sync serve advertises `self.view`.
       | Self::SyncCheckpoint(_)
-      // The chunked-transfer serves are the SAME state-sync answer split across messages — the
-      // announce and each chunk advertise `self.view` exactly as the whole `SyncCheckpoint` does, so
-      // they ride the same emit gate (a donor never serves while its view write is in flight).
-      | Self::SyncCheckpointMeta(_)
-      | Self::SyncChunk(_)
       // The windowed repair serve advertises `self.view` exactly as the per-op repair-serve `Prepare`
       // does (it is the batched form of the same answer): the server emits it only when Normal +
       // durable-view (`on_request_prepare_range` self-gates like `on_request_prepare`), so gating it at
@@ -2788,8 +2449,6 @@ impl Message {
       | Self::RequestPrepareRange(_)
       | Self::Recovery(_)
       | Self::RequestSync(_)
-      // The chunk pull is a solicitation, exactly like the `RequestSync` it follows.
-      | Self::RequestSyncChunk(_)
       // A learner's progress report carries NO vote/lead authority — it advertises no participatory
       // view, so it may be emitted while a view write is in flight (it is config-scoped, not view-scoped).
       | Self::LearnerStatus(_)
@@ -2800,7 +2459,10 @@ impl Message {
       // solicitation and a no-vote reply that gate a reconfiguration proposal, never a view-bearing
       // vote/lead/serve. They claim no participatory view (emittable while a view write is in flight).
       | Self::RequestLearnerProof(_)
-      | Self::LearnerProof(_) => false,
+      | Self::LearnerProof(_)
+      // Block solicitation + reply carry no view authority (content-addressed data plane).
+      | Self::RequestBlock(_)
+      | Self::BlockResponse(_) => false,
     }
   }
 
@@ -2827,14 +2489,15 @@ impl Message {
       Self::SyncCheckpoint(_) => 13,
       Self::RequestPrepareRange(_) => 14,
       Self::RepairBatch(_) => 15,
-      Self::SyncCheckpointMeta(_) => 16,
-      Self::RequestSyncChunk(_) => 17,
-      Self::SyncChunk(_) => 18,
+      // Tags 16/17/18 are retired: the over-frame chunked state-sync (`SyncCheckpointMeta` /
+      // `RequestSyncChunk` / `SyncChunk`) was replaced by the content-addressed block fetch.
       Self::PrepareBatch(_) => 19,
       Self::LearnerStatus(_) => 20,
       Self::EpochAhead(_) => 21,
       Self::RequestLearnerProof(_) => 22,
       Self::LearnerProof(_) => 23,
+      Self::RequestBlock(_) => 24,
+      Self::BlockResponse(_) => 25,
     }
   }
 
@@ -2984,37 +2647,6 @@ impl Message {
         out.put_u128(m.config_id);
         write_log(&mut out, &m.log);
       }
-      Self::SyncCheckpointMeta(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u128(m.checkpoint_id);
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-        out.put_u64(m.total_len);
-        out.put_u16(m.replica.get());
-        out.put_u64(m.nonce);
-        write_bytes_u32(&mut out, &m.membership);
-      }
-      Self::RequestSyncChunk(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u128(m.checkpoint_id);
-        out.put_u128(m.config_id);
-        out.put_u64(m.offset);
-        out.put_u16(m.replica.get());
-        out.put_u64(m.nonce);
-      }
-      Self::SyncChunk(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u128(m.checkpoint_id);
-        out.put_u128(m.config_id);
-        out.put_u64(m.total_len);
-        out.put_u64(m.offset);
-        out.put_u16(m.replica.get());
-        out.put_u64(m.nonce);
-        write_bytes_u32(&mut out, &m.bytes);
-      }
       Self::PrepareBatch(m) => {
         out.put_u64(m.view.get());
         out.put_u64(m.commit.get());
@@ -3047,6 +2679,21 @@ impl Message {
         out.put_u64(m.frontier.get());
         out.put_u64(m.epoch.get());
         out.put_u128(m.config_id);
+      }
+      Self::RequestBlock(addr) => {
+        out.put_slice(addr.as_bytes());
+      }
+      Self::BlockResponse(m) => {
+        out.put_slice(m.addr.as_bytes());
+        match &m.block {
+          Some(bytes) => {
+            out.put_u8(1);
+            write_bytes_u32(&mut out, bytes);
+          }
+          None => {
+            out.put_u8(0);
+          }
+        }
       }
     }
     out.freeze()
@@ -3116,18 +2763,15 @@ impl Message {
       }
       Self::RequestPrepareRange(_) => U64 + U64 + U64 + U16 + U128,
       Self::RepairBatch(m) => U64 + U64 + U64 + U128 + log(&m.log),
-      Self::SyncCheckpointMeta(m) => {
-        U64 + U64 + U128 + U64 + U128 + U64 + U16 + U64 + bytes_u32(m.membership.len())
-      }
-      Self::RequestSyncChunk(_) => U64 + U64 + U128 + U128 + U64 + U16 + U64,
-      Self::SyncChunk(m) => {
-        U64 + U64 + U128 + U128 + U64 + U64 + U16 + U64 + bytes_u32(m.bytes.len())
-      }
       Self::PrepareBatch(m) => U64 + U64 + U64 + U64 + U128 + log(&m.log),
       Self::LearnerStatus(_) => U16 + U64 + U64 + U64 + U128,
       Self::EpochAhead(_) => U64 + U64,
       Self::RequestLearnerProof(_) => U16 + U64 + U64 + U64 + U128,
       Self::LearnerProof(_) => U16 + U64 + U64 + U64 + U128,
+      // addr (16 bytes fixed)
+      Self::RequestBlock(_) => 16,
+      // addr (16) + presence flag (u8=1) + optional block (u32 length prefix + bytes)
+      Self::BlockResponse(m) => 16 + 1 + m.block.as_deref().map_or(0, |b| 4 + b.len()),
     };
     HEADER + body
   }
@@ -3279,37 +2923,8 @@ impl Message {
         config_id: r.u128()?,
         log: read_log(&mut r)?,
       }),
-      16 => Self::SyncCheckpointMeta(SyncCheckpointMeta {
-        view: read_view(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        checkpoint_id: r.u128()?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-        total_len: r.u64()?,
-        replica: read_replica(&mut r)?,
-        nonce: r.u64()?,
-        membership: read_body(&mut r)?,
-      }),
-      17 => Self::RequestSyncChunk(RequestSyncChunk {
-        view: read_view(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        checkpoint_id: r.u128()?,
-        config_id: r.u128()?,
-        offset: r.u64()?,
-        replica: read_replica(&mut r)?,
-        nonce: r.u64()?,
-      }),
-      18 => Self::SyncChunk(SyncChunk {
-        view: read_view(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        checkpoint_id: r.u128()?,
-        config_id: r.u128()?,
-        total_len: r.u64()?,
-        offset: r.u64()?,
-        replica: read_replica(&mut r)?,
-        nonce: r.u64()?,
-        bytes: read_body(&mut r)?,
-      }),
+      // Tags 16/17/18 are retired (see `tag`); a peer on this wire version never emits them, so they
+      // fall through to the unknown-tag error below.
       19 => Self::PrepareBatch(PrepareBatch {
         view: read_view(&mut r)?,
         commit: read_op(&mut r)?,
@@ -3343,6 +2958,19 @@ impl Message {
         epoch: read_epoch(&mut r)?,
         config_id: r.u128()?,
       }),
+      24 => Self::RequestBlock(read_block_address(&mut r)?),
+      25 => {
+        let addr = read_block_address(&mut r)?;
+        let flag = r.u8()?;
+        let block = match flag {
+          0 => None,
+          1 => Some(read_body(&mut r)?),
+          _ => {
+            return Err(CodecError::UnknownTag(flag));
+          }
+        };
+        Self::BlockResponse(BlockResponse { addr, block })
+      }
       other => return Err(CodecError::UnknownTag(other)),
     };
     r.finish()?;
@@ -3355,6 +2983,12 @@ impl Message {
 #[cfg_attr(not(tarpaulin), inline)]
 fn read_view(r: &mut Reader<'_>) -> Result<View, CodecError> {
   Ok(View::with(r.u64()?))
+}
+
+#[cfg_attr(not(tarpaulin), inline)]
+fn read_block_address(r: &mut Reader<'_>) -> Result<crate::BlockAddress, CodecError> {
+  let bytes: [u8; 16] = r.take(16)?.try_into().expect("take(16) yields 16 bytes");
+  Ok(crate::BlockAddress::from_bytes(bytes))
 }
 
 #[cfg_attr(not(tarpaulin), inline)]
