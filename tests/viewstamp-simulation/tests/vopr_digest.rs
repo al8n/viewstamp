@@ -25,7 +25,6 @@
 
 use core::time::Duration;
 
-use viewstamp_proto::max_unchunked_snapshot_len;
 use viewstamp_simulation::{Cluster, DEFAULT_TICKS, Faults, VoprReport, run_vopr};
 
 /// The default contiguous seed count, overridable via `VOPR_SEEDS` like the committed sweep.
@@ -129,7 +128,6 @@ fn report_digest(r: &VoprReport) -> u64 {
     r.wal_capacity().map_or(0, |n| n + 1),
     r.wal_stalls(),
     r.below_ring_window_syncs(),
-    r.sync_chunk_transfers(),
     u64::from(r.bounded_seed_wrapped()),
     r.large_bodies_sent(),
     r.oversized_dropped(),
@@ -174,99 +172,6 @@ fn report_digest(r: &VoprReport) -> u64 {
   h
 }
 
-/// The largest live ROOTED checkpoint envelope (the exact bytes a state-sync serve would carry) any
-/// replica holds at any point during a fixed checkpoint-forming schedule for `seed`. A 3-replica
-/// cluster with a SMALL checkpoint interval and a sustained client load under a lossy network crosses
-/// several checkpoints, so every replica roots a checkpoint and the envelope (bound op + the
-/// client-session table + the SM snapshot) is non-empty. The envelope length is sampled every tick
-/// across the run (it grows as the committed prefix and session table grow), so the result is this
-/// seed's high-water.
-fn max_live_envelope(seed: u64) -> usize {
-  // A small interval (8) so a few-thousand-tick run crosses many checkpoints; a sustained request
-  // budget so the committed prefix (and thus the snapshot riding the envelope) keeps growing across
-  // them. The envelope high-water is reached well within this window.
-  let mut c = Cluster::with_checkpoint_ops(3, 3, 200, seed, 8);
-  c.set_faults(Faults {
-    latency: Duration::from_millis(1),
-    jitter: Duration::from_millis(2),
-    drop_per_mille: 50,
-    duplicate_per_mille: 100,
-    hold_per_mille: 0,
-  });
-  let mut hw = 0usize;
-  let sample = |c: &Cluster, hw: &mut usize| {
-    for i in 0..c.replica_count() {
-      if let Some(len) = c.replica_durable_envelope_len(i) {
-        *hw = (*hw).max(len);
-      }
-    }
-  };
-  for t in 0..3_000u32 {
-    match t {
-      600 => c.crash(1),
-      1_000 => c.restart(1),
-      _ => {}
-    }
-    c.tick();
-    sample(&c, &mut hw);
-  }
-  c.set_faults(Faults::none());
-  for _ in 0..3_000 {
-    c.tick();
-    sample(&c, &mut hw);
-    if c.is_quiescent() {
-      break;
-    }
-  }
-  hw
-}
-
-/// The chunking decision is a strict inequality: an envelope `<= max_unchunked_snapshot_len()` ships
-/// whole, a larger one ships chunked. A prior carrier-overhead change shrank that boundary by one
-/// byte, so a seed whose envelope sat exactly on the old boundary could have flipped from whole to
-/// chunked. This MEASURES the corpus's envelope high-water and proves no seed sits anywhere near the
-/// boundary: the max is far below the cap, so the one-byte shift cannot have flipped any seed's
-/// whole-vs-chunked sync decision. (The sim's bodies are bounded to ~64 KiB and a run commits ~1.1k
-/// ops, so the envelope stays well under the ~16 MiB cap — but this asserts it by measurement.)
-#[test]
-fn checkpoint_envelope_stays_well_under_unchunked_cap() {
-  // A handful of seeds demonstrates the multi-MiB margin conclusively (the envelope magnitude barely
-  // varies by seed); `VOPR_SEEDS` widens the sweep for a thorough cross-checkout run.
-  let count = std::env::var("VOPR_SEEDS")
-    .ok()
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(8);
-  let cap = max_unchunked_snapshot_len();
-  let mut corpus_max = 0usize;
-  let mut worst_seed = 0u64;
-  for seed in 0..count {
-    let m = max_live_envelope(seed);
-    if m > corpus_max {
-      corpus_max = m;
-      worst_seed = seed;
-    }
-  }
-  // A 1-byte margin would suffice to prove no flip; assert the actual, far larger margin so the
-  // measured headroom is self-documenting in the failure message.
-  assert!(
-    corpus_max < cap,
-    "max live checkpoint envelope across {count} seeds was {corpus_max} bytes (worst seed \
-     {worst_seed}), which is NOT strictly below max_unchunked_snapshot_len() = {cap} — a seed's \
-     envelope sits in the whole-vs-chunked band the carrier-overhead change could flip"
-  );
-  // The corpus must actually FORM checkpoint envelopes (a vacuous all-zero measurement would pass
-  // the bound trivially); the digest schedule crosses many checkpoints, so the high-water is > 0.
-  assert!(
-    corpus_max > 0,
-    "no rooted checkpoint envelope was observed across {count} seeds — the measurement is vacuous"
-  );
-  let margin = cap - corpus_max;
-  println!(
-    "checkpoint envelope high-water across {count} seeds: {corpus_max} bytes (worst seed \
-     {worst_seed}); max_unchunked_snapshot_len() = {cap}; margin = {margin} bytes"
-  );
-}
-
 /// Pinned baseline `(applied, report)` digests for the first few seeds, captured on `main` BEFORE the
 /// live-reconfiguration axis landed. The opt-in live-reconfig axis (and its always-on checker
 /// plumbing + `MembershipChanged` capture) must be byte-identical to `main` when OFF — the cluster's
@@ -277,11 +182,16 @@ fn checkpoint_envelope_stays_well_under_unchunked_cap() {
 /// in-process guard for that: a future change that perturbs the off-axis schedule (an extra draw, a
 /// reordered action, a captured-but-mutating observer) breaks one of these and fails here with the
 /// exact seed. (The `#[ignore]`d [`vopr_digest_sweep`] above is the wider cross-checkout diff tool.)
+/// The APPLIED-history digests are unchanged from `main` — the block-DAG state-sync migration is
+/// behaviour-preserving (the consensus applied stream + replies are byte-identical). The REPORT
+/// digests were re-pinned because the retired `sync_chunk_transfers` observability counter (always 0
+/// off-axis, an artefact of the removed over-frame chunked path) was dropped from the report fold; its
+/// removal shifts the FNV-folded report hash without any behavioural change.
 const BASELINE_DIGESTS: &[(u64, u64, u64)] = &[
-  (0, 0x3011_cd95_7970_09d6, 0xe7a7_437d_c5ea_01b9),
-  (1, 0x8180_484c_aaf2_15a4, 0xfc32_3922_0e6d_17a0),
-  (2, 0x27fd_ef6b_3b83_c631, 0x1e70_2256_c5fe_7b39),
-  (3, 0x94d1_3cab_40a7_0dc2, 0x70da_f20a_75a6_ef44),
+  (0, 0x3011_cd95_7970_09d6, 0x5310_fabf_544b_7a19),
+  (1, 0x8180_484c_aaf2_15a4, 0x704d_dc76_945b_97c0),
+  (2, 0x27fd_ef6b_3b83_c631, 0x07a5_5860_35bf_4bf9),
+  (3, 0x94d1_3cab_40a7_0dc2, 0x0249_a3f9_dcb7_b704),
 ];
 
 #[test]

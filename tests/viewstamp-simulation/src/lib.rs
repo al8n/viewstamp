@@ -5,6 +5,7 @@
 //! deterministic function of its seed.
 
 pub mod batching;
+pub mod block_store;
 pub mod checker;
 pub mod client;
 pub mod clock;
@@ -15,6 +16,7 @@ pub mod storage;
 pub mod vopr;
 
 pub use batching::{BatchingConfig, check_batching};
+pub use block_store::MemBlockStore;
 pub use checker::{
   AppliedOnceChecker, BoundednessChecker, CheckResult, ConfigLineageChecker, DurabilityChecker,
   EpochViewMonotonicChecker, MembershipMonotonicChecker, ReconfigureAppliedOnceChecker,

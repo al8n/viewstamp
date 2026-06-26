@@ -16,7 +16,7 @@ use viewstamp_proto::{
   ClientId, Config, Endpoint, Epoch, Instant, MemberId, Membership, Message, OpNumber, Peer,
   Prepare, ReplicaId, RequestNumber, StateMachine, View, Wal,
 };
-use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, sm::LogSm};
+use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, MemBlockStore, sm::LogSm};
 
 /// Drains the backup's outgoing queue, returning how many `PrepareOk(op)` it emitted for `want_op`.
 fn drain_prepare_oks<S: StateMachine>(e: &mut Endpoint<S>, want_op: OpNumber) -> usize {
@@ -50,6 +50,7 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   // is the ordinary synchronous sim superblock — only the WAL append timing matters here.
   let mut wal = InMemoryWal::with_async_appends(4);
   let mut sb = InMemorySuperblock::new();
+  let mut blocks = MemBlockStore::new();
   let now = Instant::ZERO;
 
   let primary = Peer::Replica(ReplicaId::new(0));
@@ -69,7 +70,14 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   };
 
   // (1) First delivery: the backup appends op 1 — but the append is ASYNC, so op 1 is NOT yet durable.
-  backup.handle_message(now, &mut wal, &mut sb, primary, Message::Prepare(prepare()));
+  backup.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary,
+    Message::Prepare(prepare()),
+  );
   assert_eq!(backup.op(), op1, "the head advanced to op 1 on the append");
   assert_eq!(
     wal.staged_len(),
@@ -94,7 +102,14 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
     1,
     "the append is still in flight at retransmit time"
   );
-  backup.handle_message(now, &mut wal, &mut sb, primary, Message::Prepare(prepare()));
+  backup.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary,
+    Message::Prepare(prepare()),
+  );
 
   // (3) THE LOAD-BEARING ASSERT (append-before-ack): while op 1's append is in flight, the backup
   // must emit NO PrepareOk(1). On the pre-fix proto the re-ack branch fires INLINE here → FAIL.
@@ -112,7 +127,7 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
   // (4) Now let the append complete (becomes durable) and drive the deferred ack.
   let mut total_acks = 0;
   for _ in 0..16 {
-    backup.handle_storage(now, &mut wal, &mut sb);
+    backup.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     total_acks += drain_prepare_oks(&mut backup, op1);
     if wal.staged_len() == 0 {
       break;

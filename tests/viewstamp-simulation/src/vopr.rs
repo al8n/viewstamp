@@ -150,13 +150,6 @@ pub struct VoprReport {
   /// own checkpoint lags below the ring window); the deterministic `bounded_wal.rs` laggard gate covers
   /// it directly, so the committed sweep only NOTES this count rather than forcing a flaky assert.
   below_ring_window_syncs: u64,
-  /// Cumulative CHUNKED state-sync transfers completed across the run (an announced over-frame
-  /// checkpoint pulled chunk-by-chunk, assembled, and verified — the chunked path genuinely carrying
-  /// a sync), summed over replicas and accumulated across crash/restart like [`Self::forced_syncs`]
-  /// (the `Endpoint` counter resets on `recover`). `0` under the sweep's default load (its envelopes
-  /// stay under one frame); the focused `large_state_sync.rs` gate drives and asserts the chunked
-  /// path deterministically, so the sweep only REPORTS this count.
-  sync_chunk_transfers: u64,
   /// `true` iff this is a BOUNDED seed (`wal_capacity.is_some()`) that committed STRICTLY MORE than `N`
   /// ops — i.e. its ring genuinely WRAPPED at least once (an op `K + N` reused op `K`'s physical slot).
   /// This is the strongest single witness that the bounded mode did real work: a seed whose committed
@@ -434,14 +427,6 @@ impl VoprReport {
     self.below_ring_window_syncs
   }
 
-  /// The cumulative CHUNKED state-sync transfer count across the run (an over-frame checkpoint
-  /// pulled, assembled, and verified chunk-by-chunk). `0` under the sweep's default load (its
-  /// envelopes fit one frame); the focused `large_state_sync.rs` gate drives + asserts the chunked
-  /// path deterministically.
-  pub const fn sync_chunk_transfers(&self) -> u64 {
-    self.sync_chunk_transfers
-  }
-
   /// `true` iff this is a bounded seed whose ring genuinely WRAPPED — it committed strictly more than
   /// `N` ops, so an op `K + N` physically reused op `K`'s ring slot. The strongest single witness that
   /// the bounded mode did real work (the sweep asserts SOME bounded seed wrapped).
@@ -680,10 +665,6 @@ struct Vopr {
   /// like [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by
   /// replica.
   below_ring_window_syncs_seen: Vec<u64>,
-  /// Per-replica last-observed CHUNKED-transfer-completed count, accumulated reset-robustly like
-  /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by
-  /// replica.
-  sync_chunk_transfers_seen: Vec<u64>,
   /// Per-replica last-observed floored-union count, accumulated reset-robustly like
   /// [`Self::forced_sync_seen`] (this `Endpoint` counter also zeroes on `recover`). Indexed by replica.
   unions_floored_seen: Vec<u64>,
@@ -1416,7 +1397,6 @@ impl Vopr {
       forced_sync_seen: vec![0; node_count],
       wal_stalls_seen: vec![0; node_count],
       below_ring_window_syncs_seen: vec![0; node_count],
-      sync_chunk_transfers_seen: vec![0; node_count],
       unions_floored_seen: vec![0; node_count],
       repair_batches_served_seen: vec![0; node_count],
       prepare_batches_sent_seen: vec![0; node_count],
@@ -3165,14 +3145,6 @@ impl Vopr {
         self.report.below_ring_window_syncs += syncs - self.below_ring_window_syncs_seen[i];
       }
       self.below_ring_window_syncs_seen[i] = syncs;
-      // Chunked-transfer completions, same reset-robust positive-delta accumulation (the counter
-      // zeroes on `recover`; the focused large_state_sync gate is the asserting oracle — the sweep
-      // only reports).
-      let transfers = c.replica_sync_chunk_transfers_completed(i);
-      if transfers > self.sync_chunk_transfers_seen[i] {
-        self.report.sync_chunk_transfers += transfers - self.sync_chunk_transfers_seen[i];
-      }
-      self.sync_chunk_transfers_seen[i] = transfers;
     }
     // Non-vacuity witnesses: floored canonical unions, served `RepairBatch`es, header-only carriers.
     // All three live on the `Endpoint` and reset to 0 on `recover`, so they use the SAME reset-robust

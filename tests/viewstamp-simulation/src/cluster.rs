@@ -4,13 +4,15 @@ use bytes::Bytes;
 use smol_str::SmolStr;
 
 use viewstamp_proto::{
-  Committed, Config, DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, MemberId, Membership,
-  MembershipChanged, Message, OpNumber, Outgoing, Peer, Prng, ProposeMembershipError, Recipient,
-  Recovered, ReplicaId, SingleChange, SingleVoterDelta, Wal, prepare_restart,
+  BlockAddress, BlockResponse, BlockStore, Committed, Config, DEFAULT_CHECKPOINT_OPS, Endpoint,
+  Event, Instant, MemberId, Membership, MembershipChanged, Message, OpNumber, Outgoing, Peer, Prng,
+  ProposeMembershipError, Recipient, Recovered, ReplicaId, SingleChange, SingleVoterDelta, Wal,
+  block_address, prepare_restart,
 };
 
 use crate::{
   batching::{BatchingClient, BatchingConfig},
+  block_store::MemBlockStore,
   client::ClientModel,
   clock::Clock,
   network::{Faults, InFlight, Network, SlowProfile, Target},
@@ -86,6 +88,9 @@ pub struct Cluster {
   wals: Vec<InMemoryWal>,
   /// Per-replica superblocks (persist across crashes; see `crash`).
   sbs: Vec<InMemorySuperblock>,
+  /// Per-replica content-addressed block stores holding the SM checkpoint DAGs (persist across
+  /// crashes — the SM blocks must survive a restart, exactly like the WAL + superblock).
+  block_stores: Vec<MemBlockStore>,
   clients: Vec<ClientModel>,
   net: Network,
   clock: Clock,
@@ -280,6 +285,30 @@ pub struct Cluster {
   /// `reconfigure_offline` axis), so the off-axis sweeps assert it stays `0` (byte-identity to a
   /// no-escalation run) while the wedge repro asserts it goes `> 0` (the escalation genuinely fired).
   reform_escalations_fired: u64,
+  /// Per-replica count of SM checkpoint blocks this replica ACCEPTED (hash-verified + wrote) from a
+  /// `BlockResponse` during a state-sync block fetch. Detected at the ingress chokepoint by sampling
+  /// `has_block(addr)` immediately before and after delivering a present `BlockResponse`: a block the
+  /// receiver did not hold before and DOES hold after was accepted and written (a hash-mismatched /
+  /// corrupted block is never written, so it is never counted). The incremental-sync oracle reads this
+  /// as the incrementality witness — a laggard holding a prior checkpoint that fetches strictly FEWER
+  /// blocks than the full reachable set proves the shared earlier leaves were not re-fetched. PURELY
+  /// observational (reads store membership; no PRNG draw, no message, no schedule change), so every
+  /// off-axis schedule stays byte-identical.
+  blocks_fetched: Vec<u64>,
+  /// How many of the next outbound `BlockResponse` payloads to CORRUPT before shipping (flip one byte,
+  /// so `block_address(bytes) != addr`), decremented once per corruption. `0` (default) ⇒ no served
+  /// block is ever altered and the corruption branch is never entered, so the default schedule is
+  /// byte-identical and NO PRNG draw is taken (the corruption is DETERMINISTIC, not probabilistic).
+  /// `Some(k)` via [`set_corrupt_block_responses`](Self::set_corrupt_block_responses) corrupts the next
+  /// `k` present block responses — the corrupted-block axis, proving a laggard rejects + re-requests +
+  /// still completes with correct state.
+  corrupt_block_responses: u32,
+  /// How many outbound `BlockResponse` payloads were actually corrupted (the corrupted-block axis's
+  /// non-vacuity witness). Monotone over the cluster's lifetime. `0` unless
+  /// [`set_corrupt_block_responses`](Self::set_corrupt_block_responses) armed corruption AND a present
+  /// block response was then served; the axis asserts this went `> 0` so a vacuous "never corrupted
+  /// anything" run cannot pass.
+  corrupted_blocks_served: u64,
 }
 
 impl Cluster {
@@ -354,10 +383,18 @@ impl Cluster {
     let n = node_count as usize;
     let storage_faults = StorageFaults::none();
     let (wals, sbs) = Self::seed_storage(node_count, seed, storage_faults, None, None, None);
+    // GC-DISABLED: the seeded cluster holds every checkpoint block for the run's lifetime so a
+    // mid-run prune never makes a donor answer a `RequestBlock` ABSENT, which would shift the
+    // byte-identical VOPR schedule. The GC mark-and-sweep contract is verified by the dedicated
+    // block-store tests, not by perturbing the seeded schedule (see `MemBlockStore::new_gc_disabled`).
+    let block_stores = (0..node_count)
+      .map(|_| MemBlockStore::new_gc_disabled())
+      .collect();
     Self {
       replicas: replica_set,
       wals,
       sbs,
+      block_stores,
       clients: client_set,
       net: Network::new(),
       clock: Clock::new(),
@@ -393,6 +430,9 @@ impl Cluster {
       was_recovering_head_inc: vec![0; n],
       recovered_band_high_water: 0,
       reform_escalations_fired: 0,
+      blocks_fetched: vec![0; n],
+      corrupt_block_responses: 0,
+      corrupted_blocks_served: 0,
     }
   }
 
@@ -535,7 +575,9 @@ impl Cluster {
     self.clock.now()
   }
 
-  /// Read access to replica `i`'s state machine (for invariant checking).
+  /// Read access to replica `i`'s state machine (for invariant checking). Uses the raw
+  /// white-box accessor so the sim can inspect SM state at any point — including while a
+  /// replica is mid-sync or recovering — without hitting the production readiness gate.
   pub fn replica_sm(&self, i: usize) -> &SimSm {
     self.replicas[i].state_machine_ref()
   }
@@ -1135,6 +1177,7 @@ impl Cluster {
       self.make_sm(),
       &mut self.wals[i],
       &mut self.sbs[i],
+      &mut self.block_stores[i],
     ) {
       Recovered::Active(endpoint) => {
         self.replicas[i] = endpoint;
@@ -1143,7 +1186,12 @@ impl Cluster {
         // CALLER — `restart` advances the shared clock for a single node, while `reconfigure_offline` ticks
         // the whole cluster so every voter recovers IN PARALLEL (aligned recover-head windows, which the
         // re-formation escalation's two-window gate needs). Driving here, per node, would stagger them.
-        self.replicas[i].handle_storage(self.clock.now(), &mut self.wals[i], &mut self.sbs[i]);
+        self.replicas[i].handle_storage(
+          self.clock.now(),
+          &mut self.wals[i],
+          &mut self.sbs[i],
+          &mut self.block_stores[i],
+        );
         // Witness the recover read-window's HELD TAIL above the durable checkpoint, captured ONCE here at
         // construction: `op` is the held head the read loop scans/repairs, fixed at recover and never
         // raised by it (see `recovered_band_high_water`), so there is no later completion-edge instant to
@@ -1405,6 +1453,7 @@ impl Cluster {
       now,
       &mut self.wals[primary],
       &mut self.sbs[primary],
+      &mut self.block_stores[primary],
       Peer::Client(tail_client),
       req,
     );
@@ -1758,16 +1807,35 @@ impl Cluster {
         viewstamp_proto::Epoch::new(0),
         0,
       ));
-      self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, gv);
+      self.replicas[i].handle_message(
+        now,
+        &mut self.wals[i],
+        &mut self.sbs[i],
+        &mut self.block_stores[i],
+        from,
+        gv,
+      );
       let rec = Message::Recovery(viewstamp_proto::Recovery::new(
         peer,
         0xF2_u64,
         viewstamp_proto::Epoch::new(0),
         0,
       ));
-      self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, rec);
+      self.replicas[i].handle_message(
+        now,
+        &mut self.wals[i],
+        &mut self.sbs[i],
+        &mut self.block_stores[i],
+        from,
+        rec,
+      );
       // Fire the primary timers too (the `primary_timeouts` heartbeat/retransmit gate).
-      self.replicas[i].handle_timeout(now, &mut self.wals[i], &mut self.sbs[i]);
+      self.replicas[i].handle_timeout(
+        now,
+        &mut self.wals[i],
+        &mut self.sbs[i],
+        &mut self.block_stores[i],
+      );
       // Inspect EVERYTHING the probe made the replica emit: a correct (gated) primary emits no
       // StartView/RecoveryResponse for its not-yet-durable view; an ungated one does → durable-view
       // violation. Drain the queue (re-enqueuing for normal routing) and check each message.
@@ -1802,6 +1870,121 @@ impl Cluster {
     self.replicas[i].forced_syncs_applied()
   }
 
+  /// How many SM checkpoint blocks replica `i` has ACCEPTED (hash-verified + written) from a
+  /// `BlockResponse` over its state-sync block fetch since construction. The incremental-sync oracle's
+  /// incrementality witness: a laggard holding a PRIOR checkpoint that syncs to a NEWER one over a
+  /// mostly-unchanged log fetches `0 < missing < total` blocks — strictly fewer than the full reachable
+  /// set, because the shared earlier leaves it already holds are never re-fetched. Observation-only
+  /// (sampled at the ingress chokepoint), so reading it never perturbs a schedule.
+  pub fn replica_blocks_fetched(&self, i: usize) -> u64 {
+    self.blocks_fetched[i]
+  }
+
+  /// The number of distinct checkpoint blocks reachable from replica `i`'s CURRENT durable checkpoint
+  /// across BOTH content-addressed DAGs (the SM state AND the client-session table) — the `total` of the
+  /// incrementality witness (the full set a from-empty laggard would have to fetch). Delegates to the
+  /// proto's `reachable_checkpoint_block_count`, which walks both roots via their respective resolvers;
+  /// returns `0` if no checkpoint is held yet or a reachable block is absent (the DAGs are not fully
+  /// present, so the count is not yet meaningful). Pure observation. Counting BOTH DAGs keeps `total`
+  /// like-for-like with `missing` (which counts fetched blocks across both DAGs).
+  pub fn replica_reachable_block_count(&self, i: usize) -> usize {
+    self.replicas[i].reachable_checkpoint_block_count(&self.block_stores[i])
+  }
+
+  /// Mis-store ONE locally-present block in replica `i`'s block store: overwrite the bytes at a
+  /// non-root address reachable from its current durable checkpoint root with bytes that hash
+  /// ELSEWHERE, so `block_address(bytes) != addr` (the content-address violation a disk fault — bit-rot
+  /// or a misdirected write — produces). Returns the corrupted address, or `None` if the replica holds
+  /// no multi-block checkpoint to corrupt.
+  ///
+  /// Models a laggard whose OWN persistent checkpoint DAG has silently rotted under a still-valid root.
+  /// On its next state-sync the local-DAG drain must treat the corrupt block as MISSING (not trust it
+  /// on presence) and re-fetch a clean copy from a donor — proving the locally-present fast path
+  /// verifies content, not just presence. Deterministic and used only by the corrupt-local-block lane.
+  pub fn corrupt_local_block(&mut self, i: usize) -> Option<BlockAddress> {
+    let root = self.replicas[i].checkpoint_sm_root()?;
+    let store = &self.block_stores[i];
+    // Find the first non-root descendant of the root, in deterministic DAG-walk order.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = std::vec![root];
+    let mut victim = None;
+    while let Some(addr) = stack.pop() {
+      if !seen.insert(addr) {
+        continue;
+      }
+      let block = store.read_block(addr)?;
+      if addr != root {
+        victim = Some(addr);
+        break;
+      }
+      for child in <SimSm as viewstamp_proto::StateMachine>::block_references(&block) {
+        stack.push(child);
+      }
+    }
+    let victim = victim?;
+    // Overwrite the victim with bytes that hash elsewhere (a mis-store under a content-addressed key).
+    let corrupt = Bytes::from_static(b"locally rotted checkpoint block");
+    debug_assert_ne!(block_address(&corrupt), victim);
+    self.block_stores[i].write_block(victim, corrupt);
+    Some(victim)
+  }
+
+  /// Enable real block-store GC on every replica (default OFF). The seeded cluster's stores are built
+  /// GC-DISABLED so a mid-run prune never perturbs the byte-identical VOPR schedule (see
+  /// `MemBlockStore::new_gc_disabled`); the incremental-sync oracle calls this BEFORE running so GC
+  /// keeps each store bounded over its long warm-up/drain. Call before the run starts (it flips the
+  /// already-empty stores, so it changes no held block). NOT for use on a pinned-seed VOPR schedule —
+  /// enabling GC there shifts the schedule (a since-pruned block answered ABSENT triggers a re-request).
+  pub fn enable_block_gc(&mut self) {
+    for store in &mut self.block_stores {
+      store.set_gc_enabled(true);
+    }
+  }
+
+  /// Arm the corrupted-block axis: the next `n` present `BlockResponse` payloads any replica serves are
+  /// CORRUPTED (one byte flipped, so the bytes no longer hash to the requested address) before they
+  /// leave the sender. Deterministic (no PRNG draw) and OFF by default (`0`), so it perturbs no
+  /// schedule until armed. The proto's content-addressed block-fetch must reject each corrupted block
+  /// (hash mismatch), re-request it, and still complete the sync with correct state.
+  pub fn set_corrupt_block_responses(&mut self, n: u32) {
+    self.corrupt_block_responses = n;
+  }
+
+  /// How many `BlockResponse` payloads the corrupted-block axis has actually corrupted (its
+  /// non-vacuity witness). `0` until [`set_corrupt_block_responses`](Self::set_corrupt_block_responses)
+  /// armed corruption AND a present block response was served.
+  pub fn corrupted_blocks_served(&self) -> u64 {
+    self.corrupted_blocks_served
+  }
+
+  /// When the corrupted-block axis is armed, corrupt a present `BlockResponse` payload (flip one byte
+  /// so `block_address(bytes) != addr`) and decrement the budget; otherwise return `out` unchanged.
+  /// Deterministic — no PRNG draw — and a no-op (no clone, no branch taken) when the budget is `0` or
+  /// the message is not a present block response, so off-axis schedules are byte-identical.
+  fn maybe_corrupt_block_response(&mut self, out: Outgoing) -> Outgoing {
+    if self.corrupt_block_responses == 0 {
+      return out;
+    }
+    let Message::BlockResponse(br) = out.msg_ref() else {
+      return out;
+    };
+    let Some(bytes) = br.block() else {
+      return out; // an absent response carries no payload to corrupt.
+    };
+    let addr = br.addr();
+    let mut corrupted = bytes.to_vec();
+    // Flip the first byte (every leaf/index block carries at least a tag byte, so the payload is
+    // non-empty). The flipped content hashes to a different address than `addr` was requested at.
+    corrupted[0] ^= 0xFF;
+    self.corrupt_block_responses -= 1;
+    self.corrupted_blocks_served += 1;
+    let recipient = out.to();
+    Outgoing::new(
+      recipient,
+      Message::BlockResponse(BlockResponse::new(addr, Some(Bytes::from(corrupted)))),
+    )
+  }
+
   /// Test-only: how many client requests replica `i` DROPPED at op-assignment because the next
   /// op would overflow its bounded WAL ring (the physical stall-before-wrap). `0` for an unbounded WAL.
   /// The bounded-WAL gate asserts this goes `> 0` to prove the stall genuinely engaged (non-vacuity).
@@ -1822,23 +2005,13 @@ impl Cluster {
     self.replicas[i].below_ring_window_syncs()
   }
 
-  /// Test-only: how many CHUNKED checkpoint transfers replica `i` completed (an announced
-  /// over-frame checkpoint pulled chunk-by-chunk, assembled, and verified against the pinned content
-  /// id). The large-snapshot gate asserts this goes `>= 1` to prove the CHUNKED path genuinely
-  /// carried the sync (vs the single-frame fast path); the VOPR sweep folds it reset-robustly.
-  /// Mirrors the proto's `Endpoint::sync_chunk_transfers_completed`.
-  #[doc(hidden)]
-  pub fn replica_sync_chunk_transfers_completed(&self, i: usize) -> u64 {
-    self.replicas[i].sync_chunk_transfers_completed()
-  }
-
-  /// Test-only: the donor replica `i`'s chunked transfer is currently pinned to, or `None` when no
-  /// chunked pull is in progress. The donor-crash gate variant uses this to crash the LIVE donor
-  /// deterministically mid-transfer (forcing the failover re-pin). Mirrors the proto's
-  /// `Endpoint::sync_transfer_donor`.
+  /// Test-only: the donor replica `i`'s block-fetch is currently pinned to, or `None` when no
+  /// block pull is in progress. The donor-crash gate variant uses this to crash the live donor
+  /// deterministically mid-transfer (forcing the failover re-pin). Mirrors
+  /// `Endpoint::block_fetch_donor`.
   #[doc(hidden)]
   pub fn replica_sync_transfer_donor(&self, i: usize) -> Option<u16> {
-    self.replicas[i].sync_transfer_donor()
+    self.replicas[i].block_fetch_donor()
   }
 
   /// Test-only: the byte length of replica `i`'s LIVE ROOTED checkpoint envelope (exactly the bytes
@@ -2126,6 +2299,12 @@ impl Cluster {
         // retransmit path) for a view above the emitter's durable view is a participation in a
         // not-yet-recoverable view.
         self.record_durable_view_violation(ri, &out);
+        // Corrupted-block axis: when armed (default OFF, so the branch is never entered and no served
+        // block is ever altered), flip one byte of the next present `BlockResponse` payload so its
+        // content no longer hashes to the requested address. Deterministic (no PRNG draw), so it
+        // perturbs no schedule beyond the corrupted bytes themselves — the proto's block-fetch must
+        // then REJECT the block (hash mismatch), re-request it, and still complete with correct state.
+        let out = self.maybe_corrupt_block_response(out);
         outgoing.push((ReplicaId::new(ri as u16), out));
       }
     }
@@ -2151,13 +2330,31 @@ impl Cluster {
             // or a not-yet-installed successor) keeps its raw value — the proto then drops it at the
             // sender binding exactly as the real transport's unresolved-peer path would.
             let from = self.translate_from_for_receiver(ri, m.from);
+            // Incrementality witness: a present `BlockResponse` the receiver did not already hold and
+            // DOES hold after delivery was hash-verified + written by the proto's block-fetch (a
+            // corrupted/mismatched block is rejected, never written, so never counted). Sampling
+            // `has_block` around the delivery is pure observation — no PRNG draw, no message, no
+            // schedule change — so off-axis runs stay byte-identical.
+            let fetched_addr = match &m.msg {
+              Message::BlockResponse(br) if br.is_present() => {
+                let addr = br.addr();
+                (!self.block_stores[ri].has_block(addr)).then_some(addr)
+              }
+              _ => None,
+            };
             self.replicas[ri].handle_message(
               now,
               &mut self.wals[ri],
               &mut self.sbs[ri],
+              &mut self.block_stores[ri],
               from,
               m.msg,
             );
+            if let Some(addr) = fetched_addr
+              && self.block_stores[ri].has_block(addr)
+            {
+              self.blocks_fetched[ri] += 1;
+            }
           }
         }
         Target::Client(id) => {
@@ -2173,7 +2370,12 @@ impl Cluster {
       if self.crashed[ri] {
         continue;
       }
-      self.replicas[ri].handle_storage(now, &mut self.wals[ri], &mut self.sbs[ri]);
+      self.replicas[ri].handle_storage(
+        now,
+        &mut self.wals[ri],
+        &mut self.sbs[ri],
+        &mut self.block_stores[ri],
+      );
     }
 
     for ri in 0..self.replicas.len() {
@@ -2207,9 +2409,19 @@ impl Cluster {
       if self.crashed[ri] {
         continue;
       }
-      self.replicas[ri].handle_timeout(now, &mut self.wals[ri], &mut self.sbs[ri]);
+      self.replicas[ri].handle_timeout(
+        now,
+        &mut self.wals[ri],
+        &mut self.sbs[ri],
+        &mut self.block_stores[ri],
+      );
       // Pump storage after timeout: drives append-before-ack (on_wal_done) + durable-view (on_sb_done).
-      self.replicas[ri].handle_storage(now, &mut self.wals[ri], &mut self.sbs[ri]);
+      self.replicas[ri].handle_storage(
+        now,
+        &mut self.wals[ri],
+        &mut self.sbs[ri],
+        &mut self.block_stores[ri],
+      );
     }
 
     // Drain the apply/swap events this second pump produced BEFORE the per-tick invariant check reads the
@@ -3116,94 +3328,6 @@ mod tests {
       c.oversized_dropped(),
       1,
       "a client-bound message is not subject to the inter-replica frame cap (different path)"
-    );
-  }
-
-  #[test]
-  fn an_over_threshold_sync_checkpoint_would_drop_but_its_chunks_all_fit() {
-    // The chunked state-sync CONVERSE: a whole `SyncCheckpoint` of an envelope just past the
-    // unchunked threshold is EXACTLY what the single-frame path would have sent — the modelled
-    // transport frame guard DROPS it (counted), which on a laggard whose only recovery is that
-    // envelope was a permanent liveness wedge. Every `SyncChunk` of the SAME envelope fits the cap
-    // by construction, a max-fill chunk landing EXACTLY on it — so the chunked path keeps
-    // `oversized_dropped == 0` a real oracle over SyncCheckpoint traffic of any size.
-    use viewstamp_proto::{
-      MAX_FRAME_LEN, OpNumber, ReplicaId, SYNC_CHUNK_LEN, SyncCheckpoint, SyncChunk, View,
-      max_unchunked_snapshot_len,
-    };
-
-    let env_len = max_unchunked_snapshot_len() + 1; // one byte past the whole-message threshold
-    let env = bytes::Bytes::from(std::vec![0x5Au8; env_len]);
-    let whole = Message::SyncCheckpoint(SyncCheckpoint::new(
-      View::with(1),
-      OpNumber::with(8),
-      0xFEED,
-      viewstamp_proto::Epoch::new(0),
-      0,
-      ReplicaId::new(0),
-      7,
-      env.clone(),
-      Bytes::new(),
-    ));
-    assert!(
-      whole.encoded_len() > MAX_FRAME_LEN as usize,
-      "one byte past the threshold makes the whole SyncCheckpoint oversized"
-    );
-
-    let mut c = Cluster::new(3, 1, 1, /*seed*/ 7);
-    let now = c.now();
-    let from = Peer::Replica(ReplicaId::new(0));
-    c.schedule(now, from, Target::Replica(1), whole);
-    assert_eq!(
-      c.oversized_dropped(),
-      1,
-      "the whole over-threshold envelope is dropped + counted by the frame guard"
-    );
-    assert!(
-      c.net.is_empty(),
-      "the oversized serve never reached the wire"
-    );
-
-    // EVERY chunk of the same envelope is deliverable; the max-fill first chunk lands exactly on
-    // the cap and the partial tail is far under it.
-    let mut offset = 0usize;
-    let mut chunks = 0usize;
-    while offset < env_len {
-      let end = (offset + SYNC_CHUNK_LEN).min(env_len);
-      let chunk = Message::SyncChunk(SyncChunk::new(
-        View::with(1),
-        OpNumber::with(8),
-        0xFEED,
-        0,
-        env_len as u64,
-        offset as u64,
-        ReplicaId::new(0),
-        7,
-        env.slice(offset..end),
-      ));
-      assert!(
-        chunk.encoded_len() <= MAX_FRAME_LEN as usize,
-        "every chunk of the over-threshold envelope fits the frame cap"
-      );
-      if end - offset == SYNC_CHUNK_LEN {
-        assert_eq!(
-          chunk.encoded_len(),
-          MAX_FRAME_LEN as usize,
-          "a max-fill chunk lands exactly on the cap (the chunk size wastes nothing)"
-        );
-      }
-      c.schedule(now, from, Target::Replica(1), chunk);
-      offset = end;
-      chunks += 1;
-    }
-    assert_eq!(
-      chunks, 2,
-      "one byte past the threshold splits into exactly two chunks"
-    );
-    assert_eq!(
-      c.oversized_dropped(),
-      1,
-      "no chunk was dropped — the chunked path never produces an oversized frame"
     );
   }
 }

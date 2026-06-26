@@ -1,5 +1,132 @@
 use bytes::Bytes;
-use viewstamp_proto::{BatchView, OpNumber, ReplyBuilder, StateMachine};
+use viewstamp_proto::{
+  BatchView, BlockAddress, BlockStore, OpNumber, ReplyBuilder, RestoreError, StateMachine,
+  block_address,
+};
+
+/// The number of consecutive `applied` entries packed into one DAG leaf block.
+///
+/// A leaf's bytes — and therefore its content address — depend ONLY on the entries it holds, so a
+/// FULL leaf keeps the same address across later appends. That stability is what makes a checkpoint
+/// incremental: appending past a full leaf rewrites only the (new) trailing leaf and the index
+/// root, leaving every earlier full leaf shared by identical address.
+const DAG_LEAF_RUN: usize = 4;
+
+/// Tag byte prefixing a DAG leaf block (a run of `applied` entries).
+const DAG_LEAF_TAG: u8 = 0x00;
+
+/// Tag byte prefixing a DAG index (root) block (the ordered list of leaf addresses).
+const DAG_INDEX_TAG: u8 = 0x01;
+
+/// Encodes one DAG leaf: the leaf tag followed by `entries`, each `op:u64-be | len:u64-be | body`.
+///
+/// Because the bytes are a pure function of the entries (no position, no neighbours), a full leaf
+/// hashes to the same [`BlockAddress`] regardless of what is appended after it.
+fn encode_leaf(entries: &[(u64, Bytes)]) -> Bytes {
+  let mut out = Vec::new();
+  out.push(DAG_LEAF_TAG);
+  for (op, body) in entries {
+    out.extend_from_slice(&op.to_be_bytes());
+    out.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    out.extend_from_slice(body);
+  }
+  Bytes::from(out)
+}
+
+/// Decodes a DAG leaf's entries. Panics on a malformed leaf — the sim only ever feeds back blocks
+/// it wrote itself, so a parse failure is a sim bug, not a protocol input to recover from.
+fn decode_leaf(block: &[u8]) -> Vec<(u64, Bytes)> {
+  assert_eq!(
+    block.first().copied(),
+    Some(DAG_LEAF_TAG),
+    "decode_leaf on a non-leaf block"
+  );
+  let mut entries = Vec::new();
+  let mut i = 1usize;
+  while i < block.len() {
+    let op = u64::from_be_bytes(block[i..i + 8].try_into().unwrap());
+    i += 8;
+    let len = u64::from_be_bytes(block[i..i + 8].try_into().unwrap()) as usize;
+    i += 8;
+    entries.push((op, Bytes::copy_from_slice(&block[i..i + len])));
+    i += len;
+  }
+  entries
+}
+
+/// Encodes the index (root) block: the index tag, the leaf count as `u32-be`, then each leaf
+/// address (16 bytes) in log order.
+fn encode_index(leaves: &[BlockAddress]) -> Bytes {
+  let mut out = Vec::new();
+  out.push(DAG_INDEX_TAG);
+  out.extend_from_slice(&(leaves.len() as u32).to_be_bytes());
+  for addr in leaves {
+    out.extend_from_slice(addr.as_bytes());
+  }
+  Bytes::from(out)
+}
+
+/// Chunks `applied` into leaves of [`DAG_LEAF_RUN`] entries (the last leaf may be partial), writes
+/// every leaf and the index block into `store`, and returns the index block's address as the root.
+///
+/// Re-writing an unchanged full leaf recomputes its identical address, so the write is idempotent;
+/// only a changed trailing leaf and the index block differ from the previous checkpoint generation.
+fn dag_checkpoint(applied: &[(u64, Bytes)], store: &mut dyn BlockStore) -> BlockAddress {
+  let mut leaves = Vec::new();
+  for chunk in applied.chunks(DAG_LEAF_RUN) {
+    let block = encode_leaf(chunk);
+    let addr = block_address(&block);
+    store.write_block(addr, block);
+    leaves.push(addr);
+  }
+  let index = encode_index(&leaves);
+  let root = block_address(&index);
+  store.write_block(root, index);
+  root
+}
+
+/// The child addresses a block directly references: an index block yields its leaf addresses in log
+/// order; a leaf block yields none.
+fn dag_block_references(block: &[u8]) -> Vec<BlockAddress> {
+  match block.first().copied() {
+    Some(DAG_INDEX_TAG) => {
+      let count = u32::from_be_bytes(block[1..5].try_into().unwrap()) as usize;
+      let mut refs = Vec::with_capacity(count);
+      let mut i = 5usize;
+      for _ in 0..count {
+        let mut raw = [0u8; 16];
+        raw.copy_from_slice(&block[i..i + 16]);
+        refs.push(BlockAddress::from_bytes(raw));
+        i += 16;
+      }
+      refs
+    }
+    _ => Vec::new(),
+  }
+}
+
+/// Reconstructs the `applied` log from the DAG rooted at `root`: read the index, then read each
+/// leaf in log order and concatenate its entries.
+///
+/// `store` is the verify-on-read view the proto hands `restore`: a block missing OR corrupt (its
+/// stored bytes do not hash to its address) reads back as `None`, so a `None` is surfaced as a
+/// [`RestoreError`] for the proto to re-fetch rather than feeding garbage into the log. Reconstruction
+/// is into a LOCAL `Vec` returned only on full success, so the SM that calls this leaves itself
+/// unchanged on error.
+fn dag_restore(
+  root: BlockAddress,
+  store: &dyn BlockStore,
+) -> Result<Vec<(u64, Bytes)>, RestoreError> {
+  let index = store.read_block(root).ok_or(RestoreError::new(root))?;
+  let mut applied = Vec::new();
+  for leaf_addr in dag_block_references(&index) {
+    let leaf = store
+      .read_block(leaf_addr)
+      .ok_or(RestoreError::new(leaf_addr))?;
+    applied.extend(decode_leaf(&leaf));
+  }
+  Ok(applied)
+}
 
 /// The per-unit reply ceiling [`BatchSm`] declares to its [`ReplyBuilder`] and the batching client
 /// model budgets each body against. Every [`BatchSm`] unit reply is exactly 8 bytes (the LogSm-style
@@ -35,31 +162,17 @@ impl StateMachine for LogSm {
     Bytes::from((self.applied.len() as u64).to_be_bytes().to_vec())
   }
 
-  fn snapshot(&self) -> Bytes {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(self.applied.len() as u64).to_be_bytes());
-    for (op, body) in &self.applied {
-      out.extend_from_slice(&op.to_be_bytes());
-      out.extend_from_slice(&(body.len() as u64).to_be_bytes());
-      out.extend_from_slice(body);
-    }
-    Bytes::from(out)
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    dag_checkpoint(&self.applied, store)
   }
 
-  fn restore(&mut self, snapshot: &[u8]) {
-    let mut applied = Vec::new();
-    let mut i = 0usize;
-    let count = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap());
-    i += 8;
-    for _ in 0..count {
-      let op = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap());
-      i += 8;
-      let len = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap()) as usize;
-      i += 8;
-      applied.push((op, Bytes::copy_from_slice(&snapshot[i..i + len])));
-      i += len;
-    }
-    self.applied = applied;
+  fn block_references(block: &[u8]) -> Vec<BlockAddress> {
+    dag_block_references(block)
+  }
+
+  fn restore(&mut self, root: BlockAddress, store: &dyn BlockStore) -> Result<(), RestoreError> {
+    self.applied = dag_restore(root, store)?;
+    Ok(())
   }
 }
 
@@ -137,36 +250,24 @@ impl StateMachine for BatchSm {
       .expect("a parsed batch carries at least one unit")
   }
 
-  fn snapshot(&self) -> Bytes {
-    // Byte-identical to LogSm's encoding over the per-op log; the unit history is derived state.
-    let mut out = Vec::new();
-    out.extend_from_slice(&(self.applied.len() as u64).to_be_bytes());
-    for (op, body) in &self.applied {
-      out.extend_from_slice(&op.to_be_bytes());
-      out.extend_from_slice(&(body.len() as u64).to_be_bytes());
-      out.extend_from_slice(body);
-    }
-    Bytes::from(out)
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
+    dag_checkpoint(&self.applied, store)
   }
 
-  fn restore(&mut self, snapshot: &[u8]) {
-    let mut applied = Vec::new();
-    let mut i = 0usize;
-    let count = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap());
-    i += 8;
-    for _ in 0..count {
-      let op = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap());
-      i += 8;
-      let len = u64::from_be_bytes(snapshot[i..i + 8].try_into().unwrap()) as usize;
-      i += 8;
-      applied.push((op, Bytes::copy_from_slice(&snapshot[i..i + len])));
-      i += len;
-    }
+  fn block_references(block: &[u8]) -> Vec<BlockAddress> {
+    dag_block_references(block)
+  }
+
+  fn restore(&mut self, root: BlockAddress, store: &dyn BlockStore) -> Result<(), RestoreError> {
+    // Reconstruct the whole DAG FIRST (fallible); only on success replace `self`, so a missing/corrupt
+    // block leaves the SM unchanged for the proto to re-fetch and retry.
+    let applied = dag_restore(root, store)?;
     self.units.clear();
     for (op, body) in &applied {
       self.record_units(*op, body);
     }
     self.applied = applied;
+    Ok(())
   }
 }
 
@@ -211,17 +312,23 @@ impl StateMachine for SimSm {
     }
   }
 
-  fn snapshot(&self) -> Bytes {
+  fn checkpoint(&mut self, store: &mut dyn BlockStore) -> BlockAddress {
     match self {
-      Self::Plain(sm) => sm.snapshot(),
-      Self::Batch(sm) => sm.snapshot(),
+      Self::Plain(sm) => sm.checkpoint(store),
+      Self::Batch(sm) => sm.checkpoint(store),
     }
   }
 
-  fn restore(&mut self, snapshot: &[u8]) {
+  fn block_references(block: &[u8]) -> Vec<BlockAddress> {
+    // Both variants share the same DAG block layout, so the reference walk is variant-independent
+    // (matching `block_references` being an associated fn with no receiver to dispatch on).
+    dag_block_references(block)
+  }
+
+  fn restore(&mut self, root: BlockAddress, store: &dyn BlockStore) -> Result<(), RestoreError> {
     match self {
-      Self::Plain(sm) => sm.restore(snapshot),
-      Self::Batch(sm) => sm.restore(snapshot),
+      Self::Plain(sm) => sm.restore(root, store),
+      Self::Batch(sm) => sm.restore(root, store),
     }
   }
 }
@@ -229,6 +336,7 @@ impl StateMachine for SimSm {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::block_store::MemBlockStore;
 
   #[test]
   fn apply_records_and_counts() {
@@ -249,9 +357,12 @@ mod tests {
     let mut sm = LogSm::default();
     sm.apply(OpNumber::with(1), b"a");
     sm.apply(OpNumber::with(2), b"bb");
-    let snap = sm.snapshot();
+    let mut store = MemBlockStore::new();
+    let root = sm.checkpoint(&mut store);
     let mut restored = LogSm::default();
-    restored.restore(&snap);
+    restored
+      .restore(root, &store)
+      .expect("the whole DAG is present");
     assert_eq!(restored.applied(), sm.applied());
   }
 
@@ -298,9 +409,12 @@ mod tests {
     let mut sm = BatchSm::default();
     sm.apply(OpNumber::with(1), &batch_body(&[b"a", b"bb"]));
     sm.apply(OpNumber::with(2), &batch_body(&[b"c"]));
-    let snap = sm.snapshot();
+    let mut store = MemBlockStore::new();
+    let root = sm.checkpoint(&mut store);
     let mut restored = BatchSm::default();
-    restored.restore(&snap);
+    restored
+      .restore(root, &store)
+      .expect("the whole DAG is present");
     assert_eq!(restored.applied(), sm.applied());
     assert_eq!(
       restored.units(),
@@ -320,6 +434,157 @@ mod tests {
     BatchSm::default().apply(OpNumber::with(1), &1u64.to_be_bytes());
   }
 
+  /// Walks the checkpoint DAG rooted at `root` via `S::block_references`, returning every reachable
+  /// block address (root included). Every reachable block is required to be present in `store`,
+  /// matching the proto contract that the sync frontier drains before reconstruction.
+  fn reachable<S: StateMachine>(
+    root: BlockAddress,
+    store: &MemBlockStore,
+  ) -> std::collections::BTreeSet<BlockAddress> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(addr) = stack.pop() {
+      if !seen.insert(addr) {
+        continue;
+      }
+      let block = store
+        .read_block(addr)
+        .expect("every reachable block is present in the store");
+      for child in S::block_references(&block) {
+        stack.push(child);
+      }
+    }
+    seen
+  }
+
+  #[test]
+  fn incremental_checkpoint_rewrites_only_changed_blocks() {
+    // A log of several FULL leaves: with DAG_LEAF_RUN == 4, 20 ops is exactly 5 full leaves, so the
+    // earlier leaves are unaffected by a later append and must keep their content addresses.
+    let mut sm = LogSm::default();
+    for op in 1..=20u64 {
+      sm.apply(OpNumber::with(op), format!("body-{op}").as_bytes());
+    }
+    assert_eq!(
+      sm.applied().len() % DAG_LEAF_RUN,
+      0,
+      "fixture is full leaves"
+    );
+
+    let mut store = MemBlockStore::new();
+    let root1 = sm.checkpoint(&mut store);
+    let set1 = reachable::<LogSm>(root1, &store);
+    // 5 leaves + 1 index root.
+    assert_eq!(set1.len(), 6, "5 full leaves plus the index root");
+
+    // One more op: a new partial leaf (1 entry) plus a new index root that names six leaves.
+    sm.apply(OpNumber::with(21), b"body-21");
+    let root2 = sm.checkpoint(&mut store);
+    let set2 = reachable::<LogSm>(root2, &store);
+
+    assert_ne!(
+      root2, root1,
+      "the root changed: the index now names a new leaf"
+    );
+
+    // Blocks a holder of root1's set would have to fetch to materialize root2: exactly the blocks
+    // reachable from root2 that were NOT already reachable from root1.
+    let missing: std::collections::BTreeSet<_> = set2.difference(&set1).copied().collect();
+    assert_eq!(
+      missing.len(),
+      2,
+      "only the new partial leaf and the new index root are unshared: {missing:?}"
+    );
+    // The real incrementality claim: the diff is a small constant, STRICTLY fewer than a full
+    // re-fetch of root2 (7 blocks). The five earlier full leaves are shared by identical address.
+    assert_eq!(set2.len(), 7, "6 leaves plus the index root");
+    assert!(
+      missing.len() < set2.len(),
+      "incremental fetch ({}) << full re-fetch ({})",
+      missing.len(),
+      set2.len()
+    );
+    let shared = set1.intersection(&set2).count();
+    assert_eq!(
+      shared, 5,
+      "the five earlier full leaves are shared verbatim"
+    );
+
+    // Faithful reconstruction: a fresh SM rebuilt from root2 reproduces the applied history.
+    let mut fresh = LogSm::default();
+    fresh
+      .restore(root2, &store)
+      .expect("the whole DAG is present");
+    assert_eq!(fresh.applied(), sm.applied());
+  }
+
+  #[test]
+  fn dag_checkpoint_round_trips_partial_and_empty_logs() {
+    // A partial trailing leaf (6 ops = one full leaf + a 2-entry leaf) round-trips faithfully.
+    for n in [0u64, 1, 3, 6, 9] {
+      let mut sm = LogSm::default();
+      for op in 1..=n {
+        sm.apply(OpNumber::with(op), format!("x{op}").as_bytes());
+      }
+      let mut store = MemBlockStore::new();
+      let root = sm.checkpoint(&mut store);
+      let mut fresh = LogSm::default();
+      fresh
+        .restore(root, &store)
+        .expect("all blocks present after checkpoint");
+      assert_eq!(fresh.applied(), sm.applied(), "round-trip with {n} ops");
+    }
+  }
+
+  #[test]
+  fn dag_checkpoint_and_restore_carry_batch_units() {
+    let mut sm = BatchSm::default();
+    for op in 1..=6u64 {
+      sm.apply(OpNumber::with(op), &batch_body(&[b"a", b"bb"]));
+    }
+    let mut store = MemBlockStore::new();
+    let root = sm.checkpoint(&mut store);
+    let mut fresh = BatchSm::default();
+    fresh
+      .restore(root, &store)
+      .expect("all blocks present after checkpoint");
+    assert_eq!(fresh.applied(), sm.applied());
+    assert_eq!(
+      fresh.units(),
+      sm.units(),
+      "the unit history is rebuilt from the restored bodies, as restore does"
+    );
+  }
+
+  #[test]
+  fn sim_sm_delegates_dag_per_variant() {
+    // Plain and Batch both route the DAG methods to their inner SM; the variant restored matches.
+    let mut plain = SimSm::Plain(LogSm::default());
+    for op in 1..=5u64 {
+      plain.apply(OpNumber::with(op), format!("p{op}").as_bytes());
+    }
+    let mut store = MemBlockStore::new();
+    let root = plain.checkpoint(&mut store);
+    let mut fresh = SimSm::Plain(LogSm::default());
+    fresh
+      .restore(root, &store)
+      .expect("all blocks present after checkpoint");
+    assert_eq!(fresh.applied(), plain.applied());
+
+    let mut batch = SimSm::Batch(BatchSm::default());
+    for op in 1..=5u64 {
+      batch.apply(OpNumber::with(op), &batch_body(&[b"u"]));
+    }
+    let mut bstore = MemBlockStore::new();
+    let broot = batch.checkpoint(&mut bstore);
+    let mut bfresh = SimSm::Batch(BatchSm::default());
+    bfresh
+      .restore(broot, &bstore)
+      .expect("all blocks present after checkpoint");
+    assert_eq!(bfresh.applied(), batch.applied());
+    assert_eq!(bfresh.units(), batch.units());
+  }
+
   #[test]
   fn sim_sm_delegates_per_variant() {
     let mut plain = SimSm::Plain(LogSm::default());
@@ -330,18 +595,27 @@ mod tests {
     );
     assert_eq!(plain.applied().len(), 1);
     assert!(plain.units().is_empty(), "no unit structure in plain mode");
-    // Plain snapshots restore into a plain SM byte-compatibly with LogSm.
+    // The plain variant checkpoints byte-compatibly with LogSm: the content-addressed root over the
+    // same applied history is identical, so a holder cannot distinguish the two checkpoints.
     let mut log = LogSm::default();
     log.apply(OpNumber::with(1), b"x");
-    assert_eq!(plain.snapshot(), log.snapshot());
+    let mut plain_store = MemBlockStore::new();
+    let mut log_store = MemBlockStore::new();
+    assert_eq!(
+      plain.checkpoint(&mut plain_store),
+      log.checkpoint(&mut log_store)
+    );
 
     let mut batch = SimSm::Batch(BatchSm::default());
     batch.apply(OpNumber::with(1), &batch_body(&[b"u1", b"u2"]));
     assert_eq!(batch.applied().len(), 1);
     assert_eq!(batch.units().len(), 2);
-    let snap = batch.snapshot();
+    let mut store = MemBlockStore::new();
+    let root = batch.checkpoint(&mut store);
     let mut restored = SimSm::Batch(BatchSm::default());
-    restored.restore(&snap);
+    restored
+      .restore(root, &store)
+      .expect("all blocks present after checkpoint");
     assert_eq!(restored.units(), batch.units());
   }
 }
