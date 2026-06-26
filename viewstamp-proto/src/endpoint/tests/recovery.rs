@@ -55,9 +55,18 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot read permanently faults → Repairing
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -100,6 +109,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -109,7 +119,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     )),
   );
   assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
-  r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // complete the SendDoViewChange durable-view write
   // The recovered replica's OWN DVC must report its KNOWN committed frontier (commit_max == 2), not
   // commit_min == 0 — otherwise the laggard quorum loses op 2. Verify it on the wire.
   let own_dvc_commit = core::iter::from_fn(|| r.poll_message())
@@ -133,6 +143,7 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -172,16 +183,17 @@ fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated()
   // Pump the StartViewAsPrimary durable-view write, then a committed-vouching peer answers our
   // RequestPrepare for op 2 (commit 2 >= op 2) → fill the hole and resume the held commit to op 2. The
   // fill is a durability barrier: complete the repaired append before the hole clears.
-  r.handle_storage(now, &mut wal, &mut sb);
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while r.poll_message().is_some() {}
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
-  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → clear hole + resume
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → clear hole + resume
   assert!(
     !r.has_repair_hole_for_test(2),
     "the committed-vouching Prepare fills the known-committed hole"
@@ -247,9 +259,18 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's slot read permanently faults → Repairing
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -286,6 +307,7 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -302,7 +324,7 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   // Complete the durable-view root write — this is the write the fix changed. The persisted `VsrState`
   // must record the KNOWN-committed frontier `commit_max == 2`, NOT `commit_min == 0`. (FAIL-BEFORE:
   // `submit_durable_view` persisted `self.commit_min`, so the root's commit was 0.)
-  r.handle_storage(now, &mut wal, &mut sb);
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     !r.pending_sb_for_test(),
     "the durable-view root write completed"
@@ -350,10 +372,18 @@ fn recover_keeps_the_known_commit_when_durable_view_written_while_held_at_a_repa
   let mut wal2 = ScriptedWal::with_entries(3);
   wal2.script_read_fault(OpNumber::with(2), u8::MAX);
   let cfg2 = Config::try_new(1, MemberId::new(1)).unwrap();
-  let mut r2 =
-    Endpoint::recover(cfg2, genesis(3), 0, CountSm::default(), &mut wal2, &mut sb).expect_active();
+  let mut r2 = Endpoint::recover(
+    cfg2,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal2,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   for _ in 0..32 {
-    r2.handle_storage(now, &mut wal2, &mut sb);
+    r2.handle_storage(now, &mut wal2, &mut sb, &mut blocks);
     if !r2.status().is_recovering() {
       break;
     }
@@ -410,9 +440,11 @@ fn recover_keeps_a_body_faulty_committed_op_as_repairing_then_peer_repairs_its_b
   wal.script_body_faulty(OpNumber::with(1)); // header durable, body unrecoverable → BodyFaulty
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb, &mut blocks).expect_active();
   for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -461,8 +493,15 @@ fn recover_keeps_a_body_faulty_committed_op_as_repairing_then_peer_repairs_its_b
   while r.poll_event().is_some() {}
   // Drive commit toward op 1 so the commit path requests the body (advance_commit holds at the hole
   // and registers a repair request).
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 1));
-  r.handle_storage(now, &mut wal, &mut sb);
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 1),
+  );
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     r.has_repair_hole_for_test(1),
     "the commit path holds at the Repairing op and arms peer-repair for its body"
@@ -472,10 +511,11 @@ fn recover_keeps_a_body_faulty_committed_op_as_repairing_then_peer_repairs_its_b
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     repair_prepare(0, 1, 1),
   );
-  r.handle_storage(now, &mut wal, &mut sb); // the RepairFill append lands → body Present, hole clears
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the RepairFill append lands → body Present, hole clears
   assert!(
     !r.has_repair_hole_for_test(1),
     "the repaired body fills the hole — the op is no longer repair-pending"
@@ -532,9 +572,11 @@ fn recover_drops_a_stale_committed_op_read_back_body_faulty_not_resurrected_as_r
   wal.script_body_faulty(OpNumber::with(2));
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb, &mut blocks).expect_active();
   for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -590,8 +632,10 @@ fn recover_drops_a_genuinely_absent_committed_op_as_today() {
   wal.remove_entry_for_test(OpNumber::with(2)); // op 2 has NO durable header → read is Absent
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb).expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r =
+    Endpoint::recover(cfg, genesis(3), 0, EchoSm, &mut wal, &mut sb, &mut blocks).expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -615,9 +659,24 @@ fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.handle_storage(now, &mut wal, &mut sb);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(2, 1),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   drop(e);
 
   let mut r = Endpoint::recover(
@@ -627,6 +686,7 @@ fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   assert_eq!(
@@ -634,7 +694,7 @@ fn recover_enters_recovering_then_reaches_normal_after_reads_drain() {
     Status::Recovering,
     "recover is now a metadata-only constructor (Recovering)"
   );
-  r.handle_storage(now, &mut wal, &mut sb); // drain the tail reads
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain the tail reads
   assert_eq!(r.status(), Status::Normal, "tail consistent => Normal");
   assert_eq!(r.op(), OpNumber::with(2));
 }
@@ -647,6 +707,7 @@ fn recover_retries_a_transient_read_fault_then_reaches_normal() {
   wal.script_read_fault(OpNumber::with(2), 1);
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -654,12 +715,13 @@ fn recover_retries_a_transient_read_fault_then_reaches_normal() {
     EchoSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   assert_eq!(r.status(), Status::Recovering);
   // Pump storage + the recover-retry timer until the retry clears (bounded): the timer re-reads the
   // pending op additively and the next drain consumes the now-clean completion.
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -677,6 +739,7 @@ fn recover_head_permanently_faulty_enters_recovering_head() {
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // exceeds the retry budget
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -684,9 +747,10 @@ fn recover_head_permanently_faulty_enters_recovering_head() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -700,7 +764,14 @@ fn recover_head_permanently_faulty_enters_recovering_head() {
     );
   }
   // A RecoveringHead replica must not participate: it casts no PrepareOk on a re-delivered prepare.
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(2, 1),
+  );
   assert!(
     r.poll_message().is_none(),
     "RecoveringHead replica emits no ack/vote in response to a prepare"
@@ -739,10 +810,12 @@ fn recover_non_head_faulty_committed_slot_becomes_normal_and_requests_repair() {
   // HELD at 1 (never skips to apply op 3 with op 2 missing). Reaching op 2 with commit now covering
   // it is exactly when `advance_commit` requests the repair ON DEMAND.
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -865,10 +938,19 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
     checkpoint: None,
   };
   let cfg = Config::try_new(1, MemberId::new(2)).unwrap();
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -929,7 +1011,14 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
     RequestNumber::with(3),
     Bytes::copy_from_slice(&[3]),
   ));
-  r.handle_message(now, &mut wal, &mut sb, primary1, canonical_retransmit);
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary1,
+    canonical_retransmit,
+  );
   // BEFORE the append completes (no handle_storage yet): NO PrepareOk(3) may have been emitted. The op was
   // missing/mismatched, so the fix (re)appends the canonical body and DEFERS the ack — it must NOT have
   // inline-acked off the stale slot. (FAIL-BEFORE: a PrepareOk(3) is emitted immediately here.)
@@ -963,7 +1052,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
   );
 
   // Now the append completes → on_wal_done clears `appending(3)` and sends EXACTLY ONE deferred PrepareOk(3).
-  r.handle_storage(now, &mut wal, &mut sb);
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   let acks_after: std::vec::Vec<_> = core::iter::from_fn(|| r.poll_message())
     .filter_map(|out| match out.into_msg() {
       Message::PrepareOk(ok) if ok.op() == OpNumber::with(3) => Some(ok),
@@ -983,6 +1072,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary1,
     Message::Commit(Commit::new(
       View::with(1),
@@ -992,7 +1082,7 @@ fn recover_drops_a_superseded_above_commit_tail_slot_so_the_canonical_body_is_ap
       0,
     )),
   );
-  r.handle_storage(now, &mut wal, &mut sb);
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     !r.has_repair_hole_for_test(3),
     "op 3 needs no repair — its canonical body was re-appended, so the commit applies it directly"
@@ -1061,10 +1151,12 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
     );
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     p.repair.insert(5); // simulate the old pre-registration of an uncommitted faulty slot
+    let mut blocks = crate::block_store::MemBlockStore::new();
     p.handle_message(
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Client(ClientId::new(7)),
       mk_request(),
     );
@@ -1083,10 +1175,12 @@ fn recover_does_not_pre_register_an_uncommitted_faulty_tail_slot_as_a_repair_hol
     );
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     assert!(p.repair.is_empty(), "fresh primary has no repair holes");
+    let mut blocks = crate::block_store::MemBlockStore::new();
     p.handle_message(
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Client(ClientId::new(7)),
       mk_request(),
     );
@@ -1155,10 +1249,12 @@ fn recovering_head_adopts_start_view_and_becomes_normal() {
       ),
     ],
   );
+  let mut blocks = crate::block_store::MemBlockStore::new();
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartView(sv),
   );
@@ -1180,7 +1276,7 @@ fn recovering_head_adopts_start_view_and_becomes_normal() {
   // The recovery bookkeeping is cleared (structurally None in Normal).
   assert!(r.recover.is_none(), "recover state cleared on adoption");
   // The new view is persisted before participation; pump the durable-view write, then it re-acks.
-  r.handle_storage(now, &mut wal, &mut sb);
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(sb.state().view(), View::new());
 }
 
@@ -1199,6 +1295,7 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // faulty NON-head committed slot (empty in cache)
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -1206,9 +1303,10 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
     CountSm::default(),
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -1244,6 +1342,7 @@ fn recovering_head_with_a_faulty_non_head_slot_never_applies_an_empty_body() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartView(sv),
   );
@@ -1323,10 +1422,12 @@ fn recovering_head_adopts_recovery_response_from_primary() {
       ),
     ],
   );
+  let mut blocks = crate::block_store::MemBlockStore::new();
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::RecoveryResponse(resp),
   );
@@ -1354,10 +1455,12 @@ fn recovering_head_ignores_stale_or_non_primary_recovery_response() {
   }
   let now = Instant::ZERO;
   // Wrong nonce → ignored.
+  let mut blocks = crate::block_store::MemBlockStore::new();
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::RecoveryResponse(RecoveryResponse::new(
       View::new(),
@@ -1385,6 +1488,7 @@ fn recovering_head_ignores_stale_or_non_primary_recovery_response() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RecoveryResponse(RecoveryResponse::new(
       View::new(),
@@ -1413,10 +1517,12 @@ fn recovering_head_does_not_participate_on_non_head_learning_messages() {
   while r.poll_message().is_some() {} // discard the solicitation
   let now = Instant::ZERO;
   // A higher-view Prepare would normally trigger catch_up_to_view → ViewChange. It must be dropped.
+  let mut blocks = crate::block_store::MemBlockStore::new();
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::with(5),
@@ -1431,12 +1537,20 @@ fn recovering_head_does_not_participate_on_non_head_learning_messages() {
     )),
   );
   // A current-view Prepare for an op we hold would normally re-ack. It must be dropped too.
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
   // A Commit would normally advance commit. Dropped.
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -1469,6 +1583,7 @@ fn recovered_primary_abdicates_to_a_view_change_instead_of_resuming_normal() {
   let mut wal = wal_in_view(2, 0);
   let mut sb = sb_with_view(0, 0);
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(3),
@@ -1476,10 +1591,11 @@ fn recovered_primary_abdicates_to_a_view_change_instead_of_resuming_normal() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1502,6 +1618,7 @@ fn recovered_primary_abdicates_to_a_view_change_instead_of_resuming_normal() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     client_request(1),
   );
@@ -1521,6 +1638,7 @@ fn recovered_backup_resumes_normal_unchanged() {
   let mut wal = wal_in_view(2, 0);
   let mut sb = sb_with_view(0, 0);
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -1528,10 +1646,11 @@ fn recovered_backup_resumes_normal_unchanged() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1557,6 +1676,7 @@ fn recovered_mid_view_change_redrives_the_in_progress_view_change() {
   let mut wal = wal_in_view(2, 0);
   let mut sb = sb_with_view(1, 0);
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(2)).unwrap(),
     genesis(3),
@@ -1564,10 +1684,11 @@ fn recovered_mid_view_change_redrives_the_in_progress_view_change() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1593,6 +1714,7 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
   let mut wal = wal_in_view(2, 0);
   let mut sb = sb_with_view(0, 0);
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(1),
@@ -1600,10 +1722,11 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
     CountSm::default(),
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   for _ in 0..16 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1625,11 +1748,12 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     client_request(1),
   );
   for _ in 0..4 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert_eq!(
     r.commit(),
@@ -1641,11 +1765,12 @@ fn recovered_solo_primary_resumes_normal_and_commits_its_tail() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     client_request(3),
   );
   for _ in 0..4 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert_eq!(
     r.commit(),
@@ -1667,10 +1792,12 @@ fn normal_primary_answers_recovery_with_canonical_response() {
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Give the primary one committed op so its response is non-trivial.
+  let mut blocks = crate::block_store::MemBlockStore::new();
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -1678,13 +1805,14 @@ fn normal_primary_answers_recovery_with_canonical_response() {
       Bytes::from_static(b"a"),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // own append durable → commit op 1 (quorum 2 in N=3? no)
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own append durable → commit op 1 (quorum 2 in N=3? no)
   while e.poll_message().is_some() {}
   // A peer (replica 2) solicits recovery.
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::Recovery(Recovery::new(
       ReplicaId::new(2),
@@ -1725,10 +1853,12 @@ fn has_inflight_storage_is_true_mid_append_and_false_when_quiesced() {
     !e.has_inflight_storage(),
     "a freshly-constructed endpoint owes no storage completion"
   );
+  let mut blocks = crate::block_store::MemBlockStore::new();
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -1742,7 +1872,7 @@ fn has_inflight_storage_is_true_mid_append_and_false_when_quiesced() {
     e.has_inflight_storage(),
     "an outstanding WAL append must report in-flight storage"
   );
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   // Drained: `on_wal_done` cleared `pending`/`appending`; the lone own-vote is below quorum so no
   // commit/checkpoint/view write was started — the endpoint owes the driver nothing.
   assert!(
@@ -1763,10 +1893,12 @@ fn normal_backup_answers_recovery_with_view_only() {
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::Recovery(Recovery::new(
       ReplicaId::new(1),
@@ -1798,6 +1930,7 @@ fn recover_read_ok_with_bad_checksum_does_not_adopt_the_corrupt_body() {
   wal.script_corrupt_body(OpNumber::with(1)); // ReadOk with a body that fails verify, forever
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -1805,9 +1938,10 @@ fn recover_read_ok_with_bad_checksum_does_not_adopt_the_corrupt_body() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::RecoveringHead,
@@ -1878,10 +2012,19 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
 
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -1910,6 +2053,7 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -1951,10 +2095,11 @@ fn recover_repairs_a_committed_slot_whose_wal_body_mismatches_the_persisted_head
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
-  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + resume
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + resume
   assert_eq!(
     r.commit(),
     OpNumber::with(2),
@@ -2031,10 +2176,19 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
 
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -2054,6 +2208,7 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2079,10 +2234,11 @@ fn recover_drops_a_known_committed_op_above_the_persisted_header_prefix() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
-  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + resume
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + resume
   assert_eq!(
     r.commit(),
     OpNumber::with(2),
@@ -2155,9 +2311,18 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
   wal.script_read_fault(OpNumber::with(2), u8::MAX);
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -2200,6 +2365,7 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2227,10 +2393,11 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 4),
   );
-  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply the held suffix
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply the held suffix
   assert_eq!(
     r.commit(),
     OpNumber::with(4),
@@ -2303,8 +2470,17 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
   // A checkpoint interval far above the window — the regime in which this hazard is reachable.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   // THE CORE assertion: the recovered head reads the FULL durable committed band — `self.op >=
   // commit_max`, NOT the old `checkpoint_op + RECOVER_TAIL_WINDOW`. (FAIL-BEFORE: `self.op ==
   // RECOVER_TAIL_WINDOW` < commit_max, hiding the top two held committed ops.)
@@ -2321,7 +2497,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
   );
   // Drain the committed-band reads → Normal, every held op cached + verified.
   for _ in 0..(commit_max + 8) {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -2361,6 +2537,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -2370,7 +2547,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
     )),
   );
   assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
-  r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // complete the SendDoViewChange durable-view write
   // The recovered replica's OWN DVC reports the KNOWN committed frontier == commit_max, with a
   // log_slice carrying the held band up to commit_max — so `commit* == commit_max <= op_head ==
   // commit_max` and the fail-stop does NOT trip. (FAIL-BEFORE: the DVC reported op == RECOVER_TAIL_WINDOW
@@ -2407,6 +2584,7 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -2454,8 +2632,17 @@ fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
     "the durable root has NO committed band above the checkpoint"
   );
   let now = Instant::ZERO;
-  let e =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   // With commit_max == checkpoint_op == 0, the floor is checkpoint_op, so `hi` caps at
   // `checkpoint_op + RECOVER_TAIL_WINDOW`: exactly RECOVER_TAIL_WINDOW reads, NOT u64::MAX.
@@ -2546,10 +2733,19 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
 
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -2575,6 +2771,7 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2609,8 +2806,15 @@ fn recover_repairs_a_committed_slot_with_matching_body_but_wrong_client_or_reque
     RequestNumber::with(3),
     Bytes::copy_from_slice(&[2u8]),
   ));
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), canonical_repair);
-  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → resume
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    canonical_repair,
+  );
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → resume
   assert_eq!(
     r.commit(),
     OpNumber::with(2),
@@ -2680,10 +2884,19 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
   let mut wal = ScriptedWal::with_entries(3); // ops 1,2,3 all canonical [op]
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   for _ in 0..32 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -2708,6 +2921,7 @@ fn recover_trusts_a_committed_slot_that_matches_its_persisted_header() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2742,6 +2956,7 @@ fn recovering_replica_ignores_messages_and_does_not_join_a_view_change() {
   wal.script_read_fault(OpNumber::with(2), 2); // keep it Recovering (not yet drained)
   let mut sb = TestSb::default();
   let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -2749,6 +2964,7 @@ fn recovering_replica_ignores_messages_and_does_not_join_a_view_change() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   assert_eq!(r.status(), Status::Recovering);
@@ -2764,7 +2980,7 @@ fn recovering_replica_ignores_messages_and_does_not_join_a_view_change() {
     RequestNumber::with(3),
     Bytes::from_static(b"z"),
   ));
-  r.handle_message(now, &mut wal, &mut sb, primary_peer(), higher);
+  r.handle_message(now, &mut wal, &mut sb, &mut blocks, primary_peer(), higher);
   assert_eq!(
     r.status(),
     Status::Recovering,
@@ -2787,6 +3003,7 @@ fn recover_timer_resubmits_a_dropped_transient_fault() {
   wal.script_read_fault(OpNumber::with(2), 2);
   let mut sb = TestSb::default();
   let mut now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -2794,6 +3011,7 @@ fn recover_timer_resubmits_a_dropped_transient_fault() {
     EchoSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   // A Recovering replica must arm a timer (so an owner driving poll_timeout makes progress).
@@ -2802,14 +3020,14 @@ fn recover_timer_resubmits_a_dropped_transient_fault() {
     "Recovering arms the recover_retry timer"
   );
   for _ in 0..8 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if r.status() == Status::Normal {
       break;
     }
     // Advance to the next timer deadline and fire it (re-submits pending/faulty reads).
     if let Some(t) = r.poll_timeout() {
       now = t;
-      r.handle_timeout(now, &mut wal, &mut sb);
+      r.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
     }
   }
   assert_eq!(
@@ -2864,12 +3082,21 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   wal.script_defer_read(OpNumber::with(2)); // op 2's read is HELD — it completes only on release
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(r.status(), Status::Recovering);
 
   // Drain op 1's clean read (resolved); op 2 stays pending with NO completion (its read is held).
-  r.handle_storage(now, &mut wal, &mut sb);
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     r.status(),
     Status::Recovering,
@@ -2879,7 +3106,7 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   // One recover-retry tick: `recover_timeouts` re-submits op 2 ADDITIVELY (a fresh id, prior id kept)
   // and decrements its absolute budget. op 2's read is STILL held, so this enqueues no completion.
   now = now + RECOVER_READ_RETRANSMIT;
-  r.handle_timeout(now, &mut wal, &mut sb);
+  r.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     r.status(),
     Status::Recovering,
@@ -2894,7 +3121,7 @@ fn recover_resolves_a_read_that_completes_after_a_retransmit() {
   );
 
   // Drive to completion (pump storage + the retry timer); recovery reaches Normal with op 2 resolved.
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -2923,9 +3150,24 @@ fn recover_rebuilds_log_and_op_from_wal() {
   let mut e = backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.handle_storage(now, &mut wal, &mut sb);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(2, 1),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   // Drop `e` (crash). Recover a fresh endpoint from the SAME durable wal/sb.
   drop(e);
   let mut recovered = Endpoint::recover(
@@ -2935,6 +3177,7 @@ fn recover_rebuilds_log_and_op_from_wal() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   assert_eq!(
@@ -2942,7 +3185,7 @@ fn recover_rebuilds_log_and_op_from_wal() {
     Status::Recovering,
     "recover is a metadata-only constructor (Recovering)"
   );
-  recovered.handle_storage(now, &mut wal, &mut sb); // drain the tail reads → Normal
+  recovered.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain the tail reads → Normal
   assert_eq!(
     recovered.op(),
     OpNumber::with(2),
@@ -2975,20 +3218,36 @@ fn recover_restores_real_bodies() {
   let now = Instant::ZERO;
 
   let mut e = Endpoint::new(cfg(), genesis(3), 0, EchoSm);
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.handle_storage(now, &mut wal, &mut sb);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(2, 1),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   drop(e); // crash
 
   let mut recovered =
-    Endpoint::recover(cfg(), genesis(3), 0, EchoSm, &mut wal, &mut sb).expect_active();
+    Endpoint::recover(cfg(), genesis(3), 0, EchoSm, &mut wal, &mut sb, &mut blocks).expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
-  recovered.handle_storage(now, &mut wal, &mut sb); // restore the tail bodies → Normal
+  recovered.handle_storage(now, &mut wal, &mut sb, &mut blocks); // restore the tail bodies → Normal
   assert_eq!(recovered.status(), Status::Normal);
   recovered.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -3026,11 +3285,13 @@ fn recover_restores_a_nonzero_durable_view() {
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle → propose view 1 (own SVC bit)
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // primary_idle → propose view 1 (own SVC bit)
   e.handle_message(
     later,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -3039,7 +3300,7 @@ fn recover_restores_a_nonzero_durable_view() {
       0,
     )),
   ); // SVC quorum → ViewChange(view 1) → durable-view write submitted
-  e.handle_storage(later, &mut wal, &mut sb); // make the durable-view write complete
+  e.handle_storage(later, &mut wal, &mut sb, &mut blocks); // make the durable-view write complete
   assert_eq!(
     sb.state().view(),
     View::with(1),
@@ -3059,6 +3320,7 @@ fn recover_restores_a_nonzero_durable_view() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   assert_eq!(
@@ -3091,12 +3353,15 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
   let cfg = || Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
+  // ONE block store for the whole test — the SM checkpoint DAG must survive into recover().
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut e = Endpoint::new(cfg(), genesis(1), 0, CountSm::default());
   for rn in 1..=2u64 {
     e.handle_message(
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Client(ClientId::new(7)),
       Message::Request(Request::new(
         ClientId::new(7),
@@ -3104,7 +3369,7 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
         Bytes::from(std::vec![rn as u8]),
       )),
     );
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -3113,8 +3378,16 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
   );
   drop(e); // crash
 
-  let mut r =
-    Endpoint::recover(cfg(), genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut r = Endpoint::recover(
+    cfg(),
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(r.status(), Status::Recovering);
   // Simulate the recover-retry timer minting a FRESH checkpoint read id before the original (slow) read's
   // completion is drained — the completion will then arrive under a SUPERSEDED id.
@@ -3129,7 +3402,7 @@ fn recover_accepts_a_checkpoint_read_completing_under_a_superseded_id() {
   // restoring the SM and completing recovery. (FAIL-BEFORE the additive accept: the superseded id is
   // ignored, the SM is never restored, and recovery stays `Recovering`.)
   for _ in 0..4 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if r.status() != Status::Recovering {
       break;
     }
@@ -3160,8 +3433,14 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
   // SM LOCALLY — no peer. (FAIL-BEFORE, were a fault to escalate in-band: the storm sets
   // `awaiting_peer_checkpoint`, failing the asserts below.)
   let good_snap = CountSm::default().snapshot();
-  let good_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(2), &BTreeMap::new(), &good_snap);
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(
+      &std::collections::BTreeMap::new(),
+      &mut crate::block_store::MemBlockStore::new(),
+    ),
+  );
   let good_id = crate::checkpoint_id(&good_env);
   let state = VsrState::try_new(
     View::new(),
@@ -3185,8 +3464,21 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
   };
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let now = Instant::ZERO;
-  let mut e =
-    Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  // The envelope names the SM leaf by its content address; the leaf itself lives in the block store, so
+  // recover walks the local DAG and restores from it rather than escalating to a peer fetch.
+  blocks.write_verified(good_snap.clone());
+  super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert!(
     e.recover.as_ref().unwrap().checkpoint.is_some(),
@@ -3195,7 +3487,12 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
 
   // A STORM of in-band checkpoint faults under arbitrary ids — none may decrement the budget or escalate.
   for k in 0..(4 * RECOVER_READ_RETRIES as u64) {
-    e.on_recover_sb_done(now, &mut sb, SuperblockDone::Fault(OpId::new(9000 + k)));
+    e.on_recover_sb_done(
+      now,
+      &mut sb,
+      &mut blocks,
+      SuperblockDone::Fault(OpId::new(9000 + k)),
+    );
   }
   assert_eq!(
     e.status(),
@@ -3213,7 +3510,7 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
 
   // The still-in-flight valid read lands → SM restored LOCALLY, recovery completes. No peer was needed.
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -3247,16 +3544,20 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
       Bytes::from(std::vec![rn as u8]),
     ))
   };
+  // ONE block store for the whole test — the SM checkpoint DAG written at commit must survive into
+  // recover() (it reads the blocks back to restore the SM), exactly as the WAL + superblock persist.
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut e = Endpoint::new(cfg(), genesis(1), 0, CountSm::default());
   for rn in 1..=2 {
     e.handle_message(
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Client(ClientId::new(7)),
       req(rn),
     );
-    e.handle_storage(now, &mut wal, &mut sb); // append durable → commit → (at op 2) checkpoint
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // append durable → commit → (at op 2) checkpoint
   }
   assert_eq!(
     e.checkpoint_op(),
@@ -3272,9 +3573,18 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
 
   // recover() restores from the checkpoint snapshot, NOT by replaying from op 0. The consensus
   // metadata (commit/checkpoint/op) is set synchronously in Phase 1; the SM snapshot restore
-  // happens in the Recovering handle_storage loop (Phase 2), so pump it before the SM asserts.
-  let mut recovered =
-    Endpoint::recover(cfg(), genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  // happens in the Recovering handle_storage loop (Phase 2), so pump it before the SM asserts. The
+  // SAME `blocks` store carries the checkpoint DAG across the crash (the SM blocks persist).
+  let mut recovered = Endpoint::recover(
+    cfg(),
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
   assert_eq!(
     recovered.commit(),
@@ -3293,7 +3603,7 @@ fn recover_restores_from_the_durable_checkpoint_not_op_zero() {
   );
   // commit_max is restored to checkpoint_op too (monotone bounds: op >= commit_max >= commit_min).
   assert_eq!(recovered.commit_max(), OpNumber::with(2));
-  recovered.handle_storage(now, &mut wal, &mut sb); // restore the SM snapshot + tail bodies → Normal
+  recovered.handle_storage(now, &mut wal, &mut sb, &mut blocks); // restore the SM snapshot + tail bodies → Normal
   assert_eq!(recovered.status(), Status::Normal);
   // The SM was restored from the snapshot: it already reflects ops 1,2 (NOT re-applied → exactly 2).
   assert_eq!(
@@ -3319,8 +3629,14 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   // The SM tail must be a VALID CountSm snapshot (an empty one = 8 zero bytes for the count), so the
   // restore on the genuine read succeeds; the verify logic under test is independent of the payload.
   let good_snap = CountSm::default().snapshot();
-  let good_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(2), &BTreeMap::new(), &good_snap);
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(
+      &std::collections::BTreeMap::new(),
+      &mut crate::block_store::MemBlockStore::new(),
+    ),
+  );
   let good_id = crate::checkpoint_id(&good_env);
   // Durable root: checkpoint at op 2, naming the GOOD envelope's content id.
   let state = VsrState::try_new(
@@ -3352,8 +3668,21 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   };
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let now = Instant::ZERO;
-  let mut e =
-    Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  // The envelope names the SM leaf by content address; the leaf lives in the block store, so the genuine
+  // read restores from the local DAG.
+  blocks.write_verified(good_snap.clone());
+  super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     e.commit(),
@@ -3363,7 +3692,7 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
 
   // Drain #1: the corrupt-bytes read is REJECTED — SM not restored, still Recovering, a new read armed.
   sb.flush(); // release the Phase-1 checkpoint read (the corrupt one)
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.state_machine_ref().applied().len(),
     0,
@@ -3378,11 +3707,11 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
   // Pump the recover-retry timer so the next checkpoint read is submitted (the timer is the sole
   // owner of the read-retry budget).
   let t = e.poll_timeout().expect("recover-retry timer armed");
-  e.handle_timeout(t, &mut wal, &mut sb);
+  e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
 
   // Drain #2: the wrong-op read is REJECTED too — still no restore, still Recovering.
   sb.flush(); // release the retry read submitted in drain #1 (the wrong-op one)
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.state_machine_ref().applied().len(),
     0,
@@ -3396,11 +3725,11 @@ fn recover_rejects_a_mismatched_checkpoint_read_and_retries_then_restores() {
 
   // Pump the recover-retry timer again so the genuine retry read is submitted.
   let t = e.poll_timeout().expect("recover-retry timer armed");
-  e.handle_timeout(t, &mut wal, &mut sb);
+  e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
 
   // Drain #3: the genuine read is accepted → SM restored, recovery completes to Normal.
   sb.flush(); // release the retry read submitted in drain #2 (the genuine one)
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -3421,8 +3750,14 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
   // The SM tail must be a VALID CountSm snapshot (an empty one = 8 zero bytes for the count), so the
   // restore on the genuine read succeeds; the verify logic under test is independent of the payload.
   let good_snap = CountSm::default().snapshot();
-  let good_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(2), &BTreeMap::new(), &good_snap);
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(
+      &std::collections::BTreeMap::new(),
+      &mut crate::block_store::MemBlockStore::new(),
+    ),
+  );
   let good_id = crate::checkpoint_id(&good_env);
   let state = VsrState::try_new(
     View::new(),
@@ -3448,11 +3783,24 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
   };
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
   let now = Instant::ZERO;
-  let mut e =
-    Endpoint::recover(cfg, genesis(1), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  // The envelope names the SM leaf by content address; the leaf lives in the block store so the genuine
+  // read restores from the local DAG.
+  blocks.write_verified(good_snap.clone());
+  super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   // Drain #1: the truncated read does NOT panic — it is rejected; still Recovering.
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.status(),
     Status::Recovering,
@@ -3465,10 +3813,10 @@ fn recover_does_not_panic_on_a_truncated_checkpoint_read() {
   );
   // Pump the recover-retry timer so the genuine retry read is submitted.
   let t = e.poll_timeout().expect("recover-retry timer armed");
-  e.handle_timeout(t, &mut wal, &mut sb);
+  e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
   // Drain #2: the genuine read completes recovery.
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -3504,14 +3852,23 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e =
-    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
 
   // Drive well past the per-op retry budget (RECOVER_READ_RETRIES), pumping the recover-retry timer
   // each round (the timer is the sole owner of the read-retry budget). The CORE property: this NEVER
   // panics (the old `assert!` is gone).
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   // After exhaustion the replica escalated to a peer fetch: still Recovering (SM not yet restored —
   // never silently Normal with a fresh SM at commit_min == 2), awaiting a peer checkpoint, with a
   // FORCED sync armed at our own checkpoint op and a RequestSync emitted.
@@ -3553,14 +3910,21 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
   // recovering replica accepts it (the relaxed guard), restores the SM, durably re-persists, and
   // completes recovery to Normal.
   let good_snap = CountSm::default().snapshot();
-  let good_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(2), &BTreeMap::new(), &good_snap);
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
   let good_id = crate::checkpoint_id(&good_env);
+  // The envelope names the SM leaf by content address; seed the store so the peer-served checkpoint's
+  // block-fetch frontier drains locally and installs without a RequestBlock round trip.
+  blocks.write_verified(good_snap.clone());
   let nonce = e.sync_nonce_for_test();
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -3577,7 +3941,7 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
   // apply_sync staged the durable re-persist (two superblock writes); drive them to completion.
   for _ in 0..3 {
     sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -3632,9 +3996,18 @@ fn a_cross_epoch_recovery_peer_fetch_survives_an_old_epoch_same_epoch_commit() {
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e =
-    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(e.status(), Status::Recovering);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
@@ -3657,6 +4030,7 @@ fn a_cross_epoch_recovery_peer_fetch_survives_an_old_epoch_same_epoch_commit() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::Commit(Commit::new(
       View::new(),
@@ -3718,8 +4092,17 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e =
-    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert!(
     e.is_primary(),
     "replica 0 recovered at view 0 is the primary of its view"
@@ -3727,7 +4110,7 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   assert_eq!(e.status(), Status::Recovering);
 
   // Exhaust the checkpoint-read budget → escalate to a peer fetch (still Recovering, SM not restored).
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "the primary escalated to a peer fetch (its own checkpoint is unreadable)"
@@ -3743,14 +4126,21 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   // `complete_recovery` STEPS IT DOWN — a recovered primary forces a clean view change rather than resume
   // as the established primary with a torn-down pipeline.
   let good_snap = CountSm::default().snapshot();
-  let good_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(2), &BTreeMap::new(), &good_snap);
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
   let good_id = crate::checkpoint_id(&good_env);
+  // The envelope names the SM leaf by content address; seed the store so the peer-served checkpoint's
+  // block-fetch frontier drains locally and installs without a RequestBlock round trip.
+  blocks.write_verified(good_snap.clone());
   let nonce = e.sync_nonce_for_test();
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -3768,7 +4158,7 @@ fn recover_peer_fetch_on_a_primary_steps_down_via_the_abdicate_chokepoint() {
   // writes surface and `on_sb_done` lands the root, installing + completing recovery).
   for _ in 0..6 {
     sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !e.status().is_recovering() {
       break;
     }
@@ -3824,9 +4214,21 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
   let now = Instant::ZERO;
   let good_snap = CountSm::default().snapshot();
-  let good_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(2), &BTreeMap::new(), &good_snap);
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(
+      &std::collections::BTreeMap::new(),
+      &mut crate::block_store::MemBlockStore::new(),
+    ),
+  );
   let good_id = crate::checkpoint_id(&good_env);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  // The leaf the envelope names lives in the block store, so the peer-served checkpoint installs once
+  // its block-fetch frontier drains locally (the corrupt LOCAL reads still fail the id gate before the
+  // DAG walk, so the peer-fetch escalation is unaffected).
+  blocks.write_verified(good_snap.clone());
+  super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
   // Durable root names the GOOD id at op 2, but every scripted read returns CORRUPT bytes (wrong
   // hash) — a permanently-inconsistent snapshot. Provide many corrupt reads (more than the budget).
   let state = VsrState::try_new(
@@ -3847,10 +4249,18 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
     head: 2,
     done: VecDeque::new(),
   };
-  let mut e =
-    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   // Drive the verify-failure exhaustion (pumping the recover-retry timer each round) → must NOT panic.
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     e.status(),
     Status::Recovering,
@@ -3863,6 +4273,7 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -3878,7 +4289,7 @@ fn recover_does_not_panic_when_a_mismatched_checkpoint_read_always_faults_then_a
   );
   for _ in 0..3 {
     sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -3964,8 +4375,17 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   };
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // never clears within any finite budget
 
-  let mut e =
-    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     e.commit_max(),
@@ -3975,7 +4395,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
 
   // Drive past the per-op + checkpoint retry budgets so op-2 classes permanently faulty AND the own
   // checkpoint read exhausts → escalation to a peer fetch (pumping the recover-retry timer each round).
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     e.status(),
     Status::Recovering,
@@ -3995,14 +4415,21 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   let mut peer_sm = CountSm::default();
   peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
   let peer_snap = peer_sm.snapshot();
-  let peer_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(1), &BTreeMap::new(), &peer_snap);
+  let peer_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(1),
+    crate::block_address(&peer_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
   let peer_id = crate::checkpoint_id(&peer_env);
+  // The envelope names the SM leaf by content address; seed the store so the peer-served checkpoint's
+  // block-fetch frontier drains locally and installs without a RequestBlock round trip.
+  blocks.write_verified(peer_snap.clone());
   let nonce = e.sync_nonce_for_test();
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -4019,7 +4446,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   // Drive the durable re-persist (two superblock writes) to completion → Normal.
   for _ in 0..3 {
     sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -4059,6 +4486,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -4099,6 +4527,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Prepare(Prepare::new(
       View::new(),
@@ -4112,7 +4541,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
       body2.clone(),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // the repair-fill append lands → apply op 2 (real body)
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repair-fill append lands → apply op 2 (real body)
   assert!(
     !e.has_repair_hole_for_test(2),
     "the op-2 hole is filled once the canonical Prepare's append is durable"
@@ -4198,11 +4627,20 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
     deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
   };
-  let mut e =
-    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   // Drive: tail reads settle (Present), the own checkpoint read exhausts → peer-fetch escalation
   // (pumping the recover-retry timer each round).
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch (own checkpoint unreadable)"
@@ -4217,9 +4655,15 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
   let mut peer_sm = CountSm::default();
   peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
   let peer_snap = peer_sm.snapshot();
-  let peer_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(1), &BTreeMap::new(), &peer_snap);
+  let peer_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(1),
+    crate::block_address(&peer_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
   let peer_id = crate::checkpoint_id(&peer_env);
+  // The envelope names the SM leaf by content address; seed the store so the peer-served checkpoint's
+  // block-fetch frontier drains locally and installs without a RequestBlock round trip.
+  blocks.write_verified(peer_snap.clone());
   let nonce = e.sync_nonce_for_test();
   let sync = crate::SyncCheckpoint::new(
     View::new(),
@@ -4254,12 +4698,13 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(sync),
   );
   for _ in 0..3 {
     sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -4340,9 +4785,18 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
   };
-  let mut e =
-    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch (own checkpoint unreadable)"
@@ -4350,9 +4804,15 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
   let mut peer_sm = CountSm::default();
   peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
   let peer_snap = peer_sm.snapshot();
-  let peer_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(1), &BTreeMap::new(), &peer_snap);
+  let peer_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(1),
+    crate::block_address(&peer_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
   let peer_id = crate::checkpoint_id(&peer_env);
+  // The envelope names the SM leaf by content address; seed the store so the peer-served checkpoint's
+  // block-fetch frontier drains locally and installs without a RequestBlock round trip.
+  blocks.write_verified(peer_snap.clone());
   let nonce = e.sync_nonce_for_test();
   let sync = crate::SyncCheckpoint::new(
     View::new(),
@@ -4382,12 +4842,13 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(sync),
   );
   for _ in 0..3 {
     sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert_eq!(
     e.status(),
@@ -4405,6 +4866,7 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -4482,9 +4944,18 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
   };
-  let mut e =
-    Endpoint::recover(cfg, genesis(3), 5, CountSm::default(), &mut wal, &mut sb).expect_active();
-  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, now);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert!(
     e.awaiting_peer_checkpoint_for_test(),
     "escalated to a peer fetch"
@@ -4492,9 +4963,15 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
   let mut peer_sm = CountSm::default();
   peer_sm.apply(OpNumber::with(1), b"OP1-REAL-BODY");
   let peer_snap = peer_sm.snapshot();
-  let peer_env =
-    Endpoint::<CountSm>::encode_checkpoint(OpNumber::with(1), &BTreeMap::new(), &peer_snap);
+  let peer_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(1),
+    crate::block_address(&peer_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
   let peer_id = crate::checkpoint_id(&peer_env);
+  // The envelope names the SM leaf by content address; seed the store so the peer-served checkpoint's
+  // block-fetch frontier drains locally and installs without a RequestBlock round trip.
+  blocks.write_verified(peer_snap.clone());
   let nonce = e.sync_nonce_for_test();
   let sync = crate::SyncCheckpoint::new(
     View::with(1),
@@ -4521,6 +4998,7 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::SyncCheckpoint(sync),
   );
@@ -4528,7 +5006,7 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
   // SyncRepersist root, which installs + completes recovery.
   for _ in 0..6 {
     sb.flush();
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !e.status().is_recovering() {
       break;
     }
@@ -4615,8 +5093,17 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
   wal.script_read_fault(OpNumber::with(2), u8::MAX); // op 2's read always faults → fault-exhaustion path
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(
     r.log.get(&2).map(|e| e.client),
     Some(ClientId::new(99)),
@@ -4624,7 +5111,7 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
   );
   // The in-model header resolution now agrees with the canonical band: op 2's durable header becomes H2.
   wal.entries.insert(2u64, (h2_canon, canon2.clone()));
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
     Status::Normal,
@@ -4717,9 +5204,18 @@ fn fault_exhaustion_rejects_a_misdirected_durable_header() {
   wal.script_read_fault(OpNumber::with(2), u8::MAX);
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
-  drive_recovery(&mut r, &mut wal, &mut sb, now);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(r.status(), Status::Normal, "recovers to Normal");
   // THE PLACEMENT GUARD: op 2 is NOT promoted to Repairing off the misplaced (op-99-stamped) header — it
   // is dropped to a peer-repaired hole. (FAIL-BEFORE the placement check: classify accepted the
@@ -4745,16 +5241,39 @@ fn recover_with_no_checkpoint_is_unchanged() {
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let mut e = Endpoint::new(cfg(), genesis(3), 0, CountSm::default());
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.handle_storage(now, &mut wal, &mut sb);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(2, 1),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.checkpoint_op(), OpNumber::with(0), "no checkpoint taken");
   drop(e);
 
-  let mut recovered =
-    Endpoint::recover(cfg(), genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut recovered = Endpoint::recover(
+    cfg(),
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(recovered.status(), Status::Recovering);
-  recovered.handle_storage(now, &mut wal, &mut sb); // drain the tail reads → Normal
+  recovered.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain the tail reads → Normal
   assert_eq!(recovered.status(), Status::Normal);
   assert_eq!(recovered.op(), OpNumber::with(2), "op from the WAL head");
   assert_eq!(
@@ -4786,8 +5305,17 @@ fn recover_bounds_the_read_window_for_a_huge_op_head() {
     done: VecDeque::new(),
   };
   let mut sb = TestSb::default(); // no checkpoint (checkpoint_op == 0) → no checkpoint read
-  let e =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   // `recover()` submits exactly one read per materialized tail slot, each queued in the WAL's
   // `done` buffer. The count must be bounded by the window, never the claimed head.
@@ -4833,8 +5361,17 @@ fn recover_does_not_overflow_with_a_checkpoint_op_near_u64_max() {
   };
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   // The CORE assertion is simply that this does not overflow-panic.
-  let e =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   assert_eq!(e.status(), Status::Recovering);
   assert_eq!(
     wal.done.len(),
@@ -4860,10 +5397,14 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
   let mut donor_sm = CountSm::default();
   donor_sm.apply(OpNumber::with(1), &[1]);
   donor_sm.apply(OpNumber::with(2), &[2]);
+  let donor_snap = donor_sm.snapshot();
   let env = Endpoint::<CountSm>::encode_checkpoint(
     OpNumber::with(checkpoint_op),
-    &BTreeMap::new(),
-    &donor_sm.snapshot(),
+    crate::block_address(&donor_snap),
+    super::super::session_blocks::encode_sessions(
+      &std::collections::BTreeMap::new(),
+      &mut crate::block_store::MemBlockStore::new(),
+    ),
   );
   let id = crate::checkpoint_id(&env);
   let state = VsrState::try_new(
@@ -4901,8 +5442,21 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
   };
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), RECOVER_TAIL_WINDOW).unwrap();
   let now = Instant::ZERO;
-  let mut e =
-    Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb).expect_active();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  // The envelope names the SM leaf by content address; the leaf lives in the block store so recover
+  // restores from the local DAG.
+  blocks.write_verified(donor_snap.clone());
+  super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks);
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
   // THE core assertion: the recovered head is the VERIFIED read frontier, NOT the raw head.
   assert_eq!(
     e.op(),
@@ -4912,7 +5466,7 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
   assert_ne!(e.op(), OpNumber::with(head), "must NOT hold the raw head");
   // Drive the in-window tail reads + the checkpoint read to completion → Normal.
   while e.status() != Status::Normal {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
   assert_eq!(
     e.op(),
@@ -4937,7 +5491,14 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
     RequestNumber::with(danger),
     Bytes::from(std::vec![0xAB]),
   );
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), Message::Prepare(p));
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Prepare(p),
+  );
   assert_eq!(
     e.op(),
     OpNumber::with(danger),

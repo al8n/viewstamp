@@ -126,11 +126,23 @@ fn assert_invariants_rejects_pending_install_without_sync() {
   let mut e = backup();
   e.pending_install = Some(PendingInstall {
     checkpoint_op: OpNumber::with(0),
-    sessions: BTreeMap::new(),
-    sm_tail: Bytes::new(),
+    sessions_root: crate::block_address(&[]),
+    sm_root: crate::block_address(&[]),
     held_tail: false,
     successor: None,
     successor_prev_config_id: None,
+    checkpoint: crate::SyncCheckpoint::new(
+      crate::View::new(),
+      OpNumber::with(0),
+      0,
+      crate::Epoch::new(0),
+      0,
+      crate::ReplicaId::new(0),
+      0,
+      bytes::Bytes::new(),
+      bytes::Bytes::new(),
+    ),
+    donor: crate::ReplicaId::new(0),
   });
   // self.sync is None → violates clause (1)
   e.assert_invariants();

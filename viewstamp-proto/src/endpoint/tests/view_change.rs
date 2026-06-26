@@ -17,15 +17,17 @@ fn backup_transitions_on_svc_quorum_and_sends_dvc() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
-  e.handle_timeout(now, &mut wal, &mut sb); // status=Normal backup → bootstraps primary_idle; not yet due
+  e.handle_timeout(now, &mut wal, &mut sb, &mut blocks); // status=Normal backup → bootstraps primary_idle; not yet due
   let later = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb); // primary_idle due → on_primary_idle → broadcast SVC(view 1), own bit set
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // primary_idle due → on_primary_idle → broadcast SVC(view 1), own bit set
   assert_eq!(e.status(), Status::Normal); // 1 of 2 — not yet quorum
   e.handle_message(
     later,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -37,7 +39,7 @@ fn backup_transitions_on_svc_quorum_and_sends_dvc() {
   assert_eq!(e.status(), Status::ViewChange);
   assert_eq!(e.view(), View::with(1));
   // DoViewChange is deferred until the view is durable — pump storage first.
-  e.handle_storage(later, &mut wal, &mut sb);
+  e.handle_storage(later, &mut wal, &mut sb, &mut blocks);
   // it should have emitted a DoViewChange to primary(view 1) = replica 1 (itself).
   let mut saw_dvc = false;
   while let Some(out) = e.poll_message() {
@@ -60,17 +62,20 @@ fn new_primary_adopts_canonical_log_and_starts_view() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // drive it into ViewChange(view 1) first (reuse the SVC path):
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   ); // primary_idle → SVC(view1), own bit
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -109,6 +114,7 @@ fn new_primary_adopts_canonical_log_and_starts_view() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -118,7 +124,7 @@ fn new_primary_adopts_canonical_log_and_starts_view() {
   assert_eq!(e.view(), View::with(1));
   assert_eq!(e.op(), OpNumber::with(2));
   // StartView is deferred until the view is durable — pump storage first.
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   // It must broadcast a StartView carrying the canonical log.
   let mut saw_sv = false;
   while let Some(out) = e.poll_message() {
@@ -147,17 +153,20 @@ fn new_primary_carries_a_header_only_repairing_op_through_the_dvc_and_repairs_it
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // Drive replica 1 into ViewChange(view 1) as the prospective primary (reuse the SVC path).
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -199,6 +208,7 @@ fn new_primary_carries_a_header_only_repairing_op_through_the_dvc_and_repairs_it
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -227,7 +237,7 @@ fn new_primary_carries_a_header_only_repairing_op_through_the_dvc_and_repairs_it
   // A RequestPrepare(op 2) is emitted to fetch the canonical body from a peer that holds it. The
   // StartView the new primary broadcasts carries head op 2 as a HEADER-ONLY (`Repairing`) entry — its
   // existence + canonical body_checksum, but NO fabricated body (the body is peer-fetched).
-  e.handle_storage(now, &mut wal, &mut sb); // pump the deferred StartView / repair solicitation
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // pump the deferred StartView / repair solicitation
   let mut solicited = false;
   while let Some(out) = e.poll_message() {
     match out.msg_ref() {
@@ -262,10 +272,11 @@ fn new_primary_carries_a_header_only_repairing_op_through_the_dvc_and_repairs_it
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     repair_prepare(1, 2, 2),
   );
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::with(2),
@@ -299,16 +310,19 @@ fn new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -351,6 +365,7 @@ fn new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -371,7 +386,7 @@ fn new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_
   );
   // Pump the durable-view write + repair solicitation. op 2's body is absent, so it is a peer-repair
   // hole and a RequestPrepare(op 2) is emitted; the own vote is STILL absent (the body has not landed).
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     e.has_repair_hole_for_test(2),
     "op 2 is a peer-repair hole until its canonical body is fetched"
@@ -387,10 +402,11 @@ fn new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     repair_prepare(1, 2, 1), // commit 1 < op 2: accepted via the kept canonical-checksum path, not a vouch
   );
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   let own_bit = 1u64 << 1; // replica 1
   assert!(
     !e.has_repair_hole_for_test(2),
@@ -417,6 +433,7 @@ fn new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(PrepareOk::new(
       View::with(1),
@@ -494,10 +511,12 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     NoopSm,
   );
   let (mut wal1, mut sb1) = (TestWal::default(), TestSb::default());
+  let mut blocks1 = crate::block_store::MemBlockStore::new();
   r1.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal1,
     &mut sb1,
+    &mut blocks1,
   );
   // Drive replica 1 into ViewChange(view 1). SVC quorum for n=5 is 3: own bit (from primary_idle above)
   // + two peer SVCs.
@@ -505,6 +524,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     now,
     &mut wal1,
     &mut sb1,
+    &mut blocks1,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -517,6 +537,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     now,
     &mut wal1,
     &mut sb1,
+    &mut blocks1,
     Peer::Replica(ReplicaId::new(3)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -533,6 +554,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     now,
     &mut wal1,
     &mut sb1,
+    &mut blocks1,
     Peer::Replica(ReplicaId::new(3)),
     Message::DoViewChange(donor_dvc(3)),
   );
@@ -540,6 +562,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     now,
     &mut wal1,
     &mut sb1,
+    &mut blocks1,
     Peer::Replica(ReplicaId::new(4)),
     Message::DoViewChange(donor_dvc(4)),
   );
@@ -560,7 +583,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     "the commit is HELD at the body-absent Repairing op 3"
   );
   // Pump the durable-view write → `start_view_participate` broadcasts the StartView. Capture it.
-  r1.handle_storage(now, &mut wal1, &mut sb1);
+  r1.handle_storage(now, &mut wal1, &mut sb1, &mut blocks1);
   let sv = {
     let mut found = None;
     while let Some(out) = r1.poll_message() {
@@ -587,10 +610,12 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   r2.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(sv),
   );
@@ -631,6 +656,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(3)),
     Message::StartViewChange(StartViewChange::new(
       View::with(2),
@@ -643,6 +669,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(4)),
     Message::StartViewChange(StartViewChange::new(
       View::with(2),
@@ -654,7 +681,7 @@ fn committed_repairing_op_survives_a_second_view_change_before_repair() {
   assert_eq!(r2.status(), Status::ViewChange);
   assert_eq!(r2.view(), View::with(2));
   // Pump the durable-view write so the deferred DoViewChange is emitted.
-  r2.handle_storage(now, &mut wal, &mut sb);
+  r2.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   let r2_dvc = {
     let mut found = None;
     while let Some(out) = r2.poll_message() {
@@ -731,16 +758,19 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   ); // primary_idle → SVC(view1), own bit
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -778,6 +808,7 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -802,7 +833,7 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
   // Pump storage: the AdoptVote append for op 2 completes → on_wal_done sets the own vote; the
   // durable-view write completes → start_view_participate broadcasts StartView + try_commit. With a
   // 3-cluster quorum of 2, the lone own vote still cannot commit op 2.
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.inflight.get(&2).map(|i| i.oks),
     Some(own_bit),
@@ -824,6 +855,7 @@ fn new_primary_does_not_vote_for_an_adopted_op_before_its_wal_append() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(PrepareOk::new(
       View::with(1),
@@ -860,16 +892,19 @@ fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -905,13 +940,14 @@ fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
   // Pump until the AdoptVote append is durable (the own vote is recorded only then).
   let own_bit = 1u64 << 1;
   for _ in 0..4 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if e.inflight.get(&2).map(|i| i.oks) == Some(own_bit) {
       break;
     }
@@ -932,10 +968,11 @@ fn new_primary_adopted_vote_survives_crash_before_checkpoint() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   for _ in 0..16 {
-    recovered.handle_storage(now, &mut wal, &mut sb);
+    recovered.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !recovered.status().is_recovering() {
       break;
     }
@@ -964,6 +1001,7 @@ fn backup_adopted_ack_survives_crash_before_checkpoint() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let sv = StartView::new(
     View::with(1),
@@ -991,13 +1029,14 @@ fn backup_adopted_ack_survives_crash_before_checkpoint() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(sv),
   );
   // Pump until the PrepareOk for op 2 is emitted (which is gated on its AdoptAck append landing).
   let mut acked = false;
   for _ in 0..4 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     while let Some(out) = e.poll_message() {
       if let Message::PrepareOk(ok) = out.into_msg()
         && ok.op() == OpNumber::with(2)
@@ -1020,10 +1059,11 @@ fn backup_adopted_ack_survives_crash_before_checkpoint() {
     NoopSm,
     &mut wal,
     &mut sb,
+    &mut blocks,
   )
   .expect_active();
   for _ in 0..16 {
-    recovered.handle_storage(now, &mut wal, &mut sb);
+    recovered.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !recovered.status().is_recovering() {
       break;
     }
@@ -1056,6 +1096,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
   // no peer can supply the unique uncommitted op. The fix truncates the head at the first gap above
   // commit* BEFORE seeding, dropping the uncommitted suffix `{2, 3}`.
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
+  let mut blocks = crate::block_store::MemBlockStore::new();
   assert_eq!(r.op(), OpNumber::with(3), "recovered head is op 3");
   assert!(
     !r.log.contains_key(&2),
@@ -1074,6 +1115,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -1083,7 +1125,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
     )),
   );
   assert_eq!(r.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
-  r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // complete the SendDoViewChange durable-view write
   while r.poll_message().is_some() {}
   // Replica 2's DVC ALSO lacks op 2 (uncommitted+unique: no quorum holds it), same generation
   // (log_view 0), head 3, commit 0 → the offset-union still has the interior gap at op 2.
@@ -1091,6 +1133,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -1139,11 +1182,11 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
   );
 
   // Pump the StartViewAsPrimary durable-view write so the new primary begins participating.
-  r.handle_storage(now, &mut wal, &mut sb);
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while r.poll_message().is_some() {}
   // Land the AdoptVote append for the surviving tail op 1 (its own vote is recorded then).
   for _ in 0..4 {
-    r.handle_storage(now, &mut wal, &mut sb);
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
 
   // Liveness: a fresh client request is accepted (commit_max == commit_min == 0, repair empty) and —
@@ -1153,6 +1196,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -1166,7 +1210,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
     "the fresh client op fills the truncated head's next slot (op 2), not op 4"
   );
   for _ in 0..4 {
-    r.handle_storage(now, &mut wal, &mut sb); // land the fresh op's own-vote append
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the fresh op's own-vote append
   }
   // Both backups ack the surviving tail op 1 AND the fresh op 2 → each reaches the quorum of 2.
   for ack_op in [1u64, 2] {
@@ -1190,6 +1234,7 @@ fn new_primary_truncates_an_uncommitted_interior_canonical_log_gap() {
         now,
         &mut wal,
         &mut sb,
+        &mut blocks,
         Peer::Replica(ReplicaId::new(backup)),
         Message::PrepareOk(PrepareOk::new(
           View::with(1),
@@ -1220,12 +1265,14 @@ fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
   // and a peer-supplied (committed-vouching) Prepare fills it and resumes the held commit. This guards
   // the truncation from over-reaching into a committed op (which would silently drop it).
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
+  let mut blocks = crate::block_store::MemBlockStore::new();
   while r.poll_message().is_some() {}
   let now = Instant::ZERO;
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -1234,7 +1281,7 @@ fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
       0,
     )),
   );
-  r.handle_storage(now, &mut wal, &mut sb); // complete the SendDoViewChange durable-view write
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // complete the SendDoViewChange durable-view write
   while r.poll_message().is_some() {}
   // Replica 2's DVC: same generation (log_view 0), head 3, but commit 3 (it committed past op 2). Its
   // own offset log still lacks op 2, so the union has the gap at op 2 — but commit* now == 3.
@@ -1242,6 +1289,7 @@ fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -1289,16 +1337,17 @@ fn new_primary_does_not_truncate_a_committed_interior_gap_it_repairs_it() {
   // Pump the StartViewAsPrimary durable-view write, then a peer answers our RequestPrepare with op 2's
   // committed-vouching Prepare (commit 3 >= op 2) → fill the hole and resume the held commit to op 3.
   // The fill is a durability barrier: complete the repaired append before the hole clears.
-  r.handle_storage(now, &mut wal, &mut sb);
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while r.poll_message().is_some() {}
   r.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 3),
   );
-  r.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → clear hole + resume
+  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → clear hole + resume
   assert!(
     !r.has_repair_hole_for_test(2),
     "the committed-vouching Prepare fills the hole"
@@ -1320,16 +1369,19 @@ fn new_primary_reconstructs_sessions_so_retries_dedup() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   ); // primary_idle → SVC
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -1343,6 +1395,7 @@ fn new_primary_reconstructs_sessions_so_retries_dedup() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -1373,7 +1426,7 @@ fn new_primary_reconstructs_sessions_so_retries_dedup() {
   while e.poll_message().is_some() {}
   // The new primary deferred participation until its view is durable; pump storage so the
   // durable-view write completes and it may serve requests (durable-view-before-participate).
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
 
   // A retry of request 1 (already adopted+committed) must NOT create a new op (dedup, no re-exec).
@@ -1381,6 +1434,7 @@ fn new_primary_reconstructs_sessions_so_retries_dedup() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -1399,6 +1453,7 @@ fn new_primary_reconstructs_sessions_so_retries_dedup() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -1517,12 +1572,14 @@ fn stalled_view_change_escalates_to_the_next_view() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let t = Instant::ZERO + core::time::Duration::from_millis(300);
-  e.handle_timeout(t, &mut wal, &mut sb); // primary_idle → propose view 1 (own bit, 1/3)
+  e.handle_timeout(t, &mut wal, &mut sb, &mut blocks); // primary_idle → propose view 1 (own bit, 1/3)
   e.handle_message(
     t,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -1535,6 +1592,7 @@ fn stalled_view_change_escalates_to_the_next_view() {
     t,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -1548,12 +1606,13 @@ fn stalled_view_change_escalates_to_the_next_view() {
 
   // Stuck: fire view_change_status (~500ms after transition) → escalate, proposing view 2.
   let t2 = t + core::time::Duration::from_millis(600);
-  e.handle_timeout(t2, &mut wal, &mut sb);
+  e.handle_timeout(t2, &mut wal, &mut sb, &mut blocks);
   // Two peers also propose view 2 → quorum → transition to view 2.
   e.handle_message(
     t2,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(2),
@@ -1566,6 +1625,7 @@ fn stalled_view_change_escalates_to_the_next_view() {
     t2,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartViewChange(StartViewChange::new(
       View::with(2),
@@ -1588,6 +1648,7 @@ fn backup_adopts_start_view() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let sv = StartView::new(
     View::with(1),
@@ -1615,6 +1676,7 @@ fn backup_adopts_start_view() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(sv),
   );
@@ -1636,7 +1698,7 @@ fn backup_adopts_start_view() {
   // (2) the append completes → `on_wal_done` sends the PrepareOk. Pump until it appears (bounded).
   let mut acked_op2 = false;
   for _ in 0..4 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     while let Some(out) = e.poll_message() {
       if let Message::PrepareOk(ok) = out.into_msg()
         && ok.op() == OpNumber::with(2)
@@ -1672,6 +1734,7 @@ fn backup_adopts_start_view() {
 #[test]
 fn no_old_generation_state_survives_a_view_transition() {
   let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // (1) enter_view_change (the self-driven entry, reached here via the recovery wrapper that shares
@@ -1719,6 +1782,7 @@ fn no_old_generation_state_survives_a_view_transition() {
   e.adopt_canonical_head(
     now,
     &mut sb,
+    &mut blocks,
     View::with(1),
     OpNumber::with(1),
     OpNumber::with(0),
@@ -1749,11 +1813,13 @@ fn higher_view_prepare_triggers_get_view_catch_up() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::Prepare(Prepare::new(
       View::with(1),
@@ -1786,6 +1852,7 @@ fn higher_view_prepare_triggers_get_view_catch_up() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(StartView::new(
       View::with(1),
@@ -1831,11 +1898,13 @@ fn normal_primary_answers_get_view_with_start_view() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   assert_eq!(e.header_only_carriers_emitted(), 0, "no carrier built yet");
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::GetView(GetView::new(
       View::with(0),
@@ -1872,10 +1941,12 @@ fn lone_high_svc_is_ignored_not_driven() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(100),
@@ -1904,10 +1975,12 @@ fn on_start_view_rewind_below_commit_panics() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)), // primary of view 1
     Message::StartView(StartView::new(
       View::with(1),
@@ -1937,6 +2010,7 @@ fn on_start_view_rewind_below_commit_panics() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)), // primary of view 2
     Message::StartView(StartView::new(
       View::with(2),
@@ -1971,6 +2045,7 @@ fn adopting_a_canonical_head_truncates_the_wal_above_it() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // Seed the WAL with a stale uncommitted tail op 3 (as if appended in an earlier generation).
   let stale = Header::new(
@@ -2020,6 +2095,7 @@ fn adopting_a_canonical_head_truncates_the_wal_above_it() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(sv),
   );
@@ -2046,12 +2122,14 @@ fn dvc_is_deferred_until_view_is_durable() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
   e.handle_message(
     later,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -2077,7 +2155,7 @@ fn dvc_is_deferred_until_view_is_durable() {
     View::with(1),
     "new view submitted to the superblock"
   );
-  e.handle_storage(later, &mut wal, &mut sb);
+  e.handle_storage(later, &mut wal, &mut sb, &mut blocks);
   let mut saw_dvc_after = false;
   while let Some(out) = e.poll_message() {
     if let Message::DoViewChange(d) = out.into_msg() {
@@ -2111,16 +2189,18 @@ fn dvc_retransmit_waits_for_the_durable_view_write() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let mut now = Instant::ZERO;
   // Drive replica 0 into ViewChange(view 1) as a DRIVER (primary(1) = replica 1, a peer): its own
   // idle-SVC + replica 2's SVC meet the SVC quorum (2), so `enter_view_change` fires.
-  e.handle_timeout(now, &mut wal, &mut sb); // bootstrap primary_idle
+  e.handle_timeout(now, &mut wal, &mut sb, &mut blocks); // bootstrap primary_idle
   now = now + core::time::Duration::from_millis(300);
-  e.handle_timeout(now, &mut wal, &mut sb); // primary_idle due → propose view 1 (own SVC)
+  e.handle_timeout(now, &mut wal, &mut sb, &mut blocks); // primary_idle due → propose view 1 (own SVC)
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -2145,7 +2225,7 @@ fn dvc_retransmit_waits_for_the_durable_view_write() {
   // the view stays non-durable across every retransmit deadline.
   for _ in 0..6 {
     now = now + VC_MESSAGE_RETRANSMIT;
-    e.handle_timeout(now, &mut wal, &mut sb);
+    e.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
     assert!(
       e.pending_sb_for_test(),
       "the view write is still inflight across the retransmit cadence"
@@ -2160,7 +2240,7 @@ fn dvc_retransmit_waits_for_the_durable_view_write() {
 
   // Now make the view durable: the deferred initial DVC fires from `on_sb_done`.
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   let mut saw_dvc_after = false;
   while let Some(out) = e.poll_message() {
     if let Message::DoViewChange(d) = out.into_msg() {
@@ -2176,7 +2256,7 @@ fn dvc_retransmit_waits_for_the_durable_view_write() {
 
   // And the retransmit cadence RESUMES now that the view is durable.
   now = now + VC_MESSAGE_RETRANSMIT;
-  e.handle_timeout(now, &mut wal, &mut sb);
+  e.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
   let mut saw_dvc_retransmit = false;
   while let Some(out) = e.poll_message() {
     if matches!(out.into_msg(), Message::DoViewChange(_)) {
@@ -2199,12 +2279,14 @@ fn superseded_view_write_is_ignored() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let t = Instant::ZERO + core::time::Duration::from_millis(300);
-  e.handle_timeout(t, &mut wal, &mut sb);
+  e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
   e.handle_message(
     t,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -2217,6 +2299,7 @@ fn superseded_view_write_is_ignored() {
     t,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -2228,11 +2311,12 @@ fn superseded_view_write_is_ignored() {
   assert_eq!(e.view(), View::with(1));
   while e.poll_message().is_some() {}
   let t2 = t + core::time::Duration::from_millis(600);
-  e.handle_timeout(t2, &mut wal, &mut sb);
+  e.handle_timeout(t2, &mut wal, &mut sb, &mut blocks);
   e.handle_message(
     t2,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(2),
@@ -2245,6 +2329,7 @@ fn superseded_view_write_is_ignored() {
     t2,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartViewChange(StartViewChange::new(
       View::with(2),
@@ -2255,7 +2340,7 @@ fn superseded_view_write_is_ignored() {
   );
   assert_eq!(e.view(), View::with(2));
   while e.poll_message().is_some() {}
-  e.handle_storage(t2, &mut wal, &mut sb);
+  e.handle_storage(t2, &mut wal, &mut sb, &mut blocks);
   let mut dvc_views = std::vec::Vec::new();
   while let Some(out) = e.poll_message() {
     if let Message::DoViewChange(d) = out.into_msg() {
@@ -2281,6 +2366,7 @@ fn backup_does_not_prepare_ok_before_start_view_is_durable() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let sv = StartView::new(
     View::with(1),
@@ -2308,6 +2394,7 @@ fn backup_does_not_prepare_ok_before_start_view_is_durable() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(sv),
   );
@@ -2322,7 +2409,7 @@ fn backup_does_not_prepare_ok_before_start_view_is_durable() {
   // arrives after two sequential storage steps (durable-view → submit append; append → PrepareOk).
   let mut acked_op2 = false;
   for _ in 0..4 {
-    e.handle_storage(now, &mut wal, &mut sb);
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     while let Some(out) = e.poll_message() {
       if let Message::PrepareOk(ok) = out.into_msg()
         && ok.op() == OpNumber::with(2)
@@ -2357,6 +2444,7 @@ fn new_prepare_not_acked_while_view_write_pending() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // Adopt a StartView for view 1 with op 1 fully committed (no held re-acks to muddy the assertion).
   let sv = StartView::new(
@@ -2377,6 +2465,7 @@ fn new_prepare_not_acked_while_view_write_pending() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(sv),
   );
@@ -2399,10 +2488,11 @@ fn new_prepare_not_acked_while_view_write_pending() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     prep2(),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // drains the StartView write; would pump op 2 if accepted
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drains the StartView write; would pump op 2 if accepted
   let mut acked_op2 = false;
   while let Some(out) = e.poll_message() {
     if let Message::PrepareOk(ok) = out.into_msg()
@@ -2420,10 +2510,11 @@ fn new_prepare_not_acked_while_view_write_pending() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     prep2(),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // append-before-ack: pump the WAL append
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // append-before-ack: pump the WAL append
   let mut acked_after = false;
   while let Some(out) = e.poll_message() {
     if let Message::PrepareOk(ok) = out.into_msg()
@@ -2448,12 +2539,14 @@ fn new_primary_does_not_answer_get_view_while_its_view_write_is_pending() {
   // window. PASS-AFTER: silent in the window; the deferred `StartView` fires once the view is
   // durable, and a later `GetView` is then answered.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // A peer solicits the canonical head for view 1 — delivered WHILE the view write is pending.
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::GetView(GetView::new(
       View::with(1),
@@ -2475,7 +2568,7 @@ fn new_primary_does_not_answer_get_view_while_its_view_write_is_pending() {
   );
   // Make the view durable: the deferred StartView broadcast fires now (start_view_participate).
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.pending_sb_for_test(),
     "the view is now durable (pending_sb cleared)"
@@ -2496,6 +2589,7 @@ fn new_primary_does_not_answer_get_view_while_its_view_write_is_pending() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::GetView(GetView::new(
       View::with(1),
@@ -2524,11 +2618,13 @@ fn new_primary_does_not_answer_recovery_while_its_view_write_is_pending() {
   // the not-yet-durable view. FAIL-BEFORE: a `RecoveryResponse` appears in the window. PASS-AFTER:
   // silent in the window; once the view is durable a Recovery is answered normally.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::Recovery(Recovery::new(
       ReplicaId::new(2),
@@ -2549,12 +2645,13 @@ fn new_primary_does_not_answer_recovery_while_its_view_write_is_pending() {
   );
   // Make the view durable, then a fresh Recovery IS answered (with the canonical head).
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {} // discard the deferred StartView broadcast
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::Recovery(Recovery::new(
       ReplicaId::new(2),
@@ -2584,15 +2681,16 @@ fn new_primary_does_not_heartbeat_or_retransmit_while_its_view_write_is_pending(
   // yet durable. FAIL-BEFORE: a `Commit`/`Prepare` appears when `primary_timeouts` fires in the
   // window. PASS-AFTER: silent in the window; heartbeats resume once the view is durable.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   // Tick the primary TWICE while the view write is still pending: the first tick would BOOTSTRAP the
   // commit/prepare timers (the deferred `start_view_participate` has not armed them yet), the second
   // — well past those deadlines — would FIRE the heartbeat/retransmit if the gate were absent. Both
   // ticks happen entirely inside the pending_sb window (we never flush the superblock between them),
   // exactly the multi-tick window a real driver leaves open. Nothing must be emitted in either.
   let later = Instant::ZERO + core::time::Duration::from_secs(5);
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
   let later_fire = later + core::time::Duration::from_secs(1); // >> COMMIT_HEARTBEAT/PREPARE_RETRANSMIT
-  e.handle_timeout(later_fire, &mut wal, &mut sb);
+  e.handle_timeout(later_fire, &mut wal, &mut sb, &mut blocks);
   let mut emitted_in_window = false;
   while let Some(out) = e.poll_message() {
     if matches!(
@@ -2612,10 +2710,10 @@ fn new_primary_does_not_heartbeat_or_retransmit_while_its_view_write_is_pending(
   );
   // Once the view is durable, the heartbeat resumes (start_view_participate arms the timers).
   sb.flush();
-  e.handle_storage(later_fire, &mut wal, &mut sb);
+  e.handle_storage(later_fire, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {} // discard the deferred StartView
   let later2 = later_fire + core::time::Duration::from_secs(5);
-  e.handle_timeout(later2, &mut wal, &mut sb);
+  e.handle_timeout(later2, &mut wal, &mut sb, &mut blocks);
   let mut heartbeat_after = false;
   while let Some(out) = e.poll_message() {
     if matches!(out.msg_ref(), Message::Commit(_)) {
@@ -2640,6 +2738,7 @@ fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
   // `Prepare` appears in the window. PASS-AFTER: silent in the window; once the view is durable the same
   // `RequestPrepare` IS answered with a `Prepare` carrying the now-durable view.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(
     e.commit(),
@@ -2651,6 +2750,7 @@ fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::with(1),
@@ -2676,7 +2776,7 @@ fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
   // Make the view durable (this fires the deferred StartView broadcast — discard it), then the SAME
   // RequestPrepare IS answered with a Prepare carrying the now-durable view 1.
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.pending_sb_for_test(),
     "the view is now durable (pending_sb cleared)"
@@ -2686,6 +2786,7 @@ fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::with(1),
@@ -2729,6 +2830,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   // PASS-AFTER: silent in the window; once the view is durable the same `RequestSync` IS answered with
   // a `SyncCheckpoint` carrying the now-durable view.
   let (mut e, mut wal, mut sb) = primed_new_primary_in_pending_view_window();
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // Give this primed primary a DURABLE checkpoint to serve: a `checkpoint_op` of 1 (a committed op it
   // holds — its `commit_min` is 1) and a readable snapshot envelope in the StepSb at that op. The
@@ -2758,6 +2860,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestSync(crate::RequestSync::new(
       View::with(1),
@@ -2771,7 +2874,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   // Pump storage so the checkpoint read completes (StepSb serves reads eagerly into `ready`) and
   // `serve_sync_checkpoint` runs — but WITHOUT flushing the inflight view write, so the window stays
   // open. The serve must DROP (no SyncCheckpoint) because our view is not yet durable.
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   let mut sync_checkpoint_in_window = false;
   while let Some(out) = e.poll_message() {
     if matches!(out.msg_ref(), Message::SyncCheckpoint(_)) {
@@ -2789,16 +2892,13 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
   // Make the view durable (this fires the deferred StartView broadcast — discard it), then the SAME
   // RequestSync IS answered with a SyncCheckpoint carrying the now-durable view 1.
   sb.flush();
-  e.handle_storage(now, &mut wal, &mut sb);
-  assert!(
-    !e.pending_sb_for_test(),
-    "the view is now durable (pending_sb cleared)"
-  );
   // The flushed view-1 root was SUBMITTED by the shared harness before the checkpoint was injected
-  // (when the durable root was `initial()`), so the StepSb published it with checkpoint_id 0 — a harness
-  // artifact: the real `submit_durable_view` PRESERVES the durable checkpoint id (see its doc-comment).
-  // Re-establish the proto-correct durable root (now at view 1, still naming the op-1 checkpoint) so the
-  // The integrity gate sees the genuine durable id the post-flush serve must match.
+  // (when the durable root was `initial()`), so the StepSb published it with checkpoint_op/id 0 — a
+  // harness artifact: the real `submit_durable_view` PRESERVES the durable checkpoint (see its doc).
+  // Re-establish the proto-correct durable root (now at view 1, still naming the op-1 checkpoint) BEFORE
+  // draining storage, so the durable `checkpoint_op` matches the in-memory `checkpoint_op == 1` the
+  // settled-frontier invariant (`assert_invariants` exit) checks — and so the integrity gate sees the
+  // genuine durable id the post-flush serve must match.
   sb.state = VsrState::try_new(
     View::with(1),
     View::with(1),
@@ -2808,11 +2908,17 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
     std::vec::Vec::new(),
   )
   .expect("durable root: commit == checkpoint_op, log_view <= view");
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    !e.pending_sb_for_test(),
+    "the view is now durable (pending_sb cleared)"
+  );
   while e.poll_message().is_some() {} // discard the deferred StartView broadcast
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestSync(crate::RequestSync::new(
       View::with(1),
@@ -2823,7 +2929,7 @@ fn serve_sync_checkpoint_does_not_serve_during_the_durable_view_window() {
       0,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // the checkpoint read completes → ship SyncCheckpoint
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the checkpoint read completes → ship SyncCheckpoint
   let mut served = false;
   while let Some(out) = e.poll_message() {
     if let Message::SyncCheckpoint(s) = out.msg_ref() {
@@ -2896,12 +3002,14 @@ fn view_change_abandons_an_outstanding_sync() {
   // behind.
   let mut e = sync_backup();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // Trigger a sync (in view 0).
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -2918,6 +3026,7 @@ fn view_change_abandons_an_outstanding_sync() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::Commit(Commit::new(
       View::with(1),
@@ -3273,6 +3382,7 @@ fn laggard_adopter_of_a_floored_start_view_trims_its_ancient_band_and_state_sync
     );
   }
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // The floored canonical StartView from view 1's primary: floor 600, band 601..=605 (head 605,
   // commit 605). The adopter's whole world (1..=6) is below the floor.
@@ -3300,6 +3410,7 @@ fn laggard_adopter_of_a_floored_start_view_trims_its_ancient_band_and_state_sync
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(sv),
   );
@@ -3323,7 +3434,7 @@ fn laggard_adopter_of_a_floored_start_view_trims_its_ancient_band_and_state_sync
     "the known-committed frontier is learned from the canonical head"
   );
   // Pump the durable-view write (start_view_acks has no uncommitted tail to re-ack here).
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   // (2b) The ESCAPE engages: a Commit heartbeat re-registers the sub-floor hole and the force-sync
   // escalation fires — its floor includes the adoption-raised `log_floor`, so the hole at op 7
@@ -3333,6 +3444,7 @@ fn laggard_adopter_of_a_floored_start_view_trims_its_ancient_band_and_state_sync
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::Commit(crate::Commit::new(
       View::with(1),
@@ -3422,6 +3534,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
     );
   }
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // The canonical StartView for view 1 from primary 1: an OFFSET log starting at op 9 (head 10),
   // commit 8. It does NOT carry ops 5..=8.
@@ -3451,6 +3564,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(sv),
   );
@@ -3483,10 +3597,11 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Replica(ReplicaId::new(1)),
       repair_prepare(1, op, 8),
     );
-    e.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + register next hole
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + register next hole
   }
   assert_eq!(
     e.commit(),
@@ -3556,6 +3671,7 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
   // op 7,8 are also in the (commit_min .. commit] band and OMITTED below; they ride the same repair
   // path. Give the adopter NO held copy for them, so they are pure holes filled only from the peer.
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // The canonical offset StartView for view 1 (head 10, commit 8) starts at op 9 — it OMITS 5,6,7,8.
   let sv = StartView::new(
@@ -3584,6 +3700,7 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::StartView(sv),
   );
@@ -3626,10 +3743,11 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
       now,
       &mut wal,
       &mut sb,
+      &mut blocks,
       Peer::Replica(ReplicaId::new(1)),
       repair_prepare(1, op, 8),
     );
-    e.handle_storage(now, &mut wal, &mut sb); // the repaired append completes → apply + register next hole
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + register next hole
   }
   assert!(
     e.repair.is_empty(),
@@ -3676,16 +3794,19 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -3727,10 +3848,11 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // durable-view write → start_view_participate; repair solicit
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // durable-view write → start_view_participate; repair solicit
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
   assert_eq!(e.op(), OpNumber::with(2), "op 2's number is taken (head 2)");
@@ -3750,6 +3872,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -3765,7 +3888,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
   // RequestPrepare, so it never fills. We fire timeouts repeatedly across virtual time; the grace MUST be
   // virtual-time, not tick-gated, so only advancing the clock past the deadline truncates.
   let before_grace = now + (REPAIR_OR_TRUNCATE_GRACE - core::time::Duration::from_millis(1));
-  e.handle_timeout(before_grace, &mut wal, &mut sb);
+  e.handle_timeout(before_grace, &mut wal, &mut sb, &mut blocks);
   assert!(
     e.has_repair_hole_for_test(2),
     "before the grace deadline the candidate is still held + repaired (never truncated early)"
@@ -3777,7 +3900,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
   );
   // Now advance PAST the grace deadline → the candidate is truncated and the tail above it is dropped.
   let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
-  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  e.handle_timeout(after_grace, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.has_repair_hole_for_test(2),
     "the grace elapsed with the body absent → the uncommitted op 2 is truncated, the hole clears"
@@ -3799,6 +3922,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     after_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -3806,7 +3930,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
       Bytes::from_static(b"x"),
     )),
   );
-  e.handle_storage(after_grace, &mut wal, &mut sb); // the own append lands → own vote
+  e.handle_storage(after_grace, &mut wal, &mut sb, &mut blocks); // the own append lands → own vote
   assert_eq!(
     e.op(),
     OpNumber::with(2),
@@ -3823,6 +3947,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     after_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(PrepareOk::new(
       View::with(1),
@@ -3845,6 +3970,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     after_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::PrepareOk(PrepareOk::new(
       View::with(1),
@@ -3882,16 +4008,19 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -3930,10 +4059,11 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(2));
   assert!(
     e.has_repair_hole_for_test(2),
@@ -3948,10 +4078,11 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
     within_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     repair_prepare(1, 2, 1),
   );
-  e.handle_storage(within_grace, &mut wal, &mut sb);
+  e.handle_storage(within_grace, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.has_repair_hole_for_test(2),
     "the canonical body filled the hole within the grace"
@@ -3962,7 +4093,7 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
   );
   // Now fire timeouts PAST the grace deadline: the op must NOT be truncated — the Present fill cancelled it.
   let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
-  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  e.handle_timeout(after_grace, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(2),
@@ -3977,6 +4108,7 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
     after_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(PrepareOk::new(
       View::with(1),
@@ -4069,15 +4201,18 @@ fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_gra
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -4091,6 +4226,7 @@ fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_gra
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -4116,7 +4252,7 @@ fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_gra
       ],
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(2), "op 2 is TAKEN (head 2)");
   assert!(
     e.has_repair_hole_for_test(2),
@@ -4130,17 +4266,18 @@ fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_gra
     within_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     repair_prepare(1, 2, 1),
   );
-  e.handle_storage(within_grace, &mut wal, &mut sb);
+  e.handle_storage(within_grace, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.has_repair_hole_for_test(2),
     "op 2 is filled within the grace (a Present holder answered)"
   );
   // Past the grace deadline: op 2 is KEPT — a Present holder vouched its body, so it is never truncated.
   let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
-  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  e.handle_timeout(after_grace, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(2),
@@ -4169,16 +4306,19 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -4219,10 +4359,11 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // durable-view write → repair solicit + grace armed
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // durable-view write → repair solicit + grace armed
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
   assert_eq!(e.op(), OpNumber::with(2), "op 2's number is TAKEN (head 2)");
@@ -4240,6 +4381,7 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
     before_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     repair_prepare(1, 2, 1), // commit 1 < op 2: accepted via the kept canonical-checksum path
   );
@@ -4255,7 +4397,7 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
   // truncates op 2 (still `Repairing` above commit_max) → drops a committed op whose body was found in
   // time. After the fix the in-flight fill is treated as body-present → op 2 is KEPT.
   let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
-  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  e.handle_timeout(after_grace, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(2),
@@ -4267,7 +4409,7 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
   );
   // Drain the in-flight append: the staged canonical body lands durably → op 2 becomes Present, the
   // hole clears, and the primary casts its own vote (append-before-ack). The op was applied, not lost.
-  e.handle_storage(after_grace, &mut wal, &mut sb);
+  e.handle_storage(after_grace, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.has_repair_hole_for_test(2),
     "the repair hole clears once the staged body lands durably (after the grace)"
@@ -4286,6 +4428,7 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
     after_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::PrepareOk(PrepareOk::new(
       View::with(1),
@@ -4319,16 +4462,19 @@ fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -4369,6 +4515,7 @@ fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -4385,7 +4532,7 @@ fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
   );
   // A direct `handle_timeout` PAST the grace must NOT truncate while `pending_sb` holds.
   let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
-  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  e.handle_timeout(after_grace, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(2),
@@ -4402,13 +4549,14 @@ fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
   // The deadline is PRESERVED for the post-window tick: drain the durable-view write (the view becomes
   // durable, `pending_sb` clears), then a tick past the grace truncates the still-absent candidate —
   // proving the gate suspended (not dropped) the grace.
-  e.handle_storage(after_grace, &mut wal, &mut sb);
+  e.handle_storage(after_grace, &mut wal, &mut sb, &mut blocks);
   assert!(!e.pending_sb_for_test(), "the view is now durable");
   while e.poll_message().is_some() {}
   e.handle_timeout(
     after_grace + core::time::Duration::from_millis(1),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   assert_eq!(
     e.op(),
@@ -4433,16 +4581,19 @@ fn repair_or_truncate_does_not_fire_in_pending_forfeit_window() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -4480,12 +4631,13 @@ fn repair_or_truncate_does_not_fire_in_pending_forfeit_window() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
   // Make the view durable (clears `pending_sb`), so the ONLY non-serviceable cause under test is the
   // forfeit latch — the candidate + its armed grace persist.
-  e.handle_storage(now, &mut wal, &mut sb);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
   assert!(!e.pending_sb_for_test(), "the view is durable");
@@ -4501,7 +4653,7 @@ fn repair_or_truncate_does_not_fire_in_pending_forfeit_window() {
   );
   // A direct `handle_timeout` PAST the grace must NOT truncate while stepping down.
   let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
-  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  e.handle_timeout(after_grace, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(2),
@@ -4535,16 +4687,19 @@ fn uncommitted_candidate_does_not_forfeit_and_truncation_fires_at_the_grace_poll
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -4582,10 +4737,11 @@ fn uncommitted_candidate_does_not_forfeit_and_truncation_fires_at_the_grace_poll
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // make the view durable + arm the grace
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // make the view durable + arm the grace
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
   assert_eq!(e.op(), OpNumber::with(2), "op 2's number is TAKEN (head 2)");
@@ -4610,8 +4766,8 @@ fn uncommitted_candidate_does_not_forfeit_and_truncation_fires_at_the_grace_poll
       "poll_timeout must return a strictly-future serviceable deadline (no spin)"
     );
     clock = next;
-    e.handle_timeout(clock, &mut wal, &mut sb);
-    e.handle_storage(clock, &mut wal, &mut sb);
+    e.handle_timeout(clock, &mut wal, &mut sb, &mut blocks);
+    e.handle_storage(clock, &mut wal, &mut sb, &mut blocks);
     assert!(
       !e.pending_forfeit_for_test(),
       "the above-commit* candidate must NEVER latch pending_forfeit (it is resolved by truncation)"
@@ -4673,16 +4829,19 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -4728,10 +4887,11 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // durable-view write → solicit ops 2 + 3, arm the grace
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // durable-view write → solicit ops 2 + 3, arm the grace
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
   assert_eq!(e.op(), OpNumber::with(3), "head 3 (ops 2 + 3 taken)");
@@ -4750,6 +4910,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
     before_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     repair_prepare(1, 3, 1), // commit 1 < op 3: accepted via the kept canonical-checksum path
   );
@@ -4765,7 +4926,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
   // The grace fires past the deadline: the gap is op 2 (op 3 is `appending`, excluded), so the suffix
   // `[2 ..= 3]` truncates — INCLUDING op 3, whose RepairFill append is still in flight.
   let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
-  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  e.handle_timeout(after_grace, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(1),
@@ -4787,7 +4948,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
   // The WAL completion for op 3's now-abandoned append is STILL queued (it was staged before the
   // truncation). Delivering it must NOT resurrect op 3 into `self.log` above the lowered `self.op`, nor
   // cast any vote/commit — the abandoned completion finds no `pending` entry and is a no-op.
-  e.handle_storage(after_grace, &mut wal, &mut sb);
+  e.handle_storage(after_grace, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.has_log_entry_for_test(3),
     "the abandoned RepairFill completion does NOT resurrect op 3 into self.log above self.op \
@@ -4810,6 +4971,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
     after_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -4817,7 +4979,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
       Bytes::from_static(b"x"),
     )),
   );
-  e.handle_storage(after_grace, &mut wal, &mut sb); // the own append lands → own vote
+  e.handle_storage(after_grace, &mut wal, &mut sb, &mut blocks); // the own append lands → own vote
   assert_eq!(
     e.op(),
     OpNumber::with(2),
@@ -4827,6 +4989,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
     after_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::PrepareOk(PrepareOk::new(
       View::with(1),
@@ -4870,16 +5033,19 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   e.handle_timeout(
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -4919,10 +5085,11 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
-  e.handle_storage(now, &mut wal, &mut sb); // make the view durable + arm the grace
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // make the view durable + arm the grace
   assert_eq!(e.status(), Status::Normal);
   assert!(e.is_primary());
   assert_eq!(e.op(), OpNumber::with(2), "op 2's number is TAKEN (head 2)");
@@ -4943,7 +5110,7 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
   // No peer answers op 2's RequestPrepare; the grace truncates the body-absent op 2.
   while e.poll_message().is_some() {}
   let after_grace = now + REPAIR_OR_TRUNCATE_GRACE + core::time::Duration::from_millis(1);
-  e.handle_timeout(after_grace, &mut wal, &mut sb);
+  e.handle_timeout(after_grace, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(1),
@@ -4966,6 +5133,7 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
     after_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -4995,11 +5163,12 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
     other => panic!("expected a Prepare for the re-minted request, got {other:?}"),
   }
   // And it commits on a backup ack — the client gets a reply, proving the hang is gone.
-  e.handle_storage(after_grace, &mut wal, &mut sb); // the own append lands → own vote
+  e.handle_storage(after_grace, &mut wal, &mut sb, &mut blocks); // the own append lands → own vote
   e.handle_message(
     after_grace,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::PrepareOk(PrepareOk::new(
       View::with(1),
@@ -5303,6 +5472,7 @@ fn new_primary_session_backfill_over_a_floored_log_matches_the_dense_scan() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   // Into ViewChange for view 1 (replica 1 is its primary): the idle timeout proposes, r0's SVC
   // completes the quorum.
@@ -5310,11 +5480,13 @@ fn new_primary_session_backfill_over_a_floored_log_matches_the_dense_scan() {
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
+    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -5353,6 +5525,7 @@ fn new_primary_session_backfill_over_a_floored_log_matches_the_dense_scan() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(dvc),
   );
@@ -5423,12 +5596,14 @@ fn implausible_view_claims_are_ignored_and_the_replica_stays_serviceable() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let absurd = View::with(u64::MAX);
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::Commit(Commit::new(
       absurd,
@@ -5442,6 +5617,7 @@ fn implausible_view_claims_are_ignored_and_the_replica_stays_serviceable() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::Prepare(Prepare::new(
       absurd,
@@ -5459,6 +5635,7 @@ fn implausible_view_claims_are_ignored_and_the_replica_stays_serviceable() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::PrepareOk(PrepareOk::new(
       absurd,
@@ -5487,6 +5664,7 @@ fn implausible_view_claims_are_ignored_and_the_replica_stays_serviceable() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::Commit(Commit::new(
       View::with(2),
@@ -5511,6 +5689,7 @@ fn view_jump_clamp_accepts_the_bound_and_rejects_just_above_it() {
   // view 0; primary(2^32) = replica 1 and primary(2^32 + 1) = replica 2 (2^32 ≡ 1 mod 3), so both
   // claims pass the Commit sender binding and the difference below is the clamp alone.
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
   // One past the bound: rejected (stays Normal at view 0).
@@ -5524,6 +5703,7 @@ fn view_jump_clamp_accepts_the_bound_and_rejects_just_above_it() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::Commit(Commit::new(
       View::with(MAX_VIEW_JUMP + 1),
@@ -5551,6 +5731,7 @@ fn view_jump_clamp_accepts_the_bound_and_rejects_just_above_it() {
     now,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::Commit(Commit::new(
       View::with(MAX_VIEW_JUMP),
@@ -5582,6 +5763,7 @@ fn svc_and_get_view_at_view_max_neither_panic_nor_wrap() {
     NoopSm,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   e.view = View::with(u64::MAX);
   e.log_view = View::with(u64::MAX);
   e.svc_target = View::with(u64::MAX);
@@ -5589,6 +5771,7 @@ fn svc_and_get_view_at_view_max_neither_panic_nor_wrap() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(u64::MAX),
@@ -5603,6 +5786,7 @@ fn svc_and_get_view_at_view_max_neither_panic_nor_wrap() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
+    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::GetView(GetView::new(
       View::with(u64::MAX),
