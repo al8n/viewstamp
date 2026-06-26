@@ -3340,6 +3340,20 @@ impl<S, R> Endpoint<S, R> {
     self.block_fetch.as_ref().map(|bf| bf.donor.get())
   }
 
+  /// Test-only debug snapshot of the install/sync obligation state:
+  /// `(pending_install checkpoint_op, pending_checkpoint target_op, pending_sb, sync target,
+  /// sm_reconstruct_owed)`. Not part of the stable API.
+  #[doc(hidden)]
+  pub fn debug_install_state(&self) -> (Option<u64>, Option<u64>, bool, Option<u64>, bool) {
+    (
+      self.pending_install.as_ref().map(|p| p.checkpoint_op.get()),
+      self.pending_checkpoint.as_ref().map(|p| p.target_op.get()),
+      self.pending_sb.is_some(),
+      self.sync.as_ref().map(|s| s.target.get()),
+      self.sm_reconstruct_owed(),
+    )
+  }
+
   /// Test-only: does the live block-fetch's pinned checkpoint actually PRESENT a cross-epoch crossing
   /// (foreign config + non-empty membership)? `None` when no fetch is in flight. The crossing-answer
   /// predicates shield a stale `cross_epoch_intent` only on a `true` here, NOT on the bare fetch presence.

@@ -2014,6 +2014,14 @@ impl Cluster {
     self.replicas[i].block_fetch_donor()
   }
 
+  #[doc(hidden)]
+  pub fn replica_debug_install_state(
+    &self,
+    i: usize,
+  ) -> (Option<u64>, Option<u64>, bool, Option<u64>, bool) {
+    self.replicas[i].debug_install_state()
+  }
+
   /// Test-only: the byte length of replica `i`'s LIVE ROOTED checkpoint envelope (exactly the bytes
   /// a state-sync serve would carry), or `None` when no checkpoint has been rooted. The
   /// large-snapshot gate compares this against `max_unchunked_snapshot_len()` to assert the

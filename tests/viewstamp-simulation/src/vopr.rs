@@ -3068,8 +3068,9 @@ impl Vopr {
       }
     }
     for (i, log) in logs.iter().enumerate() {
+      let (pi, pc, psb, sync, smr) = c.replica_debug_install_state(i);
       eprintln!(
-        "  replica {i}: crashed={} retired={} status={} epoch={} view={} op={} commit_min={} commit_max={} checkpoint_op={} applied_len={}",
+        "  replica {i}: crashed={} retired={} status={} epoch={} view={} op={} commit_min={} commit_max={} checkpoint_op={} applied_len={} pending_install={pi:?} pending_checkpoint={pc:?} pending_sb={psb} sync_target={sync:?} sm_reconstruct={smr} fetch_donor={:?}",
         c.is_crashed(i),
         c.is_retired(i),
         c.replica_status_str(i),
@@ -3080,6 +3081,7 @@ impl Vopr {
         c.replica_commit_max(i).get(),
         c.replica_checkpoint_op(i).get(),
         log.len(),
+        c.replica_sync_transfer_donor(i),
       );
     }
     let lo = diverge_at.saturating_sub(2);
