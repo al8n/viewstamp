@@ -633,7 +633,7 @@ fn bounded_wal_backup_below_ring_window_state_syncs_instead_of_overwriting() {
   // sub-floor holes at adoption — so the overflow confluence is rare and seed-specific, and the sync
   // the overflow rides is typically armed by the SAME delivery's carried floor a moment before the
   // ring guard runs.)
-  const PROVOKING_SEEDS: [u64; 3] = [7, 8, 13];
+  const PROVOKING_SEEDS: [u64; 3] = [1, 11, 13];
   let mut total_below_ring_window_syncs = 0u64;
   for seed in PROVOKING_SEEDS {
     // N=5 (a 4-of-5 quorum always commits + checkpoints), a SMALL checkpoint interval (4) and a SMALL ring
@@ -732,5 +732,56 @@ fn bounded_wal_backup_below_ring_window_state_syncs_instead_of_overwriting() {
     total_below_ring_window_syncs > 0,
     "VACUOUS — no backup hit the below-ring-window state-sync path across the provoking seeds \
      (total below_ring_window_syncs == 0); the connected backup-overflow case was never exercised."
+  );
+}
+
+/// Offline harness (ignored) to re-derive [`PROVOKING_SEEDS`] for the below-ring-window gate when a proto
+/// change shifts the deterministic schedule so the pinned seeds stop provoking the overflow. Runs the same
+/// `N=5 / interval=4 / ring=12 / drop=300 / flap-5000-2500` scenario across a seed range and prints the
+/// seeds whose connected backup-overflow fired (`below_ring_window_syncs > 0`). Run with
+/// `cargo test -p viewstamp-simulation --test bounded_wal zz_scan_below_ring_window_provoking_seeds -- --ignored --nocapture`,
+/// then paste the first three printed seeds into `PROVOKING_SEEDS`.
+#[test]
+#[ignore = "offline seed-derivation harness; run with --ignored --nocapture"]
+fn zz_scan_below_ring_window_provoking_seeds() {
+  let mut provoking = std::vec::Vec::new();
+  for seed in 0..256u64 {
+    let mut c = Cluster::with_checkpoint_ops(5, 4, 60, seed, 4);
+    c.set_wal_capacity(Some(12));
+    c.set_faults(Faults {
+      latency: Duration::from_millis(1),
+      jitter: Duration::from_millis(3),
+      drop_per_mille: 300,
+      duplicate_per_mille: 100,
+      hold_per_mille: 0,
+    });
+    let mut fired = false;
+    for step in 0..40_000u64 {
+      if step % 5000 == 0 {
+        c.partition(vec![0, 0, 1, 0, 0]);
+      } else if step % 5000 == 2500 {
+        c.heal();
+      }
+      c.tick();
+      let syncs: u64 = (0..c.replica_count())
+        .map(|r| c.replica_below_ring_window_syncs(r))
+        .sum();
+      if syncs > 0 {
+        fired = true;
+        break;
+      }
+    }
+    if fired {
+      provoking.push(seed);
+      if provoking.len() >= 8 {
+        break;
+      }
+    }
+  }
+  println!("PROVOKING_SEEDS (below-ring-window): {provoking:?}");
+  assert!(
+    provoking.len() >= 3,
+    "found fewer than 3 provoking seeds in 0..256 — the scenario may have changed shape; widen the scan \
+     or revisit the fault/flap parameters"
   );
 }

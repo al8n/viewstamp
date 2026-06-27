@@ -845,4 +845,56 @@ fn on_commit_records_the_primary_checkpoint_monotonically() {
   );
 }
 
+#[test]
+fn committed_session_projection_drops_provisionals_and_lowers_accept_ahead_watermarks() {
+  // A checkpoint persists only COMMITTED dedup state. The live table can carry two rows a checkpoint must
+  // NOT capture, because a view change can later truncate the op they name and the restored watermark
+  // would then hang the client's retry as a replyless in-flight duplicate (see
+  // `committed_session_projection`): a PROVISIONAL row (no committed reply) is dropped, and an ACCEPT-AHEAD
+  // watermark (`request` above the applied `reply.0`) is lowered to the applied request.
+  let mut e = backup();
+  // C1 (client 1): provisional — accepted request 1, never committed (no reply, last_op 0).
+  e.clients.insert(
+    1,
+    Session {
+      request: RequestNumber::with(1),
+      reply: None,
+      last_op: OpNumber::new(),
+    },
+  );
+  // C2 (client 2): known — applied request 3 (reply cached), then accepted request 4 (watermark ahead,
+  // its op not yet committed). This is the row a bare `last_op == 0` filter would WRONGLY keep.
+  e.clients.insert(
+    2,
+    Session {
+      request: RequestNumber::with(4),
+      reply: Some((RequestNumber::with(3), Bytes::copy_from_slice(&[3u8]))),
+      last_op: OpNumber::with(5),
+    },
+  );
+  let projected = e.committed_session_projection();
+  assert!(
+    !projected.contains_key(&1),
+    "the provisional row is dropped — recovery must not restore a replyless watermark"
+  );
+  let c2 = projected
+    .get(&2)
+    .expect("the known client survives the projection");
+  assert_eq!(
+    c2.request,
+    RequestNumber::with(3),
+    "the accept-ahead watermark is lowered to the applied request reply.0, not the uncommitted 4"
+  );
+  assert_eq!(
+    c2.reply.as_ref().map(|(r, _)| *r),
+    Some(RequestNumber::with(3)),
+    "the cached reply is preserved"
+  );
+  assert_eq!(
+    c2.last_op,
+    OpNumber::with(5),
+    "the applied-op stamp is preserved"
+  );
+}
+
 // ── State-sync ──

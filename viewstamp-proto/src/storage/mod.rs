@@ -1239,7 +1239,21 @@ pub trait Superblock {
   /// Submit a write of a checkpoint snapshot at `op`. MUST complete only as [`SuperblockDone::Wrote`]
   /// — never [`SuperblockDone::Fault`] (see the trait-level write-fault contract).
   fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes);
-  /// Submit a read of the latest checkpoint snapshot.
+  /// Submit a read of the checkpoint snapshot the CURRENT durable root names — the snapshot written at
+  /// [`state`](Superblock::state)'s `checkpoint_op`, NOT merely the last snapshot write submitted.
+  ///
+  /// **A staged-but-unrooted snapshot MUST NOT become the read-back checkpoint** (load-bearing for VSR
+  /// safety). A [`submit_write_checkpoint`](Superblock::submit_write_checkpoint) whose matching durable
+  /// root ([`submit_write`](Superblock::submit_write)) has not yet completed is NOT yet the durable
+  /// checkpoint; serving it would return a checkpoint the durable root does not name. So a recovery read
+  /// MUST satisfy `read.op == state().checkpoint_op()`. This is what makes it safe for the proto to
+  /// abandon an in-flight state-sync re-persist before its root is staged (a view change supersedes it):
+  /// the abandoned snapshot write may still complete in the store, but with no matching root it must
+  /// never be read back against a durable root naming the PRIOR checkpoint — which would make local
+  /// recovery reject its own (still-valid) durable checkpoint by op/id mismatch and force a needless peer
+  /// fetch. A backend keyed by checkpoint op (as the test fixture is, and as TigerBeetle's single rooted
+  /// superblock slot is by construction) satisfies this naturally; one that returns the last-written
+  /// snapshot regardless of which root is durable would violate it.
   fn submit_read_checkpoint(&mut self, id: OpId);
   /// Drain the next completed op, if any.
   fn poll(&mut self) -> Option<SuperblockDone>;

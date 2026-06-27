@@ -830,7 +830,7 @@ struct Inflight {
 
 /// Per-client session for at-most-once semantics.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Session {
+pub(crate) struct Session {
   /// Highest request number accepted (assigned an op or committed).
   request: RequestNumber,
   /// Cached `(request_number, reply_body)` of the latest committed request.
@@ -2806,6 +2806,31 @@ impl<S, R> Endpoint<S, R> {
           | PendingSbAction::StartViewAsPrimary
           | PendingSbAction::AdoptedStartView
       ))
+    )
+  }
+
+  /// True iff a state-sync RE-PERSIST root write is already STAGED (its `AwaitRoot` step) — the
+  /// un-cancellable superblock write that advances the durable checkpoint to the synced point `M` and is
+  /// then INSTALLED ([`Self::install_sync`]) on its completion. A view-change transition must NOT begin
+  /// while this is true: the transition would either rewind the durable checkpoint (a trailing view root
+  /// persisting the stale pre-sync pointer) or, copy-forwarded, leave the durable at `M` while the SM is
+  /// never restored to `M` — because the install is destructive (it resets `op`/`commit_min`, restores the
+  /// SM, prunes the WAL) and cannot run interleaved with the transition's adopted log. So each view-change
+  /// trigger DEFERS while this holds; the deferred trigger is re-driven (its sender retransmits / the SVC
+  /// quorum re-evaluates) the instant the root lands and the sync installs cleanly. (`AwaitSnapshot` has
+  /// no staged root, so its checkpoint is dropped on transition — durable stays at the old pointer, and the
+  /// abandoned snapshot write is harmless: with no root it can never become the read-back checkpoint by the
+  /// [`Superblock::submit_read_checkpoint`] contract, which serves only the durable-root-named one.) This
+  /// mirrors the in-flight-checkpoint defer the cross-epoch peer-fetch already observes and keeps state-sync
+  /// and view-change mutually exclusive by status.
+  fn sync_repersist_root_staged(&self) -> bool {
+    matches!(
+      self.pending_checkpoint,
+      Some(PendingCheckpoint {
+        kind: CheckpointKind::SyncRepersist,
+        step: CheckpointStep::AwaitRoot(_),
+        ..
+      })
     )
   }
 
