@@ -16,7 +16,7 @@ use bytes::Bytes;
 use viewstamp_driver::{BatchConfig, aggregator, aggregator_with_stall};
 use viewstamp_proto::{
   BlockAddress, BlockStore, Conn, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer,
-  ReplicaId, StateMachine, Superblock, Wal,
+  ReplicaId, RestoreError, StateMachine, Superblock, Wal,
 };
 use viewstamp_simulation::{
   InMemorySuperblock, InMemoryWal,
@@ -161,7 +161,7 @@ impl StateMachine for SharedSm {
   fn block_references(block: &[u8]) -> std::vec::Vec<BlockAddress> {
     BatchSm::block_references(block)
   }
-  fn restore(&mut self, root: BlockAddress, store: &dyn BlockStore) {
+  fn restore(&mut self, root: BlockAddress, store: &dyn BlockStore) -> Result<(), RestoreError> {
     self.0.lock().unwrap().restore(root, store)
   }
 }
