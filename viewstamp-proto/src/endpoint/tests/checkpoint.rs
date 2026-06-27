@@ -897,4 +897,81 @@ fn committed_session_projection_drops_provisionals_and_lowers_accept_ahead_water
   );
 }
 
+#[test]
+fn adoption_rolls_back_an_orphaned_accept_ahead_watermark() {
+  // A deposed primary's ACCEPT-AHEAD watermark must roll back when adoption truncates the op it named —
+  // else a retransmit of that truncated request dedups as a replyless duplicate and hangs the client (the
+  // wedge `reconcile_session_watermarks` closes). Model a replica that accepted client 1's request 2 as
+  // op 2 (watermark 2, reply cached at request 1) but never committed it, then adopt a higher view whose
+  // canonical head is op 1 — op 2 is dropped, and the watermark must roll back to the reply-backed 1.
+  let mut e = backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  e.force_state_for_test(0, 2, 1, 0, &[]);
+  e.log.insert(
+    1,
+    LogEntry::present(
+      ClientId::new(1),
+      RequestNumber::with(1),
+      Bytes::copy_from_slice(&[1u8]),
+    ),
+  );
+  e.log.insert(
+    2,
+    LogEntry::present(
+      ClientId::new(1),
+      RequestNumber::with(2),
+      Bytes::copy_from_slice(&[2u8]),
+    ),
+  );
+  e.clients.insert(
+    1,
+    Session {
+      request: RequestNumber::with(2), // accept-ahead: op 2 minted, not yet committed
+      reply: Some((RequestNumber::with(1), Bytes::copy_from_slice(&[1u8]))),
+      last_op: OpNumber::with(1),
+    },
+  );
+  assert_eq!(
+    e.session_request_for_test(1),
+    Some(2),
+    "precondition: the accept-ahead watermark is at the uncommitted request 2"
+  );
+
+  // Adopt view 1 whose canonical head is op 1 (commit 1): the uncommitted op 2 is truncated.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(crate::StartView::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(1),
+      Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec::Vec::new(),
+    )),
+  );
+
+  assert!(
+    !e.has_log_entry_for_test(2),
+    "the uncommitted accept-ahead op 2 was truncated by the adoption"
+  );
+  assert_eq!(
+    e.session_request_for_test(1),
+    Some(1),
+    "the orphaned accept-ahead watermark rolled back to the reply-backed request 1 — not left at 2, \
+     where a retransmit of request 2 would dedup to a replyless hang"
+  );
+  assert_eq!(
+    e.session_reply_for_test(1).map(|(r, _)| r),
+    Some(1),
+    "the cached reply is preserved — at-most-once holds (a committed request stays deduped)"
+  );
+}
+
 // ── State-sync ──

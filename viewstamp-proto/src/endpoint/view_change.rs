@@ -907,6 +907,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         session.request = request;
       }
     }
+    // The interior-gap cut above (and `adopt_log`'s tail trim this routed through) may have truncated a
+    // `Present` accept-ahead tail op while this replica formed the new view; the backfill loop only RAISES,
+    // so roll any watermark that truncation orphaned back to its backed floor here too — else this new
+    // primary dedups the truncated request's retransmit to a no-reply hang.
+    self.reconcile_session_watermarks();
 
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = self.view;
@@ -1168,6 +1173,40 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         body,
       };
       self.log.insert(e.op().get(), entry);
+    }
+    // The adopted canonical log dropped any uncommitted tail above the applied frontier — including a
+    // deposed primary's accept-ahead `Present` op whose session watermark was bumped at accept time. Roll
+    // any watermark that op left orphaned back to its backed floor (see `reconcile_session_watermarks`):
+    // without this, a later retransmit of that truncated request dedups as a duplicate whose cached reply
+    // is for an earlier request, so the primary resends nothing AND mints nothing, hanging the client.
+    self.reconcile_session_watermarks();
+  }
+
+  /// Re-establish the session dedup-watermark backing invariant after an adoption truncated the log tail.
+  /// A watermark (`Session::request`) may legitimately exceed `max(reply.request, highest in-log request
+  /// for that client)` ONLY as a primary's accept-ahead while the minted op is still in `self.log`. Adopting
+  /// a canonical log can DROP that op (a deposed primary's uncommitted accept-ahead tail), and the adoption
+  /// path does not roll the watermark back — orphaning it. A later retransmit of that truncated request then
+  /// dedups as a duplicate (`request == session.request`) whose cached reply is for an EARLIER request, so
+  /// the primary resends nothing AND mints nothing: the client hangs forever and the cluster livelocks.
+  ///
+  /// Roll every orphaned watermark down to its backed floor. The `>` guard never RAISES (so it cannot
+  /// regress a legitimate watermark — the new-primary backfill owns raising) and never lowers below the
+  /// cached-reply request (so at-most-once holds: a committed request stays deduped). This mirrors the
+  /// `Repairing`-hole rollback in `repair_or_truncate_timeouts`, extended to the ADOPTION-truncation of a
+  /// `Present` tail op that the grace path (keyed on header-only `Repairing` candidates) does not cover.
+  fn reconcile_session_watermarks(&mut self) {
+    let mut highest_in_log: BTreeMap<u128, u64> = BTreeMap::new();
+    for e in self.log.values() {
+      let slot = highest_in_log.entry(e.client.get()).or_insert(0);
+      *slot = (*slot).max(e.request.get());
+    }
+    for (client, session) in &mut self.clients {
+      let reply_request = session.reply.as_ref().map_or(0, |(rn, _)| rn.get());
+      let backed = reply_request.max(highest_in_log.get(client).copied().unwrap_or(0));
+      if session.request.get() > backed {
+        session.request = RequestNumber::with(backed);
+      }
     }
   }
 
