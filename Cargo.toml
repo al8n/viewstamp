@@ -25,10 +25,7 @@ flume = { version = "0.12", default-features = false, features = ["async"] }
 futures-channel = { version = "0.3.32", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
-# Resolution bound only: time 0.3.48 added impls that collide (E0119) with rcgen 0.14's blanket
-# From impls, breaking every dev build that includes rcgen. Remove once rcgen ships a release
-# that compiles against current time.
-time = { version = ">=0.3.36, <0.3.48", default-features = false }
+time = { version = "0.3", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", default-features = false }
 viewstamp-simulation = { path = "tests/viewstamp-simulation", version = "0.0.0" }
