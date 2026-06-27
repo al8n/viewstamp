@@ -13,9 +13,8 @@
 // a `RequestBlock` round trip) — the install assertions are unchanged.
 use super::{super::*, *};
 use crate::{
-  ClientId, Config, DoViewChange, Header, OpId, OpNumber, Prepare, PreparedEntry, ReadOk,
-  ReplicaId, Request, RequestNumber, SlotStatus, StartViewChange, View, VsrState, Wal, WalDone,
-  block_store::MemBlockStore,
+  ClientId, Config, Header, OpId, OpNumber, Prepare, ReadOk, ReplicaId, Request, RequestNumber,
+  SlotStatus, StartViewChange, View, VsrState, Wal, WalDone, block_store::MemBlockStore,
 };
 use std::collections::VecDeque;
 
@@ -1345,17 +1344,16 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
 }
 
 #[test]
-fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_band() {
-  // REGRESSION (the wedge). A laggard STAGES a SyncCheckpoint but a VIEW CHANGE fires
-  // before the sync ROOT completes, and the laggard becomes the new PRIMARY. It must NOT advertise the
-  // synced commit while carrying a STALE `checkpoint_op` over a PRUNED committed band — that strands a
-  // lower laggard (which can neither RequestPrepare the pruned band nor is triggered to RequestSync,
-  // since the primary advertises the old checkpoint) → cluster wedge if the donor crashes. With the
-  // durable-before-install fix the STAGE no longer prunes/advances, so the view change finds the OLD
-  // consistent state intact (`enter_view_change` cleanly cancels the not-yet-applied install): the band
-  // is NOT pruned and `commit_min`/`checkpoint_op` are CONSISTENT (both old), so a lower laggard is not
-  // stranded. FAIL-BEFORE: the laggard becomes primary with `commit == synced (4)`, `checkpoint_op ==
-  // old (0)`, and the band pruned.
+fn state_sync_view_change_defers_while_a_re_persist_root_is_staged() {
+  // REGRESSION (the durable-checkpoint rewind). A laggard STAGES a SyncCheckpoint and its re-persist ROOT
+  // write reaches the superblock queue (AwaitRoot) — that root will advance the durable checkpoint to the
+  // synced point. A VIEW CHANGE (SVC quorum) fires in this window. It must NOT proceed: the staged root
+  // cannot be cancelled, so a view-change root submitted now would land BEHIND it and REWIND the durable
+  // checkpoint back to the stale pre-sync pointer (and the destructive install cannot run interleaved with
+  // a transition's adopted log). So the transition is DEFERRED until the sync installs to the synced point
+  // (durable advances 0→4 MONOTONICALLY); the sticky SVC then re-drives the view change from the
+  // cleanly-synced state. FAIL-BEFORE: the view change proceeds, the sync root lands at 4, and a trailing
+  // view root rewinds the durable checkpoint back to 0.
   let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(4);
   let (env, id) = donor_envelope(&dsb);
   // The laggard: replica 1 of 3 over CountSm with a HUGE checkpoint interval (so its own band does not
@@ -1430,8 +1428,9 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
     OpNumber::with(0),
     "checkpoint_op is still old at this point"
   );
-  // A VIEW CHANGE fires in this window: an SVC quorum drives the laggard into ViewChange(1), and a DVC
-  // quorum makes it (replica 1 = primary of view 1) the new primary — all BEFORE the sync root lands.
+  // A VIEW CHANGE fires in this window: the laggard's own primary-idle timeout plus an SVC from replica 2
+  // form an SVC quorum (2 of 3) for view 1 — which would normally drive it into ViewChange(1). But the
+  // sync re-persist ROOT is staged (AwaitRoot), so the transition is DEFERRED.
   let later = now + core::time::Duration::from_millis(300);
   e.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // primary_idle → SVC(view 1), own bit
   e.handle_message(
@@ -1447,67 +1446,53 @@ fn state_sync_view_change_before_the_sync_root_does_not_strand_the_committed_ban
       0,
     )),
   );
-  assert_eq!(e.status(), Status::ViewChange, "SVC quorum → ViewChange(1)");
   assert_eq!(
-    e.sync_target_for_test(),
-    None,
-    "entering ViewChange cancelled the pending install (sync cleared)"
+    e.status(),
+    Status::Normal,
+    "the SVC quorum is DEFERRED while the sync re-persist root is staged — no view change proceeds"
   );
-  sb.flush();
-  e.handle_storage(later, &mut wal, &mut sb, &mut blocks); // complete the SendDoViewChange durable-view write
-  while e.poll_message().is_some() {}
-  // Feed a DVC from replica 0 (op 2, commit 0) → with our own DVC that is a quorum (2 of 3) → primary.
-  e.handle_message(
-    later,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    Peer::Replica(ReplicaId::new(0)),
-    Message::DoViewChange(DoViewChange::new(
-      View::with(1),
-      View::with(0),
-      OpNumber::with(2),
-      OpNumber::with(0),
-      crate::Epoch::new(0),
-      0,
-      ReplicaId::new(0),
-      std::vec![
-        PreparedEntry::new(
-          OpNumber::with(1),
-          ClientId::new(7),
-          RequestNumber::with(1),
-          Bytes::copy_from_slice(&[1u8]),
-        ),
-        PreparedEntry::new(
-          OpNumber::with(2),
-          ClientId::new(7),
-          RequestNumber::with(2),
-          Bytes::copy_from_slice(&[2u8]),
-        ),
-      ],
-    )),
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "the staged sync is NOT cancelled by the deferred view change"
   );
-  assert!(e.is_primary(), "replica 1 became the new primary of view 1");
-  // THE CORE ASSERTION. The new primary did NOT install the synced state behind a stale checkpoint:
-  // `commit_min` and `checkpoint_op` are CONSISTENT (both old, not commit==4/checkpoint==0), and the
-  // committed band {1,2} is NOT pruned — so a lower laggard can still be served + caught up.
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(0),
-    "the new primary advertises its OLD durable checkpoint (the synced install never landed)"
+    "checkpoint_op is still old — the sync has not installed yet"
   );
-  assert!(
-    e.commit().get() <= e.op().get() && e.checkpoint_op().get() <= e.commit().get(),
-    "commit_min/op/checkpoint_op are consistent (checkpoint <= commit <= op), not commit==synced over a stale checkpoint"
-  );
-  assert_ne!(
-    e.commit(),
+  // Land the staged sync root → the sync INSTALLS to the synced point. The durable checkpoint advances
+  // 0 → 4 MONOTONICALLY; no trailing view root rewinds it (the bug this guards).
+  sb.flush();
+  e.handle_storage(later, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    e.checkpoint_op(),
     OpNumber::with(4),
-    "commit_min was NOT advanced to the synced point by an uninstalled sync"
+    "the sync installed: in-memory checkpoint_op advanced to the synced point"
   );
-  assert!(
-    wal.entries.contains_key(&1) && wal.entries.contains_key(&2),
-    "the committed band is NOT pruned (no stranded laggard): the STAGE never pruned the WAL"
+  assert_eq!(
+    sb.state().checkpoint_op(),
+    OpNumber::with(4),
+    "the durable checkpoint advanced 0→4 monotonically — never rewound by a stale view root"
+  );
+  assert_eq!(
+    e.sync_target_for_test(),
+    None,
+    "the sync completed (its install ran on the root's completion)"
+  );
+  // The deferred trigger is STICKY: the next primary-idle timeout re-emits the SVC and re-evaluates the
+  // persisted quorum, now re-driving the view change from the cleanly-synced state (the laggard is at
+  // checkpoint 4, so becoming primary strands no lower laggard).
+  let later2 = later + core::time::Duration::from_millis(300);
+  e.handle_timeout(later2, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "the deferred view change re-drives once the sync installed"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the re-driven view change carries the synced checkpoint — monotone, no rewind"
   );
 }
 

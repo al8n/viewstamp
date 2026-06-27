@@ -550,6 +550,39 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let _ = self.force_checkpoint(sb, blocks);
   }
 
+  /// The COMMITTED dedup projection of the live session table, for a checkpoint. The live `self.clients`
+  /// carries state a checkpoint must NOT persist: PROVISIONAL rows (`last_op == 0`, minted at accept time
+  /// or by a new primary's watermark backfill, with no committed reply) and ACCEPT-AHEAD watermarks
+  /// (`request` is bumped when an op is merely ACCEPTED, before it commits — so a known client's `request`
+  /// can name an op above the committed prefix). The live table self-corrects both when their op fails to
+  /// commit (a view transition purges provisionals; a repair-timeout rolls accept-ahead watermarks back to
+  /// the reply-backed floor), but a checkpoint captured BEFORE those corrections would — if carried across
+  /// a view change and later restored on recovery / state-sync — resurrect a dedup watermark for a
+  /// TRUNCATED request, and the client's retry of it would dedup as an in-flight duplicate with no cached
+  /// reply, hanging forever.
+  ///
+  /// So project each row to the dedup state derivable from the committed prefix alone: drop any row with
+  /// no committed reply, and lower `request` to the applied request (`reply.0`). A still-uncommitted
+  /// request that LATER commits re-applies on recovery and re-bumps the watermark identically, so the
+  /// projection drops only the truncate-able surplus, never committed dedup state.
+  pub(crate) fn committed_session_projection(&self) -> std::collections::BTreeMap<u128, Session> {
+    self
+      .clients
+      .iter()
+      .filter_map(|(&client, s)| {
+        let (applied_request, _) = s.reply.as_ref()?;
+        Some((
+          client,
+          Session {
+            request: *applied_request,
+            reply: s.reply.clone(),
+            last_op: s.last_op,
+          },
+        ))
+      })
+      .collect()
+  }
+
   /// Begin an ORDINARY checkpoint at `commit_min` UNCONDITIONALLY — the post-cadence-gate body of
   /// [`Self::maybe_checkpoint`] with the three guards (status/`log_view`, in-flight exclusion, cadence)
   /// STRIPPED. The caller owns the preconditions: status Normal with `log_view == view` and a FREE
@@ -588,7 +621,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // DAG and bind its root into the envelope: the table is no longer inline, so the envelope is always
     // frame-bounded (op + two 16-byte roots) regardless of session count or cached-reply size. A laggard
     // state-syncs the table by fetching only the session blocks it is missing from the DAG rooted here.
-    let sessions_root = super::session_blocks::encode_sessions(&self.clients, blocks);
+    // Project the live table to its COMMITTED dedup state before encoding: drop provisional rows (no
+    // committed reply) and lower each accept-ahead `request` watermark to the applied request (`reply.0`).
+    // A checkpoint is committed state, so it must not persist a watermark for an op above `target_op` that
+    // a later view change may TRUNCATE — restoring such a row on recovery / state-sync would dedup the
+    // client's retry as an in-flight duplicate with no cached reply (a permanent hang). The live table
+    // self-corrects (a view transition purges provisionals, a repair-timeout rolls accept-ahead watermarks
+    // back), but a checkpoint captured before those corrections must not outlive them. See
+    // [`Self::committed_session_projection`].
+    let sessions_root =
+      super::session_blocks::encode_sessions(&self.committed_session_projection(), blocks);
     // DURABILITY BARRIER: the blocks this checkpoint NAMES must be durable BEFORE the superblock pointer
     // that references them. `write_block` is infallible with no durability guarantee, so `flush` is what
     // makes the SM + session DAGs durable; ordering it here — strictly before `submit_write_checkpoint`
@@ -1027,13 +1069,25 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   }
 
   pub(crate) fn submit_durable_view(&mut self, action: PendingSbAction, sb: &mut impl Superblock) {
-    // Take the checkpoint pair from the in-memory frontier directly: `self.checkpoint_op` is ALWAYS equal
-    // to the durable `sb.state().checkpoint_op()` (the state-sync install advances `checkpoint_op` in
-    // lockstep with its durable root), so pairing it with the durable `checkpoint_id` names a CONSISTENT
-    // pair that can never rewind the durable checkpoint — the no-rewind property is structural, not a
-    // per-writer floor.
-    let checkpoint_id = sb.state().checkpoint_id();
-    let checkpoint_op = self.checkpoint_op;
+    // COPY-FORWARD the checkpoint pair so this view-change root never rewinds the durable checkpoint. An
+    // in-flight ORDINARY checkpoint at `AwaitRoot` has its durable root write STAGED AHEAD of this view
+    // write (FIFO), so that root lands FIRST and advances the durable checkpoint to `target_op`; persisting
+    // the stale `self.checkpoint_op` here would then rewind it. So carry that checkpoint's own
+    // (`target_op`, `checkpoint_id`) verbatim — at `AwaitRoot` its snapshot bytes are already durable (the
+    // `AwaitSnapshot` write completed before the root was staged), so the named pair is recoverable. In
+    // every other case — no checkpoint in flight, or one still at `AwaitSnapshot` whose root is staged
+    // BEHIND this view write (so it lands LAST, a monotone no-op) — the durable pair equals
+    // `self.checkpoint_op` paired with the durable `checkpoint_id`. The persisted `checkpoint_op` is thus
+    // monotone non-decreasing across the two concurrent writers; `commit` + the band below derive from it.
+    let (checkpoint_op, checkpoint_id) = match &self.pending_checkpoint {
+      Some(pc)
+        if matches!(pc.kind, CheckpointKind::Ordinary)
+          && matches!(pc.step, CheckpointStep::AwaitRoot(_)) =>
+      {
+        (pc.target_op, pc.checkpoint_id)
+      }
+      _ => (self.checkpoint_op, sb.state().checkpoint_id()),
+    };
     let commit = OpNumber::with(self.commit_max.get().max(checkpoint_op.get()));
     let state = self.durable_root(
       self.view,

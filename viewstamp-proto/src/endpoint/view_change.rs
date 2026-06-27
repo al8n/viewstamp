@@ -179,6 +179,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     sb: &mut B,
     view_new: View,
   ) {
+    if self.sync_repersist_root_staged() {
+      // Defer the SVC-quorum view change while a state-sync re-persist root is staged: let it install to
+      // the synced point first (the install is destructive — see `sync_repersist_root_staged`). The
+      // `StartViewChange` quorum bits persist, so the next retransmitted SVC re-evaluates the quorum and
+      // re-drives this transition once the sync installs.
+      return;
+    }
     assert!(
       view_new.get() > self.view.get(),
       "view change must strictly advance the view"
@@ -282,9 +289,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // never committed — a silent permanent drop). APPLIED rows (and restored snapshot rows) persist:
     // they are the consensus table.
     self.clients.retain(|_, s| s.last_op.get() > 0);
-    // Supersede any in-flight checkpoint: a view change drops it (its stale superblock completion is
-    // then ignored in on_sb_done). It re-triggers once Normal resumes — commit_min is preserved.
-    self.pending_checkpoint = None;
+    // KEEP an in-flight ORDINARY checkpoint across the transition: once its durable root write is staged
+    // it advances the durable checkpoint pointer, and `submit_durable_view` COPY-FORWARDS that checkpoint
+    // into the view-change root (persisting its target + id verbatim), so the view write CARRIES it
+    // forward rather than rewinding the durable checkpoint to the stale pre-checkpoint pointer. The two
+    // writes then complete independently (distinct `OpId`s) in FIFO order, both naming the same checkpoint.
+    // A state-sync re-persist is dropped here (its `pending_install` + `sync` are cleared above, so a kept
+    // one would be orphaned + incoherent); it re-solicits, its committed prefix recovered from the
+    // canonical log.
+    if self
+      .pending_checkpoint
+      .as_ref()
+      .is_some_and(|pc| matches!(pc.kind, CheckpointKind::SyncRepersist))
+    {
+      self.pending_checkpoint = None;
+    }
     // Release the PROPOSAL latch: an uncommitted `Reconfigure` op this primary proposed belongs to the
     // generation a view change ends. If that op rides the canonical log and RE-COMMITS under the new
     // view, `commit_reconfigure` stages its swap fresh; if it is TRUNCATED (not canonical), it never
@@ -766,13 +785,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     sb: &mut B,
     blocks: &mut dyn BlockStore,
   ) {
-    // A checkpoint is never logically armed when forming a new primary's view: `maybe_checkpoint`
-    // is gated on Normal status, and entering ViewChange dropped `pending_checkpoint`. (A physically
-    // in-flight checkpoint root write is handled by the Superblock serialized root-write ordering
-    // contract — see `submit_durable_view`.)
+    // No NEW checkpoint starts when forming a new primary's view (`maybe_checkpoint` is gated on Normal
+    // status). An ORDINARY checkpoint kept in flight ACROSS the transition is permitted: it completes
+    // independently (distinct `OpId`) and `submit_durable_view` COPY-FORWARDS it into the view-change root
+    // (see there). A state-sync re-persist was dropped on entering ViewChange (its install was cleared).
     debug_assert!(
-      self.pending_checkpoint.is_none(),
-      "no checkpoint may be logically in flight when forming a new primary's view"
+      self
+        .pending_checkpoint
+        .as_ref()
+        .is_none_or(|pc| matches!(pc.kind, CheckpointKind::Ordinary)),
+      "only an ordinary checkpoint may be in flight when forming a new primary's view"
     );
     // Offset-aware canonical-log selection (UNION, floored at the canonical generation's vouched
     // checkpoint floor) + nack-prepare truncation (see `select_canonical_log`). The canonical log is
@@ -796,8 +818,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.timers.repair_retry = None;
     }
     // status is still ViewChange here, so the maybe_checkpoint at advance_commit's tail is a no-op
-    // (checkpoints only start in Normal) — a checkpoint must not race the StartViewAsPrimary
-    // durable-view write submitted below.
+    // (checkpoints only start in Normal) — no NEW checkpoint starts. An ordinary checkpoint kept in flight
+    // across the transition is carried forward verbatim by the StartViewAsPrimary durable-view write below
+    // (`submit_durable_view` copy-forwards it), so it does not rewind the durable checkpoint.
     self.advance_commit(now, sb, blocks, commit_star); // apply newly-exposed committed ops (prior-view quorum decision)
 
     // truncate the uncommitted suffix at the FIRST interior gap above commit*. The
@@ -1168,6 +1191,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if m.replica() != self.membership.primary(m.view()) {
       return; // must come from the view's primary
     }
+    if self.sync_repersist_root_staged() {
+      // Defer adopting the canonical log while a state-sync re-persist root is staged: the install
+      // (destructive — see `sync_repersist_root_staged`) must complete to the synced point before we
+      // overwrite `op`/`commit_min`/`self.log` with the adopted head. The primary retransmits its
+      // `StartView`, re-driving the adopt from the cleanly-synced state.
+      return;
+    }
     self.adopt_canonical_head(
       now,
       sb,
@@ -1274,8 +1304,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.timers.repair_retry = None;
     }
     // status is still ViewChange/RecoveringHead here, so the maybe_checkpoint at advance_commit's
-    // tail is a no-op (checkpoints only start in Normal) — a checkpoint must not race the
-    // AdoptedStartView durable-view write submitted below.
+    // tail is a no-op (checkpoints only start in Normal) — no NEW checkpoint starts; an ordinary
+    // checkpoint kept in flight is carried forward verbatim by the AdoptedStartView durable-view write
+    // below (`submit_durable_view` copy-forwards it), so it does not rewind the durable checkpoint.
     self.advance_commit(now, sb, blocks, commit.get());
     // log_view = view BEFORE submit_durable_view (try_new requires log_view <= view).
     self.log_view = view;

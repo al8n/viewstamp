@@ -1914,6 +1914,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// adoption vehicles (`on_start_view`/`on_recovery_response`, sender-bound to the claimed view's
   /// primary) remain unclamped.
   pub(crate) fn catch_up_to_view(&mut self, now: Instant, view: View) {
+    if self.sync_repersist_root_staged() {
+      // Defer: a state-sync re-persist root is staged. Let it install to the synced point first (the
+      // install is destructive and cannot run interleaved with the catch-up posture). The higher-view
+      // Prepare/Commit/PrepareOk that drove us here retransmits, re-driving catch-up from the synced state.
+      return;
+    }
     if view.get() > self.view.get().saturating_add(MAX_VIEW_JUMP) {
       return; // implausible advertised view (see MAX_VIEW_JUMP) — ignore the claim, stay put.
     }
@@ -2118,6 +2124,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // A non-primary response (empty log) only confirms the current generation; we cannot adopt a
       // head from it. Stay RecoveringHead; the recover_head timer keeps soliciting until the
       // primary answers (or a StartView arrives).
+      return;
+    }
+    if self.sync_repersist_root_staged() {
+      // Defensive (a `RecoveringHead` replica carries no Normal-path state-sync re-persist): defer the
+      // adopt while a re-persist root is staged, symmetric with `on_start_view`. The recover-head timer
+      // re-solicits, re-driving the adopt once the sync installs.
       return;
     }
     self.adopt_canonical_head(
