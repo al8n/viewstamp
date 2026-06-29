@@ -1,10 +1,10 @@
 [package]
 name = "viewstamp-compio"
 version = "0.0.0"
-edition = "2024"
-rust-version = "1.95"
-repository = "https://github.com/al8n/viewstamp"
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
 description = "Proactor (compio) QUIC driver for viewstamp-proto"
 
 [dependencies]

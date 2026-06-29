@@ -4,12 +4,18 @@ members = [
   "viewstamp-driver",
   "viewstamp-compio",
   "viewstamp-reactor",
-  "tests/viewstamp-simulation",
+  "tests/viewstamp-simulation", "viewstamp",
 ]
 # The fuzz harness is its own nested workspace (nightly + libFuzzer instrumentation); keep it out
 # of the stable workspace and its feature-powerset sweeps.
 exclude = ["fuzz"]
 resolver = "3"
+
+[workspace.package]
+edition = "2024"
+repository = "https://github.com/al8n/viewstamp"
+license = "MPL-2.0"
+rust-version = "1.95"
 
 [workspace.dependencies]
 bytes = { version = "1", default-features = false }
@@ -27,8 +33,10 @@ time = { version = "0.3", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", default-features = false }
 
-viewstamp-proto = { path = "viewstamp-proto", version = "0.0.0" }
+viewstamp-proto = { path = "viewstamp-proto", version = "0.0.0", default-features = false }
 viewstamp-driver = { path = "viewstamp-driver", version = "0.0.0", default-features = false }
+viewstamp-compio = { path = "viewstamp-compio", version = "0.0.0", default-features = false }
+viewstamp-reactor = { path = "viewstamp-reactor", version = "0.0.0", default-features = false }
 viewstamp-simulation = { path = "tests/viewstamp-simulation", version = "0.0.0" }
 
 [profile.bench]

@@ -1,0 +1,13 @@
+[package]
+name = "viewstamp"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+viewstamp-proto.workspace = true
+
+[lints]
+workspace = true
