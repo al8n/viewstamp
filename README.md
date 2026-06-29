@@ -13,6 +13,8 @@ Pure-Rust Viewstamped Replication: a Sans-I/O consensus state machine, QUIC and 
 
 </div>
 
+## Introduction
+
 `viewstamp` is a [Viewstamped Replication] consensus library in pure Rust. The protocol
 logic lives in a single Sans-I/O "super state machine" — modeled on `quinn-proto`: it
 takes events as inputs (`handle_*`) and emits actions as outputs (`poll_*`), owning no
