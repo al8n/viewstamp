@@ -1042,6 +1042,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.buffer.clear();
     self.view_change = None;
     self.pending_sb = None;
+    // Sweep in-flight serve-reads: a Recovering node abandons its donor role. A leaked `sync_serving`
+    // entry (its completion is dropped as foreign by `on_recover_sb_done` without removing the entry) would
+    // make `submit_or_refresh_serve` dedupe every future `RequestSync` from that requester — never
+    // re-submitting a read once Normal again — and keep `has_inflight_storage()` (hence
+    // `seal_committed_frontier`) wedged forever. Any read still outstanding in the superblock completes as
+    // foreign and is dropped; the requesters re-solicit and are served afresh after this node is Normal.
+    self.sync_serving.clear();
     // Enter Recovering with a fresh, read-free RecoverState: the WAL/SM are already consistent at our
     // (stale) durable point, so there is no local tail/checkpoint read to drain — we go straight to the
     // peer fetch. The FORCED sync targets `max(checkpoint, self.checkpoint_op)`: at/above the advertised
