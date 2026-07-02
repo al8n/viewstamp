@@ -1688,9 +1688,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // SM-RECONSTRUCT obligation owed while still Recovering (a post-root restore faulted; `self.checkpoint_op
     // == M`): a fresh reply AT M re-pulls M's DAG from THIS donor — donor FAILOVER for a dead pinned donor —
-    // rather than re-staging. A reply ABOVE M supersedes the obligation forward (it falls through, and
-    // `begin_recover_block_sync` clears the obligation as it re-stages). The `< M` reply was already dropped.
-    if self.sm_reconstruct_owed() && m.checkpoint_op() == self.checkpoint_op {
+    // rather than re-staging. A reply ABOVE M supersedes the obligation forward (it falls through to
+    // `begin_recover_block_sync`, which keeps the obligation owed until `install_sync` installs the newer
+    // point). The `< M` reply was already dropped. GATE on `pending_install.is_none()` for the same reason as
+    // the Normal mirror: a retained newer install (a superseding sync whose flush faulted) subsumes M and is
+    // retried locally, so a same-M reconstruct here would orphan it.
+    if self.sm_reconstruct_owed()
+      && self.pending_install.is_none()
+      && m.checkpoint_op() == self.checkpoint_op
+    {
       self.refetch_sm_reconstruct(now, wal, sb, blocks, from, &m);
       return;
     }
@@ -1842,11 +1848,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ) -> bool {
     // A reply reaching here while an SM-reconstruct obligation is owed is, by the ingress gates, a
     // STRICTLY-NEWER checkpoint (`> self.checkpoint_op == M`): it SUPERSEDES the obligation forward (its own
-    // install reconstructs the SM to the newer point). The obligation is KEPT owed through this peer-fetch,
-    // mirroring `begin_block_sync`: it is dropped only when `apply_sync` atomically stages the replacement
-    // `pending_install`, so a STALLED fetch or a REJECTED reply leaves the obligation to keep reconstructing
-    // M rather than wiping it. The drain routes a SAME-M fetch to the SM-content retry and a NEWER M'
-    // through `on_recover_sync_checkpoint` → `apply_sync` (which clears the obligation at stage time).
+    // install reconstructs the SM to the newer point). The obligation is KEPT owed through this peer-fetch
+    // AND through the staged-but-pre-root install, mirroring `begin_block_sync`: it is dropped only when
+    // `install_sync` actually installs the replacement (root durable). So a STALLED fetch, a REJECTED reply,
+    // or a view transition cancelling the pre-root install leaves the obligation to keep reconstructing M
+    // rather than wiping it. The drain routes a SAME-M fetch to the SM-content retry and a NEWER M' through
+    // `on_recover_sync_checkpoint` → `apply_sync`.
     // A RETAINED-but-not-staged install (a prior verified install whose flush faulted, still owed as
     // `pending_install` with no in-flight checkpoint — the ingress gate rules out a staged one) is LEFT INTACT
     // here, mirroring `begin_block_sync`: it is the local flush-retry source, a LIVE GC root, and a verified

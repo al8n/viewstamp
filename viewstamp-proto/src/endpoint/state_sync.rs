@@ -882,7 +882,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // block-fetch when its pinned donor died (the ordinary `<= self.checkpoint_op == M` reject just below
     // would otherwise drop it, stranding the obligation on a dead donor). A reply ABOVE M falls through to
     // supersede the obligation forward via `begin_block_sync`; a reply BELOW M is dropped below as usual.
-    if self.sm_reconstruct_owed() && m.checkpoint_op() == self.checkpoint_op {
+    //
+    // GATE on `pending_install.is_none()`: while the obligation is owed, a strictly-newer install may be
+    // RETAINED as `pending_install` (a superseding sync staged, then its flush faulted — `pending_checkpoint`
+    // is `None`, so the in-flight-write defer above does NOT catch it). That newer install subsumes M and is
+    // retried LOCALLY (`retry_install_flush`); running the same-M reconstruct here would, on success, clear
+    // `sm_reconstruct` + `sync` (via `retry_sm_reconstruct` / `complete_state_sync`) and ORPHAN the retained
+    // `pending_install` — tripping `pending_install ⟹ sync` (debug) or wedging the apply gate with no sync
+    // left to drive the install (release). The equal-M reply is stale below the staged newer install, so drop
+    // it here (it falls through to the monotone `<= checkpoint_op` reject); a view transition that later
+    // cancels the retained install clears `pending_install`, and this same-M path resumes.
+    if self.sm_reconstruct_owed()
+      && self.pending_install.is_none()
+      && m.checkpoint_op() == self.checkpoint_op
+    {
       // Trust the bytes only if they hash to the advertised id (the same integrity gate the ordinary path
       // applies below) before re-pinning the fetch to this donor's `sm_root`.
       if crate::checkpoint_id(m.snapshot()) != m.checkpoint_id() {
@@ -1042,12 +1055,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // A reply reaching here while an SM-reconstruct obligation is owed is, by the ingress gates, a
     // STRICTLY-NEWER checkpoint (`> self.checkpoint_op == M`): it SUPERSEDES the obligation forward — its
     // own install reconstructs the SM to the newer point, subsuming M. The obligation is KEPT owed through
-    // this fetch: it is dropped only when `apply_sync` atomically stages the replacement `pending_install`,
-    // handing the apply gate over with NO window. Clearing it here (as the code previously did) opened a
-    // window where the SM is still pre-M yet NEITHER `sm_reconstruct` NOR `pending_install` gates the apply
-    // loop — a Commit heartbeat could then apply held-tail ops over the stale SM (divergence) — and if this
-    // fetch STALLS or `apply_sync` REJECTS the reply (a same-config / empty-membership reply admitted here
-    // under `require_cross_epoch`), the obligation must survive to keep reconstructing M rather than vanish.
+    // this fetch AND through the staged-but-pre-root install: it is dropped only when `install_sync`
+    // actually installs the replacement (root durable, non-cancellable). Clearing it here (as the code
+    // previously did) opened a window where the SM is still pre-M yet NEITHER `sm_reconstruct` NOR
+    // `pending_install` gates the apply loop — a Commit heartbeat could then apply held-tail ops over the
+    // stale SM (divergence) — and if this fetch STALLS, or `apply_sync` REJECTS the reply (a same-config /
+    // empty-membership reply admitted here under `require_cross_epoch`), or a view transition CANCELS the
+    // pre-root install, the obligation must survive to keep reconstructing M rather than vanish.
     // The drain (`on_block_response`) routes by comparing the drained fetch's checkpoint op to
     // `self.checkpoint_op`: a SAME-M fetch is the SM-content retry, a NEWER M' re-stages via `apply_sync`.
     // A RETAINED-but-not-staged install (a prior verified install whose flush faulted, still owed as
@@ -1596,13 +1610,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Because `pending_install` is a LIVE GC root (`gc_blocks` marks both its DAG roots), the drained blocks
     // survive any intervening checkpoint GC while the flush is owed.
     //
-    // ATOMIC HANDOVER from any owed SM-reconstruct: staging this fresh install supersedes an obligation for
-    // an OLDER checkpoint M (this checkpoint's own install reconstructs the SM to `>= M`). Clear it in the
-    // SAME step as setting `pending_install` so the apply gate (`pending_install.is_some() ||
-    // sm_reconstruct_owed()`) hands over with no window where the SM is behind `checkpoint_op` yet ungated.
-    // `install_sync` re-raises the obligation for THIS checkpoint if its own post-root restore faults; a
-    // reject path above (which never reaches here) deliberately leaves the old obligation owed.
-    self.sm_reconstruct = None;
+    // KEEP any owed SM-reconstruct obligation for an OLDER checkpoint M through this staging — do NOT clear
+    // it here. The pre-root `pending_install` is CANCELLABLE: a view transition (`reset_for_view_transition`)
+    // drops it before its root lands. Clearing `sm_reconstruct` at stage time would then leave the SM behind
+    // the durable `checkpoint_op == M` with NEITHER gate set (`pending_install` cancelled, `sm_reconstruct`
+    // gone), so a Commit heartbeat could `advance_commit` / `state_machine()` over stale pre-M content —
+    // committed-state divergence. The apply gate (`pending_install.is_some() || sm_reconstruct_owed()`) must
+    // stay closed until the SM ACTUALLY holds this checkpoint's content, which only `install_sync` (running
+    // when the root is durable, non-cancellable) establishes: on a clean restore it clears the obligation
+    // (the SM now reflects `>= M`), on a restore fault it re-raises it for THIS checkpoint — either way
+    // consistent with the then-advanced `checkpoint_op`. `reset_for_view_transition` KEEPS `sm_reconstruct`
+    // (and its `sync`) across a pre-root cancel, so a fresh reconstruct is driven. Both gates coexisting here
+    // is invariant-clean: `checkpoint_op` is still M until `install_sync` advances it, so `sm_reconstruct.op
+    // == checkpoint_op` holds, and M's DAG stays GC-rooted by the durable checkpoint root regardless.
     self.pending_install = Some(install);
     self.flush_and_stage_install(now, sb, blocks);
   }
