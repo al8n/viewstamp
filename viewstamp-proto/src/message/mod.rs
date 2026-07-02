@@ -3018,7 +3018,14 @@ fn read_replica(r: &mut Reader<'_>) -> Result<ReplicaId, CodecError> {
 
 #[cfg_attr(not(tarpaulin), inline)]
 fn read_bool(r: &mut Reader<'_>) -> Result<bool, CodecError> {
-  Ok(r.u8()? != 0)
+  // Canonical encoding: exactly one byte representation per value. A non-0/1 byte is a malformed frame,
+  // not a truthy value (accepting any-nonzero would break decode∘encode identity + the `TrailingBytes`
+  // canonical-form discipline the rest of the codec enforces).
+  match r.u8()? {
+    0 => Ok(false),
+    1 => Ok(true),
+    other => Err(CodecError::InvalidBool(other)),
+  }
 }
 
 #[cfg_attr(not(tarpaulin), inline)]

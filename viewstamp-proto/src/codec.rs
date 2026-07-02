@@ -81,6 +81,10 @@ pub enum CodecError {
   /// `1` (a membership block follows). Carries the unexpected byte.
   #[error("invalid membership-present flag: {0}")]
   InvalidMembershipPresent(u8),
+  /// A boolean-encoded field was neither `0` nor `1`. The wire form is canonical (exactly one byte
+  /// representation per value), so a non-`0`/`1` byte is a malformed frame, not a truthy value.
+  #[error("invalid boolean byte: {0}")]
+  InvalidBool(u8),
 }
 
 impl From<crate::MembershipError> for CodecError {
