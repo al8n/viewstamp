@@ -86,6 +86,83 @@ fn backup_buffers_out_of_order_prepares() {
 }
 
 #[test]
+fn a_stale_view_buffered_prepare_is_not_drained_into_the_adopted_view() {
+  // A backup carries its reorder `buffer` across a `StartView` adoption (by design), so a `Prepare`
+  // buffered under an OLD view must NOT be spliced into the new view when the head later reaches it — the
+  // new view may have re-minted a different op at that number, and a spliced stale body would apply off a
+  // Commit heartbeat / poison a future DVC (`LogEntry` records no per-entry view to catch it later).
+  let mut e = backup(); // replica 1 of 3, view 0, head 0
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  // Buffer a view-0 Prepare at op 2 (op 1 missing) — head stays 0.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(2, 0),
+  );
+  assert_eq!(e.op(), OpNumber::with(0));
+
+  // Adopt view 2 (primary = 2 % 3 = 2, not this backup) at canonical head 0 via StartView; drain the
+  // durable-view write so the backup is Normal at view 2. The buffered view-0 op-2 entry survives.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartView(crate::StartView::new(
+      View::with(2),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec::Vec::new(),
+    )),
+  );
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(e.view(), View::with(2));
+  assert!(e.status().is_normal());
+
+  // A view-2 Prepare at op 1 extends the head to 1, then the drain reaches the buffered op 2 — which is
+  // stamped view 0. It must be DROPPED, not appended: the head stays at 1, op 2 is absent from the log.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Prepare(Prepare::new(
+      View::with(2),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::new(7),
+      RequestNumber::with(1),
+      Bytes::copy_from_slice(&[1u8]),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the stale view-0 buffered op 2 was dropped, not spliced into view 2",
+  );
+  assert!(
+    !e.has_log_entry_for_test(2),
+    "no stale op sits in the log at 2",
+  );
+}
+
+#[test]
 fn backup_caches_the_reply_so_a_backup_turned_primary_can_resend_it() {
   // REGRESSION (the lost-reply-across-failover hang): the primary caches each
   // committed reply (`commit_op`), but a BACKUP used to discard it. So if a client's reply was LOST

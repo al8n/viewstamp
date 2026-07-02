@@ -928,6 +928,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // and a later heartbeat re-drains the buffer once the band has room).
       while let Some(next) = self.buffer.get(&(self.op.get() + 1)) {
         let (next_op, next_ckpt) = (next.op().get(), next.checkpoint_op());
+        let (next_view, next_epoch) = (next.view(), next.epoch());
+        // A buffered `Prepare` stamped for an OLD view/epoch must NEVER be spliced into the current view. A
+        // backup carries its reorder `buffer` across a `StartView` adoption (`adopt_canonical_head` keeps it
+        // by design), so after a view/epoch advance a stale entry can still sit here — and the new view may
+        // have re-minted a DIFFERENT op at this number. `LogEntry` records no per-entry view, so a spliced
+        // stale body is indistinguishable later: it would apply off a `Commit` heartbeat (agreement
+        // violation) or poison a future DVC. Drop it; the current primary's canonical `Prepare` for this op
+        // re-extends the head. Mirrors the `on_prepare` ingress epoch+view gate the buffered entry bypassed
+        // (it was admitted under a prior view). A stale entry is a hole, so draining stops here — any higher
+        // buffered op is unreachable until the real current-view `Prepare` fills the gap.
+        if next_epoch != self.membership.epoch() || next_view != self.view {
+          self.buffer.remove(&(self.op.get() + 1));
+          break;
+        }
         if self.maybe_sync_below_ring_window(now, wal, next_op, next_ckpt)
           || self.band_at_capacity()
         {
@@ -1191,20 +1205,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     blocks: &mut dyn BlockStore,
     target: u64,
   ) {
-    // Do NOT apply ops over an SM that is about to be replaced or that does not yet hold its checkpoint:
-    // - PRE-ROOT staged install (`pending_install`): the SM is about to be wholesale-REPLACED at the synced
-    //   point by `install_sync`, and this also keeps `commit_min`/`commit_max`/`self.op` FROZEN across the
-    //   STAGE→install window so the install is the single atomic mutation point (the captured held-tail
-    //   decision + the monotonic advances stay exactly as at STAGE, with no commit_max rewind).
-    // - SM-RECONSTRUCT owed (`sm_reconstruct`): a post-root restore faulted, so `self.checkpoint_op == M`
-    //   but the SM still holds the OLD content — applying an op over it would corrupt committed state (the
-    //   warm analogue of cold-start `recover()`'s un-reconstructed-SM window). The retry reconstructs the
-    //   SM under the fixed M pointer; ops re-apply via the next Commit/Prepare once the obligation clears.
-    if self.pending_install.is_some() || self.sm_reconstruct_owed() {
+    // A PRE-ROOT staged install (`pending_install`) is about to wholesale-REPLACE the SM at the synced
+    // point (`install_sync`), and keeps `commit_min`/`commit_max`/`self.op` FROZEN across the STAGE→install
+    // window so the install is the single atomic mutation point (the captured held-tail decision + the
+    // monotonic advances stay exactly as at STAGE, no commit_max rewind). Return BEFORE learning the commit.
+    if self.pending_install.is_some() {
       return;
     }
-    // Record the learned commit regardless of whether we hold the ops yet.
+    // Record the learned commit regardless of whether we hold — or can yet apply — the ops: `commit_max` is
+    // a re-learnable HINT, not an apply effect. An SM-reconstruct-owed node MUST still raise it, unlike the
+    // frozen install case: otherwise a view change it wins forms with a stale `commit_max` (the
+    // `advance_commit(commit_star)` in `start_view_as_new_primary` would no-op below), and the
+    // repair-or-truncate grace then classifies genuinely-committed header-only ops in `(checkpoint_op,
+    // commit*]` as truncation candidates (`op > commit_max`) and can truncate a client-acked op.
     self.commit_max = OpNumber::with(self.commit_max.get().max(target));
+    // SM-RECONSTRUCT owed (`sm_reconstruct`): a post-root restore faulted, so `self.checkpoint_op == M` is
+    // durable but the SM still holds the OLD content — applying an op over it would corrupt committed state
+    // (the warm analogue of cold-start `recover()`'s un-reconstructed-SM window). We LEARNED the commit
+    // above but must NOT apply here; the retry reconstructs the SM under the fixed M pointer and ops
+    // re-apply via the next Commit/Prepare once the obligation clears.
+    if self.sm_reconstruct_owed() {
+      return;
+    }
     while self.commit_min.get() < target && self.commit_min.get() < self.op.get() {
       let op = self.commit_min.get() + 1;
       // Faults-as-data (peer fault-repair): a committed op whose body read back
