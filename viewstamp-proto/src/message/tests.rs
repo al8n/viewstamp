@@ -190,14 +190,12 @@ fn request_prepare_constructs_and_round_trips() {
     OpNumber::with(7),
     ReplicaId::new(3),
     0,
-    42,
   ));
   assert!(m.is_request_prepare());
   let rp = m.unwrap_request_prepare();
   assert_eq!(rp.view(), View::with(2));
   assert_eq!(rp.op(), OpNumber::with(7));
   assert_eq!(rp.replica(), ReplicaId::new(3));
-  assert_eq!(rp.generation(), 42);
 }
 
 #[test]
@@ -210,7 +208,6 @@ fn nack_constructs_and_round_trips() {
     OpNumber::with(7),
     ReplicaId::new(3),
     0xCAFE,
-    99,
   ));
   assert!(
     !m.advertises_authoritative_view(),
@@ -225,7 +222,6 @@ fn nack_constructs_and_round_trips() {
   assert_eq!(n.op(), OpNumber::with(7));
   assert_eq!(n.replica(), ReplicaId::new(3));
   assert_eq!(n.config_id(), 0xCAFE);
-  assert_eq!(n.generation(), 99);
 }
 
 #[test]
@@ -422,8 +418,7 @@ fn advertises_authoritative_view_is_exactly_the_gated_set() {
       View::with(1),
       OpNumber::with(1),
       ReplicaId::new(2),
-      0,
-      0,
+      0
     )),
     Message::Recovery(Recovery::new(ReplicaId::new(2), 0, crate::Epoch::new(0), 0)),
     Message::RequestSync(RequestSync::new(
@@ -597,7 +592,6 @@ fn one_of_each_variant() -> std::vec::Vec<Message> {
       OpNumber::with(7),
       ReplicaId::new(3),
       0,
-      13,
     )),
     Message::Recovery(Recovery::new(
       ReplicaId::new(9),
@@ -746,7 +740,6 @@ fn one_of_each_variant() -> std::vec::Vec<Message> {
       OpNumber::with(u64::MAX), // edge scalar op — round-trips
       ReplicaId::new(300),      // a slot above a single byte exercises both u16 bytes
       0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, // non-zero config lineage — round-trips
-      u64::MAX,                 // edge generation — round-trips
     )),
   ]
 }

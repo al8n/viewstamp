@@ -43,7 +43,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         OpNumber::with(op),
         self.local_slot(),
         self.membership.config_id(),
-        self.solicit_gen,
       )),
     ));
   }
@@ -164,11 +163,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if !self.participates_as_primary() || self.pending_forfeit {
       return;
     }
-    // Freshness gate: count a nack only against the CURRENT solicitation. A nack echoing a superseded
-    // generation is stale — its sender may since have repaired the op and joined its write-quorum — so it
-    // is not evidence of a current durable lack. `repair_timeouts` clears `nack_from` on each bump, so a
-    // survivor here always answers this round's `RequestPrepare`.
-    if m.generation() != self.solicit_gen {
+    // Generation gate: count a nack only from THIS view. The view is the primary generation — a nack from a
+    // prior view answers a superseded solicitation (and its op number may have been reused by this view), so
+    // it is not evidence about a current candidate. Within a view a counted nack cannot go stale: a nacker
+    // lacks an op ABOVE its head (the `op > self.op` emit gate), and it can only come to HOLD an above-head
+    // op via this primary's `Prepare` — which requires the primary to hold the op's body, making the op
+    // `Present` here and therefore no longer a candidate (the `is_repair_or_truncate_candidate` re-check
+    // below then declines to count). So the nacker stays a genuine non-holder for as long as the op is a
+    // candidate, and the tally accumulates soundly across retransmit rounds. `nack_from` is cleared at the
+    // view boundary (`reset_for_view_transition`), so a straggling prior-view nack that arrives after is
+    // dropped here by the view check.
+    if m.view() != self.view {
       return;
     }
     let Some(rid) = from.as_replica() else {
@@ -316,11 +321,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.timers.repair_retry = None;
       return;
     }
-    // Open a fresh solicitation round: bump the generation and clear the nack tally. Every nack gathered
-    // this round answers a `RequestPrepare` stamped with the new generation, so it reflects a CURRENT
-    // durable lack; a nack echoing the prior generation is dropped by `on_nack`.
-    self.solicit_gen = self.solicit_gen.wrapping_add(1);
-    self.nack_from.clear();
     // Split the holes: a repair-or-truncate CANDIDATE (a `Repairing` hole above `commit_max`) is
     // re-solicited PER-OP with a `RequestPrepare`, because that is the path a lacking peer answers with a
     // `Nack` (the range serve only returns `Present` bodies, never negative evidence) — so a dropped first
@@ -399,14 +399,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // op IS body-bearing (`body_bytes()` yields its `encode_body()`), so we serve its reconfiguration
     // bytes exactly like a client op — a peer repairing the carried reconfiguration op fetches it from us.
     let Some(entry) = self.log.get(&op) else {
-      // We DURABLY LACK this op — no record, not even a header. If it is ABOVE our checkpoint (so our log
-      // is the authoritative durable record for that slot), answer the NEGATIVE: "I lack op N." The new
-      // primary counts this toward the nack quorum that truncates its uncommitted tail. It is a
-      // view-INDEPENDENT fact, so — unlike the Prepare serve — it is emitted even while our own view write
-      // is in flight (the log is durable regardless of the view), maximizing the liveness of the
-      // truncate-vs-block decision. An op `<= checkpoint_op` is subsumed by our snapshot (we HOLD it), so
-      // we never nack it; the requester should state-sync the checkpoint instead.
-      if op > self.checkpoint_op.get() {
+      // We have NO log entry for this op. Answer the NEGATIVE "I lack op N" — but ONLY when the op is ABOVE
+      // OUR HEAD (`op > self.op`): then we genuinely never RECEIVED it, so we are a true non-holder and our
+      // lack is evidence toward truncating an uncommitted tail op. An op `<= self.op` is our OWN prefix —
+      // even absent from the cache it is a slot we ACKED (a below-head committed hole we are repairing, its
+      // faulted body dropped but its durable header proving we held it), so it is committed-or-accepted
+      // evidence, NOT a lack: nacking it could truncate a committed op a new primary's quorum excluded us
+      // from. Also require `op > commit_max`: an op we know committed (learned via a peer's commit) is never
+      // lack-evidence. The nack is view-INDEPENDENT content, so — unlike the Prepare serve — it is emitted
+      // even while our own view write is in flight (the log is durable regardless of the view). (`op >
+      // self.op >= checkpoint_op`, so the snapshot-subsumed case is covered.)
+      if op > self.op.get() && op > self.commit_max.get() {
         self.emit(Outgoing::new(
           Recipient::To(Peer::Replica(requester)),
           Message::Nack(crate::Nack::new(
@@ -414,7 +417,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
             OpNumber::with(op),
             self.local_slot(),
             self.membership.config_id(),
-            m.generation(),
           )),
         ));
       }

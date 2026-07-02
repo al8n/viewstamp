@@ -2774,7 +2774,6 @@ fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
       OpNumber::with(1),
       ReplicaId::new(2),
       0,
-      0,
     )),
   );
   let mut prepare_in_window = false;
@@ -2810,7 +2809,6 @@ fn on_request_prepare_does_not_serve_during_the_durable_view_window() {
       View::with(1),
       OpNumber::with(1),
       ReplicaId::new(2),
-      0,
       0,
     )),
   );
@@ -3917,7 +3915,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   assert!(
     e.has_repair_hole_for_test(2),
@@ -3935,7 +3933,7 @@ fn b_uncommitted_repairing_tail_with_no_body_truncates_after_grace_and_progresse
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert!(
     !e.has_repair_hole_for_test(2),
@@ -4114,7 +4112,7 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   assert_eq!(
     e.nack_voters_for_test(2),
@@ -4154,7 +4152,7 @@ fn a_committed_repairing_op_is_kept_when_a_present_holder_answers_within_the_gra
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   assert_eq!(
     e.op(),
@@ -4331,7 +4329,7 @@ fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_gra
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   e.handle_message(
     now,
@@ -4358,7 +4356,7 @@ fn c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_gra
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   assert_eq!(
     e.op(),
@@ -4484,7 +4482,7 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   e.handle_message(
     now,
@@ -4492,7 +4490,7 @@ fn repair_fill_in_flight_across_the_grace_is_never_truncated() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert_eq!(
     e.op(),
@@ -4638,7 +4636,7 @@ fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   e.handle_message(
     now,
@@ -4646,7 +4644,7 @@ fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert_eq!(
     e.op(),
@@ -4678,7 +4676,7 @@ fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   e.handle_message(
     now,
@@ -4686,7 +4684,7 @@ fn repair_or_truncate_does_not_fire_in_pending_sb_window() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert_eq!(
     e.op(),
@@ -4784,7 +4782,7 @@ fn repair_or_truncate_does_not_fire_in_pending_forfeit_window() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   e.handle_message(
     now,
@@ -4792,7 +4790,7 @@ fn repair_or_truncate_does_not_fire_in_pending_forfeit_window() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert_eq!(
     e.op(),
@@ -4926,7 +4924,7 @@ fn uncommitted_candidate_does_not_forfeit_and_truncation_fires_on_the_nack_quoru
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   e.handle_message(
     clock,
@@ -4934,7 +4932,7 @@ fn uncommitted_candidate_does_not_forfeit_and_truncation_fires_on_the_nack_quoru
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert_eq!(
     e.op(),
@@ -5081,7 +5079,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   e.handle_message(
     now,
@@ -5089,7 +5087,7 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert_eq!(
     e.op(),
@@ -5281,7 +5279,7 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   e.handle_message(
     now,
@@ -5289,7 +5287,7 @@ fn repair_tail_truncation_lets_a_truncated_clients_retry_be_processed_fresh() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert_eq!(
     e.op(),
@@ -5389,7 +5387,7 @@ fn on_nack_truncates_at_the_f_plus_one_voter_quorum() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   assert_eq!(e.nack_voters_for_test(2), 1, "one voter nack is tallied");
   assert!(
@@ -5403,7 +5401,7 @@ fn on_nack_truncates_at_the_f_plus_one_voter_quorum() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert!(
     !e.has_repair_hole_for_test(2),
@@ -5413,106 +5411,145 @@ fn on_nack_truncates_at_the_f_plus_one_voter_quorum() {
 }
 
 #[test]
-fn a_stale_nack_from_a_superseded_generation_is_not_counted() {
-  // A nack echoes the generation of the `RequestPrepare` it answers, and the primary counts a nack only
-  // against its CURRENT solicitation. A voter that nacked a candidate, then repaired the op and joined its
-  // write-quorum, stops nacking the next round — so its earlier nack (a superseded generation) MUST NOT
-  // linger in the tally as a stale durable-lack claim, or a since-committed op could reach the quorum.
-  let (mut e, mut wal, mut sb, mut blocks) = new_primary_with_op2_candidate(genesis(3));
+fn a_below_head_committed_hole_does_not_nack() {
+  // A replica that ACKED a committed op and later recovered it as a body-faulty BELOW-HEAD hole (its
+  // faulted Present entry dropped, so `log.get(op) == None`, but the op is at/below its head — it did reach
+  // and append it) must NOT nack a RequestPrepare for it: it is that replica's own committed prefix, not a
+  // lack. Nacking it would let a new primary whose quorum excluded this replica count negative evidence
+  // toward truncating a COMMITTED op. The `op > self.op` emit gate makes only an ABOVE-head op nackable.
+  let mut e = backup(); // replica 1 of 3
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
-  let stale_gen = e.solicit_gen_for_test();
+  // Head at op 3, commit 1, a below-head repair hole at op 2 (log.get(2) == None, 2 < head 3).
+  e.force_state_for_test(0, 3, 1, 0, &[2]);
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "op 2 is a below-head repair hole"
+  );
+  assert!(
+    !e.has_log_entry_for_test(2),
+    "the faulted body left no log entry at 2"
+  );
+  // A peer solicits op 2. Op 2 <= our head, so it is our own acked prefix — we stay SILENT (no nack).
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(stale_gen, 1, 2, 0),
-  );
-  assert_eq!(
-    e.nack_voters_for_test(2),
-    1,
-    "the current-generation nack tallies"
-  );
-
-  // A repair round opens: the generation bumps and the tally clears (the candidate is re-solicited afresh).
-  let later = now + core::time::Duration::from_millis(500);
-  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
-  assert!(
-    e.solicit_gen_for_test() > stale_gen,
-    "the repair round bumped the solicitation generation"
-  );
-  assert_eq!(
-    e.nack_voters_for_test(2),
-    0,
-    "the tally cleared for the new round"
-  );
-
-  // The two voters' ORIGINAL nacks (the superseded generation) arrive late — both dropped, so the quorum is
-  // never reached on stale evidence.
-  for r in [0u16, 2] {
-    e.handle_message(
-      later,
-      &mut wal,
-      &mut sb,
-      &mut blocks,
-      Peer::Replica(ReplicaId::new(r)),
-      nack(stale_gen, 1, 2, r),
-    );
-  }
-  assert_eq!(
-    e.nack_voters_for_test(2),
-    0,
-    "stale-generation nacks are dropped — never counted toward the truncation quorum"
+    Message::RequestPrepare(crate::RequestPrepare::new(
+      View::new(),
+      OpNumber::with(2),
+      ReplicaId::new(0),
+      0,
+    )),
   );
   assert!(
-    e.has_repair_hole_for_test(2),
-    "so the candidate is not truncated by stale nacks"
-  );
-
-  // Fresh nacks at the CURRENT generation from f+1 distinct voters DO truncate — liveness is intact.
-  let fresh_gen = e.solicit_gen_for_test();
-  for r in [0u16, 2] {
-    e.handle_message(
-      later,
-      &mut wal,
-      &mut sb,
-      &mut blocks,
-      Peer::Replica(ReplicaId::new(r)),
-      nack(fresh_gen, 1, 2, r),
-    );
-  }
-  assert!(
-    !e.has_repair_hole_for_test(2),
-    "f+1 current-generation nacks truncate the candidate"
+    !core::iter::from_fn(|| e.poll_message()).any(|o| matches!(o.msg_ref(), Message::Nack(_))),
+    "a below-head committed hole is never nacked — it is our own acked prefix, not a durable lack"
   );
 }
 
 #[test]
-fn a_lost_first_request_prepare_still_gathers_nacks_and_truncates() {
-  // The repair retry re-emits a PER-OP `RequestPrepare` for each candidate (not only the committed-band
-  // range serve), so a dropped first solicit or first nack is re-elicited and the truncate-or-repair
-  // decision keeps making progress. Here the initial solicitation's nacks never arrive; the retry round
-  // re-solicits, and the f+1 nacks it gathers truncate the genuinely-uncommitted candidate.
+fn a_served_candidate_is_not_truncated_by_a_straggling_nack() {
+  // A nacker lacks an op ABOVE its head and can only come to hold it via this primary's Prepare — which
+  // needs the primary to hold the body, making the op Present here and therefore NOT a candidate. So a
+  // holder's serve that fills the primary's own header structurally preempts truncation: once the candidate
+  // is Present, `on_nack`'s candidate re-check drops any straggling nack, even below the f+1 quorum. Here
+  // one voter nacks (below quorum), a holder serves op 2's body, and a second voter's nack is then ignored.
   let (mut e, mut wal, mut sb, mut blocks) = new_primary_with_op2_candidate(genesis(3));
   let now = Instant::ZERO;
-  assert!(e.has_repair_hole_for_test(2), "op 2 is the candidate");
-  let later = now + core::time::Duration::from_millis(500);
-  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
-  let current_gen = e.solicit_gen_for_test();
-  for r in [0u16, 2] {
-    e.handle_message(
-      later,
-      &mut wal,
-      &mut sb,
-      &mut blocks,
-      Peer::Replica(ReplicaId::new(r)),
-      nack(current_gen, 1, 2, r),
-    );
-  }
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    nack(1, 2, 0),
+  );
+  assert_eq!(
+    e.nack_voters_for_test(2),
+    1,
+    "one nack tallied, below the f+1 quorum"
+  );
+  // A holder serves op 2's real body (client 7 / request 2) — the primary's header fills to Present.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Prepare(Prepare::new(
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::new(7),
+      RequestNumber::with(2),
+      Bytes::copy_from_slice(&[2u8]),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     !e.has_repair_hole_for_test(2),
-    "the retry re-elicited nacks and the f+1 quorum truncated the candidate"
+    "op 2 filled to Present — no longer a candidate"
+  );
+  // A straggling second-voter nack now arrives — it is dropped (op 2 is not a candidate), so the filled
+  // (possibly-committed) op is never truncated even though f+1 voters would have nominally been reached.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    nack(1, 2, 2),
+  );
+  assert!(
+    e.has_log_entry_for_test(2),
+    "the served op survives — a straggling nack cannot truncate a filled op"
+  );
+}
+
+#[test]
+fn a_slow_nack_across_retransmit_rounds_still_accumulates_and_truncates() {
+  // Nacks are counted for the current VIEW and accumulate across retransmit rounds — they are NOT
+  // invalidated by the repair-retry cadence. So a connected-but-slow path (RTT beyond one retransmit
+  // interval) still reaches the f+1 quorum, rather than perpetually re-soliciting and never accumulating.
+  let (mut e, mut wal, mut sb, mut blocks) = new_primary_with_op2_candidate(genesis(3));
+  let now = Instant::ZERO;
+  // Voter 0's nack lands in the first round.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    nack(1, 2, 0),
+  );
+  assert_eq!(e.nack_voters_for_test(2), 1, "first-round nack tallied");
+  // A repair-retry round fires (re-solicits the candidate); the tally is NOT cleared.
+  let later = now + core::time::Duration::from_millis(500);
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    e.nack_voters_for_test(2),
+    1,
+    "the retransmit round did not clear the accumulated nack"
+  );
+  // Voter 2's nack arrives a round late — it accumulates with voter 0's to reach f+1 → truncate.
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    nack(1, 2, 2),
+  );
+  assert!(
+    !e.has_repair_hole_for_test(2),
+    "the slow second nack accumulates to f+1 and truncates — no livelock"
   );
   assert_eq!(e.op(), OpNumber::with(1), "the uncommitted tail is dropped");
 }
@@ -5532,7 +5569,7 @@ fn on_nack_ignores_a_non_voter_nack() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(3)), // the learner
-    nack(e.solicit_gen_for_test(), 1, 2, 3),
+    nack(1, 2, 3),
   );
   assert_eq!(
     e.nack_voters_for_test(2),
@@ -5545,7 +5582,7 @@ fn on_nack_ignores_a_non_voter_nack() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)), // a voter
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   assert_eq!(e.nack_voters_for_test(2), 1, "only the voter is tallied");
   assert!(
@@ -5558,7 +5595,7 @@ fn on_nack_ignores_a_non_voter_nack() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)), // a second voter
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert!(
     !e.has_repair_hole_for_test(2),
@@ -5584,7 +5621,7 @@ fn on_nack_ignores_a_nack_for_a_committed_op() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 1, 0),
+    nack(1, 1, 0),
   );
   e.handle_message(
     now,
@@ -5592,7 +5629,7 @@ fn on_nack_ignores_a_nack_for_a_committed_op() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 1, 2),
+    nack(1, 1, 2),
   );
   assert_eq!(
     e.nack_voters_for_test(1),
@@ -5623,7 +5660,7 @@ fn on_nack_counts_a_repeated_member_once() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   e.handle_message(
     now,
@@ -5631,7 +5668,7 @@ fn on_nack_counts_a_repeated_member_once() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(0)), // the SAME member again
-    nack(e.solicit_gen_for_test(), 1, 2, 0),
+    nack(1, 2, 0),
   );
   assert_eq!(
     e.nack_voters_for_test(2),
@@ -5648,7 +5685,7 @@ fn on_nack_counts_a_repeated_member_once() {
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    nack(e.solicit_gen_for_test(), 1, 2, 2),
+    nack(1, 2, 2),
   );
   assert!(
     !e.has_repair_hole_for_test(2),
