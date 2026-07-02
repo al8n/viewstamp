@@ -199,6 +199,32 @@ fn request_prepare_constructs_and_round_trips() {
 }
 
 #[test]
+fn nack_constructs_and_round_trips() {
+  // The NEGATIVE answer to a RequestPrepare: a replica declares it durably LACKS `op`. Carries
+  // view/op/replica/config_id, round-trips byte-for-byte, and — like its paired RequestPrepare — is
+  // NEVER an authoritative-view claim (so it may be emitted while a view write is in flight).
+  let m = Message::Nack(Nack::new(
+    View::with(2),
+    OpNumber::with(7),
+    ReplicaId::new(3),
+    0xCAFE,
+  ));
+  assert!(
+    !m.advertises_authoritative_view(),
+    "a Nack is a view-independent 'I lack this op' fact, never a view-authority claim"
+  );
+  let back = Message::decode(&m.encode()).expect("round-trip decodes");
+  assert_eq!(back, m, "decode(encode(nack)) == nack");
+  let Message::Nack(n) = back else {
+    panic!("expected a Nack")
+  };
+  assert_eq!(n.view(), View::with(2));
+  assert_eq!(n.op(), OpNumber::with(7));
+  assert_eq!(n.replica(), ReplicaId::new(3));
+  assert_eq!(n.config_id(), 0xCAFE);
+}
+
+#[test]
 fn sync_messages_construct_and_round_trip() {
   use crate::ReplicaId;
   // A lagging replica solicits with its CURRENT (stale) checkpoint + a nonce.
@@ -709,6 +735,12 @@ fn one_of_each_variant() -> std::vec::Vec<Message> {
       crate::block_store::block_address(b"test-block"),
       Some(Bytes::from_static(b"test-block")),
     )),
+    Message::Nack(Nack::new(
+      View::with(3),
+      OpNumber::with(u64::MAX), // edge scalar op — round-trips
+      ReplicaId::new(300),      // a slot above a single byte exercises both u16 bytes
+      0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, // non-zero config lineage — round-trips
+    )),
   ]
 }
 
@@ -1000,7 +1032,7 @@ fn max_request_body_len_is_tight_against_every_body_carrier() {
 #[test]
 fn every_variant_round_trips_through_the_wire_codec() {
   let all = one_of_each_variant();
-  assert_eq!(all.len(), 23, "every Message variant is represented");
+  assert_eq!(all.len(), 24, "every Message variant is represented");
   for m in &all {
     let bytes = m.encode();
     let back = Message::decode(&bytes).expect("round-trip decodes");
@@ -1078,7 +1110,7 @@ fn a_replica_id_above_a_byte_round_trips_through_the_wire_codec() {
 
 #[test]
 fn commit_golden_bytes_pin_the_wire_layout() {
-  // A small STRICT variant pinned exactly: WIRE_VERSION(u16=12) ++ tag 4 ++ view ++ commit ++
+  // A small STRICT variant pinned exactly: WIRE_VERSION(u16=14) ++ tag 4 ++ view ++ commit ++
   // checkpoint_op ++ the strict epoch-policy pair epoch(u64) ++ config_id(u128).
   let c = Message::Commit(Commit::new(
     View::with(4),
@@ -1088,7 +1120,7 @@ fn commit_golden_bytes_pin_the_wire_layout() {
     0,
   ));
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 13, 4, // version 13, tag 4 (Commit)
+    0, 14, 4, // version 14, tag 4 (Commit)
     0, 0, 0, 0, 0, 0, 0, 4, // view = 4
     0, 0, 0, 0, 0, 0, 0, 9, // commit = 9
     0, 0, 0, 0, 0, 0, 0, 7, // checkpoint_op = 7
@@ -1123,7 +1155,7 @@ fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
     .with_checkpoint_op(OpNumber::with(3)),
   );
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 13, 6, // version 13, tag 6 (DoViewChange)
+    0, 14, 6, // version 14, tag 6 (DoViewChange)
     0, 0, 0, 0, 0, 0, 0, 3, // view = 3
     0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
     0, 0, 0, 0, 0, 0, 0, 5, // op = 5
@@ -1167,7 +1199,7 @@ fn do_view_change_golden_bytes_pin_a_repairing_entry() {
     .with_checkpoint_op(OpNumber::with(3)),
   );
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 13, 6, // version 13, tag 6 (DoViewChange)
+    0, 14, 6, // version 14, tag 6 (DoViewChange)
     0, 0, 0, 0, 0, 0, 0, 3, // view = 3
     0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
     0, 0, 0, 0, 0, 0, 0, 5, // op = 5
@@ -1325,7 +1357,7 @@ fn reconfigure_body_golden_bytes_pin_the_wire_layout() {
     .with_checkpoint_op(OpNumber::with(3)),
   );
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 13, 6, // version 13, tag 6 (DoViewChange)
+    0, 14, 6, // version 14, tag 6 (DoViewChange)
     0, 0, 0, 0, 0, 0, 0, 3, // view = 3
     0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
     0, 0, 0, 0, 0, 0, 0, 5, // op = 5

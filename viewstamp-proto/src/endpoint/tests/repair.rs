@@ -61,29 +61,99 @@ fn on_request_prepare_holder_replies_with_the_prepare() {
 }
 
 #[test]
-fn on_request_prepare_for_an_op_we_lack_is_silent() {
-  // A replica that does NOT hold the requested op stays silent (another peer answers) — never
-  // fabricates a Prepare.
-  let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
+fn on_request_prepare_is_serve_silent_or_nack_by_local_holding() {
+  // The THREE-WAY answer a Normal replica gives a peer's RequestPrepare, by what it durably holds:
+  //   * `Present` at/below head       → SERVE the Prepare (the body it holds);
+  //   * header-only `Repairing`       → SILENT (it holds the identity, not the body — a body holder answers);
+  //   * durably LACKS it, op > checkpoint_op  → NACK (its log is the authoritative durable record for the slot);
+  //   * durably LACKS it, op <= checkpoint_op → SILENT (subsumed by its snapshot — it HOLDS the op).
+  // A new primary holding op 1 `Present`, op 2 header-only `Repairing`, checkpoint 0, head 2 covers the
+  // first three; a separate replica with a non-zero checkpoint covers the fourth.
+  let (mut e, mut wal, mut sb, mut blocks) = new_primary_with_op2_candidate(genesis(3));
   let now = Instant::ZERO;
+  let request_prepare = |op: u64| {
+    Message::RequestPrepare(crate::RequestPrepare::new(
+      View::with(1),
+      OpNumber::with(op),
+      ReplicaId::new(2),
+      0,
+    ))
+  };
+
+  // `Present` op 1 (at/below head) → serve the Prepare carrying its body.
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
     &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
-    Message::RequestPrepare(crate::RequestPrepare::new(
-      View::new(),
-      OpNumber::with(9),
-      ReplicaId::new(2),
-      0,
-    )),
+    request_prepare(1),
+  );
+  match e.poll_message().expect("a Present op is served").into_msg() {
+    Message::Prepare(p) => {
+      assert_eq!(p.op(), OpNumber::with(1), "serves the held op 1");
+      assert_eq!(p.body(), &b"a"[..], "carries op 1's real body");
+    }
+    other => panic!("expected a Prepare serve, got {other:?}"),
+  }
+
+  // Header-only `Repairing` op 2 → SILENT (we hold the identity, not the body).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    request_prepare(2),
   );
   assert!(
     e.poll_message().is_none(),
-    "a replica that lacks the op answers no RequestPrepare"
+    "a header-only Repairing op is never served NOR nacked — a body holder answers"
+  );
+
+  // Durably LACKED op 5, above our checkpoint (0) → NACK, addressed back to the requester.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    request_prepare(5),
+  );
+  let out = e
+    .poll_message()
+    .expect("a durably-lacked op above the checkpoint is nacked");
+  assert_eq!(
+    out.to(),
+    Recipient::To(Peer::Replica(ReplicaId::new(2))),
+    "the nack routes back to the requester"
+  );
+  match out.into_msg() {
+    Message::Nack(n) => {
+      assert_eq!(n.op(), OpNumber::with(5), "the nack names the lacked op");
+      assert_eq!(n.replica(), ReplicaId::new(1), "stamped with our own slot");
+      assert_eq!(n.view(), View::with(1), "carries our current view");
+    }
+    other => panic!("expected a Nack, got {other:?}"),
+  }
+  assert!(e.poll_message().is_none(), "exactly one nack");
+
+  // A durably-LACKED op AT/BELOW the checkpoint is subsumed by the snapshot → SILENT (state-sync, not nack).
+  let mut b = backup();
+  b.force_state_for_test(0, 5, 5, 5, &[]); // op/commit/checkpoint all 5 (a self-consistent snapshot)
+  let (mut wal2, mut sb2) = (TestWal::default(), TestSb::default());
+  let mut blocks2 = crate::block_store::MemBlockStore::new();
+  b.handle_message(
+    now,
+    &mut wal2,
+    &mut sb2,
+    &mut blocks2,
+    Peer::Replica(ReplicaId::new(2)),
+    request_prepare(3), // 3 <= checkpoint 5: subsumed
+  );
+  assert!(
+    b.poll_message().is_none(),
+    "an op at/below the checkpoint is subsumed by the snapshot — silent, never nacked"
   );
 }
 
@@ -189,7 +259,9 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
     other => panic!("expected a Prepare for the committed op, got {other:?}"),
   }
 
-  // Asking for op 3 (ABOVE our head) → SILENT (not ours to serve).
+  // Asking for op 3 (ABOVE our head — we durably LACK it, above our checkpoint 0) → NACK, not a serve:
+  // we never fabricate a Prepare for an op we do not hold, and our log is the authoritative durable record
+  // for that slot, so we answer the negative "I lack op 3".
   e.handle_message(
     now,
     &mut wal,
@@ -203,9 +275,17 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
       0,
     )),
   );
+  match e
+    .poll_message()
+    .expect("a durably-lacked op above the checkpoint is nacked, not served")
+    .into_msg()
+  {
+    Message::Nack(n) => assert_eq!(n.op(), OpNumber::with(3), "the nack names the lacked op 3"),
+    other => panic!("expected a Nack for the lacked op above our head, got {other:?}"),
+  }
   assert!(
     e.poll_message().is_none(),
-    "no Prepare for an op above our head (op 3 > self.op == 2)"
+    "no Prepare for an op we do not hold"
   );
 }
 
