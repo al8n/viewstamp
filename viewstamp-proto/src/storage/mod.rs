@@ -1193,9 +1193,27 @@ pub trait Wal {
   fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes);
   /// Submit a read of `op`'s entry. Completion via [`Wal::poll`].
   fn submit_read(&mut self, id: OpId, op: OpNumber);
-  /// Drop all slots strictly above `op` (view-change tail truncation).
+  /// Drop all slots strictly above `above` (view-change tail truncation).
+  ///
+  /// # Contract
+  /// Takes effect SYNCHRONOUSLY on the synchronous views ([`Wal::op_head`] / [`Wal::header`]) — Phase-1
+  /// `recover` and the ring-window math read them immediately after — AND acts as an ORDERING BARRIER for
+  /// any append submitted AFTER it. An implementation that queues the truncate as a lazy async trim and
+  /// completes it AFTER a later head-extending `submit_append` to the same slots would destroy freshly
+  /// appended, already-acked ops — a committed-loss / false-vote hazard. The endpoint always truncates the
+  /// tail BEFORE re-appending the canonical head (`start_view_as_new_primary` / `adopt_canonical_head`), so
+  /// honoring this ordering is required. CRASH-durability MAY be lazy: a resurrected stale tail above the
+  /// authoritative head is re-classified (view / canonical checks) and self-heals into `RecoveringHead`, so
+  /// the drop need not be persisted synchronously — only REORDERING it relative to later appends is fatal.
   fn truncate(&mut self, above: OpNumber);
-  /// Free all slots strictly below `op` (post-checkpoint GC).
+  /// Free all slots strictly below `below` (post-checkpoint GC).
+  ///
+  /// # Contract
+  /// Like [`Wal::truncate`]: takes effect SYNCHRONOUSLY on the synchronous views and must not be reordered
+  /// with subsequently-submitted appends. Freeing a slot the endpoint has not moved past is a contract
+  /// violation — the endpoint only prunes strictly below a checkpoint-subsumed floor (`run_gc`). Crash
+  /// durability may be lazy (a resurrected pruned slot below the checkpoint is inert — the SM snapshot owns
+  /// that prefix).
   fn prune(&mut self, below: OpNumber);
   /// Drain the next completed op, if any. Completions for appends ([`WalDone::Appended`]) MAY be
   /// delivered in ANY order relative to their submission (a real proactor reorders); see the
