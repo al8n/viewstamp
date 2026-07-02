@@ -380,6 +380,40 @@ fn the_reconfigure_op_is_never_delivered_to_the_state_machine() {
 }
 
 #[test]
+fn e_epoch_ops_sit_at_or_below_commit_max_after_a_swap_so_are_never_nack_candidates() {
+  // A new voter admitted by an epoch swap cannot nack-truncate a predecessor-epoch committed op. The
+  // reason is structural, not a nack-side check: committing the `Reconfigure` op N lifts `commit_max >= N`
+  // (in `commit_reconfigure`, before the SwapEpoch even stages), and the mint fence makes N the LAST op of
+  // its epoch — so every E-epoch op sits at/below `commit_max` once the swap installs. A repair-or-truncate
+  // candidate is STRICTLY above `commit_max`, so no E-epoch op is ever a candidate in E+1, and `on_nack`'s
+  // candidate re-check drops any nack for it regardless of the (larger) successor voter set / quorum. This
+  // pins the invariant that makes the counting-proof truncation safe across a voter-set growth.
+  let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install E+1
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(1),
+    "the epoch swapped to E+1"
+  );
+  assert!(
+    e.commit_max() >= op,
+    "committing the reconfigure op N (op {}) lifted commit_max ({}) to >= N before the E+1 config installed",
+    op.get(),
+    e.commit_max().get(),
+  );
+  // Every E-epoch op (1..=N) is at/below commit_max — the committed band — never strictly above it (the
+  // region a repair-or-truncate candidate must occupy). So a new E+1 voter's nack can never truncate one.
+  for x in 1..=op.get() {
+    assert!(
+      x <= e.commit_max().get(),
+      "E-epoch op {x} is <= commit_max {} — subsumed in the committed band, never a nack candidate",
+      e.commit_max().get(),
+    );
+  }
+}
+
+#[test]
 fn on_the_durable_root_the_epoch_swaps_and_membership_changed_is_emitted() {
   // Once the SwapEpoch root lands, `install_membership` runs: epoch == old+1, prev_epoch == old, the
   // successor membership is active, and a `MembershipChanged` event is emitted.
