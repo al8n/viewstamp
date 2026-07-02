@@ -43,6 +43,7 @@ fn on_request_prepare_holder_replies_with_the_prepare() {
       OpNumber::with(1),
       ReplicaId::new(2),
       0,
+      0,
     )),
   );
   let out = e.poll_message().expect("holder answers RequestPrepare");
@@ -76,6 +77,7 @@ fn on_request_prepare_is_serve_silent_or_nack_by_local_holding() {
       View::with(1),
       OpNumber::with(op),
       ReplicaId::new(2),
+      0,
       0,
     ))
   };
@@ -213,6 +215,7 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
       OpNumber::with(2),
       ReplicaId::new(2),
       0,
+      0,
     )),
   );
   match e
@@ -241,6 +244,7 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
       View::new(),
       OpNumber::with(1),
       ReplicaId::new(2),
+      0,
       0,
     )),
   );
@@ -272,6 +276,7 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
       View::new(),
       OpNumber::with(3),
       ReplicaId::new(2),
+      0,
       0,
     )),
   );

@@ -43,6 +43,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         OpNumber::with(op),
         self.local_slot(),
         self.membership.config_id(),
+        self.solicit_gen,
       )),
     ));
   }
@@ -161,6 +162,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// re-elicits nacks until the quorum is reached or a holder fills the hole.
   pub(crate) fn on_nack<W: Wal>(&mut self, wal: &mut W, from: Peer, m: crate::Nack) {
     if !self.participates_as_primary() || self.pending_forfeit {
+      return;
+    }
+    // Freshness gate: count a nack only against the CURRENT solicitation. A nack echoing a superseded
+    // generation is stale — its sender may since have repaired the op and joined its write-quorum — so it
+    // is not evidence of a current durable lack. `repair_timeouts` clears `nack_from` on each bump, so a
+    // survivor here always answers this round's `RequestPrepare`.
+    if m.generation() != self.solicit_gen {
       return;
     }
     let Some(rid) = from.as_replica() else {
@@ -308,24 +316,47 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.timers.repair_retry = None;
       return;
     }
+    // Open a fresh solicitation round: bump the generation and clear the nack tally. Every nack gathered
+    // this round answers a `RequestPrepare` stamped with the new generation, so it reflects a CURRENT
+    // durable lack; a nack echoing the prior generation is dropped by `on_nack`.
+    self.solicit_gen = self.solicit_gen.wrapping_add(1);
+    self.nack_from.clear();
+    // Split the holes: a repair-or-truncate CANDIDATE (a `Repairing` hole above `commit_max`) is
+    // re-solicited PER-OP with a `RequestPrepare`, because that is the path a lacking peer answers with a
+    // `Nack` (the range serve only returns `Present` bodies, never negative evidence) — so a dropped first
+    // solicit or nack is re-elicited and the truncate-or-repair decision keeps making progress. Committed
+    // holes (`<= commit_max`, always body-holder-backed) keep the byte-bounded `RequestPrepareRange`
+    // coalescing so a deep header-only band re-solicits in a handful of windowed messages. The candidate
+    // tail is shallow (the uncommitted pipeline tail near the head), so the per-op fan-out is cheap.
     let ops: std::vec::Vec<u64> = self.repair.iter().copied().collect();
-    // Coalesce ascending ops into maximal contiguous runs, emitting one `RequestPrepareRange` per run
-    // (chunked at `REPAIR_WINDOW` ops so a single re-solicit never spans an unbounded range). `lo`/`hi`
-    // track the current open run; a break in contiguity OR a full window flushes it.
-    let mut lo = ops[0];
-    let mut hi = ops[0];
-    for &op in &ops[1..] {
-      let contiguous = op == hi + 1;
-      let within_window = op < lo + REPAIR_WINDOW;
-      if contiguous && within_window {
-        hi = op;
+    let commit_max = self.commit_max.get();
+    let mut committed_holes: std::vec::Vec<u64> = std::vec::Vec::new();
+    for op in ops {
+      if op > commit_max {
+        self.send_request_prepare(op);
       } else {
-        self.send_request_prepare_range(lo, hi);
-        lo = op;
-        hi = op;
+        committed_holes.push(op);
       }
     }
-    self.send_request_prepare_range(lo, hi);
+    // Coalesce the committed holes into maximal contiguous runs, emitting one `RequestPrepareRange` per run
+    // (chunked at `REPAIR_WINDOW` ops so a single re-solicit never spans an unbounded range). `lo`/`hi`
+    // track the current open run; a break in contiguity OR a full window flushes it.
+    if let Some((&first, rest)) = committed_holes.split_first() {
+      let mut lo = first;
+      let mut hi = first;
+      for &op in rest {
+        let contiguous = op == hi + 1;
+        let within_window = op < lo + REPAIR_WINDOW;
+        if contiguous && within_window {
+          hi = op;
+        } else {
+          self.send_request_prepare_range(lo, hi);
+          lo = op;
+          hi = op;
+        }
+      }
+      self.send_request_prepare_range(lo, hi);
+    }
     self.timers.repair_retry = Some(now + REPAIR_RETRANSMIT);
   }
 
@@ -383,6 +414,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
             OpNumber::with(op),
             self.local_slot(),
             self.membership.config_id(),
+            m.generation(),
           )),
         ));
       }

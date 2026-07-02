@@ -704,13 +704,16 @@ fn repair_prepare(view: u64, op: u64, commit: u64) -> Message {
 
 /// The negative answer `replica` sends a new primary's `RequestPrepare(op)` when it durably LACKS the
 /// op — the vote the primary counts toward its `f+1` truncation quorum. Carries the fixture lineage
-/// (`config_id = 0`), matching the strict-self-id ingress the counted nack binds to.
-fn nack(view: u64, op: u64, replica: u16) -> Message {
+/// (`config_id = 0`), matching the strict-self-id ingress the counted nack binds to. `generation` echoes
+/// the soliciting `RequestPrepare`'s generation; the primary counts a nack only against its CURRENT
+/// solicitation (read via `solicit_gen_for_test`), so a stale generation is dropped.
+fn nack(generation: u64, view: u64, op: u64, replica: u16) -> Message {
   Message::Nack(crate::Nack::new(
     View::with(view),
     OpNumber::with(op),
     ReplicaId::new(replica),
     0,
+    generation,
   ))
 }
 

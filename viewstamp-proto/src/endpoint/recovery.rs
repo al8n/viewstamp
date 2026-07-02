@@ -397,6 +397,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       log_floor: OpNumber::with(checkpoint_op),
       peer_checkpoint: BTreeMap::new(),
       nack_from: BTreeMap::new(),
+      solicit_gen: 0,
       // The quorum-th order statistic over {own durable checkpoint, no peer reports} — coherent with
       // `recompute_quorum_checkpoint` (and its staleness assert) over the fields above. The own
       // checkpoint seeds the statistic only when self is a VOTER in a solo voting set (`quorum == 1`):

@@ -948,6 +948,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       })
       .map(|(op, _)| *op)
       .collect();
+    // Open the first solicitation round of this primary generation: bump the generation so the initial
+    // per-op `RequestPrepare`s below carry a fresh one, and any nack answering a PRIOR generation's
+    // solicitation (from before this formation) is dropped by `on_nack`. (`reset_for_view_transition`
+    // already cleared `nack_from`; the generation is monotone across generations, never reset.)
+    self.solicit_gen = self.solicit_gen.wrapping_add(1);
     for op in repairing_tail {
       self.request_repair(now, op);
     }

@@ -38,7 +38,7 @@ fn sender_matches_accepts_serve_and_solicit_messages_from_a_learner() {
 
   let serves = [
     Message::GetView(crate::GetView::new(v, learner, 7, crate::Epoch::new(0), 0)),
-    Message::RequestPrepare(crate::RequestPrepare::new(v, op, learner, 0)),
+    Message::RequestPrepare(crate::RequestPrepare::new(v, op, learner, 0, 0)),
     Message::RequestPrepareRange(crate::RequestPrepareRange::new(v, op, op, learner, 0)),
     Message::Recovery(crate::Recovery::new(learner, 7, crate::Epoch::new(0), 0)),
     Message::RequestSync(crate::RequestSync::new(
@@ -220,6 +220,7 @@ fn on_request_prepare_serves_a_learner_requester() {
       View::new(),
       OpNumber::with(1),
       learner,
+      0,
       0,
     )),
   );
