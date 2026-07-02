@@ -396,6 +396,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // force-sync escalation re-narrows it as soon as a peer checkpoint is heard.
       log_floor: OpNumber::with(checkpoint_op),
       peer_checkpoint: BTreeMap::new(),
+      nack_from: BTreeMap::new(),
       // The quorum-th order statistic over {own durable checkpoint, no peer reports} — coherent with
       // `recompute_quorum_checkpoint` (and its staleness assert) over the fields above. The own
       // checkpoint seeds the statistic only when self is a VOTER in a solo voting set (`quorum == 1`):
@@ -762,19 +763,25 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       .map(|h| (h.client(), h.request(), h.body_checksum()))
   }
 
-  /// Resolve a tail op whose ABSOLUTE read budget is exhausted, from its durable header. A held
-  /// COMMITTED op (`op <= commit_max`) whose durable header classifies `Verified` is KEPT header-only
-  /// as `Body::Repairing` (existence + identity preserved so a later view change cannot re-mint its op
-  /// number); every other case — a StaleCommitted/superseded committed slot, a committed slot with no
-  /// durable header, OR an UNCOMMITTED op (`op > commit_max`, the faulty HEAD included, which must stay
-  /// faulty to drive `RecoveringHead` / be truncated) — is routed to `rec.faulty` (a peer-repaired
-  /// hole). This is the STORAGE-path resolution `recover_timeouts` invokes on budget exhaustion. It shares
-  /// the VERDICT (`inflight_tail_repairing_identity`) with the peer-checkpoint completion's per-op
-  /// resolution (`on_recover_sync_checkpoint`) so the two cannot drift, but DIFFERS on an UNCOMMITTED op:
-  /// here it routes one to faulty (so a faulty head still drives `RecoveringHead` / is truncated), whereas
-  /// the always-Normal-bound message path keeps a Verified uncommitted op header-only as `Body::Repairing`.
+  /// Resolve a tail op whose ABSOLUTE read budget is exhausted, from its durable header. Any op EXCEPT a
+  /// non-committed HEAD whose durable header classifies `Verified` is KEPT header-only as `Body::Repairing`
+  /// (existence + identity preserved so a later view change cannot re-mint its op number); a
+  /// StaleCommitted/superseded slot, a slot with no durable header, and the non-committed HEAD
+  /// (`op == self.op` above `commit_max`, which must stay faulty to drive `RecoveringHead`) are routed to
+  /// `rec.faulty` (a peer-repaired hole). This is the STORAGE-path resolution `recover_timeouts` invokes on
+  /// budget exhaustion; it now MATCHES the always-Normal-bound message path (`on_recover_sync_checkpoint`),
+  /// which shares the VERDICT (`inflight_tail_repairing_identity`) and also keeps a Verified non-head
+  /// uncommitted op header-only — the two no longer drift.
+  ///
+  /// Keeping a NON-HEAD op ABOVE `commit_max` (an acked, cluster-committed op whose commit knowledge was
+  /// not yet durable — the storage-fault committed-loss shape) is what makes the nack-truncation counting
+  /// proof SOUND: a write-quorum member whose body faulted keeps a header and therefore does NOT nack, so a
+  /// committed op can never accrue the `f+1` nacks that truncate. A genuinely-uncommitted such op (held by
+  /// no one else) is still safely removed — it reaches `f+1` nacks from the non-holders and is nack-truncated
+  /// on the new primary — so keeping it here never wedges. (Dropping it to `rec.faulty` would instead let its
+  /// number be silently re-minted, the committed loss this closes.)
   fn resolve_exhausted_tail_read<W: Wal>(&mut self, wal: &W, op: u64) {
-    let keep = (op <= self.commit_max.get())
+    let keep = (op != self.op.get() || op <= self.commit_max.get())
       .then(|| self.inflight_tail_repairing_identity(wal, op))
       .flatten();
     if let Some(rec) = self.recover.as_mut() {

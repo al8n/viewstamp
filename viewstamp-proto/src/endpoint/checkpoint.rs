@@ -95,11 +95,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         if self.repair.is_empty() {
           self.timers.repair_retry = None;
         }
-        // Body-aware nack-truncation: a `Present` body just landed for this op (now `Present` in
-        // `self.log`). If it was the LAST repair-or-truncate candidate (a header-only op above
-        // `commit_max`), CANCEL the truncation grace — a holder answered, so the op was committed after
-        // all and must NEVER be truncated. (No-op when no grace is armed, or other candidates remain.)
-        self.cancel_repair_or_truncate_if_no_candidate();
+        // Nack-truncation: a `Present` body just landed for this op (now `Present` in `self.log`), so it
+        // is no longer a repair-or-truncate candidate — a holder answered, which PROVES it was committed,
+        // and it must NEVER be truncated. Drop any nack tally accrued against it. (No-op when none.)
+        self.nack_from.remove(&op.get());
         // Two disjoint cases for the now-durable repaired op, by whether it is committed:
         //
         //   * COMMITTED (`op <= commit_max`): peer-repair is NOT a vote — committed-op survival means

@@ -138,89 +138,87 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     op > self.commit_max.get() && entry.body.is_repairing() && !self.appending.contains(&op)
   }
 
-  /// Whether any *repair-or-truncate candidate* remains. The candidate set shrinks via a `Present` fill
-  /// (`on_wal_done`'s `RepairFill` arm turns the entry `Present`) OR the moment `fill_repair` ACCEPTS a
-  /// body (the op enters `self.appending`, so `is_repair_or_truncate_candidate` excludes it) —
-  /// `commit_max` cannot cross a candidate without first filling its body (the apply/`try_commit` loop
-  /// HOLDS at the body-absent hole) — so re-deriving from current state is exact.
-  fn has_repair_or_truncate_candidate(&self) -> bool {
-    self
-      .log
-      .iter()
-      .any(|(op, e)| self.is_repair_or_truncate_candidate(*op, e))
-  }
-
-  /// Clear the body-aware nack-truncation grace once the LAST candidate is gone (filled or
-  /// learned-committed). Called after a `Present` fill lands (`on_wal_done`'s `RepairFill` arm): a
-  /// holder answered, so the candidate was committed after all and must never be truncated — disarm the
-  /// deadline. Idempotent (a no-op if the timer is already `None` or candidates remain).
-  pub(crate) fn cancel_repair_or_truncate_if_no_candidate(&mut self) {
-    if self.timers.repair_or_truncate.is_some() && !self.has_repair_or_truncate_candidate() {
-      self.timers.repair_or_truncate = None;
-    }
-  }
-
-  /// Body-aware nack-truncation GRACE expiry (the f-fault-model liveness closure). Run on the
-  /// Normal-primary heartbeat path (after `primary_timeouts`); a no-op unless the grace deadline is due.
+  /// Count a peer's [`crate::Nack`] — its durable LACK of `m.op()` — toward the nack quorum that
+  /// truncates this new primary's uncommitted tail. A *repair-or-truncate candidate* (a header-only
+  /// `Repairing` op above `commit_max` that no canonical donor holds `Present`) is locally undecidable —
+  /// a committed op whose body-holders are merely unreachable looks byte-identical to a
+  /// genuinely-uncommitted no-body op. The COUNTING proof resolves it: once a candidate accrues a nack
+  /// QUORUM ([`Membership::quorum_nack_prepare`] = `f+1`) of DISTINCT voters that durably lack it, it
+  /// CANNOT have committed — a commit needs a write-quorum (`f+1`) to durably hold the op, and every
+  /// write-quorum member keeps at least a header (so it never nacks), hence a committed op accrues at most
+  /// `f` nacks. `f+1` nacks therefore proves `> f` replicas lack it, so it (and the tail above it) is
+  /// uncommitted and is truncated. A candidate that never reaches `f+1` nacks (some holder has it,
+  /// reachable or not) is NEVER truncated — it BLOCKS until a holder fills it (consistency over
+  /// availability in the genuinely-beyond-`f`-ambiguous case).
   ///
-  /// On expiry, RE-CONFIRM the candidate from CURRENT state — any op still held `Repairing` AND still
-  /// ABOVE the known-committed frontier `commit_max` (so it was not, in the meantime, filled by a
-  /// `Present` body nor learned-committed). If such candidates remain, the body is provably absent
-  /// across the collected quorum and the grace has elapsed with no holder answering, so it is
-  /// uncommitted-or-lost-beyond-`f`: TRUNCATE from the LOWEST such candidate up — drop the whole suffix
-  /// `[gap ..= self.op]` from `self.log`, lower `self.op` to the op below `gap`, drop the stranded WAL
-  /// tail, and clear EVERY per-op side table for that suffix: `repair`/`inflight`, the in-flight WAL
-  /// appends `pending`/`appending` (a higher suffix op can have an accepted-out-of-order `RepairFill` or
-  /// an adopted-tail `AdoptVote`/`AdoptAck` in flight — its abandoned completion must not resurrect a
-  /// truncated op nor vote on a reused number), and the client-session request high-water (roll back any
-  /// watermark a truncated uncommitted request advanced, so the client's retry is processed fresh, not
-  /// deduped to a no-reply hang). Then `on_request`'s `!repair.is_empty()` / `commit_max > commit_min`
-  /// guard clears (for the no-other-hole case) and the primary serves clients again.
-  ///
-  /// SAFETY: every truncated op is `> commit_max` (the lowest candidate `gap` is, and the tail above it
-  /// is too), so each satisfies [`Self::assert_committed_survives`]'s uncommitted clause — no committed
-  /// op is ever dropped here. Within `f` faults a committed op's body is reachable on a write-quorum and
-  /// answers the `RequestPrepare` BEFORE this deadline (so a committed op is never a still-unfilled
-  /// candidate at expiry — it would have filled + cancelled the grace). Gated, like the heartbeat, on
-  /// `participates_as_primary() && !pending_forfeit`: a not-yet-durable-view or stepping-down primary
-  /// must not truncate — the deadline is PRESERVED for the post-window tick (it stays non-serviceable,
-  /// so `poll_timeout` filters it and the no-orphan-due assert ignores it; no spin).
-  pub(crate) fn repair_or_truncate_timeouts<W: Wal>(&mut self, now: Instant, wal: &mut W) {
-    // SERVICEABILITY GATE (the SAME `serviceable_now(RepairOrTruncate)` condition, enforced HERE so a
-    // DIRECT `handle_timeout` tick — the VOPR + tests call it directly, bypassing `poll_timeout`'s
-    // filter — never truncates in a non-serviceable window). A not-yet-durable-view (`pending_sb`) or
-    // stepping-down (`pending_forfeit`) primary must NOT mutate the tail: the deadline is PRESERVED
-    // (this returns WITHOUT clearing it), staying non-serviceable so `poll_timeout` filters it and the
-    // no-orphan-due assert ignores it — no spin — and the post-window tick re-confirms + truncates.
+  /// Only the new primary that armed the candidates tallies; a not-yet-durable-view or stepping-down
+  /// primary must not mutate the tail (`participates_as_primary() && !pending_forfeit`, the same gate the
+  /// old grace timer rode). The tally is keyed by the sender's STABLE [`MemberId`] (resolved from its
+  /// slot, so it follows the member across a reconfiguration) and counts ONLY current voters — a learner
+  /// holds no write-quorum, so its lack is irrelevant. Truncation is decided on the LOWEST candidate `gap`
+  /// (a voter lacking `gap` lacks the whole suffix above it) and is EVENT-DRIVEN on the `f+1`-th nack —
+  /// no wall-clock deadline; candidates are re-solicited on the ordinary `repair_retry` cadence, which
+  /// re-elicits nacks until the quorum is reached or a holder fills the hole.
+  pub(crate) fn on_nack<W: Wal>(&mut self, wal: &mut W, from: Peer, m: crate::Nack) {
     if !self.participates_as_primary() || self.pending_forfeit {
       return;
     }
-    // A no-op unless the grace is armed-and-due. (With the gate above this only fires on a serviceable
-    // tick, so guarding the due-ness here ensures a serviced grace is never left armed-and-due.)
-    if self.timers.repair_or_truncate.is_none_or(|d| d > now) {
+    let Some(rid) = from.as_replica() else {
+      return;
+    };
+    // Only a VOTER's durable lack counts toward the write-quorum nack proof.
+    if !self.membership.is_voter(rid) {
       return;
     }
-    // RE-CONFIRM from CURRENT state: the LOWEST still-open candidate (held `Repairing`, above
-    // `commit_max`, and NOT an accepted-but-not-yet-durable repair fill — see
-    // `is_repair_or_truncate_candidate`). Everything from there to the head is the still-body-absent
-    // uncommitted tail. The `appending` exclusion is load-bearing: a grace firing CONCURRENTLY with a
-    // fill `fill_repair` already accepted (whose append has not yet landed) must not truncate that op —
-    // a holder answered, so it was committed.
-    let gap = self
+    let Some(member) = self.membership.member_at(rid) else {
+      return;
+    };
+    let op = m.op().get();
+    // Record only against a STILL-OPEN candidate; a stale nack for a filled / committed op is inert.
+    if !self
+      .log
+      .get(&op)
+      .is_some_and(|e| self.is_repair_or_truncate_candidate(op, e))
+    {
+      return;
+    }
+    self.nack_from.entry(op).or_default().insert(member);
+    // The LOWEST current candidate: a voter lacking it lacks the whole suffix above, so its `f+1` nack
+    // quorum proves the entire uncommitted tail `[gap ..= self.op]`.
+    let Some(gap) = self
       .log
       .iter()
       .filter(|(op, e)| self.is_repair_or_truncate_candidate(**op, e))
       .map(|(op, _)| *op)
-      .min();
-    let Some(gap) = gap else {
-      // The last candidate filled / was learned-committed between the arm and now — nothing to
-      // truncate; just disarm the grace.
-      self.timers.repair_or_truncate = None;
+      .min()
+    else {
       return;
     };
-    // Truncate the uncommitted tail `[gap ..= self.op]`. SAFETY: `gap > commit_max`, so `gap` and every
-    // op above it is uncommitted — each satisfies `assert_committed_survives`'s `> commit_max` clause, so
-    // no committed op is ever dropped here.
+    if self.nack_from.get(&gap).map_or(0, |voters| voters.len())
+      >= self.membership.quorum_nack_prepare()
+    {
+      self.truncate_uncommitted_tail_from(wal, gap);
+    }
+  }
+
+  /// Truncate the uncommitted tail `[gap ..= self.op]` — the suffix at/above the lowest
+  /// repair-or-truncate candidate `gap`, proven uncommitted by a nack QUORUM (`f+1` distinct voters
+  /// durably lacking `gap`, tallied in [`Self::on_nack`]). Drop the whole suffix from `self.log`, lower
+  /// `self.op` to the op below `gap`, drop the stranded WAL tail, and clear EVERY per-op side table for
+  /// that suffix: `repair`/`inflight`/`nack_from`, the in-flight WAL appends `pending`/`appending` (a
+  /// higher suffix op can have an accepted-out-of-order `RepairFill` or an adopted-tail
+  /// `AdoptVote`/`AdoptAck` in flight — its abandoned completion must not resurrect a truncated op nor
+  /// vote on a reused number), and the client-session request high-water (roll back any watermark a
+  /// truncated uncommitted request advanced, so the client's retry is processed fresh, not deduped to a
+  /// no-reply hang). Then `on_request`'s `!repair.is_empty()` / `commit_max > commit_min` guard clears
+  /// (for the no-other-hole case) and the primary serves clients again.
+  ///
+  /// SAFETY: every truncated op is `> commit_max` (the caller passes the lowest candidate `gap`, which is,
+  /// and the tail above it is too), so each satisfies [`Self::assert_committed_survives`]'s uncommitted
+  /// clause — no committed op is ever dropped. The `f+1`-nack precondition the caller checked proves it:
+  /// a committed op needs a write-quorum (`f+1`) to durably hold it, and every write-quorum member keeps
+  /// at least a header (so never nacks), hence a committed op can never accrue `f+1` nacks.
+  fn truncate_uncommitted_tail_from<W: Wal>(&mut self, wal: &mut W, gap: u64) {
     let head = self.op.get();
     let floor = self.checkpoint_op.get();
     // Clients whose at-most-once request high-water was advanced by a now-truncated op: their watermark
@@ -285,7 +283,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.appending.retain(|&op| op < gap);
     self.op = OpNumber::with(gap - 1);
     wal.truncate(OpNumber::with(gap - 1));
-    self.timers.repair_or_truncate = None;
+    // The truncated ops no longer exist — drop their nack tallies so a late nack for one cannot re-fire.
+    self.nack_from.retain(|&op, _| op < gap);
     if self.repair.is_empty() {
       self.timers.repair_retry = None;
     }
@@ -347,8 +346,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // is view-independent, so the requester loses nothing by waiting: it broadcasts the `RequestPrepare`
     // to ALL peers and retries on the repair-retransmit timer, so another Normal+durable peer answers
     // (and we answer once our own view is durable). Negligible liveness cost; consistent with the class.
-    if !self.status.is_normal() || self.pending_durable_view() {
-      return; // only a Normal replica whose view is durable may serve a (view-advertising) repair Prepare
+    // Only a recovered (Normal) replica's log is the authoritative durable record of WHICH ops it holds,
+    // so only a Normal replica may serve OR nack. (The view-durability gate is applied ONLY to the
+    // view-advertising Prepare serve below, not to the view-independent nack.)
+    if !self.status.is_normal() {
+      return;
     }
     // Route the reply by the AUTHENTICATED `from` (the requester's CURRENT slot), never the self-claimed
     // `m.replica()`: a slot-shifted retained laggard stamps its OLD slot, and `sender_admits_solicitation`
@@ -366,13 +368,37 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // op IS body-bearing (`body_bytes()` yields its `encode_body()`), so we serve its reconfiguration
     // bytes exactly like a client op — a peer repairing the carried reconfiguration op fetches it from us.
     let Some(entry) = self.log.get(&op) else {
-      return; // we do not hold this op (or it is a hole for us too) — stay silent; another peer answers
+      // We DURABLY LACK this op — no record, not even a header. If it is ABOVE our checkpoint (so our log
+      // is the authoritative durable record for that slot), answer the NEGATIVE: "I lack op N." The new
+      // primary counts this toward the nack quorum that truncates its uncommitted tail. It is a
+      // view-INDEPENDENT fact, so — unlike the Prepare serve — it is emitted even while our own view write
+      // is in flight (the log is durable regardless of the view), maximizing the liveness of the
+      // truncate-vs-block decision. An op `<= checkpoint_op` is subsumed by our snapshot (we HOLD it), so
+      // we never nack it; the requester should state-sync the checkpoint instead.
+      if op > self.checkpoint_op.get() {
+        self.emit(Outgoing::new(
+          Recipient::To(Peer::Replica(requester)),
+          Message::Nack(crate::Nack::new(
+            self.view,
+            OpNumber::with(op),
+            self.local_slot(),
+            self.membership.config_id(),
+          )),
+        ));
+      }
+      return;
     };
     let Some(body) = entry.body_bytes() else {
-      return; // header-only (`Repairing`): we hold the identity, not the bytes — a body holder answers
+      return; // header-only (`Repairing`): we hold the identity, not the bytes — NEVER nack, a body holder answers
     };
     if op > self.op.get() {
       return; // above our head — not ours to serve
+    }
+    // The Prepare serve advertises `self.view`, so it is gated on a durable view (the same fence the
+    // primary `Prepare`/`Commit`/`StartView` paths ride) — unlike the view-independent nack above. A
+    // commit-first SwapEpoch root does NOT raise this fence ([`Self::pending_durable_view`]).
+    if self.pending_durable_view() {
+      return;
     }
     // The reply's `commit` field is our TRUTHFUL `commit_min`. For a committed op (`op <= commit_min`)
     // this vouches the body is committed (`commit >= op`), the requester's committed-hole path. For an
@@ -663,14 +689,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       Pending::RepairFill(RepairFill::new(p.op(), entry)),
     );
     self.appending.insert(op);
-    // STAGE-TIME CANCEL of the body-aware nack-truncation grace: a holder ANSWERED with the canonical
-    // body for this op, which PROVES the op was committed — it must NEVER be truncated. `op` is now in
-    // `self.appending`, so `is_repair_or_truncate_candidate` excludes it; if it was the LAST candidate
-    // the grace disarms HERE (the moment of acceptance), not only when the append lands durably in
-    // `on_wal_done`. This closes the async-fill race where a fill accepted before the deadline but made
-    // durable after it would otherwise let the grace fire on a still-`Repairing` (but already-answered)
-    // entry. Idempotent + safe with other still-open candidates outstanding (it keeps the grace then).
-    self.cancel_repair_or_truncate_if_no_candidate();
+    // STAGE-TIME nack-tally drop: a holder ANSWERED with the canonical body for this op, which PROVES it
+    // was committed — it must NEVER be truncated. `op` is now in `self.appending`, so
+    // `is_repair_or_truncate_candidate` already excludes it from any fresh tally; drop any nacks accrued
+    // against it BEFORE the accept, so a stale nack cannot re-fire a truncation on this already-answered
+    // (but not-yet-durable) entry. Dropping the whole per-op set is safe — the op is answered.
+    self.nack_from.remove(&op);
     true
   }
 }

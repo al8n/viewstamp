@@ -702,6 +702,96 @@ fn repair_prepare(view: u64, op: u64, commit: u64) -> Message {
   ))
 }
 
+/// The negative answer `replica` sends a new primary's `RequestPrepare(op)` when it durably LACKS the
+/// op — the vote the primary counts toward its `f+1` truncation quorum. Carries the fixture lineage
+/// (`config_id = 0`), matching the strict-self-id ingress the counted nack binds to.
+fn nack(view: u64, op: u64, replica: u16) -> Message {
+  Message::Nack(crate::Nack::new(
+    View::with(view),
+    OpNumber::with(op),
+    ReplicaId::new(replica),
+    0,
+  ))
+}
+
+/// Drive replica 1 of `membership` to become the new primary of view 1 holding op 1 (committed, real
+/// body) plus a header-only `Repairing` op 2 ABOVE `commit_max` — the repair-or-truncate candidate the
+/// nack quorum decides — with its view already DURABLE (so it `participates_as_primary`). Op 2's header
+/// is client 7 / request 2 / `fnv1a_128([2])`, and NO canonical donor holds it `Present`, so it is a
+/// runtime candidate the primary solicits. Returns the endpoint and its storage, drained of chatter.
+fn new_primary_with_op2_candidate(
+  membership: Membership,
+) -> (
+  Endpoint<NoopSm>,
+  TestWal,
+  TestSb,
+  crate::block_store::MemBlockStore,
+) {
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    membership,
+    0,
+    NoopSm,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  while e.poll_message().is_some() {}
+  let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::repairing(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          op2_checksum,
+        ),
+      ],
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  (e, wal, sb, blocks)
+}
+
 /// Recover replica 1 of 3 from a WAL holding dense ops `1..=head` where the single NON-head
 /// committed slot `faulty_op` read back permanently faulty (bit-rot). Returns the recovered
 /// endpoint (now Normal, holding a peer-repair hole at `faulty_op`) + its wal/sb.

@@ -1642,6 +1642,64 @@ impl RequestPrepare {
   }
 }
 
+/// Peer → requester: the NEGATIVE answer to a [`RequestPrepare`] — "I durably LACK `op`". A replica that
+/// receives a `RequestPrepare(op)`, has NO record of `op` in its log (not even a header-only `Repairing`
+/// entry), and holds `op` above its durable checkpoint (so its log is the authoritative durable record
+/// for that slot), answers this instead of staying silent. A replica that holds `op` — `Present` OR
+/// header-only `Repairing` — does NOT nack (it is a potential holder / vouches the op existed).
+///
+/// The new primary of a view collects these into a per-op nack set for its repair-or-truncate candidates
+/// (a header-only op above `commit_max` no canonical donor holds `Present`). Once a candidate accrues a
+/// nack QUORUM of distinct replicas durably lacking it, the op cannot have committed (a commit needs a
+/// write-quorum to hold it, and every write-quorum member keeps at least a header), so its uncommitted
+/// tail is truncated. The view is carried for routing/freshness only — the "I lack this op" fact is
+/// view-independent (like [`RequestPrepare`]), so it is never an authoritative-view claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nack {
+  view: View,
+  op: OpNumber,
+  replica: ReplicaId,
+  config_id: u128,
+}
+
+impl Nack {
+  /// Creates a `Nack` from `replica` for op `op` it durably lacks. `config_id` is the sender's active
+  /// configuration lineage (the AGNOSTIC epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(view: View, op: OpNumber, replica: ReplicaId, config_id: u128) -> Self {
+    Self {
+      view,
+      op,
+      replica,
+      config_id,
+    }
+  }
+
+  /// The sender's configuration lineage id (the agnostic epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
+  }
+
+  /// The nacking replica's current view.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn view(&self) -> View {
+    self.view
+  }
+
+  /// The op number the sender durably lacks.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op(&self) -> OpNumber {
+    self.op
+  }
+
+  /// The nacking replica (the sender that lacks the op).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+}
+
 /// Replica → peers (the windowed analogue of [`RequestPrepare`]): solicit a CONTIGUOUS RUN of
 /// committed ops `[lo, hi]` this replica is missing/repairing below its head, in ONE message. A
 /// far-behind replica that adopted a deep header-only band (e.g. a view-change carrier carried the
@@ -2366,6 +2424,9 @@ pub enum Message {
   /// Answer a `RequestBlock`: either the block bytes or an absent signal (the donor does not hold
   /// this address).
   BlockResponse(BlockResponse),
+  /// The NEGATIVE answer to a `RequestPrepare`: "I durably LACK this op" (no local record, not even a
+  /// header). The new primary counts these toward the nack quorum that truncates an uncommitted tail.
+  Nack(Nack),
 }
 
 impl Message {
@@ -2397,6 +2458,7 @@ impl Message {
       Self::LearnerProof(_) => "LearnerProof",
       Self::RequestBlock(_) => "RequestBlock",
       Self::BlockResponse(_) => "BlockResponse",
+      Self::Nack(_) => "Nack",
     }
   }
 
@@ -2462,7 +2524,10 @@ impl Message {
       | Self::LearnerProof(_)
       // Block solicitation + reply carry no view authority (content-addressed data plane).
       | Self::RequestBlock(_)
-      | Self::BlockResponse(_) => false,
+      | Self::BlockResponse(_)
+      // The negative repair answer is a view-independent "I lack this op" fact (like `RequestPrepare`),
+      // never an authority claim, so it may be emitted while a view write is in flight.
+      | Self::Nack(_) => false,
     }
   }
 
@@ -2498,6 +2563,7 @@ impl Message {
       Self::LearnerProof(_) => 23,
       Self::RequestBlock(_) => 24,
       Self::BlockResponse(_) => 25,
+      Self::Nack(_) => 26,
     }
   }
 
@@ -2695,6 +2761,12 @@ impl Message {
           }
         }
       }
+      Self::Nack(m) => {
+        out.put_u64(m.view.get());
+        out.put_u64(m.op.get());
+        out.put_u16(m.replica.get());
+        out.put_u128(m.config_id);
+      }
     }
     out.freeze()
   }
@@ -2772,6 +2844,8 @@ impl Message {
       Self::RequestBlock(_) => 16,
       // addr (16) + presence flag (u8=1) + optional block (u32 length prefix + bytes)
       Self::BlockResponse(m) => 16 + 1 + m.block.as_deref().map_or(0, |b| 4 + b.len()),
+      // view(u64) + op(u64) + replica(u16) + config_id(u128), an AGNOSTIC carrier (like RequestPrepare).
+      Self::Nack(_) => U64 + U64 + U16 + U128,
     };
     HEADER + body
   }
@@ -2971,6 +3045,12 @@ impl Message {
         };
         Self::BlockResponse(BlockResponse { addr, block })
       }
+      26 => Self::Nack(Nack {
+        view: read_view(&mut r)?,
+        op: read_op(&mut r)?,
+        replica: read_replica(&mut r)?,
+        config_id: r.u128()?,
+      }),
       other => return Err(CodecError::UnknownTag(other)),
     };
     r.finish()?;
