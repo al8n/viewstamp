@@ -277,6 +277,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.pending_sb.is_some() || self.sync.is_some() || self.pending_checkpoint.is_some() {
       return Err(NewOpReject::Busy);
     }
+    // Fence client minting while a reconfiguration is IN FLIGHT (proposed-but-not-committed OR
+    // committed-but-not-installed — [`Self::has_pending_reconfigure`]): a `Reconfigure` op must be the LAST
+    // op of its epoch (VSR-Revisited §5). Otherwise a client op minted ABOVE the reconfiguration op `N`
+    // commits under the OLD epoch's quorum (which can include a being-removed voter) yet is NOT covered by
+    // the cross-config quorum-intersection at the epoch swap — that argument spans only ops at/below `N`, so
+    // a subsequent E+1 view change can form at head `N` and silently drop the client-acked op above it.
+    // Blocking here makes every op `> N` mint + commit under E+1's own (sound) quorum instead. Returns
+    // `Busy` so the client simply retries once the swap installs (the same self-releasing shape as the
+    // in-flight guard above); the reconfiguration's OWN first proposal is unaffected (the predicate is false
+    // until that op is in the log). `propose_membership`'s single-flight guard already blocks a SECOND
+    // reconfiguration, so this does not deadlock the change itself.
+    if self.has_pending_reconfigure() {
+      return Err(NewOpReject::Busy);
+    }
     // A primary that has FLAGGED a forfeit (a step-down — `maybe_force_sync`'s primary guard, or the
     // recovery-peer-fetch / state-sync apply that reset `self.op` back to a checkpoint) must NOT assign
     // new ops: it has reset `self.op` below a value the cluster moved PAST (a newer view's primary already
