@@ -263,12 +263,29 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           // can donate), so it still forces. A swap queued behind this one stays deferred: `maybe_swap_epoch`
           // below re-checks `pending_checkpoint.is_none()`, so this forced checkpoint holds it back.
           if self.status.is_normal() {
-            // A `false` return means the block-store flush failed → the swap-completion checkpoint was
-            // not submitted, leaving the self-describing debt (`config_install_op = N > checkpoint_op`)
-            // owed. That debt is durable in the just-landed SwapEpoch root, so `maybe_pay_checkpoint_debt`
-            // (sticky from every commit-advance tail and from recovery) re-forces it once a flush succeeds;
-            // the cross-epoch serve gate stays correctly withheld until then. Ignored deliberately.
-            let _ = self.force_checkpoint(sb, blocks);
+            // `force_checkpoint` snapshots the LIVE SM, so — like its two sibling force sites
+            // (`maybe_checkpoint`, `maybe_pay_checkpoint_debt`) — it must never run while the SM does not yet
+            // hold what `checkpoint_op` names: an owed SM-reconstruct (SM behind M) or a pre-root staged
+            // install (SM about to be wholesale-replaced) would bind a WRONG snapshot at op M and
+            // serve/persist stale committed state. Today an emergent cross-module fence keeps both flags
+            // clear here (a Reconfigure cannot commit while either is set, and the SM-restore-fault
+            // completion arm returns before `maybe_swap_epoch` ever submits a swap root), but
+            // `maybe_swap_epoch` — the sole swap-root submitter — does not itself check these flags, so pin
+            // the invariant locally rather than trust the emergent web; the assert catches any future path
+            // that breaks the fence, and the release guard defers safely to the debt path.
+            debug_assert!(
+              !self.sm_reconstruct_owed() && self.pending_install.is_none(),
+              "SwapEpoch-completion force_checkpoint would snapshot a stale / about-to-be-replaced SM at M",
+            );
+            if !self.sm_reconstruct_owed() && self.pending_install.is_none() {
+              // A `false` return (block-store flush failed) — OR a deferral by the guard above — leaves the
+              // self-describing debt (`config_install_op = N > checkpoint_op`) owed. That debt is durable in
+              // the just-landed SwapEpoch root, so `maybe_pay_checkpoint_debt` (sticky from every
+              // commit-advance tail and from recovery, under the same SM guard) re-forces it once the SM is
+              // ready + a flush succeeds; the cross-epoch serve gate stays correctly withheld until then.
+              // Ignored deliberately.
+              let _ = self.force_checkpoint(sb, blocks);
+            }
           }
         }
       }
