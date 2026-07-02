@@ -213,7 +213,6 @@ fn agnostic_request_prepare_is_admitted_only_in_lineage() {
       OpNumber::with(1),
       ReplicaId::new(2),
       FOREIGN_CONFIG_ID,
-      0,
     )),
   );
   assert!(
@@ -232,7 +231,6 @@ fn agnostic_request_prepare_is_admitted_only_in_lineage() {
       View::new(),
       OpNumber::with(1),
       ReplicaId::new(2),
-      0,
       0,
     )),
   );

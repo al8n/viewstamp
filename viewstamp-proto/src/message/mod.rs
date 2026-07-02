@@ -1602,36 +1602,19 @@ pub struct RequestPrepare {
   op: OpNumber,
   replica: ReplicaId,
   config_id: u128,
-  generation: u64,
 }
 
 impl RequestPrepare {
   /// Creates a RequestPrepare for the missing committed op `op`. `config_id` is the sender's active
-  /// configuration lineage (the AGNOSTIC epoch-policy field). `gen` is the requester's monotone repair
-  /// solicitation generation — a responder echoes it in its [`Nack`], letting the new primary count only
-  /// nacks answering its CURRENT solicitation (a stale nack from a prior round, after its sender became a
-  /// holder, carries an older `gen` and is dropped).
+  /// configuration lineage (the AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(
-    view: View,
-    op: OpNumber,
-    replica: ReplicaId,
-    config_id: u128,
-    generation: u64,
-  ) -> Self {
+  pub const fn new(view: View, op: OpNumber, replica: ReplicaId, config_id: u128) -> Self {
     Self {
       view,
       op,
       replica,
       config_id,
-      generation,
     }
-  }
-
-  /// The requester's repair solicitation generation (echoed back in a [`Nack`]).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn generation(&self) -> u64 {
-    self.generation
   }
 
   /// The sender's configuration lineage id (the agnostic epoch-policy field).
@@ -1677,34 +1660,19 @@ pub struct Nack {
   op: OpNumber,
   replica: ReplicaId,
   config_id: u128,
-  generation: u64,
 }
 
 impl Nack {
   /// Creates a `Nack` from `replica` for op `op` it durably lacks. `config_id` is the sender's active
-  /// configuration lineage (the AGNOSTIC epoch-policy field). `gen` is the soliciting [`RequestPrepare`]'s
-  /// generation, echoed verbatim so the new primary counts this nack only against its current solicitation.
+  /// configuration lineage (the AGNOSTIC epoch-policy field).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(
-    view: View,
-    op: OpNumber,
-    replica: ReplicaId,
-    config_id: u128,
-    generation: u64,
-  ) -> Self {
+  pub const fn new(view: View, op: OpNumber, replica: ReplicaId, config_id: u128) -> Self {
     Self {
       view,
       op,
       replica,
       config_id,
-      generation,
     }
-  }
-
-  /// The echoed solicitation generation of the `RequestPrepare` this nack answers.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn generation(&self) -> u64 {
-    self.generation
   }
 
   /// The sender's configuration lineage id (the agnostic epoch-policy field).
@@ -2694,7 +2662,6 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u16(m.replica.get());
         out.put_u128(m.config_id);
-        out.put_u64(m.generation);
       }
       Self::Recovery(m) => {
         out.put_u16(m.replica.get());
@@ -2799,7 +2766,6 @@ impl Message {
         out.put_u64(m.op.get());
         out.put_u16(m.replica.get());
         out.put_u128(m.config_id);
-        out.put_u64(m.generation);
       }
     }
     out.freeze()
@@ -2852,7 +2818,7 @@ impl Message {
       Self::DoViewChange(m) => U64 + U64 + U64 + U64 + U64 + U64 + U128 + U16 + log(&m.log),
       Self::StartView(m) => U64 + U64 + U64 + U64 + U64 + U128 + U16 + log(&m.log),
       Self::GetView(_) => U64 + U16 + U64 + U64 + U128,
-      Self::RequestPrepare(_) => U64 + U64 + U16 + U128 + U64,
+      Self::RequestPrepare(_) => U64 + U64 + U16 + U128,
       Self::Recovery(_) => U16 + U64 + U64 + U128,
       Self::RecoveryResponse(m) => U64 + U64 + U64 + U64 + U64 + U128 + U16 + U64 + log(&m.log),
       Self::RequestSync(_) => U64 + U64 + U16 + U64 + U8 + U128,
@@ -2879,7 +2845,7 @@ impl Message {
       // addr (16) + presence flag (u8=1) + optional block (u32 length prefix + bytes)
       Self::BlockResponse(m) => 16 + 1 + m.block.as_deref().map_or(0, |b| 4 + b.len()),
       // view(u64) + op(u64) + replica(u16) + config_id(u128), an AGNOSTIC carrier (like RequestPrepare).
-      Self::Nack(_) => U64 + U64 + U16 + U128 + U64,
+      Self::Nack(_) => U64 + U64 + U16 + U128,
     };
     HEADER + body
   }
@@ -2980,7 +2946,6 @@ impl Message {
         op: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
         config_id: r.u128()?,
-        generation: r.u64()?,
       }),
       10 => Self::Recovery(Recovery {
         replica: read_replica(&mut r)?,
@@ -3085,7 +3050,6 @@ impl Message {
         op: read_op(&mut r)?,
         replica: read_replica(&mut r)?,
         config_id: r.u128()?,
-        generation: r.u64()?,
       }),
       other => return Err(CodecError::UnknownTag(other)),
     };

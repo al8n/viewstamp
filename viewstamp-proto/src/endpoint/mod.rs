@@ -1162,13 +1162,6 @@ pub struct Endpoint<S, R = RestartOnly> {
   /// `MemberId` so a slot shift never double-counts; entries are dropped when a hole fills (a holder
   /// answered) and cleared wholesale by the view-transition reset (a fresh primary generation re-gathers).
   nack_from: BTreeMap<u64, BTreeSet<MemberId>>,
-  /// Monotone repair solicitation generation, stamped into every `RequestPrepare` and echoed back in a
-  /// [`crate::Nack`]. Bumped (and `nack_from` cleared) at the start of each `repair_timeouts` round and at
-  /// new-primary formation, so a nack is counted only against the CURRENT solicitation: a voter that nacked
-  /// a candidate, then repaired the op and joined its write-quorum, simply stops nacking the next round's
-  /// solicitation, and its earlier nack — carrying a superseded generation — is dropped by [`Self::on_nack`]
-  /// rather than lingering in the tally as a stale durable-lack claim.
-  solicit_gen: u64,
   /// CACHED [`Self::quorum_checkpoint_op`] (the quorum-th order statistic over
   /// `self.checkpoint_op` + the `peer_checkpoint` reports). The uncached computation allocates +
   /// sorts per call, and `prune_floor()` reads it on EVERY client request (the WAL-stall check), so
@@ -1506,7 +1499,6 @@ impl<S, R> Endpoint<S, R> {
       log_floor: OpNumber::new(),
       peer_checkpoint: BTreeMap::new(),
       nack_from: BTreeMap::new(),
-      solicit_gen: 0,
       // Genesis: own checkpoint 0, no peer reports — the quorum-th order statistic is 0 (matches
       // `recompute_quorum_checkpoint` over this state, so the cache starts coherent).
       quorum_checkpoint: OpNumber::new(),
@@ -3209,12 +3201,6 @@ impl<S, R> Endpoint<S, R> {
   #[cfg(test)]
   fn nack_voters_for_test(&self, op: u64) -> usize {
     self.nack_from.get(&op).map_or(0, BTreeSet::len)
-  }
-
-  /// Test-only: the current repair solicitation generation a `Nack` must echo to be counted by `on_nack`.
-  #[cfg(test)]
-  fn solicit_gen_for_test(&self) -> u64 {
-    self.solicit_gen
   }
 
   /// Test-only: seed an in-memory `log` entry at `op` (a placeholder body), so the held-tail

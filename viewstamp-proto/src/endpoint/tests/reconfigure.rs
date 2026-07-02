@@ -5100,7 +5100,6 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
       OpNumber::with(1),
       old_claimed_slot,
       predecessor_config_id,
-      0,
     )),
   );
   let mut served = false;
@@ -5133,7 +5132,6 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
       OpNumber::with(1),
       ReplicaId::new(2), // mismatched self-id, but SAME config (E+1) → strict binding applies
       e1_config,
-      0,
     )),
   );
   assert!(
