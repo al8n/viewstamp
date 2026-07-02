@@ -495,6 +495,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.send_request_sync(now);
   }
 
+  /// Abort the in-flight block-DAG fetch after a reachable-block-bound breach — a malformed / foreign /
+  /// oversized source DAG exceeded `MAX_REACHABLE_BLOCKS` while draining a frontier. COUNT it
+  /// (`dag_walks_capped`) for observability, then free the fetch; `sync` stays armed, so the solicit timer
+  /// re-solicits and a fresh `SyncCheckpoint` re-pins the donor (the content-addressed blocks already
+  /// written survive). Every bound-breach abort that drops a live `block_fetch` routes through here so the
+  /// counter is honest — an otherwise-silent re-walk loop stays visible.
+  pub(super) fn abort_oversized_block_fetch(&mut self) {
+    self.dag_walks_capped += 1;
+    self.block_fetch = None;
+  }
+
   /// Send the block-fetch transfer's one outstanding pull: a `RequestBlock` for the next MISSING block
   /// across the COMBINED frontier (the SM checkpoint DAG, then the session-table DAG), addressed to the
   /// pinned donor, while Normal re-arming the solicit deadline (the stop-and-wait ARQ rides it); while
@@ -523,9 +534,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let next = match bf.next_missing(&*blocks) {
       Ok(next) => next,
       Err(_) => {
-        // A malformed/foreign DAG exceeded the reachable-block bound: abort the transfer (free it) but
-        // keep `sync` armed — the solicit timer re-solicits and a fresh checkpoint re-pins.
-        self.block_fetch = None;
+        // A malformed/foreign DAG exceeded the reachable-block bound: abort the transfer (counted, freed)
+        // but keep `sync` armed — the solicit timer re-solicits and a fresh checkpoint re-pins.
+        self.abort_oversized_block_fetch();
         return;
       }
     };
@@ -1104,7 +1115,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     let next = match bf.next_missing(&*blocks) {
       Ok(next) => next,
-      Err(_) => return,
+      // The fresh checkpoint's DAG breached the reachable-block bound: count it and drop the new (local,
+      // not-yet-installed) `bf`; any prior fetch is left to its own ARQ.
+      Err(_) => {
+        self.dag_walks_capped += 1;
+        return;
+      }
     };
     // This fresh `SyncCheckpoint` re-pins to a LIVE address + routeable donor, re-seeding the frontier's
     // front. Both arms below REPLACE the whole `block_fetch` field, so a prior fetch whose front an
@@ -1194,8 +1210,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
             // A corrupt/substituted block: not written, still re-requestable. Re-drive the pull below.
           }
           Err(super::block_sync::BlockSyncError::TooManyBlocks) => {
-            // A malformed/foreign DAG: abort the transfer, keep `sync` armed (the solicit timer re-fetches).
-            self.block_fetch = None;
+            // A malformed/foreign DAG: abort the transfer (counted), keep `sync` armed (solicit re-fetches).
+            self.abort_oversized_block_fetch();
             return;
           }
         }
@@ -1208,7 +1224,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let next = match bf.next_missing(&*blocks) {
       Ok(next) => next,
       Err(_) => {
-        self.block_fetch = None;
+        // Bound breach while draining: abort the transfer (counted, freed); the solicit ARQ re-pins.
+        self.abort_oversized_block_fetch();
         return;
       }
     };
@@ -2013,11 +2030,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           Message::RequestBlock(addr),
         ));
       }
-      // The whole DAG reads back present-and-verified (the corrupt block was already repaired out of band),
-      // or the walk breached its bound: no fetch to arm. The serviced re-solicit still drives the retry — a
-      // fresh M re-served by the donor re-arms this fetch and retries the restore.
-      Ok(None) | Err(_) => {
+      // The whole DAG reads back present-and-verified (the corrupt block was already repaired out of band):
+      // no fetch to arm. The serviced re-solicit still drives the retry — a fresh M re-served by the donor
+      // re-arms this fetch and retries the restore.
+      Ok(None) => {
         self.block_fetch = None;
+      }
+      // The walk breached its reachable-block bound: count the abort and drop the fetch; the serviced
+      // re-solicit still retries off a fresh M.
+      Err(_) => {
+        self.abort_oversized_block_fetch();
       }
     }
     // Re-arm the serviced ARQ for the node's current status.
