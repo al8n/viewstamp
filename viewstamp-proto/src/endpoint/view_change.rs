@@ -335,7 +335,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // re-submit covers the no-write `catch_up_to_view` path; `assert_invariants` does not run mid-reset.)
     // Abandon any PRE-ROOT in-flight state-sync: a view change supersedes it (state-sync and view
     // change are mutually exclusive by status — §2.6). The `sync` handshake, its PRE-ROOT staging
-    // (`pending_install`), and any in-progress block-DAG transfer (`transfer`) are cancelled TOGETHER:
+    // (`pending_install`), and any in-progress block-DAG transfer (`block_fetch`) are cancelled TOGETHER:
     // with durable-before-install the STAGE never restored the SM, advanced `commit_min`/`op`, nor pruned
     // the WAL, so this finds the OLD (consistent, if stale) state intact — there is NO pruned-but-stale
     // window. Dropping `pending_install` here releases the staged snapshot bytes — and, gated by the

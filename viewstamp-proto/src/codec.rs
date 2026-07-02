@@ -222,6 +222,14 @@ impl<'a> Reader<'a> {
 /// bytes). Used to frame every `Bytes` payload + snapshot envelope in a message.
 #[cfg_attr(not(tarpaulin), inline)]
 pub(crate) fn write_bytes_u32(out: &mut impl BufMut, bytes: &[u8]) {
+  // The length prefix is a `u32`; a payload at/above 4 GiB would silently truncate the count and corrupt
+  // the frame. No proto payload approaches this (a message is frame-bounded well below 4 GiB), so it is a
+  // `debug_assert` guarding the cast rather than a runtime branch.
+  debug_assert!(
+    bytes.len() <= u32::MAX as usize,
+    "write_bytes_u32: payload length {} exceeds u32::MAX",
+    bytes.len()
+  );
   out.put_u32(bytes.len() as u32);
   out.put_slice(bytes);
 }

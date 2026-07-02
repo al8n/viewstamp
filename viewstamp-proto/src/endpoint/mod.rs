@@ -1293,6 +1293,15 @@ pub struct Endpoint<S, R = RestartOnly> {
   /// state-sync trigger alone). Same lifecycle as the other observability counters (reset to 0 on
   /// `new`/`recover`); exposed only via `below_ring_window_syncs()`.
   below_ring_window_syncs: u64,
+  /// Test/observability counter: how many block-DAG sync reads/transfers were ABORTED for exceeding
+  /// `MAX_REACHABLE_BLOCKS` (a malformed / foreign / oversized DAG). The unit is ONE increment per aborted
+  /// read/transfer — NOT per breached walk: a combined SM + session read whose BOTH sub-walks breach still
+  /// counts once, because a single read/transfer aborts (the `on_block` loop returns on the first breach; the
+  /// recovery-read match counts its `Err` arm once). The abort keeps `sync` armed so the solicit timer
+  /// re-fetches — without this counter a persistently oversized DAG is a SILENT re-walk loop; the count makes
+  /// it diagnosable. Same lifecycle as the other observability counters (reset to 0 on `new`/`recover`);
+  /// exposed only via `dag_walks_capped()`.
+  dag_walks_capped: u64,
   /// Test/observability counter: how many canonical-log selections actually FLOORED the union —
   /// [`Self::select_canonical_log`] dropped at least one canonical-donor entry at/below the vouched
   /// checkpoint floor `floor*` (the floored-union path doing real work). `0` while every selection's
@@ -1515,6 +1524,7 @@ impl<S, R> Endpoint<S, R> {
       forced_syncs_applied: 0,
       wal_stalls: 0,
       below_ring_window_syncs: 0,
+      dag_walks_capped: 0,
       unions_floored: 0,
       repair_batches_served: 0,
       prepare_batches_sent: 0,
@@ -1925,17 +1935,18 @@ impl<S, R> Endpoint<S, R> {
     S: StateMachine,
     R: Reconfig,
   {
-    // DEFENSE IN DEPTH, ENFORCED IN RELEASE: never overwrite an already-staged successor. `propose_membership`
-    // refuses a second change while a swap is outstanding (`has_pending_reconfigure`), so the
-    // single-change-at-a-time contract guarantees at most ONE committed-but-not-installed reconfiguration.
-    // A staged `pending_swap` here would mean a second reconfiguration committed before the first
-    // installed — overwriting it would CLOBBER the first's staged successor and lose it on the first
-    // `on_sb_done`. So KEEP the existing staged swap and refuse the overwrite in RELEASE too (a debug-only
-    // assert vanishes in production, leaving the clobber live): the first swap still installs, and the
-    // second op stays committed in the log — it re-stages off its pinned predecessor once the first's
-    // install advances `self.membership` to that predecessor (`commit_reconfigure`'s predecessor gate).
-    // (A laggard re-reaching an ALREADY-staged op is impossible: `commit_min` is monotone and
-    // `stage_epoch_swap` runs once as `commit_min` crosses the op.)
+    // DEFENSE IN DEPTH, ENFORCED IN RELEASE: never overwrite an already-staged successor. This branch is
+    // UNREACHABLE by construction: `propose_membership` refuses a new reconfiguration while one is
+    // outstanding (`has_pending_reconfigure`, which includes `pending_swap.is_some()`), so at most ONE
+    // reconfiguration is ever committed-but-not-installed, and `stage_epoch_swap` runs EXACTLY once — the
+    // instant `commit_min` (monotone) crosses the op, never re-entered afterward. A staged `pending_swap`
+    // here would therefore mean the single-change-at-a-time gate was already violated (a second
+    // `Reconfigure` committed before the first installed) — a latent bug, not a supported state. Overwriting
+    // would CLOBBER the first's staged successor and lose it on the first `on_sb_done`, so we KEEP the
+    // existing staged swap and refuse in RELEASE too (a debug-only assert vanishes in production, leaving the
+    // clobber live). This is a FAIL-SAFE against an invariant break — NOT a recovery path: the refused op is
+    // NOT re-staged (its `stage_epoch_swap` ran once and `commit_min` is already past it), so if this branch
+    // ever fired the second change would simply not install until the gate bug that let it commit is fixed.
     debug_assert!(
       self.pending_swap.is_none(),
       "stage_epoch_swap would overwrite a staged successor for op {:?} with op {}",
@@ -3390,6 +3401,16 @@ impl<S, R> Endpoint<S, R> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn below_ring_window_syncs(&self) -> u64 {
     self.below_ring_window_syncs
+  }
+
+  /// Test/observability counter: how many block-DAG sync reads/transfers aborted for exceeding
+  /// `MAX_REACHABLE_BLOCKS` (a malformed / foreign / oversized sync-source DAG — one increment per aborted
+  /// read/transfer, see the field). A non-zero, growing value is the otherwise-silent re-walk loop becoming
+  /// observable. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn dag_walks_capped(&self) -> u64 {
+    self.dag_walks_capped
   }
 
   /// Test/observability counter: how many canonical-log selections actually FLOORED the union —

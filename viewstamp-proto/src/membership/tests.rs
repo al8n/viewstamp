@@ -385,6 +385,17 @@ fn apply_delta_rejects_promoting_an_existing_voter() {
 }
 
 #[test]
+fn apply_delta_rejects_removing_a_learner_with_remove_voter() {
+  let m = base_3v_1l();
+  // Member 10 is a learner, not a voter; `RemoveVoter` targets the voting set (a learner is removed with
+  // `RemoveLearner`), so this reports `NotAVoter` — not the inverted `NotALearner`.
+  assert!(matches!(
+    m.apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(10))),
+    Err(MembershipError::NotAVoter)
+  ));
+}
+
+#[test]
 fn apply_delta_rejects_adding_a_duplicate() {
   let m = base_3v_1l();
   // Member 2 is already a voter; member 10 is already a learner.

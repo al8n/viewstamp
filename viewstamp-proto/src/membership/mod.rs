@@ -60,6 +60,10 @@ pub enum MembershipError {
   /// be promoted into the voting set.
   #[error("member is not a learner")]
   NotALearner,
+  /// A `RemoveVoter` delta named a [`MemberId`] that is present but a learner, not a voter; only a voter
+  /// can be removed from the voting set (a learner is removed with `RemoveLearner`).
+  #[error("member is not a voter")]
+  NotAVoter,
   /// A `RemoveVoter` delta would drop `replica_count` to zero; a configuration needs at least one
   /// voter.
   #[error("removing the voter would leave no voters")]
@@ -375,8 +379,9 @@ impl Membership {
       SingleVoterDelta::RemoveVoter(who) => {
         let slot = self.slot_of(*who).ok_or(MembershipError::UnknownMember)?;
         if !self.is_voter(slot) {
-          // Present, but a learner — removing it does not change the voter count.
-          return Err(MembershipError::NotALearner);
+          // Present, but a learner — `RemoveVoter` targets a voter; a learner is removed with
+          // `RemoveLearner`, so this delta does not apply.
+          return Err(MembershipError::NotAVoter);
         }
         if self.replica_count == 1 {
           return Err(MembershipError::WouldRemoveLastVoter);

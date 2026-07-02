@@ -3120,6 +3120,11 @@ fn read_body(r: &mut Reader<'_>) -> Result<Bytes, CodecError> {
 fn write_reconfigure(out: &mut impl BufMut, payload: &ReconfigurePayload) {
   out.put_u8(payload.replica_count);
   out.put_u16(payload.learner_count);
+  debug_assert!(
+    payload.members.len() <= u32::MAX as usize,
+    "write_reconfigure: member count {} exceeds u32::MAX",
+    payload.members.len()
+  );
   out.put_u32(payload.members.len() as u32);
   for m in payload.members.iter() {
     out.put_u128(m.get());
@@ -3155,6 +3160,11 @@ fn read_reconfigure(r: &mut Reader<'_>) -> Result<ReconfigurePayload, CodecError
 /// `Repairing` entry carries a body-faulty committed op's existence through a view change so its op
 /// number is never re-minted; a `Reconfigure` entry carries a membership-change op.
 fn write_log(out: &mut impl BufMut, log: &[PreparedEntry]) {
+  debug_assert!(
+    log.len() <= u32::MAX as usize,
+    "write_log: entry count {} exceeds u32::MAX",
+    log.len()
+  );
   out.put_u32(log.len() as u32);
   for e in log {
     out.put_u64(e.op.get());

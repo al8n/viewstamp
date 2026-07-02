@@ -423,6 +423,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       forced_syncs_applied: 0,
       wal_stalls: 0,
       below_ring_window_syncs: 0,
+      dag_walks_capped: 0,
       unions_floored: 0,
       repair_batches_served: 0,
       prepare_batches_sent: 0,
@@ -882,7 +883,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           session_walk.next_request(&*blocks),
         ) {
           (Ok(None), Ok(None)) => {} // complete — every reachable block of both DAGs is present locally.
-          _ => return, // a missing/malformed block in either: discard, retry, escalate (peer block-fetch).
+          // A reachable-block-bound breach in EITHER local walk (a malformed / oversized checkpoint DAG):
+          // count the abort ONCE for observability — `recover_timeouts` would otherwise re-read it silently —
+          // then discard/retry/escalate to a peer block-fetch, exactly like a missing block.
+          (Err(_), _) | (_, Err(_)) => {
+            self.dag_walks_capped += 1;
+            return;
+          }
+          // A missing block (`Ok(Some(_))`) in either walk: NOT a bound breach — discard, retry, escalate.
+          _ => return,
         }
         // Reconstruct through a VERIFY-ON-READ view: the walks above drained, but a block can bit-rot or
         // be misdirected in the window before this destructive reconstruct, so check every block read
@@ -1118,9 +1127,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       }
       // Committed-survival backstop: a faulty committed slot is `> checkpoint_op` (only the offset tail
       // is materialized), so it is NOT covered by the snapshot — survival relies on it being TRACKED for
-      // repair. It is in `rec.faulty` here, which `recover_progress` promotes to a `self.repair` hole on
-      // the `→ Normal` transition (or drives `RecoveringHead`), so the canonical body is re-fetched; the
-      // helper's tracked-for-repair clause witnesses that. Asserted per dropped op.
+      // repair. It is in `rec.faulty` here (which `is_tracked_for_repair` reads) and is DROPPED from
+      // `self.log` below, leaving an absent committed-band slot. It is NOT pre-registered as a `self.repair`
+      // hole on the `→ Normal` transition; instead `advance_commit`, applying through the committed band,
+      // re-requests the absent slot on demand (`request_repair_run`, which registers `self.repair`) and
+      // peer-repairs the canonical body — a permanently-faulty head drives `RecoveringHead` instead.
+      // Asserted per dropped op.
       self.assert_committed_survives(op, self.checkpoint_op.get());
       self.log.remove(&op);
     }
@@ -1897,8 +1909,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let next = match bf.next_missing(&*blocks) {
       Ok(next) => next,
       Err(_) => {
-        // A malformed/foreign DAG: abort the fetch, keep the peer-fetch armed (re-solicits a fresh one).
-        self.block_fetch = None;
+        // A malformed/foreign DAG breached the reachable-block bound: abort the fetch (counted), keep the
+        // peer-fetch armed (re-solicits a fresh one).
+        self.abort_oversized_block_fetch();
         return false;
       }
     };

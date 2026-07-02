@@ -85,6 +85,25 @@ impl Wal for RingWal {
 }
 
 #[test]
+fn a_bound_breach_abort_increments_the_dag_walk_counter() {
+  // `dag_walks_capped` is the observability witness for a block-DAG sync read/transfer ABORTED at
+  // MAX_REACHABLE_BLOCKS (a malformed / foreign / oversized DAG). Every abort increments it once: a teardown
+  // that frees a live `block_fetch` routes through the shared `abort_oversized_block_fetch` helper (this
+  // test's target), while the two NO-fetch local walks — the recovery checkpoint read and the
+  // fresh-checkpoint re-pin, where the aborted fetch is a local not yet installed — count inline. This test
+  // pins the shared helper moving the witness 0 → 1; the 2^20-block TooManyBlocks trigger itself is covered
+  // by the block_sync unit tests.
+  let mut e = sync_backup();
+  assert_eq!(e.dag_walks_capped(), 0, "no aborts yet");
+  e.abort_oversized_block_fetch();
+  assert_eq!(
+    e.dag_walks_capped(),
+    1,
+    "a reachable-block-bound abort increments the observability counter"
+  );
+}
+
+#[test]
 fn stale_checkpoint_commit_triggers_request_sync() {
   // replica 1 of 3, Normal, head op 0, checkpoint 0. A Commit advertising checkpoint_op=8 (> our
   // head) means the cluster checkpointed past our entire WAL → we must state-sync.
