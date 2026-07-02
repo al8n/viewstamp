@@ -7258,6 +7258,182 @@ fn an_owed_sm_reconstruct_survives_a_view_change_and_no_durable_view_write_rewin
 }
 
 #[test]
+fn a_cancelled_superseding_sync_keeps_the_sm_reconstruct_obligation_gated() {
+  // REGRESSION: an SM-reconstruct obligation for M=4 is owed (M's restore faulted; the SM still holds pre-M
+  // content while `checkpoint_op == 4`). A strictly-NEWER checkpoint M'=8 supersedes it and stages a
+  // PRE-ROOT `pending_install`. That install is CANCELLABLE — a view transition drops it before its root
+  // lands. The obligation for M MUST survive the whole handoff: if it were cleared at M''s stage time,
+  // cancelling `pending_install` would leave the SM behind `checkpoint_op` with NEITHER gate set, and a
+  // Commit heartbeat could `advance_commit` over stale pre-M content (committed-state divergence).
+  let (mut e, mut wal, mut sb, mut blocks, _sm_root_m, _id_m) = laggard_owing_sm_reconstruct_at_m();
+  let now = Instant::ZERO;
+  let later = now + core::time::Duration::from_secs(1);
+  assert!(
+    e.sm_reconstruct_owed(),
+    "precondition: M's reconstruct is owed"
+  );
+  assert!(
+    e.pending_install.is_none(),
+    "precondition: the M install already faulted, none staged"
+  );
+
+  // A strictly-newer checkpoint M'=8, its DAG already present locally so `apply_sync` stages immediately.
+  let (_d8, _w8, s8) = donor_primary_at_checkpoint(8);
+  let (env8, id8) = donor_envelope(&s8);
+  seed_donor_blocks(&mut blocks, 8);
+  // Fire the sync-solicit timer so a fresh RequestSync (carrying the current nonce) is emitted to capture.
+  e.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(8),
+      id8,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env8,
+      Bytes::new(),
+    )),
+  );
+  assert!(
+    e.pending_install.is_some(),
+    "M'=8 staged a pre-root install"
+  );
+  assert!(
+    e.sm_reconstruct_owed(),
+    "the M obligation is KEPT through the M' staging (not cleared) — the SM is still pre-M",
+  );
+
+  // A view change cancels the pre-root M' install (SVC quorum → ViewChange).
+  for r in [1u16, 2] {
+    e.handle_message(
+      later,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Replica(ReplicaId::new(r)),
+      Message::StartViewChange(StartViewChange::new(
+        View::with(1),
+        ReplicaId::new(r),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+  }
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "the SVC quorum entered ViewChange"
+  );
+  assert!(
+    e.pending_install.is_none(),
+    "the view transition cancelled the pre-root M' install",
+  );
+  assert!(
+    e.sm_reconstruct_owed(),
+    "the SM-reconstruct obligation SURVIVES the cancel — the SM stays gated (no ungated pre-M apply window)",
+  );
+}
+
+#[test]
+fn a_retained_newer_install_is_not_orphaned_by_an_equal_checkpoint_reply() {
+  // REGRESSION: while an SM-reconstruct obligation for M=4 is owed AND a strictly-newer M'=8 install is
+  // RETAINED (staged, then its block-store flush faulted — `pending_checkpoint` is None), a fresh EQUAL-M
+  // (=4) reply must NOT run the same-M reconstruct: doing so would, on success, clear `sm_reconstruct` +
+  // `sync` and orphan the retained `pending_install(8)` (tripping `pending_install => sync` in debug /
+  // wedging the apply gate in release). The newer install subsumes M and is retried locally.
+  let (mut e, mut wal, mut sb, mut blocks, _sm_root_m, _id_m) = laggard_owing_sm_reconstruct_at_m();
+  let now = Instant::ZERO;
+  let t1 = now + core::time::Duration::from_secs(1);
+  let t2 = now + core::time::Duration::from_secs(2);
+
+  // Stage a strictly-newer M'=8 whose flush FAULTS, leaving `pending_install(8)` retained.
+  let (_d8, _w8, s8) = donor_primary_at_checkpoint(8);
+  let (env8, id8) = donor_envelope(&s8);
+  seed_donor_blocks(&mut blocks, 8);
+  blocks.script_flush_fault(1);
+  e.handle_timeout(t1, &mut wal, &mut sb, &mut blocks);
+  let nonce1 = captured_sync_nonce(&mut e);
+  e.handle_message(
+    t1,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(8),
+      id8,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce1,
+      env8,
+      Bytes::new(),
+    )),
+  );
+  assert!(
+    e.pending_install.is_some(),
+    "M'=8 install retained after the flush fault"
+  );
+  assert!(
+    e.sm_reconstruct_owed(),
+    "M's obligation still owed alongside the retained newer install"
+  );
+
+  // No block-fetch is armed while the newer install is retained (it was consumed at stage time).
+  assert!(
+    e.block_fetch.is_none(),
+    "no block-fetch while the newer install is retained"
+  );
+
+  // An EQUAL-M (=4) reply now. The guard DROPS it (falls through to the monotone reject); without the
+  // guard it would route to `refetch_sm_reconstruct`, which arms a block-fetch pinned to M=4 and, on
+  // success, clears `sync` and orphans the retained install.
+  let (_d4, _w4, s4) = donor_primary_at_checkpoint(4);
+  let (env4, id4) = donor_envelope(&s4);
+  e.handle_timeout(t2, &mut wal, &mut sb, &mut blocks);
+  let nonce2 = captured_sync_nonce(&mut e);
+  e.handle_message(
+    t2,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id4,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce2,
+      env4,
+      Bytes::new(),
+    )),
+  );
+  assert!(
+    e.pending_install.is_some(),
+    "the equal-M reply did NOT orphan the retained newer install",
+  );
+  assert!(
+    e.sm_reconstruct_owed(),
+    "the obligation is still owed (the equal-M reply was dropped, not routed to a same-M reconstruct)",
+  );
+  assert!(
+    e.block_fetch.is_none(),
+    "the equal-M reply was DROPPED, not routed to refetch_sm_reconstruct (which would arm a block-fetch)",
+  );
+}
+
+#[test]
 fn an_owed_sm_reconstruct_blocks_a_competing_lower_checkpoint_write() {
   // An SM-RECONSTRUCT obligation for M=4 is owed (M's durable root is written, in-memory checkpoint_op=4).
   // A competing LOWER durable-root write must NOT produce a root naming a checkpoint < M:
