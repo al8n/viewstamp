@@ -163,17 +163,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if !self.participates_as_primary() || self.pending_forfeit {
       return;
     }
-    // Generation gate: count a nack only from THIS view. The view is the primary generation — a nack from a
-    // prior view answers a superseded solicitation (and its op number may have been reused by this view), so
-    // it is not evidence about a current candidate. Within a view a counted nack cannot go stale: a nacker
-    // lacks an op ABOVE its head (the `op > self.op` emit gate), and it can only come to HOLD an above-head
-    // op via this primary's `Prepare` — which requires the primary to hold the op's body, making the op
-    // `Present` here and therefore no longer a candidate (the `is_repair_or_truncate_candidate` re-check
-    // below then declines to count). So the nacker stays a genuine non-holder for as long as the op is a
-    // candidate, and the tally accumulates soundly across retransmit rounds. `nack_from` is cleared at the
-    // view boundary (`reset_for_view_transition`), so a straggling prior-view nack that arrives after is
-    // dropped here by the view check.
-    if m.view() != self.view {
+    // Generation gate: count a nack only from THIS (view, configuration). The generation is `(view,
+    // config_id)` — a nack from a prior VIEW answers a superseded solicitation (and its op number may have
+    // been reused), and a nack from a prior CONFIGURATION was cast by voters counted against a DIFFERENT
+    // `quorum_nack_prepare()` threshold (a membership change within a view resets the proof — see the
+    // `nack_from` clear in `install_membership`). Both are dropped: `nack_from` is cleared at the view
+    // boundary (`reset_for_view_transition`) and at the swap (`install_membership`), and these checks drop a
+    // straggling nack that arrives after either boundary. Within a (view, config) a counted nack cannot go
+    // stale: a nacker lacks an op ABOVE its head (the `op > self.op` emit gate), and it can only come to HOLD
+    // an above-head op via this primary's `Prepare` — which requires the primary to hold the op's body,
+    // making the op `Present` here and therefore no longer a candidate (the `is_repair_or_truncate_candidate`
+    // re-check below then declines to count). So the nacker stays a genuine non-holder for as long as the op
+    // is a candidate, and the tally accumulates soundly across retransmit rounds.
+    if m.view() != self.view || m.config_id() != self.membership.config_id() {
       return;
     }
     let Some(rid) = from.as_replica() else {
