@@ -5555,6 +5555,39 @@ fn a_slow_nack_across_retransmit_rounds_still_accumulates_and_truncates() {
 }
 
 #[test]
+fn on_nack_ignores_a_nack_from_a_foreign_configuration() {
+  // The nack generation is (view, config_id): a membership change within a view resets the proof (the
+  // successor recomputes `quorum_nack_prepare()`), so a nack cast under a DIFFERENT configuration must not
+  // count against the current threshold. A nack carrying a foreign config lineage is dropped, so a
+  // straggling predecessor-configuration nack arriving after an epoch swap cannot help reach the quorum.
+  let (mut e, mut wal, mut sb, mut blocks) = new_primary_with_op2_candidate(genesis(3));
+  let now = Instant::ZERO;
+  // A voter's nack for the candidate, but stamped with a foreign config_id (not the fixture lineage 0).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Nack(crate::Nack::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(0),
+      0xDEAD_BEEF, // a foreign configuration lineage
+    )),
+  );
+  assert_eq!(
+    e.nack_voters_for_test(2),
+    0,
+    "a nack from a foreign configuration is not counted toward the current quorum"
+  );
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "so the candidate is not truncated by it"
+  );
+}
+
+#[test]
 fn on_nack_ignores_a_non_voter_nack() {
   // A learner holds no write-quorum, so its durable lack is irrelevant to the counting proof: `on_nack`
   // filters it (`is_voter`). Config n=3 + 1 learner (slot 3). The learner's nack is never tallied, so the

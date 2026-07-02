@@ -1747,6 +1747,16 @@ impl<S, R> Endpoint<S, R> {
     // Mirrors the `peer_checkpoint` MemberId re-key; with no reconfiguration this never runs, so the
     // off-axis behavior is byte-identical.
     self.rekey_slot_quorums_for_swap(&successor);
+    // Clear the nack-truncation tally at the swap: a membership change within a view resets the generation
+    // the nack proof is scoped to. `nack_from` holds distinct voters that nacked a candidate under the OLD
+    // configuration, and `on_nack` counts it against `quorum_nack_prepare()` — which the successor config
+    // recomputes (a smaller voter set lowers `f+1`). Counting predecessor nacks against the successor
+    // threshold is the exact hazard the `inflight.oks` re-key above closes for commit votes: it could
+    // truncate a candidate without a current-config non-holder quorum. The nack tally is cheap to re-gather
+    // (the candidates are re-solicited every repair round), so clear it rather than re-key — a fresh
+    // generation under the new config re-accumulates. (Off the reconfiguration path this never runs, so the
+    // behavior is byte-identical.)
+    self.nack_from.clear();
     self.membership = successor;
     // Push the superseded config_id onto the recent-prior lineage ring (most-recent-first), so
     // `in_lineage` keeps admitting a bounded window of recent ancestors for live cross-epoch catch-up.
