@@ -674,6 +674,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Checkpoint at `commit_min` (a committed+applied boundary), not at the raw `boundary` op:
     // `commit_min` may have jumped past `boundary` in a batch commit, and the SM has applied through
     // `commit_min` (apply is forward-only) — so the checkpoint reflects state through `commit_min`.
+    // That prose is now WITNESSED: snapshotting an SM whose content lags the frontier would persist a
+    // stale checkpoint under a forward op — the exact hazard every force site's guards exist to fence
+    // (`maybe_checkpoint`'s `sm_reconstruct_owed`/`pending_install` exclusions, the SwapEpoch arm's
+    // sibling guard) — so the content witness is asserted locally at the one place the snapshot is cut.
+    debug_assert_eq!(
+      self.sm_at,
+      self.commit_min,
+      "checkpointing an SM whose content ({}) lags the applied frontier ({})",
+      self.sm_at.get(),
+      self.commit_min.get(),
+    );
     let target_op = self.commit_min;
     // Write the SM checkpoint as a content-addressed block DAG into the block store and bind its
     // root into the envelope so `checkpoint_id` covers it: the written op and the op hashed alongside

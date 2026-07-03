@@ -662,6 +662,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return false;
     };
     let reply_body = self.sm.apply(OpNumber::with(op), body);
+    self.note_sm_advanced(OpNumber::with(op));
     // Reply-size contract (see `StateMachine::apply`): an over-bound reply encodes past the frame
     // cap and the transport refuses the send — unrecoverable, since the op is already committed.
     debug_assert!(
@@ -723,8 +724,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     // The op is committed at the consensus layer regardless of whether THIS node stages the swap: advance
     // the applied frontier past it (no `sm.apply`) and mark it committed for the primary's inflight
-    // tracker (a backup holds no inflight entry — the `if let` is a no-op).
+    // tracker (a backup holds no inflight entry — the `if let` is a no-op). The SM-content witness is
+    // accounted alongside — a `Reconfigure` op's SM-effect is vacuous by design (the epoch swap, not an
+    // apply, is its effect), so "fully performed" is immediate and `sm_at` stays sequential per
+    // committed op through reconfiguration epochs.
     self.set_commit_min(OpNumber::with(op));
+    self.note_sm_advanced(OpNumber::with(op));
     // Lift the KNOWN-committed frontier to cover this op BEFORE staging the swap. On the PRIMARY commit
     // path (`commit_op` ← `try_commit`) `commit_max` is raised to `commit_min` only AFTER the commit
     // loop, but the SwapEpoch root is staged HERE, mid-loop: `submit_swap_epoch` reads `self.commit_max`
@@ -1283,6 +1288,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         break;
       };
       let reply = self.sm.apply(OpNumber::with(op), body);
+      self.note_sm_advanced(OpNumber::with(op));
       // Reply-size contract (see `StateMachine::apply`): mirrors the primary's apply-site assert.
       debug_assert!(
         reply.len() <= crate::message::max_reply_body_len(),

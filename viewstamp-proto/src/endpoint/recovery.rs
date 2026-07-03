@@ -386,6 +386,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // `commit == checkpoint_op` (apply_sync persists that), so `commit_max == checkpoint_op` there —
       // unchanged behaviour.
       commit_min: OpNumber::with(checkpoint_op),
+      // The caller-supplied SM is FRESH (content position 0) until the Recovering checkpoint read
+      // restores it at `checkpoint_op` (`note_sm_restored`); the divergence from `commit_min` above
+      // is exactly the recovery behind-window the (5c) content witness exempts by status. With no
+      // durable checkpoint (`checkpoint_op == 0`, nothing to restore) the two start equal.
+      sm_at: OpNumber::new(),
       commit_max: state.commit(),
       log_view: state.log_view(),
       svc_from: 0,
@@ -999,6 +1004,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           return;
         }
         self.clients = sessions;
+        // The SM now holds the durable checkpoint's content (`cr.op() == state.checkpoint_op()`,
+        // verified above).
+        self.note_sm_restored(cr.op());
         // Record the restored SM + session DAG roots as the live roots the block GC marks from.
         self.checkpoint_sm_root = Some(sm_root);
         self.checkpoint_sessions_root = Some(sessions_root);
