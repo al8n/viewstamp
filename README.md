@@ -88,7 +88,7 @@ each committed reply back to its callers. Your `apply` then decodes each committ
 with the shared codec — `BatchView` in, one result per unit out through a
 `ReplyBuilder`:
 
-```rust
+```rust,ignore
 let (batch, pump) = aggregator(handle, BatchConfig::new(max_unit_reply_len));
 // spawn pump.run() exactly like the driver's own run(); then, from any task:
 let reply = batch.submit(unit).await?;

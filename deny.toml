@@ -25,6 +25,8 @@ version = 2
 # allowed branch (e.g. `Unlicense OR MIT` passes via MIT; `... OR LGPL-2.1-or-later`
 # passes via MIT/Apache-2.0, so no copyleft obligation is ever selected).
 allow = [
+  # The workspace's own crates.
+  "MPL-2.0",
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",

@@ -6,12 +6,11 @@
 //! cargo run --bin corpus_gen
 //! ```
 
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Commit, GetView, Header, Message, OpNumber, ReplicaId, Request, RequestNumber,
+  ClientId, Commit, Epoch, GetView, Header, Message, OpNumber, ReplicaId, Request, RequestNumber,
   StartViewChange, View, VsrState,
 };
 
@@ -42,9 +41,22 @@ fn main() {
     View::with(3),
     OpNumber::with(9),
     OpNumber::with(4),
+    Epoch::new(0),
+    0,
   ));
-  let svc = Message::StartViewChange(StartViewChange::new(View::with(2), ReplicaId::new(1)));
-  let get_view = Message::GetView(GetView::new(View::with(1), ReplicaId::new(2), 0xDEAD));
+  let svc = Message::StartViewChange(StartViewChange::new(
+    View::with(2),
+    ReplicaId::new(1),
+    Epoch::new(0),
+    0,
+  ));
+  let get_view = Message::GetView(GetView::new(
+    View::with(1),
+    ReplicaId::new(2),
+    0xDEAD,
+    Epoch::new(0),
+    0,
+  ));
   for (name, msg) in [
     ("request", &request),
     ("commit", &commit),
