@@ -237,13 +237,29 @@ type RestartDriver = viewstamp_reactor::ReactorStreamDriver<
   MemBlocks,
 >;
 
-/// Bind a fresh 3-node cluster on `127.0.0.1` TCP ports starting at `base_port`, each on its own
+/// Reserve `n` distinct loopback TCP socket addresses by binding kernel-assigned (port `0`)
+/// listeners, reading back their addresses, and dropping the listeners. Fresh ephemeral ports per
+/// process keep repeated executions of this binary (CI runs it once per cargo feature combination,
+/// back-to-back) from colliding with the previous run's TIME_WAIT connection remnants: rebinding a
+/// fixed port constant fails with `AddrInUse` for up to a minute after the prior run's cluster
+/// connections closed. A reservation listener never accepts, so dropping it leaves no TIME_WAIT of
+/// its own.
+fn reserve_loopback_addrs(n: usize) -> Vec<SocketAddr> {
+  let listeners: Vec<std::net::TcpListener> = (0..n)
+    .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port"))
+    .collect();
+  listeners
+    .iter()
+    .map(|l| l.local_addr().expect("reserved listener has an address"))
+    .collect()
+}
+
+/// Bind a fresh 3-node cluster on freshly reserved `127.0.0.1` TCP ports, each on its own
 /// spawned `run` task, and return the node handles (index = replica id). The record layer `R` is
 /// fixed by the `make_dialer` / `make_acceptor` factories (plain or TLS); each takes the node's own
-/// replica id so the `Labeled` handshake announces the correct `Peer::Replica(me)`. Distinct ports
-/// per test keep concurrently-running tests from colliding on the loopback address.
+/// replica id so the `Labeled` handshake announces the correct `Peer::Replica(me)`. Per-cluster
+/// reserved ports keep concurrently-running tests from colliding on the loopback address.
 async fn spawn_cluster<R, MkD, MkA>(
-  base_port: u16,
   make_dialer: MkD,
   make_acceptor: MkA,
 ) -> Vec<viewstamp_reactor::Handle>
@@ -252,9 +268,7 @@ where
   MkD: Fn(u8) -> Arc<dyn Fn(Peer) -> Conn<R> + Send + Sync>,
   MkA: Fn(u8) -> Arc<dyn Fn() -> Conn<R> + Send + Sync>,
 {
-  let addrs: Vec<SocketAddr> = (0..3)
-    .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
-    .collect();
+  let addrs = reserve_loopback_addrs(3);
   let mut handles = Vec::new();
   for id in 0u8..3 {
     let peers: Vec<_> = (0u8..3)
@@ -315,7 +329,7 @@ async fn three_node_tcp_cluster_commits_a_client_request() {
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
-  let handles = spawn_cluster::<Labeled<Passthrough>, _, _>(45000, mk_dialer, mk_acceptor).await;
+  let handles = spawn_cluster::<Labeled<Passthrough>, _, _>(mk_dialer, mk_acceptor).await;
 
   let reply = tokio::time::timeout(
     std::time::Duration::from_secs(15),
@@ -367,9 +381,7 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
-  let addrs: Vec<SocketAddr> = (0..3)
-    .map(|i| format!("127.0.0.1:{}", 45500 + i).parse().unwrap())
-    .collect();
+  let addrs = reserve_loopback_addrs(3);
   let peers_of = |id: u8| -> Vec<(ReplicaId, SocketAddr)> {
     (0u8..3)
       .filter(|&p| p != id)
@@ -548,7 +560,7 @@ async fn stream_driver_exits_when_all_handles_dropped() {
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
   let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
   let blocks = MemBlocks::default();
-  let bind: SocketAddr = "127.0.0.1:45200".parse().unwrap();
+  let bind = reserve_loopback_addrs(1)[0];
   let (driver, handle) = GateDriver::new(
     config,
     genesis(3),
@@ -604,7 +616,7 @@ async fn shutdown_ack_frees_the_address_for_immediate_rebind_stream() {
     })
   };
 
-  let bind: SocketAddr = "127.0.0.1:45600".parse().unwrap();
+  let bind = reserve_loopback_addrs(1)[0];
   for i in 0..5 {
     // Iterations 1.. bind the address the PREVIOUS iteration's driver just released: this
     // constructor succeeding immediately after the ack is the assertion.
@@ -688,7 +700,7 @@ async fn shutdown_releases_a_queued_dial_completion() {
     blocks,
     viewstamp_proto::ClientId::new(1),
     0,
-    "127.0.0.1:45620".parse().unwrap(),
+    reserve_loopback_addrs(1)[0],
     vec![(ReplicaId::new(1), peer_addr)],
     mk_dialer(0),
     mk_acceptor(0),
@@ -754,7 +766,7 @@ async fn stalled_unvalidated_accept_is_reaped_at_the_auth_deadline() {
     })
   };
 
-  let bind: SocketAddr = "127.0.0.1:45300".parse().unwrap();
+  let bind = reserve_loopback_addrs(1)[0];
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
@@ -838,7 +850,7 @@ async fn stalled_dialed_conn_is_reaped_at_the_auth_deadline_and_redials() {
     .expect("raw peer listener binds");
   let peer_addr: SocketAddr = peer_listener.local_addr().expect("listener has an address");
 
-  let bind: SocketAddr = "127.0.0.1:45400".parse().unwrap();
+  let bind = reserve_loopback_addrs(1)[0];
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
@@ -979,7 +991,7 @@ mod tls {
         Conn::from_parts(Labeled::acceptor(inner, &opts))
       })
     };
-    let handles = spawn_cluster::<Labeled<TlsRecords>, _, _>(45100, mk_dialer, mk_acceptor).await;
+    let handles = spawn_cluster::<Labeled<TlsRecords>, _, _>(mk_dialer, mk_acceptor).await;
 
     let reply = tokio::time::timeout(
       std::time::Duration::from_secs(15),
@@ -1020,7 +1032,7 @@ async fn a_full_cap_evicts_the_oldest_unvalidated_accept_for_a_fresh_one() {
     })
   };
 
-  let bind: SocketAddr = "127.0.0.1:45800".parse().unwrap();
+  let bind = reserve_loopback_addrs(1)[0];
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());

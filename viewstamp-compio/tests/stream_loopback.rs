@@ -349,9 +349,7 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
       Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
     })
   };
-  let addrs: Vec<SocketAddr> = (0..3)
-    .map(|i| format!("127.0.0.1:{}", 45500 + i).parse().unwrap())
-    .collect();
+  let addrs = reserve_loopback_addrs(3);
   let peers_of = |id: u8| -> Vec<(ReplicaId, SocketAddr)> {
     (0u8..3)
       .filter(|&p| p != id)

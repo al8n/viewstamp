@@ -192,16 +192,21 @@ fn mk_acceptor(me: u8) -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sy
   })
 }
 
-/// Bind a fresh 3-node cluster on `127.0.0.1` TCP ports starting at `base_port`, each on its own
+/// Bind a fresh 3-node cluster on freshly reserved `127.0.0.1` TCP ports, each on its own
 /// spawned `run` task, and return the node handles (index = replica id) alongside each node's
-/// shared [`BatchSm`] recorder. Distinct ports per test keep concurrently-running tests from
-/// colliding on the loopback address.
-async fn spawn_cluster(
-  base_port: u16,
-) -> (Vec<viewstamp_reactor::Handle>, Vec<Arc<Mutex<BatchSm>>>) {
-  let addrs: Vec<SocketAddr> = (0..3)
-    .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+/// shared [`BatchSm`] recorder. Kernel-assigned ports per cluster keep concurrently-running
+/// tests — and back-to-back per-feature-combination re-runs of this binary, whose previous
+/// run's connections sit in TIME_WAIT for up to a minute — from colliding on the loopback
+/// address (a fixed port constant fails `bind` with AddrInUse in that window).
+async fn spawn_cluster() -> (Vec<viewstamp_reactor::Handle>, Vec<Arc<Mutex<BatchSm>>>) {
+  let reservations: Vec<std::net::TcpListener> = (0..3)
+    .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port"))
     .collect();
+  let addrs: Vec<SocketAddr> = reservations
+    .iter()
+    .map(|l| l.local_addr().expect("reserved listener has an address"))
+    .collect();
+  drop(reservations);
   let mut handles = Vec::new();
   let mut sms = Vec::new();
   for id in 0u8..3 {
@@ -267,7 +272,7 @@ async fn wait_until(secs: u64, mut cond: impl FnMut() -> bool, what: &str) {
 /// is the `Send` placeholder) and crosses `tokio::spawn`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_units_batch_into_fewer_ops_over_a_real_cluster() {
-  let (mut handles, sms) = spawn_cluster(45900).await;
+  let (mut handles, sms) = spawn_cluster().await;
 
   // Consume replica 1's Handle into the aggregator. A clone survives ONLY for the final driver
   // shutdown: it never submits — the pump must stay the session's sole submitter.
@@ -400,7 +405,7 @@ async fn concurrent_units_batch_into_fewer_ops_over_a_real_cluster() {
 /// viewstamp-driver; this pins the runtime wiring.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_generous_stall_deadline_never_fires_on_a_healthy_cluster() {
-  let (mut handles, _sms) = spawn_cluster(45910).await;
+  let (mut handles, _sms) = spawn_cluster().await;
 
   let node1 = handles.remove(1);
   let shutdown1 = node1.clone();
