@@ -412,16 +412,23 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           self.view,
           self.log_view,
           self.op,
-          // The DVC reports the KNOWN committed frontier `commit_max` — VSR's commit-number `k` (the
-          // highest op this replica KNOWS is committed), NOT the locally-applied `commit_min`.
-          // `select_canonical_log` takes `commit* = max(d.commit())`, so under-reporting
-          // commit_min would let a known-committed op (whose slot is a dropped repair hole on this
-          // replica) fall ABOVE `commit*` and be truncated as an uncommitted gap when the DVC quorum is
-          // this replica + a laggard. Reporting commit_max keeps `commit*` at/above it, so it is a
-          // COMMITTED hole the new primary HOLDS + peer-repairs (never silently dropped). Fail-stop-safe:
-          // a committed op N is held by a write-quorum, which intersects the DVC quorum, so some donor
-          // claims `op >= N` → `commit* (<= max commit_max == N) <= op_head` holds.
-          self.commit_max,
+          // The DVC reports the KNOWN committed frontier BOUNDED BY THE HELD HEAD, `commit_max.min(op)`
+          // — VSR's commit-number `k` (the highest op this replica KNOWS is committed), but never above
+          // an op it actually holds. This is the vsrr analogue of TigerBeetle advertising `commit_min`
+          // (an evidence-backed frontier `<= op`): a replica vouches only for what it holds, so a bare
+          // peer `commit` scalar corrupted above the head (in-model, a bit-flip — see the threat model)
+          // cannot make this DVC advertise `commit > op` and trip `select_canonical_log`'s `commit* <=
+          // op_head` fail-stop, halting view formation cluster-wide from one faulty peer.
+          //
+          // The `.min(op)` never drops a committed op. A committed op N this replica HOLDS as a dropped
+          // repair hole is an INTERIOR op (`N <= op`), so `commit_max.min(op) >= N` still covers it — it
+          // stays a COMMITTED hole the new primary holds + peer-repairs, exactly as before. A committed
+          // op N this replica does NOT hold (`commit_max > op`, the tail-gap shape) is, by quorum
+          // intersection, carried in some OTHER canonical donor's `log_slice` (`select_canonical_log`'s
+          // offset-union), so it survives the selection regardless of this DVC's `commit`, and the new
+          // primary re-commits it via a fresh AdoptVote quorum. Under-reporting `commit` only DEFERS such
+          // an op to re-commit; it never truncates it (truncation is by the offset-union, not `commit*`).
+          self.commit_max.min(self.op),
           self.membership.epoch(),
           self.membership.config_id(),
           self.local_slot(),
@@ -529,10 +536,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         self.view,
         self.log_view,
         self.op,
-        // Report the KNOWN committed frontier `commit_max` (VSR's `k`), not `commit_min` — see
-        // `send_do_view_change`. This own-DVC feeds the same `select_canonical_log`
-        // `commit*` union, so it must carry the same frontier the wire DVC does.
-        self.commit_max,
+        // Report the known committed frontier bounded by the held head, `commit_max.min(op)` — see
+        // `send_do_view_change` for the full rationale. This own-DVC feeds the same `select_canonical_log`
+        // `commit*` union, so it must carry the same held-bounded frontier the wire DVC does.
+        self.commit_max.min(self.op),
         self.membership.epoch(),
         self.membership.config_id(),
         self.local_slot(),
@@ -805,6 +812,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.raise_log_floor(OpNumber::with(floor_star));
     self.adopt_log(&canonical_log, floor_star);
     self.op = OpNumber::with(op_head);
+    // Re-establish the committed frontier from the view-change-authoritative `commit*`, DISCARDING any
+    // stale/poisoned pre-view `commit_max`. `commit*` is the quorum-vouched, held-bounded committed
+    // frontier (`<= op_head` by `select_canonical_log`, now that every DVC advertises `commit_max.min(op)`),
+    // so it is the correct new authority — the vsrr analogue of TigerBeetle deriving the view's commit from
+    // the JoinView quorum rather than carrying a learned hint across the transition. This must OVERWRITE,
+    // not `max`: a replica that adopted a bare corrupt `commit` scalar (in-model) before becoming primary
+    // would otherwise carry `commit_max > op` past here — wedging the AdoptVote tail-seeding below
+    // (`(commit_max .. op]` goes empty, so the genuinely-uncommitted tail is never re-voted) and, worse,
+    // broadcasting `commit_max > op` in the deferred `start_view_participate` StartView, tripping every
+    // backup's `adopt_canonical_head` `commit <= op` assert. A committed op above `commit*` (the tail-gap
+    // case) is carried in the canonical union and re-committed by the AdoptVote quorum below, so lowering
+    // `commit_max` to `commit*` defers it, never drops it. (`advance_commit(commit*)` next is then a no-op
+    // raise.)
+    self.commit_max = OpNumber::with(commit_star);
     // Retire any pending-repair holes the adopted canonical log NOW supplies; leave the rest (a
     // committed op held by no canonical donor) for `advance_commit` below to re-`request_repair` from
     // a peer. We must NOT blanket-clear `repair` here: a committed op the union could not carry is a
