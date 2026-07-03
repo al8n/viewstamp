@@ -476,6 +476,17 @@ fn vopr_sweep_no_violations() {
 /// schedule, and this lane is ADDITIVE to the default sweep, so its budget is kept modest.
 const HOLD_SEEDS: u64 = 16;
 
+/// Hold-axis regression seeds: each caught a real bug under a held-message schedule (the nightly wide
+/// hold sweep, `VOPR_HOLD=1` over `0..1024`), pinned here with the axis FORCED ON — a default-axis run
+/// of the same seed consumes different PRNG draws and never reaches the failing schedule.
+///
+/// - **903** — ring-residency committed-op loss on a BOUNDED ring: a deep laggard (own checkpoint a
+///   full ring behind the cluster) was handed a peer-repair body for a committed op ABOVE its ring
+///   window, and `fill_repair` appended it, physically evicting a committed, un-pruned op (the
+///   adoption re-append had the same unguarded shape). Fixed by extending the below-ring-window
+///   discipline (`ring_append_would_wrap`) to BOTH non-head-extend append paths.
+const HOLD_REGRESSION_SEEDS: [u64; 1] = [903];
+
 /// The committed HOLD sweep: [`run_vopr_with_hold`] over `0..HOLD_SEEDS` — the unbounded-hold network
 /// axis FORCE-ENABLED programmatically (no env var, so it cannot race other tests in this process and
 /// cannot be forgotten by a runner). A held message's delivery is pushed far past the proto's
@@ -496,7 +507,7 @@ fn vopr_hold_sweep_no_violations() {
   println!(
     "VOPR hold sweep: 0..{HOLD_SEEDS} contiguous, {DEFAULT_TICKS} ticks each, hold axis forced on"
   );
-  for seed in 0..HOLD_SEEDS {
+  for seed in (0..HOLD_SEEDS).chain(HOLD_REGRESSION_SEEDS) {
     let r = run_vopr_with_hold(seed, DEFAULT_TICKS);
     total_holds += r.holds_fired();
     total_committed += r.max_committed();

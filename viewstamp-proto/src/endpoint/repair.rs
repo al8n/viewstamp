@@ -715,6 +715,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // see `log_entries`) arrives here as the canonical body to fill; storing it as an opaque
     // `Body::Present` would make `commit_reconfigure` fail to recognize it at commit — the epoch swap
     // would silently never fire and the membership bytes would be mis-applied to the state machine.
+    // The same ring-window discipline as the head-extend and adoption appends: a repair body for a
+    // hole deeper than a ring above this laggard's checkpoint must not physically wrap a committed,
+    // un-pruned slot. Reject the fill and keep the hole open; the below-ring-window forced sync jumps
+    // the checkpoint forward and subsumes (or re-exposes) the band.
+    if self.ring_append_would_wrap(wal, p.op().get()) {
+      return false;
+    }
     let entry = self.log_entry_from_prepare(p);
     let id = self.mint_op_id();
     wal.submit_append(id, p.op(), header, p.body_bytes());

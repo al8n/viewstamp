@@ -1456,6 +1456,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let Some(body) = entry.body_bytes() else {
       return;
     };
+    // The ring-window discipline the head-extend paths enforce (`maybe_sync_below_ring_window`) applies
+    // to the adoption (re-)append identically: a deep laggard — its own checkpoint fallen more than a
+    // ring behind the adopted band — must not physically wrap a committed, un-pruned slot (appending
+    // `op` evicts `op − ring`, which recovery and its peers may still need). Skip the durable append
+    // and owe NO vote/ack for the op (append-before-ack: nothing lands, nothing is cast, so the op is
+    // never advertised as durably held); the below-ring-window forced sync jumps the checkpoint forward
+    // and ordinary catch-up re-covers the band.
+    if self.ring_append_would_wrap(wal, op) {
+      return;
+    }
     let header = Header::new(
       OpNumber::with(op),
       self.view,
