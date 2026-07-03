@@ -1138,6 +1138,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// that the Prepare is current-view (`p.view() == self.view`), so overwriting the slot is safe: the op is
   /// either committed-or-current-view-canonical, and only a stale superseded earlier-view body is replaced.
   fn reappend_canonical_prepare<W: Wal>(&mut self, wal: &mut W, p: &Prepare) {
+    // The interior overwrite obeys the same ring-window discipline as every other append lane
+    // (`maybe_sync_below_ring_window` on the head-extends, the `adopt_append`/`fill_repair` wrap
+    // guards): physically writing this slot from more than a full window above `checkpoint_op`
+    // would evict the un-pruned op one ring below it, which recovery and peer repair may still
+    // need. Drop instead — the primary's retransmit re-delivers this Prepare, and the laggard's
+    // committed-band catch-up keeps its ordinary checkpoints firing, so the window slides until
+    // the re-delivery fits.
+    if self.ring_append_would_wrap(wal, p.op().get()) {
+      return;
+    }
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
     let id = self.mint_op_id();
     wal.submit_append(id, p.op(), header, p.body_bytes());
@@ -1158,7 +1168,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// torn / bit-rotted — the append still completed; the corrupt bytes are a separate, peer-repaired
   /// concern). A `Dirty` (still in flight) or `Empty` (never written / truncated) slot above the
   /// checkpoint is NOT yet durable.
-  fn op_durably_appended<W: Wal>(&self, wal: &W, op: u64) -> bool {
+  pub(crate) fn op_durably_appended<W: Wal>(&self, wal: &W, op: u64) -> bool {
     op <= self.checkpoint_op.get()
       || matches!(
         wal.status(OpNumber::with(op)),

@@ -2414,6 +2414,692 @@ fn adoption_does_not_append_ops_that_would_wrap_the_ring() {
 }
 
 #[test]
+fn a_checkpoint_advance_re_drives_a_backups_over_window_adoption_appends() {
+  // The over-window adoption skip (`adoption_does_not_append_ops_that_would_wrap_the_ring`) must
+  // not be terminal: the adoption already installed the op in `self.log` and advanced `self.op`,
+  // so a Prepare retransmit lands in the `pop <= self.op` re-ack branch — which waits on a
+  // durability that nothing else produces — and the skipped op would never be durably held nor
+  // acked, leaving the view one ack short of quorum with every replica live. The re-drive is
+  // event-driven: the exact event that makes a skipped op fit — a `checkpoint_op` advance sliding
+  // the ring window forward — re-runs the un-appended tail (`retry_unappended_adopted_tail`), so
+  // the deferred AdoptAck append lands and the PrepareOk follows.
+  //
+  // Same shape as the skip regression — replica 2 of 3, checkpoint 0, BOUNDED ring 8, StartView
+  // head 12 / commit 6 (7 and 8 append + ack; 9..=12 skip) — but with `checkpoint_ops = 4` so the
+  // band is checkpoint-eligible. The primary then commits 7 and 8 via a heartbeat: applying them
+  // lifts `commit_min` to 8 >= 0 + 4, the ordinary checkpoint fires, `checkpoint_op` advances, and
+  // the sweep re-appends 9..=12 — whose acks then flow.
+  let mut e = Endpoint::new(
+    Config::with_checkpoint_ops(1, MemberId::new(2), 4).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
+  let mut wal = ScriptedWal::with_entries(6);
+  wal.capacity = 8;
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  let entries: std::vec::Vec<PreparedEntry> = (1..=12u64)
+    .map(|op| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      )
+    })
+    .collect();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(12),
+      OpNumber::with(6),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      entries,
+    )),
+  );
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  for op in 9..=12u64 {
+    assert!(
+      !wal.entries.contains_key(&op),
+      "precondition: op {op} was skipped over the ring window at adoption"
+    );
+  }
+  // The primary commits the acked in-window tail: applying 7 and 8 lifts `commit_min` past the
+  // checkpoint boundary and the ordinary checkpoint cadence fires.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Commit(Commit::new(
+      View::with(1),
+      OpNumber::with(8),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  // Land the checkpoint root, then the re-driven appends and their deferred acks.
+  for _ in 0..6 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert!(
+    e.checkpoint_op().get() >= 4,
+    "the ordinary checkpoint advanced the window (the re-drive's trigger fired)"
+  );
+  for op in 9..=12u64 {
+    assert!(
+      wal.entries.contains_key(&op),
+      "FAIL-BEFORE: op {op} must be durably re-appended once the window admits it \
+       (nothing else re-drives a skipped adoption append)"
+    );
+  }
+  let mut acked: std::vec::Vec<u64> = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.into_msg() {
+      acked.push(ok.op().get());
+    }
+  }
+  for op in 9..=12u64 {
+    assert!(
+      acked.contains(&op),
+      "FAIL-BEFORE: the deferred AdoptAck for re-appended op {op} must follow its durable append"
+    );
+  }
+}
+
+#[test]
+fn a_checkpoint_completing_before_the_adopted_view_root_does_not_leak_early_acks() {
+  // Durable-view-before-participate under the FIFO race: an ordinary checkpoint root submitted in
+  // the OLD view survives the transition, and can complete while the adopted view's own root is
+  // still in flight. The checkpoint-advance sweep must NOT run in that window — the adopted
+  // entries are already installed in `self.log`, so an ungated sweep would adopt-append them and
+  // `on_wal_done` would cast their `PrepareOk`s for a view this replica has not yet persisted
+  // (a crash rolls the view back while the vote is already out). FAIL-BEFORE: the sweep gated on
+  // Normal status only, and a backup is Normal-with-pending-durable-view during adoption.
+  //
+  // Replica 2 (view-0 backup, `checkpoint_ops = 4`): Prepares 1..=6 + a Commit(6) heartbeat lift
+  // `commit_min` to 6 and submit the ordinary checkpoint root to a lazy superblock (in flight).
+  // The StartView(view 1) then queues the adopted-view root BEHIND it. Completing ONLY the
+  // checkpoint root must produce no appends and no acks; completing the view root then runs
+  // `start_view_acks`, whose appends + acks flow under the ALREADY-ADVANCED window.
+  let mut e = Endpoint::new(
+    Config::with_checkpoint_ops(1, MemberId::new(2), 4).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
+  let mut wal = ScriptedWal::with_entries(0);
+  wal.capacity = 8;
+  let mut sb = StepSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  for op in 1..=6u64 {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::Prepare(Prepare::new(
+        View::new(),
+        OpNumber::with(op),
+        OpNumber::with(op.saturating_sub(1)),
+        OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(6),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.commit(), OpNumber::with(6), "the view-0 band is applied");
+  assert!(
+    sb.has_inflight(),
+    "precondition: the checkpoint snapshot write is in flight on the superblock"
+  );
+  // Step the checkpoint to its ROOT write: the snapshot completion submits the root (in flight).
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    sb.has_inflight(),
+    "precondition: the ordinary checkpoint ROOT write is in flight"
+  );
+  // Make the root completion READY (but not yet polled), then adopt the new view — its own root
+  // queues behind the ready checkpoint-root completion.
+  sb.flush();
+  while e.poll_message().is_some() {}
+  let entries: std::vec::Vec<PreparedEntry> = (1..=12u64)
+    .map(|op| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      )
+    })
+    .collect();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(12),
+      OpNumber::with(6),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      entries,
+    )),
+  );
+  // The checkpoint root completes while the adopted-view root is still in flight: the window
+  // advances, but the sweep must stay silent (no appends, no acks) until the view is durable.
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    e.checkpoint_op().get() >= 4,
+    "the surviving checkpoint root advanced the window during the pending-view window"
+  );
+  for op in 7..=12u64 {
+    assert!(
+      !wal.entries.contains_key(&op),
+      "FAIL-BEFORE: no adoption append for op {op} may run before the adopted view is durable"
+    );
+  }
+  let mut early: std::vec::Vec<u64> = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.into_msg() {
+      early.push(ok.op().get());
+    }
+  }
+  assert!(
+    early.is_empty(),
+    "FAIL-BEFORE: no PrepareOk may precede the durable adopted view (got {early:?})"
+  );
+  // The adopted-view root lands: `start_view_acks` runs under the advanced window, so the whole
+  // tail appends and the deferred acks flow.
+  sb.flush();
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  let mut acked: std::vec::Vec<u64> = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.into_msg() {
+      acked.push(ok.op().get());
+    }
+  }
+  for op in 7..=12u64 {
+    assert!(
+      wal.entries.contains_key(&op),
+      "op {op} appends once the view is durable (the advanced window admits it)"
+    );
+    assert!(
+      acked.contains(&op),
+      "the deferred ack for op {op} follows the durable view + durable append"
+    );
+  }
+}
+
+#[test]
+fn the_new_primary_re_drives_skipped_adoptions_when_its_view_root_lands() {
+  // The primary half of the FIFO race: a checkpoint root completing while the new primary's
+  // `StartViewAsPrimary` root is in flight advances the window with the sweep GATED
+  // (durable-view-before-participate). The advance must not be lost — nothing retransmits to a
+  // primary, and no further checkpoint may ever fire if the remaining tail cannot commit without
+  // the primary's own votes. The `StartViewAsPrimary` completion therefore re-runs the sweep once
+  // the view is durable, re-appending the now-fitting ops so their own votes land.
+  //
+  // Replica 1 (a view-0 backup, `checkpoint_ops = 8`, ring 8) applies 1..=8 and submits its
+  // ordinary checkpoint SNAPSHOT write (held in flight). The view-change bump queues behind it;
+  // releasing both lets the snapshot completion submit the checkpoint ROOT write, which now sits
+  // in flight ACROSS the DVC adoption: replica 1 wins view 1 with a union of head 16 / commit 8,
+  // and with `checkpoint_op` still 0 the whole tail 9..=16 skips over the window. The checkpoint
+  // root then completes AHEAD of the StartViewAsPrimary root (FIFO) — the window advances to
+  // 8 + 8 = 16 with the sweep gated — and the view-root completion re-drives: 9..=16 append,
+  // their own votes land, and the held backup acks commit the whole tail with one backup down.
+  // Were the completion-arm re-drive absent, no further checkpoint could ever fire (`commit_min`
+  // 8 < boundary 16) and the view would wedge at commit 8.
+  let mut e = Endpoint::new(
+    Config::with_checkpoint_ops(1, MemberId::new(1), 8).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
+  let mut wal = ScriptedWal::with_entries(0);
+  wal.capacity = 8;
+  let mut sb = StepSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  for op in 1..=8u64 {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::Prepare(Prepare::new(
+        View::new(),
+        OpNumber::with(op),
+        OpNumber::with(op.saturating_sub(1)),
+        OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      )),
+    );
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(8),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.commit(), OpNumber::with(8), "the view-0 band is applied");
+  assert!(
+    sb.has_inflight(),
+    "precondition: the checkpoint snapshot write is in flight"
+  );
+  // The view change begins with the snapshot write still in flight; its durable view bump queues
+  // behind. Releasing both completes the snapshot — submitting the checkpoint ROOT write — and the
+  // bump, whose completion sends this replica's own DVC.
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    sb.has_inflight(),
+    "precondition: the checkpoint ROOT write is in flight across the view change"
+  );
+  while e.poll_message().is_some() {}
+  let entries: std::vec::Vec<PreparedEntry> = (1..=16u64)
+    .map(|op| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      )
+    })
+    .collect();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(16),
+      OpNumber::with(8),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      entries,
+    )),
+  );
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(16), "the union head is adopted");
+  for op in 9..=16u64 {
+    assert!(
+      !wal.entries.contains_key(&op),
+      "precondition: op {op} was skipped over the ring window at adoption (checkpoint_op still 0)"
+    );
+  }
+  // Release the queue: the checkpoint root completes FIRST (window advances; the sweep runs GATED
+  // — the StartViewAsPrimary root is still in flight), then the view root lands and its completion
+  // arm re-drives the skipped tail. The follow-on rounds complete the re-driven appends.
+  sb.flush();
+  for _ in 0..4 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(8),
+    "the surviving ordinary checkpoint advanced the window across the adoption"
+  );
+  let own_bit = 1u64 << 1; // replica 1
+  for op in 9..=16u64 {
+    assert!(
+      wal.entries.contains_key(&op),
+      "FAIL-BEFORE: skipped op {op} must be re-appended at the durable-view completion \
+       (no retransmit reaches a primary, and no further checkpoint can fire below the boundary)"
+    );
+    assert_eq!(
+      e.inflight.get(&op).map(|i| i.oks),
+      Some(own_bit),
+      "the re-driven append casts the primary's own vote for op {op}"
+    );
+  }
+  // The held backup acks commit the whole tail with one backup down.
+  for op in 9..=16u64 {
+    let identity = crate::storage::prepare_identity(
+      ClientId::new(7),
+      RequestNumber::with(op),
+      crate::storage::fnv1a_128(&[op as u8]),
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::PrepareOk(PrepareOk::new(
+        View::with(1),
+        OpNumber::with(op),
+        ReplicaId::new(2),
+        OpNumber::new(),
+        identity,
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+  }
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(16),
+    "own votes + the single backup ack commit the whole adopted tail"
+  );
+}
+
+#[test]
+fn an_interior_reappend_does_not_wrap_the_ring() {
+  // The interior re-append lane (`reappend_canonical_prepare` — a retransmitted current-view
+  // Prepare whose `self.log` slot is MISSING or mismatched) obeys the same ring-window discipline
+  // as every other append lane: writing an over-window op would physically evict the un-pruned op
+  // one ring below it. Here the adopted log has a GAP at op 10 (the StartView omitted it), so the
+  // primary's retransmit of op 10 lands in the re-append lane — and with `10 − checkpoint_op(0) >
+  // capacity(8)` it must be DROPPED, not appended. FAIL-BEFORE: the lane appended unconditionally,
+  // wrapping committed op 2's slot. The drop is not terminal: the retransmit cadence re-delivers,
+  // and the window slides as the laggard's committed-band catch-up keeps checkpointing.
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(2)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
+  let mut wal = ScriptedWal::with_entries(6);
+  wal.capacity = 8;
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  let entries: std::vec::Vec<PreparedEntry> = (1..=12u64)
+    .filter(|op| *op != 10)
+    .map(|op| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      )
+    })
+    .collect();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(12),
+      OpNumber::with(6),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      entries,
+    )),
+  );
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(e.op(), OpNumber::with(12), "the canonical head is adopted");
+  // The primary retransmits op 10 (the gap): `self.log` has no entry for it, so the delivery falls
+  // into the interior re-append lane — which must refuse the over-window write.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Prepare(Prepare::new(
+      View::with(1),
+      OpNumber::with(10),
+      OpNumber::with(6),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::new(7),
+      RequestNumber::with(10),
+      Bytes::from_static(&[10u8]),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    !wal.entries.contains_key(&10),
+    "FAIL-BEFORE: an interior re-append of op 10 (op − checkpoint_op > capacity) must be dropped — \
+     appending it would physically wrap committed op 2's un-pruned ring slot"
+  );
+}
+
+#[test]
+fn a_checkpoint_advance_re_drives_a_new_primarys_over_window_adopt_votes() {
+  // The primary half of the over-window adoption skip: a new primary that cannot physically hold
+  // its adopted tail owes its OWN votes for the skipped ops, and — unlike a backup — receives no
+  // retransmit that could ever re-drive them (`start_view_as_new_primary` seeds each inflight
+  // entry `oks: 0`; the vote is cast only when the AdoptVote append lands). Without the
+  // checkpoint-advance re-drive, with one backup down the view wedges on an uncommittable tail:
+  // one backup ack per op, forever one vote short of the 2-of-3 quorum, despite the op's body
+  // sitting in the primary's own memory. This is the skipped-body sibling of
+  // `new_primary_votes_a_repaired_uncommitted_repairing_tail_and_commits_with_one_backup_down`
+  // (there the tail op was header-only and the vote rode the repair fill; here the body is held
+  // and the vote rides the re-driven append).
+  //
+  // Replica 1 (view-1 primary), checkpoint 0, BOUNDED ring 8, `checkpoint_ops = 8` (the boundary
+  // sits ABOVE the adopted `commit_min` of 6, so no checkpoint debt is paid during the adoption
+  // itself and the wedge shape is observable): the DVC union has head 12 / commit 6. Adoption
+  // appends 7 and 8 (`AdoptVote`), skips 9..=12 over the window. The one live backup acks 7..=12;
+  // 7 and 8 commit (own vote + ack), 9..=12 sit at one vote. Applying 7 and 8 lifts `commit_min`
+  // to 8 >= 0 + 8 → the ordinary checkpoint fires → the sweep re-appends 9..=12 → their own votes
+  // land → own vote + the held backup ack commit the tail.
+  let mut e = Endpoint::new(
+    Config::with_checkpoint_ops(1, MemberId::new(1), 8).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
+  let mut wal = ScriptedWal::with_entries(0);
+  wal.capacity = 8;
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+  let entries: std::vec::Vec<PreparedEntry> = (1..=12u64)
+    .map(|op| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      )
+    })
+    .collect();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(12),
+      OpNumber::with(6),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      entries,
+    )),
+  );
+  assert!(e.is_primary());
+  assert_eq!(e.op(), OpNumber::with(12), "the union head is adopted");
+  // Land the durable-view write and the in-window AdoptVote appends (7, 8).
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  let own_bit = 1u64 << 1; // replica 1
+  for op in 7..=8u64 {
+    assert_eq!(
+      e.inflight.get(&op).map(|i| i.oks),
+      Some(own_bit),
+      "in-window adopted op {op} carries the primary's own durable vote"
+    );
+  }
+  for op in 9..=12u64 {
+    assert!(
+      !wal.entries.contains_key(&op),
+      "precondition: op {op} was skipped over the ring window at adoption"
+    );
+    assert_eq!(
+      e.inflight.get(&op).map(|i| i.oks),
+      Some(0),
+      "no own vote may exist for skipped op {op} (append-before-ack)"
+    );
+  }
+  // ONE backup (replica 2) acks the whole tail; the other backup (replica 0) is DOWN. 7 and 8
+  // commit (own vote + ack = 2); 9..=12 hold at ONE vote — the wedge shape, were the own votes
+  // never re-driven.
+  for op in 7..=12u64 {
+    let identity = crate::storage::prepare_identity(
+      ClientId::new(7),
+      RequestNumber::with(op),
+      crate::storage::fnv1a_128(&[op as u8]),
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Replica(ReplicaId::new(2)),
+      Message::PrepareOk(PrepareOk::new(
+        View::with(1),
+        OpNumber::with(op),
+        ReplicaId::new(2),
+        OpNumber::new(),
+        identity,
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+  }
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(8),
+    "the in-window tail commits; the skipped tail holds at one vote"
+  );
+  // Applying 7 and 8 lifted `commit_min` past the boundary: land the ordinary checkpoint, then the
+  // re-driven AdoptVote appends and the commits their votes complete.
+  for _ in 0..8 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert!(
+    e.checkpoint_op().get() >= 4,
+    "the ordinary checkpoint advanced the window (the re-drive's trigger fired)"
+  );
+  for op in 9..=12u64 {
+    assert!(
+      wal.entries.contains_key(&op),
+      "FAIL-BEFORE: skipped op {op} must be durably re-appended once the window admits it"
+    );
+  }
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(12),
+    "FAIL-BEFORE: the re-driven own votes + the held backup acks commit the whole adopted tail — \
+     the view must not wedge with one backup down"
+  );
+}
+
+#[test]
 fn dvc_is_deferred_until_view_is_durable() {
   use crate::StartViewChange;
   let mut e = Endpoint::new(
