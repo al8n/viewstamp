@@ -19,6 +19,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # cargo-fuzz composes its sanitizer RUSTFLAGS onto this env value, and a set RUSTFLAGS makes
+  # cargo ignore the config-file rustflags — which is where the workspace's `.cargo/config.toml`
+  # injects this cfg. Without re-stating it here the fuzz build of viewstamp-simulation loses its
+  # testkit-gated accessors (E0599 on Endpoint::state_machine_ref).
+  RUSTFLAGS: "--cfg vsrr_internal_testkit"
 
 jobs:
   fuzz:
@@ -42,18 +47,21 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # The prebuilt cargo-fuzz is a musl-static binary, and without an explicit --target it builds
+      # the fuzz targets for ITS OWN host triple (x86_64-unknown-linux-musl) — where the address
+      # sanitizer has no std/core (E0463). Every run below pins the GNU target instead.
       - name: Fuzz message_decode
         env:
           SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
-        run: cargo fuzz run message_decode -- -max_total_time=$SECONDS_PER_TARGET
+        run: cargo fuzz run message_decode --target x86_64-unknown-linux-gnu -- -max_total_time=$SECONDS_PER_TARGET
       - name: Fuzz stream_ingress
         env:
           SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
-        run: cargo fuzz run stream_ingress -- -max_total_time=$SECONDS_PER_TARGET
+        run: cargo fuzz run stream_ingress --target x86_64-unknown-linux-gnu -- -max_total_time=$SECONDS_PER_TARGET
       - name: Fuzz superblock_decode
         env:
           SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
-        run: cargo fuzz run superblock_decode -- -max_total_time=$SECONDS_PER_TARGET
+        run: cargo fuzz run superblock_decode --target x86_64-unknown-linux-gnu -- -max_total_time=$SECONDS_PER_TARGET
       - name: Upload crash artifacts (if any)
         if: failure()
         uses: actions/upload-artifact@v7

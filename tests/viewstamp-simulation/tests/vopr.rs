@@ -317,148 +317,157 @@ fn vopr_sweep_no_violations() {
       seeds_with_view_change += 1;
     }
   }
-  // Non-vacuity: across the sweep the driver genuinely committed ops, crashed + restarted replicas,
-  // installed partitions, and drove real view changes — i.e. it exercised the protocol under stress,
-  // not a quiet happy path. (A regression that silently stopped applying faults would trip here.)
-  assert!(
-    total_committed > 0,
-    "the sweep committed no ops at all — the driver is not exercising the protocol"
-  );
-  assert!(
-    total_crashes > 0 && total_restarts > 0,
-    "the sweep never crashed/restarted a replica (crashes={total_crashes}, restarts={total_restarts})"
-  );
-  assert!(
-    total_partitions > 0,
-    "the sweep never installed a partition (partitions={total_partitions})"
-  );
-  assert!(
-    seeds_with_view_change > 0,
-    "no seed drove a view change — failover is not being exercised"
-  );
-  // Async-superblock non-vacuity: the async-superblock mode must actually OPEN the pending-durable-view
-  // window (a Normal primary whose view is not yet durable) somewhere across the sweep — otherwise the
-  // durable-view-before-participate gates are being checked vacuously. `> 0` proves a
-  // seed drove a replica into that window while a view-change root write was in flight.
-  assert!(
-    total_pending_view_windows > 0,
-    "async-superblock never opened the pending-durable-view window — the durable-view gate is untested"
-  );
-  // Adversarial-coverage axes must actually FIRE, or they are vacuous:
-  // - large `checkpoint_ops` drove the recover read-window over a NON-trivial held tail (`op` far above
-  //   `checkpoint_op`, sampled at recover construction — see `Cluster::recovered_band_high_water`), well
-  //   above the small interval's ~12 ceiling, not always a tiny one;
-  // - the misdirected-read axis fired, exercising the recovery/repair placement-integrity checks
-  //   (`header.op() == op`) that the DST otherwise never reaches;
-  // - the two-slot/redundant-copy superblock (finding B) still drives GENUINE peer-fetch escalations
-  //   (only the SPURIOUS orphaned-checkpoint ones were removed) — `forced_syncs > 0` proves a replica
-  //   really had to fetch a checkpoint/op from a peer because its own disk could not serve it.
-  assert!(
-    max_recovered_band > 50,
-    "no seed drove the recover read-window over a non-trivial held tail (max={max_recovered_band}) — \
-     the large-checkpoint_ops axis is vacuous"
-  );
-  assert!(
-    total_misdirects > 0,
-    "the misdirected-read axis never fired — the recovery/repair placement-integrity checks are untested"
-  );
-  assert!(
-    total_forced_syncs > 0,
-    "no forced-sync/peer-fetch escalation occurred across the sweep — finding B may have silently \
-     removed that coverage (forced_syncs={total_forced_syncs})"
-  );
-  // Frame-cap axis (the header-only view-change carriers + windowed `RepairBatch` repair):
-  // - the sweep genuinely PRODUCED large client bodies (`> 0`), so the frame cap is exercised — a
-  //   large-bodied uncheckpointed band really rode the view-change/recovery carriers + the repair
-  //   serve; without this the `oversized_dropped == 0` guarantee below would be vacuous;
-  // - and NOT ONE legitimate inter-replica message was oversized-dropped across the whole sweep: the
-  //   header-only carriers ship NO body (a fixed ~49 bytes/op) and the `RepairBatch` serve is
-  //   byte-bounded, so every peer message stays at/below `MAX_FRAME_LEN` no matter how large the
-  //   bodies are. (`run_vopr` already panics per-tick on any drop — this is the cumulative witness.)
-  //   A `> 0` here would be a REAL bug: a carrier overflowed the frame — to report, never to mask by
-  //   loosening the cap.
-  assert!(
-    total_large_bodies > 0,
-    "the sweep minted no large client bodies — the frame-cap axis is vacuous (header-only carriers + \
-     windowed repair are not being stressed by a large-bodied band)"
-  );
-  assert_eq!(
-    total_oversized_dropped, 0,
-    "a legitimate inter-replica message exceeded MAX_FRAME_LEN and was oversized-dropped \
-     ({total_oversized_dropped} across the sweep) — a view-change/recovery carrier or repair batch \
-     overflowed the frame (the old full-body view-change bug, or an incomplete bound); this is a REAL \
-     bug to fix, NOT to mask by loosening the cap"
-  );
-  // These consensus paths must genuinely FIRE under the combined-fault schedule (sweep-level
-  // evidence, not just focused unit gates):
-  // - HEADER-ONLY CARRIERS: every `DoViewChange`/`StartView`/`RecoveryResponse` log payload flows
-  //   through `log_entries`; view changes happen in many seeds, so a zero here means the carrier
-  //   chokepoint stopped being exercised (or the counter plumbing broke);
-  // - REPAIR-BATCH SERVES: peers under faults solicit windowed bulk repair (`RequestPrepareRange`)
-  //   and a donor must answer with NON-EMPTY byte-bounded batches — a zero means every repair
-  //   regressed to the per-op path and the windowed serve is untested;
-  // - FLOORED UNIONS: `select_canonical_log` dropping a canonical-donor entry at/below the vouched
-  //   checkpoint floor needs donors with divergent checkpoints inside ONE view change — a rare
-  //   confluence, but one the contiguous range reaches on its own (a 0..512 scan fires it on 101
-  //   seeds, six of them — 21, 28, 36, 51, 56, 61 — inside 0..64), so the assert needs no pinned
-  //   seed.
-  assert!(
-    total_header_only_carriers > 0,
-    "no header-only view-change/recovery carrier was built across the sweep \
-     (header_only_carriers={total_header_only_carriers}) — the carrier path is vacuous"
-  );
-  assert!(
-    total_repair_batches > 0,
-    "no non-empty RepairBatch was served across the sweep (repair_batches={total_repair_batches}) — \
-     the byte-bounded bulk-repair serve is vacuous"
-  );
+  // The non-vacuity battery below is tuned for the CANONICAL band — `0..SEEDS` plus the pinned
+  // regression seeds — where every axis is known to fire (the per-commit gate and a manual base
+  // dispatch both run exactly that band). A ROTATED deep-sweep shard is a thin slice of an
+  // ever-advancing high band whose purpose is violation-hunting; any individual axis (a bounded-ring
+  // stall, a floored union, a header-only carrier) can legitimately never fire inside one such
+  // slice, so asserting its counter there turns schedule drift into a false alarm. Gate the battery
+  // on the base band: shards with `VOPR_SEED_START != 0` run the violation checkers only.
+  if sweep_seed_start() == 0 {
+    // Non-vacuity: across the sweep the driver genuinely committed ops, crashed + restarted replicas,
+    // installed partitions, and drove real view changes — i.e. it exercised the protocol under stress,
+    // not a quiet happy path. (A regression that silently stopped applying faults would trip here.)
+    assert!(
+      total_committed > 0,
+      "the sweep committed no ops at all — the driver is not exercising the protocol"
+    );
+    assert!(
+      total_crashes > 0 && total_restarts > 0,
+      "the sweep never crashed/restarted a replica (crashes={total_crashes}, restarts={total_restarts})"
+    );
+    assert!(
+      total_partitions > 0,
+      "the sweep never installed a partition (partitions={total_partitions})"
+    );
+    assert!(
+      seeds_with_view_change > 0,
+      "no seed drove a view change — failover is not being exercised"
+    );
+    // Async-superblock non-vacuity: the async-superblock mode must actually OPEN the pending-durable-view
+    // window (a Normal primary whose view is not yet durable) somewhere across the sweep — otherwise the
+    // durable-view-before-participate gates are being checked vacuously. `> 0` proves a
+    // seed drove a replica into that window while a view-change root write was in flight.
+    assert!(
+      total_pending_view_windows > 0,
+      "async-superblock never opened the pending-durable-view window — the durable-view gate is untested"
+    );
+    // Adversarial-coverage axes must actually FIRE, or they are vacuous:
+    // - large `checkpoint_ops` drove the recover read-window over a NON-trivial held tail (`op` far above
+    //   `checkpoint_op`, sampled at recover construction — see `Cluster::recovered_band_high_water`), well
+    //   above the small interval's ~12 ceiling, not always a tiny one;
+    // - the misdirected-read axis fired, exercising the recovery/repair placement-integrity checks
+    //   (`header.op() == op`) that the DST otherwise never reaches;
+    // - the two-slot/redundant-copy superblock (finding B) still drives GENUINE peer-fetch escalations
+    //   (only the SPURIOUS orphaned-checkpoint ones were removed) — `forced_syncs > 0` proves a replica
+    //   really had to fetch a checkpoint/op from a peer because its own disk could not serve it.
+    assert!(
+      max_recovered_band > 50,
+      "no seed drove the recover read-window over a non-trivial held tail (max={max_recovered_band}) — \
+       the large-checkpoint_ops axis is vacuous"
+    );
+    assert!(
+      total_misdirects > 0,
+      "the misdirected-read axis never fired — the recovery/repair placement-integrity checks are untested"
+    );
+    assert!(
+      total_forced_syncs > 0,
+      "no forced-sync/peer-fetch escalation occurred across the sweep — finding B may have silently \
+       removed that coverage (forced_syncs={total_forced_syncs})"
+    );
+    // Frame-cap axis (the header-only view-change carriers + windowed `RepairBatch` repair):
+    // - the sweep genuinely PRODUCED large client bodies (`> 0`), so the frame cap is exercised — a
+    //   large-bodied uncheckpointed band really rode the view-change/recovery carriers + the repair
+    //   serve; without this the `oversized_dropped == 0` guarantee below would be vacuous;
+    // - and NOT ONE legitimate inter-replica message was oversized-dropped across the whole sweep: the
+    //   header-only carriers ship NO body (a fixed ~49 bytes/op) and the `RepairBatch` serve is
+    //   byte-bounded, so every peer message stays at/below `MAX_FRAME_LEN` no matter how large the
+    //   bodies are. (`run_vopr` already panics per-tick on any drop — this is the cumulative witness.)
+    //   A `> 0` here would be a REAL bug: a carrier overflowed the frame — to report, never to mask by
+    //   loosening the cap.
+    assert!(
+      total_large_bodies > 0,
+      "the sweep minted no large client bodies — the frame-cap axis is vacuous (header-only carriers + \
+       windowed repair are not being stressed by a large-bodied band)"
+    );
+    assert_eq!(
+      total_oversized_dropped, 0,
+      "a legitimate inter-replica message exceeded MAX_FRAME_LEN and was oversized-dropped \
+       ({total_oversized_dropped} across the sweep) — a view-change/recovery carrier or repair batch \
+       overflowed the frame (the old full-body view-change bug, or an incomplete bound); this is a REAL \
+       bug to fix, NOT to mask by loosening the cap"
+    );
+    // These consensus paths must genuinely FIRE under the combined-fault schedule (sweep-level
+    // evidence, not just focused unit gates):
+    // - HEADER-ONLY CARRIERS: every `DoViewChange`/`StartView`/`RecoveryResponse` log payload flows
+    //   through `log_entries`; view changes happen in many seeds, so a zero here means the carrier
+    //   chokepoint stopped being exercised (or the counter plumbing broke);
+    // - REPAIR-BATCH SERVES: peers under faults solicit windowed bulk repair (`RequestPrepareRange`)
+    //   and a donor must answer with NON-EMPTY byte-bounded batches — a zero means every repair
+    //   regressed to the per-op path and the windowed serve is untested;
+    // - FLOORED UNIONS: `select_canonical_log` dropping a canonical-donor entry at/below the vouched
+    //   checkpoint floor needs donors with divergent checkpoints inside ONE view change — a rare
+    //   confluence, but one the contiguous range reaches on its own (a 0..512 scan fires it on 101
+    //   seeds, six of them — 21, 28, 36, 51, 56, 61 — inside 0..64), so the assert needs no pinned
+    //   seed.
+    assert!(
+      total_header_only_carriers > 0,
+      "no header-only view-change/recovery carrier was built across the sweep \
+       (header_only_carriers={total_header_only_carriers}) — the carrier path is vacuous"
+    );
+    assert!(
+      total_repair_batches > 0,
+      "no non-empty RepairBatch was served across the sweep (repair_batches={total_repair_batches}) — \
+       the byte-bounded bulk-repair serve is vacuous"
+    );
 
-  // Prepare-retransmit batching non-vacuity: under the sweep's drop/dup axes some Prepare broadcast
-  // is always lost and re-sent, and the retransmit path emits batches — if this is ever zero the
-  // batched retransmit path has gone vacuous (or the axes stopped losing Prepares).
-  assert!(
-    total_prepare_batches > 0,
-    "no PrepareBatch retransmit was emitted across the sweep (prepare_batches={total_prepare_batches}) — \
-     the batched-retransmit path is vacuous"
-  );
-  assert!(
-    total_unions_floored > 0,
-    "no canonical-log selection floored its union across the sweep \
-     (unions_floored={total_unions_floored}) — the floored-union path is vacuous (a schedule change \
-     swept away every firing seed in the contiguous range; re-scan and pin one)"
-  );
-  // Bounded-WAL (wrap) axis must genuinely fire, or the wrap coverage is vacuous:
-  // - SOME seeds ran the bounded ring (the ~1/3 seed-derived draw — sanity that the axis is wired and
-  //   the env mask is off);
-  // - across those bounded seeds the primary STALLED (`wal_stalls > 0`): the ring genuinely FILLED and
-  //   the physical stall-before-wrap engaged under the full crash + partition + disk-fault schedule —
-  //   wrap was EXERCISED, not vacuously skipped by an under-filled ring (the headline bounded-WAL stress);
-  // - SOME bounded seed genuinely WRAPPED (committed strictly more ops than its ring size `N`), so an op
-  //   `K + N` physically reused op `K`'s slot — the strongest single witness the wrap path did real work.
-  // The per-tick ring-residency checker (in `run_vopr`) proves no wrap ever dropped a needed op; these
-  // assert the wrap actually HAPPENED so that checker is non-vacuous on the committed range.
-  assert!(
-    bounded_seeds > 0,
-    "no seed ran the bounded-WAL ring — the seed-derived bounded mode is not firing (is \
-     VOPR_NO_BOUNDED_WAL set, or the 1/3 draw never hit on this range?)"
-  );
-  assert!(
-    total_wal_stalls > 0,
-    "the bounded seeds never STALLED (wal_stalls={total_wal_stalls}) — the bounded ring did not fill, \
-     so the physical stall-before-wrap was not exercised; the wrap axis is vacuous"
-  );
-  assert!(
-    any_bounded_wrapped,
-    "no bounded seed committed past its ring size N (max bounded committed={max_bounded_committed}) — \
-     the ring never WRAPPED, so wrap-under-adversity was not genuinely exercised"
-  );
-  // NOTE: `below_ring_window_syncs` (the CONNECTED backup-overflow path — a sub-quorum laggard adopting
-  // a head over a held-commit hole while its checkpoint lags below the ring window) is a RARE confluence
-  // under the VOPR's quorum-preserving schedule; the deterministic `bounded_wal.rs` laggard gate covers
-  // it directly with hand-picked provoking seeds. So we do NOT force a (flaky) `> 0` assert here — we
-  // only assert it when it IS reachable on this range, and otherwise leave it observed. (Currently it is
-  // not consistently hit by the committed range, so this stays a soft observation, never a hard gate.)
-  let _ = total_below_ring_window_syncs;
+    // Prepare-retransmit batching non-vacuity: under the sweep's drop/dup axes some Prepare broadcast
+    // is always lost and re-sent, and the retransmit path emits batches — if this is ever zero the
+    // batched retransmit path has gone vacuous (or the axes stopped losing Prepares).
+    assert!(
+      total_prepare_batches > 0,
+      "no PrepareBatch retransmit was emitted across the sweep (prepare_batches={total_prepare_batches}) — \
+       the batched-retransmit path is vacuous"
+    );
+    assert!(
+      total_unions_floored > 0,
+      "no canonical-log selection floored its union across the sweep \
+       (unions_floored={total_unions_floored}) — the floored-union path is vacuous (a schedule change \
+       swept away every firing seed in the contiguous range; re-scan and pin one)"
+    );
+    // Bounded-WAL (wrap) axis must genuinely fire, or the wrap coverage is vacuous:
+    // - SOME seeds ran the bounded ring (the ~1/3 seed-derived draw — sanity that the axis is wired and
+    //   the env mask is off);
+    // - across those bounded seeds the primary STALLED (`wal_stalls > 0`): the ring genuinely FILLED and
+    //   the physical stall-before-wrap engaged under the full crash + partition + disk-fault schedule —
+    //   wrap was EXERCISED, not vacuously skipped by an under-filled ring (the headline bounded-WAL stress);
+    // - SOME bounded seed genuinely WRAPPED (committed strictly more ops than its ring size `N`), so an op
+    //   `K + N` physically reused op `K`'s slot — the strongest single witness the wrap path did real work.
+    // The per-tick ring-residency checker (in `run_vopr`) proves no wrap ever dropped a needed op; these
+    // assert the wrap actually HAPPENED so that checker is non-vacuous on the committed range.
+    assert!(
+      bounded_seeds > 0,
+      "no seed ran the bounded-WAL ring — the seed-derived bounded mode is not firing (is \
+       VOPR_NO_BOUNDED_WAL set, or the 1/3 draw never hit on this range?)"
+    );
+    assert!(
+      total_wal_stalls > 0,
+      "the bounded seeds never STALLED (wal_stalls={total_wal_stalls}) — the bounded ring did not fill, \
+       so the physical stall-before-wrap was not exercised; the wrap axis is vacuous"
+    );
+    assert!(
+      any_bounded_wrapped,
+      "no bounded seed committed past its ring size N (max bounded committed={max_bounded_committed}) — \
+       the ring never WRAPPED, so wrap-under-adversity was not genuinely exercised"
+    );
+    // NOTE: `below_ring_window_syncs` (the CONNECTED backup-overflow path — a sub-quorum laggard adopting
+    // a head over a held-commit hole while its checkpoint lags below the ring window) is a RARE confluence
+    // under the VOPR's quorum-preserving schedule; the deterministic `bounded_wal.rs` laggard gate covers
+    // it directly with hand-picked provoking seeds. So we do NOT force a (flaky) `> 0` assert here — we
+    // only assert it when it IS reachable on this range, and otherwise leave it observed. (Currently it is
+    // not consistently hit by the committed range, so this stays a soft observation, never a hard gate.)
+    let _ = total_below_ring_window_syncs;
+  }
   println!(
     "VOPR sweep OK: committed={total_committed} crashes={total_crashes} restarts={total_restarts} \
      partitions={total_partitions} view_change_seeds={seeds_with_view_change} \

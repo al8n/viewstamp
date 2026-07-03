@@ -6,6 +6,19 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+# Forward the proto's feature surface: `std`/`alloc` are independent tiers (the crate requires the
+# heap, so `alloc` is the minimal viable config), and the transports are additive opt-ins.
+alloc = ["viewstamp-proto/alloc"]
+std = ["viewstamp-proto/std"]
+tcp = ["viewstamp-proto/tcp"]
+tls = ["viewstamp-proto/tls"]
+tls-rustls-ring = ["viewstamp-proto/tls-rustls-ring"]
+tls-rustls-aws-lc-rs = ["viewstamp-proto/tls-rustls-aws-lc-rs"]
+tls-rustls-aws-lc-rs-fips = ["viewstamp-proto/tls-rustls-aws-lc-rs-fips"]
+quic = ["viewstamp-proto/quic"]
+
 [dependencies]
 viewstamp-proto.workspace = true
 

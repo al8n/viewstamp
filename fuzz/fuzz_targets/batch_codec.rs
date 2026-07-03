@@ -12,7 +12,11 @@ fuzz_target!(|data: &[u8]| {
   // Parse arbitrary bytes: never panics; an accepted view's units re-add to the input length.
   let batch = BatchView::parse(data);
   let reply = ReplyView::parse(data);
-  assert_eq!(batch.is_ok(), reply.is_ok(), "the two views share one validator");
+  assert_eq!(
+    batch.is_ok(),
+    reply.is_ok(),
+    "the two views share one validator"
+  );
   assert_eq!(
     batch.as_ref().err(),
     reply.as_ref().err(),
@@ -57,7 +61,9 @@ fuzz_target!(|data: &[u8]| {
   let reply_body = reply.finish().expect("at least one unit was pushed");
   assert_eq!(reply_body, body, "the two builders emit one layout");
   assert_eq!(
-    ReplyView::parse(&reply_body).expect("reply output parses").len(),
+    ReplyView::parse(&reply_body)
+      .expect("reply output parses")
+      .len(),
     units.len()
   );
 });

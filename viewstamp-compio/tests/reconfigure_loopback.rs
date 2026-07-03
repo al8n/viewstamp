@@ -554,10 +554,20 @@ async fn stream_cluster_survives_slot_shift() {
     })
   };
 
-  let base_port: u16 = 46000;
-  let addrs: Vec<SocketAddr> = (0..4)
-    .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+  // Reserve kernel-assigned TCP ports (bind port-0 listeners, read the addresses, drop them):
+  // fresh ephemeral ports per process keep repeated runs of this binary (CI runs it once per cargo
+  // feature combination, back-to-back) from colliding with the previous run's TIME_WAIT connection
+  // remnants — rebinding a fixed port constant fails with `AddrInUse` for up to a minute after the
+  // prior run's cluster connections closed. (The QUIC tests above keep fixed ports: UDP has no
+  // TIME_WAIT.)
+  let reservations: Vec<std::net::TcpListener> = (0..4)
+    .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port"))
     .collect();
+  let addrs: Vec<SocketAddr> = reservations
+    .iter()
+    .map(|l| l.local_addr().expect("reserved listener has an address"))
+    .collect();
+  drop(reservations);
 
   let mut handles = Vec::new();
   for id in 0u8..4 {

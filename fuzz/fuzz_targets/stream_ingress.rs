@@ -21,17 +21,33 @@ use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
 use viewstamp_proto::{
-  Config, Conn, Endpoint, Instant, LabelOptions, Labeled, Passthrough, Peer, ReplicaId,
-  StreamCoordinator,
+  Config, Conn, Endpoint, Instant, LabelOptions, Labeled, MemberId, Membership, Passthrough, Peer,
+  ReplicaId, StreamCoordinator,
 };
-use viewstamp_simulation::sm::LogSm;
-use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
+use viewstamp_simulation::{InMemorySuperblock, InMemoryWal, MemBlockStore, sm::LogSm};
 
 const CLUSTER: u128 = 0xF022;
 
+fn genesis(n: u8) -> Membership {
+  Membership::from_durable_parts(
+    viewstamp_proto::Epoch::new(0),
+    n,
+    0,
+    (0..n as u128).map(MemberId::new).collect(),
+    0,
+  )
+  .expect("valid genesis membership")
+}
+
 fn coordinator(me: u8) -> StreamCoordinator<LogSm, Labeled<Passthrough>> {
-  let config = Config::try_new(CLUSTER, ReplicaId::new(me), 3).expect("static config is valid");
-  StreamCoordinator::new(Endpoint::new(config, 0, LogSm::default()))
+  let config =
+    Config::try_new(CLUSTER, MemberId::new(u128::from(me))).expect("static config is valid");
+  StreamCoordinator::new(Endpoint::with_reconfig(
+    config,
+    genesis(3),
+    0,
+    LogSm::default(),
+  ))
 }
 
 /// The canonical bytes a replica-1 DIALER writes first (its `Labeled` hello): registered on a
@@ -65,6 +81,7 @@ fuzz_target!(|data: &[u8]| {
 
   let mut wal = InMemoryWal::new();
   let mut sb = InMemorySuperblock::new();
+  let mut blocks = MemBlockStore::new();
   let now = Instant::ZERO;
 
   let mut coord = coordinator(0);
@@ -73,7 +90,15 @@ fuzz_target!(|data: &[u8]| {
   let id = coord.register_accepted(Peer::Replica(ReplicaId::new(1)), conn);
 
   if lane & 1 == 1 {
-    coord.handle_conn_data(id, replica1_hello(), false, now, &mut wal, &mut sb);
+    coord.handle_conn_data(
+      id,
+      replica1_hello(),
+      false,
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    );
     // Postcondition (and proof the deep path is reached): the canonical hello always validates,
     // so everything after it exercises the post-validation frame/message/endpoint pipeline.
     assert!(
@@ -88,14 +113,14 @@ fuzz_target!(|data: &[u8]| {
     let take = ((rest[0] as usize) % 67 + 1).min(rest.len());
     let (chunk, tail) = rest.split_at(take);
     rest = tail;
-    coord.handle_conn_data(id, chunk, false, now, &mut wal, &mut sb);
+    coord.handle_conn_data(id, chunk, false, now, &mut wal, &mut sb, &mut blocks);
     while coord.poll_conn_transmit().is_some() {}
     while coord.poll_event().is_some() {}
     while coord.poll_conn_closed().is_some() {}
   }
 
   // EOF pass: a peer-finished conn finalizes + closes cleanly.
-  coord.handle_conn_data(id, &[], true, now, &mut wal, &mut sb);
+  coord.handle_conn_data(id, &[], true, now, &mut wal, &mut sb, &mut blocks);
   while coord.poll_conn_transmit().is_some() {}
   while coord.poll_conn_closed().is_some() {}
 });
