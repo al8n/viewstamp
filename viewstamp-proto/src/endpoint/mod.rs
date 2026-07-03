@@ -3731,6 +3731,18 @@ impl<S, R> Endpoint<S, R> {
     effective_wal_capacity(wal.capacity(), self.config.checkpoint_ops())
   }
 
+  /// Whether durably appending `op` would physically WRAP an un-pruned ring slot: `op` reuses slot
+  /// `op mod effective`, last held by `op − effective`, which is still un-pruned iff
+  /// `op − checkpoint_op > effective` ([`effective_wal_capacity`]). The head-extend paths enforce this
+  /// via [`Self::maybe_sync_below_ring_window`] (drop the Prepare + jump via a forced sync); the
+  /// ADOPTION (re-)append and the peer-repair fill enforce it with this predicate directly — skip the
+  /// append, owing no vote/ack/fill off an append that never ran — since a deep laggard can be handed a
+  /// canonical view-change log or a repair body whose band exceeds its own ring, and appending it would
+  /// evict a committed, un-pruned op (the committed-op-loss class the ring-residency oracle checks).
+  fn ring_append_would_wrap<W: Wal>(&self, wal: &W, op: u64) -> bool {
+    op.saturating_sub(self.checkpoint_op.get()) > self.effective_wal_capacity(wal)
+  }
+
   /// The status-transition chokepoint: assigns `self.status` and emits
   /// [`Event::StatusChanged`] on an ACTUAL change (a same-status re-entry — e.g. a ViewChange
   /// escalating to the next view — emits nothing). Every production status write routes here so the

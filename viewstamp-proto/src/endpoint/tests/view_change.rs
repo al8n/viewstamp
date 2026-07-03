@@ -2330,6 +2330,90 @@ fn adopting_a_canonical_head_truncates_the_wal_above_it() {
 }
 
 #[test]
+fn adoption_does_not_append_ops_that_would_wrap_the_ring() {
+  // The below-ring-window discipline applies to the ADOPTION (re-)append exactly as it does to the
+  // `on_prepare` head-extend: a deep laggard — its own checkpoint more than a ring behind the adopted
+  // band — must not durably append an adopted op whose ring slot still holds a committed, un-pruned
+  // predecessor (`op − checkpoint_op > capacity` ⇒ appending `op` physically evicts `op − capacity`,
+  // the committed-op-loss class the ring-residency oracle checks). Such ops are adopted IN MEMORY only
+  // and owe NO ack (append-before-ack: nothing lands, nothing is cast); the below-ring-window forced
+  // sync jumps the checkpoint forward and ordinary catch-up re-covers the band.
+  //
+  // Replica 2 of 3 (a backup of view 1), checkpoint 0 on a BOUNDED ring of 8: adopting a StartView
+  // with head 12 / commit 6 owes acks for `(6 .. 12]` — 7 and 8 fit the ring (append + ack); 9..=12
+  // would wrap (9 evicts 1, ...) and must be skipped.
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(2)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
+  let mut wal = ScriptedWal::with_entries(6);
+  wal.capacity = 8; // a BOUNDED ring — window top = checkpoint 0 + 8
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  let entries: std::vec::Vec<PreparedEntry> = (1..=12u64)
+    .map(|op| {
+      PreparedEntry::new(
+        OpNumber::with(op),
+        ClientId::new(7),
+        RequestNumber::with(op),
+        Bytes::copy_from_slice(&[op as u8]),
+      )
+    })
+    .collect();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(12),
+      OpNumber::with(6),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      entries,
+    )),
+  );
+  for _ in 0..3 {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the view root + the in-window appends
+  }
+  assert_eq!(
+    e.op(),
+    OpNumber::with(12),
+    "the canonical head is adopted (held in memory)"
+  );
+  assert!(
+    wal.entries.contains_key(&7) && wal.entries.contains_key(&8),
+    "in-window adopted ops append durably"
+  );
+  for op in 9..=12u64 {
+    assert!(
+      !wal.entries.contains_key(&op),
+      "op {op} would wrap the ring (op - checkpoint > capacity) — its adoption append is skipped"
+    );
+  }
+  // The acks follow the appends: PrepareOks are cast for the landed in-window ops only — the
+  // over-window ops were never durably appended, so no ack may vouch them.
+  let mut acked: std::vec::Vec<u64> = std::vec::Vec::new();
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.into_msg() {
+      acked.push(ok.op().get());
+    }
+  }
+  acked.sort_unstable();
+  assert_eq!(
+    acked,
+    std::vec![7, 8],
+    "acks are cast exactly for the durably-appended in-window ops"
+  );
+}
+
+#[test]
 fn dvc_is_deferred_until_view_is_durable() {
   use crate::StartViewChange;
   let mut e = Endpoint::new(
