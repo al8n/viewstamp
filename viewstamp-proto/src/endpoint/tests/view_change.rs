@@ -138,6 +138,114 @@ fn new_primary_adopts_canonical_log_and_starts_view() {
 }
 
 #[test]
+fn a_poisoned_commit_max_neither_halts_view_formation_nor_over_vouches_the_start_view() {
+  // A replica that adopted a bare CORRUPT `commit` scalar (in-model, a bit-flip — see the threat model)
+  // holds `commit_max` far above its own head. Two structural defenses keep one such faulty peer from
+  // halting the cluster:
+  //   (1) SOURCE-SEPARATION: its DoViewChange advertises `commit_max.min(op)`, so `select_canonical_log`
+  //       never sees `commit* > op_head` and its release `commit* <= op_head` fail-stop is not tripped.
+  //   (2) RE-ESTABLISH AT FORMING: on becoming primary it resets `commit_max` to the view-change-
+  //       authoritative `commit*` (<= op_head), so the deferred StartView never advertises `commit > op`
+  //       (which would trip every backup's `adopt_canonical_head` `commit <= op` assert) and the AdoptVote
+  //       tail-seeding `(commit_max .. op]` is not wedged empty.
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  // POISON: a corrupt learned `commit` drove commit_max far above the head (op is still 0).
+  e.commit_max = OpNumber::with(u64::MAX / 2);
+  // Drive replica 1 into ViewChange(1) as primary(view 1); it emits its own DVC on entry.
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {} // discard the SVC/GetView traffic emitted on entry
+  // A canonical donor (op 2, commit 1) completes the 2-of-3 quorum → replica 1 forms the view. On its
+  // arrival the replica synthesizes its OWN DVC with commit = commit_max.min(op) = 0 (source-separation),
+  // so `select_canonical_log` sees commit* = max(0, 1) = 1 <= op_head = 2 and does NOT fail-stop.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::with(0),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          bytes::Bytes::from_static(b"a"),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(7),
+          RequestNumber::with(2),
+          bytes::Bytes::from_static(b"b"),
+        ),
+      ],
+    )),
+  );
+  // FORMED — no `select_canonical_log` fail-stop panic (FAIL-BEFORE: commit* == u64::MAX/2 > op_head 2).
+  assert!(
+    e.is_primary(),
+    "replica 1 formed the view despite a poisoned commit_max — the fail-stop was not tripped"
+  );
+  assert_eq!(e.op(), OpNumber::with(2));
+  // (2) The committed frontier was re-established to commit* (<= op), discarding the poison.
+  assert!(
+    e.commit_max().get() <= e.op().get(),
+    "commit_max was reset to the view-authoritative commit* (<= op {}), got {}",
+    e.op().get(),
+    e.commit_max().get()
+  );
+  // The deferred StartView never over-vouches: commit <= op (FAIL-BEFORE would broadcast the poison,
+  // crashing every backup's adopt_canonical_head `commit <= op` assert).
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  let sv = core::iter::from_fn(|| e.poll_message())
+    .filter_map(|out| match out.into_msg() {
+      Message::StartView(s) => Some(s),
+      _ => None,
+    })
+    .next()
+    .expect("the new primary broadcasts a StartView");
+  assert!(
+    sv.commit().get() <= sv.op().get(),
+    "StartView commit ({}) must not exceed op ({}) — a formed primary never vouches beyond its head",
+    sv.commit().get(),
+    sv.op().get()
+  );
+}
+
+#[test]
 fn new_primary_carries_a_header_only_repairing_op_through_the_dvc_and_repairs_it() {
   // The committed-op-loss closed: a DoViewChange carrying a body-faulty-but-header-durable COMMITTED
   // op (a header-only `Repairing` PreparedEntry — its body did not survive a torn-body fault on the
@@ -1553,6 +1661,98 @@ fn committed_ops_are_never_truncated() {
     "uncommitted op 5 truncated, committed 1..=4 kept"
   );
   assert_eq!(log.len(), 4);
+}
+
+#[test]
+fn source_separated_commit_preserves_a_committed_tail_gap_op_via_the_holder_quorum() {
+  // A committed op held by a QUORUM is never truncated, INDEPENDENT of `commit*` — so bounding the DVC
+  // commit advertisement to the held head (source-separation) cannot drop it. This pins the answer to the
+  // adversarial concern that suppressing a tail-gap `commit_max` below a committed op could let the
+  // nack-truncation cut it: it cannot, because truncation is driven by the nack quorum on real holders,
+  // and a committed op has `f+1` holders that do NOT nack it.
+  //
+  // Setup (N=5 → quorum_nack_prepare=3): op 4 was committed (held by r0,r1,r2 = a quorum). r0 then took a
+  // disk fault on op 4's BODY and — per the durable-header design — retains it as a header-only
+  // `Repairing` entry, so r0's head STAYS at 4 (it is a holder, not a nacker). The tail-gap witness r3
+  // learned commit 4 but holds only op 1; under source-separation it advertises commit == its head (1),
+  // NOT 4. So `commit* == 1`, far below the committed op 4 — the exact condition under which a bare-scalar
+  // scheme would rely on r3's `commit_max == 4` to protect op 4.
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(5),
+    0,
+    NoopSm,
+  );
+  // r0: committed holder of op 4 whose body faulted → carries op 4 as a header-only `Repairing` entry.
+  e.dvc_from_mut_for_test().insert(
+    ReplicaId::new(0),
+    DoViewChange::new(
+      View::with(11),
+      View::with(1),
+      OpNumber::with(4),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(1),
+          RequestNumber::with(1),
+          bytes::Bytes::copy_from_slice(&[1u8]),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(2),
+          ClientId::new(1),
+          RequestNumber::with(2),
+          bytes::Bytes::copy_from_slice(&[2u8]),
+        ),
+        PreparedEntry::new(
+          OpNumber::with(3),
+          ClientId::new(1),
+          RequestNumber::with(3),
+          bytes::Bytes::copy_from_slice(&[3u8]),
+        ),
+        PreparedEntry::repairing(
+          OpNumber::with(4),
+          ClientId::new(1),
+          RequestNumber::with(4),
+          0xDEAD_BEEF,
+        ),
+      ],
+    ),
+  );
+  // r1, r2: committed holders of op 4 (full `Present` log 1..=4). Together with r0 this is the `f+1`
+  // holder quorum for op 4.
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(1), dvc(1, 1, 4, 1));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(2), dvc(2, 1, 4, 1));
+  // r3, r4: the two lagging replicas — r3 is the tail-gap witness (knows commit 4 but holds only op 1;
+  // source-separation makes it advertise commit == 1, its head), r4 simply never received op 4. Both hold
+  // only op 1, so both NACK op 4. That is exactly `f` = 2 nacks — one short of the `quorum_nack_prepare`
+  // of 3. r0's retained `Repairing` header is load-bearing: it keeps r0 a HOLDER of op 4, so nacks stay at
+  // 2. Were r0 to have LOST op 4's header too (head regressing to 3), it would nack op 4, tipping nacks to
+  // 3 == threshold and truncating this committed op — the committed-loss the durable-header design closes.
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(3), dvc(3, 1, 1, 1));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(4), dvc(4, 1, 1, 1));
+
+  let (log, op_head, commit_star, _) = e.select_canonical_log();
+  assert_eq!(
+    commit_star, 1,
+    "source-separation suppresses the tail-gap commit_max: commit* stays at the held frontier"
+  );
+  assert_eq!(
+    op_head, 4,
+    "op 4 is NOT truncated even though commit* == 1: its f+1 holders (r0 as Repairing, r1, r2) mean only \
+     r3+r4 nack it (2 < 3), so no nack quorum forms — the holder quorum protects it, not commit*"
+  );
+  assert!(
+    log.iter().any(|entry| entry.op().get() == 4),
+    "the committed op 4 survives into the canonical log (re-committed as the new view's commit advances)"
+  );
 }
 
 #[test]
