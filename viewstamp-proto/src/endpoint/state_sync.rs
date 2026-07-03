@@ -2106,6 +2106,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // checkpoint root, GC the WAL caches, and complete the sync bookkeeping — the same tail as a clean
     // first-try install (it lands at exactly this point), now reached after the retry.
     self.complete_state_sync(now, sb, blocks);
+    // The install advanced `checkpoint_op` (the ring window slid forward): re-drive any adopted-tail
+    // append that was skipped over the old window.
+    self.retry_unappended_adopted_tail(wal);
     true
   }
 }

@@ -229,7 +229,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       let (_, action) = self.pending_sb.take().expect("just matched Some");
       match action {
         PendingSbAction::SendDoViewChange => self.send_do_view_change(now),
-        PendingSbAction::StartViewAsPrimary => self.start_view_participate(now, sb, blocks),
+        PendingSbAction::StartViewAsPrimary => {
+          self.start_view_participate(now, sb, blocks);
+          // A checkpoint root that completed while this view write was in flight advanced the
+          // ring window with the sweep gated (durable-view-before-participate): re-drive the
+          // still-unappended adopted tail now that the view is durable. (A backup needs no such
+          // call — its whole adoption-append loop runs at its completion, `start_view_acks`.)
+          self.retry_unappended_adopted_tail(wal);
+        }
         PendingSbAction::AdoptedStartView => self.start_view_acks(wal),
         // A frontier seal has no follow-up: the durable root now carries `commit_max`, which is all
         // the operator awaited before deriving an offline-restart successor.
@@ -414,6 +421,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               // The retry path (`retry_sm_reconstruct`) reaches the IDENTICAL tail once a re-pull finally
               // reconstructs the SM, so it lands at exactly this point.
               self.complete_state_sync(now, sb, blocks);
+              // The install advanced `checkpoint_op` (the ring window slid forward): re-drive any
+              // adopted-tail append that was skipped over the old window. (No-op unless the tail
+              // above the completion exit's frontier holds an un-durable body — see the fn doc.)
+              self.retry_unappended_adopted_tail(wal);
             }
             CheckpointKind::Ordinary => {
               // ORDINARY checkpoint: advance the in-memory checkpoint_op, then GC the WAL + per-op caches
@@ -433,6 +444,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               // sweep from the live roots). Runs AFTER the durable root, so a freed block is provably
               // unreferenced by any live checkpoint.
               self.gc_blocks(blocks);
+              // `checkpoint_op` advanced (the ring window slid forward): re-drive any adopted-tail
+              // append that was skipped over the old window.
+              self.retry_unappended_adopted_tail(wal);
             }
           }
         }

@@ -1437,6 +1437,52 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
+  /// Re-drive the durable append of any adopted uncommitted-tail op whose adoption-time
+  /// (re-)append was SKIPPED over the ring window ([`Self::adopt_append`]'s wrap guard). Runs at
+  /// every `checkpoint_op` advance — the exact event that slides the ring window forward and makes
+  /// a previously-unappendable op fit — because nothing else re-drives such an op: the adoption
+  /// already installed it in `self.log` and advanced `self.op`, so a Prepare retransmit lands in
+  /// the `pop <= self.op` re-ack branch (which defers to durability that never arrives), and the
+  /// primary receives no retransmit at all. Without this, the skipped op is never durably held, its
+  /// vote/ack is never cast, and with one backup unavailable the view wedges on an uncommittable
+  /// tail despite every replica being live.
+  ///
+  /// The primary re-appends tagged `AdoptVote` (its own inflight vote, cast in `on_wal_done` when
+  /// the append lands), a backup tagged `AdoptAck` (the deferred `PrepareOk`) — the same kinds the
+  /// adoption itself used. Ops already durable, already in flight, body-less (`Repairing` — the
+  /// repair channel owns those, casting the vote via the `RepairFill` completion), or still over
+  /// the window (`adopt_append` re-checks) are skipped; a still-over-window op is retried at the
+  /// next advance. Convergence is guaranteed by the [`Wal::capacity`] liveness contract (the ring
+  /// exceeds one checkpoint interval plus the pipeline): a skip then implies the adopted committed
+  /// band crosses a checkpoint boundary, so applying it keeps ordinary checkpoints firing — each
+  /// advance slides the window a full interval — until the window admits the whole tail; no new
+  /// client traffic or retransmit is needed to release the re-drive.
+  ///
+  /// GATED on no durable-view write being in flight (durable-view-before-participate): an ordinary
+  /// checkpoint root submitted before a view transition survives it and may complete while the
+  /// adopted view's own root is still in flight — appending then would let `on_wal_done` cast the
+  /// AdoptAck's `PrepareOk` for a view this replica could still roll back from on crash. The gated
+  /// advance is not lost: the durable-view completion itself re-drives (a backup re-runs the full
+  /// loop via [`Self::start_view_acks`]; the new primary re-runs this sweep from its
+  /// `StartViewAsPrimary` completion arm).
+  pub(crate) fn retry_unappended_adopted_tail<W: Wal>(&mut self, wal: &mut W) {
+    if !self.status.is_normal() || self.pending_durable_view() {
+      return;
+    }
+    let lo = self.commit_min.get().max(self.commit_max.get());
+    for op in (lo + 1)..=self.op.get() {
+      if self.appending.contains(&op) || self.op_durably_appended(wal, op) {
+        continue;
+      }
+      let kind = if self.is_primary() {
+        Pending::AdoptVote(OpNumber::with(op))
+      } else {
+        Pending::AdoptAck(OpNumber::with(op))
+      };
+      self.adopt_append(wal, op, kind);
+    }
+  }
+
   /// Durably (re-)append an op the replica adopted into `self.log` during a view change, recording the
   /// deferred action (`Pending::AdoptVote` for the new primary's own vote, `Pending::AdoptAck` for a
   /// backup's PrepareOk) so `on_wal_done` casts it ONLY once the append lands (append-before-ack). The op's body lives only in the in-memory `self.log` until this completes —
@@ -1461,8 +1507,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // ring behind the adopted band — must not physically wrap a committed, un-pruned slot (appending
     // `op` evicts `op − ring`, which recovery and its peers may still need). Skip the durable append
     // and owe NO vote/ack for the op (append-before-ack: nothing lands, nothing is cast, so the op is
-    // never advertised as durably held); the below-ring-window forced sync jumps the checkpoint forward
-    // and ordinary catch-up re-covers the band.
+    // never advertised as durably held). The skip is NOT terminal: every `checkpoint_op` advance
+    // re-runs the still-unappended tail through [`Self::retry_unappended_adopted_tail`], and applying
+    // the adopted committed band keeps those checkpoints firing until the window admits the whole tail.
     if self.ring_append_would_wrap(wal, op) {
       return;
     }
