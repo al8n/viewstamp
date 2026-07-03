@@ -435,6 +435,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         OpNumber::new()
       },
       recover: None,
+      sync_carried_faulty: std::collections::BTreeSet::new(),
       repair: std::collections::BTreeSet::new(),
       sync: None,
       // IN-MEMORY only: a crash drops the crossing intent; the recovery checkpoint-debt machine + the
@@ -1595,9 +1596,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // exactly as `on_recover_sync_checkpoint` does on a fresh staged reply — a still-armed recover-retry /
     // sync-solicit would spin a poll_timeout driver (neither is serviced while Recovering with a staged sync).
     if self.pending_checkpoint.is_some() {
-      self.recover = None;
-      self.timers.recover_retry = None;
-      self.timers.sync_solicit = None;
+      self.retire_recover_for_staged_sync();
       return;
     }
     // Snapshot the PENDING ops (the in-flight tail reads) so we can re-borrow `recover` per op while
@@ -1681,6 +1680,34 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // transition). Idempotent: it re-arms and returns while any read is still pending, and finalizes only
     // once `rec.pending` empties.
     self.recover_progress(now, sb, blocks);
+  }
+
+  /// Retire the local recovery bookkeeping once a sync install is STAGED (`pending_checkpoint` set),
+  /// FIRST carrying the faulty verdicts across the install — the shared chokepoint of BOTH staging
+  /// lanes: the fresh `SyncCheckpoint` escape (`on_recover_sync_checkpoint`) and the local flush-retry
+  /// (`recover_timeouts` → `retry_install_flush`, reached when the escape's first flush FAULTED so no
+  /// `pending_checkpoint` existed there and `recover` survived into the retry cadence). The read phase
+  /// settled its verdicts before either staging, but the `awaiting_peer_checkpoint` gate in
+  /// `recover_progress` sits BEFORE its faulty-head → `RecoveringHead` decision — so a
+  /// permanently-faulty (occupied-but-unidentifiable) HEAD reaches staging still marked only in
+  /// `rec.faulty`, which this teardown discards. Carrying the WHOLE set (`sync_carried_faulty`) lets
+  /// the install completion route to `RecoveringHead` instead of `Normal` when the installed
+  /// checkpoint does not subsume the head (completing `Normal` would hold an op with no identity
+  /// anywhere: blind re-acks; a DVC advertising an unheld head), with the interior verdicts riding
+  /// along because the reform-escalation gate (`committed_band_intact`) must keep refusing same-epoch
+  /// reformation while a COMMITTED-band faulty slot remains. Replace-only-when-non-empty: a re-fetch
+  /// reply after an install error re-runs a staging with a fresh READ-FREE `RecoverState` (empty
+  /// `faulty`) and must not erase the original verdicts — nothing was re-read, so they stand until
+  /// consumed by `complete_state_sync`.
+  fn retire_recover_for_staged_sync(&mut self) {
+    if let Some(rec) = self.recover.as_ref()
+      && !rec.faulty.is_empty()
+    {
+      self.sync_carried_faulty = rec.faulty.clone();
+    }
+    self.recover = None;
+    self.timers.recover_retry = None;
+    self.timers.sync_solicit = None;
   }
 
   /// RecoveringHead solicitation timer: re-broadcast the `Recovery` request (and re-arm) until a
@@ -2037,9 +2064,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // armed (`recover` + `awaiting_peer_checkpoint` + the solicit timer) so it re-fetches from another donor
     // — tearing `recover` down here would silently end the fetch at the old epoch.
     if self.pending_checkpoint.is_some() {
-      self.recover = None;
-      self.timers.recover_retry = None;
-      self.timers.sync_solicit = None;
+      // Carry the faulty verdicts + retire the bookkeeping via the shared staging chokepoint (see
+      // `retire_recover_for_staged_sync` for the full rationale — the same teardown runs on the
+      // flush-retry staging lane, which is reached when THIS staging never happened because the first
+      // flush faulted, so the two must not drift).
+      self.retire_recover_for_staged_sync();
     }
   }
 
@@ -2211,7 +2240,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Broadcast a `Recovery` solicitation (RecoveringHead) and re-arm the solicitation timer. The
   /// stable `self.nonce` tags the request so a `RecoveryResponse` to THIS replica's recovery is
   /// distinguished from unrelated traffic and matched across retries.
-  fn send_recovery(&mut self, now: Instant) {
+  pub(crate) fn send_recovery(&mut self, now: Instant) {
     self.emit(Outgoing::new(
       Recipient::Backups,
       Message::Recovery(crate::Recovery::new(

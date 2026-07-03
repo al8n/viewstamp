@@ -2767,6 +2767,385 @@ fn a_peer_checkpoint_after_a_phantom_tail_completes_recovery_at_the_verified_hea
 }
 
 #[test]
+fn a_staged_sync_install_with_an_untruthed_head_completes_to_recovering_head_not_normal() {
+  // The peer-checkpoint escape × un-truthed head: the `awaiting_peer_checkpoint` gate in
+  // `recover_progress` sits BEFORE its faulty-head → `RecoveringHead` decision, and the escape
+  // (`on_recover_sync_checkpoint`) clears `recover` at staging — so without the carried verdict, a
+  // permanently-faulty (occupied-but-unidentifiable) HEAD rides the staged install into `Normal`,
+  // holding an op with no identity anywhere: a later `Prepare` for it would be blind-re-acked
+  // (append-before-ack broken) and the DoViewChange would advertise an unheld head. The carried
+  // verdict resumes the preempted decision at the install completion: `RecoveringHead`, soliciting the
+  // canonical head, and a peer's `RecoveryResponse` adopts back to Normal — never a silent unheld head,
+  // never a wedge.
+  //
+  // The triple fault: (1) the head slot's durable header bit-rotted in its `op` field — occupied
+  // (occupancy-scanned into the window) but unidentifiable (placement fails, `verify_header` fails, and
+  // the root's canonical band stops below it, so no witness anywhere) with its reads faulting to
+  // exhaustion → `rec.faulty`; (2) the own checkpoint snapshot is permanently unreadable → the peer
+  // fetch (`awaiting_peer_checkpoint`), whose gate preempts the head decision; (3) a peer serves the
+  // checkpoint (M == 2 < the head), which must NOT subsume the verdict.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let now = Instant::ZERO;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
+  let mut wal = ScriptedWal::with_entries(6);
+  let (clean, body) = wal.entries.get(&6).cloned().expect("head entry");
+  let mut rotted = clean.encode();
+  rotted[47] ^= 0xFF; // rot the op field — occupied, but no placement/checksum/root witness
+  let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
+  wal.entries.insert(6, (rotted, body));
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  // Exhaust both budgets: the unidentifiable head lands in `rec.faulty`; the checkpoint escalates to
+  // the peer fetch. The awaiting gate holds recovery open BEFORE the faulty-head decision.
+  drive_recovery_scripted_sb(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert!(
+    r.awaiting_peer_checkpoint_for_test(),
+    "own checkpoint exhausted → fetching from a peer, the head decision preempted"
+  );
+  while r.poll_message().is_some() {}
+
+  // A peer answers with a VALID SyncCheckpoint (op 2, genuine snapshot, matching nonce) — the escape
+  // stages the install, carrying the un-truthed-head verdict.
+  let good_snap = CountSm::default().snapshot();
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  let good_id = crate::checkpoint_id(&good_env);
+  blocks.write_verified(good_snap.clone());
+  let nonce = r.sync_nonce_for_test();
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(2),
+      good_id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      good_env.clone(),
+      Bytes::new(),
+    )),
+  );
+  for _ in 0..3 {
+    sb.flush();
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  // THE fix: the install completed (checkpoint 2 durable + restored) but the un-truthed head (6 > 2)
+  // resumes the preempted decision — RecoveringHead, not Normal.
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "an un-truthed head survives the staged install → RecoveringHead, never Normal holding an unheld op"
+  );
+  assert_eq!(
+    r.checkpoint_op(),
+    OpNumber::with(2),
+    "the peer checkpoint IS installed (the SM was locally unrestorable)"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(6),
+    "the head stays at the written extent while the canonical head is solicited"
+  );
+  assert!(
+    !r.log.contains_key(&6),
+    "no identity is fabricated for the un-truthed head"
+  );
+  // The exit: the replica solicits the canonical head; the primary's RecoveryResponse re-establishes
+  // it and adoption returns to Normal — the wedge-free completion.
+  let mut nonce = 0;
+  while let Some(out) = r.poll_message() {
+    if let Message::Recovery(rec) = out.into_msg() {
+      nonce = rec.nonce();
+    }
+  }
+  assert_ne!(nonce, 0, "RecoveringHead solicited the canonical head");
+  let resp = RecoveryResponse::new(
+    View::new(),
+    OpNumber::with(6),
+    OpNumber::with(6),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(0),
+    nonce,
+    (3..=6u64)
+      .map(|op| {
+        PreparedEntry::new(
+          OpNumber::with(op),
+          ClientId::new(7),
+          RequestNumber::with(op),
+          bytes::Bytes::copy_from_slice(&[op as u8]),
+        )
+      })
+      .collect(),
+  );
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::RecoveryResponse(resp),
+  );
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the primary's canonical head re-establishes the replica — adopted back to Normal"
+  );
+  assert_eq!(r.op(), OpNumber::with(6), "the canonical head is adopted");
+}
+
+#[test]
+fn the_flush_retry_staging_lane_carries_the_faulty_verdicts_too() {
+  // The SECOND staging lane: the escape's first durability barrier FAULTS (a transient block-store
+  // flush fault), so `apply_sync` stages nothing — `pending_checkpoint` stays `None`, the escape's
+  // staging chokepoint is skipped, and `recover` (with the faulty verdicts) survives into the retry
+  // cadence. `recover_timeouts` → `retry_install_flush` later re-flushes and stages LOCALLY, and ITS
+  // teardown must run the SAME carry — a bare teardown there would drop the verdicts and the install
+  // completion would flip Normal at the un-truthed head, the exact escape this branch closes, reopened
+  // by one transient disk fault.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let now = Instant::ZERO;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
+  let mut wal = ScriptedWal::with_entries(6);
+  let (clean, body) = wal.entries.get(&6).cloned().expect("head entry");
+  let mut rotted = clean.encode();
+  rotted[47] ^= 0xFF; // rot the op field — occupied, but no witness anywhere
+  let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
+  wal.entries.insert(6, (rotted, body));
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery_scripted_sb(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert!(
+    r.awaiting_peer_checkpoint_for_test(),
+    "own checkpoint exhausted → fetching from a peer"
+  );
+  while r.poll_message().is_some() {}
+
+  // The peer answers — but the FIRST flush barrier faults, so the escape stages nothing and `recover`
+  // (with the un-truthed-head verdict) survives into the retry cadence.
+  let good_snap = CountSm::default().snapshot();
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  let good_id = crate::checkpoint_id(&good_env);
+  blocks.write_verified(good_snap.clone());
+  blocks.script_flush_fault(1); // the escape's durability barrier faults; the retry's succeeds
+  let nonce = r.sync_nonce_for_test();
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(2),
+      good_id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      good_env.clone(),
+      Bytes::new(),
+    )),
+  );
+  assert!(
+    r.install_flush_retry_owed(),
+    "the faulted flush retains the verified install for a local retry"
+  );
+  assert!(
+    r.recover.is_some(),
+    "the escape staged nothing — recovery bookkeeping (and its verdicts) survive into the retry"
+  );
+  // The retry cadence re-flushes (now succeeding) and stages locally; its teardown must carry the
+  // verdicts exactly as the escape's would have.
+  let later = r
+    .poll_timeout()
+    .expect("the recover-retry cadence stays armed while awaiting");
+  r.handle_timeout(later, &mut wal, &mut sb, &mut blocks);
+  for _ in 0..3 {
+    sb.flush();
+    r.handle_storage(later, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "the flush-retry staging lane carries the un-truthed-head verdict — RecoveringHead, not Normal"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(6),
+    "the head stays at the written extent while the canonical head is solicited"
+  );
+  assert!(
+    !r.log.contains_key(&6),
+    "no identity is fabricated for the un-truthed head"
+  );
+}
+
+#[test]
+fn the_staged_install_carries_every_faulty_verdict_not_just_the_untruthed_head() {
+  // The carry across the staged install must be the WHOLE faulty set: the RecoveringHead
+  // reform-escalation gate (`committed_band_intact`) refuses same-epoch reformation while any
+  // COMMITTED-band faulty slot remains — a committed op this replica cannot vouch would be omitted
+  // from its DoViewChange, so escalating could lose it. A head-only carry would rebuild `rec.faulty`
+  // as `{head}`, the gate would wrongly see the committed band intact, and an all-restart quorum could
+  // reform around the missing committed op.
+  //
+  // Setup: durable root vouches commit 5 over checkpoint 2 with a canonical band {3, 5} — a GAP at 4
+  // (the writer never held it), so the self-verifying WAL slot at 4 is known-committed-but-UNPROVEN →
+  // `StaleCommitted` → faulty (an interior committed-band verdict). The head 6 is occupied but
+  // unidentifiable (op-field-rotted header, above the band). The own checkpoint snapshot is
+  // permanently unreadable → the peer fetch; the peer serves checkpoint 2 (below both verdicts).
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(5),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec![mk(3), mk(5)], // the band has a GAP at 4
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
+  let mut wal = ScriptedWal::with_entries(6);
+  let (clean, body) = wal.entries.get(&6).cloned().expect("head entry");
+  let mut rotted = clean.encode();
+  rotted[47] ^= 0xFF; // rot the head's op field — occupied, no witness anywhere
+  let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
+  wal.entries.insert(6, (rotted, body));
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap(),
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  let now = Instant::ZERO;
+  drive_recovery_scripted_sb(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert!(
+    r.awaiting_peer_checkpoint_for_test(),
+    "own checkpoint exhausted → fetching from a peer"
+  );
+  assert_eq!(
+    r.recover
+      .as_ref()
+      .map(|rec| rec.faulty.iter().copied().collect::<std::vec::Vec<_>>()),
+    Some(std::vec![4, 6]),
+    "both verdicts settled before the escape: the unproven committed interior AND the un-truthed head"
+  );
+  while r.poll_message().is_some() {}
+
+  let good_snap = CountSm::default().snapshot();
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  let good_id = crate::checkpoint_id(&good_env);
+  blocks.write_verified(good_snap.clone());
+  let nonce = r.sync_nonce_for_test();
+  r.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(2),
+      good_id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      good_env.clone(),
+      Bytes::new(),
+    )),
+  );
+  for _ in 0..3 {
+    sb.flush();
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "the un-truthed head resumes the preempted decision after the install"
+  );
+  // THE fix: the re-armed recovery restores EVERY non-subsumed verdict — the reform gate keeps seeing
+  // the committed-band faulty slot (4 <= commit_max 5) and refuses same-epoch reformation.
+  assert_eq!(
+    r.recover
+      .as_ref()
+      .map(|rec| rec.faulty.iter().copied().collect::<std::vec::Vec<_>>()),
+    Some(std::vec![4, 6]),
+    "the full faulty set rides the staged install — not just the head"
+  );
+  assert!(
+    !r.log.contains_key(&4) && !r.log.contains_key(&6),
+    "no identity is fabricated for either verdict"
+  );
+}
+
+#[test]
 fn recover_reads_a_committed_band_above_the_imposed_ring_on_a_ring_less_wal() {
   // The read ceiling is FLOORED at the durable committed frontier, by LOCAL proof: a ring-less WAL
   // (default `capacity()`) whose durable root vouches a commit ABOVE the proto-imposed ring — a tail no

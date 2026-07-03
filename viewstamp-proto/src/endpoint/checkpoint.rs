@@ -488,6 +488,40 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // and abdicate/rebuild/resume. The Normal deferred-sync path is already Normal, so it just resumes as a
     // backup.
     if self.status.is_recovering() {
+      // The escape carried the recovery FAULTY verdicts across the staged install
+      // (`sync_carried_faulty` — the read phase found the head occupied but with no verifiable
+      // identity and no root witness, possibly alongside interior faulty slots, and the
+      // awaiting-checkpoint gate preempted `recover_progress`'s `RecoveringHead` decision). Filter out
+      // what the installed checkpoint SUBSUMED (the snapshot owns `[1..=checkpoint_op]`); if the head
+      // is among the survivors, resume the preempted decision now: `RecoveringHead` — do not
+      // participate, solicit the canonical head (a peer's `RecoveryResponse`/`StartView`
+      // re-establishes it and adoption returns to Normal) — instead of completing `Normal` holding an
+      // op with no identity anywhere (a later `Prepare` would be blind-re-acked and the DoViewChange
+      // would advertise an unheld head). The FULL surviving set is restored into the re-armed
+      // `RecoverState`, not just the head: the reform-escalation gate (`committed_band_intact`) reads
+      // `rec.faulty` to refuse same-epoch reformation while a COMMITTED-band faulty slot remains — a
+      // committed op this replica cannot vouch would be omitted from its DoViewChange — so dropping
+      // the interior verdicts would let an all-restart quorum escalate into exactly that loss. A
+      // clean-head remainder (interiors only, or nothing) completes normally: the interior slots were
+      // already dropped to on-demand repair holes at the escape's finalize, the pre-existing Normal
+      // semantics for non-head faults.
+      let carried: std::collections::BTreeSet<u64> = core::mem::take(&mut self.sync_carried_faulty)
+        .into_iter()
+        .filter(|&op| op > self.checkpoint_op.get())
+        .collect();
+      if carried.contains(&self.op.get()) {
+        // Re-arm the recovery bookkeeping the RecoveringHead machinery reads (the verdicts stay
+        // flagged until adoption clears `recover`), exactly as `recover_progress`'s faulty-head
+        // branch leaves it.
+        self.recover = Some(RecoverState {
+          faulty: carried,
+          ..RecoverState::default()
+        });
+        self.set_status(Status::RecoveringHead);
+        self.arm_timers(now);
+        self.send_recovery(now);
+        return;
+      }
       self.complete_recovery(now, sb, blocks);
     } else {
       self.arm_timers(now);

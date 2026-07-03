@@ -1197,6 +1197,24 @@ pub struct Endpoint<S, R = RestartOnly> {
   /// not participate in consensus (the `handle_message` guard) and so cannot enter a view change
   /// while recovering.
   recover: Option<RecoverState>,
+  /// The recovery FAULTY verdicts (`rec.faulty` — permanently unreadable/unprovable slots, the settled
+  /// head possibly among them) at the moment the peer-checkpoint escape (`on_recover_sync_checkpoint`)
+  /// abandoned local recovery for a staged install. The escape clears `recover` at staging (completion
+  /// routing requires it), discarding the verdicts — but the `awaiting_peer_checkpoint` gate in
+  /// `recover_progress` sits BEFORE its faulty-head → `RecoveringHead` decision, so without this carry
+  /// the install completion would flip to `Normal` HOLDING an un-truthed head (an op with no identity
+  /// anywhere: a later `Prepare` would be blind-re-acked and the DoViewChange would advertise an unheld
+  /// head). The WHOLE set is carried, not just the head: the `RecoveringHead` reform-escalation gate
+  /// (`committed_band_intact`) refuses same-epoch reformation while any COMMITTED-band faulty slot
+  /// remains — a committed op this replica cannot vouch would be omitted from its DoViewChange — so
+  /// the interior verdicts are as load-bearing as the head's. Replaced (never cleared) at the staging
+  /// chokepoint only when the staging `rec.faulty` is non-empty — a re-fetch reply after an install
+  /// error re-runs the staging with a fresh READ-FREE `RecoverState` and must not erase the original
+  /// verdicts; consumed exactly once by `complete_state_sync`, which filters out what the installed
+  /// checkpoint subsumed and routes to `RecoveringHead` — resuming the preempted decision, verdicts
+  /// restored — when the head is among the survivors, and to the normal `complete_recovery` otherwise.
+  /// Empty means none carried.
+  sync_carried_faulty: std::collections::BTreeSet<u64>,
   /// Peer fault-repair: committed ops whose body read back PERMANENTLY faulty (bit-rot / torn)
   /// from this replica's own durable WAL and must be re-fetched from a peer (`RequestPrepare` →
   /// `Prepare`). An op lands here when the recover loop classes a non-head committed slot permanently
@@ -1534,6 +1552,7 @@ impl<S, R> Endpoint<S, R> {
       // `recompute_quorum_checkpoint` over this state, so the cache starts coherent).
       quorum_checkpoint: OpNumber::new(),
       recover: None,
+      sync_carried_faulty: std::collections::BTreeSet::new(),
       repair: std::collections::BTreeSet::new(),
       sync: None,
       // No reconfiguration has been hinted: no crossing is owed (re-established by a higher-epoch trigger).
