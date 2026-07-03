@@ -4356,6 +4356,7 @@ fn laggard_adopter_of_a_floored_start_view_trims_its_ancient_band_and_state_sync
   // The laggard's own ancient state: applied 1..=6 (commit_min == commit_max == 6), head 6, the
   // band 1..=6 held Present, nothing checkpointed.
   e.commit_min = OpNumber::with(6);
+  e.sm_at = e.commit_min; // hand-built state: the SM is modelled as applied through commit_min
   e.commit_max = OpNumber::with(6);
   e.op = OpNumber::with(6);
   for op in 1..=6u64 {
@@ -4508,6 +4509,7 @@ fn adopt_canonical_head_keeps_committed_ops_an_offset_canonical_log_omits() {
   e.checkpoint_op = OpNumber::with(4);
   e.log_floor = OpNumber::with(4); // the coupling a real checkpoint advance maintains
   e.commit_min = OpNumber::with(6);
+  e.sm_at = e.commit_min; // hand-built state: the SM is modelled as applied through commit_min
   e.commit_max = OpNumber::with(6);
   e.op = OpNumber::with(8);
   for op in 5..=8u64 {
@@ -4634,6 +4636,7 @@ fn adopt_log_does_not_preserve_a_stale_unapplied_held_copy_for_a_committed_op() 
   e.checkpoint_op = OpNumber::with(4);
   e.log_floor = OpNumber::with(4); // the coupling a real checkpoint advance maintains
   e.commit_min = OpNumber::with(4);
+  e.sm_at = e.commit_min; // hand-built state: the SM is modelled as applied through commit_min
   e.commit_max = OpNumber::with(4);
   e.op = OpNumber::with(8);
   // The STALE, TRANSPOSED held copies for the (commit_min .. commit] band: op 5 holds op 6's body and
@@ -6725,6 +6728,7 @@ fn large_bodied_view_change_carriers_and_repair_serve_fit_the_frame() {
   e.log_view = View::with(1);
   e.op = OpNumber::with(ENTRIES);
   e.commit_min = OpNumber::with(ENTRIES);
+  e.sm_at = e.commit_min; // hand-built state: the SM is modelled as applied through commit_min
   e.commit_max = OpNumber::with(ENTRIES);
   for op in 1..=ENTRIES {
     e.log.insert(
@@ -6895,6 +6899,7 @@ fn repair_range_serve_clamps_a_huge_hi_to_the_window_against_a_sparse_high_op_lo
   e.log_view = View::with(1);
   e.op = OpNumber::with(head);
   e.commit_min = OpNumber::with(head);
+  e.sm_at = e.commit_min; // hand-built state: the SM is modelled as applied through commit_min
   e.commit_max = OpNumber::with(head);
   // Present ops only at `[lo, lo+SPARSE)` — a sparse low-end prefix of the solicited run; every other
   // slot (including the whole window's tail and the billions above it) is a hole we do not hold.

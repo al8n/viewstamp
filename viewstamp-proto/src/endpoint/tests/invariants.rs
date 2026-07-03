@@ -147,3 +147,88 @@ fn assert_invariants_rejects_pending_install_without_sync() {
   // self.sync is None → violates clause (1)
   e.assert_invariants();
 }
+
+// --- The SM-content witness (`sm_at`): the two chokes + the (5c) cross-check. ---
+
+#[test]
+fn note_sm_advanced_accepts_exactly_the_next_op() {
+  // The content witness advances strictly one committed op at a time — an apply (or a committed
+  // reconfigure's vacuous-effect account) for the exact successor succeeds.
+  let mut e = backup();
+  e.note_sm_advanced(OpNumber::with(1));
+  assert_eq!(e.sm_at, OpNumber::with(1));
+  e.note_sm_advanced(OpNumber::with(2));
+  assert_eq!(e.sm_at, OpNumber::with(2));
+}
+
+#[test]
+#[should_panic(expected = "SM content advanced non-sequentially")]
+fn note_sm_advanced_skipping_an_op_panics() {
+  // A skipped op means the SM missed a committed effect (or applied out of order) — the choke
+  // fail-stops rather than letting the divergence surface as wrong SM state views later.
+  let mut e = backup();
+  e.note_sm_advanced(OpNumber::with(1));
+  e.note_sm_advanced(OpNumber::with(3)); // skips 2: must panic in debug
+}
+
+#[test]
+#[should_panic(expected = "SM content advanced non-sequentially")]
+fn note_sm_advanced_double_apply_panics() {
+  // A double-apply re-runs a committed effect (non-idempotent SMs corrupt silently) — fail-stop.
+  let mut e = backup();
+  e.note_sm_advanced(OpNumber::with(1));
+  e.note_sm_advanced(OpNumber::with(1)); // re-applies 1: must panic in debug
+}
+
+#[test]
+fn note_sm_restored_allows_forward_and_equal_moves() {
+  // A restore replaces content wholesale at/above the current position: forward (a sync install
+  // ahead of the applied frontier) and equal (a retried reconstruct landing the same M) both hold.
+  let mut e = backup();
+  e.note_sm_restored(OpNumber::with(8));
+  assert_eq!(e.sm_at, OpNumber::with(8));
+  e.note_sm_restored(OpNumber::with(8)); // equal is allowed (>=)
+  e.note_sm_restored(OpNumber::with(12));
+  assert_eq!(e.sm_at, OpNumber::with(12));
+}
+
+#[test]
+#[should_panic(expected = "SM content restored backward")]
+fn note_sm_restored_backward_panics() {
+  // Every restore site installs a checkpoint at/above the applied frontier — a backward restore
+  // would regress applied state and is a bug, not a state to represent.
+  let mut e = backup();
+  e.note_sm_restored(OpNumber::with(12));
+  e.note_sm_restored(OpNumber::with(8)); // backward: must panic in debug
+}
+
+#[test]
+#[should_panic(expected = "SM content at")]
+fn the_sm_content_witness_trips_on_an_unflagged_behind_window() {
+  // Clause (5c): the applied frontier advanced past the SM's content with NO behind-window flagged
+  // (no owed reconstruct, not recovering) — the exact state C2 left behind when a view transition
+  // dropped the sm_reconstruct obligation (pointers at M, SM stale, nothing tracking the debt).
+  // Reverting that fix makes three state-sync suite tests fail at THIS clause; this directed form
+  // pins the witness itself without depending on any particular producer of the divergence.
+  let mut e = backup();
+  e.op = OpNumber::with(4);
+  e.commit_min = OpNumber::with(4); // the frontier says 4 ...
+  e.commit_max = OpNumber::with(4);
+  // ... while sm_at (never advanced) still says 0, Normal, no flags → (5c) must fire.
+  e.assert_invariants();
+}
+
+#[test]
+fn the_sm_content_witness_exempts_exactly_the_flagged_windows() {
+  // The two legitimate behind-windows: an owed SM reconstruction (the install advanced the pointers
+  // but the verify-on-read restore faulted), and cold-start recovery (the SM not yet restored from
+  // the durable checkpoint). Each exempts the divergence; clearing it re-arms the witness.
+  let mut e = backup();
+  e.op = OpNumber::with(4);
+  e.commit_min = OpNumber::with(4);
+  e.commit_max = OpNumber::with(4);
+  e.status = Status::Recovering;
+  e.assert_invariants(); // recovering: exempt
+  e.status = Status::RecoveringHead;
+  e.assert_invariants(); // head re-establishment: exempt
+}

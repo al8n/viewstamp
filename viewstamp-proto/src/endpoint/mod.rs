@@ -1042,6 +1042,19 @@ pub struct Endpoint<S, R = RestartOnly> {
   op: OpNumber,
   /// Highest op durably applied to the state machine (applied frontier).
   commit_min: OpNumber,
+  /// The SM-CONTENT position witness: the op through which the in-memory state machine's content is
+  /// current. Advanced ONLY by the SM-content operations themselves — a successful `sm.apply`
+  /// (+1, via [`Self::note_sm_advanced`]; a committed `Reconfigure` op is accounted there too, its
+  /// SM-effect being vacuous by design) and a successful `sm.restore` (wholesale, via
+  /// [`Self::note_sm_restored`]) — NEVER by the consensus pointers. `commit_min` is written by the
+  /// commit machinery and `sm_at` by the content machinery, so `assert_invariants` can cross-check
+  /// the two independently-written frontiers: at every handler exit `sm_at == commit_min` unless a
+  /// flagged behind-window is open (`sm_reconstruct` owed, or recovery rebuilding). This reifies
+  /// "the SM's content is where the pointers say it is" — previously only the emergent negation of
+  /// a three-flag disjunction spread across five modules — as one first-class witness, making any
+  /// future path that applies over a stale SM or advances a pointer past un-restored content trip
+  /// deterministically across the suite and the VOPR debug gate.
+  sm_at: OpNumber,
   /// Highest op known committed cluster-wide (may exceed locally-held + applied ops).
   ///
   /// A re-learnable HINT, not a monotone invariant: re-learned via `advance_commit`'s `max` on the
@@ -1523,6 +1536,7 @@ impl<S, R> Endpoint<S, R> {
       view: View::new(),
       op: OpNumber::new(),
       commit_min: OpNumber::new(),
+      sm_at: OpNumber::new(),
       commit_max: OpNumber::new(),
       log_view: View::new(),
       svc_from: 0,
@@ -1680,6 +1694,38 @@ impl<S, R> Endpoint<S, R> {
       self.commit_min.get(),
     );
     self.commit_min = to;
+  }
+
+  /// One of the two sole advancers of the [`Self::sm_at`] SM-content witness: op `op`'s SM-effect
+  /// has just been fully performed — an `sm.apply` returned, or a committed `Reconfigure` op was
+  /// accounted (its SM-effect is vacuous by design: the epoch swap, not an apply, is its effect).
+  /// Committed ops reach the SM strictly in order with no skips, so the witness is pinned to the
+  /// exact successor — a double-apply, a skipped op, or an apply ordered before its predecessor
+  /// trips here rather than surfacing as divergent SM state three views later.
+  fn note_sm_advanced(&mut self, op: OpNumber) {
+    debug_assert_eq!(
+      op.get(),
+      self.sm_at.get() + 1,
+      "SM content advanced non-sequentially (op {} over sm_at {})",
+      op.get(),
+      self.sm_at.get(),
+    );
+    self.sm_at = op;
+  }
+
+  /// The other sole advancer of the [`Self::sm_at`] SM-content witness: a successful `sm.restore`
+  /// replaced the SM's content wholesale with checkpoint `at`'s. Monotone — every restore site
+  /// installs a checkpoint at/above the applied frontier (`install_sync` asserts `checkpoint_op >=
+  /// commit_min`; recovery restores the durable root's own checkpoint into a fresh endpoint) — so a
+  /// backward restore is a bug this catches, not a state to represent.
+  fn note_sm_restored(&mut self, at: OpNumber) {
+    debug_assert!(
+      at.get() >= self.sm_at.get(),
+      "SM content restored backward (to {} below sm_at {})",
+      at.get(),
+      self.sm_at.get(),
+    );
+    self.sm_at = at;
   }
 
   /// Install a committed reconfiguration's SUCCESSOR membership — the DESTRUCTIVE half of the
@@ -2392,6 +2438,30 @@ impl<S, R> Endpoint<S, R> {
       self.op.get(),
       self.log_floor.get()
     );
+    // (5c) The SM-CONTENT witness: the state machine's content position (`sm_at`, written only by the
+    // content operations — apply / reconfigure-account / restore) equals the applied frontier
+    // (`commit_min`, written only by the commit machinery) at every handler exit, UNLESS a flagged
+    // behind-window is open: an owed SM reconstruction (the install advanced the pointers to M but the
+    // verify-on-read restore faulted — the SM still holds pre-M content), or a cold-start recovery
+    // still rebuilding the SM from the durable checkpoint. This is the first-class form of the
+    // `state_machine()` readiness gate's prose ("once Some, the SM is consistent with all applied ops
+    // up to commit_min") — two independently-written frontiers cross-checked, so a path that applies
+    // over a stale SM, double-applies, or advances a pointer past un-restored content trips HERE
+    // deterministically instead of surfacing as divergent SM state views later. `pending_install` is
+    // deliberately NOT a disjunct: a pre-root staged install has not advanced `commit_min` yet, so the
+    // equality must still hold through that window — listing it would blind the witness there.
+    debug_assert!(
+      self.sm_at == self.commit_min
+        || self.sm_reconstruct.is_some()
+        || self.status.is_recovering()
+        || self.status.is_recovering_head(),
+      "SM content at {} diverges from the applied frontier {} with no behind-window flagged \
+       (status {:?}, sm_reconstruct owed: {})",
+      self.sm_at.get(),
+      self.commit_min.get(),
+      self.status,
+      self.sm_reconstruct.is_some(),
+    );
     // (6) The peer-checkpoint fetch is a Recovering sub-state: `escalate_checkpoint_to_peer_fetch` sets
     // it only on the Recovering checkpoint-read-exhausted path, and `recover` is structurally `None`
     // (hence `awaiting_peer_checkpoint()` false) in every non-recovering status.
@@ -2908,6 +2978,16 @@ impl<S, R> Endpoint<S, R> {
     {
       return None;
     }
+    // The readiness gate's contract, witnessed at the exposure point: an SM this accessor hands out
+    // is at the applied frontier (`sm_at` is the content-side witness `assert_invariants` (5c)
+    // cross-checks; asserting here too catches a stale exposure at the exact read that would leak it).
+    debug_assert_eq!(
+      self.sm_at,
+      self.commit_min,
+      "state_machine() exposing SM content at {} behind the applied frontier {}",
+      self.sm_at.get(),
+      self.commit_min.get(),
+    );
     Some(&self.sm)
   }
 
@@ -3233,6 +3313,10 @@ impl<S, R> Endpoint<S, R> {
     self.log_view = View::with(view);
     self.op = OpNumber::with(op);
     self.commit_min = OpNumber::with(commit_min);
+    // Arbitrary-construction helper: keep the SM-content witness in lockstep with the forced applied
+    // frontier (the (5c) coupling a real apply path maintains) — the forced state models an endpoint
+    // whose SM has applied through `commit_min`.
+    self.sm_at = OpNumber::with(commit_min);
     let committed_frontier = repair
       .iter()
       .copied()

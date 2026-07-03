@@ -1942,6 +1942,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Both DAGs read back clean — install the session table now (the SM was already committed by
     // `restore` on success).
     self.clients = sessions;
+    self.note_sm_restored(checkpoint_op);
     // The SM now holds this checkpoint's content — clear any owed reconstruction (this install is either the
     // first for this point, where none was owed, or a strictly-newer one superseding an older M obligation
     // forward; either way no SM debt remains after a clean restore).
@@ -2097,6 +2098,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // Both DAGs read back clean — install the session table (the SM was committed by `restore`).
     self.clients = sessions;
+    self.note_sm_restored(checkpoint_op);
     // The SM now holds M's content. The obligation is met: clear it and run the success effects the
     // `install_sync` happy path runs (the WAL prune is the irreversible GC held for restore success).
     self.sm_reconstruct = None;

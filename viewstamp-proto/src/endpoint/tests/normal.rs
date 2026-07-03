@@ -970,6 +970,7 @@ fn a_quorum_checkpoint_report_advances_prune_floor_without_a_gc_trim_yet_the_car
   );
   e.op = OpNumber::with(depth as u64);
   e.commit_min = OpNumber::with(depth as u64);
+  e.sm_at = e.commit_min; // hand-built state: the SM is modelled as applied through commit_min
   e.commit_max = OpNumber::with(depth as u64);
   let body = bytes::Bytes::from(std::vec![0x5Au8; 8]);
   for op in 1..=depth as u64 {
@@ -1078,6 +1079,7 @@ fn a_backup_whose_checkpoint_lags_while_it_accepts_prepares_keeps_its_carrier_un
   let mut e = backup();
   e.op = OpNumber::with(depth as u64);
   e.commit_min = OpNumber::with(depth as u64);
+  e.sm_at = e.commit_min; // hand-built state: the SM is modelled as applied through commit_min
   e.commit_max = OpNumber::with(depth as u64);
   let body = bytes::Bytes::from(std::vec![0x5Au8; 8]);
   for op in 1..=depth as u64 {
