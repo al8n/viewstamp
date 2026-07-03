@@ -550,23 +550,36 @@ const LEARNER_STATUS_CADENCE: core::time::Duration = core::time::Duration::from_
 /// many windows) catches up via state-sync, not tail-gap, so a modest window suffices; sized at a few
 /// pipeline depths so steady-state catch-up never needs more than one window.
 const TAIL_GAP_WINDOW: u64 = 64;
-/// Recovery (`recover()`): the maximum number of WAL-tail slots ABOVE the durable committed frontier
-/// `recover()` will bookkeep + submit a read for in ONE pass — the size of the uncommitted-tail window
-/// it materializes above `commit_max` (the full committed band `(checkpoint_op .. commit_max]` is ALWAYS
-/// read; the cap bounds only the uncommitted tail above it). Bounds the synchronous work
-/// of constructing a `Recovering` replica: `recover()` inserts a dense-cache entry and submits one read
-/// per tail slot, so without a cap a corrupt/buggy `Wal` reporting a huge `op_head` (e.g. `u64::MAX` from
-/// bit-rot in the head slot) would force unbounded CPU / allocation / outgoing reads before the async
-/// fault-handling loop ever runs. The committed frontier (`state.commit()`) cannot be inflated this way —
-/// `VsrState` is checksum-validated and `commit_max` is at most the real committed frontier — so reading
-/// the full committed band is always bounded by genuine, quorum-bounded progress. A real uncommitted tail
-/// is the small un-checkpointed pipeline above the committed frontier (a handful to a few hundred ops), so
-/// this generous power-of-two bound never clips a legitimate recovery while capping a pathological head to a
-/// fixed budget. A head BEYOND the window means this replica cannot synchronously read its whole tail in
-/// one pass: the slots above `commit_max + RECOVER_TAIL_WINDOW` are left unread (recovered incrementally
-/// as the primary re-announces them, or — if the head slot itself is unreadable — via the
-/// `RecoveringHead`/peer head-fault path), never billions of reads.
-const RECOVER_TAIL_WINDOW: u64 = 8192;
+/// How many checkpoint intervals the PROTO-IMPOSED WAL ring spans for a backend with no fixed ring of
+/// its own ([`Wal::capacity`] `== u64::MAX`): [`effective_wal_capacity`] is then
+/// `IMPLIED_RING_INTERVALS * checkpoint_ops + MAX_PIPELINE`. Sized generously — TigerBeetle's journal
+/// spans about two checkpoint intervals plus its pipeline, so four intervals means even a checkpoint
+/// lagging a whole extra interval never stalls a healthy cluster — while staying FINITE, which is the
+/// property everything rests on: the ring is what bounds a bit-rotted `op_head` at recovery and what
+/// the op-assignment stall + the backup ring-window guard enforce at append time.
+const IMPLIED_RING_INTERVALS: u64 = 4;
+
+/// The WAL's EFFECTIVE ring capacity — the single source of the ring geometry every capacity-derived
+/// bound uses (the primary's op-assignment stall, the backup ring-window guard, and `recover()`'s tail
+/// read ceiling): the backend's own [`Wal::capacity`], with the "no fixed ring" sentinel (`u64::MAX`)
+/// replaced by a proto-imposed ring of [`IMPLIED_RING_INTERVALS`]` * checkpoint_ops + `[`MAX_PIPELINE`]
+/// slots. Imposing a finite ring on a ring-less backend is what makes the recovery geometry sound for
+/// EVERY backend: append-time enforcement guarantees `op_head <= checkpoint_op + effective` for honest
+/// operation, so recovery can cap a bit-rotted `op_head` scalar at that provable maximum instead of
+/// trusting it (reading to a corrupt `u64::MAX` head would hang/OOM at startup) — and, symmetrically,
+/// no op a conforming replica legitimately holds can ever sit above the recovery read ceiling, so the
+/// cap never clips a real tail. For a ring-less backend the imposed ring surfaces only as deliberate
+/// append backpressure when checkpointing stalls far behind — TigerBeetle's flow control, and strictly
+/// better than the unbounded WAL growth it replaces.
+const fn effective_wal_capacity(capacity: u64, checkpoint_ops: u64) -> u64 {
+  if capacity == u64::MAX {
+    checkpoint_ops
+      .saturating_mul(IMPLIED_RING_INTERVALS)
+      .saturating_add(MAX_PIPELINE)
+  } else {
+    capacity
+  }
+}
 /// Peer fault-repair BELOW-head window ([`Endpoint::request_repair_run`]): the maximum number of ops a
 /// single `RequestPrepareRange` solicits — the size of the contiguous below-head `Repairing`/missing
 /// band it requests per call. The sibling of [`TAIL_GAP_WINDOW`] for the below-head path: where
@@ -634,9 +647,18 @@ struct RecoverState {
   /// `recover_timeouts` re-submits ADDITIVELY (a fresh id without retiring the prior ones), so a late
   /// completion under any still-live id resolves the op; resolving an op retires ALL of its ids.
   reads: BTreeMap<u64, u64>,
-  /// Ops that read back permanently faulty/absent (retry budget exhausted). Drives the
-  /// `Normal`-vs-`RecoveringHead` decision in `recover_progress`.
+  /// Ops that read back permanently FAULTY — a written slot that is torn/bit-rotted/misdirected (a
+  /// definitive read fault or a retry-exhausted one). Drives the `Normal`-vs-`RecoveringHead` decision in
+  /// `recover_progress`: a faulty HEAD cannot be trusted → RecoveringHead. Distinct from `absent` (a slot
+  /// that was NEVER written), which is a phantom above the real head, not a fault.
   faulty: std::collections::BTreeSet<u64>,
+  /// Ops that read back ABSENT — the WAL has no slot there (never written). These are the phantom tail an
+  /// over-counted/bit-rotted `op_head` scalar reports above the highest slot the replica actually wrote.
+  /// `recover_progress` caps `self.op` at the highest WRITTEN op (present or faulty) and DISCARDS the
+  /// absents above it (a clean cap → Normal, never RecoveringHead — no committed op lives above the real
+  /// head); an absent BELOW the real head is a genuine interior hole and is reclassified faulty (repaired
+  /// on demand). Kept separate from `faulty` so a phantom tail never drives the head-fault decision.
+  absent: std::collections::BTreeSet<u64>,
   /// The in-flight checkpoint-read `OpId` (`Some` until the snapshot is restored), or `None` if no
   /// checkpoint exists / it is already restored.
   checkpoint: Option<u64>,
@@ -3682,6 +3704,12 @@ impl<S, R> Endpoint<S, R> {
     let id = self.next_op_id;
     self.next_op_id += 1;
     crate::OpId::new(id)
+  }
+
+  /// This WAL's [`effective_wal_capacity`] under this endpoint's checkpoint interval — see the free
+  /// function for the geometry contract.
+  fn effective_wal_capacity<W: Wal>(&self, wal: &W) -> u64 {
+    effective_wal_capacity(wal.capacity(), self.config.checkpoint_ops())
   }
 
   /// The status-transition chokepoint: assigns `self.status` and emits

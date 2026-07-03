@@ -172,9 +172,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// defers here, so every bare `Endpoint::recover(..)` call resolves unannotated.
   ///
   /// **Phase 1 (here, sync + infallible).** Reads only synchronous trait metadata — the superblock
-  /// root via `sb.state()` for `(view, log_view, checkpoint_op, checkpoint_id)` and `wal.op_head()` /
-  /// `wal.header(op)` — and constructs the endpoint with:
-  /// - `view = state.view()`, `log_view = state.log_view()`, `op = wal.op_head()`,
+  /// root via `sb.state()` for `(view, log_view, checkpoint_op, checkpoint_id)` and
+  /// `wal.header(op)` (the durable-header scan that derives the written extent) — and constructs the
+  /// endpoint with:
+  /// - `view = state.view()`, `log_view = state.log_view()`, `op` = the scanned written extent floored
+  ///   at the durable commit (never the `op_head()` scalar),
   ///   `checkpoint_op = state.checkpoint_op()`, `commit_min = checkpoint_op` (the restored SM already
   ///   reflects `[1..=checkpoint_op]`, so this prevents a double-apply), and `commit_max = state.commit()`
   ///   — the DURABLE known-committed frontier, `>= checkpoint_op` and possibly above it, so
@@ -265,46 +267,69 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       });
     };
     let nonce = Prng::new(seed).next_u64();
-    let head = wal.op_head().get();
     let checkpoint_op = state.checkpoint_op().get();
-    // The high end of the tail read window (the VERIFIED read frontier): the WAL head, but capped so a
-    // corrupt/buggy `op_head` cannot force unbounded reads (the cap rationale is on `RECOVER_TAIL_WINDOW`).
-    // The cap floor is the DURABLE committed frontier `state.commit()` (`>= checkpoint_op`), NOT
-    // `checkpoint_op` alone: `RECOVER_TAIL_WINDOW` must bound only the UNCOMMITTED tail
-    // above the committed band, never HIDE a committed op this replica HOLDS. `state.commit()` is the
-    // writer's `commit_max` — a DURABLE, checksum-validated (`VsrState`), quorum-bounded frontier; a
-    // corrupt superblock CANNOT inflate it (it would fail `VsrState` validation) and `commit_max` is at
-    // most the real committed frontier, so reading up to it never reads a bogus band. With the old
-    // `checkpoint_op + RECOVER_TAIL_WINDOW` floor, a durable root naming `commit_max` above that cap
-    // (reachable with `Config::with_checkpoint_ops > RECOVER_TAIL_WINDOW`: commit far past the last
-    // checkpoint, persist a durable-view root, crash) would cap `self.op` BELOW held committed ops — its
-    // DVC would then under-report `commit_max > self.op` with a short `log_slice`, tripping
-    // `select_canonical_log`'s `commit* > op_head` fail-stop (or a truncating adoption would DESTROY the
-    // hidden committed copies). The loop below materializes + reads exactly `(checkpoint_op .. hi]`, so
-    // `hi` is the highest op this `recover()` actually reads and verifies. When `commit_max > head` (a
-    // synced/truncated replica that does NOT hold the committed ops above its head) the `head.min(..)`
-    // still clamps `hi = head` — the band `(head, commit_max]` stays repair holes / peer-repaired,
-    // unchanged.
-    let committed_frontier = state.commit().get().max(checkpoint_op);
-    let hi = head.min(committed_frontier.saturating_add(RECOVER_TAIL_WINDOW));
-    // The recovered head is the VERIFIED read FRONTIER `hi`, never BELOW the durable checkpoint — NOT
-    // the RAW `head` (safety). A STATE-SYNCED replica holds no WAL at or below the synced
-    // checkpoint (it pruned the WAL there and never appended the tail), so its `wal.op_head()` can be
-    // below `checkpoint_op`; the SM snapshot owns `[1..=checkpoint_op]`, so the recovered head must be
-    // at least `checkpoint_op` to preserve `op >= commit_max >= commit_min == checkpoint_op`. The cache
-    // below covers only the OFFSET tail `(checkpoint_op .. hi]` — for a synced replica that range is
-    // empty; the prefix `[1..=checkpoint_op]` lives in the restored SM snapshot.
+    // The recovery head is DERIVED by scanning the WAL's durable headers — TigerBeetle's
+    // `op = journal.op_maximum()` — never trusted from the `op_head()` scalar, which bit-rot can turn
+    // in EITHER direction: inflated (a phantom tail that would force unbounded work) or under-reporting
+    // (hiding written committed slots — including a client-acked op in the band above the durable
+    // `state.commit()`, which lags live `commit_max` between checkpoints and so witnesses nothing
+    // there). The ring itself is the witness: `Wal::header(op)` is `Some` exactly for a completed
+    // append (headers are durable independently of bodies — the trait-level header-durability
+    // contract), so the highest placement-valid header in `(checkpoint_op .. checkpoint_op + effective]`
+    // IS the written extent. The scan is synchronous, header-index-backed, and bounded by the EFFECTIVE
+    // ring (`effective_wal_capacity` — the backend's own ring, or the proto-imposed ring for a ring-less
+    // backend): the maximum extent a conforming append can reach above the checkpoint, enforced at
+    // append time by the on_request mint stall + the ring-window backup guard. Scanning DOWN from the
+    // ring top, the first hit is the head (the probes above it are the price of deriving instead of
+    // trusting). The scan checks OCCUPANCY only — `header(probe).is_some()`, which the trait keys by op
+    // (`Some` exactly for a completed append; `None` for never-written / pruned / ring-wrapped) — and
+    // deliberately neither placement nor the header checksum: its question is written-ness, and bit-rot
+    // does not un-append a slot, so a slot whose stored header content rotted (its `op` field included)
+    // still bounds the window rather than being silently skipped below a held — possibly client-acked —
+    // tail op. Every occupied slot's read then classifies the CONTENT: placement + `Header::verify` on
+    // the completion, `verify_header` + the canonical-root fallback at the exhaustion resolver, and the
+    // faulty-head machinery for what cannot be identified. Skipping is the loss direction;
+    // over-inclusion only ever adds reads that resolve conservatively. Body reads are submitted only
+    // for the REAL extent — a corrupt-inflated scalar no longer causes a phantom read storm; it causes
+    // nothing at all.
     //
-    // Why `hi`, not `head`: if `head > hi` (a pathological / bit-rotted head far above the window), the
-    // ops in `(hi, head]` were NEVER read/verified/cached here. Setting `self.op = head` would "hold"
-    // them per the head, so `on_prepare`'s `pop <= self.op` branch would BLIND-RE-ACK them WITHOUT
-    // consulting `self.log` — voting for ops this replica never durably appended (breaking
-    // append-before-ack, risking a committed-op loss if the primary counted that false ack and then
-    // died). Capping `self.op` at the read frontier means an op above it is NOT held: a later `Prepare`
-    // for it takes the `pop == self.op + 1` APPEND branch (the primary re-sends; idempotent), durably
-    // appending before any ack — correct. So: head below checkpoint → op = checkpoint; checkpoint <=
-    // head <= frontier → op = head (unchanged, the legitimate small-tail case); head > frontier → op =
-    // frontier (capped — the deep tail recovers incrementally as the primary re-announces it).
+    // The window is additionally FLOORED at the top of the durable root's CANONICAL COMMITTED BAND
+    // (`committed_headers_slice()`, op-ascending — the checksummed record of exactly the committed-band
+    // ops this writer HELD): a held committed slot whose WAL HEADER also rotted is invisible to the
+    // scan, but the band still vouches it, so the floor forces its read, which resolves through the
+    // root's identity into a committed repair hole, peer-repaired on demand. The floor is the band's
+    // EVIDENCE, deliberately NOT the raw `state.commit()` scalar: a corrupt in-model peer `commit` can
+    // be adopted into live `commit_max` and then SEALED into a durable root, and a raw-scalar floor
+    // would turn that poison into an unbounded dense read at every restart — whereas the band stops at
+    // ops the writer genuinely held (it is size-validated, and a poisoned scalar mints no headers), so
+    // the floor extends the window only by evidence-backed progress. Ops the root records as committed
+    // but NOT held (no band entry — commit knowledge without the ops, the laggard shape) have nothing
+    // local to read; they stay covered by `commit_max = state.commit()` and the Normal-path tail-gap /
+    // repair solicitation, exactly as a synced/truncated replica's above-head band is. The floor never
+    // inflates the SETTLED head: a floored slot genuinely gone reads back ABSENT and the settle
+    // collapses `self.op` to the highest written op.
+    //
+    // The loop reads `(checkpoint_op .. hi]` in a SINGLE pass. `self.op` is PROVISIONAL here (the read
+    // frontier); `recover_progress` re-derives it as the highest present-or-faulty op once the reads
+    // resolve. Capping `self.op` at a verified op (never a phantom above the real head) preserves
+    // append-before-ack: a later `Prepare` for a not-held op takes the append branch (the primary
+    // re-sends; idempotent) rather than a blind re-ack.
+    let ring_top = checkpoint_op.saturating_add(effective_wal_capacity(
+      wal.capacity(),
+      config.checkpoint_ops(),
+    ));
+    let scan_head = (checkpoint_op.saturating_add(1)..=ring_top)
+      .rev()
+      .find(|&probe| wal.header(OpNumber::with(probe)).is_some())
+      .unwrap_or(checkpoint_op);
+    let canonical_top = state
+      .committed_headers_slice()
+      .last()
+      .map(|h| h.op().get())
+      .unwrap_or(checkpoint_op);
+    let hi = scan_head.max(canonical_top);
+    // Never below the durable checkpoint (the SM snapshot owns `[1..=checkpoint_op]`, so the recovered
+    // head must be at least `checkpoint_op` to preserve `op >= commit_max >= commit_min == checkpoint_op`).
     let op = hi.max(checkpoint_op);
 
     // `local_slot` is this node's slot in the EFFECTIVE membership, resolved by its stable `MemberId`
@@ -468,48 +493,53 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         .canonical
         .insert(h.op().get(), (h.client(), h.request(), h.body_checksum()));
     }
-    // Bound the per-recover read-submission window: a corrupt/buggy `Wal` reporting a huge
-    // `op_head` must not force unbounded bookkeeping + reads here. SATURATING `checkpoint_op + 1`
-    // (never overflow), with the high end `hi` (computed above) capped at `committed_frontier +
-    // RECOVER_TAIL_WINDOW` and at `head` — at most `RECOVER_TAIL_WINDOW` slots ABOVE the durable
-    // committed frontier are materialized per pass (the cap bounds the uncommitted tail,
-    // never the committed band, which is read in full up to the validated `commit_max`). A legitimate
-    // uncommitted tail (the small un-checkpointed pipeline above the committed frontier) is far below the
-    // cap; a pathological head is clipped (its deep tail is recovered incrementally / via the head-fault
-    // path), never billions of reads. `self.op` was set to `hi.max(checkpoint_op)` above, so the window
-    // this loop reads and the held head agree EXACTLY (no held op above the verified frontier).
+    // Read the whole tail window `(checkpoint_op .. hi]` in a SINGLE pass — `hi` is the scanned written
+    // extent floored at the durable commit (see the window derivation above), so a conforming backend's
+    // held tail is fully covered for any checkpoint interval with body reads proportional to the REAL
+    // extent. `recover_progress` re-derives `self.op` as the highest VERIFIED op once the reads resolve.
     let lo = checkpoint_op.saturating_add(1);
-    for op in lo..=hi {
-      if let Some(h) = wal.header(OpNumber::with(op)) {
-        // A Phase-1 header-only PLACEHOLDER: the body is filled in by the WAL-tail read completion
-        // (`on_recover_wal_done`). Kept as a `Present(empty)` body — NOT a `Body::Repairing` hole — so
-        // behavior is exactly as before this task; a recovering replica does not apply ops, so the empty
-        // placeholder is never read by the commit path (it is filled, or dropped + peer-repaired, first).
-        endpoint
-          .log
-          .insert(op, LogEntry::present(h.client(), h.request(), Bytes::new()));
-      }
-      // Submit a read for EVERY tail op (even one whose header is absent/faulty now): the read is
-      // the authoritative resolution, and a `Fault`/`Absent` completion routes through the retry
-      // path. Each read gets a minted OpId (never aliases a future real op — next_op_id grows).
-      let id = endpoint.mint_op_id();
-      wal.submit_read(id, OpNumber::with(op));
-      rec.reads.insert(id.get(), op);
-      rec.pending.insert(op, RECOVER_READ_RETRIES);
-    }
+    endpoint.recover = Some(rec);
+    endpoint.submit_recover_tail_batch(wal, lo, hi);
     if checkpoint_op > 0 {
       let id = endpoint.mint_op_id();
       sb.submit_read_checkpoint(id);
-      rec.checkpoint = Some(id.get());
-      rec.checkpoint_retries = RECOVER_READ_RETRIES;
+      if let Some(rec) = endpoint.recover.as_mut() {
+        rec.checkpoint = Some(id.get());
+        rec.checkpoint_retries = RECOVER_READ_RETRIES;
+      }
     }
-    endpoint.recover = Some(rec);
-    // Settle the transition decider once: an EMPTY WAL with no checkpoint (head == 0) has nothing to
-    // read, so it must reach Normal here (no completion would ever arrive to drive the loop).
+    // Settle the transition decider once: an EMPTY WAL with no checkpoint (the scan found no written
+    // slot) has nothing to read, so it must reach Normal here (no completion would ever arrive to drive
+    // the loop).
     // Otherwise this arms the recover_retry timer so an owner driving `poll_timeout`/`handle_timeout`
     // re-submits any read whose completion is dropped or whose transient fault clears on a later read.
     endpoint.recover_progress(Instant::ZERO, sb, blocks);
     Recovered::Active(endpoint)
+  }
+
+  /// Submit tail-body reads for the whole window `(lo ..= hi]`: materialize a Phase-1 header-only
+  /// placeholder where the WAL already holds the durable header, and submit an authoritative read for EVERY
+  /// slot (even one whose header is absent/faulty now — the read is the authoritative resolution, and a
+  /// `Fault`/`Absent` completion routes through the retry/verdict path). Each read gets a freshly minted
+  /// `OpId` (never aliases a future real op — `next_op_id` grows).
+  fn submit_recover_tail_batch<W: Wal>(&mut self, wal: &mut W, lo: u64, hi: u64) {
+    for op in lo..=hi {
+      if let Some(h) = wal.header(OpNumber::with(op)) {
+        // A Phase-1 header-only PLACEHOLDER: the body is filled in by the read completion
+        // (`on_recover_wal_done`). Kept as a `Present(empty)` body — NOT a `Body::Repairing` hole — a
+        // recovering replica does not apply ops, so the empty placeholder is never read by the commit
+        // path (it is filled, or dropped + peer-repaired, first).
+        self
+          .log
+          .insert(op, LogEntry::present(h.client(), h.request(), Bytes::new()));
+      }
+      let id = self.mint_op_id();
+      wal.submit_read(id, OpNumber::with(op));
+      if let Some(rec) = self.recover.as_mut() {
+        rec.reads.insert(id.get(), op);
+        rec.pending.insert(op, RECOVER_READ_RETRIES);
+      }
+    }
   }
 
   /// Handles a WAL completion while `Recovering`/`RecoveringHead` (Phase 2 of `recover`). Adopts a
@@ -536,10 +566,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       WalDone::BodyFaulty(bf) => bf.id(),
       WalDone::Appended(_) => return,
     };
-    // `wal` is part of the uniform recover-completion signature (the `handle_storage` call site passes
-    // it the same way to every `on_recover_*` handler), but a completion now carries its own outcome —
-    // the Fault arm no longer re-submits here (`recover_timeouts` owns retry/resolve), so no read is
-    // submitted from this handler.
+    // `wal` is part of the uniform recover-completion signature (`handle_storage` passes it the same way to
+    // every `on_recover_*` handler), but a completion carries its own outcome and this handler submits no
+    // read — `recover_timeouts` owns retry/resolve.
     let _ = &mut *wal;
     // Capture the durable known-committed frontier + log_view BEFORE borrowing `rec` (the above-band
     // view check reads them, and `rec` mutably borrows `self.recover`). Both are
@@ -588,6 +617,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       KeepRepairing(ClientId, RequestNumber, u128),
       StaleCommitted,
       Fault,
+      // The WAL has NO slot for this op (never written). DEFINITIVE (a re-read stays absent), so it is
+      // resolved immediately (never retried) into `rec.absent` — a slot the read window covered (the
+      // durable-commit floor, or a scan/read inconsistency) that was never appended, resolved by
+      // `recover_progress` (cap the head / reclassify an interior hole), NOT a retryable fault.
+      Absent,
     }
     let outcome = match &done {
       // Adopt only a body that BOTH verifies (header + body checksums) AND lands on the op we asked
@@ -626,16 +660,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           SlotVerdict::Verified => Outcome::Verified(h.client(), h.request(), r.body_bytes()),
         }
       }
-      // A durable-header read whose BODY is faulty (torn/rotted/absent): we HAVE the self-verified
-      // header for `op`, so run the SAME `classify_committed_slot` verdict a clean read runs — only the
-      // body verdict differs (we lack the bytes). The placement check is the header's own op: a
-      // BodyFaulty whose `header().op()` is NOT `op` is a misdirected-read sibling — not a trustworthy
-      // read of THIS op — so it falls to `Fault` (the catch-all below) and retries.
+      // A durable-header read whose BODY is faulty (torn/rotted/absent): the header must first prove
+      // ITSELF (`verify_header` — the backend may return it as stored, and a bit-rotted header with a
+      // surviving `op` field is no identity witness) and land on the op we asked for; then run the SAME
+      // `classify_committed_slot` verdict a clean read runs — only the body verdict differs (we lack
+      // the bytes). A BodyFaulty that fails either gate — a misdirected-read sibling, or a
+      // checksum-failing header — falls to `Fault` (the catch-all below) and retries, exactly like a
+      // ReadOk that fails `verify`: a transient rot may clear on a re-read, and on exhaustion the
+      // resolver (`inflight_tail_repairing_identity`, the ONE owner of the definitive no-body verdict)
+      // applies the same `verify_header` gate with the canonical-root fallback.
       //   * Verified → KEEP the op header-only as `Body::Repairing` (existence preserved, body
       //     peer-repaired) rather than drop it — so a later view change can never re-mint its number.
       //   * StaleCommitted → drop + peer-repair the canonical body (a superseded/stale slot must NOT be
       //     resurrected as `Repairing`), exactly as a stale ReadOk is dropped.
-      WalDone::BodyFaulty(bf) if bf.header().op() == OpNumber::with(op) => {
+      WalDone::BodyFaulty(bf)
+        if bf.header().op() == OpNumber::with(op) && bf.header().verify_header() =>
+      {
         let h = bf.header();
         match classify_committed_slot(
           (h.client(), h.request(), h.body_checksum()),
@@ -651,7 +691,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           }
         }
       }
-      _ => Outcome::Fault, // Absent, Fault, misdirected, OR a ReadOk that fails verify (torn/bit-rot).
+      // A slot the WAL does not have: DEFINITIVE (no retry). If the durable ROOT's canonical committed
+      // band vouches the op (`rec.canonical` — the writer HELD it committed), the slot rotted away
+      // rather than never existing: keep it header-only as `Body::Repairing` from the root's identity,
+      // exactly as the header-absent exhaustion resolver does (`inflight_tail_repairing_identity`'s
+      // canonical fallback) — a backend may report the rotted slot as `Absent` instead of faulting, and
+      // the verdict must not depend on which of the two no-slot answers it gives. Otherwise a genuinely
+      // never-written phantom → `rec.absent` — distinct from a Fault (a written-but-corrupt slot that
+      // IS retried and drives `RecoveringHead` if it is the head).
+      WalDone::Absent(_) => match rec.canonical.get(&op).copied() {
+        Some((client, request, body_checksum)) => {
+          Outcome::KeepRepairing(client, request, body_checksum)
+        }
+        None => Outcome::Absent,
+      },
+      _ => Outcome::Fault, // Fault, misdirected, OR a ReadOk that fails verify (torn/bit-rot).
     };
     match outcome {
       Outcome::Verified(client, request, body) => {
@@ -723,16 +777,39 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // late completion arrives under).
         rec.reads.remove(&id.get());
       }
+      Outcome::Absent => {
+        // The WAL has NO slot here (never written). DEFINITIVE — a re-read stays absent — so resolve it
+        // immediately into `rec.absent` (never retry) and retire ALL of the op's reads. Drop any Phase-1
+        // placeholder (an absent slot has no durable header, so normally there is none; defensive). This is
+        // the phantom an over-counted / bit-rotted `op_head` reports above the highest slot actually
+        // written; `recover_progress` caps `self.op` at the real head and discards the phantom (or, for an
+        // op BELOW the real head, reclassifies it a faulty interior hole).
+        rec.reads.retain(|_, &mut o| o != op);
+        rec.pending.remove(&op);
+        rec.faulty.remove(&op);
+        rec.absent.insert(op);
+        self.log.remove(&op);
+      }
     }
     self.recover_progress(now, sb, blocks);
   }
 
-  /// The placement + `classify_committed_slot` verdict for resolving an in-flight tail op from its
-  /// DURABLE header alone (no body): `Some(client, request, body_checksum)` when the durable header is
-  /// placement-valid (`header().op() == op`) AND classifies `Verified` — keep it header-only as a
-  /// `Body::Repairing` hole; `None` otherwise. The SINGLE source of the verdict the Fault
-  /// retry-exhaustion path (`resolve_exhausted_tail_read`) and the peer-checkpoint completion
-  /// (`on_recover_sync_checkpoint`) both apply, so they cannot drift.
+  /// The identity verdict for resolving an in-flight tail op WITHOUT its body, from either durable
+  /// witness: `Some(client, request, body_checksum)` — keep the op header-only as a `Body::Repairing`
+  /// hole — when EITHER the WAL's durable header is SELF-CONSISTENT (`verify_header()` — a rotted
+  /// header is no witness), placement-valid (`header().op() == op`), and classifies `Verified`, OR the
+  /// WAL holds no usable header for the op (absent, or failing its own checksum) but the durable ROOT's
+  /// canonical committed band does (`rec.canonical`, seeded from the checksummed `VsrState`): a
+  /// root-vouched committed op whose WAL slot rotted entirely still has its existence + full identity
+  /// witnessed by the root, so it becomes a committed repair hole (peer-repaired on demand) rather than
+  /// `rec.faulty` — which, at the head, would drive `RecoveringHead` and wedge an all-restart quorum's
+  /// reformation (the reform gate refuses while a committed faulty slot remains) even though the root
+  /// carries everything needed to repair. A header that IS present but placement-invalid or
+  /// non-`Verified` (a stale/superseded slot) still resolves `None` → faulty (the pinned
+  /// drop-and-peer-repair semantics — the fallback never launders a stale slot through the root's
+  /// identity). `None` otherwise. The SINGLE source of the verdict the Fault retry-exhaustion path
+  /// (`resolve_exhausted_tail_read`) and the peer-checkpoint completion (`on_recover_sync_checkpoint`)
+  /// both apply, so they cannot drift.
   fn inflight_tail_repairing_identity<W: Wal>(
     &self,
     wal: &W,
@@ -742,8 +819,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       .recover
       .as_ref()
       .and_then(|r| r.canonical.get(&op).copied());
-    wal
-      .header(OpNumber::with(op))
+    let Some(h) = wal.header(OpNumber::with(op)) else {
+      // No WAL header at all (the slot — header included — rotted away, or was never written): the
+      // durable ROOT is the remaining witness. `rec.canonical` has entries only for committed-band ops
+      // the writer HELD, so an uncommitted / never-held op still resolves `None` → faulty.
+      return canonical;
+    };
+    if !h.verify_header() {
+      // A header that fails its OWN checksum is no witness — bit-rot with a surviving `op` field must
+      // not smuggle a corrupted `(client, request, body_checksum)` into a `Repairing` identity (peer
+      // repair validates all three fields, so a garbage identity is an unfillable hole), nor drive the
+      // classify-mismatch → faulty → `RecoveringHead` lane for an op the ROOT can still vouch.
+      // Equivalent to the slot having no header: the root is the remaining witness.
+      return canonical;
+    }
+    Some(h)
       // PLACEMENT: the durable header must be FOR `op`. `Wal::header` returns the header at `op`'s slot,
       // which a misdirected write can leave holding a SIBLING op's header — not a trustworthy read of
       // THIS op. Guard it exactly as the ReadOk/BodyFaulty arms do via `header().op() == op`.
@@ -764,15 +854,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       .map(|h| (h.client(), h.request(), h.body_checksum()))
   }
 
-  /// Resolve a tail op whose ABSOLUTE read budget is exhausted, from its durable header. Any op EXCEPT a
-  /// non-committed HEAD whose durable header classifies `Verified` is KEPT header-only as `Body::Repairing`
-  /// (existence + identity preserved so a later view change cannot re-mint its op number); a
-  /// StaleCommitted/superseded slot, a slot with no durable header, and the non-committed HEAD
-  /// (`op == self.op` above `commit_max`, which must stay faulty to drive `RecoveringHead`) are routed to
-  /// `rec.faulty` (a peer-repaired hole). This is the STORAGE-path resolution `recover_timeouts` invokes on
-  /// budget exhaustion; it now MATCHES the always-Normal-bound message path (`on_recover_sync_checkpoint`),
-  /// which shares the VERDICT (`inflight_tail_repairing_identity`) and also keeps a Verified non-head
-  /// uncommitted op header-only — the two no longer drift.
+  /// Resolve a tail op whose ABSOLUTE read budget is exhausted, from its durable header. Any op whose
+  /// durable header classifies `Verified` is KEPT header-only as `Body::Repairing` (existence + identity
+  /// preserved so a later view change cannot re-mint its op number); a StaleCommitted/superseded slot or a
+  /// slot with no durable header is routed to `rec.faulty` (a peer-repaired hole). This is the STORAGE-path
+  /// resolution `recover_timeouts` invokes on budget exhaustion; it shares the VERDICT
+  /// (`inflight_tail_repairing_identity`) with the always-Normal-bound message path
+  /// (`on_recover_sync_checkpoint`), so the two do not drift.
+  ///
+  /// This does NOT itself decide the non-committed-faulty-HEAD case (route the head to `RecoveringHead`):
+  /// under batched reads `self.op` here is only the PROVISIONAL batch frontier, so a boundary op with
+  /// written ops in later batches is INTERIOR, not the head. `recover_progress` makes that call once the
+  /// VERIFIED head is known — a `Repairing` head above `commit_max` is promoted to `rec.faulty` there.
   ///
   /// Keeping a NON-HEAD op ABOVE `commit_max` (an acked, cluster-committed op whose commit knowledge was
   /// not yet durable — the storage-fault committed-loss shape) is what makes the nack-truncation counting
@@ -782,9 +875,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// on the new primary — so keeping it here never wedges. (Dropping it to `rec.faulty` would instead let its
   /// number be silently re-minted, the committed loss this closes.)
   fn resolve_exhausted_tail_read<W: Wal>(&mut self, wal: &W, op: u64) {
-    let keep = (op != self.op.get() || op <= self.commit_max.get())
-      .then(|| self.inflight_tail_repairing_identity(wal, op))
-      .flatten();
+    let keep = self.inflight_tail_repairing_identity(wal, op);
     if let Some(rec) = self.recover.as_mut() {
       rec.pending.remove(&op);
       rec.reads.retain(|_, &mut o| o != op); // drop ALL of op's in-flight ids
@@ -1180,6 +1271,46 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
+  /// Settle the VERIFIED recovery head — TigerBeetle's `op = journal.op_maximum()` (the highest slot the
+  /// WAL actually WROTE), replacing the PROVISIONAL read-window `self.op`. A slot counts as written if it
+  /// is present in `self.log` (a verified / `Repairing` body) or in `rec.faulty` (a written-but-corrupt
+  /// slot). Every op that read ABSENT is a never-written phantom the reported / bit-rotted `op_head`
+  /// over-counts: cap `self.op` at the real head (floored at the durable checkpoint) and DISCARD the
+  /// phantom absents above it — no committed op lives above the highest written slot, so this is a clean
+  /// cap, never `RecoveringHead` for a mere over-count. An absent BELOW the real head is a genuine
+  /// interior hole (a written region straddling it), so reclassify it faulty and let `advance_commit`
+  /// peer-repair it on demand. Returns the settled head, or `None` when recovery is already retired.
+  ///
+  /// This is the SINGLE settle choke: EVERY path that leaves the recovery read phase runs it —
+  /// `recover_progress` (the completion/timeout drains, which then also decide `RecoveringHead`) and the
+  /// peer-checkpoint escape (`on_recover_sync_checkpoint`, which abandons local recovery for
+  /// `apply_sync`) — so no exit can carry a provisional, unverified head into `Normal`/`ViewChange`
+  /// (an unheld head would be blind-re-acked on a later `Prepare` and advertised in a `DoViewChange`).
+  fn settle_recover_verified_head(&mut self) -> Option<u64> {
+    let cp = self.checkpoint_op.get();
+    let present_head = self.log.keys().next_back().copied().unwrap_or(0);
+    let rec = self.recover.as_mut()?;
+    let faulty_head = rec.faulty.iter().next_back().copied().unwrap_or(0);
+    let real_head = present_head.max(faulty_head).max(cp);
+    let interior: std::vec::Vec<u64> = rec
+      .absent
+      .iter()
+      .copied()
+      .filter(|&op| op <= real_head)
+      .collect();
+    for op in interior {
+      rec.faulty.insert(op);
+    }
+    rec.absent.clear();
+    if real_head < self.op.get() {
+      self.op = OpNumber::with(real_head);
+      // No `self.log` entry lives above the highest present op by construction; retain defensively so a
+      // stray placeholder above the capped head can never be applied / carried.
+      self.log.retain(|&op, _| op <= real_head);
+    }
+    Some(real_head)
+  }
+
   /// The recovery transition decider (Phase 2), called after every recovery read completion. Stays
   /// `Recovering` while any tail read or the checkpoint read is still outstanding; once all reads are
   /// satisfied it transitions to `Normal` (tail consistent / non-head holes peer-repaired) or
@@ -1207,6 +1338,38 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if !rec.pending.is_empty() {
       self.arm_timers(now);
       return;
+    }
+    // Reads settled → settle the VERIFIED head through the shared choke.
+    let Some(real_head) = self.settle_recover_verified_head() else {
+      return;
+    };
+    // Deferred non-committed-faulty-HEAD decision. `resolve_exhausted_tail_read` keeps EVERY placement-valid
+    // durable header as `Repairing` — it cannot decide head-vs-interior itself, since while reads are in
+    // flight `self.op` is only the PROVISIONAL read-window top (an op at the momentary frontier with written
+    // ops above it is INTERIOR, not the head). Now that the VERIFIED head is known: a head kept header-only
+    // as `Repairing` (its body permanently unreadable) that sits ABOVE the durable `commit_max` is an
+    // un-truthed head this replica must NOT hold — route it to `rec.faulty` (the head-fault check below
+    // drives `RecoveringHead`, soliciting the canonical head from a peer) AND make it NOT HELD: remove its
+    // `Repairing` entry from `self.log`. The removal is load-bearing: `drop_faulty_committed_slots`
+    // deliberately KEEPS `Repairing` entries (they are committed body-repairs), so without this the head
+    // would survive as an ordinary log entry and a later reformation (which clears `recover` before
+    // ViewChange) would carry it into a DoViewChange/StartView — advertising an uncommitted head this
+    // replica cannot vouch. A `Repairing` head at/below `commit_max` is a committed body-repair (kept); a
+    // NON-head `Repairing` op above `commit_max` also stays kept — the storage-fault preservation (it does
+    // not nack, so a committed op is never truncated). This promotion is recover_progress-only: the
+    // peer-checkpoint escape (`on_recover_sync_checkpoint`) runs the settle choke but keeps a `Repairing`
+    // head held — it vouches the durable header (existence, not body) and lets the online repair/nack
+    // machinery resolve it, the established semantics of that path.
+    let promote_faulty_head = real_head > self.commit_max.get()
+      && matches!(
+        self.log.get(&real_head).map(|e| &e.body),
+        Some(Body::Repairing(_))
+      );
+    if promote_faulty_head {
+      self.log.remove(&real_head);
+      if let Some(rec) = self.recover.as_mut() {
+        rec.faulty.insert(real_head);
+      }
     }
     // Tail verification is settled (no tail read in flight) → `rec.faulty` is FINAL. Drop every faulty
     // committed-band slot's empty placeholder NOW, BEFORE the checkpoint/peer continuation early-return
@@ -1511,12 +1674,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // Re-arm so we keep retrying until the loop completes.
     self.timers.recover_retry = Some(now + RECOVER_READ_RETRANSMIT);
-    // Drive the transition decider: a budget-exhaustion resolution above
-    // (`resolve_exhausted_tail_read`) removed the op from `rec.pending` WITHOUT producing a WAL
-    // completion, so unlike a clean read it does NOT route through `on_recover_wal_done` →
-    // `recover_progress`. Without this call, exhausting the LAST pending op's budget here would leave
-    // recovery stuck `Recovering` forever (nothing else re-evaluates the transition). Idempotent: it
-    // re-arms and returns while any read is still pending, and finalizes only once `rec.pending` empties.
+    // A budget-exhaustion resolution above (`resolve_exhausted_tail_read`) removes the op from
+    // `rec.pending` WITHOUT producing a WAL completion, so — unlike a clean read — it does NOT route
+    // through `on_recover_wal_done` → `recover_progress`. Without this call, exhausting the LAST pending
+    // op's budget here would leave recovery stuck `Recovering` forever (nothing else re-evaluates the
+    // transition). Idempotent: it re-arms and returns while any read is still pending, and finalizes only
+    // once `rec.pending` empties.
     self.recover_progress(now, sb, blocks);
   }
 
@@ -1760,6 +1923,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // uncommitted hole is just removed, never advertised).
     let durable_commit = self.commit_max.get();
     let synced_checkpoint = m.checkpoint_op().get();
+    // Whether the local tail-read pass is UNSETTLED at this reply — reads still in flight (the head is the
+    // PROVISIONAL read-window top) or absent verdicts not yet consumed by a settle. Captured BEFORE the
+    // resolution loop below empties `pending`; gates the settle choke after it. The read-FREE lanes that
+    // also route through here (the cross-epoch crossing fetch and the install-error re-pull arm a fresh
+    // `RecoverState` with no reads) must NOT be settled against: there `self.op` is the node's LIVE head,
+    // whose committed on-demand repair holes legitimately have no `self.log` entry, so a settle would
+    // wrongly cap `op` below the applied frontier.
+    let tail_unsettled = self
+      .recover
+      .as_ref()
+      .is_some_and(|rec| !rec.pending.is_empty() || !rec.absent.is_empty());
     let pending_tail: std::vec::Vec<u64> = self
       .recover
       .as_ref()
@@ -1803,6 +1977,26 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           self.log.remove(&op);
         }
       }
+    }
+    // Settle the VERIFIED head through the shared choke BEFORE abandoning local recovery, so this exit
+    // upholds the recovery exit invariant LOCALLY: no path leaves the read phase with `self.op` still the
+    // PROVISIONAL read-window top (which, under an over-counted / bit-rotted `op_head`, includes a phantom
+    // suffix this replica never wrote — an unheld head a later `Prepare` would blind-re-ack and a DVC
+    // would falsely advertise). On today's schedules this is a defensive no-op — every path that arms
+    // `awaiting_peer_checkpoint` (the ingress gate for this reply) is already settled-or-read-free: the
+    // own-checkpoint exhaustion shares its retry budget cadence with the tail reads, so `recover_timeouts`
+    // resolves the last pending op and runs `recover_progress`'s settle in the SAME call that escalates;
+    // the cross-epoch fetch and the install-error re-pull arm a fresh READ-FREE `RecoverState`. But that
+    // is a global argument spanning the budget cadence, `recover_timeouts`'s internal order, and the
+    // ingress gate — this call makes the invariant hold by construction instead, so a future escalation
+    // lane or budget change cannot silently reopen it. Gated on `tail_unsettled`: only a reply landing
+    // mid-read-pass needs settling (the just-resolved in-flight ops are then already in `self.log` as
+    // `Repairing` or in `rec.faulty`, so the settle sees the full written tail); the read-free lanes are
+    // excluded (see `tail_unsettled`). Unlike `recover_progress`, a `Repairing` real head is NOT
+    // re-classified here (no `RecoveringHead` on this path): the durable header is vouched header-only
+    // and the online repair/nack machinery resolves it.
+    if tail_unsettled {
+      self.settle_recover_verified_head();
     }
     // CENTRALIZED committed-band drop via the `finalize_recovery` choke: before we abandon local recovery
     // (`recover = None` discards `rec.faulty`) and `apply_sync` (whose held-tail retain KEEPS `self.log`

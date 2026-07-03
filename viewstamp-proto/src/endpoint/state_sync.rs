@@ -260,11 +260,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     cluster_checkpoint: OpNumber,
   ) -> bool {
     // Only the head-extend append can overwrite a ring slot; the caller invokes this for `pop ==
-    // self.op + 1`. Appending `pop` reuses slot `pop mod capacity` (last held by `pop - capacity`); it is
-    // an UN-pruned overwrite iff `pop - self.checkpoint_op > capacity`. Unbounded ⇒ never.
-    let capacity = wal.capacity();
+    // self.op + 1`. Appending `pop` reuses slot `pop mod capacity` (last held by `pop - capacity`); it
+    // is an UN-pruned overwrite iff `pop - self.checkpoint_op > capacity`. The EFFECTIVE ring
+    // (`effective_wal_capacity` — the backend's own, or the proto-imposed ring for a ring-less backend):
+    // enforcing it here is the backup half of the `op_head <= checkpoint_op + effective` geometry that
+    // `recover()`'s read ceiling leans on.
+    let capacity = self.effective_wal_capacity(wal);
     if pop.saturating_sub(self.checkpoint_op.get()) <= capacity {
-      return false; // fits the ring (or unbounded) — append normally.
+      return false; // fits the ring — append normally.
     }
     // We have fallen below the ring window: appending `pop` would wrap away the un-pruned op `pop -
     // capacity`. DROP the prepare (do not overwrite a needed slot). Additionally, if the cluster

@@ -2418,6 +2418,974 @@ fn recover_keeps_a_locally_held_committed_op_above_a_lower_headerless_hole() {
 }
 
 #[test]
+fn recover_reads_the_deep_tail_when_a_mid_tail_read_resolves_only_via_timeout() {
+  // A deep held committed tail must be fully read even when one of its slots resolves ONLY through the
+  // TIMEOUT path — a dropped/faulty read that exhausts its retry budget in `recover_timeouts`
+  // (`resolve_exhausted_tail_read`) rather than a clean `on_recover_wal_done` completion. The single-pass
+  // read window submits the whole `(checkpoint_op .. hi]` at once, so a slot stuck on the timeout path is
+  // kept header-only as `Repairing` and never clips the ops above it. Here a mid-tail op faults on EVERY
+  // read (resolving only via exhaustion); recovery still settles at the verified tail K.
+  let k = RECOVER_TAIL_WINDOW + 2;
+  let top = RECOVER_TAIL_WINDOW; // a mid-tail op forced onto the timeout drain path
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let headers: std::vec::Vec<Header> = (1..=k).map(mk).collect();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(k),
+    OpNumber::new(),
+    0,
+    headers,
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(k);
+  // The first-batch top op faults on every read → its ONLY resolution is budget exhaustion in the
+  // timeout path (never a clean `on_recover_wal_done`), so the batch drains WITHOUT that op's completion.
+  wal.script_read_fault(OpNumber::with(top), u8::MAX);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  assert_eq!(r.status(), Status::Recovering);
+  // Drive storage drains + the recover-retry timer past the per-op budget: the faulty top op exhausts and
+  // the continuation (from the timeout path) extends to the second batch, which reads K.
+  let mut t = now;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 20) {
+    r.handle_storage(t, &mut wal, &mut sb, &mut blocks);
+    if !r.status().is_recovering() {
+      break;
+    }
+    if let Some(deadline) = r.poll_timeout() {
+      t = deadline;
+      r.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovery completes even though the first batch drained through the timeout path"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(k),
+    "the continuation fired on the TIMEOUT path — the held tail up to K is read, not clipped at the first batch"
+  );
+  assert!(
+    r.log
+      .get(&k)
+      .is_some_and(|e| e.body.as_present() == Some(&[k as u8][..])),
+    "the committed op K above the first batch is read + cached (the continuation reached it)"
+  );
+}
+
+#[test]
+fn recover_carries_a_faulting_interior_op_above_a_stale_commit_max_not_dropped_as_head() {
+  // A faulting op above a STALE `commit_max` must NOT be dropped as the non-committed HEAD when it is
+  // actually INTERIOR (written ops sit above it). `resolve_exhausted_tail_read` keeps EVERY placement-valid
+  // durable header as `Repairing` — it does not decide head-vs-interior — and `recover_progress`, once the
+  // VERIFIED head is known, promotes to `RecoveringHead` ONLY the real head. So an interior faulting op is
+  // CARRIED header-only into `self.log` / a later DoViewChange (its number taken, never re-minted), even
+  // though it sits above the stale `commit_max`. With a STALE durable commit (commit_max == 0 below the held
+  // tail — the between-checkpoints lag), a mid-tail op faults on every read (resolving ONLY via the timeout
+  // path) while ops above it are present.
+  //
+  // FAIL-BEFORE: the faulting op, being above the stale `commit_max`, was routed to `rec.faulty` → dropped
+  // from the log → omitted from the DVC → a truncatable committed loss.
+  let k = RECOVER_TAIL_WINDOW + 2;
+  let top = RECOVER_TAIL_WINDOW; // a mid-tail op forced onto the timeout path
+  // STALE durable commit: commit == checkpoint_op == 0 with an EMPTY committed band — ops 1..=K are HELD in
+  // the WAL but their commit is not yet durable (the between-checkpoints lag), so the root vouches nothing.
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::new(),
+    OpNumber::new(),
+    0,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(k);
+  wal.script_read_fault(OpNumber::with(top), u8::MAX);
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap();
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  let mut t = now;
+  for _ in 0..(RECOVER_READ_RETRIES as usize + 20) {
+    r.handle_storage(t, &mut wal, &mut sb, &mut blocks);
+    if !r.status().is_recovering() {
+      break;
+    }
+    if let Some(deadline) = r.poll_timeout() {
+      t = deadline;
+      r.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    }
+  }
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the head above the faulting boundary is present → Normal (not RecoveringHead)"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(k),
+    "the tail above the faulting boundary is read — self.op == K"
+  );
+  // THE fix: the faulting batch-boundary op is CARRIED header-only (Repairing), NOT dropped as an interior
+  // gap — even though it faulted while at the provisional frontier and sits above the stale commit_max.
+  let entry = r
+    .log
+    .get(&top)
+    .expect("the faulting batch-boundary op is CARRIED, not dropped from the log");
+  assert!(
+    matches!(entry.body, Body::Repairing(_)),
+    "carried header-only as Body::Repairing (its number taken, body peer-repaired on demand)"
+  );
+}
+
+#[test]
+fn recovering_head_drops_the_uncommitted_faulty_head_but_keeps_a_committed_interior_repairing() {
+  // The deferred faulty-HEAD promotion must make the head NOT HELD, not merely route it to `rec.faulty`:
+  // `drop_faulty_committed_slots` KEEPS `Repairing` entries (committed body-repairs), so a head left in
+  // `self.log` survives as an ordinary entry and a later reformation (which clears `recover` before
+  // ViewChange) carries it into a DoViewChange/StartView — advertising an uncommitted head this replica
+  // cannot vouch. A COMMITTED interior op whose body faulted is the CONTRAST: it stays held (`Repairing`)
+  // and IS carried. Setup: commit == 2 (op 2 committed, op 4 the uncommitted head), WAL holds 1..=4; op 2
+  // (interior) and op 4 (head) both fault their reads permanently.
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2), // commit == 2
+    OpNumber::new(),   // checkpoint_op 0
+    0,
+    std::vec![mk(1), mk(2)], // committed band 1..=2 (canonical headers matching the WAL)
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(4);
+  wal.script_read_fault(OpNumber::with(2), u8::MAX); // committed interior body faults permanently
+  wal.script_read_fault(OpNumber::with(4), u8::MAX); // uncommitted HEAD body faults permanently
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "the uncommitted faulty head → RecoveringHead"
+  );
+  // THE fix: the uncommitted faulty head (op 4) is NOT HELD — removed from the log so no reformation
+  // DoViewChange/StartView can advertise it.
+  assert!(
+    !r.log.contains_key(&4),
+    "the promoted uncommitted faulty head is NOT held (removed from the log)"
+  );
+  // CONTRAST: the committed interior op (op 2), body-faulted, stays HELD as `Repairing` — carried into a
+  // view change (its number taken; body peer-repaired on demand), never dropped.
+  assert!(
+    matches!(r.log.get(&2).map(|e| &e.body), Some(Body::Repairing(_))),
+    "the committed interior faulty op is KEPT header-only as Repairing (held, carried)"
+  );
+}
+
+#[test]
+fn a_peer_checkpoint_after_a_phantom_tail_completes_recovery_at_the_verified_head() {
+  // The recovery EXIT INVARIANT at the peer-checkpoint escape (`on_recover_sync_checkpoint`): recovery
+  // must never leave the read phase with `self.op` still the PROVISIONAL read-window top — which, under
+  // an over-counted / bit-rotted `op_head`, includes a phantom suffix this replica never wrote (an
+  // unheld head a later Prepare would blind-re-ack and a DVC would falsely advertise). This pins BOTH
+  // halves of that guarantee: (1) the schedule property — the reply ingress is gated on
+  // `awaiting_peer_checkpoint`, and by the time it is armed the phantom band has resolved ABSENT and the
+  // head has SETTLED at the verified frontier (asserted below as pending-empty + head-already-capped at
+  // reply time; the sync path re-runs the settle choke anyway, so the invariant holds by construction
+  // even if a future escalation lane arms `awaiting` with reads still pending); and (2) the end-to-end
+  // outcome — the sync completes to Normal at the VERIFIED head, the phantom band discarded.
+  //
+  // Setup: a checkpoint at op 2 whose own snapshot read faults permanently (escalating to the peer
+  // fetch); a BOUNDED ring (capacity 38 → scan probe bound 2 + 38 = 40) whose real slots end at op 4
+  // and whose `op_head` scalar is bit-rotted to u64::MAX — the durable-header scan finds the true
+  // frontier 4, so the phantom band above it is never materialized nor read.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let now = Instant::ZERO;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec::Vec::new(),
+  )
+  .unwrap();
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new()); // empty → every checkpoint read faults
+  let mut wal = ScriptedWal::with_entries(4); // real slots end at op 4
+  wal.head = u64::MAX; // a bit-rotted head scalar
+  wal.capacity = 38; // a BOUNDED ring → the read ceiling is checkpoint 2 + 38 = 40
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  assert_eq!(e.status(), Status::Recovering);
+  assert_eq!(
+    e.op(),
+    OpNumber::with(4),
+    "the provisional head is the scanned written frontier — the phantom band is never materialized"
+  );
+  // Drain the tail reads + exhaust the checkpoint budget → the peer fetch. The head settles at the
+  // verified frontier as soon as the tail drains — well before the reply.
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "own checkpoint exhausted → fetching from a peer"
+  );
+  // The schedule half of the exit invariant: by the time a reply is admissible (awaiting == true), the
+  // tail has fully resolved and the head has ALREADY settled at the verified frontier.
+  assert!(
+    e.recover.as_ref().is_some_and(|rec| rec.pending.is_empty()),
+    "every tail read resolved before the peer reply is admissible"
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(4),
+    "the head settled at the verified frontier before the reply — the phantom band is not held"
+  );
+  while e.poll_message().is_some() {}
+
+  // A peer answers with a VALID SyncCheckpoint (op 2, the genuine snapshot, matching nonce) while the
+  // phantom read is still in flight.
+  let good_snap = CountSm::default().snapshot();
+  let good_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(2),
+    crate::block_address(&good_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  let good_id = crate::checkpoint_id(&good_env);
+  blocks.write_verified(good_snap.clone());
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(2),
+      good_id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      good_env.clone(),
+      Bytes::new(),
+    )),
+  );
+  for _ in 0..3 {
+    sb.flush();
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the verified peer checkpoint completes recovery"
+  );
+  // THE fix: the head settled at the highest WRITTEN op before the install — the phantom band is NOT
+  // held into Normal.
+  assert_eq!(
+    e.op(),
+    OpNumber::with(4),
+    "the settle choke caps the head to the verified frontier before the install"
+  );
+  assert!(
+    e.log.contains_key(&4),
+    "the real tail op 4 is held; the phantom band above it is discarded"
+  );
+}
+
+#[test]
+fn recover_reads_a_committed_band_above_the_imposed_ring_on_a_ring_less_wal() {
+  // The read ceiling is FLOORED at the durable committed frontier, by LOCAL proof: a ring-less WAL
+  // (default `capacity()`) whose durable root vouches a commit ABOVE the proto-imposed ring — a tail no
+  // conforming append under the ring enforcement produces, but one the geometry argument alone cannot
+  // rule out for an arbitrary disk — still has its FULL committed band read. Without the floor the
+  // ceiling would clip `self.op` below the durable commit, hiding held committed ops from `self.log` and
+  // the DVC (a committed loss with the bytes intact on disk). The floor is safe against the
+  // corrupt-scalar threat: `state.commit()` is checksum-validated and quorum-bounded, so it extends the
+  // window only by genuine committed progress.
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let ring = effective_wal_capacity(u64::MAX, cfg.checkpoint_ops());
+  let commit_max = ring + 848; // strictly above the imposed ring
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let headers: std::vec::Vec<Header> = (1..=commit_max).map(mk).collect();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(commit_max), // durable commit above the imposed ring
+    OpNumber::new(),            // checkpoint_op 0
+    0,
+    headers,
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(commit_max); // ring-less (default capacity), holds 1..=commit_max
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "the ceiling is floored at the durable commit — the full committed band is materialized"
+  );
+  for _ in 0..(commit_max + 8) {
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal, "tail consistent → Normal");
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "every held committed op above the imposed ring is read + held — no clip below the durable commit"
+  );
+  assert!(
+    r.log
+      .get(&commit_max)
+      .is_some_and(|e| e.body.as_present() == Some(&[commit_max as u8][..])),
+    "the top committed op is read + cached with its canonical body"
+  );
+}
+
+#[test]
+fn recover_finds_a_committed_tail_above_a_stale_commit_when_the_head_scalar_under_reports() {
+  // The hardest under-report shape: a client-acked committed tail lives ABOVE the STALE durable commit
+  // (the between-checkpoints lag — `state.commit()` witnesses nothing there) AND the `op_head` scalar is
+  // bit-rotted BELOW it, so NO scalar witness covers the band. The durable-header SCAN is what finds it:
+  // the ring itself is the witness (`Wal::header` is `Some` exactly for a completed append), so the
+  // written extent is derived, every held op is read + held, and this replica's DoViewChange still
+  // vouches the client-acked tail — no committed loss from a lying scalar plus a lagging root.
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let held = 600u64; // the written committed tail — within the proto-imposed ring, above every scalar witness
+  let mut wal = ScriptedWal::with_entries(held); // holds 1..=600, each header durable
+  wal.head = 10; // a corrupt-LOW head scalar, far below the real written extent
+  let mut sb = TestSb::default(); // VsrState::new(): STALE durable commit == checkpoint_op == 0
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  assert_eq!(
+    r.op(),
+    OpNumber::with(held),
+    "the scan derives the written extent — neither the lying scalar nor the stale commit hides it"
+  );
+  for _ in 0..(held + 8) {
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal, "tail consistent → Normal");
+  assert_eq!(
+    r.op(),
+    OpNumber::with(held),
+    "the full written tail is read + held — the DVC vouches the client-acked band"
+  );
+  assert!(
+    r.log
+      .get(&held)
+      .is_some_and(|e| e.body.as_present() == Some(&[held as u8][..])),
+    "the top held op is read + cached with its canonical body"
+  );
+}
+
+#[test]
+fn recover_does_not_skip_a_written_head_whose_header_op_field_rotted() {
+  // The scan's occupancy predicate must be `header(probe).is_some()` ALONE: a written top slot whose
+  // stored header rotted in its `op` FIELD fails a placement-filtered probe, and a scan that skips it
+  // under-derives the extent — the held head (possibly client-acked, and ABOVE the durable root's
+  // canonical band, which lags live commit progress between roots) is then never read, silently dropped
+  // from `self.log`/the DVC: the committed-loss direction. With occupancy-only the slot bounds the
+  // window, its read fails placement/verify and exhausts, the resolver finds no usable witness (rotted
+  // header, no canonical entry — the root does not carry the op yet), and the replica conservatively
+  // enters `RecoveringHead` to learn the canonical head from a peer — never Normal with the op skipped.
+  let held = 6u64;
+  let mut wal = ScriptedWal::with_entries(held);
+  let (clean, body) = wal.entries.get(&held).cloned().expect("head entry");
+  // Rot the header's OP field (canonical layout: checksum | version | op | view | client | request |
+  // body_checksum, 16 bytes each — op's low byte is index 47): placement now fails, checksum stale.
+  let mut rotted = clean.encode();
+  rotted[47] ^= 0xFF;
+  let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
+  assert_ne!(
+    rotted.op(),
+    clean.op(),
+    "the op field rotted — placement no longer matches"
+  );
+  wal.entries.insert(held, (rotted, body));
+  let mut sb = TestSb::default(); // stale root: commit == 0, NO canonical band — the op is above every root witness
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  assert_eq!(
+    r.op(),
+    OpNumber::with(held),
+    "the occupied slot bounds the window — the rotted op field does not shrink the scanned extent"
+  );
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert_eq!(
+    r.status(),
+    Status::RecoveringHead,
+    "an unidentifiable written head is a head fault — solicit the canonical head, never skip the op"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(held),
+    "the head stays at the written extent while the canonical head is solicited"
+  );
+}
+
+#[test]
+fn a_committed_head_whose_body_faulty_completion_carries_a_rotted_header_resolves_via_the_root() {
+  // The `WalDone::BodyFaulty` variant of the rotted-header case below: the backend reports the body as
+  // permanently faulty and hands back the header AS STORED — bit-rotted, `op` field intact (placement
+  // passes), stored checksum stale. The BodyFaulty arm must not classify the rotted identity (without
+  // the `verify_header` gate the flipped client MISMATCHES the canonical band → StaleCommitted → the
+  // committed head lands faulty → `RecoveringHead`, the reform wedge): it falls to the retry path, and
+  // on exhaustion the resolver's `verify_header` gate routes it through the ROOT's canonical identity —
+  // a committed repair hole, recovery Normal.
+  let commit_max = 6u64;
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let canonical_checksum = mk(commit_max).body_checksum();
+  let headers: std::vec::Vec<Header> = (1..=commit_max).map(mk).collect();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(commit_max),
+    OpNumber::new(),
+    0,
+    headers,
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(commit_max);
+  let (clean, body) = wal.entries.get(&commit_max).cloned().expect("head entry");
+  let mut rotted = clean.encode();
+  rotted[79] ^= 0xFF; // flip the client field's low byte — op survives, the checksum goes stale
+  let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
+  assert!(
+    !rotted.verify_header(),
+    "the rotted header fails its own checksum"
+  );
+  wal.entries.insert(commit_max, (rotted, body));
+  wal.script_body_faulty(OpNumber::with(commit_max)); // reads answer BodyFaulty(rotted header)
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the rotted-header BodyFaulty head resolves via the ROOT — not RecoveringHead (the reform wedge)"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "the committed head stays HELD via the root's identity"
+  );
+  assert_eq!(
+    r.log.get(&commit_max).map(|e| &e.body),
+    Some(&Body::Repairing(canonical_checksum)),
+    "kept as Body::Repairing carrying the ROOT's canonical identity, not the rotted header's"
+  );
+}
+
+#[test]
+fn a_committed_head_with_a_bit_rotted_header_resolves_via_the_root_not_recovering_head() {
+  // A durable header can bit-rot with its `op` field INTACT: placement passes, but the stored header
+  // checksum no longer matches the canonical fields — the header is no witness. Without the
+  // `verify_header` guard the exhaustion resolver would run the rotted identity through the canonical
+  // cross-check, MISMATCH (the flipped client), classify the committed head faulty, and enter
+  // `RecoveringHead` — the reformation wedge — even though the durable ROOT still vouches the true
+  // identity. With the guard, a checksum-failing header is treated exactly like an absent one: the
+  // root's canonical band resolves the op to `Body::Repairing` and recovery completes Normal.
+  let commit_max = 6u64;
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let canonical_checksum = mk(commit_max).body_checksum();
+  let headers: std::vec::Vec<Header> = (1..=commit_max).map(mk).collect();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(commit_max),
+    OpNumber::new(),
+    0,
+    headers,
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(commit_max);
+  // Bit-rot the head's DURABLE HEADER: encode, flip the low byte of the `client` field (canonical
+  // layout: checksum | version | op | view | client | request | body_checksum, 16 bytes each — client's
+  // low byte is index 79), decode. The `op` field survives (placement passes) but the stored checksum
+  // no longer matches the fields.
+  let (clean, body) = wal.entries.get(&commit_max).cloned().expect("head entry");
+  let mut rotted = clean.encode();
+  rotted[79] ^= 0xFF;
+  let rotted = Header::decode(&rotted).expect("decode does not re-validate the checksum");
+  assert!(
+    !rotted.verify_header(),
+    "the rotted header fails its own checksum"
+  );
+  assert_eq!(
+    rotted.op(),
+    clean.op(),
+    "the op field survived the rot (placement still passes)"
+  );
+  wal.entries.insert(commit_max, (rotted, body));
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the rotted-header committed head resolves via the ROOT — not RecoveringHead (the reform wedge)"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "the committed head stays HELD via the root's identity"
+  );
+  assert_eq!(
+    r.log.get(&commit_max).map(|e| &e.body),
+    Some(&Body::Repairing(canonical_checksum)),
+    "kept as Body::Repairing carrying the ROOT's canonical identity, not the rotted header's"
+  );
+}
+
+#[test]
+fn a_root_vouched_committed_head_whose_read_answers_absent_becomes_a_repair_hole() {
+  // The ABSENT-verdict twin of the fault-to-exhaustion case below: a backend may report a fully-rotted
+  // slot as a clean `WalDone::Absent` rather than faulting the read. The verdict must not depend on
+  // which of the two no-slot answers the backend gives: the durable ROOT's canonical band vouches the
+  // committed op, so the Absent completion resolves it header-only as `Body::Repairing` from the root's
+  // identity — never a phantom to be capped away (which would silently drop the only in-memory identity
+  // a later DoViewChange could carry).
+  let commit_max = 6u64;
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let canonical_checksum = mk(commit_max).body_checksum();
+  let headers: std::vec::Vec<Header> = (1..=commit_max).map(mk).collect();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(commit_max),
+    OpNumber::new(),
+    0,
+    headers,
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(commit_max);
+  wal.entries.remove(&commit_max); // the slot is GONE — its read answers a clean Absent
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the root-vouched hole completes clean"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "the committed head stays HELD via the root's identity — never capped away as a phantom"
+  );
+  assert_eq!(
+    r.log.get(&commit_max).map(|e| &e.body),
+    Some(&Body::Repairing(canonical_checksum)),
+    "the Absent completion resolves through the ROOT's canonical identity"
+  );
+}
+
+#[test]
+fn a_poisoned_sealed_commit_does_not_force_an_unbounded_recovery_read() {
+  // A corrupt in-model peer `commit` scalar can be adopted into live `commit_max` and then SEALED into
+  // a durable root — so the recovery window must NOT floor at the raw `state.commit()` scalar (a dense
+  // read to a poisoned frontier would allocate/queue reads without bound at every restart). The floor
+  // is the root's canonical BAND top — evidence of what the writer actually held (a poisoned scalar
+  // mints no headers) — so recovery reads exactly the held extent, completes Normal, and the poisoned
+  // `commit_max` rides above the head as the tail-gap shape the view-change advertisement already
+  // bounds (`commit_max.min(op)`).
+  let held = 6u64;
+  let poisoned_commit = u64::MAX / 2;
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let headers: std::vec::Vec<Header> = (1..=held).map(mk).collect();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(poisoned_commit), // the sealed poison
+    OpNumber::new(),
+    0,
+    headers, // the band stops at the genuinely-held extent
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(held);
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  assert_eq!(
+    wal.done.len() as u64,
+    held,
+    "reads are bounded by the band's evidence — the poisoned commit scalar forces nothing"
+  );
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "recovery completes despite the poisoned sealed commit"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(held),
+    "the head is the held extent — the poisoned frontier is a tail-gap above it, not a read target"
+  );
+}
+
+#[test]
+fn a_root_vouched_committed_head_with_no_wal_header_becomes_a_repair_hole_not_recovering_head() {
+  // A committed op whose WAL slot rotted ENTIRELY — header included — and whose reads fault to
+  // exhaustion still has a second durable witness: the ROOT's canonical committed band (`rec.canonical`,
+  // from the checksummed `VsrState`) carries its full `(client, request, body_checksum)` identity. The
+  // exhaustion resolver falls back to it, keeping the op header-only as `Body::Repairing` (existence +
+  // identity preserved; body peer-repaired on demand). Without the fallback the op lands in
+  // `rec.faulty`; at the HEAD that drives `RecoveringHead`, and the reform gate refuses same-epoch
+  // reformation while a committed faulty slot remains — an all-restart quorum would wedge soliciting a
+  // Normal peer that does not exist, despite every root carrying the identity needed to repair.
+  //
+  // Setup: durable root vouches commit == 6 with dense canonical headers 1..=6; the WAL holds 1..=5
+  // (op 6's slot is GONE — `wal.header(6)` is None, so the scan stops at 5 and only the commit floor
+  // reaches 6) and every read of op 6 faults (a rotted slot, not a clean absence).
+  let commit_max = 6u64;
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let canonical_checksum = mk(commit_max).body_checksum();
+  let headers: std::vec::Vec<Header> = (1..=commit_max).map(mk).collect();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(commit_max),
+    OpNumber::new(),
+    0,
+    headers,
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(commit_max);
+  wal.entries.remove(&commit_max); // the committed head's slot — header AND body — rotted away
+  wal.script_read_fault(OpNumber::with(commit_max), u8::MAX); // its reads fault, never a clean Absent
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
+  assert_eq!(
+    r.status(),
+    Status::Normal,
+    "the root-vouched committed head resolves to a repair hole — NOT RecoveringHead (the reform wedge)"
+  );
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "the committed head stays HELD (its number taken) via the root's identity"
+  );
+  assert_eq!(
+    r.log.get(&commit_max).map(|e| &e.body),
+    Some(&Body::Repairing(canonical_checksum)),
+    "kept header-only as Body::Repairing carrying the ROOT's canonical identity"
+  );
+}
+
+#[test]
+fn recover_reads_the_committed_band_when_the_op_head_scalar_under_reports() {
+  // The durable-commit floor is INDEPENDENT of the reported head: a corrupt-LOW `op_head` scalar (the
+  // symmetric rot of the inflated one the ring caps) must not hide committed slots that are still
+  // readable. The WAL holds canonical ops `1..=commit_max` and the durable root vouches
+  // `commit == commit_max` (checksummed, quorum-bounded — the trustworthy witness), but the head scalar
+  // reports far below it. The window floors at the durable commit, the band reads back present, and the
+  // verified head settles at `commit_max` — no committed op is hidden behind the lying scalar.
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let ring = effective_wal_capacity(u64::MAX, cfg.checkpoint_ops());
+  let commit_max = ring + 848;
+  let mk = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let headers: std::vec::Vec<Header> = (1..=commit_max).map(mk).collect();
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(commit_max),
+    OpNumber::new(),
+    0,
+    headers,
+  )
+  .unwrap();
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(commit_max); // holds 1..=commit_max
+  wal.head = ring; // a corrupt-LOW head scalar, far below the durable committed frontier
+  let now = Instant::ZERO;
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "the window floors at the durable commit despite the under-reporting head scalar"
+  );
+  for _ in 0..(commit_max + 8) {
+    r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+    if !r.status().is_recovering() {
+      break;
+    }
+  }
+  assert_eq!(r.status(), Status::Normal, "tail consistent → Normal");
+  assert_eq!(
+    r.op(),
+    OpNumber::with(commit_max),
+    "the full committed band is read + held — the lying head scalar hides nothing committed"
+  );
+  assert!(
+    r.log
+      .get(&commit_max)
+      .is_some_and(|e| e.body.as_present() == Some(&[commit_max as u8][..])),
+    "the top committed op is read + cached with its canonical body"
+  );
+}
+
+#[test]
 fn recover_reads_held_committed_ops_above_the_default_window() {
   // CONSENSUS-CRITICAL regression. `recover`'s tail read window was capped at
   // `checkpoint_op + RECOVER_TAIL_WINDOW`, which exists ONLY to bound reads against a BOGUS `op_head`
@@ -2481,19 +3449,16 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
     &mut blocks,
   )
   .expect_active();
-  // THE CORE assertion: the recovered head reads the FULL durable committed band — `self.op >=
-  // commit_max`, NOT the old `checkpoint_op + RECOVER_TAIL_WINDOW`. (FAIL-BEFORE: `self.op ==
-  // RECOVER_TAIL_WINDOW` < commit_max, hiding the top two held committed ops.)
+  // `recover` submits the FIRST bounded read batch (`RECOVER_TAIL_WINDOW` slots); the continuation batches
+  // THE CORE assertion: the recovered head reads the FULL durable committed band — `self.op == commit_max`,
+  // NOT the old `checkpoint_op + RECOVER_TAIL_WINDOW`. The single-pass read window is bounded by the WAL
+  // ring capacity (`op_head.min(checkpoint_op + capacity)` == `op_head` here), so the whole held band is
+  // materialized up front. (FAIL-BEFORE: `self.op == RECOVER_TAIL_WINDOW` < commit_max, hiding the top two
+  // held committed ops.)
   assert_eq!(
     r.op(),
     OpNumber::with(commit_max),
-    "recover reads up to the durable committed frontier, not checkpoint_op + RECOVER_TAIL_WINDOW \
-     (FAIL-BEFORE: self.op == {} < commit_max {commit_max})",
-    RECOVER_TAIL_WINDOW
-  );
-  assert!(
-    r.op().get() > RECOVER_TAIL_WINDOW,
-    "the held committed band above the OLD cap is NOT hidden"
+    "recover reads up to the durable committed frontier, not checkpoint_op + RECOVER_TAIL_WINDOW"
   );
   // Drain the committed-band reads → Normal, every held op cached + verified.
   for _ in 0..(commit_max + 8) {
@@ -2616,22 +3581,20 @@ fn recover_reads_held_committed_ops_above_the_default_window() {
 }
 
 #[test]
-fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
-  // COMPANION test (keep the bogus-`op_head` bound green): when `commit_max == checkpoint_op` (a
-  // synced/fresh root with NO committed band above the checkpoint) a HUGE `op_head` must STILL cap at
-  // `checkpoint_op + RECOVER_TAIL_WINDOW` — the window bounds the uncommitted tail against bit-rot, and
-  // a corrupt superblock cannot inflate `commit_max` to widen it. This is the bogus-head defense the
-  // recovery window bound must not weaken.
+fn recover_bounds_the_read_window_for_a_ring_less_wal_with_a_corrupt_op_head() {
+  // REGRESSION (the ring-less lane of the bogus-`op_head` bound): a backend that does NOT override
+  // `Wal::capacity()` (the `u64::MAX` "no fixed ring" sentinel — every default/test backend) gets the
+  // PROTO-IMPOSED ring as the durable-header scan's probe bound, so a bit-rotted `op_head = u64::MAX`
+  // costs at most `effective_wal_capacity` header probes and — over an empty WAL — ZERO body reads,
+  // never a `u64::MAX` enumeration (which would hang/OOM `recover()` before the async fault handling
+  // ever ran). Recovery completes at once holding nothing.
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
-  let mut wal = ScriptedWal::with_entries(0);
-  wal.head = u64::MAX; // a pathological / bit-rotted head
-  let mut sb = TestSb::default(); // VsrState::new(): commit == checkpoint_op == 0
-  assert_eq!(
-    sb.state().commit(),
-    sb.state().checkpoint_op(),
-    "the durable root has NO committed band above the checkpoint"
-  );
-  let now = Instant::ZERO;
+  let mut wal = TestWal {
+    entries: BTreeMap::new(),
+    head: u64::MAX, // a bit-rotted head scalar on a ring-less backend — ignored by the scan
+    done: VecDeque::new(),
+  };
+  let mut sb = TestSb::default(); // no checkpoint (checkpoint_op == 0) → no checkpoint read
   let mut blocks = crate::block_store::MemBlockStore::new();
   let e = Endpoint::recover(
     cfg,
@@ -2643,20 +3606,67 @@ fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
     &mut blocks,
   )
   .expect_active();
-  assert_eq!(e.status(), Status::Recovering);
-  // With commit_max == checkpoint_op == 0, the floor is checkpoint_op, so `hi` caps at
-  // `checkpoint_op + RECOVER_TAIL_WINDOW`: exactly RECOVER_TAIL_WINDOW reads, NOT u64::MAX.
   assert_eq!(
-    wal.done.len() as u64,
-    RECOVER_TAIL_WINDOW,
-    "a bogus huge op_head with no committed band still caps at RECOVER_TAIL_WINDOW"
+    wal.done.len(),
+    0,
+    "the scan (bounded by the proto-imposed ring) found no written slot — NO reads"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "nothing to read → Normal at once"
   );
   assert_eq!(
     e.op(),
-    OpNumber::with(RECOVER_TAIL_WINDOW),
-    "self.op is the verified frontier checkpoint_op + RECOVER_TAIL_WINDOW (the bogus head is NOT held)"
+    OpNumber::new(),
+    "the corrupt head is NOT held — the head derives from the (empty) scan"
   );
-  let _ = now;
+}
+
+#[test]
+fn recover_caps_the_read_window_when_commit_max_equals_checkpoint_op() {
+  // COMPANION test (keep the bogus-`op_head` bound green): a HUGE / bit-rotted `op_head` over a bounded
+  // ring with NO committed band above the checkpoint (`commit == checkpoint_op == 0`) must not drive ANY
+  // read work — the head derives from the durable-header scan (which finds nothing on the empty ring)
+  // floored at the durable commit (== the checkpoint here), so recovery completes at once holding
+  // nothing. The corrupt superblock cannot inflate `commit` to widen the window (`VsrState` is
+  // checksum-validated), and the scalar is never consulted.
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let mut wal = ScriptedWal::with_entries(0);
+  wal.head = u64::MAX; // a pathological / bit-rotted head scalar — ignored by the scan
+  wal.capacity = RECOVER_TAIL_WINDOW; // a BOUNDED ring — the scan's probe bound
+  let mut sb = TestSb::default(); // VsrState::new(): commit == checkpoint_op == 0
+  assert_eq!(
+    sb.state().commit(),
+    sb.state().checkpoint_op(),
+    "the durable root has NO committed band above the checkpoint"
+  );
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  assert_eq!(
+    wal.done.len(),
+    0,
+    "no written slot + no committed band → NO reads, regardless of the claimed head"
+  );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "nothing to read → Normal at once"
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::new(),
+    "the bogus head above the ring is NOT held — the head derives from the (empty) scan"
+  );
 }
 
 #[test]
@@ -4364,6 +5374,7 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
   let mut wal = ScriptedWal {
     entries,
     head: 3,
+    capacity: u64::MAX,
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
@@ -4618,6 +5629,7 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
   let mut wal = ScriptedWal {
     entries,
     head: 3,
+    capacity: u64::MAX,
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
@@ -4776,6 +5788,7 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
   let mut wal = ScriptedWal {
     entries,
     head: 3,
+    capacity: u64::MAX,
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
@@ -4935,6 +5948,7 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
   let mut wal = ScriptedWal {
     entries,
     head: 3,
+    capacity: u64::MAX,
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
@@ -5081,6 +6095,7 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
   let mut wal = ScriptedWal {
     entries,
     head: 3,
+    capacity: u64::MAX,
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
@@ -5192,6 +6207,7 @@ fn fault_exhaustion_rejects_a_misdirected_durable_header() {
   let mut wal = ScriptedWal {
     entries,
     head: 3,
+    capacity: u64::MAX,
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
@@ -5292,18 +6308,16 @@ fn recover_with_no_checkpoint_is_unchanged() {
 
 #[test]
 fn recover_bounds_the_read_window_for_a_huge_op_head() {
-  // REGRESSION (unbounded read submission): a corrupt/buggy `Wal` reporting an enormous
-  // `op_head` must NOT make `recover()` bookkeep + submit a read per slot from `checkpoint_op+1`
-  // up to that head (billions of inserts/reads/allocations before any async fault-handling runs).
-  // With the fix, the per-recover window is capped at `RECOVER_TAIL_WINDOW`, so at most that many
-  // reads are submitted regardless of the claimed head. (Before the fix this loops ~u64::MAX times
-  // and never returns.)
+  // REGRESSION (unbounded read submission): a corrupt/buggy `Wal` reporting an enormous `op_head` must
+  // NOT make `recover()` bookkeep + submit a read per slot from `checkpoint_op+1` up to that head
+  // (billions of inserts/reads/allocations). The head is DERIVED from the durable-header scan over the
+  // ring — the scalar is never consulted — so a bit-rotted head over an EMPTY bounded ring
+  // (`capacity == RECOVER_TAIL_WINDOW`) submits NO body reads at all and recovery completes immediately
+  // at the checkpoint. (Before deriving, this looped ~u64::MAX times and never returned.)
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
-  let mut wal = TestWal {
-    entries: BTreeMap::new(),
-    head: u64::MAX, // a pathological / bit-rotted head
-    done: VecDeque::new(),
-  };
+  let mut wal = ScriptedWal::with_entries(0);
+  wal.head = u64::MAX; // a pathological / bit-rotted head scalar — ignored by the scan
+  wal.capacity = RECOVER_TAIL_WINDOW; // a BOUNDED ring — the scan's probe bound
   let mut sb = TestSb::default(); // no checkpoint (checkpoint_op == 0) → no checkpoint read
   let mut blocks = crate::block_store::MemBlockStore::new();
   let e = Endpoint::recover(
@@ -5316,18 +6330,22 @@ fn recover_bounds_the_read_window_for_a_huge_op_head() {
     &mut blocks,
   )
   .expect_active();
-  assert_eq!(e.status(), Status::Recovering);
-  // `recover()` submits exactly one read per materialized tail slot, each queued in the WAL's
-  // `done` buffer. The count must be bounded by the window, never the claimed head.
-  assert!(
-    wal.done.len() as u64 <= RECOVER_TAIL_WINDOW,
-    "recover submitted {} reads — must be capped at RECOVER_TAIL_WINDOW ({RECOVER_TAIL_WINDOW})",
-    wal.done.len()
+  // The scan found no written slot and there is nothing committed → nothing to read, no phantom
+  // read storm, and recovery completes synchronously.
+  assert_eq!(
+    wal.done.len(),
+    0,
+    "a corrupt head scalar over an empty ring submits NO reads — the scan found no written slot"
   );
   assert_eq!(
-    wal.done.len() as u64,
-    RECOVER_TAIL_WINDOW,
-    "with a head far above the window, exactly RECOVER_TAIL_WINDOW slots are materialized"
+    e.status(),
+    Status::Normal,
+    "nothing to read → Normal at once"
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::new(),
+    "the corrupt head scalar is NOT held — the head derives from the (empty) scan"
   );
 }
 
@@ -5457,21 +6475,30 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
     &mut blocks,
   )
   .expect_active();
-  // THE core assertion: the recovered head is the VERIFIED read frontier, NOT the raw head.
+  // The head DERIVES from the durable-header scan — the raw scalar is never consulted — so the
+  // provisional head is the true written frontier IMMEDIATELY: the phantom band `(frontier, head]`
+  // (which the lying scalar claims) has no headers to find and is never materialized nor read.
   assert_eq!(
     e.op(),
     OpNumber::with(frontier),
-    "recover holds the verified read frontier, never the raw (pathological) head"
+    "the provisional head is the scanned written frontier — the raw scalar is never consulted"
   );
-  assert_ne!(e.op(), OpNumber::with(head), "must NOT hold the raw head");
   // Drive the in-window tail reads + the checkpoint read to completion → Normal.
   while e.status() != Status::Normal {
     e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   }
+  // THE core assertion: the recovered head is the VERIFIED read frontier, NOT the raw (pathological) head —
+  // the phantom `(frontier, head]` read ABSENT and `recover_progress` capped `self.op` at the highest
+  // written op.
   assert_eq!(
     e.op(),
     OpNumber::with(frontier),
-    "frontier preserved into Normal"
+    "frontier preserved into Normal — the verified read frontier, never the raw head"
+  );
+  assert_ne!(
+    e.op(),
+    OpNumber::with(head),
+    "must NOT hold the raw (pathological) head"
   );
   while e.poll_message().is_some() {} // drain everything emitted during recovery
 
