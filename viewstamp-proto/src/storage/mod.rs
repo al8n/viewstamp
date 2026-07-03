@@ -297,7 +297,17 @@ impl Header {
 
   /// Whether this header + `body` are self-consistent (header checksum valid AND body matches).
   pub fn verify(&self, body: &[u8]) -> bool {
-    self.checksum == self.compute_checksum() && self.body_checksum == fnv1a_128(body)
+    self.verify_header() && self.body_checksum == fnv1a_128(body)
+  }
+
+  /// Whether this header ALONE is self-consistent — the stored header checksum matches the canonical
+  /// fields. The body-less counterpart of [`Self::verify`], for decisions made from a durable header
+  /// WITHOUT its body (the recovery exhaustion resolver keeps a header-only op as a `Body::Repairing`
+  /// identity): a bit-rotted header whose `op` field survived the placement check must not be trusted
+  /// as an identity witness — peer repair validates the full `(client, request, body_checksum)`, so a
+  /// smuggled garbage identity would be an unfillable hole.
+  pub fn verify_header(&self) -> bool {
+    self.checksum == self.compute_checksum()
   }
 
   /// Writes the CANONICAL body of this header — the six checksummed fields, each widened to a
@@ -1164,19 +1174,33 @@ pub enum SuperblockDone {
 /// responsible for honouring this (the sim's bounded mode picks `n` well above `checkpoint_ops`; a
 /// disk driver must size its WAL ring the same way).
 pub trait Wal {
-  /// The highest op number held.
+  /// The highest op number held. Advisory: `recover()` does NOT trust this scalar — it derives the
+  /// written extent by scanning [`header`](Wal::header) over the effective ring (a stored scalar can
+  /// bit-rot in either direction; the ring's own durable headers are the witness). It remains the
+  /// live-node self-report (e.g. the learner status frontier, which the promote-time challenge
+  /// re-verifies).
   fn op_head(&self) -> OpNumber;
   /// The durable header at `op`, or `None` ONLY if the slot holds no completed append (never
   /// written, or truncated / pruned / ring-wrapped away). A body-faulty slot MUST still report its
   /// header — headers are durable independently of bodies (the trait-level header-durability
-  /// contract); only [`status`](Wal::status)/reads convey the body fault.
+  /// contract); only [`status`](Wal::status)/reads convey the body fault. The backend may return the
+  /// header AS STORED, without validating it: the proto self-verifies before trusting one
+  /// ([`Header::verify`] on every body read; [`Header::verify_header`] before any header-only identity
+  /// decision), treating an inconsistent header as faults-as-data.
   fn header(&self, op: OpNumber) -> Option<Header>;
   /// The slot status for `op` (the present/nack signal).
   fn status(&self, op: OpNumber) -> SlotStatus;
-  /// The total WAL slot capacity — the maximum number of un-pruned slots that can be live at once
-  /// (`u64::MAX` ⇒ effectively unbounded). The proto observes this to stall op-assignment before it
-  /// would wrap a fixed ring; see the trait-level capacity contract.
-  /// Defaults to `u64::MAX` (unbounded) so a backend with no fixed bound need not override it.
+  /// The total WAL slot capacity — the maximum number of un-pruned slots that can be live at once.
+  /// The proto observes this to stall op-assignment before it would wrap a fixed ring, to guard a
+  /// backup's head-extend append the same way, and to bound `recover()`'s tail read window at the
+  /// provable ring maximum `checkpoint_op + capacity` (a bit-rotted `op_head` scalar is capped there
+  /// instead of trusted); see the trait-level capacity contract.
+  ///
+  /// Defaults to `u64::MAX` — the "no fixed ring" sentinel for a backend with no bound of its own. The
+  /// proto then IMPOSES its own finite ring (a few checkpoint intervals plus the pipeline) at those same
+  /// enforcement points, so the recovery geometry stays sound for every backend: a ring-less backend
+  /// sees this only as deliberate append backpressure when checkpointing stalls far behind
+  /// (TigerBeetle's flow control — and strictly better than unbounded WAL growth during such a stall).
   fn capacity(&self) -> u64 {
     u64::MAX
   }

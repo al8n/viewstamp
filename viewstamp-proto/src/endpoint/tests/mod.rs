@@ -4,6 +4,11 @@
 //! `endpoint/tests.rs` — the test bodies themselves are unchanged.
 
 use super::*;
+
+/// A deep-tail size the recovery fixtures share: comfortably larger than any real pipeline, so a test
+/// tail of this depth (or a corrupt `op_head` capped to it via a bounded `capacity`) exercises the
+/// window machinery well past ordinary operation.
+const RECOVER_TAIL_WINDOW: u64 = 8192;
 use crate::{
   BlockAddress, BlockStore, CheckpointRead, ClientId, Config, DoViewChange, Header, MemberId,
   Membership, OpId, OpNumber, Prepare, PreparedEntry, ReadOk, ReplicaId, Request, RequestNumber,
@@ -442,6 +447,9 @@ impl Superblock for StepSb {
 struct ScriptedWal {
   entries: BTreeMap<u64, (Header, Bytes)>,
   head: u64,
+  /// The ring slot capacity reported by [`Wal::capacity`] — `u64::MAX` (unbounded) by default; a test sets
+  /// it to model a bounded WAL whose `op_head` cannot exceed `checkpoint_op + capacity`.
+  capacity: u64,
   read_faults: BTreeMap<u64, u8>,
   corrupt: std::collections::BTreeSet<u64>,
   /// Slots whose HEADER is durable (still served by `header()`) but whose BODY is permanently
@@ -486,6 +494,7 @@ impl ScriptedWal {
     Self {
       entries,
       head: n,
+      capacity: u64::MAX,
       read_faults: BTreeMap::new(),
       corrupt: std::collections::BTreeSet::new(),
       body_faulty: std::collections::BTreeSet::new(),
@@ -552,6 +561,9 @@ impl ScriptedWal {
 impl Wal for ScriptedWal {
   fn op_head(&self) -> OpNumber {
     OpNumber::with(self.head)
+  }
+  fn capacity(&self) -> u64 {
+    self.capacity
   }
   fn header(&self, op: OpNumber) -> Option<Header> {
     self.entries.get(&op.get()).map(|(h, _)| *h)

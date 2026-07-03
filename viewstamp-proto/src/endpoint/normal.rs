@@ -311,16 +311,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.op.get().saturating_sub(self.commit_min.get()) >= MAX_PIPELINE {
       return Err(NewOpReject::PipelineFull);
     }
-    // Physical bounded-WAL stall-before-wrap: never assign an op whose ring slot still holds an un-pruned
-    // op (one not yet checkpoint-subsumed on a quorum). The un-pruned window `(floor, op]` must fit in the
-    // WAL's `capacity()` slots; minting the next op makes it `next_op - floor` wide, so if THAT exceeds
-    // `capacity()` we STALL. The unbounded WAL (`capacity() == u64::MAX`) never overflows. ALSO the
-    // header-only view-change-carrier band frame-fit bound ([`Self::band_at_capacity`]) — the floor that
-    // still holds for an unbounded WAL. Both self-release as `quorum_checkpoint_op` rises and `run_gc`
-    // frees slots / shrinks the band.
+    // Physical WAL-ring stall-before-wrap: never assign an op whose ring slot still holds an un-pruned
+    // op (one not yet checkpoint-subsumed on a quorum). The un-pruned window `(floor, op]` must fit in
+    // the EFFECTIVE ring ([`effective_wal_capacity`] — the backend's own ring, or the proto-imposed ring
+    // for a ring-less backend); minting the next op makes it `next_op - floor` wide, so if THAT exceeds
+    // the ring we STALL. Enforcing the ring even for a ring-less backend is what keeps
+    // `op_head <= checkpoint_op + effective` true for every replica — the geometry `recover()`'s read
+    // ceiling leans on to cap a bit-rotted `op_head` without ever clipping a legitimately-held tail.
+    // ALSO the header-only view-change-carrier band frame-fit bound ([`Self::band_at_capacity`]). Both
+    // self-release as `quorum_checkpoint_op` rises and `run_gc` frees slots / shrinks the band.
     let next_op = self.op.get().saturating_add(1);
     let unpruned_window = next_op.saturating_sub(self.prune_floor().get());
-    let wal_would_overflow = unpruned_window > wal.capacity();
+    let wal_would_overflow = unpruned_window > self.effective_wal_capacity(wal);
     let band_would_overflow = self.band_at_capacity();
     if wal_would_overflow || band_would_overflow {
       return Err(NewOpReject::AtCapacity);
@@ -1099,19 +1101,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   fn append_prepare<W: Wal>(&mut self, wal: &mut W, p: Prepare) {
     // the backup-overflow guard ([`Self::maybe_sync_below_ring_window`]) runs in
     // `on_prepare` BEFORE every head-extend append (the new-op branch + each buffered-prepare drain), so
-    // a bounded-WAL append never overwrites an un-pruned ring slot. This debug-assert FREEZES that
-    // contract: a future caller that extends the head without the guard (re-opening the
-    // resident-tail-overflow class — `recover` would then read a wrapped-away op) trips it. Unbounded ⇒
-    // never fires (`capacity == u64::MAX`); and `pop == self.op + 1 > checkpoint_op` here, so the
-    // condition asserted is the exact negation of the guard's overflow test (`pop - checkpoint_op > cap`).
+    // an append never overwrites an un-pruned slot of the EFFECTIVE ring ([`effective_wal_capacity`] —
+    // the backend's own ring, or the proto-imposed ring for a ring-less backend). This debug-assert
+    // FREEZES that contract: a future caller that extends the head without the guard (re-opening the
+    // resident-tail-overflow class — `recover` would then read a wrapped-away op) trips it.
+    // `pop == self.op + 1 > checkpoint_op` here, so the condition asserted is the exact negation of the
+    // guard's overflow test (`pop - checkpoint_op > effective`).
     debug_assert!(
-      wal.capacity() == u64::MAX
-        || p.op().get().saturating_sub(self.checkpoint_op.get()) <= wal.capacity(),
-      "bounded-WAL backup-overflow: appending op {} would overwrite an un-pruned ring slot \
-       (checkpoint_op={}, capacity={}) — the maybe_sync_below_ring_window guard was bypassed",
+      p.op().get().saturating_sub(self.checkpoint_op.get()) <= self.effective_wal_capacity(wal),
+      "WAL-ring backup-overflow: appending op {} would overwrite an un-pruned ring slot \
+       (checkpoint_op={}, effective capacity={}) — the maybe_sync_below_ring_window guard was bypassed",
       p.op().get(),
       self.checkpoint_op.get(),
-      wal.capacity(),
+      self.effective_wal_capacity(wal),
     );
     self.op = p.op();
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());

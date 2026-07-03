@@ -1127,15 +1127,13 @@ fn sealed_successor_root_carries_the_committed_frontier_across_a_restart() {
     &mut blocks,
   )
   .expect_active();
-  // The recovered head reads up to the sealed committed frontier K, not C0 + RECOVER_TAIL_WINDOW.
+  // The single-pass read window is bounded by the ring capacity (`op_head.min(checkpoint_op + capacity)` ==
+  // op_head here), so the whole sealed band up to K is materialized up front — the recovered head reads up
+  // to the sealed committed frontier K, not `checkpoint_op + RECOVER_TAIL_WINDOW`.
   assert_eq!(
     r.op(),
     OpNumber::with(k),
     "recover off the SEALED successor reads the full committed band (self.op == K), so K is not stranded"
-  );
-  assert!(
-    r.op().get() > RECOVER_TAIL_WINDOW,
-    "the committed op K above the window is held, not capped away"
   );
   for _ in 0..(k + 8) {
     r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
@@ -1168,13 +1166,18 @@ fn sealed_successor_root_carries_the_committed_frontier_across_a_restart() {
 }
 
 #[test]
-fn unsealed_successor_strands_a_committed_op_above_the_window() {
-  // (c) THE BUG WITNESS (non-vacuity). WITHOUT the seal the successor copies the STALE durable commit
-  // C0 == 0 even though the WAL holds a committed op K = RECOVER_TAIL_WINDOW + 2. On recover the tail
-  // window floors at the durable commit C0, so `hi = head.min(C0 + RECOVER_TAIL_WINDOW)` caps `self.op`
-  // at C0 + RECOVER_TAIL_WINDOW < K — K is STRANDED below the re-formed head, its op-number freed and
-  // overwritten on the next round: a committed-op loss. This pins WHY the seal is needed; it is today's
-  // pre-seal recover behaviour for a stale root.
+fn an_unsealed_successor_reads_the_held_committed_op_but_not_its_committed_status() {
+  // (c) THE SEAL'S RESIDUAL VALUE, once the recover-read window is bounded by the WAL ring `capacity`
+  // (`op_head.min(checkpoint_op + capacity)`) rather than the durable commit. WITHOUT the seal the
+  // successor copies the STALE durable commit C0 == 0 even though the WAL holds a committed op K =
+  // RECOVER_TAIL_WINDOW + 2. Recover now reads the FULL VERIFIED held tail up to the WAL head regardless of
+  // the stale commit, so K is READ + HELD (`self.op == K`, cached), NOT stranded: the committed-op loss is
+  // prevented by the capacity-bounded window itself, not only by the seal (K rides its held header through
+  // any later view change, exactly as a sealed-and-recovered committed tail does). What the seal still
+  // buys is the KNOWN-committed frontier: a SEALED successor recovers `commit_max == K` and applies K
+  // outright, whereas this UNSEALED one holds K with `commit_max` still at the stale C0 == 0 — K survives
+  // but is re-committed rather than applied on recovery. This is the seal's non-vacuous, still-load-bearing
+  // effect (`commit_max == K` vs `C0`), now that the read window no longer strands the op.
   let k = RECOVER_TAIL_WINDOW + 2;
   // The UNSEALED predecessor: a v4 root whose durable commit is the STALE C0 == 0, with NO committed
   // header above C0 (the band was never sealed). `prepare_restart` faithfully copies that stale commit.
@@ -1215,31 +1218,39 @@ fn unsealed_successor_strands_a_committed_op_above_the_window() {
     &mut blocks,
   )
   .expect_active();
-  // THE HAZARD: the recovered head is capped at C0 + RECOVER_TAIL_WINDOW, STRICTLY BELOW K — the held
-  // committed op K is stranded above the read frontier (the loss the seal prevents).
+  // The single-pass read window is bounded by the ring capacity (== op_head here), so the full held tail up
+  // to K is materialized regardless of the stale durable commit C0.
   assert_eq!(
     r.op(),
-    OpNumber::with(RECOVER_TAIL_WINDOW),
-    "the unsealed stale root caps recover at C0 + RECOVER_TAIL_WINDOW < K — K is stranded above the window"
+    OpNumber::with(k),
+    "recover reads the full held tail (self.op == K) regardless of the stale durable commit"
   );
-  assert!(
-    r.op().get() < k,
-    "the recovered head is BELOW the held committed op K — without the seal K is not read back"
-  );
-  for _ in 0..(RECOVER_TAIL_WINDOW + 8) {
+  for _ in 0..(k + 8) {
     r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
   }
+  assert_eq!(r.status(), Status::Normal, "recover reaches Normal");
+  // #31: the capacity-bounded window reads the FULL held tail — K is NOT stranded, even off an unsealed root.
   assert_eq!(
-    r.status(),
-    Status::Normal,
-    "the capped recover still reaches Normal"
+    r.op(),
+    OpNumber::with(k),
+    "recover reads the held committed op K back (self.op == K) despite the stale durable commit — no loss"
   );
   assert!(
-    !r.log.contains_key(&k),
-    "the stranded committed op K is NOT in the recovered cache — its slot is free to be overwritten"
+    r.log
+      .get(&k)
+      .is_some_and(|e| e.body.as_present() == Some(&[k as u8][..])),
+    "K is read + cached with its canonical body (held), not freed for overwrite"
+  );
+  // The seal's RESIDUAL, still-load-bearing effect: WITHOUT it `commit_max` stays the stale C0 == 0, so K
+  // is held but not KNOWN-committed (re-committed via a later view change rather than applied on recovery).
+  // A SEALED successor instead recovers `commit_max == K` (the (b) test).
+  assert_eq!(
+    r.commit_max(),
+    OpNumber::new(),
+    "without the seal the recovered node's known-committed frontier stays the stale C0 == 0"
   );
 }
 

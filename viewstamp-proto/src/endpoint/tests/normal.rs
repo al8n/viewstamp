@@ -809,8 +809,8 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
   // op, header-only, with NO range filter — as one HEADER-ONLY band. A band past
   // `MAX_HEADER_ONLY_BAND_DEPTH` encodes a carrier OVER the transport frame cap, which the transport
   // drops on the send path, wedging the view change. `MAX_CHECKPOINT_OPS` + the `log_entries()`
-  // `debug_assert` already bound this for a ring-sized WAL, but an UNBOUNDED WAL (`capacity() ==
-  // u64::MAX`, so the wal-wrap stall never fires) with a deep uncommitted tail could grow the band past
+  // `debug_assert` already bound this for a ring-sized WAL, but a backend whose OWN ring exceeds the
+  // band depth (its wal-wrap stall sits above it) with a deep uncommitted tail could grow the band past
   // the bound in a release build. So op-admission must REFUSE to mint a new op the instant its carrier
   // band would exceed the depth — the same backpressure as the wal-wrap stall, gating the carrier
   // instead of the ring.
@@ -820,8 +820,11 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
   // quorum checkpoint REPORT raises it without a local `run_gc`), so the proxy can under-count. Here we
   // SEED `self.log` to the band depth so the realized carrier is exactly what the gate reads.
   //
-  // `TestWal::capacity()` is the default `u64::MAX`, so the wal-wrap stall is OUT of the picture here:
-  // any refusal is the band bound alone.
+  // The WAL is a backend with its OWN ring larger than the band depth (`capacity = depth + 8`), so the
+  // wal-wrap stall is OUT of the picture and any refusal is the band bound alone. (A RING-LESS backend
+  // cannot reach this edge any more: the proto-imposed ring — a few checkpoint intervals + the pipeline,
+  // far below the ~342k band depth — stalls admission first. The band gate remains the only guard for a
+  // backend whose genuine ring exceeds the band depth, which is what this pins.)
   let depth = crate::message::MAX_HEADER_ONLY_BAND_DEPTH as u64;
   let body = bytes::Bytes::from(std::vec![1u8]);
 
@@ -833,7 +836,9 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
   {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
     let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
-    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let mut wal = ScriptedWal::with_entries(0);
+    wal.capacity = depth + 8; // the backend's own ring, above the band depth
+    let mut sb = TestSb::default();
     let mut blocks = crate::block_store::MemBlockStore::new();
     let head = depth - 1;
     ep.force_state_for_test(0, head, head, 0, &[]); // commit_min == op (caught up), no holes
@@ -891,7 +896,9 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
   {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
     let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
-    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let mut wal = ScriptedWal::with_entries(0);
+    wal.capacity = depth + 8; // the backend's own ring, above the band depth
+    let mut sb = TestSb::default();
     let mut blocks = crate::block_store::MemBlockStore::new();
     ep.force_state_for_test(0, depth, depth, 0, &[]); // head exactly at the bound, caught up, no holes
     for op in 1..=depth {
