@@ -351,6 +351,14 @@ where
   L: BlockStore,
   I: viewstamp_proto::IdentitySource,
 {
+  /// The number of connection closes attributed to `cause` so far — forwards the coordinator's
+  /// per-cause close counter (the QUIC analogue of the stream driver's `conn_close_count`).
+  /// Test/diagnostic observability, not a stable embedder API (hence `#[doc(hidden)]`).
+  #[doc(hidden)]
+  pub fn conn_close_count(&self, cause: viewstamp_proto::CloseCause) -> u64 {
+    self.coord.conn_close_count(cause)
+  }
+
   /// Run the driver to completion. Returns on a `Shutdown` command or when all `Handle` clones drop.
   ///
   /// Both orderly exits — and therefore the ack a [`Handle::shutdown`] awaits — are fd-release

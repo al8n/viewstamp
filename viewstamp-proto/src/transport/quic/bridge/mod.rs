@@ -64,7 +64,10 @@ use super::{
 };
 use crate::{
   MemberId, Message, Peer,
-  transport::frame::{FrameDecoder, MAX_FRAME_LEN, STAGE_CHUNK, encode_frame},
+  transport::{
+    CloseCause,
+    frame::{FrameDecoder, MAX_FRAME_LEN, STAGE_CHUNK, encode_frame},
+  },
 };
 
 /// Per-class outbound staging cap. When a class's `outbound` would exceed this, the bridge RESETs
@@ -203,12 +206,17 @@ pub(crate) enum FinDisposition {
   /// `partial_len` is the legitimately-retained pipelined tail). Run the class-split — Control reaps the
   /// whole connection, Bulk retires the stream in place — via [`Bridge::close_fault_class`].
   Clean,
-  /// A framing FAULT after some complete frames: a graceful FIN left a TORN frame (`partial_len != 0` at
-  /// the FINAL cap), or `extend`/`extend_first` rejected an over-`MAX_FRAME_LEN` length AFTER queuing a
-  /// complete prefix. Both are unrecoverable framing failures — reap the WHOLE connection (BOTH classes)
-  /// via [`Bridge::close_local`], exactly as the inline framing-error path does; only deferred so the
-  /// complete prefix frames are delivered first.
+  /// A graceful FIN left a TORN frame (`partial_len != 0` at the FINAL cap) — the peer finished
+  /// mid-frame. An unrecoverable framing failure: reap the WHOLE connection (BOTH classes) via
+  /// [`Bridge::close_local`] with [`CloseCause::TruncatedFrame`], exactly as the inline
+  /// framing-error path does; only deferred so the complete prefix frames are delivered first.
   Truncated,
+  /// The decoder REJECTED the fed bytes — a declared length over the cap (`extend`/`extend_first`
+  /// returned `FrameTooLong`). The same whole-connection reap as `Truncated`, but attributed to
+  /// [`CloseCause::FrameTooLong`]: an oversized peer frame is a protocol violation an operator
+  /// diagnoses differently from a torn FIN, so the two dispositions stay distinguishable through
+  /// the per-cause close counters.
+  OverCap,
 }
 
 /// The three decode-derived facts the fatal-recv close disposition needs, snapshotted from a class
@@ -221,8 +229,8 @@ pub(crate) enum FinDisposition {
 struct RecvDecode {
   /// The decoder REJECTED the fed bytes — a declared length over the cap the bytes decode under
   /// (`extend`/`extend_first` returned `FrameTooLong`). An unrecoverable framing failure: the disposition
-  /// is always `Truncated` (reap the whole connection), only DEFERRED behind any complete frames already
-  /// queued so they are delivered first.
+  /// is `OverCap` (reap the whole connection, attributed to [`CloseCause::FrameTooLong`]), only DEFERRED
+  /// behind any complete frames already queued so they are delivered first.
   frame_error: bool,
   /// At least one COMPLETE frame is queued on this class decoder's ready queue (`has_ready()`), to be
   /// delivered by the coordinator's `next_frame` drain before any teardown.
@@ -309,6 +317,10 @@ pub(crate) struct Bridge {
   /// framing, and emitting a datagram the peer would only fatal on. Surfaced (not silently swallowed)
   /// so a driver/operator can see a protocol message outgrew the transport frame limit.
   oversized_dropped: u64,
+  /// Closes counted by [`CloseCause`] (indexed by [`CloseCause::index`]) at the shared
+  /// Closed-transition tail, once per connection — the QUIC analogue of the stream drivers'
+  /// per-cause close counters. Read via [`Self::conn_close_count`].
+  close_counts: [u64; CloseCause::COUNT],
   /// Connections that just reached `Event::Connected`, drained by the
   /// coordinator via [`Self::take_connected`].
   connected: VecDeque<ConnectionHandle>,
@@ -397,6 +409,7 @@ impl Bridge {
       pending_endpoint_events: VecDeque::new(),
       endpoint_events_processed: 0,
       oversized_dropped: 0,
+      close_counts: [0; CloseCause::COUNT],
       connected: VecDeque::new(),
       stream_ready: VecDeque::new(),
       deferred_ready: VecDeque::new(),
@@ -490,6 +503,10 @@ impl Bridge {
         // validation could reject it. The SAME `at_capacity` gate bounds the dial path
         // ([`Self::connect`]). `refuse` returns a single close `Transmit` written into `rbuf`.
         if self.at_capacity() {
+          // The refusal happens BEFORE any `ConnEntry` exists, so the shared Closed-transition
+          // counting never sees it — count it here directly, or the diagnostic stays at zero under
+          // exactly the connection-cap saturation it exists to surface.
+          self.close_counts[CloseCause::AcceptCapacity.index()] += 1;
           let mut rbuf = Vec::new();
           let t = self.endpoint.refuse(incoming, &mut rbuf);
           debug_assert!(
@@ -726,7 +743,7 @@ impl Bridge {
       })
       .collect();
     for h in expired {
-      self.close_local(now, h);
+      self.close_local(now, h, CloseCause::AuthDeadline);
     }
     // Exit the re-entrancy guard (test-only): the depth returns to 0. A `close_local` above that
     // re-entered `service` would have tripped the entry assertion before reaching here.
@@ -793,13 +810,24 @@ impl Bridge {
         // is irrelevant (this transport opens only bidi streams) — left to the `_` arm below.
         self.stream_ready.push_back(h);
       }
-      Event::ConnectionLost { .. } => {
+      Event::ConnectionLost { reason } => {
         // A PEER-initiated loss: quinn is already draining this connection toward `Drained`, so no
         // local `close` is re-issued. Run the SHARED teardown tail — mark `Closed`, clear the auth
         // deadline, unbind routing, queue `lost` — so the connection is unrouteable atomically the
         // instant it is lost (symmetric with `close_local`, which differs only by issuing the quinn
-        // `close` first). The entry is kept for the drain.
-        self.mark_closed_unbind_push(h);
+        // `close` first). The entry is kept for the drain. The loss reason maps onto the shared
+        // close-cause vocabulary: an idle expiry is its own cause (the operator signal that a peer
+        // went dark), an application/connection close is the peer ending the conn, and everything
+        // else (a transport/protocol error, a version mismatch, a stateless reset, CID exhaustion)
+        // is the QUIC layer rejecting the connection — the record layer's analogue.
+        let cause = match &reason {
+          quinn_proto::ConnectionError::TimedOut => CloseCause::IdleTimeout,
+          quinn_proto::ConnectionError::ApplicationClosed(_)
+          | quinn_proto::ConnectionError::ConnectionClosed(_)
+          | quinn_proto::ConnectionError::LocallyClosed => CloseCause::PeerClosed,
+          _ => CloseCause::RecordRejected,
+        };
+        self.mark_closed_unbind_push(h, cause);
       }
       Event::Stream(StreamEvent::Stopped { id, .. }) => {
         // The peer sent STOP_SENDING on a send stream of OURS. `StreamEvent::Stopped { id }` is for one
@@ -831,7 +859,7 @@ impl Bridge {
           .is_some_and(|e| e.class_mut(class).send == Some(id));
         if is_current {
           match class {
-            StreamClass::Control => self.close_local(now, h),
+            StreamClass::Control => self.close_local(now, h, CloseCause::PeerClosed),
             StreamClass::Bulk => self.reset_send_class(h, class),
           }
         } else if let Some(e) = self.table.entry(h) {
@@ -997,6 +1025,16 @@ impl Bridge {
     self.oversized_dropped
   }
 
+  /// The number of connection closes attributed to `cause` so far — every teardown routes through
+  /// the shared Closed-transition tail ([`Self::mark_closed_unbind_push`]), which counts exactly
+  /// once per connection (the first transition wins; a peer loss racing a local close does not
+  /// double-count). Forwarded to the driver through the coordinator's
+  /// [`QuicCoordinator::conn_close_count`](super::QuicCoordinator::conn_close_count), mirroring the
+  /// stream drivers' per-cause close observability.
+  pub(crate) fn conn_close_count(&self, cause: CloseCause) -> u64 {
+    self.close_counts[cause.index()]
+  }
+
   /// The number of connections the quinn `Endpoint` still tracks in its slab. The reconnect-churn
   /// regression asserts this stays bounded: a `Drained` connection must be forwarded to
   /// `Endpoint::handle_event` so the endpoint frees its slab slot, not merely reaped from the table.
@@ -1110,6 +1148,50 @@ impl Bridge {
   /// The recv `sid` is re-read from the entry; a `None` (already gone — e.g. a prior close in this same
   /// drain reaped it) is a no-op. Any `retire_peer_recv` credit/STOP/FIN this queues is collected by the
   /// coordinator's unconditional pump-end [`Bridge::service`].
+  /// The SOLE producer choke for the deferred FIN queue, enforcing per-connection disposition
+  /// PRECEDENCE: a whole-connection fatal (`OverCap`, `Truncated`) supersedes anything queued for
+  /// the same handle. Without it, FIFO application lets a queued `Clean` reach the entry first
+  /// (`close_fault_class` marks the connection `Closed` under `PeerClosed`), and the later fatal's
+  /// `close_local` becomes an idempotent no-op that never counts — a real over-cap/torn recv fault
+  /// silently attributed to a clean peer close. Delivery is unaffected by the purge: complete
+  /// frames are delivered by `drain_bridge`'s frame drain, not by the queue entries. An `OverCap`
+  /// already queued outranks an incoming `Truncated` (the over-cap rejection is the dominant
+  /// protocol-violation fact — the same preference the inline classify applies); a `Clean` is
+  /// skipped when any fatal is queued for the handle and deduplicated against an identical
+  /// `(handle, class)` `Clean`.
+  fn push_fin_close(
+    &mut self,
+    h: ConnectionHandle,
+    class: StreamClass,
+    disposition: FinDisposition,
+  ) {
+    match disposition {
+      FinDisposition::OverCap | FinDisposition::Truncated => {
+        if disposition == FinDisposition::Truncated
+          && self
+            .pending_fin_close
+            .iter()
+            .any(|(hh, _, d)| *hh == h && *d == FinDisposition::OverCap)
+        {
+          return;
+        }
+        self.pending_fin_close.retain(|(hh, _, _)| *hh != h);
+        self.pending_fin_close.push_back((h, class, disposition));
+      }
+      FinDisposition::Clean => {
+        let superseded = self
+          .pending_fin_close
+          .iter()
+          .any(|(hh, cls, d)| *hh == h && (*d != FinDisposition::Clean || *cls == class));
+        if !superseded {
+          self
+            .pending_fin_close
+            .push_back((h, class, FinDisposition::Clean));
+        }
+      }
+    }
+  }
+
   pub(crate) fn finish_fin_close(
     &mut self,
     now: Instant,
@@ -1134,7 +1216,10 @@ impl Bridge {
     match disposition {
       // A framing failure tears down the whole connection regardless of class — the deferred twin of the
       // inline `close_local` framing-error path; the complete prefix frames were already delivered above.
-      FinDisposition::Truncated => self.close_local(now, h),
+      // The two fatal dispositions differ only in the attributed cause: a torn FIN vs an over-cap
+      // declared length.
+      FinDisposition::Truncated => self.close_local(now, h, CloseCause::TruncatedFrame),
+      FinDisposition::OverCap => self.close_local(now, h, CloseCause::FrameTooLong),
       FinDisposition::Clean => {
         let Some(sid) = self.table.entry(h).and_then(|e| e.class_mut(class).recv) else {
           return;
@@ -1277,7 +1362,7 @@ impl Bridge {
       match self.frame_checked(preface.len(), || preface) {
         Some(framed) => Some(framed),
         None => {
-          self.close_local(now, h);
+          self.close_local(now, h, CloseCause::FrameTooLong);
           return;
         }
       }
@@ -1376,6 +1461,7 @@ impl Bridge {
     // COUNT to `PER_PEER_CONN_LIMIT`. Empty in the common (within-bound) case.
     let stale = self.table.validate_routing(h, peer, PER_PEER_CONN_LIMIT);
     let mut tail_frame_error = false;
+    let mut tail_truncated_partial = false;
     if let Some(e) = self.table.entry(h) {
       e.phase = Phase::Validated;
       // Validated: clear the authentication deadline so this connection is never a reap candidate.
@@ -1404,7 +1490,9 @@ impl Bridge {
       // cannot legitimately fail; but a framing error here is still fatal — recorded so the connection is
       // DEFERRED for the post-delivery reap (below), never closed synchronously while the hello + any
       // complete tail frames are still queued for `drain_bridge` to deliver.
-      tail_frame_error = decode_and_classify(&mut control.decoder, &[], false).frame_error;
+      let tail_rec = decode_and_classify(&mut control.decoder, &[], false);
+      tail_frame_error = tail_rec.frame_error;
+      tail_truncated_partial = tail_rec.truncated_partial;
       // I7: the auth deadline was just cleared and `h` is no longer `Authenticating` (it is `Validated`),
       // so the deadline-present-iff-authenticating biconditional holds for this entry.
       debug_assert!(
@@ -1422,21 +1510,31 @@ impl Bridge {
       //
       // This branch is DEFENSIVE: `extend_first`'s prefix guard already rejected an over-`MAX_FRAME_LEN`
       // tail during the pre-auth read (against the same constant the raised cap checks), so a tail that
-      // reaches here over-declaring at the raised cap is unconstructable through the live decode path. When
-      // it IS reachable, that same rejection already pushed a `Truncated` for `h` from `ingest_recv` (the
-      // `[hello][over-cap tail][FIN]` shape), so dedup on `h` — skipping a second push — keeps exactly one
-      // disposition recorded.
-      if !self.pending_fin_close.iter().any(|(hh, _, _)| *hh == h) {
-        self
-          .pending_fin_close
-          .push_back((h, StreamClass::Control, FinDisposition::Truncated));
-      }
+      // reaches here over-declaring at the raised cap is unconstructable through the live decode path.
+      // When it IS reachable, `ingest_recv` already recorded a disposition for `h` — the choke's
+      // per-connection precedence keeps exactly one, with the fatal winning.
+      self.push_fin_close(h, StreamClass::Control, FinDisposition::OverCap);
       return;
+    }
+    if tail_truncated_partial {
+      // The raised-cap re-decode proves the retained tail is TORN at the FINAL cap. Whether that is a
+      // fault depends on whether the stream already FINISHED: `ingest_recv` classified the pre-auth
+      // `[hello][partial tail][FIN]` shape as a Clean FIN (a non-zero partial behind a complete hello
+      // is normally the legitimately-retained pipelined tail — ambiguous under the small cap), and
+      // that queued Clean is the FIN's only record. UPGRADE it to `Truncated` so the reap is
+      // attributed to the torn frame, not to a clean peer close. With NO queued Clean the stream has
+      // not finished — the partial is an in-flight frame whose remaining bytes are still coming, so
+      // nothing is recorded (a later FIN classifies it at the final cap directly).
+      if let Some(entry) = self.pending_fin_close.iter_mut().find(|(hh, cls, d)| {
+        *hh == h && *cls == StreamClass::Control && *d == FinDisposition::Clean
+      }) {
+        entry.2 = FinDisposition::Truncated;
+      }
     }
     // Close the selected stale excess through the shared teardown choke-point (issues the quinn `close`
     // so each drains to `Drained` and frees its slab + cap slot). `h` is never in this set.
     for stale_h in stale {
-      self.close_local(now, stale_h);
+      self.close_local(now, stale_h, CloseCause::Superseded);
     }
     // DEFENSIVE (idempotent): each `close_local` above already recovers routing in its teardown tail, so
     // `by_peer[peer]` is restored before this runs. Kept as the localized invariant anchor — re-point an
@@ -1507,13 +1605,20 @@ impl Bridge {
   /// Does NOT issue the quinn `close` — that is the local-fatal caller's job (a peer-initiated loss is
   /// already draining). A missing entry still unbinds + queues `lost` (a harmless no-op against the later
   /// reap). Does NOT call `service` (see [`Self::close_local`]'s non-recursion note).
-  fn mark_closed_unbind_push(&mut self, h: ConnectionHandle) {
+  fn mark_closed_unbind_push(&mut self, h: ConnectionHandle, cause: CloseCause) {
     // Capture the peer BEFORE the teardown: the routing recovery below must promote a sibling for the
     // peer this handle carried, and `unbind` does not change `entry.peer`, but reading it up front keeps
     // the promote independent of any later mutation. `None` for a `Handshaking` connection that never
     // bound a peer — nothing to recover.
     let peer = self.table.entry(h).and_then(|e| e.peer);
     if let Some(e) = self.table.entry(h) {
+      // Per-cause close observability, counted exactly once per connection at the Closed
+      // TRANSITION: a peer loss racing an already-issued local close (or any repeated teardown of
+      // the same handle) finds the entry already `Closed` and does not re-count — the first cause
+      // to tear the connection down is the one recorded.
+      if !e.phase.is_closed() {
+        self.close_counts[cause.index()] += 1;
+      }
       e.phase = Phase::Closed;
       e.auth_deadline = None;
       // I7: leaving `Authenticating` for `Closed` clears the deadline, so the
@@ -1566,7 +1671,7 @@ impl Bridge {
   ///
   /// Idempotent: a second call on an already-`Closed` entry is a no-op (the phase check prevents a
   /// duplicate `close` / `lost` push / `unbind`).
-  pub(crate) fn close_local(&mut self, now: Instant, h: ConnectionHandle) {
+  pub(crate) fn close_local(&mut self, now: Instant, h: ConnectionHandle, cause: CloseCause) {
     if let Some(e) = self.table.entry(h) {
       if e.phase.is_closed() {
         return;
@@ -1575,7 +1680,7 @@ impl Bridge {
       // peer-initiated loss skips this close (it is already draining) but shares the same tail.
       e.conn.close(now, VarInt::from_u32(1), bytes::Bytes::new());
     }
-    self.mark_closed_unbind_push(h);
+    self.mark_closed_unbind_push(h, cause);
     // No `service` here (see the non-recursion note above): the CONNECTION_CLOSE is collected by the next
     // service pass — the coordinator's pump-end `service`, or the immediate re-pump a `poll_timeout`-driven
     // driver makes because `lost` is now non-empty (`has_pending_work`).
@@ -1678,7 +1783,7 @@ impl Bridge {
         match class {
           StreamClass::Bulk => self.reset_send_class(h, class),
           StreamClass::Control => {
-            self.close_local(now, h);
+            self.close_local(now, h, CloseCause::OutboundOverflow);
             return;
           }
         }
@@ -1736,7 +1841,7 @@ impl Bridge {
     sid: StreamId,
   ) -> Option<bool> {
     if class == StreamClass::Control {
-      self.close_local(now, h);
+      self.close_local(now, h, CloseCause::PeerClosed);
       return None;
     }
     let Some(e) = self.table.entry(h) else {
@@ -1991,7 +2096,13 @@ impl Bridge {
       // torn partial reaps the whole connection (`Truncated`); anything else is `Clean`.
       if fault.is_graceful() || rec.frame_error {
         let truncated = rec.frame_error || rec.truncated_partial;
-        let disposition = if truncated {
+        // The two fatal classifications are distinguishable facts (`RecvDecode` keeps them as
+        // separate fields), so keep them distinguishable in the disposition: an over-cap declared
+        // length is a peer protocol violation (`FrameTooLong`), a torn partial at FIN is a
+        // truncation — an operator reading the per-cause counters must be able to tell them apart.
+        let disposition = if rec.frame_error {
+          FinDisposition::OverCap
+        } else if rec.truncated_partial {
           FinDisposition::Truncated
         } else {
           FinDisposition::Clean
@@ -2003,7 +2114,7 @@ impl Bridge {
         // `finish_fin_close` applies `disposition`. The connection stays live until then, so the other
         // class is still read this pass.
         if !truncated || rec.has_ready || self.has_pending_delivery(h) {
-          self.pending_fin_close.push_back((h, class, disposition));
+          self.push_fin_close(h, class, disposition);
           continue;
         }
         // A `Truncated` close with nothing to deliver — an over-cap framing error with no complete prefix,
@@ -2018,7 +2129,12 @@ impl Bridge {
           "ingest_recv: an inline reap (return true) leaves no complete frame queued on either class — \
            the empty-drain precondition of the bool contract"
         );
-        self.close_local(now, h);
+        let cause = if rec.frame_error {
+          CloseCause::FrameTooLong
+        } else {
+          CloseCause::TruncatedFrame
+        };
+        self.close_local(now, h, cause);
         return true;
       }
       reschedule |= leftover;
@@ -2181,7 +2297,7 @@ impl Bridge {
             return true;
           }
           StreamClass::Control => {
-            self.close_local(now, h);
+            self.close_local(now, h, CloseCause::PeerClosed);
             return false;
           }
         },

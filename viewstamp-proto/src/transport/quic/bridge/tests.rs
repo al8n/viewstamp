@@ -2,6 +2,7 @@ use super::*;
 use crate::{
   Commit, OpNumber, ReplicaId, View,
   transport::{
+    CloseCause,
     frame::LEN_PREFIX,
     quic::{
       crypto::MAX_BIDI_STREAMS,
@@ -2427,7 +2428,7 @@ fn drained_connections_do_not_leak_endpoint_slab_state() {
     // Close A's connection and ferry until it fully drains: the table entry is reaped AND the
     // endpoint slab slot is freed (Drained forwarded). Reap the `lost` queue each tick the way the
     // coordinator would, so the close path is exercised end to end.
-    a.close_local(now, ha);
+    a.close_local(now, ha, CloseCause::PeerClosed);
     let mut drained = false;
     for _ in 0..600 {
       step(&mut a, &mut b, &mut now);
@@ -2666,6 +2667,20 @@ fn an_oversized_pre_auth_control_frame_is_rejected_not_buffered() {
      open_connections={}, table_len={}",
     a.endpoint_open_connections(),
     a.table_len(),
+  );
+  // Per-cause close observability: the over-cap declared length is a peer PROTOCOL VIOLATION and
+  // must be attributed to FrameTooLong — not collapsed into TruncatedFrame (a torn FIN), which
+  // would make an oversized-frame peer indistinguishable from a mid-frame disconnect in the
+  // counters an operator diagnoses from.
+  assert_eq!(
+    a.conn_close_count(CloseCause::FrameTooLong),
+    1,
+    "the over-cap inbound frame is counted as FrameTooLong"
+  );
+  assert_eq!(
+    a.conn_close_count(CloseCause::TruncatedFrame),
+    0,
+    "an over-cap rejection is NOT a truncation — the two fatal framing causes stay distinguishable"
   );
 }
 
@@ -3024,6 +3039,16 @@ fn inbound_accepts_are_bounded_by_the_connection_cap() {
   assert!(
     max_server_slab <= CAP,
     "the endpoint slab must stay within the cap ({CAP}); peak was {max_server_slab}"
+  );
+  // Per-cause close observability: the refusals are COUNTED even though a refused attempt never
+  // allocates a `ConnEntry` (the refusal branch counts directly — the shared Closed-transition
+  // counting can never see a pre-entry refusal). Excess dialers retry their Initials, so the count
+  // is at least the surplus beyond the cap, and every refusal is attributed to AcceptCapacity.
+  assert!(
+    server.conn_close_count(CloseCause::AcceptCapacity) >= (DIALERS - CAP) as u64,
+    "at-cap inbound refusals are counted (got {}, expected at least {})",
+    server.conn_close_count(CloseCause::AcceptCapacity),
+    DIALERS - CAP
   );
 }
 
@@ -3394,7 +3419,7 @@ fn a_poll_timeout_driven_driver_drains_a_closed_connection() {
 
   // Close locally: the quinn `close` arms the drain timer. From here the ONLY thing that advances
   // the connection is the `poll_timeout`-driven loop below — no inbound datagram is ever delivered.
-  a.close_local(base, ha);
+  a.close_local(base, ha, CloseCause::PeerClosed);
 
   // Sleep-until-`poll_timeout` driver: drain transmits AND the coordinator queues (the real
   // `drain_bridge` reaps `lost`), then jump the clock straight to the reported deadline and fire
@@ -4038,6 +4063,28 @@ fn an_authenticating_connection_past_its_deadline_is_reaped_freeing_its_slot() {
     a.table_len(),
     a.endpoint_open_connections(),
   );
+  // Per-cause close observability: the reap counted EXACTLY ONE AuthDeadline close — and stayed at
+  // one through the whole drain, even though quinn's own `ConnectionLost { LocallyClosed }` event
+  // for the locally-issued close runs the same teardown tail again (the Closed-transition guard is
+  // what makes the count once-per-connection, whichever notification arrives second).
+  assert_eq!(
+    a.conn_close_count(CloseCause::AuthDeadline),
+    1,
+    "the auth-deadline reap is counted exactly once for the connection"
+  );
+  for cause in [
+    CloseCause::PeerClosed,
+    CloseCause::IdleTimeout,
+    CloseCause::Superseded,
+    CloseCause::IdentityRejected,
+    CloseCause::TruncatedFrame,
+  ] {
+    assert_eq!(
+      a.conn_close_count(cause),
+      0,
+      "no close is attributed to {cause} in the auth-deadline reap scenario"
+    );
+  }
 }
 
 /// MANY connections that all sit in `Authenticating` and expire TOGETHER are reaped by a SINGLE
@@ -4530,7 +4577,7 @@ fn losing_a_routed_connection_recovers_routing_to_a_live_sibling() {
   // no live same-peer connection left (the first handle is Closed), routing correctly CLEARS: a
   // single-connection-worth-of-live peer losing its only live connection is unrouteable, and that is the
   // consistent state (`routing_is_live` holds vacuously — no live entry, empty slot).
-  a.close_local(now, h_sibling);
+  a.close_local(now, h_sibling, CloseCause::PeerClosed);
   assert_eq!(
     a.handle_for(peer),
     None,
@@ -4558,7 +4605,7 @@ fn losing_a_routed_connection_recovers_routing_to_a_live_sibling() {
     Some(h_routed2),
     "routed2 holds the slot"
   );
-  a.close_local(now, h_extra);
+  a.close_local(now, h_extra, CloseCause::PeerClosed);
   assert_eq!(
     a.handle_for(peer),
     Some(h_routed2),
@@ -4571,7 +4618,7 @@ fn losing_a_routed_connection_recovers_routing_to_a_live_sibling() {
     .connect(now, b_addr, "viewstamp.local", peer)
     .expect("dial fits under the cap");
   a.table.entry(h_handshaking).expect("entry").peer = None;
-  a.close_local(now, h_handshaking);
+  a.close_local(now, h_handshaking, CloseCause::PeerClosed);
   assert_eq!(
     a.handle_for(peer),
     Some(h_routed2),
@@ -5516,7 +5563,7 @@ fn auth_deadline_is_present_exactly_while_authenticating() {
   );
 
   // EXIT to Closed (local fatal): closing B's still-Authenticating connection clears its deadline.
-  b.close_local(now, hb);
+  b.close_local(now, hb, CloseCause::PeerClosed);
   assert!(
     b.table.entry(hb).is_some_and(|e| e.phase.is_closed())
       && b.table.entry(hb).and_then(|e| e.auth_deadline).is_none(),
@@ -6209,7 +6256,7 @@ fn peer_bulk_recv_fin_complete_then_partial_delivers_prefix_then_reaps() {
 /// frame. The fix DEFERS (`Truncated`) when `has_ready()`, delivering the prefix, then reaps the whole
 /// connection.
 ///
-/// NEUTER CHECK: restore the framing branch's bare `self.close_local(now, h); return true;` (no
+/// NEUTER CHECK: restore the framing branch's bare `self.close_local(now, h, CloseCause::PeerClosed); return true;` (no
 /// `has_ready()` defer). `ingest_recv` returns `true`, so the complete prefix frame is never pulled —
 /// the `returned_false` assert fires, then the delivery assert.
 #[test]
@@ -6302,12 +6349,25 @@ fn peer_control_recv_frame_too_long_behind_complete_frame_delivers_prefix_then_r
   let deferred = a.take_pending_fin_close();
   assert_eq!(
     deferred,
-    Some((ha, StreamClass::Control, FinDisposition::Truncated)),
-    "a framing error behind a complete frame defers a Truncated (whole-connection) reap"
+    Some((ha, StreamClass::Control, FinDisposition::OverCap)),
+    "an over-cap declared length behind a complete frame defers an OverCap (whole-connection) reap"
   );
   if let Some((hh, cls, disp)) = deferred {
     a.finish_fin_close(read_tick, hh, cls, disp);
   }
+  // The deferred over-cap reap is attributed to FrameTooLong — the protocol violation — not to
+  // TruncatedFrame (a torn FIN), keeping the two fatal framing causes distinguishable in the
+  // per-cause counters on the DEFERRED path exactly as on the inline one.
+  assert_eq!(
+    a.conn_close_count(CloseCause::FrameTooLong),
+    1,
+    "the deferred over-cap reap counts as FrameTooLong"
+  );
+  assert_eq!(
+    a.conn_close_count(CloseCause::TruncatedFrame),
+    0,
+    "the deferred over-cap reap is not attributed to truncation"
+  );
   assert!(
     a.table.entry(ha).is_some_and(|e| e.phase.is_closed()),
     "after delivering the complete frame, the framing-error connection is reaped (Closed)"
@@ -6316,6 +6376,78 @@ fn peer_control_recv_frame_too_long_behind_complete_frame_delivers_prefix_then_r
     a.handle_for(peer_b),
     None,
     "the reaped connection is unrouted"
+  );
+}
+
+/// The deferred-FIN queue's per-connection disposition PRECEDENCE: a whole-connection fatal
+/// supersedes a queued `Clean` for the same handle, regardless of arrival order. FAIL-BEFORE
+/// (FIFO application): a Control `[complete frame][FIN]` queues `Clean` first; a Bulk over-cap
+/// prefix in the same pump then queues `OverCap` BEHIND it — the drain applied `Clean` first,
+/// `close_fault_class` marked the connection `Closed` under `PeerClosed`, and the later fatal's
+/// `close_local` was an idempotent no-op that never counted, leaving a real over-cap inbound frame
+/// outside the `FrameTooLong` counter.
+#[test]
+fn a_deferred_fatal_disposition_supersedes_a_queued_clean_fin() {
+  let Linked {
+    mut a,
+    b: _b,
+    ha,
+    now,
+    ..
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+
+  // The cross-class same-pump order the FIFO bug needs: the Control clean FIN is recorded first,
+  // the Bulk over-cap fatal second (both route through the producer choke).
+  a.push_fin_close(ha, StreamClass::Control, FinDisposition::Clean);
+  a.push_fin_close(ha, StreamClass::Bulk, FinDisposition::OverCap);
+  // The fatal PURGED the queued Clean: exactly one disposition remains for the handle.
+  let first = a.take_pending_fin_close();
+  assert_eq!(
+    first,
+    Some((ha, StreamClass::Bulk, FinDisposition::OverCap)),
+    "the fatal supersedes the earlier-queued Clean for the same connection"
+  );
+  assert_eq!(
+    a.take_pending_fin_close(),
+    None,
+    "no second disposition survives for the handle"
+  );
+  // A Clean arriving AFTER the fatal was applied-or-queued is likewise inert: re-queue the fatal,
+  // then push a late Clean — the fatal still wins.
+  a.push_fin_close(ha, StreamClass::Bulk, FinDisposition::OverCap);
+  a.push_fin_close(ha, StreamClass::Control, FinDisposition::Clean);
+  assert_eq!(
+    a.take_pending_fin_close(),
+    Some((ha, StreamClass::Bulk, FinDisposition::OverCap)),
+    "a Clean queued after a fatal is skipped (the fatal wins in either order)"
+  );
+  assert_eq!(a.take_pending_fin_close(), None);
+  // A queued OverCap outranks an incoming Truncated (the over-cap rejection is the dominant fact).
+  a.push_fin_close(ha, StreamClass::Control, FinDisposition::OverCap);
+  a.push_fin_close(ha, StreamClass::Control, FinDisposition::Truncated);
+  assert_eq!(
+    a.take_pending_fin_close(),
+    Some((ha, StreamClass::Control, FinDisposition::OverCap)),
+    "an incoming Truncated does not demote a queued OverCap"
+  );
+  assert_eq!(a.take_pending_fin_close(), None);
+  // Applying the surviving fatal counts FrameTooLong — never PeerClosed — closing the loop on the
+  // accounting the precedence exists for.
+  let (hh, cls, disp) = first.expect("asserted Some above");
+  a.finish_fin_close(now, hh, cls, disp);
+  assert!(
+    a.table.entry(ha).is_some_and(|e| e.phase.is_closed()),
+    "the surviving fatal reaps the whole connection"
+  );
+  assert_eq!(
+    a.conn_close_count(CloseCause::FrameTooLong),
+    1,
+    "the over-cap fatal is counted as FrameTooLong despite the earlier clean FIN"
+  );
+  assert_eq!(
+    a.conn_close_count(CloseCause::PeerClosed),
+    0,
+    "the superseded Clean never attributes a clean peer close"
   );
 }
 
@@ -6638,14 +6770,17 @@ fn preauth_control_fin_with_partial_tail_validates_then_reaps(layout: StreamLayo
     a.test_partial_len(ha, StreamClass::Control) > 0,
     "the torn tail's prefix remains buffered (undeliverable), to be dropped at the reap"
   );
-  // The deferred FIN reaps the connection. The hello completed, so the close is `Clean` (the partial
-  // tail is the pre-auth retained pipeline re-checked under the raised cap, NOT a torn frame); the reap
-  // is identical to the clean-tail case, only no tail frame is delivered.
+  // The deferred FIN reaps the connection — attributed to the TORN tail. At ingest time the
+  // pre-auth classification was ambiguous (a partial behind a complete hello is normally the
+  // legitimately-retained pipelined tail), so a Clean FIN was queued; the raised-cap re-decode at
+  // validation resolved the ambiguity (the tail is torn at the FINAL cap) and UPGRADED the queued
+  // disposition — the peer finished mid-frame, and the per-cause counters must say so rather than
+  // reporting a clean peer close.
   let deferred = a.take_pending_fin_close();
   assert_eq!(
     deferred,
-    Some((ha, StreamClass::Control, FinDisposition::Clean)),
-    "the FIN is deferred to the post-delivery reap (Clean — the torn bytes are the pre-auth tail)"
+    Some((ha, StreamClass::Control, FinDisposition::Truncated)),
+    "the deferred FIN was upgraded to Truncated once the raised-cap re-decode proved the tail torn"
   );
   if let Some((hh, cls, disp)) = deferred {
     a.finish_fin_close(read_tick, hh, cls, disp);
@@ -6653,6 +6788,16 @@ fn preauth_control_fin_with_partial_tail_validates_then_reaps(layout: StreamLayo
   assert!(
     a.table.entry(ha).is_some_and(|e| e.phase.is_closed()),
     "the connection reaps after delivering the hello and dropping the torn tail"
+  );
+  assert_eq!(
+    a.conn_close_count(CloseCause::TruncatedFrame),
+    1,
+    "the torn-tail reap is counted as TruncatedFrame (not a clean peer close)"
+  );
+  assert_eq!(
+    a.conn_close_count(CloseCause::PeerClosed),
+    0,
+    "no clean peer close is attributed for a FIN that tore a frame"
   );
   assert_eq!(
     a.handle_for(peer_b),
@@ -6847,20 +6992,21 @@ fn bind_validated_tail_decode_error_defers_truncated_close_not_synchronous() {
     "the complete hello is delivered before the deferred reap (NEUTER: a synchronous close drops it)"
   );
 
-  // The deferred close carries `Truncated` (the over-cap tail is a framing failure → whole-connection
-  // reap), queued for the post-delivery teardown — empty under the synchronous-close neuter.
+  // The deferred close carries `OverCap` (the over-cap tail is a peer protocol violation →
+  // whole-connection reap attributed to FrameTooLong), queued for the post-delivery teardown —
+  // empty under the synchronous-close neuter.
   let deferred = a.take_pending_fin_close();
   assert_eq!(
     deferred,
-    Some((ha, StreamClass::Control, FinDisposition::Truncated)),
-    "the tail framing error defers a Truncated (whole-connection) close, not a synchronous reap"
+    Some((ha, StreamClass::Control, FinDisposition::OverCap)),
+    "the tail framing error defers an OverCap (whole-connection) close, not a synchronous reap"
   );
   if let Some((hh, cls, disp)) = deferred {
     a.finish_fin_close(now, hh, cls, disp);
   }
   assert!(
     a.table.entry(ha).is_some_and(|e| e.phase.is_closed()),
-    "after the hello is delivered, the deferred Truncated close reaps the whole connection (Closed)"
+    "after the hello is delivered, the deferred OverCap close reaps the whole connection (Closed)"
   );
   assert_eq!(
     a.handle_for(peer_b),
@@ -6965,7 +7111,7 @@ fn a_short_first_control_frame_does_not_let_a_later_frame_authenticate(short_fir
         IdentityOutcome::Pending => {}
         IdentityOutcome::Rejected => {
           rejected_on_first = true;
-          a.close_local(read_tick, ha);
+          a.close_local(read_tick, ha, CloseCause::PeerClosed);
         }
       }
       if !a.is_validated(ha) {

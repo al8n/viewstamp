@@ -481,10 +481,14 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     for (h, member, bound_peer) in self.bridge.validated_member_conns() {
       match self.endpoint.slot_of(member) {
         // Removed (or for a member outside the new config): close + drop routing; redial suppressed.
-        None => self.bridge.close_local(std_now, h),
+        None => self
+          .bridge
+          .close_local(std_now, h, crate::transport::CloseCause::Superseded),
         // Shifted to a different slot: close so it reconnects and re-binds under the new slot.
         Some(new_slot) if Peer::Replica(new_slot) != bound_peer => {
-          self.bridge.close_local(std_now, h);
+          self
+            .bridge
+            .close_local(std_now, h, crate::transport::CloseCause::Superseded);
         }
         // Slot unchanged: keep the connection bound (no churn for an unmoved retained member).
         Some(_) => {}
@@ -515,6 +519,15 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// is required. Forwards the bridge's counter, mirroring `StreamCoordinator::oversized_outbound_dropped`.
   pub fn oversized_outbound_dropped(&self) -> u64 {
     self.bridge.oversized_dropped()
+  }
+
+  /// The number of connection closes attributed to `cause` so far — counted once per connection at
+  /// the shared teardown tail, whichever side (a local fatal, a peer loss, an idle expiry, a
+  /// membership-change retirement) tore it down first. The QUIC analogue of the stream drivers'
+  /// per-cause close observability; test/diagnostic surface, not a stable embedder API.
+  #[doc(hidden)]
+  pub fn conn_close_count(&self, cause: crate::transport::CloseCause) -> u64 {
+    self.bridge.conn_close_count(cause)
   }
 
   /// Submit a client request originating at this node's local application.
@@ -751,7 +764,9 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       IdentityOutcome::Identified(id) => id,
       IdentityOutcome::Pending => return,
       IdentityOutcome::Rejected => {
-        self.bridge.close_local(std_now, h);
+        self
+          .bridge
+          .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
         return;
       }
     };
@@ -763,13 +778,17 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     // source owns its own attested cluster (it may report any cluster), so this only re-confirms what
     // that source asserts — the embedder owns that correctness per the named hazard.
     if identified.cluster() != self.cluster() {
-      self.bridge.close_local(std_now, h);
+      self
+        .bridge
+        .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
       return;
     }
     // The attested identity must be a REPLICA's stable `MemberId` (a CLIENT identity uses a separate
     // endpoint, so `as_replica()` is `None` → reject).
     let Some(member_id) = identified.id().as_replica() else {
-      self.bridge.close_local(std_now, h);
+      self
+        .bridge
+        .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
       return;
     };
     // A replica must NEVER bind a peer claiming to be ITSELF, keyed on the stable member id. An ACCEPTED
@@ -780,7 +799,9 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     // needs a valid cluster cert for our id), not a Byzantine claim. Checked BEFORE the membership
     // resolution: a node IS in its own membership, so resolving first would admit the self-claim.
     if member_id == self.endpoint.local() {
-      self.bridge.close_local(std_now, h);
+      self
+        .bridge
+        .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
       return;
     }
     // Resolve the attested stable `MemberId` to its routing slot against the ACTIVE membership. `Some`
@@ -790,14 +811,18 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     // `Backups`/`AllReplicas` fanout, yet the endpoint's own `sender_matches` then drops every inbound
     // consensus frame from it. In-model misconfiguration, not a Byzantine claim.
     let Some(slot) = self.endpoint.slot_of(member_id) else {
-      self.bridge.close_local(std_now, h);
+      self
+        .bridge
+        .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
       return;
     };
     let routing_peer = Peer::Replica(slot);
     match self.bridge.dialed_expectation_of(h) {
       // Dialed: the resolved routing peer must be exactly the peer we meant to reach.
       Some(expected) if routing_peer != expected => {
-        self.bridge.close_local(std_now, h);
+        self
+          .bridge
+          .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
         return;
       }
       // Dialed-and-matched, or accepted (adopt): fall through to bind.

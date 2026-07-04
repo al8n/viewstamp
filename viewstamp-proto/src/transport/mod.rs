@@ -78,11 +78,16 @@ pub enum CloseCause {
   AuthDeadline,
   /// An accepted socket was dropped at the driver's live-connection cap before registration.
   AcceptCapacity,
+  /// The transport's own idle timeout expired with no peer traffic (a QUIC `TimedOut` loss).
+  IdleTimeout,
+  /// A live conn was retired by newer state — a fresher validated conn for the same peer won the
+  /// duplicate race, or a membership change removed/re-slotted the member it was bound to.
+  Superseded,
 }
 
 impl CloseCause {
   /// The number of causes — sizes a per-cause counter array (`[u64; CloseCause::COUNT]`).
-  pub const COUNT: usize = Self::AcceptCapacity as usize + 1;
+  pub const COUNT: usize = Self::Superseded as usize + 1;
 
   /// The dense counter-array slot of this cause (`0..COUNT`).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -103,6 +108,8 @@ impl CloseCause {
       Self::IdentityRejected => "identity_rejected",
       Self::AuthDeadline => "auth_deadline",
       Self::AcceptCapacity => "accept_capacity",
+      Self::IdleTimeout => "idle_timeout",
+      Self::Superseded => "superseded",
     }
   }
 }
