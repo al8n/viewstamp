@@ -135,7 +135,7 @@ VOPR_SEED=<seed> cargo test -p viewstamp-simulation --test vopr replay_single_se
 ```
 
 Byte-decode surfaces (`Message`, the superblock root, the WAL header codec, the stream
-transport ingress) are additionally fuzzed under `cargo fuzz` (see [`fuzz/`](fuzz)).
+transport ingress) are additionally fuzzed under `cargo fuzz` (see [`fuzz/`](https://github.com/al8n/viewstamp/tree/main/fuzz)).
 
 ## Status
 
