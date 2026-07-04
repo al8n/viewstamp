@@ -1254,6 +1254,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // `checkpoint_op`, so the gate flips from withhold to serve at exactly the right checkpoint.
       self.config_install_op,
     )
+    // The vouched carried-log floor, raised to this root's own checkpoint: a checkpoint root is built
+    // with a `checkpoint_op` param that may be AHEAD of the live `self.checkpoint_op` (the in-memory
+    // advance lands at the root's completion, which then raises the live floor to the same point).
+    .and_then(|s| s.with_log_floor(OpNumber::with(self.log_floor.get().max(checkpoint_op.get()))))
     .expect("durable root: log_view <= view, commit >= checkpoint_op, membership epoch consistent")
   }
 
@@ -1321,6 +1325,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // restart-survivable lower bound for the gate on this node (now a potential re-donor).
       checkpoint_op,
     )
+    // The vouched carried-log floor, raised to the synced checkpoint (the install advances the live
+    // floor to the same point at this root's completion); a higher adoption-learned floor is kept.
+    .and_then(|s| s.with_log_floor(OpNumber::with(self.log_floor.get().max(checkpoint_op.get()))))
     .expect(
       "sync-successor root: log_view <= view, commit >= checkpoint_op, membership epoch consistent",
     )
