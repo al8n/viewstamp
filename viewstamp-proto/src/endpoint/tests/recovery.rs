@@ -6932,3 +6932,125 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
     "no PrepareOk before the append is durable — the false-re-ack path is closed",
   );
 }
+
+#[test]
+fn recover_restores_the_persisted_log_floor_capped_at_the_recovered_head() {
+  // A v7 root persists the writer's adoption-learned carried-log floor. Recovery RESTORES it (the
+  // pre-v7 behaviour restarted the floor at the own checkpoint and re-learned it from the next
+  // carrier — the un-synced crash window where the restarted node's own carrier could over-span),
+  // capped at the recovered head: a floor above what the WAL actually retained has nothing left to
+  // bound below it, and the cap keeps the `op >= log_floor` invariant.
+  let mk_header = |op: u64| {
+    Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(7),
+      RequestNumber::with(op),
+      &[op as u8],
+    )
+  };
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![mk_header(1), mk_header(2)],
+  )
+  .unwrap()
+  .with_log_floor(OpNumber::with(2))
+  .unwrap();
+  // RESTORE: the WAL retained the whole band (head 3 >= floor 2) → the floor restores verbatim.
+  let mut sb = TestSb {
+    state: state.clone(),
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal = ScriptedWal::with_entries(3);
+  let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut r = Endpoint::recover(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect_active();
+  drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, Instant::ZERO);
+  assert_eq!(
+    r.log_floor,
+    OpNumber::with(2),
+    "the persisted adoption-learned floor restores (FAIL-BEFORE: restarted at checkpoint_op 0)"
+  );
+  // CAP: a root whose floor exceeds everything the recovery can re-derive — the band header for
+  // op 2 was never held (a SPARSE band: the floor came from an adoption's cluster evidence, not a
+  // local hold) and the WAL retained only op 1 → the recovered head is 1 (scan 1, canonical band
+  // top 1) and the floor caps there (`op >= log_floor` holds; the force-sync escalation re-learns
+  // the cluster floor upward, exactly as pre-v7).
+  let sparse = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::new(),
+    0,
+    std::vec![mk_header(1)],
+  )
+  .unwrap()
+  .with_log_floor(OpNumber::with(2))
+  .unwrap();
+  let mut sb2 = TestSb {
+    state: sparse,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut wal2 = ScriptedWal::with_entries(1);
+  let cfg2 = Config::try_new(1, MemberId::new(1)).unwrap();
+  let mut blocks2 = crate::block_store::MemBlockStore::new();
+  let mut r2 = Endpoint::recover(
+    cfg2,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal2,
+    &mut sb2,
+    &mut blocks2,
+  )
+  .expect_active();
+  drive_recovery(&mut r2, &mut wal2, &mut sb2, &mut blocks2, Instant::ZERO);
+  assert_eq!(
+    r2.log_floor,
+    OpNumber::with(1),
+    "a floor above the recovered head caps at the head (nothing below it left to bound)"
+  );
+}
+
+#[test]
+fn a_durable_root_write_carries_the_live_log_floor() {
+  // Every durable-root writer threads the LIVE vouched floor into the root (the v7 scalar), so the
+  // floor a crash would restore is the one the node actually carries — not its own checkpoint. Pin
+  // the threading through the seal writer (`submit_durable_view` → the shared root builder): raise
+  // the in-memory floor above the checkpoint, seal, and read the durable root back.
+  let mut e = Endpoint::new(
+    Config::try_new(1, MemberId::new(2)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  e.force_state_for_test(0, 6, 6, 2, &[]);
+  e.log_floor = OpNumber::with(4); // an adoption-learned floor above the own checkpoint (2)
+  assert!(
+    e.seal_committed_frontier(&mut sb),
+    "a Normal node with no in-flight storage seals"
+  );
+  e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    sb.state.log_floor(),
+    OpNumber::with(4),
+    "the durable root carries the live floor, not the checkpoint restart value"
+  );
+}

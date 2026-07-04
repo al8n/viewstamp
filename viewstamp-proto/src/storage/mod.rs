@@ -129,12 +129,17 @@ pub const HEADER_VERSION: u16 = 1;
 /// without it a donor that recovered into a swapped-but-not-yet-checkpointed window would re-attach its
 /// successor membership to a checkpoint BELOW the reconfigure op, letting a laggard install the new epoch
 /// without the committed prefix through that op.
+/// Version `7` APPENDS one further scalar — `log_floor`, the writer's vouched carried-log floor — so a
+/// recovered node restores an adoption-learned floor instead of restarting it at its own `checkpoint_op`
+/// and re-learning it from the next carrier (the un-synced crash window where its own carrier could
+/// exceed the frame-fit span until the floor is re-heard).
 /// [`VsrState::decode`] dispatches on the leading version — `1..=3` parse the pre-membership layout
 /// (bridged to `epoch = 0`, no membership), `4` parses that body plus the epoch/membership tail, `5`
-/// parses that plus the lineage tail, and `6` parses that plus the `config_install_op` scalar — so NO
+/// parses that plus the lineage tail, `6` parses that plus the `config_install_op` scalar, and `7`
+/// parses that plus the `log_floor` scalar — so NO
 /// persisted root is stranded and a message-only `WIRE_VERSION` bump still can never invalidate a root. A
 /// future `VsrState` layout change bumps this again and extends that per-version dispatch.
-pub const SUPERBLOCK_VERSION: u16 = 6;
+pub const SUPERBLOCK_VERSION: u16 = 7;
 
 /// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
 /// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are
@@ -466,6 +471,16 @@ pub struct VsrState {
   /// root's own `checkpoint_op` (so the gate is trivially satisfied — the pre-fix serve behaviour); for a
   /// no-reconfiguration cluster it is genesis, unchanged.
   config_install_op: OpNumber,
+  /// The writer's vouched carried-log floor: every op at/below it is folded into a checkpoint SOMEWHERE
+  /// in the cluster (the writer's own, or an adoption-learned cluster floor), so the writer's carriers
+  /// legitimately omit those ops and its carrier span is bounded by `op − log_floor`. Persisted so a
+  /// recovered node RESTORES an adoption-learned floor instead of restarting at its own `checkpoint_op`
+  /// and re-learning it from the next carrier/Commit — closing the un-synced crash window where the
+  /// restarted node's own carrier could exceed the frame-fit span while its WAL still holds the
+  /// pre-adoption band. Never below `checkpoint_op` ([`Self::with_log_floor`] validates; the plain
+  /// constructors default it TO `checkpoint_op` — the exact pre-v7 recovery behaviour, which is also what
+  /// a v1-6 root decodes to).
+  log_floor: OpNumber,
 }
 
 impl Default for VsrState {
@@ -542,7 +557,27 @@ impl VsrState {
       // root decoded WITHOUT the v6 tail re-validates through here / `try_new_v4` and so inherits the same
       // `checkpoint_op` default (the pre-fix serve behaviour, never withholding a v4/v5 donor's membership).
       config_install_op: checkpoint_op,
+      // The floor a root vouches with no adoption evidence recorded: its own checkpoint. A pre-v7 root
+      // decodes to the same (the pre-v7 recovery behaviour); a writer with a higher adoption-learned
+      // floor raises it via `with_log_floor`.
+      log_floor: checkpoint_op,
     })
+  }
+
+  /// Raise this root's vouched carried-log floor to `log_floor` — an adoption-learned cluster floor the
+  /// writer carries above its own `checkpoint_op` (see the field's doc). Validated, not clamped: a floor
+  /// below the root's `checkpoint_op` contradicts "the own checkpoint always vouches its own prefix"
+  /// (every production writer raises the floor to at least its checkpoint), so it is a writer bug or a
+  /// corrupt decode, rejected as [`VsrStateError::LogFloorBelowCheckpoint`].
+  ///
+  /// # Errors
+  /// [`VsrStateError::LogFloorBelowCheckpoint`] if `log_floor < self.checkpoint_op()`.
+  pub fn with_log_floor(mut self, log_floor: OpNumber) -> Result<Self, VsrStateError> {
+    if log_floor.get() < self.checkpoint_op.get() {
+      return Err(VsrStateError::LogFloorBelowCheckpoint);
+    }
+    self.log_floor = log_floor;
+    Ok(self)
   }
 
   /// Creates a v5 durable root carrying the configuration epoch + the active [`Membership`] + the
@@ -620,6 +655,7 @@ impl VsrState {
       membership: None,
       prior_config_ids: Vec::new(),
       config_install_op: OpNumber::new(),
+      log_floor: OpNumber::new(),
     }
   }
 
@@ -654,6 +690,14 @@ impl VsrState {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checkpoint_id(&self) -> u128 {
     self.checkpoint_id
+  }
+
+  /// The writer's vouched carried-log floor (never below [`Self::checkpoint_op`]; see the field's
+  /// doc). `recover` restores it — capped at the recovered head, whose WAL is the only carrier
+  /// evidence that survived the crash — instead of restarting the floor at the own checkpoint.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn log_floor(&self) -> OpNumber {
+    self.log_floor
   }
 
   /// The canonical headers for the un-checkpointed committed band `(checkpoint_op .. commit]` — a SPARSE,
@@ -745,9 +789,10 @@ impl VsrState {
       // The appended v4 tail: epoch + prev_epoch + present-flag, plus the membership block when present.
         + 8 + 8 + 1
         + self.membership.as_ref().map_or(0, |_| 16 + 8 + 1 + 2 + 4 + members_len * 16)
-      // The appended v5 tail: the lineage count + its ids; then the v6 tail: config_install_op (u64).
+      // The appended v5 tail: the lineage count + its ids; then the v6 + v7 scalar tails
+      // (config_install_op + log_floor, a u64 each).
         + 4 + self.prior_config_ids.len() * 16
-        + 8,
+        + 8 + 8,
     );
     out.put_u16(SUPERBLOCK_VERSION);
     out.put_u64(self.view.get());
@@ -788,6 +833,9 @@ impl VsrState {
     // written for a v6 root — a fixed `u64` so it round-trips uniformly whether or not a membership is
     // present.
     out.put_u64(self.config_install_op.get());
+    // The appended v7 tail: `log_floor` (the writer's vouched carried-log floor). A fixed `u64`,
+    // uniform like the v6 scalar.
+    out.put_u64(self.log_floor.get());
     out.freeze()
   }
 
@@ -896,27 +944,39 @@ impl VsrState {
     } else {
       checkpoint_op
     };
+    // v7+: the appended `log_floor` scalar (the writer's vouched carried-log floor). A v1-6 root has
+    // none — default to `checkpoint_op` (the own checkpoint always vouches its own prefix; exactly the
+    // pre-v7 recovery behaviour). Validated through `with_log_floor` below, so a corrupt scalar below
+    // the checkpoint is rejected, never constructed.
+    let log_floor = if version >= 7 {
+      OpNumber::with(r.u64()?)
+    } else {
+      checkpoint_op
+    };
     r.finish()?;
     match membership {
-      // A v4/v5/v6 root with a real membership re-validates through `try_new_v4` (which adds the
+      // A v4+ root with a real membership re-validates through `try_new_v4` (which adds the
       // epoch-consistency check `membership.epoch() == epoch` on top of the scalar/header invariants).
-      Some(membership) => Ok(Self::try_new_v4(
-        view,
-        log_view,
-        commit,
-        checkpoint_op,
-        checkpoint_id,
-        committed_headers,
-        epoch,
-        prev_epoch,
-        membership,
-        prior_config_ids,
-        config_install_op,
-      )?),
-      // A v4/v5/v6-tagged root that carries no membership (a legacy root re-saved): scalar/header
-      // re-validation only, with the durable epoch/prev_epoch (and any lineage + config_install_op) carried
-      // through. A membership-less root has no config chain, so its lineage is normally empty; carried for
-      // fidelity.
+      Some(membership) => Ok(
+        Self::try_new_v4(
+          view,
+          log_view,
+          commit,
+          checkpoint_op,
+          checkpoint_id,
+          committed_headers,
+          epoch,
+          prev_epoch,
+          membership,
+          prior_config_ids,
+          config_install_op,
+        )?
+        .with_log_floor(log_floor)?,
+      ),
+      // A v4+-tagged root that carries no membership (a legacy root re-saved): scalar/header
+      // re-validation only, with the durable epoch/prev_epoch (and any lineage + config_install_op +
+      // log_floor) carried through. A membership-less root has no config chain, so its lineage is
+      // normally empty; carried for fidelity.
       None => {
         let mut state = Self::try_new(
           view,
@@ -930,7 +990,7 @@ impl VsrState {
         state.prev_epoch = prev_epoch;
         state.prior_config_ids = prior_config_ids;
         state.config_install_op = config_install_op;
-        Ok(state)
+        Ok(state.with_log_floor(log_floor)?)
       }
     }
   }
@@ -966,6 +1026,10 @@ pub enum VsrStateError {
   /// underlying [`MembershipError`].
   #[error("decoded membership is invalid: {0}")]
   InvalidMembership(#[from] MembershipError),
+  /// `log_floor` was below `checkpoint_op` — the own checkpoint always vouches its own prefix, so a
+  /// lower floor is a writer bug or a corrupt decode, never a representable state.
+  #[error("log_floor is below checkpoint_op")]
+  LogFloorBelowCheckpoint,
 }
 
 /// A successful WAL read result.

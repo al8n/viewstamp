@@ -2201,6 +2201,9 @@ impl<S, R> Endpoint<S, R> {
       // even though the checkpoint here is still BELOW `N` (the commit-first window the gate exists for).
       reconfigure_op,
     )
+    // The live vouched floor, carried verbatim (a swap changes only the configuration; `log_floor >=
+    // checkpoint_op` holds live, so no raise is needed).
+    .and_then(|s| s.with_log_floor(self.log_floor))
     .expect(
       "SwapEpoch root: log_view <= view, commit >= checkpoint_op, membership epoch consistent",
     );

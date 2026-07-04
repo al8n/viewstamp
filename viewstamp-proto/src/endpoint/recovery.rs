@@ -419,12 +419,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // which decodes the `sm_root`; `None` until then (block GC skips a cycle without a live root).
       checkpoint_sm_root: None,
       checkpoint_sessions_root: None,
-      // The vouched log floor restarts at the DURABLE checkpoint: an adoption-learned (in-memory)
-      // floor does not survive a crash, so a pre-crash floored adoption re-learns the cluster floor
-      // from the next carrier / Commit it hears. Until then this replica's own carrier may exceed
-      // the frame if its WAL still spans the pre-adoption band (the un-synced crash window); the
-      // force-sync escalation re-narrows it as soon as a peer checkpoint is heard.
-      log_floor: OpNumber::with(checkpoint_op),
+      // The vouched log floor RESTORES from the durable root (a v7 root persists the
+      // adoption-learned cluster floor; a pre-v7 root decodes it to its own `checkpoint_op` — the old
+      // restart-at-checkpoint behaviour), capped at the recovered head: the floor bounds the carrier
+      // span `op − log_floor`, and a floor above the head this WAL actually retained (an adoption
+      // band un-synced at the crash) has nothing left to bound below it — the force-sync escalation
+      // re-learns the cluster floor upward from the next carrier / peer checkpoint, exactly as
+      // before. `state.log_floor() >= checkpoint_op` is decode-validated, and `op >= checkpoint_op`
+      // by construction above, so the cap keeps both `(5b)` invariants (`log_floor >= checkpoint_op`,
+      // `op >= log_floor`).
+      log_floor: OpNumber::with(state.log_floor().get().min(op)),
       peer_checkpoint: BTreeMap::new(),
       nack_from: BTreeMap::new(),
       // The quorum-th order statistic over {own durable checkpoint, no peer reports} — coherent with

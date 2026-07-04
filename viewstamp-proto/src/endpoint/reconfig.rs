@@ -237,6 +237,10 @@ pub fn prepare_restart(
     // node restarted off this root may serve the new membership immediately (the gate withholds only the
     // LIVE swap window where the checkpoint genuinely trails the reconfigure op).
     cur.checkpoint_op(),
-  )?;
+  )?
+  // The predecessor root's vouched carried-log floor, carried verbatim: the offline successor changes
+  // only the configuration, and the floor evidence (what some checkpoint in the cluster vouches) is
+  // unchanged by deriving a successor.
+  .with_log_floor(cur.log_floor())?;
   Ok(state)
 }
