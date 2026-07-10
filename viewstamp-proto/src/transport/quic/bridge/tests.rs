@@ -3202,6 +3202,35 @@ fn an_oversized_message_is_dropped_before_encoding_and_not_transmitted() {
   );
 }
 
+/// `frame_checked`'s `len` parameter is a caller-supplied estimate computed BEFORE `payload` runs
+/// (`Message::encoded_len()` for a consensus send, via the pb view `write_framed` builds). A
+/// message whose true size nears 4 GiB could wrap that estimate below the cap via buffa's
+/// unchecked `u32` accumulation while the real encoding is not — unreproducible here with an
+/// actual message, so this drives `frame_checked` directly with a `len` that UNDERSTATES the
+/// payload (as a wrapped estimate would), pinning that the backstop re-checks the bytes `payload`
+/// actually produces and refuses (counting it) regardless of what `len` claimed.
+#[test]
+fn frame_checked_backstop_refuses_bytes_over_the_cap_even_when_len_understates_them() {
+  let opts = QuicOptions::accept_any_for_test();
+  let mut a = Bridge::new(&opts, Some([0x11; 32]));
+  assert_eq!(a.oversized_dropped(), 0, "no oversize recorded yet");
+
+  // `len = 0` lies that the payload is empty; only the backstop (which re-checks the bytes the
+  // closure actually returns) can catch this one.
+  let oversized = vec![0u8; MAX_FRAME_LEN as usize + 1];
+  let framed = a.frame_checked(0, || oversized);
+
+  assert!(
+    framed.is_none(),
+    "the backstop refuses a produced payload over the cap even though `len` said 0"
+  );
+  assert_eq!(
+    a.oversized_dropped(),
+    1,
+    "the backstop counts its refusal through the same oversized-dropped counter as the preflight"
+  );
+}
+
 /// An oversized control PREFACE is size-checked through the same `frame_checked` choke-point as a
 /// consensus message: it is NOT framed or staged, it bumps the oversized counter, and the connection
 /// is torn down (an over-cap preface is local API-misuse of the custom-identity hatch — the peer

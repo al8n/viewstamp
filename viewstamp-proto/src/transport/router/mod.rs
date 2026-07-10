@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
 
-use crate::{MemberId, Message, Peer, Recipient, ReplicaId, encode_message};
+use crate::{MemberId, Message, Peer, Recipient, ReplicaId};
 
 use super::{
   CloseCause,
@@ -208,6 +208,13 @@ impl<R> PeerRouter<R> {
   }
 }
 
+/// Whether an encoded frame of `len` bytes is admissible under [`MAX_FRAME_LEN`] — the one
+/// comparison [`PeerRouter::route`] runs twice: once against the pre-encode `encoded_len()`
+/// estimate, once against the bytes the encode actually produces.
+fn frame_fits(len: usize) -> bool {
+  len <= MAX_FRAME_LEN as usize
+}
+
 impl<R: StreamTransport> PeerRouter<R> {
   /// Registers a conn this node dialed (it becomes authoritative for `peer` once its handshake
   /// validates that identity — see `note_established`). It is NOT a routing target while handshaking.
@@ -380,6 +387,7 @@ impl<R: StreamTransport> PeerRouter<R> {
   /// promoted standby rather than a stale closed conn — closing the same-pump black-hole at every
   /// call site by construction, not only in the coordinator's pump.
   pub fn route(&mut self, to: Recipient, msg: &Message, self_id: ReplicaId) -> usize {
+    use buffa::Message as _;
     // Symmetric frame cap, preflighted BEFORE encoding: the transport never emits a frame larger
     // than it would accept inbound, so a message whose frame would exceed MAX_FRAME_LEN is refused
     // here WITHOUT paying for a full encode + copy of an oversized buffer the peer would only
@@ -389,12 +397,22 @@ impl<R: StreamTransport> PeerRouter<R> {
     // are fetched block-by-block, never shipped as one oversized frame) — so a refusal here is a
     // REAL bug; it is counted visibly (the oversized-dropped counter) rather than emitting a doomed
     // frame or silently swallowing the send and wedging liveness. VSR retransmission covers a
-    // refused send. `encoded_len()` is the exact length `encode_message` would produce.
-    if msg.encoded_len() > MAX_FRAME_LEN as usize {
+    // refused send. The wire view is built ONCE here and reused for both this preflight and the
+    // encode below, rather than rebuilding it per send.
+    let view = crate::wire::pb_message(msg);
+    if !frame_fits(view.encoded_len() as usize) {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
       return 0;
     }
-    let encoded = encode_message(msg);
+    let encoded = view.encode_to_bytes();
+    // Backstop: buffa's `encoded_len()` is a `u32` with unchecked accumulation, so a message whose
+    // true size nears 4 GiB could wrap the estimate just checked below the cap while the real
+    // encoding is not — re-check the bytes ACTUALLY produced before they reach `encode_frame`'s own
+    // `u32` length prefix.
+    if !frame_fits(encoded.len()) {
+      self.oversized_dropped = self.oversized_dropped.saturating_add(1);
+      return 0;
+    }
     let mut framed = Vec::with_capacity(4 + encoded.len());
     encode_frame(&encoded, &mut framed);
     let mut dropped = 0;

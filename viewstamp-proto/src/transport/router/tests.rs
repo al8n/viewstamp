@@ -666,3 +666,21 @@ fn an_oversized_outbound_frame_is_dropped_and_the_conn_stays_open() {
     "a normal message is queued on the still-open conn"
   );
 }
+
+#[test]
+fn frame_fits_pins_the_boundary_the_post_encode_backstop_relies_on() {
+  use crate::transport::frame::MAX_FRAME_LEN;
+  // `route()`'s post-encode backstop re-checks the bytes it actually produced against this exact
+  // predicate — the same one the preflight above checks the `encoded_len()` estimate against. A
+  // real message that disagrees between the two (the u32-wraparound the backstop guards against)
+  // cannot be constructed in a unit test short of allocating a message nearing 4 GiB, so this pins
+  // the boundary the predicate itself enforces directly.
+  assert!(
+    frame_fits(MAX_FRAME_LEN as usize),
+    "exactly at the cap fits"
+  );
+  assert!(
+    !frame_fits(MAX_FRAME_LEN as usize + 1),
+    "one byte over the cap does not fit"
+  );
+}
