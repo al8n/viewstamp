@@ -170,14 +170,31 @@ pub fn encode_message(msg: &Message) -> Bytes {
 /// O(1) refcount slice of `frame`'s allocation, never a byte copy. The returned [`Message`] keeps
 /// `frame`'s backing allocation alive for as long as any such field does.
 ///
+/// # Bounds
+///
+/// `frame` itself is capped at `MAX_FRAME_LEN` bytes (`DecodeOptions::with_max_message_size`),
+/// explicitly bounding buffa's input reader to the frame cap rather than trusting its 2 GiB
+/// default — defense-in-depth atop the frame layer's own cap, in case `decode_message` is ever
+/// reached on a buffer the frame layer did not itself size-check. A `log` (`repeated
+/// PreparedEntry`) or `ReconfigurePayload.members` count above the PROTOCOL's own maximum is
+/// rejected at the wire→domain conversion (`convert::log_from` / `convert::reconfigure_from`)
+/// before it drives further allocation — a valid peer never sends more. Neither bound closes
+/// amplification WITHIN the frame cap by an authenticated but Byzantine/compromised peer (e.g.
+/// many minimal repeated submessages materializing more transient memory than the wire bytes alone
+/// suggest): fully closing that would need a pre-scan of the wire bytes, which is out of
+/// viewstamp's non-Byzantine (crash-fault) threat model — the same stance taken everywhere else a
+/// validated peer is trusted not to be malicious.
+///
 /// # Errors
 ///
 /// - [`CodecError::Truncated`] if `frame` ends before a complete envelope can be read.
 /// - [`CodecError::Malformed`] if `frame` violates the protobuf wire grammar, omits the
-///   envelope's body, or decodes to a value the domain type cannot represent (a wrong-length
-///   id/checksum, an out-of-range count, an absent required oneof).
+///   envelope's body, decodes to a value the domain type cannot represent (a wrong-length
+///   id/checksum, an out-of-range count, an absent required oneof), or exceeds a bound described
+///   above.
 pub fn decode_message(mut frame: Bytes) -> Result<Message, CodecError> {
   let wire = buffa::DecodeOptions::new()
+    .with_max_message_size(crate::message::MAX_FRAME_LEN as usize)
     .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
     .decode::<pb::Message>(&mut frame)
     .map_err(map_decode_err)?;

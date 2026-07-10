@@ -122,6 +122,20 @@ fn log_round_trips_a_mixed_batch() {
 }
 
 #[test]
+fn log_from_rejects_a_log_over_the_protocol_maximum() {
+  // A valid peer never sends a log deeper than MAX_HEADER_ONLY_BAND_DEPTH (the deepest
+  // header-only band any single view-change carrier can legitimately hold) in one message;
+  // log_from rejects a wire count above it BEFORE converting a single entry — pinning the
+  // domain's own protocol maximum, not an invented looser one. Default (body-state-less) entries
+  // are used since only the COUNT matters for this bound (each would separately reject at
+  // entry_from for its absent body_state, but the length check must fire first, before any
+  // per-entry conversion runs).
+  let over = crate::message::MAX_HEADER_ONLY_BAND_DEPTH + 1;
+  let w = std::vec![pb::PreparedEntry::default(); over];
+  assert!(convert::log_from(w).is_err());
+}
+
+#[test]
 fn entry_with_undersized_client_id_rejects() {
   let mut w = convert::pb_entry(&some_entry());
   w.client = Bytes::from_static(&[0u8; 15]);
@@ -158,6 +172,33 @@ fn reconfigure_with_oversized_replica_count_rejects() {
   ));
   w.replica_count = 300;
   assert!(convert::reconfigure_from(w).is_err());
+}
+
+#[test]
+fn reconfigure_from_rejects_members_over_the_protocol_maximum() {
+  // Every member occupies a u16 ReplicaId slot, so a wire member count above u16::MAX can never
+  // validate at Membership::validate_structure regardless of the voting/learner split;
+  // reconfigure_from rejects it before the per-member conversion allocates.
+  let over = u16::MAX as usize + 1;
+  let mut w = convert::pb_reconfigure(&ReconfigurePayload::new(
+    1,
+    0,
+    std::vec![MemberId::new(1)].into_boxed_slice(),
+    0,
+  ));
+  w.members = std::vec![Bytes::from_static(&[0u8; 16]); over];
+  assert!(convert::reconfigure_from(w).is_err());
+}
+
+#[test]
+fn reconfigure_from_accepts_a_normal_sized_membership_and_still_round_trips() {
+  // Regression guard: the new over-max rejection must not disturb an ordinary membership size —
+  // paired with `reconfigure_body_round_trips_through_the_wire_codec`
+  // (`src/message/tests.rs`), which exercises the full round trip through the domain type.
+  let members: std::vec::Vec<MemberId> = (1..=5u128).map(MemberId::new).collect();
+  let payload = ReconfigurePayload::new(3, 2, members.into_boxed_slice(), 0);
+  let back = convert::reconfigure_from(convert::pb_reconfigure(&payload)).expect("round-trip");
+  assert_eq!(back, payload);
 }
 
 #[test]

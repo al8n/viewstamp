@@ -79,6 +79,18 @@ the SEMANTICS.
   resynchronize mid-stream, while the QUIC coordinator instead drops just the failed frame and
   keeps draining the rest of the batch (`src/transport/quic/mod.rs`'s `drain_bridge`) —
   consensus retransmission recovers the dropped message.
+- Decode input itself is explicitly capped at `MAX_FRAME_LEN` (`decode_message`'s
+  `DecodeOptions::with_max_message_size`, `src/wire/mod.rs`) rather than trusting buffa's 2 GiB
+  default — defense-in-depth atop the frame layer's own cap (§2), since a well-formed frame can
+  never exceed it anyway. A `log` (`repeated PreparedEntry`) longer than `MAX_HEADER_ONLY_BAND_DEPTH`
+  or a `ReconfigurePayload.members` list longer than `u16::MAX` (every member occupies a `u16`
+  `ReplicaId` slot) is rejected at the wire→domain conversion (`src/wire/convert.rs`'s `log_from` /
+  `reconfigure_from`) before the per-entry/per-member conversion allocates — a valid peer never
+  sends more. Neither bound closes amplification WITHIN the frame cap by an authenticated but
+  Byzantine/compromised peer (e.g. many minimal repeated submessages materializing more transient
+  memory than the wire bytes alone suggest): fully closing that would need a pre-scan of the wire
+  bytes, which is out of viewstamp's non-Byzantine (crash-fault) threat model — the same stance
+  taken everywhere else a validated peer is trusted not to be malicious.
 
 **Determinism vs. acceptance:** `encode_message`'s output is deterministic — fields in ascending
 field-number order, a proto3-default scalar OMITTED rather than written as zero (pinned by

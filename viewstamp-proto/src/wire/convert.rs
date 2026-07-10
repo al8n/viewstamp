@@ -100,8 +100,15 @@ pub(crate) fn pb_log(log: &[PreparedEntry]) -> Vec<pb::PreparedEntry> {
 }
 
 /// Converts a wire log into the domain form, one [`entry_from`] per entry; the first rejected
-/// entry short-circuits the whole log.
+/// entry short-circuits the whole log. Rejects via [`malformed`] a log longer than the protocol
+/// maximum ([`crate::message::MAX_HEADER_ONLY_BAND_DEPTH`] — the deepest header-only band any
+/// single view-change carrier can legitimately hold) BEFORE converting a single entry: a valid
+/// peer never sends a longer log in one message, so this bounds the allocation the entry-by-entry
+/// conversion below would otherwise perform on a hostile (or corrupt) over-long count.
 pub(crate) fn log_from(w: Vec<pb::PreparedEntry>) -> Result<Vec<PreparedEntry>, CodecError> {
+  if w.len() > crate::message::MAX_HEADER_ONLY_BAND_DEPTH {
+    return Err(malformed("Message.log"));
+  }
   w.into_iter().map(entry_from).collect()
 }
 
@@ -118,12 +125,25 @@ pub(crate) fn pb_reconfigure(p: &ReconfigurePayload) -> pb::ReconfigurePayload {
   }
 }
 
+/// The protocol's absolute ceiling on `ReconfigurePayload.members.len()`: every member occupies a
+/// [`ReplicaId`] (`u16`) slot, so a successor whose `replica_count + learner_count` exceeds
+/// [`u16::MAX`] can never validate — [`crate::MembershipError::TooManyNodes`] rejects it,
+/// regardless of the voting/learner split. This is therefore the TIGHTEST bound that holds for
+/// EVERY structurally-valid successor (not a looser one invented here): a wire count above it can
+/// never validate at [`ReconfigurePayload::to_membership`], so it is rejected below, before the
+/// per-member conversion allocates.
+const MAX_RECONFIGURE_MEMBERS: usize = u16::MAX as usize;
+
 /// Converts a wire [`pb::ReconfigurePayload`] into the domain [`ReconfigurePayload`], rejecting
-/// via [`malformed`] a voting/learner count that overflows its domain width ([`u8`]/[`u16`]) or a
-/// member/predecessor id whose byte length isn't the canonical 16.
+/// via [`malformed`] a `members` list longer than [`MAX_RECONFIGURE_MEMBERS`], a voting/learner
+/// count that overflows its domain width ([`u8`]/[`u16`]), or a member/predecessor id whose byte
+/// length isn't the canonical 16.
 pub(crate) fn reconfigure_from(
   w: pb::ReconfigurePayload,
 ) -> Result<ReconfigurePayload, CodecError> {
+  if w.members.len() > MAX_RECONFIGURE_MEMBERS {
+    return Err(malformed("ReconfigurePayload.members"));
+  }
   let replica_count =
     u8::try_from(w.replica_count).map_err(|_| malformed("ReconfigurePayload.replica_count"))?;
   let learner_count =
