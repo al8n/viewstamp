@@ -52,6 +52,7 @@ mod time;
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 mod transport;
+mod wire;
 pub use batch::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchFull, BatchMalformed, BatchUnits,
   BatchView, EmptyBatch, ReplyBuilder, ReplyPushError, ReplyView,

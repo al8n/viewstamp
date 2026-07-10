@@ -1,0 +1,317 @@
+// The viewstamp consensus wire envelope (normative; WIRE.md pins the semantics).
+//
+// Envelope semantics are protobuf (proto3): absent scalars decode as zero/empty;
+// duplicate scalars are last-wins while embedded messages merge; unknown fields
+// are skipped (bounded). Viewstamp's stricter validation — 16-byte id/checksum
+// lengths, replica-id bounds, oneof presence — is enforced at the wire→domain
+// conversion (src/wire/) and documented in WIRE.md.
+
+syntax = "proto3";
+
+package viewstamp.v1;
+
+// One replicated log entry as carried by view-change/repair/batch messages.
+message PreparedEntry {
+  uint64 op = 1;
+  // The submitting client (16 bytes, big-endian u128).
+  bytes client = 2;
+  uint64 request = 3;
+  // Exactly one body state must be present; an absent oneof rejects at conversion.
+  oneof body_state {
+    // The body bytes are held.
+    bytes present = 4;
+    // Body absent (torn/not-yet-repaired): the durable canonical checksum (16 bytes).
+    bytes repairing_checksum = 5;
+    // A membership-change op's successor membership.
+    ReconfigurePayload reconfigure = 6;
+  }
+}
+
+// The successor membership carried by a Reconfigure op.
+message ReconfigurePayload {
+  // Voting-set size; validated <= 255 at conversion.
+  uint32 replica_count = 1;
+  // Learner count; validated <= 65535 at conversion.
+  uint32 learner_count = 2;
+  // Member ids, 16 bytes each (big-endian u128), in membership order.
+  repeated bytes members = 3;
+  // The pinned predecessor configuration (16 bytes).
+  bytes prev_config_id = 4;
+}
+
+message Request {
+  bytes client = 1;
+  uint64 request = 2;
+  bytes body = 3;
+}
+
+// Primary to backups: replicate a prepared operation, piggybacking the
+// primary's commit number and its latest durable checkpoint_op.
+message Prepare {
+  uint64 view = 1;
+  uint64 op = 2;
+  uint64 commit = 3;
+  uint64 checkpoint_op = 4;
+  uint64 epoch = 5;
+  bytes config_id = 6;
+  bytes client = 7;
+  uint64 request = 8;
+  bytes body = 9;
+}
+
+// Backup to primary: acknowledge a prepared op.
+message PrepareOk {
+  uint64 view = 1;
+  uint64 op = 2;
+  uint32 replica = 3;
+  uint64 checkpoint_op = 4;
+  // Content address of the (client, request, body) identity of the op held at op.
+  bytes prepare_checksum = 5;
+  uint64 epoch = 6;
+  bytes config_id = 7;
+}
+
+// Primary to client: the result of a committed operation.
+message Reply {
+  uint64 view = 1;
+  bytes client = 2;
+  uint64 request = 3;
+  bytes body = 4;
+}
+
+// Primary to backups: commit heartbeat advancing the commit number without a
+// piggybacked prepare.
+message Commit {
+  uint64 view = 1;
+  uint64 commit = 2;
+  uint64 checkpoint_op = 3;
+  uint64 epoch = 4;
+  bytes config_id = 5;
+}
+
+// Backup to all: leave the current view. view is the view to enter.
+message StartViewChange {
+  uint64 view = 1;
+  uint32 replica = 2;
+  uint64 epoch = 3;
+  bytes config_id = 4;
+}
+
+// Replica to a prospective new primary: the sender's full log and position.
+message DoViewChange {
+  uint64 view = 1;
+  // The latest view in which the sender changed its head log.
+  uint64 log_view = 2;
+  uint64 op = 3;
+  uint64 commit = 4;
+  uint64 checkpoint_op = 5;
+  uint64 epoch = 6;
+  bytes config_id = 7;
+  uint32 replica = 8;
+  repeated PreparedEntry log = 9;
+}
+
+// New primary to all backups: the canonical log and new view.
+message StartView {
+  uint64 view = 1;
+  uint64 op = 2;
+  uint64 commit = 3;
+  uint64 checkpoint_op = 4;
+  uint64 epoch = 5;
+  bytes config_id = 6;
+  uint32 replica = 7;
+  repeated PreparedEntry log = 8;
+}
+
+// Lagging backup to a prospective primary: request the current StartView.
+message GetView {
+  uint64 view = 1;
+  uint32 replica = 2;
+  uint64 nonce = 3;
+  uint64 epoch = 4;
+  bytes config_id = 5;
+}
+
+// Replica to peers: solicit a single committed op by number.
+message RequestPrepare {
+  uint64 view = 1;
+  uint64 op = 2;
+  uint32 replica = 3;
+  bytes config_id = 4;
+}
+
+// Recovering replica to all: solicit the cluster's canonical head.
+message Recovery {
+  uint32 replica = 1;
+  uint64 nonce = 2;
+  uint64 epoch = 3;
+  bytes config_id = 4;
+}
+
+// Replica to a recovering peer: the sender's view and position (and, from the
+// primary, the full log).
+message RecoveryResponse {
+  uint64 view = 1;
+  uint64 op = 2;
+  uint64 commit = 3;
+  uint64 checkpoint_op = 4;
+  uint64 epoch = 5;
+  bytes config_id = 6;
+  uint32 replica = 7;
+  uint64 nonce = 8;
+  repeated PreparedEntry log = 9;
+}
+
+// Lagging replica to peers: request the latest state-sync checkpoint.
+message RequestSync {
+  uint64 view = 1;
+  uint64 checkpoint_op = 2;
+  uint32 replica = 3;
+  uint64 nonce = 4;
+  // True iff this is an equal-checkpoint block-repair request rather than a
+  // lagging-checkpoint sync.
+  bool recovery = 5;
+  bytes config_id = 6;
+}
+
+// Replica to peers: solicit a contiguous run of committed ops by range.
+message RequestPrepareRange {
+  uint64 view = 1;
+  // Inclusive low bound of the requested op run.
+  uint64 lo = 2;
+  // Inclusive high bound of the requested op run.
+  uint64 hi = 3;
+  uint32 replica = 4;
+  bytes config_id = 5;
+}
+
+// Holder to requester: a byte-bounded prefix of the log run a
+// RequestPrepareRange solicited.
+message RepairBatch {
+  uint64 view = 1;
+  uint64 commit = 2;
+  uint64 checkpoint_op = 3;
+  bytes config_id = 4;
+  repeated PreparedEntry log = 5;
+}
+
+// Primary to all backups: a batched retransmit of the un-acked prepare window.
+message PrepareBatch {
+  uint64 view = 1;
+  uint64 commit = 2;
+  uint64 checkpoint_op = 3;
+  uint64 epoch = 4;
+  bytes config_id = 5;
+  repeated PreparedEntry log = 6;
+}
+
+// Learner to configuration members: a non-voting report of the learner's
+// durable progress.
+message LearnerStatus {
+  uint32 replica = 1;
+  // The learner's contiguous applied frontier: the highest op below which it
+  // has no hole.
+  uint64 durable_commit_min = 2;
+  // The learner's durable WAL head.
+  uint64 durable_op = 3;
+  uint64 epoch = 4;
+  bytes config_id = 5;
+}
+
+// Settled member to a lower-epoch peer: a minimal cross-epoch catch-up hint.
+message EpochAhead {
+  // The responder's current configuration epoch (strictly ahead of the
+  // recipient's).
+  uint64 epoch = 1;
+  // The cluster checkpoint op the recipient must cross to.
+  uint64 checkpoint_op = 2;
+}
+
+// Primary to a target learner: a fresh-proof solicitation for the learner's
+// durable position.
+message RequestLearnerProof {
+  // The soliciting primary's own replica id.
+  uint32 from = 1;
+  // The op the learner must prove it durably holds the committed prefix
+  // through.
+  uint64 at_op = 2;
+  uint64 nonce = 3;
+  uint64 epoch = 4;
+  bytes config_id = 5;
+}
+
+// Target learner to the soliciting primary: the fresh-proof reply answering a
+// RequestLearnerProof.
+message LearnerProof {
+  uint32 replica = 1;
+  uint64 nonce = 2;
+  // The learner's contiguous applied frontier, recomputed from durable state
+  // at reply time.
+  uint64 frontier = 3;
+  uint64 epoch = 4;
+  bytes config_id = 5;
+}
+
+// Peer to requester: the negative answer to a RequestPrepare/RequestPrepareRange
+// — the op is not durably held.
+message Nack {
+  uint64 view = 1;
+  uint64 op = 2;
+  uint32 replica = 3;
+  bytes config_id = 4;
+}
+
+message SyncCheckpoint {
+  uint64 view = 1;
+  uint64 checkpoint_op = 2;
+  bytes checkpoint_id = 3;
+  uint64 epoch = 4;
+  bytes config_id = 5;
+  uint32 replica = 6;
+  uint64 nonce = 7;
+  bytes snapshot = 8;
+  bytes membership = 9;
+}
+
+message RequestBlock {
+  // The content address (16 bytes, fnv1a_128 of the block content).
+  bytes addr = 1;
+}
+
+message BlockResponse {
+  bytes addr = 1;
+  // Present iff the responder holds the block; an empty present block is
+  // distinct from an absent one (proto3 explicit presence).
+  optional bytes block = 2;
+}
+
+// The consensus RPC envelope: exactly one frame carries exactly one Message.
+// An absent body rejects at conversion (parity with the prior unknown-tag reject).
+message Message {
+  oneof body {
+    Request request = 1;
+    Prepare prepare = 2;
+    PrepareOk prepare_ok = 3;
+    Reply reply = 4;
+    Commit commit = 5;
+    StartViewChange start_view_change = 6;
+    DoViewChange do_view_change = 7;
+    StartView start_view = 8;
+    GetView get_view = 9;
+    RequestPrepare request_prepare = 10;
+    Recovery recovery = 11;
+    RecoveryResponse recovery_response = 12;
+    RequestSync request_sync = 13;
+    SyncCheckpoint sync_checkpoint = 14;
+    RequestPrepareRange request_prepare_range = 15;
+    RepairBatch repair_batch = 16;
+    PrepareBatch prepare_batch = 17;
+    LearnerStatus learner_status = 18;
+    EpochAhead epoch_ahead = 19;
+    RequestLearnerProof request_learner_proof = 20;
+    LearnerProof learner_proof = 21;
+    RequestBlock request_block = 22;
+    BlockResponse block_response = 23;
+    Nack nack = 24;
+  }
+}
