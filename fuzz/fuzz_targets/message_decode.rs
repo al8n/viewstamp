@@ -1,6 +1,6 @@
-//! `decode_message` over arbitrary bytes: must never panic, must allocate boundedly, and must
-//! round-trip — anything it accepts re-encodes infallibly to bytes that decode back equal (the
-//! codec is a bijection on its image), with `encoded_len` agreeing with the actual encoding.
+//! `decode_message` over arbitrary bytes: must never panic, must allocate boundedly; anything it
+//! accepts re-encodes to the canonical form, which decodes back equal (one-round fixpoint: the
+//! canonical image is stable even though arbitrary accepted inputs need not be byte-canonical).
 
 #![no_main]
 
@@ -9,14 +9,15 @@ use libfuzzer_sys::fuzz_target;
 use viewstamp_proto::{decode_message, encode_message};
 
 fuzz_target!(|data: &[u8]| {
-  if let Ok(msg) = decode_message(Bytes::copy_from_slice(data)) {
-    let bytes = encode_message(&msg);
+  let frame = Bytes::copy_from_slice(data);
+  if let Ok(msg) = decode_message(frame) {
+    let canonical = encode_message(&msg);
     assert_eq!(
-      bytes.len(),
+      canonical.len(),
       msg.encoded_len(),
       "encoded_len disagrees with encode_message"
     );
-    let again = decode_message(bytes).expect("re-encoded message decodes");
+    let again = decode_message(canonical).expect("canonical form decodes");
     assert_eq!(again, msg, "decode(encode(m)) != m");
   }
 });
