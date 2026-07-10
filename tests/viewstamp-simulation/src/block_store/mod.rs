@@ -117,7 +117,7 @@ impl BlockStore for MemBlockStore {
     let mut reachable = BTreeSet::new();
     for walk in walks {
       let mut visited = BTreeSet::new();
-      let mut stack: Vec<BlockAddress> = walk.roots.to_vec();
+      let mut stack: Vec<BlockAddress> = walk.roots().to_vec();
       while let Some(addr) = stack.pop() {
         if !visited.insert(addr) {
           continue; // already traversed by THIS walk — skip (cycle / shared-subtree convergence).
@@ -127,7 +127,7 @@ impl BlockStore for MemBlockStore {
           if block_address(block) != addr {
             continue; // corrupt block — do not follow its garbage edges.
           }
-          for child in (walk.references)(block) {
+          for child in (walk.references())(block) {
             if !visited.contains(&child) {
               stack.push(child);
             }

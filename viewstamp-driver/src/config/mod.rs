@@ -18,7 +18,7 @@ pub const REDIAL_BACKOFF_CAP: Duration = Duration::from_secs(5);
 /// Default bound on one TCP connect attempt (stream driver). A connect to a black-holed address
 /// otherwise parks the dial task for the kernel's SYN-retry horizon (minutes), and the redial
 /// schedule cannot probe again until the attempt resolves.
-pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default per-conn authentication window (stream driver): how long a freshly-connected/accepted
 /// socket may remain unvalidated before it is torn down. A peer that completes the socket connect
@@ -33,7 +33,7 @@ pub const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 /// `conns` + the coordinator router without bound. 1024 is generous: a full mutual-dial mesh over the
 /// configured membership needs only ~`2*(node_count-1)` steady connections (126 for a 64-member
 /// cluster), so this never refuses a legitimate peer while still bounding an accept flood.
-pub(crate) const MAX_CONNS: usize = 1024;
+pub const MAX_CONNS: usize = 1024;
 
 /// Default acknowledgement look-back window for the reconfiguration executor: how many ops back the
 /// driver scans for recent voter acks as a liveness signal when choosing which voter to remove in a
@@ -214,6 +214,12 @@ impl DriverConfig {
   /// Override the redial backoff base (the first post-loss redial delay).
   #[must_use]
   pub const fn with_redial_backoff_base(mut self, base: Duration) -> Self {
+    self.set_redial_backoff_base(base);
+    self
+  }
+
+  /// In-place form of [`Self::with_redial_backoff_base`] — same semantics, chainable.
+  pub const fn set_redial_backoff_base(&mut self, base: Duration) -> &mut Self {
     self.redial_backoff_base = base;
     self
   }
@@ -221,6 +227,12 @@ impl DriverConfig {
   /// Override the redial backoff ceiling (the slowest a dead peer is probed).
   #[must_use]
   pub const fn with_redial_backoff_cap(mut self, cap: Duration) -> Self {
+    self.set_redial_backoff_cap(cap);
+    self
+  }
+
+  /// In-place form of [`Self::with_redial_backoff_cap`] — same semantics, chainable.
+  pub const fn set_redial_backoff_cap(&mut self, cap: Duration) -> &mut Self {
     self.redial_backoff_cap = cap;
     self
   }
@@ -228,6 +240,12 @@ impl DriverConfig {
   /// Override the TCP connect-attempt bound (stream driver only).
   #[must_use]
   pub const fn with_dial_timeout(mut self, timeout: Duration) -> Self {
+    self.set_dial_timeout(timeout);
+    self
+  }
+
+  /// In-place form of [`Self::with_dial_timeout`] — same semantics, chainable.
+  pub const fn set_dial_timeout(&mut self, timeout: Duration) -> &mut Self {
     self.dial_timeout = timeout;
     self
   }
@@ -236,6 +254,12 @@ impl DriverConfig {
   /// legitimate handshake on the deployed links, or healthy slow connections are reaped.
   #[must_use]
   pub const fn with_auth_deadline(mut self, deadline: Duration) -> Self {
+    self.set_auth_deadline(deadline);
+    self
+  }
+
+  /// In-place form of [`Self::with_auth_deadline`] — same semantics, chainable.
+  pub const fn set_auth_deadline(&mut self, deadline: Duration) -> &mut Self {
     self.auth_deadline = deadline;
     self
   }
@@ -244,6 +268,12 @@ impl DriverConfig {
   /// the 250 ms default) raise it so steady-state submits are not re-broadcast spuriously.
   #[must_use]
   pub const fn with_request_timeout(mut self, timeout: Duration) -> Self {
+    self.set_request_timeout(timeout);
+    self
+  }
+
+  /// In-place form of [`Self::with_request_timeout`] — same semantics, chainable.
+  pub const fn set_request_timeout(&mut self, timeout: Duration) -> &mut Self {
     self.request_timeout = timeout;
     self
   }
@@ -252,6 +282,12 @@ impl DriverConfig {
   /// admissible on an empty session).
   #[must_use]
   pub const fn with_max_inflight(mut self, max: usize) -> Self {
+    self.set_max_inflight(max);
+    self
+  }
+
+  /// In-place form of [`Self::with_max_inflight`] — same semantics, chainable.
+  pub const fn set_max_inflight(&mut self, max: usize) -> &mut Self {
     self.max_inflight = if max == 0 { 1 } else { max };
     self
   }
@@ -260,6 +296,12 @@ impl DriverConfig {
   /// [`viewstamp_proto::max_request_body_len`] or a lone maximal request is refused `Busy` forever.
   #[must_use]
   pub const fn with_max_pending_bytes(mut self, max: usize) -> Self {
+    self.set_max_pending_bytes(max);
+    self
+  }
+
+  /// In-place form of [`Self::with_max_pending_bytes`] — same semantics, chainable.
+  pub const fn set_max_pending_bytes(&mut self, max: usize) -> &mut Self {
     self.max_pending_bytes = if max == 0 { 1 } else { max };
     self
   }
@@ -267,6 +309,12 @@ impl DriverConfig {
   /// Override the committed-events channel capacity (clamped to at least 1).
   #[must_use]
   pub const fn with_events_cap(mut self, cap: usize) -> Self {
+    self.set_events_cap(cap);
+    self
+  }
+
+  /// In-place form of [`Self::with_events_cap`] — same semantics, chainable.
+  pub const fn set_events_cap(&mut self, cap: usize) -> &mut Self {
     self.events_cap = if cap == 0 { 1 } else { cap };
     self
   }
@@ -275,6 +323,12 @@ impl DriverConfig {
   /// above `2*(node_count-1)` plus reconnect headroom or the mesh itself is refused.
   #[must_use]
   pub const fn with_max_conns(mut self, max: usize) -> Self {
+    self.set_max_conns(max);
+    self
+  }
+
+  /// In-place form of [`Self::with_max_conns`] — same semantics, chainable.
+  pub const fn set_max_conns(&mut self, max: usize) -> &mut Self {
     self.max_conns = if max == 0 { 1 } else { max };
     self
   }
@@ -284,6 +338,12 @@ impl DriverConfig {
   /// with a longer heartbeat interval or to tolerate more transient quiescence.
   #[must_use]
   pub const fn with_ack_window(mut self, window: u64) -> Self {
+    self.set_ack_window(window);
+    self
+  }
+
+  /// In-place form of [`Self::with_ack_window`] — same semantics, chainable.
+  pub const fn set_ack_window(&mut self, window: u64) -> &mut Self {
     self.ack_window = window;
     self
   }
@@ -293,6 +353,12 @@ impl DriverConfig {
   /// an intentionally-fail-closed change (e.g. a shrink with no live witness) sooner.
   #[must_use]
   pub const fn with_reconfigure_timeout(mut self, timeout: Duration) -> Self {
+    self.set_reconfigure_timeout(timeout);
+    self
+  }
+
+  /// In-place form of [`Self::with_reconfigure_timeout`] — same semantics, chainable.
+  pub const fn set_reconfigure_timeout(&mut self, timeout: Duration) -> &mut Self {
     self.reconfigure_timeout = timeout;
     self
   }

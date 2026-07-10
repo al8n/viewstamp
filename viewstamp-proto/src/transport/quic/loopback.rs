@@ -94,7 +94,7 @@ pub(super) fn replica(
     ),
   };
   let opts = ClusterTls::new(ca.roots(), cert.chain(), cert.key())
-    .layout(layout)
+    .with_layout(layout)
     .build();
 
   let coord = QuicCoordinator::with_identity(endpoint, opts, Some(rng_seed), identity);
@@ -711,7 +711,7 @@ fn replica_in_cluster_of(
     ),
   };
   let opts = ClusterTls::new(ca.roots(), cert.chain(), cert.key())
-    .layout(layout)
+    .with_layout(layout)
     .build();
   let coord = QuicCoordinator::with_identity(endpoint, opts, Some(rng_seed), identity);
   (

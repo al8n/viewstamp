@@ -60,7 +60,7 @@ use crate::{
 /// its own reply channel and per-unit state. Past the cap a submit returns
 /// [`BatchError::Refused`] / [`RefusedReason::QueueFull`]. Tunable via
 /// [`BatchConfig::with_max_queued_units`].
-const MAX_QUEUED_UNITS: usize = 4096;
+pub const DEFAULT_MAX_QUEUED_UNITS: usize = 4096;
 
 /// Default cap on total queued unit bytes, charged at each unit's ENCODED cost: its logical
 /// [`Bytes::len`] plus the codec's per-unit framing ([`BATCH_UNIT_OVERHEAD`]) — so even
@@ -71,7 +71,7 @@ const MAX_QUEUED_UNITS: usize = 4096;
 /// realistic waiting working set — about eight maximal request bodies — yet a hard bound a
 /// flooding caller cannot exceed. Past the cap a submit returns [`BatchError::Refused`] /
 /// [`RefusedReason::QueueFull`]. Tunable via [`BatchConfig::with_max_queued_bytes`].
-const MAX_QUEUED_BYTES: usize = 128 * 1024 * 1024;
+pub const DEFAULT_MAX_QUEUED_BYTES: usize = 128 * 1024 * 1024;
 
 /// Tunable aggregator parameters. Unlike [`crate::DriverConfig`] there is no zero-argument
 /// default: the per-unit reply ceiling is the embedder's contract with its state machine — any
@@ -101,8 +101,8 @@ impl BatchConfig {
   #[must_use]
   pub const fn new(max_unit_reply_len: usize) -> Self {
     Self {
-      max_queued_units: MAX_QUEUED_UNITS,
-      max_queued_bytes: MAX_QUEUED_BYTES,
+      max_queued_units: DEFAULT_MAX_QUEUED_UNITS,
+      max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
       max_unit_reply_len,
     }
   }
@@ -131,6 +131,12 @@ impl BatchConfig {
   /// admit one lone unit).
   #[must_use]
   pub const fn with_max_queued_units(mut self, max: usize) -> Self {
+    self.set_max_queued_units(max);
+    self
+  }
+
+  /// In-place form of [`Self::with_max_queued_units`] — same clamp, chainable.
+  pub const fn set_max_queued_units(&mut self, max: usize) -> &mut Self {
     self.max_queued_units = if max == 0 { 1 } else { max };
     self
   }
@@ -142,6 +148,12 @@ impl BatchConfig {
   /// queue yet legal for a body — is refused [`RefusedReason::QueueFull`] forever.
   #[must_use]
   pub const fn with_max_queued_bytes(mut self, max: usize) -> Self {
+    self.set_max_queued_bytes(max);
+    self
+  }
+
+  /// In-place form of [`Self::with_max_queued_bytes`] — same clamp, chainable.
+  pub const fn set_max_queued_bytes(&mut self, max: usize) -> &mut Self {
     self.max_queued_bytes = if max == 0 { 1 } else { max };
     self
   }

@@ -77,12 +77,12 @@ fn active_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// changes and would idle out this long after the last one — leaving the NEXT view change (the
 /// primary just died) with no live backup↔backup links for `StartViewChange`/`DoViewChange`.
 /// [`keep_alive_interval_millis`] is what keeps those zero-traffic edges alive under this timeout.
-const IDLE_TIMEOUT_MILLIS: u64 = 1_000;
+pub const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 1_000;
 
 /// Keep-alive PING interval derived from the idle timeout: one third, so up to two consecutive
 /// lost keep-alives still refresh the peer's idle timer in time.  quinn's default is NO keep-alive,
 /// under which a healthy-but-quiet connection idles out — and the backup↔backup mesh edges are
-/// exactly that between view changes (see [`IDLE_TIMEOUT_MILLIS`]).  A zero result (an idle timeout
+/// exactly that between view changes (see [`DEFAULT_IDLE_TIMEOUT_MILLIS`]).  A zero result (an idle timeout
 /// too small to subdivide) leaves keep-alive off.
 const fn keep_alive_interval_millis(idle_timeout_millis: u64) -> u64 {
   idle_timeout_millis / 3
@@ -105,7 +105,7 @@ const fn keep_alive_interval_millis(idle_timeout_millis: u64) -> u64 {
 /// A geo-replicated cluster (real RTTs near or above 50 ms) raises it via
 /// [`QuicTuning::with_initial_rtt_millis`] — together with the consensus timing — so the estimate
 /// stays above the real RTT.
-const INITIAL_RTT_MILLIS: u64 = 50;
+pub const DEFAULT_INITIAL_RTT_MILLIS: u64 = 50;
 
 /// Pinned max concurrent bidi streams.  Each side opens up to 2 send streams
 /// under `ControlBulk` (Control + Bulk); 8 gives cluster-mesh headroom for the
@@ -115,12 +115,12 @@ pub(crate) const MAX_BIDI_STREAMS: u32 = 8;
 /// Connection-level receive window: max frame (16 MiB) plus control headroom
 /// (1 MiB) so a single max-sized bulk frame on the Bulk stream cannot exhaust
 /// the connection window and block the Control stream.
-const CONNECTION_RECEIVE_WINDOW: u64 = 17 * 1024 * 1024;
+pub const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 17 * 1024 * 1024;
 
 /// Per-stream receive window: a checkpoint snapshot can arrive in one shot but
 /// a single stream is bounded below the connection window so it cannot itself
 /// exhaust connection-level flow control.
-const STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
 
 /// The largest value a QUIC `VarInt` can carry (`2^62 - 1`).  The tuning setters clamp to this so an
 /// embedder-supplied window/timeout can never make the `VarInt` conversions in
@@ -154,16 +154,16 @@ const fn clamp_tuning(v: u64) -> u64 {
 /// transport with a zero timeout/window or fail the `VarInt` conversions at construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuicTuning {
-  /// `max_idle_timeout`, milliseconds. Default [`IDLE_TIMEOUT_MILLIS`].
+  /// `max_idle_timeout`, milliseconds. Default [`DEFAULT_IDLE_TIMEOUT_MILLIS`].
   idle_timeout_millis: u64,
   /// `keep_alive_interval`, milliseconds. `None` (the default) derives idle/3 — the two-lost-pings
   /// margin [`keep_alive_interval_millis`] documents; an explicit `Some(0)` disables keep-alive.
   keep_alive_interval_millis: Option<u64>,
-  /// `initial_rtt`, milliseconds. Default [`INITIAL_RTT_MILLIS`].
+  /// `initial_rtt`, milliseconds. Default [`DEFAULT_INITIAL_RTT_MILLIS`].
   initial_rtt_millis: u64,
-  /// Connection-level `receive_window`, bytes. Default [`CONNECTION_RECEIVE_WINDOW`].
+  /// Connection-level `receive_window`, bytes. Default [`DEFAULT_CONNECTION_RECEIVE_WINDOW`].
   connection_receive_window: u64,
-  /// Per-stream `stream_receive_window`, bytes. Default [`STREAM_RECEIVE_WINDOW`].
+  /// Per-stream `stream_receive_window`, bytes. Default [`DEFAULT_STREAM_RECEIVE_WINDOW`].
   stream_receive_window: u64,
 }
 
@@ -172,15 +172,15 @@ impl QuicTuning {
   #[must_use]
   pub const fn new() -> Self {
     Self {
-      idle_timeout_millis: IDLE_TIMEOUT_MILLIS,
+      idle_timeout_millis: DEFAULT_IDLE_TIMEOUT_MILLIS,
       keep_alive_interval_millis: None,
-      initial_rtt_millis: INITIAL_RTT_MILLIS,
-      connection_receive_window: CONNECTION_RECEIVE_WINDOW,
-      stream_receive_window: STREAM_RECEIVE_WINDOW,
+      initial_rtt_millis: DEFAULT_INITIAL_RTT_MILLIS,
+      connection_receive_window: DEFAULT_CONNECTION_RECEIVE_WINDOW,
+      stream_receive_window: DEFAULT_STREAM_RECEIVE_WINDOW,
     }
   }
 
-  /// Idle timeout in milliseconds (see `IDLE_TIMEOUT_MILLIS` for the consensus coupling).
+  /// Idle timeout in milliseconds (see `DEFAULT_IDLE_TIMEOUT_MILLIS` for the consensus coupling).
   #[inline(always)]
   pub const fn idle_timeout_millis(&self) -> u64 {
     self.idle_timeout_millis
@@ -197,20 +197,20 @@ impl QuicTuning {
     }
   }
 
-  /// Initial RTT estimate in milliseconds (see `INITIAL_RTT_MILLIS` for why the default is
+  /// Initial RTT estimate in milliseconds (see `DEFAULT_INITIAL_RTT_MILLIS` for why the default is
   /// LAN-tuned and what a geo-replicated cluster must raise it to).
   #[inline(always)]
   pub const fn initial_rtt_millis(&self) -> u64 {
     self.initial_rtt_millis
   }
 
-  /// Connection-level receive window in bytes (see `CONNECTION_RECEIVE_WINDOW`).
+  /// Connection-level receive window in bytes (see `DEFAULT_CONNECTION_RECEIVE_WINDOW`).
   #[inline(always)]
   pub const fn connection_receive_window(&self) -> u64 {
     self.connection_receive_window
   }
 
-  /// Per-stream receive window in bytes (see `STREAM_RECEIVE_WINDOW`).
+  /// Per-stream receive window in bytes (see `DEFAULT_STREAM_RECEIVE_WINDOW`).
   #[inline(always)]
   pub const fn stream_receive_window(&self) -> u64 {
     self.stream_receive_window
@@ -221,6 +221,12 @@ impl QuicTuning {
   /// (derived) keep-alive the idle/3 ping interval scales along with it.
   #[must_use]
   pub const fn with_idle_timeout_millis(mut self, millis: u64) -> Self {
+    self.set_idle_timeout_millis(millis);
+    self
+  }
+
+  /// In-place form of [`Self::with_idle_timeout_millis`] — same clamp/semantics, chainable.
+  pub const fn set_idle_timeout_millis(&mut self, millis: u64) -> &mut Self {
     self.idle_timeout_millis = clamp_tuning(millis);
     self
   }
@@ -228,9 +234,15 @@ impl QuicTuning {
   /// Override the keep-alive interval (milliseconds; `0` disables keep-alive). Without an override
   /// the interval is derived as idle/3. Disabling keep-alive on a production mesh is a liveness
   /// hazard: the zero-traffic backup↔backup edges then idle out between view changes (see
-  /// `IDLE_TIMEOUT_MILLIS`).
+  /// `DEFAULT_IDLE_TIMEOUT_MILLIS`).
   #[must_use]
   pub const fn with_keep_alive_interval_millis(mut self, millis: u64) -> Self {
+    self.set_keep_alive_interval_millis(millis);
+    self
+  }
+
+  /// In-place form of [`Self::with_keep_alive_interval_millis`] — same clamp/semantics, chainable.
+  pub const fn set_keep_alive_interval_millis(&mut self, millis: u64) -> &mut Self {
     self.keep_alive_interval_millis = Some(millis);
     self
   }
@@ -240,6 +252,12 @@ impl QuicTuning {
   /// while the consensus primary-idle must in turn stay above the resulting ~3×RTT initial PTO.
   #[must_use]
   pub const fn with_initial_rtt_millis(mut self, millis: u64) -> Self {
+    self.set_initial_rtt_millis(millis);
+    self
+  }
+
+  /// In-place form of [`Self::with_initial_rtt_millis`] — same clamp/semantics, chainable.
+  pub const fn set_initial_rtt_millis(&mut self, millis: u64) -> &mut Self {
     self.initial_rtt_millis = clamp_tuning(millis);
     self
   }
@@ -250,6 +268,12 @@ impl QuicTuning {
   /// throttles bulk throughput (credit regrants as the reader drains), it cannot deadlock.
   #[must_use]
   pub const fn with_connection_receive_window(mut self, bytes: u64) -> Self {
+    self.set_connection_receive_window(bytes);
+    self
+  }
+
+  /// In-place form of [`Self::with_connection_receive_window`] — same clamp/semantics, chainable.
+  pub const fn set_connection_receive_window(&mut self, bytes: u64) -> &mut Self {
     self.connection_receive_window = clamp_tuning(bytes);
     self
   }
@@ -258,6 +282,12 @@ impl QuicTuning {
   /// flows in one shot but a single stream stays bounded below the connection window.
   #[must_use]
   pub const fn with_stream_receive_window(mut self, bytes: u64) -> Self {
+    self.set_stream_receive_window(bytes);
+    self
+  }
+
+  /// In-place form of [`Self::with_stream_receive_window`] — same clamp/semantics, chainable.
+  pub const fn set_stream_receive_window(&mut self, bytes: u64) -> &mut Self {
     self.stream_receive_window = clamp_tuning(bytes);
     self
   }
@@ -429,7 +459,7 @@ impl QuicOptions {
   }
 
   /// Initial RTT estimate in milliseconds baked into the transport config (the value loss recovery
-  /// uses before the first real RTT sample; see `INITIAL_RTT_MILLIS`).
+  /// uses before the first real RTT sample; see `DEFAULT_INITIAL_RTT_MILLIS`).
   #[inline(always)]
   pub const fn initial_rtt_millis(&self) -> u64 {
     self.initial_rtt_millis
@@ -494,6 +524,12 @@ impl QuicOptions {
   /// a value ABOVE that floor still takes effect (a larger flood budget); a lower one is floored.
   #[must_use]
   pub const fn with_max_connections(mut self, max: usize) -> Self {
+    self.set_max_connections(max);
+    self
+  }
+
+  /// In-place form of [`Self::with_max_connections`] — same zero-floor, chainable.
+  pub const fn set_max_connections(&mut self, max: usize) -> &mut Self {
     self.max_connections = if max == 0 { 1 } else { max };
     self
   }
@@ -603,9 +639,10 @@ impl ClusterTls {
     }
   }
 
-  /// Set the stream-layout selector for the built [`QuicOptions`].  The default
+  /// Select the stream layout for the built [`QuicOptions`].  The default
   /// is `StreamLayout::ControlBulk`.
-  pub fn layout(mut self, layout: StreamLayout) -> Self {
+  #[must_use]
+  pub fn with_layout(mut self, layout: StreamLayout) -> Self {
     self.layout = layout;
     self
   }
@@ -614,7 +651,8 @@ impl ClusterTls {
   /// [`QuicTuning::new`] (the LAN-tuned constants).  Tuning carries ONLY performance knobs — the
   /// mandatory-mTLS construction this builder performs is unaffected by any tuning value (see
   /// [`QuicTuning`]'s scope note).
-  pub fn tuning(mut self, tuning: QuicTuning) -> Self {
+  #[must_use]
+  pub fn with_tuning(mut self, tuning: QuicTuning) -> Self {
     self.tuning = tuning;
     self
   }
