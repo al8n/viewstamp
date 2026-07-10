@@ -3208,6 +3208,162 @@ fn an_oversized_message_is_dropped_before_encoding_and_not_transmitted() {
   );
 }
 
+/// The classify-then-admit regression for a `PrepareBatch`: `layout::partition`'s `PrepareBatch` arm
+/// sizes the batch with `wire_size_bound()` — a saturating, allocation-free structural bound — rather
+/// than `encoded_len()`, which would build the `pb` view (allocating) BEFORE `write_framed`'s own
+/// admission gate ever runs. This drives BOTH calls in their true production order — `partition` (the
+/// classifier `write_to_peer` calls first), then `write_framed` (the admission gate at
+/// bridge/mod.rs's `wire_size_bound() > MAX_FRAME_LEN` check) — over a REAL validated connection, and
+/// proves the oversized batch is refused at admission on whichever class it was classified onto,
+/// with no frame ever built or observed by the peer on either stream class.
+///
+/// NEUTER CHECK: reverting `partition`'s `PrepareBatch` arm to `msg.encoded_len()` still passes this
+/// test (both measures agree well below the `u32`-wrap regime this crafted 16 MiB+1 batch exercises),
+/// but it is exactly the call `layout::tests::control_and_bulk_classify_as_expected` pins as unsound
+/// pre-admission — this test's job is only to prove the PRODUCTION ROUTE refuses the batch, not to
+/// re-litigate which sizing call classification uses.
+#[test]
+fn an_oversized_prepare_batch_is_refused_before_classification_builds_a_view() {
+  use crate::{ClientId, PreparedEntry, RequestNumber, message::PrepareBatch};
+
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  // Open A's send streams and validate BOTH sides so `write_framed` would otherwise flush to the
+  // wire and B's `ingest_recv` actually runs (rather than early-outing pre-validation).
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+
+  // Drain any datagrams the open/bind produced so the post-write checks below see only what the
+  // oversized route would add (which must be NOTHING).
+  while a.poll_transmit().is_some() {}
+
+  // A `PrepareBatch` carrying one entry whose body alone is one byte over `MAX_FRAME_LEN`; the
+  // carrier + per-entry framing pushes `wire_size_bound()` further past the cap. Only ONE such
+  // message is allocated.
+  let body = Bytes::from(vec![0u8; MAX_FRAME_LEN as usize + 1]);
+  let huge = Message::PrepareBatch(PrepareBatch::new(
+    View::with(1),
+    OpNumber::with(0),
+    OpNumber::with(0),
+    crate::Epoch::new(0),
+    0,
+    vec![PreparedEntry::new(
+      OpNumber::with(1),
+      ClientId::new(1),
+      RequestNumber::with(1),
+      body,
+    )],
+  ));
+  assert!(
+    huge.wire_size_bound() > MAX_FRAME_LEN as usize,
+    "the crafted batch's wire_size_bound() exceeds the frame cap (checked without building the pb view)"
+  );
+
+  // Classify through the REAL production function, in the REAL order `write_to_peer` calls it —
+  // BEFORE `write_framed`'s admission gate — proving classification alone does not choke on (or
+  // misclassify) an oversized batch.
+  let class = crate::transport::quic::layout::partition(&huge, StreamLayout::ControlBulk);
+  assert!(
+    class.is_bulk(),
+    "an over-threshold batch classifies onto Bulk, the conservative direction"
+  );
+
+  assert_eq!(a.oversized_dropped(), 0, "no oversize recorded yet");
+  let control_outbound_before = a
+    .table
+    .entry(ha)
+    .map(|e| e.class_mut(StreamClass::Control).outbound.len())
+    .expect("A's entry");
+  let bulk_outbound_before = a
+    .table
+    .entry(ha)
+    .map(|e| e.class_mut(StreamClass::Bulk).outbound.len())
+    .expect("A's entry");
+
+  // Admit through the production choke-point with the class `partition` picked.
+  a.write_framed(now, ha, class, &huge);
+
+  assert_eq!(
+    a.oversized_dropped(),
+    1,
+    "the oversized PrepareBatch is refused at write_framed's admission gate and counted"
+  );
+  assert_eq!(
+    a.table
+      .entry(ha)
+      .map(|e| e.class_mut(StreamClass::Control).outbound.len()),
+    Some(control_outbound_before),
+    "no framed bytes are staged on Control for a batch that failed the size preflight"
+  );
+  assert_eq!(
+    a.table
+      .entry(ha)
+      .map(|e| e.class_mut(StreamClass::Bulk).outbound.len()),
+    Some(bulk_outbound_before),
+    "no framed bytes are staged on Bulk either — the class partition picked still refuses"
+  );
+  assert!(
+    a.poll_transmit().is_none(),
+    "an oversized PrepareBatch must not produce any outbound datagram"
+  );
+
+  // Ferry forward: the peer must never observe a frame on either class, since none was ever built.
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  for k in 1..20u64 {
+    let tick = now + Duration::from_millis(k * 5);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    b.ingest_recv(tick, hb);
+  }
+  assert_eq!(
+    b.test_ready_len(hb, StreamClass::Control),
+    0,
+    "no frame is ready on the peer's Control class"
+  );
+  assert_eq!(
+    b.test_ready_len(hb, StreamClass::Bulk),
+    0,
+    "no frame is ready on the peer's Bulk class"
+  );
+  assert!(
+    b.next_frame(hb, StreamClass::Control).is_none(),
+    "no frame was ever queued on Control"
+  );
+  assert!(
+    b.next_frame(hb, StreamClass::Bulk).is_none(),
+    "no frame was ever queued on Bulk"
+  );
+
+  // A normal-sized frame still routes on the same connection afterwards and does not bump the
+  // oversized counter.
+  a.write_framed(now, ha, StreamClass::Control, &commit(0x01));
+  assert_eq!(
+    a.oversized_dropped(),
+    1,
+    "a normal-sized message does not increment the oversized counter"
+  );
+}
+
 /// `frame_checked`'s `len` parameter is a caller-supplied estimate computed BEFORE `payload` runs
 /// (`Message::encoded_len()` for a consensus send, via the pb view `write_framed` builds). A
 /// message whose true size nears 4 GiB could wrap that estimate below the cap via buffa's
