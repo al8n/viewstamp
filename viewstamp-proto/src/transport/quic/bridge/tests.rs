@@ -1,6 +1,8 @@
 use super::*;
+use bytes::Bytes;
+
 use crate::{
-  Commit, OpNumber, ReplicaId, View,
+  Commit, OpNumber, ReplicaId, View, decode_message, encode_message,
   transport::{
     CloseCause,
     frame::LEN_PREFIX,
@@ -604,7 +606,7 @@ fn staged_then_new_frame_preserves_on_wire_order() {
   {
     let e = a.table.entry(ha).expect("A's entry");
     let mut staged1 = Vec::new();
-    encode_frame(&frame1.encode(), &mut staged1);
+    encode_frame(&encode_message(&frame1), &mut staged1);
     e.class_mut(StreamClass::Control).outbound.extend(staged1);
   }
 
@@ -640,7 +642,7 @@ fn staged_then_new_frame_preserves_on_wire_order() {
 
     b.ingest_recv(tick, hb);
     while let Some(frame) = b.next_frame(hb, StreamClass::Control) {
-      if let Ok(msg) = Message::decode(&frame) {
+      if let Ok(msg) = decode_message(Bytes::from(frame)) {
         got.push(msg);
       }
     }
@@ -762,12 +764,12 @@ fn control_and_bulk_frames_route_to_their_class_recv() {
     if got_ctrl.is_none()
       && let Some(f) = b.next_frame(hb, StreamClass::Control)
     {
-      got_ctrl = Message::decode(&f).ok();
+      got_ctrl = decode_message(Bytes::from(f)).ok();
     }
     if got_bulk.is_none()
       && let Some(f) = b.next_frame(hb, StreamClass::Bulk)
     {
-      got_bulk = Message::decode(&f).ok();
+      got_bulk = decode_message(Bytes::from(f)).ok();
     }
     if got_ctrl.is_some() && got_bulk.is_some() {
       break;
@@ -1107,7 +1109,7 @@ fn single_layout_round_trips_one_frame() {
     );
     b.ingest_recv(tick, hb);
     if let Some(f) = b.next_frame(hb, StreamClass::Control) {
-      got = Message::decode(&f).ok();
+      got = decode_message(Bytes::from(f)).ok();
       break;
     }
   }
@@ -1181,7 +1183,7 @@ fn single_layout_refuses_a_peer_opened_bulk_stream() {
     if got_ctrl.is_none()
       && let Some(f) = b.next_frame(hb, StreamClass::Control)
     {
-      got_ctrl = Message::decode(&f).ok();
+      got_ctrl = decode_message(Bytes::from(f)).ok();
     }
     // The Bulk decoder must stay empty for the whole run: the refused stream is never read into it.
     if b.next_frame(hb, StreamClass::Bulk).is_some() {
@@ -1467,7 +1469,7 @@ fn a_staged_bulk_frame_flushes_when_a_bidi_slot_frees_via_max_streams() {
   let staged = commit(0x71);
   {
     let mut framed = Vec::new();
-    encode_frame(&staged.encode(), &mut framed);
+    encode_frame(&encode_message(&staged), &mut framed);
     a.test_stage_outbound(ha, StreamClass::Bulk, &framed);
   }
 
@@ -1549,7 +1551,7 @@ fn a_staged_bulk_frame_flushes_when_a_bidi_slot_frees_via_max_streams() {
     }
     let _ = b.ingest_recv(now, hb);
     if let Some(f) = b.next_frame(hb, StreamClass::Bulk) {
-      got = Message::decode(&f).ok();
+      got = decode_message(Bytes::from(f)).ok();
       break;
     }
   }
@@ -1719,7 +1721,7 @@ fn sustained_bulk_reopen_churn_replenishes_bidi_credit_via_peer_max_streams() {
     }
     let _ = b.ingest_recv(now, hb);
     if let Some(f) = b.next_frame(hb, StreamClass::Bulk)
-      && Message::decode(&f).ok() == Some(final_frame.clone())
+      && decode_message(Bytes::from(f)).ok() == Some(final_frame.clone())
     {
       delivered = Some(final_frame.clone());
       break;
@@ -1995,7 +1997,7 @@ fn bulk_reset_reopen_resets_recv_decoder_and_frees_the_old_stream() {
     );
     new_recv = b.test_recv_id(hb, StreamClass::Bulk);
     if let Some(f) = b.next_frame(hb, StreamClass::Bulk) {
-      got_bulk = Message::decode(&f).ok();
+      got_bulk = decode_message(Bytes::from(f)).ok();
       break;
     }
   }
@@ -2758,7 +2760,7 @@ fn a_large_post_validation_control_frame_is_accepted_after_the_cap_is_raised() {
       break; // a teardown (the neuter) — leave `got` None so the assert fails informatively
     }
     while let Some(payload) = a.next_frame(ha, StreamClass::Control) {
-      if let Ok(msg) = Message::decode(&payload) {
+      if let Ok(msg) = decode_message(Bytes::from(payload)) {
         got = Some(msg);
       }
     }
@@ -2832,7 +2834,7 @@ fn a_control_frame_pipelined_after_the_hello_is_buffered_then_delivered_post_val
     RequestNumber::with(1),
     bytes::Bytes::from(vec![0x6Cu8; 1024]),
   ));
-  let big_payload = big.encode();
+  let big_payload = encode_message(&big);
   assert!(
     big_payload.len() > MAX_HELLO_LEN,
     "the pipelined frame must exceed the pre-auth cap to exercise the fix"
@@ -2920,7 +2922,7 @@ fn a_control_frame_pipelined_after_the_hello_is_buffered_then_delivered_post_val
       "the buffered larger frame decodes cleanly post-validation, no teardown (k={k})"
     );
     while let Some(payload) = a.next_frame(ha, StreamClass::Control) {
-      if let Ok(msg) = Message::decode(&payload) {
+      if let Ok(msg) = decode_message(Bytes::from(payload)) {
         got = Some(msg);
       }
     }
@@ -4763,7 +4765,8 @@ fn bulk_is_not_read_or_credited_before_the_peer_identity_validates() {
     // Skip the Control keepalive frames; find the one Bulk frame B sent pre-validation.
     while a.next_frame(ha, StreamClass::Control).is_some() {}
     if let Some(payload) = a.next_frame(ha, StreamClass::Bulk) {
-      bulk_msg_received = Some(Message::decode(&payload).expect("a valid framed Bulk message"));
+      bulk_msg_received =
+        Some(decode_message(Bytes::from(payload)).expect("a valid framed Bulk message"));
       break;
     }
   }
@@ -4891,7 +4894,7 @@ fn pre_auth_bulk_is_read_immediately_after_validation_without_new_traffic() {
   }
   while a.next_frame(ha, StreamClass::Control).is_some() {}
   if let Some(payload) = a.next_frame(ha, StreamClass::Bulk) {
-    delivered = Message::decode(&payload).ok();
+    delivered = decode_message(Bytes::from(payload)).ok();
   }
   assert_eq!(
     delivered,
@@ -5666,7 +5669,7 @@ fn peer_control_recv_fin_delivers_frames_before_reaping(layout: StreamLayout) {
   // Deliver the queued frame, exactly as `drain_bridge`'s `next_frame` drain does.
   let delivered = a
     .next_frame(ha, StreamClass::Control)
-    .and_then(|payload| Message::decode(&payload).ok());
+    .and_then(|payload| decode_message(Bytes::from(payload)).ok());
   // The deferred teardown is queued; running it (as `drain_bridge` does after the frame drain) reaps.
   let mut deferred_close = false;
   if let Some((hh, cls, disp)) = a.take_pending_fin_close() {
@@ -5810,7 +5813,7 @@ fn peer_bulk_recv_fin_delivers_frames_before_retiring() {
   );
   let delivered = a
     .next_frame(ha, StreamClass::Bulk)
-    .and_then(|payload| Message::decode(&payload).ok());
+    .and_then(|payload| decode_message(Bytes::from(payload)).ok());
   let mut deferred_retire = false;
   if let Some((hh, cls, disp)) = a.take_pending_fin_close() {
     assert_eq!(
@@ -5914,7 +5917,7 @@ fn peer_recv_fin_mid_frame_reaps_as_truncation(
   // bytes) or the whole prefix plus a partial body. B writes exactly that prefix raw onto its `class`
   // send stream and FINs — so A reads `[partial-frame][FIN]` and the decoder is left mid-frame.
   let mut framed = Vec::new();
-  encode_frame(&commit(0x7C).encode(), &mut framed);
+  encode_frame(&encode_message(&commit(0x7C)), &mut framed);
   let cut = match trunc {
     Truncation::SplitPrefix => 2,
     // Prefix (4) + a few body bytes, but strictly fewer than the whole frame.
@@ -6115,9 +6118,9 @@ fn peer_recv_fin_complete_then_partial_delivers_prefix_then_reaps(class: StreamC
   // survive; the torn one must not.
   let complete = commit(0xC0);
   let mut bytes = Vec::new();
-  encode_frame(&complete.encode(), &mut bytes);
+  encode_frame(&encode_message(&complete), &mut bytes);
   let mut second = Vec::new();
-  encode_frame(&commit(0xD1).encode(), &mut second);
+  encode_frame(&encode_message(&commit(0xD1)), &mut second);
   let torn_cut = LEN_PREFIX + 3;
   assert!(
     torn_cut < second.len(),
@@ -6188,7 +6191,7 @@ fn peer_recv_fin_complete_then_partial_delivers_prefix_then_reaps(class: StreamC
   // Deliver the queued frame, exactly as `drain_bridge`'s `next_frame` drain does.
   let delivered_before_close = a
     .next_frame(ha, class)
-    .and_then(|payload| Message::decode(&payload).ok());
+    .and_then(|payload| decode_message(Bytes::from(payload)).ok());
   assert_eq!(
     delivered_before_close.as_ref(),
     Some(&complete),
@@ -6284,7 +6287,7 @@ fn peer_control_recv_frame_too_long_behind_complete_frame_delivers_prefix_then_r
   // oversized prefix trips `FrameTooLong` after the complete frame is already queued.
   let complete = commit(0xE2);
   let mut bytes = Vec::new();
-  encode_frame(&complete.encode(), &mut bytes);
+  encode_frame(&encode_message(&complete), &mut bytes);
   bytes.extend_from_slice(&(MAX_FRAME_LEN + 1).to_be_bytes());
 
   let b_send = b
@@ -6338,7 +6341,7 @@ fn peer_control_recv_frame_too_long_behind_complete_frame_delivers_prefix_then_r
   );
   let delivered_before_close = a
     .next_frame(ha, StreamClass::Control)
-    .and_then(|payload| Message::decode(&payload).ok());
+    .and_then(|payload| decode_message(Bytes::from(payload)).ok());
   assert_eq!(
     delivered_before_close.as_ref(),
     Some(&complete),
@@ -6541,7 +6544,7 @@ fn preauth_control_fin_with_complete_tail_validates_then_reaps(layout: StreamLay
     RequestNumber::with(1),
     bytes::Bytes::from(vec![0x6Cu8; 1024]),
   ));
-  let pipelined_payload = pipelined.encode();
+  let pipelined_payload = encode_message(&pipelined);
   assert!(
     pipelined_payload.len() > MAX_HELLO_LEN,
     "the pipelined frame must exceed the pre-auth cap to exercise the buffered-tail path"
@@ -6616,7 +6619,7 @@ fn preauth_control_fin_with_complete_tail_validates_then_reaps(layout: StreamLay
   // delivered — `drain_bridge`'s same-pass `next_frame` loop pops it right after validation.
   let pipelined_got = a
     .next_frame(ha, StreamClass::Control)
-    .and_then(|p| Message::decode(&p).ok());
+    .and_then(|p| decode_message(Bytes::from(p)).ok());
   assert_eq!(
     pipelined_got,
     Some(pipelined),
@@ -6707,7 +6710,7 @@ fn preauth_control_fin_with_partial_tail_validates_then_reaps(layout: StreamLayo
     RequestNumber::with(1),
     bytes::Bytes::from(vec![0x6Cu8; 1024]),
   ));
-  let pipelined_payload = pipelined.encode();
+  let pipelined_payload = encode_message(&pipelined);
   let mut framed_tail = Vec::new();
   encode_frame(&pipelined_payload, &mut framed_tail);
   // `[hello][PREFIX of the pipelined frame]`: keep the whole hello frame plus only part of the tail

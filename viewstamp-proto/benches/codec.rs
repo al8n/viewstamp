@@ -16,7 +16,9 @@
 //! # Baseline — MACHINE-SPECIFIC, for trend comparison on the same box only
 //!
 //! Recorded from one local `cargo bench` run (Apple M1 Max, macOS,
-//! rustc 1.98.0-nightly) as the initial reference point:
+//! rustc 1.98.0-nightly) as the initial reference point. Predates the protobuf wire envelope
+//! (`encode_message`/`decode_message`); re-baseline after that cutover before trusting a delta
+//! against these numbers.
 //!
 //! | benchmark                          | time     | throughput  |
 //! |------------------------------------|----------|-------------|
@@ -37,7 +39,7 @@ use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use viewstamp_proto::{
   ClientId, Commit, DoViewChange, Message, OpNumber, Prepare, PrepareOk, PreparedEntry,
-  RepairBatch, ReplicaId, RequestNumber, View,
+  RepairBatch, ReplicaId, RequestNumber, View, decode_message, encode_message,
 };
 
 const KIB: usize = 1024;
@@ -140,17 +142,17 @@ fn bench_codec(c: &mut Criterion) {
     ("repair_batch_4x1kib", repair_batch_4x1kib()),
   ];
   for (name, msg) in kinds {
-    let encoded = msg.encode();
+    let encoded = encode_message(&msg);
     assert_eq!(
-      Message::decode(&encoded).expect("the fixture round-trips"),
+      decode_message(encoded.clone()).expect("the fixture round-trips"),
       msg,
       "fixture sanity: encode → decode is the identity"
     );
     let mut g = c.benchmark_group(format!("codec/{name}"));
     g.throughput(Throughput::Bytes(encoded.len() as u64));
-    g.bench_function("encode", |b| b.iter(|| black_box(&msg).encode()));
+    g.bench_function("encode", |b| b.iter(|| encode_message(black_box(&msg))));
     g.bench_function("decode", |b| {
-      b.iter(|| Message::decode(black_box(&encoded)).expect("a round-tripped buffer decodes"))
+      b.iter(|| decode_message(black_box(encoded.clone())).expect("a round-tripped buffer decodes"))
     });
     g.finish();
   }

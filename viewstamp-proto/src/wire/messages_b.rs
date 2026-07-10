@@ -290,12 +290,13 @@ pub(crate) fn request_block_from(w: pb::RequestBlock) -> Result<BlockAddress, Co
 }
 
 /// Converts a borrowed [`BlockResponse`] into its wire form: the address's 16 bytes copied as-is,
-/// and the block payload copied into the `optional bytes` slot when present (`None` maps to wire
-/// absence, preserving the presence/absence distinction).
+/// and the block payload (an O(1) refcount clone, never a byte copy) placed into the `optional
+/// bytes` slot when present (`None` maps to wire absence, preserving the presence/absence
+/// distinction).
 pub(crate) fn pb_block_response(m: &BlockResponse) -> pb::BlockResponse {
   pb::BlockResponse {
     addr: Bytes::copy_from_slice(m.addr().as_bytes()),
-    block: m.block().map(Bytes::copy_from_slice),
+    block: m.block_bytes(),
     ..Default::default()
   }
 }

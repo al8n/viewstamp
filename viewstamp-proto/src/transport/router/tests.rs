@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
   LabelOptions, Labeled, MemberId, Message, OpNumber, Peer, Recipient, ReplicaId, View,
-  message::Commit, transport::stream::RecordIo,
+  encode_message, message::Commit, transport::stream::RecordIo,
 };
 
 fn conn() -> Conn<crate::Passthrough> {
@@ -269,7 +269,7 @@ fn the_cap_accounts_for_the_queued_handshake_hello() {
   };
   let framed_len = {
     let mut framed = Vec::new();
-    encode_frame(&commit_msg().encode(), &mut framed);
+    encode_frame(&encode_message(&commit_msg()), &mut framed);
     framed.len()
   };
   let cap = hello_len + framed_len;
@@ -447,7 +447,7 @@ fn a_conn_aborted_by_route_is_reaped_and_a_standby_is_promoted_in_the_same_pass(
   // overflows and aborts it.
   let framed_len = {
     let mut framed = Vec::new();
-    encode_frame(&commit_msg().encode(), &mut framed);
+    encode_frame(&encode_message(&commit_msg()), &mut framed);
     framed.len()
   };
   let mut r = PeerRouter::<crate::Passthrough>::with_outbound_cap(framed_len);

@@ -22,17 +22,16 @@ pub const MAX_FRAME_LEN: u32 = crate::message::MAX_FRAME_LEN;
 /// A client body does not travel alone — the SAME body bytes are wrapped by a [`Request`](crate::Request)
 /// encoding on the client → primary hop, by a (larger) [`Prepare`](crate::Prepare) encoding on the
 /// primary → backups hop, and — once the op is logged — by a single
-/// [`PreparedEntry`](crate::PreparedEntry) inside the log slice a
-/// [`DoViewChange`](crate::DoViewChange) / [`StartView`](crate::StartView) /
-/// [`RecoveryResponse`](crate::RecoveryResponse) carries at view change or recovery. The send path
-/// refuses any message whose `encoded_len()` exceeds [`MAX_FRAME_LEN`], and
-/// `MAX_REQUEST_BODY_OVERHEAD` is the largest of those
-/// per-carrier overheads (the log carriers, not the `Prepare` hop, bind it). A body of at most this many
-/// bytes therefore encodes to at most [`MAX_FRAME_LEN`] on EVERY message that can carry it, so it is
-/// deliverable on every hop; one byte more would push the tightest carrier (a one-entry log slice) past
-/// the frame cap and be dropped by the transport, wedging a view change or recovery that had accepted
-/// it. A driver should reject an over-this-size submit up front rather than admit a request the cluster
-/// can never commit.
+/// [`PreparedEntry`](crate::PreparedEntry) inside a `RepairBatch` (the windowed peer-repair answer)
+/// or `PrepareBatch` (the primary's batched retransmit) log slice. The send path refuses any message
+/// whose `encoded_len()` exceeds [`MAX_FRAME_LEN`], and `MAX_REQUEST_BODY_OVERHEAD` is the largest
+/// of those per-carrier overheads at their protobuf WORST CASE — every scalar charged its
+/// varint-widest encoding (the one-entry `PrepareBatch`, not the bare `Prepare` hop, binds it). A
+/// body of at most this many bytes therefore encodes to at most [`MAX_FRAME_LEN`] on EVERY message
+/// that can carry it, whatever its scalar values, so it is deliverable on every hop; past the bound
+/// a carrier can encode over the frame cap and be dropped by the transport, wedging the repair or
+/// retransmit of a committed op that had been accepted. A driver should reject an over-this-size
+/// submit up front rather than admit a request the cluster can never commit.
 ///
 /// `const`: [`MAX_FRAME_LEN`] (16 MiB) dwarfs the fixed overhead, so the subtraction never underflows.
 #[cfg_attr(not(tarpaulin), inline)]

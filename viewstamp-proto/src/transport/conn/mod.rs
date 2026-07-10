@@ -6,7 +6,9 @@
 #[cfg(not(feature = "std"))]
 use std::vec::Vec;
 
-use crate::{Instant, Message, Peer};
+use bytes::Bytes;
+
+use crate::{Instant, Message, Peer, decode_message};
 
 use super::{
   CloseCause, TransportError,
@@ -210,7 +212,7 @@ impl<R: StreamTransport> Conn<R> {
       None => return Ok(()),
     };
     while let Some(frame) = self.decoder.next_frame() {
-      match Message::decode(&frame) {
+      match decode_message(Bytes::from(frame)) {
         Ok(msg) => out.push((from, msg)),
         Err(e) => {
           let e = TransportError::from(e);

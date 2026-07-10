@@ -58,7 +58,7 @@ pub use batch::{
   BatchView, EmptyBatch, ReplyBuilder, ReplyPushError, ReplyView,
 };
 pub use block_store::{BlockAddress, BlockDagWalk, BlockStore, BlockStoreError, block_address};
-pub use codec::{CodecError, WIRE_VERSION};
+pub use codec::CodecError;
 pub use config::{
   Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS, MAX_CLIENT_SESSIONS,
 };

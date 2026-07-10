@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use bytes::Bytes;
 
-use crate::{MemberId, Message, Peer, Recipient, ReplicaId};
+use crate::{MemberId, Message, Peer, Recipient, ReplicaId, encode_message};
 
 use super::{
   CloseCause,
@@ -389,12 +389,12 @@ impl<R: StreamTransport> PeerRouter<R> {
     // are fetched block-by-block, never shipped as one oversized frame) — so a refusal here is a
     // REAL bug; it is counted visibly (the oversized-dropped counter) rather than emitting a doomed
     // frame or silently swallowing the send and wedging liveness. VSR retransmission covers a
-    // refused send. `encoded_len()` is the exact length `encode()` would produce.
+    // refused send. `encoded_len()` is the exact length `encode_message` would produce.
     if msg.encoded_len() > MAX_FRAME_LEN as usize {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
       return 0;
     }
-    let encoded = msg.encode();
+    let encoded = encode_message(msg);
     let mut framed = Vec::with_capacity(4 + encoded.len());
     encode_frame(&encoded, &mut framed);
     let mut dropped = 0;

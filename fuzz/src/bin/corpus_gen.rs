@@ -11,7 +11,7 @@ use std::{fs, path::Path};
 use bytes::Bytes;
 use viewstamp_proto::{
   ClientId, Commit, Epoch, GetView, Header, Message, OpNumber, ReplicaId, Request, RequestNumber,
-  StartViewChange, View, VsrState,
+  StartViewChange, View, VsrState, encode_message,
 };
 
 fn write(target: &str, name: &str, bytes: &[u8]) {
@@ -63,23 +63,23 @@ fn main() {
     ("start_view_change", &svc),
     ("get_view", &get_view),
   ] {
-    write("message_decode", name, &msg.encode());
+    write("message_decode", name, &encode_message(msg));
   }
 
   // ── stream_ingress: [lane byte][wire payload] (lane 1 = hello prefixed by the harness) ──
   write("stream_ingress", "framed_request_validated", &{
     let mut v = vec![1u8];
-    v.extend_from_slice(&frame(&request.encode()));
+    v.extend_from_slice(&frame(&encode_message(&request)));
     v
   });
   write("stream_ingress", "framed_commit_validated", &{
     let mut v = vec![1u8];
-    v.extend_from_slice(&frame(&commit.encode()));
+    v.extend_from_slice(&frame(&encode_message(&commit)));
     v
   });
   write("stream_ingress", "framed_request_raw", &{
     let mut v = vec![0u8];
-    v.extend_from_slice(&frame(&request.encode()));
+    v.extend_from_slice(&frame(&encode_message(&request)));
     v
   });
 

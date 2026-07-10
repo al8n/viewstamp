@@ -34,10 +34,12 @@ use layout::StreamClass;
 
 use std::collections::BTreeSet;
 
+use bytes::Bytes;
+
 use crate::{
   BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
   ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
-  endpoint::ProposeMembershipError,
+  decode_message, endpoint::ProposeMembershipError,
 };
 
 /// Derive the SNI server-name a dial presents for `peer` in `cluster`.
@@ -663,7 +665,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
         } else if self.bridge.is_validated(h) {
           // A validated connection: the frame is a consensus message. A frame that fails to decode
           // is dropped (the consensus layer retransmits); keep draining the rest of the batch.
-          if let (Some(from), Ok(msg)) = (self.bridge.bound_peer_of(h), Message::decode(&payload)) {
+          if let (Some(from), Ok(msg)) = (
+            self.bridge.bound_peer_of(h),
+            decode_message(Bytes::from(payload)),
+          ) {
             self.deliver_decoded(now, wal, sb, blocks, from, msg);
           }
         } else {
@@ -677,7 +682,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       // so interleaving Bulk frames with the Control batch above is safe.
       if self.bridge.is_validated(h) {
         while let Some(payload) = self.bridge.next_frame(h, StreamClass::Bulk) {
-          if let (Some(from), Ok(msg)) = (self.bridge.bound_peer_of(h), Message::decode(&payload)) {
+          if let (Some(from), Ok(msg)) = (
+            self.bridge.bound_peer_of(h),
+            decode_message(Bytes::from(payload)),
+          ) {
             self.deliver_decoded(now, wal, sb, blocks, from, msg);
           }
         }

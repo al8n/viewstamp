@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ClientId, OpNumber, ReplicaId, RequestNumber, View};
+use crate::{ClientId, OpNumber, ReplicaId, RequestNumber, View, decode_message, encode_message};
 
 #[test]
 fn commit_and_prepare_ok_carry_checkpoint_op() {
@@ -41,7 +41,7 @@ fn prepare_ok_prepare_checksum_round_trips_through_the_wire_codec() {
     crate::Epoch::new(0),
     0,
   ));
-  let back = Message::decode(&ok.encode()).expect("round-trips");
+  let back = decode_message(encode_message(&ok)).expect("round-trips");
   assert_eq!(back, ok);
   let p = back.unwrap_prepare_ok();
   assert_eq!(p.prepare_checksum(), u128::MAX);
@@ -60,7 +60,7 @@ fn learner_status_round_trips_through_the_wire_codec_and_carries_no_vote() {
     crate::Epoch::new(9),
     0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00,
   ));
-  let back = Message::decode(&m.encode()).expect("round-trips");
+  let back = decode_message(encode_message(&m)).expect("round-trips");
   assert_eq!(back, m, "decode(encode(m)) == m");
   let ls = back.unwrap_learner_status();
   assert_eq!(ls.replica(), ReplicaId::new(300));
@@ -213,7 +213,7 @@ fn nack_constructs_and_round_trips() {
     !m.advertises_authoritative_view(),
     "a Nack is a view-independent 'I lack this op' fact, never a view-authority claim"
   );
-  let back = Message::decode(&m.encode()).expect("round-trip decodes");
+  let back = decode_message(encode_message(&m)).expect("round-trip decodes");
   assert_eq!(back, m, "decode(encode(nack)) == nack");
   let Message::Nack(n) = back else {
     panic!("expected a Nack")
@@ -484,8 +484,6 @@ fn backup_recovery_response_carries_no_log() {
 
 // ── wire codec: all 20 Message variants ──
 
-use crate::codec::CodecError;
-
 fn entry(op: u64, body: &[u8]) -> PreparedEntry {
   PreparedEntry::new(
     OpNumber::with(op),
@@ -745,15 +743,15 @@ fn one_of_each_variant() -> std::vec::Vec<Message> {
 }
 
 #[test]
-fn encoded_len_matches_encode_len_for_every_variant() {
+fn encoded_len_matches_encode_message_len_for_every_variant() {
   // The preflight size must exactly equal the encoded length for every variant (incl. empty and
   // populated bodies/log slices), so the transport's pre-encode frame-cap check can never disagree
-  // with the bytes a subsequent encode would actually produce.
+  // with the bytes a subsequent encode_message would actually produce.
   for m in one_of_each_variant() {
     assert_eq!(
       m.encoded_len(),
-      m.encode().len(),
-      "encoded_len() must equal encode().len() for {}",
+      encode_message(&m).len(),
+      "encoded_len() must equal encode_message().len() for {}",
       m.kind_str()
     );
   }
@@ -766,134 +764,132 @@ fn encoded_len_matches_encode_len_for_every_variant() {
     false,
     0,
   ));
-  assert_eq!(rq.encoded_len(), rq.encode().len());
+  assert_eq!(rq.encoded_len(), encode_message(&rq).len());
 }
 
 #[test]
-fn max_reply_body_len_is_tight_against_the_reply_carrier() {
-  // The reply-size contract is tight to the byte: a reply body of exactly `max_reply_body_len()`
-  // encodes as a `Reply` of exactly `MAX_FRAME_LEN` (deliverable), and one byte more exceeds the
-  // cap (the transport refuses the send — unrecoverable for an already-committed op, which is why
-  // `StateMachine::apply` carries the bound as an embedder obligation).
-  let reply_of = |len: usize| {
-    Message::Reply(Reply::new(
-      View::with(1),
-      ClientId::new(7),
-      RequestNumber::with(1),
-      Bytes::from(std::vec![0u8; len]),
-    ))
-  };
-  let max = max_reply_body_len();
+fn a_reply_with_worst_case_scalars_at_the_body_bound_fits_the_frame_cap() {
+  // `max_reply_body_len()` subtracts `REPLY_ENCODE_OVERHEAD` — the protobuf WORST-CASE overhead,
+  // every scalar charged its varint-widest — from the frame cap, so a reply body of exactly the
+  // bound must fit `MAX_FRAME_LEN` even when every other field genuinely encodes at that widest
+  // (u64::MAX view/request, u128::MAX client). Load-bearing: an already-committed op has no
+  // in-protocol recovery if its cached reply cannot be sent (`StateMachine::apply` carries the
+  // bound as an embedder obligation), so the bound must hold for EVERY field value, not just small
+  // ones whose varints shrink.
+  let reply = Message::Reply(Reply::new(
+    View::with(u64::MAX),
+    ClientId::new(u128::MAX),
+    RequestNumber::with(u64::MAX),
+    Bytes::from(std::vec![0u8; max_reply_body_len()]),
+  ));
+  let encoded = encode_message(&reply).len();
   let cap = MAX_FRAME_LEN as usize;
-  assert_eq!(
-    reply_of(max).encode().len(),
-    cap,
-    "a max-size reply body lands exactly on MAX_FRAME_LEN"
-  );
   assert!(
-    reply_of(max + 1).encode().len() > cap,
-    "one byte over the max pushes the Reply past the frame cap"
+    encoded <= cap,
+    "a worst-case-scalar Reply at the body bound must fit the frame cap: {encoded} > {cap}"
   );
-  // The overhead const matches the Reply encode arm widths (header 3 + view 8 + client 16 +
-  // request 8 + body length prefix 4).
-  assert_eq!(REPLY_ENCODE_OVERHEAD, 39);
-  assert_eq!(reply_of(0).encode().len(), REPLY_ENCODE_OVERHEAD);
 }
 
 #[test]
-fn prepare_batch_is_tight_against_the_frame_cap() {
-  // The batched-retransmit frame arithmetic, pinned by REAL encodings (not just the modelled
-  // consts): the carrier const matches the encode arm widths, a max-fill one-entry PrepareBatch
-  // lands EXACTLY on MAX_FRAME_LEN, one byte more exceeds it, and a multi-entry batch whose
-  // per-entry costs sum exactly to the budget also lands exactly on the cap — so the retransmit
-  // accumulator (budget = MAX_FRAME_LEN - PREPARE_BATCH_CARRIER_OVERHEAD, cost =
-  // present_entry_encoded_len) can never produce an oversized frame, and wastes nothing.
+fn batch_carriers_with_worst_case_scalars_at_the_modeled_budget_fit_the_frame_cap() {
+  // The byte-bounded serve (`RepairBatch`) and the batched retransmit (`PrepareBatch`) accumulate
+  // entries against `MAX_FRAME_LEN - *_CARRIER_OVERHEAD` charging `present_entry_encoded_len` per
+  // entry — both protobuf WORST-CASE models. A batch built to exactly fill that modeled budget must
+  // fit the frame once actually encoded, even with every scalar at its varint-widest (u64::MAX
+  // ops/views, u128::MAX ids), as a single entry or split across two — so the accumulators can
+  // never emit an oversized frame whatever the field values.
   let cap = MAX_FRAME_LEN as usize;
-  let batch_of = |entries: std::vec::Vec<PreparedEntry>| {
-    Message::PrepareBatch(PrepareBatch::new(
-      View::with(1),
-      OpNumber::with(0),
-      OpNumber::with(0),
-      crate::Epoch::new(0),
-      0,
-      entries,
-    ))
-  };
-  let entry_of = |op: u64, len: usize| {
+  let entry_of = |len: usize| {
     PreparedEntry::new(
-      OpNumber::with(op),
-      ClientId::new(7),
-      RequestNumber::with(op),
+      OpNumber::with(u64::MAX),
+      ClientId::new(u128::MAX),
+      RequestNumber::with(u64::MAX),
       Bytes::from(std::vec![0u8; len]),
     )
   };
-  // The carrier const matches the encode arm widths (header 3 + view/commit/checkpoint_op 24 + the
-  // strict epoch(8)+config_id(16) 24 + log count prefix 4) — an empty batch encodes to exactly the
-  // carrier.
-  assert_eq!(PREPARE_BATCH_CARRIER_OVERHEAD, 55);
-  assert_eq!(
-    batch_of(std::vec![]).encode().len(),
-    PREPARE_BATCH_CARRIER_OVERHEAD
-  );
-  let budget = cap - PREPARE_BATCH_CARRIER_OVERHEAD;
-  // Max-fill single entry: a body whose entry cost is exactly the budget lands exactly on the cap
-  // (the first-entry-progress case — one such op still ships); one byte more exceeds it.
-  let max = budget - present_entry_encoded_len(0);
-  assert_eq!(
-    batch_of(std::vec![entry_of(1, max)]).encode().len(),
-    cap,
-    "a max-fill one-entry PrepareBatch lands exactly on MAX_FRAME_LEN"
-  );
-  assert!(
-    batch_of(std::vec![entry_of(1, max + 1)]).encode().len() > cap,
-    "one byte over the max pushes the PrepareBatch past the frame cap"
-  );
-  // Multi-entry max-fill: two entries whose costs sum exactly to the budget land exactly on the
-  // cap — the running-cost accumulation models the encoding to the byte across entries.
-  let half = budget / 2;
-  let (a, b) = (
-    half - present_entry_encoded_len(0),
-    (budget - half) - present_entry_encoded_len(0),
-  );
-  assert_eq!(
-    present_entry_encoded_len(a) + present_entry_encoded_len(b),
-    budget
-  );
-  assert_eq!(
-    batch_of(std::vec![entry_of(1, a), entry_of(2, b)])
-      .encode()
-      .len(),
-    cap,
-    "two entries summing exactly to the budget land exactly on MAX_FRAME_LEN"
-  );
+  let prepare_batch_of = |entries: std::vec::Vec<PreparedEntry>| {
+    Message::PrepareBatch(PrepareBatch::new(
+      View::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      crate::Epoch::new(u64::MAX),
+      u128::MAX,
+      entries,
+    ))
+  };
+  let repair_batch_of = |entries: std::vec::Vec<PreparedEntry>| {
+    Message::RepairBatch(RepairBatch::new(
+      View::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      u128::MAX,
+      entries,
+    ))
+  };
+
+  for (name, carrier_overhead, batch_of) in [
+    (
+      "PrepareBatch",
+      PREPARE_BATCH_CARRIER_OVERHEAD,
+      &prepare_batch_of as &dyn Fn(std::vec::Vec<PreparedEntry>) -> Message,
+    ),
+    (
+      "RepairBatch",
+      REPAIR_BATCH_CARRIER_OVERHEAD,
+      &repair_batch_of,
+    ),
+  ] {
+    let budget = cap - carrier_overhead;
+    // Single entry filling the whole modeled budget.
+    let max = budget - present_entry_encoded_len(0);
+    let one = encode_message(&batch_of(std::vec![entry_of(max)])).len();
+    assert!(
+      one <= cap,
+      "a worst-case-scalar one-entry {name} filling the modeled budget must fit the frame cap: \
+       {one} > {cap}"
+    );
+    // Two entries splitting the modeled budget.
+    let half = budget / 2;
+    let (a, b) = (
+      half - present_entry_encoded_len(0),
+      (budget - half) - present_entry_encoded_len(0),
+    );
+    assert_eq!(
+      present_entry_encoded_len(a) + present_entry_encoded_len(b),
+      budget
+    );
+    let two = encode_message(&batch_of(std::vec![entry_of(a), entry_of(b)])).len();
+    assert!(
+      two <= cap,
+      "a worst-case-scalar two-entry {name} splitting the modeled budget must fit the frame cap: \
+       {two} > {cap}"
+    );
+  }
 }
 
-/// The transport's `max_request_body_len()` is the largest client body deliverable on EVERY message
-/// that can carry it, and it is tight to the byte. The view-change log carriers
-/// (`DoViewChange` / `StartView` / `RecoveryResponse`) are HEADER-ONLY (they ship no body — see
-/// `Endpoint::log_entries`), so the SAME body bytes travel only as the `Request` the client sends, the
-/// `Prepare` the primary replicates, and — once the op is logged — a single `Body::Present`
-/// `PreparedEntry` inside a `RepairBatch` (the windowed peer-repair answer) or a `PrepareBatch` (the
-/// primary's batched retransmit). The epoch-policy matrix makes the STRICT `PrepareBatch` carrier
-/// (epoch + config_id) strictly larger than the AGNOSTIC `RepairBatch` carrier (config_id only), so
-/// the two batch carriers no longer TIE — `PrepareBatch` is the sole BINDING carrier. This proves,
-/// via the ACTUAL `encode().len()` (real messages, not just the modelled `encoded_len()`), that a
-/// body of exactly the bound fits `MAX_FRAME_LEN` on ALL of those carriers, that the binding
-/// single-entry `PrepareBatch` lands EXACTLY on the cap (and a `RepairBatch` sits just under it by the
-/// strict/agnostic 8-byte carrier gap), that one byte more pushes the binding `PrepareBatch` past the
-/// cap, and — separately — that a header-only `DoViewChange` is INSENSITIVE to body size (a whole band
-/// of max-body ops stays far under cap as fixed-size headers). Enumerating every carrier here means a
-/// future message that wraps the body in MORE framing fails this test until the bound accounts for it.
+/// The transport's `max_request_body_len()` bounds the largest client body deliverable on EVERY
+/// message that can carry it. The view-change log carriers (`DoViewChange` / `StartView` /
+/// `RecoveryResponse`) are HEADER-ONLY (they ship no body — see `Endpoint::log_entries`), so the
+/// SAME body bytes travel only as the `Request` the client sends, the `Prepare` the primary
+/// replicates, and — once the op is logged — a single `Body::Present` `PreparedEntry` inside a
+/// `RepairBatch` (the windowed peer-repair answer) or a `PrepareBatch` (the primary's batched
+/// retransmit). `MAX_REQUEST_BODY_OVERHEAD` is the protobuf WORST-CASE overhead over all of those
+/// carriers, so this builds each with EVERY scalar at its varint-widest (u64::MAX views/ops/epochs/
+/// request, u128::MAX ids) plus a body of exactly the bound and checks the ACTUAL
+/// `encode_message(..).len()` fits `MAX_FRAME_LEN` — the maximal-scalar case is precisely the one a
+/// small-value fixture would mask. Also pins the header-only `DoViewChange` staying INSENSITIVE to
+/// body size. Enumerating every carrier here means a future message that wraps the body in MORE
+/// framing fails this test until the bound accounts for it.
 #[cfg(feature = "tcp")]
 #[test]
-fn max_request_body_len_is_tight_against_every_body_carrier() {
+fn every_body_carrier_with_worst_case_scalars_at_the_body_bound_fits_the_frame_cap() {
   use crate::{MAX_FRAME_LEN, max_request_body_len};
 
   let max = max_request_body_len();
   let cap = MAX_FRAME_LEN as usize;
 
-  let client = ClientId::new(7);
-  let request = RequestNumber::with(1);
+  let client = ClientId::new(u128::MAX);
+  let request = RequestNumber::with(u64::MAX);
 
   // Each closure builds a real message that carries a body of `len` bytes. The `RepairBatch` and
   // `PrepareBatch` wrap it in a single-entry `Body::Present` log slice — the worst case for one
@@ -903,12 +899,12 @@ fn max_request_body_len_is_tight_against_every_body_carrier() {
   let request_of = |len: usize| Message::Request(Request::new(client, request, body_of(len)));
   let prepare_of = |len: usize| {
     Message::Prepare(Prepare::new(
-      View::with(1),
-      OpNumber::with(1),
-      OpNumber::with(0),
-      OpNumber::with(0),
-      crate::Epoch::new(0),
-      0,
+      View::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      crate::Epoch::new(u64::MAX),
+      u128::MAX,
       client,
       request,
       body_of(len),
@@ -916,12 +912,12 @@ fn max_request_body_len_is_tight_against_every_body_carrier() {
   };
   let repair_batch_of = |len: usize| {
     Message::RepairBatch(RepairBatch::new(
-      View::with(1),
-      OpNumber::with(1),
-      OpNumber::with(0),
-      0,
+      View::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      u128::MAX,
       std::vec![PreparedEntry::new(
-        OpNumber::with(1),
+        OpNumber::with(u64::MAX),
         client,
         request,
         body_of(len),
@@ -930,13 +926,13 @@ fn max_request_body_len_is_tight_against_every_body_carrier() {
   };
   let prepare_batch_of = |len: usize| {
     Message::PrepareBatch(PrepareBatch::new(
-      View::with(1),
-      OpNumber::with(0),
-      OpNumber::with(0),
-      crate::Epoch::new(0),
-      0,
+      View::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      crate::Epoch::new(u64::MAX),
+      u128::MAX,
       std::vec![PreparedEntry::new(
-        OpNumber::with(1),
+        OpNumber::with(u64::MAX),
         client,
         request,
         body_of(len),
@@ -944,89 +940,101 @@ fn max_request_body_len_is_tight_against_every_body_carrier() {
     ))
   };
 
-  // Every BODY carrier of a max-size body, paired with its builder, checked by its REAL encoded length.
+  // Every BODY carrier of a bound-size body, paired with its builder, checked by its REAL encoded
+  // length at maximal scalars.
   let carriers: [(&str, &dyn Fn(usize) -> Message); 4] = [
     ("Request", &request_of),
     ("Prepare", &prepare_of),
     ("RepairBatch", &repair_batch_of),
     ("PrepareBatch", &prepare_batch_of),
   ];
-
-  // At the max: every body carrier fits the frame cap (the bound is the MAX over all per-carrier
-  // overheads, so the body fits the tightest carrier and a fortiori the rest).
-  let mut tightest = 0usize;
   for (name, build) in carriers {
-    let encoded = build(max).encode().len();
+    let encoded = encode_message(&build(max)).len();
     assert!(
       encoded <= cap,
-      "a max-size body carried by {name} must fit the frame cap: {encoded} > {cap}"
+      "a worst-case-scalar {name} carrying a bound-size body must fit the frame cap: \
+       {encoded} > {cap}"
     );
-    tightest = tightest.max(encoded);
   }
-  // Tight: the tightest carrier sits EXACTLY at the cap, so the bound wastes nothing. The single-entry
-  // STRICT `PrepareBatch` is this binding max — larger than the `Prepare` hop by the per-entry log
-  // framing, and larger than the AGNOSTIC `RepairBatch` by the strict epoch (the +8 epoch field; the
-  // +16 config_id is shared).
-  assert_eq!(
-    tightest, cap,
-    "the tightest body carrier lands exactly on MAX_FRAME_LEN at the max body"
-  );
-  let pb_at = prepare_batch_of(max).encode().len();
-  assert_eq!(
-    pb_at, cap,
-    "the binding one-entry PrepareBatch lands exactly on MAX_FRAME_LEN"
-  );
-  // The agnostic `RepairBatch` carrier is 8 bytes smaller (no `epoch`), so a max-size body in a
-  // one-entry RepairBatch sits exactly 8 bytes under the cap — comfortably deliverable, never the
-  // binding carrier.
-  let rb_at = repair_batch_of(max).encode().len();
-  assert_eq!(
-    rb_at,
-    cap - 8,
-    "a one-entry RepairBatch sits 8 bytes under the cap (it lacks the strict epoch field)"
-  );
 
-  // One byte more: the BINDING carrier (`PrepareBatch`) exceeds the cap, so the transport would drop
-  // it. The smaller-overhead carriers (`Request`, `Prepare`, `RepairBatch`) may still fit at max+1 — it
-  // is enough that the binding one does not, which is exactly why the bound subtracts the LARGEST
-  // per-carrier overhead.
-  let pb_over = prepare_batch_of(max + 1).encode().len();
-  assert!(
-    pb_over > cap,
-    "one byte over the max must push a one-entry PrepareBatch past the frame cap: {pb_over} <= {cap}"
-  );
-  // The RepairBatch still fits at max+1 (it had 8 bytes of headroom): this documents that it is NOT
-  // the binding carrier — only the strict PrepareBatch is.
-  let rb_over = repair_batch_of(max + 1).encode().len();
-  assert!(
-    rb_over <= cap,
-    "a one-entry RepairBatch still fits at max+1 (it is not the binding carrier): {rb_over} > {cap}"
-  );
-
-  // The header-only view-change carriers are INSENSITIVE to body size: a `DoViewChange` whose entry is
-  // header-only (`Repairing`) encodes the same whether the op's body is empty or `max` bytes — it ships
-  // only the 16-byte `body_checksum`. So a max-body op rides a view change far under the frame cap, the
-  // whole point of the header-only carrier. (The DEEP-band fit is bounded separately by
-  // `MAX_HEADER_ONLY_BAND_DEPTH` / the `MAX_CHECKPOINT_OPS` cap.)
+  // The header-only view-change carriers are INSENSITIVE to body size: a `DoViewChange` whose entry
+  // is header-only (`Repairing`) encodes the same whether the op's body is empty or `max` bytes —
+  // it ships only the 16-byte `body_checksum`. So a max-body op rides a view change far under the
+  // frame cap, the whole point of the header-only carrier. (The DEEP-band fit is pinned separately
+  // by `a_worst_case_header_only_band_at_max_depth_fits_the_frame_cap`.)
   let header_only_dvc = Message::DoViewChange(DoViewChange::new(
-    View::with(1),
-    View::with(1),
-    OpNumber::with(1),
-    OpNumber::with(0),
-    crate::Epoch::new(0),
-    0,
-    ReplicaId::new(0),
+    View::with(u64::MAX),
+    View::with(u64::MAX),
+    OpNumber::with(u64::MAX),
+    OpNumber::with(u64::MAX),
+    crate::Epoch::new(u64::MAX),
+    u128::MAX,
+    ReplicaId::new(u16::MAX),
     std::vec![PreparedEntry::repairing(
-      OpNumber::with(1),
+      OpNumber::with(u64::MAX),
       client,
       request,
-      0xDEAD_BEEF_CAFE_F00D_0102_0304_0506_0708,
+      u128::MAX,
     )],
   ));
   assert!(
-    header_only_dvc.encode().len() < cap / 2,
+    encode_message(&header_only_dvc).len() < cap / 2,
     "a header-only DoViewChange entry is body-size-insensitive and well under the frame cap"
   );
+}
+
+#[test]
+fn a_worst_case_header_only_band_at_max_depth_fits_the_frame_cap() {
+  // `MAX_HEADER_ONLY_BAND_DEPTH` divides the frame budget (less a fixed carrier allowance) by
+  // `PER_HEADER_ENTRY_BYTES`, the protobuf WORST-CASE size of one header-only (`Repairing`) entry.
+  // A band of exactly that many entries with EVERY scalar at its varint-widest (u64::MAX op and
+  // request, u128::MAX client and checksum), riding the two largest-carrier view-change messages
+  // (`DoViewChange` and `RecoveryResponse` tie, with maximal carrier scalars too), must encode
+  // within `MAX_FRAME_LEN` — the deepest band the admission gate ever lets accumulate stays
+  // deliverable whatever the field values.
+  let cap = MAX_FRAME_LEN as usize;
+  let entry = PreparedEntry::repairing(
+    OpNumber::with(u64::MAX),
+    ClientId::new(u128::MAX),
+    RequestNumber::with(u64::MAX),
+    u128::MAX,
+  );
+  let band: std::vec::Vec<PreparedEntry> = std::vec![entry; MAX_HEADER_ONLY_BAND_DEPTH];
+  let dvc = Message::DoViewChange(
+    DoViewChange::new(
+      View::with(u64::MAX),
+      View::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      crate::Epoch::new(u64::MAX),
+      u128::MAX,
+      ReplicaId::new(u16::MAX),
+      band.clone(),
+    )
+    .with_checkpoint_op(OpNumber::with(u64::MAX)),
+  );
+  let rr = Message::RecoveryResponse(
+    RecoveryResponse::new(
+      View::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      crate::Epoch::new(u64::MAX),
+      u128::MAX,
+      ReplicaId::new(u16::MAX),
+      u64::MAX,
+      band,
+    )
+    .with_checkpoint_op(OpNumber::with(u64::MAX)),
+  );
+  for m in [&dvc, &rr] {
+    let encoded = encode_message(m).len();
+    assert!(
+      encoded <= cap,
+      "a worst-case-scalar {} carrying a MAX_HEADER_ONLY_BAND_DEPTH band must fit the frame cap: \
+       {encoded} > {cap}",
+      m.kind_str()
+    );
+  }
 }
 
 #[test]
@@ -1034,15 +1042,9 @@ fn every_variant_round_trips_through_the_wire_codec() {
   let all = one_of_each_variant();
   assert_eq!(all.len(), 24, "every Message variant is represented");
   for m in &all {
-    let bytes = m.encode();
-    let back = Message::decode(&bytes).expect("round-trip decodes");
+    let bytes = encode_message(m);
+    let back = decode_message(bytes).expect("round-trip decodes");
     assert_eq!(&back, m, "decode(encode(m)) == m for {}", m.kind_str());
-    // The encoding leads with the wire version then the variant tag.
-    assert_eq!(
-      &bytes[..2],
-      &crate::WIRE_VERSION.to_be_bytes(),
-      "leads with WIRE_VERSION"
-    );
   }
   // Also exercise an ordinary state-sync (recovery = false) so both bool encodings round-trip.
   let rq = Message::RequestSync(RequestSync::new(
@@ -1053,7 +1055,7 @@ fn every_variant_round_trips_through_the_wire_codec() {
     false,
     0,
   ));
-  assert_eq!(Message::decode(&rq.encode()).unwrap(), rq);
+  assert_eq!(decode_message(encode_message(&rq)).unwrap(), rq);
 }
 
 #[test]
@@ -1095,143 +1097,9 @@ fn a_replica_id_above_a_byte_round_trips_through_the_wire_codec() {
     Message::Recovery(Recovery::new(id, 0xABCD, crate::Epoch::new(0), 0)),
   ];
   for m in &carriers {
-    let back = Message::decode(&m.encode()).expect("round-trips");
+    let back = decode_message(encode_message(m)).expect("round-trips");
     assert_eq!(&back, m, "decode(encode(m)) == m for {}", m.kind_str());
   }
-  // The big-endian id occupies exactly two bytes: a `Recovery` leads its body with the replica id
-  // right after the 3-byte header, so bytes [3..5] are `0x01, 0x2C`.
-  let rec = Message::Recovery(Recovery::new(id, 0, crate::Epoch::new(0), 0)).encode();
-  assert_eq!(
-    &rec[3..5],
-    &300u16.to_be_bytes(),
-    "the replica id is a 2-byte big-endian field"
-  );
-}
-
-#[test]
-fn commit_golden_bytes_pin_the_wire_layout() {
-  // A small STRICT variant pinned exactly: WIRE_VERSION(u16=14) ++ tag 4 ++ view ++ commit ++
-  // checkpoint_op ++ the strict epoch-policy pair epoch(u64) ++ config_id(u128).
-  let c = Message::Commit(Commit::new(
-    View::with(4),
-    OpNumber::with(9),
-    OpNumber::with(7),
-    crate::Epoch::new(0),
-    0,
-  ));
-  let expected: std::vec::Vec<u8> = std::vec![
-    0, 14, 4, // version 14, tag 4 (Commit)
-    0, 0, 0, 0, 0, 0, 0, 4, // view = 4
-    0, 0, 0, 0, 0, 0, 0, 9, // commit = 9
-    0, 0, 0, 0, 0, 0, 0, 7, // checkpoint_op = 7
-    0, 0, 0, 0, 0, 0, 0, 0, // epoch = 0
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // config_id = 0 (u128)
-  ];
-  assert_eq!(c.encode(), expected, "Commit wire layout is pinned");
-}
-
-#[test]
-fn do_view_change_golden_bytes_pin_the_nested_log_layout() {
-  // A nested STRICT variant pinned exactly: header (ver 11 + tag 6), scalars (incl. the advertised
-  // checkpoint floor after the commit, then the strict epoch-policy pair epoch(u64)+config_id(u128)
-  // before the u16 replica id), then a 1-entry log slice (count=1, op, client, request, body-state
-  // tag 0 = Present, length-prefixed body "hi").
-  let dvc = Message::DoViewChange(
-    DoViewChange::new(
-      View::with(3),
-      View::with(2),
-      OpNumber::with(5),
-      OpNumber::with(4),
-      crate::Epoch::new(0),
-      0,
-      ReplicaId::new(6),
-      std::vec![PreparedEntry::new(
-        OpNumber::with(5),
-        ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
-        RequestNumber::with(9),
-        Bytes::from_static(b"hi"),
-      )],
-    )
-    .with_checkpoint_op(OpNumber::with(3)),
-  );
-  let expected: std::vec::Vec<u8> = std::vec![
-    0, 14, 6, // version 14, tag 6 (DoViewChange)
-    0, 0, 0, 0, 0, 0, 0, 3, // view = 3
-    0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
-    0, 0, 0, 0, 0, 0, 0, 5, // op = 5
-    0, 0, 0, 0, 0, 0, 0, 4, // commit = 4
-    0, 0, 0, 0, 0, 0, 0, 3, // checkpoint_op = 3
-    0, 0, 0, 0, 0, 0, 0, 0, // epoch = 0
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // config_id = 0 (u128)
-    0, 6, // replica = 6 (u16)
-    0, 0, 0, 1, // log count = 1
-    0, 0, 0, 0, 0, 0, 0, 5, // entry op = 5
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // entry client (u128)
-    0, 0, 0, 0, 0, 0, 0, 9, // entry request = 9
-    0, // body-state tag 0 = Present
-    0, 0, 0, 2, 104, 105, // body length 2, "hi"
-  ];
-  assert_eq!(dvc.encode(), expected, "DoViewChange wire layout is pinned");
-}
-
-#[test]
-fn do_view_change_golden_bytes_pin_a_repairing_entry() {
-  // The header-only (Repairing) entry layout pinned exactly: same scalars (incl. the advertised
-  // checkpoint floor after the commit, then the strict epoch-policy pair epoch(u64)+config_id(u128)
-  // before the u16 replica id), then body-state tag 1 = Repairing, followed by the 16-byte
-  // body_checksum (NO length-prefixed body).
-  let dvc = Message::DoViewChange(
-    DoViewChange::new(
-      View::with(3),
-      View::with(2),
-      OpNumber::with(5),
-      OpNumber::with(4),
-      crate::Epoch::new(0),
-      0,
-      ReplicaId::new(6),
-      std::vec![PreparedEntry::repairing(
-        OpNumber::with(5),
-        ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
-        RequestNumber::with(9),
-        0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
-      )],
-    )
-    .with_checkpoint_op(OpNumber::with(3)),
-  );
-  let expected: std::vec::Vec<u8> = std::vec![
-    0, 14, 6, // version 14, tag 6 (DoViewChange)
-    0, 0, 0, 0, 0, 0, 0, 3, // view = 3
-    0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
-    0, 0, 0, 0, 0, 0, 0, 5, // op = 5
-    0, 0, 0, 0, 0, 0, 0, 4, // commit = 4
-    0, 0, 0, 0, 0, 0, 0, 3, // checkpoint_op = 3
-    0, 0, 0, 0, 0, 0, 0, 0, // epoch = 0
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // config_id = 0 (u128)
-    0, 6, // replica = 6 (u16)
-    0, 0, 0, 1, // log count = 1
-    0, 0, 0, 0, 0, 0, 0, 5, // entry op = 5
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // entry client (u128)
-    0, 0, 0, 0, 0, 0, 0, 9, // entry request = 9
-    1, // body-state tag 1 = Repairing
-    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, // body_checksum (u128)
-  ];
-  assert_eq!(
-    dvc.encode(),
-    expected,
-    "DoViewChange Repairing-entry wire layout is pinned"
-  );
-  // And it round-trips, preserving the op/client/request/checksum with no body bytes.
-  let back = Message::decode(&dvc.encode()).expect("round-trips");
-  let e = &back.unwrap_do_view_change().into_log()[0];
-  assert!(e.is_repairing(), "decoded back as a Repairing entry");
-  assert_eq!(e.op(), OpNumber::with(5));
-  assert_eq!(
-    e.client(),
-    ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10)
-  );
-  assert_eq!(e.request(), RequestNumber::with(9));
-  assert_eq!(e.body(), None, "a Repairing entry carries no bytes");
-  assert_eq!(e.body_checksum(), 0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20);
 }
 
 /// Builds a [`MemberId`] list `[1, 2, ..., n]` for a payload of `n` members.
@@ -1259,7 +1127,7 @@ fn reconfigure_body_round_trips_through_the_wire_codec() {
       payload.clone(),
     )],
   ));
-  let back = Message::decode(&dvc.encode()).expect("round-trips");
+  let back = decode_message(encode_message(&dvc)).expect("round-trips");
   let e = &back.unwrap_do_view_change().into_log()[0];
   assert!(e.is_reconfigure(), "decoded back as a Reconfigure entry");
   assert_eq!(e.op(), OpNumber::with(5));
@@ -1309,7 +1177,7 @@ fn a_reconfigure_body_is_not_mistaken_for_present_or_repairing() {
       ),
     ],
   ));
-  let log = Message::decode(&rb.encode())
+  let log = decode_message(encode_message(&rb))
     .expect("round-trips")
     .unwrap_repair_batch()
     .into_log();
@@ -1322,74 +1190,9 @@ fn a_reconfigure_body_is_not_mistaken_for_present_or_repairing() {
 }
 
 #[test]
-fn reconfigure_body_golden_bytes_pin_the_wire_layout() {
-  // The Reconfigure entry layout pinned exactly: same scalars as the other DoViewChange goldens,
-  // then body-state tag 2 = Reconfigure, followed by replica_count(u8) learner_count(u16), a
-  // u32-count-prefixed member list (each MemberId a 16-byte big-endian u128), and the trailing
-  // prev_config_id(u128) pinning the predecessor the successor chains from.
-  let payload = ReconfigurePayload::new(
-    2,
-    1,
-    std::vec![
-      crate::MemberId::new(0x0000_0000_0000_0000_0000_0000_0000_00AA),
-      crate::MemberId::new(0x0000_0000_0000_0000_0000_0000_0000_00BB),
-      crate::MemberId::new(0x0000_0000_0000_0000_0000_0000_0000_00CC),
-    ]
-    .into_boxed_slice(),
-    0x0000_0000_0000_0000_0000_0000_0000_00DD,
-  );
-  let dvc = Message::DoViewChange(
-    DoViewChange::new(
-      View::with(3),
-      View::with(2),
-      OpNumber::with(5),
-      OpNumber::with(4),
-      crate::Epoch::new(0),
-      0,
-      ReplicaId::new(6),
-      std::vec![PreparedEntry::reconfigure(
-        OpNumber::with(5),
-        ClientId::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
-        RequestNumber::with(9),
-        payload,
-      )],
-    )
-    .with_checkpoint_op(OpNumber::with(3)),
-  );
-  let expected: std::vec::Vec<u8> = std::vec![
-    0, 14, 6, // version 14, tag 6 (DoViewChange)
-    0, 0, 0, 0, 0, 0, 0, 3, // view = 3
-    0, 0, 0, 0, 0, 0, 0, 2, // log_view = 2
-    0, 0, 0, 0, 0, 0, 0, 5, // op = 5
-    0, 0, 0, 0, 0, 0, 0, 4, // commit = 4
-    0, 0, 0, 0, 0, 0, 0, 3, // checkpoint_op = 3
-    0, 0, 0, 0, 0, 0, 0, 0, // epoch = 0
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // config_id = 0 (u128)
-    0, 6, // replica = 6 (u16)
-    0, 0, 0, 1, // log count = 1
-    0, 0, 0, 0, 0, 0, 0, 5, // entry op = 5
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // entry client (u128)
-    0, 0, 0, 0, 0, 0, 0, 9, // entry request = 9
-    2, // body-state tag 2 = Reconfigure
-    2, // replica_count = 2 (u8)
-    0, 1, // learner_count = 1 (u16)
-    0, 0, 0, 3, // member count = 3
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA, // member 0
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xBB, // member 1
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xCC, // member 2
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xDD, // prev_config_id (u128)
-  ];
-  assert_eq!(
-    dvc.encode(),
-    expected,
-    "DoViewChange Reconfigure-entry wire layout is pinned"
-  );
-}
-
-#[test]
 fn reconfigure_encoded_len_matches_encode_and_respects_the_frame_cap() {
   // The full-voting-set successor membership (64 voters) is the worst case for one Reconfigure
-  // entry; its preflight size matches encode and stays well under the frame cap.
+  // entry; its preflight size matches encode_message and stays well under the frame cap.
   let payload = ReconfigurePayload::new(64, 0, member_ids(64).into_boxed_slice(), 0);
   let rb = Message::RepairBatch(RepairBatch::new(
     View::with(4),
@@ -1403,7 +1206,7 @@ fn reconfigure_encoded_len_matches_encode_and_respects_the_frame_cap() {
       payload,
     )],
   ));
-  let encoded = rb.encode();
+  let encoded = encode_message(&rb);
   assert_eq!(
     rb.encoded_len(),
     encoded.len(),
@@ -1441,124 +1244,25 @@ fn distinct_reconfigure_successors_have_distinct_operation_identities() {
 }
 
 #[test]
-fn decode_rejects_bad_version_unknown_tag_and_truncation_without_panicking() {
-  let bytes = Message::Commit(Commit::new(
-    View::with(1),
-    OpNumber::with(1),
-    OpNumber::with(0),
-    crate::Epoch::new(0),
-    0,
-  ))
-  .encode();
-  // Empty / too-short to even hold the version → Truncated.
-  assert!(matches!(
-    Message::decode(&[]),
-    Err(CodecError::Truncated { .. })
-  ));
-  assert!(matches!(
-    Message::decode(&[0]),
-    Err(CodecError::Truncated { .. })
-  ));
-  // A bad leading version → UnknownVersion (0x00FF is well above any real WIRE_VERSION).
-  let mut badver = bytes.to_vec();
-  badver[1] = 0xFF;
-  assert!(matches!(
-    Message::decode(&badver),
-    Err(CodecError::UnknownVersion(0xFF))
-  ));
-  // An unknown variant tag (99) → UnknownTag.
-  let mut badtag = bytes.to_vec();
-  badtag[2] = 99;
-  assert!(matches!(
-    Message::decode(&badtag),
-    Err(CodecError::UnknownTag(99))
-  ));
-  // Truncating a variant mid-field → Truncated (never an OOB panic).
-  assert!(matches!(
-    Message::decode(&bytes[..bytes.len() - 1]),
-    Err(CodecError::Truncated { .. })
-  ));
-  // Trailing bytes after a fully-decoded variant → TrailingBytes.
-  let mut over = bytes.to_vec();
-  over.push(0);
-  assert!(matches!(
-    Message::decode(&over),
-    Err(CodecError::TrailingBytes(1))
-  ));
-}
-
-#[test]
-fn decode_rejects_an_oversized_length_prefix_without_panicking() {
-  // A SyncCheckpoint's snapshot length prefix overstated past the buffer → LengthOverflow, not
-  // an out-of-range slice.
-  let sc = Message::SyncCheckpoint(SyncCheckpoint::new(
-    View::with(1),
-    OpNumber::with(1),
-    0,
-    crate::Epoch::new(0),
-    0,
-    ReplicaId::new(0),
-    0,
-    Bytes::from_static(b"abc"),
-    Bytes::new(),
-  ));
-  let mut bytes = sc.encode().to_vec();
-  // The encoding ends with the snapshot (4-byte length prefix + 3 body bytes) followed by the empty
-  // membership (4-byte length prefix + 0 bytes), so the SNAPSHOT length prefix sits 4 + 3 + 4 = 11
-  // bytes from the end (the membership Bytes was added AFTER the snapshot).
-  let n = bytes.len();
-  bytes[n - 11..n - 7].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
-  assert!(matches!(
-    Message::decode(&bytes),
-    Err(CodecError::LengthOverflow { .. })
-  ));
-
-  // A DoViewChange whose log COUNT is absurd → LengthOverflow, caught before allocating.
-  let dvc = Message::DoViewChange(DoViewChange::new(
-    View::with(1),
-    View::with(0),
-    OpNumber::with(1),
-    OpNumber::with(0),
-    crate::Epoch::new(0),
-    0,
-    ReplicaId::new(0),
-    std::vec![entry(1, b"x")],
-  ));
-  let mut d = dvc.encode().to_vec();
-  // Locate the log count (after the strict epoch-policy pair epoch(8)+config_id(16) added before the
-  // replica id): ver(2)+tag(1)+view(8)+log_view(8)+op(8)+commit(8)+checkpoint_op(8)+epoch(8)+
-  // config_id(16)+replica(2) = 69.
-  d[69..73].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
-  assert!(matches!(
-    Message::decode(&d),
-    Err(CodecError::LengthOverflow { .. })
-  ));
-}
-
-#[test]
 fn decode_never_panics_on_truncations_or_random_bytes() {
   // Fuzz-style no-panic sweep: every prefix of every variant's encoding, plus a pseudo-random
-  // stream of growing length (with a valid version/tag header sometimes prepended), must always
-  // yield a typed error — never a panic / out-of-range index.
+  // stream of growing length, must always yield a typed error (or, for a prefix short enough to
+  // still be a structurally-valid — if incomplete — protobuf message, an `Ok`) — never a panic or
+  // out-of-range index.
   for m in one_of_each_variant() {
-    let enc = m.encode();
+    let enc = encode_message(&m);
     for n in 0..=enc.len() {
-      let _ = Message::decode(&enc[..n]);
+      let _ = decode_message(enc.slice(..n));
     }
   }
   let mut x = 0x1357_9bdfu32;
   for len in 0..600usize {
-    let mut v = std::vec::Vec::with_capacity(len + 3);
-    // Sometimes prepend a well-formed version + a random tag to drive deeper into the parsers.
-    if len % 3 == 0 {
-      v.extend_from_slice(&crate::WIRE_VERSION.to_be_bytes());
-      v.push((len as u8) % 16);
-    }
+    let mut v = std::vec::Vec::with_capacity(len);
     for _ in 0..len {
       x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
       v.push((x >> 24) as u8);
     }
-    let _ = Message::decode(&v); // must not panic
+    let _ = decode_message(Bytes::from(v)); // must not panic
   }
 }
 
@@ -1568,7 +1272,7 @@ fn request_block_and_block_response_round_trip_through_the_wire_codec() {
 
   // RequestBlock: a fixed 16-byte payload carrying the content address.
   let req = Message::RequestBlock(addr);
-  let back = Message::decode(&req.encode()).expect("RequestBlock round-trips");
+  let back = decode_message(encode_message(&req)).expect("RequestBlock round-trips");
   assert_eq!(back, req, "decode(encode(RequestBlock)) == RequestBlock");
   assert!(
     !req.advertises_authoritative_view(),
@@ -1578,7 +1282,7 @@ fn request_block_and_block_response_round_trip_through_the_wire_codec() {
   // BlockResponse with a present block.
   let block_bytes = Bytes::from_static(b"some-block-bytes");
   let present = Message::BlockResponse(BlockResponse::new(addr, Some(block_bytes.clone())));
-  let back = Message::decode(&present.encode()).expect("BlockResponse(Some) round-trips");
+  let back = decode_message(encode_message(&present)).expect("BlockResponse(Some) round-trips");
   assert_eq!(
     back, present,
     "decode(encode(BlockResponse(Some))) == present"
@@ -1589,7 +1293,7 @@ fn request_block_and_block_response_round_trip_through_the_wire_codec() {
 
   // BlockResponse with an absent block (donor does not hold this address).
   let absent = Message::BlockResponse(BlockResponse::new(addr, None));
-  let back = Message::decode(&absent.encode()).expect("BlockResponse(None) round-trips");
+  let back = decode_message(encode_message(&absent)).expect("BlockResponse(None) round-trips");
   assert_eq!(
     back, absent,
     "decode(encode(BlockResponse(None))) == absent"
@@ -1600,7 +1304,7 @@ fn request_block_and_block_response_round_trip_through_the_wire_codec() {
   assert!(br.is_absent(), "None block is absent");
   assert!(!br.is_present(), "None block is not present");
 
-  // encoded_len matches encode().len() for both shapes.
-  assert_eq!(present.encoded_len(), present.encode().len());
-  assert_eq!(absent.encoded_len(), absent.encode().len());
+  // encoded_len matches encode_message().len() for both shapes.
+  assert_eq!(present.encoded_len(), encode_message(&present).len());
+  assert_eq!(absent.encoded_len(), encode_message(&absent).len());
 }

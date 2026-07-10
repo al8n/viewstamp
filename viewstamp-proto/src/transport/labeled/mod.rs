@@ -8,7 +8,11 @@ use crate::{ClientId, Instant, MemberId, Peer};
 use super::stream::{Intake, RecordIo, StreamTransport};
 
 const HELLO_TAG: u8 = 0x0C;
-const HELLO_VERSION: u8 = 2;
+/// The single wire-version fence: the hello is the ONE place a peer's wire version is checked. Every
+/// message after it rides the protobuf envelope (`crate::wire`; `encode_message`/`decode_message`),
+/// which carries no per-message version of its own — a cross-version peer is refused here, at the
+/// handshake, before any consensus traffic flows. Bumped 2 → 3 for the protobuf envelope cutover.
+const HELLO_VERSION: u8 = 3;
 const PEER_REPLICA: u8 = 0;
 const PEER_CLIENT: u8 = 1;
 /// The maximum encoded length of a hello: tag+ver+cluster(16)+peer_tag = 19, then a 16-byte id = 35

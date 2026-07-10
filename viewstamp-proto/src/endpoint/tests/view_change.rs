@@ -2,7 +2,7 @@ use super::*;
 use crate::{
   ClientId, Config, DoViewChange, GetView, Header, OpId, OpNumber, Prepare, PreparedEntry,
   Recovery, ReplicaId, Request, RequestNumber, StartView, StartViewChange, Superblock, View,
-  VsrState, Wal,
+  VsrState, Wal, encode_message,
 };
 
 #[test]
@@ -6780,7 +6780,7 @@ fn large_bodied_view_change_carriers_and_repair_serve_fit_the_frame() {
   // size: it is bounded by the fixed per-header-entry geometry, NOT the (~8 MiB each) bodies.
   let header_band = ENTRIES as usize * PER_HEADER_ENTRY_BYTES;
   for m in [&dvc, &sv, &rr] {
-    let n = m.encode().len();
+    let n = encode_message(m).len();
     assert!(
       n <= cap,
       "header-only {} must fit the frame cap: {n} > {cap}",
@@ -6817,7 +6817,7 @@ fn large_bodied_view_change_carriers_and_repair_serve_fit_the_frame() {
       .collect(),
   ));
   assert!(
-    full_body_dvc.encode().len() > cap,
+    encode_message(&full_body_dvc).len() > cap,
     "a full-body DoViewChange of the same band MUST exceed the frame cap (the old, fixed bug)"
   );
 
@@ -6861,7 +6861,7 @@ fn large_bodied_view_change_carriers_and_repair_serve_fit_the_frame() {
     (served as u64) < ENTRIES,
     "a large-bodied run is served as a strict PREFIX, not the whole run (served={served})"
   );
-  let encoded = Message::RepairBatch(batch.clone()).encode().len();
+  let encoded = encode_message(&Message::RepairBatch(batch.clone())).len();
   assert!(
     encoded <= cap,
     "the served RepairBatch must fit the frame cap: {encoded} > {cap}"
@@ -6959,7 +6959,7 @@ fn repair_range_serve_clamps_a_huge_hi_to_the_window_against_a_sparse_high_op_lo
     lo + REPAIR_WINDOW
   );
   // And the produced batch is frame-bounded regardless of the huge claimed `hi`.
-  let encoded = Message::RepairBatch(batch).encode().len();
+  let encoded = encode_message(&Message::RepairBatch(batch)).len();
   assert!(
     encoded <= cap,
     "the window-bounded serve must fit the frame cap even for a u64::MAX hi: {encoded} > {cap}"

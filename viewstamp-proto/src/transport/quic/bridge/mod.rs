@@ -63,7 +63,7 @@ use super::{
   table::ConnTable,
 };
 use crate::{
-  MemberId, Message, Peer,
+  MemberId, Message, Peer, encode_message,
   transport::{
     CloseCause,
     frame::{FrameDecoder, MAX_FRAME_LEN, STAGE_CHUNK, encode_frame},
@@ -1690,7 +1690,7 @@ impl Bridge {
   /// `MAX_FRAME_LEN` preflight lives in exactly one place. `len` is the payload length the caller
   /// already knows cheaply (`Message::encoded_len()` for a consensus message, `preface.len()` for the
   /// identity preface); `payload` produces the bytes ONLY when the length is within the cap, so an
-  /// oversized message never pays its full `encode()` allocation.
+  /// oversized message never pays its full `encode_message` allocation.
   ///
   /// Returns the framed `[u32 len][payload]` bytes, or `None` when `len` exceeds [`MAX_FRAME_LEN`]. On
   /// the `None` path it bumps [`Self::oversized_dropped`] and frames/stages nothing: the RECEIVE side
@@ -1753,18 +1753,18 @@ impl Bridge {
     // already unbound its routing (so the router cannot resolve it), and an `Authenticating`/`Handshaking`
     // one is not yet bound; staging to either would grow a doomed connection's outbound buffers. The
     // router never reaches such a connection, so this is a structural guard, not a hot path. Frame
-    // nothing (and pay no `encode()`) when the entry is absent or not `Validated`.
+    // nothing (and pay no `encode_message`) when the entry is absent or not `Validated`.
     if !self.is_validated(h) {
       return;
     }
     // Size-check + frame through the single `frame_checked` choke-point (mirrors the byte-stream
-    // router's symmetric cap). `encoded_len()` is the exact length `encode()` would produce, so passing
-    // it as the cheap preflight length means an oversized message (e.g. a large `SyncCheckpoint` /
-    // whole-log `DoViewChange` awaiting the deferred chunking) is counted and dropped WITHOUT paying
-    // the full `encode()` allocation; a within-cap message is framed. `None` ⇒ over-cap, already
-    // counted — drop the send (consensus retransmission covers it; an over-cap unit could never
-    // deliver, and the peer would only fatal on its declared length).
-    let Some(framed) = self.frame_checked(msg.encoded_len(), || msg.encode()) else {
+    // router's symmetric cap). `encoded_len()` is the exact length `encode_message` would produce, so
+    // passing it as the cheap preflight length means an oversized message (e.g. a large
+    // `SyncCheckpoint` / whole-log `DoViewChange` awaiting the deferred chunking) is counted and
+    // dropped WITHOUT paying the full `encode_message` allocation; a within-cap message is framed.
+    // `None` ⇒ over-cap, already counted — drop the send (consensus retransmission covers it; an
+    // over-cap unit could never deliver, and the peer would only fatal on its declared length).
+    let Some(framed) = self.frame_checked(msg.encoded_len(), || encode_message(msg)) else {
       return;
     };
     // Per-stream backpressure, class-aware (see the fn doc): a Bulk overflow resets just that stream, a

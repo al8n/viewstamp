@@ -1,7 +1,7 @@
 //! The stream-transport ingress pipeline fed arbitrary bytes in arbitrary CHUNKINGS, through the
 //! public API: `StreamCoordinator::handle_conn_data` on an accepted `Labeled<Passthrough>` conn —
 //! i.e. record layer -> `Labeled` hello handshake -> incremental `FrameDecoder` -> the per-frame
-//! `Message::decode` -> endpoint ingress. (`FrameDecoder` itself is crate-private; this is its
+//! `decode_message` -> endpoint ingress. (`FrameDecoder` itself is crate-private; this is its
 //! only public reachability, and it exercises the decoder exactly as a driver does.)
 //!
 //! Input shape: the first byte picks the lane, the rest is the wire payload.
@@ -9,7 +9,7 @@
 //!   hello frame parse + rejection).
 //! - Lane 1 (odd): a CANONICAL replica-1 hello (obtained from a real dialer conn, the only public
 //!   source of one) is fed first so the conn validates, then the payload — fuzzes the
-//!   post-validation path (frame chunk reassembly, `Message::decode`, endpoint dispatch).
+//!   post-validation path (frame chunk reassembly, `decode_message`, endpoint dispatch).
 //!
 //! Chunk sizes are derived from the payload bytes themselves, so the corpus explores both the
 //! byte content and its fragmentation. Nothing here may panic; outputs are drained every chunk so
