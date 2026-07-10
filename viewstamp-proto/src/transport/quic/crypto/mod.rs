@@ -76,7 +76,7 @@ fn active_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// primary→backups only (heartbeats), so the backup↔backup connections carry NOTHING between view
 /// changes and would idle out this long after the last one — leaving the NEXT view change (the
 /// primary just died) with no live backup↔backup links for `StartViewChange`/`DoViewChange`.
-/// [`keep_alive_interval_millis`] is what keeps those zero-traffic edges alive under this timeout.
+/// `keep_alive_interval_millis` is what keeps those zero-traffic edges alive under this timeout.
 pub const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 1_000;
 
 /// Keep-alive PING interval derived from the idle timeout: one third, so up to two consecutive

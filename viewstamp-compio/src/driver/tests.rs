@@ -824,3 +824,44 @@ async fn inbound_datagram_rekeys_so_the_dial_pass_drops_a_removed_slot() {
     "no conn was dialed for the removed slot after the inbound-feed rekey"
   );
 }
+
+#[test]
+fn embedder_facing_default_constants_are_reachable_at_the_crate_roots() {
+  // The referenceable defaults exist so an embedder can compute RELATIVE overrides (e.g. a
+  // geo-tuned RTT as a multiple of the pinned LAN default). This pins their crate-root paths from
+  // OUTSIDE the defining crates — a `pub` const inside a private module is unreachable no matter
+  // its visibility, which is exactly the defect this test compiles away.
+  assert_eq!(
+    viewstamp_proto::DEFAULT_IDLE_TIMEOUT_MILLIS,
+    viewstamp_proto::QuicTuning::new().idle_timeout_millis()
+  );
+  assert_eq!(
+    viewstamp_proto::DEFAULT_INITIAL_RTT_MILLIS,
+    viewstamp_proto::QuicTuning::new().initial_rtt_millis()
+  );
+  assert_eq!(
+    viewstamp_proto::DEFAULT_CONNECTION_RECEIVE_WINDOW,
+    viewstamp_proto::QuicTuning::new().connection_receive_window()
+  );
+  assert_eq!(
+    viewstamp_proto::DEFAULT_STREAM_RECEIVE_WINDOW,
+    viewstamp_proto::QuicTuning::new().stream_receive_window()
+  );
+  assert_eq!(
+    viewstamp_driver::DriverConfig::new().max_conns(),
+    viewstamp_driver::MAX_CONNS
+  );
+  assert_eq!(
+    viewstamp_driver::DriverConfig::new().dial_timeout(),
+    viewstamp_driver::DIAL_TIMEOUT
+  );
+  let batch = viewstamp_driver::BatchConfig::new(64);
+  assert_eq!(
+    batch.max_queued_units(),
+    viewstamp_driver::DEFAULT_MAX_QUEUED_UNITS
+  );
+  assert_eq!(
+    batch.max_queued_bytes(),
+    viewstamp_driver::DEFAULT_MAX_QUEUED_BYTES
+  );
+}

@@ -18,11 +18,12 @@ mod reconfigure;
 mod session;
 
 pub use aggregate::{
-  AggregatorPump, BatchConfig, BatchError, BatchHandle, NeverReady, NoStall, OutcomeUnknownReason,
-  RefusedReason, ReplyLostReason, aggregator, aggregator_with_stall,
+  AggregatorPump, BatchConfig, BatchError, BatchHandle, DEFAULT_MAX_QUEUED_BYTES,
+  DEFAULT_MAX_QUEUED_UNITS, NeverReady, NoStall, OutcomeUnknownReason, RefusedReason,
+  ReplyLostReason, aggregator, aggregator_with_stall,
 };
 pub use clock::Clock;
-pub use config::DriverConfig;
+pub use config::{DIAL_TIMEOUT, DriverConfig, MAX_CONNS};
 pub use handle::{Command, Handle, Reply};
 pub use reconcile::MembershipReconciler;
 pub use reconfigure::{

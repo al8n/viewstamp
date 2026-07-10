@@ -92,15 +92,18 @@ impl<'a> BlockDagWalk<'a> {
     Self { roots, references }
   }
 
-  /// The live roots of this DAG.
+  /// The live roots of this DAG. Returns the descriptor's own 'a borrow (the fields are copies of
+  /// caller-owned references), so a caller holding the walk by value can extract a slice that
+  /// outlives it — exactly what the public fields allowed.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn roots(&self) -> &[BlockAddress] {
+  pub const fn roots(&self) -> &'a [BlockAddress] {
     self.roots
   }
 
-  /// The edge resolver for this DAG's block format.
+  /// The edge resolver for this DAG's block format (the descriptor's own 'a borrow, as with
+  /// [`Self::roots`]).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn references(&self) -> &dyn Fn(&[u8]) -> std::vec::Vec<BlockAddress> {
+  pub const fn references(&self) -> &'a dyn Fn(&[u8]) -> std::vec::Vec<BlockAddress> {
     self.references
   }
 }
