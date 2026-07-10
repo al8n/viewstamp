@@ -1,4 +1,4 @@
-use std::fmt::Write as _;
+use std::{boxed::Box, fmt::Write as _};
 
 use bytes::Bytes;
 
