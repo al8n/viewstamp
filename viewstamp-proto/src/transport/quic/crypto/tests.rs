@@ -22,7 +22,7 @@ fn quic_options_carry_layout_and_size_the_connection_window() {
   let cert0 = ca.issue_replica(0, 0x5151);
   // The builder accepts a layout override and threads it through to QuicOptions.
   let opts = ClusterTls::new(ca.roots(), cert0.chain(), cert0.key())
-    .layout(StreamLayout::ControlBulk)
+    .with_layout(StreamLayout::ControlBulk)
     .build();
   assert_eq!(opts.layout(), StreamLayout::ControlBulk);
   // Connection window must be at least MAX_FRAME_LEN (16 MiB) so a bulk frame
@@ -113,7 +113,7 @@ fn a_non_default_tuning_takes_effect_through_cluster_tls() {
     .with_initial_rtt_millis(200)
     .with_stream_receive_window(2 * 1024 * 1024);
   let opts = ClusterTls::new(ca.roots(), cert0.chain(), cert0.key())
-    .tuning(tuning)
+    .with_tuning(tuning)
     .build();
   assert_eq!(opts.idle_timeout_millis(), 4_000);
   assert_eq!(

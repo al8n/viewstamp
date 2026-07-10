@@ -246,7 +246,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // clear the staging latch. `pending_swap` and this action carry the IDENTICAL `(op, successor)`;
         // clear the latch FIRST so `install_membership` (and any re-entrant `maybe_swap_epoch`) sees no
         // residual staging. The carried `op` is the reconfigure op number captured at stage time.
-        PendingSbAction::SwapEpoch(op, successor) => {
+        PendingSbAction::SwapEpoch(swap) => {
+          let (op, successor) = swap.into_parts();
           self.pending_swap = None;
           self.install_membership(Some(op), successor);
           // This node CROSSED into the new epoch via its OWN committed reconfigure op (not a sync) — so any
@@ -1000,14 +1001,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return; // no durable root established yet — nothing is safely prunable.
     }
     blocks.gc(&[
-      crate::block_store::BlockDagWalk {
-        roots: &sm_roots,
-        references: &|block| S::block_references(block),
-      },
-      crate::block_store::BlockDagWalk {
-        roots: &session_roots,
-        references: &super::session_blocks::session_block_references,
-      },
+      crate::block_store::BlockDagWalk::new(&sm_roots, &|block| S::block_references(block)),
+      crate::block_store::BlockDagWalk::new(
+        &session_roots,
+        &super::session_blocks::session_block_references,
+      ),
     ]);
   }
 

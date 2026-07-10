@@ -450,16 +450,10 @@ impl IdentitySource for CertOid {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IdentityConfig {
-  /// Identity via the [`Hello`] control-stream preface for `cluster`.
-  Hello {
-    /// The cluster id this coordinator authenticates for.
-    cluster: u128,
-  },
-  /// Identity via the [`CertOid`] certificate extension for `cluster`.
-  CertOid {
-    /// The cluster id this coordinator authenticates for.
-    cluster: u128,
-  },
+  /// Identity via the [`Hello`] control-stream preface for the carried cluster id.
+  Hello(u128),
+  /// Identity via the [`CertOid`] certificate extension for the carried cluster id.
+  CertOid(u128),
 }
 
 impl IdentityConfig {
@@ -467,8 +461,20 @@ impl IdentityConfig {
   #[inline(always)]
   pub const fn cluster(&self) -> u128 {
     match self {
-      Self::Hello { cluster } | Self::CertOid { cluster } => *cluster,
+      Self::Hello(cluster) | Self::CertOid(cluster) => *cluster,
     }
+  }
+
+  /// True iff this selects the [`Hello`] control-stream preface scheme.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_hello(&self) -> bool {
+    matches!(self, Self::Hello(_))
+  }
+
+  /// True iff this selects the [`CertOid`] certificate-extension scheme.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_cert_oid(&self) -> bool {
+    matches!(self, Self::CertOid(_))
   }
 
   /// Produce the sealed [`ProvidedIdentity`] source this configuration selects. Crate-internal: the
@@ -476,8 +482,8 @@ impl IdentityConfig {
   /// selector (and thus through [`QuicCoordinator::with_identity`](super::QuicCoordinator::with_identity)).
   pub(crate) fn into_source(self) -> ProvidedIdentity {
     match self {
-      Self::Hello { cluster } => ProvidedIdentity::Hello(Hello::new(cluster)),
-      Self::CertOid { cluster } => ProvidedIdentity::CertOid(CertOid::new(cluster)),
+      Self::Hello(cluster) => ProvidedIdentity::Hello(Hello::new(cluster)),
+      Self::CertOid(cluster) => ProvidedIdentity::CertOid(CertOid::new(cluster)),
     }
   }
 }

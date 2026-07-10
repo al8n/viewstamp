@@ -48,10 +48,7 @@ fn log_refs(block: &[u8]) -> Vec<BlockAddress> {
 /// One typed mark walk over the SM DAG (`log_refs` resolver) for these single-DAG GC tests. The
 /// proto passes a per-DAG walk; these tests exercise only the SM DAG, so they build the one walk.
 fn sm_walk(roots: &[BlockAddress]) -> [BlockDagWalk<'_>; 1] {
-  [BlockDagWalk {
-    roots,
-    references: &log_refs,
-  }]
+  [BlockDagWalk::new(roots, &log_refs)]
 }
 
 #[test]

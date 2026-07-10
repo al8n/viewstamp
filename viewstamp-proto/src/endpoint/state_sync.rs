@@ -1873,7 +1873,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // supersession path; this is the direct cleanup at the cross-epoch crossing. With no staged swap
       // (the laggard never proposed one) this is a no-op, keeping that path byte-identical.
       self.pending_swap = None;
-      if matches!(self.pending_sb, Some((_, PendingSbAction::SwapEpoch(_, _)))) {
+      if matches!(self.pending_sb, Some((_, PendingSbAction::SwapEpoch(_)))) {
         self.pending_sb = None;
       }
     }

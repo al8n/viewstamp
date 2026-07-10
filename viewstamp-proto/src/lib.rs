@@ -91,9 +91,10 @@ pub use time::Instant;
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
 pub use transport::{
-  AttestedId, CertOid, ClusterTls, DialError, Hello, Identified, IdentityConfig, IdentityCtx,
-  IdentityOutcome, IdentitySource, ProvidedIdentity, QuicCoordinator, QuicOptions, QuicTuning,
-  StreamLayout,
+  AttestedId, CertOid, ClusterTls, DEFAULT_CONNECTION_RECEIVE_WINDOW, DEFAULT_IDLE_TIMEOUT_MILLIS,
+  DEFAULT_INITIAL_RTT_MILLIS, DEFAULT_STREAM_RECEIVE_WINDOW, DialError, Hello, Identified,
+  IdentityConfig, IdentityCtx, IdentityOutcome, IdentitySource, ProvidedIdentity, QuicCoordinator,
+  QuicOptions, QuicTuning, StreamLayout,
 };
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]

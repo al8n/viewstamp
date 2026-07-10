@@ -15,7 +15,10 @@ mod table;
 mod testutil;
 
 pub use bridge::DialError;
-pub use crypto::{ClusterTls, QuicOptions, QuicTuning};
+pub use crypto::{
+  ClusterTls, DEFAULT_CONNECTION_RECEIVE_WINDOW, DEFAULT_IDLE_TIMEOUT_MILLIS,
+  DEFAULT_INITIAL_RTT_MILLIS, DEFAULT_STREAM_RECEIVE_WINDOW, QuicOptions, QuicTuning,
+};
 pub use identity::{
   AttestedId, CertOid, Hello, Identified, IdentityConfig, IdentityCtx, IdentityOutcome,
   IdentitySource, ProvidedIdentity,

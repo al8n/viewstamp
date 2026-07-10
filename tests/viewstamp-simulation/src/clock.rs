@@ -2,9 +2,15 @@ use viewstamp_proto::Instant;
 
 /// A virtual monotonic clock. Time only advances when `advance_to` is called; the
 /// simulator jumps it to the next scheduled deadline.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Clock {
   nanos: u64,
+}
+
+impl Default for Clock {
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 impl Clock {

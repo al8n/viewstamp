@@ -709,8 +709,8 @@ impl VsrState {
   /// May be SHORTER than the full band AND contain gaps when the caller had repair holes (each held op
   /// keeps its header regardless of a lower hole; [`Self::try_new`] allows gaps).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn committed_headers_slice(&self) -> &[Header] {
-    &self.committed_headers
+  pub const fn committed_headers_slice(&self) -> &[Header] {
+    self.committed_headers.as_slice()
   }
 
   /// The current configuration epoch (high-order to `view`). A legacy pre-membership root reads `0`.
@@ -744,7 +744,7 @@ impl VsrState {
   /// The active [`Membership`], or `None` for a legacy (v1-3) root that predates membership (filled by
   /// `recover` from the caller's `Config`).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn membership_opt(&self) -> Option<&Membership> {
+  pub const fn membership_opt(&self) -> Option<&Membership> {
     self.membership.as_ref()
   }
 
@@ -753,8 +753,8 @@ impl VsrState {
   /// the current `config_id` (the pre-v5 behaviour). Read by `recover` to restore the in-memory lineage
   /// so a retained old-epoch laggard's cross-epoch catch-up is still admitted after the donors restart.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn prior_config_ids(&self) -> &[u128] {
-    &self.prior_config_ids
+  pub const fn prior_config_ids(&self) -> &[u128] {
+    self.prior_config_ids.as_slice()
   }
 
   /// The op of the last reconfigure that produced this root's [`Membership`] (genesis `0` when none). A
