@@ -158,7 +158,7 @@ pub fn encode_message(msg: &Message) -> Bytes {
 
 /// Decodes a [`Message`] from its protobuf wire envelope — the inverse of [`encode_message`].
 ///
-/// Unknown fields are tolerated up to a small bound and bounded past it, so a hostile flood of
+/// Unknown fields are tolerated up to a small bound and rejected past it, so a hostile flood of
 /// unknown fields cannot force an unbounded transient allocation (a well-formed envelope carries
 /// none — cross-version peers are fenced before any consensus traffic flows, so this is
 /// forward-compatibility headroom, not a feature any current peer exercises).

@@ -482,7 +482,7 @@ fn backup_recovery_response_carries_no_log() {
   assert_eq!(rr.view(), View::with(3));
 }
 
-// ── wire codec: all 20 Message variants ──
+// ── wire codec: all 24 Message variants ──
 
 fn entry(op: u64, body: &[u8]) -> PreparedEntry {
   PreparedEntry::new(

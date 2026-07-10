@@ -20,7 +20,10 @@ the SEMANTICS.
 **Envelope semantics (protobuf, accepted as-is):**
 
 - Absent scalar fields decode as zero/empty — identical in meaning to an explicit zero (proto3's
-  default-value rule).
+  default-value rule); this equivalence applies to SCALARS. For the exactly-16-byte id/checksum
+  `bytes` fields (below), an absent field decodes as EMPTY bytes and is REJECTED by the length
+  check, so absence is NOT equivalent to an explicit all-zero 16-byte id (which decodes to `0`
+  and is accepted).
 - Duplicate fields follow protobuf merge semantics precisely: duplicate singular SCALAR fields are
   last-wins; duplicate singular EMBEDDED-MESSAGE fields MERGE their field sets; a `oneof`
   re-occurrence of the SAME message-typed variant (e.g. two `PreparedEntry.reconfigure` arms in
@@ -70,9 +73,12 @@ the SEMANTICS.
 - Each of the checks above rejects as `CodecError::Malformed { what }` naming the offending
   field (e.g. `"Prepare.config_id"`); structural failures surface as described earlier. An
   envelope that ends before it can be fully read surfaces as `CodecError::Truncated`. A
-  rejected message never panics and is never partially applied —
-  `decode_message` returns `Err` for the WHOLE envelope, and the transport closes the connection
-  on it (`Conn::poll_decoded`) rather than attempt to resynchronize mid-stream.
+  rejected message never panics and is never partially applied — `decode_message` returns `Err`
+  for the WHOLE envelope. The transport's reaction to that `Err` is transport-specific: the
+  byte-stream transport closes the connection on it (`Conn::poll_decoded`) rather than attempt to
+  resynchronize mid-stream, while the QUIC coordinator instead drops just the failed frame and
+  keeps draining the rest of the batch (`src/transport/quic/mod.rs`'s `drain_bridge`) —
+  consensus retransmission recovers the dropped message.
 
 **Determinism vs. acceptance:** `encode_message`'s output is deterministic — fields in ascending
 field-number order, a proto3-default scalar OMITTED rather than written as zero (pinned by

@@ -773,7 +773,10 @@ fn public_seam_round_trips_every_variant() {
 #[test]
 fn envelope_without_body_rejects() {
   let frame = pb::Message::default().encode_to_bytes();
-  assert!(decode_message(frame).is_err());
+  match decode_message(frame) {
+    Err(CodecError::Malformed { what }) => assert_eq!(what, "Message.body"),
+    other => panic!("expected CodecError::Malformed(\"Message.body\"), got {other:?}"),
+  }
 }
 
 /// A valid tiny envelope followed by `count` copies of an unknown field: field number 1000 (well
@@ -849,8 +852,18 @@ fn hex(bytes: &[u8]) -> std::string::String {
   s
 }
 
+/// The inverse of [`hex`]: parses a lowercase hex string back into bytes, for the golden vectors'
+/// decode-direction check below.
+fn unhex(s: &str) -> std::vec::Vec<u8> {
+  (0..s.len())
+    .step_by(2)
+    .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("golden vector is valid hex"))
+    .collect()
+}
+
 /// Golden byte vectors: `encode_message` output for one exemplar of every [`Message`] variant
-/// (see [`one_of_each_message`]), pinned byte-for-byte in declaration order. A later DELIBERATE
+/// (see [`one_of_each_message`]), pinned byte-for-byte in declaration order, and the inverse —
+/// `decode_message` on each pinned vector must reproduce the same exemplar. A later DELIBERATE
 /// wire-format change updates these vectors consciously; an accidental one fails here first.
 #[test]
 fn golden_byte_vectors() {
@@ -891,6 +904,18 @@ fn golden_byte_vectors() {
       hex(&encode_message(m)),
       expected,
       "{} golden encoding mismatch",
+      m.kind_str()
+    );
+    let decoded = decode_message(Bytes::from(unhex(expected))).unwrap_or_else(|e| {
+      panic!(
+        "{}: decode_message on its own golden vector erred: {e:?}",
+        m.kind_str()
+      )
+    });
+    assert_eq!(
+      &decoded,
+      m,
+      "{} golden vector did not decode back to the exemplar",
       m.kind_str()
     );
   }
