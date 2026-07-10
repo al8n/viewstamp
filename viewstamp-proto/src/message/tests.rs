@@ -1308,3 +1308,81 @@ fn request_block_and_block_response_round_trip_through_the_wire_codec() {
   assert_eq!(present.encoded_len(), encode_message(&present).len());
   assert_eq!(absent.encoded_len(), encode_message(&absent).len());
 }
+
+#[test]
+fn wire_size_bound_is_a_true_upper_bound_for_every_variant() {
+  // The admission bound must never UNDER-count: for every Message variant (including the
+  // edge-scalar and populated-log/body fixtures `one_of_each_variant` exercises),
+  // wire_size_bound() >= the ACTUAL encode_message().len(). A conservative over-estimate is fine
+  // (the safe direction); an under-estimate would let an oversized message slip past the
+  // transport's admission gate.
+  for m in one_of_each_variant() {
+    let bound = m.wire_size_bound();
+    let actual = encode_message(&m).len();
+    assert!(
+      bound >= actual,
+      "{}: wire_size_bound() {bound} must be >= encode_message().len() {actual}",
+      m.kind_str()
+    );
+  }
+}
+
+#[test]
+fn wire_size_bound_holds_for_a_multi_megabyte_body() {
+  // A moderately large (multi-MiB, cheaply allocatable) body on each single-body carrier still
+  // satisfies the upper-bound property — not just the small bodies `one_of_each_variant` uses.
+  let body = Bytes::from(std::vec![0xABu8; 4 * 1024 * 1024]);
+  let client = ClientId::new(0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00);
+  let request = RequestNumber::with(u64::MAX);
+  let carriers = std::vec![
+    Message::Request(Request::new(client, request, body.clone())),
+    Message::Prepare(Prepare::new(
+      View::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      OpNumber::with(u64::MAX),
+      crate::Epoch::new(u64::MAX),
+      u128::MAX,
+      client,
+      request,
+      body.clone(),
+    )),
+    Message::Reply(Reply::new(
+      View::with(u64::MAX),
+      client,
+      request,
+      body.clone(),
+    )),
+  ];
+  for m in &carriers {
+    let bound = m.wire_size_bound();
+    let actual = encode_message(m).len();
+    assert!(
+      bound >= actual,
+      "{}: wire_size_bound() {bound} must be >= encode_message().len() {actual} for a \
+       multi-MiB body",
+      m.kind_str()
+    );
+  }
+}
+
+#[test]
+fn wire_size_bound_exceeds_the_frame_cap_for_an_over_cap_body() {
+  // Pin the property the transport's send choke points gate admission on: a message whose
+  // wire_size_bound() exceeds MAX_FRAME_LEN must be identifiable as refused WITHOUT ever
+  // encoding it. A body a bit over max_reply_body_len()'s bound is cheaply allocatable
+  // (~17 MiB) here — unlike the ~4 GiB wrap hazard wire_size_bound guards against, which cannot
+  // be constructed in a test.
+  let over = max_reply_body_len() + 1024 * 1024;
+  let reply = Message::Reply(Reply::new(
+    View::with(1),
+    ClientId::new(1),
+    RequestNumber::with(1),
+    Bytes::from(std::vec![0u8; over]),
+  ));
+  assert!(
+    reply.wire_size_bound() > MAX_FRAME_LEN as usize,
+    "a body {over} bytes (max_reply_body_len() + 1 MiB) must push wire_size_bound() past the \
+     frame cap"
+  );
+}

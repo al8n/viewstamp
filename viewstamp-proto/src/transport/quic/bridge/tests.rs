@@ -3106,10 +3106,11 @@ fn outbound_dials_are_bounded_by_the_connection_cap() {
 }
 
 /// An outbound message whose encoded frame would exceed [`MAX_FRAME_LEN`] is DROPPED by
-/// `write_framed`'s size preflight — never encoded, framed, or emitted as a datagram — and the
-/// connection is NOT reaped. The receive side fatals on an over-cap declared length, so emitting
-/// such a frame could only make the peer close; consensus retransmission cannot help (the message
-/// can never fit a frame), so dropping is the correct behaviour. Mirrors the byte-stream router's
+/// `write_framed`'s `wire_size_bound()` ADMISSION gate — never even built as a pb view, let alone
+/// encoded, framed, or emitted as a datagram — and the connection is NOT reaped. The receive side
+/// fatals on an over-cap declared length, so emitting such a frame could only make the peer close;
+/// consensus retransmission cannot help (the message can never fit a frame), so dropping is the
+/// correct behaviour. Mirrors the byte-stream router's
 /// `an_oversized_outbound_frame_is_dropped_and_the_conn_stays_open`.
 #[test]
 fn an_oversized_message_is_dropped_before_encoding_and_not_transmitted() {
@@ -3134,7 +3135,8 @@ fn an_oversized_message_is_dropped_before_encoding_and_not_transmitted() {
 
   // A `SyncCheckpoint` whose snapshot alone is `MAX_FRAME_LEN` bytes — the surrounding header pushes
   // the encoded length strictly over the cap. Only ONE such message is allocated, and the preflight
-  // is asserted via the cheap `encoded_len()` so no second 16 MiB copy is paid.
+  // is asserted via the cheap `wire_size_bound()` — the ADMISSION gate `write_framed` actually
+  // checks, BEFORE building the pb view or encoding — so no second 16 MiB copy is paid.
   let snapshot = bytes::Bytes::from(vec![0u8; MAX_FRAME_LEN as usize]);
   let huge = Message::SyncCheckpoint(SyncCheckpoint::new(
     View::with(1),
@@ -3148,8 +3150,12 @@ fn an_oversized_message_is_dropped_before_encoding_and_not_transmitted() {
     bytes::Bytes::new(),
   ));
   assert!(
+    huge.wire_size_bound() > MAX_FRAME_LEN as usize,
+    "the crafted message's wire_size_bound() exceeds the frame cap (checked without encoding)"
+  );
+  assert!(
     huge.encoded_len() > MAX_FRAME_LEN as usize,
-    "the crafted message's encoded length exceeds the frame cap (checked without encoding)"
+    "the crafted message's encoded length also exceeds the frame cap (sanity check)"
   );
   assert_eq!(a.oversized_dropped(), 0, "no oversize recorded yet");
 

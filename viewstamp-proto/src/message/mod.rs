@@ -47,22 +47,22 @@ const LEN_FIELD_OVERHEAD: usize = 1 + 5;
 /// 5 bytes.
 const ENVELOPE_ARM_OVERHEAD: usize = 2 + 5;
 
-#[cfg(feature = "tcp")]
 /// Worst-case bytes a [`Request`] envelope wraps around its body, field by field over the schema
 /// (`client` 16-byte id, `request` uint64, `body` bytes): `ENVELOPE_ARM_OVERHEAD` (7) plus
 /// `WORST_ID_FIELD` (18) plus `WORST_UINT64_FIELD` (11) plus the body's `LEN_FIELD_OVERHEAD` (6)
-/// = 42. A body of `b` bytes therefore encodes to AT MOST `REQUEST_ENCODE_OVERHEAD + b`.
+/// = 42. A body of `b` bytes therefore encodes to AT MOST `REQUEST_ENCODE_OVERHEAD + b`. Not
+/// `tcp`-gated: [`Message::wire_size_bound`] (available whenever the base crate is) reuses it too.
 pub const REQUEST_ENCODE_OVERHEAD: usize =
   ENVELOPE_ARM_OVERHEAD + WORST_ID_FIELD + WORST_UINT64_FIELD + LEN_FIELD_OVERHEAD;
 
-#[cfg(feature = "tcp")]
 /// Worst-case bytes a [`Prepare`] envelope wraps around the SAME client body once the primary
 /// replicates it to backups, field by field (`view`/`op`/`commit`/`checkpoint_op`/`epoch`/`request`
 /// six uint64s, `config_id` + `client` two 16-byte ids, `body` bytes): `ENVELOPE_ARM_OVERHEAD`
 /// (7) plus 6 × `WORST_UINT64_FIELD` (66) plus 2 × `WORST_ID_FIELD` (36) plus the body's
 /// `LEN_FIELD_OVERHEAD` (6) = 115. Strictly larger than [`REQUEST_ENCODE_OVERHEAD`] (a `Prepare`
 /// carries the extra consensus header fields), but NOT the worst hop the body sees — the log-slice
-/// carriers below wrap it in more — so it is only one input to [`MAX_REQUEST_BODY_OVERHEAD`].
+/// carriers below wrap it in more — so it is only one input to [`MAX_REQUEST_BODY_OVERHEAD`]. Not
+/// `tcp`-gated: [`Message::wire_size_bound`] (available whenever the base crate is) reuses it too.
 pub const PREPARE_ENCODE_OVERHEAD: usize =
   ENVELOPE_ARM_OVERHEAD + 6 * WORST_UINT64_FIELD + 2 * WORST_ID_FIELD + LEN_FIELD_OVERHEAD;
 
@@ -2554,13 +2554,125 @@ impl Message {
   ///
   /// Unlike the prior fixed-width codec's preflight, this is NOT const-cheap: building the envelope
   /// allocates (a log-carrying variant's entries and any `Bytes` payload are cloned into the `pb`
-  /// view). The transport still preflights with this before paying for a full encode, so an
-  /// oversized message is counted and dropped without the additional cost of serializing it to
-  /// bytes.
+  /// view). It is also NOT safe as a SEND-ADMISSION gate on its own: buffa's `encoded_len()` returns
+  /// a `u32` with unchecked accumulation, so a message whose true size nears 4 GiB can WRAP this
+  /// estimate down to a small value. [`Self::wire_size_bound`] is the admission bound a transport
+  /// preflights a send against instead (a saturating `usize` that never wraps); this method stays
+  /// useful once a message is already known-admissible — a cheap exact re-check before a full
+  /// encode, or the QUIC stream-layout classifier's routing heuristic — where post-admission sizes
+  /// (`<= MAX_FRAME_LEN`) cannot approach the `u32` wrap boundary.
   pub fn encoded_len(&self) -> usize {
     use buffa::Message as _;
     crate::wire::pb_message(self).encoded_len() as usize
   }
+
+  /// A SATURATING [`usize`] UPPER BOUND on [`encode_message`](crate::encode_message)'s output
+  /// length for this message — the ADMISSION bound a transport preflights a send against BEFORE
+  /// paying for [`Self::encoded_len`] / building the buffa envelope at all.
+  ///
+  /// Computed STRUCTURALLY from the domain value's own fields, never by asking buffa for a length:
+  /// each variant's FIXED shape is charged its protobuf worst-case overhead — the same frame-budget
+  /// model `REQUEST_ENCODE_OVERHEAD` / `PREPARE_ENCODE_OVERHEAD` / [`REPLY_ENCODE_OVERHEAD`] /
+  /// `REPAIR_BATCH_CARRIER_OVERHEAD` / `PREPARE_BATCH_CARRIER_OVERHEAD` / `LOG_ENTRY_BODY_OVERHEAD`
+  /// already use — and every variable-length component (a body/log/snapshot/membership) is folded in
+  /// via `saturating_add`/`saturating_mul` throughout, so the arithmetic can NEVER wrap the way
+  /// [`Self::encoded_len`]'s `u32` accumulation can. It is deliberately a conservative OVER-estimate
+  /// (a looser bound is always safe — refusing a message that would actually fit costs a retransmit;
+  /// under-estimating is the bug this method exists to rule out), so
+  /// `wire_size_bound() >= encode_message(self).len()` holds for EVERY message, whatever its field
+  /// values, not just small ones.
+  pub fn wire_size_bound(&self) -> usize {
+    match self {
+      Self::Request(m) => REQUEST_ENCODE_OVERHEAD.saturating_add(m.body().len()),
+      Self::Prepare(m) => PREPARE_ENCODE_OVERHEAD.saturating_add(m.body().len()),
+      Self::PrepareOk(_) => fixed_fields_bound(5, 2),
+      Self::Reply(m) => REPLY_ENCODE_OVERHEAD.saturating_add(m.body().len()),
+      Self::Commit(_) => fixed_fields_bound(4, 1),
+      Self::StartViewChange(_) => fixed_fields_bound(3, 1),
+      Self::DoViewChange(m) => {
+        fixed_fields_bound(7, 1).saturating_add(log_wire_size_bound(m.log_slice()))
+      }
+      Self::StartView(m) => {
+        fixed_fields_bound(6, 1).saturating_add(log_wire_size_bound(m.log_slice()))
+      }
+      Self::GetView(_) => fixed_fields_bound(4, 1),
+      Self::RequestPrepare(_) => fixed_fields_bound(3, 1),
+      Self::Recovery(_) => fixed_fields_bound(3, 1),
+      Self::RecoveryResponse(m) => {
+        fixed_fields_bound(7, 1).saturating_add(log_wire_size_bound(m.log_slice()))
+      }
+      Self::RequestSync(_) => fixed_fields_bound(5, 1),
+      Self::SyncCheckpoint(m) => fixed_fields_bound(5, 2)
+        .saturating_add(LEN_FIELD_OVERHEAD)
+        .saturating_add(m.snapshot().len())
+        .saturating_add(LEN_FIELD_OVERHEAD)
+        .saturating_add(m.membership().len()),
+      Self::RequestPrepareRange(_) => fixed_fields_bound(4, 1),
+      Self::RepairBatch(m) => {
+        REPAIR_BATCH_CARRIER_OVERHEAD.saturating_add(log_wire_size_bound(m.log_slice()))
+      }
+      Self::PrepareBatch(m) => {
+        PREPARE_BATCH_CARRIER_OVERHEAD.saturating_add(log_wire_size_bound(m.log_slice()))
+      }
+      Self::LearnerStatus(_) => fixed_fields_bound(4, 1),
+      Self::EpochAhead(_) => fixed_fields_bound(2, 0),
+      Self::RequestLearnerProof(_) => fixed_fields_bound(4, 1),
+      Self::LearnerProof(_) => fixed_fields_bound(4, 1),
+      Self::RequestBlock(_) => fixed_fields_bound(0, 1),
+      Self::BlockResponse(m) => fixed_fields_bound(0, 1).saturating_add(
+        m.block()
+          .map_or(0, |b| LEN_FIELD_OVERHEAD.saturating_add(b.len())),
+      ),
+      Self::Nack(_) => fixed_fields_bound(3, 1),
+    }
+  }
+}
+
+/// Worst-case bytes the FIXED (non-variable-length) shape of a message contributes: the
+/// `Message.body` oneof arm framing ([`ENVELOPE_ARM_OVERHEAD`]), `scalars` bare `uint64`/`uint32`/
+/// `bool` fields (each charged the WIDEST possible varint, [`WORST_UINT64_FIELD`] — a safe
+/// over-charge for the schema's narrower `uint32`/`bool` fields, e.g. `replica`/`recovery`, since a
+/// looser upper bound is always safe), and `ids` 16-byte id/checksum `bytes` fields (each
+/// [`WORST_ID_FIELD`]). Every [`Message`] variant with NO variable-length field (no
+/// body/log/snapshot/membership) is bounded by this alone; a variant WITH one adds its own
+/// worst-case variable component on top (see [`Message::wire_size_bound`]).
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn fixed_fields_bound(scalars: usize, ids: usize) -> usize {
+  ENVELOPE_ARM_OVERHEAD
+    .saturating_add(scalars.saturating_mul(WORST_UINT64_FIELD))
+    .saturating_add(ids.saturating_mul(WORST_ID_FIELD))
+}
+
+/// Worst-case bytes a whole `repeated PreparedEntry log` field contributes, entry by entry. A
+/// protobuf `repeated` field carries no count/container framing of its own — each element pays
+/// only its own tag+length (see [`LOG_ENTRY_BODY_OVERHEAD`]'s doc) — so this is exactly the
+/// SATURATING SUM of every entry's own worst-case size: a `Present` entry via
+/// [`present_entry_encoded_len`], a header-only `Repairing` entry at the fixed
+/// [`PER_HEADER_ENTRY_BYTES`], or a `Reconfigure` entry via [`reconfigure_entry_wire_size_bound`].
+fn log_wire_size_bound(log: &[PreparedEntry]) -> usize {
+  log.iter().fold(0usize, |acc, e| {
+    let entry_bound = match e.body_state() {
+      Body::Present(bytes) => present_entry_encoded_len(bytes.len()),
+      Body::Repairing(_) => PER_HEADER_ENTRY_BYTES,
+      Body::Reconfigure(payload) => reconfigure_entry_wire_size_bound(payload),
+    };
+    acc.saturating_add(entry_bound)
+  })
+}
+
+/// Worst-case bytes ONE `Body::Reconfigure` [`PreparedEntry`] contributes to a log field. The
+/// `reconfigure` oneof arm is, like `present`, a single length-delimited sub-message, so its own
+/// entry-level framing plus `op`/`request`/`client` fields are IDENTICAL to a `Present` entry's —
+/// exactly what [`LOG_ENTRY_BODY_OVERHEAD`] already models ([`present_entry_encoded_len`] adds the
+/// flat body length on top of it; here the "body" is the successor [`ReconfigurePayload`]'s own
+/// fields instead): `replica_count` + `learner_count` (2 × [`WORST_UINT64_FIELD`], a safe
+/// over-charge for their narrower `uint32` wire width), `prev_config_id` ([`WORST_ID_FIELD`]), and
+/// one [`WORST_ID_FIELD`] per member id.
+fn reconfigure_entry_wire_size_bound(p: &ReconfigurePayload) -> usize {
+  let payload_fields = (2 * WORST_UINT64_FIELD)
+    .saturating_add(WORST_ID_FIELD)
+    .saturating_add(p.members().len().saturating_mul(WORST_ID_FIELD));
+  LOG_ENTRY_BODY_OVERHEAD.saturating_add(payload_fields)
 }
 
 // ── the `ReconfigurePayload` canonical body codec (still used by `encode_body`/`decode_body`) ──

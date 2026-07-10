@@ -624,16 +624,21 @@ fn an_oversized_outbound_frame_is_dropped_and_the_conn_stays_open() {
   // needlessly close an otherwise healthy conn. The conn must stay open with nothing queued, and
   // the oversize must be surfaced via the oversized-dropped counter (not silently counted as sent).
   // A body of MAX_FRAME_LEN bytes plus the message header encodes to strictly more than
-  // MAX_FRAME_LEN. Only ONE such message is allocated, and the preflight check is asserted via the
-  // cheap encoded_len() so no second 16 MiB copy is made.
+  // MAX_FRAME_LEN. Only ONE such message is allocated, and the preflight is asserted via the cheap
+  // wire_size_bound() — the ADMISSION gate `route()` actually checks, BEFORE building the pb view
+  // or encoding — so no second 16 MiB copy is made.
   let mut r = PeerRouter::<crate::Passthrough>::new();
   let peer = Peer::Replica(ReplicaId::new(1));
   let c = established(&mut r, peer);
   let body = bytes::Bytes::from(std::vec![0u8; MAX_FRAME_LEN as usize]);
   let huge = Message::Request(Request::new(ClientId::new(1), RequestNumber::with(1), body));
   assert!(
+    huge.wire_size_bound() > MAX_FRAME_LEN as usize,
+    "the crafted message's wire_size_bound() exceeds the frame cap (checked without encoding)"
+  );
+  assert!(
     huge.encoded_len() > MAX_FRAME_LEN as usize,
-    "the crafted message's encoded length exceeds the frame cap (checked without encoding)"
+    "the crafted message's encoded length also exceeds the frame cap (sanity check)"
   );
   assert_eq!(r.oversized_dropped(), 0, "no oversize recorded yet");
   let dropped = r.route(Recipient::To(peer), &huge, ReplicaId::new(9));
