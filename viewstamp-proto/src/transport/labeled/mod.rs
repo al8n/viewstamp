@@ -13,6 +13,20 @@ const HELLO_TAG: u8 = 0x0C;
 /// which carries no per-message version of its own — a cross-version peer is refused here, at the
 /// handshake, before any consensus traffic flows. Bumped 2 → 3 for the protobuf envelope cutover.
 const HELLO_VERSION: u8 = 3;
+
+/// Exposes [`HELLO_VERSION`] to sibling transport layers OUTSIDE this module — namely the QUIC
+/// transport's ALPN (`transport::quic::crypto::alpn_protocols`), which folds it into the negotiated
+/// protocol id so a QUIC identity mode that sends no hello preface at all (`CertOid`) is still
+/// version-fenced, at the TLS handshake, exactly like the stream `Labeled` hello and the QUIC
+/// `Hello` control-stream preface. Both derive from this ONE source of truth, so a future
+/// `HELLO_VERSION` bump updates the ALPN in lockstep automatically. `quic`-gated: it is otherwise
+/// unused (the byte-stream transport's own version fence is the hello itself), and `quic` implies
+/// `tcp`, so this is reachable everywhere `labeled` compiles WITH the one feature that calls it.
+#[cfg(feature = "quic")]
+#[cfg_attr(not(tarpaulin), inline(always))]
+pub(crate) const fn wire_version() -> u8 {
+  HELLO_VERSION
+}
 const PEER_REPLICA: u8 = 0;
 const PEER_CLIENT: u8 = 1;
 /// The maximum encoded length of a hello: tag+ver+cluster(16)+peer_tag = 19, then a 16-byte id = 35

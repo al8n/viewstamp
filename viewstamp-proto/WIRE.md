@@ -124,8 +124,15 @@ validating the dialer's) and the QUIC control-stream preface written by the `Hel
 `labeled::encode_hello` / `classify_hello` codec the stream transport uses — one format, one
 parser, one version byte, shared by both. (A cluster configured with the alternative `CertOid`
 identity source carries no hello frame at all on QUIC — its identity rides the mTLS certificate
-extension instead, so `HELLO_VERSION` does not fence it; mixing identity sources within one
-cluster is not a supported configuration.)
+extension instead, so the hello's version byte does not fence it directly; mixing identity sources
+within one cluster is not a supported configuration.)
+
+The QUIC transport additionally carries `HELLO_VERSION` in its TLS ALPN protocol id —
+`viewstamp/<version>`, built by `src/transport/quic/crypto/mod.rs`'s `alpn_protocols` from
+`labeled::wire_version` (the same source `HELLO_VERSION` above reads from) — so EVERY QUIC identity
+mode, including the preface-less `CertOid` mode, is version-fenced at the TLS handshake itself,
+before any QUIC stream opens: a mismatched-version peer fails ALPN negotiation and the connection
+never completes, independent of whether either side ever sends a hello preface.
 
 Rule: an ADDITIVE protobuf field — a new field number an old decoder tolerates as unknown within
 `MAX_UNKNOWN_FIELDS` — needs NO `HELLO_VERSION` bump. Any OTHER wire-affecting change — a new field

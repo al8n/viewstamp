@@ -70,6 +70,27 @@ fn active_provider() -> Arc<rustls::crypto::CryptoProvider> {
   }
 }
 
+/// The QUIC ALPN protocol id every TLS config this module builds negotiates:
+/// `viewstamp/<wire version>`, where the version is
+/// [`labeled::wire_version`](crate::transport::labeled::wire_version) — the SAME wire-version fence
+/// the stream `Labeled` hello and the QUIC `Hello` control-stream preface check.
+///
+/// A hello (or its QUIC-preface equivalent) is a PREFACE some identity modes send and others don't:
+/// the `CertOid` identity mode authenticates purely from the certificate and sends NO preface at
+/// all, so without this it would reach `Validated` against a differently-versioned `CertOid` peer
+/// (same ALPN, same cert format) without either side ever comparing wire versions — then silently
+/// mis-decode or drop the other's consensus frames. Carrying the version in the ALPN instead fences
+/// it at TLS's OWN negotiation step, before any QUIC stream even opens, so EVERY identity mode
+/// (`Hello`, `CertOid`, and any `dangerous_custom_identity`) is version-fenced identically: a
+/// mismatched-version peer fails ALPN negotiation and the connection never completes its handshake.
+///
+/// Both [`ClusterTls::build`] (production, mandatory mTLS) and the test-only
+/// [`QuicOptions::accept_any_with_layout`] set their client AND server `alpn_protocols` from this
+/// ONE helper, so they can never drift apart from each other or from the hello's `HELLO_VERSION`.
+fn alpn_protocols() -> Vec<Vec<u8>> {
+  vec![format!("viewstamp/{}", crate::transport::labeled::wire_version()).into_bytes()]
+}
+
 /// Default idle timeout.  Must exceed the 200 ms consensus primary-idle.
 ///
 /// On its own an idle timeout is fatal to the mesh: steady-state consensus traffic is
@@ -601,7 +622,9 @@ impl QuicOptions {
 ///   same cluster CA, and presents this node's cert chain for mutual
 ///   authentication (`with_client_auth_cert`).
 ///
-/// Both configs are TLS 1.3-only with ALPN set to `b"viewstamp"`.
+/// Both configs are TLS 1.3-only with ALPN set to the wire-versioned protocol id `alpn_protocols`
+/// builds (`viewstamp/<wire version>`), so a peer at a different wire version fails ALPN
+/// negotiation at the handshake rather than connecting and mis-decoding traffic.
 ///
 /// ## SNI server name
 ///
@@ -679,7 +702,7 @@ impl ClusterTls {
       .with_client_cert_verifier(client_verifier)
       .with_single_cert(self.chain.clone(), self.key.clone_key())
       .expect("valid cluster cert and key");
-    rustls_server.alpn_protocols = vec![b"viewstamp".to_vec()];
+    rustls_server.alpn_protocols = alpn_protocols();
     let qsc = QuicServerConfig::try_from(Arc::new(rustls_server))
       .expect("QuicServerConfig from cluster-CA rustls ServerConfig");
     let server = ServerConfig::with_crypto(Arc::new(qsc));
@@ -695,7 +718,7 @@ impl ClusterTls {
       .with_custom_certificate_verifier(server_verifier)
       .with_client_auth_cert(self.chain, self.key)
       .expect("valid cluster cert and key for client auth");
-    rustls_client.alpn_protocols = vec![b"viewstamp".to_vec()];
+    rustls_client.alpn_protocols = alpn_protocols();
     let qcc = QuicClientConfig::try_from(Arc::new(rustls_client))
       .expect("QuicClientConfig from cluster-CA rustls ClientConfig");
     let client = ClientConfig::new(Arc::new(qcc));
@@ -745,7 +768,7 @@ impl QuicOptions {
       .with_no_client_auth()
       .with_single_cert(vec![cert], key)
       .unwrap();
-    rustls_server.alpn_protocols = vec![b"viewstamp".to_vec()];
+    rustls_server.alpn_protocols = alpn_protocols();
     let qsc =
       QuicServerConfig::try_from(Arc::new(rustls_server)).expect("QuicServerConfig from rustls");
     let server = ServerConfig::with_crypto(Arc::new(qsc));
@@ -757,7 +780,7 @@ impl QuicOptions {
       .dangerous()
       .with_custom_certificate_verifier(Arc::new(AcceptAny))
       .with_no_client_auth();
-    rustls_client.alpn_protocols = vec![b"viewstamp".to_vec()];
+    rustls_client.alpn_protocols = alpn_protocols();
     let qcc =
       QuicClientConfig::try_from(Arc::new(rustls_client)).expect("QuicClientConfig from rustls");
     let client = ClientConfig::new(Arc::new(qcc));

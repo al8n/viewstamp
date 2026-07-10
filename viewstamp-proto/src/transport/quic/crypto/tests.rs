@@ -1,5 +1,20 @@
 use super::*;
 
+/// The QUIC ALPN carries the wire version, referencing
+/// [`labeled::wire_version`](crate::transport::labeled::wire_version) directly (not a hardcoded
+/// literal) so a future `HELLO_VERSION` bump updates this assertion — and the ALPN both `ClusterTls`
+/// production configs and the test-only accept-any configs build — in lockstep, from the ONE
+/// source of truth. This is the pin for the version-fence fix: every QUIC identity mode negotiates
+/// this SAME ALPN, so a differently-versioned peer (any identity mode, including preface-less
+/// `CertOid`) fails ALPN negotiation at the TLS handshake rather than connecting.
+#[test]
+fn alpn_protocols_carries_the_wire_version_from_the_single_source_of_truth() {
+  let expected = format!("viewstamp/{}", crate::transport::labeled::wire_version()).into_bytes();
+  assert_eq!(alpn_protocols(), vec![expected]);
+  // Concretely pins the current version too, so a bump is a deliberate, visible diff here.
+  assert_eq!(alpn_protocols(), vec![b"viewstamp/3".to_vec()]);
+}
+
 #[test]
 fn accept_any_options_build_tls13_configs() {
   let opts = QuicOptions::accept_any_for_test();
