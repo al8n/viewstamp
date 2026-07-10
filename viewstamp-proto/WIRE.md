@@ -67,9 +67,10 @@ the SEMANTICS.
   message" case (parity with the retired codec's unknown-tag reject).
 - `PreparedEntry.body_state` must be present: every log entry carries exactly one of `present` /
   `repairing_checksum` / `reconfigure` on the wire.
-- Any rejection surfaces as `CodecError::Malformed { what }` naming the offending field (e.g.
-  `"Prepare.config_id"`); an envelope that ends before it can be fully read surfaces as
-  `CodecError::Truncated`. A rejected message never panics and is never partially applied —
+- Each of the checks above rejects as `CodecError::Malformed { what }` naming the offending
+  field (e.g. `"Prepare.config_id"`); structural failures surface as described earlier. An
+  envelope that ends before it can be fully read surfaces as `CodecError::Truncated`. A
+  rejected message never panics and is never partially applied —
   `decode_message` returns `Err` for the WHOLE envelope, and the transport closes the connection
   on it (`Conn::poll_decoded`) rather than attempt to resynchronize mid-stream.
 
