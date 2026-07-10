@@ -112,13 +112,48 @@ pub(crate) enum PendingSbAction {
   /// the current `commit_max` + committed-band headers and has no follow-up participation.
   Seal,
   /// A commit-first epoch swap: a `Body::Reconfigure` op committed under the OLD epoch, and this
-  /// durable root carries the `(reconfigure op number, SUCCESSOR membership)` (NOT yet installed in
-  /// memory). On completion `on_sb_done` calls [`Endpoint::install_membership`] — so the node advertises
-  /// the new quorum/voter-set only AFTER a durable root proves the swap (the durable-epoch-before-
-  /// participate fence). The op number + successor are held here, not in `self.membership`, for exactly
-  /// the STAGE→durable-root window — and the op number is the captured reconfigure op (NOT `commit_min`,
-  /// which advances past it while the primary keeps committing through this window).
-  SwapEpoch(OpNumber, Membership),
+  /// durable root carries the staged [`EpochSwap`] (NOT yet installed in memory). On completion
+  /// `on_sb_done` calls [`Endpoint::install_membership`] — so the node advertises the new
+  /// quorum/voter-set only AFTER a durable root proves the swap (the durable-epoch-before-
+  /// participate fence). The swap is held here, not in `self.membership`, for exactly the
+  /// STAGE→durable-root window.
+  SwapEpoch(EpochSwap),
+}
+
+/// The `(reconfigure op, successor membership)` payload of a staged commit-first epoch swap,
+/// extracted from the `PendingSbAction::SwapEpoch` variant (and backing `pending_swap`) so its two
+/// fields are named + accessor-wrapped. The op number is the CAPTURED reconfigure op — NOT
+/// `commit_min`, which advances past it while the primary keeps committing through the staging
+/// window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EpochSwap {
+  op: OpNumber,
+  successor: Membership,
+}
+
+impl EpochSwap {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn new(op: OpNumber, successor: Membership) -> Self {
+    Self { op, successor }
+  }
+
+  /// The captured reconfigure op number the staged swap installs at.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn op(&self) -> OpNumber {
+    self.op
+  }
+
+  /// The staged successor membership (the configuration the committed `Reconfigure` op produced).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn successor(&self) -> &Membership {
+    &self.successor
+  }
+
+  /// Consumes the staged swap, yielding the reconfigure op + the successor to install.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn into_parts(self) -> (OpNumber, Membership) {
+    (self.op, self.successor)
+  }
 }
 
 /// Which of a checkpoint's two superblock writes is outstanding. Kept SEPARATE from
@@ -1425,7 +1460,7 @@ pub struct Endpoint<S, R = RestartOnly> {
   /// reconfigure op by the time the root lands. The successor is identical on every replica (all commit
   /// at the identical OLD membership), so this is the pre-install staging of a convergent value; private,
   /// never hashed/serialized/emitted.
-  pending_swap: Option<(OpNumber, Membership)>,
+  pending_swap: Option<EpochSwap>,
   /// Re-entrancy guard for [`Self::maybe_pay_checkpoint_debt`]: `true` only WHILE that routine's own
   /// proactive `advance_commit` is on the stack. The debt routine is called from the commit-advance
   /// tails (`try_commit` / `advance_commit`) so the checkpoint debt re-checks every time commit moves;
@@ -2037,14 +2072,14 @@ impl<S, R> Endpoint<S, R> {
     debug_assert!(
       self.pending_swap.is_none(),
       "stage_epoch_swap would overwrite a staged successor for op {:?} with op {}",
-      self.pending_swap.as_ref().map(|(o, _)| o.get()),
+      self.pending_swap.as_ref().map(|s| s.op().get()),
       reconfigure_op.get(),
     );
     if self.pending_swap.is_some() {
       return;
     }
     self.reconfigure_inflight = None;
-    self.pending_swap = Some((reconfigure_op, successor));
+    self.pending_swap = Some(EpochSwap::new(reconfigure_op, successor));
     self.maybe_swap_epoch(sb);
   }
 
@@ -2057,7 +2092,7 @@ impl<S, R> Endpoint<S, R> {
   /// second reconfiguration cannot be proposed across the epoch boundary while the first is installing.
   fn swap_in_flight(&self) -> bool {
     self.pending_swap.is_some()
-      || matches!(self.pending_sb, Some((_, PendingSbAction::SwapEpoch(_, _))))
+      || matches!(self.pending_sb, Some((_, PendingSbAction::SwapEpoch(_))))
   }
 
   /// Is ANY membership change in flight — proposed-but-not-committed OR committed-but-not-installed —
@@ -2129,7 +2164,8 @@ impl<S, R> Endpoint<S, R> {
     // A legitimately staged swap that still chains from the live config matches and proceeds unchanged, so
     // the normal (non-crossed) path — and the off-axis no-reconfiguration path, where `pending_swap` is
     // always `None` — is byte-identical.
-    if let Some((_, successor)) = self.pending_swap.as_ref() {
+    if let Some(swap) = self.pending_swap.as_ref() {
+      let successor = swap.successor();
       let chained = Membership::recompute_config_id(
         successor.epoch(),
         successor.replica_count(),
@@ -2148,9 +2184,10 @@ impl<S, R> Endpoint<S, R> {
     if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
       return; // a superblock write is in flight — the swap waits its turn
     }
-    let Some((reconfigure_op, successor)) = self.pending_swap.clone() else {
+    let Some(swap) = self.pending_swap.clone() else {
       return; // nothing staged
     };
+    let (reconfigure_op, successor) = swap.into_parts();
     self.submit_swap_epoch(reconfigure_op, successor, sb);
   }
 
@@ -2209,7 +2246,10 @@ impl<S, R> Endpoint<S, R> {
     );
     let id = self.mint_op_id();
     sb.submit_write(id, state);
-    self.pending_sb = Some((id, PendingSbAction::SwapEpoch(reconfigure_op, successor)));
+    self.pending_sb = Some((
+      id,
+      PendingSbAction::SwapEpoch(EpochSwap::new(reconfigure_op, successor)),
+    ));
   }
 
   /// Cancel an outstanding FORCED sync once repair/commit has SATISFIED its target. A forced sync

@@ -246,7 +246,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // clear the staging latch. `pending_swap` and this action carry the IDENTICAL `(op, successor)`;
         // clear the latch FIRST so `install_membership` (and any re-entrant `maybe_swap_epoch`) sees no
         // residual staging. The carried `op` is the reconfigure op number captured at stage time.
-        PendingSbAction::SwapEpoch(op, successor) => {
+        PendingSbAction::SwapEpoch(swap) => {
+          let (op, successor) = swap.into_parts();
           self.pending_swap = None;
           self.install_membership(Some(op), successor);
           // This node CROSSED into the new epoch via its OWN committed reconfigure op (not a sync) — so any

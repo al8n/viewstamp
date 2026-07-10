@@ -114,6 +114,27 @@ pub struct Retired {
 }
 
 impl<S, R> Recovered<S, R> {
+  /// True iff this is [`Recovered::Active`] (the node occupies a slot and resumes as an endpoint).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_active(&self) -> bool {
+    matches!(self, Recovered::Active(_))
+  }
+
+  /// True iff this is [`Recovered::Retired`] (a reconfiguration removed the node).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_retired(&self) -> bool {
+    matches!(self, Recovered::Retired(_))
+  }
+
+  /// Consumes the outcome, yielding the recovering endpoint — `None` for a retired node.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn try_active(self) -> Option<Endpoint<S, R>> {
+    match self {
+      Recovered::Active(endpoint) => Some(endpoint),
+      Recovered::Retired(_) => None,
+    }
+  }
+
   /// Unwraps the [`Recovered::Active`] endpoint, panicking on [`Recovered::Retired`]. Test-only: the
   /// fixtures always recover a present member, so they assert presence by construction.
   #[cfg(test)]
