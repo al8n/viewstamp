@@ -74,12 +74,35 @@ impl Default for BlockStoreError {
 /// panic or return bogus edges in a strict parser, which is why the resolvers are kept SEPARATE rather
 /// than unioned into one closure.
 pub struct BlockDagWalk<'a> {
-  /// The live roots of this DAG (a current durable checkpoint root and/or an in-flight sync target
-  /// root), all parsed by [`references`](Self::references).
-  pub roots: &'a [BlockAddress],
-  /// The edge resolver for THIS DAG's block format: given a block's bytes, returns its direct child
-  /// addresses. Only ever invoked on blocks reached from [`roots`](Self::roots).
-  pub references: &'a dyn Fn(&[u8]) -> std::vec::Vec<BlockAddress>,
+  roots: &'a [BlockAddress],
+  references: &'a dyn Fn(&[u8]) -> std::vec::Vec<BlockAddress>,
+}
+
+impl<'a> BlockDagWalk<'a> {
+  /// Pairs one DAG's live roots with the resolver that parses that DAG's blocks: `roots` are the
+  /// live roots (a current durable checkpoint root and/or an in-flight sync target root), and
+  /// `references` is the edge resolver for THIS DAG's block format — given a block's bytes it
+  /// returns the direct child addresses, and it is only ever invoked on blocks reached from
+  /// `roots`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    roots: &'a [BlockAddress],
+    references: &'a dyn Fn(&[u8]) -> std::vec::Vec<BlockAddress>,
+  ) -> Self {
+    Self { roots, references }
+  }
+
+  /// The live roots of this DAG.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn roots(&self) -> &[BlockAddress] {
+    self.roots
+  }
+
+  /// The edge resolver for this DAG's block format.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn references(&self) -> &dyn Fn(&[u8]) -> std::vec::Vec<BlockAddress> {
+    self.references
+  }
 }
 
 /// Reads the block at `addr`, returning it ONLY if its bytes hash back to `addr`.

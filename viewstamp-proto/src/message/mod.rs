@@ -1079,7 +1079,7 @@ impl Body {
 
   /// The successor membership when [`Reconfigure`](Body::Reconfigure), else `None`.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn as_reconfigure(&self) -> Option<&ReconfigurePayload> {
+  pub const fn as_reconfigure(&self) -> Option<&ReconfigurePayload> {
     match self {
       Body::Reconfigure(payload) => Some(payload),
       Body::Present(_) | Body::Repairing(_) => None,
@@ -1346,6 +1346,7 @@ impl DoViewChange {
 
   /// Sets the advertised checkpoint floor (see [`Self::checkpoint_op`]).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub fn with_checkpoint_op(mut self, checkpoint_op: OpNumber) -> Self {
     self.checkpoint_op = checkpoint_op;
     self
@@ -1409,8 +1410,8 @@ impl DoViewChange {
   /// or dense `[1..=op]` otherwise. The new primary's `select_canonical_log` is offset-aware and
   /// UNIONs these across DVCs, so an offset slice drops no committed op at view change.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn log_slice(&self) -> &[PreparedEntry] {
-    &self.log
+  pub const fn log_slice(&self) -> &[PreparedEntry] {
+    self.log.as_slice()
   }
 
   /// Consumes the message and returns the log vector.
@@ -1462,6 +1463,7 @@ impl StartView {
 
   /// Sets the advertised checkpoint floor (see [`Self::checkpoint_op`]).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub fn with_checkpoint_op(mut self, checkpoint_op: OpNumber) -> Self {
     self.checkpoint_op = checkpoint_op;
     self
@@ -1517,8 +1519,8 @@ impl StartView {
   /// which an adopter merges with its own preserved committed ops (it is not necessarily dense
   /// `[1..=op]` if the primary itself checkpointed/state-synced).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn log_slice(&self) -> &[PreparedEntry] {
-    &self.log
+  pub const fn log_slice(&self) -> &[PreparedEntry] {
+    self.log.as_slice()
   }
 
   /// Consumes the message and returns the log vector.
@@ -1868,6 +1870,7 @@ impl RecoveryResponse {
 
   /// Sets the advertised checkpoint floor (see [`Self::checkpoint_op`]).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub fn with_checkpoint_op(mut self, checkpoint_op: OpNumber) -> Self {
     self.checkpoint_op = checkpoint_op;
     self
@@ -1928,8 +1931,8 @@ impl RecoveryResponse {
   /// `(min_floor .. op]`, merged by the adopter with its own preserved committed ops; not
   /// necessarily dense `[1..=op]`.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn log_slice(&self) -> &[PreparedEntry] {
-    &self.log
+  pub const fn log_slice(&self) -> &[PreparedEntry] {
+    self.log.as_slice()
   }
 
   /// Consumes the message and returns the log vector.
@@ -2006,8 +2009,8 @@ impl RepairBatch {
   /// The served prefix as a slice — the `Body::Present` entries the holder fit under the frame cap,
   /// in ascending op order (a sub-run of the solicited `[lo, hi]`).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn log_slice(&self) -> &[PreparedEntry] {
-    &self.log
+  pub const fn log_slice(&self) -> &[PreparedEntry] {
+    self.log.as_slice()
   }
 
   /// Consumes the message and returns the served-entry vector.
@@ -2093,8 +2096,8 @@ impl PrepareBatch {
   /// The retransmitted run as a slice — the `Body::Present` entries the primary fit under the
   /// frame cap, in ascending op order.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn log_slice(&self) -> &[PreparedEntry] {
-    &self.log
+  pub const fn log_slice(&self) -> &[PreparedEntry] {
+    self.log.as_slice()
   }
 
   /// Consumes the message and returns the retransmitted-entry vector.

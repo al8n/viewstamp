@@ -1000,14 +1000,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return; // no durable root established yet — nothing is safely prunable.
     }
     blocks.gc(&[
-      crate::block_store::BlockDagWalk {
-        roots: &sm_roots,
-        references: &|block| S::block_references(block),
-      },
-      crate::block_store::BlockDagWalk {
-        roots: &session_roots,
-        references: &super::session_blocks::session_block_references,
-      },
+      crate::block_store::BlockDagWalk::new(&sm_roots, &|block| S::block_references(block)),
+      crate::block_store::BlockDagWalk::new(
+        &session_roots,
+        &super::session_blocks::session_block_references,
+      ),
     ]);
   }
 

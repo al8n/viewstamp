@@ -896,7 +896,7 @@ struct Timers {
   forfeit_armed: Option<Instant>,
 }
 
-/// The twelve scheduled timers, as an enumerable kind. Used by [`Endpoint::serviceable_now`] (the
+/// The thirteen scheduled timers, as an enumerable kind. Used by [`Endpoint::serviceable_now`] (the
 /// single source of truth for "will the CURRENT (status, substate) actually SERVICE this timer if it
 /// fires?") so [`Endpoint::poll_timeout`] can filter to only-serviceable deadlines — making the
 /// timer-wedge spin (a `poll_timeout`-driven driver re-returning a stale, never-serviced deadline)

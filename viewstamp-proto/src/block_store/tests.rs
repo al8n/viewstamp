@@ -130,10 +130,7 @@ fn gc_marks_from_live_roots_keeps_shared_subtree_and_sweeps_the_rest() {
   assert_eq!(store.len(), 5, "two indexes + three leaves");
 
   // GC with ONLY the newer root live (one DAG → one typed walk).
-  store.gc(&[BlockDagWalk {
-    roots: &[new_root],
-    references: &test_refs,
-  }]);
+  store.gc(&[BlockDagWalk::new(&[new_root], &test_refs)]);
 
   // The newer DAG — root, shared leaf, new-only leaf — survives; the old root and its exclusive
   // leaf are pruned.
@@ -160,10 +157,7 @@ fn gc_with_no_live_roots_frees_every_block() {
   store.write_verified(bytes::Bytes::from_static(b"a"));
   store.write_verified(bytes::Bytes::from_static(b"b"));
   assert_eq!(store.len(), 2);
-  store.gc(&[BlockDagWalk {
-    roots: &[],
-    references: &test_refs,
-  }]);
+  store.gc(&[BlockDagWalk::new(&[], &test_refs)]);
   assert_eq!(store.len(), 0, "an empty live set prunes every block");
 }
 
@@ -220,14 +214,8 @@ fn gc_runs_each_dag_with_only_its_own_resolver_and_unions_the_marked_sets() {
   };
 
   store.gc(&[
-    BlockDagWalk {
-      roots: &[a_root],
-      references: &a_refs,
-    },
-    BlockDagWalk {
-      roots: &[b_root],
-      references: &b_refs,
-    },
+    BlockDagWalk::new(&[a_root], &a_refs),
+    BlockDagWalk::new(&[b_root], &b_refs),
   ]);
 
   // Both DAGs' reachable sets survive (the UNION of the marked sets); only the unreferenced leaf is freed.
@@ -285,14 +273,8 @@ fn gc_retains_session_only_children_of_a_block_also_reachable_from_the_sm_dag() 
   // SM walk listed FIRST so it marks the shared address before the session walk reaches it (the order
   // that triggers the under-mark under a shared visited set).
   store.gc(&[
-    BlockDagWalk {
-      roots: &[shared_root],
-      references: &sm_refs,
-    },
-    BlockDagWalk {
-      roots: &[shared_root],
-      references: &session_refs,
-    },
+    BlockDagWalk::new(&[shared_root], &sm_refs),
+    BlockDagWalk::new(&[shared_root], &session_refs),
   ]);
 
   assert!(
