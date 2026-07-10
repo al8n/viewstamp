@@ -8,6 +8,7 @@ license.workspace = true
 description = "Runtime-agnostic driver core shared by the viewstamp drivers"
 
 [dependencies]
+derive_more = { workspace = true, features = ["display", "is_variant"] }
 viewstamp-proto = { workspace = true, features = ["std", "tcp"] }
 bytes = { workspace = true, features = ["std"] }
 flume = { workspace = true }

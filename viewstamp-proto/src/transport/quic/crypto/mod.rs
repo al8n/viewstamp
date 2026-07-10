@@ -22,7 +22,7 @@
 //! validation against the cluster CA, so a peer without a valid cert is
 //! rejected at the TLS handshake before any stream opens. A geo-replicated or
 //! otherwise non-default deployment overrides the timer/window values via
-//! [`ClusterTls::tuning`]; the security-relevant construction (roots, mTLS,
+//! [`ClusterTls::with_tuning`]; the security-relevant construction (roots, mTLS,
 //! TLS 1.3, ALPN) is not tunable.
 
 use core::time::Duration;
@@ -142,7 +142,7 @@ const fn clamp_tuning(v: u64) -> u64 {
 /// Embedder-tunable timer and flow-control values for the QUIC `TransportConfig`, with `Default` =
 /// the pinned LAN-tuned constants (see each field's constant for the rationale).
 /// A geo-replicated cluster — where the defaults' assumptions (sub-50 ms RTT, 200 ms primary-idle
-/// headroom) do not hold — overrides them via [`ClusterTls::tuning`].
+/// headroom) do not hold — overrides them via [`ClusterTls::with_tuning`].
 ///
 /// **Scope (the security posture).** This carries ONLY performance knobs — timers and window sizes.
 /// It cannot reach the security-relevant construction: the cluster-private roots, mandatory mTLS

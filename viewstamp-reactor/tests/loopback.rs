@@ -218,7 +218,7 @@ async fn build_driver(
     viewstamp_proto::ClientId::new(u128::from(id) + 1),
     0,
     opts,
-    IdentityConfig::Hello { cluster: CLUSTER },
+    IdentityConfig::Hello(CLUSTER),
     Some([id; 32]),
     bind,
     peers,

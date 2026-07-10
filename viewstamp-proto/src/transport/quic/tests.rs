@@ -25,7 +25,7 @@ fn connect_emits_an_initial_datagram() {
     Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
     mtls_opts(cluster),
     Some([0u8; 32]),
-    IdentityConfig::Hello { cluster },
+    IdentityConfig::Hello(cluster),
   );
   c.connect(Instant::ZERO, addr(2), Peer::Replica(ReplicaId::new(1)))
     .expect("the first dial on a fresh coordinator is under the cap");
@@ -72,7 +72,7 @@ fn a_public_connect_over_the_cap_returns_at_capacity_and_allocates_nothing() {
     // Explicit `1` is floored up to the mutual-dial-mesh minimum; read the effective cap below.
     mtls_opts(cluster).with_max_connections(1),
     Some([0u8; 32]),
-    IdentityConfig::Hello { cluster },
+    IdentityConfig::Hello(cluster),
   );
   let cap = c.max_connections_for_test();
 
@@ -139,7 +139,7 @@ fn dial_error_is_nameable_through_the_public_reexport() {
     // Explicit `1` is floored up to the mutual-dial-mesh minimum; read the effective cap below.
     mtls_opts(cluster).with_max_connections(1),
     Some([0u8; 32]),
-    IdentityConfig::Hello { cluster },
+    IdentityConfig::Hello(cluster),
   );
   let effective_cap = c.max_connections_for_test();
 
@@ -192,7 +192,7 @@ fn poll_timeout_is_anchored_to_a_non_zero_driver_epoch() {
     Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
     mtls_opts(cluster),
     Some([0u8; 32]),
-    IdentityConfig::Hello { cluster },
+    IdentityConfig::Hello(cluster),
   );
 
   // A driver whose monotonic clock starts well past zero: the FIRST drive is at viewstamp epoch 10 s.
@@ -243,7 +243,7 @@ fn with_identity_rejects_options_without_mandatory_client_auth() {
     Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
     QuicOptions::accept_any_for_test(),
     Some([0u8; 32]),
-    IdentityConfig::Hello { cluster },
+    IdentityConfig::Hello(cluster),
   );
 }
 
@@ -264,7 +264,7 @@ fn with_identity_accepts_cluster_tls_mandatory_mtls_options() {
     Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
     opts,
     Some([0u8; 32]),
-    IdentityConfig::Hello { cluster },
+    IdentityConfig::Hello(cluster),
   );
   assert_eq!(
     c.endpoint().cluster(),
@@ -286,7 +286,7 @@ fn effective_cap(replica_count: u8, override_cap: Option<usize>) -> usize {
     Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(replica_count), 1, CountSm::default()),
     opts,
     Some([0u8; 32]),
-    IdentityConfig::Hello { cluster },
+    IdentityConfig::Hello(cluster),
   );
   c.max_connections_for_test()
 }
@@ -372,7 +372,7 @@ fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() 
     Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
     mtls_opts(cluster),
     Some([0u8; 32]),
-    IdentityConfig::Hello { cluster },
+    IdentityConfig::Hello(cluster),
   );
   assert_eq!(c.endpoint().op().get(), 0, "no op before any request");
   assert_eq!(
@@ -475,7 +475,7 @@ fn dial_sni_is_keyed_to_the_stable_member_id_not_the_routing_slot() {
     Endpoint::<_, SingleChange>::with_reconfig(cfg, shifted_membership, 1, CountSm::default()),
     mtls_opts(cluster),
     Some([0u8; 32]),
-    IdentityConfig::Hello { cluster },
+    IdentityConfig::Hello(cluster),
   );
 
   // The SNI the fixed `connect` presents for slot 1: stable MemberId(2) form.

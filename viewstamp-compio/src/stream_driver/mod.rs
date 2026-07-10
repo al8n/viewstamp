@@ -975,14 +975,6 @@ where
     }
   }
 
-  /// The number of connection closes attributed to `cause` so far — the coordinator's internal
-  /// closes plus the driver's own (auth-deadline, out-queue overflow, accept-cap). Test/diagnostic
-  /// observability, not a stable embedder API (hence `#[doc(hidden)]`).
-  #[doc(hidden)]
-  pub fn conn_close_count(&self, cause: CloseCause) -> u64 {
-    self.close_counts[cause.index()]
-  }
-
   /// Tear down a connection the proto/socket/queue has lost: one `remove` drops the [`Conn`], which
   /// cancels its live task(s) (the connect task OR both bridge halves) and drops its `out_tx`; then
   /// reap it in the coordinator (eof) and, if it was a DIALED conn, redial the peer/addr held in
@@ -1328,3 +1320,14 @@ where
 
 #[cfg(test)]
 mod tests;
+
+impl<S, R, W, B, L> CompioStreamDriver<S, R, W, B, L> {
+  /// The number of connection closes attributed to `cause` so far — the coordinator's internal
+  /// closes plus the driver's own (auth-deadline, out-queue overflow, accept-cap). Test/diagnostic
+  /// observability, not a stable embedder API (hence `#[doc(hidden)]`). Reads only the local
+  /// counter array, so it carries none of the operational impl block's bounds.
+  #[doc(hidden)]
+  pub fn conn_close_count(&self, cause: CloseCause) -> u64 {
+    self.close_counts[cause.index()]
+  }
+}

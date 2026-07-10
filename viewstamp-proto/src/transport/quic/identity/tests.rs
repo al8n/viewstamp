@@ -363,18 +363,15 @@ fn cert_oid_rejects_an_empty_chain() {
 
 #[test]
 fn identity_config_carries_the_cluster_for_both_variants() {
-  assert_eq!(IdentityConfig::Hello { cluster: 0x5151 }.cluster(), 0x5151);
-  assert_eq!(
-    IdentityConfig::CertOid { cluster: 0x9999 }.cluster(),
-    0x9999
-  );
+  assert_eq!(IdentityConfig::Hello(0x5151).cluster(), 0x5151);
+  assert_eq!(IdentityConfig::CertOid(0x9999).cluster(), 0x9999);
 }
 
 #[test]
 fn provided_identity_from_hello_config_authenticates_via_the_preface() {
   // The `Hello` selector produces a source that writes a preface and parses it back to the peer.
   let cluster = 0x5151_u128;
-  let src = IdentityConfig::Hello { cluster }.into_source();
+  let src = IdentityConfig::Hello(cluster).into_source();
   let mut frame = Vec::new();
   src.write_control_preface(replica(1), &mut frame);
   assert!(
@@ -397,7 +394,7 @@ fn provided_identity_from_cert_oid_config_authenticates_via_the_cert() {
 
   // The `CertOid` selector produces a source that writes NO preface and reads identity from the cert.
   let cluster = 0x5151_u128;
-  let src = IdentityConfig::CertOid { cluster }.into_source();
+  let src = IdentityConfig::CertOid(cluster).into_source();
   let mut preface = Vec::new();
   src.write_control_preface(replica(2), &mut preface);
   assert!(

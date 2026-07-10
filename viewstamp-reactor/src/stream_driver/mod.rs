@@ -964,15 +964,6 @@ where
     }
   }
 
-  /// The number of connection closes attributed to `cause` so far — the coordinator's internal
-  /// closes plus the driver's own (auth-deadline, out-queue overflow, dead-bridge send failure,
-  /// accept-cap). Test/diagnostic
-  /// observability, not a stable embedder API (hence `#[doc(hidden)]`).
-  #[doc(hidden)]
-  pub fn conn_close_count(&self, cause: CloseCause) -> u64 {
-    self.close_counts[cause.index()]
-  }
-
   /// Tear down a connection the proto/socket/queue has lost: one `remove` drops the [`Conn`], whose
   /// [`AbortOnDrop`] handle(s) abort its live task(s) (the dial task OR both bridge halves) and
   /// whose `out_tx` drops; then reap it in the coordinator (eof) and, if it was a DIALED conn,
@@ -1318,3 +1309,15 @@ where
 
 #[cfg(test)]
 mod tests;
+
+impl<R: Runtime, S, T, W, B, L> ReactorStreamDriver<R, S, T, W, B, L> {
+  /// The number of connection closes attributed to `cause` so far — the coordinator's internal
+  /// closes plus the driver's own (auth-deadline, out-queue overflow, dead-bridge send failure,
+  /// accept-cap). Test/diagnostic observability, not a stable embedder API (hence
+  /// `#[doc(hidden)]`). Reads only the local counter array, so it carries none of the operational
+  /// impl block's bounds (`R: Runtime` alone is structural to the type).
+  #[doc(hidden)]
+  pub fn conn_close_count(&self, cause: CloseCause) -> u64 {
+    self.close_counts[cause.index()]
+  }
+}

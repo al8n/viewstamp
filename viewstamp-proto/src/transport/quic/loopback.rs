@@ -86,11 +86,11 @@ pub(super) fn replica(
   let (cert, identity) = match scheme {
     Scheme::Hello => (
       ca.issue_replica(id, CLUSTER),
-      IdentityConfig::Hello { cluster: CLUSTER },
+      IdentityConfig::Hello(CLUSTER),
     ),
     Scheme::CertOid => (
       ca.issue_replica_with_oid(id, CLUSTER),
-      IdentityConfig::CertOid { cluster: CLUSTER },
+      IdentityConfig::CertOid(CLUSTER),
     ),
   };
   let opts = ClusterTls::new(ca.roots(), cert.chain(), cert.key())
@@ -306,7 +306,7 @@ fn converges_with_foreign_ca() -> bool {
       Endpoint::<_, SingleChange>::with_reconfig(cfg0, genesis(2), 1, CountSm::default()),
       opts0,
       Some([0u8; 32]),
-      IdentityConfig::Hello { cluster: CLUSTER },
+      IdentityConfig::Hello(CLUSTER),
     ),
     TestWal::default(),
     TestSb::default(),
@@ -322,7 +322,7 @@ fn converges_with_foreign_ca() -> bool {
       Endpoint::<_, SingleChange>::with_reconfig(cfg1, genesis(2), 2, CountSm::default()),
       opts1,
       Some([1u8; 32]),
-      IdentityConfig::Hello { cluster: CLUSTER },
+      IdentityConfig::Hello(CLUSTER),
     ),
     TestWal::default(),
     TestSb::default(),
@@ -703,11 +703,11 @@ fn replica_in_cluster_of(
   let (cert, identity) = match scheme {
     Scheme::Hello => (
       ca.issue_replica(id, CLUSTER),
-      IdentityConfig::Hello { cluster: CLUSTER },
+      IdentityConfig::Hello(CLUSTER),
     ),
     Scheme::CertOid => (
       ca.issue_replica_with_oid(id, CLUSTER),
-      IdentityConfig::CertOid { cluster: CLUSTER },
+      IdentityConfig::CertOid(CLUSTER),
     ),
   };
   let opts = ClusterTls::new(ca.roots(), cert.chain(), cert.key())

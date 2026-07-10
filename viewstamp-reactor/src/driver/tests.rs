@@ -148,7 +148,7 @@ async fn test_quic_driver_with_config(
     viewstamp_proto::ClientId::new(1),
     0,
     opts,
-    IdentityConfig::Hello { cluster: CLUSTER },
+    IdentityConfig::Hello(CLUSTER),
     Some([0u8; 32]),
     "127.0.0.1:0".parse().unwrap(),
     Vec::new(), // no peers: never a quorum, so nothing ever commits on its own

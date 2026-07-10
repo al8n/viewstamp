@@ -60,8 +60,9 @@ impl MemBlockStore {
   /// flips this ON for its cluster (`Cluster::enable_block_gc`): GC keeps each store bounded over the
   /// oracle's long warm-up/drain (hundreds of thousands of ticks, a checkpoint every few ops), where a
   /// never-pruning store would grow without bound and make every per-tick `has_block` lookup slower.
-  pub fn set_gc_enabled(&mut self, enabled: bool) {
+  pub const fn set_gc_enabled(&mut self, enabled: bool) -> &mut Self {
     self.gc_enabled = enabled;
+    self
   }
 
   /// The number of distinct blocks currently held.

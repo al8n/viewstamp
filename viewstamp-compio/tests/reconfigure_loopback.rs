@@ -223,7 +223,7 @@ async fn build_driver(
     viewstamp_proto::ClientId::new(1),
     0,
     opts,
-    IdentityConfig::Hello { cluster: CLUSTER },
+    IdentityConfig::Hello(CLUSTER),
     Some([0u8; 32]),
     bind,
     Vec::new(), // no peers: a single-voter cluster self-commits at quorum 1
@@ -259,7 +259,7 @@ async fn build_cluster_driver(
     viewstamp_proto::ClientId::new(u128::from(id) + 1),
     0,
     opts,
-    IdentityConfig::Hello { cluster: CLUSTER },
+    IdentityConfig::Hello(CLUSTER),
     Some([id; 32]),
     bind,
     peers,
@@ -624,10 +624,11 @@ async fn stream_cluster_survives_slot_shift() {
     BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
     BTreeSet::new(),
   );
-  let health = HealthHint {
-    known_up: BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
-    known_down: BTreeSet::new(),
-  };
+  let health = HealthHint::new().with_known_up(BTreeSet::from([
+    MemberId::new(0),
+    MemberId::new(2),
+    MemberId::new(3),
+  ]));
   compio::time::timeout(
     Duration::from_secs(20),
     handles[0].reconfigure_to(target, health),
@@ -765,9 +766,7 @@ async fn quic_cluster_survives_slot_shift() {
       viewstamp_proto::ClientId::new(u128::from(id) + 1),
       0,
       opts,
-      viewstamp_proto::IdentityConfig::Hello {
-        cluster: QUIC_CLUSTER,
-      },
+      viewstamp_proto::IdentityConfig::Hello(QUIC_CLUSTER),
       Some([id; 32]),
       addrs[id as usize],
       peers,
@@ -798,10 +797,11 @@ async fn quic_cluster_survives_slot_shift() {
     BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
     BTreeSet::new(),
   );
-  let health = HealthHint {
-    known_up: BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
-    known_down: BTreeSet::new(),
-  };
+  let health = HealthHint::new().with_known_up(BTreeSet::from([
+    MemberId::new(0),
+    MemberId::new(2),
+    MemberId::new(3),
+  ]));
   compio::time::timeout(
     Duration::from_secs(20),
     handles[0].reconfigure_to(target, health),

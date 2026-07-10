@@ -81,10 +81,16 @@ pub struct SlowProfile {
 }
 
 /// The virtual network: a queue of in-flight messages ordered by delivery time.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Network {
   queue: Vec<InFlight>,
   next_seq: u64,
+}
+
+impl Default for Network {
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 impl Network {

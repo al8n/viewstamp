@@ -29,12 +29,55 @@ use viewstamp_proto::{
 ///
 /// `Default` (both empty) means "no operator hint — rely on the automatic oracle", which on an idle
 /// cluster makes the shrink STALL fail-closed rather than guess.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthHint {
-  /// NEGATIVE: voters the operator KNOWS are down (disqualify from any successor quorum + remove first).
-  pub known_down: BTreeSet<MemberId>,
-  /// POSITIVE: voters the operator CONFIRMS are alive (count toward a successor quorum's positive evidence).
-  pub known_up: BTreeSet<MemberId>,
+  known_down: BTreeSet<MemberId>,
+  known_up: BTreeSet<MemberId>,
+}
+
+impl HealthHint {
+  /// No operator hint (both sets empty) — rely on the automatic oracle alone.
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      known_down: BTreeSet::new(),
+      known_up: BTreeSet::new(),
+    }
+  }
+
+  /// NEGATIVE: voters the operator KNOWS are down (disqualified from any successor quorum, removed
+  /// first). Absence from the set is NOT evidence of life.
+  #[must_use]
+  pub fn with_known_down(mut self, members: BTreeSet<MemberId>) -> Self {
+    self.known_down = members;
+    self
+  }
+
+  /// POSITIVE: voters the operator CONFIRMS are alive (counted toward a successor quorum's positive
+  /// evidence).
+  #[must_use]
+  pub fn with_known_up(mut self, members: BTreeSet<MemberId>) -> Self {
+    self.known_up = members;
+    self
+  }
+
+  /// The operator-declared down set.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn known_down(&self) -> &BTreeSet<MemberId> {
+    &self.known_down
+  }
+
+  /// The operator-confirmed alive set.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn known_up(&self) -> &BTreeSet<MemberId> {
+    &self.known_up
+  }
+}
+
+impl Default for HealthHint {
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 /// What the plan reached when a bounded-loop outcome fired. The cluster is NOT necessarily back at
@@ -48,14 +91,32 @@ pub struct HealthHint {
 /// `Ok(())` before any progress is built).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconfigureProgress {
+  live: Membership,
+  remaining: Option<Vec<SingleVoterDelta>>,
+  reason: Option<PlanError>,
+}
+
+impl ReconfigureProgress {
   /// The live membership the loop reached.
-  pub live: Membership,
-  /// The still-pending plan suffix from `live` when the plan is STILL VALID — always `Some(NON-empty)` for
-  /// a stall; `None` only when a post-start re-plan FAILED (then `reason` holds the `PlanError`).
-  pub remaining: Option<Vec<SingleVoterDelta>>,
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn live(&self) -> &Membership {
+    &self.live
+  }
+
+  /// The still-pending plan suffix from [`Self::live`] when the plan is STILL VALID — always a
+  /// NON-empty slice for a stall; `None` only when a post-start re-plan FAILED (then
+  /// [`Self::reason`] holds the `PlanError`).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn remaining(&self) -> Option<&[SingleVoterDelta]> {
+    self.remaining.as_deref()
+  }
+
   /// WHY the loop stopped: `Some(PlanError)` for a post-start planning failure (paired with
-  /// `remaining == None`), or `None` for a deadline/oscillation stall with a valid `remaining`.
-  pub reason: Option<PlanError>,
+  /// `remaining == None`), or `None` for a deadline/oscillation stall with a valid remaining plan.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn reason(&self) -> Option<&PlanError> {
+    self.reason.as_ref()
+  }
 }
 
 impl ReconfigureProgress {
@@ -163,7 +224,7 @@ fn pick_fresh_quorum_preserving_removal(
     live.members_slice()[..n].iter().copied().collect()
   };
   let is_alive = |m: &MemberId| -> bool {
-    !health.known_down.contains(m) && (health.known_up.contains(m) || responsive.contains(m))
+    !health.known_down().contains(m) && (health.known_up().contains(m) || responsive.contains(m))
   };
   // Rank: self LAST (primary sort key — retiring the local driver mid-plan ends the plan),
   // then apparently-DOWN before live (remove unresponsive peers before live ones), then
@@ -173,7 +234,7 @@ fn pick_fresh_quorum_preserving_removal(
   let mut ordered: Vec<&SingleVoterDelta> = candidates.iter().collect();
   ordered.sort_by_key(|d| {
     let m = d.member();
-    let apparently_down = health.known_down.contains(&m) || !is_alive(&m);
+    let apparently_down = health.known_down().contains(&m) || !is_alive(&m);
     (m == local_member, !apparently_down, m.get())
   });
   for cand in ordered {
@@ -599,28 +660,28 @@ impl LoopController {
 /// `Send` bound is satisfied because `LoopBackend` uses `Arc<Mutex<>>` (not `Rc`).
 pub struct ReconfigureJob {
   /// The boxed executor future, driven by the driver's poll-once-per-iteration strategy.
-  pub fut: Pin<Box<dyn Future<Output = Result<(), ReconfigureError>> + Send>>,
+  fut: Pin<Box<dyn Future<Output = Result<(), ReconfigureError>> + Send>>,
   /// The controller the driver uses to feed state + drain proposals.
-  pub controller: LoopController,
+  controller: LoopController,
   /// Completion channel: the driver sends the `run_reconfigure` result here when the future resolves.
-  pub reply: futures_channel::oneshot::Sender<Result<(), ReconfigureError>>,
+  reply: futures_channel::oneshot::Sender<Result<(), ReconfigureError>>,
   /// The op number of the in-flight `propose_membership` call, set once the driver issues it; `None`
   /// when no proposal is outstanding. Carried for the operator-visible diagnostic of which op the
   /// step minted; the install is detected by `expected_config_id`, not this.
-  pub pending_op: Option<OpNumber>,
+  pending_op: Option<OpNumber>,
   /// The config_id the outstanding proposal's successor membership WILL carry once installed, or
   /// `None` when no proposal is outstanding. It is a deterministic function of the predecessor + the
   /// proposed delta (`predecessor.apply_delta(step).config_id()`), so matching the live membership's
   /// `config_id` against it detects the EXACT successor's install — precise where an epoch-advance
   /// check is not (a cross-epoch state-sync install bumps the epoch without installing THIS step).
-  pub expected_config_id: Option<u128>,
+  expected_config_id: Option<u128>,
   /// The reply channel from `take_proposal`: the driver holds this until the successor's epoch swap
   /// is confirmed (its `config_id` becomes live), then sends `StepOutcome::Installed`.
-  pub pending_step_reply: Option<futures_channel::oneshot::Sender<StepOutcome>>,
+  pending_step_reply: Option<futures_channel::oneshot::Sender<StepOutcome>>,
   /// The deadline this job's cap fires at: armed `reconfigure_timeout` ahead of the FIRST advance
   /// (`None` until then). Each advance feeds `now >= deadline` to the executor as `cap_exhausted`, so
   /// a stalled plan resolves `Timeout` carrying its durable partial progress rather than spinning.
-  pub deadline: Option<Instant>,
+  deadline: Option<Instant>,
   /// The configured per-call deadline band, used to arm `deadline` on the first advance.
   reconfigure_timeout: Duration,
   /// The reconfiguration goal, stored so the advance-level Timeout path can re-plan and build
@@ -629,11 +690,24 @@ pub struct ReconfigureJob {
 }
 
 /// Outcome of one [`ReconfigureJob::advance`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
 pub enum AdvanceOutcome {
   /// The job is still in progress; continue on the next loop iteration.
   InFlight,
   /// The job completed (ok or err). The reply has already been sent; drop the job.
   Done,
+}
+
+impl AdvanceOutcome {
+  /// The stable string name of this outcome (snake_case, serialization-stable).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::InFlight => "in_flight",
+      Self::Done => "done",
+    }
+  }
 }
 
 impl ReconfigureJob {

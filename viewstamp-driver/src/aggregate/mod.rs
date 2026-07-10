@@ -270,7 +270,7 @@ impl ReplyLostReason {
 
 /// A batched unit's failure, classed by its RETRY CONTRACT — the class, not the reason, is what a
 /// caller's retry logic may branch on.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, derive_more::IsVariant)]
 #[non_exhaustive]
 pub enum BatchError {
   /// The unit never reached consensus: it was refused before entering any submitted body (or its

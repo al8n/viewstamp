@@ -6,7 +6,7 @@ pub struct MembershipReconciler {
 }
 
 impl MembershipReconciler {
-  pub fn new(last_config_id: u128) -> Self {
+  pub const fn new(last_config_id: u128) -> Self {
     Self { last_config_id }
   }
 

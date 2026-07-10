@@ -258,16 +258,19 @@ impl InflightBudget {
   }
 
   /// The current count of reserved in-flight slots (test/observability).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn count(&self) -> usize {
     self.count.load(Ordering::Relaxed)
   }
 
   /// The current reserved byte total (test/observability).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn bytes(&self) -> usize {
     self.bytes.load(Ordering::Relaxed)
   }
 
   /// The count cap this budget enforces (immutable after construction).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn max_count(&self) -> usize {
     self.max_count
   }
@@ -276,6 +279,7 @@ impl InflightBudget {
   /// on a single submit's body: a body longer than this can never reserve, so anything packing
   /// bodies for [`crate::Handle::submit`] must size them against it (see
   /// [`crate::Handle::submit_byte_limit`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn max_bytes(&self) -> usize {
     self.max_bytes
   }
