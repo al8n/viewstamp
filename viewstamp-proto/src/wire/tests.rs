@@ -1,12 +1,16 @@
+use std::fmt::Write as _;
+
 use bytes::Bytes;
 
-use super::{convert, messages_a, messages_b, pb};
+use super::{
+  MAX_UNKNOWN_FIELDS, convert, decode_message, encode_message, messages_a, messages_b, pb,
+};
 use crate::{
-  BlockAddress, BlockResponse, ClientId, Commit, DoViewChange, Epoch, EpochAhead, GetView,
-  LearnerProof, LearnerStatus, MemberId, Nack, OpNumber, Prepare, PrepareBatch, PrepareOk,
-  PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse, RepairBatch, ReplicaId, Reply,
-  Request, RequestLearnerProof, RequestNumber, RequestPrepare, RequestPrepareRange, RequestSync,
-  StartView, StartViewChange, SyncCheckpoint, View,
+  BlockAddress, BlockResponse, ClientId, CodecError, Commit, DoViewChange, Epoch, EpochAhead,
+  GetView, LearnerProof, LearnerStatus, MemberId, Message, Nack, OpNumber, Prepare, PrepareBatch,
+  PrepareOk, PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse, RepairBatch, ReplicaId,
+  Reply, Request, RequestLearnerProof, RequestNumber, RequestPrepare, RequestPrepareRange,
+  RequestSync, StartView, StartViewChange, SyncCheckpoint, View,
 };
 use buffa::Message as _;
 
@@ -558,4 +562,336 @@ fn block_response_with_oversized_addr_rejects() {
   let mut w = messages_b::pb_block_response(&m);
   w.addr = Bytes::from_static(&[0u8; 17]);
   assert!(messages_b::block_response_from(w).is_err());
+}
+
+// ── the public seam: encode_message / decode_message ──
+
+/// One exemplar of each of [`Message`]'s 24 variants, in declaration order, built with small
+/// deterministic field values. Shared by the round-trip and golden-vector tests below so both
+/// exercise identical values — a golden mismatch and a round-trip failure can never disagree
+/// about what was encoded.
+fn one_of_each_message() -> std::vec::Vec<Message> {
+  let client = ClientId::new(0x40);
+  let config_id = 0x50u128;
+  let prepare_checksum = 0x60u128;
+  let checkpoint_id = 0x70u128;
+  let addr = BlockAddress::from_bytes(0x90u128.to_be_bytes());
+  let body = Bytes::from_static(b"body");
+  let snapshot = Bytes::from_static(b"snapshot");
+  let membership = Bytes::from_static(b"membership");
+
+  std::vec![
+    Message::Request(Request::new(client, RequestNumber::with(80), body.clone())),
+    Message::Prepare(Prepare::new(
+      View::with(10),
+      OpNumber::with(11),
+      OpNumber::with(12),
+      OpNumber::with(13),
+      Epoch::new(14),
+      config_id,
+      client,
+      RequestNumber::with(80),
+      body.clone(),
+    )),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(10),
+      OpNumber::with(11),
+      ReplicaId::new(30),
+      OpNumber::with(13),
+      prepare_checksum,
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::Reply(Reply::new(
+      View::with(10),
+      client,
+      RequestNumber::with(80),
+      body.clone(),
+    )),
+    Message::Commit(Commit::new(
+      View::with(10),
+      OpNumber::with(12),
+      OpNumber::with(13),
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(10),
+      ReplicaId::new(30),
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::DoViewChange(
+      DoViewChange::new(
+        View::with(10),
+        View::with(15),
+        OpNumber::with(11),
+        OpNumber::with(12),
+        Epoch::new(14),
+        config_id,
+        ReplicaId::new(30),
+        mixed_log(),
+      )
+      .with_checkpoint_op(OpNumber::with(13)),
+    ),
+    Message::StartView(
+      StartView::new(
+        View::with(10),
+        OpNumber::with(11),
+        OpNumber::with(12),
+        Epoch::new(14),
+        config_id,
+        ReplicaId::new(30),
+        mixed_log(),
+      )
+      .with_checkpoint_op(OpNumber::with(13)),
+    ),
+    Message::GetView(GetView::new(
+      View::with(10),
+      ReplicaId::new(30),
+      16,
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::RequestPrepare(RequestPrepare::new(
+      View::with(10),
+      OpNumber::with(11),
+      ReplicaId::new(30),
+      config_id,
+    )),
+    Message::Recovery(Recovery::new(
+      ReplicaId::new(30),
+      16,
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::RecoveryResponse(
+      RecoveryResponse::new(
+        View::with(10),
+        OpNumber::with(11),
+        OpNumber::with(12),
+        Epoch::new(14),
+        config_id,
+        ReplicaId::new(30),
+        16,
+        mixed_log(),
+      )
+      .with_checkpoint_op(OpNumber::with(13)),
+    ),
+    Message::RequestSync(RequestSync::new(
+      View::with(10),
+      OpNumber::with(13),
+      ReplicaId::new(30),
+      16,
+      true,
+      config_id,
+    )),
+    Message::SyncCheckpoint(SyncCheckpoint::new(
+      View::with(10),
+      OpNumber::with(13),
+      checkpoint_id,
+      Epoch::new(14),
+      config_id,
+      ReplicaId::new(30),
+      16,
+      snapshot.clone(),
+      membership.clone(),
+    )),
+    Message::RequestPrepareRange(RequestPrepareRange::new(
+      View::with(10),
+      OpNumber::with(17),
+      OpNumber::with(18),
+      ReplicaId::new(30),
+      config_id,
+    )),
+    Message::RepairBatch(RepairBatch::new(
+      View::with(10),
+      OpNumber::with(12),
+      OpNumber::with(13),
+      config_id,
+      mixed_log(),
+    )),
+    Message::PrepareBatch(PrepareBatch::new(
+      View::with(10),
+      OpNumber::with(12),
+      OpNumber::with(13),
+      Epoch::new(14),
+      config_id,
+      mixed_log(),
+    )),
+    Message::LearnerStatus(LearnerStatus::new(
+      ReplicaId::new(30),
+      OpNumber::with(19),
+      OpNumber::with(20),
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::EpochAhead(EpochAhead::new(Epoch::new(14), OpNumber::with(13))),
+    Message::RequestLearnerProof(RequestLearnerProof::new(
+      ReplicaId::new(31),
+      OpNumber::with(21),
+      16,
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::LearnerProof(LearnerProof::new(
+      ReplicaId::new(30),
+      16,
+      OpNumber::with(22),
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::RequestBlock(addr),
+    Message::BlockResponse(BlockResponse::new(addr, Some(Bytes::from_static(b"block")))),
+    Message::Nack(Nack::new(
+      View::with(10),
+      OpNumber::with(11),
+      ReplicaId::new(30),
+      config_id,
+    )),
+  ]
+}
+
+/// Every [`Message`] variant survives the PUBLIC seam — `decode_message(encode_message(&m))` —
+/// with value identity, not just the per-variant conversion pair the earlier tests in this file
+/// exercise directly.
+#[test]
+fn public_seam_round_trips_every_variant() {
+  for m in one_of_each_message() {
+    let back = decode_message(encode_message(&m)).unwrap_or_else(|e| {
+      panic!(
+        "{}: decode_message(encode_message(&m)) erred: {e:?}",
+        m.kind_str()
+      )
+    });
+    assert_eq!(back, m, "{} did not round-trip", m.kind_str());
+  }
+}
+
+/// An envelope with no `Message.body` oneof arm set is the wire's "no known message" case —
+/// parity with the prior codec's unknown-tag reject — and `decode_message` must reject it.
+#[test]
+fn envelope_without_body_rejects() {
+  let frame = pb::Message::default().encode_to_bytes();
+  assert!(decode_message(frame).is_err());
+}
+
+/// A valid tiny envelope followed by `count` copies of an unknown field: field number 1000 (well
+/// outside the 24 known `Message.body` arms), wire type 0 (varint). Tag = `(1000 << 3) | 0` =
+/// 8000, varint-encoded as `[0xC0, 0x3E]`; value = varint(1) = `[0x01]`.
+fn frame_with_unknown_fields(count: usize) -> Bytes {
+  let valid = encode_message(&Message::EpochAhead(EpochAhead::new(
+    Epoch::new(1),
+    OpNumber::with(1),
+  )));
+  let mut buf = valid.to_vec();
+  for _ in 0..count {
+    buf.extend_from_slice(&[0xC0, 0x3E, 0x01]);
+  }
+  Bytes::from(buf)
+}
+
+/// A frame packed with more unknown fields than [`MAX_UNKNOWN_FIELDS`] must be rejected rather
+/// than materialize an unbounded number of `UnknownField` entries — but exactly at the allowance
+/// it still decodes, so this pins the boundary at the configured limit, not some unrelated
+/// failure (a frame this small would never legitimately trip any OTHER rejection).
+#[test]
+fn unknown_field_flood_is_bounded() {
+  assert!(
+    decode_message(frame_with_unknown_fields(MAX_UNKNOWN_FIELDS)).is_ok(),
+    "exactly MAX_UNKNOWN_FIELDS unknown fields must still decode"
+  );
+  assert!(
+    decode_message(frame_with_unknown_fields(MAX_UNKNOWN_FIELDS + 1)).is_err(),
+    "one more than MAX_UNKNOWN_FIELDS must be rejected"
+  );
+}
+
+/// Dropping the last byte of a valid frame must surface as [`CodecError::Truncated`], not any
+/// other variant and not a panic.
+#[test]
+fn truncated_envelope_maps_to_truncated() {
+  let m = Message::EpochAhead(EpochAhead::new(Epoch::new(9), OpNumber::with(3)));
+  let full = encode_message(&m);
+  let short = full.slice(..full.len() - 1);
+  match decode_message(short) {
+    Err(CodecError::Truncated { .. }) => {}
+    other => panic!("expected CodecError::Truncated, got {other:?}"),
+  }
+}
+
+/// A wire-conversion rejection (here: a 15-byte `config_id`, one byte short of the canonical 16)
+/// surfaces as [`CodecError::Malformed`] naming the offending field.
+#[test]
+fn malformed_fields_map_to_malformed() {
+  let bad = pb::Prepare {
+    config_id: Bytes::from_static(&[0u8; 15]),
+    ..Default::default()
+  };
+  let frame = pb::Message {
+    body: Some(pb::message::Body::from(bad)),
+    ..Default::default()
+  }
+  .encode_to_bytes();
+  match decode_message(frame) {
+    Err(CodecError::Malformed { what }) => assert_eq!(what, "Prepare.config_id"),
+    other => panic!("expected CodecError::Malformed(\"Prepare.config_id\"), got {other:?}"),
+  }
+}
+
+/// Renders `bytes` as a lowercase hex string for the golden vectors below (no `hex` dependency in
+/// this crate).
+fn hex(bytes: &[u8]) -> std::string::String {
+  let mut s = std::string::String::with_capacity(bytes.len() * 2);
+  for b in bytes {
+    let _ = write!(s, "{b:02x}");
+  }
+  s
+}
+
+/// Golden byte vectors: `encode_message` output for one exemplar of every [`Message`] variant
+/// (see [`one_of_each_message`]), pinned byte-for-byte in declaration order. A later DELIBERATE
+/// wire-format change updates these vectors consciously; an accidental one fails here first.
+#[test]
+fn golden_byte_vectors() {
+  let golden: [&str; 24] = [
+    "0a1a0a100000000000000000000000000000004010501a04626f6479", // Request
+    "1236080a100b180c200d280e3210000000000000000000000000000000503a100000000000000000000000000000004040504a04626f6479", // Prepare
+    "1a2e080a100b181e200d2a1000000000000000000000000000000060300e3a1000000000000000000000000000000050", // PrepareOk
+    "221c080a12100000000000000000000000000000004018502204626f6479", // Reply
+    "2a1a080a100c180d200e2a1000000000000000000000000000000050",     // Commit
+    "3218080a101e180e221000000000000000000000000000000050",         // StartViewChange
+    "3ab701080a100f180b200c280d300e3a1000000000000000000000000000000050401e4a19080112100000000000000000000000000000000118012201614a28080212100000000000000000000000000000000218022a10112233445566778899aabbccddeeff004a5008031210ffffffffffffffffffffffffffffffff1803323808021a10000000000000000000000000000000011a1000000000000000000000000000000002221000000000000000000000000000000000", // DoViewChange
+    "42b501080a100b180c200d280e321000000000000000000000000000000050381e4219080112100000000000000000000000000000000118012201614228080212100000000000000000000000000000000218022a10112233445566778899aabbccddeeff00425008031210ffffffffffffffffffffffffffffffff1803323808021a10000000000000000000000000000000011a1000000000000000000000000000000002221000000000000000000000000000000000", // StartView
+    "4a1a080a101e1810200e2a1000000000000000000000000000000050", // GetView
+    "5218080a100b181e221000000000000000000000000000000050",     // RequestPrepare
+    "5a18081e1010180e221000000000000000000000000000000050",     // Recovery
+    "62b701080a100b180c200d280e321000000000000000000000000000000050381e40104a19080112100000000000000000000000000000000118012201614a28080212100000000000000000000000000000000218022a10112233445566778899aabbccddeeff004a5008031210ffffffffffffffffffffffffffffffff1803323808021a10000000000000000000000000000000011a1000000000000000000000000000000002221000000000000000000000000000000000", // RecoveryResponse
+    "6a1c080a100d181e20102801321000000000000000000000000000000050", // RequestSync
+    "7244080a100d1a1000000000000000000000000000000070200e2a1000000000000000000000000000000050301e38104208736e617073686f744a0a6d656d62657273686970", // SyncCheckpoint
+    "7a1a080a10111812201e2a1000000000000000000000000000000050", // RequestPrepareRange
+    "8201af01080a100c180d2210000000000000000000000000000000502a19080112100000000000000000000000000000000118012201612a28080212100000000000000000000000000000000218022a10112233445566778899aabbccddeeff002a5008031210ffffffffffffffffffffffffffffffff1803323808021a10000000000000000000000000000000011a1000000000000000000000000000000002221000000000000000000000000000000000", // RepairBatch
+    "8a01b101080a100c180d200e2a10000000000000000000000000000000503219080112100000000000000000000000000000000118012201613228080212100000000000000000000000000000000218022a10112233445566778899aabbccddeeff00325008031210ffffffffffffffffffffffffffffffff1803323808021a10000000000000000000000000000000011a1000000000000000000000000000000002221000000000000000000000000000000000", // PrepareBatch
+    "92011a081e10131814200e2a1000000000000000000000000000000050", // LearnerStatus
+    "9a0104080e100d",                                             // EpochAhead
+    "a2011a081f10151810200e2a1000000000000000000000000000000050", // RequestLearnerProof
+    "aa011a081e10101816200e2a1000000000000000000000000000000050", // LearnerProof
+    "b201120a1000000000000000000000000000000090",                 // RequestBlock
+    "ba01190a10000000000000000000000000000000901205626c6f636b",   // BlockResponse
+    "c20118080a100b181e221000000000000000000000000000000050",     // Nack
+  ];
+  let msgs = one_of_each_message();
+  assert_eq!(
+    msgs.len(),
+    golden.len(),
+    "one_of_each_message count drifted from the golden table"
+  );
+  for (m, expected) in msgs.iter().zip(golden) {
+    assert_eq!(
+      hex(&encode_message(m)),
+      expected,
+      "{} golden encoding mismatch",
+      m.kind_str()
+    );
+  }
 }

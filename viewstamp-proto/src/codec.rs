@@ -85,6 +85,15 @@ pub enum CodecError {
   /// representation per value), so a non-`0`/`1` byte is a malformed frame, not a truthy value.
   #[error("invalid boolean byte: {0}")]
   InvalidBool(u8),
+  /// A wire field decoded to a value the domain type cannot represent (a wrong-length id/checksum,
+  /// an out-of-range count, an absent required oneof), or the protobuf envelope itself violated the
+  /// wire grammar (an invalid wire type, an overlong varint, a missing message body) without a more
+  /// specific variant to name it. Carries a static label naming the offending field or context.
+  #[error("malformed wire field: {what}")]
+  Malformed {
+    /// A static label naming the offending field or decode context.
+    what: &'static str,
+  },
 }
 
 impl From<crate::MembershipError> for CodecError {

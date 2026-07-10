@@ -17,16 +17,11 @@ use crate::{
 };
 
 /// Maps a wire-conversion rejection (a wrong-length id/checksum, an out-of-range count, an absent
-/// oneof) onto a `CodecError`. The streaming-decode variants were all written around a byte
-/// `Reader` cursor, not a protobuf value-level check, so none names this rejection directly; the
-/// closest is [`CodecError::TrailingBytes`] (both mean "decoded content that isn't the format's
-/// one canonical shape"), used here as the shared mapping for every such rejection so a future
-/// dedicated variant only has to change this one function's body. `what` names the offending
-/// field for that future variant; it is accepted (so call sites already read as self-documenting)
-/// but not yet threaded through.
+/// oneof) onto a [`CodecError::Malformed`], naming the offending field or bound in `what` (e.g.
+/// `"Prepare.config_id"`, `"PreparedEntry.body_state"`).
+#[cfg_attr(not(tarpaulin), inline)]
 pub(crate) fn malformed(what: &'static str) -> CodecError {
-  let _ = what;
-  CodecError::TrailingBytes(0)
+  CodecError::Malformed { what }
 }
 
 /// Encodes `v` as the canonical 16-byte big-endian wire form shared by every id/checksum field (a

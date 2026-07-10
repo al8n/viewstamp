@@ -106,3 +106,4 @@ pub use transport::{
 #[cfg(feature = "tls")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
 pub use transport::{TlsOptions, TlsRecords};
+pub use wire::{decode_message, encode_message};
