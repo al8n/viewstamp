@@ -24,5 +24,11 @@ pub(crate) use generated::viewstamp::v1 as pb;
 #[cfg_attr(not(test), allow(dead_code))]
 mod convert;
 
+// `messages_a`'s functions have no production call site yet: the envelope-level oneof dispatch
+// that will call them lands in a later addition to this module, so only the round-trip/rejection
+// tests exercise them for now, leaving them unreachable in a non-test build.
+#[cfg_attr(not(test), allow(dead_code))]
+mod messages_a;
+
 #[cfg(test)]
 mod tests;
