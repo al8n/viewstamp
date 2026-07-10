@@ -30,5 +30,10 @@ mod convert;
 #[cfg_attr(not(test), allow(dead_code))]
 mod messages_a;
 
+// `messages_b`'s functions have no production call site yet, for the same reason as
+// `messages_a` above.
+#[cfg_attr(not(test), allow(dead_code))]
+mod messages_b;
+
 #[cfg(test)]
 mod tests;

@@ -1,10 +1,12 @@
 use bytes::Bytes;
 
-use super::{convert, messages_a, pb};
+use super::{convert, messages_a, messages_b, pb};
 use crate::{
-  ClientId, Commit, DoViewChange, Epoch, GetView, MemberId, OpNumber, Prepare, PrepareOk,
-  PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse, ReplicaId, Reply, Request,
-  RequestNumber, RequestPrepare, StartView, StartViewChange, View,
+  BlockAddress, BlockResponse, ClientId, Commit, DoViewChange, Epoch, EpochAhead, GetView,
+  LearnerProof, LearnerStatus, MemberId, Nack, OpNumber, Prepare, PrepareBatch, PrepareOk,
+  PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse, RepairBatch, ReplicaId, Reply,
+  Request, RequestLearnerProof, RequestNumber, RequestPrepare, RequestPrepareRange, RequestSync,
+  StartView, StartViewChange, SyncCheckpoint, View,
 };
 use buffa::Message as _;
 
@@ -356,4 +358,204 @@ fn start_view_change_with_oversized_replica_rejects() {
   let mut w = messages_a::pb_start_view_change(&m);
   w.replica = 70_000;
   assert!(messages_a::start_view_change_from(w).is_err());
+}
+
+// ── rows 13–24: sync, windowed repair, batching, learner, block, and nack messages ──
+
+#[test]
+fn request_sync_round_trips() {
+  let m = RequestSync::new(
+    View::with(1201),
+    OpNumber::with(1202),
+    ReplicaId::new(1203),
+    1204,
+    true,
+    0x8181_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back = messages_b::request_sync_from(messages_b::pb_request_sync(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn sync_checkpoint_round_trips() {
+  let m = SyncCheckpoint::new(
+    View::with(1301),
+    OpNumber::with(1302),
+    0x8282_1111_2222_3333_4444_5555_6666_7777,
+    Epoch::new(1303),
+    0x8383_1111_2222_3333_4444_5555_6666_7777,
+    ReplicaId::new(1304),
+    1305,
+    Bytes::from_static(b"snapshot-body"),
+    Bytes::from_static(b"membership-body"),
+  );
+  let back =
+    messages_b::sync_checkpoint_from(messages_b::pb_sync_checkpoint(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn request_prepare_range_round_trips() {
+  let m = RequestPrepareRange::new(
+    View::with(1401),
+    OpNumber::with(1402),
+    OpNumber::with(1403),
+    ReplicaId::new(1404),
+    0x8484_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back = messages_b::request_prepare_range_from(messages_b::pb_request_prepare_range(&m))
+    .expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn repair_batch_round_trips() {
+  let m = RepairBatch::new(
+    View::with(1501),
+    OpNumber::with(1502),
+    OpNumber::with(1503),
+    0x8585_1111_2222_3333_4444_5555_6666_7777,
+    mixed_log(),
+  );
+  let back = messages_b::repair_batch_from(messages_b::pb_repair_batch(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn prepare_batch_round_trips() {
+  let m = PrepareBatch::new(
+    View::with(1601),
+    OpNumber::with(1602),
+    OpNumber::with(1603),
+    Epoch::new(1604),
+    0x8686_1111_2222_3333_4444_5555_6666_7777,
+    mixed_log(),
+  );
+  let back = messages_b::prepare_batch_from(messages_b::pb_prepare_batch(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn learner_status_round_trips() {
+  let m = LearnerStatus::new(
+    ReplicaId::new(1701),
+    OpNumber::with(1702),
+    OpNumber::with(1703),
+    Epoch::new(1704),
+    0x8787_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back =
+    messages_b::learner_status_from(messages_b::pb_learner_status(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn epoch_ahead_round_trips() {
+  let m = EpochAhead::new(Epoch::new(1801), OpNumber::with(1802));
+  let back = messages_b::epoch_ahead_from(messages_b::pb_epoch_ahead(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn request_learner_proof_round_trips() {
+  let m = RequestLearnerProof::new(
+    ReplicaId::new(1901),
+    OpNumber::with(1902),
+    1903,
+    Epoch::new(1904),
+    0x8888_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back = messages_b::request_learner_proof_from(messages_b::pb_request_learner_proof(&m))
+    .expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn learner_proof_round_trips() {
+  let m = LearnerProof::new(
+    ReplicaId::new(2001),
+    2002,
+    OpNumber::with(2003),
+    Epoch::new(2004),
+    0x8989_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back = messages_b::learner_proof_from(messages_b::pb_learner_proof(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn request_block_round_trips() {
+  let addr = BlockAddress::from_bytes(0x8B8B_1111_2222_3333_4444_5555_6666_7777u128.to_be_bytes());
+  let back =
+    messages_b::request_block_from(messages_b::pb_request_block(&addr)).expect("round-trip");
+  assert_eq!(back, addr);
+}
+
+#[test]
+fn block_response_round_trips_when_absent() {
+  let addr = BlockAddress::from_bytes(0x8C8C_1111_2222_3333_4444_5555_6666_7777u128.to_be_bytes());
+  let m = BlockResponse::new(addr, None);
+  let back =
+    messages_b::block_response_from(messages_b::pb_block_response(&m)).expect("round-trip");
+  assert_eq!(back, m);
+  assert!(back.is_absent());
+}
+
+#[test]
+fn block_response_round_trips_when_present_empty() {
+  let addr = BlockAddress::from_bytes(0x8C8C_1111_2222_3333_4444_5555_6666_7777u128.to_be_bytes());
+  let m = BlockResponse::new(addr, Some(Bytes::new()));
+  let back =
+    messages_b::block_response_from(messages_b::pb_block_response(&m)).expect("round-trip");
+  assert_eq!(back, m);
+  assert!(back.is_present());
+  assert_eq!(back.block(), Some(&b""[..]));
+}
+
+#[test]
+fn block_response_round_trips_when_present_with_data() {
+  let addr = BlockAddress::from_bytes(0x8C8C_1111_2222_3333_4444_5555_6666_7777u128.to_be_bytes());
+  let m = BlockResponse::new(addr, Some(Bytes::from_static(b"block-data")));
+  let back =
+    messages_b::block_response_from(messages_b::pb_block_response(&m)).expect("round-trip");
+  assert_eq!(back, m);
+  assert_eq!(back.block(), Some(&b"block-data"[..]));
+}
+
+#[test]
+fn nack_round_trips() {
+  let m = Nack::new(
+    View::with(2101),
+    OpNumber::with(2102),
+    ReplicaId::new(2103),
+    0x8A8A_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back = messages_b::nack_from(messages_b::pb_nack(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn sync_checkpoint_with_undersized_checkpoint_id_rejects() {
+  let m = SyncCheckpoint::new(
+    View::with(1),
+    OpNumber::with(1),
+    0xAB,
+    Epoch::new(0),
+    0,
+    ReplicaId::new(1),
+    0,
+    Bytes::new(),
+    Bytes::new(),
+  );
+  let mut w = messages_b::pb_sync_checkpoint(&m);
+  w.checkpoint_id = Bytes::from_static(&[0u8; 15]);
+  assert!(messages_b::sync_checkpoint_from(w).is_err());
+}
+
+#[test]
+fn block_response_with_oversized_addr_rejects() {
+  let m = BlockResponse::new(BlockAddress::from_bytes([0u8; 16]), None);
+  let mut w = messages_b::pb_block_response(&m);
+  w.addr = Bytes::from_static(&[0u8; 17]);
+  assert!(messages_b::block_response_from(w).is_err());
 }
