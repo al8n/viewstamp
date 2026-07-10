@@ -16,10 +16,13 @@ mod generated {
   #![allow(single_use_lifetimes)]
   include!(concat!(env!("OUT_DIR"), "/viewstamp_wire_generated.rs"));
 }
-// `pb` has no non-test consumer yet: the wire<->domain conversions land in
-// later additions to this module, so only the smoke test below uses it for now.
-#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use generated::viewstamp::v1 as pb;
+
+// `convert`'s functions have no production call site yet: the per-message-variant conversions
+// that will call them land in later additions to this module, so only the round-trip/rejection
+// tests exercise them for now, leaving them unreachable in a non-test build.
+#[cfg_attr(not(test), allow(dead_code))]
+mod convert;
 
 #[cfg(test)]
 mod tests;
