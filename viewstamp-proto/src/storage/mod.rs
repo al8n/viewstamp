@@ -111,14 +111,15 @@ pub const HEADER_VERSION: u16 = 1;
 
 /// On-disk superblock-root ([`VsrState`]) format version — the version NEW roots are written with, and
 /// the high end of the layout-compatible range [`VsrState::decode`] accepts. The superblock root carries
-/// its OWN version, like the disk [`Header`]'s [`HEADER_VERSION`], INDEPENDENT of the message
-/// [`WIRE_VERSION`](crate::WIRE_VERSION): a version names a disk LAYOUT, and it moves ONLY when the
-/// `VsrState` layout itself changes — never as collateral from a message-format change.
+/// its OWN version, like the disk [`Header`]'s [`HEADER_VERSION`], INDEPENDENT of the message wire
+/// format: a version names a disk LAYOUT, and it moves ONLY when the `VsrState` layout itself changes —
+/// never as collateral from a message-format change.
 ///
 /// The committed-band-header root layout was byte-identical from the first release through version `3`,
-/// but the pre-decoupling code led the root with the shared `WIRE_VERSION`, which bumped `1 → 2 → 3` for
-/// MESSAGE-only changes (the `DoViewChange`/`PreparedEntry` Repairing wire, then the `PrepareOk` field).
-/// So that ONE pre-membership root layout exists tagged `1`, `2`, AND `3`. Version `4` is the FIRST real
+/// but the pre-decoupling code led the root with a version shared with the message encoding, which
+/// bumped `1 → 2 → 3` for MESSAGE-only changes (the `DoViewChange`/`PreparedEntry` Repairing wire, then
+/// the `PrepareOk` field). So that ONE pre-membership root layout exists tagged `1`, `2`, AND `3`.
+/// Version `4` is the FIRST real
 /// `VsrState` LAYOUT change: it APPENDS a durable epoch + membership tail after the v3 body. Version `5`
 /// APPENDS a further tail — the recent-prior `config_id` lineage (the superseded ancestor ids that widen
 /// cross-epoch catch-up admission) — so a node recovering into a post-reconfiguration epoch RESTORES the
@@ -137,7 +138,7 @@ pub const HEADER_VERSION: u16 = 1;
 /// (bridged to `epoch = 0`, no membership), `4` parses that body plus the epoch/membership tail, `5`
 /// parses that plus the lineage tail, `6` parses that plus the `config_install_op` scalar, and `7`
 /// parses that plus the `log_floor` scalar — so NO
-/// persisted root is stranded and a message-only `WIRE_VERSION` bump still can never invalidate a root. A
+/// persisted root is stranded and a message-format-only change still can never invalidate a root. A
 /// future `VsrState` layout change bumps this again and extends that per-version dispatch.
 pub const SUPERBLOCK_VERSION: u16 = 7;
 

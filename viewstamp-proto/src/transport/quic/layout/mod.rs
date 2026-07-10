@@ -64,9 +64,9 @@ pub(crate) const PREPARE_BULK_THRESHOLD: usize = 64 * 1024;
 /// - State-transfer / whole-log carriers (`SyncCheckpoint`, `DoViewChange`,
 ///   `StartView`, `RecoveryResponse`) → `Bulk`.
 /// - A `Prepare` whose body exceeds `PREPARE_BULK_THRESHOLD` → `Bulk`.
-/// - A `PrepareBatch` whose encoded size exceeds `PREPARE_BULK_THRESHOLD` →
+/// - A `PrepareBatch` whose size bound exceeds `PREPARE_BULK_THRESHOLD` →
 ///   `Bulk` (the batched retransmit of the same prepares; its whole frame is
-///   what would occupy the stream, so the threshold applies to the encoding).
+///   what would occupy the stream, so the threshold applies to the frame size).
 /// - Everything else → `Control`: `Commit` / heartbeat, `PrepareOk`, `Reply`,
 ///   `StartViewChange`, `GetView`, `RequestPrepare`, `Recovery`, `RequestSync`,
 ///   `Request`, and small `Prepare`s / `PrepareBatch`es.
@@ -86,8 +86,12 @@ pub(crate) fn partition(msg: &Message, layout: StreamLayout) -> StreamClass {
     Message::Prepare(p) if p.body().len() > PREPARE_BULK_THRESHOLD => StreamClass::Bulk,
     // The batched retransmit aggregates many prepare bodies into one frame — the same
     // must-not-block-a-heartbeat rule, applied to the frame the batch actually occupies the
-    // stream with (its exact pre-encode size, `encoded_len`).
-    Message::PrepareBatch(_) if msg.encoded_len() > PREPARE_BULK_THRESHOLD => StreamClass::Bulk,
+    // stream with. Classification runs BEFORE the send-path admission gate, so it sizes the batch
+    // with `wire_size_bound` (a saturating structural upper bound) rather than `encoded_len`: the
+    // latter builds the `pb` view and returns a `u32` that a multi-GiB batch could wrap, which would
+    // both allocate the view pre-admission and misclassify. The bound is conservative (an
+    // over-threshold batch rides Bulk, never wrongly kept on Control), which is the safe direction.
+    Message::PrepareBatch(_) if msg.wire_size_bound() > PREPARE_BULK_THRESHOLD => StreamClass::Bulk,
     // All other messages — Commit/heartbeat, PrepareOk, Reply, StartViewChange,
     // GetView, RequestPrepare, Recovery, RequestSync, Request, and small
     // Prepares / PrepareBatches — ride Control.

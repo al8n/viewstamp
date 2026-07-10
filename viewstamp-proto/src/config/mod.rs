@@ -7,20 +7,20 @@ pub const DEFAULT_CHECKPOINT_OPS: u64 = 32;
 /// view-change band so its carrier fits the transport frame cap, by construction.
 ///
 /// The `DoViewChange` / `StartView` / `RecoveryResponse` log carriers emit every entry HEADER-ONLY
-/// (a fixed `PER_HEADER_ENTRY_BYTES` of 49 bytes each — see
+/// (a worst-case `PER_HEADER_ENTRY_BYTES` of 60 bytes each — see
 /// [`Endpoint::log_entries`](crate::Endpoint)), so a carrier of a `d`-op uncheckpointed band
-/// `(checkpoint_op .. op]` encodes to `d × 49 + framing` bytes regardless of body sizes. The deepest such
-/// band is bounded by the WAL/checkpoint geometry. The un-checkpointed COMMITTED prefix `commit_min −
-/// checkpoint_op` is at most about `2 × checkpoint_ops` (a checkpoint triggers at `checkpoint_op +
-/// checkpoint_ops`, and during the async checkpoint window `commit_min` advances by at most another
-/// interval before the next trigger). The uncommitted tail `op − commit_min` is at most the WAL ring
-/// capacity, which the bounded sims size at `checkpoint_ops × k` (with `k` up to 6) plus headroom (and
-/// the capacity contract requires capacity above `checkpoint_ops + pipeline` for liveness either way). So
-/// the band depth is at most about `6 × checkpoint_ops + headroom`. Capping `checkpoint_ops` at `2^15`
-/// keeps even that worst case (`6 × 2^15 + 8 = 196_616`) at or below
-/// `MAX_HEADER_ONLY_BAND_DEPTH` (`(16 MiB − 80) / 49 =
-/// 342_390`), so a header-only carrier of the deepest band stays sub-frame-cap regardless of body sizes.
-/// (A `2^20` cap would let a `49 × 2^20 ≈ 51 MiB` carrier overflow the 16 MiB frame.)
+/// `(checkpoint_op .. op]` encodes to at most `d × 60 + framing` bytes regardless of body sizes. The
+/// deepest such band is bounded by the WAL/checkpoint geometry. The un-checkpointed COMMITTED prefix
+/// `commit_min − checkpoint_op` is at most about `2 × checkpoint_ops` (a checkpoint triggers at
+/// `checkpoint_op + checkpoint_ops`, and during the async checkpoint window `commit_min` advances by at
+/// most another interval before the next trigger). The uncommitted tail `op − commit_min` is at most the
+/// WAL ring capacity, which the bounded sims size at `checkpoint_ops × k` (with `k` up to 6) plus
+/// headroom (and the capacity contract requires capacity above `checkpoint_ops + pipeline` for liveness
+/// either way). So the band depth is at most about `6 × checkpoint_ops + headroom`. Capping
+/// `checkpoint_ops` at `2^15` keeps even that worst case (`6 × 2^15 + 8 = 196_616`) at or below
+/// `MAX_HEADER_ONLY_BAND_DEPTH` (`(16 MiB − 128) / 60 =
+/// 279_618`), so a header-only carrier of the deepest band stays sub-frame-cap regardless of body sizes.
+/// (A `2^20` cap would let a `60 × 2^20 = 60 MiB` worst-case carrier overflow the 16 MiB frame.)
 /// [`Endpoint::log_entries`](crate::Endpoint) additionally `debug_assert`s each band against
 /// `MAX_HEADER_ONLY_BAND_DEPTH`, catching a bounded-WAL embedder that sized capacity beyond the `6×`
 /// geometry the cap assumes. `DEFAULT_CHECKPOINT_OPS` (32) and the sim's largest interval (about 768) sit

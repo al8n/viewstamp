@@ -1,6 +1,8 @@
 use super::*;
+use bytes::Bytes;
+
 use crate::{
-  Commit, OpNumber, ReplicaId, View,
+  Commit, OpNumber, ReplicaId, View, decode_message, encode_message,
   transport::{
     CloseCause,
     frame::LEN_PREFIX,
@@ -604,7 +606,7 @@ fn staged_then_new_frame_preserves_on_wire_order() {
   {
     let e = a.table.entry(ha).expect("A's entry");
     let mut staged1 = Vec::new();
-    encode_frame(&frame1.encode(), &mut staged1);
+    encode_frame(&encode_message(&frame1), &mut staged1);
     e.class_mut(StreamClass::Control).outbound.extend(staged1);
   }
 
@@ -640,7 +642,7 @@ fn staged_then_new_frame_preserves_on_wire_order() {
 
     b.ingest_recv(tick, hb);
     while let Some(frame) = b.next_frame(hb, StreamClass::Control) {
-      if let Ok(msg) = Message::decode(&frame) {
+      if let Ok(msg) = decode_message(Bytes::from(frame)) {
         got.push(msg);
       }
     }
@@ -762,12 +764,12 @@ fn control_and_bulk_frames_route_to_their_class_recv() {
     if got_ctrl.is_none()
       && let Some(f) = b.next_frame(hb, StreamClass::Control)
     {
-      got_ctrl = Message::decode(&f).ok();
+      got_ctrl = decode_message(Bytes::from(f)).ok();
     }
     if got_bulk.is_none()
       && let Some(f) = b.next_frame(hb, StreamClass::Bulk)
     {
-      got_bulk = Message::decode(&f).ok();
+      got_bulk = decode_message(Bytes::from(f)).ok();
     }
     if got_ctrl.is_some() && got_bulk.is_some() {
       break;
@@ -1107,7 +1109,7 @@ fn single_layout_round_trips_one_frame() {
     );
     b.ingest_recv(tick, hb);
     if let Some(f) = b.next_frame(hb, StreamClass::Control) {
-      got = Message::decode(&f).ok();
+      got = decode_message(Bytes::from(f)).ok();
       break;
     }
   }
@@ -1181,7 +1183,7 @@ fn single_layout_refuses_a_peer_opened_bulk_stream() {
     if got_ctrl.is_none()
       && let Some(f) = b.next_frame(hb, StreamClass::Control)
     {
-      got_ctrl = Message::decode(&f).ok();
+      got_ctrl = decode_message(Bytes::from(f)).ok();
     }
     // The Bulk decoder must stay empty for the whole run: the refused stream is never read into it.
     if b.next_frame(hb, StreamClass::Bulk).is_some() {
@@ -1467,7 +1469,7 @@ fn a_staged_bulk_frame_flushes_when_a_bidi_slot_frees_via_max_streams() {
   let staged = commit(0x71);
   {
     let mut framed = Vec::new();
-    encode_frame(&staged.encode(), &mut framed);
+    encode_frame(&encode_message(&staged), &mut framed);
     a.test_stage_outbound(ha, StreamClass::Bulk, &framed);
   }
 
@@ -1549,7 +1551,7 @@ fn a_staged_bulk_frame_flushes_when_a_bidi_slot_frees_via_max_streams() {
     }
     let _ = b.ingest_recv(now, hb);
     if let Some(f) = b.next_frame(hb, StreamClass::Bulk) {
-      got = Message::decode(&f).ok();
+      got = decode_message(Bytes::from(f)).ok();
       break;
     }
   }
@@ -1719,7 +1721,7 @@ fn sustained_bulk_reopen_churn_replenishes_bidi_credit_via_peer_max_streams() {
     }
     let _ = b.ingest_recv(now, hb);
     if let Some(f) = b.next_frame(hb, StreamClass::Bulk)
-      && Message::decode(&f).ok() == Some(final_frame.clone())
+      && decode_message(Bytes::from(f)).ok() == Some(final_frame.clone())
     {
       delivered = Some(final_frame.clone());
       break;
@@ -1995,7 +1997,7 @@ fn bulk_reset_reopen_resets_recv_decoder_and_frees_the_old_stream() {
     );
     new_recv = b.test_recv_id(hb, StreamClass::Bulk);
     if let Some(f) = b.next_frame(hb, StreamClass::Bulk) {
-      got_bulk = Message::decode(&f).ok();
+      got_bulk = decode_message(Bytes::from(f)).ok();
       break;
     }
   }
@@ -2758,7 +2760,7 @@ fn a_large_post_validation_control_frame_is_accepted_after_the_cap_is_raised() {
       break; // a teardown (the neuter) — leave `got` None so the assert fails informatively
     }
     while let Some(payload) = a.next_frame(ha, StreamClass::Control) {
-      if let Ok(msg) = Message::decode(&payload) {
+      if let Ok(msg) = decode_message(Bytes::from(payload)) {
         got = Some(msg);
       }
     }
@@ -2832,7 +2834,7 @@ fn a_control_frame_pipelined_after_the_hello_is_buffered_then_delivered_post_val
     RequestNumber::with(1),
     bytes::Bytes::from(vec![0x6Cu8; 1024]),
   ));
-  let big_payload = big.encode();
+  let big_payload = encode_message(&big);
   assert!(
     big_payload.len() > MAX_HELLO_LEN,
     "the pipelined frame must exceed the pre-auth cap to exercise the fix"
@@ -2920,7 +2922,7 @@ fn a_control_frame_pipelined_after_the_hello_is_buffered_then_delivered_post_val
       "the buffered larger frame decodes cleanly post-validation, no teardown (k={k})"
     );
     while let Some(payload) = a.next_frame(ha, StreamClass::Control) {
-      if let Ok(msg) = Message::decode(&payload) {
+      if let Ok(msg) = decode_message(Bytes::from(payload)) {
         got = Some(msg);
       }
     }
@@ -3104,10 +3106,11 @@ fn outbound_dials_are_bounded_by_the_connection_cap() {
 }
 
 /// An outbound message whose encoded frame would exceed [`MAX_FRAME_LEN`] is DROPPED by
-/// `write_framed`'s size preflight — never encoded, framed, or emitted as a datagram — and the
-/// connection is NOT reaped. The receive side fatals on an over-cap declared length, so emitting
-/// such a frame could only make the peer close; consensus retransmission cannot help (the message
-/// can never fit a frame), so dropping is the correct behaviour. Mirrors the byte-stream router's
+/// `write_framed`'s `wire_size_bound()` ADMISSION gate — never even built as a pb view, let alone
+/// encoded, framed, or emitted as a datagram — and the connection is NOT reaped. The receive side
+/// fatals on an over-cap declared length, so emitting such a frame could only make the peer close;
+/// consensus retransmission cannot help (the message can never fit a frame), so dropping is the
+/// correct behaviour. Mirrors the byte-stream router's
 /// `an_oversized_outbound_frame_is_dropped_and_the_conn_stays_open`.
 #[test]
 fn an_oversized_message_is_dropped_before_encoding_and_not_transmitted() {
@@ -3132,7 +3135,8 @@ fn an_oversized_message_is_dropped_before_encoding_and_not_transmitted() {
 
   // A `SyncCheckpoint` whose snapshot alone is `MAX_FRAME_LEN` bytes — the surrounding header pushes
   // the encoded length strictly over the cap. Only ONE such message is allocated, and the preflight
-  // is asserted via the cheap `encoded_len()` so no second 16 MiB copy is paid.
+  // is asserted via the cheap `wire_size_bound()` — the ADMISSION gate `write_framed` actually
+  // checks, BEFORE building the pb view or encoding — so no second 16 MiB copy is paid.
   let snapshot = bytes::Bytes::from(vec![0u8; MAX_FRAME_LEN as usize]);
   let huge = Message::SyncCheckpoint(SyncCheckpoint::new(
     View::with(1),
@@ -3146,8 +3150,12 @@ fn an_oversized_message_is_dropped_before_encoding_and_not_transmitted() {
     bytes::Bytes::new(),
   ));
   assert!(
+    huge.wire_size_bound() > MAX_FRAME_LEN as usize,
+    "the crafted message's wire_size_bound() exceeds the frame cap (checked without encoding)"
+  );
+  assert!(
     huge.encoded_len() > MAX_FRAME_LEN as usize,
-    "the crafted message's encoded length exceeds the frame cap (checked without encoding)"
+    "the crafted message's encoded length also exceeds the frame cap (sanity check)"
   );
   assert_eq!(a.oversized_dropped(), 0, "no oversize recorded yet");
 
@@ -3197,6 +3205,191 @@ fn an_oversized_message_is_dropped_before_encoding_and_not_transmitted() {
     a.oversized_dropped(),
     1,
     "a normal-sized message does not increment the oversized counter"
+  );
+}
+
+/// The classify-then-admit regression for a `PrepareBatch`: `layout::partition`'s `PrepareBatch` arm
+/// sizes the batch with `wire_size_bound()` — a saturating, allocation-free structural bound — rather
+/// than `encoded_len()`, which would build the `pb` view (allocating) BEFORE `write_framed`'s own
+/// admission gate ever runs. This drives BOTH calls in their true production order — `partition` (the
+/// classifier `write_to_peer` calls first), then `write_framed` (the admission gate at
+/// bridge/mod.rs's `wire_size_bound() > MAX_FRAME_LEN` check) — over a REAL validated connection, and
+/// proves the oversized batch is refused at admission on whichever class it was classified onto,
+/// with no frame ever built or observed by the peer on either stream class.
+///
+/// NEUTER CHECK: reverting `partition`'s `PrepareBatch` arm to `msg.encoded_len()` still passes this
+/// test (both measures agree well below the `u32`-wrap regime this crafted 16 MiB+1 batch exercises),
+/// but it is exactly the call `layout::tests::control_and_bulk_classify_as_expected` pins as unsound
+/// pre-admission — this test's job is only to prove the PRODUCTION ROUTE refuses the batch, not to
+/// re-litigate which sizing call classification uses.
+#[test]
+fn an_oversized_prepare_batch_is_refused_before_classification_builds_a_view() {
+  use crate::{ClientId, PreparedEntry, RequestNumber, message::PrepareBatch};
+
+  let Linked {
+    mut a,
+    mut b,
+    a_addr,
+    b_addr,
+    ha,
+    hb,
+    now: start,
+  } = connect_two_bridges(StreamLayout::ControlBulk);
+  let peer_b = Peer::Replica(ReplicaId::new(1));
+  let peer_a = Peer::Replica(ReplicaId::new(0));
+  let now = start + Duration::from_millis(5);
+
+  // Open A's send streams and validate BOTH sides so `write_framed` would otherwise flush to the
+  // wire and B's `ingest_recv` actually runs (rather than early-outing pre-validation).
+  a.open_send_and_preface(now, ha, &[]);
+  a.bind_validated(now, ha, peer_b);
+  b.bind_validated(now, hb, peer_a);
+
+  // Drain any datagrams the open/bind produced so the post-write checks below see only what the
+  // oversized route would add (which must be NOTHING).
+  while a.poll_transmit().is_some() {}
+
+  // A `PrepareBatch` carrying one entry whose body alone is one byte over `MAX_FRAME_LEN`; the
+  // carrier + per-entry framing pushes `wire_size_bound()` further past the cap. Only ONE such
+  // message is allocated.
+  let body = Bytes::from(vec![0u8; MAX_FRAME_LEN as usize + 1]);
+  let huge = Message::PrepareBatch(PrepareBatch::new(
+    View::with(1),
+    OpNumber::with(0),
+    OpNumber::with(0),
+    crate::Epoch::new(0),
+    0,
+    vec![PreparedEntry::new(
+      OpNumber::with(1),
+      ClientId::new(1),
+      RequestNumber::with(1),
+      body,
+    )],
+  ));
+  assert!(
+    huge.wire_size_bound() > MAX_FRAME_LEN as usize,
+    "the crafted batch's wire_size_bound() exceeds the frame cap (checked without building the pb view)"
+  );
+
+  // Classify through the REAL production function, in the REAL order `write_to_peer` calls it —
+  // BEFORE `write_framed`'s admission gate — proving classification alone does not choke on (or
+  // misclassify) an oversized batch.
+  let class = crate::transport::quic::layout::partition(&huge, StreamLayout::ControlBulk);
+  assert!(
+    class.is_bulk(),
+    "an over-threshold batch classifies onto Bulk, the conservative direction"
+  );
+
+  assert_eq!(a.oversized_dropped(), 0, "no oversize recorded yet");
+  let control_outbound_before = a
+    .table
+    .entry(ha)
+    .map(|e| e.class_mut(StreamClass::Control).outbound.len())
+    .expect("A's entry");
+  let bulk_outbound_before = a
+    .table
+    .entry(ha)
+    .map(|e| e.class_mut(StreamClass::Bulk).outbound.len())
+    .expect("A's entry");
+
+  // Admit through the production choke-point with the class `partition` picked.
+  a.write_framed(now, ha, class, &huge);
+
+  assert_eq!(
+    a.oversized_dropped(),
+    1,
+    "the oversized PrepareBatch is refused at write_framed's admission gate and counted"
+  );
+  assert_eq!(
+    a.table
+      .entry(ha)
+      .map(|e| e.class_mut(StreamClass::Control).outbound.len()),
+    Some(control_outbound_before),
+    "no framed bytes are staged on Control for a batch that failed the size preflight"
+  );
+  assert_eq!(
+    a.table
+      .entry(ha)
+      .map(|e| e.class_mut(StreamClass::Bulk).outbound.len()),
+    Some(bulk_outbound_before),
+    "no framed bytes are staged on Bulk either — the class partition picked still refuses"
+  );
+  assert!(
+    a.poll_transmit().is_none(),
+    "an oversized PrepareBatch must not produce any outbound datagram"
+  );
+
+  // Ferry forward: the peer must never observe a frame on either class, since none was ever built.
+  let mut pipe_to_a = PacketPipe::default();
+  let mut pipe_to_b = PacketPipe::default();
+  for k in 1..20u64 {
+    let tick = now + Duration::from_millis(k * 5);
+    ferry_once(
+      &mut a,
+      &mut b,
+      a_addr,
+      b_addr,
+      &mut pipe_to_a,
+      &mut pipe_to_b,
+      tick,
+    );
+    b.ingest_recv(tick, hb);
+  }
+  assert_eq!(
+    b.test_ready_len(hb, StreamClass::Control),
+    0,
+    "no frame is ready on the peer's Control class"
+  );
+  assert_eq!(
+    b.test_ready_len(hb, StreamClass::Bulk),
+    0,
+    "no frame is ready on the peer's Bulk class"
+  );
+  assert!(
+    b.next_frame(hb, StreamClass::Control).is_none(),
+    "no frame was ever queued on Control"
+  );
+  assert!(
+    b.next_frame(hb, StreamClass::Bulk).is_none(),
+    "no frame was ever queued on Bulk"
+  );
+
+  // A normal-sized frame still routes on the same connection afterwards and does not bump the
+  // oversized counter.
+  a.write_framed(now, ha, StreamClass::Control, &commit(0x01));
+  assert_eq!(
+    a.oversized_dropped(),
+    1,
+    "a normal-sized message does not increment the oversized counter"
+  );
+}
+
+/// `frame_checked`'s `len` parameter is a caller-supplied estimate computed BEFORE `payload` runs
+/// (`Message::encoded_len()` for a consensus send, via the pb view `write_framed` builds). A
+/// message whose true size nears 4 GiB could wrap that estimate below the cap via buffa's
+/// unchecked `u32` accumulation while the real encoding is not — unreproducible here with an
+/// actual message, so this drives `frame_checked` directly with a `len` that UNDERSTATES the
+/// payload (as a wrapped estimate would), pinning that the backstop re-checks the bytes `payload`
+/// actually produces and refuses (counting it) regardless of what `len` claimed.
+#[test]
+fn frame_checked_backstop_refuses_bytes_over_the_cap_even_when_len_understates_them() {
+  let opts = QuicOptions::accept_any_for_test();
+  let mut a = Bridge::new(&opts, Some([0x11; 32]));
+  assert_eq!(a.oversized_dropped(), 0, "no oversize recorded yet");
+
+  // `len = 0` lies that the payload is empty; only the backstop (which re-checks the bytes the
+  // closure actually returns) can catch this one.
+  let oversized = vec![0u8; MAX_FRAME_LEN as usize + 1];
+  let framed = a.frame_checked(0, || oversized);
+
+  assert!(
+    framed.is_none(),
+    "the backstop refuses a produced payload over the cap even though `len` said 0"
+  );
+  assert_eq!(
+    a.oversized_dropped(),
+    1,
+    "the backstop counts its refusal through the same oversized-dropped counter as the preflight"
   );
 }
 
@@ -4763,7 +4956,8 @@ fn bulk_is_not_read_or_credited_before_the_peer_identity_validates() {
     // Skip the Control keepalive frames; find the one Bulk frame B sent pre-validation.
     while a.next_frame(ha, StreamClass::Control).is_some() {}
     if let Some(payload) = a.next_frame(ha, StreamClass::Bulk) {
-      bulk_msg_received = Some(Message::decode(&payload).expect("a valid framed Bulk message"));
+      bulk_msg_received =
+        Some(decode_message(Bytes::from(payload)).expect("a valid framed Bulk message"));
       break;
     }
   }
@@ -4891,7 +5085,7 @@ fn pre_auth_bulk_is_read_immediately_after_validation_without_new_traffic() {
   }
   while a.next_frame(ha, StreamClass::Control).is_some() {}
   if let Some(payload) = a.next_frame(ha, StreamClass::Bulk) {
-    delivered = Message::decode(&payload).ok();
+    delivered = decode_message(Bytes::from(payload)).ok();
   }
   assert_eq!(
     delivered,
@@ -5666,7 +5860,7 @@ fn peer_control_recv_fin_delivers_frames_before_reaping(layout: StreamLayout) {
   // Deliver the queued frame, exactly as `drain_bridge`'s `next_frame` drain does.
   let delivered = a
     .next_frame(ha, StreamClass::Control)
-    .and_then(|payload| Message::decode(&payload).ok());
+    .and_then(|payload| decode_message(Bytes::from(payload)).ok());
   // The deferred teardown is queued; running it (as `drain_bridge` does after the frame drain) reaps.
   let mut deferred_close = false;
   if let Some((hh, cls, disp)) = a.take_pending_fin_close() {
@@ -5810,7 +6004,7 @@ fn peer_bulk_recv_fin_delivers_frames_before_retiring() {
   );
   let delivered = a
     .next_frame(ha, StreamClass::Bulk)
-    .and_then(|payload| Message::decode(&payload).ok());
+    .and_then(|payload| decode_message(Bytes::from(payload)).ok());
   let mut deferred_retire = false;
   if let Some((hh, cls, disp)) = a.take_pending_fin_close() {
     assert_eq!(
@@ -5914,7 +6108,7 @@ fn peer_recv_fin_mid_frame_reaps_as_truncation(
   // bytes) or the whole prefix plus a partial body. B writes exactly that prefix raw onto its `class`
   // send stream and FINs — so A reads `[partial-frame][FIN]` and the decoder is left mid-frame.
   let mut framed = Vec::new();
-  encode_frame(&commit(0x7C).encode(), &mut framed);
+  encode_frame(&encode_message(&commit(0x7C)), &mut framed);
   let cut = match trunc {
     Truncation::SplitPrefix => 2,
     // Prefix (4) + a few body bytes, but strictly fewer than the whole frame.
@@ -6115,9 +6309,9 @@ fn peer_recv_fin_complete_then_partial_delivers_prefix_then_reaps(class: StreamC
   // survive; the torn one must not.
   let complete = commit(0xC0);
   let mut bytes = Vec::new();
-  encode_frame(&complete.encode(), &mut bytes);
+  encode_frame(&encode_message(&complete), &mut bytes);
   let mut second = Vec::new();
-  encode_frame(&commit(0xD1).encode(), &mut second);
+  encode_frame(&encode_message(&commit(0xD1)), &mut second);
   let torn_cut = LEN_PREFIX + 3;
   assert!(
     torn_cut < second.len(),
@@ -6188,7 +6382,7 @@ fn peer_recv_fin_complete_then_partial_delivers_prefix_then_reaps(class: StreamC
   // Deliver the queued frame, exactly as `drain_bridge`'s `next_frame` drain does.
   let delivered_before_close = a
     .next_frame(ha, class)
-    .and_then(|payload| Message::decode(&payload).ok());
+    .and_then(|payload| decode_message(Bytes::from(payload)).ok());
   assert_eq!(
     delivered_before_close.as_ref(),
     Some(&complete),
@@ -6284,7 +6478,7 @@ fn peer_control_recv_frame_too_long_behind_complete_frame_delivers_prefix_then_r
   // oversized prefix trips `FrameTooLong` after the complete frame is already queued.
   let complete = commit(0xE2);
   let mut bytes = Vec::new();
-  encode_frame(&complete.encode(), &mut bytes);
+  encode_frame(&encode_message(&complete), &mut bytes);
   bytes.extend_from_slice(&(MAX_FRAME_LEN + 1).to_be_bytes());
 
   let b_send = b
@@ -6338,7 +6532,7 @@ fn peer_control_recv_frame_too_long_behind_complete_frame_delivers_prefix_then_r
   );
   let delivered_before_close = a
     .next_frame(ha, StreamClass::Control)
-    .and_then(|payload| Message::decode(&payload).ok());
+    .and_then(|payload| decode_message(Bytes::from(payload)).ok());
   assert_eq!(
     delivered_before_close.as_ref(),
     Some(&complete),
@@ -6541,7 +6735,7 @@ fn preauth_control_fin_with_complete_tail_validates_then_reaps(layout: StreamLay
     RequestNumber::with(1),
     bytes::Bytes::from(vec![0x6Cu8; 1024]),
   ));
-  let pipelined_payload = pipelined.encode();
+  let pipelined_payload = encode_message(&pipelined);
   assert!(
     pipelined_payload.len() > MAX_HELLO_LEN,
     "the pipelined frame must exceed the pre-auth cap to exercise the buffered-tail path"
@@ -6616,7 +6810,7 @@ fn preauth_control_fin_with_complete_tail_validates_then_reaps(layout: StreamLay
   // delivered — `drain_bridge`'s same-pass `next_frame` loop pops it right after validation.
   let pipelined_got = a
     .next_frame(ha, StreamClass::Control)
-    .and_then(|p| Message::decode(&p).ok());
+    .and_then(|p| decode_message(Bytes::from(p)).ok());
   assert_eq!(
     pipelined_got,
     Some(pipelined),
@@ -6707,7 +6901,7 @@ fn preauth_control_fin_with_partial_tail_validates_then_reaps(layout: StreamLayo
     RequestNumber::with(1),
     bytes::Bytes::from(vec![0x6Cu8; 1024]),
   ));
-  let pipelined_payload = pipelined.encode();
+  let pipelined_payload = encode_message(&pipelined);
   let mut framed_tail = Vec::new();
   encode_frame(&pipelined_payload, &mut framed_tail);
   // `[hello][PREFIX of the pipelined frame]`: keep the whole hello frame plus only part of the tail

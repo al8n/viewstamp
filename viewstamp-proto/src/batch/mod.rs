@@ -43,11 +43,11 @@ pub const BATCH_COUNT_OVERHEAD: usize = 4;
 /// Fixed bytes each unit costs beyond its own length: its big-endian `u32` length prefix.
 pub const BATCH_UNIT_OVERHEAD: usize = 4;
 
-/// The largest budget a builder honors. The count and per-unit length prefixes are `u32`, and the
-/// message layer length-prefixes every body with a `u32` (`codec::write_bytes_u32`), so no body
-/// over `u32::MAX` bytes is encodable anyway; clamping the budget here is what lets `push` prove —
-/// from `total <= budget` alone — that every emitted length fits its prefix and that the unit
-/// count can never reach `u32::MAX`.
+/// The largest budget a builder honors. The count and per-unit length prefixes of THIS batch
+/// layout are `u32`, and the transport frames every message under `MAX_FRAME_LEN` (itself a `u32`),
+/// so no body over `u32::MAX` bytes is deliverable anyway; clamping the budget here is what lets
+/// `push` prove — from `total <= budget` alone — that every emitted length fits its prefix and that
+/// the unit count can never reach `u32::MAX`.
 const BUDGET_CAP: usize = u32::MAX as usize;
 
 /// A pushed unit does not fit the batch: its length prefix plus its bytes would lift the encoded

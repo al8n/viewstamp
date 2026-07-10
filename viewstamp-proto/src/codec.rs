@@ -1,16 +1,19 @@
-//! Versioned, canonical, bounds-checked wire/disk codec primitives shared by the
-//! durable ([`Header`](crate::Header)/[`VsrState`](crate::VsrState)) and message
-//! ([`Message`](crate::Message)) encodings.
+//! Versioned, canonical, bounds-checked disk codec primitives for the durable
+//! ([`Header`](crate::Header)/[`VsrState`](crate::VsrState)) encodings, plus the [`CodecError`]
+//! surface a decoded [`Message`](crate::Message) wire envelope also reports through.
 //!
 //! The proto owns no I/O; a later I/O layer (TCP networking + async disk storage) serializes these
 //! value types over the wire and onto disk, so the encoding is **part of the protocol
-//! contract**, not a driver detail. The three requirements every encoding here meets:
+//! contract**, not a driver detail. The MESSAGE encoding itself is the protobuf wire envelope
+//! (`crate::wire`; `encode_message`/`decode_message`) — a peer's wire version is fenced once, at the
+//! transport handshake (`HELLO_VERSION`), not carried by every message. The DURABLE on-disk forms
+//! version INDEPENDENTLY of that handshake fence and of each other (the [`Header`] via
+//! [`HEADER_VERSION`](crate::HEADER_VERSION), the superblock root [`VsrState`](crate::VsrState) via
+//! [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION)), so neither a message-format change nor the
+//! other durable form ever invalidates a persisted root. The requirements the durable codecs meet:
 //!
-//! - **Versioned** — every MESSAGE encoding leads with [`WIRE_VERSION`]; the DURABLE on-disk forms
-//!   version INDEPENDENTLY (the [`Header`] via [`HEADER_VERSION`](crate::HEADER_VERSION), the superblock
-//!   root [`VsrState`](crate::VsrState) via [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION)), so a
-//!   message-format change never invalidates a persisted root. Decode REJECTS an unknown version with
-//!   [`CodecError::UnknownVersion`] so each format can evolve.
+//! - **Versioned** — decode REJECTS an unknown leading version with [`CodecError::UnknownVersion`]
+//!   so each on-disk format can evolve.
 //! - **Canonical** — a fixed field order, big-endian scalars (matching the existing
 //!   `Header::compute_checksum` `to_be_bytes` order), length-prefixed variable parts.
 //! - **Bounds-checked, panic-free decode** — decode takes `&[u8]` and returns
@@ -18,25 +21,14 @@
 //!   corrupt, or adversarial buffer (the internal `Reader` below length-checks every read,
 //!   mirroring `Endpoint::decode_checkpoint`).
 
-use bytes::BufMut;
-
-/// The MESSAGE wire format version every [`Message`](crate::Message) encoding leads with. The DURABLE
-/// on-disk forms version INDEPENDENTLY — the [`Header`](crate::Header) via
-/// [`HEADER_VERSION`](crate::HEADER_VERSION), the superblock root [`VsrState`](crate::VsrState) via
-/// [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION) — so a message-only bump here never invalidates a
-/// persisted root or blocks a rolling upgrade. A decode that reads a different version fails with
-/// [`CodecError::UnknownVersion`] rather than misinterpreting later bytes, letting each format evolve
-/// without silently reinterpreting old/foreign data.
-pub const WIRE_VERSION: u16 = 14;
-
 /// A typed, structured error from decoding a [`Header`](crate::Header),
 /// [`VsrState`](crate::VsrState), or [`Message`](crate::Message) from bytes (or from a
 /// [`VsrState`](crate::VsrState) whose decoded fields violate its invariants).
 ///
-/// Every variant is a *parse* outcome, never a panic: a short buffer, an unknown version
-/// or message tag, a length prefix that overruns the remaining bytes, or trailing garbage
-/// each map to a distinct variant so a caller (and the fuzz/corruption tests) can tell
-/// *why* a buffer was rejected.
+/// Every variant is a *parse* outcome, never a panic: a short buffer, an unknown version,
+/// a length prefix that overruns the remaining bytes, trailing garbage, or a malformed
+/// wire field each map to a distinct variant so a caller (and the fuzz/corruption tests)
+/// can tell *why* a buffer was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CodecError {
@@ -49,14 +41,12 @@ pub enum CodecError {
     /// The number of bytes actually remaining.
     got: usize,
   },
-  /// The leading format version did not match [`WIRE_VERSION`] (or, for a [`Header`](crate::Header),
-  /// [`HEADER_VERSION`](crate::HEADER_VERSION)). Carries the version that was read.
+  /// The leading format version did not match the decoder's expectation — for a
+  /// [`Header`](crate::Header), [`HEADER_VERSION`](crate::HEADER_VERSION); for a durable
+  /// [`VsrState`](crate::VsrState) root, [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION) (or an
+  /// older layout-compatible version it still parses). Carries the version that was read.
   #[error("unknown wire/disk version: {0}")]
   UnknownVersion(u16),
-  /// The leading [`Message`](crate::Message) discriminant tag did not name a known variant.
-  /// Carries the unknown tag byte.
-  #[error("unknown message tag: {0}")]
-  UnknownTag(u8),
   /// A length-prefixed field's prefix named more elements/bytes than the rest of the buffer
   /// could contain (a corrupt or adversarial length). Distinct from [`Self::Truncated`] so a
   /// hostile oversized prefix is not confused with an honestly-short tail.
@@ -81,10 +71,15 @@ pub enum CodecError {
   /// `1` (a membership block follows). Carries the unexpected byte.
   #[error("invalid membership-present flag: {0}")]
   InvalidMembershipPresent(u8),
-  /// A boolean-encoded field was neither `0` nor `1`. The wire form is canonical (exactly one byte
-  /// representation per value), so a non-`0`/`1` byte is a malformed frame, not a truthy value.
-  #[error("invalid boolean byte: {0}")]
-  InvalidBool(u8),
+  /// A wire field decoded to a value the domain type cannot represent (a wrong-length id/checksum,
+  /// an out-of-range count, an absent required oneof), or the protobuf envelope itself violated the
+  /// wire grammar (an invalid wire type, an overlong varint, a missing message body) without a more
+  /// specific variant to name it. Carries a static label naming the offending field or context.
+  #[error("malformed wire field: {what}")]
+  Malformed {
+    /// A static label naming the offending field or decode context.
+    what: &'static str,
+  },
 }
 
 impl From<crate::MembershipError> for CodecError {
@@ -180,21 +175,6 @@ impl<'a> Reader<'a> {
     Ok(u128::from_be_bytes(b))
   }
 
-  /// Reads a `u32`-length-prefixed byte run (a `Bytes` payload), validating the prefix against
-  /// the bytes that actually remain: a prefix exceeding the remainder is a corrupt or adversarial
-  /// length, reported as [`CodecError::LengthOverflow`] rather than an out-of-range slice.
-  #[cfg_attr(not(tarpaulin), inline)]
-  pub(crate) fn bytes_u32(&mut self) -> Result<&'a [u8], CodecError> {
-    let len = self.u32()? as usize;
-    if len > self.remaining() {
-      return Err(CodecError::LengthOverflow {
-        len,
-        remaining: self.remaining(),
-      });
-    }
-    self.take(len)
-  }
-
   /// Reads a `u32` element-count for a length-prefixed sequence, rejecting a count that
   /// could not possibly fit (each element is at least `min_elem_len` bytes) as
   /// [`CodecError::LengthOverflow`] *before* any element is parsed — so a hostile huge count
@@ -215,21 +195,4 @@ impl<'a> Reader<'a> {
     }
     Ok(count)
   }
-}
-
-/// Appends a `u32`-length-prefixed copy of `bytes` to `out` (the canonical variable-length
-/// payload framing read back by [`Reader::bytes_u32`]: a big-endian `u32` byte count, then the
-/// bytes). Used to frame every `Bytes` payload + snapshot envelope in a message.
-#[cfg_attr(not(tarpaulin), inline)]
-pub(crate) fn write_bytes_u32(out: &mut impl BufMut, bytes: &[u8]) {
-  // The length prefix is a `u32`; a payload at/above 4 GiB would silently truncate the count and corrupt
-  // the frame. No proto payload approaches this (a message is frame-bounded well below 4 GiB), so it is a
-  // `debug_assert` guarding the cast rather than a runtime branch.
-  debug_assert!(
-    bytes.len() <= u32::MAX as usize,
-    "write_bytes_u32: payload length {} exceeds u32::MAX",
-    bytes.len()
-  );
-  out.put_u32(bytes.len() as u32);
-  out.put_slice(bytes);
 }

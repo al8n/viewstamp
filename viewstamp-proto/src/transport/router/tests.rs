@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
   LabelOptions, Labeled, MemberId, Message, OpNumber, Peer, Recipient, ReplicaId, View,
-  message::Commit, transport::stream::RecordIo,
+  encode_message, message::Commit, transport::stream::RecordIo,
 };
 
 fn conn() -> Conn<crate::Passthrough> {
@@ -269,7 +269,7 @@ fn the_cap_accounts_for_the_queued_handshake_hello() {
   };
   let framed_len = {
     let mut framed = Vec::new();
-    encode_frame(&commit_msg().encode(), &mut framed);
+    encode_frame(&encode_message(&commit_msg()), &mut framed);
     framed.len()
   };
   let cap = hello_len + framed_len;
@@ -447,7 +447,7 @@ fn a_conn_aborted_by_route_is_reaped_and_a_standby_is_promoted_in_the_same_pass(
   // overflows and aborts it.
   let framed_len = {
     let mut framed = Vec::new();
-    encode_frame(&commit_msg().encode(), &mut framed);
+    encode_frame(&encode_message(&commit_msg()), &mut framed);
     framed.len()
   };
   let mut r = PeerRouter::<crate::Passthrough>::with_outbound_cap(framed_len);
@@ -624,16 +624,21 @@ fn an_oversized_outbound_frame_is_dropped_and_the_conn_stays_open() {
   // needlessly close an otherwise healthy conn. The conn must stay open with nothing queued, and
   // the oversize must be surfaced via the oversized-dropped counter (not silently counted as sent).
   // A body of MAX_FRAME_LEN bytes plus the message header encodes to strictly more than
-  // MAX_FRAME_LEN. Only ONE such message is allocated, and the preflight check is asserted via the
-  // cheap encoded_len() so no second 16 MiB copy is made.
+  // MAX_FRAME_LEN. Only ONE such message is allocated, and the preflight is asserted via the cheap
+  // wire_size_bound() — the ADMISSION gate `route()` actually checks, BEFORE building the pb view
+  // or encoding — so no second 16 MiB copy is made.
   let mut r = PeerRouter::<crate::Passthrough>::new();
   let peer = Peer::Replica(ReplicaId::new(1));
   let c = established(&mut r, peer);
   let body = bytes::Bytes::from(std::vec![0u8; MAX_FRAME_LEN as usize]);
   let huge = Message::Request(Request::new(ClientId::new(1), RequestNumber::with(1), body));
   assert!(
+    huge.wire_size_bound() > MAX_FRAME_LEN as usize,
+    "the crafted message's wire_size_bound() exceeds the frame cap (checked without encoding)"
+  );
+  assert!(
     huge.encoded_len() > MAX_FRAME_LEN as usize,
-    "the crafted message's encoded length exceeds the frame cap (checked without encoding)"
+    "the crafted message's encoded length also exceeds the frame cap (sanity check)"
   );
   assert_eq!(r.oversized_dropped(), 0, "no oversize recorded yet");
   let dropped = r.route(Recipient::To(peer), &huge, ReplicaId::new(9));
@@ -664,5 +669,23 @@ fn an_oversized_outbound_frame_is_dropped_and_the_conn_stays_open() {
   assert!(
     r.conn(c).unwrap().queued_outbound() > 0,
     "a normal message is queued on the still-open conn"
+  );
+}
+
+#[test]
+fn frame_fits_pins_the_boundary_the_post_encode_backstop_relies_on() {
+  use crate::transport::frame::MAX_FRAME_LEN;
+  // `route()`'s post-encode backstop re-checks the bytes it actually produced against this exact
+  // predicate — the same one the preflight above checks the `encoded_len()` estimate against. A
+  // real message that disagrees between the two (the u32-wraparound the backstop guards against)
+  // cannot be constructed in a unit test short of allocating a message nearing 4 GiB, so this pins
+  // the boundary the predicate itself enforces directly.
+  assert!(
+    frame_fits(MAX_FRAME_LEN as usize),
+    "exactly at the cap fits"
+  );
+  assert!(
+    !frame_fits(MAX_FRAME_LEN as usize + 1),
+    "one byte over the cap does not fit"
   );
 }

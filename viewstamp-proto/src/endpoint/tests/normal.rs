@@ -1,6 +1,7 @@
 use super::{super::*, *};
 use crate::{
   ClientId, Config, Header, OpId, OpNumber, ReplicaId, Request, RequestNumber, SlotStatus, View,
+  encode_message,
 };
 
 #[test]
@@ -1023,7 +1024,7 @@ fn a_quorum_checkpoint_report_advances_prune_floor_without_a_gc_trim_yet_the_car
     ReplicaId::new(0),
     e.log_entries(),
   ));
-  let n = dvc.encode().len();
+  let n = encode_message(&dvc).len();
   assert!(
     n <= cap,
     "the header-only DoViewChange carrier must fit the frame cap: {n} > {cap}"
@@ -1128,7 +1129,7 @@ fn a_backup_whose_checkpoint_lags_while_it_accepts_prepares_keeps_its_carrier_un
     ReplicaId::new(1),
     e.log_entries(),
   ));
-  let n = dvc.encode().len();
+  let n = encode_message(&dvc).len();
   assert!(
     n <= cap,
     "the lagging backup's header-only DoViewChange carrier must fit the frame cap: {n} > {cap}"
@@ -1144,7 +1145,7 @@ fn a_backup_whose_checkpoint_lags_while_it_accepts_prepares_keeps_its_carrier_un
     0xC0FFEE,
     e.log_entries(),
   ));
-  let nr = rr.encode().len();
+  let nr = encode_message(&rr).len();
   assert!(
     nr <= cap,
     "the lagging backup's RecoveryResponse carrier must fit the frame cap: {nr} > {cap}"

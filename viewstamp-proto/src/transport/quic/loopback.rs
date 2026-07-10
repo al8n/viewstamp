@@ -27,7 +27,7 @@ use bytes::Bytes;
 
 use crate::{
   ClientId, Commit, Config, Endpoint, Event, Instant, MemberId, Message, OpNumber, Peer, ReplicaId,
-  RequestNumber, SingleChange, View,
+  RequestNumber, SingleChange, View, encode_message,
   message::Request,
   transport::{
     frame::{LEN_PREFIX, STAGE_CHUNK, encode_frame},
@@ -949,7 +949,7 @@ fn a_buffered_tiny_frame_window_drains_one_budget_per_pump() {
       crate::Epoch::new(0),
       0,
     ));
-    encode_frame(&msg.encode(), &mut blob);
+    encode_frame(&encode_message(&msg), &mut blob);
     frames += 1;
   }
   let total_frames = frames;

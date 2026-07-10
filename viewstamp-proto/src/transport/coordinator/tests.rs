@@ -3,6 +3,7 @@ use std::vec;
 use super::*;
 use crate::{
   ClientId, Config, LabelOptions, Labeled, MemberId, ReplicaId, RequestNumber, SingleChange,
+  encode_message,
   message::Request,
   transport::{
     Passthrough,
@@ -206,7 +207,7 @@ fn a_large_multi_chunk_read_is_processed_without_closing_the_conn() {
   // Build more than one 64 KiB STAGE_CHUNK worth of framed messages so the read spans chunks.
   let mut frames = Vec::new();
   while frames.len() <= 64 * 1024 {
-    encode_frame(&req().encode(), &mut frames);
+    encode_frame(&encode_message(&req()), &mut frames);
   }
   coord.handle_conn_data(
     id,
@@ -332,7 +333,7 @@ fn an_internally_reaped_conn_surfaces_through_poll_conn_closed() {
   );
 }
 
-// A bad frame (a length-prefixed payload that fails Message::decode) closes the conn at the decode
+// A bad frame (a length-prefixed payload that fails decode_message) closes the conn at the decode
 // boundary, and the reap surfaces (id, BadFrame) through poll_conn_closed — the typed cause a
 // driver attributes the close to, instead of a bare id.
 #[test]
@@ -490,7 +491,7 @@ fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
     0,
   ));
   let mut framed = Vec::new();
-  encode_frame(&get_view.encode(), &mut framed);
+  encode_frame(&encode_message(&get_view), &mut framed);
   coord.handle_conn_data(
     authoritative,
     &framed,

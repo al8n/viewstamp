@@ -1688,17 +1688,28 @@ impl Bridge {
 
   /// The SINGLE size-checked framing primitive: every encode-and-stage path runs through here, so the
   /// `MAX_FRAME_LEN` preflight lives in exactly one place. `len` is the payload length the caller
-  /// already knows cheaply (`Message::encoded_len()` for a consensus message, `preface.len()` for the
-  /// identity preface); `payload` produces the bytes ONLY when the length is within the cap, so an
-  /// oversized message never pays its full `encode()` allocation.
+  /// computes BEFORE `payload` runs (`view.encoded_len()` for an already wire_size_bound-ADMITTED
+  /// consensus message — see `write_framed` — or `preface.len()` for the identity preface); `payload`
+  /// produces the bytes ONLY when `len` is within the cap, so a message THIS check alone catches
+  /// never additionally pays for `encode_to_bytes`.
   ///
-  /// Returns the framed `[u32 len][payload]` bytes, or `None` when `len` exceeds [`MAX_FRAME_LEN`]. On
-  /// the `None` path it bumps [`Self::oversized_dropped`] and frames/stages nothing: the RECEIVE side
-  /// (`FrameDecoder` / [`Self::ingest_recv`]) tears the connection down on an over-cap declared length,
-  /// so emitting such a frame could only force the peer to close. Surfacing the drop via the counter
-  /// (rather than silently swallowing) lets a driver/operator see a unit outgrew the transport frame
-  /// limit; consensus retransmission covers a dropped consensus send, and an oversized unit could never
-  /// deliver regardless.
+  /// Returns the framed `[u32 len][payload]` bytes, or `None` when `len` exceeds [`MAX_FRAME_LEN`] OR
+  /// the bytes `payload` actually produces do. NEITHER check here is a safe ADMISSION gate on its own
+  /// for an unbounded `len`: buffa's `encoded_len()` returns a `u32` with unchecked accumulation, so a
+  /// message nearing 4 GiB could wrap `len` below the cap — and `payload` (`encode_to_bytes`) then
+  /// RUNS and pays for the full multi-GiB allocation before the second (`bytes.len()`) check ever gets
+  /// a chance to reject it. A consensus-message caller therefore gates admission BEFORE reaching this
+  /// function at all (`write_framed`'s `msg.wire_size_bound()` check, computed structurally from the
+  /// message's own fields with saturating arithmetic throughout, so it never wraps); both checks here
+  /// remain as cheap framing-correctness backstops for that caller, and are the ONLY (sufficient)
+  /// admission gate for the identity-preface caller, whose `preface.len()` is bounded by a small
+  /// compile-time constant (`crate::transport::labeled::MAX_HELLO_LEN`-scale) nowhere near the wrap
+  /// boundary. Either refusal path bumps [`Self::oversized_dropped`] and frames/stages
+  /// nothing: the RECEIVE side (`FrameDecoder` / [`Self::ingest_recv`]) tears the connection down on
+  /// an over-cap declared length, so emitting such a frame could only force the peer to close.
+  /// Surfacing the drop via the counter (rather than silently swallowing) lets a driver/operator see a
+  /// unit outgrew the transport frame limit; consensus retransmission covers a dropped consensus send,
+  /// and an oversized unit could never deliver regardless.
   fn frame_checked<T: AsRef<[u8]>>(
     &mut self,
     len: usize,
@@ -1708,8 +1719,16 @@ impl Bridge {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
       return None;
     }
+    let produced = payload();
+    let bytes = produced.as_ref();
+    // Backstop: re-check the length `payload` ACTUALLY produced (see the doc comment above for why
+    // `len` alone cannot be trusted).
+    if bytes.len() > MAX_FRAME_LEN as usize {
+      self.oversized_dropped = self.oversized_dropped.saturating_add(1);
+      return None;
+    }
     let mut framed = Vec::new();
-    encode_frame(payload().as_ref(), &mut framed);
+    encode_frame(bytes, &mut framed);
     Some(framed)
   }
 
@@ -1753,18 +1772,32 @@ impl Bridge {
     // already unbound its routing (so the router cannot resolve it), and an `Authenticating`/`Handshaking`
     // one is not yet bound; staging to either would grow a doomed connection's outbound buffers. The
     // router never reaches such a connection, so this is a structural guard, not a hot path. Frame
-    // nothing (and pay no `encode()`) when the entry is absent or not `Validated`.
+    // nothing (and pay no `encode_message`) when the entry is absent or not `Validated`.
     if !self.is_validated(h) {
       return;
     }
-    // Size-check + frame through the single `frame_checked` choke-point (mirrors the byte-stream
-    // router's symmetric cap). `encoded_len()` is the exact length `encode()` would produce, so passing
-    // it as the cheap preflight length means an oversized message (e.g. a large `SyncCheckpoint` /
-    // whole-log `DoViewChange` awaiting the deferred chunking) is counted and dropped WITHOUT paying
-    // the full `encode()` allocation; a within-cap message is framed. `None` ⇒ over-cap, already
-    // counted — drop the send (consensus retransmission covers it; an over-cap unit could never
-    // deliver, and the peer would only fatal on its declared length).
-    let Some(framed) = self.frame_checked(msg.encoded_len(), || msg.encode()) else {
+    // ADMISSION gate, BEFORE building the pb view at all: `msg.wire_size_bound()` is a saturating
+    // `usize` upper bound computed from `msg`'s own fields, so it can never wrap the way buffa's
+    // `u32`-returning `encoded_len()` can on an absurd (multi-GiB) variable-length field. Gating here
+    // means an oversized message never even reaches `pb_message`/`encode_to_bytes` below — closing
+    // the hazard where a wrapped `encoded_len()` estimate would pass a preflight and only THEN pay
+    // for (and OOM/panic on) a multi-GiB allocation.
+    if msg.wire_size_bound() > MAX_FRAME_LEN as usize {
+      self.oversized_dropped = self.oversized_dropped.saturating_add(1);
+      return;
+    }
+    // Admitted: size-check + frame through the single `frame_checked` choke-point (mirrors the
+    // byte-stream router's symmetric cap). The wire view is built ONCE here and reused for both the
+    // preflight length and the encode `frame_checked` runs on success, rather than rebuilding it per
+    // send. `frame_checked`'s own `len > MAX_FRAME_LEN` check is now unreachable via oversize (an
+    // admitted message's `encoded_len()` is bounded by `wire_size_bound()`, itself `<= MAX_FRAME_LEN`
+    // here), but is retained cheaply — it is shared with the identity-preface caller, and its
+    // post-encode backstop (`bytes.len() > MAX_FRAME_LEN`) remains the framing-correctness assertion
+    // of last resort. `None` ⇒ refused there, already counted.
+    use buffa::Message as _;
+    let view = crate::wire::pb_message(msg);
+    let Some(framed) = self.frame_checked(view.encoded_len() as usize, || view.encode_to_bytes())
+    else {
       return;
     };
     // Per-stream backpressure, class-aware (see the fn doc): a Bulk overflow resets just that stream, a

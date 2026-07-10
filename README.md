@@ -73,7 +73,7 @@ The proto owns no log and no disk: you supply a `Wal` (the operation log) and a
 them. The contracts those implementations must honor — completion-means-durable,
 writes-never-fault, header durability independent of bodies, crash-atomic serialized
 root writes, drain-in-flight-before-recover — are consolidated in the
-[`storage` module documentation](viewstamp-proto/src/storage.rs). Read that before
+[`storage` module documentation](viewstamp-proto/src/storage/mod.rs). Read that before
 writing a backend; each clause is load-bearing for committed-op survival.
 
 The state machine side is three methods (`apply` / `snapshot` / `restore`), required to
@@ -148,23 +148,24 @@ compatibility story yet — upgrades are flag-day. APIs will move.
 The wire protocol and the durable formats version **independently**, so a
 message-format change can never invalidate data already on disk:
 
-- **Messages** lead with `WIRE_VERSION`
-  ([`viewstamp-proto/src/codec.rs`](viewstamp-proto/src/codec.rs)) and decode by
-  **strict equality**: any other version is rejected as
-  `CodecError::UnknownVersion`, never reinterpreted.
+- **Messages** ride a protobuf envelope, normatively defined by the schema
+  ([`proto/viewstamp/v1/messages.proto`](viewstamp-proto/proto/viewstamp/v1/messages.proto));
+  [`viewstamp-proto/WIRE.md`](viewstamp-proto/WIRE.md) pins the byte-level semantics.
+  There is no per-message version field — the `Labeled` hello's `HELLO_VERSION` is
+  the single wire-version fence instead, and mixed-version peers reject each other
+  at the handshake before any consensus frame is trusted. An additive protobuf
+  field needs no bump; a semantic break to the wire bumps `HELLO_VERSION`.
 - **Durable formats** carry their own versions
-  ([`viewstamp-proto/src/storage.rs`](viewstamp-proto/src/storage.rs)): the
+  ([`viewstamp-proto/src/storage/mod.rs`](viewstamp-proto/src/storage/mod.rs)): the
   superblock root leads with `SUPERBLOCK_VERSION` and decodes by
   **compatibility range** — the whole layout-compatible range
   `1..=SUPERBLOCK_VERSION` is accepted, so a wire-only bump never strands a
   persisted root — and each WAL slot header leads with its own `HEADER_VERSION`.
 
 Pre-1.0 the cluster upgrade story is **flag-day**: stop all replicas, upgrade all
-of them, restart. Mixed-version clusters are rejected at connect time — the
-transport handshake hello carries its own version byte, and a peer speaking a
-different `WIRE_VERSION` has its first frame fail to decode and its connection
-dropped. Rolling upgrades require wire-version negotiation (accept a range,
-speak the lowest common version), which is future work.
+of them, restart — mixed-version clusters are rejected at connect time by the
+handshake fence above. Rolling upgrades require wire-version negotiation (accept
+a range, speak the lowest common version), which is future work.
 
 #### License
 

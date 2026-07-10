@@ -52,12 +52,13 @@ mod time;
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
 mod transport;
+mod wire;
 pub use batch::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchFull, BatchMalformed, BatchUnits,
   BatchView, EmptyBatch, ReplyBuilder, ReplyPushError, ReplyView,
 };
 pub use block_store::{BlockAddress, BlockDagWalk, BlockStore, BlockStoreError, block_address};
-pub use codec::{CodecError, WIRE_VERSION};
+pub use codec::CodecError;
 pub use config::{
   Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS, MAX_CLIENT_SESSIONS,
 };
@@ -105,3 +106,4 @@ pub use transport::{
 #[cfg(feature = "tls")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
 pub use transport::{TlsOptions, TlsRecords};
+pub use wire::{decode_message, encode_message};

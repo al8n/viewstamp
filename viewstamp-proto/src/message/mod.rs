@@ -1,30 +1,13 @@
 //! Wire message types for the Viewstamped Replication protocol.
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes};
 use std::{boxed::Box, vec::Vec};
 
 use crate::{
   ClientId, Epoch, MemberId, Membership, MembershipError, OpNumber, Recipient, ReplicaId,
-  RequestNumber, View, WIRE_VERSION,
-  codec::{CodecError, Reader, write_bytes_u32},
+  RequestNumber, View,
+  codec::{CodecError, Reader},
 };
-
-/// The minimum encoded length of one [`PreparedEntry`] in a log slice: `op` (`u64`) + `client`
-/// (`u128`) + `request` (`u64`) + a body-state tag (`u8`) + the cheapest body-state payload. The
-/// cheapest is a `Present` empty body (a `u32` length prefix = `4`, total `8 + 16 + 8 + 1 + 4`),
-/// which is smaller than a `Repairing` 16-byte checksum and than a `Reconfigure` payload (`replica_count`
-/// `u8` + `learner_count` `u16` + a `u32` member-count prefix = `7`, before any members), so this is the
-/// floor used to reject a hostile log-slice element count before parsing (see [`Reader::seq_len`]).
-const PREPARED_ENTRY_MIN_LEN: usize = 8 + 16 + 8 + 1 + 4;
-
-/// Wire body-state discriminant for a [`PreparedEntry`] in a log slice: `0` = [`Body::Present`] (a
-/// `u32`-length-prefixed body follows), `1` = [`Body::Repairing`] (a 16-byte `u128` `body_checksum`
-/// follows, no bytes), `2` = [`Body::Reconfigure`] (a [`ReconfigurePayload`] — the successor
-/// membership — follows). One source of truth shared by [`write_log`] (writes it) and [`read_log`]
-/// (dispatches on it).
-const BODY_TAG_PRESENT: u8 = 0;
-const BODY_TAG_REPAIRING: u8 = 1;
-const BODY_TAG_RECONFIGURE: u8 = 2;
 
 /// The maximum encoded message length the transport framing admits (16 MiB). The single source of
 /// truth for the frame cap: the (feature-gated) transport re-exports this as
@@ -35,140 +18,162 @@ const BODY_TAG_RECONFIGURE: u8 = 2;
 /// against the very cap the wire enforces.
 pub(crate) const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
-/// Bytes [`Message::encode`] prepends before any variant body: [`WIRE_VERSION`](crate::WIRE_VERSION)
-/// (`u16`) then the variant discriminant tag (`u8`).
-const ENCODE_HEADER_LEN: usize = 2 + 1;
-/// The `u32` length prefix [`crate::codec::write_bytes_u32`] writes before a `Bytes` payload.
-const BYTES_LEN_PREFIX: usize = 4;
+// ── Worst-case frame-budget model over the protobuf wire envelope ──
+//
+// Every frame-budget constant below charges a message field its LARGEST possible protobuf
+// encoding, so `modeled overhead >= actual encoded overhead` holds for EVERY field value — a body
+// admitted against a modeled budget can never encode past `MAX_FRAME_LEN` and be dropped
+// unsendable by the transport's symmetric cap, even with every scalar at its varint-widest.
+// (Proto3 omits default-valued scalars and varints shrink for small values, so the actual encoding
+// is usually a few bytes under the model; the tests pin the safe direction with maximal scalars.)
 
-#[cfg(feature = "tcp")]
-/// Fixed bytes a [`Request`] encoding wraps around its body: the [`ENCODE_HEADER_LEN`] message header,
-/// then `client` (`u128`) + `request` (`u64`), then the body's [`BYTES_LEN_PREFIX`]. So a body of `b`
-/// bytes encodes to `REQUEST_ENCODE_OVERHEAD + b`. Derived from the exact widths
-/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::Request`] arm.
-pub const REQUEST_ENCODE_OVERHEAD: usize = ENCODE_HEADER_LEN + 16 + 8 + BYTES_LEN_PREFIX;
+/// Worst-case bytes of one `uint64` field: a 1-byte tag (every inner message field is numbered
+/// `<= 9`) + a varint that reaches 10 bytes at `u64::MAX`. The prior fixed-width codec spent
+/// exactly 8 per `u64`; a varint spends 2..=11, so a sound budget charges 11.
+const WORST_UINT64_FIELD: usize = 1 + 10;
 
-#[cfg(feature = "tcp")]
-/// Fixed bytes a [`Prepare`] encoding wraps around the SAME client body once the primary replicates it
-/// to backups: the [`ENCODE_HEADER_LEN`] message header, then `view` + `op` + `commit` + `checkpoint_op`
-/// (four `u64`s) + the strict epoch-policy pair `epoch` (`u64`) + `config_id` (`u128`) + `client`
-/// (`u128`) + `request` (`u64`), then the body's [`BYTES_LEN_PREFIX`]. So the same `b`-byte client body
-/// that arrived as a `Request` leaves as a `Prepare` of `PREPARE_ENCODE_OVERHEAD + b` bytes. Derived
-/// from the exact widths [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::Prepare`]
-/// arm. This is strictly larger than [`REQUEST_ENCODE_OVERHEAD`] (a `Prepare` carries the extra
-/// consensus header fields), but it is NOT the worst hop the body sees — the log-slice carriers below
-/// wrap it in more — so it is only one input to [`MAX_REQUEST_BODY_OVERHEAD`].
+/// Worst-case bytes of one 16-byte id/checksum `bytes` field (`client` / `config_id` /
+/// `prepare_checksum` / `checkpoint_id` / a `repairing_checksum` arm): a 1-byte tag + a 1-byte
+/// length (16 < 128) + the 16 payload bytes.
+const WORST_ID_FIELD: usize = 1 + 1 + 16;
+
+/// Worst-case FRAMING of one variable length-delimited inner field, excluding its payload — a
+/// body/snapshot `bytes` field, or one `repeated PreparedEntry` element: a 1-byte tag + a length
+/// varint bounded at 5 bytes (any length below `2^35`, far above the frame cap).
+const LEN_FIELD_OVERHEAD: usize = 1 + 5;
+
+/// Worst-case framing the `Message.body` oneof envelope wraps around an encoded inner message: the
+/// arm's tag (2 bytes — arms 16..=24 need two; 1..=15 need one) + a length varint bounded at
+/// 5 bytes.
+const ENVELOPE_ARM_OVERHEAD: usize = 2 + 5;
+
+/// Worst-case bytes a [`Request`] envelope wraps around its body, field by field over the schema
+/// (`client` 16-byte id, `request` uint64, `body` bytes): `ENVELOPE_ARM_OVERHEAD` (7) plus
+/// `WORST_ID_FIELD` (18) plus `WORST_UINT64_FIELD` (11) plus the body's `LEN_FIELD_OVERHEAD` (6)
+/// = 42. A body of `b` bytes therefore encodes to AT MOST `REQUEST_ENCODE_OVERHEAD + b`. Not
+/// `tcp`-gated: [`Message::wire_size_bound`] (available whenever the base crate is) reuses it too.
+pub const REQUEST_ENCODE_OVERHEAD: usize =
+  ENVELOPE_ARM_OVERHEAD + WORST_ID_FIELD + WORST_UINT64_FIELD + LEN_FIELD_OVERHEAD;
+
+/// Worst-case bytes a [`Prepare`] envelope wraps around the SAME client body once the primary
+/// replicates it to backups, field by field (`view`/`op`/`commit`/`checkpoint_op`/`epoch`/`request`
+/// six uint64s, `config_id` + `client` two 16-byte ids, `body` bytes): `ENVELOPE_ARM_OVERHEAD`
+/// (7) plus 6 × `WORST_UINT64_FIELD` (66) plus 2 × `WORST_ID_FIELD` (36) plus the body's
+/// `LEN_FIELD_OVERHEAD` (6) = 115. Strictly larger than [`REQUEST_ENCODE_OVERHEAD`] (a `Prepare`
+/// carries the extra consensus header fields), but NOT the worst hop the body sees — the log-slice
+/// carriers below wrap it in more — so it is only one input to [`MAX_REQUEST_BODY_OVERHEAD`]. Not
+/// `tcp`-gated: [`Message::wire_size_bound`] (available whenever the base crate is) reuses it too.
 pub const PREPARE_ENCODE_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 8 + 8 + 8 + 16 + 16 + 8 + BYTES_LEN_PREFIX;
+  ENVELOPE_ARM_OVERHEAD + 6 * WORST_UINT64_FIELD + 2 * WORST_ID_FIELD + LEN_FIELD_OVERHEAD;
 
-/// Fixed bytes a [`Reply`] encoding wraps around its body: the `ENCODE_HEADER_LEN` message header,
-/// then `view` (`u64`) + `client` (`u128`) + `request` (`u64`), then the body's `BYTES_LEN_PREFIX`.
-/// So a reply body of `b` bytes encodes to `REPLY_ENCODE_OVERHEAD + b`. Derived from the exact widths
-/// [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::Reply`] arm. The `Reply` is
-/// the ONLY carrier of a reply body on the wire (the checkpoint envelope also embeds cached reply
-/// bodies, but that envelope is chunk-transferable and so unbounded by any single frame), so this is
-/// the binding overhead behind [`max_reply_body_len`].
-pub const REPLY_ENCODE_OVERHEAD: usize = ENCODE_HEADER_LEN + 8 + 16 + 8 + BYTES_LEN_PREFIX;
+/// Worst-case bytes a [`Reply`] envelope wraps around its body, field by field (`view` + `request`
+/// two uint64s, `client` a 16-byte id, `body` bytes): `ENVELOPE_ARM_OVERHEAD` (7) plus
+/// 2 × `WORST_UINT64_FIELD` (22) plus `WORST_ID_FIELD` (18) plus the body's `LEN_FIELD_OVERHEAD`
+/// (6) = 53. The `Reply` is the ONLY carrier of a reply body on the wire (the checkpoint envelope
+/// also embeds cached reply bodies, but that envelope is chunk-transferable and so unbounded by any
+/// single frame), so this is the binding overhead behind [`max_reply_body_len`].
+pub const REPLY_ENCODE_OVERHEAD: usize =
+  ENVELOPE_ARM_OVERHEAD + 2 * WORST_UINT64_FIELD + WORST_ID_FIELD + LEN_FIELD_OVERHEAD;
 
 /// The largest reply body a [`crate::StateMachine::apply`] may return: a reply of this many bytes
-/// encodes as a [`Reply`] of exactly `MAX_FRAME_LEN`, the largest frame the transport will send or
-/// accept. One byte more and the encoded `Reply` exceeds the frame cap — the transport refuses the
-/// send, the client never hears the result, and since the op is ALREADY COMMITTED there is no
-/// in-protocol recovery (the request cannot be re-executed; the cached over-bound reply re-fails on
-/// every resend). The bound is therefore an EMBEDDER OBLIGATION documented on
-/// [`crate::StateMachine::apply`] and debug-asserted at both apply sites, mirroring how
-/// `max_request_body_len()` bounds the request body at driver submit.
+/// encodes as a [`Reply`] of AT MOST `MAX_FRAME_LEN` — the largest frame the transport will send or
+/// accept — even with every other field at its varint-widest ([`REPLY_ENCODE_OVERHEAD`] is the
+/// worst-case overhead). Past the bound the encoded `Reply` can exceed the frame cap — the
+/// transport refuses the send, the client never hears the result, and since the op is ALREADY
+/// COMMITTED there is no in-protocol recovery (the request cannot be re-executed; the cached
+/// over-bound reply re-fails on every resend). The bound is therefore an EMBEDDER OBLIGATION
+/// documented on [`crate::StateMachine::apply`] and debug-asserted at both apply sites, mirroring
+/// how `max_request_body_len()` bounds the request body at driver submit.
 pub const fn max_reply_body_len() -> usize {
   MAX_FRAME_LEN as usize - REPLY_ENCODE_OVERHEAD
 }
 
-/// Fixed bytes that wrap ONE client body inside a single [`Body::Present`] [`PreparedEntry`] within a
-/// log slice (the per-element framing [`write_log`] emits around the body): `op` (`u64`) + `client`
-/// (`u128`) + `request` (`u64`) + the body-state tag (`u8`, [`BODY_TAG_PRESENT`]), then the body's
-/// [`BYTES_LEN_PREFIX`]. The same client body that arrived as a `Request` and replicated as a `Prepare`
-/// is re-encoded as one of these entries when it rides a `DoViewChange` / `StartView` /
-/// `RecoveryResponse` log at view change or recovery. Derived from the exact widths [`write_log`] /
-/// [`Message::encoded_len`]'s `log(..)` write per `Present` entry.
-const LOG_ENTRY_BODY_OVERHEAD: usize = 8 + 16 + 8 + 1 + BYTES_LEN_PREFIX;
+/// Worst-case bytes that wrap ONE client body inside a single [`Body::Present`] [`PreparedEntry`]
+/// element of a `repeated PreparedEntry` log field: the element's own [`LEN_FIELD_OVERHEAD`] (6),
+/// the `op` and `request` uint64s (2 × [`WORST_UINT64_FIELD`] = 22), the `client` id
+/// ([`WORST_ID_FIELD`] = 18), and the `present` body arm's [`LEN_FIELD_OVERHEAD`] (6) — 52 in all.
+/// The same client body that arrived as a `Request` and replicated as a `Prepare` is re-encoded as
+/// one of these entries when it rides a `RepairBatch` / `PrepareBatch` log slice (the view-change
+/// carriers ship entries header-only instead; a `repeated` field has no count prefix — each element
+/// pays only this framing).
+const LOG_ENTRY_BODY_OVERHEAD: usize =
+  LEN_FIELD_OVERHEAD + 2 * WORST_UINT64_FIELD + WORST_ID_FIELD + LEN_FIELD_OVERHEAD;
 
-/// The `u32` element-count prefix [`write_log`] writes before the entries of a log slice.
-const LOG_COUNT_PREFIX: usize = 4;
-
-/// Fixed bytes a [`RepairBatch`] encoding wraps around its served log slice, BEFORE the per-entry
-/// framing: the [`ENCODE_HEADER_LEN`] message header, then `view` + `commit` + `checkpoint_op` (three
-/// `u64`s) + the agnostic `config_id` (`u128`), then the log slice's [`LOG_COUNT_PREFIX`]. The
-/// byte-bounded serve ([`Endpoint::on_request_prepare_range`](crate::Endpoint)) subtracts this from
-/// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN) to get the budget for the per-entry payloads
-/// it accumulates, so the produced `RepairBatch` never exceeds the frame cap. Derived from the exact
-/// widths [`Message::encode`]/[`Message::encoded_len`] write for the [`Message::RepairBatch`] arm.
+/// Worst-case bytes a [`RepairBatch`] envelope wraps around its served log slice, BEFORE the
+/// per-entry framing, field by field (`view`/`commit`/`checkpoint_op` three uint64s, `config_id` a
+/// 16-byte id): [`ENVELOPE_ARM_OVERHEAD`] (7) + 3 × [`WORST_UINT64_FIELD`] (33) +
+/// [`WORST_ID_FIELD`] (18) = 58. The byte-bounded serve
+/// ([`Endpoint::on_request_prepare_range`](crate::Endpoint)) subtracts this from
+/// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN) to get the budget for the per-entry
+/// costs it accumulates ([`present_entry_encoded_len`]); both model worst cases, so a produced
+/// `RepairBatch` never exceeds the frame cap.
 pub(crate) const REPAIR_BATCH_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 8 + 16 + LOG_COUNT_PREFIX;
+  ENVELOPE_ARM_OVERHEAD + 3 * WORST_UINT64_FIELD + WORST_ID_FIELD;
 
 #[cfg(feature = "tcp")]
-/// Fixed bytes a [`RepairBatch`] encoding wraps around ONE client body when that body is the sole
-/// [`Body::Present`] entry served: the [`REPAIR_BATCH_CARRIER_OVERHEAD`] carrier framing plus one
-/// [`LOG_ENTRY_BODY_OVERHEAD`] per-entry framing. Since the view-change log carriers are
-/// header-only (see [`Endpoint::log_entries`](crate::Endpoint)), the `RepairBatch` repair serve is THE
-/// binding BODY carrier — a committed op's full body travels the wire as a single-entry
-/// `RepairBatch` (the windowed peer-repair answer), so a max-size body must fit one of these. This is
-/// the largest of the three body carriers (a one-entry `RepairBatch` carries more framing than a bare
-/// `Prepare`), so it sets [`MAX_REQUEST_BODY_OVERHEAD`].
+/// Worst-case bytes a [`RepairBatch`] envelope wraps around ONE client body when that body is the
+/// sole [`Body::Present`] entry served: the [`REPAIR_BATCH_CARRIER_OVERHEAD`] carrier framing (58)
+/// plus one [`LOG_ENTRY_BODY_OVERHEAD`] per-entry framing (52) = 110. The view-change log carriers
+/// are header-only (see [`Endpoint::log_entries`](crate::Endpoint)), so a committed op's full body
+/// travels the wire as a single-entry `RepairBatch` (the windowed peer-repair answer) or
+/// `PrepareBatch` — one input to [`MAX_REQUEST_BODY_OVERHEAD`].
 const REPAIR_BATCH_BODY_OVERHEAD: usize = REPAIR_BATCH_CARRIER_OVERHEAD + LOG_ENTRY_BODY_OVERHEAD;
 
-/// Fixed bytes a [`PrepareBatch`] encoding wraps around its retransmitted log slice, BEFORE the
-/// per-entry framing: the [`ENCODE_HEADER_LEN`] message header, then `view` + `commit` +
-/// `checkpoint_op` (three `u64`s) + the strict epoch-policy pair `epoch` (`u64`) + `config_id`
-/// (`u128`), then the log slice's [`LOG_COUNT_PREFIX`]. The primary's byte-bounded prepare retransmit
-/// ([`Endpoint::primary_timeouts`](crate::Endpoint) via its `prepare` timer) subtracts this from
-/// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN) to get the budget for the per-entry
-/// payloads each batch accumulates, so a produced `PrepareBatch` never exceeds the frame cap. Derived
-/// from the exact widths [`Message::encode`]/[`Message::encoded_len`] write for the
-/// [`Message::PrepareBatch`] arm.
+/// Worst-case bytes a [`PrepareBatch`] envelope wraps around its retransmitted log slice, BEFORE
+/// the per-entry framing, field by field (`view`/`commit`/`checkpoint_op` + the strict `epoch` —
+/// four uint64s — and `config_id` a 16-byte id): [`ENVELOPE_ARM_OVERHEAD`] (7) +
+/// 4 × [`WORST_UINT64_FIELD`] (44) + [`WORST_ID_FIELD`] (18) = 69. The primary's byte-bounded
+/// prepare retransmit ([`Endpoint::primary_timeouts`](crate::Endpoint) via its `prepare` timer)
+/// subtracts this from [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN) to get the budget
+/// for the per-entry costs each batch accumulates ([`present_entry_encoded_len`]); both model worst
+/// cases, so a produced `PrepareBatch` never exceeds the frame cap.
 pub(crate) const PREPARE_BATCH_CARRIER_OVERHEAD: usize =
-  ENCODE_HEADER_LEN + 8 + 8 + 8 + 8 + 16 + LOG_COUNT_PREFIX;
+  ENVELOPE_ARM_OVERHEAD + 4 * WORST_UINT64_FIELD + WORST_ID_FIELD;
 
 #[cfg(feature = "tcp")]
-/// Fixed bytes a [`PrepareBatch`] encoding wraps around ONE client body when that body is the sole
-/// [`Body::Present`] entry retransmitted: the [`PREPARE_BATCH_CARRIER_OVERHEAD`] carrier framing
-/// plus one [`LOG_ENTRY_BODY_OVERHEAD`] per-entry framing — byte-identical to
-/// [`REPAIR_BATCH_BODY_OVERHEAD`] (the two batch carriers share the envelope + per-entry layout).
-/// A committed-band op's full body also rides the retransmit as a one-entry `PrepareBatch`, so a
-/// max-size body must fit one of these; it TIES the `RepairBatch` carrier as the binding input to
-/// [`MAX_REQUEST_BODY_OVERHEAD`], leaving the bound unchanged.
+/// Worst-case bytes a [`PrepareBatch`] envelope wraps around ONE client body when that body is the
+/// sole [`Body::Present`] entry retransmitted: the [`PREPARE_BATCH_CARRIER_OVERHEAD`] carrier
+/// framing (69) plus one [`LOG_ENTRY_BODY_OVERHEAD`] per-entry framing (52) = 121 — the LARGEST of
+/// the body carriers (the strict `epoch` uint64 puts it 11 over the agnostic
+/// [`REPAIR_BATCH_BODY_OVERHEAD`]), so it alone binds [`MAX_REQUEST_BODY_OVERHEAD`].
 const PREPARE_BATCH_BODY_OVERHEAD: usize = PREPARE_BATCH_CARRIER_OVERHEAD + LOG_ENTRY_BODY_OVERHEAD;
 
-/// The exact number of bytes one [`Body::Present`] [`PreparedEntry`] of `body_len` body bytes
-/// contributes to a `write_log` slice: the per-entry framing [`LOG_ENTRY_BODY_OVERHEAD`] plus the body
-/// bytes themselves. Used by the byte-bounded repair serve to accumulate a served prefix without
-/// exceeding the frame budget (one source of truth with [`write_log`]'s `Present` arm).
+/// The worst-case number of bytes one [`Body::Present`] [`PreparedEntry`] of `body_len` body bytes
+/// contributes to a log field: the per-entry framing [`LOG_ENTRY_BODY_OVERHEAD`] plus the body
+/// bytes themselves. Used by the byte-bounded repair serve and the batched retransmit to accumulate
+/// a served prefix without exceeding the frame budget — the model charges at least the actual
+/// encoding, so an accumulated batch fits by construction.
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(crate) const fn present_entry_encoded_len(body_len: usize) -> usize {
   LOG_ENTRY_BODY_OVERHEAD + body_len
 }
 
-/// The exact encoded size of one HEADER-ONLY ([`Body::Repairing`]) [`PreparedEntry`] in a log slice:
-/// `op` (`u64`) + `client` (`u128`) + `request` (`u64`) + the body-state tag (`u8`,
-/// [`BODY_TAG_REPAIRING`]) + the 16-byte `body_checksum` (`u128`), NO body bytes. The view-change log
-/// carriers (`DoViewChange` / `StartView` / `RecoveryResponse`) emit EVERY entry header-only (see
-/// [`Endpoint::log_entries`](crate::Endpoint)), so a whole uncheckpointed band of `d` ops encodes to a
-/// fixed `d * PER_HEADER_ENTRY_BYTES + carrier framing` regardless of body sizes — the property
-/// [`crate::config::MAX_CHECKPOINT_OPS`] is capped against so even the deepest band fits the frame.
-pub(crate) const PER_HEADER_ENTRY_BYTES: usize = 8 + 16 + 8 + 1 + 16;
+/// Worst-case encoded size of one HEADER-ONLY ([`Body::Repairing`]) [`PreparedEntry`] element in a
+/// log field: its content is `op` + `request` (2 × [`WORST_UINT64_FIELD`] = 22) + the `client` id
+/// and the 16-byte `repairing_checksum` arm (2 × [`WORST_ID_FIELD`] = 36) = 58 bytes at most —
+/// which keeps the element's own length varint at exactly ONE byte (58 < 128), so the element
+/// framing is 2 bytes (tag + length), not the generic 5-byte-varint [`LEN_FIELD_OVERHEAD`] bound,
+/// and the whole element is bounded at 2 + 58 = 60 bytes. The view-change log carriers
+/// (`DoViewChange` / `StartView` / `RecoveryResponse`) emit EVERY entry header-only (see
+/// [`Endpoint::log_entries`](crate::Endpoint)), so a whole uncheckpointed band of `d` ops encodes
+/// to at most `d * PER_HEADER_ENTRY_BYTES + carrier framing` regardless of body sizes — the
+/// property [`crate::config::MAX_CHECKPOINT_OPS`] is capped against so even the deepest band fits
+/// the frame.
+pub(crate) const PER_HEADER_ENTRY_BYTES: usize = 2 + 2 * WORST_UINT64_FIELD + 2 * WORST_ID_FIELD;
 
-/// The MAXIMUM header-only band depth (op count) that fits one view-change log carrier under the frame
-/// cap, by construction: the frame budget less the largest carrier framing, divided by the fixed
-/// per-header-entry size. The carrier framing is the largest of the three strict log carriers — a
-/// `DoViewChange` (header + `view`/`log_view`/`op`/`commit`/`checkpoint_op` five `u64`s + the strict
-/// `epoch` `u64` + `config_id` `u128` + `replica` `u16` + [`LOG_COUNT_PREFIX`]) and a
-/// `RecoveryResponse` (header + four `u64`s + `epoch` `u64` + `config_id` `u128` + `replica` `u16` +
-/// `nonce` `u64` + [`LOG_COUNT_PREFIX`]) tie at the larger framing; we use a generous fixed `80`-byte
-/// allowance that exceeds either (each is `73`). [`crate::config::MAX_CHECKPOINT_OPS`] is capped so the
-/// deepest achievable band `(checkpoint_op .. op]` stays at/below this, making a header-only carrier
-/// sub-cap by construction; [`Endpoint::log_entries`](crate::Endpoint) also `debug_assert`s the band
-/// against it. The strict carrier grows +24 bytes (epoch + config_id); the per-entry log bytes are
-/// UNCHANGED (only the carrier framing grew), so [`PER_HEADER_ENTRY_BYTES`] stays the same.
+/// The MAXIMUM header-only band depth (op count) that fits one view-change log carrier under the
+/// frame cap, by construction: the frame budget less a fixed carrier-framing allowance, divided by
+/// the worst-case per-header-entry size. The allowance is a generous 128 bytes, above the largest
+/// worst-case strict log carrier: a `DoViewChange` ([`ENVELOPE_ARM_OVERHEAD`] 7 +
+/// `view`/`log_view`/`op`/`commit`/`checkpoint_op`/`epoch` six uint64s 66 + `config_id` 18 +
+/// `replica` ≤ 6) and a `RecoveryResponse` (7 + `view`/`op`/`commit`/`checkpoint_op`/`epoch`/
+/// `nonce` six uint64s 66 + `config_id` 18 + `replica` ≤ 6) tie at 97; a `StartView` is 86.
+/// [`crate::config::MAX_CHECKPOINT_OPS`] is capped so the deepest achievable band
+/// `(checkpoint_op .. op]` stays at/below this, making a header-only carrier sub-cap by
+/// construction; [`Endpoint::log_entries`](crate::Endpoint) also `debug_assert`s the band
+/// against it.
 pub(crate) const MAX_HEADER_ONLY_BAND_DEPTH: usize =
-  (MAX_FRAME_LEN as usize - 80) / PER_HEADER_ENTRY_BYTES;
+  (MAX_FRAME_LEN as usize - 128) / PER_HEADER_ENTRY_BYTES;
 
 #[cfg(feature = "tcp")]
 /// `const` max of two `usize`s ([`usize::max`] is not yet `const` in this MSRV).
@@ -177,32 +182,32 @@ const fn max_usize(a: usize, b: usize) -> usize {
 }
 
 #[cfg(feature = "tcp")]
-/// The WORST-CASE encoding overhead a single client request body incurs over EVERY message that carries
-/// it on its way through the cluster, so a body bounded by `MAX_FRAME_LEN - MAX_REQUEST_BODY_OVERHEAD`
-/// encodes to at most the frame cap on its tightest carrier and is therefore deliverable on every hop it
-/// causes. The same body bytes are wrapped, in turn, by:
+/// The WORST-CASE encoding overhead a single client request body incurs over EVERY message that
+/// carries it on its way through the cluster, so a body bounded by
+/// `MAX_FRAME_LEN - MAX_REQUEST_BODY_OVERHEAD` encodes to at most the frame cap on its tightest
+/// carrier — even with every scalar at its varint-widest — and is therefore deliverable on every
+/// hop it causes. The same body bytes are wrapped, in turn, by:
 ///
-/// - the [`Request`] the client sends ([`REQUEST_ENCODE_OVERHEAD`] = 31; AGNOSTIC-NEITHER, no
-///   epoch-policy fields),
-/// - the [`Prepare`] the primary replicates ([`PREPARE_ENCODE_OVERHEAD`] = 87; STRICT, +24 for
-///   `epoch` + `config_id`),
+/// - the [`Request`] the client sends ([`REQUEST_ENCODE_OVERHEAD`] = 42),
+/// - the [`Prepare`] the primary replicates ([`PREPARE_ENCODE_OVERHEAD`] = 115; the strict
+///   epoch-policy pair and the consensus header fields),
 /// - and — once the op is logged — a single [`Body::Present`] [`PreparedEntry`] inside a
-///   [`RepairBatch`] ([`REPAIR_BATCH_BODY_OVERHEAD`] = 84; AGNOSTIC, +16 for `config_id`), the windowed
+///   [`RepairBatch`] (`REPAIR_BATCH_BODY_OVERHEAD` = 110; AGNOSTIC, no `epoch`), the windowed
 ///   peer-repair answer that ships a committed op's full body, or inside a [`PrepareBatch`]
-///   ([`PREPARE_BATCH_BODY_OVERHEAD`] = 92; STRICT, +24), the primary's batched retransmit of the
-///   un-acked window.
+///   (`PREPARE_BATCH_BODY_OVERHEAD` = 121; STRICT, plus the `epoch` uint64), the primary's batched
+///   retransmit of the un-acked window.
 ///
 /// The view-change log carriers (`DoViewChange` / `StartView` / `RecoveryResponse`) are NOT in
 /// this list: they carry every entry HEADER-ONLY (see [`Endpoint::log_entries`](crate::Endpoint)),
-/// so they ship NO client body — the binding BODY carriers are the batch slices. The BINDING max is
-/// therefore the STRICT `PrepareBatch` carrier (92): the epoch-policy matrix makes it strictly larger
-/// than the agnostic `RepairBatch` (84), so the two batch carriers no longer tie — `PrepareBatch` alone
-/// is the worst hop, exceeding the `Prepare` hop (87) by the single-entry log framing it wraps the body
-/// in. Bounding by `Prepare` alone would let a max-size body retransmitted as a one-entry `PrepareBatch`
-/// encode past the frame cap and be dropped, leaving a single max-body committed op unrepairable. The
-/// transport's `max_request_body_len()` subtracts exactly this from
-/// [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN); each batch's per-entry byte cap then
-/// guarantees a single served entry (a max body) lands exactly on the cap.
+/// so they ship NO client body — a full body's worst hops are the batch slices and the `Prepare`.
+/// The BINDING max is the STRICT `PrepareBatch` carrier (121): the epoch-policy matrix makes it
+/// strictly larger than the agnostic `RepairBatch` (110), and its single-entry log framing puts it
+/// over the bare `Prepare` hop (115). Bounding by `Prepare` alone would let a max-size body
+/// retransmitted as a one-entry `PrepareBatch` encode past the frame cap and be dropped, leaving a
+/// single max-body committed op unrepairable. The transport's `max_request_body_len()` subtracts
+/// exactly this from [`MAX_FRAME_LEN`](crate::transport::frame::MAX_FRAME_LEN); each batch's
+/// per-entry byte cap then guarantees a single served entry (a max body) encodes to at most the
+/// cap.
 pub const MAX_REQUEST_BODY_OVERHEAD: usize = max_usize(
   max_usize(REQUEST_ENCODE_OVERHEAD, PREPARE_ENCODE_OVERHEAD),
   max_usize(REPAIR_BATCH_BODY_OVERHEAD, PREPARE_BATCH_BODY_OVERHEAD),
@@ -2350,6 +2355,13 @@ impl BlockResponse {
     self.block.as_deref()
   }
 
+  /// The block bytes when the donor holds them, as a cloned [`Bytes`] handle (an O(1) refcount
+  /// clone, never a byte copy), or `None` when absent.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn block_bytes(&self) -> Option<Bytes> {
+    self.block.clone()
+  }
+
   /// `true` when the donor holds the block (`block` is `Some`).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn is_present(&self) -> bool {
@@ -2534,592 +2546,141 @@ impl Message {
     }
   }
 
-  /// The stable wire discriminant tag for each variant, matching declaration order. One source of
-  /// truth shared by [`Self::encode`] (writes it) and [`Self::decode`] (dispatches on it); the
-  /// `match` is EXHAUSTIVE (no wildcard) so a future 25th variant fails to compile until it is
-  /// assigned a tag here.
-  #[cfg_attr(not(tarpaulin), inline)]
-  const fn tag(&self) -> u8 {
-    match self {
-      Self::Request(_) => 0,
-      Self::Prepare(_) => 1,
-      Self::PrepareOk(_) => 2,
-      Self::Reply(_) => 3,
-      Self::Commit(_) => 4,
-      Self::StartViewChange(_) => 5,
-      Self::DoViewChange(_) => 6,
-      Self::StartView(_) => 7,
-      Self::GetView(_) => 8,
-      Self::RequestPrepare(_) => 9,
-      Self::Recovery(_) => 10,
-      Self::RecoveryResponse(_) => 11,
-      Self::RequestSync(_) => 12,
-      Self::SyncCheckpoint(_) => 13,
-      Self::RequestPrepareRange(_) => 14,
-      Self::RepairBatch(_) => 15,
-      // Tags 16/17/18 are retired: the over-frame chunked state-sync (`SyncCheckpointMeta` /
-      // `RequestSyncChunk` / `SyncChunk`) was replaced by the content-addressed block fetch.
-      Self::PrepareBatch(_) => 19,
-      Self::LearnerStatus(_) => 20,
-      Self::EpochAhead(_) => 21,
-      Self::RequestLearnerProof(_) => 22,
-      Self::LearnerProof(_) => 23,
-      Self::RequestBlock(_) => 24,
-      Self::BlockResponse(_) => 25,
-      Self::Nack(_) => 26,
-    }
+  /// The exact number of bytes [`encode_message`](crate::encode_message) would produce for this
+  /// message: exact by construction, since it builds the same internal wire envelope that encoding
+  /// serializes and asks buffa for its length, rather than modeling the encoding's byte widths
+  /// separately. The `#[cfg(test)]` `encoded_len() == encode_message().len()` equivalence assertion
+  /// below keeps that honest.
+  ///
+  /// Unlike the prior fixed-width codec's preflight, this is NOT const-cheap: building the envelope
+  /// allocates (a log-carrying variant's entries and any `Bytes` payload are cloned into the `pb`
+  /// view). It is also NOT safe as a SEND-ADMISSION gate on its own: buffa's `encoded_len()` returns
+  /// a `u32` with unchecked accumulation, so a message whose true size nears 4 GiB can WRAP this
+  /// estimate down to a small value. [`Self::wire_size_bound`] is the admission bound a transport
+  /// preflights a send against instead (a saturating `usize` that never wraps); this method stays
+  /// useful once a message is already known-admissible — a cheap exact re-check before a full
+  /// encode, or the QUIC stream-layout classifier's routing heuristic — where post-admission sizes
+  /// (`<= MAX_FRAME_LEN`) cannot approach the `u32` wrap boundary.
+  pub fn encoded_len(&self) -> usize {
+    use buffa::Message as _;
+    crate::wire::pb_message(self).encoded_len() as usize
   }
 
-  /// Encodes this message to a versioned, canonical, self-describing byte vector for the wire.
+  /// A SATURATING [`usize`] UPPER BOUND on [`encode_message`](crate::encode_message)'s output
+  /// length for this message — the ADMISSION bound a transport preflights a send against BEFORE
+  /// paying for [`Self::encoded_len`] / building the buffa envelope at all.
   ///
-  /// Layout: [`WIRE_VERSION`](crate::WIRE_VERSION) (`u16` BE), then the variant's discriminant tag
-  /// (`u8`), then the variant's fields in canonical order — all scalars big-endian, every `Bytes`
-  /// payload + snapshot envelope `u32`-length-prefixed, every `Vec<PreparedEntry>` log slice a
-  /// `u32` count followed by each entry (`op`/`client`/`request`, a body-state tag, then a
-  /// length-prefixed body for `Present` or a 16-byte `body_checksum` for `Repairing`).
-  /// Nested [`crate::Header`]s (none appear in messages today) would reuse the fixed-size
-  /// `Header::encode`. The `match` over every variant is EXHAUSTIVE (no wildcard), preserving the
-  /// codebase's exhaustive-`Message`-match property.
-  pub fn encode(&self) -> Bytes {
-    // Pre-size to the exact encoded length ([`Self::encoded_len`], pinned to `encode().len()` by
-    // test) so an MB-scale Prepare/SyncCheckpoint encodes into one allocation instead of paying
-    // doubling-realloc copies.
-    let mut out = BytesMut::with_capacity(self.encoded_len());
-    out.put_u16(WIRE_VERSION);
-    out.put_u8(self.tag());
+  /// Computed STRUCTURALLY from the domain value's own fields, never by asking buffa for a length:
+  /// each variant's FIXED shape is charged its protobuf worst-case overhead — the same frame-budget
+  /// model `REQUEST_ENCODE_OVERHEAD` / `PREPARE_ENCODE_OVERHEAD` / [`REPLY_ENCODE_OVERHEAD`] /
+  /// `REPAIR_BATCH_CARRIER_OVERHEAD` / `PREPARE_BATCH_CARRIER_OVERHEAD` / `LOG_ENTRY_BODY_OVERHEAD`
+  /// already use — and every variable-length component (a body/log/snapshot/membership) is folded in
+  /// via `saturating_add`/`saturating_mul` throughout, so the arithmetic can NEVER wrap the way
+  /// [`Self::encoded_len`]'s `u32` accumulation can. It is deliberately a conservative OVER-estimate
+  /// (a looser bound is always safe — refusing a message that would actually fit costs a retransmit;
+  /// under-estimating is the bug this method exists to rule out), so
+  /// `wire_size_bound() >= encode_message(self).len()` holds for EVERY message, whatever its field
+  /// values, not just small ones.
+  pub fn wire_size_bound(&self) -> usize {
     match self {
-      Self::Request(m) => {
-        out.put_u128(m.client.get());
-        out.put_u64(m.request.get());
-        write_bytes_u32(&mut out, &m.body);
-      }
-      Self::Prepare(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.op.get());
-        out.put_u64(m.commit.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-        out.put_u128(m.client.get());
-        out.put_u64(m.request.get());
-        write_bytes_u32(&mut out, &m.body);
-      }
-      Self::PrepareOk(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.op.get());
-        out.put_u16(m.replica.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u128(m.prepare_checksum);
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-      }
-      Self::Reply(m) => {
-        out.put_u64(m.view.get());
-        out.put_u128(m.client.get());
-        out.put_u64(m.request.get());
-        write_bytes_u32(&mut out, &m.body);
-      }
-      Self::Commit(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.commit.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-      }
-      Self::StartViewChange(m) => {
-        out.put_u64(m.view.get());
-        out.put_u16(m.replica.get());
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-      }
+      Self::Request(m) => REQUEST_ENCODE_OVERHEAD.saturating_add(m.body().len()),
+      Self::Prepare(m) => PREPARE_ENCODE_OVERHEAD.saturating_add(m.body().len()),
+      Self::PrepareOk(_) => fixed_fields_bound(5, 2),
+      Self::Reply(m) => REPLY_ENCODE_OVERHEAD.saturating_add(m.body().len()),
+      Self::Commit(_) => fixed_fields_bound(4, 1),
+      Self::StartViewChange(_) => fixed_fields_bound(3, 1),
       Self::DoViewChange(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.log_view.get());
-        out.put_u64(m.op.get());
-        out.put_u64(m.commit.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-        out.put_u16(m.replica.get());
-        write_log(&mut out, &m.log);
+        fixed_fields_bound(7, 1).saturating_add(log_wire_size_bound(m.log_slice()))
       }
       Self::StartView(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.op.get());
-        out.put_u64(m.commit.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-        out.put_u16(m.replica.get());
-        write_log(&mut out, &m.log);
+        fixed_fields_bound(6, 1).saturating_add(log_wire_size_bound(m.log_slice()))
       }
-      Self::GetView(m) => {
-        out.put_u64(m.view.get());
-        out.put_u16(m.replica.get());
-        out.put_u64(m.nonce);
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-      }
-      Self::RequestPrepare(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.op.get());
-        out.put_u16(m.replica.get());
-        out.put_u128(m.config_id);
-      }
-      Self::Recovery(m) => {
-        out.put_u16(m.replica.get());
-        out.put_u64(m.nonce);
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-      }
+      Self::GetView(_) => fixed_fields_bound(4, 1),
+      Self::RequestPrepare(_) => fixed_fields_bound(3, 1),
+      Self::Recovery(_) => fixed_fields_bound(3, 1),
       Self::RecoveryResponse(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.op.get());
-        out.put_u64(m.commit.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-        out.put_u16(m.replica.get());
-        out.put_u64(m.nonce);
-        write_log(&mut out, &m.log);
+        fixed_fields_bound(7, 1).saturating_add(log_wire_size_bound(m.log_slice()))
       }
-      Self::RequestSync(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u16(m.replica.get());
-        out.put_u64(m.nonce);
-        out.put_u8(m.recovery as u8);
-        out.put_u128(m.config_id);
-      }
-      Self::SyncCheckpoint(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u128(m.checkpoint_id);
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-        out.put_u16(m.replica.get());
-        out.put_u64(m.nonce);
-        write_bytes_u32(&mut out, &m.snapshot);
-        write_bytes_u32(&mut out, &m.membership);
-      }
-      Self::RequestPrepareRange(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.lo.get());
-        out.put_u64(m.hi.get());
-        out.put_u16(m.replica.get());
-        out.put_u128(m.config_id);
-      }
+      Self::RequestSync(_) => fixed_fields_bound(5, 1),
+      Self::SyncCheckpoint(m) => fixed_fields_bound(5, 2)
+        .saturating_add(LEN_FIELD_OVERHEAD)
+        .saturating_add(m.snapshot().len())
+        .saturating_add(LEN_FIELD_OVERHEAD)
+        .saturating_add(m.membership().len()),
+      Self::RequestPrepareRange(_) => fixed_fields_bound(4, 1),
       Self::RepairBatch(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.commit.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u128(m.config_id);
-        write_log(&mut out, &m.log);
+        REPAIR_BATCH_CARRIER_OVERHEAD.saturating_add(log_wire_size_bound(m.log_slice()))
       }
       Self::PrepareBatch(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.commit.get());
-        out.put_u64(m.checkpoint_op.get());
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-        write_log(&mut out, &m.log);
+        PREPARE_BATCH_CARRIER_OVERHEAD.saturating_add(log_wire_size_bound(m.log_slice()))
       }
-      Self::LearnerStatus(m) => {
-        out.put_u16(m.replica.get());
-        out.put_u64(m.durable_commit_min.get());
-        out.put_u64(m.durable_op.get());
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-      }
-      Self::EpochAhead(m) => {
-        out.put_u64(m.epoch.get());
-        out.put_u64(m.checkpoint_op.get());
-      }
-      Self::RequestLearnerProof(m) => {
-        out.put_u16(m.from.get());
-        out.put_u64(m.at_op.get());
-        out.put_u64(m.nonce);
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-      }
-      Self::LearnerProof(m) => {
-        out.put_u16(m.replica.get());
-        out.put_u64(m.nonce);
-        out.put_u64(m.frontier.get());
-        out.put_u64(m.epoch.get());
-        out.put_u128(m.config_id);
-      }
-      Self::RequestBlock(addr) => {
-        out.put_slice(addr.as_bytes());
-      }
-      Self::BlockResponse(m) => {
-        out.put_slice(m.addr.as_bytes());
-        match &m.block {
-          Some(bytes) => {
-            out.put_u8(1);
-            write_bytes_u32(&mut out, bytes);
-          }
-          None => {
-            out.put_u8(0);
-          }
-        }
-      }
-      Self::Nack(m) => {
-        out.put_u64(m.view.get());
-        out.put_u64(m.op.get());
-        out.put_u16(m.replica.get());
-        out.put_u128(m.config_id);
-      }
+      Self::LearnerStatus(_) => fixed_fields_bound(4, 1),
+      Self::EpochAhead(_) => fixed_fields_bound(2, 0),
+      Self::RequestLearnerProof(_) => fixed_fields_bound(4, 1),
+      Self::LearnerProof(_) => fixed_fields_bound(4, 1),
+      Self::RequestBlock(_) => fixed_fields_bound(0, 1),
+      Self::BlockResponse(m) => fixed_fields_bound(0, 1).saturating_add(
+        m.block()
+          .map_or(0, |b| LEN_FIELD_OVERHEAD.saturating_add(b.len())),
+      ),
+      Self::Nack(_) => fixed_fields_bound(3, 1),
     }
-    out.freeze()
   }
+}
 
-  /// The exact number of bytes [`Self::encode`] would produce for this message, computed WITHOUT
-  /// encoding (no allocation/copy). It sums the same fixed-width scalars, length-prefixed payloads,
-  /// and log slices that `encode` writes, so the transport can preflight a message against its
-  /// frame cap before paying for a full encode of an oversized one. The `#[cfg(test)]`
-  /// `encoded_len() == encode().len()` equivalence assertion below pins the two together so they
-  /// cannot drift; if a future field changes `encode`, update both.
-  pub fn encoded_len(&self) -> usize {
-    // Shared per-encoding prefix: WIRE_VERSION (u16) + the variant discriminant tag (u8).
-    const HEADER: usize = 2 + 1;
-    // Fixed-width scalar widths as `encode` writes them.
-    const U64: usize = 8;
-    const U128: usize = 16;
-    const U16: usize = 2;
-    const U8: usize = 1;
-    // A `write_bytes_u32` payload is a u32 length prefix plus the bytes.
-    fn bytes_u32(len: usize) -> usize {
-      4 + len
-    }
-    // A `write_log` slice is a u32 count plus, per entry, op(u64) + client(u128) + request(u64), a
-    // body-state tag (u8), and its payload — a length-prefixed body (Present), a u128 checksum
-    // (Repairing), or a Reconfigure payload (replica_count u8 + learner_count u16 + a u32-count-prefixed
-    // member list of 16-byte ids + the trailing prev_config_id u128).
-    fn log(log: &[PreparedEntry]) -> usize {
-      let mut n = 4;
-      for e in log {
-        let body = match &e.body {
-          Body::Present(body) => bytes_u32(body.len()),
-          Body::Repairing(_) => U128,
-          Body::Reconfigure(p) => U8 + U16 + 4 + p.members().len() * U128 + U128,
-        };
-        n += U64 + U128 + U64 + U8 + body;
-      }
-      n
-    }
-    // The epoch-policy matrix widths: a STRICT carrier adds `epoch` (u64) + `config_id` (u128); an
-    // AGNOSTIC carrier adds `config_id` (u128); `Request`/`Reply` add neither. Spelled out per arm in
-    // canonical field order so this preflight stays byte-identical to `encode`.
-    let body = match self {
-      Self::Request(m) => U128 + U64 + bytes_u32(m.body.len()),
-      Self::Prepare(m) => U64 + U64 + U64 + U64 + U64 + U128 + U128 + U64 + bytes_u32(m.body.len()),
-      Self::PrepareOk(_) => U64 + U64 + U16 + U64 + U128 + U64 + U128,
-      Self::Reply(m) => U64 + U128 + U64 + bytes_u32(m.body.len()),
-      Self::Commit(_) => U64 + U64 + U64 + U64 + U128,
-      Self::StartViewChange(_) => U64 + U16 + U64 + U128,
-      Self::DoViewChange(m) => U64 + U64 + U64 + U64 + U64 + U64 + U128 + U16 + log(&m.log),
-      Self::StartView(m) => U64 + U64 + U64 + U64 + U64 + U128 + U16 + log(&m.log),
-      Self::GetView(_) => U64 + U16 + U64 + U64 + U128,
-      Self::RequestPrepare(_) => U64 + U64 + U16 + U128,
-      Self::Recovery(_) => U16 + U64 + U64 + U128,
-      Self::RecoveryResponse(m) => U64 + U64 + U64 + U64 + U64 + U128 + U16 + U64 + log(&m.log),
-      Self::RequestSync(_) => U64 + U64 + U16 + U64 + U8 + U128,
-      Self::SyncCheckpoint(m) => {
-        U64
-          + U64
-          + U128
-          + U64
-          + U128
-          + U16
-          + U64
-          + bytes_u32(m.snapshot.len())
-          + bytes_u32(m.membership.len())
-      }
-      Self::RequestPrepareRange(_) => U64 + U64 + U64 + U16 + U128,
-      Self::RepairBatch(m) => U64 + U64 + U64 + U128 + log(&m.log),
-      Self::PrepareBatch(m) => U64 + U64 + U64 + U64 + U128 + log(&m.log),
-      Self::LearnerStatus(_) => U16 + U64 + U64 + U64 + U128,
-      Self::EpochAhead(_) => U64 + U64,
-      Self::RequestLearnerProof(_) => U16 + U64 + U64 + U64 + U128,
-      Self::LearnerProof(_) => U16 + U64 + U64 + U64 + U128,
-      // addr (16 bytes fixed)
-      Self::RequestBlock(_) => 16,
-      // addr (16) + presence flag (u8=1) + optional block (u32 length prefix + bytes)
-      Self::BlockResponse(m) => 16 + 1 + m.block.as_deref().map_or(0, |b| 4 + b.len()),
-      // view(u64) + op(u64) + replica(u16) + config_id(u128), an AGNOSTIC carrier (like RequestPrepare).
-      Self::Nack(_) => U64 + U64 + U16 + U128,
+/// Worst-case bytes the FIXED (non-variable-length) shape of a message contributes: the
+/// `Message.body` oneof arm framing ([`ENVELOPE_ARM_OVERHEAD`]), `scalars` bare `uint64`/`uint32`/
+/// `bool` fields (each charged the WIDEST possible varint, [`WORST_UINT64_FIELD`] — a safe
+/// over-charge for the schema's narrower `uint32`/`bool` fields, e.g. `replica`/`recovery`, since a
+/// looser upper bound is always safe), and `ids` 16-byte id/checksum `bytes` fields (each
+/// [`WORST_ID_FIELD`]). Every [`Message`] variant with NO variable-length field (no
+/// body/log/snapshot/membership) is bounded by this alone; a variant WITH one adds its own
+/// worst-case variable component on top (see [`Message::wire_size_bound`]).
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn fixed_fields_bound(scalars: usize, ids: usize) -> usize {
+  ENVELOPE_ARM_OVERHEAD
+    .saturating_add(scalars.saturating_mul(WORST_UINT64_FIELD))
+    .saturating_add(ids.saturating_mul(WORST_ID_FIELD))
+}
+
+/// Worst-case bytes a whole `repeated PreparedEntry log` field contributes, entry by entry. A
+/// protobuf `repeated` field carries no count/container framing of its own — each element pays
+/// only its own tag+length (see [`LOG_ENTRY_BODY_OVERHEAD`]'s doc) — so this is exactly the
+/// SATURATING SUM of every entry's own worst-case size: a `Present` entry via
+/// [`present_entry_encoded_len`], a header-only `Repairing` entry at the fixed
+/// [`PER_HEADER_ENTRY_BYTES`], or a `Reconfigure` entry via [`reconfigure_entry_wire_size_bound`].
+fn log_wire_size_bound(log: &[PreparedEntry]) -> usize {
+  log.iter().fold(0usize, |acc, e| {
+    let entry_bound = match e.body_state() {
+      Body::Present(bytes) => present_entry_encoded_len(bytes.len()),
+      Body::Repairing(_) => PER_HEADER_ENTRY_BYTES,
+      Body::Reconfigure(payload) => reconfigure_entry_wire_size_bound(payload),
     };
-    HEADER + body
-  }
-
-  /// Decodes a message produced by [`Self::encode`], bounds-checked and panic-free on any
-  /// truncated / corrupt / adversarial input.
-  ///
-  /// Rejects (never panics): an unknown leading version ([`CodecError::UnknownVersion`]), an
-  /// unknown variant tag ([`CodecError::UnknownTag`]), a buffer that ends mid-field
-  /// ([`CodecError::Truncated`]), a body/log length prefix exceeding the remaining bytes
-  /// ([`CodecError::LengthOverflow`]), or trailing bytes after the variant
-  /// ([`CodecError::TrailingBytes`]). The tag dispatch covers the 24 known tags, with any other
-  /// byte falling through to [`CodecError::UnknownTag`] — adding a 25th variant means adding its
-  /// discriminant tag + a decode arm here (the encode `match` will not compile until the variant
-  /// is handled, preserving the exhaustive-`Message`-match property).
-  pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
-    let mut r = Reader::new(buf);
-    let version = r.u16()?;
-    if version != WIRE_VERSION {
-      return Err(CodecError::UnknownVersion(version));
-    }
-    let tag = r.u8()?;
-    let msg = match tag {
-      0 => Self::Request(Request {
-        client: read_client(&mut r)?,
-        request: read_request(&mut r)?,
-        body: read_body(&mut r)?,
-      }),
-      1 => Self::Prepare(Prepare {
-        view: read_view(&mut r)?,
-        op: read_op(&mut r)?,
-        commit: read_op(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-        client: read_client(&mut r)?,
-        request: read_request(&mut r)?,
-        body: read_body(&mut r)?,
-      }),
-      2 => Self::PrepareOk(PrepareOk {
-        view: read_view(&mut r)?,
-        op: read_op(&mut r)?,
-        replica: read_replica(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        prepare_checksum: r.u128()?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      3 => Self::Reply(Reply {
-        view: read_view(&mut r)?,
-        client: read_client(&mut r)?,
-        request: read_request(&mut r)?,
-        body: read_body(&mut r)?,
-      }),
-      4 => Self::Commit(Commit {
-        view: read_view(&mut r)?,
-        commit: read_op(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      5 => Self::StartViewChange(StartViewChange {
-        view: read_view(&mut r)?,
-        replica: read_replica(&mut r)?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      6 => Self::DoViewChange(DoViewChange {
-        view: read_view(&mut r)?,
-        log_view: read_view(&mut r)?,
-        op: read_op(&mut r)?,
-        commit: read_op(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-        replica: read_replica(&mut r)?,
-        log: read_log(&mut r)?,
-      }),
-      7 => Self::StartView(StartView {
-        view: read_view(&mut r)?,
-        op: read_op(&mut r)?,
-        commit: read_op(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-        replica: read_replica(&mut r)?,
-        log: read_log(&mut r)?,
-      }),
-      8 => Self::GetView(GetView {
-        view: read_view(&mut r)?,
-        replica: read_replica(&mut r)?,
-        nonce: r.u64()?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      9 => Self::RequestPrepare(RequestPrepare {
-        view: read_view(&mut r)?,
-        op: read_op(&mut r)?,
-        replica: read_replica(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      10 => Self::Recovery(Recovery {
-        replica: read_replica(&mut r)?,
-        nonce: r.u64()?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      11 => Self::RecoveryResponse(RecoveryResponse {
-        view: read_view(&mut r)?,
-        op: read_op(&mut r)?,
-        commit: read_op(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-        replica: read_replica(&mut r)?,
-        nonce: r.u64()?,
-        log: read_log(&mut r)?,
-      }),
-      12 => Self::RequestSync(RequestSync {
-        view: read_view(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        replica: read_replica(&mut r)?,
-        nonce: r.u64()?,
-        recovery: read_bool(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      13 => Self::SyncCheckpoint(SyncCheckpoint {
-        view: read_view(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        checkpoint_id: r.u128()?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-        replica: read_replica(&mut r)?,
-        nonce: r.u64()?,
-        snapshot: read_body(&mut r)?,
-        membership: read_body(&mut r)?,
-      }),
-      14 => Self::RequestPrepareRange(RequestPrepareRange {
-        view: read_view(&mut r)?,
-        lo: read_op(&mut r)?,
-        hi: read_op(&mut r)?,
-        replica: read_replica(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      15 => Self::RepairBatch(RepairBatch {
-        view: read_view(&mut r)?,
-        commit: read_op(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        config_id: r.u128()?,
-        log: read_log(&mut r)?,
-      }),
-      // Tags 16/17/18 are retired (see `tag`); a peer on this wire version never emits them, so they
-      // fall through to the unknown-tag error below.
-      19 => Self::PrepareBatch(PrepareBatch {
-        view: read_view(&mut r)?,
-        commit: read_op(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-        log: read_log(&mut r)?,
-      }),
-      20 => Self::LearnerStatus(LearnerStatus {
-        replica: read_replica(&mut r)?,
-        durable_commit_min: read_op(&mut r)?,
-        durable_op: read_op(&mut r)?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      21 => Self::EpochAhead(EpochAhead {
-        epoch: read_epoch(&mut r)?,
-        checkpoint_op: read_op(&mut r)?,
-      }),
-      22 => Self::RequestLearnerProof(RequestLearnerProof {
-        from: read_replica(&mut r)?,
-        at_op: read_op(&mut r)?,
-        nonce: r.u64()?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      23 => Self::LearnerProof(LearnerProof {
-        replica: read_replica(&mut r)?,
-        nonce: r.u64()?,
-        frontier: read_op(&mut r)?,
-        epoch: read_epoch(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      24 => Self::RequestBlock(read_block_address(&mut r)?),
-      25 => {
-        let addr = read_block_address(&mut r)?;
-        let flag = r.u8()?;
-        let block = match flag {
-          0 => None,
-          1 => Some(read_body(&mut r)?),
-          _ => {
-            return Err(CodecError::UnknownTag(flag));
-          }
-        };
-        Self::BlockResponse(BlockResponse { addr, block })
-      }
-      26 => Self::Nack(Nack {
-        view: read_view(&mut r)?,
-        op: read_op(&mut r)?,
-        replica: read_replica(&mut r)?,
-        config_id: r.u128()?,
-      }),
-      other => return Err(CodecError::UnknownTag(other)),
-    };
-    r.finish()?;
-    Ok(msg)
-  }
+    acc.saturating_add(entry_bound)
+  })
 }
 
-// ── per-field readers (narrow a bounds-checked scalar to its newtype) + log slice codec ──
-
-#[cfg_attr(not(tarpaulin), inline)]
-fn read_view(r: &mut Reader<'_>) -> Result<View, CodecError> {
-  Ok(View::with(r.u64()?))
+/// Worst-case bytes ONE `Body::Reconfigure` [`PreparedEntry`] contributes to a log field. The
+/// `reconfigure` oneof arm is, like `present`, a single length-delimited sub-message, so its own
+/// entry-level framing plus `op`/`request`/`client` fields are IDENTICAL to a `Present` entry's —
+/// exactly what [`LOG_ENTRY_BODY_OVERHEAD`] already models ([`present_entry_encoded_len`] adds the
+/// flat body length on top of it; here the "body" is the successor [`ReconfigurePayload`]'s own
+/// fields instead): `replica_count` + `learner_count` (2 × [`WORST_UINT64_FIELD`], a safe
+/// over-charge for their narrower `uint32` wire width), `prev_config_id` ([`WORST_ID_FIELD`]), and
+/// one [`WORST_ID_FIELD`] per member id.
+fn reconfigure_entry_wire_size_bound(p: &ReconfigurePayload) -> usize {
+  let payload_fields = (2 * WORST_UINT64_FIELD)
+    .saturating_add(WORST_ID_FIELD)
+    .saturating_add(p.members().len().saturating_mul(WORST_ID_FIELD));
+  LOG_ENTRY_BODY_OVERHEAD.saturating_add(payload_fields)
 }
 
-#[cfg_attr(not(tarpaulin), inline)]
-fn read_block_address(r: &mut Reader<'_>) -> Result<crate::BlockAddress, CodecError> {
-  let bytes: [u8; 16] = r.take(16)?.try_into().expect("take(16) yields 16 bytes");
-  Ok(crate::BlockAddress::from_bytes(bytes))
-}
-
-#[cfg_attr(not(tarpaulin), inline)]
-fn read_op(r: &mut Reader<'_>) -> Result<OpNumber, CodecError> {
-  Ok(OpNumber::with(r.u64()?))
-}
-
-#[cfg_attr(not(tarpaulin), inline)]
-fn read_epoch(r: &mut Reader<'_>) -> Result<Epoch, CodecError> {
-  Ok(Epoch::new(r.u64()?))
-}
-
-#[cfg_attr(not(tarpaulin), inline)]
-fn read_request(r: &mut Reader<'_>) -> Result<RequestNumber, CodecError> {
-  Ok(RequestNumber::with(r.u64()?))
-}
-
-#[cfg_attr(not(tarpaulin), inline)]
-fn read_client(r: &mut Reader<'_>) -> Result<ClientId, CodecError> {
-  Ok(ClientId::new(r.u128()?))
-}
-
-#[cfg_attr(not(tarpaulin), inline)]
-fn read_replica(r: &mut Reader<'_>) -> Result<ReplicaId, CodecError> {
-  Ok(ReplicaId::new(r.u16()?))
-}
-
-#[cfg_attr(not(tarpaulin), inline)]
-fn read_bool(r: &mut Reader<'_>) -> Result<bool, CodecError> {
-  // Canonical encoding: exactly one byte representation per value. A non-0/1 byte is a malformed frame,
-  // not a truthy value (accepting any-nonzero would break decode∘encode identity + the `TrailingBytes`
-  // canonical-form discipline the rest of the codec enforces).
-  match r.u8()? {
-    0 => Ok(false),
-    1 => Ok(true),
-    other => Err(CodecError::InvalidBool(other)),
-  }
-}
-
-#[cfg_attr(not(tarpaulin), inline)]
-fn read_body(r: &mut Reader<'_>) -> Result<Bytes, CodecError> {
-  Ok(Bytes::copy_from_slice(r.bytes_u32()?))
-}
+// ── the `ReconfigurePayload` canonical body codec (still used by `encode_body`/`decode_body`) ──
 
 /// Writes a [`ReconfigurePayload`] in canonical form: `replica_count` (`u8`), `learner_count` (`u16`),
 /// then a `u32`-count-prefixed member list (each [`MemberId`] a 16-byte big-endian `u128`). One source
-/// of truth for both the wire encoding ([`write_log`]'s `Reconfigure` arm) and the payload's
-/// `body_checksum`, so a Reconfigure op's identity is exactly its on-wire content.
+/// of truth for both [`ReconfigurePayload::encode_body`] and the payload's `body_checksum`, so a
+/// Reconfigure op's identity is exactly its canonical body content.
 fn write_reconfigure(out: &mut impl BufMut, payload: &ReconfigurePayload) {
   out.put_u8(payload.replica_count);
   out.put_u16(payload.learner_count);
@@ -3154,70 +2715,6 @@ fn read_reconfigure(r: &mut Reader<'_>) -> Result<ReconfigurePayload, CodecError
     members.into_boxed_slice(),
     prev_config_id,
   ))
-}
-
-/// Writes a `Vec<PreparedEntry>` log slice: a `u32` element count, then each entry as
-/// `op`(u64) `client`(u128) `request`(u64) + a body-state tag (u8) + its payload — a
-/// length-prefixed body for [`Body::Present`], a 16-byte `body_checksum` for [`Body::Repairing`]
-/// (no bytes), or a [`ReconfigurePayload`] for [`Body::Reconfigure`] (the successor membership). A
-/// `Repairing` entry carries a body-faulty committed op's existence through a view change so its op
-/// number is never re-minted; a `Reconfigure` entry carries a membership-change op.
-fn write_log(out: &mut impl BufMut, log: &[PreparedEntry]) {
-  debug_assert!(
-    log.len() <= u32::MAX as usize,
-    "write_log: entry count {} exceeds u32::MAX",
-    log.len()
-  );
-  out.put_u32(log.len() as u32);
-  for e in log {
-    out.put_u64(e.op.get());
-    out.put_u128(e.client.get());
-    out.put_u64(e.request.get());
-    match &e.body {
-      Body::Present(body) => {
-        out.put_u8(BODY_TAG_PRESENT);
-        write_bytes_u32(out, body);
-      }
-      Body::Repairing(checksum) => {
-        out.put_u8(BODY_TAG_REPAIRING);
-        out.put_u128(*checksum);
-      }
-      Body::Reconfigure(payload) => {
-        out.put_u8(BODY_TAG_RECONFIGURE);
-        write_reconfigure(out, payload);
-      }
-    }
-  }
-}
-
-/// Reads a `Vec<PreparedEntry>` log slice written by [`write_log`]. The element count is validated
-/// against the remaining bytes ([`Reader::seq_len`] with [`PREPARED_ENTRY_MIN_LEN`]) before any
-/// allocation, so a hostile count cannot drive an unbounded pre-allocation; each entry's body-state
-/// tag selects a `u32`-length-prefixed body ([`Body::Present`], length-checked individually), a
-/// 16-byte checksum ([`Body::Repairing`]), or a [`ReconfigurePayload`] ([`Body::Reconfigure`], whose
-/// member count is length-checked). An unknown body-state tag is rejected as
-/// [`CodecError::UnknownTag`].
-fn read_log(r: &mut Reader<'_>) -> Result<Vec<PreparedEntry>, CodecError> {
-  let count = r.seq_len(PREPARED_ENTRY_MIN_LEN)?;
-  let mut log = Vec::with_capacity(count);
-  for _ in 0..count {
-    let op = read_op(r)?;
-    let client = read_client(r)?;
-    let request = read_request(r)?;
-    let body = match r.u8()? {
-      BODY_TAG_PRESENT => Body::Present(read_body(r)?),
-      BODY_TAG_REPAIRING => Body::Repairing(r.u128()?),
-      BODY_TAG_RECONFIGURE => Body::Reconfigure(read_reconfigure(r)?),
-      other => return Err(CodecError::UnknownTag(other)),
-    };
-    log.push(PreparedEntry {
-      op,
-      client,
-      request,
-      body,
-    });
-  }
-  Ok(log)
 }
 
 /// A message the state machine wants the driver to send.

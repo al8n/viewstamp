@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  ClientId, Instant, Message, Peer, ReplicaId, RequestNumber,
+  ClientId, Instant, Message, Peer, ReplicaId, RequestNumber, encode_message,
   message::Request,
   transport::{frame::encode_frame, stream::RecordIo},
 };
@@ -81,8 +81,8 @@ impl RecordIo for FakeRecords {
 fn decodes_two_messages_from_one_read() {
   let from = Peer::Replica(ReplicaId::new(2));
   let mut frames = Vec::new();
-  encode_frame(&req_msg().encode(), &mut frames);
-  encode_frame(&req_msg().encode(), &mut frames);
+  encode_frame(&encode_message(&req_msg()), &mut frames);
+  encode_frame(&encode_message(&req_msg()), &mut frames);
   let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
   conn.mark_validated(from);
   let closed = conn.handle_data(&frames, false, Instant::ZERO).unwrap();
@@ -97,7 +97,7 @@ fn decodes_two_messages_from_one_read() {
 fn intake_pending_loop_reassembles_a_large_frame() {
   let from = Peer::Replica(ReplicaId::new(0));
   let mut frame = Vec::new();
-  encode_frame(&req_msg().encode(), &mut frame);
+  encode_frame(&encode_message(&req_msg()), &mut frame);
   // chunk smaller than the frame forces multiple Pending iterations.
   let mut conn = Conn::from_parts(FakeRecords::new(4, from));
   conn.mark_validated(from);
@@ -116,7 +116,7 @@ fn intake_pending_loop_reassembles_a_large_frame() {
 fn mid_frame_eof_is_truncation() {
   let from = Peer::Replica(ReplicaId::new(0));
   let mut frame = Vec::new();
-  encode_frame(&req_msg().encode(), &mut frame);
+  encode_frame(&encode_message(&req_msg()), &mut frame);
   let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
   conn.mark_validated(from);
   // EOF mid-frame: the peer finished but the conn is not yet closed; finalize reports truncation.
@@ -132,7 +132,7 @@ fn mid_frame_eof_is_truncation() {
 fn a_complete_final_frame_is_delivered_then_closed() {
   let from = Peer::Replica(ReplicaId::new(0));
   let mut frame = Vec::new();
-  encode_frame(&req_msg().encode(), &mut frame);
+  encode_frame(&encode_message(&req_msg()), &mut frame);
   let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
   conn.mark_validated(from);
   // A complete frame arrives in the SAME read that signals EOF.
@@ -205,7 +205,7 @@ fn many_frames_in_one_read_all_decode() {
   let mut frames = Vec::new();
   let count = 2000;
   for _ in 0..count {
-    encode_frame(&req_msg().encode(), &mut frames);
+    encode_frame(&encode_message(&req_msg()), &mut frames);
   }
   let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
   conn.mark_validated(from);
@@ -220,7 +220,7 @@ fn handshake_gate_blocks_decode() {
   // A conn that was never validated buffers plaintext but decodes nothing.
   let from = Peer::Replica(ReplicaId::new(0));
   let mut frames = Vec::new();
-  encode_frame(&req_msg().encode(), &mut frames);
+  encode_frame(&encode_message(&req_msg()), &mut frames);
   let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
   conn.handle_data(&frames, false, Instant::ZERO).unwrap();
   let mut out = Vec::new();
@@ -233,7 +233,7 @@ fn a_short_write_closes_the_conn() {
   use crate::transport::testutil::MockRecords;
   let from = Peer::Replica(ReplicaId::new(0));
   let mut frame = Vec::new();
-  encode_frame(&req_msg().encode(), &mut frame);
+  encode_frame(&encode_message(&req_msg()), &mut frame);
   // Cap the record layer below the frame so write_framed short-writes (the out-of-contract path
   // the router's projective cap normally prevents).
   let records = MockRecords::new(false, Some(from)).with_write_cap(frame.len() - 1);
@@ -302,7 +302,7 @@ fn a_bound_raw_conn_decodes_inbound_with_the_bound_peer() {
   let who = Peer::Replica(ReplicaId::new(3));
   conn.mark_validated(who); // the router validates + binds the trusted identity
   let mut frames = Vec::new();
-  encode_frame(&req_msg().encode(), &mut frames);
+  encode_frame(&encode_message(&req_msg()), &mut frames);
   conn.handle_data(&frames, false, Instant::ZERO).unwrap();
   let mut out = Vec::new();
   conn.poll_decoded(&mut out).unwrap();

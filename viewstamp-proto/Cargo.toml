@@ -14,7 +14,7 @@ default = ["std"]
 # heap, so its minimal viable config is `alloc` (the bare no-feature build does
 # not compile — that is the intended signal).
 alloc = []
-std = ["bytes/std"]
+std = ["bytes/std", "buffa/std"]
 # Network transport, folded in as feature-gated modules (additive over the core).
 # `tcp` is no_std+alloc; no new REQUIRED deps. `tls` adds the rustls record layer,
 # implies `tcp` (reuses the framing/Conn/router) and `std` (rustls is std-only).
@@ -29,11 +29,15 @@ quic = ["tcp", "std", "dep:quinn-proto", "dep:x509-parser"]
 
 [dependencies]
 bytes = { workspace = true }
+buffa = { workspace = true }
 derive_more = { workspace = true, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 thiserror = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
 quinn-proto = { version = "0.11", default-features = false, optional = true }
 x509-parser = { version = "0.18", default-features = false, optional = true }
+
+[build-dependencies]
+buffa-build.workspace = true
 
 [dev-dependencies]
 criterion = "0.8"

@@ -10,9 +10,41 @@ use std::{fs, path::Path};
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  ClientId, Commit, Epoch, GetView, Header, Message, OpNumber, ReplicaId, Request, RequestNumber,
-  StartViewChange, View, VsrState,
+  BlockAddress, BlockResponse, ClientId, Commit, DoViewChange, Epoch, GetView, Header, MemberId,
+  Message, Nack, OpNumber, Prepare, PreparedEntry, ReconfigurePayload, ReplicaId, Request,
+  RequestNumber, StartViewChange, SyncCheckpoint, View, VsrState, encode_message,
 };
+
+/// A 3-entry log spanning all three `PreparedEntry` body states (`Present`, `Repairing`,
+/// `Reconfigure`) — exercises the `repeated PreparedEntry` field's nested oneof and the
+/// `ReconfigurePayload` sub-message in one seed.
+fn mixed_log() -> Vec<PreparedEntry> {
+  vec![
+    PreparedEntry::new(
+      OpNumber::with(1),
+      ClientId::new(1),
+      RequestNumber::with(1),
+      Bytes::from_static(b"a"),
+    ),
+    PreparedEntry::repairing(
+      OpNumber::with(2),
+      ClientId::new(2),
+      RequestNumber::with(2),
+      0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00,
+    ),
+    PreparedEntry::reconfigure(
+      OpNumber::with(3),
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(3),
+      ReconfigurePayload::new(
+        2,
+        0,
+        vec![MemberId::new(1), MemberId::new(2)].into_boxed_slice(),
+        0,
+      ),
+    ),
+  ]
+}
 
 fn write(target: &str, name: &str, bytes: &[u8]) {
   let dir = Path::new("corpus").join(target);
@@ -57,29 +89,84 @@ fn main() {
     Epoch::new(0),
     0,
   ));
+  let prepare = Message::Prepare(Prepare::new(
+    View::with(5),
+    OpNumber::with(10),
+    OpNumber::with(9),
+    OpNumber::with(4),
+    Epoch::new(0),
+    0xC0FFEE,
+    ClientId::new(7),
+    RequestNumber::with(2),
+    Bytes::from_static(b"prepare-body"),
+  ));
+  let do_view_change = Message::DoViewChange(
+    DoViewChange::new(
+      View::with(6),
+      View::with(5),
+      OpNumber::with(9),
+      OpNumber::with(4),
+      Epoch::new(0),
+      0xC0FFEE,
+      ReplicaId::new(1),
+      mixed_log(),
+    )
+    .with_checkpoint_op(OpNumber::with(3)),
+  );
+  let sync_checkpoint = Message::SyncCheckpoint(SyncCheckpoint::new(
+    View::with(4),
+    OpNumber::with(8),
+    0xBEEF,
+    Epoch::new(0),
+    0xC0FFEE,
+    ReplicaId::new(2),
+    0x1234,
+    Bytes::from_static(b"snapshot-body"),
+    Bytes::from_static(b"membership-body"),
+  ));
+  let block_response_present = Message::BlockResponse(BlockResponse::new(
+    BlockAddress::from_bytes(0xAA55u128.to_be_bytes()),
+    Some(Bytes::from_static(b"block-body")),
+  ));
+  let block_response_absent = Message::BlockResponse(BlockResponse::new(
+    BlockAddress::from_bytes(0xAA55u128.to_be_bytes()),
+    None,
+  ));
+  let nack = Message::Nack(Nack::new(
+    View::with(7),
+    OpNumber::with(11),
+    ReplicaId::new(3),
+    0xC0FFEE,
+  ));
   for (name, msg) in [
     ("request", &request),
     ("commit", &commit),
     ("start_view_change", &svc),
     ("get_view", &get_view),
+    ("prepare", &prepare),
+    ("do_view_change", &do_view_change),
+    ("sync_checkpoint", &sync_checkpoint),
+    ("block_response_present", &block_response_present),
+    ("block_response_absent", &block_response_absent),
+    ("nack", &nack),
   ] {
-    write("message_decode", name, &msg.encode());
+    write("message_decode", name, &encode_message(msg));
   }
 
   // ── stream_ingress: [lane byte][wire payload] (lane 1 = hello prefixed by the harness) ──
   write("stream_ingress", "framed_request_validated", &{
     let mut v = vec![1u8];
-    v.extend_from_slice(&frame(&request.encode()));
+    v.extend_from_slice(&frame(&encode_message(&request)));
     v
   });
   write("stream_ingress", "framed_commit_validated", &{
     let mut v = vec![1u8];
-    v.extend_from_slice(&frame(&commit.encode()));
+    v.extend_from_slice(&frame(&encode_message(&commit)));
     v
   });
   write("stream_ingress", "framed_request_raw", &{
     let mut v = vec![0u8];
-    v.extend_from_slice(&frame(&request.encode()));
+    v.extend_from_slice(&frame(&encode_message(&request)));
     v
   });
 

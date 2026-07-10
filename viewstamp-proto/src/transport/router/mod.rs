@@ -208,6 +208,14 @@ impl<R> PeerRouter<R> {
   }
 }
 
+/// Whether an encoded frame of `len` bytes is admissible under [`MAX_FRAME_LEN`] —
+/// [`PeerRouter::route`]'s post-encode framing-correctness backstop, checked against the bytes the
+/// encode actually produces (admission itself is [`Message::wire_size_bound`]'s job, checked
+/// BEFORE the view is built).
+fn frame_fits(len: usize) -> bool {
+  len <= MAX_FRAME_LEN as usize
+}
+
 impl<R: StreamTransport> PeerRouter<R> {
   /// Registers a conn this node dialed (it becomes authoritative for `peer` once its handshake
   /// validates that identity — see `note_established`). It is NOT a routing target while handshaking.
@@ -380,21 +388,42 @@ impl<R: StreamTransport> PeerRouter<R> {
   /// promoted standby rather than a stale closed conn — closing the same-pump black-hole at every
   /// call site by construction, not only in the coordinator's pump.
   pub fn route(&mut self, to: Recipient, msg: &Message, self_id: ReplicaId) -> usize {
-    // Symmetric frame cap, preflighted BEFORE encoding: the transport never emits a frame larger
-    // than it would accept inbound, so a message whose frame would exceed MAX_FRAME_LEN is refused
-    // here WITHOUT paying for a full encode + copy of an oversized buffer the peer would only
-    // reject as FrameTooLong. EVERY protocol message is bounded under the cap by construction —
-    // header-only view-change carriers, the byte-bounded RepairBatch serve, and the state-sync
-    // checkpoint (bounded to [`max_unchunked_snapshot_len`] before shipping; over-frame checkpoints
-    // are fetched block-by-block, never shipped as one oversized frame) — so a refusal here is a
-    // REAL bug; it is counted visibly (the oversized-dropped counter) rather than emitting a doomed
-    // frame or silently swallowing the send and wedging liveness. VSR retransmission covers a
-    // refused send. `encoded_len()` is the exact length `encode()` would produce.
-    if msg.encoded_len() > MAX_FRAME_LEN as usize {
+    use buffa::Message as _;
+    // Symmetric frame cap, ADMITTED before building the pb view at all: the transport never emits a
+    // frame larger than it would accept inbound, so a message whose frame would exceed MAX_FRAME_LEN
+    // is refused here WITHOUT paying for building the view or a full encode + copy of an oversized
+    // buffer the peer would only reject as FrameTooLong. EVERY protocol message is bounded under the
+    // cap by construction — header-only view-change carriers, the byte-bounded RepairBatch serve,
+    // and the state-sync checkpoint (bounded to [`max_unchunked_snapshot_len`] before shipping;
+    // over-frame checkpoints are fetched block-by-block, never shipped as one oversized frame) — so a
+    // refusal here is a REAL bug; it is counted visibly (the oversized-dropped counter) rather than
+    // emitting a doomed frame or silently swallowing the send and wedging liveness. VSR
+    // retransmission covers a refused send.
+    //
+    // `wire_size_bound()` is the admission gate, NOT `encoded_len()`: buffa's `encoded_len()` returns
+    // a `u32` with unchecked accumulation, so an absurd (multi-GiB) variable-length field could wrap
+    // it to a small estimate that passes a preflight — and only THEN does `encode_to_bytes()` below
+    // allocate/copy the multi-GiB encoding, long before any post-encode length check runs.
+    // `wire_size_bound()` is computed structurally from `msg`'s own fields with saturating
+    // arithmetic throughout, so it never wraps and refuses an oversized message before the view is
+    // even built.
+    if msg.wire_size_bound() > MAX_FRAME_LEN as usize {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
       return 0;
     }
-    let encoded = msg.encode();
+    // Admitted: build the view once here and reuse it for the encode below, rather than rebuilding
+    // it per send.
+    let view = crate::wire::pb_message(msg);
+    let encoded = view.encode_to_bytes();
+    // Framing-correctness backstop: re-check the bytes the encode ACTUALLY produced before they
+    // reach `encode_frame`'s own `u32` length prefix. Unreachable via OVERSIZE now that
+    // `wire_size_bound` gates admission above (a message ~4 GiB nowhere near fits `MAX_FRAME_LEN`
+    // and is already refused), but retained cheaply as the framing-correctness assertion of last
+    // resort.
+    if !frame_fits(encoded.len()) {
+      self.oversized_dropped = self.oversized_dropped.saturating_add(1);
+      return 0;
+    }
     let mut framed = Vec::with_capacity(4 + encoded.len());
     encode_frame(&encoded, &mut framed);
     let mut dropped = 0;

@@ -591,8 +591,8 @@ fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
   // membership) and none is stranded. Version 4 is a SECOND layout (body + epoch/membership tail),
   // version 5 a THIRD (that plus the lineage tail), and version 6 (= SUPERBLOCK_VERSION) a FOURTH (that
   // plus the `config_install_op` scalar). Together with the root carrying its OWN version, independent of
-  // the message WIRE_VERSION, this keeps the decoupling correct-by-construction — a message-only
-  // WIRE_VERSION bump can never invalidate a persisted root.
+  // the message wire format, this keeps the decoupling correct-by-construction — a message-format-only
+  // change can never invalidate a persisted root.
   //
   // The pre-membership 1..=3 layout: a true v3 body (NOT a relabelled v4/v5/v6 root, whose appended tails
   // would become trailing bytes under the legacy path) decodes identically under every legacy tag.
