@@ -1,5 +1,9 @@
 <div align="center">
+
+<img src="https://raw.githubusercontent.com/al8n/viewstamp/main/art/logo.png" height="200px">
+
 <h1>viewstamp</h1>
+
 </div>
 <div align="center">
 

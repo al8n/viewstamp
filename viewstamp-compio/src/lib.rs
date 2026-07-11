@@ -1,3 +1,4 @@
+#![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/viewstamp/main/art/logo_72x72.png")]
 //! Proactor (compio) QUIC driver for `viewstamp-proto`.
 //!
 //! A single compio task owns a [`viewstamp_proto::QuicCoordinator`] plus the embedder's

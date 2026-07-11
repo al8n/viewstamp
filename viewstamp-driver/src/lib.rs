@@ -1,3 +1,4 @@
+#![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/viewstamp/main/art/logo_72x72.png")]
 //! Runtime-agnostic driver core shared by the viewstamp driver crates.
 //!
 //! A driver binds `viewstamp-proto`'s Sans-I/O consensus endpoint to a real runtime; this crate is

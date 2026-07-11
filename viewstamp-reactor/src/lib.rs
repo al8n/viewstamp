@@ -1,3 +1,4 @@
+#![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/viewstamp/main/art/logo_72x72.png")]
 //! Reactor-I/O (readiness) QUIC and TCP/TLS drivers for `viewstamp-proto`.
 //!
 //! One task owns a [`viewstamp_proto::QuicCoordinator`] ([`ReactorQuicDriver`]) or a

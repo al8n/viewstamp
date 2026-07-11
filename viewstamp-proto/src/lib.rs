@@ -1,3 +1,4 @@
+#![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/viewstamp/main/art/logo_72x72.png")]
 //! Sans-I/O state machine for the Viewstamped Replication protocol.
 //!
 //! Modeled on `quinn-proto`: a pure state machine that takes events as inputs
