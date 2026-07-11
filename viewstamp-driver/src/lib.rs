@@ -1,14 +1,5 @@
+#![doc = include_str!("../README.md")]
 #![doc(html_logo_url = "https://raw.githubusercontent.com/al8n/viewstamp/main/art/logo_72x72.png")]
-//! Runtime-agnostic driver core shared by the viewstamp driver crates.
-//!
-//! A driver binds `viewstamp-proto`'s Sans-I/O consensus endpoint to a real runtime; this crate is
-//! the runtime-independent half of that job, shared by every driver: the embedder-facing
-//! [`Handle`] and its [`Command`] protocol, the in-flight submit budget the handle reserves
-//! against, the [`DriverConfig`] tuning surface, the [`Clock`] anchoring the proto's monotonic
-//! instants to std time, the session run-loop helpers (endpoint construction, pending-submit
-//! bookkeeping, retransmission, committed-event delivery), the [`DriverError`] type drivers
-//! surface to the application, and the edge-batching [`aggregator`] coalescing many caller units
-//! into one consensus op per submit.
 
 mod aggregate;
 mod clock;
