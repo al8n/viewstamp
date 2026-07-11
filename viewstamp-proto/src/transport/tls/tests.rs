@@ -267,3 +267,146 @@ fn malformed_post_handshake_input_is_fatal_not_backpressure() {
     "malformed TLS input must be fatal, not Pending backpressure"
   );
 }
+
+#[test]
+fn tls_options_debug_is_non_exhaustive() {
+  let _ = rustls::crypto::ring::default_provider().install_default();
+  let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+  let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+  let key_der =
+    rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+  let server = rustls::ServerConfig::builder()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der], key_der)
+    .unwrap();
+  let client = rustls::ClientConfig::builder()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(test_verifier::AcceptAny))
+    .with_no_client_auth();
+  let opts = TlsOptions::new(server, client);
+  let debug = format!("{opts:?}");
+  assert!(
+    debug.contains("TlsOptions"),
+    "the Debug impl names the type: {debug}"
+  );
+}
+
+#[test]
+fn tls_records_debug_reports_a_field_snapshot() {
+  let (_, client, name) = test_configs();
+  let mut c = TlsRecords::client(client, name).unwrap();
+  c.write_plaintext(b"hello");
+  let debug = format!("{c:?}");
+  assert!(debug.contains("TlsRecords"), "{debug}");
+  assert!(
+    debug.contains("pending: 5"),
+    "the staged plaintext length is surfaced: {debug}"
+  );
+  assert!(debug.contains("peer_closed: false"), "{debug}");
+  assert!(debug.contains("aborted: false"), "{debug}");
+}
+
+#[test]
+fn peer_identity_is_always_none() {
+  let (_, client, name) = test_configs();
+  let c = TlsRecords::client(client, name).unwrap();
+  assert_eq!(
+    c.peer_identity(),
+    None,
+    "TlsRecords carries no peer identity of its own — the Labeled decorator supplies one"
+  );
+}
+
+#[test]
+fn clear_outbound_discards_staged_plaintext_and_is_terminal() {
+  let (_, client, name) = test_configs();
+  let mut c = TlsRecords::client(client, name).unwrap();
+  c.write_plaintext(b"staged");
+  assert_eq!(c.buffered_outbound(), 6);
+  c.clear_outbound();
+  assert_eq!(
+    c.buffered_outbound(),
+    0,
+    "clear_outbound discards the staged plaintext"
+  );
+  assert!(
+    c.is_handshaking(),
+    "a cleared (aborted) layer never reports settled again"
+  );
+  assert!(
+    c.peer_has_closed(),
+    "a cleared (aborted) layer always reports the peer as closed"
+  );
+}
+
+#[test]
+fn send_close_notify_queues_an_alert_for_both_roles_until_aborted() {
+  let (server, client, name) = test_configs();
+  let mut c = TlsRecords::client(client, name).unwrap();
+  let mut s = TlsRecords::server(server).unwrap();
+  for _ in 0..16 {
+    let a = pump(&mut c, &mut s);
+    let b = pump(&mut s, &mut c);
+    if !a && !b {
+      break;
+    }
+  }
+  assert!(!c.is_handshaking() && !s.is_handshaking());
+  // Both roles forward to the inner rustls connection.
+  c.send_close_notify();
+  let mut wire = Vec::new();
+  c.poll_transport_transmit(&mut wire);
+  assert!(
+    !wire.is_empty(),
+    "the client role queues a close_notify alert"
+  );
+  s.send_close_notify();
+  let mut wire2 = Vec::new();
+  s.poll_transport_transmit(&mut wire2);
+  assert!(
+    !wire2.is_empty(),
+    "the server role queues a close_notify alert"
+  );
+  // Once aborted, send_close_notify is a no-op: no panic and nothing further is queued.
+  c.clear_outbound();
+  c.send_close_notify();
+  let mut wire3 = Vec::new();
+  assert_eq!(
+    c.poll_transport_transmit(&mut wire3),
+    0,
+    "an aborted layer emits nothing, even after send_close_notify"
+  );
+}
+
+#[test]
+fn a_processed_close_notify_short_circuits_read_tls_on_the_next_feed() {
+  // rustls's read_tls short-circuits to Ok(0) once has_received_close_notify is set (without
+  // touching the reader), which surfaces as an immediate n==0 break in the intake loop; the
+  // re-entrant process() call afterwards still reports the (already-true) closed state.
+  let (server, client, name) = test_configs();
+  let mut c = TlsRecords::client(client, name).unwrap();
+  let mut s = TlsRecords::server(server).unwrap();
+  for _ in 0..16 {
+    let a = pump(&mut c, &mut s);
+    let b = pump(&mut s, &mut c);
+    if !a && !b {
+      break;
+    }
+  }
+  assert!(!c.is_handshaking() && !s.is_handshaking());
+  c.send_close_notify();
+  let mut wire = Vec::new();
+  c.poll_transport_transmit(&mut wire);
+  assert!(!wire.is_empty());
+  // First feed: the alert is actually processed, so peer_has_closed flips true.
+  assert_eq!(s.handle_transport_data(&wire, Instant::ZERO), Intake::Done);
+  assert!(s.peer_has_closed(), "the close_notify was processed");
+  // Second feed, with fresh (unrelated) bytes: read_tls now short-circuits to Ok(0) rather than
+  // consuming them, and the layer stays a harmless Done, not a failure.
+  assert_eq!(
+    s.handle_transport_data(b"ignored-after-close", Instant::ZERO),
+    Intake::Done,
+    "a feed after an already-processed close_notify is a harmless no-op, not a failure"
+  );
+  assert!(s.peer_has_closed());
+}

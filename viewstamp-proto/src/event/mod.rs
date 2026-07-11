@@ -205,3 +205,6 @@ pub enum Event {
   /// configuration (epoch, voter set, quorums). Emitted at the durable `SwapEpoch` root, not at commit.
   MembershipChanged(MembershipChanged),
 }
+
+#[cfg(test)]
+mod tests;

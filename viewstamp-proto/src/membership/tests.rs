@@ -79,6 +79,16 @@ fn membership_rejects_dupes_and_bad_counts() {
 }
 
 #[test]
+fn membership_rejects_a_voting_replica_count_above_the_64_voter_cap() {
+  // The TooManyReplicas check fires before the member-count-mismatch check, so an empty member
+  // list still reaches it cheaply (no need to materialize 65 real members).
+  assert!(matches!(
+    Membership::genesis(65, 0, std::vec![]),
+    Err(MembershipError::TooManyReplicas { count: 65 })
+  ));
+}
+
+#[test]
 fn membership_rejects_a_node_count_above_the_u16_slot_space() {
   // `replica_count + learner_count` must fit the u16 `ReplicaId` slot space — else `node_count`
   // wraps and `slot_of` aliases a high member onto a low slot. The check fires BEFORE the
@@ -232,14 +242,17 @@ fn single_voter_delta_predicates_and_accessors() {
   let promote = SingleVoterDelta::PromoteLearner(MemberId::new(10));
   assert!(promote.is_promote_learner());
   assert_eq!(promote.as_str(), "promote_learner");
+  assert_eq!(promote.member(), MemberId::new(10));
 
   let add_l = SingleVoterDelta::AddLearner(MemberId::new(11));
   assert!(add_l.is_add_learner());
   assert_eq!(add_l.as_str(), "add_learner");
+  assert_eq!(add_l.member(), MemberId::new(11));
 
   let rm_l = SingleVoterDelta::RemoveLearner(MemberId::new(10));
   assert!(rm_l.is_remove_learner());
   assert_eq!(rm_l.as_str(), "remove_learner");
+  assert_eq!(rm_l.member(), MemberId::new(10));
 }
 
 #[test]
@@ -392,6 +405,17 @@ fn apply_delta_rejects_removing_a_learner_with_remove_voter() {
   assert!(matches!(
     m.apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(10))),
     Err(MembershipError::NotAVoter)
+  ));
+}
+
+#[test]
+fn apply_delta_rejects_removing_a_voter_with_remove_learner() {
+  let m = base_3v_1l();
+  // Member 1 is a voter, not a learner; `RemoveLearner` targets the learner set (a voter is removed
+  // with `RemoveVoter`), so this reports `NotALearner` — the inverse of the case above.
+  assert!(matches!(
+    m.apply_delta(&SingleVoterDelta::RemoveLearner(MemberId::new(1))),
+    Err(MembershipError::NotALearner)
   ));
 }
 

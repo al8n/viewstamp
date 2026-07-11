@@ -30,6 +30,8 @@ mod quic;
 mod router;
 mod stream;
 #[cfg(test)]
+mod tests;
+#[cfg(test)]
 mod testutil;
 #[cfg(feature = "tls")]
 mod tls;

@@ -673,6 +673,160 @@ fn an_oversized_outbound_frame_is_dropped_and_the_conn_stays_open() {
 }
 
 #[test]
+fn conn_id_new_wraps_a_raw_handle() {
+  let id = ConnId::new(42);
+  assert_eq!(id.get(), 42, "new/get round-trip the raw handle value");
+}
+
+#[test]
+fn default_router_starts_with_no_conns() {
+  let r: PeerRouter<crate::Passthrough> = Default::default();
+  assert!(
+    r.ids().is_empty(),
+    "a Default-built router starts with no conns, same as new()"
+  );
+  assert_eq!(r.oversized_dropped(), 0);
+}
+
+#[test]
+fn bound_replica_slots_lists_only_established_replica_peers() {
+  use crate::ClientId;
+  let mut r = PeerRouter::<crate::Passthrough>::new();
+  let _p0 = established(&mut r, Peer::Replica(ReplicaId::new(0)));
+  let _p2 = established(&mut r, Peer::Replica(ReplicaId::new(2)));
+  // A validated Client conn is bound too, but must not appear among the replica slots.
+  r.register_dialed(Peer::Client(ClientId::new(9)), conn());
+  let mut slots = r.bound_replica_slots();
+  slots.sort();
+  assert_eq!(
+    slots,
+    std::vec![ReplicaId::new(0), ReplicaId::new(2)],
+    "bound_replica_slots lists exactly the established replica slots, excluding a client peer"
+  );
+}
+
+#[test]
+fn note_established_on_an_unknown_id_is_a_no_op() {
+  let mut r = PeerRouter::<crate::Passthrough>::new();
+  r.note_established(ConnId::new(999));
+  assert!(
+    r.ids().is_empty(),
+    "an unknown id creates no conn and installs no routing entry"
+  );
+}
+
+#[test]
+fn note_established_member_on_an_unknown_id_is_a_no_op() {
+  let mut r = PeerRouter::<crate::Passthrough>::new();
+  r.note_established_member(ConnId::new(999), MemberId::new(1), ReplicaId::new(1));
+  assert_eq!(
+    r.authoritative(Peer::Replica(ReplicaId::new(1))),
+    None,
+    "an unknown id installs no routing entry"
+  );
+}
+
+#[test]
+fn note_established_member_is_a_no_op_once_the_conn_is_already_closed() {
+  let mut r = PeerRouter::<crate::Passthrough>::new();
+  let peer = Peer::Replica(ReplicaId::new(1));
+  let id = r.register_dialed(peer, conn());
+  r.conn_mut(id).unwrap().mark_closed_for_test();
+  r.note_established_member(id, MemberId::new(1), ReplicaId::new(1));
+  assert_eq!(
+    r.authoritative(peer),
+    None,
+    "a closed conn is never validated by note_established_member"
+  );
+  assert!(
+    r.conn(id).unwrap().is_closed(),
+    "the conn stays closed, untouched by the no-op"
+  );
+}
+
+#[test]
+fn note_established_member_aborts_a_dialed_conn_that_settles_as_a_different_slot() {
+  let mut r = PeerRouter::<crate::Passthrough>::new();
+  let dialed_slot = ReplicaId::new(1);
+  let resolved_slot = ReplicaId::new(2);
+  let id = r.register_dialed(Peer::Replica(dialed_slot), conn());
+  r.note_established_member(id, MemberId::new(2), resolved_slot);
+  assert!(
+    r.conn(id).unwrap().is_closed(),
+    "a dialed conn that settles as a DIFFERENT slot than it dialed is aborted"
+  );
+  assert_eq!(
+    r.authoritative(Peer::Replica(resolved_slot)),
+    None,
+    "the mismatched conn is never installed as authoritative"
+  );
+}
+
+#[test]
+fn route_skips_a_conn_closed_before_it_is_reaped() {
+  let mut r = PeerRouter::<crate::Passthrough>::new();
+  let peer = Peer::Replica(ReplicaId::new(1));
+  let id = established(&mut r, peer);
+  // Aborted directly, WITHOUT an intervening reap: `peers` still points at `id`, but the conn is no
+  // longer validated (mirrors the window between an inbound reject and the next reap_closed()).
+  r.conn_mut(id).unwrap().abort(CloseCause::IdentityRejected);
+  assert_eq!(
+    r.authoritative(peer),
+    Some(id),
+    "the stale mapping survives until reaped"
+  );
+  let dropped = r.route(Recipient::To(peer), &commit_msg(), ReplicaId::new(9));
+  assert_eq!(
+    dropped, 0,
+    "a closed-but-not-yet-reaped conn is skipped, not counted as a drop"
+  );
+  assert_eq!(
+    r.conn(id).unwrap().queued_outbound(),
+    0,
+    "nothing is queued to the closed conn"
+  );
+}
+
+#[test]
+fn backups_exclude_the_local_replica_and_any_client_conn() {
+  use crate::ClientId;
+  let mut r = PeerRouter::<crate::Passthrough>::new();
+  let p0 = established(&mut r, Peer::Replica(ReplicaId::new(0)));
+  let self_conn = established(&mut r, Peer::Replica(ReplicaId::new(1)));
+  let p2 = established(&mut r, Peer::Replica(ReplicaId::new(2)));
+  let client_conn = r.register_dialed(Peer::Client(ClientId::new(5)), conn());
+  let dropped = r.route(Recipient::Backups, &commit_msg(), ReplicaId::new(1)); // self_id = 1
+  assert_eq!(dropped, 0);
+  assert!(
+    r.conn(p0).unwrap().queued_outbound() > 0,
+    "replica 0 receives the backup fan-out"
+  );
+  assert!(
+    r.conn(p2).unwrap().queued_outbound() > 0,
+    "replica 2 receives the backup fan-out"
+  );
+  assert_eq!(
+    r.conn(self_conn).unwrap().queued_outbound(),
+    0,
+    "the local replica (self_id) is excluded even though it has a validated conn"
+  );
+  assert_eq!(
+    r.conn(client_conn).unwrap().queued_outbound(),
+    0,
+    "a validated non-replica (Client) peer is never a backup fan-out target"
+  );
+}
+
+#[test]
+fn reap_on_an_unknown_id_returns_false() {
+  let mut r = PeerRouter::<crate::Passthrough>::new();
+  assert!(
+    !r.reap(ConnId::new(777)),
+    "reaping an id that was never registered is a no-op"
+  );
+}
+
+#[test]
 fn frame_fits_pins_the_boundary_the_post_encode_backstop_relies_on() {
   use crate::transport::frame::MAX_FRAME_LEN;
   // `route()`'s post-encode backstop re-checks the bytes it actually produced against this exact

@@ -446,6 +446,110 @@ fn an_inner_failure_is_terminal() {
 }
 
 #[test]
+fn classify_hello_incomplete_and_rejected_edge_cases() {
+  // A short buffer (< 18 bytes) with the right tag but the WRONG version: rejected outright, distinct
+  // from the plain "still incomplete" case that a matching prefix produces.
+  assert!(matches!(
+    classify_hello(&[HELLO_TAG, HELLO_VERSION.wrapping_add(1)], CLUSTER),
+    HelloOutcome::Rejected
+  ));
+  // A full tag+version+cluster prefix (18 bytes) with nothing beyond it: Incomplete (the peer-kind
+  // byte has not arrived yet).
+  let mut buf18 = Vec::new();
+  buf18.push(HELLO_TAG);
+  buf18.push(HELLO_VERSION);
+  buf18.extend_from_slice(&CLUSTER.to_be_bytes());
+  assert_eq!(buf18.len(), 18);
+  assert!(matches!(
+    classify_hello(&buf18, CLUSTER),
+    HelloOutcome::Incomplete
+  ));
+  // An invalid peer-kind byte (neither PEER_REPLICA nor PEER_CLIENT) is a terminal reject.
+  let mut buf19 = buf18.clone();
+  buf19.push(0xFF);
+  assert!(matches!(
+    classify_hello(&buf19, CLUSTER),
+    HelloOutcome::Rejected
+  ));
+}
+
+#[test]
+fn an_incomplete_short_hello_prefix_is_not_a_reject() {
+  let a_id = Peer::Member(MemberId::new(0));
+  let mut acceptor: Labeled<crate::Passthrough> =
+    Labeled::acceptor(crate::Passthrough::new(), &opts(a_id));
+  // Only the tag+version (2 of the 35 bytes a complete hello needs): Incomplete, not a reject, and
+  // nothing about the peer settles yet.
+  assert_ne!(
+    acceptor.handle_transport_data(&[HELLO_TAG, HELLO_VERSION], Instant::ZERO),
+    Intake::Failed,
+    "a short-but-valid-so-far hello prefix is not a terminal reject"
+  );
+  assert!(
+    acceptor.peer_identity().is_none(),
+    "the peer is not yet known"
+  );
+  assert!(
+    acceptor.is_handshaking(),
+    "still handshaking: the hello is not complete"
+  );
+}
+
+#[test]
+fn flush_prefix_into_inner_is_idempotent_once_flushed() {
+  let d_id = Peer::Member(MemberId::new(1));
+  let mut dialer: Labeled<crate::Passthrough> =
+    Labeled::dialer(crate::Passthrough::new(), &opts(d_id));
+  assert!(
+    dialer.prefix_flushed,
+    "the dialer's hello is flushed eagerly at construction"
+  );
+  let before = dialer.buffered_outbound();
+  // A direct second call (bypassing the two production call sites, each of which runs at most once
+  // per instance): the already-flushed guard must make this a no-op, not a double-queue.
+  dialer.flush_prefix_into_inner();
+  assert_eq!(
+    dialer.buffered_outbound(),
+    before,
+    "flushing an already-flushed prefix does not re-queue it"
+  );
+}
+
+#[test]
+fn send_close_notify_forwards_to_the_inner_layer_until_aborted() {
+  let a_id = Peer::Member(MemberId::new(0));
+  let mut acceptor: Labeled<crate::Passthrough> =
+    Labeled::acceptor(crate::Passthrough::new(), &opts(a_id));
+  let d_id = Peer::Member(MemberId::new(1));
+  let mut hello = Vec::new();
+  encode_hello(CLUSTER, HelloId::from_peer(d_id), &mut hello);
+  assert_ne!(
+    acceptor.handle_transport_data(&hello, Instant::ZERO),
+    Intake::Failed
+  );
+  assert!(!acceptor.is_handshaking(), "settled");
+  // Live: forwards to the inner layer without panicking. Passthrough's own close is out-of-band, so
+  // peer_has_closed still defers to the (unaffected) inner state.
+  acceptor.send_close_notify();
+  assert!(
+    !acceptor.peer_has_closed(),
+    "a live layer's peer_has_closed defers to the inner layer, not the aborted flag"
+  );
+  acceptor.clear_outbound();
+  assert!(
+    acceptor.peer_has_closed(),
+    "an aborted layer always reports the peer as closed"
+  );
+  // A no-op once aborted: no panic, and nothing further is (or can be) queued.
+  acceptor.send_close_notify();
+  assert_eq!(
+    acceptor.buffered_outbound(),
+    0,
+    "send_close_notify is a no-op once the layer is aborted"
+  );
+}
+
+#[test]
 fn the_local_hello_is_never_partial_because_app_writes_are_gated() {
   // The structural consequence of gating app writes: because no app write can pre-fill the inner
   // while the acceptor is handshaking, the local hello always writes into an empty inner buffer.

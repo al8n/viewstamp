@@ -473,6 +473,26 @@ fn budgets_above_the_u32_ceiling_are_clamped() {
 }
 
 #[test]
+fn batch_full_accessors_expose_the_refused_push_context() {
+  let err = BatchFull {
+    bytes_used: 18,
+    unit_len: 4,
+    budget: 20,
+  };
+  assert_eq!(err.bytes_used(), 18);
+  assert_eq!(err.unit_len(), 4);
+  assert_eq!(err.budget(), 20);
+}
+
+#[test]
+fn reply_view_is_empty_is_always_false_for_a_parsed_view() {
+  // `parse` rejects a zero count, so a successfully parsed `ReplyView` is never empty.
+  let body = encode_raw(&[b"solo"]);
+  let view = ReplyView::parse(&body).expect("parses");
+  assert!(!view.is_empty());
+}
+
+#[test]
 fn the_unit_iterator_is_exact_size_and_fused() {
   let body = encode_raw(&[b"a", b"bc", b""]);
   let view = BatchView::parse(&body).expect("parses");

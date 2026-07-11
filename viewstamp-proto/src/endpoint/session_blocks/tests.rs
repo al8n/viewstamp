@@ -266,3 +266,239 @@ fn references_expose_index_children_and_leaf_body_chunks() {
     "the leaf references the externalized body-chunk blocks"
   );
 }
+
+#[test]
+fn index_children_and_leaf_body_refs_reject_the_wrong_block_kind() {
+  let leaf = {
+    let mut b = std::vec::Vec::new();
+    b.extend_from_slice(&MAGIC);
+    b.push(TAG_LEAF);
+    Bytes::from(b)
+  };
+  assert!(
+    index_children(&leaf).is_empty(),
+    "index_children only parses an INDEX block"
+  );
+
+  let index = {
+    let mut b = std::vec::Vec::new();
+    b.extend_from_slice(&MAGIC);
+    b.push(TAG_INDEX);
+    b.extend_from_slice(&0u32.to_be_bytes());
+    Bytes::from(b)
+  };
+  assert!(
+    leaf_body_refs(&index).is_empty(),
+    "leaf_body_refs only parses a LEAF block"
+  );
+}
+
+#[test]
+fn index_children_rejects_a_truncated_count_field() {
+  // MAGIC + TAG_INDEX with fewer than 4 bytes following: the count field itself is truncated.
+  let mut block = std::vec::Vec::new();
+  block.extend_from_slice(&MAGIC);
+  block.push(TAG_INDEX);
+  block.extend_from_slice(&[0u8; 2]);
+  assert!(index_children(&block).is_empty());
+}
+
+#[test]
+fn build_index_tree_splits_into_a_second_level_past_the_fanout() {
+  // One more leaf address than a single index block's fanout forces a second tree level: the root
+  // then names two second-level index blocks instead of the raw leaves directly.
+  let mut store = MemBlockStore::new();
+  let leaves: std::vec::Vec<BlockAddress> = (0u64..=INDEX_FANOUT as u64)
+    .map(|i| {
+      let mut b = [0u8; 16];
+      b[8..].copy_from_slice(&i.to_be_bytes());
+      BlockAddress::from_bytes(b)
+    })
+    .collect();
+  assert_eq!(
+    leaves.len(),
+    INDEX_FANOUT + 1,
+    "one more address than a single index block's fanout"
+  );
+
+  let root = build_index_tree(leaves.clone(), &mut store);
+
+  let root_bytes = store.read_block(root).expect("root written");
+  assert_eq!(block_kind(&root_bytes), Some(TAG_INDEX));
+  let top_children = index_children(&root_bytes);
+  assert_eq!(
+    top_children.len(),
+    2,
+    "the fanout-plus-one leaves split into two second-level chunks"
+  );
+
+  let mut recovered = std::vec::Vec::new();
+  for child in &top_children {
+    let child_bytes = store.read_block(*child).expect("child index written");
+    assert_eq!(
+      block_kind(&child_bytes),
+      Some(TAG_INDEX),
+      "each top-level child is itself an index block, not a leaf"
+    );
+    recovered.extend(index_children(&child_bytes));
+  }
+  assert_eq!(
+    recovered, leaves,
+    "flattening both second-level chunks recovers every original leaf address, in order"
+  );
+}
+
+#[test]
+fn leaf_body_refs_skips_inline_replies_and_collects_only_externalized_chunk_addresses() {
+  let mut table = std::collections::BTreeMap::new();
+  // An INLINE reply (kind 1): small enough to stay embedded in the record — contributes no
+  // body-chunk address.
+  table.insert(
+    1u128,
+    session(1, 1, Some((1, Bytes::from_static(b"small-inline-reply")))),
+  );
+  // An EXTERNALIZED reply (kind 2): larger than one leaf on its own, so it splits into body-chunk
+  // blocks — the only records leaf_body_refs should report addresses for.
+  let big = Bytes::from(std::vec![0x42u8; SESSION_BLOCK_BUDGET + 1]);
+  table.insert(2u128, session(2, 2, Some((2, big))));
+
+  let mut store = MemBlockStore::new();
+  let root = encode_sessions(&table, &mut store);
+  let root_block = store.read_block(root).expect("root present");
+  let leaf_addrs = index_children(&root_block);
+  assert_eq!(leaf_addrs.len(), 1, "both tiny records share one leaf");
+  let leaf_block = store.read_block(leaf_addrs[0]).expect("leaf present");
+
+  let refs = leaf_body_refs(&leaf_block);
+  assert!(
+    !refs.is_empty(),
+    "the externalized record's chunk addresses are collected"
+  );
+  for addr in &refs {
+    let chunk = store.read_block(*addr).expect("chunk present");
+    assert_eq!(block_kind(&chunk), Some(TAG_BODY));
+  }
+}
+
+#[test]
+fn leaf_body_refs_stops_at_a_malformed_record_and_keeps_prior_references() {
+  // A hand-built leaf: a well-formed EXTERNAL-reply record (kind 2, contributing one address)
+  // followed by a record with an invalid reply-kind byte. `skip_record_collecting_body_refs`
+  // rejects the second record, so `leaf_body_refs` stops scanning and returns exactly the address
+  // already collected from the first.
+  let chunk_addr = BlockAddress::from_bytes([7u8; 16]);
+  let mut payload = std::vec::Vec::new();
+  // Record 1: client=1, request=1, last_op=1, kind=2 (external), rn=1, count=1, one address.
+  payload.extend_from_slice(&1u128.to_be_bytes());
+  payload.extend_from_slice(&1u64.to_be_bytes());
+  payload.extend_from_slice(&1u64.to_be_bytes());
+  payload.push(2);
+  payload.extend_from_slice(&1u64.to_be_bytes());
+  payload.extend_from_slice(&1u32.to_be_bytes());
+  payload.extend_from_slice(chunk_addr.as_bytes());
+  // Record 2: client=2, request=2, last_op=2, kind=99 (invalid).
+  payload.extend_from_slice(&2u128.to_be_bytes());
+  payload.extend_from_slice(&2u64.to_be_bytes());
+  payload.extend_from_slice(&2u64.to_be_bytes());
+  payload.push(99);
+
+  let mut block = std::vec::Vec::new();
+  block.extend_from_slice(&MAGIC);
+  block.push(TAG_LEAF);
+  block.extend_from_slice(&payload);
+
+  let refs = leaf_body_refs(&block);
+  assert_eq!(
+    refs,
+    std::vec![chunk_addr],
+    "the malformed second record halts the scan; only the first record's address is collected"
+  );
+}
+
+#[test]
+fn decode_record_rejects_a_wrong_kind_chunk_and_an_invalid_reply_kind_byte() {
+  let mut store = MemBlockStore::new();
+  // A real stored block that is NOT a body chunk (an empty index block) — used as the address an
+  // external-reply record's chunk list points at.
+  let not_a_chunk = {
+    let mut b = std::vec::Vec::new();
+    b.extend_from_slice(&MAGIC);
+    b.push(TAG_INDEX);
+    b.extend_from_slice(&0u32.to_be_bytes());
+    Bytes::from(b)
+  };
+  let not_a_chunk_addr = block_address(&not_a_chunk);
+  store.write_block(not_a_chunk_addr, not_a_chunk);
+
+  // client=1, request=1, last_op=1, kind=2 (external), rn=1, count=1, the wrong-kind address.
+  let mut payload = std::vec::Vec::new();
+  payload.extend_from_slice(&1u128.to_be_bytes());
+  payload.extend_from_slice(&1u64.to_be_bytes());
+  payload.extend_from_slice(&1u64.to_be_bytes());
+  payload.push(2);
+  payload.extend_from_slice(&1u64.to_be_bytes());
+  payload.extend_from_slice(&1u32.to_be_bytes());
+  payload.extend_from_slice(not_a_chunk_addr.as_bytes());
+  let mut d = Decoder::new(&payload);
+  assert_eq!(
+    decode_record(&mut d, &store),
+    None,
+    "a resolved-but-wrong-kind chunk aborts the decode"
+  );
+
+  // A record whose reply-kind byte is neither 0, 1, nor 2.
+  let mut invalid_kind = std::vec::Vec::new();
+  invalid_kind.extend_from_slice(&2u128.to_be_bytes());
+  invalid_kind.extend_from_slice(&2u64.to_be_bytes());
+  invalid_kind.extend_from_slice(&2u64.to_be_bytes());
+  invalid_kind.push(7);
+  let mut d2 = Decoder::new(&invalid_kind);
+  assert_eq!(decode_record(&mut d2, &store), None);
+}
+
+#[test]
+fn ordered_leaves_visits_a_duplicated_child_only_once() {
+  let mut store = MemBlockStore::new();
+  let leaf = {
+    let mut b = std::vec::Vec::new();
+    b.extend_from_slice(&MAGIC);
+    b.push(TAG_LEAF);
+    Bytes::from(b)
+  };
+  let leaf_addr = block_address(&leaf);
+  store.write_block(leaf_addr, leaf);
+
+  // An index naming the SAME leaf address twice.
+  let index = {
+    let mut b = std::vec::Vec::new();
+    b.extend_from_slice(&MAGIC);
+    b.push(TAG_INDEX);
+    b.extend_from_slice(&2u32.to_be_bytes());
+    b.extend_from_slice(leaf_addr.as_bytes());
+    b.extend_from_slice(leaf_addr.as_bytes());
+    Bytes::from(b)
+  };
+  let root = block_address(&index);
+  store.write_block(root, index);
+
+  assert_eq!(
+    ordered_leaves(root, &store).unwrap(),
+    std::vec![leaf_addr],
+    "the duplicated child is enqueued only once"
+  );
+}
+
+#[test]
+fn ordered_leaves_rejects_a_root_that_is_neither_index_nor_leaf() {
+  let mut store = MemBlockStore::new();
+  let body_chunk = {
+    let mut b = std::vec::Vec::new();
+    b.extend_from_slice(&MAGIC);
+    b.push(TAG_BODY);
+    b.extend_from_slice(b"chunk-bytes");
+    Bytes::from(b)
+  };
+  let addr = block_address(&body_chunk);
+  store.write_block(addr, body_chunk);
+  assert_eq!(ordered_leaves(addr, &store), None);
+}

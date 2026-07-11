@@ -697,3 +697,367 @@ fn an_accepted_conn_attesting_the_local_member_id_is_aborted() {
     "no authoritative conn for the local slot after the self-attest abort"
   );
 }
+
+#[test]
+fn coordinator_debug_is_non_exhaustive() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let coord = StreamCoordinator::<CountSm, Passthrough>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  let debug = std::format!("{coord:?}");
+  assert!(
+    debug.contains("StreamCoordinator"),
+    "the Debug impl names the type: {debug}"
+  );
+}
+
+#[test]
+fn with_outbound_cap_scales_the_backlog_threshold() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let coord = StreamCoordinator::<CountSm, Passthrough>::with_outbound_cap(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    4096,
+  );
+  assert_eq!(
+    coord.max_outbound_backlog(),
+    4096 * 2,
+    "with_outbound_cap sizes the coordinator's backlog threshold from the given cap, not the default"
+  );
+}
+
+#[test]
+fn propose_membership_delegates_to_the_endpoint() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap(); // primary of view 0, Normal
+  let mut wal = TestWal::default();
+  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  let op = coord
+    .propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      crate::SingleVoterDelta::AddLearner(MemberId::new(5)),
+    )
+    .expect("a Normal primary with no in-flight change can propose");
+  assert_eq!(
+    op.get(),
+    1,
+    "the first proposed op follows the fresh op head (0)"
+  );
+}
+
+#[test]
+fn recently_acked_voters_is_empty_before_any_prepare_ack() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  assert!(
+    coord.recently_acked_voters(64).is_empty(),
+    "a fresh endpoint has acknowledged no in-flight prepare"
+  );
+}
+
+#[test]
+fn try_note_established_member_on_an_unknown_id_is_a_no_op() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  let bogus = crate::ConnId::new(u64::MAX);
+  // No conn was ever registered at this id: the identity-seal must return without panicking or
+  // installing any routing entry.
+  coord.try_note_established_for_test(bogus);
+  assert!(
+    coord.router_ref().conn(bogus).is_none(),
+    "an unknown ConnId stays absent from the router"
+  );
+}
+
+#[test]
+fn a_member_outside_the_active_membership_is_rejected_with_identity_rejected() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  // MemberId(99) is not in the genesis(3) membership {0,1,2}: slot_of must miss and the conn aborts.
+  let id = coord.register_accepted(
+    Peer::Replica(ReplicaId::new(9)),
+    Conn::from_parts(MockRecords::new(
+      false,
+      Some(Peer::Member(MemberId::new(99))),
+    )),
+  );
+  coord.try_note_established_for_test(id);
+  assert!(
+    coord
+      .router_ref()
+      .conn(id)
+      .map(|c| c.is_closed())
+      .unwrap_or(true),
+    "a member outside the active membership is aborted (IdentityRejected)"
+  );
+  assert!(!coord.is_conn_validated(id));
+}
+
+#[test]
+fn a_settling_client_handshake_is_validated_through_try_note_established_member() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut coord =
+    StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
+      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    );
+  // Registered still-handshaking (an acceptor that has not yet seen a hello): note_established is a
+  // no-op at registration time, so the Client identity settles only once try_note_established_member
+  // is driven by a real inbound handshake — the production path for a genuine client connection.
+  let id = coord.register_accepted(
+    Peer::Client(ClientId::new(0)),
+    labeled_conn(0xABCD, 0, true),
+  );
+  assert!(
+    !coord.is_conn_validated(id),
+    "still handshaking at registration"
+  );
+  let client = ClientId::new(0xFEED);
+  let mut dialer = Labeled::<Passthrough>::dialer(
+    Passthrough::new(),
+    &LabelOptions::new(0xABCD, Peer::Client(client)),
+  );
+  let mut hello = Vec::new();
+  dialer.poll_transport_transmit(&mut hello);
+  coord.handle_conn_data(
+    id,
+    &hello,
+    false,
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  assert!(
+    coord.is_conn_validated(id),
+    "the settled Client handshake is validated via note_established (Client is never blocked)"
+  );
+  assert_eq!(
+    coord.router_ref().authoritative(Peer::Client(client)),
+    Some(id),
+    "the conn is bound to the attested Client identity"
+  );
+}
+
+#[test]
+fn submit_client_request_drops_an_over_max_body_with_no_side_effects() {
+  use crate::transport::frame::max_request_body_len;
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  let over = Request::new(
+    ClientId::new(1),
+    RequestNumber::with(1),
+    Bytes::from(vec![0u8; max_request_body_len() + 1]),
+  );
+  coord.submit_client_request(Instant::ZERO, &mut wal, &mut sb, &mut blocks, over);
+  assert_eq!(
+    coord.endpoint().op().get(),
+    0,
+    "an over-max local submit appends no op (dropped before the endpoint)"
+  );
+  assert!(
+    coord.poll_conn_transmit().is_none(),
+    "an over-max local submit routes nothing to the backups"
+  );
+}
+
+/// Drives a fresh 3-voter primary (local = `local`, primary of view 0) to propose
+/// `RemoveVoter(removed)` and commit + durably install it — generalizes
+/// `endpoint::tests::reconfigure::removed_self_primary` to any voter, not only self-removal. Two
+/// validated conns for members 1 and 2 are registered BEFORE the removal, so the caller can inspect
+/// how `reconcile_routing` treated each afterward. The acking voter is whichever of {0,1,2} is
+/// neither `local` nor `removed`, so the 2-of-3 commit quorum always forms.
+fn commit_and_install_a_voter_removal(
+  local: u128,
+  removed: u128,
+) -> (
+  StreamCoordinator<CountSm, MockRecords>,
+  TestWal,
+  TestSb,
+  crate::block_store::MemBlockStore,
+  ConnId,
+  ConnId,
+) {
+  use crate::{SingleVoterDelta, View, message::Body};
+  let cfg = Config::try_new(0xABCD, MemberId::new(local)).unwrap();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 0, CountSm::default()),
+  );
+  let conn1 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
+  let conn2 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 2);
+
+  let successor = coord
+    .live_membership()
+    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(removed)))
+    .expect("removing one of three voters is valid");
+  let payload = crate::ReconfigurePayload::from_membership(&successor, 0);
+  let op = coord
+    .propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::RemoveVoter(MemberId::new(removed)),
+    )
+    .expect("the primary mints the removal Reconfigure op");
+  coord.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // own append durable -> own vote
+  let acker = (0..3u128)
+    .find(|&m| m != local && m != removed)
+    .expect("a third voter exists to ack");
+  coord.inject_message_for_test(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(acker as u16)),
+    Message::PrepareOk(crate::PrepareOk::new(
+      View::new(),
+      op,
+      ReplicaId::new(acker as u16),
+      OpNumber::new(),
+      crate::storage::prepare_identity(
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(op.get()),
+        Body::Reconfigure(payload.clone()).body_checksum(),
+      ),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  // The 2-of-3 commit quorum stages the SwapEpoch root; a further handle_storage lands that durable
+  // root, which installs the successor (config_id changes) and triggers reconcile_routing/pump.
+  coord.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  (coord, wal, sb, blocks, conn1, conn2)
+}
+
+#[test]
+fn a_removed_local_member_routes_nothing_gracefully() {
+  // The local member (0, primary of view 0) proposes and commits its OWN removal, all the way to a
+  // durable, installed swap. Once installed, local_slot_opt() is None: pump() (driven by the trailing
+  // pump inside handle_storage's own install) and submit_client_request() must each route nothing
+  // rather than panic on an absent local slot.
+  let (mut coord, mut wal, mut sb, mut blocks, _conn1, _conn2) =
+    commit_and_install_a_voter_removal(0, 0);
+  assert!(
+    coord.endpoint().local_slot_opt().is_none(),
+    "the removed local member has no slot in the installed successor"
+  );
+  coord.submit_client_request(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Request::new(
+      ClientId::new(1),
+      RequestNumber::with(1),
+      Bytes::from_static(b"x"),
+    ),
+  );
+  assert!(
+    coord.poll_conn_transmit().is_none(),
+    "a removed local member routes nothing (graceful no-op, not a panic)"
+  );
+}
+
+#[test]
+fn reconcile_routing_closes_a_removed_member_and_leaves_an_unshifted_survivor_bound() {
+  // Removing member 2 (the HIGHEST-slot voter) leaves the retained voters at their OLD slots {0,1}.
+  // reconcile_routing (driven automatically inside handle_storage, right after the installing pump)
+  // must therefore close member 2's conn (slot_of(2) is now None) while leaving member 1's conn
+  // untouched (still slot 1, so no churn for the unmoved retained member).
+  let (coord, _wal, _sb, _blocks, conn1, conn2) = commit_and_install_a_voter_removal(0, 2);
+  assert_eq!(
+    coord.membership_config_id(),
+    coord.live_membership().config_id(),
+    "the installed config_id matches the live membership snapshot"
+  );
+  assert!(
+    coord
+      .router_ref()
+      .conn(conn1)
+      .map(|c| !c.is_closed())
+      .unwrap_or(false),
+    "member 1 keeps its slot across the removal of the higher-slot member 2, so reconcile leaves it bound"
+  );
+  assert!(
+    coord.router_ref().conn(conn2).is_none(),
+    "member 2's conn is closed and reaped: reconcile_routing sees slot_of(2) == None post-removal"
+  );
+}
+
+#[test]
+fn poll_timeout_reports_a_scheduled_deadline_for_a_fresh_primary() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  // A brand-new endpoint has no timer armed yet; the first handle_timeout bootstraps the Normal
+  // primary's cadence (its own commit-heartbeat / prepare-retransmit deadline).
+  coord.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    coord.poll_timeout().is_some(),
+    "a bootstrapped Normal primary has a scheduled timer deadline (poll_timeout delegates to the endpoint)"
+  );
+}
+
+#[test]
+fn poll_event_is_empty_on_a_fresh_coordinator() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  assert!(
+    coord.poll_event().is_none(),
+    "a fresh endpoint has no queued application event yet"
+  );
+}
+
+#[test]
+fn membership_config_id_and_live_membership_reflect_the_active_config() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  let live = coord.live_membership();
+  assert_eq!(
+    coord.membership_config_id(),
+    live.config_id(),
+    "membership_config_id is a cheap read of the same config_id live_membership's clone carries"
+  );
+  assert_eq!(
+    live.replica_count(),
+    3,
+    "the genesis(3) membership has 3 voters"
+  );
+}
+
+#[test]
+fn oversized_outbound_dropped_starts_at_zero_and_delegates_to_the_router() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let coord = StreamCoordinator::<CountSm, MockRecords>::new(
+    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+  );
+  assert_eq!(
+    coord.oversized_outbound_dropped(),
+    0,
+    "oversized_outbound_dropped reads the router's counter, which starts at zero"
+  );
+}

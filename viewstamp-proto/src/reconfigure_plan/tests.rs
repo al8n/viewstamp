@@ -125,6 +125,18 @@ fn overlap_demotion_empty_and_oversize_reject_at_preflight_with_zero_steps() {
 }
 
 #[test]
+fn plan_reconfiguration_rejects_a_target_voter_set_above_the_64_voter_cap() {
+  // Checked before the union-peak simulation: the target SIZE alone (65 voters, independent of
+  // `current`) is already over the cap.
+  let c = genesis(&[1], &[]);
+  let too_many: Vec<u128> = (1..=65).collect();
+  assert_eq!(
+    plan_reconfiguration(&c, &target(&too_many, &[])),
+    Err(PlanError::TooManyVoters { count: 65 })
+  );
+}
+
+#[test]
 fn peak_cap_admits_remove_then_add_the_union_overestimates() {
   // The closed-form union |Vc∪Vt| is the VOTER peak; a 4→4 disjoint swap with a real 4-cap is rejected,
   // but a remove-then-add target whose UNION over-estimates the node peak is admitted.
@@ -243,6 +255,21 @@ fn shrink_candidates_is_empty_until_the_grow_prefix_is_done() {
     shrink_candidates(&grown, &t).unwrap(),
     std::vec![SingleVoterDelta::RemoveVoter(MemberId::new(3))]
   );
+}
+
+#[test]
+fn shrink_candidates_is_empty_when_the_plan_has_no_removals_at_all() {
+  // Pure growth: {1,2,3} -> {1,2,3,4} adds a voter without removing any existing one, so the plan
+  // never emits a RemoveVoter at all (distinct from the grow-prefix-pending case above, where a
+  // RemoveVoter IS in the plan but not yet due).
+  let c = genesis(&[1, 2, 3], &[]);
+  let t = target(&[1, 2, 3, 4], &[]);
+  let plan = plan_reconfiguration(&c, &t).unwrap();
+  assert!(
+    !plan.iter().any(SingleVoterDelta::is_remove_voter),
+    "sanity: pure growth emits no RemoveVoter"
+  );
+  assert!(shrink_candidates(&c, &t).unwrap().is_empty());
 }
 
 #[test]
