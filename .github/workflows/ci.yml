@@ -178,7 +178,7 @@ jobs:
     # The facade crate's docs ARE its README (include_str) — the one crate whose intra-doc links
     # only rustdoc can check, and docs.rs will build it at publish.
     - name: cargo doc viewstamp
-      run: cargo doc --no-deps -p viewstamp --features quic,tcp,tls,tls-rustls-ring
+      run: cargo doc --no-deps -p viewstamp --features quic,tcp,tls,tls-rustls-ring,tokio,smol,compio
 
   # Licenses / security advisories / bans / sources over the whole dependency graph; the policy
   # (and the documented allowances) lives in deny.toml at the workspace root.

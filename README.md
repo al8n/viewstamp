@@ -71,6 +71,7 @@ against a genuinely malicious replica — signatures, BFT voting — is out of s
 
 | Crate | What it is |
 |---|---|
+| [`viewstamp`](viewstamp/) | The batteries-included umbrella: re-exports the consensus core as `viewstamp::proto` and, behind driver features, the real-I/O drivers as `viewstamp::{compio, reactor}` — plus `viewstamp::{tokio, smol}`, the reactor drivers with the runtime pre-pinned so callers never name it. Depend on this one crate and select a driver feature. |
 | [`viewstamp-proto`](viewstamp-proto) | The Sans-I/O consensus core (`no_std` + `alloc` capable), plus feature-gated Sans-I/O transports: `tcp` (length-prefixed framing + connection lifecycle + peer routing), `tls` (rustls record layer), `quic` (quinn-proto with mandatory cluster-private mTLS). |
 | [`viewstamp-driver`](viewstamp-driver) | The runtime-agnostic driver core shared by both driver crates: the embedder `Handle`/`Command` surface, in-flight submit budgets, the `DriverConfig` tuning surface, the `Clock`, and `DriverError`. |
 | [`viewstamp-compio`](viewstamp-compio) | Real-I/O drivers on the [compio] proactor runtime: a QUIC driver and a TCP/TLS stream driver. Generic over storage, state machine, and identity — they bundle no backend. |

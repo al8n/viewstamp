@@ -6,6 +6,13 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[package.metadata.docs.rs]
+# A ring-backed set instead of all-features: the aws-lc-rs backends need a C/cmake build docs.rs
+# does not reliably provide. This documents the full umbrella (proto + both real-I/O driver families)
+# on the ring provider.
+features = ["std", "quic", "tls-rustls-ring", "tokio", "smol", "compio"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = ["std"]
 # Forward the proto's feature surface: `std`/`alloc` are independent tiers (the crate requires the
@@ -19,8 +26,20 @@ tls-rustls-aws-lc-rs = ["viewstamp-proto/tls-rustls-aws-lc-rs"]
 tls-rustls-aws-lc-rs-fips = ["viewstamp-proto/tls-rustls-aws-lc-rs-fips"]
 quic = ["viewstamp-proto/quic"]
 
+# Real-I/O driver selection. Each driver crate bundles a ring-backed QUIC + TCP/TLS transport, so
+# enabling a driver pulls the proto's `quic`/`tls-rustls-ring` in transitively. All are std-only.
+compio = ["dep:viewstamp-compio", "std"]
+reactor = ["dep:viewstamp-reactor", "std"]
+# The reactor drivers are generic over any `agnostic::Runtime`; `tokio`/`smol` wire a concrete one
+# and expose a runtime-pinned module ([`crate::tokio`] / [`crate::smol`]).
+tokio = ["reactor", "dep:agnostic", "agnostic/tokio", "viewstamp-reactor/tokio"]
+smol = ["reactor", "dep:agnostic", "agnostic/smol", "viewstamp-reactor/smol"]
+
 [dependencies]
 viewstamp-proto.workspace = true
+viewstamp-reactor = { workspace = true, optional = true }
+viewstamp-compio = { workspace = true, optional = true }
+agnostic = { workspace = true, optional = true }
 
 [lints]
 workspace = true
