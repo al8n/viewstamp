@@ -24,7 +24,36 @@ corruption (torn writes, bit-rot, misdirected reads) is part of the fault model,
 afterthought, and faults surface as data the protocol repairs from peers — never as
 panics.
 
-## Threat model — non-Byzantine, crash-fault-tolerant
+## Why viewstamp
+
+- **Sans-I/O core** — the consensus logic is a pure state machine with no I/O, clock, or
+  RNG of its own, so it ports to any runtime, embeds anywhere, and is exhaustively
+  testable in a single thread. Batteries-included [compio] and [tokio]/[smol] drivers are
+  provided when you *do* want real I/O.
+- **Storage faults are first-class** — torn writes, bit-rot, and misdirected reads are
+  part of the fault model (following TigerBeetle), repaired from peers rather than
+  crashing the process.
+- **Deterministic replay** — a whole cluster run is a pure function of one seed, so any
+  failure the adversarial simulator finds replays exactly (see [the VOPR](#validation-the-vopr)).
+- **Feature-complete VR** — not just the happy path: dynamic reconfiguration, non-voting
+  learners, content-addressed incremental snapshots, and edge batching all ship today
+  (see [Capabilities](#capabilities)).
+- **`no_std` + `alloc` capable** — the core builds without the standard library.
+
+> **Status:** pre-0.1 and unpublished; the wire and on-disk formats are unstable and
+> upgrades are flag-day. See [Status](#status).
+
+## Contents
+
+- [Threat model](#threat-model-non-byzantine-crash-fault-tolerant)
+- [Workspace](#workspace)
+- [Capabilities](#capabilities)
+- [Quickstart](#quickstart)
+- [The embedder contract](#the-embedder-contract)
+- [Validation: the VOPR](#validation-the-vopr)
+- [Status & versioning](#status)
+
+## Threat model (non-Byzantine, crash-fault-tolerant)
 
 viewstamp is **crash-fault-tolerant** for a **trusted** cluster, exactly like
 TigerBeetle — explicitly **not** Byzantine-fault-tolerant. It tolerates crash-stop
@@ -41,8 +70,49 @@ against a genuinely malicious replica — signatures, BFT voting — is out of s
 | [`viewstamp-proto`](viewstamp-proto) | The Sans-I/O consensus core (`no_std` + `alloc` capable), plus feature-gated Sans-I/O transports: `tcp` (length-prefixed framing + connection lifecycle + peer routing), `tls` (rustls record layer), `quic` (quinn-proto with mandatory cluster-private mTLS). |
 | [`viewstamp-driver`](viewstamp-driver) | The runtime-agnostic driver core shared by both driver crates: the embedder `Handle`/`Command` surface, in-flight submit budgets, the `DriverConfig` tuning surface, the `Clock`, and `DriverError`. |
 | [`viewstamp-compio`](viewstamp-compio) | Real-I/O drivers on the [compio] proactor runtime: a QUIC driver and a TCP/TLS stream driver. Generic over storage, state machine, and identity — they bundle no backend. |
-| [`viewstamp-simulation`](viewstamp-simulation) | The deterministic simulation harness + the VOPR adversarial sweep (see below). Also home of the in-memory `Wal`/`Superblock` fixtures. |
 | [`viewstamp-reactor`](viewstamp-reactor) | Reactor-I/O drivers on tokio or smol via the [agnostic] runtime abstraction: a QUIC driver and a TCP/TLS stream driver. Generic over storage, state machine, and identity — they bundle no backend. |
+| [`viewstamp-simulation`](viewstamp-simulation) | The deterministic simulation harness + the VOPR adversarial sweep (see below). Also home of the in-memory `Wal`/`Superblock` fixtures. |
+
+## Capabilities
+
+Beyond the core VR replication + view-change + recovery paths, the following ship today:
+
+- **Dynamic reconfiguration** — the membership mode is a compile-time choice on the
+  `Endpoint<S, R>` parameter (a sealed `Reconfig` trait): `RestartOnly` (the
+  default — a fixed set, membership only changes across a coordinated restart) and
+  `SingleChange` (add or remove a single member at a time on a live cluster, driven
+  through consensus). The two form a compile-time capability ladder — `SingleChange`
+  subsumes `RestartOnly` — and the planner (`plan_reconfiguration`, `MembershipTarget`)
+  turns a desired target into a legal sequence of single steps. Multi-change joint
+  consensus is future work.
+- **Non-voting learners / standbys** — replicas that receive the log and stay current
+  without counting toward quorum, so quorum math is unchanged. A learner catches up and
+  is then promoted to a voter through a fresh durable-prefix proof at promotion time — the
+  read/standby and safe-onboarding scale-out path, rather than a bigger voting set.
+- **Content-addressed incremental snapshots** — checkpoints are a content-addressed block
+  DAG behind the `BlockStore` trait, so a laggard state-syncs only the blocks that
+  actually changed instead of re-fetching the entire state machine on every transfer.
+- **Edge batching** — many small operations share one consensus op through a batching
+  aggregator, with per-unit reply demultiplexing (see [below](#edge-batching)).
+- **Three Sans-I/O transports** — length-prefixed TCP, TLS-over-TCP (rustls record
+  layer), and QUIC (quinn-proto), all driven by the same consensus core.
+
+### Feature flags
+
+`viewstamp-proto` (the core crate):
+
+| Feature | Enables |
+|---|---|
+| `std` *(default)* | The standard library. Disable (`--no-default-features`) for a `no_std` build. |
+| `alloc` | Heap types without the OS — the consensus core builds `no_std` + `alloc`. |
+| `tcp` | Sans-I/O length-prefixed TCP framing, connection lifecycle, and peer routing. |
+| `tls` | A rustls record layer over `tcp` (pick a provider below). |
+| `tls-rustls-ring` | The `ring` crypto provider — pure Rust + asm, builds on every platform. |
+| `tls-rustls-aws-lc-rs` / `…-fips` | The aws-lc-rs provider (and its FIPS build). |
+| `quic` | The quinn-proto QUIC transport with mandatory cluster-private mTLS (reuses the tls provider). |
+
+Runtime drivers select their reactor: `viewstamp-compio` (the compio proactor) and
+`viewstamp-reactor` (`tokio` or `smol`).
 
 ## Quickstart
 
@@ -98,8 +168,8 @@ A body applies atomically (it is one op) and a group is never split across bodie
 batches are not transactions — units stay independent operations that share an op. The
 codec layout, the request/reply budget contracts, and the aggregator's retry-contract
 error taxonomy are documented in the
-[`batch` module](viewstamp-proto/src/batch.rs) and the
-[`aggregate` module](viewstamp-driver/src/aggregate.rs).
+[`batch` module](viewstamp-proto/src/batch/mod.rs) and the
+[`aggregate` module](viewstamp-driver/src/aggregate/mod.rs).
 
 ## Validation: the VOPR
 
@@ -141,7 +211,8 @@ transport ingress) are additionally fuzzed under `cargo fuzz` (see [`fuzz/`](htt
 
 Pre-0.1 and unpublished. The wire format and the on-disk formats are **unstable**:
 versions are checked and mismatches rejected, but there is no cross-version
-compatibility story yet — upgrades are flag-day. APIs will move.
+compatibility story yet — upgrades are flag-day. APIs will move. The minimum supported
+Rust version is **1.95**.
 
 ### Versioning and upgrades
 
@@ -183,4 +254,6 @@ Copyright (c) 2021 Al Liu.
 [TigerBeetle]: https://github.com/tigerbeetle/tigerbeetle
 [VOPR-style]: https://docs.tigerbeetle.com/concepts/safety/
 [compio]: https://github.com/compio-rs/compio
+[tokio]: https://github.com/tokio-rs/tokio
+[smol]: https://github.com/smol-rs/smol
 [agnostic]: https://github.com/al8n/agnostic
