@@ -33,6 +33,12 @@ impl FakeRecords {
       from,
     }
   }
+  /// Overrides the handshaking flag `RecordIo::is_handshaking` reports (default false), so a test can
+  /// drive Conn's stalled-handshake-is-fatal branch.
+  fn handshaking(mut self, v: bool) -> Self {
+    self.handshaking = v;
+    self
+  }
 }
 impl RecordIo for FakeRecords {
   fn handle_transport_data(&mut self, input: &[u8], _: Instant) -> Intake {
@@ -308,4 +314,109 @@ fn a_bound_raw_conn_decodes_inbound_with_the_bound_peer() {
   conn.poll_decoded(&mut out).unwrap();
   assert_eq!(out.len(), 1, "a bound raw conn decodes inbound frames");
   assert_eq!(out[0].0, who, "inbound is tagged with the bound peer");
+}
+
+#[test]
+fn handle_data_on_an_already_closed_conn_is_a_no_op() {
+  let from = Peer::Replica(ReplicaId::new(0));
+  let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
+  conn.mark_closed_for_test();
+  let fin = conn.handle_data(b"anything", false, Instant::ZERO).unwrap();
+  assert!(
+    fin,
+    "an already-closed conn reports itself as finished without touching the record layer"
+  );
+}
+
+#[test]
+fn a_record_layer_failure_closes_the_conn_with_record_rejected() {
+  use crate::transport::testutil::MockRecords;
+  let from = Peer::Replica(ReplicaId::new(0));
+  let mut conn = Conn::from_parts(MockRecords::new(false, Some(from)).failing());
+  conn.mark_validated(from);
+  let err = conn.handle_data(b"x", false, Instant::ZERO).unwrap_err();
+  assert!(matches!(err, TransportError::RecordRejected));
+  assert!(conn.is_closed(), "a record-layer failure closes the conn");
+}
+
+#[test]
+fn an_oversized_frame_discovered_mid_pending_intake_closes_the_conn() {
+  let from = Peer::Replica(ReplicaId::new(0));
+  // chunk=2 forces the record layer to surface plaintext only 2 bytes at a time, so the 4-byte
+  // over-cap length prefix only becomes fully visible to the decoder on the SECOND drain, while the
+  // record layer is still reporting Pending (more than `chunk` remains buffered after the first read)
+  // — driving the decode-error arm reached from the Pending branch, not the Done branch.
+  let mut conn = Conn::from_parts(FakeRecords::new(2, from));
+  conn.mark_validated(from);
+  let mut bad = Vec::new();
+  bad.extend_from_slice(&u32::MAX.to_be_bytes());
+  bad.extend_from_slice(&[0xAA; 4]); // trailing bytes so the record layer keeps reporting Pending
+  let err = conn.handle_data(&bad, false, Instant::ZERO).unwrap_err();
+  assert!(matches!(err, TransportError::FrameTooLong { .. }));
+  assert!(
+    conn.is_closed(),
+    "the over-cap length discovered while still Pending closes the conn"
+  );
+}
+
+#[test]
+fn a_handshaking_stall_with_no_progress_is_a_fatal_record_reject() {
+  let from = Peer::Replica(ReplicaId::new(0));
+  // chunk=0 makes read_plaintext always drain 0 bytes: the second intake iteration (n==0, nothing
+  // drained) hits the stalled-handshake guard.
+  let mut conn = Conn::from_parts(FakeRecords::new(0, from).handshaking(true));
+  let err = conn.handle_data(&[0x01], false, Instant::ZERO).unwrap_err();
+  assert!(matches!(err, TransportError::RecordRejected));
+  assert!(
+    conn.is_closed(),
+    "a handshake that stalls with no progress is a fatal reject, not a silent hang"
+  );
+}
+
+#[test]
+fn a_post_handshake_stall_with_no_progress_breaks_without_closing() {
+  let from = Peer::Replica(ReplicaId::new(0));
+  let mut conn = Conn::from_parts(FakeRecords::new(0, from)); // handshaking=false (default)
+  let fin = conn.handle_data(&[0x01], false, Instant::ZERO).unwrap();
+  assert!(!fin, "no EOF / peer-close signal was raised");
+  assert!(
+    !conn.is_closed(),
+    "a post-handshake stall with no progress just stops this round; it is not terminal"
+  );
+}
+
+#[test]
+fn finalize_is_idempotent_once_already_closed() {
+  let from = Peer::Replica(ReplicaId::new(0));
+  let mut frame = Vec::new();
+  encode_frame(&encode_message(&req_msg()), &mut frame);
+  let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
+  conn.mark_validated(from);
+  conn.handle_data(&frame, true, Instant::ZERO).unwrap();
+  let mut out = Vec::new();
+  conn.poll_decoded(&mut out).unwrap();
+  conn.finalize().unwrap();
+  assert!(conn.is_closed());
+  // A second finalize on an already-closed conn is an idempotent success, not an error.
+  assert!(
+    conn.finalize().is_ok(),
+    "finalize is idempotent once the conn is already closed"
+  );
+}
+
+#[test]
+fn write_framed_is_rejected_before_the_conn_is_validated() {
+  let from = Peer::Replica(ReplicaId::new(0));
+  let mut frame = Vec::new();
+  encode_frame(&encode_message(&req_msg()), &mut frame);
+  let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from)); // never mark_validated
+  assert!(
+    !conn.write_framed(&frame),
+    "write_framed on a not-yet-validated conn reports no close"
+  );
+  assert_eq!(
+    conn.queued_outbound(),
+    0,
+    "a not-yet-validated conn never queues an application frame"
+  );
 }

@@ -15,6 +15,26 @@ fn address_is_fnv1a128_and_stable() {
 }
 
 #[test]
+fn block_store_error_default_equals_new() {
+  assert_eq!(BlockStoreError::default(), BlockStoreError::new());
+}
+
+#[test]
+fn block_dag_walk_exposes_its_roots_and_reference_resolver() {
+  let roots = [block_address(b"root-a"), block_address(b"root-b")];
+  let resolver: &dyn Fn(&[u8]) -> std::vec::Vec<BlockAddress> =
+    &|bytes: &[u8]| std::vec![block_address(bytes)];
+  let walk = BlockDagWalk::new(&roots, resolver);
+  assert_eq!(walk.roots(), &roots);
+  // The resolver is the SAME closure handed to `new`: calling it through the accessor reproduces
+  // the expected edge.
+  assert_eq!(
+    (walk.references())(b"child"),
+    std::vec![block_address(b"child")]
+  );
+}
+
+#[test]
 fn mem_store_roundtrips_and_reports_membership() {
   let mut store = MemBlockStore::new();
   let block = bytes::Bytes::from_static(b"hello block");
@@ -383,5 +403,46 @@ fn verified_blocks_rejects_corrupt_block_and_passes_clean_block() {
   assert_eq!(
     fresh2.count, 99,
     "restored SM reaches the checkpointed state"
+  );
+}
+
+#[test]
+fn verified_blocks_has_block_agrees_with_verified_read_block() {
+  // has_block reports present-AND-verified, exactly like read_block: a genuine block is present,
+  // a corrupt one (bytes that hash elsewhere) reads as absent through the view even though the raw
+  // store still holds it.
+  let good = bytes::Bytes::from_static(b"a genuine block");
+  let good_addr = block_address(&good);
+  let mut store = MemBlockStore::new();
+  store.write_verified(good.clone());
+
+  let corrupt_addr = block_address(b"never written under this address");
+  let garbage = bytes::Bytes::from_static(b"garbage bytes stored under a foreign address");
+  assert_ne!(block_address(&garbage), corrupt_addr, "sanity: mis-stored");
+  store.write_block(corrupt_addr, garbage);
+
+  let verified = VerifiedBlocks::new(&store);
+  assert!(verified.has_block(good_addr), "a genuine block is present");
+  assert!(
+    !verified.has_block(corrupt_addr),
+    "a corrupt block reads as absent, consistent with read_block"
+  );
+}
+
+#[test]
+fn verified_blocks_flush_and_gc_use_the_trait_defaults() {
+  // VerifiedBlocks overrides only read_block/has_block/write_block; flush and gc fall through to
+  // the BlockStore trait's default implementations (an infallible Ok(()) and a no-op sweep).
+  let block = bytes::Bytes::from_static(b"retained");
+  let addr = block_address(&block);
+  let mut store = MemBlockStore::new();
+  store.write_verified(block);
+
+  let mut verified = VerifiedBlocks::new(&store);
+  assert_eq!(verified.flush(), Ok(()), "the default flush is infallible");
+  verified.gc(&[]); // the default gc is a no-op regardless of the walks supplied.
+  assert!(
+    verified.has_block(addr),
+    "the no-op default gc must not remove anything reachable through the view"
   );
 }

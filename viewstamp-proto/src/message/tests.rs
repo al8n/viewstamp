@@ -1386,3 +1386,79 @@ fn wire_size_bound_exceeds_the_frame_cap_for_an_over_cap_body() {
      frame cap"
   );
 }
+
+#[cfg(feature = "tcp")]
+#[test]
+fn max_usize_picks_the_larger_operand() {
+  assert_eq!(max_usize(3, 5), 5);
+  assert_eq!(max_usize(5, 3), 5);
+  assert_eq!(max_usize(4, 4), 4);
+}
+
+#[test]
+fn kind_str_names_every_variant_when_read_directly() {
+  // Elsewhere in this file `kind_str()` only ever appears as a lazily-evaluated `assert!`/
+  // `assert_eq!` failure-message argument, so on the (always-passing) success path it is never
+  // actually called. Read its return value directly here, for every variant, so each match arm
+  // runs for real.
+  for m in one_of_each_variant() {
+    let expected = match &m {
+      Message::Request(_) => "Request",
+      Message::Prepare(_) => "Prepare",
+      Message::PrepareOk(_) => "PrepareOk",
+      Message::Reply(_) => "Reply",
+      Message::Commit(_) => "Commit",
+      Message::StartViewChange(_) => "StartViewChange",
+      Message::DoViewChange(_) => "DoViewChange",
+      Message::StartView(_) => "StartView",
+      Message::GetView(_) => "GetView",
+      Message::RequestPrepare(_) => "RequestPrepare",
+      Message::Recovery(_) => "Recovery",
+      Message::RecoveryResponse(_) => "RecoveryResponse",
+      Message::RequestSync(_) => "RequestSync",
+      Message::SyncCheckpoint(_) => "SyncCheckpoint",
+      Message::RequestPrepareRange(_) => "RequestPrepareRange",
+      Message::RepairBatch(_) => "RepairBatch",
+      Message::PrepareBatch(_) => "PrepareBatch",
+      Message::LearnerStatus(_) => "LearnerStatus",
+      Message::EpochAhead(_) => "EpochAhead",
+      Message::RequestLearnerProof(_) => "RequestLearnerProof",
+      Message::LearnerProof(_) => "LearnerProof",
+      Message::RequestBlock(_) => "RequestBlock",
+      Message::BlockResponse(_) => "BlockResponse",
+      Message::Nack(_) => "Nack",
+    };
+    assert_eq!(m.kind_str(), expected);
+  }
+}
+
+#[test]
+fn to_membership_verified_rejects_a_config_id_that_does_not_match_the_recomputed_hash() {
+  let epoch = crate::Epoch::new(1);
+  let members = member_ids(2);
+  let payload = ReconfigurePayload::new(2, 0, members.clone().into_boxed_slice(), 0);
+  let genuine = Membership::recompute_config_id(epoch, 2, 0, &members, 0);
+  // Any config_id other than the recomputed hash is a forged/corrupt/wrong-lineage claim.
+  let forged = genuine.wrapping_add(1);
+  assert_eq!(
+    payload.to_membership_verified(epoch, forged),
+    Err(MembershipError::ForkedConfigId)
+  );
+  // The genuine hash passes verification and rebuilds the successor membership.
+  assert!(payload.to_membership_verified(epoch, genuine).is_ok());
+}
+
+#[test]
+fn start_view_into_log_consumes_and_returns_the_log_vector() {
+  let entries = std::vec![entry(1, b"a"), entry(2, b"b")];
+  let sv = StartView::new(
+    View::with(3),
+    OpNumber::with(2),
+    OpNumber::with(1),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(1),
+    entries.clone(),
+  );
+  assert_eq!(sv.into_log(), entries);
+}

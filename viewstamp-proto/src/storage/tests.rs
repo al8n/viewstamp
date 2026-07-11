@@ -221,6 +221,9 @@ fn vsr_state_accepts_a_sparse_in_band_header_set_but_rejects_a_malformed_one() {
 
 #[test]
 fn slot_status_as_str_and_predicates() {
+  assert_eq!(SlotStatus::Empty.as_str(), "empty");
+  assert_eq!(SlotStatus::Dirty.as_str(), "dirty");
+  assert_eq!(SlotStatus::Clean.as_str(), "clean");
   assert_eq!(SlotStatus::Faulty.as_str(), "faulty");
   assert!(SlotStatus::Clean.is_clean());
 }
@@ -567,6 +570,32 @@ fn vsr_state_round_trips_epoch_and_membership() {
     "config_install_op round-trips verbatim"
   );
   assert_eq!(back, s);
+}
+
+#[test]
+fn try_new_v4_rejects_a_membership_epoch_that_disagrees_with_the_root_epoch() {
+  // The scalar `epoch` argument and the supplied membership's own `epoch()` must agree; the check
+  // fires before any of the other scalar/header validation, so trivial values suffice elsewhere.
+  let mem = Membership::genesis(1, 0, std::vec![MemberId::new(1)]).unwrap(); // epoch 0
+  assert_eq!(
+    VsrState::try_new_v4(
+      View::with(1),
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::new(),
+      0,
+      std::vec![],
+      Epoch::new(5),
+      Epoch::new(0),
+      mem,
+      std::vec![],
+      OpNumber::new(),
+    ),
+    Err(VsrStateError::MembershipEpochMismatch {
+      root: 5,
+      membership: 0,
+    })
+  );
 }
 
 #[test]
