@@ -313,12 +313,14 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install nightly
-        uses: dtolnay/rust-toolchain@nightly
-      - name: Install cargo-tarpaulin
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-tarpaulin
+          tool: cargo-llvm-cov
       - name: Cache ~/.cargo
         uses: actions/cache@v6
         with:
@@ -329,13 +331,14 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-coverage-cargo-build-target
-      - name: Run tarpaulin
+      - name: Run llvm-cov
         env:
-          RUSTFLAGS: "--cfg tarpaulin --cfg vsrr_internal_testkit -Dwarnings"
-        run: cargo tarpaulin -p viewstamp-proto --features tls-rustls-ring --run-types tests --out xml
+          RUSTFLAGS: "--cfg vsrr_internal_testkit -Dwarnings"
+        run: cargo llvm-cov -p viewstamp-proto --features quic,tcp,tls,tls-rustls-ring --lcov --output-path lcov.info
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: ${{ github.repository }}
+          files: lcov.info
           fail_ci_if_error: false
