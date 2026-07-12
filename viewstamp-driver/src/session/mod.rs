@@ -38,31 +38,74 @@ use std::{
 use bytes::Bytes;
 use viewstamp_proto::{
   BlockStore, ClientId, Config, Endpoint, Event, Instant, Membership, Recovered, Request,
-  RequestNumber, SingleChange, StateMachine, Superblock, VsrState, Wal,
+  RequestNumber, SingleChange, StateMachine, Superblock, Wal,
 };
 
 use crate::DriverError;
 
-/// Construct a driver's consensus endpoint from its durable store — recover-or-new, decided by
-/// INSPECTING the store rather than by an embedder flag.
+/// Initialize a driver's store as a member of a NEW cluster — the one-time cluster-creation step,
+/// forwarding to [`viewstamp_proto::format`]. It writes the durable genesis root (empty consensus
+/// state, genesis membership, pinned WAL geometry) that the subsequent [`build_endpoint`] recovery
+/// witnesses as a FORMATTED store.
+///
+/// Call it ONCE per store at cluster creation, BEFORE constructing the driver; a restarting member
+/// never calls it (it just constructs the driver, which recovers). This is the trusted witness that
+/// lets recovery resume a genuine genesis primary at view 0 while refusing to resume a WIPED member
+/// as one — a wiped store is unformatted, so it abdicates and re-learns any forgotten committed op
+/// from a peer instead of recommitting an op number under an intersecting quorum.
+///
+/// It runs before the driver's run loop exists, so it requires the superblock to complete the
+/// genesis-root write SYNCHRONOUSLY (see [`viewstamp_proto::format`]); a backend whose writes only
+/// complete under a running I/O loop must provide a blocking format-time write path.
+///
+/// # Errors
+/// [`DriverError::Format`] if the store already carries a durable root (an existing member restarts
+/// via the driver constructor, not `format`), or if the genesis-root write did not complete
+/// synchronously.
+pub fn format<W, B>(
+  config: Config,
+  membership: &Membership,
+  wal: &W,
+  sb: &mut B,
+) -> Result<(), DriverError>
+where
+  W: Wal,
+  B: Superblock,
+{
+  Ok(viewstamp_proto::format(&config, membership, wal, sb)?)
+}
+
+/// Construct a driver's consensus endpoint from its durable store — recovery UNCONDITIONALLY, with
+/// no fresh-vs-dirty fork at all.
 ///
 /// # Errors
 ///
 /// [`DriverError::Retired`] when the recover path resolves THIS node to no slot in the durable
 /// root's membership — a reconfiguration removed it (the `Endpoint::recover` →
 /// [`Recovered::Retired`](viewstamp_proto::Recovered) outcome). A retired node cannot run a replica
-/// loop, so the driver refuses to start rather than booting a node the cluster has dropped. The
-/// genesis-boot path never returns this (a fresh node is in its own genesis membership).
+/// loop, so the driver refuses to start rather than booting a node the cluster has dropped. A
+/// genesis boot never returns this (a fresh node is in its own genesis membership).
 ///
-/// A genesis store — the fresh-cluster durable root ([`VsrState::new`]) AND an empty WAL — boots a
-/// fresh endpoint (`Endpoint::new`: `Normal`, view 0). ANY durable state instead reconstructs the
-/// endpoint via `Endpoint::recover`: it resumes the durable view in `Recovering` status and
-/// re-verifies its WAL tail through the driver's ordinary pumps (`handle_storage` routes the
-/// recovery read completions, `handle_timeout` drives the recover-retry timer, `handle_message`
-/// the peer solicitation), so the run loops need no recovery special-casing. Inspecting the store
-/// is what makes the choice structural: restarting a node over a dirty store can never silently
-/// boot a fresh view-0 endpoint — the VSR amnesia hazard, where a replica that forgets its durable
-/// view/log re-votes across a view change and committed state can diverge.
+/// [`DriverError::Recover`] when the live parameters are unsafe over this store — the WAL below the
+/// configured liveness floor, or a geometry pair (`checkpoint_ops` / `Wal::capacity`) differing from
+/// the one the durable root pinned (restarting under different geometry silently moves the recovery
+/// scan window and can clip a committed tail). The remedy is operational: restore the recorded
+/// parameters or migrate the store offline.
+///
+/// EVERY boot reconstructs the endpoint via `Endpoint::recover`: it resumes the durable state in
+/// `Recovering` status and re-verifies its WAL tail through the driver's ordinary pumps
+/// (`handle_storage` routes the recovery completions, `handle_timeout` drives the recover-retry
+/// timer, `handle_message` the peer solicitation), so the run loops need no recovery
+/// special-casing. A genuine new cluster's stores are prepared once via [`format()`](viewstamp_proto::format) (which writes the
+/// pinned genesis root); recovery then witnesses that FORMAT and resumes the designated primary at
+/// view 0. Recovering unconditionally is what makes the boot structural: there is NO emptiness
+/// signal to mis-read, so a node restarting over a dirty store can never silently boot a fresh
+/// view-0 endpoint (the VSR amnesia hazard, where a replica that forgets its durable view/log
+/// re-votes across a view change and committed state diverges), and a WIPED member — its store now
+/// unformatted — abdicates rather than resuming as a view-0 primary. In particular the advisory
+/// `Wal::op_head()` scalar — which storage faults can under-report to zero while durable headers
+/// survive — is never consulted for anything boot-critical: recovery derives the written extent from
+/// the durable headers themselves.
 ///
 /// The seed feeds the endpoint's freshness nonces (`Recovery`/`GetView`). A recovery nonce MUST
 /// differ per incarnation — a restarted replica that re-used its predecessor's nonce could adopt a
@@ -97,26 +140,20 @@ where
     .duration_since(std::time::UNIX_EPOCH)
     .map_or(0, |d| d.as_nanos() as u64);
   let seed = wall ^ ((config.local().get() as u64).wrapping_add(1)).rotate_left(48);
-  if sb.state() == VsrState::new() && wal.op_head().get() == 0 {
-    // `SingleChange` is a zero-sized PhantomData witness with no runtime representation; the driver
-    // always carries the capability so the coordinators can call `propose_membership` without the
-    // embedder opting in per-instance. The bytes are identical to a `RestartOnly` endpoint.
-    Ok(Endpoint::<S, SingleChange>::with_reconfig(
-      config, membership, seed, sm,
-    ))
-  } else {
-    // The recover path resolves THIS node against the DURABLE root's membership: a v4 root that no
-    // longer lists it (an offline reconfiguration removed it) yields `Recovered::Retired`, which the
-    // driver surfaces as a hard error — a retired node has no replica loop to run.
-    match Endpoint::<S, SingleChange>::recover_with_reconfig(
-      config, membership, seed, sm, wal, sb, blocks,
-    ) {
-      Recovered::Active(endpoint) => Ok(endpoint),
-      Recovered::Retired(retired) => Err(DriverError::Retired {
-        local: retired.local(),
-        epoch: retired.epoch(),
-      }),
-    }
+  // Recovery resolves THIS node against the DURABLE root's membership: a v4 root that no longer
+  // lists it (an offline reconfiguration removed it) yields `Recovered::Retired`, which the driver
+  // surfaces as a hard error — a retired node has no replica loop to run. `SingleChange` is a
+  // zero-sized PhantomData witness with no runtime representation; the driver always carries the
+  // capability so the coordinators can call `propose_membership` without the embedder opting in
+  // per-instance.
+  match Endpoint::<S, SingleChange>::recover_with_reconfig(
+    config, membership, seed, sm, wal, sb, blocks,
+  )? {
+    Recovered::Active(endpoint) => Ok(endpoint),
+    Recovered::Retired(retired) => Err(DriverError::Retired {
+      local: retired.local(),
+      epoch: retired.epoch(),
+    }),
   }
 }
 

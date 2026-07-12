@@ -71,7 +71,14 @@ fn stream_driver_type_resolves() {
 /// until the test drives `dial_peer` itself. `R = Labeled<Passthrough>` (the loopback transport).
 async fn test_driver()
 -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks> {
-  test_driver_with_storage(InMemoryWal::new(), InMemorySuperblock::new()).await
+  // A test driver models a genuine new cluster: FORMAT the store once (writing the pinned genesis
+  // root) so recovery resumes the designated view-0 primary as Normal. `test_driver_with_storage`
+  // (the dirty-store path) is deliberately NOT formatted.
+  let wal = InMemoryWal::new();
+  let mut sb = InMemorySuperblock::new();
+  let config = Config::try_new(0x7777, MemberId::new(0_u128)).unwrap();
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+  test_driver_with_storage(wal, sb).await
 }
 
 /// Like [`test_driver`] but over caller-supplied storage, so the recover-or-new constructor-choice
@@ -117,8 +124,21 @@ async fn test_driver_with_storage(
 async fn test_driver_with_config(
   cfg: crate::DriverConfig,
 ) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks> {
+  test_driver_with_config_and_storage(cfg, InMemoryWal::new(), InMemorySuperblock::new()).await
+}
+
+async fn test_driver_with_config_and_storage(
+  cfg: crate::DriverConfig,
+  wal: InMemoryWal,
+  mut sb: InMemorySuperblock,
+) -> CompioStreamDriver<LogSm, Labeled<Passthrough>, InMemoryWal, InMemorySuperblock, MemBlocks> {
   const CLUSTER: u128 = 0x7777;
   let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
+  // A GENESIS fixture (empty store) is FORMATTED so recovery resumes rather than fail-stopping this
+  // voter; a DIRTY-store fixture is left as-is. Single format point on the stream fixture path.
+  if viewstamp_proto::Superblock::state(&sb) == viewstamp_proto::VsrState::new() {
+    viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+  }
   let dialer: super::DialerFactory<Labeled<Passthrough>> = Rc::new(|peer| {
     let opts = LabelOptions::new(CLUSTER, peer);
     Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
@@ -132,8 +152,8 @@ async fn test_driver_with_config(
     config,
     genesis(3),
     LogSm::default(),
-    InMemoryWal::new(),
-    InMemorySuperblock::new(),
+    wal,
+    sb,
     MemBlocks::default(),
     ClientId::new(1),
     0,
@@ -176,12 +196,17 @@ async fn a_peer_mesh_larger_than_the_conn_cap_is_refused_at_construction() {
   };
   let build = |cap: usize| async move {
     let (_ready_tx, ready_rx) = flume::unbounded();
+    let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
+    let wal = InMemoryWal::new();
+    let mut sb = InMemorySuperblock::new();
+    // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
+    viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
     CompioStreamDriver::with_config(
-      Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap(),
+      config,
       genesis(3),
       LogSm::default(),
-      InMemoryWal::new(),
-      InMemorySuperblock::new(),
+      wal,
+      sb,
       MemBlocks::default(),
       ClientId::new(1),
       0,
@@ -236,12 +261,16 @@ async fn test_driver_with_handle() -> (
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   });
   let (_ready_tx, ready_rx) = flume::unbounded();
+  let wal = InMemoryWal::new();
+  let mut sb = InMemorySuperblock::new();
+  // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   CompioStreamDriver::new(
     config,
     genesis(3),
     LogSm::default(),
-    InMemoryWal::new(),
-    InMemorySuperblock::new(),
+    wal,
+    sb,
     MemBlocks::default(),
     ClientId::new(1),
     0,
@@ -269,8 +298,13 @@ async fn test_driver_small_cap(
   let mut driver = test_driver().await;
   const CLUSTER: u128 = 0x7777;
   let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
+  // Genesis: commit over a throwaway store to obtain a runnable endpoint; the driver pumps it against
+  // its own (already-formatted) storage, and this coordinator never recovers.
+  let (gwal, mut gsb) = (InMemoryWal::new(), InMemorySuperblock::new());
   let endpoint =
-    Endpoint::<_, SingleChange>::with_reconfig(config, genesis(3), 1, LogSm::default());
+    Endpoint::<_, SingleChange>::with_reconfig(config, genesis(3), 1, LogSm::default(), u64::MAX)
+      .commit(&gwal, &mut gsb)
+      .expect("genesis commit formats the throwaway store");
   driver.coord = StreamCoordinator::with_outbound_cap(endpoint, cap);
   driver
 }
@@ -443,12 +477,17 @@ async fn validation_resets_the_redial_backoff_to_base() {
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   });
   let (_ready_tx, ready_rx) = flume::unbounded();
+  let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
+  let wal = InMemoryWal::new();
+  let mut sb = InMemorySuperblock::new();
+  // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let (mut driver, _handle) = CompioStreamDriver::new(
-    Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap(),
+    config,
     genesis(3),
     LogSm::default(),
-    InMemoryWal::new(),
-    InMemorySuperblock::new(),
+    wal,
+    sb,
     MemBlocks::default(),
     ClientId::new(1),
     0,
@@ -473,19 +512,25 @@ async fn validation_resets_the_redial_backoff_to_base() {
   // The remote replica (id 1): a stand-alone coordinator that accepts our conn and answers the
   // `Labeled` handshake.
   let peer_config = Config::try_new(CLUSTER, MemberId::new(1_u128)).unwrap();
-  let mut peer = StreamCoordinator::new(Endpoint::<_, SingleChange>::with_reconfig(
+  let (mut pwal, mut psb) = (InMemoryWal::new(), InMemorySuperblock::new());
+  let mut pblocks = MemBlocks::default();
+  // Genesis: commit over the peer's own store (which it then pumps), so it is formatted exactly as a
+  // real peer's store would be.
+  let peer_endpoint = Endpoint::<_, SingleChange>::with_reconfig(
     peer_config,
     genesis(3),
     2,
     LogSm::default(),
-  ));
+    u64::MAX,
+  )
+  .commit(&pwal, &mut psb)
+  .expect("genesis commit formats the peer store");
+  let mut peer = StreamCoordinator::new(peer_endpoint);
   let peer_conn = Conn::from_parts(Labeled::acceptor(
     Passthrough::new(),
     &LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(1))),
   ));
   let pid = peer.register_accepted(Peer::Replica(ReplicaId::new(0)), peer_conn);
-  let (mut pwal, mut psb) = (InMemoryWal::new(), InMemorySuperblock::new());
-  let mut pblocks = MemBlocks::default();
 
   // Shuttle the handshake bytes both ways until the driver's conn validates.
   let now = Instant::ZERO;
@@ -563,7 +608,8 @@ async fn a_dirty_store_never_boots_a_fresh_view_zero_endpoint_stream() {
       0,
       Vec::new(),
     )
-    .expect("a valid durable root"),
+    .expect("a valid durable root")
+    .with_wal_geometry(viewstamp_proto::DEFAULT_CHECKPOINT_OPS, u64::MAX),
   );
   // The storage contract: no in-flight completions cross an endpoint incarnation.
   while viewstamp_proto::Superblock::poll(&mut sb).is_some() {}
@@ -574,8 +620,11 @@ async fn a_dirty_store_never_boots_a_fresh_view_zero_endpoint_stream() {
     "the durable view is resumed, never reset to a fresh view 0"
   );
 
-  // Durable WAL op, genesis root: the endpoint enters Recovering with its durable head restored
-  // (the read completions resolve through the run loop's ordinary handle_storage pump).
+  // Durable WAL op, FORMATTED genesis root: the endpoint enters Recovering with its durable head
+  // restored (the read completions resolve through the run loop's ordinary handle_storage pump). The
+  // store is FORMATTED — a real store that ran wrote its genesis root before appending — so this is a
+  // recoverable dirty store, distinct from a VIRGIN (wiped/unformatted) store carrying a durable op,
+  // which is a wiped voter that fail-stops instead (covered by the proto recovery tests).
   let mut wal = InMemoryWal::new();
   let header = viewstamp_proto::Header::new(
     OpNumber::with(1),
@@ -592,7 +641,15 @@ async fn a_dirty_store_never_boots_a_fresh_view_zero_endpoint_stream() {
     Bytes::from_static(b"op"),
   );
   while viewstamp_proto::Wal::poll(&mut wal).is_some() {}
-  let driver = test_driver_with_storage(wal, InMemorySuperblock::new()).await;
+  let mut sb = InMemorySuperblock::new();
+  viewstamp_driver::format(
+    Config::try_new(0x7777, MemberId::new(0_u128)).unwrap(),
+    &genesis(3),
+    &wal,
+    &mut sb,
+  )
+  .expect("format the genesis store");
+  let driver = test_driver_with_storage(wal, sb).await;
   assert!(
     driver.coord.endpoint().status().is_recovering(),
     "a durable WAL boots into Recovering, not a fresh Normal"
@@ -604,9 +661,10 @@ async fn a_dirty_store_never_boots_a_fresh_view_zero_endpoint_stream() {
   );
 }
 
-/// First-boot path (stream driver): a genesis store — fresh-cluster root AND empty WAL — still
-/// boots a fresh endpoint (`Normal`, view 0, empty log); `Endpoint::new` stays reachable, guarded
-/// by the state inspection itself.
+/// First-boot path (stream driver): a genuine new cluster's store is FORMATTED once (the pinned
+/// genesis root), then recovered — the format witness lets recovery resume the designated view-0
+/// primary as Normal, synchronously (empty WAL, nothing to read). An unformatted store would
+/// abdicate instead (the wipe-amnesia safeguard).
 #[compio::test]
 async fn a_genesis_store_boots_a_fresh_normal_endpoint_stream() {
   let driver = test_driver().await;
@@ -635,12 +693,16 @@ async fn run_exits_with_an_in_flight_dial_to_an_unreachable_peer() {
   // 203.0.113.0/24 (TEST-NET-3) is reserved + unrouteable, so the connect never completes within
   // the test window — the connect task is genuinely in flight when the Handle drops.
   let unreachable: std::net::SocketAddr = "203.0.113.1:9".parse().unwrap();
+  let wal = InMemoryWal::new();
+  let mut sb = InMemorySuperblock::new();
+  // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let (driver, handle) = CompioStreamDriver::new(
     config,
     genesis(3),
     LogSm::default(),
-    InMemoryWal::new(),
-    InMemorySuperblock::new(),
+    wal,
+    sb,
     MemBlocks::default(),
     ClientId::new(1),
     0,

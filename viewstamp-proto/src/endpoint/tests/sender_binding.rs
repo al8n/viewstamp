@@ -10,11 +10,12 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
   // vote; a SECOND vote from a DISTINCT replica would reach quorum and commit. Deliver a PrepareOk
   // whose BODY claims replica 2 but whose authenticated `from` is replica 1 — a forged/misrouted
   // vote. It must NOT count toward the quorum: commit stays at 0 (only the primary's own vote stands).
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(3),
     0,
     EchoSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -99,11 +100,12 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
   // deliver a DoViewChange whose BODY claims replica 2 but whose authenticated `from` is replica 0.
   // With its own DVC, ONE more genuine DVC reaches the view-change quorum (2) and it becomes primary;
   // the forged DVC must NOT contribute, so it stays in ViewChange (does not become a serving primary).
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -470,11 +472,12 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
   // a configured cluster member (replica 5 in a 3-replica cluster) — delivered from a matching
   // out-of-range `from` by a buggy/misrouting driver — must NOT count toward the commit quorum. The
   // centralized `sender_is_member_replica` check drops it at ingress.
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(3),
     0,
     EchoSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();

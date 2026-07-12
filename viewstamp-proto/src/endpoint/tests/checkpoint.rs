@@ -82,7 +82,7 @@ fn primary_checkpoints_after_interval_ops_via_two_superblock_writes() {
   // after BOTH writes are durable. `StepSb` completes writes lazily (`flush` between rounds) so
   // each of the three steps is observed in isolation.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(1), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -177,7 +177,7 @@ fn a_block_store_flush_fault_holds_the_checkpoint_pointer_back_then_recovers() {
   // the durable root still names the OLD checkpoint. Mirrors the storage-fault discipline: a flush fault
   // is treated as data, and the sticky cadence re-forces the checkpoint once the flush succeeds.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(1), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -254,7 +254,7 @@ fn checkpoint_does_not_double_trigger_while_in_flight() {
   // committing ops 3,4 (which also cross a 2-op boundary) must not arm a second checkpoint while
   // the first is in flight — only ONE checkpoint completes, landing at the op it staged (2).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(1), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -362,7 +362,7 @@ fn checkpoint_completes_in_one_drain_with_synchronous_superblock() {
   // sequence completes in the single drain that commits the boundary op — this is the path the
   // sim `Cluster` exercises each tick, so a long-enough sim run checkpoints.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(1), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -401,7 +401,7 @@ fn checkpoint_gcs_wal_and_maps_below_the_quorum_checkpoint() {
   // is the checkpoint op (2): ops <= 2 are pruned from the WAL and the log/inflight caches, while a
   // NEW request still commits (apply reads from commit_min, not from a pruned op).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(1), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -475,7 +475,7 @@ fn backup_gcs_below_its_own_checkpoint_even_without_quorum_reports() {
   // (those ops are in its snapshot; a laggard below it state-syncs). This test drives a backup
   // (replica 1 of 3) to a durable checkpoint via Prepares + Commits and asserts it pruned.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -554,7 +554,7 @@ fn view_change_preserves_the_durable_checkpoint_pointer() {
   use crate::StartViewChange;
   // N=3 so a view change is reachable, but checkpoint_ops=2 and we commit 2 ops as primary first.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -657,11 +657,12 @@ fn primary_tracks_quorum_checkpoint_op() {
   // N=3, quorum=2. Primary self.checkpoint_op=0. Backups report checkpoints 5 and 3 via PrepareOk.
   // self(0)=0, r1=5, r2=3 → sorted desc [5,3,0]; the quorum(2)-th highest (index 1) is 3 — the
   // highest op a quorum (2 of 3) has reported checkpointing.
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(3),
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -715,7 +716,7 @@ fn primary_tracks_quorum_checkpoint_op() {
 fn quorum_checkpoint_op_single_replica_is_self() {
   // N=1, quorum=1 → the quorum checkpoint is exactly self's checkpoint (no peers to wait for).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(1), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -754,7 +755,7 @@ fn peer_checkpoint_is_monotone_under_reordering() {
   // value must NOT regress — the GC floor + the force-sync trigger that read `quorum_checkpoint_op`
   // all rely on monotone per-peer checkpoints (a regressing floor could un-fire the escalation).
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 1, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary(), "replica 0 is the view-0 primary");

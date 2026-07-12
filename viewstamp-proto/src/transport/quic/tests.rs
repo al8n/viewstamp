@@ -22,7 +22,13 @@ fn connect_emits_an_initial_datagram() {
   let cluster = 0x5151;
   let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
   let mut c = QuicCoordinator::with_identity(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(2),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     mtls_opts(cluster),
     Some([0u8; 32]),
     IdentityConfig::Hello(cluster),
@@ -68,7 +74,13 @@ fn a_public_connect_over_the_cap_returns_at_capacity_and_allocates_nothing() {
   let cluster = 0x5151;
   let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
   let mut c = QuicCoordinator::with_identity(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(2),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     // Explicit `1` is floored up to the mutual-dial-mesh minimum; read the effective cap below.
     mtls_opts(cluster).with_max_connections(1),
     Some([0u8; 32]),
@@ -135,7 +147,13 @@ fn dial_error_is_nameable_through_the_public_reexport() {
   let cluster = 0x5151;
   let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
   let mut c = QuicCoordinator::with_identity(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(2),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     // Explicit `1` is floored up to the mutual-dial-mesh minimum; read the effective cap below.
     mtls_opts(cluster).with_max_connections(1),
     Some([0u8; 32]),
@@ -189,7 +207,13 @@ fn poll_timeout_is_anchored_to_a_non_zero_driver_epoch() {
   let cluster = 0x5151;
   let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
   let mut c = QuicCoordinator::with_identity(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(2),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     mtls_opts(cluster),
     Some([0u8; 32]),
     IdentityConfig::Hello(cluster),
@@ -240,7 +264,13 @@ fn with_identity_rejects_options_without_mandatory_client_auth() {
   // `accept_any_for_test` builds a server WITHOUT client auth (`requires_client_auth() == false`):
   // the provided-identity invariant forbids it on the safe path.
   let _ = QuicCoordinator::with_identity(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(2),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     QuicOptions::accept_any_for_test(),
     Some([0u8; 32]),
     IdentityConfig::Hello(cluster),
@@ -261,7 +291,13 @@ fn with_identity_accepts_cluster_tls_mandatory_mtls_options() {
   let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
   // Must not panic: the safe provided-identity path accepts a mandatory-mTLS options bundle.
   let c = QuicCoordinator::with_identity(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(2), 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(2),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     opts,
     Some([0u8; 32]),
     IdentityConfig::Hello(cluster),
@@ -283,7 +319,13 @@ fn effective_cap(replica_count: u8, override_cap: Option<usize>) -> usize {
     opts = opts.with_max_connections(cap);
   }
   let c = QuicCoordinator::with_identity(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(replica_count), 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(replica_count),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     opts,
     Some([0u8; 32]),
     IdentityConfig::Hello(cluster),
@@ -369,7 +411,13 @@ fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() 
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
   let mut c = QuicCoordinator::with_identity(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     mtls_opts(cluster),
     Some([0u8; 32]),
     IdentityConfig::Hello(cluster),
@@ -472,7 +520,13 @@ fn dial_sni_is_keyed_to_the_stable_member_id_not_the_routing_slot() {
 
   let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
   let c = QuicCoordinator::with_identity(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, shifted_membership, 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      shifted_membership,
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     mtls_opts(cluster),
     Some([0u8; 32]),
     IdentityConfig::Hello(cluster),

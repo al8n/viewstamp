@@ -896,21 +896,28 @@ impl Superblock for InMemorySuperblock {
   }
 
   fn submit_write(&mut self, id: OpId, state: VsrState) {
+    // The one-time FORMAT write is tagged with the reserved sentinel id `u64::MAX` (which `mint_op_id`
+    // never produces): it is the blocking cluster-creation write and lands SYNCHRONOUSLY even in
+    // async-write mode — distinct from the async steady-state root writes whose in-flight window this
+    // mode exists to exercise. Without this, formatting a genesis store while async mode is enabled
+    // could never complete synchronously and the store would stay unformatted.
+    let is_format = id.get() == u64::MAX;
     match self.async_delay {
-      // SYNCHRONOUS (default): durable immediately, completion queued in this call. The new
-      // durable root may NAME a just-written snapshot generation (a checkpoint's step-2 root) — which
-      // becomes the live/readable checkpoint by virtue of `state.checkpoint_op()` now pointing at it;
-      // GC then drops strictly-older generations (staged is empty in sync mode, so GC runs inline).
-      None => {
+      // ASYNC steady-state: STAGE as not-yet-durable. `self.state` is left at the prior durable root
+      // until `poll` releases this write after `delay` ticks — opening the pending durable-view window.
+      Some(delay) if !is_format => self
+        .staged
+        .push_back((delay, StagedSbWrite::Root { id, state })),
+      // SYNCHRONOUS (the default mode, or the format write in async mode): durable immediately,
+      // completion queued in this call. The new durable root may NAME a just-written snapshot
+      // generation (a checkpoint's step-2 root) — which becomes the live/readable checkpoint by virtue
+      // of `state.checkpoint_op()` now pointing at it; GC then drops strictly-older generations (staged
+      // is empty on this path — sync mode, or the genesis format write — so GC runs inline).
+      _ => {
         self.state = state;
         self.gc_snapshots();
         self.completions.push_back(SuperblockDone::Wrote(id));
       }
-      // ASYNC: STAGE as not-yet-durable. `self.state` is left at the prior durable root until `poll`
-      // releases this write after `delay` ticks — opening the pending durable-view window.
-      Some(delay) => self
-        .staged
-        .push_back((delay, StagedSbWrite::Root { id, state })),
     }
   }
 

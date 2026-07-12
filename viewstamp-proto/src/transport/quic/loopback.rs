@@ -76,11 +76,12 @@ pub(super) fn replica(
   layout: StreamLayout,
 ) -> Replica {
   let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
-  let endpoint = Endpoint::<_, SingleChange>::with_reconfig(
+  let endpoint = Endpoint::<_, SingleChange>::genesis_unchecked(
     cfg,
     genesis(2),
     u64::from(id) + 1,
     CountSm::default(),
+    u64::MAX,
   );
 
   let (cert, identity) = match scheme {
@@ -303,7 +304,13 @@ fn converges_with_foreign_ca() -> bool {
   let opts0 = ClusterTls::new(ca_a.roots(), cert0.chain(), cert0.key()).build();
   let mut r0: Replica = (
     QuicCoordinator::with_identity(
-      Endpoint::<_, SingleChange>::with_reconfig(cfg0, genesis(2), 1, CountSm::default()),
+      Endpoint::<_, SingleChange>::genesis_unchecked(
+        cfg0,
+        genesis(2),
+        1,
+        CountSm::default(),
+        u64::MAX,
+      ),
       opts0,
       Some([0u8; 32]),
       IdentityConfig::Hello(CLUSTER),
@@ -319,7 +326,13 @@ fn converges_with_foreign_ca() -> bool {
   let opts1 = ClusterTls::new(ca_a.roots(), cert1.chain(), cert1.key()).build();
   let mut r1: Replica = (
     QuicCoordinator::with_identity(
-      Endpoint::<_, SingleChange>::with_reconfig(cfg1, genesis(2), 2, CountSm::default()),
+      Endpoint::<_, SingleChange>::genesis_unchecked(
+        cfg1,
+        genesis(2),
+        2,
+        CountSm::default(),
+        u64::MAX,
+      ),
       opts1,
       Some([1u8; 32]),
       IdentityConfig::Hello(CLUSTER),
@@ -588,11 +601,12 @@ fn a_custom_source_attesting_the_wrong_cluster_is_rejected_by_the_coordinator() 
     crate::block_store::MemBlockStore,
   ) {
     let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
-    let endpoint = Endpoint::<_, SingleChange>::with_reconfig(
+    let endpoint = Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
       genesis(2),
       u64::from(id) + 1,
       CountSm::default(),
+      u64::MAX,
     );
     let opts = QuicOptions::accept_any_for_test();
     let src = WrongClusterSource {
@@ -694,11 +708,12 @@ fn replica_in_cluster_of(
   layout: StreamLayout,
 ) -> Replica {
   let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
-  let endpoint = Endpoint::<_, SingleChange>::with_reconfig(
+  let endpoint = Endpoint::<_, SingleChange>::genesis_unchecked(
     cfg,
     genesis(count),
     u64::from(id) + 1,
     CountSm::default(),
+    u64::MAX,
   );
   let (cert, identity) = match scheme {
     Scheme::Hello => (

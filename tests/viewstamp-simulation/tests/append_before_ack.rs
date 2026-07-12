@@ -45,11 +45,14 @@ fn backup_does_not_ack_an_op_whose_append_is_still_in_flight_on_retransmit() {
     0,
   )
   .expect("valid membership");
-  let mut backup = Endpoint::new(cfg, membership, 0, LogSm::default());
   // ASYNC WAL: an append stays in flight for a few polls (the append-before-ack window). The superblock
   // is the ordinary synchronous sim superblock — only the WAL append timing matters here.
   let mut wal = InMemoryWal::with_async_appends(4);
   let mut sb = InMemorySuperblock::new();
+  // Genesis: commit over this backup's own store (formats it), yielding the runnable endpoint.
+  let mut backup = Endpoint::new(cfg, membership, 0, LogSm::default(), u64::MAX)
+    .commit(&wal, &mut sb)
+    .expect("genesis commit formats the store");
   let mut blocks = MemBlockStore::new();
   let now = Instant::ZERO;
 

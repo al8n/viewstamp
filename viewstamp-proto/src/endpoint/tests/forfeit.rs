@@ -11,7 +11,8 @@ fn a_forfeiting_primary_drops_client_requests_no_op_reuse() {
   // commit_max == commit_min, so the only guard that can drop the request is the `pending_forfeit`
   // one — not the unapplied-prefix guard).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -120,7 +121,7 @@ fn a_lagging_primary_forfeits_after_the_grace_period() {
   // PROPOSING a view change (broadcast StartViewChange for view 1) via the SVC machinery — NOT a
   // unilateral view jump (it stays in its own view until a real SVC quorum forms).
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 1, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary());
@@ -184,7 +185,7 @@ fn a_healthy_primary_never_forfeits() {
   // condition (lag >= a full checkpoint interval) is never satisfied, so the grace timer never
   // arms and no view change is ever proposed — the anti-storm guarantee in steady state.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 1, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary());
@@ -225,7 +226,7 @@ fn a_backup_never_forfeits_even_when_behind() {
   // stepping aside; a behind backup catches up via state-sync/force-sync. The forfeit check lives
   // only on the primary path (primary_timeouts), so the backup never arms it.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 1, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(!ep.is_primary());
@@ -258,7 +259,7 @@ fn solo_primary_with_a_permanent_repair_hole_stays_normal_and_does_not_view_chan
   // abdicating to a non-existent quorum is strictly worse than holding). FAIL-BEFORE: transitions to
   // ViewChange / climbs views.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(1), 1, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary(), "a solo replica is always its own primary");
@@ -325,7 +326,7 @@ fn a_transiently_lagging_primary_recovers_and_disarms_without_forfeiting() {
   // grace elapses must DISARM and never forfeit. Models a primary that was momentarily behind on
   // checkpoint, then checkpointed in step with the cluster within the grace window.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 1, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary());
@@ -374,7 +375,7 @@ fn a_primary_stuck_on_an_unfillable_committed_hole_forfeits_after_the_grace_peri
   // forfeit by PROPOSING view 1 (StartViewChange) — even though its checkpoint does NOT lag (the
   // OTHER forfeit condition is off), so this isolates the unfillable-hole trigger.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 1, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary());
@@ -419,7 +420,7 @@ fn a_primary_whose_committed_hole_fills_within_grace_does_not_forfeit() {
   // (replica 0 of 3), commit held at 1 with a hole at op 2; a peer answers with op 2's
   // committed-vouching Prepare (commit 2 >= op 2) before the grace elapses.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 1, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary());
@@ -482,7 +483,7 @@ fn a_forfeiting_primary_keeps_proposing_and_stops_heartbeating_until_the_view_ch
   // and (c) keep `pending_forfeit` latched — none of which the one-shot code did. (The companion test
   // `..._rate_limits_its_svc_rebroadcast_...` ticks at SUB-cadence spacing to pin the rate limit.)
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary(), "replica 0 at view 0 is the primary");
@@ -596,7 +597,7 @@ fn a_forfeiting_primary_rate_limits_its_svc_rebroadcast_within_one_retransmit_wi
   // first), never one-per-tick. (Heartbeat suppression + latch persistence are covered by the sibling
   // test above; this one isolates the rate limit.)
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary(), "replica 0 at view 0 is the primary");

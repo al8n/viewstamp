@@ -205,7 +205,10 @@ async fn build_driver(
       .unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  // A real new cluster: FORMAT each store once so recovery resumes the designated primary — an
+  // unformatted voter would fail-stop (the wipe-amnesia safeguard).
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let blocks = MemBlocks::default();
   viewstamp_compio::CompioQuicDriver::new(
     config,
@@ -423,12 +426,16 @@ async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
   // The notifier sender is dropped on the spot: the driver must treat the dead channel as
   // "downgrade to timer cadence", not as a wake source.
   let (_, ready_rx) = flume::unbounded();
+  let wal = InMemoryWal::new();
+  let mut sb = InMemorySuperblock::new();
+  // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let (driver, handle) = viewstamp_compio::CompioQuicDriver::new(
     config,
     genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
-    InMemoryWal::new(),
-    InMemorySuperblock::new(),
+    wal,
+    sb,
     MemBlocks::default(),
     viewstamp_proto::ClientId::new(1),
     0,

@@ -24,7 +24,7 @@ mod view_change;
 pub use reconfig::{
   ProposeMembershipError, Reconfig, ReconfigError, RestartOnly, SingleChange, prepare_restart,
 };
-pub use recovery::{Recovered, Retired};
+pub use recovery::{FormatError, RecoverError, Recovered, Retired, format};
 
 /// What the endpoint does when a submitted WAL append completes. Append-before-ack: the vote/ack a
 /// completion owes is always deferred to `on_wal_done`, never cast before the op is durable. A
@@ -697,6 +697,12 @@ struct RecoverState {
   /// The in-flight checkpoint-read `OpId` (`Some` until the snapshot is restored), or `None` if no
   /// checkpoint exists / it is already restored.
   checkpoint: Option<u64>,
+  /// Whether the durable root this recovery started from was FORMATTED — written by [`format()`](crate::format) with a
+  /// pinned nonzero `checkpoint_ops`, which an empty-consensus wipe cannot forge. Gates
+  /// `complete_recovery`'s genesis-primary exemption: only a formatted store may resume Normal at
+  /// view 0 as its primary; an unformatted store (fresh/wiped/legacy) abdicates instead, so the view
+  /// change recovers any committed op a wiped member forgot from a surviving peer.
+  formatted: bool,
   /// Remaining retry budget for the checkpoint read (the per-op `pending` analog). A transient
   /// checkpoint-read `Fault` is re-submitted within this budget; once exhausted — the durable root
   /// names a snapshot that is PERMANENTLY unreadable or permanently inconsistent with the root (wrong
@@ -1036,6 +1042,15 @@ impl TimerKind {
 #[derive(Debug)]
 pub struct Endpoint<S, R = RestartOnly> {
   config: Config,
+  /// The slot capacity of this node's WAL backend ([`Wal::capacity`]; `u64::MAX` = unbounded) —
+  /// observed from the backend at recovery, or DECLARED by the caller at genesis construction
+  /// ([`Self::with_reconfig`] takes no storage handles, so it cannot observe one). Stamped into
+  /// every durable root as half of the WAL-GEOMETRY pair so the next recovery can refuse a restart
+  /// under different geometry (which would silently move the recovery scan window off a committed
+  /// tail). Always nonzero: `0` is the wire-level "unrecorded" sentinel a pre-v8 root decodes to,
+  /// which recovery refuses on any non-virgin store — construction asserts it away so no live
+  /// endpoint can ever write it.
+  wal_capacity: u64,
   /// The active, epoch-versioned cluster configuration: who votes, who leads, the quorum sizes, and
   /// this node's slot. The single source of truth for quorum/primary/voter decisions (the static
   /// per-node parameters stay on [`Config`]). For PR1 (offline restart only) this is fixed per incarnation — it
@@ -1499,43 +1514,190 @@ pub struct Endpoint<S, R = RestartOnly> {
   _reconfig: core::marker::PhantomData<fn() -> R>,
 }
 
+/// The un-committed GENESIS state of a brand-new cluster member: the inputs a fresh [`Endpoint`]
+/// needs, held BEFORE any durable genesis root exists. [`Endpoint::new`] / [`Endpoint::with_reconfig`]
+/// return this instead of a runnable [`Endpoint`], so a member cannot begin participating without a
+/// durable FORMAT witness. It is INERT — it exposes no request/operation surface; the only way forward
+/// is [`Self::commit`], which writes the durable genesis root and yields the runnable [`Endpoint`].
+///
+/// This is the correct-by-construction core of the recovery contract: the ONLY public routes to a
+/// runnable [`Endpoint`] are [`Self::commit`] (a NEW member, over a virgin store) and
+/// [`Endpoint::recover`] (an EXISTING member, over its own durable store). Neither can produce a VOTER
+/// whose durable root is empty, so a wiped or never-formatted voter can never silently re-enter the
+/// voting set — the amnesia hazard where a replica that forgot its durable log re-votes across a view
+/// change and lets a committed op number be re-decided, which [`Endpoint::recover`] fails-stops.
+#[derive(Debug)]
+#[must_use = "a Genesis is inert; call `commit` to write its durable genesis root and get the runnable Endpoint"]
+pub struct Genesis<S, R = RestartOnly> {
+  config: Config,
+  membership: Membership,
+  seed: u64,
+  sm: S,
+  wal_capacity: u64,
+  /// The reconfiguration capability marker, carried so [`Self::commit`] can build an
+  /// [`Endpoint`]`<S, R>`. `PhantomData<fn() -> R>` for the same unconditional `Send`/`Sync` reasons
+  /// [`Endpoint`]'s own marker uses.
+  _reconfig: core::marker::PhantomData<fn() -> R>,
+}
+
+impl<S, R: Reconfig> Genesis<S, R> {
+  /// Commit this genesis to durable storage and return the runnable [`Endpoint`]. Writes the durable
+  /// GENESIS ROOT — empty consensus state (view 0, op 0, no checkpoint) carrying the genesis membership
+  /// and the WAL-GEOMETRY pair — via [`format`](crate::format), confirms it landed SYNCHRONOUSLY, then
+  /// builds the in-memory [`Endpoint`] at genesis (view 0, `Status::Normal`): the identical in-memory
+  /// state the pre-gate constructor produced, now backed by a durable format witness a later
+  /// [`Endpoint::recover`] can trust (a formatted root carries a nonzero `checkpoint_ops` a wipe cannot
+  /// forge, so recovery may resume this member while refusing an empty-rooted voter).
+  ///
+  /// This is the SOLE public route from a genesis member to a runnable [`Endpoint`]; an EXISTING member
+  /// restarts via [`Endpoint::recover`] instead. Call it ONCE per store at cluster creation, over a
+  /// VIRGIN store (before the first [`Endpoint::recover`]).
+  ///
+  /// The DECLARED WAL capacity (the `wal_capacity` this [`Genesis`] carries, from
+  /// [`Endpoint::new`]/[`Endpoint::with_reconfig`]) MUST equal the backend's live [`Wal::capacity`]:
+  /// [`format`](crate::format) pins the ACTUAL `wal.capacity()` into the durable genesis root, so a
+  /// declared value that disagreed with the backend would produce a voter whose in-memory geometry
+  /// contradicts its own durable root ([`FormatError::WalCapacityMismatch`], refused before any write).
+  ///
+  /// # Errors
+  /// [`FormatError`] if the genesis cannot be committed, leaving the store UNCHANGED so the caller can
+  /// fix the input and retry: [`FormatError::WalCapacityMismatch`] if the declared capacity differs from
+  /// the backend's [`Wal::capacity`] (checked BEFORE the write, so nothing is pinned);
+  /// [`FormatError::AlreadyInitialized`] if the store already carries a durable root (an existing member
+  /// must [`recover`](Endpoint::recover), never re-genesis over live consensus state);
+  /// [`FormatError::WalCapacityBelowMinimum`] if the backend is below the liveness floor (checked BEFORE
+  /// the write, so nothing is pinned); or [`FormatError::WriteNotDurable`] if the genesis-root write did
+  /// not complete synchronously.
+  pub fn commit<W: Wal, B: Superblock>(
+    self,
+    wal: &W,
+    sb: &mut B,
+  ) -> Result<Endpoint<S, R>, FormatError> {
+    // The declared capacity MUST match the backend `format` pins into the durable genesis root. A
+    // mismatch would build a voter whose in-memory geometry disagrees with its own durable root — the
+    // WAL laid out under one capacity while the next checkpoint/view root stamps the other — which can
+    // later pass recovery's geometry fence yet scan under a layout different from the WAL's real one
+    // (the hidden-committed-tail amnesia the fence exists to prevent). Refused BEFORE `format` submits
+    // any write, so the store stays VIRGIN and the caller can re-declare and retry.
+    let actual = wal.capacity();
+    if self.wal_capacity != actual {
+      return Err(FormatError::WalCapacityMismatch {
+        declared: self.wal_capacity,
+        actual,
+      });
+    }
+    recovery::format(&self.config, &self.membership, wal, sb)?;
+    // Build with the AUTHORITATIVE `wal.capacity()` `format` just pinned, not the caller-declared value.
+    // The check above proved them equal, so this is defensive: the endpoint, the durable root, and the
+    // backend all agree on the capacity even if that guard were ever removed.
+    Ok(Endpoint::genesis_unchecked(
+      self.config,
+      self.membership,
+      self.seed,
+      self.sm,
+      actual,
+    ))
+  }
+}
+
 impl<S> Endpoint<S, RestartOnly> {
-  /// Creates a fresh endpoint in `Status::Normal`, view 0, for the genesis `membership` — the
-  /// ergonomic [`RestartOnly`] constructor (the DEFAULT capability), so a bare un-annotated
-  /// `Endpoint::new(..)` resolves to `Endpoint<S, RestartOnly>`. A stronger capability is opted into
-  /// explicitly via [`Self::with_reconfig`] (`Endpoint::<S, SingleChange>::with_reconfig(..)`).
+  /// Begins genesis for a brand-new cluster member: returns the inert [`Genesis`] state that
+  /// [`Genesis::commit`] turns into a runnable [`Endpoint`] (view 0, `Status::Normal`) by writing the
+  /// durable genesis root. The ergonomic [`RestartOnly`] entry point (the DEFAULT capability), so a
+  /// bare un-annotated `Endpoint::new(..)` yields a [`Genesis`]`<S, RestartOnly>`; a stronger
+  /// capability is opted into explicitly via [`Self::with_reconfig`]
+  /// (`Endpoint::<S, SingleChange>::with_reconfig(..)`).
   ///
-  /// The static per-node parameters come from `config`; the active cluster configuration (the
-  /// quorum/primary/voter logic + this node's slot) comes from `membership`. The local member
-  /// ([`Config::local`]) MUST occupy a slot in `membership` — asserted at construction (release too).
-  ///
-  /// **`seed` must carry fresh entropy per incarnation**: the solicitation-freshness nonce is
-  /// derived deterministically from it, so a process restarted with a reused seed re-mints the same
-  /// nonce and a delayed response to the previous incarnation passes the freshness checks. See
-  /// [`Self::recover`] (where the hazard is concrete) for the full contract.
-  pub fn new(config: Config, membership: Membership, seed: u64, sm: S) -> Self {
-    Self::with_reconfig(config, membership, seed, sm)
+  /// See [`Self::with_reconfig`] for the full `config` / `membership` / `wal_capacity` / `seed`
+  /// contract and why genesis is a two-step gate (a runnable member requires a durable format witness).
+  // Deliberately returns the [`Genesis`] type-state, not `Self`: a runnable `Endpoint` must not exist
+  // without a durable format root, so `new` yields the inert genesis and `Genesis::commit` produces the
+  // `Endpoint`.
+  #[allow(clippy::new_ret_no_self)]
+  pub fn new(
+    config: Config,
+    membership: Membership,
+    seed: u64,
+    sm: S,
+    wal_capacity: u64,
+  ) -> Genesis<S, RestartOnly> {
+    Self::with_reconfig(config, membership, seed, sm, wal_capacity)
   }
 }
 
 impl<S, R> Endpoint<S, R> {
-  /// Creates a fresh endpoint under an EXPLICIT reconfiguration capability marker `R`, in
-  /// `Status::Normal`, view 0, for the genesis `membership`.
+  /// Begins genesis under an EXPLICIT reconfiguration capability marker `R`: returns the inert
+  /// [`Genesis`] state that [`Genesis::commit`] turns into a runnable [`Endpoint`]`<S, R>` (view 0,
+  /// `Status::Normal`) by writing the durable genesis root.
   ///
   /// The capability marker is part of the call (`Endpoint::<S, SingleChange>::with_reconfig(..)`),
   /// because a struct default type parameter does not participate in inference of an associated
   /// function's return type. The ergonomic [`Self::new`] is the [`RestartOnly`] entry point and
   /// defers here with `R = RestartOnly`, so every bare `Endpoint::new(..)` call resolves unannotated.
   ///
+  /// **Genesis is a two-step gate, because a runnable member requires a durable format witness.** This
+  /// takes no storage handles and establishes NO durability — it only packages the inputs. The runnable
+  /// [`Endpoint`] is reached ONLY by [`Genesis::commit`], which writes the durable genesis root (over a
+  /// virgin store), or — for an EXISTING member — by [`Self::recover`] over its own durable store. An
+  /// existing member ALWAYS recovers, never re-constructs, so a store that ever held consensus state can
+  /// never be silently discarded (the VSR amnesia hazard, where a replica that forgets its durable
+  /// view/log re-votes across a view change and committed state diverges). The bundled drivers do
+  /// exactly this. Recovery's genesis-primary decision is keyed on the durable FORMAT witness, which
+  /// [`Genesis::commit`] writes.
+  ///
   /// The static per-node parameters come from `config`; the active cluster configuration (the
   /// quorum/primary/voter logic + this node's slot) comes from `membership`. The local member
-  /// ([`Config::local`]) MUST occupy a slot in `membership` — asserted at construction (release too).
+  /// ([`Config::local`]) MUST occupy a slot in `membership` — asserted when the endpoint is built (at
+  /// [`Genesis::commit`]; release too).
+  ///
+  /// **`wal_capacity` declares the WAL backend this endpoint will run over** — the caller passes the
+  /// backend's [`Wal::capacity`] (`u64::MAX` for an unbounded/ring-less backend). Because the genesis
+  /// constructor observes no storage, the declaration is what every durable root this endpoint writes
+  /// stamps as the capacity half of its WAL-GEOMETRY pair; the next recovery then validates the real
+  /// backend against it and refuses a restart under different geometry (a mis-declaration is therefore
+  /// fail-closed at the next boot, never silent). It MUST be nonzero — asserted when the endpoint is
+  /// built (release too): `0` is the wire-level "unrecorded" sentinel a pre-v8 root decodes to, which
+  /// recovery refuses on any non-virgin store, so a live endpoint must never write it.
   ///
   /// **`seed` must carry fresh entropy per incarnation**: the solicitation-freshness nonce is
   /// derived deterministically from it, so a process restarted with a reused seed re-mints the same
   /// nonce and a delayed response to the previous incarnation passes the freshness checks. See
   /// [`Self::recover`] (where the hazard is concrete) for the full contract.
-  pub fn with_reconfig(config: Config, membership: Membership, seed: u64, sm: S) -> Self
+  pub fn with_reconfig(
+    config: Config,
+    membership: Membership,
+    seed: u64,
+    sm: S,
+    wal_capacity: u64,
+  ) -> Genesis<S, R>
+  where
+    R: Reconfig,
+  {
+    Genesis {
+      config,
+      membership,
+      seed,
+      sm,
+      wal_capacity,
+      _reconfig: core::marker::PhantomData,
+    }
+  }
+
+  /// Builds the runnable in-memory genesis [`Endpoint`] WITHOUT writing a durable root — the shared
+  /// core of [`Genesis::commit`] (which formats the store first) and proto-internal construct-and-drive
+  /// unit tests that never recover. Kept `pub(crate)`: the public API reaches a runnable endpoint only
+  /// via [`Genesis::commit`] (backed by a durable format witness) or [`Self::recover`], so an embedder
+  /// can never mint a voter over a store with no durable root.
+  ///
+  /// The local member ([`Config::local`]) MUST occupy a slot in `membership`, and `wal_capacity` MUST be
+  /// nonzero — both asserted here in RELEASE too.
+  pub(crate) fn genesis_unchecked(
+    config: Config,
+    membership: Membership,
+    seed: u64,
+    sm: S,
+    wal_capacity: u64,
+  ) -> Self
   where
     R: Reconfig,
   {
@@ -1552,6 +1714,14 @@ impl<S, R> Endpoint<S, R> {
       "the local member {} must occupy a slot in its own membership",
       config.local(),
     );
+    // A construction PRECONDITION enforced in RELEASE too: the declared backend capacity must be
+    // nonzero — `0` is the wire-level "unrecorded" geometry sentinel recovery refuses on any
+    // non-virgin store, so an endpoint born with it would write durable roots no later boot accepts.
+    // A caller with no bounded ring passes `u64::MAX` (the `Wal::capacity` unbounded default).
+    assert!(
+      wal_capacity != 0,
+      "wal_capacity must be nonzero: pass the backend's Wal::capacity() (u64::MAX for an unbounded backend)",
+    );
     let nonce = Prng::new(seed).next_u64();
     // Genesis: the lineage has no predecessor, so prev_epoch == the (genesis) epoch and the prior-id
     // ring is seeded with the genesis config_id (a harmless duplicate of the current id — admitting
@@ -1560,6 +1730,9 @@ impl<S, R> Endpoint<S, R> {
     let lineage = [membership.config_id(); LINEAGE_RING];
     Self {
       config,
+      // The caller-declared backend capacity (nonzero, asserted above) — stamped into every durable
+      // root this endpoint writes; the next recovery validates the real backend against it.
+      wal_capacity,
       membership,
       prev_epoch,
       lineage,
@@ -2243,7 +2416,13 @@ impl<S, R> Endpoint<S, R> {
     .and_then(|s| s.with_log_floor(self.log_floor))
     .expect(
       "SwapEpoch root: log_view <= view, commit >= checkpoint_op, membership epoch consistent",
-    );
+    )
+    // The live WAL-geometry pair, stamped exactly as `durable_root` does — a swap changes only the
+    // configuration, not the geometry, so the SwapEpoch root must stay FORMATTED. Without it, a crash
+    // in the window between this root landing and the forced-checkpoint root would leave a store whose
+    // root records no geometry (0,0), which recovery refuses fail-closed as unrecorded — bricking a
+    // legitimately-reconfigured node behind an offline migration for no reason.
+    .with_wal_geometry(self.config.checkpoint_ops(), self.wal_capacity);
     let id = self.mint_op_id();
     sb.submit_write(id, state);
     self.pending_sb = Some((
@@ -3845,9 +4024,18 @@ impl<S, R> Endpoint<S, R> {
     self.svc_target
   }
 
-  /// Mint a fresh storage correlation id.
+  /// Mint a fresh storage correlation id. Counts up from 1, RESERVING `u64::MAX`
+  /// ([`recovery::FORMAT_OP_ID`](crate::endpoint::recovery::FORMAT_OP_ID)) so it is never minted —
+  /// which is what keeps a leaked `format` completion from ever aliasing a real op's `pending_sb`. A
+  /// mint that would reach the reserved id fail-stops rather than wrapping (which would also break
+  /// the within-incarnation uniqueness of correlation ids); it is a ~1.8e19-submission backstop
+  /// (roughly 585 years at 10^9 submissions/second), never reached in practice.
   fn mint_op_id(&mut self) -> crate::OpId {
     let id = self.next_op_id;
+    assert!(
+      id < u64::MAX,
+      "OpId space exhausted: next_op_id reached the reserved FORMAT_OP_ID"
+    );
     self.next_op_id += 1;
     crate::OpId::new(id)
   }

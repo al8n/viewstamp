@@ -33,7 +33,7 @@ pub use config::{
 #[doc(hidden)]
 pub use session::{
   EVENTS_CAP, InflightBudget, MAX_INFLIGHT, MAX_PENDING_BYTES, Pending, PendingMap,
-  REQUEST_TIMEOUT, build_endpoint, deliver_event, drain_pending, pending_scan_interval,
+  REQUEST_TIMEOUT, build_endpoint, deliver_event, drain_pending, format, pending_scan_interval,
   reap_and_collect_retransmits,
 };
 
@@ -73,6 +73,19 @@ pub enum DriverError {
     /// The peer that could not be dialed.
     peer: viewstamp_proto::Peer,
   },
+  /// Recovery refused to reconstruct the endpoint over this store: the live parameters are unsafe —
+  /// the WAL below the configured liveness floor, or a `checkpoint_ops`/`Wal::capacity` geometry
+  /// pair differing from the one the durable root pinned (restarting under different geometry
+  /// silently moves the recovery scan window and can clip a committed WAL tail). Fail-fast at
+  /// construction; the remedy is operational (restore the recorded parameters, or migrate the store
+  /// offline), never a retry.
+  #[error("recovery refused this store: {0}")]
+  Recover(#[from] viewstamp_proto::RecoverError),
+  /// [`format`] refused to initialize the store because it already carries a durable
+  /// root — `format` is the once-per-store cluster-creation step, and an existing member restarts via
+  /// the driver constructor (recovery) instead.
+  #[error("format refused this store: {0}")]
+  Format(#[from] viewstamp_proto::FormatError),
   /// This node is no longer part of the recovered cluster membership: its stable
   /// [`MemberId`](viewstamp_proto::MemberId) ([`Config::local`](viewstamp_proto::Config)) did not
   /// resolve to any slot in the DURABLE root's membership, so a reconfiguration removed it (the

@@ -21,11 +21,12 @@ fn foreign_epoch_prepare_ok_does_not_count_toward_the_vote_quorum() {
   // first vote. A SECOND, otherwise-honest vote whose `epoch` is 7 (not the primary's epoch 0) must
   // contribute NOTHING — it is a vote from a different configuration, so it cannot reach the quorum
   // bitset: commit stays at 0.
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(3),
     0,
     EchoSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -387,7 +388,9 @@ fn recovering_with_hole_at_epoch(
   .expect("valid genesis membership at the chosen epoch");
   let mut wal = ScriptedWal::with_entries(head);
   wal.script_read_fault(OpNumber::with(faulty_op), u8::MAX);
-  let mut sb = TestSb::default();
+  // A store that RAN at this epoch (its non-head slot faults), not a wipe: a FORMATTED root so this
+  // voter recovers rather than empty-fail-stops.
+  let mut sb = sb_formatted();
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
@@ -399,6 +402,7 @@ fn recovering_with_hole_at_epoch(
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   (r, wal, sb)
@@ -673,11 +677,12 @@ fn settled_voter_at(epoch: u64) -> Endpoint<NoopSm> {
     0,
   )
   .expect("valid membership at the chosen epoch");
-  Endpoint::new(
+  Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
     membership,
     0,
     NoopSm,
+    u64::MAX,
   )
 }
 

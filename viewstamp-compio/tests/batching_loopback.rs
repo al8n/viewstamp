@@ -205,7 +205,10 @@ async fn spawn_cluster() -> (Vec<viewstamp_compio::Handle>, Vec<Rc<RefCell<Batch
       viewstamp_proto::Config::try_new(CLUSTER, MemberId::new((id as u16) as u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-    let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    // A real new cluster: FORMAT each store so recovery resumes the designated primary (an
+    // unformatted voter would fail-stop — the wipe-amnesia safeguard).
+    viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
     let blocks = MemBlocks::default();
     let (sm, recorder) = SharedSm::new();
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(

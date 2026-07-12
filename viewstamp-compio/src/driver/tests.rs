@@ -114,6 +114,8 @@ fn cluster_ca() -> (
 /// in-flight budget. This is the partitioned/slow case the submit budget must bound: with no quorum
 /// nothing the driver does releases a `pending` entry, so the budget only ever fills then refuses.
 async fn test_quic_driver_with_handle() -> (TestQuicDriver, crate::Handle) {
+  // A genesis fixture: the empty store is FORMATTED on the shared `with_config` path (below), so
+  // recovery resumes the designated view-0 primary as Normal rather than fail-stopping this voter.
   test_quic_driver_with_storage(InMemoryWal::new(), InMemorySuperblock::new()).await
 }
 
@@ -130,12 +132,18 @@ async fn test_quic_driver_with_storage(
 /// config-effect tests drive a non-default [`crate::DriverConfig`] through the production path.
 async fn test_quic_driver_with_config(
   wal: InMemoryWal,
-  sb: InMemorySuperblock,
+  mut sb: InMemorySuperblock,
   cfg: crate::DriverConfig,
 ) -> (TestQuicDriver, crate::Handle) {
   let (roots, chain, key) = cluster_ca();
   let opts: QuicOptions = ClusterTls::new(roots, chain, key).build();
   let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
+  // A GENESIS fixture (empty store) is FORMATTED so recovery resumes rather than fail-stopping this
+  // voter; a DIRTY-store fixture (a caller-populated store) is left as-is to exercise recovery. This
+  // is the single format point on the fixture path — `with_storage`/`with_handle` route through here.
+  if viewstamp_proto::Superblock::state(&sb) == viewstamp_proto::VsrState::new() {
+    viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+  }
   let (_ready_tx, ready_rx) = flume::unbounded();
   CompioQuicDriver::with_config(
     config,
@@ -179,7 +187,8 @@ async fn a_dirty_store_never_boots_a_fresh_view_zero_endpoint_quic() {
       0,
       Vec::new(),
     )
-    .expect("a valid durable root"),
+    .expect("a valid durable root")
+    .with_wal_geometry(viewstamp_proto::DEFAULT_CHECKPOINT_OPS, u64::MAX),
   );
   // The storage contract: no in-flight completions cross an endpoint incarnation.
   while viewstamp_proto::Superblock::poll(&mut sb).is_some() {}
@@ -220,13 +229,18 @@ async fn a_dirty_store_never_boots_a_fresh_view_zero_endpoint_quic() {
   );
 }
 
-/// First-boot path (QUIC driver): a genesis store — fresh-cluster root AND empty WAL — still boots
-/// a fresh endpoint (`Normal`, view 0, empty log); `Endpoint::new` stays reachable, guarded by the
-/// state inspection itself.
+/// First-boot path (QUIC driver): a genesis store — fresh-cluster root AND empty WAL — boots the
+/// SAME unconditional-recovery path as every other store (no emptiness fork to mis-read a rot-able
+/// scalar): a zero-length recovery, gated only on the genesis root write that pins the WAL
+/// geometry, settling `Normal`/view-0 on the run loop's ordinary storage pump with no peer
+/// dependency.
 #[compio::test]
 async fn a_genesis_store_boots_a_fresh_normal_endpoint_quic() {
-  let (driver, _handle) =
-    test_quic_driver_with_storage(InMemoryWal::new(), InMemorySuperblock::new()).await;
+  // A genuine new cluster's store is prepared ONCE via `format` (writing the pinned genesis root),
+  // then the driver recovers it: the format witness lets recovery resume the designated view-0
+  // primary as Normal, synchronously (empty WAL, nothing to read). Without format the store would be
+  // unformatted and this would-be primary would abdicate instead — the wipe-amnesia safeguard.
+  let (driver, _handle) = test_quic_driver_with_handle().await;
   assert!(driver.coord.endpoint().status().is_normal());
   assert_eq!(driver.coord.endpoint().view().get(), 0);
   assert_eq!(driver.coord.endpoint().op().get(), 0);

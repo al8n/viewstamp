@@ -51,13 +51,19 @@ fn backup() -> (
 ) {
   // The sim's `SimSm` is private; build the plain `LogSm` the cluster wraps. (Re-exported below.)
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid config");
+  let wal = InMemoryWal::new();
+  let mut sb = InMemorySuperblock::new();
+  // Genesis: commit over this backup's own store (formats it), yielding the runnable endpoint.
   let e = Endpoint::new(
     cfg,
     genesis(3),
     0,
     viewstamp_simulation::sm::LogSm::default(),
-  );
-  (e, InMemoryWal::new(), InMemorySuperblock::new())
+    u64::MAX,
+  )
+  .commit(&wal, &mut sb)
+  .expect("genesis commit formats the store");
+  (e, wal, sb)
 }
 
 /// The observable consensus state used for the byte-identity comparison: the head, the applied +

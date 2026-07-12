@@ -13,11 +13,12 @@ use crate::{
 
 /// A 3-voter cluster (ids 0,1,2) with 2 learners (ids 3,4 — `node_count == 5`), self = voter 0.
 fn voter_with_learners() -> Endpoint<NoopSm> {
-  Endpoint::new(
+  Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).expect("valid 3-voter + 2-learner config"),
     genesis_with_learners(3, 2),
     0,
     NoopSm,
+    u64::MAX,
   )
 }
 
@@ -179,11 +180,12 @@ fn on_request_prepare_serves_a_learner_requester() {
   // id (in `[replica_count, node_count)`). Drive a voter backup to hold a committed op, then a learner
   // (id 3) RequestPrepare for it — the holder answers with the Prepare addressed back to the learner.
   // Goes end-to-end through `handle_message`, so it also exercises `sender_is_member` for RequestPrepare.
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).expect("voter 1 of 3 + 2 learners"),
     genesis_with_learners(3, 2),
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -243,11 +245,12 @@ fn on_recovery_serves_a_learner_requester() {
   // `0..node_count`). A primary (voter 0) answers a learner (id 3) Recovery with a RecoveryResponse
   // addressed back to the learner. (A learner adopts a head only from the primary; the SERVE side is
   // membership-wide.)
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).expect("voter 0 (primary of view 0) + 2 learners"),
     genesis_with_learners(3, 2),
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -287,11 +290,12 @@ fn compute_quorum_checkpoint_op_on_a_learner_excludes_its_own_checkpoint() {
   // set), its own (possibly high) durable checkpoint must NOT seed the statistic — populating no voter
   // `peer_checkpoint`, the learner computes the conservative floor 0, so a high learner checkpoint
   // cannot lift the GC floor and free an op a voter quorum still needs.
-  let mut learner = Endpoint::new(
+  let mut learner = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(LEARNER as u128)).expect("learner id 3 of a 3-voter set"),
     genesis_with_learners(3, 2),
     0,
     NoopSm,
+    u64::MAX,
   );
   // Force a HIGH own durable checkpoint (op 9) on the learner.
   learner.force_state_for_test(0, 9, 9, 9, &[]);
@@ -310,11 +314,12 @@ fn compute_quorum_checkpoint_op_on_a_learner_excludes_its_own_checkpoint() {
 
   // Contrast: the SAME high own checkpoint on a VOTER (id 0) in a solo (1-voter) cluster IS the
   // quorum, so it seeds the statistic — proving the exclusion is voter-gated, not unconditional.
-  let mut solo_voter = Endpoint::new(
+  let mut solo_voter = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).expect("solo voter 0 + 2 learners"),
     genesis_with_learners(1, 2),
     0,
     NoopSm,
+    u64::MAX,
   );
   solo_voter.force_state_for_test(0, 9, 9, 9, &[]);
   assert_eq!(
@@ -327,11 +332,12 @@ fn compute_quorum_checkpoint_op_on_a_learner_excludes_its_own_checkpoint() {
 /// A LEARNER endpoint (self = learner id 3) in a 3-voter (0,1,2) + 2-learner (3,4) cluster. Voter 0 is
 /// the primary of view 0; voter 1 is the primary of view 1.
 fn learner_self() -> Endpoint<NoopSm> {
-  Endpoint::new(
+  Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(LEARNER as u128)).expect("learner id 3 of a 3-voter set"),
     genesis_with_learners(3, 2),
     0,
     NoopSm,
+    u64::MAX,
   )
 }
 
@@ -531,6 +537,7 @@ fn a_learner_recovered_mid_view_change_catches_up_and_never_emits_a_dvc() {
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   for _ in 0..16 {
     r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
@@ -569,11 +576,12 @@ fn a_voter_backup_still_acks_and_proposes_unlike_a_learner() {
   // Positive control: the SAME drive on a VOTER backup (id 1) DOES ack the prepare and DOES propose a
   // view change when the primary goes idle — so the learner exclusions are learner-specific, not a
   // blanket disable of the backup machinery.
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).expect("voter 1 backup + 2 learners"),
     genesis_with_learners(3, 2),
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -695,11 +703,12 @@ fn a_voter_never_emits_learner_status() {
   // The progress report is learner-specific: a VOTING backup participates directly (its votes carry its
   // frontier), so it never arms or fires the learner-status cadence. The same drive on a voter emits NO
   // `LearnerStatus`.
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).expect("voter 1 backup + 2 learners"),
     genesis_with_learners(3, 2),
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();

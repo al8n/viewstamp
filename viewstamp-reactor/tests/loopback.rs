@@ -206,7 +206,9 @@ async fn build_driver(
       .unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let blocks = MemBlocks::default();
   GateDriver::new(
     config,

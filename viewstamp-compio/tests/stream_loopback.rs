@@ -251,7 +251,9 @@ where
       viewstamp_proto::Config::try_new(CLUSTER, MemberId::new((id as u16) as u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-    let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
+    viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
     let blocks = MemBlocks::default();
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
       config,
@@ -373,7 +375,10 @@ async fn a_killed_node_restarts_over_its_durable_store_and_rejoins() {
       viewstamp_proto::Config::try_new(CLUSTER, MemberId::new((id as u16) as u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Shared::new(wals[id as usize].clone(), ready_tx.clone());
-    let sb = Shared::new(sbs[id as usize].clone(), ready_tx);
+    let mut sb = Shared::new(sbs[id as usize].clone(), ready_tx);
+    // A real new cluster: FORMAT each (durable, shared) store once so recovery resumes rather than
+    // fail-stopping this voter — and the kill+restart later recovers the same formatted store.
+    viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
     let blocks = MemBlocks::default();
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
       config,
@@ -522,7 +527,9 @@ async fn stream_driver_exits_when_all_handles_dropped() {
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let blocks = MemBlocks::default();
   let bind = reserve_loopback_addrs(1)[0];
   let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
@@ -585,7 +592,9 @@ async fn shutdown_ack_frees_the_address_for_immediate_rebind_stream() {
     let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-    let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
+    viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
     let blocks = MemBlocks::default();
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
       config,
@@ -648,7 +657,9 @@ async fn shutdown_releases_a_queued_dial_completion() {
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let blocks = MemBlocks::default();
   let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
     config,
@@ -728,7 +739,9 @@ async fn stalled_unvalidated_accept_is_reaped_at_the_auth_deadline() {
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let blocks = MemBlocks::default();
   let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
     config,
@@ -810,7 +823,9 @@ async fn stalled_dialed_conn_is_reaped_at_the_auth_deadline_and_redials() {
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let blocks = MemBlocks::default();
   let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
     config,
@@ -982,12 +997,16 @@ async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
   // The notifier sender is dropped on the spot: the driver must treat the dead channel as
   // "downgrade to timer cadence", not as a wake source.
   let (_, ready_rx) = flume::unbounded();
+  let wal = InMemoryWal::new();
+  let mut sb = InMemorySuperblock::new();
+  // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
     config,
     genesis(3),
     viewstamp_simulation::sm::LogSm::default(),
-    InMemoryWal::new(),
-    InMemorySuperblock::new(),
+    wal,
+    sb,
     MemBlocks::default(),
     viewstamp_proto::ClientId::new(1),
     0,
@@ -1035,7 +1054,9 @@ async fn a_full_cap_evicts_the_oldest_unvalidated_accept_for_a_fresh_one() {
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
+  viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
   let blocks = MemBlocks::default();
   let (driver, handle) = viewstamp_compio::CompioStreamDriver::with_config(
     config,

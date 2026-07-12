@@ -22,13 +22,25 @@ use crate::{
 /// endpoint is `Normal` at view 0, and slot 0 leads view 0, so this is the proposing primary.
 fn single_change_primary() -> Endpoint<CountSm, SingleChange> {
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(3), 0, CountSm::default())
+  Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  )
 }
 
 /// A 3-voter `SingleChange` endpoint whose local member is slot 1 — a BACKUP under view 0.
 fn single_change_backup() -> Endpoint<CountSm, SingleChange> {
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
-  Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(3), 0, CountSm::default())
+  Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  )
 }
 
 #[test]
@@ -332,6 +344,15 @@ fn the_swap_epoch_root_durably_records_the_reconfigure_op_as_committed() {
     "the SwapEpoch root's committed-band headers include the reconfigure op (op {})",
     op.get(),
   );
+  // The SwapEpoch root MUST carry the WAL-geometry witness — a swap changes only the configuration,
+  // not the geometry. A crash in the window between this root landing and the forced-checkpoint root
+  // is reachable, so recovery off THIS root must see a FORMATTED store: without the geometry it would
+  // read as unformatted, skip the geometry fence, AND fail-stop this legitimately-reconfigured voter.
+  assert_ne!(
+    sb.state().checkpoint_ops(),
+    0,
+    "the SwapEpoch root pins the WAL-geometry witness (a crash in the swap window stays recoverable)"
+  );
 }
 
 #[test]
@@ -353,7 +374,8 @@ fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
     &mut rwal,
     &mut rsb,
     &mut blocks,
-  );
+  )
+  .expect("recover accepts this store");
   let r = match recovered {
     Recovered::Active(e) => e,
     Recovered::Retired(_) => panic!("the proposer is still in the recovered membership → Active"),
@@ -611,7 +633,13 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
 
   // A Normal BACKUP (slot 1) that committed its OWN reconfigure op N1 (op == commit_min == N1), checkpoint 0.
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
-  let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
+  let mut e = Endpoint::<CountSm>::genesis_unchecked(
+    cfg,
+    genesis_mem.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -779,7 +807,13 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
   // A BACKUP (slot 1) at E0, Normal, that committed its own reconfigure op N (op == commit_min == N),
   // checkpoint 0 — the commit-first window where the SwapEpoch root has NOT yet installed.
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
-  let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
+  let mut e = Endpoint::<CountSm>::genesis_unchecked(
+    cfg,
+    genesis_mem.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -946,7 +980,13 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
   // A BACKUP (slot 1) at E0, Normal, that committed its own reconfigure op N (op == commit_min == N),
   // checkpoint 0 — the commit-first window before the SwapEpoch root installs.
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
-  let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
+  let mut e = Endpoint::<CountSm>::genesis_unchecked(
+    cfg,
+    genesis_mem.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -1132,7 +1172,10 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
     std::vec![genesis_mem.config_id()],
     OpNumber::with(n), // config_install_op = N, ABOVE the checkpoint
   )
-  .expect("a SwapEpoch root carrying config_install_op above its checkpoint is valid");
+  .expect("a SwapEpoch root carrying config_install_op above its checkpoint is valid")
+  // A running node stamps geometry on every durable root; match the recover config's default interval
+  // and the ring-less test WAL's `u64::MAX` capacity so recovery's geometry fence accepts it.
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
 
   // Recover replica 1 — a BACKUP of view 0 in the successor (slot 0 leads), so `complete_recovery`
   // resumes Normal (NOT the abdicate-to-view-change primary branch) and pays the debt immediately.
@@ -1154,6 +1197,7 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
 
   // The recovered node is in the debt window: at the successor epoch, gate owed.
@@ -1248,11 +1292,12 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
   // epoch boundary. The structural gate (`has_pending_reconfigure`, which reads the uncommitted log tail)
   // is what forecloses it. Here replica 1 becomes primary of view 1 and adopts an uncommitted `Reconfigure`
   // op (op 2) carried ONLY by replica 2's DVC; replica 1's own DVC holds op 0, so op 2 is peer-learned.
-  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     CountSm::default(),
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -1380,11 +1425,12 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
 /// is in scope.
 fn single_change_primed_new_primary_pending_view()
 -> (Endpoint<CountSm, SingleChange>, TestWal, StepSb) {
-  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     CountSm::default(),
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -2201,7 +2247,8 @@ fn restart_only_endpoint_has_no_propose_membership_surface() {
   // enforced by the type system, not asserted here; the `single_change_*` fixtures above exercise the
   // positive surface that a `RestartOnly` endpoint lacks.)
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  let e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   assert_eq!(e.replica(), ReplicaId::new(0), "slot 0 is the local member");
 }
 
@@ -2211,11 +2258,12 @@ fn restart_only_endpoint_has_no_propose_membership_surface() {
 /// The learner is member 3 at slot 3 (`replica_count == 3`, so id 3 is the first non-voting member).
 fn single_change_primary_with_learner() -> Endpoint<CountSm, SingleChange> {
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  Endpoint::<CountSm, SingleChange>::with_reconfig(
+  Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     cfg,
     genesis_with_learners(3, 1),
     0,
     CountSm::default(),
+    u64::MAX,
   )
 }
 
@@ -2629,11 +2677,12 @@ fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_
   // `a_backup_committing_the_same_reconfigure_installs_the_identical_successor`.)
   let cfg =
     Config::try_new(0, MemberId::new(3)).expect("learner member 3 of a 3-voter + 1-learner set");
-  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     cfg,
     genesis_with_learners(3, 1),
     0,
     CountSm::default(),
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -2837,11 +2886,12 @@ fn a_promoted_learner_voters_committed_repairing_op_rides_the_dvc_and_is_not_tru
   );
 
   // The selector is voter slot 0 (new primary of view 1) of the 4-voter post-promotion cluster.
-  let mut selector = Endpoint::new(
+  let mut selector = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).expect("voter 0 of the 4-voter post-promotion set"),
     genesis(4),
     0,
     NoopSm,
+    u64::MAX,
   );
   // For n=4, quorum_view_change == quorum_nack_prepare == 2. Collect the committed donor (slot 3) plus
   // TWO laggards (head op 1) that would form a nack quorum on op 2 — the real truncation threat the
@@ -3202,8 +3252,13 @@ fn an_epoch_swap_clears_an_outstanding_promote_challenge() {
   // validates a post-swap mint. Arm a challenge directly, then drive an AddLearner reconfiguration on a
   // sole-voter cluster through commit + the durable SwapEpoch install, and assert the swap cleared it.
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  let mut e =
-    Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(1), 0, CountSm::default());
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
 
@@ -3268,13 +3323,25 @@ fn a_non_promote_delta_is_unaffected_by_the_catch_up_gate() {
 /// produce a 2-voter successor with `quorum_view_change == 1`.
 fn single_change_primary_solo() -> Endpoint<CountSm, SingleChange> {
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(1), 0, CountSm::default())
+  Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  )
 }
 
 /// An `n`-voter `SingleChange` endpoint whose local member is slot 0 — the primary of view 0.
 fn single_change_primary_n(n: u8) -> Endpoint<CountSm, SingleChange> {
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(n), 0, CountSm::default())
+  Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(n),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  )
 }
 
 #[test]
@@ -3347,8 +3414,13 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
   // the XI-b intersection is preserved by construction (the catch-up-then-promote gate, not the
   // empty-log direct admission).
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  let mut e =
-    Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(1), 0, CountSm::default());
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let newcomer = MemberId::new(1);
@@ -3551,11 +3623,12 @@ fn a_surviving_voter_elects_a_new_primary_without_the_removed_node() {
     "member 2 is a retained voter in the successor",
   );
   let survivor_cfg = Config::try_new(1, MemberId::new(2)).expect("valid cluster config");
-  let mut survivor = Endpoint::<CountSm, SingleChange>::with_reconfig(
+  let mut survivor = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     survivor_cfg,
     successor,
     0,
     CountSm::default(),
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -3598,8 +3671,13 @@ fn a_surviving_voter_elects_a_new_primary_without_the_removed_node() {
 /// removed-PRIMARY case (`removed_self_primary`, which retires the primary cadence).
 fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
   let cfg = Config::try_new(2, MemberId::new(2)).expect("slot 2 backup of the 3-voter set");
-  let mut e =
-    Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(3), 0, CountSm::default());
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -3850,11 +3928,12 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
   // This node is slot 0 of the E=1 4-voter config (the primary of view 0), so feed the SVC to a BACKUP
   // survivor to observe a view-change transition cleanly. Re-home onto slot 1.
   let backup_cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
-  let mut backup = Endpoint::<CountSm, SingleChange>::with_reconfig(
+  let mut backup = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     backup_cfg,
     e.membership.clone(),
     0,
     CountSm::default(),
+    u64::MAX,
   );
 
   // A stale OLD-epoch (E=0) SVC for view 1 from a removed/forked server: dropped at the strict gate.
@@ -4055,11 +4134,12 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
   // change to view 1 forms on a DVC quorum that does NOT carry that op (a nack quorum truncates the
   // uncommitted tail). The op is dropped, the cluster stays at the OLD epoch (E=0), and no committed
   // op is lost (`assert_committed_survives` backstops the truncation).
-  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
     genesis(3),
     0,
     CountSm::default(),
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -4162,11 +4242,12 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
   // the new view, fire the commit-first epoch swap. This exercises the peer-repair reconstruction: the
   // adopted header-only entry is repaired with the RECONFIGURATION body, which must be rebuilt as a
   // typed Body::Reconfigure (not an opaque Body::Present) so `commit_reconfigure` recognizes it.
-  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
     genesis(3),
     0,
     CountSm::default(),
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -4331,11 +4412,12 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   //
   // Driven over an ASYNC superblock (`StepSb`) so the `SwapEpoch` root stays in flight across the
   // transition: the backup (slot 1) commits + stages, then becomes the new primary of view 1.
-  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
     genesis(3),
     0,
     CountSm::default(),
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -4613,11 +4695,12 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
   // Replica 1 becomes the primary of view 1. It holds op 2 LOCALLY as `Body::Reconfigure` (it received the
   // view-0 Prepare for it). The canonical log of view 1 carries op 2 HEADER-ONLY (its own DVC, built by
   // `log_entries()`, is all `Repairing`). Adoption must keep replica 1's local reconfiguration body.
-  let mut e = Endpoint::<CountSm, SingleChange>::with_reconfig(
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
     genesis(3),
     0,
     CountSm::default(),
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -4820,8 +4903,13 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
 fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, u128, u64)
 {
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  let mut e =
-    Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(4), 0, CountSm::default());
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(4),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -4994,7 +5082,13 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
 
   // A Normal BACKUP (slot 1) at the OLD epoch (E0, the genesis lineage), op == commit_min == 0, checkpoint 0.
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
-  let mut e = Endpoint::<CountSm>::new(cfg, genesis_mem.clone(), 0, CountSm::default());
+  let mut e = Endpoint::<CountSm>::genesis_unchecked(
+    cfg,
+    genesis_mem.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;

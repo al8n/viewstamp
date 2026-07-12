@@ -76,6 +76,274 @@ fn classify_committed_slot(
   }
 }
 
+/// Why [`Endpoint::recover`] refused to reconstruct an endpoint from the durable store.
+///
+/// Every variant is a fail-fast STARTUP refusal, raised before any storage read is submitted or any
+/// message emitted: the store itself is intact, but booting over it with the offered live parameters
+/// would be unsafe (geometry drift silently moves the recovery scan window off a committed WAL tail)
+/// or dead-on-arrival (a WAL below the liveness floor wedges the primary at its first un-releasable
+/// mint stall). The remedy is operational — restore the recorded parameters, or perform an explicit
+/// offline migration — never a retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RecoverError {
+  /// The backend's [`Wal::capacity`] is below [`Config::minimum_wal_capacity`](crate::Config) — one
+  /// full checkpoint interval plus one op of progress room — so the mint stall could never release
+  /// and the primary would wedge.
+  #[error(
+    "Wal::capacity() {capacity} is below the liveness floor {minimum} (one checkpoint interval + 1)"
+  )]
+  WalCapacityBelowMinimum {
+    /// The capacity the backend reported.
+    capacity: u64,
+    /// The floor the active `Config` requires ([`Config::minimum_wal_capacity`](crate::Config)).
+    minimum: u64,
+  },
+  /// The durable root pinned a different `checkpoint_ops` than the live [`Config`](crate::Config)
+  /// carries. The recovery scan window is derived from the interval, so restarting under a smaller
+  /// one can clip a committed WAL tail out of the scan (amnesia); a changed interval also breaks the
+  /// cluster-wide checkpoint cadence agreement. Restore the recorded value (or migrate offline).
+  #[error(
+    "Config::checkpoint_ops {configured} differs from the {stored} this store was written under"
+  )]
+  CheckpointOpsChanged {
+    /// The interval the durable root pinned.
+    stored: u64,
+    /// The interval the live `Config` carries.
+    configured: u64,
+  },
+  /// The backend reported a different [`Wal::capacity`] than the durable root pinned. Capacity
+  /// determines both the recovery scan window and a bounded backend's physical op→slot placement, so
+  /// reopening under a different value silently relocates/clips committed slots. Restore the recorded
+  /// capacity (or migrate the ring offline and rewrite the root).
+  #[error("Wal::capacity() {reported} differs from the {stored} this store was written under")]
+  WalCapacityChanged {
+    /// The capacity the durable root pinned.
+    stored: u64,
+    /// The capacity the backend reports now.
+    reported: u64,
+  },
+  /// The durable root carries consensus state but records no complete WAL-GEOMETRY pair (a zero
+  /// `checkpoint_ops` or `wal_capacity` half) — a pre-v8 root this codebase never writes. With an
+  /// unrecorded pair there is nothing to validate the live parameters against, and scanning under
+  /// UNVALIDATED live geometry can silently move the recovery window off a committed WAL tail (the
+  /// amnesia hazard the fence exists to close) — so recovery refuses FAIL-CLOSED rather than
+  /// proceeding on trust. Recovery never auto-pins (that would bless the live geometry as if it were
+  /// the writer's); the remedy is an explicit offline migration: rewrite the root as a
+  /// current-version root recording the verified historical geometry. A VIRGIN store
+  /// ([`VsrState::new()`](crate::VsrState)) is not this case — it has no consensus state to lose and
+  /// routes to the wiped-voter / genesis logic instead.
+  #[error(
+    "the durable root carries consensus state but no recorded WAL geometry (checkpoint_ops {checkpoint_ops}, wal_capacity {wal_capacity}): migrate the store offline to a root recording its verified geometry"
+  )]
+  GeometryNotRecorded {
+    /// The `checkpoint_ops` half the durable root recorded (`0` = unrecorded).
+    checkpoint_ops: u64,
+    /// The `wal_capacity` half the durable root recorded (`0` = unrecorded).
+    wal_capacity: u64,
+  },
+  /// This node is a VOTER and its durable root is empty (`VsrState::new()`) — a WIPED disk (its only
+  /// durable copy replaced with an empty store), or a virgin store the operator forgot to
+  /// [`format()`](crate::format). Raised for ANY empty-rooted voter regardless of surviving WAL headers:
+  /// a voter's genesis always writes a durable format root, so an empty root means that witness (and the
+  /// durable view it voted in) is gone. A wipe destroys exactly the durable vote that made the old commit
+  /// quorum intersect a new view's quorum, so letting an empty-rooted voter back into the voting set —
+  /// even resuming as a backup, or abdicating as primary — can let that view commit a DIFFERENT value
+  /// at an already-committed op number (quorum-intersection amnesia). The wiped state is beyond the
+  /// fault budget and must FAIL-STOP: re-provision explicitly ([`format()`](crate::format) as a new
+  /// member, or restore the store from backup; a first-class rejoin-by-sync is a later capability). A
+  /// FORMATTED store is exempt (its geometry witness a wipe cannot forge); a non-voting learner is
+  /// exempt (it never votes and may resume empty to state-sync from the voters).
+  #[error(
+    "this node is a voter with an empty durable root (wiped or unformatted): format a new cluster or restore from backup"
+  )]
+  UnformattedVoter,
+}
+
+/// Why [`format()`](crate::format) refused to initialize a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FormatError {
+  /// The superblock already carries a durable root — the store is not empty. `format` is a
+  /// once-per-store cluster-creation step and never clobbers existing consensus state; an existing
+  /// member restarts via [`Endpoint::recover`] instead.
+  #[error("format refused: the store already carries a durable root")]
+  AlreadyInitialized,
+  /// The backend's [`Wal::capacity`] is below [`Config::minimum_wal_capacity`](crate::Config) — one
+  /// full checkpoint interval plus one op of progress room — so a cluster formatted over it could
+  /// never release the mint stall (a wedged primary), and [`Endpoint::recover`](crate::Endpoint)
+  /// would refuse the store outright ([`RecoverError::WalCapacityBelowMinimum`]). Refused BEFORE the
+  /// genesis write, so the store stays VIRGIN: the operator re-`format`s over a correctly-sized WAL
+  /// (nothing was pinned, nothing to migrate). Validating here is what keeps `format` from durably
+  /// initializing an unbootable store — the genesis root pins the geometry pair, so a floor
+  /// violation pinned once would leave every later boot refused (`recover` rejects the floor,
+  /// resizing trips the capacity fence, re-`format` is `AlreadyInitialized`).
+  #[error(
+    "format refused: Wal::capacity() {capacity} is below the liveness floor {minimum} (one checkpoint interval + 1)"
+  )]
+  WalCapacityBelowMinimum {
+    /// The capacity the backend reported.
+    capacity: u64,
+    /// The floor the `Config` requires ([`Config::minimum_wal_capacity`](crate::Config)).
+    minimum: u64,
+  },
+  /// The declared WAL capacity (the `wal_capacity` a [`Genesis`](crate::Genesis) carries, passed to
+  /// [`Endpoint::new`](crate::Endpoint::new) / [`Endpoint::with_reconfig`](crate::Endpoint::with_reconfig))
+  /// does not equal the backend's live [`Wal::capacity`]. [`Genesis::commit`](crate::Genesis::commit)
+  /// pins the ACTUAL `wal.capacity()` into the durable genesis root, so a declared value that disagrees
+  /// with the backend would yield a runnable voter whose in-memory geometry contradicts its own durable
+  /// root: later checkpoint/view roots stamp one capacity while the WAL is physically laid out under the
+  /// other, which can pass recovery's geometry fence at the next boot yet scan under a layout different
+  /// from the WAL's real one — the hidden-committed-tail amnesia that fence exists to close. Refused
+  /// BEFORE the genesis write, so the store stays VIRGIN: re-declare the capacity as the backend's
+  /// [`Wal::capacity`] (`u64::MAX` for an unbounded backend) and commit again.
+  #[error(
+    "genesis commit refused: declared Wal capacity {declared} does not match the backend's {actual}"
+  )]
+  WalCapacityMismatch {
+    /// The capacity the caller DECLARED (the `wal_capacity` the [`Genesis`](crate::Genesis) carries).
+    declared: u64,
+    /// The capacity the backend actually reports ([`Wal::capacity`]).
+    actual: u64,
+  },
+  /// The genesis-root write did not become durable synchronously: [`Superblock::poll`] drained
+  /// without delivering the write's [`SuperblockDone::Wrote`], so the store is NOT yet formatted.
+  /// `format` is a one-time init that requires the superblock to complete the genesis write
+  /// synchronously (a blocking write + fsync, distinct from the async steady-state path a running
+  /// driver pumps); a backend whose writes only complete under a running I/O loop must be driven to
+  /// durability by that loop before the genesis root can be witnessed. Returning this rather than a
+  /// silent `Ok` prevents booting a "formatted" store whose root never actually landed.
+  #[error(
+    "format failed: the genesis-root write did not complete synchronously (store not formatted)"
+  )]
+  WriteNotDurable,
+}
+
+/// The RESERVED [`OpId`](crate::OpId) [`format`] tags its genesis-root write with. `mint_op_id`
+/// counts up from 1, so `u64::MAX` is unmintable — no recovered/running endpoint can ever produce
+/// it. This is load-bearing on `format`'s async failure path: if the genesis write does NOT complete
+/// synchronously, `format` returns [`FormatError::WriteNotDurable`], but the write was already handed
+/// to the backend and may land LATER. Were it a mintable id (e.g. `OpId(1)`), that leaked `Wrote`
+/// could match a subsequently-recovered endpoint's first-minted `pending_sb` — a durable view-change
+/// root also gets `OpId(1)`, since recovery restarts the counter at 1 — and falsely release its
+/// `DoViewChange` before that root is durable, a durable-view-before-participate violation. A
+/// reserved id makes any leaked completion inert: it matches no minted `pending_sb`, so `on_sb_done`
+/// / `on_recover_sb_done` ignore it everywhere.
+pub(crate) const FORMAT_OP_ID: crate::OpId = crate::OpId::new(u64::MAX);
+
+/// Initialize a VIRGIN store as a member of a NEW cluster — the trusted cluster-creation step, the
+/// analogue of TigerBeetle's `format`. It writes the durable GENESIS ROOT: empty consensus state
+/// (view 0, op 0, no checkpoint) carrying the genesis `membership` and the WAL-GEOMETRY pair
+/// (`config.checkpoint_ops()` + the backend's [`Wal::capacity`]) pinned, and confirms it landed
+/// synchronously.
+///
+/// This is the SOLE producer of the FORMATTED witness that [`Endpoint::recover`] keys its
+/// genesis-primary decision on: a formatted root carries a nonzero `checkpoint_ops` that an
+/// empty-consensus wipe can never forge, so recovery can safely resume a formatted genesis store's
+/// designated primary at view 0 while refusing to do so for an unformatted (fresh or WIPED) store —
+/// the wiped member abdicates and re-learns any committed op it forgot from a surviving peer, rather
+/// than resuming as a view-0 primary and recommitting an op number under an intersecting quorum.
+///
+/// **Synchronous-durability contract.** `format` runs at cluster creation, BEFORE any driver run
+/// loop exists to pump async I/O, so it requires the superblock to complete the genesis-root write
+/// SYNCHRONOUSLY — the write must be durable (delivered as [`SuperblockDone::Wrote`] on a
+/// [`Superblock::poll`] before `format` returns), exactly as TigerBeetle's `format` does one blocking
+/// write + fsync and exits. A disk backend's format-time write is that blocking path, distinct from
+/// the async steady-state writes the running driver pumps. If the write does NOT land synchronously,
+/// `format` returns [`FormatError::WriteNotDurable`] rather than a silent `Ok` over a store whose
+/// genesis root never became durable (which a later `recover` would read as unformatted, or a crash
+/// would lose).
+///
+/// Call it ONCE per store at cluster creation (before the first [`Endpoint::recover`]); a restarting
+/// existing member does NOT call it. It is deliberately not idempotent past initialization.
+///
+/// # Errors
+/// [`FormatError::AlreadyInitialized`] if the superblock already holds a durable root (a non-empty
+/// [`VsrState`](crate::VsrState)) — `format` never overwrites existing consensus state.
+/// [`FormatError::WalCapacityBelowMinimum`] if the backend's [`Wal::capacity`] is below
+/// [`Config::minimum_wal_capacity`](crate::Config) — refused BEFORE the genesis write, so the store
+/// stays virgin and re-formattable over a correctly-sized WAL (pinning the undersized geometry would
+/// otherwise brick the store: every later `recover` refuses the floor, and re-`format` refuses the
+/// now-initialized store).
+/// [`FormatError::WriteNotDurable`] if the genesis-root write did not complete synchronously.
+pub fn format<W: Wal, B: Superblock>(
+  config: &Config,
+  membership: &Membership,
+  wal: &W,
+  sb: &mut B,
+) -> Result<(), FormatError> {
+  // Refuse to clobber a store that already carries consensus state. A wiped/virgin store decodes as
+  // `VsrState::new()` and is initializable; a formatted or previously-run store is not (the operator
+  // restarts it via `recover`). `state()` is the authority — a rot-able `op_head()` scalar is never
+  // the basis for a durability decision (the recovery contract's core rule). Checked FIRST: an
+  // initialized store's recorded geometry governs it (recover validates against the root), so the
+  // live capacity is not this call's business there.
+  if sb.state() != crate::VsrState::new() {
+    return Err(FormatError::AlreadyInitialized);
+  }
+  // Validate the geometry BEFORE the one-time genesis write, while the store is still virgin. The
+  // genesis root pins `(config.checkpoint_ops(), wal.capacity())` irreversibly, so an undersized
+  // capacity pinned here would initialize a store no boot can ever accept: `recover` refuses the
+  // liveness floor, resizing the ring trips the capacity fence, and re-`format` refuses the
+  // initialized store. Refusing pre-write keeps the failure recoverable (fix the WAL, format again).
+  // The floor also guarantees the pinned capacity is nonzero (`minimum >= checkpoint_ops + 1 >= 2`),
+  // so a formatted root always carries a fully-recorded geometry pair.
+  let capacity = wal.capacity();
+  let minimum = config.minimum_wal_capacity();
+  if capacity < minimum {
+    return Err(FormatError::WalCapacityBelowMinimum { capacity, minimum });
+  }
+  let root = genesis_root(config, membership, capacity);
+  sb.submit_write(FORMAT_OP_ID, root.clone());
+  // Drain completions so a synchronous backend's write becomes visible on `state()`, then require the
+  // durable root to equal EXACTLY the root THIS call submitted. That single equality is both:
+  //  - the SYNCHRONOUS-DURABILITY check: an async backend whose write has not completed leaves
+  //    `state()` at the old empty root (`!= root`), so `format` returns `WriteNotDurable` rather than a
+  //    silent `Ok` over a non-durable root (there is no run loop here to pump an async write — `format`
+  //    precedes the driver — exactly as TigerBeetle's `format` does one blocking write + fsync);
+  //  - the RETRY-SAFETY guard: a second `format` attempt over a store whose first attempt is still
+  //    outstanding must NOT confirm success off the FIRST attempt's completion. Since both attempts
+  //    share `FORMAT_OP_ID`, a bare id-match would let attempt B consume attempt A's `Wrote`; requiring
+  //    `state() == root` means B succeeds only when the CURRENT durable root is B's own (equal to A's
+  //    only when they carry the same membership — the harmless case). Root writes complete in
+  //    submission order (the write-ordering contract), so no earlier attempt lands after a later Ok.
+  // Root writes never complete `Fault` (the trait requires backends to retry internally or fail-stop),
+  // so no fault arm is needed.
+  while sb.poll().is_some() {}
+  if sb.state() != root {
+    return Err(FormatError::WriteNotDurable);
+  }
+  Ok(())
+}
+
+/// Build the canonical GENESIS ROOT for `membership` under `config`, with the WAL-geometry pair
+/// pinned to `(config.checkpoint_ops(), wal_capacity)`. Empty consensus state (view 0, log_view 0,
+/// commit 0, checkpoint_op 0, no committed-band headers); genesis epoch/prev_epoch/lineage; genesis
+/// `config_install_op` and `log_floor` (both 0). Byte-identical to the root a fresh
+/// [`Endpoint::with_reconfig`] endpoint's `durable_root` would produce for the same backend capacity
+/// — [`format()`](crate::format) is the durable-init path, `durable_root` the running-node path, one shape.
+fn genesis_root(config: &Config, membership: &Membership, wal_capacity: u64) -> crate::VsrState {
+  crate::VsrState::try_new_v4(
+    View::new(),
+    View::new(),
+    OpNumber::new(),
+    OpNumber::new(),
+    0,
+    std::vec::Vec::new(),
+    membership.epoch(),
+    // Genesis: the lineage has no predecessor, so prev_epoch == the genesis epoch and the prior-id
+    // ring is seeded with the genesis config_id (mirrors `with_reconfig`).
+    membership.epoch(),
+    membership.clone(),
+    std::vec![membership.config_id(); LINEAGE_RING],
+    OpNumber::new(),
+  )
+  .expect("a genesis root satisfies every VsrState invariant by construction")
+  .with_log_floor(OpNumber::new())
+  .expect("log_floor 0 == checkpoint_op 0")
+  .with_wal_geometry(config.checkpoint_ops(), wal_capacity)
+}
+
 /// The outcome of [`Endpoint::recover`]: this node either still belongs to the recovered membership
 /// (`Active`, holding a recovering [`Endpoint`]) or was removed by a reconfiguration (`Retired`, a
 /// terminal handle).
@@ -172,6 +440,11 @@ impl<S: StateMachine> Endpoint<S, RestartOnly> {
   /// recover (the DEFAULT capability), so a bare un-annotated `Endpoint::recover(..)` resolves to
   /// [`Recovered`]`<S, RestartOnly>`. A stronger capability is opted into explicitly via
   /// [`Self::recover_with_reconfig`]. See that method for the full Phase-1/Phase-2 recovery contract.
+  ///
+  /// # Errors
+  /// [`RecoverError`] when the live parameters are unsafe over this store — a WAL below the liveness
+  /// floor, a non-virgin root whose geometry pair is unrecorded or differs from the live values, or
+  /// a wiped voter; see [`Self::recover_with_reconfig`].
   pub fn recover<W: Wal, B: Superblock>(
     config: Config,
     membership: Membership,
@@ -180,7 +453,7 @@ impl<S: StateMachine> Endpoint<S, RestartOnly> {
     wal: &mut W,
     sb: &mut B,
     blocks: &mut dyn BlockStore,
-  ) -> Recovered<S, RestartOnly> {
+  ) -> Result<Recovered<S, RestartOnly>, RecoverError> {
     Self::recover_with_reconfig(config, membership, seed, sm, wal, sb, blocks)
   }
 }
@@ -261,6 +534,29 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// randomness, a persisted boot counter, or any value that cannot repeat across restarts of the
   /// same replica. (The deterministic simulation does this with its seeded PRNG, drawing a distinct
   /// value per replica incarnation.)
+  ///
+  /// **Fail-fast parameter validation (the WAL-geometry fence).** Before any storage I/O, the live
+  /// parameters are validated against the store. [`Wal::capacity`] below
+  /// [`Config::minimum_wal_capacity`](crate::Config) is refused (the primary would wedge). A
+  /// NON-virgin store (any durable root other than `VsrState::new()`) must record its full geometry
+  /// pair ([`VsrState::checkpoint_ops`](crate::VsrState::checkpoint_ops) /
+  /// [`VsrState::wal_capacity`](crate::VsrState::wal_capacity), both nonzero — every root this
+  /// codebase writes does) AND that pair must match the live values — the scan window and a bounded
+  /// ring's op→slot placement are derived from it, so a restart under different geometry could clip
+  /// a committed tail. A non-virgin root with EITHER half unrecorded (a pre-v8 legacy root) is
+  /// refused FAIL-CLOSED ([`RecoverError::GeometryNotRecorded`]): recovery never AUTO-pins an
+  /// unrecorded store (that would bless the live geometry as the writer's) and never scans over one
+  /// on trust; such stores must be migrated offline (rewritten as a current-version root recording
+  /// the verified historical geometry) before recovery. A VIRGIN store (`VsrState::new()` — never
+  /// formatted, or WIPED) has no consensus state a geometry drift could clip and nothing recorded to
+  /// validate: it continues, and the format-witness gate in `complete_recovery` keeps it from
+  /// resuming as a view-0 primary (an empty-store voter fails-stop with
+  /// [`RecoverError::UnformattedVoter`], having no peer to recover from).
+  ///
+  /// # Errors
+  /// [`RecoverError::WalCapacityBelowMinimum`], [`RecoverError::GeometryNotRecorded`],
+  /// [`RecoverError::CheckpointOpsChanged`], [`RecoverError::WalCapacityChanged`], or
+  /// [`RecoverError::UnformattedVoter`] — all raised before any storage read/write is submitted.
   pub fn recover_with_reconfig<W: Wal, B: Superblock>(
     config: Config,
     membership: Membership,
@@ -269,8 +565,59 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     wal: &mut W,
     sb: &mut B,
     blocks: &mut dyn BlockStore,
-  ) -> Recovered<S, R> {
+  ) -> Result<Recovered<S, R>, RecoverError> {
     let state = sb.state();
+    // Fail-fast parameter validation, BEFORE any storage I/O is submitted. Order: the liveness floor
+    // first (an under-sized ring is unsafe regardless of what the root pinned), then the pinned
+    // geometry pair on any NON-virgin store — recorded-ness before value comparison, so the
+    // changed-value fences only ever compare fully-recorded pairs.
+    let capacity = wal.capacity();
+    let minimum = config.minimum_wal_capacity();
+    if capacity < minimum {
+      return Err(RecoverError::WalCapacityBelowMinimum { capacity, minimum });
+    }
+    // VIRGIN = the empty durable root `VsrState::new()` — a never-formatted or WIPED store. It has no
+    // consensus state whose scan window a geometry drift could clip and nothing recorded to validate,
+    // so it skips the geometry fence and routes to the wiped-voter fail-stop / genesis logic below.
+    // The FORMATTED witness: a durable root written by [`format()`](crate::format) pins a nonzero
+    // `checkpoint_ops`, which an empty-consensus wipe can never forge (a wiped store decodes as
+    // `VsrState::new()`, geometry `(0, 0)`). On every path that proceeds past the fence the two
+    // notions coincide (`formatted == !virgin`): a virgin root's geometry is `(0, 0)` by
+    // construction, and a non-virgin root with EITHER half unrecorded is refused just below.
+    let virgin = state == crate::VsrState::new();
+    let formatted = state.checkpoint_ops() != 0;
+    if !virgin {
+      // A non-virgin store's geometry pair must be FULLY recorded. Every root this codebase writes
+      // records both halves nonzero (`format` validates the floor; a live endpoint stamps its
+      // config's validated interval and its declared/observed backend capacity), so a zero half here
+      // is a pre-v8 legacy root. There is nothing to validate the live parameters against, and
+      // scanning under unvalidated live geometry can silently move the recovery window off a
+      // committed tail — so refuse FAIL-CLOSED rather than proceed on trust. Recovery never
+      // auto-pins an unrecorded store (that would bless the live geometry as if it were the
+      // writer's — a committed-loss hazard on a legacy/dirty store); the remedy is an explicit
+      // offline migration to a root recording the verified historical geometry.
+      if state.checkpoint_ops() == 0 || state.wal_capacity() == 0 {
+        return Err(RecoverError::GeometryNotRecorded {
+          checkpoint_ops: state.checkpoint_ops(),
+          wal_capacity: state.wal_capacity(),
+        });
+      }
+      // The recorded pair MUST match the live configuration — the recovery scan window and a bounded
+      // ring's op→slot placement are both derived from it, so a restart under different geometry
+      // silently clips a committed tail.
+      if state.checkpoint_ops() != config.checkpoint_ops() {
+        return Err(RecoverError::CheckpointOpsChanged {
+          stored: state.checkpoint_ops(),
+          configured: config.checkpoint_ops(),
+        });
+      }
+      if state.wal_capacity() != capacity {
+        return Err(RecoverError::WalCapacityChanged {
+          stored: state.wal_capacity(),
+          reported: capacity,
+        });
+      }
+    }
     // The EFFECTIVE membership: a v4 root's OWN membership is authoritative (the durable config wins,
     // so an offline reconfiguration pre-written into the root takes effect here); a legacy (v1-3) root
     // carries none, so bridge to the passed genesis `membership`. The struct stores THIS one.
@@ -282,10 +629,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // reconfiguration removed it: recover Retired (a terminal handle that never participates), BEFORE
     // any storage read is submitted. PRESENT (a voter or learner) ⇒ build the recovering Endpoint.
     let Some(local_slot) = membership.slot_of(config.local()) else {
-      return Recovered::Retired(Retired {
+      return Ok(Recovered::Retired(Retired {
         local: config.local(),
         epoch: membership.epoch(),
-      });
+      }));
     };
     let nonce = Prng::new(seed).next_u64();
     let checkpoint_op = state.checkpoint_op().get();
@@ -343,6 +690,26 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       .rev()
       .find(|&probe| wal.header(OpNumber::with(probe)).is_some())
       .unwrap_or(checkpoint_op);
+    // A VIRGIN VOTER must NOT boot — regardless of any surviving WAL headers. A voter's genesis ALWAYS
+    // writes a durable FORMAT root (the only public route to a runnable voter is
+    // [`Genesis::commit`](crate::Genesis::commit), which formats, or [`Endpoint::recover`] over an
+    // already-durable store), so an empty durable root (`VsrState::new()`) on a voter means that format
+    // witness is GONE: a wiped disk replaced its only durable copy, or the operator never formatted it.
+    // A wipe destroys exactly the durable vote that made the old commit quorum intersect a new view's
+    // quorum, so letting an empty-rooted voter back into the voting set — even resuming as a backup, or
+    // abdicating as primary — can let a view commit a DIFFERENT value at an already-committed op number
+    // (quorum-intersection amnesia). Surviving WAL headers do NOT rescue it: with the durable root (and
+    // its recorded geometry) gone, the scan runs under UNVALIDATED live geometry that can silently hide
+    // a committed tail, and the durable view it voted in is lost — so a virgin voter fails-stop whether
+    // or not headers remain, rather than trusting them. Fail-stop: the wiped state is beyond the fault
+    // budget and must be surfaced (re-`format` as a new member, or restore from backup; a first-class
+    // rejoin-by-sync is a later capability). Exemptions: a FORMATTED store (`state != VsrState::new()`,
+    // its nonzero-`checkpoint_ops` geometry witness a wipe cannot forge) recovers normally — a genesis
+    // primary resumes and a recovered voter carries its real state; and a non-voting LEARNER — it never
+    // votes, so it may resume empty and state-sync from the voters.
+    if virgin && membership.is_voter(local_slot) {
+      return Err(RecoverError::UnformattedVoter);
+    }
     let canonical_top = state
       .committed_headers_slice()
       .last()
@@ -376,6 +743,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     let mut endpoint = Self {
       config,
+      // The backend capacity observed THIS incarnation (validated against the pinned root geometry
+      // above), stamped into every durable root this incarnation writes.
+      wal_capacity: wal.capacity(),
       membership,
       // The durable backward link of the lineage: a v4 root carries its own `prev_epoch`; a legacy
       // (v1-3) root reads `prev_epoch == epoch == 0`, which equals the bridged genesis membership's
@@ -503,7 +873,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // they later send carries that (offset) tail with `commit == checkpoint_op` (the offset-safe shape
     // asserted by the A6 tests). `head` may be below `checkpoint_op` for a synced replica → the range
     // is empty and recovery completes immediately at the synced point.
-    let mut rec = RecoverState::default();
+    // `formatted` is carried into the async completion path: `complete_recovery`'s genesis-primary
+    // exemption reads it long after this synchronous Phase-1 setup returns.
+    let mut rec = RecoverState {
+      formatted,
+      ..RecoverState::default()
+    };
     // Seed the canonical committed-band IDENTITY from the durable `VsrState`'s `vsr_headers` (the
     // persisted-header cross-check, mirroring TigerBeetle). Each header is keyed by op → canonical
     // `(client, request, body_checksum)` — the FULL committed-op identity, not body bytes alone:
@@ -540,12 +915,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       }
     }
     // Settle the transition decider once: an EMPTY WAL with no checkpoint (the scan found no written
-    // slot) has nothing to read, so it must reach Normal here (no completion would ever arrive to drive
-    // the loop).
+    // slot) has nothing to read, so it settles the terminal status HERE (a formatted genesis store
+    // resumes Normal at view 0; an unformatted store abdicates / backs up — never a view-0 primary).
     // Otherwise this arms the recover_retry timer so an owner driving `poll_timeout`/`handle_timeout`
     // re-submits any read whose completion is dropped or whose transient fault clears on a later read.
     endpoint.recover_progress(Instant::ZERO, sb, blocks);
-    Recovered::Active(endpoint)
+    Ok(Recovered::Active(endpoint))
   }
 
   /// Submit tail-body reads for the whole window `(lo ..= hi]`: materialize a Phase-1 header-only
@@ -1051,8 +1426,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // until a valid read restores it or the budget exhausts.
       }
       SuperblockDone::Wrote(_) => {
-        // A stale durable-root/checkpoint *write* completion from before the crash cannot occur
-        // (a fresh recover issues no writes); ignore defensively rather than panic.
+        // A stale durable-root/checkpoint write completion from before the crash cannot occur
+        // (a fresh recover issues no writes — geometry is pinned by `format`, not recovery); ignore
+        // defensively rather than panic.
       }
     }
   }
@@ -1420,11 +1796,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     // The checkpoint snapshot not yet restored, OR awaiting a PEER checkpoint after our own read
     // exhausted. Stay Recovering and re-arm: an owner re-submits any dropped/slow checkpoint read
-    // AND re-solicits the peer checkpoint. Crucially, `awaiting_peer_checkpoint` blocks completion: we
-    // must NEVER reach Normal with the SM unrestored (`commit_min == checkpoint_op` would then be a
-    // silent committed-prefix loss) — recovery completes only once a verified `SyncCheckpoint` restores
-    // the SM (via `on_recover_sync_checkpoint` → `apply_sync`), which drops the faulty slots again
-    // (belt-and-suspenders) before applying.
+    // AND re-solicits the peer checkpoint. Crucially, `awaiting_peer_checkpoint` blocks completion:
+    // we must NEVER reach Normal with the SM unrestored (`commit_min == checkpoint_op` would then be
+    // a silent committed-prefix loss) — recovery completes only once a verified `SyncCheckpoint`
+    // restores the SM (via `on_recover_sync_checkpoint` → `apply_sync`), which drops the faulty slots
+    // again (belt-and-suspenders) before applying.
     if rec.checkpoint.is_some() || rec.awaiting_peer_checkpoint {
       self.arm_timers(now);
       return;
@@ -1505,6 +1881,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     sb: &mut B,
     blocks: &mut dyn BlockStore,
   ) {
+    // Read the FORMATTED witness before dropping the recover state — it gates the genesis-primary
+    // exemption below. A re-latched recovery (`on_recover_sync_checkpoint` builds a default state)
+    // carries `formatted = false`, which is correct: a re-syncing node is never at genesis.
+    let formatted = self.recover.as_ref().is_some_and(|r| r.formatted);
     self.recover = None;
     if self.log_view.get() < self.view.get() {
       // Crashed mid-view-change (the durable view advanced past `log_view` — the new view's log was not
@@ -1527,10 +1907,23 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       && self
         .membership
         .is_primary_slot(self.local_slot(), self.view)
+      // A FORMATTED genesis store is exempt from abdication: with a durable format witness (a pinned
+      // root a wipe cannot forge), no view ever formed beyond 0, no op ever appended, and no commit
+      // ever witnessed, the abdication rationale is vacuous — no pipeline was lost, no session a
+      // retried client could double-execute against — so the designated view-0 primary resumes Normal
+      // and serves, exactly as a freshly `format`-ed cluster should. Withholding the format witness is
+      // what closes the wipe-amnesia hole: an UNFORMATTED store with these same empty scalars (a wiped
+      // member whose disk was replaced) is a member that may have committed ops it forgot, so it must
+      // NOT resume as primary — it abdicates, and the view change recovers those ops from a surviving
+      // peer whose log still holds them.
+      && !(formatted
+        && self.view.get() == 0
+        && self.op.get() == 0
+        && self.commit_max.get() == 0)
     {
-      // Was Normal as the PRIMARY → abdicate: a restarted primary has no in-memory pipeline and a
-      // checkpoint-only session table, so it forces a clean view change to view + 1 rather than
-      // resuming as the established primary.
+      // Was Normal as the PRIMARY (or an unformatted empty store that must not resume as one) →
+      // abdicate: a restarted primary has no in-memory pipeline and a checkpoint-only session table,
+      // so it forces a clean view change to view + 1 rather than resuming as the established primary.
       self.enter_view_change_from_recovery(now, sb, self.view.next());
     } else {
       // Backup, a non-voting learner, or a SOLO replica (its own primary, no quorum to view-change)

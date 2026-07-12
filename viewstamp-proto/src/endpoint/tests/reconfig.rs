@@ -27,6 +27,11 @@ fn v4_root(membership: Membership, commit: u64) -> VsrState {
     OpNumber::new(),
   )
   .expect("valid v4 root")
+  // Pin the geometry a running node's `durable_root` write stamps, so recovery sees a FORMATTED,
+  // geometry-recorded store (a real non-virgin root always carries it). `checkpoint_ops` matches the
+  // default recover config; `wal_capacity` is the ring-less test WAL's `u64::MAX` (the `Wal::capacity`
+  // default these tests run over), so recovery's capacity fence compares equal.
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX)
 }
 
 /// A `TestSb` whose durable root is `state`.
@@ -53,7 +58,8 @@ fn recover_resolves_self_by_member_id_and_returns_active() {
   // membership resolution now).
   let cfg = Config::try_new(1, MemberId::new(7)).unwrap();
 
-  let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks);
+  let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store");
   let e = match recovered {
     Recovered::Active(e) => e,
     Recovered::Retired(_) => panic!("self IS in the membership → Active"),
@@ -79,7 +85,8 @@ fn recover_returns_retired_when_self_absent() {
   // Local member 99 is absent from the durable membership.
   let cfg = Config::try_new(1, MemberId::new(99)).unwrap();
 
-  let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks);
+  let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store");
   let retired = match recovered {
     Recovered::Retired(r) => r,
     Recovered::Active(_) => panic!("self is ABSENT from the durable membership → Retired"),
@@ -99,28 +106,39 @@ fn recover_returns_retired_when_self_absent() {
 
 #[test]
 fn recover_bridges_a_legacy_root_to_the_passed_genesis() {
-  // A legacy (v1-3) root carries NO membership (`membership_opt().is_none()`), so recover BRIDGES to
-  // the passed genesis membership. `genesis(3)` places MemberId::new(i) at slot i, so the local
-  // MemberId::new(1) is present at slot 1 → Active.
+  // A root carrying NO durable membership (`membership_opt().is_none()`) makes recover BRIDGE to the
+  // passed genesis membership. `genesis(3)` places MemberId::new(i) at slot i, so the local
+  // MemberId::new(1) is present at slot 1 → Active. The root carries a NON-ZERO view so it is not the
+  // empty `VsrState::new()` a wiped voter fails-stops on — a ran store holds durable state. It records
+  // its WAL geometry so the non-virgin geometry fence admits it (a raw geometry-unrecorded legacy root
+  // is instead refused fail-closed — see `recover_refuses_a_non_virgin_root_with_unrecorded_geometry`);
+  // membership-absence, not the geometry, is what selects the bridge.
   let legacy = VsrState::try_new(
-    View::new(),
-    View::new(),
+    View::with(1),
+    View::with(1),
     OpNumber::new(),
     OpNumber::new(),
     0,
     std::vec::Vec::new(),
   )
-  .unwrap();
+  .unwrap()
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
   assert!(
     legacy.membership_opt().is_none(),
-    "a v1-3 root has no durable membership",
+    "a membership-less root has no durable membership",
+  );
+  assert_ne!(
+    legacy,
+    VsrState::new(),
+    "a ran legacy root is not the empty wiped-store shape"
   );
   let mut wal = TestWal::default();
   let mut sb = sb_with_state(legacy);
   let mut blocks = crate::block_store::MemBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
 
-  let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks);
+  let recovered = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store");
   let e = match recovered {
     Recovered::Active(e) => e,
     Recovered::Retired(_) => panic!("legacy root bridges to the passed genesis; self IS present"),
@@ -147,8 +165,9 @@ fn recover_prefers_the_root_membership_over_the_passed_param() {
 
   // Pass a DIFFERENT genesis (the standard `genesis(3)`, MemberId(i) at slot i → MemberId(1) at slot
   // 1). The durable root places MemberId(1) at slot 0, so the resolved slot proves which won.
-  let e =
-    Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+  let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store")
+    .expect_active();
   assert_eq!(
     e.replica(),
     ReplicaId::new(0),
@@ -168,8 +187,9 @@ fn recover_resolves_a_learner_self_to_active() {
   let mut blocks = crate::block_store::MemBlockStore::new();
   let cfg = Config::try_new(2, MemberId::new(12)).unwrap();
 
-  let e =
-    Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+  let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store")
+    .expect_active();
   assert_eq!(e.replica(), ReplicaId::new(2), "learner self at slot 2");
   assert!(e.is_learner(), "slot 2 is a learner in 2v+1l");
 }
@@ -215,7 +235,11 @@ fn recover_into_a_post_reconfiguration_epoch_restores_the_predecessor_lineage() 
     std::vec::Vec::new(), // genesis: no predecessor lineage
     OpNumber::new(),      // genesis: no reconfigure has installed the membership
   )
-  .expect("genesis root");
+  .expect("genesis root")
+  // The predecessor durable root records its geometry; `prepare_restart` carries it into the successor
+  // root, so the recovered store is geometry-recorded (the default recover config's interval + the
+  // ring-less test WAL's `u64::MAX`).
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
   let succ_state = crate::endpoint::prepare_restart(
     &cur,
     3,
@@ -235,8 +259,9 @@ fn recover_into_a_post_reconfiguration_epoch_restores_the_predecessor_lineage() 
   let mut blocks = crate::block_store::MemBlockStore::new();
   // The local member (MemberId 3) is the newly-added voter in the successor — present → Active.
   let cfg = Config::try_new(2, MemberId::new(3)).unwrap();
-  let e =
-    Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+  let e = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store")
+    .expect_active();
 
   // The recovered node is at E+1, and its lineage ADMITS both the current and the predecessor config_id,
   // while REJECTING an unrelated/forked id — exactly the cross-epoch catch-up admission a laggard needs.
@@ -268,7 +293,7 @@ fn new_panics_when_the_local_member_is_absent_from_its_membership() {
   // node (`replica()`, timers, ingress). Contrast `recover`, where absence is the legitimate
   // `Recovered::Retired` outcome (a node removed by reconfiguration), tested above.
   let cfg = Config::try_new(1, MemberId::new(99)).unwrap(); // local 99 is absent from genesis(3) = {0,1,2}
-  let _ = Endpoint::new(cfg, genesis(3), 0, NoopSm);
+  let _ = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, NoopSm, u64::MAX);
 }
 
 // ── all-`RecoveringHead` re-formation escalation ──────────────────────────────────────────
@@ -320,8 +345,9 @@ fn recovering_head_post_reconfig() -> (Endpoint<NoopSm>, ScriptedWal, TestSb, Ep
   let mut blocks = crate::block_store::MemBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap(); // local = MemberId 1 → slot 1 (a voter)
   let now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store")
+    .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -440,8 +466,9 @@ fn solo_voting_set_never_escalates_despite_a_bumped_epoch() {
   let mut blocks = crate::block_store::MemBlockStore::new();
   let cfg = Config::try_new(0, MemberId::new(0)).unwrap(); // local = MemberId 0 → slot 0 (the only voter)
   let mut now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(1), 0, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+  let mut r = Endpoint::recover(cfg, genesis(1), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store")
+    .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -492,8 +519,9 @@ fn a_learner_never_escalates_a_recovering_head_wedge() {
   let mut blocks = crate::block_store::MemBlockStore::new();
   let cfg = Config::try_new(2, MemberId::new(12)).unwrap(); // local = the LEARNER at slot 2
   let mut now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store")
+    .expect_active();
   assert!(
     r.is_learner(),
     "the local node is a learner (slot 2 in 2v+1l)"
@@ -659,6 +687,7 @@ fn under_fire_co_recovering_quorum_escalates_to_view_change_at_view_plus_one() {
     &mut sb2,
     &mut blocks2,
   )
+  .expect("recover accepts this store")
   .expect_active();
   drive_recovery(&mut r2, &mut wal2, &mut sb2, &mut blocks2, now2);
   assert_eq!(
@@ -804,7 +833,9 @@ fn an_escalation_carries_a_repairing_committed_op_into_the_view_change() {
   // (Present); op 2 (committed, durable band header) read FAULTS → kept as `Body::Repairing`; op 3 (the
   // uncommitted tail head) faults → RecoveringHead. commit_max == 2, so op 2 is the interior committed op.
   let successor = crate::endpoint::prepare_restart(
-    &sealed_root(2),
+    // The sealed predecessor records its geometry; `prepare_restart` carries it into the successor,
+    // so the recovered store is geometry-recorded (default interval + the ring-less WAL's `u64::MAX`).
+    &sealed_root(2).with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX),
     3,
     0,
     std::vec![MemberId::new(0), MemberId::new(1), MemberId::new(2)],
@@ -818,8 +849,9 @@ fn an_escalation_carries_a_repairing_committed_op_into_the_view_change() {
   let mut blocks = crate::block_store::MemBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store")
+    .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -905,8 +937,9 @@ fn an_unvouchable_committed_op_blocks_escalation_into_a_wedge() {
   let mut blocks = crate::block_store::MemBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let mut now = Instant::ZERO;
-  let mut r =
-    Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, NoopSm, &mut wal, &mut sb, &mut blocks)
+    .expect("recover accepts this store")
+    .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
     r.status(),
@@ -1026,11 +1059,12 @@ fn seal_committed_frontier_persists_commit_max_into_the_durable_root() {
   // must persist `commit_max` into the durable root, so a successor `prepare_restart` derives off the
   // SEALED root carries the true committed prefix K — not the stale C0.
   let k = RECOVER_TAIL_WINDOW + 2;
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::with_checkpoint_ops(1, MemberId::new(1), crate::MAX_CHECKPOINT_OPS).unwrap(),
     genesis(3),
     0,
     CountSm::default(),
+    u64::MAX,
   );
   // Force the held-frontier shape: in-memory `commit_max == op == K`, `checkpoint_op == 0`. The durable
   // root (`TestSb::default()` → `VsrState::new()`) still names the STALE commit C0 == 0 — the lag.
@@ -1087,7 +1121,9 @@ fn sealed_successor_root_carries_the_committed_frontier_across_a_restart() {
   // successor + a WAL holding 1..=K, and assert the recovered head reads the FULL committed band — K
   // survives the coordinated restart.
   let k = RECOVER_TAIL_WINDOW + 2;
-  let sealed = sealed_root(k);
+  // The sealed predecessor records its geometry (the MAX checkpoint interval this scenario recovers
+  // under + the ring-less WAL's `u64::MAX`); `prepare_restart` carries it into the successor.
+  let sealed = sealed_root(k).with_wal_geometry(crate::MAX_CHECKPOINT_OPS, u64::MAX);
   assert_eq!(
     sealed.commit(),
     OpNumber::with(k),
@@ -1126,6 +1162,7 @@ fn sealed_successor_root_carries_the_committed_frontier_across_a_restart() {
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   // The single-pass read window is bounded by the ring capacity (`op_head.min(checkpoint_op + capacity)` ==
   // op_head here), so the whole sealed band up to K is materialized up front — the recovered head reads up
@@ -1181,7 +1218,11 @@ fn an_unsealed_successor_reads_the_held_committed_op_but_not_its_committed_statu
   let k = RECOVER_TAIL_WINDOW + 2;
   // The UNSEALED predecessor: a v4 root whose durable commit is the STALE C0 == 0, with NO committed
   // header above C0 (the band was never sealed). `prepare_restart` faithfully copies that stale commit.
-  let unsealed = v4_root(genesis(3), 0);
+  // This scenario recovers under the MAX checkpoint interval (to size the read window past `k`), so the
+  // predecessor root must pin THAT geometry — a running node stamps `config.checkpoint_ops()`, and
+  // recovery fences a mismatch. Re-stamp over `v4_root`'s default interval, keeping the ring-less test
+  // WAL's `u64::MAX` capacity.
+  let unsealed = v4_root(genesis(3), 0).with_wal_geometry(crate::MAX_CHECKPOINT_OPS, u64::MAX);
   assert_eq!(
     unsealed.commit(),
     OpNumber::new(),
@@ -1217,6 +1258,7 @@ fn an_unsealed_successor_reads_the_held_committed_op_but_not_its_committed_statu
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   // The single-pass read window is bounded by the ring capacity (== op_head here), so the full held tail up
   // to K is materialized regardless of the stale durable commit C0.
@@ -1264,7 +1306,13 @@ fn endpoint_constructs_under_the_single_change_marker() {
   // marker rides `with_reconfig` because a struct default type parameter cannot be inferred for an
   // associated function's return type.)
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
-  let e = Endpoint::<CountSm, SingleChange>::with_reconfig(cfg, genesis(3), 0, CountSm::default());
+  let e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   assert_eq!(e.status(), Status::Normal, "a fresh endpoint is Normal");
   assert_eq!(e.view(), View::new(), "a fresh endpoint is at view 0");
   assert_eq!(
@@ -1282,10 +1330,16 @@ fn the_default_reconfig_marker_is_restart_only() {
   // type, so a `RestartOnly` endpoint built via the generic `with_reconfig` and a defaulted one built
   // via `new` are interchangeable, and both observe the same fresh state.
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
-  let defaulted = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let defaulted =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let cfg2 = Config::try_new(1, MemberId::new(1)).unwrap();
-  let explicit =
-    Endpoint::<CountSm, RestartOnly>::with_reconfig(cfg2, genesis(3), 0, CountSm::default());
+  let explicit = Endpoint::<CountSm, RestartOnly>::genesis_unchecked(
+    cfg2,
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
   // `Endpoint<S>` IS `Endpoint<S, RestartOnly>`: this assignment type-checks only if the bare `new`
   // produced `Endpoint<CountSm, RestartOnly>` (the default) and the explicit marker is the same type.
   let _same_type: Endpoint<CountSm> = explicit;
@@ -1347,7 +1401,7 @@ fn a_reconfigure_log_entry_carries_the_successor_membership_in_memory() {
 /// `reports[i]` is recorded against slot `i+1` (slots `1..=4`), keyed by the stable id at that slot.
 fn primary5_with_seeded_reports(own_checkpoint: u64, reports: [u64; 4]) -> Endpoint<NoopSm> {
   let cfg = Config::try_new(0, MemberId::new(0)).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(5), 0, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(5), 0, NoopSm, u64::MAX);
   assert!(e.is_primary(), "MemberId 0 at slot 0 is the view-0 primary");
   e.set_own_checkpoint_for_test(own_checkpoint);
   for (i, &op) in reports.iter().enumerate() {
@@ -1456,7 +1510,7 @@ fn a_removed_voters_pre_swap_ack_does_not_commit_a_tail_op_after_the_swap() {
   // HIGHEST voter `MemberId 3` (slot 3) so the retained voters {0,1,2} keep their slots — isolating the
   // "removed voter's stale bit" effect from any slot shift.
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  let mut e = Endpoint::new(cfg, genesis(4), 0, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(4), 0, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;

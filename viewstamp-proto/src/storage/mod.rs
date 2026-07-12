@@ -134,13 +134,21 @@ pub const HEADER_VERSION: u16 = 1;
 /// recovered node restores an adoption-learned floor instead of restarting it at its own `checkpoint_op`
 /// and re-learning it from the next carrier (the un-synced crash window where its own carrier could
 /// exceed the frame-fit span until the floor is re-heard).
+/// Version `8` APPENDS two further scalars — the WAL GEOMETRY pair `checkpoint_ops` + `wal_capacity`
+/// (the writer's configured checkpoint interval and its backend's reported slot capacity) — so recovery
+/// can REFUSE a restart whose geometry differs from the one the store was written under: the recovery
+/// head is derived by scanning the effective ring, whose extent is computed FROM these two knobs, so a
+/// restart under a smaller interval/capacity would silently clip a committed WAL tail out of the scan
+/// window (recovering an amnesiac head). `0` means "not recorded" (a pre-v8 root — no current writer
+/// produces one): recovery REFUSES a non-virgin root carrying an unrecorded half
+/// ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)); the store must be migrated offline.
 /// [`VsrState::decode`] dispatches on the leading version — `1..=3` parse the pre-membership layout
 /// (bridged to `epoch = 0`, no membership), `4` parses that body plus the epoch/membership tail, `5`
-/// parses that plus the lineage tail, `6` parses that plus the `config_install_op` scalar, and `7`
-/// parses that plus the `log_floor` scalar — so NO
+/// parses that plus the lineage tail, `6` parses that plus the `config_install_op` scalar, `7`
+/// parses that plus the `log_floor` scalar, and `8` parses that plus the WAL-geometry pair — so NO
 /// persisted root is stranded and a message-format-only change still can never invalidate a root. A
 /// future `VsrState` layout change bumps this again and extends that per-version dispatch.
-pub const SUPERBLOCK_VERSION: u16 = 7;
+pub const SUPERBLOCK_VERSION: u16 = 8;
 
 /// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
 /// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are
@@ -482,6 +490,21 @@ pub struct VsrState {
   /// constructors default it TO `checkpoint_op` — the exact pre-v7 recovery behaviour, which is also what
   /// a v1-6 root decodes to).
   log_floor: OpNumber,
+  /// The writer's configured checkpoint interval ([`Config::checkpoint_ops`](crate::Config)) — half of
+  /// the WAL-GEOMETRY pair recovery validates a restart against (the recovery scan window is derived
+  /// from it, so a restart under a smaller interval would clip the scan below a committed tail). `0`
+  /// means "not recorded" — representable only so a pre-v8 root decodes faithfully (no current writer
+  /// produces one; a validated `Config`'s interval is nonzero): recovery REFUSES a non-virgin root
+  /// carrying it ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)). Set via
+  /// [`Self::with_wal_geometry`]; the plain constructors leave it unrecorded.
+  checkpoint_ops: u64,
+  /// The slot capacity of the writer's WAL backend ([`Wal::capacity`]; `u64::MAX` = an unbounded
+  /// backend, itself a pinned value a later BOUNDED report must not contradict) — the other half of
+  /// the geometry pair. `0` means "not recorded" — representable only so a pre-v8 root decodes
+  /// faithfully (no current writer produces one: an endpoint's capacity is observed at recovery or
+  /// declared nonzero at construction): recovery REFUSES a non-virgin root carrying it
+  /// ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)). Set via [`Self::with_wal_geometry`].
+  wal_capacity: u64,
 }
 
 impl Default for VsrState {
@@ -562,7 +585,27 @@ impl VsrState {
       // decodes to the same (the pre-v7 recovery behaviour); a writer with a higher adoption-learned
       // floor raises it via `with_log_floor`.
       log_floor: checkpoint_op,
+      // Geometry unrecorded until the writer stamps it (`with_wal_geometry`); a pre-v8 root decodes to
+      // the same. Recovery refuses a NON-virgin root left unstamped (fail-closed), so every persisting
+      // writer stamps before submitting.
+      checkpoint_ops: 0,
+      wal_capacity: 0,
     })
+  }
+
+  /// Stamp the WAL-GEOMETRY pair this root vouches — the writer's configured
+  /// [`Config::checkpoint_ops`](crate::Config) and its backend's [`Wal::capacity`] — so a later
+  /// recovery can refuse a restart under different geometry (which would silently move the recovery
+  /// scan window and can clip a committed tail out of it). Not validated here: `0` is the "not
+  /// recorded" sentinel that must stay representable so a pre-v8 root DECODES faithfully, and the
+  /// check lives at the single consumer (recovery), which refuses a non-virgin root carrying an
+  /// unrecorded half ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)). Every persisting
+  /// writer stamps both halves nonzero.
+  #[must_use]
+  pub const fn with_wal_geometry(mut self, checkpoint_ops: u64, wal_capacity: u64) -> Self {
+    self.checkpoint_ops = checkpoint_ops;
+    self.wal_capacity = wal_capacity;
+    self
   }
 
   /// Raise this root's vouched carried-log floor to `log_floor` — an adoption-learned cluster floor the
@@ -657,6 +700,8 @@ impl VsrState {
       prior_config_ids: Vec::new(),
       config_install_op: OpNumber::new(),
       log_floor: OpNumber::new(),
+      checkpoint_ops: 0,
+      wal_capacity: 0,
     }
   }
 
@@ -767,6 +812,24 @@ impl VsrState {
     self.config_install_op
   }
 
+  /// The checkpoint interval this root's writer was configured with
+  /// ([`Config::checkpoint_ops`](crate::Config)) — half of the WAL-geometry pair recovery validates a
+  /// restart against. `0` = not recorded (a pre-v8 root): recovery refuses a non-virgin root carrying
+  /// it ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checkpoint_ops(&self) -> u64 {
+    self.checkpoint_ops
+  }
+
+  /// The slot capacity of this root's writer's WAL backend ([`Wal::capacity`];
+  /// `u64::MAX` = unbounded) — the other half of the geometry pair. `0` = not recorded (a pre-v8
+  /// root): recovery refuses a non-virgin root carrying it
+  /// ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn wal_capacity(&self) -> u64 {
+    self.wal_capacity
+  }
+
   /// Encodes this durable root to a length-prefixed, versioned byte vector (the superblock
   /// on-disk form). Layout (all scalars big-endian): [`SUPERBLOCK_VERSION`] `u16`,
   /// then `view`/`log_view` (`u64` each), `commit`/`checkpoint_op` (`u64` each), `checkpoint_id`
@@ -776,8 +839,10 @@ impl VsrState {
   /// `epoch:u64 | prev_epoch:u64 | membership_present:u8`, then — iff present — `config_id:u128 |
   /// epoch:u64 | replica_count:u8 | learner_count:u16 | member_count:u32 | members:(u128 each)`. A v5 root
   /// APPENDS one further tail after that — the recent-prior lineage: `prior_config_count:u32 |
-  /// prior_config_ids:(u128 each)`. A v6 root APPENDS one final scalar after that — `config_install_op:u64`
-  /// (the op that produced this root's membership). The scalar field order matches the [`Self::try_new`] /
+  /// prior_config_ids:(u128 each)`. A v6 root APPENDS one scalar after that — `config_install_op:u64`
+  /// (the op that produced this root's membership); a v7 root APPENDS `log_floor:u64` (the writer's
+  /// vouched carried-log floor); a v8 root APPENDS the WAL-geometry pair `checkpoint_ops:u64 |
+  /// wal_capacity:u64`. The scalar field order matches the [`Self::try_new`] /
   /// [`Self::try_new_v4`] parameter order. Variable-length because the header set, the member list, and the
   /// lineage are all bounded but not fixed.
   pub fn encode(&self) -> Bytes {
@@ -790,10 +855,10 @@ impl VsrState {
       // The appended v4 tail: epoch + prev_epoch + present-flag, plus the membership block when present.
         + 8 + 8 + 1
         + self.membership.as_ref().map_or(0, |_| 16 + 8 + 1 + 2 + 4 + members_len * 16)
-      // The appended v5 tail: the lineage count + its ids; then the v6 + v7 scalar tails
-      // (config_install_op + log_floor, a u64 each).
+      // The appended v5 tail: the lineage count + its ids; then the v6 + v7 + v8 scalar tails
+      // (config_install_op + log_floor, then the checkpoint_ops + wal_capacity geometry pair, a u64 each).
         + 4 + self.prior_config_ids.len() * 16
-        + 8 + 8,
+        + 8 + 8 + 8 + 8,
     );
     out.put_u16(SUPERBLOCK_VERSION);
     out.put_u64(self.view.get());
@@ -837,6 +902,10 @@ impl VsrState {
     // The appended v7 tail: `log_floor` (the writer's vouched carried-log floor). A fixed `u64`,
     // uniform like the v6 scalar.
     out.put_u64(self.log_floor.get());
+    // The appended v8 tail: the WAL-geometry pair (`checkpoint_ops` then `wal_capacity`), two fixed
+    // `u64`s. `0` = not recorded, carried verbatim.
+    out.put_u64(self.checkpoint_ops);
+    out.put_u64(self.wal_capacity);
     out.freeze()
   }
 
@@ -845,7 +914,8 @@ impl VsrState {
   ///
   /// Dispatches on the leading version: `1..=3` parse the pre-membership layout (bridged to
   /// `epoch = 0`, no membership); `4` parses that body plus the appended epoch/membership tail; `5` adds
-  /// the lineage tail; `6` adds the `config_install_op` scalar.
+  /// the lineage tail; `6` adds the `config_install_op` scalar; `7` adds the `log_floor` scalar; `8`
+  /// adds the WAL-geometry pair.
   /// Rejects (never panics): a short buffer ([`CodecError::Truncated`]), an unknown leading version
   /// ([`CodecError::UnknownVersion`]), a header-count / member-count prefix that overruns the buffer
   /// ([`CodecError::LengthOverflow`]), a `membership_present` flag that is neither 0 nor 1
@@ -954,6 +1024,15 @@ impl VsrState {
     } else {
       checkpoint_op
     };
+    // v8+: the appended WAL-geometry pair (`checkpoint_ops` then `wal_capacity`). A v1-7 root has
+    // none — default both to `0` (= not recorded), which recovery's geometry check exempts. Carried
+    // verbatim: `0` is a legal stored value with the same exempt meaning, and the check lives at the
+    // single consumer.
+    let (checkpoint_ops, wal_capacity) = if version >= 8 {
+      (r.u64()?, r.u64()?)
+    } else {
+      (0, 0)
+    };
     r.finish()?;
     match membership {
       // A v4+ root with a real membership re-validates through `try_new_v4` (which adds the
@@ -972,12 +1051,13 @@ impl VsrState {
           prior_config_ids,
           config_install_op,
         )?
-        .with_log_floor(log_floor)?,
+        .with_log_floor(log_floor)?
+        .with_wal_geometry(checkpoint_ops, wal_capacity),
       ),
       // A v4+-tagged root that carries no membership (a legacy root re-saved): scalar/header
       // re-validation only, with the durable epoch/prev_epoch (and any lineage + config_install_op +
-      // log_floor) carried through. A membership-less root has no config chain, so its lineage is
-      // normally empty; carried for fidelity.
+      // log_floor + geometry) carried through. A membership-less root has no config chain, so its
+      // lineage is normally empty; carried for fidelity.
       None => {
         let mut state = Self::try_new(
           view,
@@ -991,7 +1071,11 @@ impl VsrState {
         state.prev_epoch = prev_epoch;
         state.prior_config_ids = prior_config_ids;
         state.config_install_op = config_install_op;
-        Ok(state.with_log_floor(log_floor)?)
+        Ok(
+          state
+            .with_log_floor(log_floor)?
+            .with_wal_geometry(checkpoint_ops, wal_capacity),
+        )
       }
     }
   }
@@ -1232,12 +1316,14 @@ pub enum SuperblockDone {
 ///
 /// **Liveness constraint on a bounded `capacity()`.** The stall self-RELEASES as the quorum checkpoint
 /// rises (which lifts the prune floor and frees slots), so `capacity()` MUST exceed one checkpoint
-/// interval plus the in-flight pipeline depth — concretely `capacity() > config.checkpoint_ops() +
-/// pipeline_headroom`. With a ring smaller than (or equal to) a checkpoint interval the un-pruned
-/// window `(floor, op]` cannot reach the next checkpoint boundary before it would wrap, so the stall
-/// would never release and the primary would WEDGE. A backend that reports a fixed `capacity()` is
-/// responsible for honouring this (the sim's bounded mode picks `n` well above `checkpoint_ops`; a
-/// disk driver must size its WAL ring the same way).
+/// interval: with a ring at or below the interval the un-pruned window `(floor, op]` cannot reach the
+/// next checkpoint boundary before it would wrap, so the stall would never release and the primary
+/// would WEDGE. That hard floor is published as
+/// [`Config::minimum_wal_capacity`](crate::Config::minimum_wal_capacity) and ENFORCED —
+/// [`Endpoint::recover`](crate::Endpoint) refuses a backend reporting less
+/// ([`RecoverError::WalCapacityBelowMinimum`](crate::RecoverError)). At exactly the floor the primary
+/// single-steps near each boundary, so size several intervals plus pipeline headroom above it (the
+/// sim's bounded mode uses 3-6 intervals; a disk driver sizes its WAL ring the same way).
 pub trait Wal {
   /// The highest op number held. Advisory: `recover()` does NOT trust this scalar — it derives the
   /// written extent by scanning [`header`](Wal::header) over the effective ring (a stored scalar can
@@ -1266,6 +1352,18 @@ pub trait Wal {
   /// enforcement points, so the recovery geometry stays sound for every backend: a ring-less backend
   /// sees this only as deliberate append backpressure when checkpointing stalls far behind
   /// (TigerBeetle's flow control — and strictly better than unbounded WAL growth during such a stall).
+  ///
+  /// **Cross-incarnation stability.** The reported value MUST be stable across restarts of the same
+  /// store: the recovery scan window AND a bounded backend's physical op→slot placement are both derived
+  /// from it, so reopening a store under a different capacity silently moves committed slots out of the
+  /// scan window (and relocates every ring slot) — a committed-loss hazard no scan can detect. A backend
+  /// that must resize its ring performs an explicit offline migration (rewrite the slots under the new
+  /// placement, then report the new value). Recovery enforces this: the durable root pins the geometry
+  /// pair ([`VsrState::wal_capacity`] / [`VsrState::checkpoint_ops`]) and
+  /// [`Endpoint::recover`](crate::Endpoint::recover) REFUSES a restart whose live values differ
+  /// ([`RecoverError`](crate::RecoverError)), and also refuses a capacity below
+  /// [`Config::minimum_wal_capacity`](crate::Config::minimum_wal_capacity) (the documented liveness
+  /// floor, otherwise the primary would wedge at the first un-releasable mint stall).
   fn capacity(&self) -> u64 {
     u64::MAX
   }
