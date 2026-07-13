@@ -72,7 +72,12 @@ fn applied_digest(seed: u64) -> u64 {
       600 => c.crash(1),
       1_000 => c.restart(1),
       1_600 => c.crash(2),
-      2_000 => c.wipe_and_restart(2),
+      // Wiping voter 2 now FAILS-STOP it (an empty-log voter must not rejoin the voting set); it stays
+      // down and the cluster survives one voter short. (Before the wipe-amnesia fix it rejoined empty,
+      // so this digest legitimately diverges from that history in the post-wipe portion.)
+      2_000 => {
+        c.wipe_and_restart(2);
+      }
       _ => {}
     }
     c.tick();

@@ -88,7 +88,7 @@ fn view_changing_replica_with_a_repair_hole_does_not_spin_a_poll_timeout_driver(
   // change never progresses. The fix gates `arm_timers`' `repair_retry` arming on `Status::Normal`, so
   // the arm-site condition matches the service-site gate and no orphaned timer is left in ViewChange.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap(); // replica 1: backup of view 0
-  let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   // A Normal backup holding a committed-op repair hole at op 2 (commit held at 1 below it).
@@ -176,7 +176,8 @@ fn forfeiting_primary_does_not_spin_a_poll_timeout_driver() {
   // `commit` (50ms COMMIT_HEARTBEAT) — earlier than the post-forfeit `svc_message` (100ms
   // VC_MESSAGE_RETRANSMIT) — which is exactly the stale spinner.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -339,7 +340,7 @@ fn normal_backup_does_not_spin_a_poll_timeout_driver_after_an_idle_svc() {
   // returns it only where it is acted on, so the clock strictly advances and the SVC is re-broadcast
   // across multiple windows.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap(); // replica 1: backup of view 0
-  let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(!e.is_primary());
@@ -441,7 +442,8 @@ fn primary_with_armed_grace_does_not_spin_after_forced_forfeit() {
   // serviceability filter no longer returns it once `pending_forfeit` holds), so `svc_message` is the
   // sole primary-side driver and the clock strictly advances to the step-down re-proposal.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   // A Normal PRIMARY (replica 0, view 0) holding a committed `repair` hole at op 2 (commit held at 1
@@ -591,7 +593,13 @@ fn poll_timeout_only_returns_serviceable_timers() {
   // (1) Normal PRIMARY (heartbeating): commit/prepare/forfeit_armed serviceable.
   {
     let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
-    let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+    let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      0,
+      CountSm::default(),
+      u64::MAX,
+    );
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     let mut blocks = crate::block_store::MemBlockStore::new();
     // Commit a tail so prepare would also be relevant, then tick to arm the heartbeat.
@@ -639,7 +647,13 @@ fn poll_timeout_only_returns_serviceable_timers() {
   // (2) Normal PRIMARY then forced into pending_forfeit (the force-forfeited substate): only svc_message drives.
   {
     let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap();
-    let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+    let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      0,
+      CountSm::default(),
+      u64::MAX,
+    );
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     let mut blocks = crate::block_store::MemBlockStore::new();
     e.force_state_for_test(0, 10, 1, 0, &[2]); // committed repair hole → grace arms on the next tick
@@ -683,7 +697,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
   // (3) Normal BACKUP that proposed an idle SVC (the idle-SVC substate): primary_idle + svc_message.
   {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
-    let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+    let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     let mut blocks = crate::block_store::MemBlockStore::new();
     e.handle_timeout(
@@ -702,7 +716,7 @@ fn poll_timeout_only_returns_serviceable_timers() {
   // (4) ViewChange (active SVC driver): svc_message + dvc_message + view_change_status.
   {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
-    let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+    let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     let mut blocks = crate::block_store::MemBlockStore::new();
     // Drive into ViewChange(1) via an SVC quorum (replica 0 + our own bit).
@@ -736,13 +750,16 @@ fn poll_timeout_only_returns_serviceable_timers() {
   // (5) Recovering: recover_retry drives (and any sync_solicit armed by the peer-fetch must NOT spin).
   {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
-    let mut sb = TestSb::default();
+    // A store that RAN (its non-head tail read faults), not a wipe: a FORMATTED root recording this
+    // config's `checkpoint_ops == 4` over a ring-less WAL, so this voter recovers rather than fail-stops.
+    let mut sb = sb_formatted_with(4, u64::MAX);
     // A WAL whose tail read faults forever on a non-head slot → the recover loop keeps retrying.
     let mut wal = ScriptedWal::with_entries(3);
     wal.script_read_fault(OpNumber::with(2), u8::MAX);
     let mut blocks = crate::block_store::MemBlockStore::new();
-    let mut e =
-      Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb, &mut blocks)
+      .expect("recover accepts this store")
+      .expect_active();
     assert!(e.status().is_recovering() || e.status().is_recovering_head());
     e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
     while e.poll_message().is_some() {}
@@ -754,13 +771,16 @@ fn poll_timeout_only_returns_serviceable_timers() {
   // (6) RecoveringHead: recover_head drives the Recovery re-solicitation.
   {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
-    let mut sb = TestSb::default();
+    // A store that RAN (its head read faults), not a wipe: a FORMATTED root recording `checkpoint_ops
+    // == 4` over a ring-less WAL, so this voter recovers into RecoveringHead rather than fail-stopping.
+    let mut sb = sb_formatted_with(4, u64::MAX);
     // The HEAD slot reads back permanently faulty → RecoveringHead.
     let mut wal = ScriptedWal::with_entries(3);
     wal.script_read_fault(OpNumber::with(3), u8::MAX);
     let mut blocks = crate::block_store::MemBlockStore::new();
-    let mut e =
-      Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb, &mut blocks).expect_active();
+    let mut e = Endpoint::recover(cfg, genesis(3), 7, NoopSm, &mut wal, &mut sb, &mut blocks)
+      .expect("recover accepts this store")
+      .expect_active();
     // Drain the recover loop to its terminal RecoveringHead (re-submit the faulty head read until the
     // budget exhausts), driving purely via the recover_retry timer.
     for _ in 0..64 {
@@ -794,11 +814,12 @@ fn sustained_client_load_does_not_starve_the_prepare_retransmit() {
   // resets `primary_idle`, so no failover) and the commit wedges below it until the load pauses a
   // full interval. The deadline must be PRESERVED across accepts (it may only move earlier), so
   // the retransmit fires at T despite continuous accepts.
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(3),
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();

@@ -211,7 +211,10 @@ async fn build_driver(
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(0)).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  // A real new cluster: FORMAT the store once (the pinned genesis root) so recovery resumes the
+  // designated primary — an unformatted SOLE VOTER would fail-stop (the wipe-amnesia safeguard).
+  viewstamp_driver::format(config, &membership, &wal, &mut sb).expect("format the genesis store");
   let blocks = MemBlocks::default();
   GateDriver::with_config(
     config,
@@ -247,7 +250,11 @@ async fn build_cluster_driver(
   let config = viewstamp_proto::Config::try_new(CLUSTER, MemberId::new(u128::from(id))).unwrap();
   let (ready_tx, ready_rx) = flume::unbounded();
   let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-  let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+  // A real new cluster: FORMAT each store once (the pinned genesis root) so recovery resumes the
+  // designated view-0 primary as Normal — an unformatted store would abdicate (the wipe-amnesia
+  // safeguard), spuriously cold-starting a view change.
+  viewstamp_driver::format(config, &membership, &wal, &mut sb).expect("format the genesis store");
   let blocks = MemBlocks::default();
   viewstamp_compio::CompioQuicDriver::new(
     config,
@@ -579,7 +586,10 @@ async fn stream_cluster_survives_slot_shift() {
       viewstamp_proto::Config::try_new(STREAM_CLUSTER, MemberId::new(id as u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-    let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    // A real new cluster: FORMAT each store once so recovery resumes the designated view-0 primary
+    // as Normal — an unformatted store would abdicate (the wipe-amnesia safeguard).
+    viewstamp_driver::format(config, &genesis(4, 0), &wal, &mut sb).expect("format genesis store");
     let blocks = MemBlocks::default();
     let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
       config,
@@ -754,7 +764,10 @@ async fn quic_cluster_survives_slot_shift() {
     let config = viewstamp_proto::Config::try_new(QUIC_CLUSTER, MemberId::new(id as u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-    let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    // A real new cluster: FORMAT each store once so recovery resumes the designated view-0 primary
+    // as Normal — an unformatted store would abdicate (the wipe-amnesia safeguard).
+    viewstamp_driver::format(config, &genesis(4, 0), &wal, &mut sb).expect("format genesis store");
     let blocks = MemBlocks::default();
     let (driver, handle) = viewstamp_compio::CompioQuicDriver::new(
       config,

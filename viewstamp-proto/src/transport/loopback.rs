@@ -16,11 +16,12 @@ const CLUSTER: u128 = 0x5151;
 
 fn replica<R: StreamTransport>(id: u16) -> (StreamCoordinator<CountSm, R>, TestWal, TestSb) {
   let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
-  let coord = StreamCoordinator::new(Endpoint::<_, SingleChange>::with_reconfig(
+  let coord = StreamCoordinator::new(Endpoint::<_, SingleChange>::genesis_unchecked(
     cfg,
     genesis(2),
     u64::from(id) + 1,
     CountSm::default(),
+    u64::MAX,
   ));
   (coord, TestWal::default(), TestSb::default())
 }

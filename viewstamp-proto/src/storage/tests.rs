@@ -450,12 +450,14 @@ fn vsr_state_round_trips_empty_and_populated() {
 
 #[test]
 fn vsr_state_golden_bytes_pin_the_layout() {
-  // The v7 layout: the byte-identical v1-3 body (version|view|log_view|commit|checkpoint_op|
+  // The v8 layout: the byte-identical v1-3 body (version|view|log_view|commit|checkpoint_op|
   // checkpoint_id|header-count|headers), then the v4 epoch/membership tail (epoch|prev_epoch|present,
   // then the membership block when present), then the v5 lineage tail (prior_config_count|ids), then the
-  // v6 `config_install_op` scalar (u64), then the v7 `log_floor` scalar (u64). The epoch-1 membership
+  // v6 `config_install_op` scalar (u64), then the v7 `log_floor` scalar (u64), then the v8 WAL-geometry
+  // pair (`checkpoint_ops`|`wal_capacity`, a u64 each). The epoch-1 membership
   // matches the root's epoch-1 scalar; the lineage carries two superseded ids; `config_install_op = 7`
-  // is the reconfigure op; `log_floor` defaults to the checkpoint (5) — the constructor's floor.
+  // is the reconfigure op; `log_floor` defaults to the checkpoint (5) — the constructor's floor; the
+  // geometry pair is stamped (interval 32, capacity 4096).
   let h = mk_header(7, 3, 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, 9, b"body");
   let mem = Membership::genesis(
     2,
@@ -482,9 +484,10 @@ fn vsr_state_golden_bytes_pin_the_layout() {
     std::vec![0x1111_2222, 0x3333_4444],
     OpNumber::with(7),
   )
-  .unwrap();
+  .unwrap()
+  .with_wal_geometry(32, 4096);
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 7, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
+    0, 8, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
     0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 187, 204, 221, 0, 0, 0, 1, 231, 44, 98, 75, 124,
     48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -495,7 +498,8 @@ fn vsr_state_golden_bytes_pin_the_layout() {
     2, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13, 0, 0, 0, 2, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11, 0x22, 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x33,
-    0x33, 0x44, 0x44, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 5,
+    0x33, 0x44, 0x44, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 32, 0,
+    0, 0, 0, 0, 0, 16, 0,
   ];
   assert_eq!(st.encode(), expected, "VsrState wire layout is pinned");
   // The pinned golden bytes are a valid decode input too: they round-trip back to the same root.
@@ -638,11 +642,11 @@ fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
       "a pre-membership root tagged with legacy version {v} decodes to the same bridged state"
     );
   }
-  // The v7 layout: a NEW root is written with SUPERBLOCK_VERSION (= 7) and round-trips under it. The
-  // floor is RAISED above the checkpoint (an adoption-learned cluster floor) so the scalar's
-  // round-trip is non-vacuous, not just the constructor default.
+  // The v8 layout: a NEW root is written with SUPERBLOCK_VERSION (= 8) and round-trips under it. The
+  // floor is RAISED above the checkpoint (an adoption-learned cluster floor) and the WAL-geometry
+  // pair is STAMPED, so both trailing tails' round-trips are non-vacuous, not constructor defaults.
   let mem = Membership::genesis(3, 0, (1..=3).map(MemberId::new).collect()).unwrap();
-  let v7 = VsrState::try_new_v4(
+  let v8 = VsrState::try_new_v4(
     View::with(2),
     View::with(1),
     OpNumber::with(5),
@@ -657,25 +661,44 @@ fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
   )
   .unwrap()
   .with_log_floor(OpNumber::with(5))
-  .unwrap();
-  let v7_bytes = v7.encode();
+  .unwrap()
+  .with_wal_geometry(16, 128);
+  let v8_bytes = v8.encode();
   assert_eq!(
-    &v7_bytes[0..2],
+    &v8_bytes[0..2],
     &SUPERBLOCK_VERSION.to_be_bytes(),
     "a new durable root leads with SUPERBLOCK_VERSION"
   );
-  assert_eq!(SUPERBLOCK_VERSION, 7, "the accepted decode range is 1..=7");
+  assert_eq!(SUPERBLOCK_VERSION, 8, "the accepted decode range is 1..=8");
   assert_eq!(
-    VsrState::decode(&v7_bytes).unwrap(),
-    v7,
-    "the v7 root round-trips (log_floor included)"
+    VsrState::decode(&v8_bytes).unwrap(),
+    v8,
+    "the v8 root round-trips (log_floor + WAL geometry included)"
+  );
+  // A v7 root (the log_floor tail but NO geometry pair) still decodes — built by truncating the v8
+  // geometry pair (two trailing `u64`s) and re-tagging as v7. It decodes with the pair DEFAULTED to
+  // `(0, 0)` (= not recorded, exempt from the recovery geometry check) — so no persisted v7 root is
+  // stranded by the bump.
+  let mut v7_bytes = v8_bytes.to_vec();
+  v7_bytes.truncate(v7_bytes.len() - 8 - 8); // drop the geometry pair
+  v7_bytes[0..2].copy_from_slice(&7u16.to_be_bytes());
+  let v7_decoded = VsrState::decode(&v7_bytes).expect("a v7 root still decodes");
+  assert_eq!(
+    (v7_decoded.checkpoint_ops(), v7_decoded.wal_capacity()),
+    (0, 0),
+    "a v7 root defaults the WAL-geometry pair to not-recorded"
+  );
+  assert_eq!(
+    v7_decoded.log_floor(),
+    OpNumber::with(5),
+    "a v7 root keeps its log_floor"
   );
   // A v6 root (the config_install_op tail but NO log_floor tail) still decodes — built by truncating
-  // the v7 `log_floor` scalar (a trailing `u64`) and re-tagging as v6. It decodes with `log_floor`
+  // the geometry pair + the `log_floor` scalar and re-tagging as v6. It decodes with `log_floor`
   // DEFAULTED to its `checkpoint_op` (the pre-v7 restart-at-checkpoint behaviour) — so no persisted v6
   // root is stranded by the bump.
-  let mut v6_bytes = v7_bytes.to_vec();
-  v6_bytes.truncate(v6_bytes.len() - 8); // drop the log_floor scalar
+  let mut v6_bytes = v8_bytes.to_vec();
+  v6_bytes.truncate(v6_bytes.len() - 8 - 8 - 8); // drop the geometry pair + the log_floor scalar
   v6_bytes[0..2].copy_from_slice(&6u16.to_be_bytes());
   let v6_decoded = VsrState::decode(&v6_bytes).expect("a v6 root still decodes");
   assert_eq!(
@@ -689,11 +712,11 @@ fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
     "a v6 root keeps its config_install_op"
   );
   // A v5 root (the lineage tail but NO config_install_op NOR log_floor tail) still decodes — built by
-  // truncating BOTH trailing scalars (a `u64` each) and re-tagging as v5. It decodes with
+  // truncating the geometry pair + both trailing scalars and re-tagging as v5. It decodes with
   // `config_install_op` (and `log_floor`) DEFAULTED to its `checkpoint_op` (the pre-v6 serve
   // behaviour) — so no persisted v5 root is stranded by the bump.
-  let mut v5_bytes = v7_bytes.to_vec();
-  v5_bytes.truncate(v5_bytes.len() - 8 - 8); // drop log_floor + config_install_op
+  let mut v5_bytes = v8_bytes.to_vec();
+  v5_bytes.truncate(v5_bytes.len() - 8 - 8 - 8 - 8); // drop geometry + log_floor + config_install_op
   v5_bytes[0..2].copy_from_slice(&5u16.to_be_bytes());
   let v5_decoded = VsrState::decode(&v5_bytes).expect("a v5 root still decodes");
   assert_eq!(
@@ -711,8 +734,9 @@ fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
   // `u32` count + one `u128`) and re-tagging as v4. It decodes with an EMPTY lineage and defaulted
   // scalars (recover seeds the lineage from the current id, the pre-v5 behaviour) — so no
   // persisted v4 root is stranded by the bump.
-  let mut v4_bytes = v7_bytes.to_vec();
-  v4_bytes.truncate(v4_bytes.len() - 8 - 8 - (4 + 16)); // drop both scalars + the lineage block
+  let mut v4_bytes = v8_bytes.to_vec();
+  // Drop the geometry pair, both scalars, and the lineage block.
+  v4_bytes.truncate(v4_bytes.len() - 8 - 8 - 8 - 8 - (4 + 16));
   v4_bytes[0..2].copy_from_slice(&4u16.to_be_bytes());
   let v4_decoded = VsrState::decode(&v4_bytes).expect("a v4 root still decodes");
   assert!(
@@ -731,7 +755,7 @@ fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
   );
   // Versions OUTSIDE the accepted range fail CLEAN (never misparse): 0 and one past the high end.
   for bad in [0u16, SUPERBLOCK_VERSION + 1] {
-    let mut wrong = v7_bytes.to_vec();
+    let mut wrong = v8_bytes.to_vec();
     wrong[0..2].copy_from_slice(&bad.to_be_bytes());
     assert!(
       matches!(VsrState::decode(&wrong), Err(CodecError::UnknownVersion(v)) if v == bad),
@@ -751,10 +775,10 @@ fn vsr_state_decode_rejects_corruption_without_panicking() {
     std::vec![mk_header(6, 1, 1, 6, b"z")],
   )
   .unwrap();
-  // `st` is built via `try_new`, so it encodes as a v7 root whose membership-present flag is 0 (a
+  // `st` is built via `try_new`, so it encodes as a v8 root whose membership-present flag is 0 (a
   // legacy-bridged shape): version(2) | body | header-count | header | epoch(8) | prev_epoch(8) |
-  // present(1) | lineage_count(4) (= 0, no ids) | config_install_op(8) | log_floor(8). The corruption
-  // probes target that exact layout.
+  // present(1) | lineage_count(4) (= 0, no ids) | config_install_op(8) | log_floor(8) |
+  // checkpoint_ops(8) | wal_capacity(8). The corruption probes target that exact layout.
   let good = st.encode();
   // Truncation WITHIN the fixed scalar prefix (before the header count) → Truncated (a scalar
   // read ran off the end). `&[]` likewise fails the very first u16 read.
@@ -766,24 +790,24 @@ fn vsr_state_decode_rejects_corruption_without_panicking() {
     VsrState::decode(&[]),
     Err(CodecError::Truncated { .. })
   ));
-  // Dropping the last byte truncates the trailing log_floor u64, so the read runs off the end →
+  // Dropping the last byte truncates the trailing wal_capacity u64, so the read runs off the end →
   // Truncated (an honestly-short tail, not an oversized length).
   assert!(matches!(
     VsrState::decode(&good[..good.len() - 1]),
     Err(CodecError::Truncated { .. })
   ));
-  // Dropping the whole trailing log_floor scalar (8 bytes) ALSO truncates — a v7 root MUST carry
-  // it (the read runs off the end after the config_install_op scalar).
+  // Dropping the whole trailing geometry pair (16 bytes) ALSO truncates — a v8 root MUST carry
+  // it (the read runs off the end after the log_floor scalar).
   assert!(matches!(
-    VsrState::decode(&good[..good.len() - 8]),
+    VsrState::decode(&good[..good.len() - 16]),
     Err(CodecError::Truncated { .. })
   ));
   // Bad leading version → UnknownVersion.
   let mut badver = good.to_vec();
-  badver[1] = 8;
+  badver[1] = 9;
   assert!(matches!(
     VsrState::decode(&badver),
-    Err(CodecError::UnknownVersion(8))
+    Err(CodecError::UnknownVersion(9))
   ));
   // A header-count prefix that overruns the buffer → LengthOverflow (not an OOB slice). The
   // count u32 sits at offset 2+8+8+8+8+16 = 50.
@@ -794,20 +818,20 @@ fn vsr_state_decode_rejects_corruption_without_panicking() {
     Err(CodecError::LengthOverflow { .. })
   ));
   // A `membership_present` flag that is neither 0 nor 1 → InvalidMembershipPresent. The present byte is
-  // the TWENTY-FIRST-from-last byte now (the trailing bytes are lineage_count(4) + config_install_op(8)
-  // + log_floor(8)): `good.len() - 21`.
+  // the THIRTY-SEVENTH-from-last byte now (the trailing bytes are lineage_count(4) + config_install_op(8)
+  // + log_floor(8) + the geometry pair(16)): `good.len() - 37`.
   let mut bad_flag = good.to_vec();
-  let present_off = bad_flag.len() - 21;
+  let present_off = bad_flag.len() - 37;
   bad_flag[present_off] = 2;
   assert!(matches!(
     VsrState::decode(&bad_flag),
     Err(CodecError::InvalidMembershipPresent(2))
   ));
   // A lineage-count prefix that overruns the buffer → LengthOverflow (each id a fixed 16-byte block, so
-  // an impossible count is a corrupt length). The lineage-count u32 sits just BEFORE the two trailing
-  // scalars (config_install_op(8) + log_floor(8)): `good.len() - 20 .. good.len() - 16`.
+  // an impossible count is a corrupt length). The lineage-count u32 sits just BEFORE the trailing
+  // scalars (config_install_op(8) + log_floor(8) + geometry(16)): `good.len() - 36 .. good.len() - 32`.
   let mut huge_lineage = good.to_vec();
-  let lineage_off = huge_lineage.len() - 20;
+  let lineage_off = huge_lineage.len() - 36;
   huge_lineage[lineage_off..lineage_off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
   assert!(matches!(
     VsrState::decode(&huge_lineage),
@@ -822,8 +846,8 @@ fn vsr_state_decode_rejects_corruption_without_panicking() {
   ));
   // A structurally-valid buffer whose decoded fields break the invariants (log_view > view) is
   // rejected as InvalidVsrState rather than constructing an illegal root. Build it by hand as a
-  // complete v7 root: an empty-header body with log_view = 5 > view = 4, the epoch tail, the
-  // empty-lineage tail, and the two trailing scalars.
+  // complete v8 root: an empty-header body with log_view = 5 > view = 4, the epoch tail, the
+  // empty-lineage tail, the two trailing scalars, and the geometry pair.
   let mut bad = std::vec::Vec::new();
   bad.extend_from_slice(&SUPERBLOCK_VERSION.to_be_bytes());
   bad.extend_from_slice(&4u64.to_be_bytes()); // view
@@ -838,6 +862,8 @@ fn vsr_state_decode_rejects_corruption_without_panicking() {
   bad.extend_from_slice(&0u32.to_be_bytes()); // lineage count = 0
   bad.extend_from_slice(&0u64.to_be_bytes()); // config_install_op
   bad.extend_from_slice(&0u64.to_be_bytes()); // log_floor
+  bad.extend_from_slice(&0u64.to_be_bytes()); // checkpoint_ops (geometry, not recorded)
+  bad.extend_from_slice(&0u64.to_be_bytes()); // wal_capacity (geometry, not recorded)
   assert!(matches!(
     VsrState::decode(&bad),
     Err(CodecError::InvalidVsrState(_))
@@ -897,14 +923,15 @@ fn vsr_state_with_log_floor_validates_against_the_checkpoint() {
     "a raised floor round-trips through the v7 scalar"
   );
   // A floor below the checkpoint contradicts "the own checkpoint vouches its own prefix": rejected,
-  // and a hand-corrupted v7 scalar is rejected at decode through the same validation.
+  // and a hand-corrupted v7 scalar is rejected at decode through the same validation. The floor
+  // scalar sits just above the trailing v8 geometry pair (16 bytes).
   assert!(matches!(
     st.with_log_floor(OpNumber::with(3)),
     Err(VsrStateError::LogFloorBelowCheckpoint)
   ));
   let mut corrupt = raised.encode().to_vec();
-  let floor_off = corrupt.len() - 8;
-  corrupt[floor_off..].copy_from_slice(&1u64.to_be_bytes()); // floor 1 < checkpoint 4
+  let floor_off = corrupt.len() - 16 - 8;
+  corrupt[floor_off..floor_off + 8].copy_from_slice(&1u64.to_be_bytes()); // floor 1 < checkpoint 4
   assert!(matches!(
     VsrState::decode(&corrupt),
     Err(CodecError::InvalidVsrState(_))

@@ -285,8 +285,11 @@ where
   B: Fn(u64) -> Bytes,
 {
   let mut reps: Vec<Replica<S>> = (0..REPLICAS)
-    .map(|i| Replica {
-      ep: Endpoint::new(
+    .map(|i| {
+      let wal = BenchWal::default();
+      let mut sb = BenchSb::default();
+      // Genesis: format the fresh store (writes the durable genesis root) and take the runnable endpoint.
+      let ep = Endpoint::new(
         Config::try_new(1, MemberId::new(i as u128)).expect("a valid 3-node config"),
         Membership::genesis(
           REPLICAS as u8,
@@ -296,10 +299,16 @@ where
         .expect("a valid 3-node genesis membership"),
         0xBE7C_0FFE ^ (i as u64).wrapping_mul(0x1234_5678),
         S::default(),
-      ),
-      wal: BenchWal::default(),
-      sb: BenchSb::default(),
-      blocks: BenchBlocks::default(),
+        u64::MAX,
+      )
+      .commit(&wal, &mut sb)
+      .expect("genesis commit formats the fresh bench store");
+      Replica {
+        ep,
+        wal,
+        sb,
+        blocks: BenchBlocks::default(),
+      }
     })
     .collect();
   let mut clients: Vec<Client> = (1..=CLIENTS)

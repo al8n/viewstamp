@@ -643,11 +643,12 @@ impl Wal for ScriptedWal {
 
 // Helper: build a backup endpoint (replica 1 of 3).
 fn backup() -> Endpoint<NoopSm> {
-  Endpoint::new(
+  Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).expect("valid cluster config"),
     genesis(3),
     0,
     NoopSm,
+    u64::MAX,
   )
 }
 
@@ -739,11 +740,12 @@ fn new_primary_with_op2_candidate(
   TestSb,
   crate::block_store::MemBlockStore,
 ) {
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     membership,
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -811,7 +813,9 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
   assert!(faulty_op < head, "the hole must be below the head");
   let mut wal = ScriptedWal::with_entries(head);
   wal.script_read_fault(OpNumber::with(faulty_op), u8::MAX); // permanent: never clears on disk
-  let mut sb = TestSb::default();
+  // A store that RAN (its op_head/body faulted), not a wipe: a FORMATTED root so recovery of this voter
+  // exercises the read mechanics rather than the empty-voter fail-stop.
+  let mut sb = sb_formatted();
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
@@ -823,6 +827,7 @@ fn recovering_with_hole(head: u64, faulty_op: u64) -> (Endpoint<CountSm>, Script
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   (r, wal, sb)
@@ -869,7 +874,9 @@ fn drive_recovery<S: StateMachine, W: Wal, B: Superblock>(
 fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
   let mut wal = ScriptedWal::with_entries(head);
   wal.script_read_fault(OpNumber::with(head), u8::MAX); // head read never clears → permanently faulty
-  let mut sb = TestSb::default();
+  // A store that RAN (its head read faults), not a wipe: a FORMATTED root so recovery of this voter
+  // reaches RecoveringHead rather than the empty-voter fail-stop.
+  let mut sb = sb_formatted();
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
   let mut r = Endpoint::recover(
@@ -881,6 +888,7 @@ fn recovering_head(head: u64) -> (Endpoint<NoopSm>, ScriptedWal, TestSb) {
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(
@@ -904,6 +912,38 @@ fn client_request(rn: u64) -> Message {
 /// Build a `TestSb` whose durable root names `(view, log_view)` (checkpoint 0, commit 0) — so a
 /// recover() reads back a replica that was Normal (log_view == view) or mid-view-change
 /// (log_view < view) before the crash.
+/// A FORMATTED-but-empty superblock: a genesis-shaped root (view 0, op 0, no checkpoint) carrying the
+/// WAL-geometry witness (`checkpoint_ops` = the default recover config, `wal_capacity` exempt 0) but no
+/// membership (bridged to the passed genesis at recover). Models a store `format` initialized whose
+/// consensus state is still empty — distinct from `TestSb::default()`, whose empty `VsrState::new()`
+/// root is a WIPED/virgin store that fails-stops for a voter. Use this when a test recovers a voter
+/// over an empty (or op_head-corrupt) WAL and wants the RECOVERY MECHANICS, not the wipe fail-stop.
+fn sb_formatted() -> TestSb {
+  sb_formatted_with(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX)
+}
+
+/// A FORMATTED-but-empty superblock whose genesis-shaped root records an EXPLICIT WAL-geometry pair —
+/// for tests whose recover [`Config`] / WAL is not the `(DEFAULT_CHECKPOINT_OPS, u64::MAX)` default that
+/// [`sb_formatted`] stamps. `checkpoint_ops` MUST equal the recover config's interval and `wal_capacity`
+/// the backend's [`Wal::capacity`], or recovery's geometry fence refuses the mismatch.
+fn sb_formatted_with(checkpoint_ops: u64, wal_capacity: u64) -> TestSb {
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::new(),
+    OpNumber::new(),
+    0,
+    std::vec::Vec::new(),
+  )
+  .expect("a genesis-shaped root is valid")
+  .with_wal_geometry(checkpoint_ops, wal_capacity);
+  TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  }
+}
+
 fn sb_with_view(view: u64, log_view: u64) -> TestSb {
   let state = VsrState::try_new(
     View::with(view),
@@ -913,7 +953,12 @@ fn sb_with_view(view: u64, log_view: u64) -> TestSb {
     0,
     std::vec::Vec::new(),
   )
-  .expect("log_view <= view, commit >= checkpoint");
+  .expect("log_view <= view, commit >= checkpoint")
+  // Pin the geometry a running node's `durable_root` write stamps, so recovery sees a FORMATTED,
+  // geometry-recorded store (a real store that ever wrote a root carries it). `checkpoint_ops` matches
+  // the default recover config; `wal_capacity` is the ring-less test WAL's `u64::MAX` (the
+  // `Wal::capacity` default these tests run over), so recovery's capacity fence compares equal.
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
   TestSb {
     state,
     done: VecDeque::new(),
@@ -948,11 +993,12 @@ fn wal_in_view(head: u64, view: u64) -> TestWal {
 /// superblock write is left inflight (not flushed), so the view is NOT yet durable.
 #[cfg(test)]
 fn primed_new_primary_in_pending_view_window() -> (Endpoint<NoopSm>, TestWal, StepSb) {
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -1121,7 +1167,8 @@ fn drive_recovery_scripted_sb<S: StateMachine, W: Wal>(
 /// tests). `checkpoint_ops == ckpt`, so committing `ckpt` ops takes exactly one checkpoint.
 fn donor_primary_at_checkpoint(ckpt: u64) -> (Endpoint<CountSm>, TestWal, TestSb) {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -1200,11 +1247,12 @@ fn captured_sync_nonce(e: &mut Endpoint<CountSm>) -> u64 {
 
 // A backup over CountSm (replica 1 of 3) — the laggard in sync tests.
 fn sync_backup() -> Endpoint<CountSm> {
-  Endpoint::new(
+  Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap(),
     genesis(3),
     0,
     CountSm::default(),
+    u64::MAX,
   )
 }
 
@@ -1228,7 +1276,8 @@ fn sync_apply_harness(checkpoint_op: u64) -> (Endpoint<CountSm>, TestWal, TestSb
 /// envelope references.
 fn seed_donor_blocks(blocks: &mut crate::block_store::MemBlockStore, ckpt: u64) {
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), ckpt).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let req = |rn: u64| {

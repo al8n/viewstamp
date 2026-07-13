@@ -45,8 +45,8 @@ pub use config::{
   Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS, MAX_CLIENT_SESSIONS,
 };
 pub use endpoint::{
-  Endpoint, ProposeMembershipError, Reconfig, ReconfigError, Recovered, RestartOnly, Retired,
-  SingleChange, prepare_restart,
+  Endpoint, FormatError, Genesis, ProposeMembershipError, Reconfig, ReconfigError, RecoverError,
+  Recovered, RestartOnly, Retired, SingleChange, format, prepare_restart,
 };
 pub use event::{Committed, Event, MembershipChanged, RepairStarted, ViewChanged};
 pub use id::{ClientId, Epoch, MemberId, Peer, Recipient, ReplicaId};

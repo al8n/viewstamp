@@ -218,7 +218,9 @@ async fn spawn_cluster() -> (Vec<viewstamp_reactor::Handle>, Vec<Arc<Mutex<Batch
       viewstamp_proto::Config::try_new(CLUSTER, MemberId::new((id as u16) as u128)).unwrap();
     let (ready_tx, ready_rx) = flume::unbounded();
     let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
-    let sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    // A genesis fixture: FORMAT so recovery resumes rather than fail-stopping this voter.
+    viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
     let blocks = MemBlocks::default();
     let (sm, recorder) = SharedSm::new();
     let (driver, handle) = GateDriver::new(

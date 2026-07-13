@@ -640,7 +640,8 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
     0xDEAD_BEEF,
     std::vec::Vec::new(),
   )
-  .unwrap();
+  .unwrap()
+  .with_wal_geometry(2, u64::MAX);
   let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
   let mut wal = TestWal {
     entries: BTreeMap::new(),
@@ -658,6 +659,7 @@ fn recovery_peer_fetch_converges_against_an_equal_checkpoint_peer() {
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   // Drive past the per-op retry budget so it escalates to a peer fetch (pumping the recover-retry
   // timer each round — the timer owns the read-retry budget).
@@ -1215,7 +1217,8 @@ fn state_sync_installs_atomically_only_after_the_root_is_durable() {
   // The laggard: replica 1 of 3 over CountSm with a HUGE checkpoint interval (so committing its own
   // little band does NOT auto-checkpoint and race the sync's persist — it stays at checkpoint 0).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   // Give the laggard a small live WAL band (ops 1,2) below the synced point so the prune is OBSERVABLE.
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
@@ -1378,7 +1381,8 @@ fn state_sync_view_change_defers_while_a_re_persist_root_is_staged() {
   // The laggard: replica 1 of 3 over CountSm with a HUGE checkpoint interval (so its own band does not
   // auto-checkpoint and race the sync persist — it stays at its old durable checkpoint 0).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -1602,7 +1606,8 @@ fn a_primary_does_not_apply_a_state_sync_it_steps_down_instead() {
   // Instead it STEPS DOWN: flags the deferred forfeit and drops the sync, unchanged. A
   // caught-up replica then leads.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 1_000).unwrap(); // huge interval: no checkpoint
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -1720,7 +1725,8 @@ fn a_recovery_peer_fetch_stays_recovering_until_the_sync_root_is_durable() {
     0xDEAD_BEEF,
     std::vec::Vec::new(),
   )
-  .unwrap();
+  .unwrap()
+  .with_wal_geometry(2, u64::MAX);
   let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
   let mut wal = TestWal {
     entries: BTreeMap::new(),
@@ -1738,6 +1744,7 @@ fn a_recovery_peer_fetch_stays_recovering_until_the_sync_root_is_durable() {
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(e.status(), Status::Recovering);
@@ -2254,7 +2261,7 @@ fn a_pruned_committed_hole_forces_a_state_sync() {
   // quorum). It must (a) clear the doomed hole, (b) emit a RequestSync (not just RequestPrepare),
   // (c) record a FORCED sync targeting the quorum checkpoint.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   // Normal-backup state: head op 4, commit held at 1, own checkpoint 0, a committed hole at op 2.
@@ -2336,7 +2343,7 @@ fn force_sync_does_not_fire_when_the_op_is_still_peer_repairable() {
   // Here the only peer report (replica 0) is a checkpoint BELOW the hole (N=4, primary checkpoint=3),
   // so the max-peer floor stays below N → no force-sync.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   // Head op 6, commit held at 3, own checkpoint 0, a committed hole at op 4.
@@ -2388,7 +2395,7 @@ fn force_sync_fires_on_a_backup_that_only_hears_the_primary() {
   // checkpoint (head above it) hangs at `commit_min == N-1` forever. Here a SINGLE peer report (the
   // primary's Commit, checkpoint=8) past the hole (N=2) is enough to force the sync.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   // Head op 10 (ABOVE the cluster checkpoint, so the ORDINARY `> self.op` sync stays FALSE — this is
@@ -2435,7 +2442,7 @@ fn force_sync_stays_dormant_until_a_quorum_floor_is_known() {
   // Empty repair set, or no quorum-checkpoint floor → the escalation is a no-op (it must never fire
   // spuriously). With a hole but a zero floor (partitioned: no peers heard), it stays dormant.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(1), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   // No holes at all → maybe_force_sync is a no-op.
   ep.maybe_force_sync(Instant::ZERO);
   assert_eq!(ep.sync_target_for_test(), None);
@@ -2466,7 +2473,8 @@ fn forced_sync_preserves_a_held_tail_above_the_checkpoint_without_panic() {
   let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(3);
   let (env, id) = donor_envelope(&dsb);
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 1, CountSm::default());
+  let mut ep =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 1, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   seed_donor_blocks(&mut blocks, 3);
@@ -2544,7 +2552,8 @@ fn a_stale_forced_sync_checkpoint_is_dropped_after_repair_advances_past_its_targ
   // A real BACKUP (replica 1 of 3) over CountSm with a HUGE checkpoint interval, so applying its band
   // does NOT auto-checkpoint (which would otherwise set `pending_checkpoint` and short-circuit the path).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, CountSm::default());
+  let mut ep =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -2680,7 +2689,8 @@ fn apply_sync_drops_a_stale_forced_sync_checkpoint_below_the_applied_frontier() 
   // path) and `< commit_min` (4) — applying it would rewind the applied frontier. Part B DROPS it
   // gracefully (no panic, no rewind) instead of asserting; the LEGITIMATE forced sync is unaffected.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, CountSm::default());
+  let mut ep =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   seed_donor_blocks(&mut blocks, 2);
@@ -2749,7 +2759,7 @@ fn a_primary_in_the_force_sync_strand_forfeits_instead_of_resetting_op() {
   // body A for the same op (committed-state divergence). The fix: the primary flags a deferred forfeit
   // and steps down on its next tick — `self.op` is NEVER rewound, and no forced sync is armed.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(ep.is_primary(), "replica 0 at view 0 is the primary");
@@ -2856,7 +2866,7 @@ fn a_primary_in_the_force_sync_strand_never_reuses_an_op_number() {
   // op ABOVE the old head (11), never at a reused number. Under the OLD force-sync behaviour `op`
   // would have collapsed to the checkpoint floor, and the next request would have reused op 9/10.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut ep = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   ep.force_state_for_test(0, 10, 1, 0, &[2]);
@@ -2979,6 +2989,7 @@ fn recover_after_state_sync_restores_the_synced_checkpoint() {
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   assert_eq!(
     recovered.checkpoint_op(),
@@ -3012,11 +3023,12 @@ fn synced_replica_reports_its_checkpoint_in_view_change() {
   // canonical log directly instead of sending a DVC).
   let (_donor, _dwal, dsb) = donor_primary_at_checkpoint(4);
   let (env, id) = donor_envelope(&dsb);
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::with_checkpoint_ops(1, MemberId::new(2), 2).unwrap(),
     genesis(3),
     0,
     CountSm::default(),
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -3142,7 +3154,8 @@ fn bounded_wal_below_ring_sync_does_not_wedge_after_a_local_checkpoint_satisfies
   // only the below-ring path can).
   const N: u64 = 4;
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 5).unwrap(); // checkpoint_ops == C
-  let mut e = Endpoint::new(cfg, genesis(3), 7, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, CountSm::default(), u64::MAX);
   let mut wal = RingWal::new(N);
   let mut sb = StepSb::default(); // async: the ordinary checkpoint root lands on a later flush
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -3736,7 +3749,9 @@ fn a_direct_e0_to_e2_crossing_stamps_the_verified_chain_so_a_reserve_verifies() 
     &mut wal,
     &mut sb,
     &mut blocks,
-  ) {
+  )
+  .expect("recover accepts this store")
+  {
     Recovered::Active(r) => r,
     Recovered::Retired(_) => panic!("MemberId 1 is retained in E2 → recover Active"),
   };
@@ -3896,7 +3911,8 @@ fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
   // A backup over CountSm (replica 1 of 3) with a high checkpoint cadence — so driving it to head op N
   // does NOT auto-checkpoint (its `checkpoint_op` stays 0, leaving `op == N`, `commit_min < N`).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 100).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -4056,7 +4072,8 @@ fn slot_shifted_crossing_laggard() -> (Endpoint<CountSm>, TestWal, TestSb, Membe
   // The laggard is MemberId 3 (slot 3) — retained across the removal, far behind, high checkpoint cadence
   // so nothing auto-checkpoints it off the bookkeeping below.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(3), 100).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(4), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(4), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let predecessor = genesis(4);
@@ -4239,7 +4256,8 @@ fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits(
   let target: u64 = n; // the advertised cluster crossing checkpoint
   // A backup laggard far behind (op 0, checkpoint 0), high checkpoint cadence.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 100).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -4395,7 +4413,8 @@ fn a_cross_epoch_fetch_crosses_below_an_unreachable_hinted_target_on_a_verified_
   let bogus_target: u64 = 9_999; // an UNREACHABLE hinted checkpoint_op no honest donor can satisfy
   // A backup laggard far behind (op 0, checkpoint 0), high checkpoint cadence.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 100).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -4561,7 +4580,10 @@ fn a_recovered_swapped_donor_restores_config_install_op_so_the_gate_still_holds(
     std::vec![genesis_mem.config_id()],
     OpNumber::with(5), // config_install_op = N, ABOVE the checkpoint
   )
-  .expect("a SwapEpoch root carrying config_install_op above its checkpoint is valid");
+  .expect("a SwapEpoch root carrying config_install_op above its checkpoint is valid")
+  // A running node stamps geometry on every durable root; match the recover config's interval (1_000)
+  // and the ring-less test WAL's `u64::MAX` capacity so recovery's geometry fence accepts it.
+  .with_wal_geometry(1_000, u64::MAX);
   assert_eq!(
     swap_root.config_install_op(),
     OpNumber::with(5),
@@ -4588,6 +4610,7 @@ fn a_recovered_swapped_donor_restores_config_install_op_so_the_gate_still_holds(
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   // Drive the recovery storage to completion (the checkpoint read restores the SM + sessions).
   let now = Instant::ZERO;
@@ -5685,7 +5708,8 @@ fn a_verified_staged_crossing_keeps_its_intent_against_stale_same_epoch_authorit
   // The laggard is replica 1 of 3 with a HUGE checkpoint interval (so its own band never auto-checkpoints
   // and races the sync persist), and `StepSb` so the re-persist ROOT is withheld across (3) and (4).
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -5820,7 +5844,8 @@ fn a_verified_crossing_retained_across_a_flush_fault_keeps_its_intent_against_st
   // to cross. Were the retained crossing not shielded, delayed same-epoch authority would clear the intent
   // and the view transition would strand the laggard at the OLD epoch.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -5961,7 +5986,8 @@ fn a_retained_crossing_install_survives_a_stale_reply_rejected_by_apply_sync() {
   // MUTATION CHECK: re-add `self.pending_install = None;` on `begin_block_sync` entry and the stale reply
   // erases the crossing — the post-stale assertions (owed install present, GC roots survive) fail.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -6120,7 +6146,8 @@ fn a_recovery_retained_crossing_survives_a_stale_reply_rejected_by_apply_sync() 
   // MUTATION CHECK: re-add `self.pending_install = None;` on `begin_recover_block_sync` entry and the stale
   // reply erases the crossing; the post-stale install/GC-root assertions fail.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -6273,7 +6300,8 @@ fn a_stale_below_commit_min_reply_does_not_tear_down_a_cross_epoch_forced_sync()
   // wedging the crossing. WITH the fix, `sync` stays Some, `require_cross_epoch` remains set, and
   // `commit_min` is not rewound — the crossing is alive and the solicit timer will re-fetch.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap(); // huge interval: no checkpoint
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -6413,7 +6441,8 @@ fn a_post_root_restore_fault_advances_to_m_owes_reconstruct_and_rejects_an_older
   };
   // The laggard: huge checkpoint interval so no auto-checkpoint races the sync persist.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -6621,7 +6650,8 @@ fn laggard_owing_sm_reconstruct_at_m() -> (
     crate::block_address(&donor_sm.snapshot())
   };
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, CountSm::default());
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -6760,7 +6790,13 @@ fn laggard_owing_two_leaf_at_m(
   // The local slot is derived from the config's `MemberId` matched in `genesis(3)` (member `i` → slot
   // `i`), so `MemberId::new(local)` makes this a slot-`local` endpoint; the seed stays 0.
   let cfg = Config::with_checkpoint_ops(1, MemberId::new(local as u128), 1_000).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, TwoLeafSm::default());
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    cfg,
+    genesis(3),
+    0,
+    TwoLeafSm::default(),
+    u64::MAX,
+  );
   let mut wal = TestWal::default();
   let mut sb = StepSb::default();
   // Seed the laggard's store with the WHOLE clean DAG so the block-fetch drains locally at stage; the

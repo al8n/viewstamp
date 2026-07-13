@@ -189,6 +189,21 @@ impl Config {
     self.checkpoint_ops
   }
 
+  /// The smallest [`Wal::capacity`](crate::Wal::capacity) this configuration can run over — one full
+  /// checkpoint interval plus one op of progress room. The prune floor rises only when a quorum
+  /// durably checkpoints, a checkpoint triggers only when `commit_min` reaches one whole interval
+  /// above the floor, and nothing prunes mid-interval — so the entire interval must fit un-pruned in
+  /// the ring with at least one mintable op, or the mint stall could never release (a wedged
+  /// primary). This is the HARD liveness floor [`Endpoint::recover`](crate::Endpoint) refuses below
+  /// ([`RecoverError::WalCapacityBelowMinimum`](crate::RecoverError)); at exactly the floor the
+  /// primary single-steps near each boundary, so a real deployment sizes several intervals plus
+  /// pipeline headroom above it (the deterministic simulation's bounded rings use 3-6 intervals).
+  /// Cannot overflow: `checkpoint_ops` is bounded by [`MAX_CHECKPOINT_OPS`] at construction.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn minimum_wal_capacity(&self) -> u64 {
+    self.checkpoint_ops + 1
+  }
+
   /// The client-session table cap (applied sessions; deterministic apply-time eviction past it).
   /// Defaults to [`MAX_CLIENT_SESSIONS`]; see that constant for the eviction contract.
   #[cfg_attr(not(tarpaulin), inline(always))]

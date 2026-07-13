@@ -7,7 +7,7 @@ use crate::{
 #[test]
 fn fresh_endpoint_state() {
   let cfg = Config::try_new(1, MemberId::new(0)).expect("valid cluster config");
-  let e = Endpoint::new(cfg, genesis(3), 99, NoopSm);
+  let e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 99, NoopSm, u64::MAX);
   assert_eq!(e.status(), Status::Normal);
   assert_eq!(e.view(), View::new());
   assert_eq!(e.op(), OpNumber::new());
@@ -448,11 +448,12 @@ fn tail_gap_repair_within_the_window_requests_the_whole_gap() {
 
 #[test]
 fn fresh_endpoint_log_view_is_zero() {
-  let e = Endpoint::new(
+  let e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(3),
     99,
     NoopSm,
+    u64::MAX,
   );
   assert_eq!(e.log_view(), View::new());
   assert_eq!(e.status(), Status::Normal);
@@ -538,11 +539,12 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
   // claiming a durability this replica does not have (it could lose the op on crash). We reproduce
   // that exact divergent state directly: op 5 committed + at the head, but ABSENT from the WAL (a
   // not-yet-durable slot, exactly like an in-flight async append) and not in `appending`.
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(2)).unwrap(),
     genesis(3),
     0,
     NoopSm,
+    u64::MAX,
   );
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -649,7 +651,8 @@ fn on_request_is_dropped_while_a_sync_or_checkpoint_persist_is_in_flight() {
   // outstanding `sync` and an outstanding `pending_checkpoint` must short-circuit `on_request`.
   let serve = |arm: fn(&mut Endpoint<NoopSm>)| -> bool {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
-    let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+    let mut ep =
+      Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
     let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
     let mut blocks = crate::block_store::MemBlockStore::new();
     assert!(ep.is_primary());
@@ -697,7 +700,8 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   // execute BOTH the original AND the duplicate → divergence. The primary must catch up first; the
   // client retries.
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
-  let mut ep = Endpoint::new(cfg, genesis(3), 7, CountSm::default());
+  let mut ep =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, CountSm::default(), u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   // Primary holding a committed-op GAP: head op 4, commit HELD at 1 by a hole at op 2, but commit_max
@@ -836,7 +840,8 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
   // in-flight band never reaches it; this is a release-build floor, not a normal-path limit).
   {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
-    let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+    let mut ep =
+      Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
     let mut wal = ScriptedWal::with_entries(0);
     wal.capacity = depth + 8; // the backend's own ring, above the band depth
     let mut sb = TestSb::default();
@@ -896,7 +901,8 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
   // backpressure before an oversized header-only carrier could ever be minted.
   {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
-    let mut ep = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+    let mut ep =
+      Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
     let mut wal = ScriptedWal::with_entries(0);
     wal.capacity = depth + 8; // the backend's own ring, above the band depth
     let mut sb = TestSb::default();
@@ -963,11 +969,12 @@ fn a_quorum_checkpoint_report_advances_prune_floor_without_a_gc_trim_yet_the_car
   // A Normal primary (replica 0 of 3, view 0 — replica 0 leads it) whose in-memory log holds the FULL
   // band `[1..=depth]` — exactly at the frame-fit ceiling. This is the state a primary reaches by
   // appending a deep tail before any local checkpoint lands.
-  let mut e = Endpoint::new(
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(0)).unwrap(),
     genesis(3),
     0,
     NoopSm,
+    u64::MAX,
   );
   e.op = OpNumber::with(depth as u64);
   e.commit_min = OpNumber::with(depth as u64);
@@ -1253,7 +1260,7 @@ fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
   // body_checksum) yet differ in (client, request), so a stale ack for an op number that was truncated
   // and re-minted for a DIFFERENT request — even one with identical body bytes — must NOT be counted.
   let cfg = Config::try_new(1, MemberId::new(0)).expect("valid cluster config");
-  let mut e = Endpoint::new(cfg, genesis(3), 7, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   assert!(e.is_primary(), "replica 0 is primary of view 0");
@@ -1467,7 +1474,7 @@ fn solo_primary_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, Te
     .unwrap()
     .with_max_client_sessions(cap)
     .unwrap();
-  let mut e = Endpoint::new(cfg, genesis(1), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -1497,7 +1504,7 @@ fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) 
     .unwrap()
     .with_max_client_sessions(cap)
     .unwrap();
-  let mut e = Endpoint::new(cfg, genesis(2), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -1582,7 +1589,7 @@ fn session_table_never_exceeds_the_cap_and_victims_are_oldest_first() {
     .unwrap()
     .with_max_client_sessions(cap)
     .unwrap();
-  let mut e = Endpoint::new(cfg, genesis(2), 0, EchoSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, EchoSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -1706,7 +1713,7 @@ fn pipeline_admission_stalls_at_the_cap_and_releases_as_commits_advance() {
   // minted, no watermark advanced, so the client's retransmit is still canonical). Acking the first
   // op then advances the commit and admission RELEASES.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(2), 0, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -1782,7 +1789,7 @@ fn prepare_retransmit_is_windowed_to_the_first_unacked_ops() {
   // The window ships as a byte-bounded `PrepareBatch` (small bodies: ONE batch carrying the whole
   // window), never as per-op `Prepare` frames.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(2), 0, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -1853,7 +1860,7 @@ fn prepare_retransmit_splits_batches_at_the_frame_budget() {
   // 6 MiB ops: two fit one frame (12 MiB + framing < 16 MiB), the third would exceed the budget —
   // so the tick emits [1,2] then [3].
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(2), 0, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -1909,7 +1916,7 @@ fn prepare_retransmit_skips_a_repairing_hole_in_the_window() {
   // retransmit must SKIP it (there is no body to ship) while still batching the `Present` ops on
   // either side.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(2), 0, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -2146,7 +2153,7 @@ fn prepare_batch_skips_a_repairing_entry_and_processes_the_rest() {
 fn recently_acked_voters_reads_only_the_uncommitted_inflight_tail() {
   // 3-voter cluster, primary at slot 0.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -2223,7 +2230,7 @@ fn recently_acked_voters_uncommitted_op_visible_before_quorum() {
   // bitset, so the oracle sees exactly the primary's member (slot 0). This proves the oracle reads
   // partial progress on uncommitted entries, not only fully-acked ops.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
-  let mut e = Endpoint::new(cfg, genesis(3), 0, NoopSm);
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
@@ -2256,7 +2263,7 @@ fn membership_accessor_returns_live_snapshot() {
   // the values from the individual accessor methods (replica_count, member_at) — proving it is the
   // SAME struct, not a copy with diverging state.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
-  let e = Endpoint::new(cfg, genesis(3), 0, NoopSm);
+  let e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, NoopSm, u64::MAX);
   let m = e.membership();
   assert_eq!(
     m.replica_count(),

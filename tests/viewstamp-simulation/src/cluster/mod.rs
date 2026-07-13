@@ -360,29 +360,36 @@ impl Cluster {
   ) -> Self {
     let node_count = replica_count as u16 + learner_count;
     let membership = Self::genesis_membership(replica_count, learner_count);
-    let replica_set: Vec<Endpoint<SimSm, SingleChange>> = (0..node_count)
-      .map(|i| {
-        // `MemberId::new(i)` occupies slot `i` in the genesis membership, so every node's local slot
-        // equals its old replica index — quorum/primary/voter logic is byte-identical at epoch 0.
-        let cfg = Config::with_checkpoint_ops(1, MemberId::new(i as u128), checkpoint_ops)
-          .expect("valid cluster config");
-        // `with_reconfig` opts into the `SingleChange` capability; it constructs IDENTICAL state to the
-        // `RestartOnly` `Endpoint::new` (the latter delegates here with `R = RestartOnly`), so the
-        // capability marker changes no runtime byte — it only makes `propose_membership` reachable.
-        Endpoint::<SimSm, SingleChange>::with_reconfig(
-          cfg,
-          membership.clone(),
-          seed ^ (i as u64).wrapping_mul(0x1234_5678),
-          SimSm::Plain(LogSm::default()),
-        )
-      })
-      .collect();
     let client_set: Vec<ClientModel> = (0..clients)
       .map(|i| ClientModel::new((i as u128) + 1, requests_per_client, seed))
       .collect();
     let n = node_count as usize;
     let storage_faults = StorageFaults::none();
-    let (wals, sbs) = Self::seed_storage(node_count, seed, storage_faults, None, None, None);
+    let (wals, mut sbs) = Self::seed_storage(node_count, seed, storage_faults, None, None, None);
+    // GENESIS: commit each replica over its freshly-seeded (virgin) store. `commit` writes the durable
+    // genesis root a later restart recovers over — a voter with no durable root fail-stops — and builds
+    // the same in-memory genesis state the bare constructor produced.
+    let mut replica_set: Vec<Endpoint<SimSm, SingleChange>> = Vec::with_capacity(n);
+    for i in 0..node_count {
+      // `MemberId::new(i)` occupies slot `i` in the genesis membership, so every node's local slot
+      // equals its old replica index — quorum/primary/voter logic is byte-identical at epoch 0.
+      let cfg = Config::with_checkpoint_ops(1, MemberId::new(i as u128), checkpoint_ops)
+        .expect("valid cluster config");
+      // `with_reconfig` opts into the `SingleChange` capability; `commit` formats the store and builds
+      // IDENTICAL genesis state to the `RestartOnly` path, so the marker changes no runtime byte. The
+      // declared WAL capacity is the unbounded default the seeded storage reports; a lane that bounds
+      // the rings (`set_wal_capacity`) rebuilds the endpoints with the ring size.
+      let ep = Endpoint::<SimSm, SingleChange>::with_reconfig(
+        cfg,
+        membership.clone(),
+        seed ^ (i as u64).wrapping_mul(0x1234_5678),
+        SimSm::Plain(LogSm::default()),
+        u64::MAX,
+      )
+      .commit(&wals[i as usize], &mut sbs[i as usize])
+      .expect("genesis commit formats the seeded store");
+      replica_set.push(ep);
+    }
     // GC-DISABLED: the seeded cluster holds every checkpoint block for the run's lifetime so a
     // mid-run prune never makes a donor answer a `RequestBlock` ABSENT, which would shift the
     // byte-identical VOPR schedule. The GC mark-and-sweep contract is verified by the dedicated
@@ -502,6 +509,10 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    // Re-format the reseeded (virgin) stores so a restart still recovers rather than fail-stopping a
+    // voter over an empty root; the existing genesis endpoints (unchanged) already declare the matching
+    // geometry.
+    self.format_all_stores();
   }
 
   /// Enables (or, with `None`, disables) **async-append mode** on every replica's WAL, with per-append
@@ -522,6 +533,8 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    // Re-format the reseeded (virgin) stores; the existing genesis endpoints are unchanged.
+    self.format_all_stores();
   }
 
   /// Enables (or, with `None`, disables) **async-write mode** on every replica's superblock, with
@@ -546,6 +559,9 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    // Re-format the reseeded (virgin) stores; the genesis format write lands synchronously even under
+    // this async-write mode, and the existing genesis endpoints are unchanged.
+    self.format_all_stores();
   }
 
   /// Enables (or, with `None`, disables) **bounded ring mode** on every replica's WAL: each WAL becomes
@@ -556,18 +572,17 @@ impl Cluster {
   ///
   /// `n` MUST exceed `checkpoint_ops` plus pipeline headroom or the stall never releases and the
   /// primary wedges (the `Wal` capacity liveness contract). `None` restores the unbounded default.
+  ///
+  /// Also REBUILDS each replica's (still-fresh) endpoint, like
+  /// [`set_max_client_sessions`](Self::set_max_client_sessions): the endpoints declare their WAL
+  /// capacity at construction (it is stamped into every durable root they write, and recovery fences
+  /// a restart whose live capacity differs), so they must be reborn declaring the same ring size the
+  /// rebuilt WALs now report.
   pub fn set_wal_capacity(&mut self, n: Option<u64>) {
     self.wal_capacity = n;
-    let (wals, sbs) = Self::seed_storage(
-      self.replicas.len() as u16,
-      self.seed,
-      self.storage_faults,
-      self.async_wal_delay,
-      self.async_sb_delay,
-      n,
-    );
-    self.wals = wals;
-    self.sbs = sbs;
+    // `rebuild_endpoints` reseeds the storage at the new ring size (reading `self.wal_capacity`) and
+    // re-commits each endpoint declaring it, so no separate reseed is needed here.
+    self.rebuild_endpoints();
   }
 
   /// The current virtual instant.
@@ -1145,10 +1160,21 @@ impl Cluster {
   /// `recover` returns `Active`. A `Retired` here — the node absent from its own durable membership — is a
   /// harness bug (a parked node must never be routed a plain restart).
   pub fn restart(&mut self, i: usize) {
-    if let Some(r) = self.recover_in_place(i) {
-      panic!("replica {i} recovered Retired (absent from its own durable membership): {r:?}");
+    match self.recover_in_place(i) {
+      Ok(None) => self.crashed[i] = false,
+      Ok(Some(r)) => {
+        panic!("replica {i} recovered Retired (absent from its own durable membership): {r:?}")
+      }
+      // A voter whose disk was WIPED (an empty store, from an earlier `wipe_and_restart`) fail-stops:
+      // it must not rejoin the voting set with an empty log. It stays DOWN (crashed) until
+      // re-provisioned — restarting it again just re-fails-stops. This is the only in-model recover
+      // refusal a plain restart can legitimately hit (a normally-crashed replica keeps its formatted
+      // store and always recovers); any OTHER error is a harness bug.
+      Err(viewstamp_proto::RecoverError::UnformattedVoter) => {}
+      Err(e) => {
+        panic!("replica {i} restart over its own store hit an unexpected recover error: {e}")
+      }
     }
-    self.crashed[i] = false;
   }
 
   /// Rebuild replica `i` from its durable WAL + superblock via `Endpoint::recover`, drive its
@@ -1160,7 +1186,10 @@ impl Cluster {
   /// this resolves the node against the EFFECTIVE (durable) membership by its stable `MemberId`. A
   /// restart begins a new INCARNATION of the apply stream (recovery re-emits from the durable
   /// checkpoint), so the per-incarnation stream invariants start afresh.
-  fn recover_in_place(&mut self, i: usize) -> Option<viewstamp_proto::Retired> {
+  fn recover_in_place(
+    &mut self,
+    i: usize,
+  ) -> Result<Option<viewstamp_proto::Retired>, viewstamp_proto::RecoverError> {
     self.incarnations[i] += 1;
     let cfg = self.replica_config(i as u16);
     // The genesis-fallback membership for a legacy root (a v4 root ignores it). Sized by the CURRENT
@@ -1169,7 +1198,10 @@ impl Cluster {
     let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
     // `recover_with_reconfig` reconstructs the endpoint under the `SingleChange` marker; it runs the
     // IDENTICAL recovery path as the `RestartOnly` `Endpoint::recover` (which delegates here with
-    // `R = RestartOnly`), so the marker changes no recovered byte.
+    // `R = RestartOnly`), so the marker changes no recovered byte. A NORMAL restart reuses the exact
+    // (formatted) store the writer left, so recovery always succeeds; a WIPED store (empty) makes
+    // recovery FAIL-STOP a voter (`UnformattedVoter`), which the wipe caller handles — hence the
+    // `Result` is propagated rather than unwrapped here.
     match Endpoint::<SimSm, SingleChange>::recover_with_reconfig(
       cfg,
       membership,
@@ -1178,7 +1210,7 @@ impl Cluster {
       &mut self.wals[i],
       &mut self.sbs[i],
       &mut self.block_stores[i],
-    ) {
+    )? {
       Recovered::Active(endpoint) => {
         self.replicas[i] = endpoint;
         // Drain the IMMEDIATE recover reads (synchronous in the sim). A faulted read leaves the op pending
@@ -1202,27 +1234,28 @@ impl Cluster {
           .get()
           .saturating_sub(self.replicas[i].checkpoint_op().get());
         self.recovered_band_high_water = self.recovered_band_high_water.max(tail);
-        None
+        Ok(None)
       }
-      Recovered::Retired(r) => Some(r),
+      Recovered::Retired(r) => Ok(Some(r)),
     }
   }
 
   /// Restart a previously-crashed replica with WIPED durable storage: its WAL + superblock are
   /// REPLACED by fresh, empty ones (same fault plan / async modes / ring capacity — a swapped disk on
-  /// the same deployment), and the replica then boots the SAME path as [`restart`](Self::restart):
-  /// `Endpoint::recover` over what the disk holds — here nothing, so recovery degenerates to the
-  /// genesis state (view 0, no checkpoint, empty log) and completes inline to `Normal`. A real wiped
-  /// node does exactly this: it cannot know it was wiped, it just recovers an empty disk.
+  /// the same deployment), then boot `Endpoint::recover` over the empty disk.
   ///
-  /// This is the classic VSR AMNESIA hazard: every promise the replica's durable state ever made
-  /// (its view participation, its durable quorum copies of committed ops) is forfeited. Losing one
-  /// replica's durable state is within the crash-fault model's `<= f` budget; the cluster-level
-  /// invariant (committed ops survive, no divergence) must still hold, which the VOPR wipe lane's
-  /// checkers judge. The caller is responsible for telling the stateful checkers about the wipe
-  /// (their per-replica monotonicity baselines — durable view, checkpoint high-water — are forfeit
-  /// with the disk).
-  pub fn wipe_and_restart(&mut self, i: usize) {
+  /// This is the classic VSR AMNESIA hazard: every promise the replica's durable state ever made (its
+  /// view participation, its durable quorum copies of committed ops) is forfeited. The recovery
+  /// contract now REFUSES to let a wiped VOTER rejoin the voting set — an empty-log voter could join a
+  /// view-change quorum having forgotten the durable vote that made the old commit quorum intersect
+  /// the new one, so it FAILS-STOP ([`RecoverError::UnformattedVoter`](viewstamp_proto::RecoverError))
+  /// and stays DOWN (`crashed`) until re-provisioned. The cluster continues one replica short; the
+  /// cluster-level invariant (committed ops survive, no divergence) must still hold with the wiped
+  /// voter absent, which the VOPR wipe lane's checkers judge. A wiped non-voting LEARNER instead
+  /// resumes empty and state-syncs, so it rejoins. Returns `true` iff the wiped node rejoined (a
+  /// learner), `false` iff it fail-stopped or retired (stays down). The caller tells the stateful
+  /// checkers about the wipe (their per-replica monotonicity baselines are forfeit with the disk).
+  pub fn wipe_and_restart(&mut self, i: usize) -> bool {
     let s = Self::storage_seed(self.seed, i as u16);
     let mut w = match self.async_wal_delay {
       Some(d) => InMemoryWal::with_async_appends_and_faults(self.storage_faults, s, d),
@@ -1234,7 +1267,16 @@ impl Cluster {
       Some(d) => InMemorySuperblock::with_async_writes_and_faults(self.storage_faults, s, d),
       None => InMemorySuperblock::with_faults(self.storage_faults, s),
     };
-    self.restart(i);
+    match self.recover_in_place(i) {
+      // A wiped LEARNER resumes empty and rejoins (it never votes, so no amnesia risk).
+      Ok(None) => {
+        self.crashed[i] = false;
+        true
+      }
+      // A wiped VOTER fail-stops (UnformattedVoter), and a Retired node stays terminal: either way the
+      // node stays DOWN (`crashed`), and the cluster must survive its absence.
+      Ok(Some(_)) | Err(_) => false,
+    }
   }
 
   /// Propose a LIVE single-member reconfiguration on the cluster's current serving primary: validate
@@ -1687,17 +1729,52 @@ impl Cluster {
   /// in-memory state is discarded; durable storage is untouched). Each rebuilt endpoint restarts
   /// its apply stream — a new incarnation, like `restart`.
   fn rebuild_endpoints(&mut self) {
+    // Reseed fresh (virgin) storage, then re-commit each genesis endpoint over it. A pre-run rebuild
+    // discards the empty in-memory state and reforms it identically over a freshly-formatted store:
+    // the store held no committed state, so reseeding loses nothing, and committing keeps each
+    // endpoint's declared WAL geometry and its durable genesis root in lockstep (so a later restart
+    // recovers rather than fail-stopping a voter over an empty root).
+    let (wals, sbs) = Self::seed_storage(
+      self.replicas.len() as u16,
+      self.seed,
+      self.storage_faults,
+      self.async_wal_delay,
+      self.async_sb_delay,
+      self.wal_capacity,
+    );
+    self.wals = wals;
+    self.sbs = sbs;
     let membership = Self::genesis_membership(self.replica_count, self.learner_count);
-    for i in 0..self.replicas.len() as u16 {
-      let cfg = self.replica_config(i);
+    for i in 0..self.replicas.len() {
+      let cfg = self.replica_config(i as u16);
       let seed = self.seed ^ (i as u64).wrapping_mul(0x1234_5678);
-      self.replicas[i as usize] = Endpoint::<SimSm, SingleChange>::with_reconfig(
+      // Declare the capacity the current WALs report (the bounded ring size, or the unbounded default)
+      // — it is stamped into every durable root, and recovery fences a mismatch.
+      let ep = Endpoint::<SimSm, SingleChange>::with_reconfig(
         cfg,
         membership.clone(),
         seed,
         self.make_sm(),
-      );
-      self.incarnations[i as usize] += 1;
+        self.wal_capacity.unwrap_or(u64::MAX),
+      )
+      .commit(&self.wals[i], &mut self.sbs[i])
+      .expect("genesis commit formats the reseeded store");
+      self.replicas[i] = ep;
+      self.incarnations[i] += 1;
+    }
+  }
+
+  /// Format every replica's freshly-seeded (virgin) store in place, WITHOUT rebuilding the endpoints —
+  /// used after a reseed that keeps the existing (already-committed) genesis endpoints (the storage
+  /// fault/async plan changed, not the endpoint's declared geometry). Keeps a later restart recovering
+  /// over a formatted root rather than fail-stopping a voter over an empty one. The format write is the
+  /// blocking cluster-creation write, so it lands synchronously even under async-write mode.
+  fn format_all_stores(&mut self) {
+    let membership = Self::genesis_membership(self.replica_count, self.learner_count);
+    for i in 0..self.wals.len() {
+      let cfg = self.replica_config(i as u16);
+      viewstamp_proto::format(&cfg, &membership, &self.wals[i], &mut self.sbs[i])
+        .expect("format a freshly-seeded virgin store");
     }
   }
 

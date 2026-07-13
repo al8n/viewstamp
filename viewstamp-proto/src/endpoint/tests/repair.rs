@@ -608,7 +608,8 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
     0,
     std::vec![mk_header(1), mk_header(2)],
   )
-  .unwrap();
+  .unwrap()
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
   let mut sb = TestSb {
     state,
     done: VecDeque::new(),
@@ -628,6 +629,7 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
     &mut sb,
     &mut blocks,
   )
+  .expect("recover accepts this store")
   .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(r.status(), Status::Normal, "recovers to Normal");

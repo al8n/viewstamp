@@ -1257,6 +1257,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // advance lands at the root's completion, which then raises the live floor to the same point).
     .and_then(|s| s.with_log_floor(OpNumber::with(self.log_floor.get().max(checkpoint_op.get()))))
     .expect("durable root: log_view <= view, commit >= checkpoint_op, membership epoch consistent")
+    // The WAL-GEOMETRY pair the next recovery validates a restart against — the config's validated
+    // interval and the backend capacity this incarnation observed at recovery (or the caller declared
+    // at genesis construction). Both halves are nonzero by construction, so every root written here
+    // is fully recorded.
+    .with_wal_geometry(self.config.checkpoint_ops(), self.wal_capacity)
   }
 
   /// Mint a durable root that stamps a CROSS-EPOCH state-sync's SUCCESSOR membership — the analogue of
@@ -1329,5 +1334,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     .expect(
       "sync-successor root: log_view <= view, commit >= checkpoint_op, membership epoch consistent",
     )
+    // The WAL-GEOMETRY pair, stamped exactly as `durable_root` does — a sync-successor root fences
+    // the next restart the same way.
+    .with_wal_geometry(self.config.checkpoint_ops(), self.wal_capacity)
   }
 }

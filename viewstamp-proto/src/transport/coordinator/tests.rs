@@ -56,9 +56,14 @@ fn inbound_request_produces_outbound_to_a_backup() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   // Register backup conns attesting Peer::Member so try_note_established_member validates them
   // through note_established_member (the production path that stores the stable MemberId).
   register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
@@ -105,9 +110,14 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   // Two backup conns validated through the coordinator seal, so a served Prepare HAS somewhere to
   // route — proving the over-max case routes NOTHING, not merely that no conn was available.
   register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
@@ -199,9 +209,14 @@ fn a_large_multi_chunk_read_is_processed_without_closing_the_conn() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   // Register and validate the conn through the coordinator seal, then feed inbound frames.
   let id = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
   // Build more than one 64 KiB STAGE_CHUNK worth of framed messages so the read spans chunks.
@@ -231,9 +246,14 @@ fn a_large_multi_chunk_read_is_processed_without_closing_the_conn() {
 #[test]
 fn max_outbound_backlog_is_twice_the_router_outbound_cap() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let coord = StreamCoordinator::<CountSm, Passthrough>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let coord =
+    StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   const DEFAULT_CAP: usize = 64 * 1024 * 1024;
   assert_eq!(
     coord.max_outbound_backlog(),
@@ -250,10 +270,16 @@ fn wrong_cluster_conn_is_reaped() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord =
-    StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
-      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-    );
+  let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
+    _,
+    SingleChange,
+  >::genesis_unchecked(
+    cfg,
+    genesis(3),
+    1,
+    CountSm::default(),
+    u64::MAX,
+  ));
   let id = coord.register_accepted(
     Peer::Replica(ReplicaId::new(1)),
     labeled_conn(0xAAAA, 0, true),
@@ -291,10 +317,16 @@ fn an_internally_reaped_conn_surfaces_through_poll_conn_closed() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord =
-    StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
-      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-    );
+  let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
+    _,
+    SingleChange,
+  >::genesis_unchecked(
+    cfg,
+    genesis(3),
+    1,
+    CountSm::default(),
+    u64::MAX,
+  ));
   // Nothing reaped yet on a fresh table.
   assert_eq!(coord.poll_conn_closed(), None, "no closed conn initially");
   let id = coord.register_accepted(
@@ -342,9 +374,14 @@ fn a_bad_frame_close_yields_its_cause_through_poll_conn_closed() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   // Register and validate through the coordinator seal so the garbage frame reaches decode.
   let id = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
   assert_eq!(coord.poll_conn_closed(), None, "no closed conn initially");
@@ -380,10 +417,16 @@ fn a_redial_is_registered_but_not_authoritative_until_validated() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord =
-    StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
-      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-    );
+  let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
+    _,
+    SingleChange,
+  >::genesis_unchecked(
+    cfg,
+    genesis(3),
+    1,
+    CountSm::default(),
+    u64::MAX,
+  ));
   let p = Peer::Replica(ReplicaId::new(1));
   let a = coord.register_dialed(p, labeled_conn(0xABCD, 0, false));
   // Close A with a wrong-cluster inbound, which reaps it.
@@ -422,10 +465,16 @@ fn route_skips_a_handshaking_conn() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord =
-    StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
-      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-    );
+  let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
+    _,
+    SingleChange,
+  >::genesis_unchecked(
+    cfg,
+    genesis(3),
+    1,
+    CountSm::default(),
+    u64::MAX,
+  ));
   // The only backup conn is an acceptor that has NOT yet validated an inbound hello -> handshaking.
   coord.register_accepted(
     Peer::Replica(ReplicaId::new(1)),
@@ -468,9 +517,14 @@ fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let peer = Peer::Replica(ReplicaId::new(1));
   // Two conns validated through the coordinator seal for the same peer (member 1 = slot 1):
   // the first becomes a live standby, the second (last-established via note_established_member)
@@ -533,9 +587,14 @@ fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
 #[test]
 fn a_settled_replica_slot_claim_is_rejected_with_identity_rejected() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let slot = ReplicaId::new(1);
   // A settled MockRecords reporting Peer::Replica(slot). note_established blocks Peer::Replica
   // identity, so the conn is NOT auto-validated on register — no reset helper needed.
@@ -577,9 +636,14 @@ fn a_settled_replica_slot_claim_is_rejected_with_identity_rejected() {
 #[test]
 fn a_settled_none_identity_is_rejected_with_identity_rejected() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let slot = ReplicaId::new(2);
   // MockRecords with identity=None registered as Peer::Replica: note_established would resolve
   // (None, _) => expected = Peer::Replica(slot), which is now blocked — so the conn is NOT
@@ -620,9 +684,14 @@ fn a_settled_none_identity_is_rejected_with_identity_rejected() {
 #[test]
 fn a_settled_client_identity_is_preserved_and_not_rejected() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let cid = ClientId::new(0xDEAD_BEEF);
   // A settled MockRecords that reports Peer::Client: note_established allows Client, so the conn
   // IS auto-validated on register. try_note_established_member then early-returns (already validated).
@@ -659,9 +728,14 @@ fn a_settled_client_identity_is_preserved_and_not_rejected() {
 fn an_accepted_conn_attesting_the_local_member_id_is_aborted() {
   let local_member = MemberId::new(0); // endpoint.local() is member 0 in this config
   let cfg = Config::try_new(0xABCD, local_member).unwrap();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   // A settled acceptor whose handshake identity claims to be the LOCAL member.
   // note_established does not auto-validate Peer::Member identities (only Peer::Client and
   // Peer::Replica, and the latter is blocked), so the conn is not auto-validated on register.
@@ -701,9 +775,14 @@ fn an_accepted_conn_attesting_the_local_member_id_is_aborted() {
 #[test]
 fn coordinator_debug_is_non_exhaustive() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let coord = StreamCoordinator::<CountSm, Passthrough>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let coord =
+    StreamCoordinator::<CountSm, Passthrough>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let debug = std::format!("{coord:?}");
   assert!(
     debug.contains("StreamCoordinator"),
@@ -715,7 +794,13 @@ fn coordinator_debug_is_non_exhaustive() {
 fn with_outbound_cap_scales_the_backlog_threshold() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let coord = StreamCoordinator::<CountSm, Passthrough>::with_outbound_cap(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
+    Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ),
     4096,
   );
   assert_eq!(
@@ -729,9 +814,14 @@ fn with_outbound_cap_scales_the_backlog_threshold() {
 fn propose_membership_delegates_to_the_endpoint() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap(); // primary of view 0, Normal
   let mut wal = TestWal::default();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let op = coord
     .propose_membership(
       Instant::ZERO,
@@ -749,9 +839,14 @@ fn propose_membership_delegates_to_the_endpoint() {
 #[test]
 fn recently_acked_voters_is_empty_before_any_prepare_ack() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   assert!(
     coord.recently_acked_voters(64).is_empty(),
     "a fresh endpoint has acknowledged no in-flight prepare"
@@ -761,9 +856,14 @@ fn recently_acked_voters_is_empty_before_any_prepare_ack() {
 #[test]
 fn try_note_established_member_on_an_unknown_id_is_a_no_op() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let bogus = crate::ConnId::new(u64::MAX);
   // No conn was ever registered at this id: the identity-seal must return without panicking or
   // installing any routing entry.
@@ -777,9 +877,14 @@ fn try_note_established_member_on_an_unknown_id_is_a_no_op() {
 #[test]
 fn a_member_outside_the_active_membership_is_rejected_with_identity_rejected() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   // MemberId(99) is not in the genesis(3) membership {0,1,2}: slot_of must miss and the conn aborts.
   let id = coord.register_accepted(
     Peer::Replica(ReplicaId::new(9)),
@@ -806,10 +911,16 @@ fn a_settling_client_handshake_is_validated_through_try_note_established_member(
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord =
-    StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(
-      Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-    );
+  let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
+    _,
+    SingleChange,
+  >::genesis_unchecked(
+    cfg,
+    genesis(3),
+    1,
+    CountSm::default(),
+    u64::MAX,
+  ));
   // Registered still-handshaking (an acceptor that has not yet seen a hello): note_established is a
   // no-op at registration time, so the Client identity settles only once try_note_established_member
   // is driven by a real inbound handshake — the production path for a genuine client connection.
@@ -855,9 +966,14 @@ fn submit_client_request_drops_an_over_max_body_with_no_side_effects() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let over = Request::new(
     ClientId::new(1),
     RequestNumber::with(1),
@@ -897,9 +1013,14 @@ fn commit_and_install_a_voter_removal(
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 0, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      0,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let conn1 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
   let conn2 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 2);
 
@@ -1006,9 +1127,14 @@ fn poll_timeout_reports_a_scheduled_deadline_for_a_fresh_primary() {
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   // A brand-new endpoint has no timer armed yet; the first handle_timeout bootstraps the Normal
   // primary's cadence (its own commit-heartbeat / prepare-retransmit deadline).
   coord.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
@@ -1021,9 +1147,14 @@ fn poll_timeout_reports_a_scheduled_deadline_for_a_fresh_primary() {
 #[test]
 fn poll_event_is_empty_on_a_fresh_coordinator() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let mut coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   assert!(
     coord.poll_event().is_none(),
     "a fresh endpoint has no queued application event yet"
@@ -1033,9 +1164,14 @@ fn poll_event_is_empty_on_a_fresh_coordinator() {
 #[test]
 fn membership_config_id_and_live_membership_reflect_the_active_config() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   let live = coord.live_membership();
   assert_eq!(
     coord.membership_config_id(),
@@ -1052,9 +1188,14 @@ fn membership_config_id_and_live_membership_reflect_the_active_config() {
 #[test]
 fn oversized_outbound_dropped_starts_at_zero_and_delegates_to_the_router() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
-  let coord = StreamCoordinator::<CountSm, MockRecords>::new(
-    Endpoint::<_, SingleChange>::with_reconfig(cfg, genesis(3), 1, CountSm::default()),
-  );
+  let coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
   assert_eq!(
     coord.oversized_outbound_dropped(),
     0,

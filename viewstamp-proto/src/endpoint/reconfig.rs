@@ -241,6 +241,11 @@ pub fn prepare_restart(
   // The predecessor root's vouched carried-log floor, carried verbatim: the offline successor changes
   // only the configuration, and the floor evidence (what some checkpoint in the cluster vouches) is
   // unchanged by deriving a successor.
-  .with_log_floor(cur.log_floor())?;
+  .with_log_floor(cur.log_floor())?
+  // Carry the predecessor's WAL-geometry pair: an offline reconfiguration changes only the
+  // configuration, not the storage geometry, so the successor root must remain FORMATTED (a node
+  // restarted off it must see the format witness — otherwise it would fail-stop as an unformatted
+  // sole voter, or abdicate as an unformatted primary, defeating the reconfiguration).
+  .with_wal_geometry(cur.checkpoint_ops(), cur.wal_capacity());
   Ok(state)
 }
