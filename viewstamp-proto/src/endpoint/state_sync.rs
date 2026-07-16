@@ -1537,22 +1537,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       let verified_prev = payload.prev_config_id();
       match payload.to_membership_verified(m.epoch(), m.config_id()) {
         Ok(successor) => {
-          // MULTI-epoch DISTANCE bound (XI-b lineage representability). The crossing carries exactly ONE
-          // verified predecessor — `verified_prev`, the installed config's IMMEDIATE predecessor. With the
-          // laggard's own current `config_id` shifted in beneath it, the post-crossing ring holds a
-          // TWO-element chain `[verified_prev, own_prior]`: enough to represent a skip of at most
-          // [`LINEAGE_RING`] epochs (E(n)→E(n+1) needs slot 0; E(n)→E(n+2) needs both slots). A DEEPER skip
-          // (E0→E3: the receiver has NOT proved the missing E2<-E1<-E0 chain, and the single carried `prev`
-          // cannot reconstruct it — `verified_prev` is E2, whose real predecessor E1 the ring cannot hold)
-          // is REJECTED here: the epoch DISTANCE `successor.epoch() - current.epoch()` exceeds what one
-          // carried predecessor can chain. A successor that is NOT strictly ahead (`<= current.epoch()`) is
-          // likewise not a forward crossing. Either way stage NOTHING and return — `sync` stays armed so the
-          // solicit timer re-fetches / a closer (smaller-skip) donor is tried — rather than mis-install a
-          // lineage the ring cannot prove. Saturating subtraction keeps the scalar arithmetic underflow-free.
-          // The single-change E(n)→E(n+1) (distance 1) path always passes (1 <= LINEAGE_RING), unaffected.
-          let current_epoch = self.membership.epoch();
-          let distance = successor.epoch().get().saturating_sub(current_epoch.get());
-          if successor.epoch() <= current_epoch || distance > LINEAGE_RING as u64 {
+          // The crossing must be strictly FORWARD — a successor at or below our current epoch is not a
+          // forward crossing (stage nothing; `sync` stays armed so the solicit timer re-fetches). There
+          // is NO multi-epoch distance bound: the successor membership is WHOLESALE content-verified
+          // (`to_membership_verified` recomputed `hash(membership, prev_config_id) == config_id` above),
+          // which self-certifies the installed configuration at ANY distance — the verification proves the
+          // membership the requester installs, and never depends on the requester's OWN lineage. A deep
+          // skip (E0→E3) is therefore as sound to install as a single step: the content check is identical,
+          // and canonical VR / TigerBeetle re-admit a far-behind replica by WHOLESALE state transfer of the
+          // verified current configuration, not by walking an intermediate E1←E2 chain the receiver was
+          // never going to verify anyway. The post-crossing lineage ring then holds `[verified_prev,
+          // own_prior]` (below), which on a skip deeper than [`LINEAGE_RING`] omits the intermediate
+          // ancestors — a BOUNDED LIVENESS nicety (the ring only widens AGNOSTIC recent-ancestor admission;
+          // a skipped-over intermediate config's agnostic solicitation is simply not admitted, and
+          // state-sync — the very path a stranded laggard uses — is admitted on member identity regardless,
+          // see `sender_admits_solicitation`), never a safety property. Removing the bound is what lets a
+          // member offline across more than two legal changes rejoin instead of stranding forever on a
+          // "closer donor" the protocol does not preserve.
+          if successor.epoch() <= self.membership.epoch() {
             return;
           }
           Some((successor, verified_prev))
@@ -1832,8 +1834,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // crossing target; subtract one for the predecessor. This stamps the EXACT value
       // `durable_root_with_successor` writes (`successor.epoch() - 1`), so a node recovering off that root
       // restores the identical scalar. Single-epoch (`old epoch == successor.epoch() - 1`) is a no-op,
-      // byte-identical. Saturating to stay underflow-free; the `apply_sync` distance bound proved a crossing
-      // has `successor.epoch() >= 1`.
+      // byte-identical. Saturating to stay underflow-free; `apply_sync`'s strictly-forward check proved
+      // `successor.epoch() > self.membership.epoch() >= 0`, so a crossing has `successor.epoch() >= 1`.
       self.prev_epoch = crate::Epoch::new(self.membership.epoch().get().saturating_sub(1));
       // LINEAGE from the VERIFIED chain (the XI-b hash-chain fix). `install_membership`'s default
       // `push_lineage` placed the laggard's own prior (`own_prior_config_id`) at the ring's slot 0 — correct
@@ -1844,7 +1846,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // laggard's own prior). Without this the ring would be `[E0, ..]` and a later re-serve of the successor
       // membership would chain it from E0, recomputing a `config_id` that NO fresh laggard expects — breaking
       // the documented two-prior lineage window. The single-epoch case (`prev == own_prior`) takes neither
-      // extra push, byte-identical to before. `apply_sync` already bounded any skip the ring cannot represent.
+      // extra push, byte-identical to before. On a wholesale crossing DEEPER than the ring (past more than
+      // [`LINEAGE_RING`] changes) the ring holds `[verified_prev, own_prior]` and simply OMITS the
+      // intermediate ancestors: the immediate predecessor is always present (the value a re-serve chains
+      // from, so the recent-lineage window stays correct), and only an agnostic solicitation carrying one of
+      // the SKIPPED-OVER intermediate `config_id`s goes un-admitted here — a bounded liveness nicety
+      // (state-sync is admitted on member identity regardless — `sender_admits_solicitation`), not a safety
+      // gap. The content verification that made the crossing sound never depended on the ring.
       if let Some(verified_prev) = successor_prev_config_id
         && verified_prev != own_prior_config_id
       {

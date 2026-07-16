@@ -1411,7 +1411,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // On a SINGLE-epoch crossing `self.membership.epoch() == successor.epoch() - 1` already, so this is a
     // no-op (the durable root is byte-identical). The in-memory install (`install_sync`) stamps the SAME
     // value, so a node recovering off this root restores the identical scalar. Saturating to keep it
-    // underflow-free; `apply_sync`'s distance bound already proved `successor.epoch() >= 1` for a crossing.
+    // underflow-free; `apply_sync`'s strictly-forward check already proved `successor.epoch() >= 1` for a crossing.
     let prev_epoch = crate::Epoch::new(successor.epoch().get().saturating_sub(1));
     crate::VsrState::try_new_v4(
       view,

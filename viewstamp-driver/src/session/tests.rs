@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use viewstamp_proto::{ClientId, Committed, Event, Instant, OpNumber, Request, RequestNumber};
+use viewstamp_proto::{
+  ClientId, Committed, Epoch, Event, Instant, MemberId, OpNumber, Request, RequestNumber, Status,
+};
 
 use super::{InflightBudget, Pending};
 
@@ -326,5 +328,220 @@ fn a_drained_events_channel_observes_every_event() {
     events_rx.len(),
     0,
     "a kept-up consumer leaves nothing buffered"
+  );
+}
+
+/// `retire` fails every in-flight submit and latches the shared signal: it drains the pending map
+/// (releasing every budget slot, exactly as a shutdown drain does) and records the local id + epoch,
+/// so a submit waiting on a drained entry — woken by its dropped reply sender — resolves to the
+/// terminal `Retired` (see the handle tests) instead of hanging forever.
+#[test]
+fn retire_drains_in_flight_submits_and_latches_the_signal() {
+  let budget = default_budget();
+  let mut pending = std::collections::HashMap::new();
+  // Hold each reply receiver so the entries are not auto-cancelled before `retire`.
+  let mut rxs = Vec::new();
+  for i in 1..=3u64 {
+    let (entry, reply_rx) = pending_entry(&budget, i, Bytes::from_static(b"x"));
+    pending.insert((ClientId::new(1), RequestNumber::with(i)), entry);
+    rxs.push(reply_rx);
+  }
+  assert_eq!(budget.count(), 3);
+
+  let retired = super::Retirement::new();
+  super::retire(&mut pending, &retired, MemberId::new(8), Epoch::new(6));
+
+  assert!(pending.is_empty(), "retire drains every in-flight entry");
+  assert_eq!(
+    budget.count(),
+    0,
+    "and releases every budget slot (no leak)"
+  );
+  assert_eq!(budget.bytes(), 0);
+  let at = retired.get().expect("the signal is latched");
+  assert_eq!(at.local, MemberId::new(8), "the latched local id");
+  assert_eq!(at.epoch, Epoch::new(6), "the latched retirement epoch");
+  for mut reply_rx in rxs {
+    assert!(
+      reply_rx.try_recv().is_err(),
+      "each drained entry's reply receiver is cancelled"
+    );
+  }
+}
+
+/// `retire` is idempotent: a second call keeps the identity latched FIRST (the `OnceLock` write-once
+/// semantics) and re-drains an already-empty map without error, so a repeated `StatusChanged(Retired)`
+/// cannot clobber the identity or double-release.
+#[test]
+fn retire_is_idempotent() {
+  let mut pending = std::collections::HashMap::new();
+  let retired = super::Retirement::new();
+  super::retire(&mut pending, &retired, MemberId::new(1), Epoch::new(1));
+  super::retire(&mut pending, &retired, MemberId::new(2), Epoch::new(2));
+  let at = retired.get().expect("latched");
+  assert_eq!(at.local, MemberId::new(1), "the first latch wins");
+  assert_eq!(at.epoch, Epoch::new(1));
+}
+
+/// Retirement stays OBSERVABLE: the `StatusChanged(Retired)` the pump forwards through `deliver_event`
+/// right after `retire` still reaches the events channel verbatim — `retire` touches only the pending
+/// map and the shared signal, never the observability stream.
+#[test]
+fn status_changed_retired_still_forwards_after_retire() {
+  let (events_tx, events_rx) = flume::bounded(super::EVENTS_CAP);
+  let mut pending = std::collections::HashMap::new();
+  let retired = super::Retirement::new();
+  super::retire(&mut pending, &retired, MemberId::new(3), Epoch::new(2));
+
+  let ev = Event::StatusChanged(Status::Retired);
+  super::deliver_event(&mut pending, &events_tx, ev.clone());
+  assert_eq!(
+    events_rx.try_recv().expect("the retirement is observable"),
+    ev,
+    "StatusChanged(Retired) forwards to the embedder verbatim"
+  );
+}
+
+/// `gate_command_on_retirement` consumes a `Submit` buffered across the latch: it DROPS the reply
+/// sender (waking the caller, whose error path reads the latch and resolves to the terminal
+/// `Retired`) and the reservation guard (releasing its budget slot), returning `None` so the run loop
+/// never inserts it into `pending` nor submits it to the retired endpoint.
+#[test]
+fn gate_command_on_retirement_drops_a_queued_submit() {
+  let budget = default_budget();
+  let reservation = budget.try_acquire(4).expect("a fresh budget has room");
+  let (reply, mut reply_rx) = futures_channel::oneshot::channel::<Bytes>();
+  let cmd = crate::Command::Submit {
+    body: Bytes::from_static(b"body"),
+    reply,
+    reservation,
+  };
+  assert_eq!(budget.count(), 1, "the queued submit holds its reservation");
+
+  let retired = super::Retirement::new();
+  super::retire(
+    &mut super::PendingMap::new(),
+    &retired,
+    MemberId::new(4),
+    Epoch::new(2),
+  );
+  let passed = super::gate_command_on_retirement(&retired, cmd);
+
+  assert!(
+    passed.is_none(),
+    "a queued submit is consumed by the gate, not passed through to the endpoint"
+  );
+  assert_eq!(budget.count(), 0, "its reservation is released (no leak)");
+  assert_eq!(budget.bytes(), 0);
+  assert!(
+    reply_rx.try_recv().is_err(),
+    "its reply sender is dropped, waking the caller (which reads the latch → Retired)"
+  );
+}
+
+/// `gate_command_on_retirement` consumes a `Reconfigure` buffered across the latch: it answers the
+/// reply with the terminal `ReconfigureError::Retired` (carrying the latched identity), mirroring the
+/// `Handle`'s up-front `reconfigure_to` rejection, and returns `None` so no job starts on the retired
+/// endpoint.
+#[test]
+fn gate_command_on_retirement_fails_a_queued_reconfigure() {
+  use std::collections::BTreeSet;
+
+  let (reply, mut reply_rx) = futures_channel::oneshot::channel();
+  let cmd = crate::Command::Reconfigure {
+    target: viewstamp_proto::MembershipTarget::new(
+      BTreeSet::from([MemberId::new(1)]),
+      BTreeSet::new(),
+    ),
+    health: crate::reconfigure::HealthHint::default(),
+    reply,
+  };
+
+  let retired = super::Retirement::new();
+  super::retire(
+    &mut super::PendingMap::new(),
+    &retired,
+    MemberId::new(7),
+    Epoch::new(3),
+  );
+  let passed = super::gate_command_on_retirement(&retired, cmd);
+
+  assert!(
+    passed.is_none(),
+    "a queued reconfigure is consumed by the gate"
+  );
+  match reply_rx.try_recv() {
+    Ok(Some(Err(crate::reconfigure::ReconfigureError::Retired { local, epoch }))) => {
+      assert_eq!(
+        local,
+        MemberId::new(7),
+        "the reconfigure reply carries the latched local id"
+      );
+      assert_eq!(epoch, Epoch::new(3), "and the latched retirement epoch");
+    }
+    other => panic!("expected the terminal Retired reconfigure error, got {other:?}"),
+  }
+}
+
+/// `gate_command_on_retirement` gates ONLY the kinds that would wait on a commit/reply from the
+/// retired endpoint: with nothing latched a `Submit` passes through untouched (keeping its
+/// reservation for the run loop), and even once latched a `Shutdown` (a retired driver must still tear
+/// down) and an `AddPeer` (waits on no commit) pass through unchanged.
+#[test]
+fn gate_command_on_retirement_passes_non_waiting_kinds_through() {
+  let budget = default_budget();
+
+  // Not retired: a Submit passes straight through, still owning its reservation.
+  let unlatched = super::Retirement::new();
+  let reservation = budget.try_acquire(1).expect("a fresh budget has room");
+  let (reply, _reply_rx) = futures_channel::oneshot::channel::<Bytes>();
+  let passed = super::gate_command_on_retirement(
+    &unlatched,
+    crate::Command::Submit {
+      body: Bytes::from_static(b"x"),
+      reply,
+      reservation,
+    },
+  );
+  assert!(
+    matches!(passed, Some(crate::Command::Submit { .. })),
+    "with no retirement latched a submit passes through unchanged"
+  );
+  assert_eq!(
+    budget.count(),
+    1,
+    "the passed-through submit still holds its reservation"
+  );
+  drop(passed);
+
+  // Retired: Shutdown and AddPeer still pass through.
+  let retired = super::Retirement::new();
+  super::retire(
+    &mut super::PendingMap::new(),
+    &retired,
+    MemberId::new(1),
+    Epoch::new(1),
+  );
+  let (ack, _ack_rx) = futures_channel::oneshot::channel::<()>();
+  assert!(
+    matches!(
+      super::gate_command_on_retirement(&retired, crate::Command::Shutdown { ack }),
+      Some(crate::Command::Shutdown { .. })
+    ),
+    "Shutdown passes through even when retired (the driver must still tear down)"
+  );
+  let addr = "127.0.0.1:9000".parse().expect("a valid socket address");
+  assert!(
+    matches!(
+      super::gate_command_on_retirement(
+        &retired,
+        crate::Command::AddPeer {
+          member_id: MemberId::new(2),
+          addr,
+        },
+      ),
+      Some(crate::Command::AddPeer { .. })
+    ),
+    "AddPeer passes through even when retired (it waits on no commit)"
   );
 }

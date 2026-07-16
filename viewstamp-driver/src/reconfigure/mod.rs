@@ -13,8 +13,8 @@ use std::{
 };
 
 use viewstamp_proto::{
-  Instant, MemberId, Membership, MembershipTarget, OpNumber, PlanError, ProposeMembershipError,
-  SingleVoterDelta,
+  Epoch, Instant, MemberId, Membership, MembershipTarget, OpNumber, PlanError,
+  ProposeMembershipError, SingleVoterDelta,
 };
 
 /// An OPTIONAL operator-supplied liveness hint for the shrink phase, split into a NEGATIVE set and a
@@ -175,6 +175,16 @@ pub enum ReconfigureError {
   /// polling a dead driver.
   #[error("the driver is gone; redirect to a live replica")]
   DriverGone,
+  /// This node removed itself from the configuration and is terminally retired — no longer a cluster
+  /// member, so it cannot drive a reconfiguration. TERMINAL — do NOT retry against this handle;
+  /// redirect to a live replica. Mirrors [`crate::DriverError::Retired`] for the reconfiguration path.
+  #[error("node {local} is retired at epoch {epoch}; redirect to a live replica")]
+  Retired {
+    /// The local member id the active membership no longer contains.
+    local: viewstamp_proto::MemberId,
+    /// The configuration epoch this node was retired at.
+    epoch: viewstamp_proto::Epoch,
+  },
   /// A non-retryable proto proposal verdict (the retryable ones — `ProofPending`/`AlreadyInFlight`/`Busy`/
   /// `AtCapacity` — are handled internally as backoff).
   #[error("the reconfiguration proposal was rejected: {0}")]
@@ -883,6 +893,50 @@ impl ReconfigureJob {
       reconfigure_timeout,
       target,
     }
+  }
+
+  /// Terminally finish this job because the local endpoint has RETIRED — either it removed itself as
+  /// this job's final step, or a CONCURRENT configuration change removed it while this job still held
+  /// an outstanding proposal. Consumes the job (its outstanding step is DISCARDED — a retired endpoint
+  /// installs nothing further) and resolves the caller's future.
+  ///
+  /// The outcome distinguishes the two facts a retirement can carry, reusing the executor's own goal
+  /// test (`plan_reconfiguration(live, target)` yielding an EMPTY plan):
+  /// - GOAL ALREADY REACHED — the reconfiguration actually completed (`sets(live) == target`): resolve
+  ///   `Ok(())`. The local removal is a SEPARATE fact the caller reads from the terminal driver state.
+  /// - OTHERWISE — the goal is unreachable from here (the concurrent removal displaced it): resolve the
+  ///   terminal [`ReconfigureError::Retired`], carrying the same `(local, epoch)` the [`crate::retire`]
+  ///   latch records.
+  ///
+  /// Without this the driver leaves the job parked: [`Self::advance`] resolves an outstanding step only
+  /// once the live `config_id` reaches the awaited successor, which a competing removal makes
+  /// unreachable — so the caller would wait out the whole `reconfigure_timeout` and receive a
+  /// misleading (resumable) [`ReconfigureError::Timeout`] instead of the terminal `Retired`.
+  pub fn finish_on_retire(self, live: Membership, local: MemberId, epoch: Epoch) {
+    use viewstamp_proto::plan_reconfiguration;
+    let result = match plan_reconfiguration(&live, &self.target) {
+      Ok(plan) if plan.is_empty() => Ok(()),
+      _ => Err(ReconfigureError::Retired { local, epoch }),
+    };
+    let _ = self.reply.send(result);
+  }
+}
+
+/// Finish an in-flight reconfiguration [`ReconfigureJob`] when the local endpoint retires, then EMPTY
+/// the slot — the companion to [`crate::retire`] for the STARTED-job case. The run loop calls this at
+/// its `StatusChanged(Retired)` site right after `retire`: `retire` fails the in-flight SUBMITS, this
+/// finishes the in-flight reconfiguration JOB. A `None` slot (no job in flight) is a no-op.
+///
+/// See [`ReconfigureJob::finish_on_retire`] for the resolution rule (goal reached → `Ok(())`, else the
+/// terminal [`ReconfigureError::Retired`]).
+pub fn finish_reconfigure_on_retire(
+  reconfigure: &mut Option<ReconfigureJob>,
+  live: Membership,
+  local: MemberId,
+  epoch: Epoch,
+) {
+  if let Some(job) = reconfigure.take() {
+    job.finish_on_retire(live, local, epoch);
   }
 }
 

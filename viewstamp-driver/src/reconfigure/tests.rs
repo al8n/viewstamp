@@ -182,6 +182,10 @@ fn reconfigure_error_display_renders_for_each_variant() {
     )),
     ReconfigureError::NotPrimary,
     ReconfigureError::DriverGone,
+    ReconfigureError::Retired {
+      local: MemberId::new(1),
+      epoch: viewstamp_proto::Epoch::new(2),
+    },
     ReconfigureError::Propose(ProposeMembershipError::NotPrimary),
   ];
   for e in &errs {
@@ -863,5 +867,75 @@ fn self_removal_is_ranked_last_even_when_local_has_no_positive_evidence() {
     result,
     Some(SingleVoterDelta::RemoveVoter(MemberId::new(3))),
     "RemoveVoter(3) must be chosen before RemoveVoter(1) (self) even when both are apparently_down"
+  );
+}
+
+// ── finish-on-retire (displaced in-flight job) tests ──────────────
+
+/// A job whose target is NOT yet reached, held in the slot when the endpoint retires (a concurrent
+/// removal), is finished with the terminal `Retired` and its slot emptied — never left parked for
+/// `advance` to spin out to a misleading resumable `Timeout`.
+#[test]
+fn finish_reconfigure_on_retire_resolves_retired_when_the_goal_is_unreached() {
+  let live = membership_of(&[1, 2, 3]);
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  let target = MembershipTarget::new(member_set(&[1, 2, 3, 4]), BTreeSet::new());
+  let job = ReconfigureJob::start(
+    target,
+    HealthHint::default(),
+    64,
+    Duration::from_secs(30),
+    reply_tx,
+    live.clone(),
+    member_set(&[1, 2, 3]),
+    MemberId::new(1),
+  );
+  let mut slot = Some(job);
+
+  let local = MemberId::new(1);
+  let epoch = viewstamp_proto::Epoch::new(7);
+  finish_reconfigure_on_retire(&mut slot, live, local, epoch);
+
+  assert!(slot.is_none(), "the job slot is emptied");
+  assert!(
+    matches!(
+      reply_rx.try_recv(),
+      Ok(Some(Err(ReconfigureError::Retired { local: l, epoch: e }))) if l == local && e == epoch
+    ),
+    "an unreached goal resolves the terminal Retired carrying the retirement identity"
+  );
+}
+
+/// A job whose target EQUALS the live membership — its reconfiguration actually completed (e.g. its
+/// final step removed the local node) — resolves `Ok(())` on retirement, not `Retired`: the local
+/// removal is a separate fact the caller reads from the terminal driver state.
+#[test]
+fn finish_reconfigure_on_retire_resolves_ok_when_the_goal_is_already_reached() {
+  let live = membership_of(&[1, 2, 3]);
+  let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
+  let target = MembershipTarget::new(member_set(&[1, 2, 3]), BTreeSet::new());
+  let job = ReconfigureJob::start(
+    target,
+    HealthHint::default(),
+    64,
+    Duration::from_secs(30),
+    reply_tx,
+    live.clone(),
+    member_set(&[1, 2, 3]),
+    MemberId::new(1),
+  );
+  let mut slot = Some(job);
+
+  finish_reconfigure_on_retire(
+    &mut slot,
+    live,
+    MemberId::new(1),
+    viewstamp_proto::Epoch::new(7),
+  );
+
+  assert!(slot.is_none(), "the job slot is emptied");
+  assert!(
+    matches!(reply_rx.try_recv(), Ok(Some(Ok(())))),
+    "a reached goal resolves Ok(()), never Retired"
   );
 }

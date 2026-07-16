@@ -29,7 +29,7 @@
 use std::{
   collections::HashMap,
   sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
   },
   time::Duration,
@@ -37,11 +37,11 @@ use std::{
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  BlockStore, ClientId, Config, Endpoint, Event, Instant, Membership, Recovered, Request,
-  RequestNumber, SingleChange, StateMachine, Superblock, Wal,
+  BlockStore, ClientId, Config, Endpoint, Epoch, Event, Instant, MemberId, Membership, Recovered,
+  Request, RequestNumber, SingleChange, StateMachine, Superblock, Wal,
 };
 
-use crate::DriverError;
+use crate::{Command, DriverError};
 
 /// Initialize a driver's store as a member of a NEW cluster — the one-time cluster-creation step,
 /// forwarding to [`viewstamp_proto::format`]. It writes the durable genesis root (empty consensus
@@ -382,6 +382,135 @@ pub type PendingMap = HashMap<(ClientId, RequestNumber), Pending>;
 /// to any still-waiting `submit`.
 pub fn drain_pending(pending: &mut PendingMap) {
   pending.clear();
+}
+
+/// The stable identity a driver latches when its endpoint retires: the local member id and the
+/// configuration epoch of the membership that removed it. These mirror the recovery-time
+/// [`Retired`](viewstamp_proto::Retired) fields, so a LIVE self-removal surfaces the SAME
+/// [`crate::DriverError::Retired`] a restart over the removed membership would — one terminal driver
+/// state for one durable node-state, however it was reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredAt {
+  /// The local member id the active membership no longer contains.
+  pub local: MemberId,
+  /// The configuration epoch this node was retired at.
+  pub epoch: Epoch,
+}
+
+/// A shared, write-once terminal signal that a driver's endpoint has RETIRED — removed itself from
+/// the configuration. One clone lives in every [`crate::Handle`] and one in the driver's run loop:
+/// the run loop LATCHES it on the live->retired transition, and the `Handle` READS it to fail submits
+/// terminally instead of blackholing them against a node that can never commit again.
+///
+/// The inner [`OnceLock`] latches exactly once. Retirement is PERMANENT (a removed node never resumes
+/// under the same identity — a restart over the removed membership fails closed with
+/// [`crate::DriverError::Retired`]), so the first latch wins and every later reader observes the same
+/// [`RetiredAt`]. Reads are lock-free; the latch is a single store.
+#[derive(Clone, Debug, Default)]
+pub struct Retirement {
+  at: Arc<OnceLock<RetiredAt>>,
+}
+
+impl Retirement {
+  /// A fresh, un-latched signal. The driver constructs one and shares a clone with its
+  /// [`crate::Handle`]; both observe the same latch.
+  #[must_use]
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// Latch the terminal retirement. Idempotent — the first call wins and later calls are no-ops (the
+  /// `OnceLock::set` fails silently once set), so a repeated `StatusChanged(Retired)` cannot clobber
+  /// the identity latched first.
+  fn latch(&self, local: MemberId, epoch: Epoch) {
+    let _ = self.at.set(RetiredAt { local, epoch });
+  }
+
+  /// The latched retirement, or `None` while the driver is still a live cluster member.
+  pub fn get(&self) -> Option<RetiredAt> {
+    self.at.get().copied()
+  }
+}
+
+/// Fail every in-flight submit with the terminal retirement outcome and latch the shared terminal
+/// signal — the driver-side handler for the live->retired transition. Each driver's event pump calls
+/// this when [`Event::StatusChanged`] reports [`Status::is_retired`](viewstamp_proto::Status::is_retired):
+/// a node that removed itself from the configuration is structurally
+/// [`Status::Retired`](viewstamp_proto::Status::Retired) and emits no further [`Event::Committed`], so
+/// a `pending` submit awaiting its commit would hang forever and further submits would blackhole
+/// against a now-no-op coordinator.
+///
+/// Two effects, in this order:
+/// 1. LATCH the shared [`Retirement`] with the endpoint's `local` id and membership `epoch`. Latching
+///    BEFORE the drain is load-bearing: a submit woken by step 2 (its reply sender dropped) reads the
+///    latch and resolves to [`crate::DriverError::Retired`] rather than the generic `ReplyDropped` a
+///    bare oneshot-cancel yields, and a submit racing in AFTER this returns `Retired` up front (before
+///    reserving budget or touching the command channel). A command ALREADY buffered in the command
+///    channel — enqueued (or racing the `Handle`'s preflight latch read) before this latch — is caught
+///    when the run loop drains it, by [`gate_command_on_retirement`].
+/// 2. DRAIN every in-flight entry via [`drain_pending`]: dropping each [`Pending`]'s reply sender
+///    cancels its waiting `submit`, and dropping each [`ReservationGuard`] frees its
+///    [`InflightBudget`] slot — so the budget returns to zero exactly as on a shutdown drain and never
+///    leaks. Idempotent: a second call latches nothing new and re-drains an already-empty map.
+///
+/// The triggering `Event::StatusChanged(Retired)` still forwards to the observability channel through
+/// the ordinary [`deliver_event`] the pump calls next, so an embedder subscribed to
+/// [`crate::Handle::events`] still observes the retirement.
+pub fn retire(pending: &mut PendingMap, retired: &Retirement, local: MemberId, epoch: Epoch) {
+  retired.latch(local, epoch);
+  drain_pending(pending);
+}
+
+/// Gate a command drained from the driver's command channel on the retirement latch — the
+/// consumption-time companion to the [`crate::Handle`]'s up-front rejection. A `Submit` or
+/// `Reconfigure` a caller enqueued (or that raced the `Handle`'s preflight latch read) BEFORE the run
+/// loop latched [`Retirement`] is still buffered when the loop drains it; a retired endpoint emits no
+/// further [`Event::Committed`] and no-ops any membership proposal, so either command handed to it
+/// would leave its caller waiting forever while its reservation stayed held — the very hang the
+/// retirement latch exists to prevent, one hop downstream.
+///
+/// Returns `Some(cmd)` for a command the run loop should still process, or `None` once this has
+/// RESOLVED the gated command in place:
+/// - [`Command::Submit`]: DROP its reply sender and its [`ReservationGuard`]. Dropping the sender
+///   wakes the caller's `submit` await, whose error path reads this same latch (the `Handle`'s
+///   `reply_dropped_reason`) and resolves to the terminal [`crate::DriverError::Retired`]; dropping
+///   the guard frees the [`InflightBudget`] slot. The submit never enters `pending` nor reaches the
+///   endpoint, and its budget cannot leak.
+/// - [`Command::Reconfigure`]: answer its reply with the terminal
+///   [`ReconfigureError::Retired`](crate::reconfigure::ReconfigureError::Retired), mirroring the
+///   `Handle`'s up-front `reconfigure_to` rejection; the goal never reaches the endpoint.
+///
+/// [`Command::Shutdown`] and [`Command::AddPeer`] pass through unchanged (`Some(cmd)`): neither waits
+/// on a commit from the retired endpoint, and a retired driver must still tear down on `Shutdown`.
+///
+/// This also closes the check-to-enqueue race against the `Handle`'s preflight: the latch is set
+/// BEFORE [`retire`] drains, and this gate runs AFTER the command is dequeued, so a command that
+/// slipped past the preflight before the latch is caught here — one of the two checks always sees it.
+pub fn gate_command_on_retirement(retired: &Retirement, cmd: Command) -> Option<Command> {
+  let Some(at) = retired.get() else {
+    return Some(cmd);
+  };
+  match cmd {
+    Command::Submit {
+      reply, reservation, ..
+    } => {
+      // Wake the caller — its dropped reply sender resolves the await to the latched `Retired` — and
+      // release the budget slot (the guard's `Drop`); the submit never enters `pending` nor reaches
+      // the endpoint.
+      drop(reply);
+      drop(reservation);
+      None
+    }
+    Command::Reconfigure { reply, .. } => {
+      let _ = reply.send(Err(crate::reconfigure::ReconfigureError::Retired {
+        local: at.local,
+        epoch: at.epoch,
+      }));
+      None
+    }
+    // A retired driver still shuts down, and an address-book update waits on no commit.
+    other => Some(other),
+  }
 }
 
 /// Reap cancelled submits, then collect the requests due for retransmission. Shared by both drivers'
