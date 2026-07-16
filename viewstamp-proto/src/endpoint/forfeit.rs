@@ -65,10 +65,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     //
     // ONLY committed holes (`op <= commit_max`) gate the forfeit. An ABOVE-`commit_max` repair hole is
     // a body-aware nack-truncation CANDIDATE (`start_view_as_new_primary` `request_repair`s it too, so
-    // it also lands in `self.repair`): it is resolved by the 5s `repair_or_truncate` grace (filled if a
-    // holder answers, else truncated), NOT by a forfeit. Counting it here would latch `pending_forfeit`
-    // at the 300ms `FORFEIT_GRACE` — long before the 5s grace — and the truncation (gated OFF during
-    // `pending_forfeit`) would never fire, wedging the cluster. So the "stuck committed hole" signal is
+    // it also lands in `self.repair`): it is resolved by the nack-quorum truncation (`on_nack` →
+    // `truncate_uncommitted_tail_from` — filled if a holder answers, truncated once `f+1` distinct
+    // voters nack), NOT by a forfeit. Counting it here would latch `pending_forfeit` at the 300ms
+    // `FORFEIT_GRACE`, and `on_nack`'s tally is gated OFF while `pending_forfeit` holds — so the
+    // truncation could never fire and the cluster would wedge. So the "stuck committed hole" signal is
     // restricted to `op <= commit_max`; a legitimate unfillable committed hole still forfeits.
     let committed_repair_hole = self.repair.iter().any(|&op| op <= self.commit_max.get());
     let stuck = lag >= self.config.forfeit_checkpoint_lag() || committed_repair_hole;

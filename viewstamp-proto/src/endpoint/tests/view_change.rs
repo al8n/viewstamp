@@ -6788,6 +6788,7 @@ fn large_bodied_view_change_carriers_and_repair_serve_fit_the_frame() {
     u64::MAX,
   );
   e.view = View::with(1);
+  e.durable_view = View::with(1);
   e.log_view = View::with(1);
   e.op = OpNumber::with(ENTRIES);
   e.commit_min = OpNumber::with(ENTRIES);
@@ -6960,6 +6961,7 @@ fn repair_range_serve_clamps_a_huge_hi_to_the_window_against_a_sparse_high_op_lo
     u64::MAX,
   );
   e.view = View::with(1);
+  e.durable_view = View::with(1);
   e.log_view = View::with(1);
   e.op = OpNumber::with(head);
   e.commit_min = OpNumber::with(head);
@@ -7345,6 +7347,7 @@ fn svc_and_get_view_at_view_max_neither_panic_nor_wrap() {
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
   e.view = View::with(u64::MAX);
+  e.durable_view = View::with(u64::MAX);
   e.log_view = View::with(u64::MAX);
   e.svc_target = View::with(u64::MAX);
   e.handle_message(
@@ -7400,6 +7403,7 @@ fn escalation_at_view_max_saturates_instead_of_wrapping() {
   );
   let mut sb = TestSb::default();
   e.view = View::with(u64::MAX);
+  e.durable_view = View::with(u64::MAX);
   e.log_view = View::with(u64::MAX);
   e.svc_target = View::with(u64::MAX);
   e.propose_next_view(Instant::ZERO, &mut sb);
@@ -7692,4 +7696,528 @@ fn drained_prepare_ok_for(e: &mut Endpoint<NoopSm>, op: u64) -> bool {
     }
   }
   saw
+}
+
+#[test]
+fn a_catch_up_escalation_casts_no_vote_for_an_undurable_view() {
+  // durable-view-before-participate across the catch-up escalation. A backup adopts an advertised
+  // higher view IN MEMORY ONLY (the catch-up posture is a probe — deliberately no durable-view
+  // write), so the posture must never migrate into the vote-casting regime: a DoViewChange for that
+  // view would be a vote a crash erases (recovery resumes the durable view), letting the replica
+  // participate twice across the crash. The escalation keeps only its safe half — driving the
+  // SUCCESSOR view's StartViewChange, a proposal needing no durability — and after the bounded
+  // validation window expires unanswered, the posture reverts to the durable view.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  // A Commit stamped view 5 from view 5's primary (replica 2 = 5 mod 3) — the higher-view rule.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Commit(Commit::new(
+      View::with(5),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  assert!(
+    e.catching_up(),
+    "the higher-view rule enters the catch-up posture"
+  );
+  assert_eq!(e.view(), View::with(5));
+  assert_eq!(
+    e.durable_view,
+    View::new(),
+    "the probe adopted the view in memory only — the durable witness stays at view 0"
+  );
+  while e.poll_message().is_some() {} // drain the initial GetView
+
+  // Step through the whole validation window (3 x 500ms) plus slack, servicing every due timer.
+  // The posture may keep probing (GetView) and may drive the SUCCESSOR view's SVC — but a
+  // DoViewChange for the un-durable view must never appear, at any tick.
+  let mut saw_successor_svc = false;
+  for ms in (100..=1600).step_by(100) {
+    let t = now + core::time::Duration::from_millis(ms);
+    e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    while let Some(out) = e.poll_message() {
+      match out.msg_ref() {
+        Message::DoViewChange(d) => panic!(
+          "a catch-up posture cast a DoViewChange for view {} with no durable witness",
+          d.view()
+        ),
+        Message::StartViewChange(s) if s.view() == View::with(6) => saw_successor_svc = true,
+        _ => {}
+      }
+    }
+  }
+  assert!(
+    saw_successor_svc,
+    "the escalation still drives the successor view's SVC (the liveness half is kept)"
+  );
+  // The window expired with nothing validating view 5: the posture reverted to the durable view
+  // instead of stranding — a Normal backup of view 0 again, no vote cast anywhere.
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::new());
+  assert_eq!(e.durable_view, View::new());
+}
+
+#[test]
+fn a_stranded_catch_up_reverts_and_readopts_the_real_view() {
+  // One corrupted view scalar of plausible magnitude must not cost the replica until a process
+  // restart. The catch-up posture it opens is unanswerable (nobody serves GetView above the
+  // cluster's view, successor SVCs are implausible to every peer, and all real traffic reads as
+  // stale) — so the bounded validation window expires and the replica REVERTS to its durable view,
+  // after which the cluster's real next view adopts it normally.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(2)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  // A Commit whose view field is corrupted to v + 2^20 (its claimed primary is replica 1 =
+  // 1048576 mod 3, so sender-binding passes — the scalar itself is the corruption).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Commit(Commit::new(
+      View::with(1 << 20),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  assert_eq!(e.view(), View::with(1 << 20));
+  while e.poll_message().is_some() {}
+  // The whole validation window passes with the claim unvalidated.
+  for ms in (100..=1600).step_by(100) {
+    let t = now + core::time::Duration::from_millis(ms);
+    e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    while e.poll_message().is_some() {}
+  }
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "the unanswerable posture reverted instead of stranding until a restart"
+  );
+  assert_eq!(e.view(), View::new());
+
+  // The cluster's REAL next view now adopts the replica normally: a StartView for view 1 from its
+  // primary lands, the adoption persists the view, and the witness advances through the completed
+  // write — full participation restored without any operator intervention.
+  let t = now + core::time::Duration::from_millis(1700);
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec![PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(7),
+        RequestNumber::with(1),
+        bytes::Bytes::from_static(b"x"),
+      )],
+    )),
+  );
+  e.handle_storage(t, &mut wal, &mut sb, &mut blocks); // the AdoptedStartView root lands
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::with(1));
+  assert_eq!(
+    e.durable_view,
+    View::with(1),
+    "the adoption's completed root advanced the durable witness"
+  );
+}
+
+#[test]
+fn a_learner_catch_up_never_arms_the_escalation_window() {
+  // A non-voting learner's catch-up posture has no vote to protect and no escalation to drive: it
+  // solicits StartView indefinitely (the validation window is never armed for it — reverting would
+  // heal nothing a learner does, and it casts nothing a revert could endanger). This pins the
+  // deliberate scope of the bounded window: voters, where the double-participation and fault-margin
+  // stakes live.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(3)).unwrap(),
+    genesis_with_learners(3, 1),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Commit(Commit::new(
+      View::with(5),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  assert!(e.catching_up());
+  assert!(
+    e.timers.view_change_status.is_none(),
+    "a learner never arms the escalation/validation window"
+  );
+  while e.poll_message().is_some() {}
+  let mut saw_get_view = false;
+  for ms in (100..=2500).step_by(100) {
+    let t = now + core::time::Duration::from_millis(ms);
+    e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    while let Some(out) = e.poll_message() {
+      match out.msg_ref() {
+        Message::DoViewChange(_) | Message::StartViewChange(_) => {
+          panic!("a learner cast a view-change message from the catch-up posture")
+        }
+        Message::GetView(_) => saw_get_view = true,
+        _ => {}
+      }
+    }
+  }
+  assert!(saw_get_view, "the learner keeps soliciting the StartView");
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "no revert: the posture persists"
+  );
+  assert!(e.catching_up());
+  assert_eq!(e.view(), View::with(5));
+}
+
+#[test]
+fn the_dvc_retransmit_waits_for_the_durable_view_witness() {
+  // The DVC gates key on the durable-view WITNESS (`durable_view == view`), not merely on "no write
+  // in flight": while the SendDoViewChange root is still with the backend, the witness trails the
+  // view and every DVC path holds; the completed write advances the witness and only then does the
+  // deferred vote go out.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  // Two peer SVCs for view 1 form the quorum; entering the view SUBMITS the durable-view write,
+  // which the stepped superblock HOLDS in flight.
+  for r in [1u16, 2] {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Replica(ReplicaId::new(r)),
+      Message::StartViewChange(StartViewChange::new(
+        View::with(1),
+        ReplicaId::new(r),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+  }
+  assert_eq!(e.status(), Status::ViewChange);
+  assert_eq!(e.view(), View::with(1));
+  assert!(
+    sb.has_inflight(),
+    "the durable-view write is held in flight"
+  );
+  assert_eq!(
+    e.durable_view,
+    View::new(),
+    "the witness trails the un-persisted view"
+  );
+  while e.poll_message().is_some() {} // drain SVC traffic
+  // Several DVC-retransmit deadlines pass while the write is in flight: no vote may go out.
+  for ms in (100..=400).step_by(100) {
+    let t = now + core::time::Duration::from_millis(ms);
+    e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    while let Some(out) = e.poll_message() {
+      assert!(
+        !matches!(out.msg_ref(), Message::DoViewChange(_)),
+        "a DVC was cast while the view's durable witness was still trailing"
+      );
+    }
+  }
+  // The write lands: the witness advances and the deferred initial DVC goes out.
+  sb.flush();
+  let t = now + core::time::Duration::from_millis(500);
+  e.handle_storage(t, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(e.durable_view, View::with(1));
+  let mut saw_dvc = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::DoViewChange(d) = out.msg_ref() {
+      assert_eq!(d.view(), View::with(1));
+      saw_dvc = true;
+    }
+  }
+  assert!(saw_dvc, "the completed write releases the deferred vote");
+}
+
+#[test]
+fn a_reverted_primary_steps_down_and_a_retried_request_applies_once() {
+  // A PRIMARY whose catch-up probe reverts must not resume serving its generation: the probe's
+  // entry reset destroyed the provisional session watermarks and vote tallies, so a resumed primary
+  // would re-mint a retried request it already holds in its log — committing BOTH copies once a
+  // later view change re-selects them (double execution) — and could never commit the held op whose
+  // tally was dropped. The revert instead lands it in the deferred-forfeit step-down: minting is
+  // refused, the successor view forms, its canonical selection re-commits the held op exactly once,
+  // and the re-seeded watermarks dedup the retry.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  // The primary of view 0 accepts request R (rn 1) at op 1; no backup acks — uncommitted.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from_static(b"R"),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(e.op(), OpNumber::with(1));
+  while e.poll_message().is_some() {}
+
+  // A corrupted higher-view Commit opens the probe (its claimed primary is replica 1 = 7 mod 3);
+  // the whole validation window then expires unanswered.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::Commit(Commit::new(
+      View::with(7),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  for ms in (100..=1600).step_by(100) {
+    let t = now + core::time::Duration::from_millis(ms);
+    e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    while e.poll_message().is_some() {}
+  }
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::new());
+  assert!(
+    e.pending_forfeit,
+    "the reverted primary lands in the deferred-forfeit step-down, not in service"
+  );
+
+  // The client retries R. A stepping-down primary refuses to mint — the retry must NOT become a
+  // second op on a generation whose dedup state is gone.
+  let t = now + core::time::Duration::from_millis(1700);
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from_static(b"R"),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "no re-mint: the retried request must not take a second op number"
+  );
+  while e.poll_message().is_some() {}
+
+  // The successor view forms (the step-down's own proposal plus the backups'), and its new primary
+  // re-drives the held op: this replica adopts the canonical log — op 1 = R, committed — and applies
+  // it EXACTLY once; the adoption re-seeds the watermark, so the retry now dedups instead of minting.
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(StartView::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec![PreparedEntry::new(
+        OpNumber::with(1),
+        ClientId::new(9),
+        RequestNumber::with(1),
+        Bytes::from_static(b"R"),
+      )],
+    )),
+  );
+  e.handle_storage(t, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::with(1));
+  assert_eq!(
+    e.state_machine_ref().applied().len(),
+    1,
+    "the retried request executed exactly once across the revert and the view change"
+  );
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from_static(b"R"),
+    )),
+  );
+  assert_eq!(
+    e.op(),
+    OpNumber::with(1),
+    "the retry dedups against the re-seeded watermark"
+  );
+  assert_eq!(e.state_machine_ref().applied().len(), 1);
+}
+
+#[test]
+fn a_reverted_probe_still_rejects_far_proposals() {
+  // The revert restores the durable view WITHOUT widening the jump guard: a far-ahead proposal —
+  // even a genuine survivor's, from a view that really formed while this replica's probe was
+  // partitioned — stays rejected, exactly as it does for a replica that CRASHED at the same lagging
+  // durable view and recovered. This pins the deliberate limitation the revert shares with the
+  // crash path (a far-lagging replica rejoins only through authoritative traffic from a live
+  // primary; a validated far-view rejoin is a distinct mechanism): the revert must never carry
+  // state that lets ONE message move the replica toward a durable transition — an admitted lone
+  // proposal reaches the SVC quorum instantly in a three-voter cluster (self plus sender), turning
+  // a memory-only strand into a durable one on a single corrupted message.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Commit(Commit::new(
+      View::with(5),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.view(), View::with(5));
+  for ms in (100..=1600).step_by(100) {
+    let t = now + core::time::Duration::from_millis(ms);
+    e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    while e.poll_message().is_some() {}
+  }
+  assert_eq!(e.status(), Status::Normal, "the unvalidated probe reverted");
+  assert_eq!(e.view(), View::new());
+  assert!(!e.pending_forfeit, "a backup's revert does not step down");
+
+  let t = now + core::time::Duration::from_millis(1700);
+  // Still bounded: a proposal far beyond the abandoned neighborhood stays rejected.
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(100),
+      ReplicaId::new(2),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    e.poll_message().is_none(),
+    "a target beyond the abandoned view's successor is still rejected"
+  );
+  // Even the ABANDONED view's own successor — a genuine survivor's proposal — is rejected: the
+  // revert retained nothing that widens the guard, so no single message can move this replica
+  // toward a durable transition (an admitted lone proposal would reach the SVC quorum instantly in
+  // a three-voter cluster — self plus sender). The replica rejoins when a live primary's
+  // authoritative traffic re-opens the catch-up probe, or via the ordinary immediate-successor
+  // proposals of its own durable view.
+  e.handle_message(
+    t,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(6),
+      ReplicaId::new(2),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    e.poll_message().is_none(),
+    "the abandoned neighborhood's successor is rejected like any far proposal"
+  );
+  assert_eq!(e.status(), Status::Normal);
+  assert_eq!(e.view(), View::new());
 }
