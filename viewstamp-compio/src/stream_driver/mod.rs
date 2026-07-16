@@ -23,8 +23,9 @@ use viewstamp_proto::{
 
 use viewstamp_driver::{
   Clock, Command, DriverConfig, DriverError, Handle, InflightBudget, Pending, PendingMap,
-  build_endpoint, deliver_event, drain_pending, jittered, pending_scan_interval,
-  reap_and_collect_retransmits,
+  Retirement, build_endpoint, deliver_event, drain_pending, finish_reconfigure_on_retire,
+  gate_command_on_retirement, jittered, pending_scan_interval, reap_and_collect_retransmits,
+  retire,
 };
 
 use crate::bridge::{
@@ -148,6 +149,10 @@ pub struct CompioStreamDriver<S, R, W, B, L> {
   /// the driver itself never releases against this handle.
   #[cfg(test)]
   budget: InflightBudget,
+  /// Shared write-once terminal retirement signal, latched by the run loop's event pump when this
+  /// endpoint removes itself from the configuration. Its `Handle` clone reads it to fail submits
+  /// terminally (see [`retire`] and [`Handle::submit`]).
+  retired: Retirement,
   /// One owned unit per connection; its redial target (if any) lives in [`Conn::redial`], so there
   /// is no separate dialed-peer map to keep in sync. Bounded by max_conns + the peer count: accept
   /// admission stops at max_conns live conns, while mesh dials are never refused (consensus
@@ -359,6 +364,7 @@ where
     // effectively bounded by the configured peer count; see the field doc.
     let (dr_tx, dr_rx) = flume::unbounded();
     let budget = InflightBudget::new(cfg.max_inflight(), cfg.max_pending_bytes());
+    let retired = Retirement::new();
     let driver = Self {
       coord,
       wal,
@@ -373,6 +379,7 @@ where
       next_pending_scan: Instant::ZERO,
       #[cfg(test)]
       budget: budget.clone(),
+      retired: retired.clone(),
       conns: HashMap::new(),
       close_counts: [0; CloseCause::COUNT],
       peer_addrs: peers.into_iter().collect(),
@@ -390,7 +397,7 @@ where
       storage_notifier_closed: false,
       reconfigure: None,
     };
-    let handle = Handle::new(commands_tx, events_rx, budget);
+    let handle = Handle::new(commands_tx, events_rx, budget, retired);
     Ok((driver, handle))
   }
 }
@@ -813,6 +820,12 @@ where
     cmd: Command,
     shutdown_ack: &mut Option<oneshot::Sender<()>>,
   ) -> bool {
+    // Gate on the retirement latch at CONSUMPTION time: a Submit/Reconfigure buffered (or racing the
+    // Handle's preflight) before the run loop latched retirement is resolved terminally here rather
+    // than handed to an endpoint that can never commit it. Shutdown/AddPeer pass through unchanged.
+    let Some(cmd) = gate_command_on_retirement(&self.retired, cmd) else {
+      return false;
+    };
     match cmd {
       Command::Submit {
         body,
@@ -1257,6 +1270,25 @@ where
         produced = true;
       }
       while let Some(event) = self.coord.poll_event() {
+        // A live self-removal makes the endpoint structurally Retired: it emits no further commits,
+        // so fail every in-flight submit terminally and latch the shared signal (so `Handle::submit`
+        // rejects further submits) rather than blackholing them. The endpoint exposes no scalar epoch
+        // getter, so the retirement epoch is read off a one-time membership clone — retirement fires
+        // at most once per driver, off the hot path. The `StatusChanged` still forwards below.
+        if matches!(&event, viewstamp_proto::Event::StatusChanged(status) if status.is_retired()) {
+          let (local, live) = {
+            let endpoint = self.coord.endpoint();
+            (endpoint.local(), endpoint.membership_clone())
+          };
+          let epoch = live.epoch();
+          retire(&mut self.pending, &self.retired, local, epoch);
+          // A retired endpoint installs nothing further, so an in-flight reconfiguration job would
+          // otherwise sit parked until `reconfigure_timeout` — `advance` resolves an outstanding step
+          // only once the live config reaches the awaited successor, which a competing removal makes
+          // unreachable — surfacing a misleading resumable Timeout. Finish it terminally instead (Ok if
+          // this job's goal was in fact reached, else the terminal Retired), off the same clone.
+          finish_reconfigure_on_retire(&mut self.reconfigure, live, local, epoch);
+        }
         deliver_event(&mut self.pending, &self.events, event);
         produced = true;
       }

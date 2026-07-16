@@ -20,7 +20,7 @@ pub use handle::{Command, Handle, Reply};
 pub use reconcile::MembershipReconciler;
 pub use reconfigure::{
   AdvanceOutcome, HealthHint, LoopBackend, LoopController, ReconfigureBackend, ReconfigureError,
-  ReconfigureJob, ReconfigureProgress, StepOutcome, run_reconfigure,
+  ReconfigureJob, ReconfigureProgress, StepOutcome, finish_reconfigure_on_retire, run_reconfigure,
 };
 pub use session::ReservationGuard;
 
@@ -33,8 +33,8 @@ pub use config::{
 #[doc(hidden)]
 pub use session::{
   EVENTS_CAP, InflightBudget, MAX_INFLIGHT, MAX_PENDING_BYTES, Pending, PendingMap,
-  REQUEST_TIMEOUT, build_endpoint, deliver_event, drain_pending, format, pending_scan_interval,
-  reap_and_collect_retransmits,
+  REQUEST_TIMEOUT, RetiredAt, Retirement, build_endpoint, deliver_event, drain_pending, format,
+  gate_command_on_retirement, pending_scan_interval, reap_and_collect_retransmits, retire,
 };
 
 /// Errors surfaced to the application through the [`Handle`].

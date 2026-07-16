@@ -5,7 +5,7 @@ use viewstamp_proto::Event;
 
 use crate::{
   DriverError,
-  session::{InflightBudget, ReservationGuard},
+  session::{InflightBudget, ReservationGuard, Retirement},
 };
 
 /// A committed reply body returned by [`Handle::submit`].
@@ -67,6 +67,10 @@ pub struct Handle {
   commands: Mutex<futures_channel::mpsc::Sender<Command>>,
   events: flume::Receiver<Event>,
   budget: InflightBudget,
+  /// The shared write-once terminal signal, latched by the driver run loop when this endpoint removes
+  /// itself from the configuration. `submit`/`reconfigure_to` read it to fail terminally with
+  /// [`DriverError::Retired`] instead of blackholing against a node that can never commit again.
+  retired: Retirement,
 }
 
 impl Clone for Handle {
@@ -74,11 +78,13 @@ impl Clone for Handle {
     // A cloned sender starts fresh (unparked) and carries its own guaranteed channel slot: the
     // command channel admits up to its buffer plus one in-flight command per live sender, so each
     // `Handle` clone widens the queue's slack by one. The submit BUDGET — shared by all clones — is
-    // the binding bound on in-flight submits, not that slack (see `DriverConfig::cmd_cap`).
+    // the binding bound on in-flight submits, not that slack (see `DriverConfig::cmd_cap`). The
+    // retirement latch is shared too, so every clone goes terminal together on self-removal.
     Self {
       commands: Mutex::new(self.commands().clone()),
       events: self.events.clone(),
       budget: self.budget.clone(),
+      retired: self.retired.clone(),
     }
   }
 }
@@ -89,11 +95,27 @@ impl Handle {
     commands: futures_channel::mpsc::Sender<Command>,
     events: flume::Receiver<Event>,
     budget: InflightBudget,
+    retired: Retirement,
   ) -> Self {
     Self {
       commands: Mutex::new(commands),
       events,
       budget,
+      retired,
+    }
+  }
+
+  /// The error a dropped reply channel maps to. A retirement drains the in-flight submits (see
+  /// [`crate::retire`]), dropping their reply senders — so if the shared signal is latched, a woken
+  /// `submit` resolves to the terminal [`DriverError::Retired`]; otherwise the drop is an ordinary
+  /// shutdown-mid-flight and maps to [`DriverError::ReplyDropped`].
+  fn reply_dropped_reason(&self) -> DriverError {
+    match self.retired.get() {
+      Some(at) => DriverError::Retired {
+        local: at.local,
+        epoch: at.epoch,
+      },
+      None => DriverError::ReplyDropped,
     }
   }
 
@@ -114,7 +136,11 @@ impl Handle {
   /// reply, not on budget.
   ///
   /// # Errors
-  /// [`DriverError::RequestTooLarge`] if `body` exceeds
+  /// [`DriverError::Retired`] if this node removed itself from the configuration and is terminally
+  /// retired — it can never emit another commit, so a submit is rejected up front (WITHOUT reserving
+  /// budget or enqueueing a command) rather than left to hang; a submit already in flight when the
+  /// node retired resolves to the same error (its outcome is unknown — it may have committed on the
+  /// surviving quorum before removal); [`DriverError::RequestTooLarge`] if `body` exceeds
   /// [`viewstamp_proto::max_request_body_len()`](viewstamp_proto::max_request_body_len) — the body
   /// would frame larger than the transport can deliver (as the relayed `Request`/`Prepare`) and be
   /// dropped, so no commit could arrive; it is rejected up front WITHOUT reserving budget or enqueueing
@@ -124,6 +150,16 @@ impl Handle {
   /// [`DriverError::DriverGone`] if the driver task has stopped; [`DriverError::ReplyDropped`] if the
   /// driver dropped the reply channel without answering (e.g. shutdown mid-flight).
   pub async fn submit(&self, body: impl Into<Bytes>) -> Result<Reply, DriverError> {
+    // A node that removed itself from the configuration is terminally retired: it emits no further
+    // commits, so reject the submit up front — before reserving budget or touching the command
+    // channel — with the SAME terminal error a restart over the removed membership returns, rather
+    // than minting a request whose commit can never arrive.
+    if let Some(at) = self.retired.get() {
+      return Err(DriverError::Retired {
+        local: at.local,
+        epoch: at.epoch,
+      });
+    }
     let body = body.into();
     let body_len = body.len();
     // Reject a body the transport can never deliver BEFORE touching the budget or the channel. A body
@@ -159,7 +195,9 @@ impl Handle {
         DriverError::DriverGone
       });
     }
-    rx.await.map_err(|_| DriverError::ReplyDropped)
+    // A dropped reply channel is `ReplyDropped` normally, but the terminal `Retired` when the run loop
+    // drained this submit on self-removal (the latch is read on the woken poll).
+    rx.await.map_err(|_| self.reply_dropped_reason())
   }
 
   /// The largest body a single [`Self::submit`] on this handle can ever carry to a commit: the
@@ -204,6 +242,10 @@ impl Handle {
   /// same driver). See [`crate::reconfigure::ReconfigureError`] for the bounded-loop outcomes.
   ///
   /// # Errors
+  /// [`crate::reconfigure::ReconfigureError::Retired`] if this node removed itself from the
+  /// configuration — it is no longer a cluster member and cannot drive a reconfiguration, so the goal
+  /// is rejected up front (terminal — redirect to a live replica) rather than sent to a removed
+  /// endpoint that would only no-op it;
   /// [`crate::reconfigure::ReconfigureError::Propose`] with
   /// [`viewstamp_proto::ProposeMembershipError::Busy`] if the command channel is full (retryable);
   /// [`crate::reconfigure::ReconfigureError::DriverGone`] if the channel is closed or the reply is
@@ -214,6 +256,14 @@ impl Handle {
     target: viewstamp_proto::MembershipTarget,
     health: crate::reconfigure::HealthHint,
   ) -> Result<(), crate::reconfigure::ReconfigureError> {
+    // A retired node is no longer a cluster member: reject the goal terminally rather than sending a
+    // command the removed endpoint would only no-op (mirrors `submit`'s up-front retired rejection).
+    if let Some(at) = self.retired.get() {
+      return Err(crate::reconfigure::ReconfigureError::Retired {
+        local: at.local,
+        epoch: at.epoch,
+      });
+    }
     let (reply, rx) = futures_channel::oneshot::channel();
     // Mirror `submit`: `try_send` never blocks. A FULL channel is backpressure — retryable Busy.
     // A CLOSED channel means the driver is gone — terminal DriverGone (never retry a dead handle).

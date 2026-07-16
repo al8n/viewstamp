@@ -853,6 +853,13 @@ fn submit_failure(err: &DriverError) -> BatchError {
         reason: RefusedReason::DriverRefused,
       }
     }
+    // A live self-removal retired the node. If the body was already in flight when the node was
+    // removed it may have replicated to the surviving quorum and committed BEFORE removal, so its
+    // fate is genuinely unknowable — the conservative class is unknown, never a false `Refused` that
+    // would license a double-apply.
+    DriverError::Retired { .. } => BatchError::OutcomeUnknown {
+      reason: OutcomeUnknownReason::Driver,
+    },
     // A submit error this aggregator does not know cannot prove the body stayed out of
     // consensus; the conservative class is unknown, never a false `Refused`.
     _ => BatchError::OutcomeUnknown {

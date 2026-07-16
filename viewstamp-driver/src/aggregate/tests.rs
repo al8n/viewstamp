@@ -16,8 +16,8 @@ use super::{
   OutcomeUnknownReason, RefusedReason, ReplyLostReason, aggregator, aggregator_with_stall,
 };
 use crate::{
-  Command, Handle,
-  session::{InflightBudget, MAX_INFLIGHT, MAX_PENDING_BYTES},
+  Command, DriverError, Handle,
+  session::{InflightBudget, MAX_INFLIGHT, MAX_PENDING_BYTES, Retirement},
 };
 
 /// The test's driver end: it owns the command receiver and plays the driver, decoding each
@@ -67,6 +67,7 @@ fn driver_handle(max_pending_bytes: usize) -> (Handle, TestDriver) {
     tx,
     events_rx,
     InflightBudget::new(MAX_INFLIGHT, max_pending_bytes),
+    Retirement::new(),
   );
   (
     handle,
@@ -1191,4 +1192,27 @@ fn a_resolved_submit_beats_a_simultaneously_fired_timer() {
   assert!(poll_once(&mut run).is_pending());
   let (_, units, _) = driver.next_body();
   assert_eq!(units, vec![b"u2".to_vec()]);
+}
+
+/// The aggregate handle behaves consistently with a retired driver: when the pump's `Handle::submit`
+/// of a packed body fails with `DriverError::Retired`, the units are classified `OutcomeUnknown`, not
+/// a false `Refused`. A body already in flight when the node was removed may have replicated to the
+/// surviving quorum and committed before removal, so its fate is genuinely unknowable — claiming
+/// `Refused` would license a double-apply.
+#[test]
+fn a_retired_submit_is_classified_outcome_unknown() {
+  let err = DriverError::Retired {
+    local: viewstamp_proto::MemberId::new(4),
+    epoch: viewstamp_proto::Epoch::new(2),
+  };
+  match super::submit_failure(&err) {
+    BatchError::OutcomeUnknown { reason } => {
+      assert_eq!(
+        reason,
+        OutcomeUnknownReason::Driver,
+        "a retired submit is conservatively unknown"
+      );
+    }
+    other => panic!("expected OutcomeUnknown for a retired submit, got {other:?}"),
+  }
 }

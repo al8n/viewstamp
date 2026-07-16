@@ -794,3 +794,232 @@ async fn a_disconnected_storage_notifier_parks_its_arm_instead_of_spinning() {
   handle.shutdown().await.expect("driver acks shutdown");
   task.await.expect("run() returns after the ack");
 }
+
+/// LIVE RETIREMENT (QUIC driver): when this endpoint removes itself from the configuration the run
+/// loop's `retire` step fails every in-flight submit with the terminal `Retired` error (never a hang
+/// or `ReplyDropped`), releases their budget, and rejects a later submit immediately — the same
+/// terminal state a restart over the removed membership reaches. Composes the REAL `Handle::submit`,
+/// the REAL `handle_command` (insert pending), the driver's shared retirement signal, and the shared
+/// `retire`, reading the retirement identity off the endpoint exactly as the run-loop pump does.
+#[tokio::test]
+async fn self_retirement_fails_in_flight_and_rejects_new_submits_quic() {
+  let (mut driver, handle) = test_quic_driver_with_handle().await;
+
+  // One in-flight submit (no quorum ever forms, so it parks): reserve + enqueue, then drain into
+  // `pending` exactly as the run loop would.
+  let fut = handle.submit(Bytes::from_static(b"x"));
+  futures_util::pin_mut!(fut);
+  assert!(
+    poll_submit(fut.as_mut()).is_none(),
+    "the submit parks on its reply"
+  );
+  drain_one_command(&mut driver);
+  assert_eq!(
+    driver.budget.count(),
+    1,
+    "the in-flight submit holds its reservation"
+  );
+
+  // The run loop's live->retired handler: read the endpoint identity and fail every in-flight submit.
+  let (local, epoch) = {
+    let endpoint = driver.coord.endpoint();
+    (endpoint.local(), endpoint.membership_clone().epoch())
+  };
+  viewstamp_driver::retire(&mut driver.pending, &driver.retired, local, epoch);
+  assert!(
+    driver.pending.is_empty(),
+    "retire drained the in-flight entry"
+  );
+  assert_eq!(driver.budget.count(), 0, "and released its budget slot");
+
+  // The parked submit resolves to the terminal Retired (its latched identity), not ReplyDropped/hang.
+  match poll_submit(fut.as_mut()) {
+    Some(Err(DriverError::Retired { local: l, epoch: e })) => {
+      assert_eq!(l, local);
+      assert_eq!(e, epoch);
+    }
+    other => panic!("expected Ready(Err(Retired)) after retirement, got {other:?}"),
+  }
+
+  // A submit issued AFTER retirement is rejected immediately, reserving no budget and enqueueing nothing.
+  let after = handle.submit(Bytes::from_static(b"y"));
+  futures_util::pin_mut!(after);
+  match poll_submit(after.as_mut()) {
+    Some(Err(DriverError::Retired { .. })) => {}
+    other => panic!("expected immediate Retired for a post-retirement submit, got {other:?}"),
+  }
+  assert_eq!(
+    driver.budget.count(),
+    0,
+    "a post-retirement submit reserves no budget"
+  );
+  assert!(
+    driver.commands.try_recv().is_err(),
+    "a post-retirement submit enqueues no command"
+  );
+}
+
+/// QUEUED SUBMIT ACROSS RETIREMENT (QUIC driver): a submit left BUFFERED in the command channel when
+/// the endpoint retires — enqueued before the latch, drained after — is caught at CONSUMPTION by
+/// `handle_command`'s retirement gate: it never enters `pending` nor reaches the endpoint, its budget
+/// releases, and its caller resolves to the terminal `Retired` rather than hanging. This is the
+/// one-hop-downstream hang the up-front `Handle` rejection alone leaves open.
+#[tokio::test]
+async fn a_queued_submit_across_retirement_resolves_to_retired_quic() {
+  let (mut driver, handle) = test_quic_driver_with_handle().await;
+
+  // Enqueue a submit but LEAVE it queued (do NOT drain the pump): the reservation is held while the
+  // command sits in the channel.
+  let fut = handle.submit(Bytes::from_static(b"x"));
+  futures_util::pin_mut!(fut);
+  assert!(
+    poll_submit(fut.as_mut()).is_none(),
+    "the submit parks on its reply"
+  );
+  assert_eq!(
+    driver.budget.count(),
+    1,
+    "the queued submit holds its reservation"
+  );
+
+  // The endpoint retires while the submit is still buffered: latch the signal exactly as the run
+  // loop's StatusChanged(Retired) handler does (pending is empty, so retire only latches).
+  let (local, epoch) = {
+    let endpoint = driver.coord.endpoint();
+    (endpoint.local(), endpoint.membership_clone().epoch())
+  };
+  viewstamp_driver::retire(&mut driver.pending, &driver.retired, local, epoch);
+
+  // NOW let the pump process the queued command: the consumption-time gate drops it instead of
+  // handing it to the retired endpoint.
+  drain_one_command(&mut driver);
+  assert!(
+    driver.pending.is_empty(),
+    "the gated submit never enters pending"
+  );
+  assert_eq!(
+    driver.budget.count(),
+    0,
+    "and its reservation is released (no leak)"
+  );
+
+  // The waiter resolves to the terminal Retired — not a hang, not a generic ReplyDropped.
+  match poll_submit(fut.as_mut()) {
+    Some(Err(DriverError::Retired { local: l, epoch: e })) => {
+      assert_eq!(l, local);
+      assert_eq!(e, epoch);
+    }
+    other => {
+      panic!("expected Ready(Err(Retired)) for a submit gated at consumption, got {other:?}")
+    }
+  }
+}
+
+/// QUEUED RECONFIGURE ACROSS RETIREMENT (QUIC driver): a reconfigure goal left BUFFERED in the command
+/// channel when the endpoint retires is answered at CONSUMPTION with the terminal
+/// `ReconfigureError::Retired` — mirroring the `Handle`'s up-front rejection — instead of starting a
+/// reconfiguration job on an endpoint that can never drive it.
+#[tokio::test]
+async fn a_queued_reconfigure_across_retirement_resolves_to_retired_quic() {
+  let (mut driver, handle) = test_quic_driver_with_handle().await;
+
+  // Enqueue a reconfigure goal but LEAVE it queued (the Handle's up-front retired check passes: the
+  // signal is not latched yet).
+  let target = viewstamp_proto::MembershipTarget::new(
+    std::collections::BTreeSet::from([viewstamp_proto::MemberId::new(1)]),
+    std::collections::BTreeSet::new(),
+  );
+  let fut = handle.reconfigure_to(target, viewstamp_driver::HealthHint::default());
+  futures_util::pin_mut!(fut);
+  let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+  assert!(
+    std::future::Future::poll(fut.as_mut(), &mut cx).is_pending(),
+    "the reconfigure enqueues its command and parks on the reply"
+  );
+
+  // The endpoint retires while the goal is still buffered.
+  let (local, epoch) = {
+    let endpoint = driver.coord.endpoint();
+    (endpoint.local(), endpoint.membership_clone().epoch())
+  };
+  viewstamp_driver::retire(&mut driver.pending, &driver.retired, local, epoch);
+
+  // NOW let the pump process the queued command: the gate answers it terminally rather than starting
+  // a job on the retired endpoint.
+  drain_one_command(&mut driver);
+  assert!(
+    driver.reconfigure.is_none(),
+    "the gated reconfigure starts no job on the retired endpoint"
+  );
+
+  match std::future::Future::poll(fut.as_mut(), &mut cx) {
+    std::task::Poll::Ready(Err(viewstamp_driver::ReconfigureError::Retired {
+      local: l,
+      epoch: e,
+    })) => {
+      assert_eq!(l, local);
+      assert_eq!(e, epoch);
+    }
+    other => {
+      panic!("expected Ready(Err(Retired)) for a reconfigure gated at consumption, got {other:?}")
+    }
+  }
+}
+
+/// ACTIVE RECONFIGURE ACROSS RETIREMENT (QUIC driver): a reconfiguration job already STARTED — with an
+/// outstanding proposal, its target not yet reached — when a concurrent removal retires the endpoint is
+/// FINISHED terminally with `ReconfigureError::Retired` and its slot cleared. The run loop's
+/// StatusChanged(Retired) handler calls `finish_reconfigure_on_retire` right after `retire`; without it
+/// the job sits parked until `reconfigure_timeout`, surfacing a misleading (resumable) Timeout.
+#[tokio::test]
+async fn an_active_reconfigure_across_retirement_resolves_to_retired_quic() {
+  let (mut driver, handle) = test_quic_driver_with_handle().await;
+
+  // Start a job whose target is NOT yet reached (grow the {0,1,2} genesis to add member 3), then advance
+  // it once so it posts its first proposal — the "outstanding proposal" state. The no-quorum driver
+  // never installs the step, so the job stays in flight.
+  let target = viewstamp_proto::MembershipTarget::new(
+    std::collections::BTreeSet::from([0u128, 1, 2, 3].map(viewstamp_proto::MemberId::new)),
+    std::collections::BTreeSet::new(),
+  );
+  let fut = handle.reconfigure_to(target, viewstamp_driver::HealthHint::default());
+  futures_util::pin_mut!(fut);
+  let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+  assert!(
+    std::future::Future::poll(fut.as_mut(), &mut cx).is_pending(),
+    "the reconfigure enqueues its command and parks on the reply"
+  );
+  drain_one_command(&mut driver); // starts the job: the endpoint is not retired yet
+  driver.advance_reconfigure(viewstamp_proto::Instant::ZERO); // posts the outstanding proposal
+  assert!(
+    driver.reconfigure.is_some(),
+    "the job is in flight with an outstanding proposal"
+  );
+
+  // The endpoint retires (a concurrent removal). Run the StatusChanged(Retired) handler's steps: latch
+  // the signal, then FINISH the in-flight job terminally off the same membership clone.
+  let (local, live) = {
+    let endpoint = driver.coord.endpoint();
+    (endpoint.local(), endpoint.membership_clone())
+  };
+  let epoch = live.epoch();
+  viewstamp_driver::retire(&mut driver.pending, &driver.retired, local, epoch);
+  viewstamp_driver::finish_reconfigure_on_retire(&mut driver.reconfigure, live, local, epoch);
+
+  assert!(
+    driver.reconfigure.is_none(),
+    "the retirement handler clears the in-flight job slot"
+  );
+  match std::future::Future::poll(fut.as_mut(), &mut cx) {
+    std::task::Poll::Ready(Err(viewstamp_driver::ReconfigureError::Retired {
+      local: l,
+      epoch: e,
+    })) => {
+      assert_eq!(l, local);
+      assert_eq!(e, epoch);
+    }
+    other => panic!(
+      "expected Ready(Err(Retired)) for an in-flight reconfigure across retirement, got {other:?}"
+    ),
+  }
+}
