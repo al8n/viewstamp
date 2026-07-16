@@ -4564,14 +4564,22 @@ impl<S, R> Endpoint<S, R> {
     if self.sender_is_member(from, claimed) {
       return true; // strict path: same-config / no slot shift — unchanged.
     }
-    // Cross-epoch relaxation: an authenticated CURRENT member soliciting from a STRICT-ANCESTOR config
-    // (its slot shifted across the reconfiguration). Bind by `from`'s current slot, not the stale claim.
+    // Cross-epoch relaxation: an authenticated CURRENT member soliciting from an EARLIER config (its
+    // slot shifted across one or more reconfigurations). Bind by `from`'s current slot, not the stale
+    // claim. The claimed `config_id` is NOT required to be in our lineage ring: a member stranded across
+    // MORE than [`Self::in_lineage`]'s two-deep window carries a `config_id` we no longer recognize, yet
+    // it is exactly the member that must be served to rejoin (finding: a retained member offline across
+    // three legal changes can never re-sync). Serving is SAFE regardless of the claimed config's age — a
+    // solicitation serve (a `SyncCheckpoint` or a repair `Prepare`) grants the requester NO authority and
+    // is content-verified by the requester on install (`apply_sync`'s hash-chain check for a checkpoint,
+    // the prepare-checksum for a repair); it is a bounded read of our own durable state, never a vote or
+    // a configuration this node adopts. The `config_id != current` guard keeps the strict path
+    // ([`Self::sender_is_member`] above) the sole admitter of a SAME-config pull, so a same-config forged
+    // self-id is still rejected here (it fails the strict path and this clause both).
     let Some(slot) = from.as_replica() else {
       return false; // a client / non-replica never solicits state-sync.
     };
-    self.membership.member_at(slot).is_some()
-      && self.in_lineage(config_id)
-      && config_id != self.membership.config_id()
+    self.membership.member_at(slot).is_some() && config_id != self.membership.config_id()
   }
 
   /// The sender binding for the state-sync SERVE REPLY (`SyncCheckpoint`) — the ingress mirror of
@@ -4731,7 +4739,16 @@ impl<S, R> Endpoint<S, R> {
       // toward the tally, keyed by stable `MemberId`).
       Message::Nack(m) => self.in_lineage(m.config_id()),
       Message::RepairBatch(m) => self.in_lineage(m.config_id()),
-      Message::RequestSync(m) => self.in_lineage(m.config_id()),
+      // AGNOSTIC SOLICITATION with NO config-lineage bound: a state-sync pull is admitted from ANY
+      // config age (not only the two-deep lineage window the other agnostic kinds require), because it
+      // carries no vote/lead/view authority and its serve grants the requester none — the reply is a
+      // bounded read of our durable checkpoint, content-verified by the requester on install. The real
+      // admission is the SENDER binding ([`Self::sender_admits_solicitation`], the dispatch's
+      // `RequestSync` arm): it confirms the requester is a CURRENT member (a non-member's pull is
+      // dropped there). Gating `in_lineage` here too would re-strand exactly the member this admits — a
+      // retained member offline across more than the lineage window, whose `config_id` we no longer
+      // recognize yet must serve to let it rejoin.
+      Message::RequestSync(_) => true,
       // A SyncCheckpoint answering an OUTSTANDING sync is admitted even from a higher (descendant)
       // config not yet in our lineage: it is the cross-epoch catch-up answer to OUR own solicitation,
       // and the serving peer stamps it with its CURRENT (post-swap) config, which a lagging solicitor

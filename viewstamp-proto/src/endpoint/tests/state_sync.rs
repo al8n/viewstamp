@@ -554,6 +554,61 @@ fn peer_without_newer_checkpoint_does_not_answer_request_sync() {
 }
 
 #[test]
+fn a_slot_shifted_member_soliciting_from_a_far_config_is_served() {
+  // The donor-side half of the far-behind rejoin (finding: a retained member offline across three
+  // legal changes can never re-sync). A SLOT-SHIFTED requester binds `from` to its CURRENT slot (the
+  // transport resolves its stable id in the donor's active membership) but stamps its OLD slot as
+  // `claimed`, so the strict binding (`sender_is_member`) fails and admission falls to the cross-epoch
+  // relaxation. That relaxation no longer requires the claimed `config_id` to be in the donor's
+  // two-deep lineage ring: a member stranded across MORE than that window carries a `config_id` the
+  // donor no longer recognizes, yet it is exactly the member that must be served to rejoin. Serving is
+  // safe at any config age — the reply grants the requester no authority and is content-verified on
+  // install — so the donor answers a solicitation whose `config_id` is a far, unrecognized ancestor.
+  let now = Instant::ZERO;
+  let (mut donor, mut wal, mut sb) = donor_primary_at_checkpoint(2);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  while donor.poll_message().is_some() {} // drain warm-up
+
+  // A recovery RequestSync at the donor's checkpoint from member slot 2 (its resolved `from`), stamping
+  // a DIFFERENT old slot (1) — the slot-shift shape — and a FAR config_id the donor does not recognize
+  // (not its own, not in its lineage ring). `from` = the transport-resolved current slot 2.
+  const FAR_CONFIG: u128 = 0xFA2_FA2_FA2;
+  assert!(
+    !donor.in_lineage_for_test(FAR_CONFIG),
+    "the solicited config is outside the donor's lineage — the pre-fix rejection point"
+  );
+  donor.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)), // the transport-authenticated CURRENT slot
+    Message::RequestSync(crate::RequestSync::new(
+      donor.view(),
+      OpNumber::with(2),
+      ReplicaId::new(1), // the stamped OLD slot — differs from `from`, so the strict path fails
+      0xF00D,
+      true, // recovery peer-fetch — served at/above our checkpoint
+      FAR_CONFIG,
+    )),
+  );
+  donor.handle_storage(now, &mut wal, &mut sb, &mut blocks); // checkpoint read completes → ship SyncCheckpoint
+  let mut served = None;
+  while let Some(out) = donor.poll_message() {
+    if let Message::SyncCheckpoint(s) = out.msg_ref() {
+      served = Some((out.to(), s.clone()));
+    }
+  }
+  // FAIL-BEFORE: with the `in_lineage(config_id)` conjunct restored, the far config fails admission and
+  // the donor serves nothing (the slot-shifted far-behind member strands). Served now: addressed to the
+  // requester's resolved current slot, carrying the donor's checkpoint.
+  let (to, s) = served.expect("the slot-shifted far-config solicitation IS served");
+  assert_eq!(to, Recipient::To(Peer::Replica(ReplicaId::new(2))));
+  assert_eq!(s.checkpoint_op(), OpNumber::with(2));
+  assert_eq!(s.nonce(), 0xF00D);
+}
+
+#[test]
 fn recovery_request_sync_is_served_by_a_peer_at_the_same_checkpoint() {
   // REGRESSION (recovery peer-fetch livelock): a recovering replica whose OWN checkpoint snapshot
   // is permanently corrupt solicits a RECOVERY RequestSync advertising its (known) checkpoint_op. The
@@ -3771,16 +3826,20 @@ fn a_direct_e0_to_e2_crossing_stamps_the_verified_chain_so_a_reserve_verifies() 
 }
 
 #[test]
-fn a_direct_e0_to_e3_crossing_too_deep_for_the_ring_is_rejected_not_mis_installed() {
-  // XI-b LINEAGE DISTANCE BOUND (the deep-skip guard). A retained E0 laggard is offered an E3 successor
-  // DIRECTLY from an E3 donor — an epoch DISTANCE of 3, beyond the two-prior `LINEAGE_RING` window. The
-  // carried payload VERIFIES (E3's config_id chains from E2, `hash(E3_membership, E2) == E3_config_id`),
-  // but a single carried predecessor (E2) cannot prove the missing E2<-E1<-E0 chain, and the ring (two
-  // slots) cannot hold both the verified immediate predecessor E2 AND the laggard's own prior E0 with E2's
-  // real predecessor E1 in between. So `apply_sync`'s distance guard REJECTS it: stage NOTHING, no install,
-  // `sync` stays armed (forced + crossing-required) so the solicit timer re-fetches / a closer-skip donor
-  // is tried — the laggard stays at E0 rather than mis-installing a lineage it cannot represent. (Contrast
-  // the distance-2 E0→E2 crossing above, which the SAME guard ACCEPTS and stamps `[E1, E0]`.)
+fn a_direct_e0_to_e3_wholesale_crossing_installs_the_content_verified_config() {
+  // WHOLESALE cross-epoch crossing past MORE than the two-prior `LINEAGE_RING` window. A retained E0
+  // laggard offline across three legal changes is offered an E3 successor DIRECTLY from an E3 donor — an
+  // epoch DISTANCE of 3. The carried payload VERIFIES (E3's config_id chains from E2,
+  // `hash(E3_membership, E2) == E3_config_id`), and that content verification is what self-certifies the
+  // installed configuration: it never depended on the laggard's own lineage, so a distance-3 skip is as
+  // sound to install as a single step. There is NO distance bound — the laggard crosses directly to E3
+  // rather than stranding forever on a "closer donor" the protocol does not preserve (the finding: a
+  // retained member offline across three changes could never re-sync). The post-crossing ring stamps
+  // `[E2, E0]` — the VERIFIED immediate predecessor E2 over the laggard's own prior E0 — which SKIPS the
+  // intermediate E1: a bounded liveness nicety (an agnostic solicitation carrying E1 is not admitted;
+  // state-sync is admitted on member identity regardless), never a safety gap, since the immediate
+  // predecessor E2 is present (a re-serve chains correctly) and `prev_epoch` is E2. (Contrast the
+  // distance-2 E0→E2 crossing above, which stamps the contiguous `[E1, E0]`.)
   let e0 = genesis(3); // [0,1,2]
   let e1 = e0
     .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
@@ -3807,7 +3866,7 @@ fn a_direct_e0_to_e3_crossing_too_deep_for_the_ring_is_rejected_not_mis_installe
       e2.config_id(),
     ),
     e3.config_id(),
-    "E3's config_id chains from E2 — the payload verifies; only the distance-3 bound rejects it"
+    "E3's config_id chains from E2 — the payload content-verifies, which is what makes the crossing sound"
   );
 
   // The laggard starts at E0 (MemberId 1, slot 1).
@@ -3822,9 +3881,9 @@ fn a_direct_e0_to_e3_crossing_too_deep_for_the_ring_is_rejected_not_mis_installe
   let now = Instant::ZERO;
   // Arm the sync exactly as the E0→E2 crossing test does: a same-epoch `Commit` advertising the higher
   // checkpoint op 4 arms an ordinary sync; the CROSSING is driven purely by the reply's higher epoch +
-  // successor membership. The distance guard lives in `apply_sync`'s successor-reconstruction block, which
-  // runs on ANY successor-carrying reply (gated on a differing config_id + non-empty membership), so it
-  // applies here independent of `require_cross_epoch`.
+  // successor membership. The successor-reconstruction block in `apply_sync` runs on ANY successor-carrying
+  // reply (gated on a differing config_id + non-empty membership), so the wholesale crossing applies here
+  // independent of `require_cross_epoch`.
   e.handle_message(
     now,
     &mut wal,
@@ -3842,8 +3901,8 @@ fn a_direct_e0_to_e3_crossing_too_deep_for_the_ring_is_rejected_not_mis_installe
   let nonce = captured_sync_nonce(&mut e);
   assert!(e.sync_target_for_test().is_some(), "a sync is armed");
   // The E3 donor's SyncCheckpoint: header advertises E3, body is the E3 membership chained from E2. The
-  // freshness/monotone gates pass (checkpoint_op 4 > self.checkpoint_op 0), so it REACHES `apply_sync` —
-  // where the distance guard is the load-bearing rejection.
+  // freshness/monotone gates pass (checkpoint_op 4 > self.checkpoint_op 0), so it REACHES `apply_sync`,
+  // which content-verifies the E3 payload and STAGES the wholesale crossing.
   let e3_body =
     crate::message::ReconfigurePayload::from_membership(&e3, e2.config_id()).encode_body();
   e.handle_message(
@@ -3864,40 +3923,60 @@ fn a_direct_e0_to_e3_crossing_too_deep_for_the_ring_is_rejected_not_mis_installe
       e3_body,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // nothing was staged → no install drives here
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // two-write persist → durable root → install
 
-  // REJECTED: no crossing installed, the laggard is STILL at E0, and the sync stays armed for a re-fetch.
+  // INSTALLED: the wholesale E0→E3 crossing applied directly — no distance bound stranded the laggard.
   assert_eq!(
     e.state_syncs_applied(),
-    0,
-    "the too-deep E0→E3 skip was REJECTED — no sync installed"
+    1,
+    "the wholesale E0→E3 crossing applied — the content-verified config installs at any distance"
   );
   assert_eq!(
-    e.membership.config_id(),
-    e0.config_id(),
-    "the laggard did NOT cross — still at E0"
+    e.membership, e3,
+    "the laggard installed the E3 successor directly"
   );
   assert_eq!(
     e.membership.epoch(),
-    crate::Epoch::new(0),
-    "still at epoch E0"
+    crate::Epoch::new(3),
+    "the laggard crossed to E3"
   );
+  // The ring stamps `[E2, E0]` — the VERIFIED immediate predecessor E2 over the laggard's own prior E0.
+  // It SKIPS the intermediate E1 (the ring holds two slots and E1 falls between the verified predecessor
+  // and the own-prior): the bounded liveness nicety, not a safety gap.
+  assert_eq!(
+    e.lineage_ring_for_test(),
+    [e2.config_id(), e0.config_id()],
+    "the deep crossing stamped [E2, E0] — verified immediate predecessor E2, then the laggard's own prior E0"
+  );
+  assert!(
+    e.in_lineage_for_test(e2.config_id()),
+    "E2 (the immediate predecessor) admitted"
+  );
+  assert!(
+    e.in_lineage_for_test(e0.config_id()),
+    "E0 (the laggard's own prior) admitted"
+  );
+  assert!(
+    !e.in_lineage_for_test(e1.config_id()),
+    "E1 (the skipped-over intermediate) is NOT admitted — the bounded liveness nicety, never a safety gap"
+  );
+  // The LIVE `prev_epoch` is the VERIFIED immediate predecessor E2 (= successor.epoch() - 1 = 2), not the
+  // stale own epoch E0 — so a re-serve of the E3 membership chains from E2 exactly as a fresh laggard expects.
   assert_eq!(
     e.prev_epoch,
-    crate::Epoch::new(0),
-    "prev_epoch unchanged (genesis) — no mis-installed scalar"
+    crate::Epoch::new(2),
+    "the LIVE prev_epoch is the verified predecessor E2 (successor.epoch() - 1)"
   );
-  assert!(
-    !e.pending_sb_for_test(),
-    "nothing was staged — no pending durable root"
+  // The DURABLE root the crossing staged records the SAME scalars (recovery restores them).
+  assert_eq!(
+    sb.state().prev_epoch(),
+    crate::Epoch::new(2),
+    "the durable sync-successor root stamps prev_epoch = E2 (matches the live scalar by construction)"
   );
-  assert!(
-    e.pending_checkpoint_is_sync_for_test().is_none(),
-    "nothing was staged — no pending checkpoint (the reject returned BEFORE submit_write_checkpoint)"
-  );
-  assert!(
-    e.sync_target_for_test().is_some(),
-    "the sync STAYS armed (the solicit timer re-fetches a closer donor) — not mis-installed"
+  assert_eq!(
+    sb.state().epoch(),
+    crate::Epoch::new(3),
+    "the durable root names the crossed-to epoch E3"
   );
 }
 

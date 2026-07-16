@@ -1585,8 +1585,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // cluster crossing point AND at/above our own checkpoint, so the only satisfiable reply is the donor's
     // `M >= N` crossing checkpoint (`apply_sync`'s forced path never rewinds the applied frontier — the
     // synced op `>= checkpoint_op == commit_min`). The recovery `RequestSync` is admitted at the E+1
-    // server (our predecessor `config_id` is an ANCESTOR in its lineage ring; its E+1 answer is admitted
-    // here via `sync.is_some()`). `require_cross_epoch = true` pins the crossing requirement in `apply_sync`.
+    // server (a state-sync pull is served to any authenticated CURRENT member regardless of how far its
+    // config has aged — the pull carries no authority and its reply is content-verified on install; its
+    // E+1 answer is admitted here via `sync.is_some()`). `require_cross_epoch = true` pins the crossing
+    // requirement in `apply_sync`.
     self.set_status(Status::Recovering);
     self.recover = Some(RecoverState::default());
     let target = OpNumber::with(checkpoint.get().max(self.checkpoint_op.get()));
