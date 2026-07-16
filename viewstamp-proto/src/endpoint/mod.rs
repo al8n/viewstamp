@@ -95,6 +95,19 @@ impl Pending {
   }
 }
 
+/// An append held back by the slot-quiescence fence: its target ring slot still has an older
+/// physical write in flight, so submitting it now would race the device — completions may reorder,
+/// and the OLD bytes could land LAST, leaving the durable slot holding a value this replica's
+/// ack/vote never named. The full submission (the deferred action `kind` plus the exact bytes) waits
+/// in `Endpoint::deferred_appends` until the blocking write's completion proves the slot quiesced;
+/// `release_deferred_append` then performs the real submit. The op number is the map key.
+#[derive(Debug, Clone)]
+struct DeferredAppend {
+  kind: Pending,
+  header: Header,
+  body: Bytes,
+}
+
 /// What the endpoint does once its pending durable-view (superblock) write completes. A transition
 /// records the participation to run *after* the new view is durable. Keyed by the minted `OpId` in
 /// `pending_sb`; a superseded (older-view) completion is ignored. Mirrors `Pending`/`on_wal_done`
@@ -1168,6 +1181,36 @@ pub struct Endpoint<S, R = RestartOnly> {
   next_op_id: u64,
   /// Outstanding storage submissions awaiting completion.
   pending: BTreeMap<u64, Pending>,
+  /// EVERY in-flight physical WAL append (`OpId` → op), entered at submit and removed ONLY when the
+  /// write QUIESCES: its completion arrives ([`WalDone::Appended`]/[`WalDone::Fault`]/
+  /// [`WalDone::Cancelled`]) or a [`Wal::truncate`]/[`Wal::prune`] reports it synchronously
+  /// cancelled. Deliberately NOT generation state: view transitions, nack truncation, and GC clear
+  /// `pending`/`appending` (abandoning the append LOGICALLY) but leave this map intact, because the
+  /// PHYSICAL write is still with the device and its bytes can land at any moment until the backend
+  /// says otherwise. This is the fence's witness set: `submit_or_defer_append` refuses to put a
+  /// second write in flight for any ring slot listed here (same op, or its ring alias
+  /// `op ± k·capacity`), so completion reordering can never let abandoned old bytes land OVER a
+  /// replacement this replica already acked — the durable slot always ends holding the value the
+  /// vote named.
+  wal_writes: BTreeMap<u64, u64>,
+  /// Appends held back by the slot-quiescence fence, keyed by op: the full submission (deferred
+  /// action + exact bytes) waiting for the blocking older write in [`Self::wal_writes`] to quiesce.
+  /// Usually one waiter per slot exists (the fence admits one in-flight + one deferred) — but on a
+  /// bounded ring TWO waiters per slot CLASS are constructible (ops `K` and `K + capacity` both
+  /// deferred behind one blocker, when the local checkpoint leads the quorum floor so `K` is already
+  /// checkpoint-subsumed while `K + capacity` is admitted). [`Self::release_deferred_append`]'s
+  /// ascending-key selection handles that corner: the subsumed lower op releases first and the LIVE
+  /// higher op lands LAST, so the durable slot ends holding the value its vote names. GENERATION
+  /// state, cleared/trimmed in lockstep with `pending`/`appending` (a deferred append abandoned by a
+  /// view change / nack truncation / state-sync install / GC must not fire later); the votable kinds
+  /// keep their `appending` mark while deferred, so the append-before-ack gate and the duplicate-
+  /// append guards see them as in flight.
+  deferred_appends: BTreeMap<u64, DeferredAppend>,
+  /// The highest prune floor actually handed to the backend (`wal.prune(floor + 1)` ⇒ `floor`),
+  /// monotone. Distinguishes a RELEASED op (at or below this floor, or above the live head) from a
+  /// live one when a [`WalDone::Cancelled`] arrives: cancelling a released op's write is the
+  /// backend's right; cancelling a live one is a contract violation degraded to a re-submit.
+  wal_pruned: u64,
   /// Op numbers with an in-flight WAL append — the single source of truth for "is op N durable yet?"
   ///. An op is INSERTED here when a votable append is submitted (`on_request`,
   /// `append_prepare`, `adopt_append`) and REMOVED in `on_wal_done` once that op's append completes.
@@ -1761,6 +1804,9 @@ impl<S, R> Endpoint<S, R> {
       timers: Timers::default(),
       next_op_id: 1,
       pending: BTreeMap::new(),
+      wal_writes: BTreeMap::new(),
+      deferred_appends: BTreeMap::new(),
+      wal_pruned: 0,
       appending: std::collections::BTreeSet::new(),
       pending_sb: None,
       pending_checkpoint: None,
@@ -2111,6 +2157,7 @@ impl<S, R> Endpoint<S, R> {
         // and no stale completion can reach `local_slot()`.
         self.pending.clear();
         self.appending.clear();
+        self.deferred_appends.clear();
         self.inflight.clear();
         self.set_status(Status::Retired);
       }
@@ -3318,6 +3365,14 @@ impl<S, R> Endpoint<S, R> {
   pub fn has_inflight_storage(&self) -> bool {
     !self.pending.is_empty()
       || !self.appending.is_empty()
+      // Physical writes the backend still owes a completion for — including appends the logical
+      // layer ABANDONED (their `pending` entry cleared by a view transition / truncation): the
+      // OpId-lifetime drain contract requires the driver to hold teardown until these quiesce, or a
+      // recreated endpoint could observe their late effects under recycled correlation ids.
+      || !self.wal_writes.is_empty()
+      // Appends parked behind the slot-quiescence fence: not yet with the backend, but durability
+      // work this endpoint still owes (each releases and submits when its blocking write quiesces).
+      || !self.deferred_appends.is_empty()
       || self.pending_sb.is_some()
       || self.pending_checkpoint.is_some()
       || self.pending_install.is_some()
@@ -4056,6 +4111,126 @@ impl<S, R> Endpoint<S, R> {
   /// evict a committed, un-pruned op (the committed-op-loss class the ring-residency oracle checks).
   fn ring_append_would_wrap<W: Wal>(&self, wal: &W, op: u64) -> bool {
     op.saturating_sub(self.checkpoint_op.get()) > self.effective_wal_capacity(wal)
+  }
+
+  /// Whether `a` and `b` occupy the SAME physical WAL slot under `capacity`: the same op, or — on a
+  /// bounded backend, whose placement is `op mod capacity` (the trait-level placement contract) —
+  /// ring aliases. A ring-less backend (`capacity == u64::MAX`) stores every op at its own location,
+  /// so only the same-op case aliases; its recycling discipline is the trait's extent-reuse clause.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn slots_alias(capacity: u64, a: u64, b: u64) -> bool {
+    a == b || (capacity != u64::MAX && a % capacity == b % capacity)
+  }
+
+  /// Whether some in-flight physical write ([`Self::wal_writes`]) targets `op`'s ring slot. The
+  /// fence predicate: while true, a new append to `op` must be DEFERRED — append completions may
+  /// reorder, so submitting now could let the OLD bytes land LAST and leave the durable slot holding
+  /// a value this replica's ack/vote never named (the truncate-reuse and ring-wrap flavors of the
+  /// same hazard). The map is pipeline-bounded, so the scan is cheap.
+  fn slot_write_in_flight<W: Wal>(&self, wal: &W, op: u64) -> bool {
+    let capacity = wal.capacity();
+    self
+      .wal_writes
+      .values()
+      .any(|&v| Self::slots_alias(capacity, v, op))
+  }
+
+  /// The single WAL-append submission choke: every durable append routes here (the normal-path mint
+  /// and backup appends, the interior canonical re-append, the view-change adoption re-appends, the
+  /// peer-repair fill, and the fault re-submit), so the slot-quiescence fence cannot be bypassed by
+  /// a new call site. If `op`'s ring slot has an un-quiesced older write, the FULL submission (the
+  /// deferred action `kind` + the exact bytes) parks in [`Self::deferred_appends`] until that
+  /// write's completion proves the slot quiesced ([`Self::release_deferred_append`]); otherwise it
+  /// submits now, entering the write in [`Self::wal_writes`] and its action in `pending`. Callers
+  /// keep their own `appending` bookkeeping (identical for the submitted and deferred shapes, so
+  /// the append-before-ack gate and duplicate-append guards treat a deferred append as in flight).
+  fn submit_or_defer_append<W: Wal>(
+    &mut self,
+    wal: &mut W,
+    op: OpNumber,
+    header: Header,
+    body: Bytes,
+    kind: Pending,
+  ) {
+    debug_assert_eq!(
+      kind.op(),
+      op,
+      "a deferred action must name the op it appends"
+    );
+    if self.slot_write_in_flight(wal, op.get()) {
+      // At most one in-flight write per slot exists (this fence's own guarantee), and a second
+      // deferral for the same op supersedes the first — the newer submission carries the newer
+      // canonical bytes/action for that op (its predecessor was abandoned by the transition that
+      // re-drove it, or is the same fill retried).
+      self
+        .deferred_appends
+        .insert(op.get(), DeferredAppend { kind, header, body });
+      return;
+    }
+    let id = self.mint_op_id();
+    wal.submit_append(id, op, header, body);
+    self.wal_writes.insert(id.get(), op.get());
+    self.pending.insert(id.get(), kind);
+  }
+
+  /// Submit a deferred append whose blocking write (to `quiesced`'s ring slot) has just quiesced.
+  /// Usually the surviving deferred entry (transitions/GC clear abandoned ones) is the slot's only
+  /// waiter — but two waiters per slot CLASS are constructible on a bounded ring (`K` and
+  /// `K + capacity`, the lower one checkpoint-subsumed; see the `deferred_appends` field doc). The
+  /// ASCENDING key scan below is load-bearing for that corner: it picks the LOWEST aliased waiter,
+  /// whose fresh write then blocks the higher one via the re-check, so the LIVE (highest) op is the
+  /// one that lands LAST in the slot. The re-check also guards the otherwise-impossible second
+  /// in-flight blocker.
+  fn release_deferred_append<W: Wal>(&mut self, wal: &mut W, quiesced: u64) {
+    let capacity = wal.capacity();
+    let Some(op) = self
+      .deferred_appends
+      .keys()
+      .copied()
+      .find(|&op| Self::slots_alias(capacity, op, quiesced))
+    else {
+      return;
+    };
+    if self.slot_write_in_flight(wal, op) {
+      return;
+    }
+    let d = self
+      .deferred_appends
+      .remove(&op)
+      .expect("the found key is present");
+    let id = self.mint_op_id();
+    wal.submit_append(id, OpNumber::with(op), d.header, d.body);
+    self.wal_writes.insert(id.get(), op);
+    self.pending.insert(id.get(), d.kind);
+  }
+
+  /// Retire the appends a [`Wal::truncate`]/[`Wal::prune`] reports SYNCHRONOUSLY cancelled: the
+  /// backend proves these writes will now neither land nor complete, so their quiescence is
+  /// immediate — clear their write entries (and any still-pending action: a synchronously-cancelled
+  /// append belongs to an op the endpoint just RELEASED, so its action owes nothing) and release any
+  /// deferred append their slots were blocking. Keeping this in the same call that truncated/pruned
+  /// means the common backend (one that can discard its own queue synchronously) never even opens a
+  /// deferral window — behavior is byte-identical to the pre-fence code there.
+  fn absorb_wal_cancellations<W: Wal>(
+    &mut self,
+    wal: &mut W,
+    cancelled: std::vec::Vec<crate::OpId>,
+  ) {
+    for id in cancelled {
+      let Some(op) = self.wal_writes.remove(&id.get()) else {
+        debug_assert!(false, "a backend cancelled an unknown append id {id:?}");
+        continue;
+      };
+      if let Some(p) = self.pending.remove(&id.get()) {
+        // The action dies with the write — but the `appending` mark may now be OWNED by a deferred
+        // replacement for the same op (deferral keeps the mark), so only clear it when no waiter
+        // holds the slot.
+        if !self.deferred_appends.contains_key(&p.op().get()) {
+          self.appending.remove(&p.op().get());
+        }
+      }
+      self.release_deferred_append(wal, op);
+    }
   }
 
   /// The status-transition chokepoint: assigns `self.status` and emits

@@ -1904,8 +1904,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     self.pending.clear();
     // In-flight WAL appends are abandoned here too; their op numbers must not linger as "in flight"
-    // (a stale completion finds no `pending` entry and is ignored) — keep `appending` in lockstep.
+    // (a stale completion finds no `pending` entry and is ignored) — keep `appending` in lockstep,
+    // and abandon any fence-deferred append the same way (the sync supersedes what it would have
+    // written; its un-quiesced blocker stays in `wal_writes`, fencing the slot until it completes).
     self.appending.clear();
+    self.deferred_appends.clear();
     // Reconstruct the proto-owned CLIENT SESSION TABLE and the SM CONTENT from their checkpoint DAGs,
     // both through a VERIFY-ON-READ view: the block-fetch drained BOTH DAGs before STAGE, but this
     // reconstruct runs later, so a block that bit-rots or is misdirected in that window must not be
@@ -1961,8 +1964,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // is why the WAL prune is NOT folded into the shared post-checkpoint trim: `run_gc` frees `<= floor`
     // (`prune(floor+1)`) because it has no such WAL-head constraint, so the two sites legitimately use a
     // different prune FLOOR. Only the in-memory log trim above is common ([`Self::trim_log_to_checkpoint`]).
-    wal.truncate(self.op);
-    wal.prune(checkpoint_op);
+    let cancelled = wal.truncate(self.op);
+    self.absorb_wal_cancellations(wal, cancelled);
+    let cancelled = wal.prune(checkpoint_op);
+    self.wal_pruned = self.wal_pruned.max(checkpoint_op.get().saturating_sub(1));
+    self.absorb_wal_cancellations(wal, cancelled);
     Ok(())
   }
 
@@ -2102,8 +2108,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // The SM now holds M's content. The obligation is met: clear it and run the success effects the
     // `install_sync` happy path runs (the WAL prune is the irreversible GC held for restore success).
     self.sm_reconstruct = None;
-    wal.truncate(self.op);
-    wal.prune(checkpoint_op);
+    let cancelled = wal.truncate(self.op);
+    self.absorb_wal_cancellations(wal, cancelled);
+    // Unlike `run_gc`, no below-floor deferred retire precedes this absorb — none can exist here:
+    // `install_sync` cleared `deferred_appends` wholesale at its reset, and `checkpoint_op` was
+    // already advanced to the synced M BEFORE this fallible restore retried, so every deferral a
+    // post-failure append could have parked sits strictly ABOVE the floor this prune frees. The
+    // absorb can therefore only release above-floor waiters, the same postcondition `run_gc`
+    // establishes explicitly.
+    let cancelled = wal.prune(checkpoint_op);
+    self.wal_pruned = self.wal_pruned.max(checkpoint_op.get().saturating_sub(1));
+    self.absorb_wal_cancellations(wal, cancelled);
     // The synced checkpoint is durable + installed: prune SM blocks unreachable from the new durable
     // checkpoint root, GC the WAL caches, and complete the sync bookkeeping — the same tail as a clean
     // first-try install (it lands at exactly this point), now reached after the retry.

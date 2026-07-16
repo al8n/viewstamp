@@ -105,12 +105,14 @@ impl Wal for BenchWal {
       None => WalDone::Absent(id),
     });
   }
-  fn truncate(&mut self, above: OpNumber) {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
     self.entries.retain(|&op, _| op <= above.get());
     self.head = self.head.min(above.get());
+    std::vec::Vec::new()
   }
-  fn prune(&mut self, below: OpNumber) {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
     self.entries.retain(|&op, _| op >= below.get());
+    std::vec::Vec::new()
   }
   fn poll(&mut self) -> Option<WalDone> {
     self.done.pop_front()

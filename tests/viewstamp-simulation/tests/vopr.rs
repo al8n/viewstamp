@@ -162,7 +162,7 @@ use viewstamp_simulation::{
   DEFAULT_TICKS, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
   run_vopr_with_churn, run_vopr_with_hold, run_vopr_with_learners, run_vopr_with_reconfig,
   run_vopr_with_reconfig_live, run_vopr_with_slow, run_vopr_with_stale_read,
-  run_vopr_with_torn_headers, run_vopr_with_wipe,
+  run_vopr_with_torn_headers, run_vopr_with_wipe, run_vopr_with_write_chaos,
 };
 
 /// The contiguous committed seed range (kept modest to bound the gate's wall-clock). Correctness
@@ -611,6 +611,67 @@ fn vopr_wipe_sweep_no_violations() {
   );
   println!(
     "VOPR wipe sweep OK: wipes_fired={total_wipes} committed={total_committed} \
+     view_change_seeds={seeds_with_view_change}"
+  );
+}
+
+/// The WAL WRITE-CHAOS sweep: [`run_vopr_with_write_chaos`] over `0..VOPR_SEEDS` (default 64, the
+/// [`sweep_seed_count`] override) — the write-chaos axis FORCE-ENABLED programmatically (the
+/// [`run_vopr_with_hold`] pattern). Every replica's WAL then completes appends in a seeded
+/// OUT-OF-SUBMISSION order and CANNOT cancel a truncated/pruned in-flight write — it lands late into
+/// the trimmed region, briefly resurrecting it. That is exactly the device model under which the
+/// endpoint's slot-quiescence fence carries the safety argument: a truncated op re-appended at the
+/// SAME number, or a checkpoint-pruned ring slot REUSED by `op + capacity`, must never end with the
+/// ABANDONED old bytes durably overwriting the value the replica's ack/vote named. The EXISTING
+/// oracles judge the outcome every tick — committed-loss (durability), ring-residency,
+/// applied-divergence (agreement), plus the liveness/final-quiesce gates — so a panic here is a REAL
+/// fence finding, reported with its seed, never masked.
+///
+/// Opt-in (`#[ignore]`): the DEFAULT sweep's schedule must stay byte-identical (this axis changes the
+/// WAL completion order, which is its own deterministic baseline). Run with
+/// `cargo test --release -p viewstamp-simulation --test vopr -- --ignored vopr_wal_write_chaos`
+/// (optionally `VOPR_SEEDS=<n>` for a wider range).
+#[test]
+#[ignore = "opt-in write-chaos sweep: run with --ignored (VOPR_SEEDS widens the range); the default lanes stay on the ordered-WAL baseline"]
+fn vopr_wal_write_chaos_sweep_no_violations() {
+  let seeds = sweep_seed_count();
+  let mut total_reorders = 0u64;
+  let mut total_committed = 0usize;
+  let mut seeds_with_view_change = 0u64;
+  println!(
+    "VOPR write-chaos sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, write-chaos axis \
+     forced on"
+  );
+  for seed in 0..seeds {
+    let r = run_vopr_with_write_chaos(seed, DEFAULT_TICKS);
+    total_reorders += r.wal_write_reorders();
+    total_committed += r.max_committed();
+    if r.max_view() >= 1 {
+      seeds_with_view_change += 1;
+    }
+  }
+  // Non-vacuity: the axis must genuinely REORDER append completions across the sweep — otherwise the
+  // lane has silently decayed into the ordered-WAL default and the fence is unguarded here.
+  assert!(
+    total_reorders > 0,
+    "the write-chaos axis never reordered an append completion across the sweep \
+     (wal_write_reorders={total_reorders}) — the chaos lane is vacuous (the axis is not plumbed \
+     through, or every release happened to be the oldest staged write)"
+  );
+  // And the chaos-enabled runs still did real work: ops committed, and at least one seed drove a
+  // view change — the truncate-then-re-append window (and its GC-prune ring-wrap sibling) opens
+  // across view changes, so a sweep with no view change could not reach the class this lane guards.
+  assert!(
+    total_committed > 0,
+    "the write-chaos sweep committed no ops at all — the driver is not exercising the protocol"
+  );
+  assert!(
+    seeds_with_view_change > 0,
+    "no write-chaos seed drove a view change — the truncate/re-append window the fence guards never \
+     opened"
+  );
+  println!(
+    "VOPR write-chaos sweep OK: wal_write_reorders={total_reorders} committed={total_committed} \
      view_change_seeds={seeds_with_view_change}"
   );
 }

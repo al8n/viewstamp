@@ -93,11 +93,11 @@ impl<T: Wal> Wal for Notifying<T> {
     self.inner.submit_read(id, op);
     self.signal();
   }
-  fn truncate(&mut self, above: viewstamp_proto::OpNumber) {
-    self.inner.truncate(above);
+  fn truncate(&mut self, above: viewstamp_proto::OpNumber) -> Vec<viewstamp_proto::OpId> {
+    self.inner.truncate(above)
   }
-  fn prune(&mut self, below: viewstamp_proto::OpNumber) {
-    self.inner.prune(below);
+  fn prune(&mut self, below: viewstamp_proto::OpNumber) -> Vec<viewstamp_proto::OpId> {
+    self.inner.prune(below)
   }
   fn poll(&mut self) -> Option<viewstamp_proto::WalDone> {
     self.inner.poll()
@@ -174,11 +174,11 @@ impl<T: Wal> Wal for Shared<T> {
     self.inner.lock().unwrap().submit_read(id, op);
     self.signal();
   }
-  fn truncate(&mut self, above: viewstamp_proto::OpNumber) {
-    self.inner.lock().unwrap().truncate(above);
+  fn truncate(&mut self, above: viewstamp_proto::OpNumber) -> Vec<viewstamp_proto::OpId> {
+    self.inner.lock().unwrap().truncate(above)
   }
-  fn prune(&mut self, below: viewstamp_proto::OpNumber) {
-    self.inner.lock().unwrap().prune(below);
+  fn prune(&mut self, below: viewstamp_proto::OpNumber) -> Vec<viewstamp_proto::OpId> {
+    self.inner.lock().unwrap().prune(below)
   }
   fn poll(&mut self) -> Option<viewstamp_proto::WalDone> {
     self.inner.lock().unwrap().poll()

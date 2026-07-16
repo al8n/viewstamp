@@ -497,8 +497,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ) {
     self.op = self.op.next();
     let header = Header::new(self.op, self.view, client, request, &body_bytes);
-    let id = self.mint_op_id();
-    wal.submit_append(id, self.op, header, body_bytes.clone());
+    // Through the slot-quiescence choke: a freshly minted op can land on a ring slot whose OLD
+    // write is still in flight (op reuse after a truncation lowered the head; a ring wrap over a
+    // GC-freed slot), and completion reordering must not let those stale bytes land over this op.
+    self.submit_or_defer_append(
+      wal,
+      self.op,
+      header,
+      body_bytes.clone(),
+      Pending::Ack(self.op),
+    );
     self.log.insert(
       self.op.get(),
       LogEntry {
@@ -523,7 +531,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         ),
       },
     );
-    self.pending.insert(id.get(), Pending::Ack(self.op));
     // Append-before-ack: op is in flight until its `on_wal_done`. The primary's own vote is
     // likewise gated — `record_own_vote` fires only on completion — but tracking it here keeps the
     // "durable?" predicate uniform across every votable append (and the choke-point debug_assert).
@@ -1122,11 +1129,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     );
     self.op = p.op();
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
-    let id = self.mint_op_id();
-    wal.submit_append(id, p.op(), header, p.body_bytes());
+    // Through the slot-quiescence choke: a backup's head extension can reuse an op number a
+    // truncation released (or ring-wrap a GC-freed slot) whose old write is still in flight.
+    self.submit_or_defer_append(wal, p.op(), header, p.body_bytes(), Pending::Ack(p.op()));
     let entry = self.log_entry_from_prepare(&p);
     self.log.insert(p.op().get(), entry);
-    self.pending.insert(id.get(), Pending::Ack(p.op()));
     // Append-before-ack: mark op in-flight so neither this op's deferred ack NOR a
     // retransmit-driven re-ack (`on_prepare`'s `pop <= self.op` branch) can emit a PrepareOk before
     // `on_wal_done` clears it. PrepareOk is deferred to on_wal_done when the append is durable.
@@ -1154,11 +1161,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     let header = Header::new(p.op(), p.view(), p.client(), p.request(), p.body());
-    let id = self.mint_op_id();
-    wal.submit_append(id, p.op(), header, p.body_bytes());
+    // Through the slot-quiescence choke: an interior overwrite by definition re-targets a slot an
+    // earlier write may still hold in flight (its own superseded stale append included).
+    self.submit_or_defer_append(wal, p.op(), header, p.body_bytes(), Pending::Ack(p.op()));
     let entry = self.log_entry_from_prepare(p);
     self.log.insert(p.op().get(), entry);
-    self.pending.insert(id.get(), Pending::Ack(p.op()));
     // Mark in-flight so a further retransmit-driven re-ack defers to `on_wal_done` (which clears it +
     // sends the single PrepareOk once the canonical append is durable). NO head rewind: `self.op` stays.
     self.appending.insert(p.op().get());

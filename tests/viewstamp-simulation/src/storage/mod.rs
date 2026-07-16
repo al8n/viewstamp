@@ -211,6 +211,21 @@ pub struct InMemoryWal {
   /// gone). The proto's stall-before-wrap keeps the un-pruned window `(prune_floor, op]` within `n`, so a
   /// committed-but-unpruned op is never the one overwritten; see [`InMemoryWal::with_capacity`].
   capacity: Option<u64>,
+  /// `None` (default) ⇒ ORDERED writes: the staged queue releases FIFO (front-only) and
+  /// `truncate`/`prune` synchronously CANCEL the staged appends they trim (reporting their ids). Both
+  /// behaviours stay byte-identical to every existing gate. `Some(prng)` ⇒ **WRITE-CHAOS mode**
+  /// ([`set_write_chaos`](InMemoryWal::set_write_chaos)): a proactor whose submitted writes are already
+  /// at the device — every append stages with a seeded JITTERED delay, `poll` ticks ALL staged entries
+  /// and lands a seeded choice among the READY ones (completions genuinely reorder relative to
+  /// submission), and `truncate`/`prune` KEEP every staged append (un-cancellable device writes that
+  /// land late — the resurrection/eviction shape the endpoint's slot-quiescence fence must survive)
+  /// and report nothing cancelled.
+  write_chaos: Option<Prng>,
+  /// Observability: how many chaos-mode releases landed an entry that was NOT the oldest staged one —
+  /// a completion genuinely delivered out of submission order. `> 0` proves the write-chaos axis
+  /// actually REORDERED completions (the fence was exercised), not merely staged them FIFO. Persists
+  /// across `restart` because the WAL struct does.
+  chaos_reorders_fired: u64,
 }
 
 impl Default for InMemoryWal {
@@ -242,6 +257,8 @@ impl InMemoryWal {
       misdirects_fired: 0,
       torn_headers_fired: 0,
       capacity: None,
+      write_chaos: None,
+      chaos_reorders_fired: 0,
     }
   }
 
@@ -283,6 +300,32 @@ impl InMemoryWal {
     );
     assert!(n != Some(0), "a bounded WAL ring needs at least one slot");
     self.capacity = n;
+  }
+
+  /// Test/harness helper: enable (`Some(seed)`) or disable (`None`) **write-chaos mode** on an EMPTY
+  /// WAL, preserving the existing fault plan / async / ring modes. In chaos mode every
+  /// `submit_append` STAGES with a seeded jittered delay, `poll` releases a seeded choice among the
+  /// READY staged entries (so append completions genuinely reorder relative to submission), and
+  /// `truncate`/`prune` KEEP staged entries — un-cancellable writes already at the device, which land
+  /// late into the trimmed region (the resurrection/eviction shape the endpoint's slot-quiescence
+  /// fence defers conflicting re-appends around) — reporting nothing cancelled. The `None` default
+  /// keeps the FIFO + synchronously-cancelling behaviour byte-identical for every existing gate.
+  /// Panics if called on a non-empty WAL (mirrors [`set_capacity`](Self::set_capacity)).
+  pub fn set_write_chaos(&mut self, seed: Option<u64>) {
+    assert!(
+      self.entries.is_empty() && self.staged.is_empty(),
+      "set_write_chaos must be called on an empty WAL"
+    );
+    self.write_chaos = seed.map(Prng::new);
+  }
+
+  /// Test-only: how many chaos-mode releases landed a staged append that was NOT the oldest one — a
+  /// completion genuinely delivered out of submission order. `> 0` proves the write-chaos axis
+  /// actually reordered completions rather than merely staging them FIFO. Persists across `restart`
+  /// because the WAL struct does.
+  #[doc(hidden)]
+  pub fn chaos_reorders_fired(&self) -> u64 {
+    self.chaos_reorders_fired
   }
 
   /// Creates an empty, reliable WAL in **async-append mode**: every `submit_append` stages the entry
@@ -439,6 +482,27 @@ impl InMemoryWal {
     self.head_read_faults.retain(|&o| o == op || o % n != slot);
     self.staged.retain(|s| s.op == op || s.op % n != slot);
   }
+
+  /// Land a staged append: the physical write happens NOW — the bounded-ring eviction of the
+  /// wrapped-over slot occupant, the submit-time fault verdicts (bit-rot / torn header), the durable
+  /// `entries` insert, the head raise, and the `Appended` completion. The ONE definition of "a staged
+  /// append becomes durable", shared by the FIFO front release and the write-chaos seeded release,
+  /// so the two release modes cannot drift on what landing does.
+  fn land_staged(&mut self, done: PendingAppend) {
+    self.evict_wrapped_slot(done.op);
+    if done.rot {
+      self.rotted.insert(done.op);
+    }
+    if done.torn_header {
+      self.torn_headers.insert(done.op);
+      self.torn_headers_fired += 1;
+    } else {
+      self.torn_headers.remove(&done.op);
+    }
+    self.entries.insert(done.op, (done.header, done.body));
+    self.head = self.head.max(done.op);
+    self.completions.push_back(WalDone::Appended(done.id));
+  }
 }
 
 /// Flips one byte of a body so `Header::verify` fails on read-back (a torn write). An empty body
@@ -522,6 +586,24 @@ impl Wal for InMemoryWal {
     // keeps its exact fault-PRNG stream (pinned seeds reproduce).
     let torn_header = self.faults.torn_header_per_mille > 0
       && self.prng.chance(self.faults.torn_header_per_mille, 1000);
+    // WRITE-CHAOS mode: stage EVERY append with a seeded JITTERED delay (centred on the async delay,
+    // spanning `1 ..= 2 * base`), so two in-flight appends genuinely complete out of submission order
+    // — the reordering device the endpoint's slot-quiescence fence exists to survive. The fault
+    // verdicts above were already decided at submit, exactly like the async path.
+    if let Some(prng) = &mut self.write_chaos {
+      let base = self.async_delay.unwrap_or(0).max(1) as u64;
+      let remaining = 1 + prng.below(base * 2) as u32;
+      self.staged.push_back(PendingAppend {
+        remaining,
+        id,
+        op: op.get(),
+        header,
+        body: stored,
+        rot,
+        torn_header,
+      });
+      return;
+    }
     match self.async_delay {
       // SYNCHRONOUS (default): durable immediately, completion queued in this call.
       None => {
@@ -624,28 +706,96 @@ impl Wal for InMemoryWal {
     self.completions.push_back(done);
   }
 
-  fn truncate(&mut self, above: OpNumber) {
+  fn truncate(&mut self, above: OpNumber) -> Vec<OpId> {
     self.entries.retain(|&op, _| op <= above.get());
     // A truncated-away slot is no longer corrupt (it will be rewritten by a later append).
     self.rotted.retain(|&op| op <= above.get());
     self.torn_headers.retain(|&op| op <= above.get());
     self.head_read_faults.retain(|&op| op <= above.get());
-    // Drop any staged (in-flight) append above the truncation point: those bytes are abandoned and
-    // must never later become durable above the new head (async mode only; a no-op otherwise).
-    self.staged.retain(|s| s.op <= above.get());
     self.head = self.head.min(above.get());
+    // WRITE-CHAOS mode: the staged appends are ALREADY AT THE DEVICE — un-cancellable. They stay in
+    // flight (each keeps ticking and lands late, briefly resurrecting the trimmed region — the
+    // tolerated shape the endpoint re-classifies and its fence defers conflicting re-appends around)
+    // and NOTHING is reported cancelled, so the endpoint awaits each completion as its quiescence
+    // witness.
+    if self.write_chaos.is_some() {
+      return Vec::new();
+    }
+    // Discard any staged (in-flight) append above the truncation point — those bytes are abandoned
+    // and must never later become durable above the new head (async mode only; a no-op otherwise) —
+    // reporting each discarded id as SYNCHRONOUSLY CANCELLED, per the trait's cancellation contract:
+    // the staged queue is this WAL's own submission queue, so removal provably prevents both the
+    // landing and any later completion. This models the ideal cancelling backend; a backend whose
+    // writes are already at the device instead keeps them in flight and lets the endpoint's fence
+    // await their completions.
+    let mut cancelled = Vec::new();
+    self.staged.retain(|s| {
+      if s.op <= above.get() {
+        true
+      } else {
+        cancelled.push(s.id);
+        false
+      }
+    });
+    cancelled
   }
 
-  fn prune(&mut self, below: OpNumber) {
+  fn prune(&mut self, below: OpNumber) -> Vec<OpId> {
     self.entries.retain(|&op, _| op >= below.get());
     self.rotted.retain(|&op| op >= below.get());
     self.torn_headers.retain(|&op| op >= below.get());
     self.head_read_faults.retain(|&op| op >= below.get());
-    // A staged append below the GC floor is moot; drop it (async mode only).
-    self.staged.retain(|s| s.op >= below.get());
+    // WRITE-CHAOS mode: staged appends below the floor stay in flight (un-cancellable device writes;
+    // a late landing below the checkpoint is inert — the snapshot owns that prefix), exactly as in
+    // `truncate` above.
+    if self.write_chaos.is_some() {
+      return Vec::new();
+    }
+    // A staged append below the GC floor is moot; discard it (async mode only), reporting it
+    // synchronously cancelled exactly as `truncate` does.
+    let mut cancelled = Vec::new();
+    self.staged.retain(|s| {
+      if s.op >= below.get() {
+        true
+      } else {
+        cancelled.push(s.id);
+        false
+      }
+    });
+    cancelled
   }
 
   fn poll(&mut self) -> Option<WalDone> {
+    // WRITE-CHAOS mode: tick ALL staged appends (a device with several writes in flight progresses
+    // them all concurrently), then land ONE seeded choice among those READY (`remaining == 0`) —
+    // NOT the front — so completions genuinely arrive out of submission order, exercising the
+    // endpoint's any-order completion tolerance and its slot-quiescence fence.
+    if self.write_chaos.is_some() {
+      for s in &mut self.staged {
+        if s.remaining > 0 {
+          s.remaining -= 1;
+        }
+      }
+      let ready: Vec<usize> = self
+        .staged
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.remaining == 0)
+        .map(|(i, _)| i)
+        .collect();
+      if !ready.is_empty() {
+        let prng = self.write_chaos.as_mut().expect("chaos mode is enabled");
+        let pick = ready[prng.below(ready.len() as u64) as usize];
+        // Landing anything but the OLDEST staged entry is a genuine out-of-submission-order
+        // completion — the reorder witness the chaos sweep asserts is non-vacuous.
+        if pick != 0 {
+          self.chaos_reorders_fired += 1;
+        }
+        let done = self.staged.remove(pick).expect("picked index is staged");
+        self.land_staged(done);
+      }
+      return self.completions.pop_front();
+    }
     // Async mode: tick the staged (in-flight) appends. A serial WAL writer completes them in
     // submission order, so we count down the FRONT entry and make it durable when it reaches zero —
     // at which point its bytes land in `entries`/`rotted` (the fault verdict taken at submit) and its
@@ -657,19 +807,7 @@ impl Wal for InMemoryWal {
         let done = self.staged.pop_front().expect("front exists");
         // Bounded ring: the physical write happens HERE (on release), so the slot-`op mod n`
         // eviction of the wrapped-over op happens here too, not at submit time.
-        self.evict_wrapped_slot(done.op);
-        if done.rot {
-          self.rotted.insert(done.op);
-        }
-        if done.torn_header {
-          self.torn_headers.insert(done.op);
-          self.torn_headers_fired += 1;
-        } else {
-          self.torn_headers.remove(&done.op);
-        }
-        self.entries.insert(done.op, (done.header, done.body));
-        self.head = self.head.max(done.op);
-        self.completions.push_back(WalDone::Appended(done.id));
+        self.land_staged(done);
       } else {
         front.remaining -= 1;
       }

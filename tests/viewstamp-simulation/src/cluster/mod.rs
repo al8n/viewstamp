@@ -24,6 +24,11 @@ use crate::{
 /// its protocol PRNG (which uses a different mixer in `with_checkpoint_ops`).
 const STORAGE_SEED_MAGIC: u64 = 0x5151_DEAD_BEEF_0F0F;
 
+/// Mixed into the per-replica WRITE-CHAOS seed so a replica's chaos PRNG (the jittered append delays
+/// and the out-of-order release choices) is independent of both its storage-fault PRNG and its
+/// protocol PRNG — even when a caller passes the cluster's own seed as the chaos base.
+const WRITE_CHAOS_SEED_MAGIC: u64 = 0xC4A0_50DE_0DD5_EED5;
+
 /// The virtual delay applied to a message the network elects to HOLD ([`Faults::hold_per_mille`]).
 /// Far past the proto's repair-or-truncate grace (5 s) so a held `PrepareOk` can outlive its op's
 /// truncation + re-mint and arrive at the new primary as a STALE-body vote — the op-reuse class the
@@ -195,6 +200,14 @@ pub struct Cluster {
   /// MUST be `> checkpoint_ops + pipeline headroom` or the stall never releases (see the `Wal` capacity
   /// liveness contract).
   wal_capacity: Option<u64>,
+  /// `None` (default) ⇒ every replica's WAL completes appends IN ORDER and `truncate`/`prune`
+  /// synchronously cancel staged writes (the deterministic gates' mode, byte-identical to before the
+  /// axis existed). `Some(base)` ⇒ WRITE-CHAOS mode on every replica's WAL with a per-replica seed
+  /// derived from `base`: jittered append delays + seeded out-of-order completion release +
+  /// un-cancellable truncated/pruned writes that land late. Set via [`set_wal_write_chaos`] before
+  /// running; persists across `crash`/`restart` because the WAL struct does (a `crash` still discards
+  /// staged writes — in-flight ops die with the process).
+  write_chaos_seed: Option<u64>,
   /// How many INTER-REPLICA messages this cluster dropped because their `encoded_len()` exceeded the
   /// transport frame cap [`MAX_FRAME_LEN`] — modelling the real transport's send-path frame guard,
   /// which refuses a peer message larger than one frame. Only `replica → replica` traffic is measured
@@ -365,7 +378,8 @@ impl Cluster {
       .collect();
     let n = node_count as usize;
     let storage_faults = StorageFaults::none();
-    let (wals, mut sbs) = Self::seed_storage(node_count, seed, storage_faults, None, None, None);
+    let (wals, mut sbs) =
+      Self::seed_storage(node_count, seed, storage_faults, None, None, None, None);
     // GENESIS: commit each replica over its freshly-seeded (virgin) store. `commit` writes the durable
     // genesis root a later restart recovers over — a voter with no durable root fail-stops — and builds
     // the same in-memory genesis state the bare constructor produced.
@@ -425,6 +439,7 @@ impl Cluster {
       async_wal_delay: None,
       async_sb_delay: None,
       wal_capacity: None,
+      write_chaos_seed: None,
       oversized_dropped: 0,
       holds_fired: 0,
       one_way_dropped: 0,
@@ -449,7 +464,9 @@ impl Cluster {
   /// `Some`, every WAL is built in async-append mode (the in-flight window); when `async_sb_delay` is
   /// `Some`, every superblock is built in async-write mode (the pending durable-view window) — both
   /// composed with the fault plan. When `wal_capacity` is `Some(n)`, every WAL is a fixed ring of `n`
-  /// slots, composed with the fault/async modes.
+  /// slots, composed with the fault/async modes. When `write_chaos` is `Some(base)`, every WAL runs in
+  /// write-chaos mode with its own [`Self::write_chaos_storage_seed`]-derived seed, composed with all
+  /// of the above.
   fn seed_storage(
     nodes: u16,
     seed: u64,
@@ -457,6 +474,7 @@ impl Cluster {
     async_wal_delay: Option<u32>,
     async_sb_delay: Option<u32>,
     wal_capacity: Option<u64>,
+    write_chaos: Option<u64>,
   ) -> (Vec<InMemoryWal>, Vec<InMemorySuperblock>) {
     let wals = (0..nodes)
       .map(|i| {
@@ -468,6 +486,11 @@ impl Cluster {
         // Bounded ring: make this (empty) WAL a fixed ring of `n` slots, composed with the
         // fault/async mode chosen above. `None` leaves it unbounded (existing-gate behaviour).
         w.set_capacity(wal_capacity);
+        // Write-chaos: seeded out-of-order completions + un-cancellable trimmed writes, composed
+        // with everything above. Skipped entirely off-axis (the byte-identical default).
+        if let Some(base) = write_chaos {
+          w.set_write_chaos(Some(Self::write_chaos_storage_seed(base, i)));
+        }
         w
       })
       .collect();
@@ -488,6 +511,13 @@ impl Cluster {
     seed ^ (replica as u64).wrapping_mul(STORAGE_SEED_MAGIC) ^ STORAGE_SEED_MAGIC
   }
 
+  /// The per-replica WRITE-CHAOS seed, derived from the chaos `base` with its own magic (mirrors
+  /// [`Self::storage_seed`]) so each replica's chaos PRNG is independent of its fault PRNG and of
+  /// every other replica's chaos stream.
+  fn write_chaos_storage_seed(base: u64, replica: u16) -> u64 {
+    base ^ (replica as u64).wrapping_mul(WRITE_CHAOS_SEED_MAGIC) ^ WRITE_CHAOS_SEED_MAGIC
+  }
+
   /// Replaces the network fault model (call before running).
   pub fn set_faults(&mut self, faults: Faults) {
     self.faults = faults;
@@ -506,6 +536,7 @@ impl Cluster {
       self.async_wal_delay,
       self.async_sb_delay,
       self.wal_capacity,
+      self.write_chaos_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -530,6 +561,7 @@ impl Cluster {
       delay,
       self.async_sb_delay,
       self.wal_capacity,
+      self.write_chaos_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -556,11 +588,40 @@ impl Cluster {
       self.async_wal_delay,
       delay,
       self.wal_capacity,
+      self.write_chaos_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
     // Re-format the reseeded (virgin) stores; the genesis format write lands synchronously even under
     // this async-write mode, and the existing genesis endpoints are unchanged.
+    self.format_all_stores();
+  }
+
+  /// Enables (or, with `None`, disables) **write-chaos mode** on every replica's WAL, each seeded from
+  /// `seed` with a per-replica derivation. In this mode a WAL models a proactor whose submitted writes
+  /// are already at the device: append delays are JITTERED and completions release in a seeded
+  /// OUT-OF-SUBMISSION order (not FIFO), and `truncate`/`prune` CANNOT cancel a staged write — it stays
+  /// in flight and lands late into the trimmed region (the resurrection/eviction shape whose
+  /// conflicting re-appends the proto's slot-quiescence fence defers until the old write's completion).
+  /// Composes with the current fault/async/ring modes. Call before running; the mode persists across
+  /// `crash`/`restart` because the WAL struct does (a `crash` still discards staged writes — in-flight
+  /// ops die with the process). `None` (the default) keeps every WAL's ordered, synchronously-cancelling
+  /// behaviour byte-identical to the pre-axis harness. Rebuilds the (empty) WALs, like
+  /// [`set_async_wal_delay`](Self::set_async_wal_delay).
+  pub fn set_wal_write_chaos(&mut self, seed: Option<u64>) {
+    self.write_chaos_seed = seed;
+    let (wals, sbs) = Self::seed_storage(
+      self.replicas.len() as u16,
+      self.seed,
+      self.storage_faults,
+      self.async_wal_delay,
+      self.async_sb_delay,
+      self.wal_capacity,
+      seed,
+    );
+    self.wals = wals;
+    self.sbs = sbs;
+    // Re-format the reseeded (virgin) stores; the existing genesis endpoints are unchanged.
     self.format_all_stores();
   }
 
@@ -1262,6 +1323,11 @@ impl Cluster {
       None => InMemoryWal::with_faults(self.storage_faults, s),
     };
     w.set_capacity(self.wal_capacity);
+    // The replaced disk keeps the cluster's write-chaos mode (the mode is per-DEPLOYMENT, not
+    // per-medium), re-seeded with the same per-replica derivation the initial seeding used.
+    if let Some(base) = self.write_chaos_seed {
+      w.set_write_chaos(Some(Self::write_chaos_storage_seed(base, i as u16)));
+    }
     self.wals[i] = w;
     self.sbs[i] = match self.async_sb_delay {
       Some(d) => InMemorySuperblock::with_async_writes_and_faults(self.storage_faults, s, d),
@@ -1741,6 +1807,7 @@ impl Cluster {
       self.async_wal_delay,
       self.async_sb_delay,
       self.wal_capacity,
+      self.write_chaos_seed,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -2182,6 +2249,14 @@ impl Cluster {
   #[doc(hidden)]
   pub fn wal_torn_headers_fired(&self, i: usize) -> u64 {
     self.wals[i].torn_headers_fired()
+  }
+
+  /// Test-only: how many of replica `i`'s chaos-mode WAL releases landed an append OUT of submission
+  /// order. The write-chaos sweep sums this across replicas to assert the axis genuinely REORDERED
+  /// completions (so the slot-quiescence fence was exercised), not merely staged them.
+  #[doc(hidden)]
+  pub fn wal_write_reorders_fired(&self, i: usize) -> u64 {
+    self.wals[i].chaos_reorders_fired()
   }
 
   /// Partition the replicas into groups: `groups[i]` is replica `i`'s group id. Replica↔replica
