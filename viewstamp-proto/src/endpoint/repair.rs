@@ -296,8 +296,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // keyed by op, so trim it directly to `< gap`.
     self.pending.retain(|_, p| p.op().get() < gap);
     self.appending.retain(|&op| op < gap);
+    // A deferred append for a truncated op is abandoned with the same scope (it must not fire later
+    // and resurrect the dropped suffix); its `wal_writes` blocker is NOT touched — the physical
+    // write is still with the device, and the fence keeps the suffix ops un-reusable until it
+    // quiesces.
+    self.deferred_appends.retain(|&op, _| op < gap);
     self.op = OpNumber::with(gap - 1);
-    wal.truncate(OpNumber::with(gap - 1));
+    let cancelled = wal.truncate(OpNumber::with(gap - 1));
+    self.absorb_wal_cancellations(wal, cancelled);
     // The truncated ops no longer exist — drop their nack tallies so a late nack for one cannot re-fire.
     self.nack_from.retain(|&op, _| op < gap);
     if self.repair.is_empty() {
@@ -723,12 +729,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return false;
     }
     let entry = self.log_entry_from_prepare(p);
-    let id = self.mint_op_id();
-    wal.submit_append(id, p.op(), header, p.body_bytes());
-    // This append owes NO PrepareOk/own-vote (peer repair is not a vote), but unlike the OLD bare write
-    // it IS tracked — as a `RepairFill`, so `on_wal_done` defers the apply + hole-clear to durability.
-    self.pending.insert(
-      id.get(),
+    // Through the slot-quiescence choke: a nack-truncated op re-filled at the same number (or a fill
+    // landing on a ring-wrapped slot) can race the abandoned old write; the fill is tracked as a
+    // `RepairFill` so `on_wal_done` defers the apply + hole-clear to durability, and it owes NO
+    // PrepareOk/own-vote (peer repair is not a vote).
+    self.submit_or_defer_append(
+      wal,
+      p.op(),
+      header,
+      p.body_bytes(),
       Pending::RepairFill(RepairFill::new(p.op(), entry)),
     );
     self.appending.insert(op);

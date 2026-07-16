@@ -272,6 +272,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // mark in `on_wal_done`.
     self.pending.clear();
     self.appending.clear();
+    // A deferred append is generation state exactly like the `pending` action it would have minted:
+    // abandoned here so it cannot fire later and append an old generation's bytes into a slot the
+    // new generation re-drives. Its `wal_writes` blocker (if any) deliberately survives — the
+    // physical write is still with the device, and the slot-quiescence fence keeps that slot
+    // un-reusable until the write's completion proves it quiesced.
+    self.deferred_appends.clear();
     // Drop stale per-member checkpoint reports: the new generation re-establishes the pipeline, so
     // old-view reports must not gate the next primary's GC. A fresh primary rebuilds the map from
     // incoming PrepareOk/Commit, staying conservative (unheard peers count as 0) until then. The
@@ -888,7 +894,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Committed-survival backstop on the BOUNDARY freed WAL slot `self.op + 1` (the lowest slot above
     // the canonical head): nothing above the authoritative head is committed, so it is uncommitted.
     self.assert_committed_survives(self.op.get() + 1, self.checkpoint_op.get());
-    wal.truncate(self.op);
+    // Retire the appends the backend could cancel synchronously; any it could NOT cancel stay in
+    // `wal_writes` as un-quiesced writes, and the adopt-append loop below defers every re-append
+    // whose slot one of them still holds (the slot-quiescence fence).
+    let cancelled = wal.truncate(self.op);
+    self.absorb_wal_cancellations(wal, cancelled);
 
     // Backfill the client-session request high-water from the adopted in-memory log tail. This is a
     // fallback that only covers the ops still cached in `self.log` (the offset tail `(floor .. op]`).
@@ -1267,11 +1277,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `self.op` drops ONLY uncommitted ops, so there is no durability dip; the uncommitted tail is simply
   /// re-fetched from the primary as `Prepare`s. (`adopt_canonical_head` never lowers `self.op`, so this is
   /// exactly the adopted head; done in the caller because it owns the `wal` handle.)
-  pub(crate) fn truncate_wal_above_adopted_head<W: Wal>(&self, wal: &mut W) {
+  pub(crate) fn truncate_wal_above_adopted_head<W: Wal>(&mut self, wal: &mut W) {
     // Committed-survival backstop on the BOUNDARY freed WAL slot `self.op + 1`: the adopted head is the
     // view's authoritative head, so nothing strictly above it is committed (the uncommitted clause).
     self.assert_committed_survives(self.op.get() + 1, self.checkpoint_op.get());
-    wal.truncate(self.op);
+    // Retire what the backend could cancel synchronously; the rest stay in `wal_writes`, fencing
+    // every re-append to their slots until they quiesce.
+    let cancelled = wal.truncate(self.op);
+    self.absorb_wal_cancellations(wal, cancelled);
   }
 
   /// Adopt an authoritative primary's canonical head + log for `view` and return to `Normal`.
@@ -1520,9 +1533,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       entry.request,
       &body,
     );
-    let id = self.mint_op_id();
-    wal.submit_append(id, OpNumber::with(op), header, body);
-    self.pending.insert(id.get(), kind);
+    // Through the slot-quiescence choke — the canonical shape of the hazard it closes: this
+    // re-append targets the SAME op a just-truncated old-view write may still hold in flight, and
+    // completion reordering must not let the abandoned bytes land over the canonical value after
+    // this replica's vote/ack named it.
+    self.submit_or_defer_append(wal, OpNumber::with(op), header, body, kind);
     // Append-before-ack: the adopted op is in flight until `on_wal_done`. Both adoption kinds
     // (AdoptVote → own vote, AdoptAck → PrepareOk) defer their cast to completion; tracking the op
     // here keeps the durable predicate uniform so the choke-point gate covers the adoption path too.

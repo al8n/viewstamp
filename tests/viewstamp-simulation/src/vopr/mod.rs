@@ -105,6 +105,14 @@ pub struct VoprReport {
   /// genuinely fired, so the proto's recovery placement check (`header.op() == op`) was exercised
   /// rather than merely armed. (Summed since each replica's WAL persists across crash/restart.)
   misdirects_fired: u64,
+  /// The high-water mark of OUT-OF-SUBMISSION-ORDER WAL append completions across the run, summed
+  /// over replicas — a chaos-mode release that landed an append other than the oldest staged one.
+  /// Always `0` off-axis (the write-chaos axis is opt-in); `> 0` on a chaos run proves the axis
+  /// genuinely REORDERED completions, so the endpoint's slot-quiescence fence and any-order
+  /// completion tolerance were exercised rather than merely armed. Deliberately NOT folded into the
+  /// digest report hash (like the other off-axis-zero witnesses), so the default lane's hash schema
+  /// is unchanged.
+  wal_write_reorders: u64,
   /// The high-water mark of the recover read-window's HELD TAIL above the durable checkpoint
   /// (`op - checkpoint_op`), folded from [`Cluster::recovered_band_high_water`] — which samples it ONCE
   /// per recovery at recover construction (the held head is fixed there; the committed band above the
@@ -385,6 +393,13 @@ impl VoprReport {
   /// misdirected-read axis genuinely fired, so the proto's recovery placement check was exercised.
   pub const fn misdirects_fired(&self) -> u64 {
     self.misdirects_fired
+  }
+
+  /// The high-water of OUT-OF-SUBMISSION-ORDER WAL append completions across the run (summed over
+  /// replicas). Always `0` off-axis; `> 0` on a write-chaos run ⇒ the axis genuinely reordered
+  /// completions, so the slot-quiescence fence was exercised rather than merely armed.
+  pub const fn wal_write_reorders(&self) -> u64 {
+    self.wal_write_reorders
   }
 
   /// The high-water of the recover read-window's HELD TAIL above the durable checkpoint
@@ -706,6 +721,14 @@ struct Vopr {
   /// byte-identical); an enabled run is its own baseline, with `VOPR_NO_TORN_HEADER` only zeroing the
   /// applied rate.
   torn_header_axis: bool,
+  /// Whether the WAL WRITE-CHAOS axis is enabled for this run: the `VOPR_WRITE_CHAOS` env var, or
+  /// force-enabled via [`run_vopr_with_write_chaos`] (the committed chaos sweep). Same discipline as
+  /// [`Self::hold_axis`]: with the axis OFF no chaos seed is installed and no PRNG value is consumed
+  /// (the chaos base derives from `self.seed` behind a separate magic, never from the action stream),
+  /// so the default per-seed schedule stays byte-identical; a chaos-enabled run is its OWN
+  /// deterministic baseline. No `VOPR_NO_*` shrink mask exists for it: masking would be identical to
+  /// simply not enabling the axis (nothing else in the schedule depends on the chaos draws).
+  write_chaos_axis: bool,
   /// How many wipe ACTIONS this run has taken (counted against [`WIPE_BUDGET`]). Advances whether or
   /// not the `VOPR_NO_WIPE` mask downgraded the effect, so a masked shrink run keeps the exact same
   /// action schedule + PRNG stream as the unmasked run it is diagnosing.
@@ -923,6 +946,27 @@ pub fn run_vopr_with_wipe(seed: u64, ticks: u64) -> VoprReport {
 pub fn run_vopr_with_torn_headers(seed: u64, ticks: u64) -> VoprReport {
   let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
   v.torn_header_axis = true;
+  run_seeded(v, ticks)
+}
+
+/// Like [`run_vopr`] but with the WAL WRITE-CHAOS axis FORCE-ENABLED, independent of the
+/// `VOPR_WRITE_CHAOS` env var (the same programmatic-override pattern as [`run_vopr_with_hold`]).
+/// Every replica's WAL then models a proactor whose submitted writes are already at the device:
+/// append delays are JITTERED and completions release in a seeded OUT-OF-SUBMISSION order, and
+/// `truncate`/`prune` CANNOT cancel a staged write — the abandoned write stays in flight and lands
+/// LATE into the trimmed region (briefly resurrecting it), exactly the reordering + resurrection
+/// shape the endpoint's slot-quiescence fence exists to survive: without the fence, a truncated op
+/// re-appended at the same number (or a checkpoint-pruned ring slot reused by `op + capacity`) could
+/// have its acked replacement value overwritten by the old write landing last. The EXISTING oracles
+/// judge the outcome — committed-loss (durability), ring-residency, applied-divergence (agreement) —
+/// so a violation here is a REAL finding in the fence, reported with its seed, never masked. A
+/// chaos-enabled run is a pure function of `(seed, ticks)` and its own deterministic baseline (the
+/// chaos seeds derive from the run seed behind a separate magic, never from the action stream, so
+/// the default schedule stays byte-identical with the axis off); this is the entry point for the
+/// committed write-chaos sweep.
+pub fn run_vopr_with_write_chaos(seed: u64, ticks: u64) -> VoprReport {
+  let mut v = Vopr::new(seed, env_flag("VOPR_LEARNER"));
+  v.write_chaos_axis = true;
   run_seeded(v, ticks)
 }
 
@@ -1408,6 +1452,7 @@ impl Vopr {
       hold_axis: env_flag("VOPR_HOLD"),
       wipe_axis: env_flag("VOPR_WIPE"),
       torn_header_axis: env_flag("VOPR_TORN_HEADER"),
+      write_chaos_axis: env_flag("VOPR_WRITE_CHAOS"),
       wipe_actions: 0,
       churn_axis: env_flag("VOPR_CHURN"),
       churn_actions: 0,
@@ -1552,6 +1597,16 @@ impl Vopr {
     // Baseline storage + network faults for the chaos phases (toggled around calm windows).
     c.set_storage_faults(self.chaos_storage_faults());
     c.set_faults(self.chaos_network_faults());
+    // WRITE-CHAOS axis: seeded out-of-order append completions + un-cancellable truncated/pruned
+    // writes on every replica's WAL (the slot-quiescence-fence stress). The chaos base derives from
+    // the run seed behind its own magic — NOT the action stream `self.prng` — and the call is
+    // CONDITIONAL on the axis, so an off-axis run makes no cluster call and consumes no draw: the
+    // default per-seed schedule stays byte-identical. A chaos-enabled run is its own deterministic
+    // baseline (the same discipline as the hold/wipe axes).
+    if self.write_chaos_axis {
+      const WRITE_CHAOS_SEED_MAGIC: u64 = 0x0F0F_C4A0_5EED_D1CE;
+      c.set_wal_write_chaos(Some(self.seed ^ WRITE_CHAOS_SEED_MAGIC));
+    }
     // install the seed-derived bounded ring LAST so its storage rebuild composes over the
     // async-WAL/superblock modes + the storage-fault plan set above (each rebuild preserves the others'
     // settings; `set_wal_capacity` is just the final pass that also fixes `capacity()` to `N`). On an
@@ -3117,6 +3172,12 @@ impl Vopr {
       .map(|i| c.wal_misdirects_fired(i))
       .sum();
     self.report.misdirects_fired = self.report.misdirects_fired.max(md);
+    // WRITE-CHAOS reorder high-water (same shape as the misdirect witness above): out-of-submission-
+    // order completions summed over the persistent per-replica WAL counters. Identically 0 off-axis.
+    let rw: u64 = (0..self.node_count)
+      .map(|i| c.wal_write_reorders_fired(i))
+      .sum();
+    self.report.wal_write_reorders = self.report.wal_write_reorders.max(rw);
     // FORCED-sync (peer-fetch escalation) cumulative accumulation. The proto's per-replica counter
     // resets to 0 on `recover` (each restart), so we fold each POSITIVE delta into the running total
     // and always re-baseline `forced_sync_seen` — a reset's downward step then contributes nothing and

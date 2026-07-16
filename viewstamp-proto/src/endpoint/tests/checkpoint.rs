@@ -976,3 +976,481 @@ fn adoption_rolls_back_an_orphaned_accept_ahead_watermark() {
 }
 
 // ── State-sync ──
+
+// ── The WAL slot-quiescence fence (checkpoint/GC lane) ──
+
+/// A client `Request` from client 7: request `rn`, body `[rn]`.
+fn chaos_req(rn: u64) -> Message {
+  Message::Request(Request::new(
+    ClientId::new(7),
+    RequestNumber::with(rn),
+    Bytes::from(std::vec![rn as u8]),
+  ))
+}
+
+/// A backup's `PrepareOk` for op `op` (view 0) from `replica`, carrying its `checkpoint_op` report and
+/// the content-addressed identity of the client-7 op minted by [`chaos_req`].
+fn chaos_ok(op: u64, replica: u16, checkpoint_op: u64) -> Message {
+  Message::PrepareOk(PrepareOk::new(
+    View::new(),
+    OpNumber::with(op),
+    ReplicaId::new(replica),
+    OpNumber::with(checkpoint_op),
+    crate::storage::prepare_identity(
+      ClientId::new(7),
+      RequestNumber::with(op),
+      crate::storage::fnv1a_128(&[op as u8]),
+    ),
+    crate::Epoch::new(0),
+    0,
+  ))
+}
+
+/// Drive a view-0 primary (replica 0 of 3, `checkpoint_ops = 2`) over a BOUNDED [`ReorderWal`] ring of
+/// 4 slots into the released-op-with-an-unquiesced-write state:
+/// - op 1's append (body `[1]`) is STILL IN FLIGHT (staged, completion held) while op 1 itself
+///   committed long ago — BOTH backups voted, so the quorum formed without the primary's own
+///   (never-cast) vote — and is now checkpoint-subsumed;
+/// - ops 2..=4 committed normally (their appends released + acked; the backups' acks carry their
+///   `checkpoint_op = 2` reports), so the checkpoint at op 4 runs GC with a quorum prune floor of 2:
+///   `wal.prune(3)` frees the durable slots through op 2, and op 1 becomes a RELEASED op whose
+///   physical write never quiesced — the exact state a late landing (or a late async cancellation)
+///   resolves.
+///
+/// Returns the endpoint + storage with the outgoing queue drained.
+fn primary_with_op1_write_held_across_checkpoint_gc() -> (
+  Endpoint<NoopSm>,
+  ReorderWal,
+  TestSb,
+  crate::block_store::MemBlockStore,
+) {
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 2).unwrap();
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, NoopSm, 4);
+  let (mut wal, mut sb) = (ReorderWal::bounded(4), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  // Op 1 = body `[1]` staged (completion HELD). Both backups vote → op 1 commits WITHOUT the
+  // primary's own vote (2-of-3 quorum from the backups alone) while its own append is still in
+  // flight — the client is replied to on the strength of the BACKUPS' durable copies.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(7)),
+    chaos_req(1),
+  );
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "op 1's append is staged, its completion withheld"
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    chaos_ok(1, 1, 0),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    chaos_ok(1, 2, 0),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "op 1 committed on the two backup votes alone (its own append still in flight)"
+  );
+
+  // Op 2: mint, release its append (own vote), one backup ack → commit 2 → the checkpoint at op 2
+  // fires and lands durably (synchronous superblock). Its GC prunes nothing yet: the quorum floor is
+  // still 0 (no peer has REPORTED a checkpoint).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(7)),
+    chaos_req(2),
+  );
+  assert!(wal.release_latest_for(2), "op 2's append lands normally");
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own vote for op 2
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    chaos_ok(2, 1, 0),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain the checkpoint writes
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(2),
+    "the checkpoint at op 2 is durable"
+  );
+
+  // Ops 3 and 4: mint + release + both backups ack CARRYING `checkpoint_op = 2`, so the quorum
+  // checkpoint rises to 2 and the checkpoint at op 4 runs GC with prune floor 2 → `wal.prune(3)`.
+  for op in 3..=4 {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Client(ClientId::new(7)),
+      chaos_req(op),
+    );
+    assert!(
+      wal.release_latest_for(op),
+      "op {op}'s append lands normally"
+    );
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own vote
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Replica(ReplicaId::new(1)),
+      chaos_ok(op, 1, 2),
+    );
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Replica(ReplicaId::new(2)),
+      chaos_ok(op, 2, 2),
+    );
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain (op 4's commit fires the checkpoint + GC)
+  }
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the checkpoint at op 4 is durable"
+  );
+  assert_eq!(
+    wal.durable_body(2),
+    None,
+    "the GC prune freed the durable WAL slots through op 2"
+  );
+  assert!(
+    wal.durable_body(3).is_some() && wal.durable_body(4).is_some(),
+    "the un-pruned tail (ops 3, 4) is durably held"
+  );
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "op 1's write is STILL staged — the prune could not cancel the device write"
+  );
+  while e.poll_message().is_some() {}
+  (e, wal, sb, blocks)
+}
+
+#[test]
+fn gc_retires_a_checkpoint_subsumed_deferred_appends_bookkeeping() {
+  // Liveness (a deferred append overtaken by the checkpoint). A fence-deferred append's op can
+  // COMMIT on the other replicas' quorum votes while the waiter still sits behind an un-quiesced
+  // blocker, and the next checkpoint then subsumes it. GC must retire the waiter's WHOLE footprint —
+  // the deferred entry AND the `appending` mark it owns — because a dropped waiter never mints a
+  // completion: an orphaned mark would hold `has_inflight_storage()` true until the next generation
+  // reset, wedging the graceful-shutdown, restart-drain, and seal paths on a healthy replica.
+  let (mut e, mut wal, mut sb, mut blocks) = primary_with_op1_write_held_across_checkpoint_gc();
+  let now = Instant::ZERO;
+
+  // Op 5 (the ring alias of op 1 under capacity 4) mints and DEFERS behind op 1's un-quiesced
+  // write, then commits on the two backup votes alone — the waiter is now covered by the cluster
+  // without ever having been submitted locally.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(7)),
+    chaos_req(5),
+  );
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "op 5's append is deferred (only op 1's old write is physically staged)"
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    chaos_ok(5, 1, 4),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    chaos_ok(5, 2, 4),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(5),
+    "op 5 commits on the backups' votes alone, its own append still deferred"
+  );
+
+  // Op 6 carries the cluster to the next checkpoint boundary; its acks report `checkpoint_op = 6`,
+  // so the boundary's GC runs with a prune floor covering the deferred op 5.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(7)),
+    chaos_req(6),
+  );
+  assert!(wal.release_latest_for(6), "op 6's append lands normally");
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own vote for op 6
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    chaos_ok(6, 1, 6),
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    chaos_ok(6, 2, 6),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // checkpoint at 6 → root durable → GC
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(6),
+    "the checkpoint at op 6 is durable and its GC subsumed the deferred op 5"
+  );
+
+  // Quiesce the one remaining physical write — op 1's blocker — and drain. With the waiter's whole
+  // footprint retired, NOTHING is left in flight: the drain signal settles instead of reading true
+  // forever off an `appending` mark no completion can ever clear.
+  assert!(wal.release_latest_for(1), "op 1's old write finally lands");
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    !e.has_inflight_storage(),
+    "the checkpoint-subsumed waiter left no orphaned bookkeeping — storage fully quiesces"
+  );
+  while e.poll_message().is_some() {}
+}
+
+#[test]
+fn ring_wrap_reappend_defers_until_the_pruned_slots_old_write_quiesces() {
+  // Safety (ring-slot reuse across a checkpoint prune). On a bounded ring of 4, op 5 physically
+  // reuses op 1's slot (5 mod 4 == 1 mod 4). Op 1 committed and was checkpoint-pruned while its own
+  // append never quiesced (the device still holds the write) — so when the primary mints op 5, the
+  // admission window allows it (5 − prune_floor(2) = 3 ≤ 4) but the PHYSICAL slot still has op 1's
+  // un-quiesced write in flight. WITHOUT the fence op 5's append is submitted immediately; append
+  // completions may reorder, so a newest-first device lands op 5's bytes FIRST and op 1's stale
+  // bytes LAST — evicting the COMMITTED op 5's durable value from the shared slot while its commit
+  // (and client reply) stand: committed-value loss. The fence DEFERS op 5's append until op 1's
+  // write quiesces, so op 5's bytes are the last write to the slot.
+  let (mut e, mut wal, mut sb, mut blocks) = primary_with_op1_write_held_across_checkpoint_gc();
+  let now = Instant::ZERO;
+
+  // Mint op 5 (body `[5]`) — the ring alias of op 1's slot. The Prepare broadcasts (consensus
+  // proceeds), but the physical append is DEFERRED behind op 1's un-quiesced write.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(7)),
+    chaos_req(5),
+  );
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "op 5's append was DEFERRED by the fence (only op 1's old write is staged) despite the \
+     admission window allowing the mint"
+  );
+  let mut saw_prepare_5 = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::Prepare(p) = out.msg_ref()
+      && p.op() == OpNumber::with(5)
+    {
+      saw_prepare_5 = true;
+    }
+  }
+  assert!(
+    saw_prepare_5,
+    "the op-5 Prepare WAS broadcast — only the physical write waits on the fence"
+  );
+  // One backup votes for op 5. It cannot commit yet: the primary's own vote follows its own durable
+  // append (append-before-ack), which is deferred.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    chaos_ok(5, 1, 2),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(4),
+    "op 5 must not commit before the primary's own durable vote"
+  );
+
+  // The device completes newest-first: repeatedly land the NEWEST staged write, draining after each.
+  // Fenced: only op 1's old write is staged — it lands late into the pruned region (an INERT
+  // resurrection: its stale completion finds op 1 released and casts nothing) and the quiesced slot
+  // releases op 5's deferred append; the next round lands op 5's bytes — physically evicting the
+  // resurrected op 1 from the shared slot — and the completion casts the primary's own vote,
+  // committing op 5 with the backup's ack. Reverted (no fence): op 5's append was submitted at mint
+  // ALONGSIDE op 1's, so newest-first lands op 5 FIRST and op 1's stale bytes LAST — evicting the
+  // committed op 5's durable value, which the final durable_body assert catches.
+  while let Some(&newest) = wal.staged_ops().last() {
+    assert!(wal.release_latest_for(newest));
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(5),
+    "op 5 commits once its deferred append lands (own vote + the backup ack)"
+  );
+  // THE property: the durable ring slot holds the COMMITTED op 5's bytes — the last write to the
+  // slot — and op 1's stale resurrection was evicted by the wrap, not the other way around.
+  assert_eq!(
+    wal.durable_body(5),
+    Some(Bytes::from(std::vec![5u8])),
+    "the shared ring slot durably holds the committed op 5's bytes, not op 1's late stale write"
+  );
+  assert_eq!(
+    wal.durable_body(1),
+    None,
+    "op 1's resurrected entry was evicted by op 5's wrap (the checkpoint owns its content)"
+  );
+  assert!(
+    !e.has_inflight_storage(),
+    "every physical write quiesced — nothing lingers after the choreography"
+  );
+}
+
+#[test]
+fn async_cancellation_of_a_released_ops_write_retires_it_silently() {
+  // The `WalDone::Cancelled` RELEASED-op arm. Op 1 is checkpoint-subsumed and GC-pruned (at/below
+  // the actually-pruned floor) while its append never quiesced, and its `Pending::Ack` action is
+  // still live (GC deliberately leaves `pending` intact — the write is still with the device). The
+  // backend then reports the write ASYNC-CANCELLED: its bytes never landed and never will. The
+  // endpoint must retire the bookkeeping ON THE SPOT — no vote cast, no resubmit staged (the op is
+  // released; nothing is owed) — so the storage-drain signal settles and a driver's graceful
+  // teardown completes.
+  let (mut e, mut wal, mut sb, mut blocks) = primary_with_op1_write_held_across_checkpoint_gc();
+  let now = Instant::ZERO;
+
+  assert!(
+    e.has_inflight_storage(),
+    "op 1's un-quiesced write still holds the storage-drain signal true"
+  );
+  assert!(
+    wal.cancel_latest_for(1),
+    "the backend async-cancels op 1's staged write"
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![] as std::vec::Vec<u64>,
+    "nothing was re-submitted for the released op (the cancellation is not a fault to retry)"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(4),
+    "no vote/commit moved — the released op's cancellation owes nothing"
+  );
+  assert_eq!(
+    wal.durable_body(1),
+    None,
+    "the cancelled write never landed (no resurrection)"
+  );
+  assert!(
+    !e.has_inflight_storage(),
+    "the released-op cancellation retired ALL bookkeeping — the endpoint settles"
+  );
+}
+
+#[test]
+fn async_cancellation_of_a_live_ops_write_degrades_to_a_resubmit() {
+  // The `WalDone::Cancelled` LIVE-op arm (a backend contract violation, degraded like `Fault`).
+  // A primary mints op 1 and the backend spuriously cancels the LIVE append — an op the endpoint
+  // still owes its own vote for. Silently retiring it would leak the op's in-flight bookkeeping and
+  // wedge the commit; treating it as `Appended` would cast a vote for bytes that never landed. The
+  // endpoint instead RE-SUBMITS the append from its still-held data, so the spurious cancel costs
+  // one retry and the op still commits.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (ReorderWal::new(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(7)),
+    chaos_req(1),
+  );
+  assert_eq!(wal.staged_ops(), std::vec![1], "op 1's append is staged");
+  assert!(
+    wal.cancel_latest_for(1),
+    "the backend spuriously cancels the LIVE append"
+  );
+  assert_eq!(
+    wal.staged_len(),
+    0,
+    "the cancel popped the old write before the endpoint reacts"
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "a FRESH re-submit was staged for the live op (degraded to a retry, not a leak)"
+  );
+
+  // The retried append lands → the primary's own vote; one backup ack completes the quorum.
+  assert!(wal.release_latest_for(1), "the re-submitted append lands");
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    chaos_ok(1, 1, 0),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "liveness preserved: the op still commits despite the spurious cancellation"
+  );
+  assert_eq!(
+    wal.durable_body(1),
+    Some(Bytes::from(std::vec![1u8])),
+    "the durable slot holds the retried append's bytes"
+  );
+  assert!(
+    !e.has_inflight_storage(),
+    "nothing lingers once the retried append quiesced"
+  );
+}

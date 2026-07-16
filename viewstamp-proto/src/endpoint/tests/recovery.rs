@@ -7662,7 +7662,7 @@ fn a_formatted_genesis_store_resumes_the_view_0_primary() {
 
 #[test]
 fn a_wiped_multi_node_voter_fails_stop_rather_than_participating() {
-  // THE wipe-amnesia fix (the R1/R3 critical finding). A wiped MULTI-NODE voter's disk is replaced
+  // THE wipe-amnesia fix. A wiped MULTI-NODE voter's disk is replaced
   // with an empty store whose consensus scalars (view 0, op 0, commit 0) are byte-identical to a
   // genuine genesis — but it carries NO format witness. It must NOT re-enter the voting set with an
   // empty log: abdicating as primary OR resuming as a backup would still let it join a view-change
@@ -7766,7 +7766,7 @@ fn format_over_an_async_superblock_reports_the_write_is_not_durable() {
 
 #[test]
 fn a_leaked_format_completion_cannot_release_a_view_change_write() {
-  // CONSENSUS-SAFETY regression (the R2 escalation). `format` writes its genesis root under a
+  // CONSENSUS-SAFETY regression. `format` writes its genesis root under a
   // RESERVED OpId (u64::MAX) that `mint_op_id` — which counts up from 1 — can never produce. So even
   // if a `format` on an async superblock leaks its write (it returned WriteNotDurable but the write
   // lands later), the late `Wrote(u64::MAX)` matches NO endpoint's minted `pending_sb` and is inert.
@@ -7853,7 +7853,7 @@ fn a_leaked_format_completion_cannot_release_a_view_change_write() {
 
 #[test]
 fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
-  // CONSENSUS-SAFETY regression (the R3 finding). A solo cluster (replica_count 1) that committed
+  // CONSENSUS-SAFETY regression. A solo cluster (replica_count 1) that committed
   // acked ops, then had its only disk WIPED, comes back with an empty UNFORMATTED store. It has no
   // quorum to abdicate to and no peer to sync from, so resuming Normal would silently authorize a NEW
   // history (a fresh op 1) over the forgotten acked ops. Recovery must FAIL-STOP instead — the loss
@@ -7898,7 +7898,7 @@ fn a_wiped_solo_voter_fails_stop_rather_than_serving_a_new_history() {
 
 #[test]
 fn a_second_format_attempt_does_not_confirm_off_the_first_attempts_completion() {
-  // RETRY-SAFETY regression (the R3 finding). `format` confirms success by requiring the durable root
+  // RETRY-SAFETY regression. `format` confirms success by requiring the durable root
   // to equal EXACTLY the root this call submitted, not merely by seeing a `Wrote` under the shared
   // FORMAT_OP_ID. So a second attempt whose write is still in flight cannot falsely confirm off a
   // first attempt's completion. Here `StepSb` holds writes in flight until `flush`, so neither format

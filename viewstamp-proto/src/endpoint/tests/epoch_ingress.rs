@@ -609,6 +609,93 @@ fn a_non_normal_laggard_routes_a_higher_epoch_heartbeat_into_the_recovery_peer_f
 }
 
 #[test]
+fn a_pre_transition_appends_completion_is_absorbed_while_recovering() {
+  // A LIVE laggard can carry an in-flight WAL append into the cross-epoch recovery peer-fetch: the
+  // escalation abandons the append LOGICALLY (`reset_for_view_transition` clears its pending
+  // action) while its physical-write witness survives — the write is still with the device, and its
+  // completion is delivered exactly once. If that completion lands while the endpoint is
+  // `Recovering` and the recovery router consumes it, the witness leaks FOREVER:
+  // `has_inflight_storage()` never settles (wedging the graceful-shutdown and seal drains) and the
+  // slot-quiescence fence defers every future append to that ring slot permanently. The completion
+  // must instead retire the witness on the spot — and cast nothing (the action was abandoned).
+  let mut e = backup();
+  let (mut wal, mut sb) = (ReorderWal::new(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  // A view-0 Prepare stages the backup's append; its completion is HELD (the async in-flight window).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  assert_eq!(wal.staged_len(), 1, "the append is physically in flight");
+  assert!(e.has_inflight_storage());
+  while e.poll_message().is_some() {}
+
+  // A same-epoch higher-view Commit catches the backup into ViewChange: the append's action is
+  // abandoned, its physical write stays in flight.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::with(3),
+      OpNumber::new(),
+      OpNumber::new(),
+      Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(e.status().is_view_change());
+  while e.poll_message().is_some() {}
+
+  // A strictly-higher-epoch Commit routes the stranded laggard into the recovery peer-fetch.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::with(3),
+      OpNumber::with(9),
+      OpNumber::with(9),
+      Epoch::new(1),
+      FOREIGN_CONFIG_ID,
+    )),
+  );
+  assert!(e.status().is_recovering());
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    wal.staged_len(),
+    1,
+    "the abandoned append is STILL physically in flight across both transitions"
+  );
+
+  // The abandoned append's completion lands WHILE RECOVERING. The witness retires on delivery;
+  // nothing else is owed (the action was abandoned at the transition), so storage is fully
+  // quiescent — the drain signal settles instead of wedging forever.
+  assert!(wal.release_latest_for(1), "the held append lands");
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    !e.has_inflight_storage(),
+    "the quiescence witness retired on delivery while Recovering — nothing leaks"
+  );
+  // And the abandoned completion cast nothing.
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::PrepareOk(_)),
+      "no ack fires off an abandoned append's completion"
+    );
+  }
+}
+
+#[test]
 fn a_pending_durable_view_write_defers_the_cross_epoch_peer_fetch() {
   // SAFETY: a non-Normal laggard with an in-flight DURABLE-VIEW write (a self-driven view change's
   // SendDoViewChange root, not yet landed) must NOT be torn into the peer-fetch mid-write — that could

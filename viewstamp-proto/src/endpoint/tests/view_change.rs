@@ -6129,13 +6129,16 @@ fn repair_tail_truncation_clears_inflight_for_a_higher_suffix_op() {
     !e.has_repair_hole_for_test(2) && !e.has_repair_hole_for_test(3),
     "both suffix repair holes are cleared by the truncation"
   );
-  // FAIL-BEFORE: the truncation left op 3's `Pending::RepairFill` + `appending` membership behind, so a
-  // permanently-stuck in-flight append remained. AFTER the fix the suffix `pending`/`appending` is
-  // cleared too, so no in-flight storage lingers.
+  // The truncation abandons op 3's fill LOGICALLY (its `pending`/`appending` entries are gone — the
+  // no-resurrection + no-phantom-vote assertions below prove it), but the PHYSICAL write has not
+  // QUIESCED: its completion is still queued, and the slot-quiescence fence tracks the write
+  // independently of the abandoned bookkeeping, so the storage-drain signal keeps reading true until
+  // the completion is delivered — exactly what a driver's graceful teardown must wait for (the OpId-
+  // lifetime drain contract). Not stuck: one drain below delivers it, and the post-drain assertion is
+  // the "nothing lingers forever" witness.
   assert!(
-    !e.has_inflight_storage(),
-    "no stuck in-flight append survives the truncation \
-     (FAIL-BEFORE: op 3's RepairFill/appending lingered → has_inflight_storage stayed true forever)"
+    e.has_inflight_storage(),
+    "the abandoned append's physical write stays un-quiesced until its completion is drained"
   );
 
   // The WAL completion for op 3's now-abandoned append is STILL queued (it was staged before the
@@ -7425,4 +7428,268 @@ fn escalation_at_view_max_saturates_instead_of_wrapping() {
     saw_svc,
     "the proposal is still broadcast (liveness intent kept)"
   );
+}
+
+#[test]
+fn adoption_reappend_defers_until_the_abandoned_same_slot_write_quiesces() {
+  // Safety (same-op reuse across a view-change adoption). A backup holds op 1 with body A whose
+  // physical WAL write is still IN FLIGHT (a proactor whose bytes are already at the device but whose
+  // completion has not been drained). It then adopts a StartView whose canonical op 1 carries a
+  // DIFFERENT body B. The transition abandons A logically, but the truncate above the adopted head
+  // (op 1) cancels NOTHING — A sits AT the head, not above it — so the abandoned write A is still with
+  // the device and can land at any moment. The adoption re-appends op 1 = B: WITHOUT the
+  // slot-quiescence fence B would be submitted immediately, and since append completions may reorder a
+  // newest-first device would land B then A — leaving the durable slot holding A while this replica's
+  // PrepareOk named B (a committed-value the vote never matched). The fence DEFERS B until A's write
+  // quiesces, so B is the LAST value written to the slot and the durable slot always holds what the ack
+  // named.
+  //
+  // Local is replica 2 of 3: a BACKUP of view 0 (primary replica 0) AND of view 1 (primary replica 1),
+  // so it legitimately adopts view 1's StartView from replica 1 (mirrors `backup_adopts_start_view`).
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(2)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (ReorderWal::new(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  // (1) A view-0 Prepare for op 1 with body A (client 7 / request 1 / body [1]) → the backup STAGES A's
+  // append (completion HELD by the ReorderWal). Append-before-ack: NO PrepareOk is emitted for the
+  // not-yet-durable op.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "op 1's body-A append is staged, its completion withheld"
+  );
+  assert!(
+    !drained_prepare_ok_for(&mut e, 1),
+    "no PrepareOk for op 1 before its append is durable (append-before-ack)"
+  );
+
+  // (2) A StartView for view 1 (from replica 1, view 1's primary) whose canonical op 1 carries a
+  // DIFFERENT operation B (client 8 / request 1 / body b"B"), commit 0 (op 1 uncommitted). The
+  // adoption abandons A logically and re-appends op 1 = B — but B must be DEFERRED behind A's
+  // un-quiesced write.
+  let start_view_1 = StartView::new(
+    View::with(1),
+    OpNumber::with(1),
+    OpNumber::with(0),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(1),
+    std::vec![PreparedEntry::new(
+      OpNumber::with(1),
+      ClientId::new(8),
+      RequestNumber::with(1),
+      bytes::Bytes::from_static(b"B"),
+    )],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(start_view_1),
+  );
+  assert_eq!(e.view(), View::with(1), "adopted view 1");
+  // The durable-view write completes → `start_view_acks` re-appends the adopted uncommitted op 1 = B.
+  // The fence sees A's write still in flight on op 1's slot, so B PARKS (deferred) — it is NOT handed to
+  // the WAL. The ONLY staged append is still A (the truncate cancelled nothing).
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "only A is staged — B was DEFERRED by the fence, not submitted (the truncate cancelled nothing)"
+  );
+  assert!(
+    !drained_prepare_ok_for(&mut e, 1),
+    "still no PrepareOk for op 1 — B's append is deferred, not durable"
+  );
+
+  // (3) A's abandoned write LANDS (its stale bytes momentarily become the durable slot content — the
+  // resurrection the fence tolerates). Its stale completion finds no pending action (the transition
+  // dropped it) so it casts nothing, and the now-quiesced slot RELEASES the deferred B. Staged now
+  // holds B; the durable slot briefly holds A.
+  assert!(wal.release_latest_for(1), "A's staged write lands");
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "the quiesced slot released B — it is now the sole staged append"
+  );
+  assert_eq!(
+    wal.durable_body(1),
+    Some(bytes::Bytes::from_static(&[1])),
+    "the durable slot briefly holds the resurrected stale A"
+  );
+  assert!(
+    !drained_prepare_ok_for(&mut e, 1),
+    "no PrepareOk yet — B is still in flight"
+  );
+
+  // (4) B lands (evicting nothing — a ring-less slot) and its completion casts the deferred PrepareOk.
+  assert!(wal.release_latest_for(1), "B's released write lands");
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    drained_prepare_ok_for(&mut e, 1),
+    "op 1's PrepareOk is cast once B is durable (append-before-ack)"
+  );
+
+  // Drain any residual staged write newest-first, so the release order is newest-first REGARDLESS of
+  // the fence (this is what would land A LAST — over B — on a reverted fence, where B was submitted at
+  // step 2 alongside A). With the fence there is nothing left to release.
+  while wal.release_latest_for(1) {
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  }
+
+  // THE PROPERTY: the durable slot holds exactly what the vote named — B. On a reverted fence B is
+  // submitted at adoption time, the newest-first release lands B then A, and the durable slot ends
+  // holding A under a PrepareOk that named B — so this final equality FAILS.
+  assert_eq!(
+    wal.durable_body(1),
+    Some(bytes::Bytes::from_static(b"B")),
+    "the durable slot holds B — the value op 1's PrepareOk named — not the resurrected stale A"
+  );
+}
+
+#[test]
+fn synchronous_truncate_cancellation_opens_no_deferral_window() {
+  // The IDEAL cancelling backend fast path (the byte-identical-default property at unit level). When a
+  // backend can synchronously cancel an in-flight append during `truncate`/`prune` — a proactor whose
+  // write is still in its own submission queue — the endpoint clears the physical-write witness ON THE
+  // SPOT, so a re-append to that slot needs NO deferral window and no stale write can ever resurrect.
+  // This is the flow every synchronous WAL (and the sim's default mode) takes; the fence's deferral
+  // machinery is inert here, so behaviour is byte-identical to the pre-fence code.
+  //
+  // The reused op must be one the truncate actually REMOVES (a truncate acts strictly ABOVE the adopted
+  // head, so the head op is never truncated). So: a backup holds op 1 = A in flight, then adopts a
+  // StartView whose canonical log is EMPTY (op 1 = A was provably uncommitted and dropped forming view
+  // 1). `truncate(above=0)` then SYNCHRONOUSLY cancels A. A later view-1 Prepare re-appends op 1 = B,
+  // which submits directly — no deferral, and A never lands.
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(2)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (ReorderWal::new().cancelling(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  // Op 1 = A staged in flight (completion held).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  assert_eq!(wal.staged_ops(), std::vec![1], "op 1 = A is staged");
+
+  // Adopt view 1 with an EMPTY canonical log (head op 0) → `truncate(above=0)` SYNCHRONOUSLY cancels
+  // A's in-flight write and clears its witness on the spot. Nothing remains staged; no resurrection can
+  // land.
+  let empty_start_view_1 = StartView::new(
+    View::with(1),
+    OpNumber::with(0),
+    OpNumber::with(0),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(1),
+    std::vec![],
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(empty_start_view_1),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(e.view(), View::with(1), "adopted view 1");
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![] as std::vec::Vec<u64>,
+    "A was synchronously cancelled by the truncate — nothing is staged, nothing can resurrect"
+  );
+
+  // A view-1 Prepare re-appends op 1 = B. Its witness slot is clear (A cancelled), so B submits WITHOUT
+  // any deferral — the ONE staged entry is B.
+  let prepare_b = Message::Prepare(Prepare::new(
+    View::with(1),
+    OpNumber::with(1),
+    OpNumber::with(0),
+    OpNumber::with(0),
+    crate::Epoch::new(0),
+    0,
+    ClientId::new(8),
+    RequestNumber::with(1),
+    bytes::Bytes::from_static(b"B"),
+  ));
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    prepare_b,
+  );
+  assert_eq!(
+    wal.staged_ops(),
+    std::vec![1],
+    "B submitted WITHOUT deferral (the cancelling backend opened no fence window)"
+  );
+  assert!(
+    !drained_prepare_ok_for(&mut e, 1),
+    "no PrepareOk before B is durable (append-before-ack)"
+  );
+
+  // B lands and its completion casts the deferred PrepareOk; the durable slot holds B, and A — cancelled
+  // — never resurrects.
+  assert!(wal.release_latest_for(1), "B lands");
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    drained_prepare_ok_for(&mut e, 1),
+    "op 1's PrepareOk fires once B is durable"
+  );
+  assert!(
+    !wal.release_latest_for(1),
+    "no second staged write exists — A was cancelled, never staged for a late landing"
+  );
+  assert_eq!(
+    wal.durable_body(1),
+    Some(bytes::Bytes::from_static(b"B")),
+    "the durable slot holds B; the cancelled A never landed"
+  );
+}
+
+/// Drain the endpoint's outgoing queue, returning whether a `PrepareOk` for op `op` was among the
+/// messages. (Discards every drained message — used by the fence tests to check append-before-ack at a
+/// point in the choreography.)
+fn drained_prepare_ok_for(e: &mut Endpoint<NoopSm>, op: u64) -> bool {
+  let mut saw = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.into_msg()
+      && ok.op() == OpNumber::with(op)
+    {
+      saw = true;
+    }
+  }
+  saw
 }

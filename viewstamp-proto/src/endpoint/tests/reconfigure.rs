@@ -1720,10 +1720,10 @@ impl Wal for ZeroCapWal {
   fn submit_read(&mut self, id: OpId, op: OpNumber) {
     self.inner.submit_read(id, op)
   }
-  fn truncate(&mut self, above: OpNumber) {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
     self.inner.truncate(above)
   }
-  fn prune(&mut self, below: OpNumber) {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
     self.inner.prune(below)
   }
   fn poll(&mut self) -> Option<WalDone> {

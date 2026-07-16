@@ -802,6 +802,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       timers: Timers::default(),
       next_op_id: 1,
       pending: BTreeMap::new(),
+      wal_writes: BTreeMap::new(),
+      deferred_appends: BTreeMap::new(),
+      // A fresh incarnation has NO in-flight writes (a restart-in-place drains them first — the
+      // `has_inflight_storage` contract — and a crash discards them with the process), so no op is
+      // wrongly judged "released" before the first `run_gc` re-raises this from 0.
+      wal_pruned: 0,
       appending: std::collections::BTreeSet::new(),
       pending_sb: None,
       pending_checkpoint: None,
@@ -970,7 +976,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       WalDone::ReadOk(r) => r.id(),
       WalDone::Absent(id) | WalDone::Fault(id) => *id,
       WalDone::BodyFaulty(bf) => bf.id(),
-      WalDone::Appended(_) => return,
+      // An append completion whose write this endpoint still witnesses never reaches here —
+      // `on_wal_done` absorbs it (retiring its `wal_writes` entry) BEFORE the recovering-status
+      // routing, because a cross-epoch peer-fetch escalation can carry a live laggard's in-flight
+      // appends into `Recovering`. What remains is stale/foreign: ignore, faults-as-data.
+      WalDone::Appended(_) | WalDone::Cancelled(_) => return,
     };
     // `wal` is part of the uniform recover-completion signature (`handle_storage` passes it the same way to
     // every `on_recover_*` handler), but a completion carries its own outcome and this handler submits no

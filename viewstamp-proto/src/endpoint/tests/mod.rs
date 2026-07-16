@@ -326,12 +326,210 @@ impl Wal for TestWal {
       None => WalDone::Absent(id),
     });
   }
-  fn truncate(&mut self, above: OpNumber) {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
     self.entries.retain(|&op, _| op <= above.get());
     self.head = self.head.min(above.get());
+    std::vec::Vec::new()
   }
-  fn prune(&mut self, below: OpNumber) {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
     self.entries.retain(|&op, _| op >= below.get());
+    std::vec::Vec::new()
+  }
+  fn poll(&mut self) -> Option<WalDone> {
+    self.done.pop_front()
+  }
+}
+
+/// One submitted-but-not-yet-landed physical append held by [`ReorderWal`]: its bytes are already at
+/// the device but its completion is withheld until the test releases (or cancels) it.
+#[derive(Clone)]
+struct StagedAppend {
+  id: OpId,
+  op: u64,
+  header: Header,
+  body: Bytes,
+}
+
+/// An async WAL modelling a proactor whose submitted writes are ALREADY AT THE DEVICE: `submit_append`
+/// STAGES the `(id, op, header, body)` in submission order — the bytes do NOT land and the completion is
+/// HELD until the test drives it. The synchronous views ([`Wal::op_head`], [`Wal::header`],
+/// [`Wal::status`]) reflect ONLY the landed `entries`; a staged slot reports [`SlotStatus::Dirty`]. The
+/// test releases completions EXPLICITLY (newest-first per op), so it can reproduce a device completing
+/// the OLD write of a slot AFTER the endpoint abandoned it — the reordering the slot-quiescence fence
+/// exists to survive.
+///
+/// `truncate`/`prune` trim the landed `entries` but KEEP every staged write — an un-cancellable device
+/// write that may land late into the trimmed region (the tolerated resurrection) — and report NOTHING
+/// cancelled, UNLESS `cancel_on_truncate` is set, in which case they synchronously drop the affected
+/// staged writes and return their ids (the ideal cancelling backend, which opens no deferral window).
+struct ReorderWal {
+  /// Durably LANDED entries. Only these back `op_head`/`header`/a `Clean` `status`.
+  entries: BTreeMap<u64, (Header, Bytes)>,
+  head: u64,
+  capacity: u64,
+  /// Submitted appends whose completion is HELD, in submission order (newest last).
+  staged: std::vec::Vec<StagedAppend>,
+  /// Completions produced by `release_latest_for` (`Appended`) / `cancel_latest_for` (`Cancelled`).
+  done: VecDeque<WalDone>,
+  /// When set, `truncate`/`prune` SYNCHRONOUSLY cancel the staged writes they trim and return their
+  /// ids (`wal_writes` clears on the spot, so a replacement append submits WITHOUT deferral).
+  cancel_on_truncate: bool,
+}
+impl ReorderWal {
+  /// A ring-less reorder WAL (`capacity == u64::MAX`): only the same op number aliases a slot.
+  fn new() -> Self {
+    Self::with_capacity(u64::MAX)
+  }
+
+  /// A BOUNDED reorder WAL of `n` slots: op `K` occupies slot `K mod n`, so op `K + n` aliases op `K`'s
+  /// slot (the ring-wrap flavour of the reuse hazard).
+  fn bounded(n: u64) -> Self {
+    Self::with_capacity(n)
+  }
+
+  fn with_capacity(capacity: u64) -> Self {
+    Self {
+      entries: BTreeMap::new(),
+      head: 0,
+      capacity,
+      staged: std::vec::Vec::new(),
+      done: VecDeque::new(),
+      cancel_on_truncate: false,
+    }
+  }
+
+  /// Enable the ideal synchronously-cancelling backend: `truncate`/`prune` cancel their trimmed staged
+  /// writes on the spot (returning the cancelled ids) instead of keeping them for a late landing.
+  fn cancelling(mut self) -> Self {
+    self.cancel_on_truncate = true;
+    self
+  }
+
+  /// The index of the NEWEST staged append for `op` (the last submitted — its completion is the one a
+  /// newest-first device would release first), or `None` if none is staged for `op`.
+  fn newest_staged_for(&self, op: u64) -> Option<usize> {
+    self.staged.iter().rposition(|s| s.op == op)
+  }
+
+  /// Pop the NEWEST staged append for `op` and LAND its bytes: insert into `entries`, raise `head`, and
+  /// (on a bounded ring) EVICT the ring-aliased entry whatever op last held that slot — the physical
+  /// overwrite a wrap performs. Queues its `Appended` completion. Landing happens even into a
+  /// truncated/pruned region (the resurrection the fence tolerates). Returns `false` if none is staged.
+  fn release_latest_for(&mut self, op: u64) -> bool {
+    let Some(i) = self.newest_staged_for(op) else {
+      return false;
+    };
+    let s = self.staged.remove(i);
+    // Bounded ring: writing slot `op mod capacity` physically evicts the DIFFERENT op that last held it.
+    if self.capacity != u64::MAX {
+      let slot = s.op % self.capacity;
+      self
+        .entries
+        .retain(|&k, _| k == s.op || k % self.capacity != slot);
+    }
+    self.entries.insert(s.op, (s.header, s.body));
+    self.head = self.head.max(s.op);
+    self.done.push_back(WalDone::Appended(s.id));
+    true
+  }
+
+  /// Pop the NEWEST staged append for `op` WITHOUT landing its bytes and queue its `Cancelled`
+  /// completion — the ASYNCHRONOUS cancellation report a proactor delivers at completion time. Returns
+  /// `false` if none is staged.
+  fn cancel_latest_for(&mut self, op: u64) -> bool {
+    let Some(i) = self.newest_staged_for(op) else {
+      return false;
+    };
+    let s = self.staged.remove(i);
+    self.done.push_back(WalDone::Cancelled(s.id));
+    true
+  }
+
+  /// The number of staged (submitted-but-not-yet-landed) appends.
+  fn staged_len(&self) -> usize {
+    self.staged.len()
+  }
+
+  /// The op numbers currently staged, in submission order — the witness a test asserts against to prove
+  /// a fence-deferred append was NOT yet submitted (its op is absent) or was released (its op appears).
+  fn staged_ops(&self) -> std::vec::Vec<u64> {
+    self.staged.iter().map(|s| s.op).collect()
+  }
+
+  /// The LANDED body at `op` (the durable slot content), or `None` if no completed append holds it — the
+  /// final-state witness that the durable slot holds exactly the value this replica's vote/ack named.
+  fn durable_body(&self, op: u64) -> Option<Bytes> {
+    self.entries.get(&op).map(|(_, b)| b.clone())
+  }
+
+  /// The staged writes a `truncate`/`prune` for the trimmed region cancels: their ids (cleared from the
+  /// staged set). Only used when `cancel_on_truncate` is set.
+  fn cancel_trimmed(&mut self, keep: impl Fn(u64) -> bool) -> std::vec::Vec<OpId> {
+    let mut cancelled = std::vec::Vec::new();
+    self.staged.retain(|s| {
+      if keep(s.op) {
+        true
+      } else {
+        cancelled.push(s.id);
+        false
+      }
+    });
+    cancelled
+  }
+}
+impl Wal for ReorderWal {
+  fn op_head(&self) -> OpNumber {
+    OpNumber::with(self.head)
+  }
+  fn capacity(&self) -> u64 {
+    self.capacity
+  }
+  fn header(&self, op: OpNumber) -> Option<Header> {
+    self.entries.get(&op.get()).map(|(h, _)| *h)
+  }
+  fn status(&self, op: OpNumber) -> SlotStatus {
+    if self.entries.contains_key(&op.get()) {
+      SlotStatus::Clean
+    } else if self.staged.iter().any(|s| s.op == op.get()) {
+      // Submitted but not yet landed — the in-flight window the fence tracks; NEVER `Clean`.
+      SlotStatus::Dirty
+    } else {
+      SlotStatus::Empty
+    }
+  }
+  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+    // STAGE only — the bytes are at the device but the completion is withheld until the test releases
+    // it. `entries`/`head` are untouched, so the synchronous views keep reporting only landed data.
+    self.staged.push(StagedAppend {
+      id,
+      op: op.get(),
+      header,
+      body,
+    });
+  }
+  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+    // Reads reflect only LANDED entries (a staged slot reads `Absent`, per the poll-ordering contract).
+    self.done.push_back(match self.entries.get(&op.get()) {
+      Some((h, b)) => WalDone::ReadOk(ReadOk::new(id, *h, b.clone())),
+      None => WalDone::Absent(id),
+    });
+  }
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
+    self.entries.retain(|&op, _| op <= above.get());
+    self.head = self.head.min(above.get());
+    if self.cancel_on_truncate {
+      return self.cancel_trimmed(|op| op <= above.get());
+    }
+    // Un-cancellable device writes: keep every staged append (it may land late — the resurrection the
+    // fence tolerates) and report NOTHING cancelled, so the endpoint awaits each completion.
+    std::vec::Vec::new()
+  }
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
+    self.entries.retain(|&op, _| op >= below.get());
+    if self.cancel_on_truncate {
+      return self.cancel_trimmed(|op| op >= below.get());
+    }
+    std::vec::Vec::new()
   }
   fn poll(&mut self) -> Option<WalDone> {
     self.done.pop_front()
@@ -629,12 +827,14 @@ impl Wal for ScriptedWal {
     };
     self.done.push_back(done);
   }
-  fn truncate(&mut self, above: OpNumber) {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
     self.entries.retain(|&op, _| op <= above.get());
     self.head = self.head.min(above.get());
+    std::vec::Vec::new()
   }
-  fn prune(&mut self, below: OpNumber) {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
     self.entries.retain(|&op, _| op >= below.get());
+    std::vec::Vec::new()
   }
   fn poll(&mut self) -> Option<WalDone> {
     self.done.pop_front()
