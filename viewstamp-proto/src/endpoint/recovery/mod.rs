@@ -762,6 +762,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       config_install_op: state.config_install_op(),
       status: Status::Recovering,
       view: state.view(),
+      // The recovered root IS the durable witness for its view — the exact ground the
+      // durable-view-before-participate gates measure against.
+      durable_view: state.view(),
       op: OpNumber::with(op),
       // The restored SM reflects [1..=checkpoint_op] exactly; commit_min = checkpoint_op so those ops
       // are NOT re-applied. commit_max = state.commit() (the DURABLE known-committed frontier),

@@ -85,20 +85,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.push_svc(self.svc_target); // re-broadcast the live SVC target (drives escalation under loss)
       self.timers.svc_message = Some(now + VC_MESSAGE_RETRANSMIT);
     }
-    // Gate the DVC retransmit on a DURABLE view (durable-view-before-participate in the
-    // retransmit path). `enter_view_change` arms `dvc_message` AND submits the SendDoViewChange
-    // durable-view write (so `pending_durable_view()` holds), with the INITIAL DVC deferred to
-    // `on_sb_done`. If the async superblock write is slower than `VC_MESSAGE_RETRANSMIT`, this retransmit
-    // would otherwise fire FIRST and cast the DVC — a VOTE the new primary counts toward forming the view —
-    // BEFORE this replica has PERSISTED the view; a crash before the write lands then recovers the OLD
-    // view after this replica helped form a quorum for the new one. So skip the send while the view
-    // write is pending (the deferred `on_sb_done` casts the initial DVC and the retransmit resumes once
-    // the view is durable). In ViewChange status the only in-flight `pending_sb` write is this
-    // SendDoViewChange one (a SwapEpoch/Seal is Normal-only), so `!pending_durable_view()` is exactly the
-    // durable-view test here. Kept in LOCKSTEP with `serviceable_now(DvcMessage)` (which gates the same
-    // way), so a `dvc_message` armed-and-due during the view write is non-serviceable: `poll_timeout`
-    // filters it out (no spin) and the `handle_timeout` no-orphan-due assert ignores it.
-    if !self.pending_durable_view() && self.timers.dvc_message.is_some_and(|d| d <= now) {
+    // Gate the DVC retransmit on the DURABLE-VIEW WITNESS (durable-view-before-participate in the
+    // retransmit path): the DVC is a VOTE the new primary counts toward forming the view, so it may
+    // be (re)cast only while `self.view == self.durable_view` — the current view provably survives a
+    // crash. `enter_view_change` arms `dvc_message` AND submits the SendDoViewChange durable-view
+    // write, with the INITIAL DVC deferred to `on_sb_done` (which advances the witness, then casts);
+    // if the async superblock write is slower than `VC_MESSAGE_RETRANSMIT`, this retransmit would
+    // otherwise fire first and cast the vote BEFORE the view is persisted — a crash then recovers the
+    // OLD view after this replica helped form a quorum for the new one. The witness equality (rather
+    // than the in-flight `pending_durable_view()`) also holds the gate on any posture whose view was
+    // never SUBMITTED for persistence at all — no write in flight is then vacuously true, but the
+    // witness inequality still refuses the vote. Kept in LOCKSTEP with `serviceable_now(DvcMessage)`
+    // (which gates the same way), so a `dvc_message` armed-and-due while the view is not durable is
+    // non-serviceable: `poll_timeout` filters it out (no spin) and the `handle_timeout` no-orphan-due
+    // assert ignores it.
+    if self.durable_view == self.view && self.timers.dvc_message.is_some_and(|d| d <= now) {
       self.send_do_view_change(now);
       self.timers.dvc_message = Some(now + VC_MESSAGE_RETRANSMIT);
     }
@@ -107,14 +108,85 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     if self.timers.view_change_status.is_some_and(|d| d <= now) {
       // The change did not complete (the next primary is also down, or our catch-up target is
-      // unreachable): become an active SVC-driver for the next view and re-arm timers for that
-      // role (clears the now-stale get_view_message; arms svc/dvc/view_change_status). Still
-      // ViewChange here, so the collection is `Some`; flip the catch-up discriminant in place.
-      if let Some(vc) = self.view_change.as_mut() {
-        vc.catching_up = false;
+      // unreachable): drive the next view's SVC. A CATCH-UP posture stays a catch-up while it does —
+      // the discriminant deliberately never flips, because its view came from ONE unvalidated
+      // advertised scalar and was never made durable: a flipped collection would migrate into the
+      // DVC-casting regime (`serviceable_now(DvcMessage)` requires `!catching_up()`) and cast a
+      // VOTE for that view — the durable-view-before-participate breach a crash converts into
+      // cross-crash double-participation (recover at the old durable view, free to vote again).
+      // The escalation only needs the SVC anyway — a PROPOSAL, not a vote, needing no durability:
+      // if the advertised view was real but its primary died mid-handoff, the peers durably AT it
+      // accept our successor target and the ordinary SVC-quorum entry (`enter_view_change`, which
+      // persists before voting) takes over from there.
+      if self.catching_up() {
+        // Bound the probe: a view NOBODY validates across the whole window — no StartView /
+        // RecoveryResponse adoption, no SVC takers — is the corrupted-scalar class
+        // ([`MAX_VIEW_JUMP`]'s documented adversary), and the posture is otherwise un-exitable
+        // (GetView for it is unanswerable, our successor SVCs are implausible to every peer, and
+        // all real cluster traffic reads as stale). REVERT to the durable view instead of
+        // stranding until a process restart. Only voters reach this expiry (`arm_timers` leaves
+        // `view_change_status` disarmed for learners), and a voter's catch-up entry advanced the
+        // view strictly above the durable one; the guard keeps that precondition explicit.
+        let vc = self
+          .view_change
+          .as_mut()
+          .expect("ViewChange status implies a live collection");
+        vc.catchup_windows = vc.catchup_windows.saturating_add(1);
+        if vc.catchup_windows >= CATCH_UP_VALIDATION_WINDOWS
+          && self.view.get() > self.durable_view.get()
+        {
+          self.revert_catch_up_to_durable_view(now);
+          return;
+        }
       }
       self.propose_next_view(now, sb);
       self.arm_timers(now);
+    }
+  }
+
+  /// Abandon an UNVALIDATED catch-up posture and return to the durable view. Vote-safe by
+  /// construction: the abandoned view was adopted in memory only (never submitted for persistence —
+  /// a crash at any point during the posture recovers the durable view, exactly where this revert
+  /// lands), and the posture cast no vote in it (the `catching_up` discriminant never flips, so the
+  /// DVC regime was unreachable; SVCs are proposals, not votes).
+  ///
+  /// KNOWN LIMITATION (deliberate, shared with the crash-recovery path): the revert lands the
+  /// replica at a durable view the cluster may have legitimately moved far beyond, and a
+  /// far-lagging replica cannot yet rejoin an IN-PROGRESS view change — `on_start_view_change`
+  /// admits only the immediate successor, and a completed view re-adopts it only through
+  /// authoritative traffic from a live primary. A view that really formed and then lost its primary
+  /// while this replica was partitioned through the whole window therefore stays unreachable until
+  /// a primary exists again, exactly as it does for a replica that CRASHED at the lagging durable
+  /// view and recovered. Unifying both shapes behind a validated far-view rejoin is a distinct
+  /// mechanism (the advertisement must re-open the memory-only probe, never move the replica
+  /// durably) and is deliberately not smuggled into this revert.
+  ///
+  /// The revert's landing depends on this replica's role at the durable view:
+  /// - A BACKUP resumes Normal directly. The probe's entry reset dropped only generation-local state
+  ///   a backup re-derives (its ack bookkeeping re-fires off the primary's retransmits; its session
+  ///   rows of record are the APPLIED ones, which the reset retains), so the resumed backup is
+  ///   behaviorally the pre-probe backup.
+  /// - The PRIMARY of the durable view must NOT resume serving: the probe's entry reset destroyed
+  ///   its accepted-but-uncommitted generation state (the provisional session watermarks and the
+  ///   vote tallies), so a resumed primary would re-mint a retried request it already holds in its
+  ///   log — a double-execution once a later view change re-commits both copies — and could never
+  ///   commit the ops whose tallies were dropped. It therefore lands in the DEFERRED-FORFEIT
+  ///   step-down ([`Self::defer_forfeit`] — the existing chokepoint for a primary that cannot
+  ///   continue with a torn-down pipeline): minting is refused (`SteppingDown`) and the next primary
+  ///   tick proposes the successor view, whose formation re-selects the canonical log (the held ops
+  ///   re-commit under fresh quorums) and re-seeds the session watermarks (the retry dedups).
+  fn revert_catch_up_to_durable_view(&mut self, now: Instant) {
+    self.view = self.durable_view;
+    self.svc_target = self.view;
+    self.svc_from = 0;
+    // Exit ViewChange: the collection is the posture (`is_some() == is_view_change()` coupling).
+    self.view_change = None;
+    self.set_status(Status::Normal);
+    self.arm_timers(now);
+    if self.is_primary() {
+      // AFTER `arm_timers` (whose role reset would clobber the serviceable `svc_message` wake the
+      // step-down bootstraps).
+      self.defer_forfeit(now);
     }
   }
 
@@ -916,9 +988,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // quorum adopted as uncommitted because the committing replicas were partitioned out): that op will
     // re-commit here, so its watermark is needed so the client's next request is not seen as a gap. The
     // one uncommitted op whose watermark must NOT outlive a rollback is a header-only `Repairing`
-    // truncation candidate whose body never arrives — `repair_or_truncate_timeouts` ROLLS the watermark
-    // back when it truncates such an op (a truncated request must be processed fresh, never deduped to a
-    // no-reply hang), so seeding it here is safe.
+    // truncation candidate whose body never arrives — the nack-quorum truncation (`on_nack` →
+    // `truncate_uncommitted_tail_from`) ROLLS the watermark back when it truncates such an op (a
+    // truncated request must be processed fresh, never deduped to a no-reply hang), so seeding it
+    // here is safe.
     //
     // NOTE: we do NOT reconstruct the cached *reply* body here, so a client whose prior-view reply
     // was LOST relies on the in-flight op re-committing; the lost-reply resend is liveness under loss.
@@ -1209,8 +1282,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// Roll every orphaned watermark down to its backed floor. The `>` guard never RAISES (so it cannot
   /// regress a legitimate watermark — the new-primary backfill owns raising) and never lowers below the
   /// cached-reply request (so at-most-once holds: a committed request stays deduped). This mirrors the
-  /// `Repairing`-hole rollback in `repair_or_truncate_timeouts`, extended to the ADOPTION-truncation of a
-  /// `Present` tail op that the grace path (keyed on header-only `Repairing` candidates) does not cover.
+  /// `Repairing`-hole rollback the nack-quorum truncation performs (`on_nack` →
+  /// `truncate_uncommitted_tail_from`), extended to the ADOPTION-truncation of a `Present` tail op
+  /// that the nack path (keyed on header-only `Repairing` candidates) does not cover.
   fn reconcile_session_watermarks(&mut self) {
     let mut highest_in_log: BTreeMap<u128, u64> = BTreeMap::new();
     for e in self.log.values() {

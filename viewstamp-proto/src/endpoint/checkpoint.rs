@@ -298,6 +298,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // read-then-clear. Guard the id-match first so a superseded (older) completion is left intact.
     if self.pending_sb.as_ref().is_some_and(|(pid, _)| *pid == id) {
       let (_, action) = self.pending_sb.take().expect("just matched Some");
+      // The completed root persisted the view current at its submit — and `self.view` has not moved
+      // since (every view transition SUPERSEDES `pending_sb`, so a completion that still matches was
+      // submitted this view-generation). Advance the durable-view witness BEFORE dispatching the
+      // action: the deferred participation the actions perform (the DVC cast, the StartView
+      // broadcast) is exactly what the `durable_view == view` gates admit, so the witness must be
+      // current when they emit. The same-view actions (Seal, SwapEpoch) re-affirm equality.
+      self.durable_view = self.view;
       match action {
         PendingSbAction::SendDoViewChange => self.send_do_view_change(now),
         PendingSbAction::StartViewAsPrimary => {

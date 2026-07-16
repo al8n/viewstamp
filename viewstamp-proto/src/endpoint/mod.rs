@@ -495,20 +495,37 @@ struct ViewChangeCollection {
   dvc_quorum: bool,
   /// `true` when this replica is merely catching up to an existing newer view (the higher-view rule)
   /// rather than driving a new view change — it sends GetView, not SVC/DVC. Set by `catch_up_to_view`;
-  /// the steady self-driven entry leaves it `false`.
+  /// the steady self-driven entry leaves it `false`. The discriminant is LOAD-BEARING for
+  /// durable-view-before-participate and stays `true` for the posture's whole life: the catch-up view
+  /// was adopted from a bare advertised scalar and never made durable, so the posture must never
+  /// migrate into the DVC-casting regime (`TimerKind::DvcMessage` is serviceable only when this is
+  /// `false`, and every `false` collection is installed by an entry that durably writes its view).
+  /// The posture exits ONLY by adopting a validated view (`StartView`/`RecoveryResponse`, which write
+  /// the view before participating), by an SVC-quorum `enter_view_change` (ditto), or by reverting to
+  /// the durable view when validation never arrives.
   catching_up: bool,
+  /// How many `view_change_status` windows this CATCH-UP posture has expired without validation
+  /// (meaningful only while `catching_up`; saturating). The advertised view was adopted from one
+  /// unvalidated scalar, so the posture is given a bounded validation window: while it runs, each
+  /// expiry re-drives the escalation SVC (`propose_next_view` — a proposal, not a vote); at
+  /// [`CATCH_UP_VALIDATION_WINDOWS`] with the view still above the durable one, the posture REVERTS
+  /// to the durable view rather than stranding forever on a claim nobody can answer (a corrupted
+  /// scalar names a view no primary serves: `GetView` goes unanswered, our SVCs for its successor
+  /// are implausible to every peer, and all real cluster traffic reads as stale).
+  catchup_windows: u8,
 }
 
 impl ViewChangeCollection {
   /// A fresh collection for a replica ENTERING `Status::ViewChange`: no DVCs collected, no quorum yet,
   /// and `catching_up` per the entry kind (`true` for the higher-view catch-up entry, `false` for the
   /// self-driven SVC-quorum entry). Replaces the old per-field `dvc_from.clear()` / `dvc_quorum = false`
-  /// / `catching_up = …` reset, now that these three live behind one Option.
+  /// / `catching_up = …` reset, now that these live behind one Option.
   fn entering(catching_up: bool) -> Self {
     Self {
       dvc_from: BTreeMap::new(),
       dvc_quorum: false,
       catching_up,
+      catchup_windows: 0,
     }
   }
 }
@@ -536,6 +553,18 @@ const COMMIT_HEARTBEAT: core::time::Duration = core::time::Duration::from_millis
 const PRIMARY_IDLE: core::time::Duration = core::time::Duration::from_millis(200);
 const VC_MESSAGE_RETRANSMIT: core::time::Duration = core::time::Duration::from_millis(100);
 const VIEW_CHANGE_STATUS: core::time::Duration = core::time::Duration::from_millis(500);
+/// How many `view_change_status` windows a CATCH-UP posture may expire unvalidated before it reverts
+/// to the durable view. The catch-up view came from ONE unvalidated scalar (a `Prepare`/`PrepareOk`/
+/// `Commit` view field — the higher-view rule), so the posture probes rather than commits: within the
+/// window a REAL view answers (`GetView` retransmits every [`VC_MESSAGE_RETRANSMIT`], and a formed
+/// view has a durable quorum able to answer) or the escalation SVC finds takers; a view nobody can
+/// validate in `3 × 500ms` — ~15 probe rounds — is treated as the corrupted-scalar class
+/// [`MAX_VIEW_JUMP`] defends against, and the replica returns to its durable view instead of
+/// stranding until an operator restarts the process. Reverting is cheap-safe: the abandoned view was
+/// never durable, the posture casts no vote (the `catching_up` discriminant never flips), and a real
+/// view re-advertises itself on the next authoritative message, re-entering catch-up with answers
+/// available.
+const CATCH_UP_VALIDATION_WINDOWS: u8 = 3;
 /// Forfeit: how long the checkpoint-lag forfeit condition must
 /// hold CONTINUOUSLY before a stuck primary actually steps down (the anti-storm grace timer). Sits
 /// above `PRIMARY_IDLE` (200ms) — so a *silent* primary is failed over first by a backup's idle VC,
@@ -1101,6 +1130,23 @@ pub struct Endpoint<S, R = RestartOnly> {
   config_install_op: OpNumber,
   status: Status,
   view: View,
+  /// The highest view with a DURABLE witness — the view a crash-and-recover provably resumes at or
+  /// above. Seeded from the recovered root at construction (genesis roots are view 0) and advanced
+  /// exactly when a `pending_sb` root write COMPLETES (`on_sb_done`; every such root persists the
+  /// view current at its submit, and view transitions supersede `pending_sb`, so completion-time
+  /// `self.view` is the view the root carried). This is the ground truth
+  /// durable-view-before-participate gates on: `self.view == self.durable_view` says the CURRENT
+  /// view is recoverable, where [`Self::pending_durable_view`] can only say no view-changing write
+  /// is in flight — vacuously true on a path that never submitted one (the catch-up posture adopts
+  /// an advertised view in memory only, deliberately: a probe needs no durability). The DVC gates
+  /// and the [`Self::emit`] fence assert the equality, so a vote or authority claim for a view with
+  /// no durable witness is structurally unreachable no matter which path minted the view.
+  ///
+  /// Invariant: `durable_view <= view` (the durable root never runs ahead of the live view), with
+  /// equality at every authoritative EMISSION (the [`Self::emit`] fence) — participation is what the
+  /// witness gates, not status: an adoption may briefly hold the new view with its root write still
+  /// in flight, and the per-site gates defer every vote/authority claim until the write lands.
+  durable_view: View,
   /// Head op (most recently prepared locally).
   op: OpNumber,
   /// Highest op durably applied to the state machine (applied frontier).
@@ -1785,6 +1831,9 @@ impl<S, R> Endpoint<S, R> {
       config_install_op: OpNumber::new(),
       status: Status::Normal,
       view: View::new(),
+      // Genesis: view 0 is the durably-witnessed view — the committed genesis root carries it (and
+      // the in-memory test seam models a formatted store the same way).
+      durable_view: View::new(),
       op: OpNumber::new(),
       commit_min: OpNumber::new(),
       sm_at: OpNumber::new(),
@@ -3587,6 +3636,9 @@ impl<S, R> Endpoint<S, R> {
     // been in ViewChange does not carry a stale `Some` into the forced Normal scenario.
     self.view_change = None;
     self.view = View::with(view);
+    // The forced state models a SETTLED Normal replica: its view is durably witnessed (the emit
+    // fence asserts the equality on every authoritative emission the scenario then drives).
+    self.durable_view = View::with(view);
     self.log_view = View::with(view);
     self.op = OpNumber::with(op);
     self.commit_min = OpNumber::with(commit_min);
@@ -3929,6 +3981,7 @@ impl<S, R> Endpoint<S, R> {
       dvc_from,
       dvc_quorum: true,
       catching_up: true,
+      catchup_windows: 1,
     });
     self.pending.insert(7, Pending::Ack(OpNumber::with(1)));
     self.appending.insert(1);
@@ -5586,22 +5639,27 @@ where
   /// The single outbound-emission chokepoint. EVERY replica-originated message goes through here so the
   /// durable-view-before-participate invariant is enforced in ONE place: a view-advertising
   /// AUTHORITY / participation message (the gated set — [`Message::advertises_authoritative_view`]) must
-  /// never be emitted while a view-CHANGING durable-view write is in flight ([`Self::pending_durable_view`]),
-  /// because `self.view` is then not yet durable and a crash rolls it back. This is the proto-side analogue
-  /// of the VOPR durable-view checker, and the STRUCTURAL close of the class: a NEW emission site cannot
-  /// bypass the per-site gates because it routes here. The `debug_assert!` is detection (it fails fast
-  /// in every test/sim at the emission site, with zero release cost) — the per-site gates
-  /// (`participates_as_primary`, the dvc gate, the
+  /// never be emitted while `self.view` lacks its durable witness (`self.view != self.durable_view`),
+  /// because a crash then rolls the view back and the emission becomes a claim the recovered replica
+  /// never made. The witness EQUALITY subsumes the older in-flight test ([`Self::pending_durable_view`]
+  /// — a view-changing write in flight means the witness still trails the view) and additionally
+  /// covers a view adopted in memory only, where no write was ever submitted and the in-flight test
+  /// passes vacuously. This is the proto-side analogue of the VOPR durable-view checker, and the
+  /// STRUCTURAL close of the class: a NEW emission site cannot bypass the per-site gates because it
+  /// routes here. The `debug_assert!` is detection (it fails fast in every test/sim at the emission
+  /// site, with zero release cost) — the per-site gates (`participates_as_primary`, the dvc gate, the
   /// `on_request_prepare` / `on_recovery` / `serve_sync_checkpoint` `pending_sb` drops) remain the
-  /// PREVENTION; this assert proves they are COMPLETE. A SwapEpoch/Seal root in flight does NOT raise the
-  /// fence (the view is durable through an epoch swap — see [`Self::pending_durable_view`]): the primary
-  /// keeps advertising its authoritative view AT the predecessor epoch through the swap window.
+  /// PREVENTION; this assert proves they are COMPLETE. A SwapEpoch/Seal root in flight does NOT raise
+  /// the fence (those roots persist the SAME view, so the witness equality holds through them): the
+  /// primary keeps advertising its authoritative view AT the predecessor epoch through the swap window.
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn emit(&mut self, out: Outgoing) {
     debug_assert!(
-      !out.msg_ref().advertises_authoritative_view() || !self.pending_durable_view(),
-      "durable-view-before-participate: emitted {} while a durable-view write is pending",
+      !out.msg_ref().advertises_authoritative_view() || self.durable_view == self.view,
+      "durable-view-before-participate: emitted {} for view {} whose durable witness is view {}",
       out.msg_ref().kind_str(),
+      self.view,
+      self.durable_view,
     );
     self.outgoing.push_back(out);
   }
@@ -5696,24 +5754,26 @@ where
             || (self.status.is_view_change() && !self.catching_up()))
       }
       // The DVC retransmit is a VOTE the new primary counts toward forming the view, so it is
-      // serviceable only once this replica's view is DURABLE — durable-view-before-participate in the
-      // retransmit path. `enter_view_change` arms `dvc_message` AND submits the
-      // SendDoViewChange durable-view write (`pending_durable_view`), and the INITIAL DVC is sent by
-      // `on_sb_done` when that write lands; gating the retransmit on `!pending_durable_view()` keeps a slow
-      // async superblock write from letting the retransmit cast the vote first (before the view is
-      // recoverable). In ViewChange status the only in-flight `pending_sb` write is that SendDoViewChange
-      // one (a SwapEpoch/Seal is Normal-only), so this is exactly the durable-view test. Kept in lockstep
-      // with the `view_change_timeouts` handler so the no-orphan-due assert holds (an armed-and-due
-      // `dvc_message` during the view write is non-serviceable, so the assert ignores it and `poll_timeout`
-      // filters it out — no spin, no premature vote). The other ViewChange retransmit timers stay ungated:
-      // `svc_message`/`view_change_status` re-broadcast a *request-to-change* (an SVC), not a vote, and
-      // `get_view_message` is a catch-up READ that (by the `catching_up` discriminant) never coexists with
-      // the SendDoViewChange durable-view window.
+      // serviceable only while `self.view == self.durable_view` — the current view provably survives
+      // a crash (durable-view-before-participate in the retransmit path). `enter_view_change` arms
+      // `dvc_message` AND submits the SendDoViewChange durable-view write, and the INITIAL DVC is
+      // sent by `on_sb_done` when that write lands (which advances the witness first); gating the
+      // retransmit on the witness EQUALITY keeps a slow async superblock write from letting the
+      // retransmit cast the vote early (the witness still trails the view), and — unlike the
+      // in-flight test `pending_durable_view()`, which is vacuously clear on a path that never
+      // submitted the write — it also refuses a vote from any posture whose view was adopted in
+      // memory only. Kept in lockstep with the `view_change_timeouts` handler so the no-orphan-due
+      // assert holds (an armed-and-due `dvc_message` while the view is not durable is
+      // non-serviceable, so the assert ignores it and `poll_timeout` filters it out — no spin, no
+      // premature vote). The other ViewChange retransmit timers stay ungated:
+      // `svc_message`/`view_change_status` re-broadcast a *request-to-change* (an SVC), not a vote,
+      // and `get_view_message` is a catch-up READ that (by the `catching_up` discriminant) never
+      // coexists with the SendDoViewChange durable-view window.
       TimerKind::DvcMessage => {
         self.is_voter()
           && self.status.is_view_change()
           && !self.catching_up()
-          && !self.pending_durable_view()
+          && self.durable_view == self.view
       }
       TimerKind::ViewChangeStatus => self.status.is_view_change() && self.is_voter(),
       TimerKind::GetViewMessage => self.status.is_view_change() && self.catching_up(),
