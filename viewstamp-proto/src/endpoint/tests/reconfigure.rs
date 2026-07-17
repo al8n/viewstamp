@@ -5603,6 +5603,13 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
 // is a LEGITIMATE shape (added-then-promoted across the skipped epochs), so no local single-change
 // diff exists to trip; that path's safety is the induction — every compliant committer runs this
 // fence, so no committed state (hence no donor checkpoint) ever contains a direct-add successor.
+//
+// The VOTE-MINT screens close the remaining ack/vote lanes for an entry that reaches a log WITHOUT
+// crossing the screened prepare append (a recovered WAL, a view-change adoption): `send_prepare_ok`
+// refuses the ack — covering the canonical re-ack and the adoption re-ack — and `record_own_vote`
+// refuses the own bit — covering the adopted-tail re-append and the peer-repair fill. Each lane has
+// a falsifier below, plus legitimate-delta positive controls proving the screens admit every legal
+// shape (and the checkpoint-report re-ack, whose GC-pruned op the ack screen must let through).
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -5970,4 +5977,645 @@ fn every_legitimate_delta_commits_and_installs_through_the_backup_lane() {
       delta.as_str(),
     );
   }
+}
+
+#[test]
+fn a_matching_durable_direct_voter_add_prepare_is_never_re_acked() {
+  // The canonical re-ack lane: the backup already holds the direct-add Reconfigure op DURABLY (the
+  // typed entry in `self.log`, its WAL slot Clean — the shape a recovered store or a completed
+  // append leaves), and the primary retransmits the identical Prepare. `on_prepare` takes the
+  // canonical-held branch (identity match + durable), which acks WITHOUT crossing the append-seam
+  // screen — the `send_prepare_ok` mint screen is what refuses the vouch.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry::reconfigure(
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.clone(),
+    ),
+  );
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.encode_body(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::PrepareOk(_)),
+      "a held direct-add op is never re-acked"
+    );
+  }
+}
+
+#[test]
+fn a_matching_durable_legitimate_reconfigure_prepare_is_re_acked() {
+  // The positive control on the canonical re-ack lane: an AddLearner successor (a legal delta) in
+  // the identical held-durable shape IS re-acked — the mint screen refuses only a brand-new voter
+  // admission, never a legitimate reconfiguration.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry::reconfigure(
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.clone(),
+    ),
+  );
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.encode_body(),
+    )),
+  );
+  let mut acked = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      assert_eq!(ok.op().get(), 1, "the re-ack names the held op");
+      acked = true;
+    }
+  }
+  assert!(acked, "the held legitimate reconfigure op is re-acked");
+}
+
+#[test]
+fn a_direct_voter_add_interior_overwrite_is_refused_before_the_log_and_wal() {
+  // The interior-overwrite lane: the backup's head is PAST the op but it holds NO entry at it (the
+  // dropped-stale interior shape), so a current-view Prepare would durably (re-)append into the
+  // interior slot. The `reappend_canonical_prepare` screen refuses the direct-add BEFORE the log
+  // insert and the WAL write — no entry, no slot, and (append-before-ack) no deferred ack. Asserted
+  // on the log + WAL state, which only this seam guards: the ack mint would independently refuse
+  // the vouch, so an ack assertion alone could not witness this screen.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.op = OpNumber::with(2);
+  e.log.insert(
+    2,
+    LogEntry::present(
+      ClientId::new(7),
+      RequestNumber::with(2),
+      Bytes::copy_from_slice(&[2u8]),
+    ),
+  );
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.encode_body(),
+    )),
+  );
+
+  assert!(
+    !e.log.contains_key(&1),
+    "the direct-add interior op takes no log entry"
+  );
+  assert!(
+    wal.entries.is_empty(),
+    "no interior WAL overwrite was submitted for the dropped prepare"
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::PrepareOk(_)),
+      "the refused interior overwrite owes no ack"
+    );
+  }
+}
+
+#[test]
+fn an_adopted_direct_voter_add_tail_op_is_never_adopt_acked() {
+  // The view-change adoption re-ack lane: a backup adopts a StartView whose canonical tail carries
+  // an uncommitted direct-add Reconfigure op alongside a legitimate client op. After the durable
+  // view lands, `start_view_acks` re-appends each held tail op and defers its PrepareOk to the
+  // append completion — a lane that never crosses the append-seam screen. The `send_prepare_ok`
+  // mint screen refuses the direct-add op's vouch; the neighboring legitimate op IS acked (the
+  // in-test positive control), so the refusal is the screen, not a stalled adoption.
+  let cfg = Config::try_new(2, MemberId::new(2)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(crate::StartView::new(
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          Bytes::copy_from_slice(b"a"),
+        ),
+        PreparedEntry::reconfigure(
+          OpNumber::with(2),
+          ClientId::RECONFIGURATION,
+          RequestNumber::with(2),
+          payload.clone(),
+        ),
+      ],
+    )),
+  );
+  // Land the durable-view root, then the AdoptAck re-appends it schedules.
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  let (mut acked_1, mut acked_2) = (false, false);
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      match ok.op().get() {
+        1 => acked_1 = true,
+        2 => acked_2 = true,
+        _ => {}
+      }
+    }
+  }
+  assert!(
+    acked_1,
+    "the legitimate adopted tail op is adopt-acked once durable"
+  );
+  assert!(!acked_2, "the adopted direct-add op is never adopt-acked");
+}
+
+#[test]
+fn an_adopted_legitimate_reconfigure_tail_op_is_adopt_acked() {
+  // The positive control on the adoption re-ack lane: a LEGAL reconfiguration op (AddLearner)
+  // adopted as the uncommitted tail is re-appended and acked once durable — the mint screen admits
+  // every legitimate delta on this lane too.
+  let cfg = Config::try_new(2, MemberId::new(2)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(crate::StartView::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec![PreparedEntry::reconfigure(
+        OpNumber::with(1),
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        payload.clone(),
+      )],
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  let mut acked = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      assert_eq!(ok.op().get(), 1, "the adopt-ack names the adopted op");
+      acked = true;
+    }
+  }
+  assert!(acked, "the adopted legitimate reconfigure op is adopt-acked");
+}
+
+#[test]
+fn a_forged_ack_cannot_commit_an_adopted_direct_voter_add_tail_op() {
+  // The adopted-tail own-vote lane, plus the single-corruption bound: replica 1 becomes the view-1
+  // primary adopting a canonical tail whose op 1 is the direct-add Reconfigure (uncommitted). The
+  // adopted-tail re-append completes and `record_own_vote` REFUSES the own bit; one forged
+  // content-matched PrepareOk (a single corrupted message) then contributes the ONLY vote the op
+  // ever gets — 1 of the required 2 — so the op never commits: no swap is staged, the commit-time
+  // fence panic is unreachable, and the cluster survives the poison op un-committed rather than
+  // fail-stopping.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  // Idle-timeout into the view change, then a second StartViewChange completes the view-change
+  // quorum for view 1 (this replica leads it).
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  while e.poll_message().is_some() {}
+  // A DoViewChange from replica 2 carries the direct-add op as the canonical uncommitted tail; the
+  // new primary adopts it (`oks: 0`) and re-appends it tagged for its own vote.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![PreparedEntry::reconfigure(
+        OpNumber::with(1),
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        payload.clone(),
+      )],
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert!(
+    e.log.contains_key(&1),
+    "precondition: the adopted direct-add op is held in the new view's log"
+  );
+
+  // The forged, content-matched ack — the single in-model corrupted message.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::PrepareOk(crate::PrepareOk::new(
+      View::with(1),
+      OpNumber::with(1),
+      ReplicaId::new(2),
+      OpNumber::new(),
+      crate::storage::prepare_identity(
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        Body::Reconfigure(payload.clone()).body_checksum(),
+      ),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+
+  assert_eq!(
+    e.commit_min.get(),
+    0,
+    "the direct-add op never commits: its only vote is the forged ack"
+  );
+  assert!(!e.pending_swap_for_test(), "no epoch swap is staged");
+  assert_eq!(e.membership, genesis(3), "the configuration is unchanged");
+}
+
+#[test]
+fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
+  // The peer-repair own-vote lane: the new primary adopted the direct-add op HEADER-ONLY (a
+  // `Repairing` carrier), so the adoption re-append skipped it and the repair channel fetches its
+  // body. When the fill lands durably, the uncommitted-tail completion casts the primary's own
+  // vote — `record_own_vote` refuses it there (the fill inserted the TYPED body first, so the
+  // screen classifies it). A forged content-matched PrepareOk then leaves the op at 1 of the
+  // required 2 votes: never committed, no swap, no fail-stop.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body_checksum = Body::Reconfigure(payload.clone()).body_checksum();
+
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  while e.poll_message().is_some() {}
+  // The canonical log: op 1 committed (a client op), op 2 the direct-add Reconfigure carried
+  // HEADER-ONLY — its durable canonical identity (client, request, body checksum) without bytes.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          Bytes::copy_from_slice(b"a"),
+        ),
+        PreparedEntry::repairing(
+          OpNumber::with(2),
+          ClientId::RECONFIGURATION,
+          RequestNumber::with(2),
+          body_checksum,
+        ),
+      ],
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert!(
+    e.log.get(&2).is_some_and(|entry| entry.body.is_repairing()),
+    "precondition: the adopted direct-add op is held header-only"
+  );
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "precondition: the header-only tail op is a registered repair hole"
+  );
+
+  // A peer's Prepare carrying the canonical body answers the hole; `fill_repair` verifies the FULL
+  // kept identity (client, request, body checksum) and stages the durable fill.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Prepare(Prepare::new(
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(2),
+      payload.encode_body(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert!(
+    e.log
+      .get(&2)
+      .is_some_and(|entry| entry.body.as_reconfigure().is_some()),
+    "the fill landed the TYPED reconfigure body (what the vote-mint screen classifies)"
+  );
+
+  // The forged, content-matched ack — the single in-model corrupted message.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::PrepareOk(crate::PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(2),
+      OpNumber::new(),
+      crate::storage::prepare_identity(
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(2),
+        body_checksum,
+      ),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+
+  assert_eq!(
+    e.commit_min.get(),
+    1,
+    "only the legitimate committed prefix applies; the direct-add op never commits"
+  );
+  assert!(!e.pending_swap_for_test(), "no epoch swap is staged");
+  assert_eq!(e.membership, genesis(3), "the configuration is unchanged");
+}
+
+#[test]
+fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
+  // The heartbeat checkpoint report re-acks the backup's own `checkpoint_op` — an op folded into
+  // the durable snapshot and GC-pruned from the log cache, so the ack mint's admission screen reads
+  // NO entry and must let the report through: the op is committed (the commit-time fence already
+  // ruled on it) and the report's identity stamp matches no live inflight entry.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  e.handle_message(now, &mut wal, &mut sb, &mut blocks, primary_peer(), prepare(1, 0));
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    e.force_checkpoint(&mut sb, &mut blocks),
+    "the committed+applied boundary is checkpointable"
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert_eq!(e.checkpoint_op.get(), 1, "precondition: the checkpoint advanced");
+  assert!(
+    !e.log.contains_key(&1),
+    "precondition: the checkpointed op is GC-pruned from the log cache"
+  );
+
+  // The next Commit heartbeat re-reports: a PrepareOk for `checkpoint_op` fires despite the pruned
+  // entry (its identity stamp is the absent-entry zero — inert at the primary's vote ingress).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let mut reported = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      assert_eq!(ok.op().get(), 1, "the report re-acks the checkpoint op");
+      reported = true;
+    }
+  }
+  assert!(
+    reported,
+    "the checkpoint report re-ack still fires with a pruned log entry"
+  );
 }
