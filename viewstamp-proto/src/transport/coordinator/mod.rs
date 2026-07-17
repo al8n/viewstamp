@@ -41,6 +41,12 @@ impl<S, R> core::fmt::Debug for StreamCoordinator<S, R> {
 }
 
 impl<S, R> StreamCoordinator<S, R> {
+  /// The maximum live QUARANTINED (`Peer::Member`) conns — attested members the active membership
+  /// does not resolve, riding the no-authority learn lane. Sized generously above the legitimate
+  /// transient population (a member offline across a rolling replacement; a node awaiting its own
+  /// retirement) while bounding a misconfigured fleet's footprint on the conn table.
+  const QUARANTINE_CONN_LIMIT: usize = 8;
+
   /// Creates a coordinator around a (driver-built) endpoint, with an empty conn table.
   pub fn new(endpoint: Endpoint<S, SingleChange>) -> Self {
     let last_reconciled_config_id = endpoint.config_id();
@@ -219,10 +225,13 @@ where
           return;
         }
         match self.endpoint.slot_of(m) {
+          // Authenticated but NOT in the active membership: QUARANTINE (bind the never-routable
+          // `Peer::Member(m)` so it rides the no-authority config-learning lane to rejoin or learn
+          // its own retirement) rather than reject. `note_established_quarantined` itself rejects a
+          // DIALED conn that no longer resolves (a stale target); this admits only ACCEPTED inbound.
           None => {
-            if let Some(conn) = self.router.conn_mut(id) {
-              conn.abort(CloseCause::IdentityRejected);
-            }
+            self.evict_quarantined_if_full();
+            self.router.note_established_quarantined(id, m);
           }
           Some(slot) => {
             self.router.note_established_member(id, m, slot);
@@ -456,16 +465,46 @@ where
     }
     for (id, member, bound_peer) in self.router.validated_member_conns() {
       match self.endpoint.slot_of(member) {
-        // Removed (or for a member outside the new config): close this conn so it leaves routing.
-        None => self.close_conn_by_id(id),
-        // Shifted to a different slot than this conn is bound to: close so it re-binds under the new
-        // slot on its next handshake (and so a displaced standby cannot be promoted under the old slot).
+        // Still unresolvable in the new config. A RESOLVED (`Peer::Replica`) member that dropped out
+        // is removed: close so it leaves routing — it re-dials and binds QUARANTINED, the intended
+        // posture for a node removed while offline. A member ALREADY quarantined (`Peer::Member`)
+        // that still does not resolve is KEPT: its learn lane must persist until the config catches up
+        // (or it idles out), never churned every install.
+        None if bound_peer.is_replica() => self.close_conn_by_id(id),
+        None => {}
+        // Resolved to a DIFFERENT routing peer than it is bound under — a retained member whose slot
+        // shifted, OR a quarantined member the new config now RESOLVES (`Peer::Member` != any
+        // `Peer::Replica(slot)`): close so it re-binds under its slot on the next handshake (and so a
+        // displaced standby cannot be promoted under the old slot). This completes a laggard's rejoin.
         Some(new_slot) if crate::Peer::Replica(new_slot) != bound_peer => self.close_conn_by_id(id),
         // Slot unchanged: leave the conn bound (no churn for an unmoved retained member).
         Some(_) => {}
       }
     }
     self.last_reconciled_config_id = current;
+  }
+
+  /// Close the oldest quarantined (`Peer::Member`-bound) conn if the quarantined population is already
+  /// at [`Self::QUARANTINE_CONN_LIMIT`], making room for a fresh quarantine bind (newest-wins). A
+  /// no-op below the cap. Quarantined conns carry only the no-authority learn lane, so evicting one at
+  /// most delays that member's rejoin until it re-dials — never a safety or live-config consequence.
+  fn evict_quarantined_if_full(&mut self) {
+    let quarantined: Vec<ConnId> = self
+      .router
+      .validated_member_conns()
+      .into_iter()
+      .filter(|(_, _, bound_peer)| bound_peer.is_member())
+      .map(|(id, _, _)| id)
+      .collect();
+    if quarantined.len() < Self::QUARANTINE_CONN_LIMIT {
+      return;
+    }
+    // Pick the victim explicitly: the lowest `ConnId` is a deterministic, oldest-biased choice (the
+    // driver allocates ids monotonically). Any victim is correct — every quarantined conn is an
+    // equivalent no-authority learn lane — but a deterministic one keeps behavior reproducible.
+    if let Some(victim) = quarantined.into_iter().min() {
+      self.close_conn_by_id(victim);
+    }
   }
 
   /// Close a specific conn by [`ConnId`], so a stale/shifted member's conn — authoritative OR a

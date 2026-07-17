@@ -222,6 +222,16 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   /// mutual-dial mesh connection (each peer pair keeps two connections, so an `N`-member node needs
   /// `2*(N-1)` plus reconnect headroom). The cap still bounds an untrusted-network flood; it is just
   /// sized to the full membership (voters plus non-voting members) rather than a fixed constant.
+  ///
+  /// The floor itself RESERVES [`Self::QUARANTINE_CONN_LIMIT`] on top of the mesh: the pre-identity
+  /// capacity gate admits a connection into the bridge table BEFORE its attested id is resolved, so a
+  /// burst of quarantined (attested-but-unresolvable) members would otherwise occupy mesh slots and let
+  /// the bridge refuse a real replica's dial before the post-identity quarantine eviction can run.
+  /// Raising the floor to `mesh_connection_floor + QUARANTINE_CONN_LIMIT` keeps the full mesh capacity
+  /// available for authoritative members even when quarantine is saturated. An operator cap ABOVE that
+  /// floor is honoured as-is (it is the operator's flood budget, already covering the mesh plus reserve);
+  /// only a cap BELOW the floor is raised. The `max` (not an addition to the operator cap) avoids
+  /// overflowing a `usize::MAX` override — the reserve is a floor GUARANTEE, not an increment.
   fn build(
     endpoint: Endpoint<S, SingleChange>,
     opts: QuicOptions,
@@ -229,8 +239,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     identity: I,
   ) -> Self {
     let layout = opts.layout();
-    let mesh_floor = crypto::mesh_connection_floor(endpoint.node_count());
-    let effective_cap = opts.max_connections().max(mesh_floor);
+    // `mesh_connection_floor` is bounded (at most `3*(node_count-1)` with `node_count <= 64`), so the
+    // reserve addition here cannot overflow; the operator cap is folded in with a `max`, never an add.
+    let floor_with_reserve = crypto::mesh_connection_floor(endpoint.node_count())
+      .saturating_add(Self::QUARANTINE_CONN_LIMIT);
+    let effective_cap = opts.max_connections().max(floor_with_reserve);
     let opts = opts.with_max_connections(effective_cap);
     let last_reconciled_config_id = endpoint.config_id();
     Self {
@@ -485,11 +498,22 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     let std_now = self.quinn_now(now);
     for (h, member, bound_peer) in self.bridge.validated_member_conns() {
       match self.endpoint.slot_of(member) {
-        // Removed (or for a member outside the new config): close + drop routing; redial suppressed.
-        None => self
-          .bridge
-          .close_local(std_now, h, crate::transport::CloseCause::Superseded),
-        // Shifted to a different slot: close so it reconnects and re-binds under the new slot.
+        // Still unresolvable in the new config. A RESOLVED (`Peer::Replica`) member that dropped out
+        // is removed: close + drop routing (redial suppressed) — it re-dials and binds QUARANTINED,
+        // the intended posture for a node removed while offline. A member ALREADY quarantined
+        // (`Peer::Member`) that still does not resolve is KEPT: its learn lane must persist until the
+        // config catches up (or it idles out), never churned every install.
+        None => {
+          if bound_peer.is_replica() {
+            self
+              .bridge
+              .close_local(std_now, h, crate::transport::CloseCause::Superseded);
+          }
+        }
+        // Resolved to a DIFFERENT routing peer than it is bound under — a retained member whose slot
+        // shifted, OR a quarantined member the new config now RESOLVES (`Peer::Member(id)` != any
+        // `Peer::Replica(slot)`): close so it reconnects and binds under its slot. This is the #65
+        // rejoin completion — the laggard's install resolves its donors, and they re-bind normally.
         Some(new_slot) if Peer::Replica(new_slot) != bound_peer => {
           self
             .bridge
@@ -817,33 +841,84 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     }
     // Resolve the attested stable `MemberId` to its routing slot against the ACTIVE membership. `Some`
     // ⇒ the peer is a member of the active configuration; bind it under `Peer::Replica(slot)`. `None` ⇒
-    // the member is NOT in the active membership (a retired / not-yet-added / foreign-but-cluster-valid
-    // cert), so REJECT: without this gate such a peer would consume a slot and join the
-    // `Backups`/`AllReplicas` fanout, yet the endpoint's own `sender_matches` then drops every inbound
-    // consensus frame from it. In-model misconfiguration, not a Byzantine claim.
-    let Some(slot) = self.endpoint.slot_of(member_id) else {
+    // the member is authenticated but NOT in our active membership (a retained member offline across a
+    // rolling replacement, a node removed while offline, a not-yet-added one) — QUARANTINE it: bind
+    // under the never-routable `Peer::Member(id)` so it can ride the no-authority config-learning lane
+    // (state-sync + the epoch-ahead hint) to rejoin or learn its own retirement, while `as_replica()`
+    // being `None` keeps it out of every vote / lead / view / fanout path at the endpoint by
+    // construction. In-model misconfiguration, never a Byzantine claim.
+    let routing_peer = match self.endpoint.slot_of(member_id) {
+      Some(slot) => {
+        let resolved = Peer::Replica(slot);
+        match self.bridge.dialed_expectation_of(h) {
+          // Dialed: the resolved routing peer must be exactly the peer we meant to reach.
+          Some(expected) if resolved != expected => {
+            self
+              .bridge
+              .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
+            return;
+          }
+          // Dialed-and-matched, or accepted (adopt): fall through to bind.
+          _ => {}
+        }
+        resolved
+      }
+      None => {
+        // We DIAL only members we expect to resolve; a dialed conn whose expectation no longer
+        // resolves is a stale target — reject rather than quarantine (quarantine is for ACCEPTED
+        // inbound from a member that cannot yet resolve us).
+        if self.bridge.dialed_expectation_of(h).is_some() {
+          self
+            .bridge
+            .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
+          return;
+        }
+        // Cap the quarantined population (newest-wins): a misconfigured fleet of valid-cert but
+        // unresolvable ids must not fill the connection table. The id space is already bounded by
+        // issued cluster certs; this bounds the LIVE quarantined-conn count as defense-in-depth.
+        self.evict_quarantined_if_full(std_now);
+        Peer::Member(member_id)
+      }
+    };
+    self.bridge.bind_validated(std_now, h, routing_peer);
+    // Record the attested STABLE member id alongside the bind. For a `Peer::Replica` the slot is the
+    // routing key and the id is the cross-config invariant `reconcile_routing` re-resolves after a
+    // membership shift; for a quarantined `Peer::Member` the id IS the routing key, and the reconcile
+    // re-resolves it on every install (now-`Some` ⇒ close so it re-handshakes into its slot). Set only
+    // after a successful bind.
+    self.bridge.set_attested_member(h, member_id);
+  }
+
+  /// The maximum live QUARANTINED (`Peer::Member`) connections — attested members our active
+  /// membership does not resolve, riding the no-authority learn lane. Sized generously above the
+  /// legitimate transient population (a member offline across a rolling replacement; a node awaiting
+  /// its own retirement) while bounding a misconfigured fleet's footprint on the connection table.
+  const QUARANTINE_CONN_LIMIT: usize = 8;
+
+  /// Close the oldest quarantined connection if the quarantined population is already at
+  /// [`Self::QUARANTINE_CONN_LIMIT`], making room for a fresh quarantine bind (newest-wins). A no-op
+  /// below the cap. Quarantined conns carry only the no-authority learn lane, so evicting one at most
+  /// delays that member's rejoin until it re-dials — never a safety or a live-config consequence.
+  fn evict_quarantined_if_full(&mut self, std_now: std::time::Instant) {
+    let quarantined: Vec<ConnectionHandle> = self
+      .bridge
+      .validated_member_conns()
+      .into_iter()
+      .filter(|(_, _, bound_peer)| bound_peer.is_member())
+      .map(|(h, _, _)| h)
+      .collect();
+    if quarantined.len() < Self::QUARANTINE_CONN_LIMIT {
+      return;
+    }
+    // The table enumerates in `HashMap` order (nondeterministic), so pick the victim explicitly:
+    // the lowest connection handle is a deterministic, oldest-biased choice (quinn allocates handles
+    // monotonically). Any victim is correct — every quarantined conn is an equivalent no-authority
+    // learn lane — but a deterministic one keeps behavior reproducible.
+    if let Some(victim) = quarantined.into_iter().min() {
       self
         .bridge
-        .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
-      return;
-    };
-    let routing_peer = Peer::Replica(slot);
-    match self.bridge.dialed_expectation_of(h) {
-      // Dialed: the resolved routing peer must be exactly the peer we meant to reach.
-      Some(expected) if routing_peer != expected => {
-        self
-          .bridge
-          .close_local(std_now, h, crate::transport::CloseCause::IdentityRejected);
-        return;
-      }
-      // Dialed-and-matched, or accepted (adopt): fall through to bind.
-      _ => {}
+        .close_local(std_now, victim, crate::transport::CloseCause::Superseded);
     }
-    self.bridge.bind_validated(std_now, h, routing_peer);
-    // Record the attested STABLE member id alongside the slot bind: the slot is the routing key, the
-    // member id is the cross-config invariant `reconcile_routing` re-resolves after a membership shift
-    // moves this member to a different slot (or removes it). Set only after a successful bind.
-    self.bridge.set_attested_member(h, member_id);
   }
 
   /// Drain the endpoint's outgoing backlog into an owned `Vec` (releasing the endpoint borrow),
@@ -1030,6 +1105,22 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   #[cfg(test)]
   pub(crate) fn bound_replica_peers_for_test(&self) -> Vec<Peer> {
     self.bridge.bound_replica_peers(None)
+  }
+
+  /// Every stable [`MemberId`](crate::MemberId) currently bound under a QUARANTINED (`Peer::Member`)
+  /// connection — an authenticated member the active membership does not resolve, riding the
+  /// no-authority learn lane. The membership-range loopback test reads it to assert an accepted
+  /// out-of-membership member is QUARANTINED (present here, absent from the replica fanout) rather
+  /// than either bound as a replica or rejected.
+  #[cfg(test)]
+  pub(crate) fn quarantined_members_for_test(&self) -> Vec<crate::MemberId> {
+    self
+      .bridge
+      .validated_member_conns()
+      .into_iter()
+      .filter(|(_, _, bound_peer)| bound_peer.is_member())
+      .map(|(_, member, _)| member)
+      .collect()
   }
 
   /// The effective live-connection cap the bridge enforces. The mutual-dial-mesh sizing test reads it

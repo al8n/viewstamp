@@ -875,7 +875,7 @@ fn try_note_established_member_on_an_unknown_id_is_a_no_op() {
 }
 
 #[test]
-fn a_member_outside_the_active_membership_is_rejected_with_identity_rejected() {
+fn an_accepted_member_outside_the_active_membership_is_quarantined_on_the_learn_lane() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -885,9 +885,49 @@ fn a_member_outside_the_active_membership_is_rejected_with_identity_rejected() {
       CountSm::default(),
       u64::MAX,
     ));
-  // MemberId(99) is not in the genesis(3) membership {0,1,2}: slot_of must miss and the conn aborts.
+  // MemberId(99) is not in the genesis(3) membership {0,1,2}: slot_of misses. For an ACCEPTED conn
+  // this is now QUARANTINED (bound `Peer::Member(99)` on the no-authority learn lane), not rejected.
   let id = coord.register_accepted(
     Peer::Replica(ReplicaId::new(9)),
+    Conn::from_parts(MockRecords::new(
+      false,
+      Some(Peer::Member(MemberId::new(99))),
+    )),
+  );
+  coord.try_note_established_for_test(id);
+  assert!(
+    coord.router_ref().conn(id).is_some_and(|c| !c.is_closed()),
+    "a quarantined member's conn is KEPT (the learn lane persists), not aborted"
+  );
+  assert!(
+    coord.is_conn_validated(id),
+    "a quarantined conn reports validated so the driver keeps the link alive"
+  );
+  assert!(
+    coord.router_ref().validated_member_conns().contains(&(
+      id,
+      MemberId::new(99),
+      Peer::Member(MemberId::new(99))
+    )),
+    "the conn is bound under the never-routable Peer::Member key, not any replica slot"
+  );
+}
+
+#[test]
+fn a_dialed_member_that_no_longer_resolves_is_rejected_not_quarantined() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      1,
+      CountSm::default(),
+      u64::MAX,
+    ));
+  // We DIAL only members we expect to resolve. A dialed conn whose attested member no longer resolves
+  // is a stale target — rejected, never quarantined (quarantine admits ACCEPTED inbound only).
+  let id = coord.register_dialed(
+    Peer::Member(MemberId::new(99)),
     Conn::from_parts(MockRecords::new(
       false,
       Some(Peer::Member(MemberId::new(99))),
@@ -900,7 +940,7 @@ fn a_member_outside_the_active_membership_is_rejected_with_identity_rejected() {
       .conn(id)
       .map(|c| c.is_closed())
       .unwrap_or(true),
-    "a member outside the active membership is aborted (IdentityRejected)"
+    "a dialed member that no longer resolves is aborted (IdentityRejected)"
   );
   assert!(!coord.is_conn_validated(id));
 }
@@ -1008,7 +1048,6 @@ fn commit_and_install_a_voter_removal(
   ConnId,
   ConnId,
 ) {
-  use crate::{SingleVoterDelta, View, message::Body};
   let cfg = Config::try_new(0xABCD, MemberId::new(local)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
@@ -1023,7 +1062,23 @@ fn commit_and_install_a_voter_removal(
     ));
   let conn1 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
   let conn2 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 2);
+  drive_voter_removal_to_installed(&mut coord, &mut wal, &mut sb, &mut blocks, local, removed);
+  (coord, wal, sb, blocks, conn1, conn2)
+}
 
+/// Drives an already-built 3-voter primary `coord` (local = `local`, primary of view 0, durable
+/// genesis(3)) to propose `RemoveVoter(removed)` and commit + durably install it, so the trailing
+/// `reconcile_routing` inside `handle_storage` runs against the shrunk membership. The acking voter is
+/// whichever of {0,1,2} is neither `local` nor `removed`, so the 2-of-3 commit quorum always forms.
+fn drive_voter_removal_to_installed(
+  coord: &mut StreamCoordinator<CountSm, MockRecords>,
+  wal: &mut TestWal,
+  sb: &mut TestSb,
+  blocks: &mut crate::block_store::MemBlockStore,
+  local: u128,
+  removed: u128,
+) {
+  use crate::{SingleVoterDelta, View, message::Body};
   let successor = coord
     .live_membership()
     .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(removed)))
@@ -1032,19 +1087,19 @@ fn commit_and_install_a_voter_removal(
   let op = coord
     .propose_membership(
       Instant::ZERO,
-      &mut wal,
+      wal,
       SingleVoterDelta::RemoveVoter(MemberId::new(removed)),
     )
     .expect("the primary mints the removal Reconfigure op");
-  coord.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // own append durable -> own vote
+  coord.handle_storage(Instant::ZERO, wal, sb, blocks); // own append durable -> own vote
   let acker = (0..3u128)
     .find(|&m| m != local && m != removed)
     .expect("a third voter exists to ack");
   coord.inject_message_for_test(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
+    wal,
+    sb,
+    blocks,
     Peer::Replica(ReplicaId::new(acker as u16)),
     Message::PrepareOk(crate::PrepareOk::new(
       View::new(),
@@ -1062,8 +1117,27 @@ fn commit_and_install_a_voter_removal(
   );
   // The 2-of-3 commit quorum stages the SwapEpoch root; a further handle_storage lands that durable
   // root, which installs the successor (config_id changes) and triggers reconcile_routing/pump.
-  coord.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
-  (coord, wal, sb, blocks, conn1, conn2)
+  coord.handle_storage(Instant::ZERO, wal, sb, blocks);
+}
+
+/// Registers an ACCEPTED conn attesting `Peer::Member(out_idx)` for a member id NOT in the active
+/// membership, then drives a zero-byte `handle_conn_data` so the coordinator seal QUARANTINES it (binds
+/// the never-routable `Peer::Member` key on the no-authority learn lane, since `slot_of(out_idx)` is
+/// `None`). Returns its `ConnId`.
+fn register_and_quarantine_member(
+  coord: &mut StreamCoordinator<CountSm, MockRecords>,
+  wal: &mut TestWal,
+  sb: &mut TestSb,
+  blocks: &mut crate::block_store::MemBlockStore,
+  out_idx: u128,
+) -> ConnId {
+  let member = MemberId::new(out_idx);
+  let id = coord.register_accepted(
+    Peer::Member(member),
+    Conn::from_parts(MockRecords::new(false, Some(Peer::Member(member)))),
+  );
+  coord.handle_conn_data(id, &[], false, Instant::ZERO, wal, sb, blocks);
+  id
 }
 
 #[test]
@@ -1118,6 +1192,127 @@ fn reconcile_routing_closes_a_removed_member_and_leaves_an_unshifted_survivor_bo
   assert!(
     coord.router_ref().conn(conn2).is_none(),
     "member 2's conn is closed and reaped: reconcile_routing sees slot_of(2) == None post-removal"
+  );
+}
+
+#[test]
+fn reconcile_routing_keeps_a_still_unresolvable_quarantined_member_and_closes_a_removed_replica() {
+  // A quarantined (`Peer::Member`) conn for a member the NEW config still does not resolve must be KEPT
+  // by reconcile (its learn lane persists), while a removed voter's `Peer::Replica` conn is closed (it
+  // re-dials into quarantine). The pre-change `None => close` arm would close the quarantined conn too,
+  // severing the learn lane the moment any unrelated config installed — the falsifier this pins.
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      0,
+      CountSm::default(),
+      u64::MAX,
+    ));
+  // A validated replica (member 2, slot 2) the removal will drop, plus a QUARANTINED member (id 5,
+  // never in genesis(3)) riding the learn lane.
+  let replica2 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 2);
+  let quarantined = register_and_quarantine_member(&mut coord, &mut wal, &mut sb, &mut blocks, 5);
+  assert!(
+    coord.router_ref().validated_member_conns().contains(&(
+      quarantined,
+      MemberId::new(5),
+      Peer::Member(MemberId::new(5))
+    )),
+    "precondition: member 5 is quarantined (bound Peer::Member) before the reconfiguration"
+  );
+
+  // Remove member 2: the config_id changes, but member 5 is STILL not in the membership.
+  drive_voter_removal_to_installed(&mut coord, &mut wal, &mut sb, &mut blocks, 0, 2);
+
+  assert!(
+    coord.router_ref().conn(replica2).is_none(),
+    "the removed replica (member 2, bound Peer::Replica) is closed by reconcile so it re-dials into quarantine"
+  );
+  assert!(
+    coord
+      .router_ref()
+      .conn(quarantined)
+      .map(|c| !c.is_closed())
+      .unwrap_or(false),
+    "the still-unresolvable quarantined member (bound Peer::Member) is KEPT: its learn lane persists across the install"
+  );
+  assert!(
+    coord.router_ref().validated_member_conns().contains(&(
+      quarantined,
+      MemberId::new(5),
+      Peer::Member(MemberId::new(5))
+    )),
+    "the quarantined conn stays bound under Peer::Member after reconcile"
+  );
+}
+
+#[test]
+fn the_quarantine_population_is_capped_evicting_the_oldest_for_a_newcomer() {
+  let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut coord =
+    StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
+      cfg,
+      genesis(3),
+      0,
+      CountSm::default(),
+      u64::MAX,
+    ));
+  let cap = StreamCoordinator::<CountSm, MockRecords>::QUARANTINE_CONN_LIMIT;
+  let quarantined_count = |c: &StreamCoordinator<CountSm, MockRecords>| {
+    c.router_ref()
+      .validated_member_conns()
+      .into_iter()
+      .filter(|(_, _, p)| p.is_member())
+      .count()
+  };
+
+  // Fill the quarantine to its cap with out-of-membership members. `register_and_quarantine_member`
+  // allocates ConnIds monotonically, so `ids[0]` is the oldest (lowest-id) quarantined conn.
+  let ids: Vec<ConnId> = (0..cap as u128)
+    .map(|m| register_and_quarantine_member(&mut coord, &mut wal, &mut sb, &mut blocks, 100 + m))
+    .collect();
+  assert_eq!(
+    quarantined_count(&coord),
+    cap,
+    "the quarantine is full at the cap"
+  );
+
+  // A further quarantine must evict the OLDEST (lowest ConnId) to admit the newcomer (newest-wins).
+  let newcomer = register_and_quarantine_member(
+    &mut coord,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    100 + cap as u128,
+  );
+  assert!(
+    coord
+      .router_ref()
+      .conn(ids[0])
+      .map(|c| c.is_closed())
+      .unwrap_or(true),
+    "the oldest quarantined conn is evicted to make room"
+  );
+  assert!(
+    coord
+      .router_ref()
+      .conn(newcomer)
+      .map(|c| !c.is_closed())
+      .unwrap_or(false),
+    "the newcomer is admitted onto the learn lane"
+  );
+  assert_eq!(
+    quarantined_count(&coord),
+    cap,
+    "the quarantined population stays bounded at the cap"
   );
 }
 

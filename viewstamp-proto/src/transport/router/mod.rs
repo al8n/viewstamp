@@ -355,6 +355,46 @@ impl<R: StreamTransport> PeerRouter<R> {
     self.peers.insert(routing_peer, id);
   }
 
+  /// Bind a validated conn under the never-routable `Peer::Member(member)` QUARANTINE key: an
+  /// authenticated member whose stable id the active membership does NOT resolve to a slot (a member
+  /// offline across a rolling replacement, one removed while offline, a not-yet-added one). The
+  /// endpoint's `as_replica()` returns `None` for a `Peer::Member`, so a quarantined conn is dropped
+  /// at every vote / lead / view / fanout gate by construction while it rides the no-authority
+  /// config-learning lane (state-sync serve + the epoch-ahead hint) to rejoin or learn its own
+  /// retirement.
+  ///
+  /// Behaves like [`Self::note_established_member`] for the already-validated / not-yet-settled /
+  /// closed guards. Quarantine is for ACCEPTED inbound ONLY: we dial only members we expect to
+  /// resolve, so a DIALED conn whose member no longer resolves is a stale target — reject it rather
+  /// than quarantine (the accept path is the one that admits a member which cannot yet resolve us).
+  pub fn note_established_quarantined(&mut self, id: ConnId, member: MemberId) {
+    let (record_settled, dialed, closed, validated) = match self.conns.get(&id) {
+      Some(e) => (
+        !e.conn.is_handshaking(),
+        e.dialed,
+        e.conn.is_closed(),
+        e.conn.is_validated(),
+      ),
+      None => return,
+    };
+    if closed || validated || !record_settled {
+      return;
+    }
+    if dialed {
+      if let Some(e) = self.conns.get_mut(&id) {
+        e.conn.abort(CloseCause::IdentityRejected);
+      }
+      return;
+    }
+    let routing_peer = Peer::Member(member);
+    if let Some(e) = self.conns.get_mut(&id) {
+      e.peer = routing_peer;
+      e.attested_member = Some(member);
+      e.conn.mark_validated(routing_peer);
+    }
+    self.peers.insert(routing_peer, id);
+  }
+
   /// Whether a conn has been validated (its identity confirmed and bound). The driver uses this to
   /// decide redial-vs-give-up.
   pub fn is_validated(&self, id: ConnId) -> bool {
