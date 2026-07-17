@@ -1538,11 +1538,29 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // reliable catch-up signal is the `EpochAhead` from a RETAINED voter — a member of our config, and a
     // single-voter change always retains at least one; the crossing fetch (forced + crossing-required,
     // self-verifying) authenticates the STATE, but the trigger still gates the SENDER to a current member.
-    let Some(slot) = from.as_replica() else {
-      return; // a client / non-replica peer cannot drive cross-epoch catch-up.
+    // The trigger sender is authenticated as either a RESOLVED current member (its slot is in our
+    // membership) or a QUARANTINED attested member (a `Peer::Member` our membership does not resolve —
+    // the #65 shape: a laggard partitioned across a rolling replacement, whose higher-epoch heartbeats
+    // arrive on quarantined conns from the new members it cannot yet resolve). A client / out-of-config
+    // slot elicits nothing. Provenance matters for the bounded probe below: a RESOLVED-member hint is
+    // authoritative (unbounded); a quarantine-sourced one arms a BOUNDED probe and records the donor to
+    // solicit directly (our `RequestSync` fan-out reaches only bound members — for #65's laggard those
+    // are its dead old peers).
+    let quarantined_source = match from {
+      Peer::Replica(slot) if self.membership.member_at(slot).is_some() => false,
+      Peer::Member(_) => true,
+      _ => return,
     };
-    if self.membership.member_at(slot).is_none() {
-      return; // an out-of-config slot — a misrouted/forged hint, not a current member of OUR config.
+    if quarantined_source {
+      // Record the donor to solicit directly and ARM the bounded-probe deadline (once — a repeated
+      // heartbeat must not slide it forward, or a faster-than-window primary would postpone expiry).
+      self.quarantined_donor = Some(from);
+      self.arm_quarantine_probe(now);
+    } else {
+      // A resolved member vouches the crossing authoritatively — drop any quarantine bound so the
+      // crossing is no longer probe-limited (and stop soliciting a now-superseded quarantined donor).
+      self.quarantined_donor = None;
+      self.quarantine_probe_deadline = None;
     }
     // PIN the PERSISTENT crossing intent: the highest hinted crossing `checkpoint_op` this node must
     // reach. The arm/upgrade below sets the IN-FLIGHT `SyncState`'s `require_cross_epoch`, but that flag

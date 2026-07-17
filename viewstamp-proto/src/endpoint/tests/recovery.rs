@@ -5485,6 +5485,117 @@ fn recover_escalates_to_a_peer_fetch_when_its_own_checkpoint_is_permanently_unre
 }
 
 #[test]
+fn a_quarantine_hint_does_not_escalate_a_checkpoint_exhausted_local_recovery() {
+  // SAFETY REGRESSION (super-high-risk): a node in a genuine CHECKPOINT-EXHAUSTED local recovery holds
+  // `commit_min` AHEAD of its SM (`sm_at < commit_min` — its Phase-2 restore faulted permanently), safe
+  // ONLY under the `Recovering` status exemption of the `sm_at == commit_min` witness. Its recovery sync is
+  // NON-crossing (`require_cross_epoch == false`). A quarantined `Peer::Member` higher-epoch hint arms the
+  // bounded probe (via `maybe_request_cross_epoch_catchup`), but `enter_cross_epoch_peer_fetch` DEFERS to
+  // the in-progress recovery (early-returns on `awaiting_peer_checkpoint`), so the sync is NOT upgraded to a
+  // crossing — the probe ends up armed on top of the genuine recovery. The probe must NOT tear that sync
+  // down and escalate out of `Recovering`: doing so lands the node in `ViewChange`/`Normal` with an
+  // unrestored SM at `commit_min == 2`, applying op 3+ over empty state — a committed-prefix loss.
+  //
+  // NEUTER CHECK: drop the `require_cross_epoch` gate in `advance_quarantine_probe` and the probe disarms
+  // the recovery sync + `retire_recover_and_escalate` moves the node to `ViewChange` with
+  // `sm_at != commit_min`, tripping the clause-(5c) `assert_invariants` in debug.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 2).unwrap();
+  let now = Instant::ZERO;
+  // Durable root: a checkpoint at op 2; the scripted superblock has an EMPTY read script, so EVERY
+  // checkpoint read FAULTS — a permanently-unreadable own snapshot (SM stays unrestored).
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(2),
+    OpNumber::with(2),
+    0xDEAD_BEEF,
+    std::vec::Vec::new(),
+  )
+  .unwrap()
+  .with_wal_geometry(2, u64::MAX);
+  let mut sb = ScriptedCheckpointSb::new(state, VecDeque::new());
+  let mut wal = TestWal {
+    entries: BTreeMap::new(),
+    head: 2,
+    done: VecDeque::new(),
+  };
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let mut e = Endpoint::recover(
+    cfg,
+    genesis(3),
+    5,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect("recover accepts this store")
+  .expect_active();
+  drive_recovery_scripted_sb(&mut e, &mut wal, &mut sb, &mut blocks, now);
+  while e.poll_message().is_some() {}
+  // Precondition: a checkpoint-exhausted local recovery — Recovering, awaiting a peer checkpoint, a
+  // NON-crossing forced sync, and the SM unrestored (`commit_min == 2 > sm_at == 0`).
+  assert_eq!(e.status(), Status::Recovering);
+  assert!(e.awaiting_peer_checkpoint_for_test());
+  assert!(
+    !e.sync_requires_cross_epoch_for_test(),
+    "the recovery sync is NON-crossing (require_cross_epoch == false)"
+  );
+  assert_eq!(
+    e.state_machine_ref().applied().len(),
+    0,
+    "precondition: the SM is unrestored"
+  );
+
+  // A quarantined higher-epoch hint arms the probe ON TOP of the recovery (the crossing is NOT armed).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Member(MemberId::new(99)),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(9),
+      OpNumber::with(9),
+      crate::Epoch::new(5),
+      0,
+    )),
+  );
+  while e.poll_message().is_some() {}
+  assert!(
+    !e.sync_requires_cross_epoch_for_test(),
+    "the hint did NOT upgrade the recovery sync to a crossing (enter_cross_epoch_peer_fetch deferred)"
+  );
+
+  // Step FAR past the probe deadline with no donor answer. The probe must NOT escalate the recovery.
+  for ms in 1..=8 {
+    e.handle_timeout(
+      now + core::time::Duration::from_millis(ms * 200),
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    );
+    while e.poll_message().is_some() {}
+  }
+  assert_eq!(
+    e.status(),
+    Status::Recovering,
+    "the checkpoint-exhausted recovery STAYS Recovering — the probe did NOT escalate it out with an \
+     unrestored SM"
+  );
+  assert!(
+    e.awaiting_peer_checkpoint_for_test(),
+    "still awaiting its peer checkpoint (the genuine recovery is intact)"
+  );
+  assert_eq!(
+    e.state_machine_ref().applied().len(),
+    0,
+    "the SM is STILL unrestored — no silent committed-prefix loss"
+  );
+}
+
+#[test]
 fn a_cross_epoch_recovery_peer_fetch_survives_an_old_epoch_same_epoch_commit() {
   // R7 SCOPE GUARD: `cancel_stale_cross_epoch_sync` must NOT tear down a GENUINE crossing. A NON-Normal
   // recovery peer-fetch (Recovering, `awaiting_peer_checkpoint`, a `require_cross_epoch` sync — what

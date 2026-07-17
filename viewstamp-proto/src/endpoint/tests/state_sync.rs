@@ -9087,3 +9087,942 @@ fn an_ordinary_fetch_does_not_shield_the_crossing_an_upgrade_makes_from_a_same_e
      NOT shield the speculative crossing)"
   );
 }
+
+// ── Quarantined-member identity lane (the stranded-member bridge) ──
+
+/// A `Peer::Member` for an attested member NOT in the genesis-3 membership — a quarantined peer (its
+/// stable id does not resolve to a slot, so the transport bound it under its member id).
+fn quarantined() -> Peer {
+  Peer::Member(MemberId::new(99))
+}
+
+#[test]
+fn a_quarantined_member_reaches_no_authority_path() {
+  // THE catastrophic-direction guard for the identity lane: a quarantined attested member
+  // (`Peer::Member`) may ride the no-authority config-learning lane, but every VOTE / LEAD / VIEW /
+  // COMMIT path must drop it with ZERO state delta — `as_replica()` is `None` for a `Peer::Member`,
+  // so every authority binding rejects it by construction. This sweeps the authority kinds under a
+  // quarantined `from` and asserts nothing moves.
+  let mut e = backup(); // a view-0 backup of {0,1,2}
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  let q = quarantined();
+
+  // A Prepare (would append + advance the head) — inert from a quarantined member.
+  e.handle_message(now, &mut wal, &mut sb, &mut blocks, q, prepare(1, 0));
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  assert_eq!(
+    e.op(),
+    OpNumber::new(),
+    "no append from a quarantined Prepare"
+  );
+  assert_eq!(e.commit(), OpNumber::new());
+  assert!(
+    !e.poll_message()
+      .is_some_and(|o| matches!(o.msg_ref(), Message::PrepareOk(_))),
+    "no PrepareOk (no vote) for a quarantined Prepare"
+  );
+
+  // A Commit (would advance commit) — inert.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    q,
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::new(),
+    "no commit advance from a quarantined Commit"
+  );
+
+  // A StartViewChange (would count toward the view-change quorum) — inert.
+  let before = e.view();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    q,
+    Message::StartViewChange(StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    e.view(),
+    before,
+    "no view movement from a quarantined StartViewChange"
+  );
+  assert!(
+    e.status().is_normal(),
+    "still Normal — no view-change entered"
+  );
+
+  // A PrepareOk (would count toward a commit quorum on a primary) — inert. Drive a primary first.
+  let mut p = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal2, mut sb2) = (TestWal::default(), TestSb::default());
+  p.handle_message(
+    now,
+    &mut wal2,
+    &mut sb2,
+    &mut blocks,
+    Peer::Client(ClientId::new(7)),
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(1),
+      Bytes::from_static(b"a"),
+    )),
+  );
+  p.handle_storage(now, &mut wal2, &mut sb2, &mut blocks); // own append → own vote (1 of 2)
+  while p.poll_message().is_some() {}
+  p.handle_message(
+    now,
+    &mut wal2,
+    &mut sb2,
+    &mut blocks,
+    quarantined(),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(1),
+      ReplicaId::new(1),
+      OpNumber::new(),
+      crate::storage::prepare_identity(
+        ClientId::new(7),
+        RequestNumber::with(1),
+        crate::storage::fnv1a_128(b"a"),
+      ),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(
+    p.commit(),
+    OpNumber::new(),
+    "a quarantined PrepareOk contributes NO vote — op 1 stays uncommitted (own vote alone is below quorum)"
+  );
+}
+
+#[test]
+fn a_quarantined_member_is_served_the_state_sync_checkpoint() {
+  // The #63/#65/#70 donor side: a quarantined attested member soliciting state-sync IS served the
+  // checkpoint (routed back to its `Peer::Member` address) — the no-authority read that lets a
+  // stranded member learn the current configuration to rejoin or discover its own retirement.
+  let now = Instant::ZERO;
+  let (mut donor, mut wal, mut sb) = donor_primary_at_checkpoint(2);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  while donor.poll_message().is_some() {}
+  donor.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    quarantined(),
+    Message::RequestSync(crate::RequestSync::new(
+      donor.view(),
+      OpNumber::with(2),
+      ReplicaId::new(0), // any self-stamped slot; the binding keys off `from`
+      0xF00D,
+      true,
+      0xDEAD, // a config the donor does not recognize
+    )),
+  );
+  donor.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  let mut served = None;
+  while let Some(out) = donor.poll_message() {
+    if let Message::SyncCheckpoint(s) = out.msg_ref() {
+      served = Some((out.to(), s.clone()));
+    }
+  }
+  let (to, s) = served.expect("a quarantined member's solicitation IS served");
+  assert_eq!(
+    to,
+    Recipient::To(quarantined()),
+    "the reply routes back to the Peer::Member address"
+  );
+  assert_eq!(s.checkpoint_op(), OpNumber::with(2));
+}
+
+#[test]
+fn a_quarantined_higher_epoch_hint_arms_a_bounded_probe_that_disarms() {
+  // The #65 laggard-trigger side + the bounded probe. A quarantined member's higher-epoch heartbeat
+  // arms a crossing sync (which blocks op-mint) AND records the quarantined donor to solicit
+  // directly (the fan-out reaches only bound members — for a partitioned laggard those are its dead
+  // old peers). If no crossing-presenting answer arrives, the probe DISARMS after the bounded window
+  // rather than wedging forever on a possibly-corrupted hint no donor can answer.
+  let mut e = backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  // A quarantined higher-epoch Commit (epoch 5 > our 0) arms the crossing probe.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    quarantined(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(4),
+      OpNumber::with(4),
+      crate::Epoch::new(5),
+      0xDEAD,
+    )),
+  );
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "the crossing sync is armed"
+  );
+  // The laggard solicits the remembered quarantined donor directly (not only Backups).
+  let mut solicited_quarantined = false;
+  while let Some(out) = e.poll_message() {
+    if matches!(out.msg_ref(), Message::RequestSync(_)) && out.to() == Recipient::To(quarantined())
+    {
+      solicited_quarantined = true;
+    }
+  }
+  assert!(
+    solicited_quarantined,
+    "the crossing solicits the remembered quarantined donor directly"
+  );
+
+  // No donor answers. Step the solicit timer past the bounded window — the probe disarms.
+  for ms in 1..=8 {
+    let t = now + core::time::Duration::from_millis(ms * 200);
+    e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    while e.poll_message().is_some() {}
+  }
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "the unanswered quarantine-armed crossing DISARMED — op-mint is no longer blocked forever"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "still at our durable epoch — no bogus cross"
+  );
+}
+
+/// Build the GENUINE crossing `SyncCheckpoint` for `donor_primary_at_checkpoint(4)` — a foreign config
+/// carrying a non-empty successor membership, so `crossing_answered` is true — echoing `nonce`.
+fn crossing_checkpoint_at_4(env: &Bytes, id: u128, nonce: u64) -> Message {
+  let successor = genesis(3)
+    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("AddVoter on the 3-voter genesis is valid");
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor, genesis(3).config_id())
+      .encode_body();
+  Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+    View::new(),
+    OpNumber::with(4),
+    id,
+    successor.epoch(),
+    successor.config_id(),
+    ReplicaId::new(0),
+    nonce,
+    env.clone(),
+    membership_body,
+  ))
+}
+
+#[test]
+fn a_crossing_that_presents_but_never_delivers_a_block_disarms() {
+  // A donor can PRESENT a crossing (a foreign config + non-empty successor membership, so
+  // `crossing_answered` is true) and then crash-stop before serving any block — its DAG never arrives.
+  // `crossing_answer_in_flight` stays set forever, but the fetch makes NO PROGRESS. The probe must read a
+  // `sync_fetch_progress` DELTA, not the persistent crossing bit, so a presented-but-stalled crossing
+  // still disarms rather than wedging op-mint at the stale epoch indefinitely.
+  //
+  // NEUTER CHECK: refresh the deadline on `crossing_answer_in_flight` alone (drop the progress-delta
+  // check) and this stalled crossing renews forever and never disarms — the wedge R4 flags.
+  let (_donor_e, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  let mut e = sync_backup();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the crossing DAG must be fetched
+  let now = Instant::ZERO;
+
+  // Arm a crossing sync and deliver the crossing `SyncCheckpoint` → a block-fetch armed with
+  // `crossing_answered = true`, then the donor goes silent (no BlockResponse ever arrives).
+  e.arm_cross_epoch_sync_for_test(4);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    crossing_checkpoint_at_4(&env, id, nonce),
+  );
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.block_fetch_crossing_answered_for_test(),
+    Some(true),
+    "precondition: a crossing block-fetch is in flight (crossing_answered is true)"
+  );
+
+  e.seed_quarantined_donor_for_test(now, quarantined());
+  for ms in 1..=8 {
+    e.handle_timeout(
+      now + core::time::Duration::from_millis(ms * 200),
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    );
+    while e.poll_message().is_some() {}
+  }
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "a crossing that PRESENTED but delivered no block makes no progress, so the probe DISARMS it"
+  );
+}
+
+#[test]
+fn a_progressing_crossing_survives_the_probe_then_a_stall_disarms() {
+  // The other side of the progress rule: a crossing whose fetch is genuinely ADVANCING — a frontier block
+  // accepted within the window — must survive, since `sync_fetch_progress` moved past the mark. Once the
+  // transfer STALLS (no further blocks), the next window makes no progress and the probe disarms. Proves
+  // the fix does not tear down a slow-but-progressing rejoin, only a genuinely stalled one.
+  let (_donor_e, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  let (_op, sm_root, _sessions_root) =
+    Endpoint::<CountSm>::decode_checkpoint(&env).expect("donor envelope decodes");
+  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  seed_donor_blocks(&mut donor_blocks, 4);
+
+  let mut e = sync_backup();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the whole DAG must be fetched
+  let now = Instant::ZERO;
+
+  e.arm_cross_epoch_sync_for_test(4);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    crossing_checkpoint_at_4(&env, id, nonce),
+  );
+  // The first outstanding request is the SM root; capture it.
+  let mut first_req = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::RequestBlock(addr) = out.msg_ref() {
+      first_req = Some(*addr);
+    }
+  }
+  assert_eq!(
+    first_req,
+    Some(sm_root),
+    "the fetch first requests the SM root"
+  );
+  e.seed_quarantined_donor_for_test(now, quarantined());
+
+  // WITHIN the first window (t=100ms), serve the SM root block — a frontier block ACCEPTED, so
+  // `sync_fetch_progress` advances. The DAG still owes the session leaf, so the fetch stays in flight.
+  let t1 = now + core::time::Duration::from_millis(100);
+  let block = donor_blocks
+    .read_block(sm_root)
+    .expect("donor holds the SM root");
+  blocks.write_block(sm_root, block.clone());
+  e.handle_message(
+    t1,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::BlockResponse(crate::BlockResponse::new(sm_root, Some(block))),
+  );
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.block_fetch_crossing_answered_for_test(),
+    Some(true),
+    "the crossing fetch is still in flight after accepting the SM root (the session leaf is still owed)"
+  );
+
+  // At the first deadline (t=300ms) the fetch PROGRESSED (the SM root was accepted), so the probe refreshes
+  // rather than disarming.
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  while e.poll_message().is_some() {}
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "a fetch that accepted a frontier block within the window survives — progress refreshed the deadline"
+  );
+
+  // Now the donor goes silent (no further block answers). The next window makes NO progress, so the probe
+  // disarms — stepping past the refreshed deadline (300ms + 300ms = 600ms).
+  for ms in 4..=14u64 {
+    e.handle_timeout(
+      now + core::time::Duration::from_millis(ms * 100),
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    );
+    while e.poll_message().is_some() {}
+  }
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "once the progressing fetch STALLS, the next window makes no progress and the probe disarms"
+  );
+}
+
+#[test]
+fn non_crossing_block_progress_does_not_refresh_a_stalled_crossing_probe() {
+  // Progress must be CROSSING-SPECIFIC. A non-crossing (below-target same-config) fetch the cross-epoch
+  // solicit admits accepts blocks too, but that progress is NOT the crossing's. If it counted, an
+  // old-config donor could feed ONE non-crossing block, then a quarantined donor re-pins crossing metadata
+  // with NO block, and the stale progress delta would refresh the stalled crossing forever. The probe bumps
+  // its progress counter only for a block accepted into a `crossing_answered` fetch, so this interleaving
+  // still disarms at the crossing's deadline.
+  //
+  // NEUTER CHECK: bump `sync_fetch_progress` for ANY accepted block (drop the `crossing` gate) and the
+  // non-crossing block's delta refreshes the crossing probe — it never disarms.
+  let (_donor_e, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  let (_op, sm_root, _sessions_root) =
+    Endpoint::<CountSm>::decode_checkpoint(&env).expect("donor envelope decodes");
+  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  seed_donor_blocks(&mut donor_blocks, 4);
+
+  let mut e = sync_backup();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the DAG must be fetched
+  let now = Instant::ZERO;
+
+  // Arm a crossing sync, then deliver a NON-crossing reply (same config, empty membership) → a live fetch
+  // with `crossing_answered = false`, armed on the SM root.
+  e.arm_cross_epoch_sync_for_test(4);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      genesis(3).config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    )),
+  );
+  let mut first_req = None;
+  while let Some(out) = e.poll_message() {
+    if let Message::RequestBlock(addr) = out.msg_ref() {
+      first_req = Some(*addr);
+    }
+  }
+  assert_eq!(
+    e.block_fetch_crossing_answered_for_test(),
+    Some(false),
+    "precondition: a NON-crossing fetch is in flight"
+  );
+  let req = first_req.expect("the non-crossing fetch requests a block");
+  assert_eq!(
+    req, sm_root,
+    "the non-crossing fetch first requests the SM root"
+  );
+  e.seed_quarantined_donor_for_test(now, quarantined());
+
+  // Feed the requested block into the NON-crossing fetch — accepted, but NOT the crossing's progress.
+  let block = donor_blocks
+    .read_block(req)
+    .expect("donor holds the requested block");
+  blocks.write_block(req, block.clone());
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::BlockResponse(crate::BlockResponse::new(req, Some(block))),
+  );
+  while e.poll_message().is_some() {}
+
+  // The quarantined donor now re-pins CROSSING metadata (foreign config, non-empty membership) with the
+  // same nonce → the fetch becomes `crossing_answered = true`, but delivers NO block for it.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    quarantined(),
+    crossing_checkpoint_at_4(&env, id, nonce),
+  );
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.block_fetch_crossing_answered_for_test(),
+    Some(true),
+    "the fetch now presents a crossing (re-pinned), but no crossing block was accepted"
+  );
+
+  // At the ORIGINAL deadline (armed at t=0 → 300ms), one step past it: the crossing made NO
+  // accepted-block progress (only the earlier NON-crossing block bumped the raw counter), so `progress ==
+  // mark` and the probe DISARMS. Were the non-crossing delta counted, it would refresh here and stay armed
+  // one more window — the R5 wedge (a repeated interleaving would sustain it forever).
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(350),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  while e.poll_message().is_some() {}
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "non-crossing progress does not refresh the crossing probe — the stalled crossing DISARMS at its \
+     original deadline"
+  );
+}
+
+#[test]
+fn a_crossing_fetch_survives_interleaved_non_crossing_replies_and_completes() {
+  // `send_request_sync` solicits BOTH old-config `Backups` AND the quarantined donor, so a crossing fetch
+  // in progress can be raced by a later non-crossing (same-config) reply from an old-config donor. That
+  // reply must NOT downgrade the crossing fetch: were it to, the crossing block would land off-frontier
+  // against the non-crossing fetch, `apply_sync` would reject the non-crossing install, and each further old
+  // reply would re-clear the crossing fetch — the healthy quarantined primary's next heartbeat only re-arms
+  // the same losing race, stranding the member forever under HONEST timing. Interleaving a non-crossing
+  // reply before every crossing block keeps the crossing fetch pinned and lets it COMPLETE and cross.
+  //
+  // NEUTER CHECK: drop the crossing-downgrade guard in begin_block_sync and the same-config reply evicts the
+  // crossing fetch — the install never happens, `state_syncs_applied` stays 0, and the epoch stays 0.
+  let (_donor_e, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  let mut donor_blocks = crate::block_store::MemBlockStore::new();
+  seed_donor_blocks(&mut donor_blocks, 4);
+
+  let mut e = sync_backup();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let non_crossing = |nonce: u64| {
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      genesis(3).config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    ))
+  };
+  let last_request = |e: &mut Endpoint<CountSm>| {
+    let mut req = None;
+    while let Some(out) = e.poll_message() {
+      if let Message::RequestBlock(addr) = out.msg_ref() {
+        req = Some(*addr);
+      }
+    }
+    req
+  };
+
+  e.arm_cross_epoch_sync_for_test(4);
+  let nonce = e.sync_nonce_for_test();
+
+  // The quarantined donor presents the crossing → a crossing fetch, requesting the first block.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    quarantined(),
+    crossing_checkpoint_at_4(&env, id, nonce),
+  );
+  let mut want = last_request(&mut e);
+  assert_eq!(
+    e.block_fetch_crossing_answered_for_test(),
+    Some(true),
+    "the crossing fetch is armed"
+  );
+
+  // Drain the crossing DAG, racing an old-config NON-crossing reply in before each block.
+  let mut applied = false;
+  for _ in 0..12 {
+    let Some(addr) = want else { break };
+    // The old-config donor's non-crossing reply races the in-flight crossing block — it must be IGNORED.
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      primary_peer(),
+      non_crossing(nonce),
+    );
+    while e.poll_message().is_some() {}
+    assert_eq!(
+      e.block_fetch_crossing_answered_for_test(),
+      Some(true),
+      "a non-crossing reply must NOT evict the live crossing fetch"
+    );
+    // Serve the requested crossing block from the quarantined donor.
+    let block = donor_blocks
+      .read_block(addr)
+      .expect("donor holds the requested block");
+    blocks.write_block(addr, block.clone());
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      quarantined(),
+      Message::BlockResponse(crate::BlockResponse::new(addr, Some(block))),
+    );
+    want = last_request(&mut e);
+    for _ in 0..4 {
+      e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+    }
+    if e.state_syncs_applied() == 1 {
+      applied = true;
+      break;
+    }
+  }
+  assert!(
+    applied,
+    "the crossing fetch stayed pinned through the interleaved non-crossing replies and COMPLETED"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(1),
+    "the laggard crossed to the successor epoch"
+  );
+}
+
+#[test]
+fn a_non_crossing_reply_does_not_shield_the_quarantine_probe() {
+  // A donor answering a quarantine crossing with a NON-crossing reply — a same-config checkpoint the
+  // cross-epoch solicit admits below target — arms a live `block_fetch` whose `crossing_answered` bit is
+  // FALSE. That must NOT shield the probe: otherwise a donor endlessly answering with non-crossing replies
+  // would hold the speculative crossing open forever, re-wedging op-mint (the exact stall the probe
+  // bounds). The probe reads `crossing_answer_in_flight`, so it keeps counting and DISARMS.
+  //
+  // NEUTER CHECK: shield on bare `block_fetch.is_some()` and this probe never disarms while the
+  // non-crossing fetch is live — the reintroduced wedge.
+  let (_donor_e, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  let mut e = sync_backup();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the DAG must be fetched
+  let now = Instant::ZERO;
+
+  // Arm a crossing sync and deliver a SAME-CONFIG `SyncCheckpoint` (config_id == ours, empty membership)
+  // echoing its nonce → a live block-fetch with `crossing_answered = false`.
+  e.arm_cross_epoch_sync_for_test(4);
+  let nonce = e.sync_nonce_for_test();
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      genesis(3).config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    )),
+  );
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.block_fetch_crossing_answered_for_test(),
+    Some(false),
+    "precondition: a NON-crossing block-fetch is in flight (crossing_answered is false)"
+  );
+
+  // Mark quarantine-sourced, then step past the disarm window with NO block answers.
+  e.seed_quarantined_donor_for_test(now, quarantined());
+  for ms in 1..=8 {
+    e.handle_timeout(
+      now + core::time::Duration::from_millis(ms * 200),
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    );
+    while e.poll_message().is_some() {}
+  }
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "a non-crossing live fetch does NOT shield the probe — the speculative crossing DISARMED"
+  );
+}
+
+#[test]
+fn a_quarantine_armed_crossing_in_recovery_disarms_and_escalates() {
+  // A quarantine-armed crossing entered while NON-Normal lives in the Recovering peer-fetch, whose retry
+  // cadence is `recover_timeouts` — NOT the Normal-only `sync_timeouts`. The probe must advance and
+  // disarm THERE too, else a bogus (e.g. bit-flipped-epoch) quarantined hint would strand the node
+  // Recovering forever. On disarm it abandons the speculative crossing and escalates to the next view
+  // change (a live posture that resumes processing same-epoch traffic), landing where a crash+restart
+  // would; a real higher epoch re-arms the crossing on its next heartbeat.
+  //
+  // NEUTER CHECK: remove the `advance_quarantine_probe` call from `recover_timeouts` and the crossing
+  // never disarms while Recovering — the node stays stranded, exactly the wedge this bounds.
+  let mut e = sync_backup();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  // Enter the Recovering cross-epoch peer-fetch with a quarantined donor recorded — what a `Peer::Member`
+  // hint does for a non-Normal laggard (`maybe_request_cross_epoch_catchup` sets the donor, then
+  // `enter_cross_epoch_peer_fetch` flips to Recovering and arms the forced crossing).
+  e.seed_quarantined_donor_for_test(now, quarantined());
+  e.enter_cross_epoch_peer_fetch(now, OpNumber::with(4));
+  assert!(
+    e.status().is_recovering(),
+    "precondition: the non-Normal laggard entered the Recovering crossing"
+  );
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "precondition: the crossing sync is armed"
+  );
+
+  // No donor answers. Step the recovery retry cadence past the bounded window.
+  for ms in 1..=8 {
+    e.handle_timeout(
+      now + core::time::Duration::from_millis(ms * 200),
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    );
+    while e.poll_message().is_some() {}
+  }
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "the unanswered quarantine crossing DISARMED on the recovery cadence — not stranded Recovering"
+  );
+  assert!(
+    !e.status().is_recovering(),
+    "the node abandoned the speculative recovery crossing and escalated to a live view change"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "still at our durable epoch — no bogus cross"
+  );
+}
+
+#[test]
+fn a_non_crossing_reply_in_recovery_does_not_shield_the_probe() {
+  // The recovery twin of `a_non_crossing_reply_does_not_shield_the_quarantine_probe`: a donor answering a
+  // Recovering quarantine crossing with a NON-crossing reply (same-config / empty membership — legitimate
+  // during the commit-first window) arms a live block-fetch with `crossing_answered = false`. On the
+  // recovery cadence too the probe must read `crossing_answer_in_flight`, NOT bare `block_fetch`, so the
+  // non-crossing fetch does not hold the crossing open forever; the probe disarms and escalates.
+  //
+  // NEUTER CHECK: shield on bare `block_fetch.is_some()` and the node stays stranded Recovering while the
+  // non-crossing fetch is live.
+  let (_donor_e, _dwal, dsb) = donor_primary_at_checkpoint(4);
+  let (env, id) = donor_envelope(&dsb);
+  let mut e = sync_backup();
+  let mut wal = TestWal::default();
+  let mut sb = TestSb::default();
+  let mut blocks = crate::block_store::MemBlockStore::new(); // EMPTY — the DAG must be fetched
+  let now = Instant::ZERO;
+
+  e.seed_quarantined_donor_for_test(now, quarantined());
+  e.enter_cross_epoch_peer_fetch(now, OpNumber::with(4));
+  let nonce = e.sync_nonce_for_test();
+  // A NON-crossing reply (same config, empty membership) admitted onto the recovery fetch path.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      genesis(3).config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(),
+    )),
+  );
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.block_fetch_crossing_answered_for_test(),
+    Some(false),
+    "precondition: a NON-crossing recovery fetch is in flight (crossing_answered is false)"
+  );
+
+  for ms in 1..=8 {
+    e.handle_timeout(
+      now + core::time::Duration::from_millis(ms * 200),
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+    );
+    while e.poll_message().is_some() {}
+  }
+  assert!(
+    e.sync_target_for_test().is_none(),
+    "a non-crossing recovery fetch does NOT shield the probe — the speculative crossing DISARMED"
+  );
+  assert!(
+    !e.status().is_recovering(),
+    "the node escalated to a live view change instead of staying stranded Recovering"
+  );
+}
+
+#[test]
+fn sustained_higher_epoch_heartbeats_do_not_postpone_probe_expiry() {
+  // The probe deadline is WALL-CLOCK, INDEPENDENT of `sync_solicit`. A quarantined laggard receiving
+  // higher-epoch Commit heartbeats every 50ms — faster than the 100ms solicit window — keeps re-soliciting
+  // (each re-trigger resets `sync_solicit`), so a solicit-gated probe would have its expiry slid forward
+  // forever and NEVER fire, leaving `sync` armed and op-mint wedged at the stale epoch. The fixed deadline
+  // fires regardless: with no crossing progress the probe disarms by the three-window bound.
+  //
+  // A genuine re-trigger legitimately RE-ARMS the crossing after each bounded disarm (the epoch really is
+  // higher), so the crossing oscillates rather than staying dead — the property under test is that it
+  // disarms AT ALL under sustained heartbeats (a sliding probe never would), not that it stays disarmed.
+  //
+  // NEUTER CHECK: make `arm_quarantine_probe` slide the deadline on every call (drop the is_none guard) and
+  // the deadline is pushed forward by every 50ms heartbeat — it never fires, `ever_disarmed` stays false.
+  let mut e = backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let heartbeat = Message::Commit(Commit::new(
+    View::new(),
+    OpNumber::with(4),
+    OpNumber::with(4),
+    crate::Epoch::new(5),
+    0xDEAD,
+  ));
+
+  // Arm on the first higher-epoch heartbeat (deadline = 0 + 3*100ms = 300ms).
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    quarantined(),
+    heartbeat.clone(),
+  );
+  while e.poll_message().is_some() {}
+  assert!(
+    e.sync_target_for_test().is_some(),
+    "the crossing armed on the first quarantined higher-epoch hint"
+  );
+
+  // Deliver a heartbeat every 50ms (re-soliciting each time) with an interleaved handle_timeout, out past
+  // the 300ms deadline. No SyncCheckpoint answers → no crossing progress. The probe MUST fire.
+  let mut ever_disarmed = false;
+  for step in 1..=12u64 {
+    let t = Instant::ZERO + core::time::Duration::from_millis(step * 50);
+    e.handle_message(
+      t,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      quarantined(),
+      heartbeat.clone(),
+    );
+    e.handle_timeout(t, &mut wal, &mut sb, &mut blocks);
+    while e.poll_message().is_some() {}
+    if e.sync_target_for_test().is_none() {
+      ever_disarmed = true;
+      break;
+    }
+  }
+  assert!(
+    ever_disarmed,
+    "the probe fired at its wall-clock deadline despite 50ms heartbeats re-soliciting — the deadline did \
+     NOT slide (sync + intent + donor disarmed)"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "still at our durable epoch — no bogus cross"
+  );
+}
+
+#[test]
+fn quarantined_serves_are_capped_independently_of_the_transport() {
+  // A rotating set of DISTINCT attested-but-unresolvable `Peer::Member` requesters must NOT grow
+  // `sync_serving` without bound. Each solicits a checkpoint serve whose read lingers until its (here
+  // never-driven) storage completion; without an endpoint-side cap the map, its read queue, and the
+  // completion scan would grow with the number of distinct valid-cert member ids that ever solicited (and
+  // never quiesce). `submit_or_refresh_serve` caps concurrent quarantined serves at QUARANTINE_SERVE_LIMIT,
+  // reserving the map's replica capacity independently of transport connection lifetime.
+  //
+  // NEUTER CHECK: drop the QUARANTINE_SERVE_LIMIT gate and the member-serve count grows to the number of
+  // distinct ids that solicited (here 32) — the unbounded growth R4-F2 flags.
+  let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  while e.poll_message().is_some() {} // drain warm-up
+
+  // 32 distinct quarantined members each solicit ONCE (a foreign config so the sender binding admits the
+  // Member; checkpoint 0 < our 2 so it is in reach and served). No serve-read is completed (no storage
+  // drive), so every admitted serve lingers in the map.
+  let foreign_config = genesis(3).config_id().wrapping_add(1);
+  for id in 100..132u128 {
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      Peer::Member(MemberId::new(id)),
+      Message::RequestSync(crate::RequestSync::new(
+        View::with(0),
+        OpNumber::with(0),
+        ReplicaId::new(0),
+        0xAA,
+        false,
+        foreign_config,
+      )),
+    );
+    while e.poll_message().is_some() {}
+  }
+  let member_serves = e.sync_serving.keys().filter(|p| p.is_member()).count();
+  assert!(
+    member_serves <= QUARANTINE_SERVE_LIMIT,
+    "quarantined serves are capped at {QUARANTINE_SERVE_LIMIT} ({member_serves} live) independently of \
+     how many distinct member ids solicited"
+  );
+}
