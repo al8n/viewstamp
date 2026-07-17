@@ -737,17 +737,30 @@ fn replica_in_cluster_of(
   )
 }
 
+/// How the small node settled an accepted peer's attested identity.
+#[derive(Debug, PartialEq, Eq)]
+enum PeerOutcome {
+  /// Resolved to a slot in the active membership and bound into the replica fanout.
+  BoundReplica,
+  /// Authenticated but not resolvable to a slot: bound under the never-routable `Peer::Member`
+  /// quarantine key on the no-authority learn lane (kept, but out of the replica fanout).
+  Quarantined,
+  /// Refused before `bind_validated` — no slot pinned, no learn lane (a self-claim or a stale dial).
+  Rejected,
+}
+
 /// Drive a `small`-replica node (`Replica(0)` of a `SMALL`-replica cluster) being dialed by a peer
 /// whose genuine, validly-attested replica index is `peer_id`, over real cluster-private mTLS for
 /// `scheme`. Both share the cluster CA and id, so the mTLS handshake completes and the binding policy
 /// runs; the small node ADOPTS the peer's attested index (it did not dial the peer, so the accept path
-/// takes the adopt branch). Returns whether the small node ended up with the peer in its bound replica
-/// fanout (`bound_replica_peers`).
+/// takes the adopt branch). Returns how the small node settled the peer — bound as a replica,
+/// quarantined on the learn lane, or rejected.
 ///
 /// `peer_id < SMALL` is a member id in the small node's active membership (`genesis(SMALL)`) and MUST
-/// bind (resolved to its slot); `peer_id >= SMALL` is NOT a member and MUST be rejected before
-/// `bind_validated` — never consuming a slot, never entering the fanout.
-fn small_node_binds_peer(scheme: Scheme, peer_id: u8) -> bool {
+/// bind (resolved to its slot); `peer_id >= SMALL` is NOT a member and, as an ACCEPTED inbound, MUST be
+/// QUARANTINED (bound `Peer::Member`, on the learn lane, never in the replica fanout) rather than
+/// consuming a replica slot.
+fn small_node_admits_peer(scheme: Scheme, peer_id: u8) -> PeerOutcome {
   const SMALL: u8 = 3;
   // The peer must live in a cluster large enough that `peer_id` is a valid index THERE (so it can
   // mint a genuine cert / hello for it), even when `peer_id` is out of the small node's membership.
@@ -821,59 +834,81 @@ fn small_node_binds_peer(scheme: Scheme, peer_id: u8) -> bool {
         &mut peer.3,
       );
     }
-    // Stop early once the small node has bound the peer (the positive case settles fast).
-    if !small.0.bound_replica_peers_for_test().is_empty() {
+    // Stop early once the small node has settled the peer either way — bound as a replica, or
+    // quarantined on the learn lane. Both positive outcomes settle fast.
+    if !small.0.bound_replica_peers_for_test().is_empty()
+      || !small.0.quarantined_members_for_test().is_empty()
+    {
       break;
     }
   }
 
-  let bound = small.0.bound_replica_peers_for_test();
-  // An out-of-membership peer must also never have pinned a connection slot: the reject path runs
-  // BEFORE `bind_validated`, so a rejected candidate leaves the small node holding no live connection
-  // for it. (The peer's own redial attempts are each closed the same way.)
-  if !bound.contains(&Peer::Replica(ReplicaId::new(u16::from(peer_id)))) {
-    assert!(
-      small.0.bridge_table_len() == 0,
-      "a rejected out-of-membership candidate must not pin a connection slot on the small node"
-    );
+  let bound_as_replica = small
+    .0
+    .bound_replica_peers_for_test()
+    .contains(&Peer::Replica(ReplicaId::new(u16::from(peer_id))));
+  let quarantined = small
+    .0
+    .quarantined_members_for_test()
+    .contains(&MemberId::new(u128::from(peer_id)));
+  match (bound_as_replica, quarantined) {
+    (true, _) => PeerOutcome::BoundReplica,
+    (false, true) => PeerOutcome::Quarantined,
+    (false, false) => {
+      // Rejected: the reject path runs BEFORE bind_validated, so a rejected candidate leaves the small
+      // node holding no live connection for it — neither a replica bind nor a quarantine slot. (The
+      // peer's own redial attempts are each refused the same way.)
+      assert!(
+        small.0.bridge_table_len() == 0,
+        "a rejected candidate must not pin a connection slot on the small node"
+      );
+      PeerOutcome::Rejected
+    }
   }
-  bound.contains(&Peer::Replica(ReplicaId::new(u16::from(peer_id))))
 }
 
 /// A replica whose validly-attested stable [`MemberId`] is NOT in the receiving node's active
-/// membership is REJECTED by the binding policy — for BOTH provided schemes (`Hello` and `CertOid`) —
-/// before it can consume a connection slot or join the outbound fanout. An IN-membership member still
-/// binds (resolved to its routing slot).
+/// membership is QUARANTINED by the binding policy — for BOTH provided schemes (`Hello` and `CertOid`)
+/// — bound under the never-routable `Peer::Member` key on the no-authority learn lane rather than into
+/// the replica fanout. An IN-membership member still binds normally (resolved to its routing slot).
 ///
-/// The mechanism: a node from a since-shrunk cluster (or a misconfigured / retired cert) presents a
-/// genuine cluster cert + Hello/OID for a member id the receiving node no longer carries. Its chain
-/// validates (same CA) and its attested cluster matches, so neither the TLS layer nor the cluster
-/// cross-check turns it away; only the coordinator's `Endpoint::slot_of` resolution does — an absent
-/// member yields `None`. Without that gate it would bind, pin a slot, and enter `Backups`/`AllReplicas`
-/// — wasted, since the endpoint's own `sender_matches` then drops every inbound consensus frame from an
-/// out-of-membership sender. (The test fixtures map `MemberId == slot`, so an out-of-range index IS an
-/// out-of-membership member id.)
+/// The mechanism: a node from a since-shrunk cluster (a member offline across a rolling replacement, or
+/// one removed while offline) presents a genuine cluster cert + Hello/OID for a member id the receiving
+/// node's ACTIVE membership does not resolve. Its chain validates (same CA) and its attested cluster
+/// matches, so neither the TLS layer nor the cluster cross-check turns it away; the coordinator's
+/// `Endpoint::slot_of` returns `None`. Binding it as a replica would pin a slot and enter
+/// `Backups`/`AllReplicas` — wasted, since the endpoint's own `sender_matches` drops every inbound
+/// consensus frame from a non-member. Instead it is QUARANTINED: `Peer::Member` has `as_replica()`
+/// `None`, so it is dropped at every vote / lead / view / fanout gate by construction while it rides
+/// state-sync + the epoch-ahead hint to rejoin or learn its own retirement. (The test fixtures map
+/// `MemberId == slot`, so an out-of-range index IS an out-of-membership member id.)
 ///
-/// NEUTER CHECK: make the `slot_of` arm in `apply_outcome` bind on `None` (e.g. fall back to a fixed
-/// slot) and the out-of-membership peer binds (enters `bound_replica_peers`), so the rejection
-/// assertion below fails — exactly the slot-and-fanout waste the gate closes.
+/// NEUTER CHECK: make the `slot_of` `None` arm in `apply_outcome` bind `Peer::Replica(fixed_slot)`
+/// instead of quarantining, and the out-of-membership peer enters `bound_replica_peers` (asserted
+/// `BoundReplica` not `Quarantined`), so this test fails — exactly the slot-and-fanout waste the
+/// quarantine avoids.
 #[test]
-fn an_out_of_membership_replica_is_rejected_for_both_provided_schemes() {
+fn an_out_of_membership_member_is_quarantined_for_both_provided_schemes() {
   for scheme in [Scheme::Hello, Scheme::CertOid] {
-    // In-membership (member id 1 ∈ genesis(3)): binds.
-    assert!(
-      small_node_binds_peer(scheme, 1),
-      "an in-membership member (id 1 ∈ genesis(3)) must bind under {scheme:?}"
+    // In-membership (member id 1 ∈ genesis(3)): resolves to its slot and binds into the fanout.
+    assert_eq!(
+      small_node_admits_peer(scheme, 1),
+      PeerOutcome::BoundReplica,
+      "an in-membership member (id 1 ∈ genesis(3)) must bind as a replica under {scheme:?}"
     );
-    // Out-of-membership (member id 3 ∉ genesis(3), and 4 ∉): rejected, never in the fanout.
-    assert!(
-      !small_node_binds_peer(scheme, 3),
-      "a member at the membership boundary (id 3 ∉ genesis(3)) must be rejected under {scheme:?}, \
-       never entering the bound fanout"
+    // Out-of-membership (member id 3 ∉ genesis(3), and 4 ∉): an ACCEPTED inbound is QUARANTINED — bound
+    // on the never-routable learn lane, never entering the replica fanout — so it can rejoin or learn
+    // its own retirement, not rejected outright.
+    assert_eq!(
+      small_node_admits_peer(scheme, 3),
+      PeerOutcome::Quarantined,
+      "a member at the membership boundary (id 3 ∉ genesis(3)) must be quarantined under {scheme:?}, \
+       never entering the replica fanout"
     );
-    assert!(
-      !small_node_binds_peer(scheme, 4),
-      "a member beyond the membership (id 4 ∉ genesis(3)) must be rejected under {scheme:?}"
+    assert_eq!(
+      small_node_admits_peer(scheme, 4),
+      PeerOutcome::Quarantined,
+      "a member beyond the membership (id 4 ∉ genesis(3)) must be quarantined under {scheme:?}"
     );
   }
 }
@@ -894,21 +929,26 @@ fn an_out_of_membership_replica_is_rejected_for_both_provided_schemes() {
 /// misconfiguration (it needs a valid cluster cert for our id), NOT a Byzantine claim.
 ///
 /// NEUTER CHECK: drop the `candidate != self.me()` gate in `apply_outcome` and the self-claiming peer
-/// binds (enters `bound_replica_peers`), so the rejection assertion below fails — exactly the
-/// bind-as-self hole the gate closes.
+/// binds as `Replica(0)` (asserted `BoundReplica` not `Rejected`), so this test fails — exactly the
+/// bind-as-self hole the gate closes. The self-id (id 0 ∈ membership) takes the self-claim reject
+/// path BEFORE `slot_of`, so it is genuinely REJECTED (no slot, no learn lane) — distinct from the
+/// out-of-membership QUARANTINE path.
 #[test]
 fn a_peer_claiming_this_replicas_own_identity_is_rejected_for_both_provided_schemes() {
   for scheme in [Scheme::Hello, Scheme::CertOid] {
-    // A peer attesting `Replica(0)` — the small node's OWN id — must be rejected: never bound, never in
-    // the fanout, never pinning a slot (the in-fanout / no-slot assertions live in `small_node_binds_peer`).
-    assert!(
-      !small_node_binds_peer(scheme, 0),
+    // A peer attesting `Replica(0)` — the small node's OWN id — must be REJECTED (not quarantined):
+    // never bound, never in the fanout, never pinning a slot (the no-slot assertion lives in
+    // `small_node_admits_peer`). The self-claim gate runs before `slot_of`, and id 0 IS in membership.
+    assert_eq!(
+      small_node_admits_peer(scheme, 0),
+      PeerOutcome::Rejected,
       "a peer authenticating as this replica's own id (Replica(0)) must be rejected under {scheme:?}, \
        never binding as the local replica"
     );
     // A DIFFERENT in-membership id still binds, so the gate is the self-id one, not a blanket refusal.
-    assert!(
-      small_node_binds_peer(scheme, 1),
+    assert_eq!(
+      small_node_admits_peer(scheme, 1),
+      PeerOutcome::BoundReplica,
       "a legitimate OTHER replica id (Replica(1)) still binds under {scheme:?}"
     );
   }

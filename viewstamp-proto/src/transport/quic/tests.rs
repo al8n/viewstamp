@@ -370,7 +370,34 @@ fn the_connection_cap_covers_the_mutual_dial_mesh_for_the_configured_membership(
   let generous = effective_cap(5, Some(1000));
   assert_eq!(
     generous, 1000,
-    "an explicit cap above the mesh floor is honoured as-is (a larger flood budget)"
+    "an explicit cap ABOVE the reserved floor is honoured as-is (the operator's flood budget already \
+     covers the mesh plus the quarantine reserve — the reserve raises only a cap below the floor)"
+  );
+}
+
+/// The quarantine reserve is folded into the floor with a `max`, never ADDED to the operator cap, so a
+/// `usize::MAX` override (the option accepts any nonzero cap) cannot overflow the effective cap down
+/// below the mesh floor and refuse authoritative dials. A tiny override is still raised to the reserved
+/// floor.
+///
+/// NEUTER CHECK: compute the cap as `operator_cap.max(floor) + QUARANTINE_CONN_LIMIT` and the
+/// `usize::MAX` case wraps (release) or panics (overflow checks) to a tiny value below the floor — the
+/// starvation this guards against.
+#[test]
+fn the_connection_cap_reserve_does_not_overflow_a_max_operator_override() {
+  let reserve = QuicCoordinator::<CountSm, ProvidedIdentity>::QUARANTINE_CONN_LIMIT;
+  // A `usize::MAX` override is honoured (it is already far above any floor), never wrapped below it.
+  assert_eq!(
+    effective_cap(5, Some(usize::MAX)),
+    usize::MAX,
+    "a usize::MAX operator cap is honoured as-is, never overflowed below the mesh floor"
+  );
+  // A tiny override is raised to the reserved floor (mesh floor + quarantine reserve).
+  let floor = crypto::mesh_connection_floor(5);
+  assert_eq!(
+    effective_cap(5, Some(1)),
+    floor + reserve,
+    "a below-floor override is raised to the mesh floor plus the quarantine reserve"
   );
 }
 
@@ -383,6 +410,30 @@ fn the_connection_cap_keeps_a_floor_for_a_tiny_cluster() {
     n1 >= 4,
     "even a 1-replica node keeps a small connection floor ({n1}) for accept/reconnect headroom"
   );
+}
+
+/// The effective cap RESERVES the quarantine ceiling ON TOP of the mesh floor, so a saturated
+/// quarantine population can never refuse a legitimate replica's dial. A quarantined
+/// (attested-but-unresolvable) member occupies a bridge-table slot at the pre-identity capacity gate —
+/// BEFORE its id is resolved and the post-identity quarantine eviction can run — so without a reserve a
+/// burst of up to [`QuicCoordinator::QUARANTINE_CONN_LIMIT`] quarantined members would consume mesh
+/// slots and starve the authoritative mesh (Codex R1 finding). The quarantine population itself is
+/// bounded at that ceiling, so reserving it above the floor keeps the full mesh capacity available.
+///
+/// NEUTER CHECK: drop the `+ QUARANTINE_CONN_LIMIT` reserve in `build` and the cap falls back to the
+/// bare mesh floor, so `cap >= floor + reserve` fails — exactly the mesh starvation this reserves against.
+#[test]
+fn the_connection_cap_reserves_quarantine_headroom_above_the_mesh_floor() {
+  let reserve = QuicCoordinator::<CountSm, ProvidedIdentity>::QUARANTINE_CONN_LIMIT;
+  for n in [2u8, 5, 33, 64] {
+    let floor = crypto::mesh_connection_floor(u16::from(n));
+    let cap = effective_cap(n, None);
+    assert!(
+      cap >= floor + reserve,
+      "a {n}-replica node's cap ({cap}) must reserve the quarantine ceiling ({reserve}) above its \
+       mesh floor ({floor}) so a saturated quarantine cannot refuse an authoritative replica's dial"
+    );
+  }
 }
 
 /// A relayed (replica-sent) `Request` whose body is ONE byte over the deliverable maximum is dropped
