@@ -178,6 +178,13 @@ fn push_lineage_ring(ring: &[u128], superseded: u128) -> Vec<u128> {
 /// the committed-band headers — so a coordinated restart changes ONLY the configuration, never the
 /// replicated log.
 ///
+/// The ONLINE install fence (a committed `Reconfigure` op may not seat a brand-new voter — see
+/// `Membership::first_new_voter`) deliberately does NOT apply to this offline lane: here the
+/// pre-written root itself is the committed-prefix evidence. It carries `cur`'s commit frontier and
+/// committed-band headers verbatim on EVERY node — a freshly added voter included — so a restarted
+/// voter proves the committed prefix in a view change from its own durable root rather than from a
+/// replicated history, and the operator may stage an arbitrary successor.
+///
 /// The resulting [`VsrState`] is a v4 root whose scalar `epoch` is the successor membership's epoch,
 /// whose `prev_epoch` is `cur.epoch()` (the durable backward link of the lineage), and whose
 /// membership is the successor.

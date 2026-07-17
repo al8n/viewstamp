@@ -2185,6 +2185,22 @@ impl<S, R> Endpoint<S, R> {
   }
 
   fn install_membership(&mut self, reconfigure_op: Option<OpNumber>, successor: Membership) {
+    // A commit-first swap (`Some` reconfigure op) installs a successor the commit-time fence already
+    // admitted (`commit_reconfigure`: every successor voter is a member of the predecessor), and
+    // `self.membership` IS still that predecessor here — a staged swap pins it until this install (a
+    // superseding cross-epoch sync CONSUMES the staged swap instead of racing it). Re-affirm at the
+    // single membership writer. The cross-epoch state-sync install (`None`) is exempt: it installs a
+    // wholesale successor possibly many epochs ahead, where a single-change predicate against this
+    // node's stale configuration does not apply — its safety is the donor's committed (fence-clean)
+    // state plus the verified `config_id` chain.
+    debug_assert!(
+      reconfigure_op.is_none()
+        || self
+          .membership
+          .first_new_voter(successor.replica_count(), successor.members_slice())
+          .is_none(),
+      "a commit-first swap must never install a successor seating a brand-new voter"
+    );
     // Capture the abdication precondition (hazard a) against the OLD membership, BEFORE the swap:
     // was this node the primary of its current view? (Robust to an already-absent local member.)
     let was_primary = self.is_primary();

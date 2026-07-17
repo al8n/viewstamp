@@ -764,6 +764,35 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     //   configuration and FORK a grand-successor — so SKIP staging; the op stays committed (commit_min
     //   advanced above) and the swap that already happened (or will, once we reach the predecessor) stands.
     if self.membership.config_id() == payload.prev_config_id() {
+      // INSTALL-TIME VOTER-ADMISSION FENCE: every voter the committed successor seats must already be
+      // a member (voter or learner) of the EXACT predecessor it chains from — `self.membership`, just
+      // proven by the pin above. A brand-new voter holds no committed prefix (it was never a member,
+      // so it never appended, let alone committed, any prior op), yet it counts toward the successor's
+      // view-change quorum, so a quorum formed without the prefix-holding retained voters could elect
+      // a leader that drops a committed op. Voters enter via AddLearner → durable catch-up →
+      // PromoteLearner (the promote-time proof), never directly.
+      //
+      // PANIC, not skip: this arm runs only for a COMMITTED op, and no compliant cluster can commit
+      // one — `propose_membership` refuses the mint and the prepare ingress refuses to append/ack the
+      // op (`is_direct_voter_add_prepare`), so it can never assemble a quorum of compliant acks. By
+      // that induction no committed state, and hence no state-sync donor checkpoint, ever contains a
+      // direct-add configuration; reaching here means the op entered durable state under code without
+      // this fence, a store this build does not support running (redeploying over such a store means
+      // re-formatting it — the one shape no runtime check can catch is a direct-add successor a
+      // pre-fence build already INSTALLED into a durable root, excluded by the same posture). A
+      // deterministic fail-stop surfaces that immediately and never diverges; skipping the swap
+      // instead would quietly re-interpret the op and fork against any node that installs it.
+      if let Some(added) = self
+        .membership
+        .first_new_voter(payload.replica_count(), payload.members())
+      {
+        panic!(
+          "refusing to install the committed Reconfigure op {op}: it seats {added:?} as a voter \
+           without prior membership — a brand-new voter holds no committed prefix, so admitting it \
+           directly can drop a committed op across the configuration change; add it as a learner, \
+           catch it up, then promote it"
+        );
+      }
       // Chain the successor off the (now proven-correct) predecessor membership. A committed
       // reconfiguration's payload was validated at propose AND re-validated when the wire body decoded
       // into `Body::Reconfigure`, so `reconfigure`'s structural re-check cannot fail here.
@@ -1110,7 +1139,39 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     LogEntry::from_committed_body(p.client(), p.request(), p.body_bytes())
   }
 
+  /// Whether `p` carries a reconfiguration whose successor, chained from THIS node's current
+  /// configuration (the payload pins its exact predecessor and it matches), seats a brand-new voter —
+  /// the unsafe direct voter admission the commit-time fence in [`Self::commit_reconfigure`] refuses.
+  /// Screened BEFORE a backup appends/acks, so such an op never gathers a quorum of compliant acks and
+  /// never commits: this early drop is what keeps the commit-time fence unreachable in a compliant
+  /// cluster rather than a cluster-wide fail-stop. A payload pinned to a DIFFERENT predecessor is not
+  /// screened here — this node cannot evaluate the diff without holding that predecessor, and if such
+  /// an op ever commits, the commit-time fence at its pinned predecessor is the authority. A decode
+  /// failure falls through unscreened (the append path's shared reconstruction owns that handling).
+  fn is_direct_voter_add_prepare(&self, p: &Prepare) -> bool {
+    if p.client() != ClientId::RECONFIGURATION {
+      return false;
+    }
+    let Ok(payload) = crate::message::ReconfigurePayload::decode_body(p.body()) else {
+      return false;
+    };
+    payload.prev_config_id() == self.membership.config_id()
+      && self
+        .membership
+        .first_new_voter(payload.replica_count(), payload.members())
+        .is_some()
+  }
+
   fn append_prepare<W: Wal>(&mut self, wal: &mut W, p: Prepare) {
+    // Refuse a direct voter admission at the append seam: dropped exactly like the ring-window/band
+    // stalls (no WAL write, no log entry, no head advance, and — by append-before-ack — no PrepareOk),
+    // so the op cannot commit on compliant replicas. See `commit_reconfigure`'s fence for the safety
+    // argument. Screening inside the append seam covers the head-extend, the buffered-prepare drain
+    // (which removes an entry before appending it, so a dropped entry cannot re-drain), and every
+    // future caller by construction.
+    if self.is_direct_voter_add_prepare(&p) {
+      return;
+    }
     // the backup-overflow guard ([`Self::maybe_sync_below_ring_window`]) runs in
     // `on_prepare` BEFORE every head-extend append (the new-op branch + each buffered-prepare drain), so
     // an append never overwrites an un-pruned slot of the EFFECTIVE ring ([`effective_wal_capacity`] —
@@ -1150,6 +1211,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// that the Prepare is current-view (`p.view() == self.view`), so overwriting the slot is safe: the op is
   /// either committed-or-current-view-canonical, and only a stale superseded earlier-view body is replaced.
   fn reappend_canonical_prepare<W: Wal>(&mut self, wal: &mut W, p: &Prepare) {
+    // The same direct-voter-admission screen as `append_prepare`: an interior overwrite also appends
+    // and acks, so it must equally refuse to seat a brand-new voter (drop; no overwrite, no ack).
+    if self.is_direct_voter_add_prepare(p) {
+      return;
+    }
     // The interior overwrite obeys the same ring-window discipline as every other append lane
     // (`maybe_sync_below_ring_window` on the head-extends, the `adopt_append`/`fill_repair` wrap
     // guards): physically writing this slot from more than a full window above `checkpoint_op`

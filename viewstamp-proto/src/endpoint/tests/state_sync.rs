@@ -3420,13 +3420,13 @@ fn a_swapped_donor_below_its_reconfigure_op_withholds_the_cross_epoch_membership
   // an EMPTY membership; once its checkpoint advances PAST N it serves the real E+1 membership.
   let (mut e, mut wal, mut sb) = donor_primary_at_checkpoint(2);
   let mut blocks = crate::block_store::MemBlockStore::new();
-  // SWAP to E+1 exactly as a commit-first swap does (AddVoter keeps replica 0 a voter, so it stays the
-  // primary), naming reconfigure op N = 5 — ABOVE the donor's durable checkpoint (op 2). This is the
+  // SWAP to E+1 exactly as a commit-first swap does (AddLearner keeps the voter set, so replica 0 stays
+  // the primary), naming reconfigure op N = 5 — ABOVE the donor's durable checkpoint (op 2). This is the
   // commit-first window: the swap is in memory (epoch = E+1) but the checkpoint does not yet reflect it.
   let successor = e
     .membership
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid");
   let predecessor_config_id = e.membership.config_id();
   e.install_membership(Some(OpNumber::with(5)), successor.clone());
   assert_eq!(

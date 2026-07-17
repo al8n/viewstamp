@@ -648,11 +648,11 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   let m2: u64 = 2; // the E+2 cluster crossing checkpoint (> the node's forced E+1 checkpoint at M1 == N1)
   let genesis_mem = genesis(3);
   let successor_e1 = genesis_mem
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
   let successor_e2 = successor_e1
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(4)))
-    .expect("a second AddVoter off the E+1 successor is valid (E+2)");
+    .apply_delta(&SingleVoterDelta::PromoteLearner(MemberId::new(3)))
+    .expect("promoting the E+1 learner off the E+1 successor is valid (E+2)");
 
   // A Normal BACKUP (slot 1) that committed its OWN reconfigure op N1 (op == commit_min == N1), checkpoint 0.
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
@@ -1817,7 +1817,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = 1u64;
@@ -4468,7 +4468,7 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
   // primary), held but never committed.
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   e.handle_message(
@@ -4573,7 +4573,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
   let now = Instant::ZERO;
 
   let successor = genesis(3)
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let reconfig_checksum = Body::Reconfigure(payload.clone()).body_checksum();
@@ -4743,7 +4743,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   let now = Instant::ZERO;
 
   let successor = genesis(3)
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = 1u64;
@@ -5031,8 +5031,8 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter is a valid delta on a 3-voter cluster");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   // (1) Replica 1 (a view-0 backup) receives the view-0 primary's Prepares: a client op at op 1, then the
@@ -5591,4 +5591,383 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
       .is_some_and(|o| matches!(o.msg_ref(), Message::Prepare(_))),
     "a same-config mismatched-self-id RequestPrepare is still DROPPED by the strict binding"
   );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The install-time voter-admission fence: a committed `Reconfigure` op may not seat a brand-new
+// voter (one that was never a member of its exact predecessor). One falsifier per reachable path —
+// the prepare-append screen, the primary commit lane, the backup/adoption re-commit lane, and the
+// recovery WAL-replay re-commit — plus the legitimate-delta positive controls. The cross-epoch
+// STATE-SYNC install has no constructible falsifier BY DESIGN: a laggard installs a wholesale,
+// hash-verified successor possibly many epochs ahead, where "voter not in my stale configuration"
+// is a LEGITIMATE shape (added-then-promoted across the skipped epochs), so no local single-change
+// diff exists to trip; that path's safety is the induction — every compliant committer runs this
+// fence, so no committed state (hence no donor checkpoint) ever contains a direct-add successor.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_direct_voter_add_prepare_is_dropped_before_append_and_ack() {
+  // The append-seam screen: a RECONFIGURATION `Prepare` whose successor seats a brand-new voter,
+  // pinned to THIS backup's current configuration, is dropped whole — no log entry, no head advance,
+  // no WAL append, and (append-before-ack) no PrepareOk. The op can therefore never assemble a
+  // quorum of compliant acks, which is what keeps the commit-time fence unreachable in a compliant
+  // cluster.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.encode_body(),
+    )),
+  );
+
+  assert!(
+    !e.log.contains_key(&1),
+    "the direct-add prepare was not appended to the log"
+  );
+  assert_eq!(e.op().get(), 0, "the head did not advance");
+  assert!(
+    wal.entries.is_empty(),
+    "no WAL append was submitted for the dropped prepare"
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::PrepareOk(_)),
+      "the dropped prepare must never be acked"
+    );
+  }
+}
+
+#[test]
+#[should_panic(expected = "refusing to install the committed Reconfigure op")]
+fn committing_a_direct_voter_add_panics_on_the_primary_commit_lane() {
+  // The authoritative fence, primary lane: `propose_membership` refuses to mint a direct AddVoter,
+  // so this seeds the minted-op shape directly (head at the op, a typed log entry, the op durable in
+  // the WAL, the primary's own vote recorded) — modeling an op minted without the propose guard. The
+  // one backup ack completes the 2-of-3 quorum, `try_commit` recognizes the Reconfigure op, and the
+  // commit-time fence refuses BEFORE any swap is staged or made durable.
+  let mut e = single_change_primary();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry::reconfigure(
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.clone(),
+    ),
+  );
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+  e.inflight.insert(
+    1,
+    Inflight {
+      oks: 1, // the primary's own slot-0 vote (its append landed)
+      committed: false,
+      prepare_checksum: crate::storage::prepare_identity(
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        Body::Reconfigure(payload.clone()).body_checksum(),
+      ),
+    },
+  );
+
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    reconfigure_ack(1, &payload, 1),
+  );
+}
+
+#[test]
+#[should_panic(expected = "refusing to install the committed Reconfigure op")]
+fn committing_a_direct_voter_add_panics_on_the_backup_recommit_lane() {
+  // The backup/adoption re-commit lane: an entry that reaches a log WITHOUT crossing the screened
+  // prepare append — a view-change adoption inserts canonical entries straight into `self.log`
+  // (typed, so `commit_reconfigure` recognizes them at re-commit), and this seeds that same shape
+  // directly — still cannot install: the shared commit recognition (`advance_commit` →
+  // `commit_reconfigure`) hits the fence the moment a Commit advances past the op.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry::reconfigure(ClientId::RECONFIGURATION, RequestNumber::with(1), payload),
+  );
+
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+}
+
+#[test]
+#[should_panic(expected = "refusing to install the committed Reconfigure op")]
+fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
+  // The recovery WAL-replay lane, modeling a store written WITHOUT this fence: the WAL holds a
+  // COMMITTED direct-voter-add Reconfigure op (the durable root's commit covers it and its
+  // committed-band header names it) while the durable membership is still the predecessor — the
+  // committed-but-uninstalled window. Recovery rebuilds the typed `Body::Reconfigure` entry from the
+  // WAL through the shared reconstruction and re-commits the band above the checkpoint through the
+  // SAME commit recognition as live traffic, where the fence refuses the direct admission. (The one
+  // pre-fence shape no runtime check can catch — a direct-add successor ALREADY INSTALLED into the
+  // durable root — is excluded by not running this build over pre-fence stores at all; see the fence
+  // comment in `commit_reconfigure`.)
+  let successor = genesis(3)
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+
+  let mut wal = TestWal::default();
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(1),
+    OpNumber::new(),
+    0,
+    std::vec![header],
+  )
+  .expect("a root recording the committed reconfigure op is valid")
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut blocks = crate::block_store::MemBlockStore::new();
+
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect("recover accepts this store");
+  let mut e = match recovered {
+    Recovered::Active(e) => e,
+    Recovered::Retired(_) => panic!("a current member recovers Active"),
+  };
+
+  // Re-commit the recovered band above the checkpoint through the ordinary commit path.
+  let now = Instant::ZERO;
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+}
+
+#[test]
+#[should_panic(expected = "a commit-first swap must never install")]
+fn installing_a_direct_voter_add_swap_panics_at_the_backstop() {
+  // The single-membership-writer backstop. `install_membership` is the ONE place a successor becomes
+  // the live configuration; for a commit-first swap (a `Some` reconfigure op) its `debug_assert`
+  // re-affirms that the successor seats no brand-new voter. On every live path this is unreachable —
+  // `commit_reconfigure`'s panic refuses a direct voter admission before any swap is staged, so no
+  // such successor ever reaches the writer — so this drives the writer DIRECTLY to pin the
+  // defense-in-depth check: build a direct-add successor (a voter absent from the predecessor) and
+  // hand it to `install_membership(Some(N), ..)`. The backstop fails-stop rather than install a
+  // configuration whose new voter holds no committed prefix. (The cross-epoch state-sync install —
+  // the `None` arm — is exempt by design and is not exercised here.)
+  let mut e = single_change_primary();
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  e.install_membership(Some(OpNumber::with(1)), successor);
+}
+
+#[test]
+fn every_legitimate_delta_commits_and_installs_through_the_backup_lane() {
+  // Positive controls: each accepted delta kind — AddLearner, PromoteLearner, RemoveVoter,
+  // RemoveLearner — still passes the fence end to end on the backup lane: the prepare appends
+  // (screened), the op commits (fenced), the SwapEpoch root lands, the successor installs, and a
+  // `MembershipChanged` names the op. The promote-time challenge is a PROPOSE-side gate (covered by
+  // the propose tests); the commit lane installs whatever legitimately committed. RemoveVoter removes
+  // a NON-local voter (removing the local node retires it — a separate concern with its own tests).
+  let cases: [(Membership, SingleVoterDelta); 4] = [
+    (genesis(3), SingleVoterDelta::AddLearner(MemberId::new(3))),
+    (
+      genesis_with_learners(3, 1),
+      SingleVoterDelta::PromoteLearner(MemberId::new(3)),
+    ),
+    (genesis(3), SingleVoterDelta::RemoveVoter(MemberId::new(2))),
+    (
+      genesis_with_learners(3, 1),
+      SingleVoterDelta::RemoveLearner(MemberId::new(3)),
+    ),
+  ];
+  for (pred, delta) in cases {
+    let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+    let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+      cfg,
+      pred.clone(),
+      0,
+      CountSm::default(),
+      u64::MAX,
+    );
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let mut blocks = crate::block_store::MemBlockStore::new();
+    let now = Instant::ZERO;
+
+    let successor = pred
+      .apply_delta(&delta)
+      .expect("a legitimate delta derives its successor");
+    let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      primary_peer(),
+      Message::Prepare(Prepare::new(
+        View::new(),
+        OpNumber::with(1),
+        OpNumber::new(),
+        OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        payload.encode_body(),
+      )),
+    );
+    assert!(
+      e.log.contains_key(&1),
+      "the {} prepare passed the append screen",
+      delta.as_str(),
+    );
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the append (deferred PrepareOk)
+    while e.poll_message().is_some() {}
+
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(1),
+        OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+    assert!(
+      e.pending_swap_for_test(),
+      "the {} op committed and staged its swap",
+      delta.as_str(),
+    );
+    while e.poll_event().is_some() {} // drain pre-swap events so the install event is observable
+
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
+    assert_eq!(
+      e.membership,
+      successor,
+      "the {} successor installed at the durable root",
+      delta.as_str(),
+    );
+    let mut changed = false;
+    while let Some(ev) = e.poll_event() {
+      if let Event::MembershipChanged(c) = ev {
+        assert_eq!(
+          c.op().get(),
+          1,
+          "the MembershipChanged names the {} op",
+          delta.as_str(),
+        );
+        changed = true;
+      }
+    }
+    assert!(
+      changed,
+      "a MembershipChanged was emitted for {}",
+      delta.as_str(),
+    );
+  }
 }
