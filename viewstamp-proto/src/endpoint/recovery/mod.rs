@@ -850,6 +850,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // IN-MEMORY only: a crash drops the crossing intent; the recovery checkpoint-debt machine + the
       // cluster's higher-epoch heartbeats re-establish it after restart, so it starts `None` here.
       cross_epoch_intent: None,
+      quarantined_donor: None,
+      quarantine_probe_deadline: None,
+      quarantine_probe_progress_mark: 0,
+      sync_fetch_progress: 0,
       pending_install: None,
       block_fetch: None,
       sm_reconstruct: None,
@@ -2274,7 +2278,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// through `complete_recovery`: that path's primary/backup role-branching (abdicate to `view + 1`
   /// vs resume Normal) would split a freshly-reset cluster's view targets, whereas every wedged voter
   /// must converge on the single `view + 1`.
-  fn retire_recover_and_escalate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn retire_recover_and_escalate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     self.recover = None;
     self.enter_view_change_from_recovery(now, sb, self.view.next());
   }
@@ -2490,11 +2494,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Pin the donor to the AUTHENTICATED sender slot — the slot the recovery sender-binding established
     // this laggard routes to (NOT the donor's self-claimed, possibly-shifted `replica()`). `apply_sync`
     // records it on the staged install so a POST-ROOT install error can re-pull THIS checkpoint's block
-    // from the same donor. A non-routeable sender cannot have answered this fetch (the ingress binding
-    // dropped it); keep the peer-fetch armed for the re-solicit rather than fabricate a target.
-    let Some(donor) = from.as_replica() else {
+    // from the same donor `Peer` — a current member (`Peer::Replica`) or a quarantined attested member
+    // (`Peer::Member`, the #65 shape where the laggard's donors are the new members it cannot resolve).
+    // A client cannot have answered this fetch (the ingress binding dropped it); keep the peer-fetch
+    // armed for the re-solicit rather than fabricate a target.
+    if from.is_client() {
       return;
-    };
+    }
+    let donor = from;
     self.apply_sync(now, sb, blocks, donor, &m);
     // `apply_sync` STAGES a `pending_checkpoint` (+ `pending_install`) iff it accepted the reply; it stages
     // NOTHING on a reject (a corrupt membership, or — the cross-epoch crossing requirement — a below-target
@@ -2547,12 +2554,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Pin the donor to the AUTHENTICATED sender slot (the slot the recovery sender-binding check
     // established this laggard routes to), not the donor's self-claimed (possibly shifted) `replica()` — a
     // cross-epoch donor's successor-epoch slot is un-routeable in this OLD-epoch laggard's membership. A
-    // non-replica sender cannot have answered; abort the fetch (keeping the peer-fetch armed for the
-    // re-solicit) rather than fabricate a target.
-    let Some(donor) = from.as_replica() else {
+    // The donor `Peer` is a current member (`Peer::Replica`) or a quarantined attested member
+    // (`Peer::Member`); a client cannot have answered — abort the fetch (keeping the peer-fetch armed
+    // for the re-solicit) rather than fabricate a target.
+    if from.is_client() {
       self.block_fetch = None;
       return false;
-    };
+    }
+    // PROVENANCE-AWARE replacement (mirrors `begin_block_sync`): a non-crossing reply must never DOWNGRADE
+    // a live crossing fetch. The recovery `recover_retry` re-solicit fans to old-config `Backups` AND the
+    // quarantined donor, so once the quarantined donor has presented a crossing here, a later same-config
+    // reply from an old-config donor would otherwise evict that crossing fetch and its block would land
+    // off-frontier — the same endless disarm/rearm strand as the Normal path. Keep the crossing fetch (the
+    // recover ARQ re-drives its pull); a crossing reply still supersedes normally below.
+    if self
+      .block_fetch
+      .as_ref()
+      .is_some_and(|bf| bf.crossing_answered)
+      && !self.checkpoint_presents_crossing(m)
+    {
+      return false;
+    }
+    let donor = from;
     // Seed both frontiers (SM + session). The fetch is complete only when BOTH drain.
     let mut bf = BlockFetch {
       checkpoint: m.clone(),
@@ -2590,7 +2613,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // leave a stale frontier).
         self.block_fetch = Some(bf);
         self.emit(Outgoing::new(
-          Recipient::To(Peer::Replica(donor)),
+          Recipient::To(donor),
           Message::RequestBlock(addr),
         ));
         // While Recovering the `recover_retry` cadence (not `sync_solicit`) re-drives the pull, so

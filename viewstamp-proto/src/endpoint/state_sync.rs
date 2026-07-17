@@ -182,6 +182,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // does. Otherwise `on_sb_done` would re-arm a crossing from the still-set intent once this now-ORDINARY
     // sync installs, re-introducing the stale-hint poison the intent refactor exists to remove.
     self.cross_epoch_intent = None;
+    self.quarantined_donor = None;
+    self.quarantine_probe_deadline = None;
     true
   }
 
@@ -450,17 +452,27 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn send_request_sync(&mut self, now: Instant) {
     let nonce = self.sync.map_or(self.nonce, |s| s.nonce);
     let recovery = self.awaiting_peer_checkpoint() || self.sm_reconstruct_owed();
+    let request = crate::RequestSync::new(
+      self.view,
+      self.checkpoint_op,
+      self.local_slot(),
+      nonce,
+      recovery,
+      self.membership.config_id(),
+    );
     self.emit(Outgoing::new(
       Recipient::Backups,
-      Message::RequestSync(crate::RequestSync::new(
-        self.view,
-        self.checkpoint_op,
-        self.local_slot(),
-        nonce,
-        recovery,
-        self.membership.config_id(),
-      )),
+      Message::RequestSync(request),
     ));
+    // ALSO solicit a remembered QUARANTINED donor directly: the `Backups` fan-out reaches only
+    // bound members, but a crossing armed by a quarantined member (#65) must reach the donor whose
+    // slot this laggard cannot yet resolve — its old bound peers are gone.
+    if let Some(donor) = self.quarantined_donor {
+      self.emit(Outgoing::new(
+        Recipient::To(donor),
+        Message::RequestSync(request),
+      ));
+    }
     self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
   }
 
@@ -496,6 +508,82 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // a dropped re-solicit is retried here without a marker to clear.
     self.send_request_block(now, blocks);
     self.send_request_sync(now);
+  }
+
+  /// Service the bounded QUARANTINE probe against its wall-clock deadline and report whether it DISARMED.
+  /// The probe bounds a crossing armed SOLELY by a quarantined member's higher-epoch evidence (the #65
+  /// C-side / a possibly bit-flipped epoch scalar no donor can answer): left unbounded it would keep a
+  /// speculative cross-epoch `sync` armed forever, wedging op-mint at the stale epoch. It is the
+  /// epoch-plane twin of the view-plane catch-up revert.
+  ///
+  /// A no-op until the [`Endpoint::quarantine_probe_deadline`] is DUE. When due, the crossing is torn
+  /// down UNLESS a donor has genuinely begun answering a crossing — the shield reads
+  /// [`Self::crossing_answer_in_flight`] (a live `block_fetch` whose reply genuinely PRESENTS a crossing,
+  /// its `crossing_answered` bit), NOT a bare `block_fetch.is_some()`: the cross-epoch solicit admits
+  /// below-target same-config / empty replies that arm a NON-crossing fetch, which must NOT shield the
+  /// probe (else a donor answering only with non-crossing replies would hold it open forever). It also
+  /// shields on `pending_install` (a staged install — REQUIRED: the disarm clears `sync`, so disarming
+  /// under a live `pending_install` would breach the `pending_install ⟹ sync` invariant; a staged install
+  /// is transient and completes on its own root) and on `sm_reconstruct` (a post-install SM retry). Any of
+  /// these REFRESHES the deadline forward so a genuine DAG transfer or two-write superblock persist
+  /// spanning several windows survives; `install_sync` clears the probe on completion.
+  ///
+  /// Serviced ONCE per `handle_timeout`, at the TOP, BEFORE the status dispatch — so its expiry is on a
+  /// wall-clock deadline INDEPENDENT of the `sync_solicit` cadence that a quarantined higher-epoch
+  /// heartbeat keeps re-soliciting (a solicit-gated probe would slide forever under sustained heartbeats).
+  /// On disarm it clears the crossing state (the sync, its intent, the remembered donor, the probe
+  /// deadline, any block-fetch, and the solicit timer); the CALLER performs the status-appropriate safe
+  /// landing (Recovering escalates to the next view change; Normal / ViewChange just drop the crossing).
+  /// A RESOLVED-member hint would have cleared `quarantined_donor` (authoritative, unbounded), so this is
+  /// inert unless the crossing is genuinely quarantine-only.
+  pub(crate) fn advance_quarantine_probe(&mut self, now: Instant) -> bool {
+    match self.quarantine_probe_deadline {
+      Some(deadline) if deadline <= now => {}
+      _ => return false, // not armed, or not yet due
+    }
+    // The probe bounds a speculative quarantine CROSSING only (a forced `require_cross_epoch` sync). If the
+    // current sync is NOT a crossing — a genuine SAME-EPOCH local recovery (`require_cross_epoch == false`),
+    // which a quarantined higher-epoch hint may have armed the probe on TOP of when
+    // `enter_cross_epoch_peer_fetch` deferred to that in-progress recovery instead of arming a crossing —
+    // the probe must NOT touch it. A checkpoint-exhausted local recovery holds `commit_min` AHEAD of the SM
+    // (`sm_at < commit_min`, its Phase-2 restore not yet done), safe ONLY under the `Recovering` status
+    // exemption of the `sm_at == commit_min` witness; tearing down its `sync` and escalating out of
+    // `Recovering` (the disarm's Recovering landing) would let it reach `Normal` with an unrestored SM —
+    // a silent committed-prefix loss. Clear only the dangling probe bookkeeping (so the timer does not spin
+    // or breach the no-orphan-due invariant); leave the genuine recovery / sync intact, no escalation.
+    if !self.sync.is_some_and(|s| s.require_cross_epoch) {
+      self.quarantined_donor = None;
+      self.quarantine_probe_deadline = None;
+      self.quarantine_probe_progress_mark = 0;
+      return false;
+    }
+    // A staged install or an owed SM-reconstruct is a VERIFIED, committed crossing near completion — it
+    // finishes on its own durable root, NOT a donor — so shield unconditionally (this also keeps the
+    // disarm from breaching the `pending_install ⟹ sync` invariant, since disarm clears `sync`).
+    if self.pending_install.is_some() || self.sm_reconstruct_owed() {
+      self.refresh_quarantine_probe(now);
+      return false;
+    }
+    // A crossing FETCH shields only while it makes OBSERVABLE PROGRESS — a frontier block accepted since
+    // the deadline was last set (`sync_fetch_progress` advanced past the mark). `crossing_answer_in_flight`
+    // alone is a PERSISTENT bit: a donor that presented a crossing checkpoint then crash-stopped (or whose
+    // DAG never arrives) keeps it set forever, so refreshing on it would renew the probe indefinitely with
+    // no progress. Requiring a progress delta tears down a STALLED crossing while a genuinely slow transfer
+    // (blocks still arriving) survives; `install_sync` clears the probe on completion.
+    if self.crossing_answer_in_flight()
+      && self.sync_fetch_progress != self.quarantine_probe_progress_mark
+    {
+      self.refresh_quarantine_probe(now);
+      return false;
+    }
+    self.sync = None;
+    self.cross_epoch_intent = None;
+    self.quarantined_donor = None;
+    self.quarantine_probe_deadline = None;
+    self.quarantine_probe_progress_mark = 0;
+    self.block_fetch = None;
+    self.timers.sync_solicit = None;
+    true
   }
 
   /// Abort the in-flight block-DAG fetch after a reachable-block-bound breach — a malformed / foreign /
@@ -545,7 +633,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     if let Some(addr) = next {
       self.emit(Outgoing::new(
-        Recipient::To(Peer::Replica(donor)),
+        Recipient::To(donor),
         Message::RequestBlock(addr),
       ));
     }
@@ -630,14 +718,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.sm_reconstruct_owed() && !m.recovery() {
       return;
     }
-    // The requester is the authenticated `from`'s CURRENT slot (the sender binding admitted it as a
-    // current member), NOT the self-claimed `m.replica()` — so a slot-shifted cross-epoch laggard's reply
-    // routes to where it now lives. `from` is a `Peer::Replica` in range here (the binding guaranteed it).
-    let Some(requester) = from.as_replica() else {
-      return;
-    };
-    if requester.get() >= self.membership.node_count() {
-      return; // the requester must be a configured cluster member (in `0..node_count`)
+    // The requester is the authenticated `from` `Peer` — keyed and addressed by it, NOT the
+    // self-claimed `m.replica()`, so a slot-shifted cross-epoch laggard's reply routes to where it
+    // now lives. A `Peer::Replica(slot)` (a current member the sender binding admitted) must be a
+    // configured slot; a `Peer::Member(id)` is a QUARANTINED attested member the sender binding
+    // admitted for config-learning (its id does not resolve in our membership, which is exactly why
+    // it is soliciting), served the same no-authority checkpoint read. A client / raw non-peer never
+    // reaches here (the binding dropped it).
+    match from {
+      Peer::Replica(slot) if slot.get() < self.membership.node_count() => {}
+      Peer::Member(_) => {}
+      _ => return,
     }
     if self.checkpoint_op.get() == 0 {
       return; // nothing durable to serve — silent.
@@ -665,21 +756,29 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // read. Without the dedupe, a buggy peer's solicit burst would stack N concurrent reads. (A
     // same-nonce burst — the timer-retransmit common case — is answered identically; a re-armed sync's
     // newer nonce is shipped without an extra round trip.)
-    self.submit_or_refresh_serve(sb, requester, m.nonce());
+    self.submit_or_refresh_serve(sb, from, m.nonce());
   }
 
-  /// Record (or refresh) the single in-flight serve for `requester`. If a serve-read is already
-  /// outstanding, only the echoed nonce is refreshed in place (the completion answers the LATEST
-  /// solicitation) — no second checkpoint read is issued; otherwise submit one read and insert the
-  /// entry. The structural one-read-per-requester bound on `sync_serving`.
-  fn submit_or_refresh_serve<B: Superblock>(
-    &mut self,
-    sb: &mut B,
-    requester: ReplicaId,
-    nonce: u64,
-  ) {
+  /// Record (or refresh) the single in-flight serve for `requester` (keyed by its `Peer` — a current
+  /// member's slot or a quarantined attested member). If a serve-read is already outstanding, only
+  /// the echoed nonce is refreshed in place (the completion answers the LATEST solicitation) — no
+  /// second checkpoint read is issued; otherwise submit one read and insert the entry. The structural
+  /// one-read-per-requester bound on `sync_serving`.
+  fn submit_or_refresh_serve<B: Superblock>(&mut self, sb: &mut B, requester: Peer, nonce: u64) {
     if let Some(serving) = self.sync_serving.get_mut(&requester) {
       serving.nonce = nonce;
+      return;
+    }
+    // Endpoint-side bound on QUARANTINED (`Peer::Member`) serves, INDEPENDENT of transport connection
+    // lifetime: a `Peer::Replica` requester is bounded by `node_count` (a configured slot), but a rotating
+    // set of distinct attested-but-unresolvable member ids would each insert a lingering serve-read and
+    // grow `sync_serving` (its read queue + completion scan) without limit — falsifying the map's bound and
+    // blocking `has_inflight_storage` quiescence. A NEW quarantined serve past [`QUARANTINE_SERVE_LIMIT`] is
+    // REFUSED (no read submitted); it re-solicits and is served once an in-flight member serve completes and
+    // frees a slot. This reserves the map's replica capacity independently of how many member conns exist.
+    if requester.is_member()
+      && self.sync_serving.keys().filter(|p| p.is_member()).count() >= QUARANTINE_SERVE_LIMIT
+    {
       return;
     }
     let id = self.mint_op_id();
@@ -732,8 +831,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if !self.status.is_normal() || self.pending_durable_view() {
       return; // no longer a trustworthy server, or our view is not yet durable — drop.
     }
-    if to.get() >= self.membership.node_count() {
-      return; // the requester must be a configured cluster member (in `0..node_count`)
+    // A `Peer::Replica` requester must still be a configured slot (its membership could have shrunk
+    // between submit and completion); a `Peer::Member` (quarantined attested member) has no slot and
+    // is served the same no-authority envelope.
+    match to {
+      Peer::Replica(slot) if slot.get() < self.membership.node_count() => {}
+      Peer::Member(_) => {}
+      _ => return,
     }
     // Only ship when the READ's op matches our CURRENT durable `checkpoint_op`: we advertise
     // `cr.op()` and bind it into the snapshot, so the op we ship must be the one whose bytes these are.
@@ -787,7 +891,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // verifies the envelope id, then walks the SM checkpoint DAG rooted at the decoded `sm_root`,
     // fetching the blocks it is missing via `RequestBlock`.
     self.emit(Outgoing::new(
-      Recipient::To(Peer::Replica(to)),
+      Recipient::To(to),
       Message::SyncCheckpoint(crate::SyncCheckpoint::new(
         self.view,
         cr.op(),
@@ -815,15 +919,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     addr: crate::BlockAddress,
     blocks: &dyn BlockStore,
   ) {
-    let Some(requester) = from.as_replica() else {
-      return; // a client / non-replica never fetches blocks (the binding guaranteed a Peer::Replica).
-    };
+    // The requester is `from` — a current member (`Peer::Replica`) or a quarantined attested member
+    // (`Peer::Member`) fetching the SM DAG of the checkpoint it is installing; a client / raw non-peer
+    // never reaches here (the binding dropped it).
+    if from.is_client() {
+      return;
+    }
     // Serve the block only if its local bytes hash back to `addr`; a corrupt local block (bit-rot, a
     // misdirected write) is served as ABSENT rather than handed over to fail the requester's verify and
     // force a reject-and-retry. The requester then solicits a clean copy from another donor.
     let block = crate::block_store::read_verified_block(blocks, addr);
     self.emit(Outgoing::new(
-      Recipient::To(Peer::Replica(requester)),
+      Recipient::To(from),
       Message::BlockResponse(crate::BlockResponse::new(addr, block)),
     ));
   }
@@ -1089,11 +1196,33 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // owed install is dropped ONLY when `apply_sync` stages a fresh `PendingInstall` (which atomically
     // REPLACES it) or a teardown (view transition / abdicate / stale-below) cancels it.
     // Pin the donor to the AUTHENTICATED sender slot the binding check established, not the donor's
-    // self-claimed (possibly shifted) `replica()`. A non-replica sender cannot have answered this sync, so
-    // drop defensively (keeping `sync` armed for the re-solicit) rather than fabricate a target.
-    let Some(donor) = from.as_replica() else {
+    // self-claimed (possibly shifted) `replica()`. The donor `Peer` is a current member
+    // (`Peer::Replica`) or a quarantined attested member (`Peer::Member`); a client cannot have
+    // answered this sync, so drop defensively (keeping `sync` armed for the re-solicit) rather than
+    // fabricate a target.
+    if from.is_client() {
       return;
-    };
+    }
+    // PROVENANCE-AWARE replacement: a reply that does NOT present a crossing must never DOWNGRADE a live
+    // crossing fetch. The cross-epoch solicit admits below-target same-config / empty-membership replies
+    // onto the fetch path (they may arm a fetch when none exists), and `send_request_sync` solicits both
+    // old-config `Backups` AND the quarantined donor — so once the quarantined donor has presented a
+    // genuine crossing and its block pull is outstanding, a LATER same-config reply from an old-config
+    // donor would otherwise evict that crossing fetch. Its crossing block then lands OFF-FRONTIER against
+    // the non-crossing fetch and can never install the successor; once the old DAG is cached each old reply
+    // immediately re-clears the crossing fetch, and the healthy quarantined primary's next heartbeat only
+    // re-arms the same losing race — stranding the member in an endless disarm/rearm cycle under honest
+    // timing. Keep the crossing fetch (its ARQ re-drives its own pull); ignore the non-crossing reply.
+    // A crossing reply (fresher or duplicate crossing metadata) still supersedes normally below.
+    if self
+      .block_fetch
+      .as_ref()
+      .is_some_and(|bf| bf.crossing_answered)
+      && !self.checkpoint_presents_crossing(&m)
+    {
+      return;
+    }
+    let donor = from;
     // Seed both frontiers (SM + session) and pump them once so a DAG the store already holds reports
     // complete immediately (a root the store holds advances to drained only after the first
     // `next_request`, never on `new` alone). A bound breach (a foreign/malformed DAG) in either drops the
@@ -1145,7 +1274,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // in the store and are re-discovered if still reachable.
         self.block_fetch = Some(bf);
         self.emit(Outgoing::new(
-          Recipient::To(Peer::Replica(donor)),
+          Recipient::To(donor),
           Message::RequestBlock(addr),
         ));
         self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
@@ -1191,11 +1320,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let Some(bf) = self.block_fetch.as_mut() else {
       return; // no live block-fetch (soliciting / already drained) — ignore.
     };
+    // Whether THIS fetch is draining a genuine CROSSING reply — only crossing progress counts toward the
+    // quarantine probe. A non-crossing (below-target same-config / empty-membership) fetch the cross-epoch
+    // solicit admitted accepts blocks too, but that progress is NOT the crossing's: were it counted, an
+    // old-config donor could feed one non-crossing block, then a quarantined donor re-pins crossing
+    // metadata with NO block, and the stale delta would refresh a stalled crossing forever.
+    let crossing = bf.crossing_answered;
     // Feed a PRESENT block into BOTH frontiers (an absent response carries nothing to write). The block
     // belongs to exactly one DAG — the owning frontier `Accepts` it; the other reports `NonFrontier`
     // (the address is not the address it is waiting on), which is inert by construction. A hash mismatch
     // or a bound breach is surfaced by `on_block`: a mismatch leaves the block re-requestable; a bound
     // breach (in either DAG) aborts the fetch.
+    // Whether this response ADVANCED a frontier — a block was accepted into the SM or session DAG. The
+    // bounded quarantine probe reads `sync_fetch_progress` as its "the crossing is genuinely progressing"
+    // signal, so it is bumped (once) below — for a CROSSING fetch only — after the `bf` borrow releases.
+    let mut accepted = false;
     if let Some(bytes) = m.block() {
       let bytes = Bytes::copy_from_slice(bytes);
       let sm_outcome = bf
@@ -1204,7 +1343,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       let session_outcome = bf.session_sync.on_block(m.addr(), bytes, &mut *blocks);
       for outcome in [sm_outcome, session_outcome] {
         match outcome {
-          Ok(super::block_sync::BlockOutcome::Accepted) => {}
+          Ok(super::block_sync::BlockOutcome::Accepted) => accepted = true,
           Ok(super::block_sync::BlockOutcome::NonFrontier) => {
             // The block is not this frontier's outstanding address (the OTHER DAG owns it, or it is a
             // delayed/superseded response): inert by construction. Re-drive the pull below.
@@ -1232,13 +1371,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         return;
       }
     };
+    // The `bf` borrow has released: record CROSSING frontier progress for the bounded probe. Only a block
+    // accepted into a genuine crossing fetch (`crossing`) counts — a non-crossing fetch's progress must not
+    // refresh a later crossing probe. A stalled crossing (a donor that presented a crossing checkpoint then
+    // went silent) never reaches here with `accepted && crossing`, so its deadline is not refreshed and it
+    // disarms; a genuinely advancing crossing transfer bumps this and the probe survives.
+    if accepted && crossing {
+      self.sync_fetch_progress = self.sync_fetch_progress.wrapping_add(1);
+    }
     match next {
       Some(addr) if present => {
         // Genuine transfer PROGRESS: re-request the next missing block from the pinned donor and re-arm
         // the ARQ deadline. The pinned checkpoint is still serviceable, so stay on it.
         let donor = bf.donor;
         self.emit(Outgoing::new(
-          Recipient::To(Peer::Replica(donor)),
+          Recipient::To(donor),
           Message::RequestBlock(addr),
         ));
         self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
@@ -1253,7 +1400,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // deadline. This prevents a stale out-of-order absent (or a spoofed absent from a non-donor) from
         // triggering a re-solicit.
         let donor = bf.donor;
-        if m.addr() != active || from != Peer::Replica(donor) {
+        if m.addr() != active || from != donor {
           return;
         }
         // KEEP THE FETCH LIVE and re-solicit a fresh `SyncCheckpoint` immediately. The fetch is NOT
@@ -1328,7 +1475,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         let donor = bf.donor;
         let checkpoint = bf.checkpoint;
         if recovering {
-          self.on_recover_sync_checkpoint(now, wal, sb, blocks, Peer::Replica(donor), checkpoint);
+          self.on_recover_sync_checkpoint(now, wal, sb, blocks, donor, checkpoint);
         } else {
           self.apply_sync(now, sb, blocks, donor, &checkpoint);
         }
@@ -1406,7 +1553,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     sb: &mut B,
     blocks: &mut dyn BlockStore,
-    donor: ReplicaId,
+    donor: Peer,
     m: &crate::SyncCheckpoint,
   ) {
     let checkpoint_op = m.checkpoint_op();
@@ -1820,6 +1967,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // NON-crossing install). Cleared HERE, inside the successor branch, so it fires on exactly the
       // crossing installs and never on a same-config (`successor == None`) one.
       self.cross_epoch_intent = None;
+      self.quarantined_donor = None;
+      self.quarantine_probe_deadline = None;
       // Capture the laggard's own current `config_id` BEFORE the swap — its prior-config slot in the
       // post-crossing lineage.
       let own_prior_config_id = self.membership.config_id();
@@ -1997,9 +2146,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     from: Peer,
     m: &crate::SyncCheckpoint,
   ) {
-    let Some(donor) = from.as_replica() else {
-      return; // a non-replica sender cannot be a donor — keep the existing pin, the timer re-solicits.
-    };
+    if from.is_client() {
+      return; // a client cannot be a donor — keep the existing pin, the timer re-solicits.
+    }
+    let donor = from;
     if let Some(recon) = self.sm_reconstruct.as_mut() {
       recon.donor = donor;
       recon.checkpoint = m.clone();
@@ -2044,7 +2194,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       Ok(Some(addr)) => {
         self.block_fetch = Some(bf);
         self.emit(Outgoing::new(
-          Recipient::To(Peer::Replica(donor)),
+          Recipient::To(donor),
           Message::RequestBlock(addr),
         ));
       }

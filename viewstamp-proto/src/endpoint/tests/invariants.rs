@@ -142,7 +142,7 @@ fn assert_invariants_rejects_pending_install_without_sync() {
       bytes::Bytes::new(),
       bytes::Bytes::new(),
     ),
-    donor: crate::ReplicaId::new(0),
+    donor: crate::Peer::Replica(crate::ReplicaId::new(0)),
   });
   // self.sync is None → violates clause (1)
   e.assert_invariants();
