@@ -124,7 +124,7 @@ pub enum RecoverError {
     reported: u64,
   },
   /// The durable root carries consensus state but records no complete WAL-GEOMETRY pair (a zero
-  /// `checkpoint_ops` or `wal_capacity` half) — a pre-v8 root this codebase never writes. With an
+  /// `checkpoint_ops` or `wal_capacity` half) — an un-stamped root this codebase never writes. With an
   /// unrecorded pair there is nothing to validate the live parameters against, and scanning under
   /// UNVALIDATED live geometry can silently move the recovery window off a committed WAL tail (the
   /// amnesia hazard the fence exists to close) — so recovery refuses FAIL-CLOSED rather than
@@ -349,10 +349,10 @@ fn genesis_root(config: &Config, membership: &Membership, wal_capacity: u64) -> 
 /// terminal handle).
 ///
 /// A node absent from the recovered membership has been removed by a reconfiguration; it recovers
-/// `Retired` and must not act as a replica. The membership is resolved from the DURABLE root: a v4
-/// root's own membership wins; a legacy (v1-3) root bridges to the genesis membership the caller
-/// supplies. This node is then resolved by its stable [`MemberId`] ([`Config::local`](crate::Config));
-/// present (a voter or learner) → `Active`, absent → `Retired`.
+/// `Retired` and must not act as a replica. The membership is resolved from the DURABLE root: a
+/// root carrying its own membership wins; a membership-less root bridges to the genesis membership
+/// the caller supplies. This node is then resolved by its stable [`MemberId`]
+/// ([`Config::local`](crate::Config)); present (a voter or learner) → `Active`, absent → `Retired`.
 ///
 /// `large_enum_variant` is allowed deliberately: this is a `Result`-shaped, transient START-UP
 /// handle — `recover` returns exactly ONE, the caller destructures it immediately, and it is never
@@ -510,16 +510,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// is trustworthy: a recovered replica resumes the view it was in when it last participated.
   ///
   /// **`membership` (the EFFECTIVE-membership rule).** The active membership is resolved from the
-  /// DURABLE root, not blindly from the param: a v4 root (`state.membership_opt().is_some()`) wins —
-  /// the durable config is authoritative, so an offline reconfiguration pre-written into the root
-  /// takes effect on the next recover regardless of what the caller passes.
-  /// A legacy (v1-3) root (`membership_opt().is_none()`) has no durable membership, so `recover`
-  /// BRIDGES to the passed `membership` — the genesis the embedder supplies (the param stays in the
-  /// signature solely as this legacy fallback). This node is then resolved against the effective
-  /// membership by its stable [`MemberId`] ([`Config::local`]): present (a voter or learner) →
-  /// [`Recovered::Active`] holding the recovering endpoint; ABSENT → [`Recovered::Retired`] (a
-  /// reconfiguration removed it — it must not act as a replica). The `Active` endpoint stores the
-  /// EFFECTIVE membership (so a v4 root's membership, never the param).
+  /// DURABLE root, not blindly from the param: a membership-bearing root
+  /// (`state.membership_opt().is_some()`) wins — the durable config is authoritative, so an offline
+  /// reconfiguration pre-written into the root takes effect on the next recover regardless of what
+  /// the caller passes. A membership-less root (`membership_opt().is_none()`) has no durable
+  /// membership, so `recover` BRIDGES to the passed `membership` — the genesis the embedder
+  /// supplies (the param stays in the signature solely as this fallback). This node is then
+  /// resolved against the effective membership by its stable [`MemberId`] ([`Config::local`]):
+  /// present (a voter or learner) → [`Recovered::Active`] holding the recovering endpoint; ABSENT →
+  /// [`Recovered::Retired`] (a reconfiguration removed it — it must not act as a replica). The
+  /// `Active` endpoint stores the EFFECTIVE membership (a durable membership, never the param, when
+  /// the root carries one).
   ///
   /// **`seed` must carry fresh entropy per incarnation.** The freshness nonce that tags this
   /// incarnation's solicitations (`Recovery`/`GetView`/`RequestSync`) is derived deterministically
@@ -543,7 +544,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// [`VsrState::wal_capacity`](crate::VsrState::wal_capacity), both nonzero — every root this
   /// codebase writes does) AND that pair must match the live values — the scan window and a bounded
   /// ring's op→slot placement are derived from it, so a restart under different geometry could clip
-  /// a committed tail. A non-virgin root with EITHER half unrecorded (a pre-v8 legacy root) is
+  /// a committed tail. A non-virgin root with EITHER half unrecorded (an un-stamped root no
+  /// persisting writer produces) is
   /// refused FAIL-CLOSED ([`RecoverError::GeometryNotRecorded`]): recovery never AUTO-pins an
   /// unrecorded store (that would bless the live geometry as the writer's) and never scans over one
   /// on trust; such stores must be migrated offline (rewritten as a current-version root recording
@@ -590,12 +592,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // A non-virgin store's geometry pair must be FULLY recorded. Every root this codebase writes
       // records both halves nonzero (`format` validates the floor; a live endpoint stamps its
       // config's validated interval and its declared/observed backend capacity), so a zero half here
-      // is a pre-v8 legacy root. There is nothing to validate the live parameters against, and
-      // scanning under unvalidated live geometry can silently move the recovery window off a
-      // committed tail — so refuse FAIL-CLOSED rather than proceed on trust. Recovery never
+      // is a root no persisting writer produces. There is nothing to validate the live parameters
+      // against, and scanning under unvalidated live geometry can silently move the recovery window
+      // off a committed tail — so refuse FAIL-CLOSED rather than proceed on trust. Recovery never
       // auto-pins an unrecorded store (that would bless the live geometry as if it were the
-      // writer's — a committed-loss hazard on a legacy/dirty store); the remedy is an explicit
-      // offline migration to a root recording the verified historical geometry.
+      // writer's — a committed-loss hazard on a dirty store); the remedy is an explicit offline
+      // migration to a root recording the verified historical geometry.
       if state.checkpoint_ops() == 0 || state.wal_capacity() == 0 {
         return Err(RecoverError::GeometryNotRecorded {
           checkpoint_ops: state.checkpoint_ops(),
@@ -618,9 +620,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         });
       }
     }
-    // The EFFECTIVE membership: a v4 root's OWN membership is authoritative (the durable config wins,
-    // so an offline reconfiguration pre-written into the root takes effect here); a legacy (v1-3) root
-    // carries none, so bridge to the passed genesis `membership`. The struct stores THIS one.
+    // The EFFECTIVE membership: a root's OWN membership is authoritative (the durable config wins,
+    // so an offline reconfiguration pre-written into the root takes effect here); a membership-less
+    // root carries none, so bridge to the passed genesis `membership`. The struct stores THIS one.
     let membership = match state.membership_opt() {
       Some(durable) => durable.clone(),
       None => membership,
@@ -733,10 +735,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // reconfiguration. Without restoring it, a node that recovers into a post-reconfiguration epoch would
     // seed every slot with only the CURRENT id, so once the new-epoch donors restart the laggard's
     // predecessor-`config_id` catch-up is rejected and it is stranded (a liveness loss). Each restored slot
-    // takes the durable id; any slot the root did not record (an empty/short lineage — a v4 or pre-swap
-    // root) falls back to the current `config_id` (the pre-v5 behaviour, a harmless self-duplicate that
+    // takes the durable id; any slot the root did not record (an empty/short lineage — a pre-swap
+    // root) falls back to the current `config_id` (a harmless self-duplicate that
     // admits nothing extra). For a no-reconfiguration cluster the durable lineage is genesis-only, so this
-    // is byte-identical to the old `[config_id; LINEAGE_RING]` seeding.
+    // equals the plain `[config_id; LINEAGE_RING]` seeding.
     let mut lineage = [membership.config_id(); LINEAGE_RING];
     for (slot, id) in lineage.iter_mut().zip(state.prior_config_ids()) {
       *slot = *id;
@@ -747,15 +749,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // above), stamped into every durable root this incarnation writes.
       wal_capacity: wal.capacity(),
       membership,
-      // The durable backward link of the lineage: a v4 root carries its own `prev_epoch`; a legacy
-      // (v1-3) root reads `prev_epoch == epoch == 0`, which equals the bridged genesis membership's
-      // epoch — so this is correct for both, and every durable-root write this incarnation makes
-      // re-persists the membership as a v4 root carrying it.
+      // The durable backward link of the lineage: the root carries its own `prev_epoch`; a
+      // membership-less root reads `prev_epoch == epoch == 0`, which equals the bridged genesis
+      // membership's epoch — so this is correct for both, and every durable-root write this
+      // incarnation makes re-persists the membership as a membership-bearing root carrying it.
       prev_epoch: state.prev_epoch(),
       lineage,
-      // RESTORE the cross-epoch serve gate: the op that produced the recovered membership. A v6 root
+      // RESTORE the cross-epoch serve gate: the op that produced the recovered membership. The root
       // carries it durably (the SwapEpoch / checkpoint / sync-successor / offline-restart writer threaded
-      // it); a pre-v6 root defaults it to its own `checkpoint_op` in `decode`. Without restoring it a donor
+      // it); a membership-less root defaults it to its own `checkpoint_op`. Without restoring it a donor
       // recovered into a swapped-but-not-yet-checkpointed window would re-attach its E+1 membership to a
       // checkpoint BELOW the reconfigure op, letting a laggard install E+1 without the committed prefix
       // through it.
@@ -819,9 +821,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // which decodes the `sm_root`; `None` until then (block GC skips a cycle without a live root).
       checkpoint_sm_root: None,
       checkpoint_sessions_root: None,
-      // The vouched log floor RESTORES from the durable root (a v7 root persists the
-      // adoption-learned cluster floor; a pre-v7 root decodes it to its own `checkpoint_op` — the old
-      // restart-at-checkpoint behaviour), capped at the recovered head: the floor bounds the carrier
+      // The vouched log floor RESTORES from the durable root (the root persists the
+      // adoption-learned cluster floor; the plain constructors default it to the root's own
+      // `checkpoint_op` — the restart-at-checkpoint floor), capped at the recovered head: the floor bounds the carrier
       // span `op − log_floor`, and a floor above the head this WAL actually retained (an adoption
       // band un-synced at the crash) has nothing left to bound below it — the force-sync escalation
       // re-learns the cluster floor upward from the next carrier / peer checkpoint, exactly as

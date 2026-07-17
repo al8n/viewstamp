@@ -5603,6 +5603,14 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
 // is a LEGITIMATE shape (added-then-promoted across the skipped epochs), so no local single-change
 // diff exists to trip; that path's safety is the induction — every compliant committer runs this
 // fence, so no committed state (hence no donor checkpoint) ever contains a direct-add successor.
+// The induction's base is ENFORCED by the version witnesses: `VsrState::decode` admits only the
+// exact current `SUPERBLOCK_VERSION` (no store written by unfenced code loads) and the transport
+// hello admits only the exact current wire version (no unfenced peer connects). A
+// recovered-unfenced-donor falsifier is therefore deliberately NOT written — such a donor is
+// unconstructible through persisted bytes (that is the witness's point; its own falsifiers are the
+// byte-level decode-rejection tests), and composing one via `VsrState::try_new_v4` in-memory would
+// model an embedder fabricating a root, which no durable witness can catch — local API misuse
+// outside the replication threat model.
 //
 // The VOTE-MINT screens close the remaining ack/vote lanes for an entry that reaches a log WITHOUT
 // crossing the screened prepare append (a recovered WAL, a view-change adoption): `send_prepare_ok`
@@ -5776,9 +5784,10 @@ fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
   // committed-but-uninstalled window. Recovery rebuilds the typed `Body::Reconfigure` entry from the
   // WAL through the shared reconstruction and re-commits the band above the checkpoint through the
   // SAME commit recognition as live traffic, where the fence refuses the direct admission. (The one
-  // pre-fence shape no runtime check can catch — a direct-add successor ALREADY INSTALLED into the
-  // durable root — is excluded by not running this build over pre-fence stores at all; see the fence
-  // comment in `commit_reconfigure`.)
+  // shape no runtime check can re-check — a direct-add successor ALREADY INSTALLED into the durable
+  // root — never reaches a running replica at all: `VsrState::decode` admits only the exact current
+  // `SUPERBLOCK_VERSION`, written exclusively by code carrying this fence; see the fence comment in
+  // `commit_reconfigure`.)
   let successor = genesis(3)
     .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
     .expect("the delta arithmetic still derives a direct-add successor");
@@ -6299,7 +6308,10 @@ fn an_adopted_legitimate_reconfigure_tail_op_is_adopt_acked() {
       acked = true;
     }
   }
-  assert!(acked, "the adopted legitimate reconfigure op is adopt-acked");
+  assert!(
+    acked,
+    "the adopted legitimate reconfigure op is adopt-acked"
+  );
 }
 
 #[test]
@@ -6562,7 +6574,14 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
-  e.handle_message(now, &mut wal, &mut sb, &mut blocks, primary_peer(), prepare(1, 0));
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
   e.handle_message(
@@ -6585,7 +6604,11 @@ fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
   );
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
-  assert_eq!(e.checkpoint_op.get(), 1, "precondition: the checkpoint advanced");
+  assert_eq!(
+    e.checkpoint_op.get(),
+    1,
+    "precondition: the checkpoint advanced"
+  );
   assert!(
     !e.log.contains_key(&1),
     "precondition: the checkpointed op is GC-pruned from the log cache"

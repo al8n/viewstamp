@@ -43,8 +43,9 @@ pub enum CodecError {
   },
   /// The leading format version did not match the decoder's expectation — for a
   /// [`Header`](crate::Header), [`HEADER_VERSION`](crate::HEADER_VERSION); for a durable
-  /// [`VsrState`](crate::VsrState) root, [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION) (or an
-  /// older layout-compatible version it still parses). Carries the version that was read.
+  /// [`VsrState`](crate::VsrState) root, exactly
+  /// [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION) (the durable-format fence — no other version
+  /// parses). Carries the version that was read.
   #[error("unknown wire/disk version: {0}")]
   UnknownVersion(u16),
   /// A length-prefixed field's prefix named more elements/bytes than the rest of the buffer

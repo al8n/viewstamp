@@ -126,46 +126,32 @@ use crate::{
 /// On-disk header format version (bumped on any wire/disk layout change).
 pub const HEADER_VERSION: u16 = 1;
 
-/// On-disk superblock-root ([`VsrState`]) format version — the version NEW roots are written with, and
-/// the high end of the layout-compatible range [`VsrState::decode`] accepts. The superblock root carries
-/// its OWN version, like the disk [`Header`]'s [`HEADER_VERSION`], INDEPENDENT of the message wire
-/// format: a version names a disk LAYOUT, and it moves ONLY when the `VsrState` layout itself changes —
-/// never as collateral from a message-format change.
+/// On-disk superblock-root ([`VsrState`]) format version — the version every NEW root is written
+/// with, and the ONLY version [`VsrState::decode`] accepts. The superblock root carries its OWN
+/// version, like the disk [`Header`]'s [`HEADER_VERSION`], INDEPENDENT of the message wire format
+/// (whose cross-peer fence is the transport hello, once per connection) — a message-format-only
+/// change never invalidates a persisted root.
 ///
-/// The committed-band-header root layout was byte-identical from the first release through version `3`,
-/// but the pre-decoupling code led the root with a version shared with the message encoding, which
-/// bumped `1 → 2 → 3` for MESSAGE-only changes (the `DoViewChange`/`PreparedEntry` Repairing wire, then
-/// the `PrepareOk` field). So that ONE pre-membership root layout exists tagged `1`, `2`, AND `3`.
-/// Version `4` is the FIRST real
-/// `VsrState` LAYOUT change: it APPENDS a durable epoch + membership tail after the v3 body. Version `5`
-/// APPENDS a further tail — the recent-prior `config_id` lineage (the superseded ancestor ids that widen
-/// cross-epoch catch-up admission) — so a node recovering into a post-reconfiguration epoch RESTORES the
-/// predecessor ids rather than dropping them, and a retained old-epoch laggard's catch-up is still
-/// admitted after the new-epoch donors restart. Version `6` APPENDS one final scalar — `config_install_op`,
-/// the op of the last reconfigure that produced this root's membership — so a recovered donor restores it
-/// and the cross-epoch state-sync SERVE gate (`checkpoint_op >= config_install_op`) survives a restart:
-/// without it a donor that recovered into a swapped-but-not-yet-checkpointed window would re-attach its
-/// successor membership to a checkpoint BELOW the reconfigure op, letting a laggard install the new epoch
-/// without the committed prefix through that op.
-/// Version `7` APPENDS one further scalar — `log_floor`, the writer's vouched carried-log floor — so a
-/// recovered node restores an adoption-learned floor instead of restarting it at its own `checkpoint_op`
-/// and re-learning it from the next carrier (the un-synced crash window where its own carrier could
-/// exceed the frame-fit span until the floor is re-heard).
-/// Version `8` APPENDS two further scalars — the WAL GEOMETRY pair `checkpoint_ops` + `wal_capacity`
-/// (the writer's configured checkpoint interval and its backend's reported slot capacity) — so recovery
-/// can REFUSE a restart whose geometry differs from the one the store was written under: the recovery
-/// head is derived by scanning the effective ring, whose extent is computed FROM these two knobs, so a
-/// restart under a smaller interval/capacity would silently clip a committed WAL tail out of the scan
-/// window (recovering an amnesiac head). `0` means "not recorded" (a pre-v8 root — no current writer
-/// produces one): recovery REFUSES a non-virgin root carrying an unrecorded half
-/// ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)); the store must be migrated offline.
-/// [`VsrState::decode`] dispatches on the leading version — `1..=3` parse the pre-membership layout
-/// (bridged to `epoch = 0`, no membership), `4` parses that body plus the epoch/membership tail, `5`
-/// parses that plus the lineage tail, `6` parses that plus the `config_install_op` scalar, `7`
-/// parses that plus the `log_floor` scalar, and `8` parses that plus the WAL-geometry pair — so NO
-/// persisted root is stranded and a message-format-only change still can never invalidate a root. A
-/// future `VsrState` layout change bumps this again and extends that per-version dispatch.
-pub const SUPERBLOCK_VERSION: u16 = 8;
+/// The version names the durable-format CONTRACT: the byte layout AND the invariant set the writer
+/// enforced over everything the root vouches for — in particular that every membership the store
+/// ever installed passed the voter-admission fence (`propose_membership`'s rejection, the
+/// prepare/vote screens, and `commit_reconfigure`'s refusal of a brand-new voter). Decode is
+/// EXACT-MATCH: a root stamped with any other version fails ([`CodecError::UnknownVersion`]), so a
+/// store written under a different contract is never recovered, never serves state-sync, and never
+/// seeds an offline restart — the one supported path for such a store is a re-format. This closes
+/// the one shape no runtime predicate can re-check: a configuration an unfenced writer already
+/// INSTALLED into a durable root would otherwise re-enter through recovery (which must trust the
+/// root's membership — it has no predecessor to diff against) and could then be served to a laggard
+/// whose cross-epoch install verifies only the `config_id` hash chain. Refusing the bytes at the
+/// single parse point turns that exclusion from an operational assumption into a structural
+/// property.
+///
+/// A contract change — a layout change OR a strengthening of the writer-enforced invariants — bumps
+/// this constant, atomically invalidating every store written under the previous contract. (An
+/// ancient store that carried this same leading number under a superseded layout is still refused:
+/// parsed as the current layout its bytes fail structurally — the current layout reads a mandatory
+/// epoch/membership/lineage/scalar/geometry tail such a root never wrote — so no such root decodes.)
+pub const SUPERBLOCK_VERSION: u16 = 1;
 
 /// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
 /// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are
@@ -462,25 +448,25 @@ pub struct VsrState {
   /// gaps). Private; read via [`Self::committed_headers_slice`]. The per-entry `body_checksum` is the
   /// load-bearing field recovery checks the WAL against.
   committed_headers: Vec<Header>,
-  /// The current configuration epoch (high-order to `view` in `(epoch, view)` leadership). A legacy
-  /// pre-membership root decodes to `0`.
+  /// The current configuration epoch (high-order to `view` in `(epoch, view)` leadership). A
+  /// membership-less root carries `0` ([`Self::try_new`]'s default).
   epoch: Epoch,
   /// The PREVIOUS epoch's number — the durable backward link of the `config_id` lineage chain that lets
   /// the ingress check whether a foreign `config_id` is an in-lineage ancestor. Equals `epoch` at
-  /// genesis / for a legacy-bridged root.
+  /// genesis / for a membership-less root.
   prev_epoch: Epoch,
   /// The active membership (who votes, who leads, the lineage `config_id`). `None` ONLY for a
-  /// legacy (v1-3) root that predates membership — `recover` fills it from the caller's `Config`. A
-  /// v4/v5 root always carries `Some`, and when present its [`Membership::epoch`] equals `self.epoch`
-  /// (enforced by [`Self::try_new_v4`]).
+  /// membership-less root (the [`Self::try_new`] shape) — `recover` fills it from the caller's
+  /// `Config`. When present its [`Membership::epoch`] equals `self.epoch` (enforced by
+  /// [`Self::try_new_v4`]).
   membership: Option<Membership>,
   /// The recent-prior `config_id` lineage — the superseded ancestor `config_id`s (most-recent-first)
   /// that a node retains in-memory to widen cross-epoch catch-up admission (`Endpoint::in_lineage`).
-  /// Persisted in a v5 root so a node recovering into a post-reconfiguration epoch RESTORES these ids
+  /// Persisted so a node recovering into a post-reconfiguration epoch RESTORES these ids
   /// instead of dropping them: without it, the recovered node would seed its in-memory lineage with only
   /// the CURRENT `config_id`, so a retained old-epoch laggard whose catch-up still carries the
   /// predecessor `config_id` would be REJECTED after the new-epoch donors restart — stranding it
-  /// (a liveness loss). A v1-4 root carries none (decoded as empty); for a no-reconfiguration cluster the
+  /// (a liveness loss). For a no-reconfiguration cluster the
   /// ring is genesis-only, so recovery's seeding is unchanged. The `config_id` is a content hash chained
   /// from the previous config's id, which a single root cannot recompute — so the lineage MUST be carried
   /// durably, exactly like the membership's own `config_id`. Bounded by the small in-memory ring.
@@ -493,9 +479,9 @@ pub struct VsrState {
   /// swapped-but-not-yet-checkpointed window (its checkpoint is BELOW the reconfigure op) would re-attach
   /// its E+1 membership to a checkpoint at op `M < N`, letting a laggard install E+1 at frontier `M`
   /// WITHOUT the committed prefix through the reconfigure op `N` (an XI-b violation, the same premise the
-  /// NORMAL commit-first path enforces). A v1-5 root has no durable `config_install_op` and decodes to the
-  /// root's own `checkpoint_op` (so the gate is trivially satisfied — the pre-fix serve behaviour); for a
-  /// no-reconfiguration cluster it is genesis, unchanged.
+  /// NORMAL commit-first path enforces). [`Self::try_new`] defaults it to the root's own
+  /// `checkpoint_op` (a membership-less root has no reconfiguration of its own, so the gate is
+  /// trivially satisfied); for a no-reconfiguration cluster it is genesis.
   config_install_op: OpNumber,
   /// The writer's vouched carried-log floor: every op at/below it is folded into a checkpoint SOMEWHERE
   /// in the cluster (the writer's own, or an adoption-learned cluster floor), so the writer's carriers
@@ -504,22 +490,22 @@ pub struct VsrState {
   /// and re-learning it from the next carrier/Commit — closing the un-synced crash window where the
   /// restarted node's own carrier could exceed the frame-fit span while its WAL still holds the
   /// pre-adoption band. Never below `checkpoint_op` ([`Self::with_log_floor`] validates; the plain
-  /// constructors default it TO `checkpoint_op` — the exact pre-v7 recovery behaviour, which is also what
-  /// a v1-6 root decodes to).
+  /// constructors default it TO `checkpoint_op` — the own checkpoint always vouches its own
+  /// prefix).
   log_floor: OpNumber,
   /// The writer's configured checkpoint interval ([`Config::checkpoint_ops`](crate::Config)) — half of
   /// the WAL-GEOMETRY pair recovery validates a restart against (the recovery scan window is derived
   /// from it, so a restart under a smaller interval would clip the scan below a committed tail). `0`
-  /// means "not recorded" — representable only so a pre-v8 root decodes faithfully (no current writer
-  /// produces one; a validated `Config`'s interval is nonzero): recovery REFUSES a non-virgin root
-  /// carrying it ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)). Set via
+  /// means "not recorded" — the un-stamped constructor shape (no persisting writer produces one; a
+  /// validated `Config`'s interval is nonzero): recovery REFUSES a non-virgin root carrying it
+  /// ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)). Set via
   /// [`Self::with_wal_geometry`]; the plain constructors leave it unrecorded.
   checkpoint_ops: u64,
   /// The slot capacity of the writer's WAL backend ([`Wal::capacity`]; `u64::MAX` = an unbounded
   /// backend, itself a pinned value a later BOUNDED report must not contradict) — the other half of
-  /// the geometry pair. `0` means "not recorded" — representable only so a pre-v8 root decodes
-  /// faithfully (no current writer produces one: an endpoint's capacity is observed at recovery or
-  /// declared nonzero at construction): recovery REFUSES a non-virgin root carrying it
+  /// the geometry pair. `0` means "not recorded" — the un-stamped constructor shape (no persisting
+  /// writer produces one: an endpoint's capacity is observed at recovery or declared nonzero at
+  /// construction): recovery REFUSES a non-virgin root carrying it
   /// ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)). Set via [`Self::with_wal_geometry`].
   wal_capacity: u64,
 }
@@ -592,19 +578,16 @@ impl VsrState {
       prev_epoch: Epoch::new(0),
       membership: None,
       prior_config_ids: Vec::new(),
-      // A legacy / membership-less root has no reconfiguration of its own; default `config_install_op` to
-      // its `checkpoint_op` (the membership it carries — if any — is reflected as of this checkpoint), so
-      // the cross-epoch serve gate `checkpoint_op >= config_install_op` is trivially satisfied. A v4/v5
-      // root decoded WITHOUT the v6 tail re-validates through here / `try_new_v4` and so inherits the same
-      // `checkpoint_op` default (the pre-fix serve behaviour, never withholding a v4/v5 donor's membership).
+      // A membership-less root has no reconfiguration of its own; default `config_install_op` to
+      // its `checkpoint_op`, so the cross-epoch serve gate `checkpoint_op >= config_install_op` is
+      // trivially satisfied.
       config_install_op: checkpoint_op,
-      // The floor a root vouches with no adoption evidence recorded: its own checkpoint. A pre-v7 root
-      // decodes to the same (the pre-v7 recovery behaviour); a writer with a higher adoption-learned
-      // floor raises it via `with_log_floor`.
+      // The floor a root vouches with no adoption evidence recorded: its own checkpoint. A writer
+      // with a higher adoption-learned floor raises it via `with_log_floor`.
       log_floor: checkpoint_op,
-      // Geometry unrecorded until the writer stamps it (`with_wal_geometry`); a pre-v8 root decodes to
-      // the same. Recovery refuses a NON-virgin root left unstamped (fail-closed), so every persisting
-      // writer stamps before submitting.
+      // Geometry unrecorded until the writer stamps it (`with_wal_geometry`). Recovery refuses a
+      // NON-virgin root left unstamped (fail-closed), so every persisting writer stamps before
+      // submitting.
       checkpoint_ops: 0,
       wal_capacity: 0,
     })
@@ -614,8 +597,8 @@ impl VsrState {
   /// [`Config::checkpoint_ops`](crate::Config) and its backend's [`Wal::capacity`] — so a later
   /// recovery can refuse a restart under different geometry (which would silently move the recovery
   /// scan window and can clip a committed tail out of it). Not validated here: `0` is the "not
-  /// recorded" sentinel that must stay representable so a pre-v8 root DECODES faithfully, and the
-  /// check lives at the single consumer (recovery), which refuses a non-virgin root carrying an
+  /// recorded" sentinel the un-stamped constructor shape and the all-zero virgin root carry, and
+  /// the check lives at the single consumer (recovery), which refuses a non-virgin root carrying an
   /// unrecorded half ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)). Every persisting
   /// writer stamps both halves nonzero.
   #[must_use]
@@ -641,9 +624,10 @@ impl VsrState {
     Ok(self)
   }
 
-  /// Creates a v5 durable root carrying the configuration epoch + the active [`Membership`] + the
-  /// recent-prior `config_id` lineage. (Named `try_new_v4` for the membership-carrying root family; the
-  /// emitted root is tagged with the current [`SUPERBLOCK_VERSION`].)
+  /// Creates a durable root carrying the configuration epoch + the active [`Membership`] + the
+  /// recent-prior `config_id` lineage. (Named `try_new_v4` for the membership-carrying root family —
+  /// [`Self::try_new`] builds the membership-less shape; the emitted root is tagged with the current
+  /// [`SUPERBLOCK_VERSION`].)
   ///
   /// Validates the same consensus-frontier invariants as [`Self::try_new`] (`log_view <= view`,
   /// `commit >= checkpoint_op`, an in-band strictly-ascending committed-header set) AND the
@@ -683,8 +667,9 @@ impl VsrState {
         membership: membership.epoch().get(),
       });
     }
-    // Reuse the scalar/header validation, then attach the epoch + membership + lineage tail (the legacy
-    // constructor leaves epoch = 0 / membership = None / empty lineage, so set them on the validated value).
+    // Reuse the scalar/header validation, then attach the epoch + membership + lineage tail (the
+    // membership-less constructor leaves epoch = 0 / membership = None / empty lineage, so set them
+    // on the validated value).
     let mut state = Self::try_new(
       view,
       log_view,
@@ -776,45 +761,45 @@ impl VsrState {
     self.committed_headers.as_slice()
   }
 
-  /// The current configuration epoch (high-order to `view`). A legacy pre-membership root reads `0`.
+  /// The current configuration epoch (high-order to `view`). A membership-less root reads `0`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn epoch(&self) -> Epoch {
     self.epoch
   }
 
   /// The previous epoch — the durable backward link of the `config_id` lineage. Equals [`Self::epoch`]
-  /// at genesis / for a legacy-bridged root.
+  /// at genesis / for a membership-less root.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn prev_epoch(&self) -> Epoch {
     self.prev_epoch
   }
 
-  /// The active [`Membership`] of a v4 root.
+  /// The active [`Membership`] of a membership-bearing root.
   ///
   /// # Panics
   ///
-  /// Panics if this root carries no membership — i.e. a legacy (v1-3) root decoded through the
-  /// migration bridge, whose membership `recover` has not yet supplied from the caller's `Config`. Use
-  /// [`Self::membership_opt`] when a root may be legacy-bridged.
+  /// Panics if this root carries no membership — i.e. a membership-less root whose membership
+  /// `recover` has not yet supplied from the caller's `Config`. Use [`Self::membership_opt`] when a
+  /// root may be membership-less.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn membership(&self) -> &Membership {
     self
       .membership
       .as_ref()
-      .expect("v4 root carries a membership; a legacy-bridged root must be filled by recover first")
+      .expect("a membership-bearing root; a membership-less root must be filled by recover first")
   }
 
-  /// The active [`Membership`], or `None` for a legacy (v1-3) root that predates membership (filled by
-  /// `recover` from the caller's `Config`).
+  /// The active [`Membership`], or `None` for a membership-less root (filled by `recover` from the
+  /// caller's `Config`).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn membership_opt(&self) -> Option<&Membership> {
     self.membership.as_ref()
   }
 
-  /// The recent-prior `config_id` lineage (superseded ancestor ids, most-recent-first) carried by a v5
-  /// root. Empty for a v1-4 root (no durable lineage tail) — `recover` then seeds the in-memory ring with
-  /// the current `config_id` (the pre-v5 behaviour). Read by `recover` to restore the in-memory lineage
-  /// so a retained old-epoch laggard's cross-epoch catch-up is still admitted after the donors restart.
+  /// The recent-prior `config_id` lineage (superseded ancestor ids, most-recent-first). Empty when
+  /// no reconfiguration has occurred — `recover` then seeds the in-memory ring with the current
+  /// `config_id`. Read by `recover` to restore the in-memory lineage so a retained old-epoch
+  /// laggard's cross-epoch catch-up is still admitted after the donors restart.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn prior_config_ids(&self) -> &[u128] {
     self.prior_config_ids.as_slice()
@@ -822,8 +807,8 @@ impl VsrState {
 
   /// The op of the last reconfigure that produced this root's [`Membership`] (genesis `0` when none). A
   /// recovered donor restores it so the cross-epoch state-sync serve gate (`checkpoint_op >=
-  /// config_install_op`) holds across a restart. A v1-5 root has no durable value and reads its own
-  /// `checkpoint_op` (the pre-v6 serve behaviour).
+  /// config_install_op`) holds across a restart. A membership-less root reads its own
+  /// `checkpoint_op` ([`Self::try_new`]'s default — the gate trivially satisfied).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn config_install_op(&self) -> OpNumber {
     self.config_install_op
@@ -831,16 +816,16 @@ impl VsrState {
 
   /// The checkpoint interval this root's writer was configured with
   /// ([`Config::checkpoint_ops`](crate::Config)) — half of the WAL-geometry pair recovery validates a
-  /// restart against. `0` = not recorded (a pre-v8 root): recovery refuses a non-virgin root carrying
-  /// it ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)).
+  /// restart against. `0` = not recorded (an un-stamped root): recovery refuses a non-virgin root
+  /// carrying it ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checkpoint_ops(&self) -> u64 {
     self.checkpoint_ops
   }
 
   /// The slot capacity of this root's writer's WAL backend ([`Wal::capacity`];
-  /// `u64::MAX` = unbounded) — the other half of the geometry pair. `0` = not recorded (a pre-v8
-  /// root): recovery refuses a non-virgin root carrying it
+  /// `u64::MAX` = unbounded) — the other half of the geometry pair. `0` = not recorded (an
+  /// un-stamped root): recovery refuses a non-virgin root carrying it
   /// ([`RecoverError::GeometryNotRecorded`](crate::RecoverError)).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn wal_capacity(&self) -> u64 {
@@ -848,20 +833,18 @@ impl VsrState {
   }
 
   /// Encodes this durable root to a length-prefixed, versioned byte vector (the superblock
-  /// on-disk form). Layout (all scalars big-endian): [`SUPERBLOCK_VERSION`] `u16`,
-  /// then `view`/`log_view` (`u64` each), `commit`/`checkpoint_op` (`u64` each), `checkpoint_id`
-  /// (`u128`), then the committed-band header set as a `u32` count followed by that many
-  /// fixed-size [`Header::encode`] blocks (one [`HEADER_ENCODED_LEN`]-byte block per header). That
-  /// is the byte-identical v1-3 body; a v4 root APPENDS the epoch + membership tail after it:
-  /// `epoch:u64 | prev_epoch:u64 | membership_present:u8`, then — iff present — `config_id:u128 |
-  /// epoch:u64 | replica_count:u8 | learner_count:u16 | member_count:u32 | members:(u128 each)`. A v5 root
-  /// APPENDS one further tail after that — the recent-prior lineage: `prior_config_count:u32 |
-  /// prior_config_ids:(u128 each)`. A v6 root APPENDS one scalar after that — `config_install_op:u64`
-  /// (the op that produced this root's membership); a v7 root APPENDS `log_floor:u64` (the writer's
-  /// vouched carried-log floor); a v8 root APPENDS the WAL-geometry pair `checkpoint_ops:u64 |
-  /// wal_capacity:u64`. The scalar field order matches the [`Self::try_new`] /
-  /// [`Self::try_new_v4`] parameter order. Variable-length because the header set, the member list, and the
-  /// lineage are all bounded but not fixed.
+  /// on-disk form). Layout (all scalars big-endian): [`SUPERBLOCK_VERSION`] `u16`, then
+  /// `view`/`log_view` (`u64` each), `commit`/`checkpoint_op` (`u64` each), `checkpoint_id`
+  /// (`u128`), the committed-band header set as a `u32` count followed by that many fixed-size
+  /// [`Header::encode`] blocks (one [`HEADER_ENCODED_LEN`]-byte block per header), the epoch pair
+  /// `epoch:u64 | prev_epoch:u64`, a `membership_present:u8` flag then — iff present —
+  /// `config_id:u128 | epoch:u64 | replica_count:u8 | learner_count:u16 | member_count:u32 |
+  /// members:(u128 each)`, the recent-prior lineage `prior_config_count:u32 | prior_config_ids:
+  /// (u128 each)`, the scalars `config_install_op:u64` (the op that produced this root's
+  /// membership) and `log_floor:u64` (the writer's vouched carried-log floor), and the WAL-geometry
+  /// pair `checkpoint_ops:u64 | wal_capacity:u64`. The scalar field order matches the
+  /// [`Self::try_new`] / [`Self::try_new_v4`] parameter order. Variable-length because the header
+  /// set, the member list, and the lineage are all bounded but not fixed.
   pub fn encode(&self) -> Bytes {
     let members_len = self
       .membership
@@ -869,11 +852,11 @@ impl VsrState {
       .map_or(0, |m| m.members_slice().len());
     let mut out = BytesMut::with_capacity(
       2 + 8 * 4 + 16 + 4 + self.committed_headers.len() * HEADER_ENCODED_LEN
-      // The appended v4 tail: epoch + prev_epoch + present-flag, plus the membership block when present.
+      // The epoch pair + present-flag, plus the membership block when present.
         + 8 + 8 + 1
         + self.membership.as_ref().map_or(0, |_| 16 + 8 + 1 + 2 + 4 + members_len * 16)
-      // The appended v5 tail: the lineage count + its ids; then the v6 + v7 + v8 scalar tails
-      // (config_install_op + log_floor, then the checkpoint_ops + wal_capacity geometry pair, a u64 each).
+      // The lineage count + its ids; then the config_install_op + log_floor scalars and the
+      // checkpoint_ops + wal_capacity geometry pair, a u64 each.
         + 4 + self.prior_config_ids.len() * 16
         + 8 + 8 + 8 + 8,
     );
@@ -887,8 +870,8 @@ impl VsrState {
     for h in &self.committed_headers {
       out.put_slice(&h.encode());
     }
-    // The appended v4 tail. `epoch`/`prev_epoch` are always written; the membership is gated by a
-    // present-flag so a legacy-bridged root (membership = None) round-trips as a v5-tagged root.
+    // The epoch pair. `epoch`/`prev_epoch` are always written; the membership is gated by a
+    // present-flag so a membership-less root (the [`Self::try_new`] shape) round-trips.
     out.put_u64(self.epoch.get());
     out.put_u64(self.prev_epoch.get());
     match &self.membership {
@@ -905,22 +888,20 @@ impl VsrState {
         }
       }
     }
-    // The appended v5 tail: the recent-prior `config_id` lineage (a `u32` count then the ids). Always
-    // written for a v5 root — an empty lineage is a count-0 block, so it round-trips uniformly whether or
-    // not a membership is present.
+    // The recent-prior `config_id` lineage (a `u32` count then the ids). An empty lineage is a
+    // count-0 block, so it round-trips uniformly whether or not a membership is present.
     out.put_u32(self.prior_config_ids.len() as u32);
     for &id in &self.prior_config_ids {
       out.put_u128(id);
     }
-    // The appended v6 tail: `config_install_op` (the op that produced this root's membership). Always
-    // written for a v6 root — a fixed `u64` so it round-trips uniformly whether or not a membership is
-    // present.
+    // `config_install_op` (the op that produced this root's membership) — a fixed `u64`, uniform
+    // whether or not a membership is present.
     out.put_u64(self.config_install_op.get());
-    // The appended v7 tail: `log_floor` (the writer's vouched carried-log floor). A fixed `u64`,
-    // uniform like the v6 scalar.
+    // `log_floor` (the writer's vouched carried-log floor) — a fixed `u64`, uniform like the
+    // previous scalar.
     out.put_u64(self.log_floor.get());
-    // The appended v8 tail: the WAL-geometry pair (`checkpoint_ops` then `wal_capacity`), two fixed
-    // `u64`s. `0` = not recorded, carried verbatim.
+    // The WAL-geometry pair (`checkpoint_ops` then `wal_capacity`), two fixed `u64`s. `0` = not
+    // recorded, carried verbatim.
     out.put_u64(self.checkpoint_ops);
     out.put_u64(self.wal_capacity);
     out.freeze()
@@ -929,27 +910,23 @@ impl VsrState {
   /// Decodes a durable root produced by [`Self::encode`], bounds-checked and panic-free on any
   /// truncated / corrupt / adversarial input.
   ///
-  /// Dispatches on the leading version: `1..=3` parse the pre-membership layout (bridged to
-  /// `epoch = 0`, no membership); `4` parses that body plus the appended epoch/membership tail; `5` adds
-  /// the lineage tail; `6` adds the `config_install_op` scalar; `7` adds the `log_floor` scalar; `8`
-  /// adds the WAL-geometry pair.
-  /// Rejects (never panics): a short buffer ([`CodecError::Truncated`]), an unknown leading version
-  /// ([`CodecError::UnknownVersion`]), a header-count / member-count prefix that overruns the buffer
-  /// ([`CodecError::LengthOverflow`]), a `membership_present` flag that is neither 0 nor 1
-  /// ([`CodecError::InvalidMembershipPresent`]), trailing bytes after the fully-decoded root
-  /// ([`CodecError::TrailingBytes`]), or a per-header decode error. The decoded fields are
-  /// re-validated through [`Self::try_new`] (v1-3) / [`Self::try_new_v4`] (v4), so a corrupt root
+  /// Accepts EXACTLY the current [`SUPERBLOCK_VERSION`] — the durable-format contract this build
+  /// writes — and parses the single current layout. Rejects (never panics): any other leading
+  /// version ([`CodecError::UnknownVersion`] — the durable-format fence; see the constant's doc), a
+  /// short buffer ([`CodecError::Truncated`]), a header-count / member-count / lineage-count prefix
+  /// that overruns the buffer ([`CodecError::LengthOverflow`]), a `membership_present` flag that is
+  /// neither 0 nor 1 ([`CodecError::InvalidMembershipPresent`]), trailing bytes after the
+  /// fully-decoded root ([`CodecError::TrailingBytes`]), or a per-header decode error. The decoded
+  /// fields are re-validated through [`Self::try_new`] / [`Self::try_new_v4`], so a corrupt root
   /// whose fields break the VSR or membership invariants surfaces as [`CodecError::InvalidVsrState`]
-  /// rather than constructing an illegal state — i.e. `decode` returns ONLY roots those constructors
-  /// would have accepted.
+  /// rather than constructing an illegal state — i.e. `decode` returns ONLY roots those
+  /// constructors would have accepted.
   pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
     let mut r = Reader::new(buf);
+    // EXACT-MATCH version gate: only the current durable-format contract is accepted. Any other
+    // leading version — older, newer, or a superseded numbering — is refused CLEAN, never parsed.
     let version = r.u16()?;
-    // Dispatch on the leading version. `1..=3` are the ONE pre-membership layout (the pre-decoupling
-    // coupling stamped it with 1, 2, AND 3): they share a body and bridge to `epoch = 0` with no
-    // membership. `4` parses that same body PLUS the appended epoch/membership tail. A version outside
-    // `1..=SUPERBLOCK_VERSION` is rejected CLEAN (never misparsed) — a future layout extends this dispatch.
-    if version == 0 || version > SUPERBLOCK_VERSION {
+    if version != SUPERBLOCK_VERSION {
       return Err(CodecError::UnknownVersion(version));
     }
     let view = View::with(r.u64()?);
@@ -964,23 +941,9 @@ impl VsrState {
     for _ in 0..count {
       committed_headers.push(Header::decode(r.take(HEADER_ENCODED_LEN)?)?);
     }
-    if version <= 3 {
-      // A legacy (v1-3) root ends after the committed-band headers — there is no epoch/membership/lineage
-      // tail.
-      r.finish()?;
-      // Re-validate the invariants (log_view <= view, commit >= checkpoint_op, in-band ascending
-      // headers): a corrupt root that breaks them is rejected, not silently constructed.
-      return Ok(Self::try_new(
-        view,
-        log_view,
-        commit,
-        checkpoint_op,
-        checkpoint_id,
-        committed_headers,
-      )?);
-    }
-    // v4+: the appended epoch/membership tail. `epoch`/`prev_epoch` are always present; the membership is
-    // gated by a present-flag (0 = a legacy-bridged root re-saved as v4/v5; 1 = a real membership block).
+    // The epoch/membership tail. `epoch`/`prev_epoch` are always present; the membership is gated
+    // by a present-flag (0 = a membership-less root, the [`Self::try_new`] shape; 1 = a real
+    // membership block).
     let epoch = Epoch::new(r.u64()?);
     let prev_epoch = Epoch::new(r.u64()?);
     let membership = match r.u8()? {
@@ -1010,51 +973,27 @@ impl VsrState {
       }
       other => return Err(CodecError::InvalidMembershipPresent(other)),
     };
-    // v5+: the appended lineage tail (a `u32` count then the superseded ancestor `config_id`s). A v4 root
-    // ends after the membership block — its lineage is empty (recover then seeds from the current id).
-    // Each id is a fixed 16-byte `u128`, so an oversized count is rejected before allocating.
-    let prior_config_ids = if version >= 5 {
-      let lineage_count = r.seq_len(16)?;
-      let mut ids = Vec::with_capacity(lineage_count);
-      for _ in 0..lineage_count {
-        ids.push(r.u128()?);
-      }
-      ids
-    } else {
-      Vec::new()
-    };
-    // v6+: the appended `config_install_op` scalar (the op that produced this root's membership). A v1-5
-    // root has none — default to `checkpoint_op` so the cross-epoch serve gate `checkpoint_op >=
-    // config_install_op` is trivially satisfied (the pre-v6 serve behaviour: a recovered v4/v5 donor never
-    // withholds its membership). Reading it AFTER the lineage keeps the per-version dispatch additive.
-    let config_install_op = if version >= 6 {
-      OpNumber::with(r.u64()?)
-    } else {
-      checkpoint_op
-    };
-    // v7+: the appended `log_floor` scalar (the writer's vouched carried-log floor). A v1-6 root has
-    // none — default to `checkpoint_op` (the own checkpoint always vouches its own prefix; exactly the
-    // pre-v7 recovery behaviour). Validated through `with_log_floor` below, so a corrupt scalar below
-    // the checkpoint is rejected, never constructed.
-    let log_floor = if version >= 7 {
-      OpNumber::with(r.u64()?)
-    } else {
-      checkpoint_op
-    };
-    // v8+: the appended WAL-geometry pair (`checkpoint_ops` then `wal_capacity`). A v1-7 root has
-    // none — default both to `0` (= not recorded). Decode stays FAITHFUL and judgment-free: `0` is
-    // carried verbatim to the single consumer, recovery's geometry fence, which REFUSES a non-virgin
-    // root with either half unrecorded (`RecoverError::GeometryNotRecorded` — a pre-v8 store is
-    // migrated offline, never scanned under unvalidated live geometry); only a fully-virgin root
-    // (`VsrState::new()`) proceeds, into the wiped-voter fail-stop.
-    let (checkpoint_ops, wal_capacity) = if version >= 8 {
-      (r.u64()?, r.u64()?)
-    } else {
-      (0, 0)
-    };
+    // The lineage tail (a `u32` count then the superseded ancestor `config_id`s). Each id is a
+    // fixed 16-byte `u128`, so an oversized count is rejected before allocating.
+    let lineage_count = r.seq_len(16)?;
+    let mut prior_config_ids = Vec::with_capacity(lineage_count);
+    for _ in 0..lineage_count {
+      prior_config_ids.push(r.u128()?);
+    }
+    // `config_install_op` (the op that produced this root's membership) and `log_floor` (the
+    // writer's vouched carried-log floor; validated through `with_log_floor` below, so a corrupt
+    // scalar below the checkpoint is rejected, never constructed).
+    let config_install_op = OpNumber::with(r.u64()?);
+    let log_floor = OpNumber::with(r.u64()?);
+    // The WAL-geometry pair (`checkpoint_ops` then `wal_capacity`). Decode stays FAITHFUL and
+    // judgment-free: `0` (= not recorded) is carried verbatim to the single consumer, recovery's
+    // geometry fence, which REFUSES a non-virgin root with either half unrecorded
+    // (`RecoverError::GeometryNotRecorded`); only a fully-virgin root (`VsrState::new()`) proceeds,
+    // into the wiped-voter fail-stop.
+    let (checkpoint_ops, wal_capacity) = (r.u64()?, r.u64()?);
     r.finish()?;
     match membership {
-      // A v4+ root with a real membership re-validates through `try_new_v4` (which adds the
+      // A root with a real membership re-validates through `try_new_v4` (which adds the
       // epoch-consistency check `membership.epoch() == epoch` on top of the scalar/header invariants).
       Some(membership) => Ok(
         Self::try_new_v4(
@@ -1073,10 +1012,11 @@ impl VsrState {
         .with_log_floor(log_floor)?
         .with_wal_geometry(checkpoint_ops, wal_capacity),
       ),
-      // A v4+-tagged root that carries no membership (a legacy root re-saved): scalar/header
-      // re-validation only, with the durable epoch/prev_epoch (and any lineage + config_install_op +
-      // log_floor + geometry) carried through. A membership-less root has no config chain, so its
-      // lineage is normally empty; carried for fidelity.
+      // A root that carries no membership (the [`Self::try_new`] shape — one written before any
+      // reconfiguration produced a durable membership): scalar/header re-validation only, with the
+      // durable epoch/prev_epoch (and any lineage + config_install_op + log_floor + geometry)
+      // carried through. A membership-less root has no config chain, so its lineage is normally
+      // empty; carried for fidelity.
       None => {
         let mut state = Self::try_new(
           view,

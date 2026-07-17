@@ -777,13 +777,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // `send_prepare_ok` never acks such an op and `record_own_vote` never counts the own bit (the
       // append seam additionally drops the `Prepare` before it burns a WAL slot), so it can never
       // assemble a quorum of compliant votes. By that induction no committed state, and hence no
-      // state-sync donor checkpoint, ever contains a direct-add configuration; reaching here means
-      // the op entered durable state under code without this fence, a store this build does not
-      // support running (redeploying over such a store means re-formatting it — the one shape no
-      // runtime check can catch is a direct-add successor such code already INSTALLED into a durable
-      // root, excluded by the same posture). A deterministic fail-stop surfaces that immediately and
-      // never diverges; skipping the swap instead would quietly re-interpret the op and fork against
-      // any node that installs it.
+      // state-sync donor checkpoint, ever contains a direct-add configuration — and the induction's
+      // base is ENFORCED, not assumed: `VsrState::decode` admits only the exact current
+      // `SUPERBLOCK_VERSION`, so recovery can only load stores this fence's code wrote (the one
+      // shape no runtime predicate can re-check — a direct-add successor an unfenced writer already
+      // INSTALLED into a durable root — never decodes), and the transport hello admits only peers
+      // speaking the exact current wire version, so every live donor/committer runs it. Reaching
+      // here therefore means in-process corruption or an embedder-fabricated store. A deterministic
+      // fail-stop surfaces that immediately and never diverges; skipping the swap instead would
+      // quietly re-interpret the op and fork against any node that installs it.
       if let Some(added) = self
         .membership
         .first_new_voter(payload.replica_count(), payload.members())

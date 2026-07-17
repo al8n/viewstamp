@@ -59,13 +59,11 @@ impl Reconfig for SingleChange {}
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReconfigError {
-  /// `cur` carried no membership — a legacy (v1-3) root that predates the configuration epoch. A
-  /// pre-membership root has no `config_id` lineage to chain the successor from, so it cannot be
-  /// reconfigured offline; bring the cluster up once (which migrates it to a v4 root carrying the
+  /// `cur` carried no membership — a membership-less root that predates the configuration epoch. A
+  /// membership-less root has no `config_id` lineage to chain the successor from, so it cannot be
+  /// reconfigured offline; bring the cluster up once (which migrates it to a root carrying the
   /// genesis membership) before pre-writing a successor.
-  #[error(
-    "cannot reconfigure a legacy (pre-membership) root: it has no config_id lineage to chain"
-  )]
+  #[error("cannot reconfigure a membership-less root: it has no config_id lineage to chain")]
   NoMembership,
   /// The requested successor membership was structurally invalid (zero `replica_count`, too many
   /// voters, a member-count mismatch, or a duplicate member). Carries the underlying
@@ -185,9 +183,9 @@ fn push_lineage_ring(ring: &[u128], superseded: u128) -> Vec<u128> {
 /// voter proves the committed prefix in a view change from its own durable root rather than from a
 /// replicated history, and the operator may stage an arbitrary successor.
 ///
-/// The resulting [`VsrState`] is a v4 root whose scalar `epoch` is the successor membership's epoch,
-/// whose `prev_epoch` is `cur.epoch()` (the durable backward link of the lineage), and whose
-/// membership is the successor.
+/// The resulting [`VsrState`] is a membership-bearing root whose scalar `epoch` is the successor
+/// membership's epoch, whose `prev_epoch` is `cur.epoch()` (the durable backward link of the
+/// lineage), and whose membership is the successor.
 ///
 /// # Precondition: seal the committed frontier, then stop from a quiesced cluster
 ///
@@ -209,7 +207,7 @@ fn push_lineage_ring(ring: &[u128], superseded: u128) -> Vec<u128> {
 ///
 /// # Errors
 ///
-/// - [`ReconfigError::NoMembership`] if `cur` is a legacy (pre-membership) root — it has no
+/// - [`ReconfigError::NoMembership`] if `cur` is a membership-less root — it has no
 ///   `config_id` lineage to chain a successor from.
 /// - [`ReconfigError::Membership`] if `(replica_count, learner_count, members)` is structurally
 ///   invalid.
@@ -228,7 +226,7 @@ pub fn prepare_restart(
   // The successor's recent-prior lineage: the predecessor (`cur`'s) `config_id` shifted onto the front of
   // `cur`'s retained lineage, bounded to the same ring width — so a node restarted off this root restores
   // the post-swap lineage and still admits a retained old-epoch laggard's cross-epoch catch-up. `cur` may
-  // be a v4 root with an empty lineage (a pre-v5 root); then the ring is just the predecessor id.
+  // carry an empty lineage (no prior reconfiguration); then the ring is just the predecessor id.
   let prior_config_ids = push_lineage_ring(cur.prior_config_ids(), current.config_id());
   let state = VsrState::try_new_v4(
     cur.view(),

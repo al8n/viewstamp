@@ -1107,7 +1107,7 @@ pub struct Endpoint<S, R = RestartOnly> {
   /// ([`Self::with_reconfig`] takes no storage handles, so it cannot observe one). Stamped into
   /// every durable root as half of the WAL-GEOMETRY pair so the next recovery can refuse a restart
   /// under different geometry (which would silently move the recovery scan window off a committed
-  /// tail). Always nonzero: `0` is the wire-level "unrecorded" sentinel a pre-v8 root decodes to,
+  /// tail). Always nonzero: `0` is the wire-level "unrecorded" sentinel of an un-stamped root,
   /// which recovery refuses on any non-virgin store — construction asserts it away so no live
   /// endpoint can ever write it.
   wal_capacity: u64,
@@ -1117,9 +1117,10 @@ pub struct Endpoint<S, R = RestartOnly> {
   /// changes only across an offline restart — so no runtime-mutation machinery rides it here.
   membership: Membership,
   /// The PREVIOUS epoch — the durable backward link of the `config_id` lineage, carried so every
-  /// durable-root write persists the membership as a v4 root (epoch = `membership.epoch()`,
-  /// prev_epoch = this) rather than dropping it to a legacy root. Set from the recovered root (a v4
-  /// root's own `prev_epoch`, or the membership epoch for a legacy bridge); at genesis it equals the
+  /// durable-root write persists the membership as a membership-bearing root (epoch =
+  /// `membership.epoch()`, prev_epoch = this) rather than dropping it to a membership-less one. Set
+  /// from the recovered root (the root's own `prev_epoch`, or the membership epoch for a
+  /// membership-less bridge); at genesis it equals the
   /// membership epoch. Fixed per incarnation (the offline-restart capability changes the configuration only across a restart).
   prev_epoch: Epoch,
   /// The bounded RECENT-PRIOR `config_id` ring — the superseded `config_id`s of the last
@@ -1805,7 +1806,7 @@ impl<S, R> Endpoint<S, R> {
   /// stamps as the capacity half of its WAL-GEOMETRY pair; the next recovery then validates the real
   /// backend against it and refuses a restart under different geometry (a mis-declaration is therefore
   /// fail-closed at the next boot, never silent). It MUST be nonzero — asserted when the endpoint is
-  /// built (release too): `0` is the wire-level "unrecorded" sentinel a pre-v8 root decodes to, which
+  /// built (release too): `0` is the wire-level "unrecorded" sentinel of an un-stamped root, which
   /// recovery refuses on any non-virgin store, so a live endpoint must never write it.
   ///
   /// **`seed` must carry fresh entropy per incarnation**: the solicitation-freshness nonce is
@@ -2191,8 +2192,11 @@ impl<S, R> Endpoint<S, R> {
     // superseding cross-epoch sync CONSUMES the staged swap instead of racing it). Re-affirm at the
     // single membership writer. The cross-epoch state-sync install (`None`) is exempt: it installs a
     // wholesale successor possibly many epochs ahead, where a single-change predicate against this
-    // node's stale configuration does not apply — its safety is the donor's committed (fence-clean)
-    // state plus the verified `config_id` chain.
+    // node's stale configuration does not apply — its safety is the donor's committed fence-clean
+    // state plus the verified `config_id` chain, and fence-cleanliness is enforced rather than
+    // assumed (the donor recovered only a root the exact-match `SUPERBLOCK_VERSION` admits — written
+    // under the fence — and was admitted as a peer only by the exact-match hello version — running
+    // it).
     debug_assert!(
       reconfigure_op.is_none()
         || self
