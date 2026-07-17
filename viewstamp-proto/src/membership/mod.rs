@@ -444,6 +444,13 @@ impl Membership {
 #[non_exhaustive]
 pub enum SingleVoterDelta {
   /// Add a brand-new [`MemberId`] as a voter.
+  ///
+  /// This is NOT an accepted `propose_membership` delta. A brand-new voter holds no committed prefix (it
+  /// was never a member, so it never committed a prior op), which can break the cross-config quorum
+  /// intersection; `propose_membership` therefore rejects a direct `AddVoter` at every cluster size, and
+  /// the planner never emits one. To add a voter, `AddLearner` the member, let it catch up, then
+  /// `PromoteLearner`. The variant is retained for the membership arithmetic ([`Membership::apply_delta`])
+  /// and the rejection tests.
   AddVoter(MemberId),
   /// Remove a voting [`MemberId`] from the configuration.
   RemoveVoter(MemberId),

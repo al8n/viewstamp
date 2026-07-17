@@ -344,7 +344,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // bearing the reserved id cannot be type-erased into a `Body::Present` op on the primary while
     // every backup reconstructs the same prepare's bytes as a typed `Body::Reconfigure`
     // (`log_entry_from_prepare` → `from_committed_body` keys on this id). That would BYPASS
-    // `propose_membership`'s entire admission ladder (the AddVoter XI-b gate, the PromoteLearner
+    // `propose_membership`'s entire admission ladder (the direct-AddVoter rejection, the PromoteLearner
     // catch-up gate, the single-change gate, the predecessor-delta validation, the single-writer
     // `reconfigure_inflight` latch) and yield a primary/backup membership SPLIT or a committed-log
     // divergence (the same committed op typed differently on the primary vs. the backups). Drop it
