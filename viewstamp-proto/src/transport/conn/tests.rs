@@ -189,7 +189,7 @@ fn an_oversized_frame_in_a_large_read_is_rejected() {
 }
 
 #[test]
-fn a_zero_length_frame_closes_the_conn_on_decode() {
+fn a_zero_length_frame_is_dropped_as_an_empty_envelope() {
   let from = Peer::Replica(ReplicaId::new(0));
   let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
   conn.mark_validated(from);
@@ -197,9 +197,71 @@ fn a_zero_length_frame_closes_the_conn_on_decode() {
   zeros.extend_from_slice(&0u32.to_be_bytes()); // a single zero-length frame
   conn.handle_data(&zeros, false, Instant::ZERO).unwrap();
   let mut out = Vec::new();
+  // A zero-length frame decodes to an EMPTY envelope with no body — the degenerate forward-compat
+  // UnknownMessage case — so it is DROPPED and the conn stays Validated, not terminated. (A newer
+  // peer's unrecognized message and this degenerate empty frame share one disposition: skip it.)
+  conn
+    .poll_decoded(&mut out)
+    .expect("an empty envelope is skipped, not fatal");
+  assert!(out.is_empty(), "an empty envelope yields no message");
+  assert!(
+    !conn.is_closed(),
+    "the conn survives an empty (forward-compat) frame"
+  );
+  assert!(conn.is_validated());
+}
+
+#[test]
+fn an_unknown_body_frame_is_skipped_and_a_following_message_still_delivers() {
+  let from = Peer::Replica(ReplicaId::new(2));
+  let mut frames = Vec::new();
+  // A forward-compat unknown-body envelope (field 99, wire type 2 — a Message.body variant this build
+  // does not know, IN KIND identical to a peer receiving a newer oneof arm) decodes cleanly to an
+  // absent body -> CodecError::UnknownMessage. The conn must SKIP it (as QUIC drops an unknown
+  // datagram), not terminate...
+  encode_frame(
+    &bytes::Bytes::from_static(&[0x9A, 0x06, 0x02, 0xAA, 0xBB]),
+    &mut frames,
+  );
+  // ...and still deliver the recognized consensus message that follows it in the SAME buffer.
+  encode_frame(&encode_message(&req_msg()), &mut frames);
+  let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
+  conn.mark_validated(from);
+  let closed = conn.handle_data(&frames, false, Instant::ZERO).unwrap();
+  assert!(!closed);
+  let mut out = Vec::new();
+  conn
+    .poll_decoded(&mut out)
+    .expect("an unknown-body frame is skipped, not fatal");
+  assert_eq!(out.len(), 1, "only the recognized message is delivered");
+  assert_eq!(out[0].0, from);
+  assert!(
+    conn.is_validated(),
+    "the conn stays Validated after skipping an unknown frame"
+  );
+  assert!(!conn.is_closed());
+}
+
+#[test]
+fn a_malformed_frame_closes_the_conn() {
+  let from = Peer::Replica(ReplicaId::new(0));
+  let mut conn = Conn::from_parts(FakeRecords::new(usize::MAX, from));
+  conn.mark_validated(from);
+  // A framed but genuinely CORRUPT payload (field 1 tag naming wire type 7, an invalid protobuf wire
+  // type) is a fault, not a newer peer — decode_message rejects it as Malformed, so poll_decoded
+  // terminates the conn. This is the corruption side of the drop-vs-terminate split, the guarantee
+  // the (now forward-compat) zero-length-frame test above no longer carries.
+  let mut framed = Vec::new();
+  encode_frame(&bytes::Bytes::from_static(&[0x0F]), &mut framed);
+  conn.handle_data(&framed, false, Instant::ZERO).unwrap();
+  let mut out = Vec::new();
   assert!(
     conn.poll_decoded(&mut out).is_err(),
-    "an empty frame fails to decode"
+    "a corrupt frame must fail to decode and terminate the conn"
+  );
+  assert!(
+    out.is_empty(),
+    "no message is delivered from a corrupt frame"
   );
   assert!(conn.is_closed());
 }

@@ -896,14 +896,47 @@ fn public_seam_round_trips_every_variant() {
   }
 }
 
-/// An envelope with no `Message.body` oneof arm set is the wire's "no known message" case —
-/// parity with the prior codec's unknown-tag reject — and `decode_message` must reject it.
+/// A degenerate EMPTY envelope (zero fields, no `Message.body` oneof arm) decodes cleanly and
+/// classifies as the forward-compatible [`CodecError::UnknownMessage`], NOT `Malformed`: the codec
+/// keeps no witness of a skipped unknown field, so "body absent" cannot be narrowed to "body absent
+/// AND an unknown field was seen", and a zero-field envelope shares the newer-peer disposition. It
+/// carries nothing, no current peer sends it, and dropping it (rather than tearing a stream down) is
+/// equally correct — pinned deliberately as the documented degenerate case.
 #[test]
-fn envelope_without_body_rejects() {
+fn an_empty_envelope_classifies_as_unknown_message() {
   let frame = pb::Message::default().encode_to_bytes();
   match decode_message(frame) {
-    Err(CodecError::Malformed { what }) => assert_eq!(what, "Message.body"),
-    other => panic!("expected CodecError::Malformed(\"Message.body\"), got {other:?}"),
+    Err(CodecError::UnknownMessage) => {}
+    other => panic!("expected CodecError::UnknownMessage, got {other:?}"),
+  }
+}
+
+/// A newer peer's message arrives as a single unknown length-delimited field (field 99, wire type 2)
+/// with no known `Message.body` oneof arm set — byte-identical IN KIND to a HELLO-1 node receiving a
+/// field-25 body it does not yet know. A clean, bounded parse yields an absent body, which
+/// classifies as the forward-compatible [`CodecError::UnknownMessage`] (dropped by transports), NOT
+/// `Malformed` (which would terminate a stream connection).
+#[test]
+fn an_unknown_body_envelope_classifies_as_unknown_message() {
+  // Field 99, wire type 2: tag = (99 << 3) | 2 = 794, varint [0x9A, 0x06]; length 2; payload 2 bytes.
+  let frame = Bytes::from_static(&[0x9A, 0x06, 0x02, 0xAA, 0xBB]);
+  match decode_message(frame) {
+    Err(CodecError::UnknownMessage) => {}
+    other => panic!("expected CodecError::UnknownMessage, got {other:?}"),
+  }
+}
+
+/// A frame whose leading tag names an invalid protobuf wire type (7) violates the wire grammar inside
+/// buffa (stage 1) and must surface as [`CodecError::Malformed`] — NOT the forward-compat
+/// `UnknownMessage`, which is reserved for a CLEANLY-parsed envelope that merely lacks a known body.
+/// Guards the terminate-vs-drop boundary from the corruption side.
+#[test]
+fn a_corrupt_wire_type_maps_to_malformed_not_unknown_message() {
+  // Field 1, wire type 7 (invalid): tag = (1 << 3) | 7 = 15 = 0x0F.
+  let frame = Bytes::from_static(&[0x0F]);
+  match decode_message(frame) {
+    Err(CodecError::Malformed { .. }) => {}
+    other => panic!("expected CodecError::Malformed, got {other:?}"),
   }
 }
 
@@ -936,6 +969,37 @@ fn unknown_field_flood_is_bounded() {
     decode_message(frame_with_unknown_fields(MAX_UNKNOWN_FIELDS + 1)).is_err(),
     "one more than MAX_UNKNOWN_FIELDS must be rejected"
   );
+}
+
+/// `count` copies of a minimal unknown varint field (field 1000, wire type 0) with NO valid body —
+/// the degenerate flood used to prove the anti-flood bound precedes the absent-body classification.
+fn frame_of_only_unknown_fields(count: usize) -> Bytes {
+  let mut buf = std::vec::Vec::new();
+  for _ in 0..count {
+    buf.extend_from_slice(&[0xC0, 0x3E, 0x01]);
+  }
+  Bytes::from(buf)
+}
+
+/// THE FLOOD / FORWARD-COMPAT BOUNDARY FALSIFIER: the anti-flood bound fires strictly BEFORE the
+/// absent-body classification, so an unknown-field flood can never launder itself into the
+/// conn-surviving `UnknownMessage` disposition. At the allowance, a body-less envelope decodes
+/// cleanly and — its body absent — classifies as the forward-compatible
+/// [`CodecError::UnknownMessage`] (dropped, conn survives). One field past it, buffa rejects the
+/// frame inside its own bounded decode as [`CodecError::Malformed`] — terminal on a stream conn —
+/// before the absent body is ever reached. Were this to regress to a dropped `UnknownMessage` one
+/// past the allowance, a flood would be silently absorbed instead of terminating the connection: the
+/// anti-flood guarantee, gone.
+#[test]
+fn the_flood_bound_precedes_the_absent_body_classification() {
+  match decode_message(frame_of_only_unknown_fields(MAX_UNKNOWN_FIELDS)) {
+    Err(CodecError::UnknownMessage) => {}
+    other => panic!("expected UnknownMessage at the allowance, got {other:?}"),
+  }
+  match decode_message(frame_of_only_unknown_fields(MAX_UNKNOWN_FIELDS + 1)) {
+    Err(CodecError::Malformed { .. }) => {}
+    other => panic!("expected Malformed one past the allowance, got {other:?}"),
+  }
 }
 
 /// Dropping the last byte of a valid frame must surface as [`CodecError::Truncated`], not any

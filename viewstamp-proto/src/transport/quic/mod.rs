@@ -696,7 +696,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
           }
         } else if self.bridge.is_validated(h) {
           // A validated connection: the frame is a consensus message. A frame that fails to decode
-          // is dropped (the consensus layer retransmits); keep draining the rest of the batch.
+          // is dropped (the consensus layer retransmits); keep draining the rest of the batch. That
+          // single drop now covers BOTH a forward-compatible unrecognized message (a newer peer's
+          // additive body — `CodecError::UnknownMessage`) and a genuinely malformed frame: QUIC has
+          // always been lossy on a validated conn, so unlike the stream transport it needs no
+          // skip-vs-terminate split — both simply fall out of this `if let (Some(from), Ok(msg))`.
           if let (Some(from), Ok(msg)) = (
             self.bridge.bound_peer_of(h),
             decode_message(Bytes::from(payload)),

@@ -32,12 +32,20 @@ mod messages_b;
 
 /// The unknown-field allowance for decoding a [`Message`] envelope.
 ///
-/// A well-formed envelope carries ZERO unknown fields: cross-version peers are fenced at the
-/// handshake, so a peer speaking this schema never legitimately sends one. buffa's own default
-/// allowance is 1,000,000, which would let a hostile frame packed with minimal unknown fields
-/// materialize up to that many `UnknownField` entries (tens of MiB transient) before the frame is
-/// rejected. 16 is generous forward-compat headroom over the "never happens" case while capping
-/// that allocation to a bounded, negligible amount.
+/// Cross-version peers are fenced at the handshake (`HELLO_VERSION`), so within one wire era a
+/// SAME-version peer's envelope carries ZERO unknown fields. The handshake fences STRUCTURAL and
+/// semantic wire eras, though — NOT additive growth WITHIN an era: a newer peer may add a
+/// `Message.body` oneof variant (a whole new message) that an older peer decodes cleanly but does not
+/// recognize, seeing it as one unknown field with the body oneof left unset. That envelope surfaces
+/// as [`CodecError::UnknownMessage`] and every transport DROPS it (the stream skips the frame and
+/// stays open; QUIC drops the datagram), never mistaking a newer peer for a corrupt one. This
+/// allowance is the headroom that keeps such an additive envelope decodable rather than treating its
+/// one unknown field as an attack: up to 16 unknown fields are tolerated; a frame carrying MORE — or
+/// any framing / wire-grammar / integrity fault — is [`CodecError::Malformed`] and terminates a
+/// stream conn. buffa's own default allowance is 1,000,000, which would let a hostile frame packed
+/// with minimal unknown fields materialize up to that many `UnknownField` entries (tens of MiB
+/// transient) before the frame is rejected; 16 caps that allocation to a bounded, negligible amount
+/// while leaving generous additive headroom.
 const MAX_UNKNOWN_FIELDS: usize = 16;
 
 /// Builds the wire [`pb::Message`] envelope for one domain [`Message`]: an exhaustive match over
@@ -81,14 +89,19 @@ pub(crate) fn pb_message(msg: &Message) -> pb::Message {
 
 /// Converts a decoded wire [`pb::Message`] into the domain [`Message`]: an exhaustive match over
 /// every `Message.body` oneof arm (no wildcard) routing to the matching per-variant `*_from`
-/// conversion, each of which owns its own field-level validation. Rejects via [`convert::malformed`]
-/// an envelope whose body is absent — the wire's "no known message" case, parity with the prior
-/// codec's unknown-tag reject.
+/// conversion, each of which owns its own field-level validation. An envelope whose body oneof is
+/// ABSENT after a clean, bounded parse names no message this build knows — a FORWARD-COMPATIBLE body
+/// a newer peer added, or the degenerate zero-field envelope — and surfaces as the distinct
+/// [`CodecError::UnknownMessage`] (dropped by transports), NOT [`CodecError::Malformed`]. This is the
+/// ONLY site that produces `UnknownMessage`, and it is reached only AFTER buffa's bounded decode has
+/// accepted the wire grammar, so a truncation / grammar violation / unknown-field flood can never
+/// arrive here (each is `Truncated`/`Malformed` upstream). The absent-body arm cannot narrow "no
+/// known body" to "a newer body was seen": the generated `pb::Message` retains no witness of a
+/// skipped unknown field, so a zero-field envelope classifies identically and is likewise dropped —
+/// documented and acceptable (it carries nothing, and no current peer sends it).
 fn message_from(wire: pb::Message) -> Result<Message, CodecError> {
   use pb::message::Body;
-  let body = wire
-    .body
-    .ok_or_else(|| convert::malformed("Message.body"))?;
+  let body = wire.body.ok_or(CodecError::UnknownMessage)?;
   Ok(match body {
     Body::Request(m) => Message::Request(messages_a::request_from(*m)?),
     Body::Prepare(m) => Message::Prepare(messages_a::prepare_from(*m)?),
@@ -133,6 +146,13 @@ fn message_from(wire: pb::Message) -> Result<Message, CodecError> {
 /// depth, an exceeded unknown-field allowance, ... — collapses to [`CodecError::Malformed`]). The
 /// caller-visible behavior is identical either way (reject the frame), so the finer buffa-internal
 /// distinctions aren't worth a dedicated `CodecError` variant per case.
+///
+/// This is one side of the anti-flood / forward-compat boundary: an unknown-field FLOOD (more than
+/// `MAX_UNKNOWN_FIELDS`) is a buffa-stage fault and is `Malformed` here — terminal on a stream conn —
+/// whereas an envelope that decodes WITHIN the allowance but names an unknown body is the newer-peer
+/// case classified downstream in [`message_from`] as [`CodecError::UnknownMessage`] (dropped, not
+/// terminal). The flood is bounded BEFORE that classification can be reached, so a flood can never
+/// launder itself into the drop-and-survive disposition.
 fn map_decode_err(e: buffa::DecodeError) -> CodecError {
   match e {
     buffa::DecodeError::UnexpectedEof => CodecError::Truncated {
@@ -143,6 +163,15 @@ fn map_decode_err(e: buffa::DecodeError) -> CodecError {
       // `Truncated` variant itself, not its numbers, carries the meaningful signal here.
       expected: 0,
       got: 0,
+    },
+    // The anti-flood / forward-compat boundary, made explicit rather than folded into the wildcard:
+    // an unknown-field flood past `MAX_UNKNOWN_FIELDS` fires INSIDE buffa (before a body is
+    // assembled) and is `Malformed` — terminal on a stream conn. It therefore never reaches
+    // `message_from`'s absent-body arm, so it can never be reclassified as a droppable, forward-
+    // compatible `UnknownMessage`. Same disposition as the wildcard below; called out on its own so
+    // the boundary is visible at the value level, not only in prose.
+    buffa::DecodeError::UnknownFieldLimitExceeded => CodecError::Malformed {
+      what: "wire envelope",
     },
     _ => CodecError::Malformed {
       what: "wire envelope",
@@ -165,9 +194,11 @@ pub fn encode_message(msg: &Message) -> Bytes {
 /// Decodes a [`Message`] from its protobuf wire envelope — the inverse of [`encode_message`].
 ///
 /// Unknown fields are tolerated up to a small bound and rejected past it, so a hostile flood of
-/// unknown fields cannot force an unbounded transient allocation (a well-formed envelope carries
-/// none — cross-version peers are fenced before any consensus traffic flows, so this is
-/// forward-compatibility headroom, not a feature any current peer exercises).
+/// unknown fields cannot force an unbounded transient allocation. A SAME-version peer's envelope
+/// carries no unknown field; the bounded headroom exists so that a NEWER peer's additive
+/// `Message.body` variant — which an older peer sees as one unknown field with the body oneof left
+/// unset — still decodes, then surfaces as the forward-compatible [`CodecError::UnknownMessage`] that
+/// transports drop (see `MAX_UNKNOWN_FIELDS` and the `# Errors` section below).
 ///
 /// # Zero-copy
 ///
@@ -194,10 +225,15 @@ pub fn encode_message(msg: &Message) -> Bytes {
 /// # Errors
 ///
 /// - [`CodecError::Truncated`] if `frame` ends before a complete envelope can be read.
-/// - [`CodecError::Malformed`] if `frame` violates the protobuf wire grammar, omits the
-///   envelope's body, decodes to a value the domain type cannot represent (a wrong-length
-///   id/checksum, an out-of-range count, an absent required oneof), or exceeds a bound described
-///   above.
+/// - [`CodecError::Malformed`] if `frame` violates the protobuf wire grammar (an invalid wire type,
+///   an overlong varint, an unknown-field FLOOD past the allowance), decodes to a value the domain
+///   type cannot represent (a wrong-length id/checksum, an out-of-range count, an absent required
+///   oneof), or exceeds a bound described above.
+/// - [`CodecError::UnknownMessage`] if `frame` decodes cleanly and within every bound but names no
+///   `Message.body` this build recognizes — a FORWARD-COMPATIBLE message from a newer peer, or the
+///   degenerate zero-field envelope. This is NOT a corruption signal: a transport DROPS such a frame
+///   and keeps the connection live (the stream skips it; QUIC drops the datagram), never terminating
+///   the peer for speaking a newer additive schema.
 pub fn decode_message(mut frame: Bytes) -> Result<Message, CodecError> {
   let wire = buffa::DecodeOptions::new()
     .with_max_message_size(crate::message::MAX_FRAME_LEN as usize)
