@@ -344,7 +344,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // bearing the reserved id cannot be type-erased into a `Body::Present` op on the primary while
     // every backup reconstructs the same prepare's bytes as a typed `Body::Reconfigure`
     // (`log_entry_from_prepare` → `from_committed_body` keys on this id). That would BYPASS
-    // `propose_membership`'s entire admission ladder (the AddVoter XI-b gate, the PromoteLearner
+    // `propose_membership`'s entire admission ladder (the direct-AddVoter rejection, the PromoteLearner
     // catch-up gate, the single-change gate, the predecessor-delta validation, the single-writer
     // `reconfigure_inflight` latch) and yield a primary/backup membership SPLIT or a committed-log
     // divergence (the same committed op typed differently on the primary vs. the backups). Drop it
@@ -764,6 +764,40 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     //   configuration and FORK a grand-successor — so SKIP staging; the op stays committed (commit_min
     //   advanced above) and the swap that already happened (or will, once we reach the predecessor) stands.
     if self.membership.config_id() == payload.prev_config_id() {
+      // INSTALL-TIME VOTER-ADMISSION FENCE: every voter the committed successor seats must already be
+      // a member (voter or learner) of the EXACT predecessor it chains from — `self.membership`, just
+      // proven by the pin above. A brand-new voter holds no committed prefix (it was never a member,
+      // so it never appended, let alone committed, any prior op), yet it counts toward the successor's
+      // view-change quorum, so a quorum formed without the prefix-holding retained voters could elect
+      // a leader that drops a committed op. Voters enter via AddLearner → durable catch-up →
+      // PromoteLearner (the promote-time proof), never directly.
+      //
+      // PANIC, not skip: this arm runs only for a COMMITTED op, and no compliant cluster can commit
+      // one — `propose_membership` refuses the mint, and every vote is refused at its mint:
+      // `send_prepare_ok` never acks such an op, `record_own_vote` never counts the own bit, and the
+      // solo-voter recovery reseed seeds none (the
+      // append seam additionally drops the `Prepare` before it burns a WAL slot), so it can never
+      // assemble a quorum of compliant votes. By that induction no committed state, and hence no
+      // state-sync donor checkpoint, ever contains a direct-add configuration — and the induction's
+      // base is ENFORCED, not assumed: `VsrState::decode` admits only the exact current
+      // `SUPERBLOCK_VERSION`, so recovery can only load stores this fence's code wrote (the one
+      // shape no runtime predicate can re-check — a direct-add successor an unfenced writer already
+      // INSTALLED into a durable root — never decodes), and the transport hello admits only peers
+      // speaking the exact current wire version, so every live donor/committer runs it. Reaching
+      // here therefore means in-process corruption or an embedder-fabricated store. A deterministic
+      // fail-stop surfaces that immediately and never diverges; skipping the swap instead would
+      // quietly re-interpret the op and fork against any node that installs it.
+      if let Some(added) = self
+        .membership
+        .first_new_voter(payload.replica_count(), payload.members())
+      {
+        panic!(
+          "refusing to install the committed Reconfigure op {op}: it seats {added:?} as a voter \
+           without prior membership — a brand-new voter holds no committed prefix, so admitting it \
+           directly can drop a committed op across the configuration change; add it as a learner, \
+           catch it up, then promote it"
+        );
+      }
       // Chain the successor off the (now proven-correct) predecessor membership. A committed
       // reconfiguration's payload was validated at propose AND re-validated when the wire body decoded
       // into `Body::Reconfigure`, so `reconfigure`'s structural re-check cannot fail here.
@@ -1110,7 +1144,69 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     LogEntry::from_committed_body(p.client(), p.request(), p.body_bytes())
   }
 
+  /// Whether `payload`'s successor, chained from THIS node's current configuration (the payload pins
+  /// its exact predecessor and it matches), seats a brand-new voter — the unsafe direct voter
+  /// admission the commit-time fence in [`Self::commit_reconfigure`] refuses. The shared core of
+  /// every screen: the append-seam `Prepare` drop ([`Self::is_direct_voter_add_prepare`]) and the
+  /// vote-mint refusals ([`Self::op_is_direct_voter_add`]). A payload pinned to a DIFFERENT
+  /// predecessor is deliberately NOT classified — this node cannot evaluate the diff without holding
+  /// that predecessor; if such an op ever commits, the commit-time fence at its pinned predecessor
+  /// is the authority (and the predecessor pin in `commit_reconfigure` means a mismatched op can
+  /// never stage a swap HERE either).
+  fn seats_new_voter_against_current(&self, payload: &crate::message::ReconfigurePayload) -> bool {
+    payload.prev_config_id() == self.membership.config_id()
+      && self
+        .membership
+        .first_new_voter(payload.replica_count(), payload.members())
+        .is_some()
+  }
+
+  /// Whether the entry this replica holds at `op` is a reconfiguration op seating a brand-new voter
+  /// against the CURRENT configuration ([`Self::seats_new_voter_against_current`]), read from the
+  /// TYPED log body — every lane that stores a reconfiguration op stores it typed
+  /// (`Body::Reconfigure`: the prepare append, the view-change adoption, the peer-repair fill, and
+  /// recovery's rebuild), so the vote-mint screens classify without a re-decode. `false` for an
+  /// absent entry (an op at/below the checkpoint is committed, and a committed reconfiguration
+  /// already passed — or refused — the commit-time fence) and for a header-only `Repairing` body
+  /// (no vote is ever cast off an absent body: the re-ack identity match fails, the adoption
+  /// re-append skips it, and the repair fill inserts the typed body before its completion votes).
+  pub(crate) fn op_is_direct_voter_add(&self, op: u64) -> bool {
+    self.log.get(&op).is_some_and(|e| {
+      e.body
+        .as_reconfigure()
+        .is_some_and(|payload| self.seats_new_voter_against_current(payload))
+    })
+  }
+
+  /// Whether `p` carries a reconfiguration whose successor seats a brand-new voter against THIS
+  /// node's current configuration ([`Self::seats_new_voter_against_current`]) — the append-seam form
+  /// of the screen, evaluated on the incoming `Prepare` BEFORE it reaches the log. Dropping at the
+  /// seam is ingress hygiene: the op burns no WAL slot, takes no log entry, and is never carried
+  /// into a `DoViewChange`/`StartView` from here. The vote-safety AUTHORITY is the pair of mint
+  /// screens — [`Self::send_prepare_ok`] refuses the ack and [`Self::record_own_vote`] refuses the
+  /// own bit — which cover every ack/vote lane, including an entry that reaches the log without
+  /// crossing this seam (a view-change adoption, a recovered WAL). A decode failure falls through
+  /// unscreened (the append path's shared reconstruction owns that handling).
+  fn is_direct_voter_add_prepare(&self, p: &Prepare) -> bool {
+    if p.client() != ClientId::RECONFIGURATION {
+      return false;
+    }
+    let Ok(payload) = crate::message::ReconfigurePayload::decode_body(p.body()) else {
+      return false;
+    };
+    self.seats_new_voter_against_current(&payload)
+  }
+
   fn append_prepare<W: Wal>(&mut self, wal: &mut W, p: Prepare) {
+    // Refuse a direct voter admission at the append seam: dropped exactly like the ring-window/band
+    // stalls (no WAL write, no log entry, no head advance, and — by append-before-ack — no PrepareOk),
+    // so the op cannot commit on compliant replicas. See `commit_reconfigure`'s fence for the safety
+    // argument. Screening inside the append seam covers the head-extend, the buffered-prepare drain
+    // (which removes an entry before appending it, so a dropped entry cannot re-drain), and every
+    // future caller by construction.
+    if self.is_direct_voter_add_prepare(&p) {
+      return;
+    }
     // the backup-overflow guard ([`Self::maybe_sync_below_ring_window`]) runs in
     // `on_prepare` BEFORE every head-extend append (the new-op branch + each buffered-prepare drain), so
     // an append never overwrites an un-pruned slot of the EFFECTIVE ring ([`effective_wal_capacity`] —
@@ -1150,6 +1246,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// that the Prepare is current-view (`p.view() == self.view`), so overwriting the slot is safe: the op is
   /// either committed-or-current-view-canonical, and only a stale superseded earlier-view body is replaced.
   fn reappend_canonical_prepare<W: Wal>(&mut self, wal: &mut W, p: &Prepare) {
+    // The same direct-voter-admission screen as `append_prepare`: an interior overwrite also appends
+    // and acks, so it must equally refuse to seat a brand-new voter (drop; no overwrite, no ack).
+    if self.is_direct_voter_add_prepare(p) {
+      return;
+    }
     // The interior overwrite obeys the same ring-window discipline as every other append lane
     // (`maybe_sync_below_ring_window` on the head-extends, the `adopt_append`/`fill_repair` wrap
     // guards): physically writing this slot from more than a full window above `checkpoint_op`
@@ -1205,6 +1306,21 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       "append-before-ack: PrepareOk for op {} whose WAL append is still in flight",
       op.get()
     );
+    // Never vouch for a reconfiguration op that seats a brand-new voter against this node's current
+    // configuration. This is the ack half of the vote-mint screen pair (the own-vote half is
+    // [`Self::record_own_vote`]): every `PrepareOk` is minted here — the append completion, the
+    // canonical re-ack, and the view-change adoption re-ack all funnel through — so refusing at the
+    // mint covers each lane, including an entry that reached the log WITHOUT crossing the screened
+    // prepare append (a view-change adoption, a recovered WAL). Withholding the ack starves the op
+    // of a compliant quorum, which is what keeps the commit-time fence in
+    // [`Self::commit_reconfigure`] unreachable rather than a cluster-wide fail-stop. The
+    // checkpoint-report re-ack ([`Self::report_checkpoint_to_primary`]) passes an at/below-checkpoint
+    // op whose entry is GC-pruned: the screen reads no entry and lets it through — that op is
+    // committed (the commit-time fence already ruled on it), and the report's vote is inert (its
+    // identity stamp matches no live inflight entry).
+    if self.op_is_direct_voter_add(op.get()) {
+      return;
+    }
     // Content-address the vote: stamp the OPERATION IDENTITY (client, request, body_checksum) of the op
     // THIS replica actually holds at `op`, so the primary counts it only against the operation it is
     // itself driving (a stale or different-operation ack — even a same-body one for a re-minted op

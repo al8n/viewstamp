@@ -59,13 +59,11 @@ impl Reconfig for SingleChange {}
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReconfigError {
-  /// `cur` carried no membership — a legacy (v1-3) root that predates the configuration epoch. A
-  /// pre-membership root has no `config_id` lineage to chain the successor from, so it cannot be
-  /// reconfigured offline; bring the cluster up once (which migrates it to a v4 root carrying the
+  /// `cur` carried no membership — a membership-less root that predates the configuration epoch. A
+  /// membership-less root has no `config_id` lineage to chain the successor from, so it cannot be
+  /// reconfigured offline; bring the cluster up once (which migrates it to a root carrying the
   /// genesis membership) before pre-writing a successor.
-  #[error(
-    "cannot reconfigure a legacy (pre-membership) root: it has no config_id lineage to chain"
-  )]
+  #[error("cannot reconfigure a membership-less root: it has no config_id lineage to chain")]
   NoMembership,
   /// The requested successor membership was structurally invalid (zero `replica_count`, too many
   /// voters, a member-count mismatch, or a duplicate member). Carries the underlying
@@ -117,21 +115,24 @@ pub enum ProposeMembershipError {
   /// storage at propose time, never an accumulated frontier.
   #[error("the learner-promotion proof is pending: a fresh catch-up proof was solicited — retry")]
   ProofPending,
-  /// An `AddVoter` would admit a brand-new voter — one holding NO committed prefix — into a successor
-  /// whose view-change quorum the new voter alone can satisfy, breaking the XI-b old-write-quorum /
-  /// new-view-change-quorum intersection. This is the single-voter predecessor case: from a 1-voter
-  /// cluster, `AddVoter` yields a 2-voter successor with `quorum_view_change == 1`, so the new voter —
-  /// which never held the old committed prefix — could form the E+1 view-change quorum ALONE, elect
-  /// itself leader with an empty log, and drop the old committed prefix (committed-op loss). Add the
-  /// new voter as a learner first (`AddLearner`), let it durably catch up, then `PromoteLearner` once
-  /// it holds the head — the catch-up-then-promote path that provably preserves the committed prefix.
-  /// For any predecessor of 2+ voters `AddVoter` is admitted: every successor view-change quorum then
-  /// necessarily includes a predecessor write-quorum member, so the intersection holds.
+  /// A direct `AddVoter` is not an accepted proposal, at ANY cluster size. A brand-new voter holds NO
+  /// committed prefix — it was never a member, so it never appended, let alone committed, any prior op —
+  /// yet as a voter it counts toward the successor's view-change quorum. A successor view-change quorum
+  /// formed WITHOUT the prefix-holding retained voters can then elect a leader that drops a committed op:
+  /// the old-write-quorum / new-view-change-quorum intersection fails. The extreme is the single-voter
+  /// predecessor, where `AddVoter` yields a 2-voter successor with `quorum_view_change == 1`, so the new
+  /// voter alone forms the E+1 view-change quorum and can elect itself with an empty log. Rather than
+  /// admit the larger sizes and reject only that extreme, every direct `AddVoter` is rejected uniformly.
+  /// The safe way to add a voter — at any size — is `AddLearner` the member, let it durably catch up to
+  /// the head, then `PromoteLearner`, so the promote-time challenge proves it holds the committed prefix
+  /// before it ever votes (the catch-up-then-promote path). The planner never emits `AddVoter`; it only
+  /// ever stages that learner-first path.
   #[error(
-    "AddVoter would break the cross-config quorum intersection: a new voter holds no committed \
-     prefix yet could form the successor view-change quorum alone (add as a learner, then promote)"
+    "a direct AddVoter is not supported: a brand-new voter holds no committed prefix and could break \
+     the cross-config quorum intersection — add the member as a learner (AddLearner), catch it up, \
+     then promote it (PromoteLearner)"
   )]
-  AddVoterBreaksQuorumIntersection,
+  DirectAddVoterUnsupported,
   /// A TRANSIENT op-admission fence is up — the SAME backpressure a client request hits before a new op
   /// is minted: a pending durable-view / state-sync / checkpoint write, a flagged forfeit step-down, or a
   /// committed-but-unapplied prefix (a repair hole). Minting now would advertise an op in a view this node
@@ -175,9 +176,16 @@ fn push_lineage_ring(ring: &[u128], superseded: u128) -> Vec<u128> {
 /// the committed-band headers — so a coordinated restart changes ONLY the configuration, never the
 /// replicated log.
 ///
-/// The resulting [`VsrState`] is a v4 root whose scalar `epoch` is the successor membership's epoch,
-/// whose `prev_epoch` is `cur.epoch()` (the durable backward link of the lineage), and whose
-/// membership is the successor.
+/// The ONLINE install fence (a committed `Reconfigure` op may not seat a brand-new voter — see
+/// `Membership::first_new_voter`) deliberately does NOT apply to this offline lane: here the
+/// pre-written root itself is the committed-prefix evidence. It carries `cur`'s commit frontier and
+/// committed-band headers verbatim on EVERY node — a freshly added voter included — so a restarted
+/// voter proves the committed prefix in a view change from its own durable root rather than from a
+/// replicated history, and the operator may stage an arbitrary successor.
+///
+/// The resulting [`VsrState`] is a membership-bearing root whose scalar `epoch` is the successor
+/// membership's epoch, whose `prev_epoch` is `cur.epoch()` (the durable backward link of the
+/// lineage), and whose membership is the successor.
 ///
 /// # Precondition: seal the committed frontier, then stop from a quiesced cluster
 ///
@@ -199,7 +207,7 @@ fn push_lineage_ring(ring: &[u128], superseded: u128) -> Vec<u128> {
 ///
 /// # Errors
 ///
-/// - [`ReconfigError::NoMembership`] if `cur` is a legacy (pre-membership) root — it has no
+/// - [`ReconfigError::NoMembership`] if `cur` is a membership-less root — it has no
 ///   `config_id` lineage to chain a successor from.
 /// - [`ReconfigError::Membership`] if `(replica_count, learner_count, members)` is structurally
 ///   invalid.
@@ -218,7 +226,7 @@ pub fn prepare_restart(
   // The successor's recent-prior lineage: the predecessor (`cur`'s) `config_id` shifted onto the front of
   // `cur`'s retained lineage, bounded to the same ring width — so a node restarted off this root restores
   // the post-swap lineage and still admits a retained old-epoch laggard's cross-epoch catch-up. `cur` may
-  // be a v4 root with an empty lineage (a pre-v5 root); then the ring is just the predecessor id.
+  // carry an empty lineage (no prior reconfiguration); then the ring is just the predecessor id.
   let prior_config_ids = push_lineage_ring(cur.prior_config_ids(), current.config_id());
   let state = VsrState::try_new_v4(
     cur.view(),

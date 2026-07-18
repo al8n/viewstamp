@@ -5,6 +5,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the primary's normal-path own append (`Pending::Ack`) and the view-change adoption append
   /// (`Pending::AdoptVote`) — both record the own vote ONLY once the op's WAL append is durable.
   pub(crate) fn record_own_vote(&mut self, op: u64) {
+    // Never count this replica's own bit toward a reconfiguration op that seats a brand-new voter
+    // against its current configuration — the own-vote half of the vote-mint screen pair (the ack
+    // half is [`Self::send_prepare_ok`]). Covers every own-vote lane that sets the bit here: the
+    // primary's normal-path append completion, the view-change adopted-tail re-append, and the
+    // peer-repair fill of an adopted header-only tail op. The one other own-bit site — the
+    // solo-voter recovery reseed ([`Self::resume_solo_voter_pipeline`]) — applies the same refusal,
+    // so with both screen halves in place no compliant vote for such an op exists anywhere, and even
+    // a single corrupted `PrepareOk` cannot complete a commit quorum at any cluster size — the own
+    // bit it would combine with is never set.
+    if self.op_is_direct_voter_add(op) {
+      return;
+    }
     let own = 1u64 << self.local_slot().get();
     // The primary's own vote is for the operation IT is driving at `op`, which is exactly the operation
     // whose identity seeded this inflight entry (the `on_request` mint, the view-change adopt loop, or —

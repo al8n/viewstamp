@@ -471,6 +471,25 @@ fn classify_hello_incomplete_and_rejected_edge_cases() {
     classify_hello(&buf19, CLUSTER),
     HelloOutcome::Rejected
   ));
+  // A COMPLETE, otherwise-well-formed hello whose version byte is any other numbering is a terminal
+  // reject — the concrete superseded values are pinned (not just the symbolic wrapping_add above),
+  // so a peer from any differently-versioned wire contract can never assemble a connection.
+  for wrong in [0u8, 2, 3] {
+    assert_ne!(
+      wrong, HELLO_VERSION,
+      "the refused set must not contain the current version"
+    );
+    let mut full = Vec::new();
+    full.push(HELLO_TAG);
+    full.push(wrong);
+    full.extend_from_slice(&CLUSTER.to_be_bytes());
+    full.push(PEER_REPLICA);
+    full.extend_from_slice(&0u128.to_be_bytes());
+    assert!(
+      matches!(classify_hello(&full, CLUSTER), HelloOutcome::Rejected),
+      "a complete hello carrying wire version {wrong} is refused"
+    );
+  }
 }
 
 #[test]

@@ -2,6 +2,37 @@
 //! grow-before-shrink sequence of proven Tier B `SingleVoterDelta` steps. PURE — no I/O, no `self`, no
 //! consensus state; it constructs no op, touches no durable state, sends no wire message. Per-step
 //! safety is inherited from Tier B unchanged.
+//!
+//! # Growing the voting set, and bootstrapping a new member
+//!
+//! A learner is a NON-VOTING member occupying a slot in `[replica_count, node_count)`. It receives the
+//! replicated log like any backup and catches up (by ordinary replication, or by state-sync when it is
+//! far behind), but it casts no counted vote and is never an active view-change participant. A learner
+//! becomes a voter only through `PromoteLearner`, which the primary admits only after a PROMOTE-TIME
+//! CHALLENGE: a fresh durable-prefix proof, re-grounded in the learner's storage at propose time, showing
+//! it durably holds the committed head. So the planner grows the voting set ONLY as
+//! `AddLearner` → catch up → `PromoteLearner`, and NEVER emits a direct `AddVoter`.
+//!
+//! A DIRECT voter addition is rejected (`propose_membership` refuses `AddVoter` at every cluster size): a
+//! brand-new voter holds no committed prefix — it was never a member and never committed a prior op — so
+//! it would count toward the successor's view-change quorum without having caught up, which can drop a
+//! committed op. Stage the member as a learner, let it catch up, then promote it.
+//!
+//! A new member's endpoint requires its slot to ALREADY be in the membership at construction (the genesis
+//! constructor asserts the local member occupies a slot). That constrains how a new physical process
+//! bootstraps:
+//!
+//! - A learner present in the GENESIS membership bootstraps cleanly from an EMPTY process: it constructs
+//!   at genesis (its slot is in the genesis membership), catches up to the committed frontier over the
+//!   mesh, and is promoted once it durably holds the head. No prior durable state is needed — a freshly
+//!   formatted store carrying only the genesis root suffices.
+//! - A learner ADDED to a RUNNING cluster (via a committed `AddLearner`) currently has NO in-repo join
+//!   protocol. The added slot exists in the cluster's live membership, but the new physical process cannot
+//!   construct its endpoint until it already holds that membership and its `config_id` / epoch lineage.
+//!   Until a join protocol exists, the operator must supply the new process with the current membership +
+//!   lineage OUT OF BAND before it starts. A full authenticated join protocol — a non-participating
+//!   Joining mode that admits a new process from a signed join ticket, then transitions it to a learner —
+//!   is a planned follow-up.
 
 use std::{collections::BTreeSet, vec::Vec};
 

@@ -7213,11 +7213,11 @@ fn recover_op_stays_at_the_verified_frontier_not_the_raw_head() {
 
 #[test]
 fn recover_restores_the_persisted_log_floor_capped_at_the_recovered_head() {
-  // A v7 root persists the writer's adoption-learned carried-log floor. Recovery RESTORES it (the
-  // pre-v7 behaviour restarted the floor at the own checkpoint and re-learned it from the next
-  // carrier — the un-synced crash window where the restarted node's own carrier could over-span),
-  // capped at the recovered head: a floor above what the WAL actually retained has nothing left to
-  // bound below it, and the cap keeps the `op >= log_floor` invariant.
+  // The root persists the writer's adoption-learned carried-log floor. Recovery RESTORES it
+  // (without the durable floor, recovery would restart it at the own checkpoint and re-learn it
+  // from the next carrier — the un-synced crash window where the restarted node's own carrier could
+  // over-span), capped at the recovered head: a floor above what the WAL actually retained has
+  // nothing left to bound below it, and the cap keeps the `op >= log_floor` invariant.
   let mk_header = |op: u64| {
     Header::new(
       OpNumber::with(op),
@@ -7269,7 +7269,7 @@ fn recover_restores_the_persisted_log_floor_capped_at_the_recovered_head() {
   // op 2 was never held (a SPARSE band: the floor came from an adoption's cluster evidence, not a
   // local hold) and the WAL retained only op 1 → the recovered head is 1 (scan 1, canonical band
   // top 1) and the floor caps there (`op >= log_floor` holds; the force-sync escalation re-learns
-  // the cluster floor upward, exactly as pre-v7).
+  // the cluster floor upward, exactly as with no durable floor at all).
   let sparse = VsrState::try_new(
     View::new(),
     View::new(),
@@ -7597,15 +7597,15 @@ fn recover_refuses_a_changed_wal_capacity() {
 
 #[test]
 fn recover_refuses_a_non_virgin_root_with_unrecorded_geometry() {
-  // FAIL-CLOSED on a pre-v8 / legacy root: a NON-virgin durable root that records NO WAL geometry
-  // (both halves zero — a v1-3/v7 root predating the geometry pair) is REFUSED before any storage I/O.
+  // FAIL-CLOSED on an un-stamped root: a NON-virgin durable root that records NO WAL geometry
+  // (both halves zero — `with_wal_geometry` never called) is REFUSED before any storage I/O.
   // Recovery never scans a store on trust when the geometry its scan window is derived from was never
   // pinned (a drift could silently move the window off a committed tail); such a store is migrated
-  // offline to a current-version root recording its verified geometry. This is the belt to the
+  // offline to a root recording its verified geometry. This is the belt to the
   // construction-time suspenders (every live endpoint stamps a nonzero pair): the fence still refuses a
-  // residual/legacy unstamped root rather than blessing the live geometry as if it were the writer's.
+  // residual unstamped root rather than blessing the live geometry as if it were the writer's.
   let mut wal = ScriptedWal::with_entries(0); // reports u64::MAX (ring-less), well above the floor
-  let legacy = VsrState::try_new(
+  let unstamped = VsrState::try_new(
     View::with(1),
     View::with(1),
     OpNumber::new(),
@@ -7613,19 +7613,19 @@ fn recover_refuses_a_non_virgin_root_with_unrecorded_geometry() {
     0,
     std::vec::Vec::new(),
   )
-  .unwrap(); // a ran legacy root: `with_wal_geometry` never called → the (0, 0) sentinel pair
+  .unwrap(); // a ran, never-stamped root: `with_wal_geometry` never called → the (0, 0) sentinel pair
   assert_ne!(
-    legacy,
+    unstamped,
     VsrState::new(),
     "precondition: non-virgin (a ran store) — a virgin store would skip the fence"
   );
   assert_eq!(
-    (legacy.checkpoint_ops(), legacy.wal_capacity()),
+    (unstamped.checkpoint_ops(), unstamped.wal_capacity()),
     (0, 0),
-    "precondition: the legacy root records no geometry"
+    "precondition: the un-stamped root records no geometry"
   );
   let mut sb = TestSb {
-    state: legacy,
+    state: unstamped,
     ..Default::default()
   };
   let mut blocks = crate::block_store::MemBlockStore::new();

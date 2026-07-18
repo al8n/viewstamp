@@ -464,3 +464,51 @@ fn apply_delta_changes_voter_count_by_at_most_one() {
     );
   }
 }
+
+#[test]
+fn first_new_voter_admits_every_legitimate_delta_and_names_a_direct_add() {
+  // The voter-admission predicate quantifies over the SUCCESSOR's voter prefix against the
+  // predecessor's member set: every legitimate single-voter delta yields a successor whose voters
+  // were all already members (a retained voter, or a promoted learner), so only a successor seating
+  // a brand-new voter trips it — and it names that member.
+  let pred = base_3v_1l();
+
+  let legitimate = std::vec![
+    SingleVoterDelta::AddLearner(MemberId::new(11)),
+    SingleVoterDelta::PromoteLearner(MemberId::new(10)),
+    SingleVoterDelta::RemoveVoter(MemberId::new(2)),
+    SingleVoterDelta::RemoveLearner(MemberId::new(10)),
+  ];
+  for d in &legitimate {
+    let succ = pred.apply_delta(d).unwrap();
+    assert_eq!(
+      pred.first_new_voter(succ.replica_count(), succ.members_slice()),
+      None,
+      "the {} successor seats no brand-new voter",
+      d.as_str(),
+    );
+  }
+
+  // A direct AddVoter seats a never-a-member id as a voter: the predicate names it.
+  let direct = pred
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(7)))
+    .unwrap();
+  assert_eq!(
+    pred.first_new_voter(direct.replica_count(), direct.members_slice()),
+    Some(MemberId::new(7)),
+    "the direct-add successor names the unadmitted voter",
+  );
+
+  // Not delta-shaped: a wholesale voter list smuggling an unknown id classifies too (conservatively),
+  // and the LEARNER suffix is exempt — an unknown id seated as a learner is not a voter admission.
+  assert_eq!(
+    pred.first_new_voter(2, &[MemberId::new(1), MemberId::new(9), MemberId::new(12)]),
+    Some(MemberId::new(9)),
+    "an arbitrary successor shape still names the first unadmitted voter",
+  );
+  assert_eq!(
+    pred.first_new_voter(2, &[MemberId::new(1), MemberId::new(2), MemberId::new(12)]),
+    None,
+    "an unknown id in the learner suffix is not a voter admission",
+  );
+}

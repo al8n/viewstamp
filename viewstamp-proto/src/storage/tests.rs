@@ -450,14 +450,14 @@ fn vsr_state_round_trips_empty_and_populated() {
 
 #[test]
 fn vsr_state_golden_bytes_pin_the_layout() {
-  // The v8 layout: the byte-identical v1-3 body (version|view|log_view|commit|checkpoint_op|
-  // checkpoint_id|header-count|headers), then the v4 epoch/membership tail (epoch|prev_epoch|present,
-  // then the membership block when present), then the v5 lineage tail (prior_config_count|ids), then the
-  // v6 `config_install_op` scalar (u64), then the v7 `log_floor` scalar (u64), then the v8 WAL-geometry
-  // pair (`checkpoint_ops`|`wal_capacity`, a u64 each). The epoch-1 membership
-  // matches the root's epoch-1 scalar; the lineage carries two superseded ids; `config_install_op = 7`
-  // is the reconfigure op; `log_floor` defaults to the checkpoint (5) — the constructor's floor; the
-  // geometry pair is stamped (interval 32, capacity 4096).
+  // The single current layout: version|view|log_view|commit|checkpoint_op|checkpoint_id|
+  // header-count|headers, the epoch pair (epoch|prev_epoch), the membership present-flag then the
+  // membership block, the lineage (prior_config_count|ids), the `config_install_op` scalar (u64),
+  // the `log_floor` scalar (u64), and the WAL-geometry pair (`checkpoint_ops`|`wal_capacity`, a u64
+  // each). The epoch-1 membership matches the root's epoch-1 scalar; the lineage carries two
+  // superseded ids; `config_install_op = 7` is the reconfigure op; `log_floor` defaults to the
+  // checkpoint (5) — the constructor's floor; the geometry pair is stamped (interval 32, capacity
+  // 4096).
   let h = mk_header(7, 3, 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10, 9, b"body");
   let mem = Membership::genesis(
     2,
@@ -487,7 +487,7 @@ fn vsr_state_golden_bytes_pin_the_layout() {
   .unwrap()
   .with_wal_geometry(32, 4096);
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 8, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
+    0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
     0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 187, 204, 221, 0, 0, 0, 1, 231, 44, 98, 75, 124,
     48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -508,21 +508,6 @@ fn vsr_state_golden_bytes_pin_the_layout() {
     st,
     "the pinned golden root round-trips through decode"
   );
-}
-
-/// The exact bytes of a version-3 (pre-membership) durable root — the layout `VsrState::encode`
-/// wrote BEFORE the epoch/membership tail existed. Pinned verbatim so the legacy-migration path
-/// (`decode` of a v1-3 root) keeps a real on-disk witness, independent of the live v4 encoder.
-fn legacy_v3_golden_bytes() -> std::vec::Vec<u8> {
-  std::vec![
-    0, 3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
-    0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 187, 204, 221, 0, 0, 0, 1, 231, 44, 98, 75, 124,
-    48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 9, 105, 137, 79, 111, 118, 117, 114, 119, 184, 6, 233, 126, 145, 224, 157, 189, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  ]
 }
 
 #[test]
@@ -603,50 +588,18 @@ fn try_new_v4_rejects_a_membership_epoch_that_disagrees_with_the_root_epoch() {
 }
 
 #[test]
-fn vsr_state_decodes_legacy_v3_as_epoch_zero_without_membership() {
-  // A v3 root (no epoch/membership) must decode into a value whose epoch is 0
-  // and whose membership is ABSENT (filled by recover from Config).
-  let legacy = legacy_v3_golden_bytes();
-  let back = VsrState::decode(&legacy).unwrap();
-  assert_eq!(back.epoch(), Epoch::new(0));
-  assert_eq!(back.prev_epoch(), Epoch::new(0));
-  assert!(
-    back.membership_opt().is_none(),
-    "legacy root carries no membership"
-  );
-}
-
-#[test]
-fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
-  // A version names a disk LAYOUT, and decode dispatches per layout. Versions 1..=3 are ONE
-  // pre-membership layout (the pre-decoupling message/disk coupling stamped that single body with 1,
-  // 2, AND 3), so a root carrying ANY of them decodes to the SAME legacy-bridged state (epoch 0, no
-  // membership) and none is stranded. Version 4 is a SECOND layout (body + epoch/membership tail),
-  // version 5 a THIRD (that plus the lineage tail), and version 6 (= SUPERBLOCK_VERSION) a FOURTH (that
-  // plus the `config_install_op` scalar). Together with the root carrying its OWN version, independent of
-  // the message wire format, this keeps the decoupling correct-by-construction — a message-format-only
-  // change can never invalidate a persisted root.
-  //
-  // The pre-membership 1..=3 layout: a true v3 body (NOT a relabelled v4/v5/v6 root, whose appended tails
-  // would become trailing bytes under the legacy path) decodes identically under every legacy tag.
-  let legacy_v3 = legacy_v3_golden_bytes();
-  let bridged = VsrState::decode(&legacy_v3).unwrap();
-  assert_eq!(bridged.epoch(), Epoch::new(0));
-  assert!(bridged.membership_opt().is_none());
-  for v in 1u16..=3 {
-    let mut tagged = legacy_v3.clone();
-    tagged[0..2].copy_from_slice(&v.to_be_bytes());
-    assert_eq!(
-      VsrState::decode(&tagged).unwrap(),
-      bridged,
-      "a pre-membership root tagged with legacy version {v} decodes to the same bridged state"
-    );
-  }
-  // The v8 layout: a NEW root is written with SUPERBLOCK_VERSION (= 8) and round-trips under it. The
-  // floor is RAISED above the checkpoint (an adoption-learned cluster floor) and the WAL-geometry
-  // pair is STAMPED, so both trailing tails' round-trips are non-vacuous, not constructor defaults.
+fn vsr_state_decode_accepts_exactly_the_current_version() {
+  // Decode is an EXACT-MATCH gate on the leading version word — the durable-format fence. A fresh
+  // root round-trips under the current [`SUPERBLOCK_VERSION`]; the SAME bytes re-tagged with ANY
+  // other version word are refused as `UnknownVersion` without being parsed. The refusal is what
+  // keeps a store written under a different contract (a different layout OR a weaker
+  // writer-enforced invariant set — superseded numberings included) from ever being recovered,
+  // served through state-sync, or seeding an offline restart: the fence holds even for a buffer
+  // that is byte-valid in every other respect. The floor is RAISED above the checkpoint and the
+  // WAL-geometry pair is STAMPED, so both trailing tails' round-trips are non-vacuous, not
+  // constructor defaults.
   let mem = Membership::genesis(3, 0, (1..=3).map(MemberId::new).collect()).unwrap();
-  let v8 = VsrState::try_new_v4(
+  let root = VsrState::try_new_v4(
     View::with(2),
     View::with(1),
     OpNumber::with(5),
@@ -663,105 +616,76 @@ fn vsr_state_decode_accepts_the_whole_layout_compatible_version_range() {
   .with_log_floor(OpNumber::with(5))
   .unwrap()
   .with_wal_geometry(16, 128);
-  let v8_bytes = v8.encode();
+  let bytes = root.encode();
+  // The writer stamps the current version — pinned symbolically AND concretely, so a version change
+  // is a deliberate, visible diff here.
   assert_eq!(
-    &v8_bytes[0..2],
+    &bytes[0..2],
     &SUPERBLOCK_VERSION.to_be_bytes(),
     "a new durable root leads with SUPERBLOCK_VERSION"
   );
-  assert_eq!(SUPERBLOCK_VERSION, 8, "the accepted decode range is 1..=8");
+  assert_eq!(SUPERBLOCK_VERSION, 1, "the accepted version is exactly 1");
   assert_eq!(
-    VsrState::decode(&v8_bytes).unwrap(),
-    v8,
-    "the v8 root round-trips (log_floor + WAL geometry included)"
+    VsrState::decode(&bytes).unwrap(),
+    root,
+    "the current-version root round-trips (log_floor + WAL geometry included)"
   );
-  // A v7 root (the log_floor tail but NO geometry pair) still decodes — built by truncating the v8
-  // geometry pair (two trailing `u64`s) and re-tagging as v7. It decodes with the pair DEFAULTED to
-  // `(0, 0)` (= not recorded, exempt from the recovery geometry check) — so no persisted v7 root is
-  // stranded by the bump.
-  let mut v7_bytes = v8_bytes.to_vec();
-  v7_bytes.truncate(v7_bytes.len() - 8 - 8); // drop the geometry pair
-  v7_bytes[0..2].copy_from_slice(&7u16.to_be_bytes());
-  let v7_decoded = VsrState::decode(&v7_bytes).expect("a v7 root still decodes");
-  assert_eq!(
-    (v7_decoded.checkpoint_ops(), v7_decoded.wal_capacity()),
-    (0, 0),
-    "a v7 root defaults the WAL-geometry pair to not-recorded"
-  );
-  assert_eq!(
-    v7_decoded.log_floor(),
-    OpNumber::with(5),
-    "a v7 root keeps its log_floor"
-  );
-  // A v6 root (the config_install_op tail but NO log_floor tail) still decodes — built by truncating
-  // the geometry pair + the `log_floor` scalar and re-tagging as v6. It decodes with `log_floor`
-  // DEFAULTED to its `checkpoint_op` (the pre-v7 restart-at-checkpoint behaviour) — so no persisted v6
-  // root is stranded by the bump.
-  let mut v6_bytes = v8_bytes.to_vec();
-  v6_bytes.truncate(v6_bytes.len() - 8 - 8 - 8); // drop the geometry pair + the log_floor scalar
-  v6_bytes[0..2].copy_from_slice(&6u16.to_be_bytes());
-  let v6_decoded = VsrState::decode(&v6_bytes).expect("a v6 root still decodes");
-  assert_eq!(
-    v6_decoded.log_floor(),
-    OpNumber::with(4),
-    "a v6 root defaults log_floor to its checkpoint_op"
-  );
-  assert_eq!(
-    v6_decoded.config_install_op(),
-    OpNumber::with(3),
-    "a v6 root keeps its config_install_op"
-  );
-  // A v5 root (the lineage tail but NO config_install_op NOR log_floor tail) still decodes — built by
-  // truncating the geometry pair + both trailing scalars and re-tagging as v5. It decodes with
-  // `config_install_op` (and `log_floor`) DEFAULTED to its `checkpoint_op` (the pre-v6 serve
-  // behaviour) — so no persisted v5 root is stranded by the bump.
-  let mut v5_bytes = v8_bytes.to_vec();
-  v5_bytes.truncate(v5_bytes.len() - 8 - 8 - 8 - 8); // drop geometry + log_floor + config_install_op
-  v5_bytes[0..2].copy_from_slice(&5u16.to_be_bytes());
-  let v5_decoded = VsrState::decode(&v5_bytes).expect("a v5 root still decodes");
-  assert_eq!(
-    v5_decoded.config_install_op(),
-    OpNumber::with(4),
-    "a v5 root defaults config_install_op to its checkpoint_op"
-  );
-  assert_eq!(
-    v5_decoded.prior_config_ids(),
-    &[0x9999u128],
-    "a v5 root keeps its lineage"
-  );
-  // A v4 root (the membership tail but NO lineage NOR either trailing scalar) still decodes — built by
-  // dropping the two scalars (u64 each) and the lineage block (a count-1 block: its trailing
-  // `u32` count + one `u128`) and re-tagging as v4. It decodes with an EMPTY lineage and defaulted
-  // scalars (recover seeds the lineage from the current id, the pre-v5 behaviour) — so no
-  // persisted v4 root is stranded by the bump.
-  let mut v4_bytes = v8_bytes.to_vec();
-  // Drop the geometry pair, both scalars, and the lineage block.
-  v4_bytes.truncate(v4_bytes.len() - 8 - 8 - 8 - 8 - (4 + 16));
-  v4_bytes[0..2].copy_from_slice(&4u16.to_be_bytes());
-  let v4_decoded = VsrState::decode(&v4_bytes).expect("a v4 root still decodes");
-  assert!(
-    v4_decoded.prior_config_ids().is_empty(),
-    "a v4 root carries no durable lineage (recover seeds from the current id)"
-  );
-  assert_eq!(
-    v4_decoded.config_install_op(),
-    OpNumber::with(4),
-    "a v4 root defaults config_install_op to its checkpoint_op"
-  );
-  assert_eq!(v4_decoded.epoch(), Epoch::new(0));
-  assert_eq!(
-    v4_decoded.membership_opt().map(|m| m.replica_count()),
-    Some(3)
-  );
-  // Versions OUTSIDE the accepted range fail CLEAN (never misparse): 0 and one past the high end.
-  for bad in [0u16, SUPERBLOCK_VERSION + 1] {
-    let mut wrong = v8_bytes.to_vec();
-    wrong[0..2].copy_from_slice(&bad.to_be_bytes());
+  // Every other version word in the byte range is refused UNPARSED — 0, and 2..=255, which covers
+  // every number a superseded layout generation ever stamped.
+  for v in (0u16..=255).filter(|&v| v != SUPERBLOCK_VERSION) {
+    let mut tagged = bytes.to_vec();
+    tagged[0..2].copy_from_slice(&v.to_be_bytes());
     assert!(
-      matches!(VsrState::decode(&wrong), Err(CodecError::UnknownVersion(v)) if v == bad),
-      "version {bad} is outside the accepted range and is rejected as unknown"
+      matches!(VsrState::decode(&tagged), Err(CodecError::UnknownVersion(got)) if got == v),
+      "version word {v} is refused as unknown"
     );
   }
+  // The high-water superseded number is pinned by name, so this refusal is a visible witness on its
+  // own — a store written by the last differently-numbered generation can never decode.
+  let mut high_water = bytes.to_vec();
+  high_water[0..2].copy_from_slice(&8u16.to_be_bytes());
+  assert!(
+    matches!(
+      VsrState::decode(&high_water),
+      Err(CodecError::UnknownVersion(8))
+    ),
+    "the superseded high-water version 8 is refused"
+  );
+  // Beyond-byte words are refused identically (the version is a full u16).
+  for v in [256u16, 0x0800, u16::MAX] {
+    let mut tagged = bytes.to_vec();
+    tagged[0..2].copy_from_slice(&v.to_be_bytes());
+    assert!(
+      matches!(VsrState::decode(&tagged), Err(CodecError::UnknownVersion(got)) if got == v),
+      "version word {v} is refused as unknown"
+    );
+  }
+}
+
+#[test]
+fn an_ancient_pre_membership_layout_fails_structurally_under_the_current_version() {
+  // The current version word `1` was also the FIRST numbering an ancient pre-membership layout
+  // ever stamped (a body ending right after the committed-band header set — no epoch, membership,
+  // lineage, scalar, or geometry tail). The exact-match gate alone cannot distinguish that one
+  // colliding number, so this pins the second layer: parsed as the CURRENT layout, such a root
+  // runs out of bytes at the mandatory epoch read and is refused `Truncated` — it can never
+  // misparse into a live state, so no store of that era decodes even though its leading word
+  // matches.
+  let mut ancient = std::vec::Vec::new();
+  ancient.extend_from_slice(&SUPERBLOCK_VERSION.to_be_bytes()); // the colliding version word
+  ancient.extend_from_slice(&4u64.to_be_bytes()); // view
+  ancient.extend_from_slice(&2u64.to_be_bytes()); // log_view
+  ancient.extend_from_slice(&7u64.to_be_bytes()); // commit
+  ancient.extend_from_slice(&5u64.to_be_bytes()); // checkpoint_op
+  ancient.extend_from_slice(&0xAABB_CCDDu128.to_be_bytes()); // checkpoint_id
+  ancient.extend_from_slice(&0u32.to_be_bytes()); // header count — the ancient layout ENDS here
+  assert!(
+    matches!(
+      VsrState::decode(&ancient),
+      Err(CodecError::Truncated { .. })
+    ),
+    "an ancient-layout body under the current version word is refused at the epoch read"
+  );
 }
 
 #[test]
@@ -775,8 +699,8 @@ fn vsr_state_decode_rejects_corruption_without_panicking() {
     std::vec![mk_header(6, 1, 1, 6, b"z")],
   )
   .unwrap();
-  // `st` is built via `try_new`, so it encodes as a v8 root whose membership-present flag is 0 (a
-  // legacy-bridged shape): version(2) | body | header-count | header | epoch(8) | prev_epoch(8) |
+  // `st` is built via `try_new`, so it encodes as a current-version root whose membership-present
+  // flag is 0 (the membership-less shape): version(2) | body | header-count | header | epoch(8) | prev_epoch(8) |
   // present(1) | lineage_count(4) (= 0, no ids) | config_install_op(8) | log_floor(8) |
   // checkpoint_ops(8) | wal_capacity(8). The corruption probes target that exact layout.
   let good = st.encode();
@@ -796,7 +720,7 @@ fn vsr_state_decode_rejects_corruption_without_panicking() {
     VsrState::decode(&good[..good.len() - 1]),
     Err(CodecError::Truncated { .. })
   ));
-  // Dropping the whole trailing geometry pair (16 bytes) ALSO truncates — a v8 root MUST carry
+  // Dropping the whole trailing geometry pair (16 bytes) ALSO truncates — the current layout MUST carry
   // it (the read runs off the end after the log_floor scalar).
   assert!(matches!(
     VsrState::decode(&good[..good.len() - 16]),
@@ -846,7 +770,7 @@ fn vsr_state_decode_rejects_corruption_without_panicking() {
   ));
   // A structurally-valid buffer whose decoded fields break the invariants (log_view > view) is
   // rejected as InvalidVsrState rather than constructing an illegal root. Build it by hand as a
-  // complete v8 root: an empty-header body with log_view = 5 > view = 4, the epoch tail, the
+  // complete current-version root: an empty-header body with log_view = 5 > view = 4, the epoch tail, the
   // empty-lineage tail, the two trailing scalars, and the geometry pair.
   let mut bad = std::vec::Vec::new();
   bad.extend_from_slice(&SUPERBLOCK_VERSION.to_be_bytes());
@@ -924,7 +848,7 @@ fn vsr_state_with_log_floor_validates_against_the_checkpoint() {
   );
   // A floor below the checkpoint contradicts "the own checkpoint vouches its own prefix": rejected,
   // and a hand-corrupted v7 scalar is rejected at decode through the same validation. The floor
-  // scalar sits just above the trailing v8 geometry pair (16 bytes).
+  // scalar sits just above the trailing geometry pair (16 bytes).
   assert!(matches!(
     st.with_log_floor(OpNumber::with(3)),
     Err(VsrStateError::LogFloorBelowCheckpoint)

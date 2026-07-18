@@ -669,6 +669,190 @@ async fn stream_cluster_survives_slot_shift() {
   }
 }
 
+/// EMPTY-PROCESS LEARNER BOOTSTRAP: a genesis learner boots from a GENUINELY EMPTY process (a freshly
+/// formatted store carrying only the genesis root — no prior log), catches up to the committed frontier
+/// over the mesh, and is then promoted to a voter. This is the end-to-end validation of the
+/// genesis-learner bootstrap: the learner is handed NO log; it reaches the frontier by replication.
+///
+/// Genesis is voter 0 (slot 0, the view-0 primary) + learner 1 (slot 1, non-voting). BOTH run as
+/// SEPARATE driver processes over real TCP. The voter commits three client ops (self-committing at
+/// quorum 1); the empty learner receives them over the mesh and applies them (its `Committed` events
+/// reach the third op's post-apply count — the committed frontier). The primary then promotes the
+/// learner (the planner lowers the target to `PromoteLearner`, admitted only because the learner's fresh
+/// durable-prefix proof covers the head), and a post-promotion client op — now needing a two-voter
+/// quorum — commits ONLY with the ex-learner's vote, proving it is an active, caught-up voter.
+#[compio::test]
+async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
+  use std::{collections::BTreeSet, rc::Rc};
+
+  use viewstamp_proto::{Conn, Epoch, LabelOptions, Labeled, OpNumber, Passthrough, Peer};
+
+  const LEARNER_CLUSTER: u128 = 0x5353;
+
+  // Genesis: voter 0 (slot 0, view-0 primary) + learner 1 (slot 1, a non-voting member).
+  let membership = genesis(1, 1);
+
+  // Self-attesting factories: each node announces its OWN stable MemberId in the `Labeled` handshake, so
+  // a peer binds it by stable id regardless of the slot it currently occupies.
+  let mk_dialer = |me: u8| -> Rc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>>> {
+    Rc::new(move |_peer| {
+      let opts = LabelOptions::new(LEARNER_CLUSTER, Peer::Member(MemberId::new(me as u128)));
+      Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+    })
+  };
+  let mk_acceptor = |me: u8| -> Rc<dyn Fn() -> Conn<Labeled<Passthrough>>> {
+    Rc::new(move || {
+      let opts = LabelOptions::new(LEARNER_CLUSTER, Peer::Member(MemberId::new(me as u128)));
+      Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+    })
+  };
+
+  // Reserve two kernel-assigned TCP ports (fresh ephemeral ports keep repeated CI runs from colliding
+  // with the previous run's TIME_WAIT remnants).
+  let reservations: Vec<std::net::TcpListener> = (0..2)
+    .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port"))
+    .collect();
+  let addrs: Vec<SocketAddr> = reservations
+    .iter()
+    .map(|l| l.local_addr().expect("reserved listener has an address"))
+    .collect();
+  drop(reservations);
+
+  let mut handles = Vec::new();
+  for id in 0u8..2 {
+    let peers: Vec<_> = (0u8..2)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let config =
+      viewstamp_proto::Config::try_new(LEARNER_CLUSTER, MemberId::new(id as u128)).unwrap();
+    let (ready_tx, ready_rx) = flume::unbounded();
+    let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
+    let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    // FORMAT the fresh store: this writes ONLY the pinned genesis root (epoch 0, empty log). The voter
+    // and the learner start from the IDENTICAL fresh-genesis state — neither is handed a prior log.
+    viewstamp_driver::format(config, &membership, &wal, &mut sb).expect("format genesis store");
+    // EMPTY-PROCESS WITNESS (load-bearing for the learner, id 1): after formatting, the durable store
+    // holds only the genesis root and the WAL holds no ops. The learner is handed NO prior log; it must
+    // reach the voter's frontier purely by catching up over the mesh. An already-populated fixture would
+    // show a non-genesis `op_head` / commit here.
+    assert_eq!(
+      wal.op_head(),
+      OpNumber::new(),
+      "node {id} starts with an empty WAL (genesis, no ops)"
+    );
+    assert_eq!(
+      sb.state().commit(),
+      OpNumber::new(),
+      "node {id} has committed nothing at genesis"
+    );
+    assert_eq!(
+      sb.state().checkpoint_op(),
+      OpNumber::new(),
+      "node {id} holds no checkpoint at genesis"
+    );
+    assert_eq!(
+      sb.state().epoch(),
+      Epoch::new(0),
+      "node {id} boots in the genesis epoch"
+    );
+    let blocks = MemBlocks::default();
+    let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
+      config,
+      membership.clone(),
+      viewstamp_simulation::sm::LogSm::default(),
+      wal,
+      sb,
+      blocks,
+      viewstamp_proto::ClientId::new(u128::from(id) + 1),
+      0,
+      addrs[id as usize],
+      peers,
+      mk_dialer(id),
+      mk_acceptor(id),
+      ready_rx,
+    )
+    .await
+    .expect("stream driver builds");
+    compio::runtime::spawn(driver.run()).detach();
+    handles.push(handle);
+  }
+
+  // Subscribe to the LEARNER's events BEFORE any op is submitted, so none of its catch-up `Committed`
+  // events are missed.
+  let learner_events = handles[1].events();
+
+  // The voter (member 0, the view-0 primary) commits three client ops, each self-committing at quorum 1.
+  // Their replies are the post-apply counts 1, 2, 3.
+  for expected in 1..=3u64 {
+    let reply = compio::time::timeout(
+      Duration::from_secs(20),
+      handles[0].submit(Bytes::from_static(b"op")),
+    )
+    .await
+    .expect("the client op commits within 20s")
+    .expect("a client reply");
+    assert_eq!(
+      &reply[..],
+      &expected.to_be_bytes(),
+      "the voter's committed op replies the post-apply count {expected}"
+    );
+  }
+
+  // CATCH-UP: the empty learner receives the voter's committed log over the mesh and applies it. Wait for
+  // its `Committed` event carrying the post-apply count 3 — the proof it reached the committed frontier
+  // (the third client op) from an empty start, by replication rather than a handed-over log.
+  compio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match learner_events.recv_async().await {
+        Ok(Event::Committed(c)) if c.reply() == 3u64.to_be_bytes() => break,
+        Ok(_) => {}
+        Err(_) => panic!("the learner's event channel closed before it caught up"),
+      }
+    }
+  })
+  .await
+  .expect("the empty learner catches up to the committed frontier (count 3) within 20s");
+
+  // PROMOTE: the primary drives the learner's promotion to a voter (target voters {0, 1}, no learners).
+  // The planner lowers this to `PromoteLearner(1)`; the promote-time challenge admits it only because the
+  // learner durably holds the head — which it just caught up to.
+  let target = MembershipTarget::new(
+    BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
+    BTreeSet::new(),
+  );
+  let health =
+    HealthHint::new().with_known_up(BTreeSet::from([MemberId::new(0), MemberId::new(1)]));
+  compio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].reconfigure_to(target, health),
+  )
+  .await
+  .expect("the promotion converges within 20s")
+  .expect("reconfigure_to resolves Ok once the learner is promoted to a voter");
+
+  // POST-PROMOTION: the ex-learner is now a VOTER, so the cluster is two voters at quorum 2. A fresh op
+  // committed at the primary REQUIRES the promoted member's `PrepareOk` — its success proves member 1 is
+  // an active, caught-up voter (not merely installed). The reply is the post-apply count 4 (the
+  // reconfiguration op is not delivered to the state machine, so it does not advance the count).
+  let reply = compio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].submit(Bytes::from_static(b"post-promote")),
+  )
+  .await
+  .expect("the post-promotion commit lands within 20s")
+  .expect("a post-promotion reply");
+  assert_eq!(
+    &reply[..],
+    &4u64.to_be_bytes(),
+    "the two-voter-quorum commit lands only with the promoted voter's vote (count 4)"
+  );
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}
+
 /// QUIC TLS SNI SLOT-SHIFT REGRESSION: a 4-voter cluster over real mTLS QUIC removes a low-slot
 /// voter so retained members shift slots, then commits a second request THROUGH a shifted member.
 ///

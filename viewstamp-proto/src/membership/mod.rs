@@ -349,6 +349,35 @@ impl Membership {
     self.members.contains(&who)
   }
 
+  /// The first id that `successor_members` seats as a VOTER (one of its first
+  /// `successor_replica_count` slots) without being a member — voter or learner — of `self`:
+  /// `Some(id)` names the offending member, `None` means every successor voter is already admitted.
+  ///
+  /// This is the voter-admission predicate the install path evaluates against a successor's EXACT
+  /// predecessor (`self`). Every legitimate single-voter delta passes: a retained voter and a
+  /// promoted learner are members of the predecessor, and adding/removing a learner or removing a
+  /// voter seats no id as a voter that was not already a member. Only a successor that admits a
+  /// BRAND-NEW voter directly trips it — such a node holds no committed prefix, yet as a voter it
+  /// counts toward the successor's view-change quorum, so a quorum formed without the prefix-holding
+  /// retained voters could elect a leader that drops a committed op. Quantified over every successor
+  /// voter rather than classifying a delta, so a payload not derived from exactly one delta still
+  /// classifies, conservatively.
+  ///
+  /// Deliberately NOT folded into [`Self::reconfigure`]: the offline restart lane
+  /// ([`prepare_restart`](crate::prepare_restart)) legitimately derives wholesale successors there,
+  /// with a different committed-prefix argument (the pre-written root itself).
+  pub(crate) fn first_new_voter(
+    &self,
+    successor_replica_count: u8,
+    successor_members: &[MemberId],
+  ) -> Option<MemberId> {
+    successor_members
+      .iter()
+      .take(successor_replica_count as usize)
+      .copied()
+      .find(|&who| !self.contains(who))
+  }
+
   /// Applies a single-voter membership delta, returning the successor configuration (epoch bumped,
   /// `config_id` chained from `self` via [`Self::reconfigure`]) or a [`MembershipError`] if the delta
   /// is invalid for this configuration.
@@ -444,6 +473,13 @@ impl Membership {
 #[non_exhaustive]
 pub enum SingleVoterDelta {
   /// Add a brand-new [`MemberId`] as a voter.
+  ///
+  /// This is NOT an accepted `propose_membership` delta. A brand-new voter holds no committed prefix (it
+  /// was never a member, so it never committed a prior op), which can break the cross-config quorum
+  /// intersection; `propose_membership` therefore rejects a direct `AddVoter` at every cluster size, and
+  /// the planner never emits one. To add a voter, `AddLearner` the member, let it catch up, then
+  /// `PromoteLearner`. The variant is retained for the membership arithmetic ([`Membership::apply_delta`])
+  /// and the rejection tests.
   AddVoter(MemberId),
   /// Remove a voting [`MemberId`] from the configuration.
   RemoveVoter(MemberId),

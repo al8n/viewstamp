@@ -83,6 +83,55 @@ fn prepared_entry_reconfigure_round_trips() {
   assert_eq!(back, e);
 }
 
+#[test]
+fn a_reconfiguration_client_entry_with_an_untyped_present_body_is_rejected() {
+  // A RECONFIGURATION-client op is typed `Reconfigure` on the wire (or header-only
+  // `RepairingChecksum`) by construction; a `Present` state under that client id is a
+  // malformed/corrupted entry. Admitting it would seed an UNTYPED log entry that commit
+  // recognition and the voter-admission screens cannot classify — `entry_from` refuses it at the
+  // seam instead.
+  let w = pb::PreparedEntry {
+    op: 1,
+    client: Bytes::copy_from_slice(&ClientId::RECONFIGURATION.get().to_be_bytes()),
+    request: 1,
+    body_state: Some(pb::prepared_entry::BodyState::Present(Bytes::from_static(
+      b"x",
+    ))),
+    ..Default::default()
+  };
+  assert!(
+    convert::entry_from(w).is_err(),
+    "a RECONFIGURATION-client entry carried as an untyped Present body is refused"
+  );
+  // The two legitimate carriages for the same client id still convert (the positive control).
+  let typed = PreparedEntry::reconfigure(
+    OpNumber::with(1),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    ReconfigurePayload::new(
+      2,
+      0,
+      std::vec![MemberId::new(1), MemberId::new(2)].into_boxed_slice(),
+      0,
+    ),
+  );
+  assert_eq!(
+    convert::entry_from(convert::pb_entry(&typed)).expect("the typed carriage round-trips"),
+    typed
+  );
+  let header_only = PreparedEntry::repairing(
+    OpNumber::with(2),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(2),
+    7,
+  );
+  assert_eq!(
+    convert::entry_from(convert::pb_entry(&header_only))
+      .expect("the header-only carriage round-trips"),
+    header_only
+  );
+}
+
 /// A representative 3-entry log spanning all three body states (`Present`, `Repairing`,
 /// `Reconfigure`) — reused by every log-carrying round-trip test below so the three states aren't
 /// re-declared per test.

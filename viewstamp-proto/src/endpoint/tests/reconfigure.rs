@@ -53,13 +53,17 @@ fn propose_membership_on_the_primary_mints_a_reconfigure_op_and_latches_inflight
   // `apply_delta`, so its `ReconfigurePayload` is what the op must carry.
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter is a valid delta on a 3-voter cluster");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
   let expected_payload = ReconfigurePayload::from_membership(&successor, 0);
 
   let before_op = e.op();
   let op = e
-    .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+    )
     .expect("the primary mints the reconfiguration op");
 
   // The op is the head's successor and is latched as the single in-flight change.
@@ -143,12 +147,20 @@ fn a_second_proposal_while_one_is_in_flight_is_rejected_already_in_flight() {
   let now = Instant::ZERO;
 
   let op = e
-    .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+    )
     .expect("the first proposal mints an op");
 
   // A second proposal while the first is uncommitted is refused — single change at a time.
   assert_eq!(
-    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(4))),
+    e.propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(4))
+    ),
     Err(ProposeMembershipError::AlreadyInFlight),
     "only one reconfiguration is in flight at a time",
   );
@@ -214,9 +226,11 @@ fn reconfigure_ack_at(
   ))
 }
 
-/// Propose `AddVoter(3)` on a fresh 3-voter SingleChange primary and drive it to COMMIT — but stop
+/// Propose `AddLearner(3)` on a fresh 3-voter SingleChange primary and drive it to COMMIT — but stop
 /// the instant it commits, BEFORE the staged `SwapEpoch` root is made durable. Returns the endpoint,
-/// its storage, the minted op, and the successor membership / payload.
+/// its storage, the minted op, and the successor membership / payload. `AddLearner` is the accepted
+/// membership-changing delta used to exercise the reconfigure MACHINERY (mint → commit → swap → carry)
+/// independently of any voter-set change; direct `AddVoter` is refused at propose time.
 ///
 /// Commit lifecycle: propose (mint + own Prepare) → the primary's own append lands (own vote) → one
 /// backup `PrepareOk` (2-of-3 quorum) → `try_commit` recognizes the Reconfigure op and stages the
@@ -237,12 +251,16 @@ fn proposed_and_committed_swap() -> (
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter is a valid delta on a 3-voter cluster");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   let op = e
-    .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+    )
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {} // drop the broadcast Prepare
   // The primary's own WAL append lands → its own vote is recorded (1 of 3).
@@ -403,13 +421,13 @@ fn the_reconfigure_op_is_never_delivered_to_the_state_machine() {
 
 #[test]
 fn e_epoch_ops_sit_at_or_below_commit_max_after_a_swap_so_are_never_nack_candidates() {
-  // A new voter admitted by an epoch swap cannot nack-truncate a predecessor-epoch committed op. The
-  // reason is structural, not a nack-side check: committing the `Reconfigure` op N lifts `commit_max >= N`
-  // (in `commit_reconfigure`, before the SwapEpoch even stages), and the mint fence makes N the LAST op of
-  // its epoch — so every E-epoch op sits at/below `commit_max` once the swap installs. A repair-or-truncate
+  // No E+1 participant can nack-truncate a predecessor-epoch committed op after an epoch swap. The reason
+  // is structural, not a nack-side check: committing the `Reconfigure` op N lifts `commit_max >= N` (in
+  // `commit_reconfigure`, before the SwapEpoch even stages), and the mint fence makes N the LAST op of its
+  // epoch — so every E-epoch op sits at/below `commit_max` once the swap installs. A repair-or-truncate
   // candidate is STRICTLY above `commit_max`, so no E-epoch op is ever a candidate in E+1, and `on_nack`'s
-  // candidate re-check drops any nack for it regardless of the (larger) successor voter set / quorum. This
-  // pins the invariant that makes the counting-proof truncation safe across a voter-set growth.
+  // candidate re-check drops any nack for it regardless of the successor voter set / quorum. This pins the
+  // invariant that keeps the counting-proof truncation safe across any epoch swap.
   let (mut e, mut wal, mut sb, op, _successor, _payload) = proposed_and_committed_swap();
   let mut blocks = crate::block_store::MemBlockStore::new();
   e.handle_storage(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install E+1
@@ -458,12 +476,17 @@ fn on_the_durable_root_the_epoch_swaps_and_membership_changed_is_emitted() {
   );
   assert_eq!(
     e.membership, successor,
-    "the successor membership (4 voters, chained config_id) is now active"
+    "the successor membership (3 voters + 1 learner, chained config_id) is now active"
+  );
+  assert_eq!(
+    e.membership.learner_count(),
+    1,
+    "the new learner is in the set"
   );
   assert_eq!(
     e.membership.replica_count(),
-    4,
-    "the new voter is in the set"
+    3,
+    "the voting set is unchanged by an AddLearner"
   );
   assert!(
     !e.pending_swap_for_test(),
@@ -625,11 +648,11 @@ fn a_speculative_cross_epoch_reply_is_deferred_while_a_swap_epoch_root_is_in_fli
   let m2: u64 = 2; // the E+2 cluster crossing checkpoint (> the node's forced E+1 checkpoint at M1 == N1)
   let genesis_mem = genesis(3);
   let successor_e1 = genesis_mem
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
   let successor_e2 = successor_e1
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(4)))
-    .expect("a second AddVoter off the E+1 successor is valid (E+2)");
+    .apply_delta(&SingleVoterDelta::PromoteLearner(MemberId::new(3)))
+    .expect("promoting the E+1 learner off the E+1 successor is valid (E+2)");
 
   // A Normal BACKUP (slot 1) that committed its OWN reconfigure op N1 (op == commit_min == N1), checkpoint 0.
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
@@ -1258,7 +1281,11 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
 
   // A second proposal in this window is refused — the swap window keeps the single change in flight.
   assert_eq!(
-    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(4))),
+    e.propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(4))
+    ),
     Err(ProposeMembershipError::AlreadyInFlight),
     "a second reconfiguration is refused while the first's swap is committed-but-not-installed",
   );
@@ -1274,8 +1301,12 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
     crate::Epoch::new(1),
     "the first change installed (E+1)"
   );
-  // A fresh single change is now proposable. (Member 4 is a fresh voter id on the new 4-voter config.)
-  let next = e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(4)));
+  // A fresh single change is now proposable. (Member 4 is a fresh learner id on the E+1 config.)
+  let next = e.propose_membership(
+    now,
+    &mut wal,
+    SingleVoterDelta::AddLearner(MemberId::new(4)),
+  );
   assert!(
     next.is_ok(),
     "after the first swap installs, a new reconfiguration is admitted: {next:?}",
@@ -1513,7 +1544,11 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   let head_before = e.op();
 
   assert_eq!(
-    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3))),
+    e.propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(3))
+    ),
     Err(ProposeMembershipError::Busy),
     "a proposal during the durable-view window is refused retryably, not minted",
   );
@@ -1548,7 +1583,11 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
   );
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {}
-  let admitted = e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)));
+  let admitted = e.propose_membership(
+    now,
+    &mut wal,
+    SingleVoterDelta::AddLearner(MemberId::new(3)),
+  );
   assert!(
     admitted.is_ok(),
     "after the durable-view write lands and the prefix applies, the proposal is admitted: {admitted:?}",
@@ -1742,7 +1781,11 @@ fn propose_membership_at_wal_capacity_is_a_retryable_at_capacity() {
   let now = Instant::ZERO;
 
   assert_eq!(
-    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3))),
+    e.propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(3))
+    ),
     Err(ProposeMembershipError::AtCapacity),
     "a proposal that would overflow the WAL ring is refused retryably, not minted",
   );
@@ -1755,7 +1798,7 @@ fn propose_membership_at_wal_capacity_is_a_retryable_at_capacity() {
     e.propose_membership(
       now,
       &mut roomy,
-      SingleVoterDelta::AddVoter(MemberId::new(3))
+      SingleVoterDelta::AddLearner(MemberId::new(3))
     )
     .is_ok(),
     "with WAL capacity, the identical proposal is admitted",
@@ -1774,7 +1817,7 @@ fn a_backup_committing_the_same_reconfigure_installs_the_identical_successor() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = 1u64;
@@ -1974,10 +2017,15 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
 // the-Reconfigure-op for EVERY E+1 participant. T5 already enforces it by construction — a node's
 // `self.membership.epoch()` becomes E+1 ONLY via `install_membership`, run ONLY from `on_sb_done`'s
 // `SwapEpoch` arm once the durable root proves the Reconfigure op committed (the single-writer
-// invariant on `self.membership`). So every E+1 voter — retained OR newly added — durably committed
-// the Reconfigure op, hence holds the FULL E-committed prefix `<=` that op (commit-first puts the
-// whole prefix on a node before its E+1 vote can count). Any E+1 DVC-quorum member therefore holds
-// any E-committed op `o`, so `o` rides `select_canonical_log`'s union and is never nack-truncated.
+// invariant on `self.membership`). So every E+1 voter durably committed the Reconfigure op, hence
+// holds the FULL E-committed prefix `<=` that op (commit-first puts the whole prefix on a node before
+// its E+1 vote can count). A RETAINED voter committed it in place; a NEWLY-ADDED voter can only be a
+// PROMOTED LEARNER — `propose_membership` refuses a direct `AddVoter`, so the sole path into the voting
+// set is a promote whose gate demands a fresh durable-prefix proof AND whose Reconfigure op the learner
+// must itself durably commit (commit-first) to install the swap. Either way the E+1 voter holds the
+// full prefix; there is NO path by which one joins the voting set without committing the Reconfigure op.
+// Any E+1 DVC-quorum member therefore holds any E-committed op `o`, so `o` rides
+// `select_canonical_log`'s union and is never nack-truncated.
 //
 // The audit of the strict E+1 emission paths (PrepareOk, StartViewChange, DoViewChange, StartView,
 // Commit, Prepare) found NO gap, so no `may_participate_under_new_epoch` gate was added:
@@ -1995,7 +2043,10 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
 //     anything emitted is stamped E and participates correctly under E. There is no E+1 participation
 //     before the durable swap because `self.membership` is literally still the predecessor.
 // These tests pin the resulting CP property end to end: a real E-committed op survives a real E+1
-// view change for both the shrink (removed voter in the old write quorum) and the grow.
+// view change for both the shrink (`cp_overlap_3_to_2_remove_voter_in_the_old_write_quorum` — the
+// removed voter sat in the old write quorum) and the grow
+// (`cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc` — a promoted learner
+// enlarges the voting set 3→4).
 
 /// The `PrepareOk` a backup at slot `replica` reports for a plain client op `o` (client 7, request
 /// `o`, body `[o]`) — the content-addressed vote shape the commit quorum accepts.
@@ -2099,19 +2150,22 @@ fn committed_op_then_swapped(
 #[test]
 fn cp_overlap_3_to_2_remove_voter_in_the_old_write_quorum() {
   // 3→2 RemoveVoter where the old WRITE quorum INCLUDES the removed voter. This is the case the naive
-  // count bound FAILS: `quorum(3) + quorum_view_change(2) = 2 + 1 = 3`, NOT `> 3`. The old write
-  // quorum {slot 0, the removed voter (slot 2)} and an E+1 DVC quorum {slot 1} are DISJOINT — only the
-  // exact-durable-catch-up structure preserves the op: slot 1 reached E+1 by durably committing the
-  // Reconfigure op (op 2), so it holds the full prefix `<= 2`, including the client op `o == 1`.
-  //
-  // Remove the HIGHEST-slot voter (member 2, slot 2) so the retained voters keep their slots
-  // (`{member0→slot0, member1→slot1}`); the acking backup for both commits is slot 1 (a RETAINED
-  // voter that is in the E+1 DVC quorum), and the old write quorum that committed `o` is {slot 0
-  // (primary), slot 1}, with the removed voter slot 2 ALSO an old-write-quorum holder of `o`.
+  // count bound FAILS: `quorum(3) + quorum_view_change(2) = 2 + 1 = 3`, NOT `> 3`. Commit `o` with the
+  // primary (slot 0) and the voter that will be REMOVED (slot 2), so `o`'s old write quorum is
+  // {slot 0, slot 2} — the removed voter is one of the two nodes that acked `o`. The swap removes
+  // member 2 (the highest slot), so the retained voters keep their slots (`{member0→slot0,
+  // member1→slot1}`); the lone retained non-primary voter slot 1 forms a full E+1 view-change quorum
+  // (`quorum_view_change(2) == 1`) and is DISJOINT from `o`'s write quorum {slot 0, slot 2}. Only the
+  // exact-durable-catch-up structure preserves `o` here: slot 1 never acked `o`, yet it reached E+1 by
+  // durably committing the Reconfigure op (op 2), so it holds the full prefix `<= 2` — including the
+  // client op `o == 1` — and must vouch for `o` at the view change.
+  let ack_backup = 2u16; // slot 2 (the voter being removed) acks both `o` and the Reconfigure op
   let (mut e, _wal, _sb, o) =
-    committed_op_then_swapped(SingleVoterDelta::RemoveVoter(MemberId::new(2)), 1);
+    committed_op_then_swapped(SingleVoterDelta::RemoveVoter(MemberId::new(2)), ack_backup);
 
-  // The post-swap config is the 2-voter E+1 membership.
+  // The post-swap config is the 2-voter E+1 membership; the removed voter (slot 2, one of `o`'s
+  // write-quorum acks) is gone, and slot 1 (the DVC donor) is a RETAINED voter — so the E+1 view-change
+  // quorum {slot 1} is DISJOINT from `o`'s write quorum {slot 0, slot 2}.
   assert_eq!(e.membership.replica_count(), 2, "E+1 is a 2-voter config");
   assert_eq!(e.membership.epoch(), crate::Epoch::new(1), "swapped to E+1");
   assert_eq!(
@@ -2119,14 +2173,30 @@ fn cp_overlap_3_to_2_remove_voter_in_the_old_write_quorum() {
     1,
     "quorum_view_change(2) == 1 — a single DVC is a full E+1 view-change quorum",
   );
+  assert!(
+    !e.membership.is_voter(ReplicaId::new(2)),
+    "the removed voter (slot 2), one of o's write-quorum acks, is NOT in the retained E+1 membership",
+  );
+  assert!(
+    e.membership.is_voter(ReplicaId::new(1)),
+    "slot 1 (the DVC donor) is a RETAINED E+1 voter",
+  );
 
-  // The E+1 DVC quorum is the single retained voter slot 1 (the worst case: it is DISJOINT from the
-  // removed voter's old write quorum). By exact catch-up it durably committed the Reconfigure op
-  // (op 2), so its DVC carries the full prefix `[1..=2]` — including the client op `o`. (A real DVC's
-  // epoch/config_id stamping is irrelevant to `select_canonical_log`, which reads only the carried
-  // log + frontier + the LOCAL membership's quorum sizes.)
+  // The E+1 DVC quorum is the single retained voter slot 1 — the worst case: DISJOINT from `o`'s write
+  // quorum {slot 0, slot 2} (slot 1 is neither the primary nor the removed voter that acked `o`). Make
+  // that disjointness explicit against the write-quorum members {slot 0, slot ack_backup}:
+  let dvc_donor = 1u16;
+  assert_ne!(dvc_donor, 0, "the DVC donor is not the primary (slot 0)");
+  assert_ne!(
+    dvc_donor, ack_backup,
+    "the DVC donor is DISJOINT from o's write-quorum backup (slot {ack_backup}, the removed voter)",
+  );
+  // By exact catch-up slot 1 durably committed the Reconfigure op (op 2), so its DVC carries the full
+  // prefix `[1..=2]` — including the client op `o`. (A real DVC's epoch/config_id stamping is irrelevant
+  // to `select_canonical_log`, which reads only the carried log + frontier + the LOCAL membership's
+  // quorum sizes.)
   e.dvc_from_mut_for_test()
-    .insert(ReplicaId::new(1), dvc(1, 0, 2, 2));
+    .insert(ReplicaId::new(dvc_donor), dvc(dvc_donor, 0, 2, 2));
   let (log, op_head, commit_star, _) = e.select_canonical_log();
 
   // THE CP PROPERTY (a DurabilityChecker-style assertion): the committed op `o`'s identity is in the
@@ -2154,7 +2224,7 @@ fn cp_overlap_3_to_2_remove_voter_in_the_old_write_quorum() {
   hazard.membership = e.membership.clone(); // the same E+1 2-voter config (same quorum sizes)
   hazard
     .dvc_from_mut_for_test()
-    .insert(ReplicaId::new(1), dvc_offset(1, 0, 0, 0, 0)); // a survivor that holds NOTHING (head 0)
+    .insert(ReplicaId::new(dvc_donor), dvc_offset(dvc_donor, 0, 0, 0, 0)); // the survivor holds NOTHING (head 0)
   let (hazard_log, hazard_head, hazard_commit, _) = hazard.select_canonical_log();
   assert_eq!(
     hazard_commit, 0,
@@ -2171,71 +2241,280 @@ fn cp_overlap_3_to_2_remove_voter_in_the_old_write_quorum() {
   );
 }
 
-#[test]
-fn cp_overlap_3_to_4_add_voter_dvc_quorum_excludes_the_new_voter() {
-  // 3→4 AddVoter (odd→even grow). The naive bound is exactly the count
-  // `quorum(3) + quorum_view_change(4) = 2 + 2 = 4`, NOT `> 4` — so a 4-voter DVC quorum is not
-  // guaranteed by COUNTING to intersect `o`'s old write quorum across ALL of V'. Two structural cases:
-  // (a) the DVC quorum EXCLUDES the new voter d → it is `⊆ V` (the old 3 voters), and
-  //     `quorum(3) + quorum_view_change(4) = 4 > 3 = |V|`, so it intersects `o`'s old write quorum
-  //     WITHIN the retained voters → some retained DVC member holds `o`;
-  // (b) the DVC quorum INCLUDES d → d holds `o` by exact catch-up (it committed the Reconfigure op).
-  // This test pins case (a): a 2-of-4 DVC quorum of RETAINED voters {slot 0, slot 1}, excluding the
-  // new voter (slot 3). Slot 1 is in `o`'s old write quorum, so it carries `o`.
-  let (mut e, _wal, _sb, o) =
-    committed_op_then_swapped(SingleVoterDelta::AddVoter(MemberId::new(3)), 1);
-
-  assert_eq!(e.membership.replica_count(), 4, "E+1 is a 4-voter config");
-  assert_eq!(e.membership.epoch(), crate::Epoch::new(1), "swapped to E+1");
-  assert_eq!(
-    e.membership.quorum_view_change(),
-    2,
-    "quorum_view_change(4) == 2",
-  );
-
-  // A 2-of-4 E+1 DVC quorum of RETAINED voters {slot 0, slot 1}, EXCLUDING the new voter (slot 3).
-  // Both retained voters committed the Reconfigure op (op 2) to reach E+1, so each carries `[1..=2]`
-  // — including the client op `o`. Slot 0 is the primary (also an old-write-quorum holder of `o`),
-  // slot 1 was the ack backup; their old write quorum {slot 0, slot 1} held `o`.
-  e.dvc_from_mut_for_test()
-    .insert(ReplicaId::new(0), dvc(0, 0, 2, 2));
-  e.dvc_from_mut_for_test()
-    .insert(ReplicaId::new(1), dvc(1, 0, 2, 2));
-  let (log, op_head, commit_star, _) = e.select_canonical_log();
-
-  assert!(commit_star >= o, "commit* >= o, got {commit_star}");
-  assert!(op_head >= o, "op_head >= o, got {op_head}");
-  assert!(
-    log.iter().any(|entry| entry.op().get() == o),
-    "the committed op o == {o} survives the 3→4 grow view change (DVC quorum excludes the new voter)",
-  );
+/// A synthetic E=0-generation DVC from `replica` carrying the dense prefix `[1..=op]` (`commit` is the
+/// vouched commit), where the op-`o` slot carries the REAL identity the committed client op `o` was
+/// minted with — client 7, request `o`, body `[o]` (checksum `fnv1a_128([o])`) — so a survival check
+/// can assert `o`'s FULL committed identity rode `select_canonical_log`'s union, not merely that its
+/// op-number slot stayed occupied. The other ops carry generic filler content, immaterial to a
+/// selection that keys only on op numbers, floors, commits, and nacks.
+fn dvc_carrying_committed_o(
+  replica: u16,
+  log_view: u64,
+  op: u64,
+  commit: u64,
+  o: u64,
+) -> DoViewChange {
+  let log = (1..=op)
+    .map(|i| {
+      if i == o {
+        PreparedEntry::new(
+          OpNumber::with(i),
+          ClientId::new(7),
+          RequestNumber::with(i),
+          Bytes::from(std::vec![o as u8]),
+        )
+      } else {
+        PreparedEntry::new(
+          OpNumber::with(i),
+          ClientId::new(1),
+          RequestNumber::with(i),
+          Bytes::copy_from_slice(&i.to_be_bytes()),
+        )
+      }
+    })
+    .collect();
+  DoViewChange::new(
+    View::with(log_view + 10),
+    View::with(log_view),
+    OpNumber::with(op),
+    OpNumber::with(commit),
+    crate::Epoch::new(0),
+    0,
+    ReplicaId::new(replica),
+    log,
+  )
 }
 
 #[test]
-fn cp_overlap_3_to_4_add_voter_dvc_quorum_includes_the_new_voter() {
-  // Case (b) of the 3→4 grow: the E+1 DVC quorum INCLUDES the newly added voter d (slot 3). By exact
-  // catch-up d durably committed the Reconfigure op (op 2) to become a voter at all, so it holds the
-  // full prefix `<= 2`, including the client op `o == 1`. The op survives even though `o`'s old write
-  // quorum was entirely WITHIN the original 3 voters and the DVC quorum here is {slot 1, the new
-  // voter slot 3}: slot 3 (and slot 1) both carry `o`.
-  let (mut e, _wal, _sb, o) =
-    committed_op_then_swapped(SingleVoterDelta::AddVoter(MemberId::new(3)), 1);
-
-  assert_eq!(e.membership.replica_count(), 4, "E+1 is a 4-voter config");
-
-  // A 2-of-4 DVC quorum {slot 1 (retained), slot 3 (the NEW voter)}. The new voter holds `[1..=2]`
-  // by exact catch-up — the "B includes d → d holds o" case of the §overlap proof.
-  e.dvc_from_mut_for_test()
-    .insert(ReplicaId::new(1), dvc(1, 0, 2, 2));
-  e.dvc_from_mut_for_test()
-    .insert(ReplicaId::new(3), dvc(3, 0, 2, 2));
-  let (log, op_head, commit_star, _) = e.select_canonical_log();
-
-  assert!(commit_star >= o, "commit* >= o, got {commit_star}");
-  assert!(op_head >= o, "op_head >= o, got {op_head}");
+fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc() {
+  // 3→4 GROW via the LEGITIMATE promote path (direct `AddVoter` is refused at propose time). Commit a
+  // client op `o` under the OLD 3-voter E=0 quorum, promote the learner into the voting set (the
+  // fresh-proof challenge + commit-first install), then prove `o` rides an E+1 DVC quorum through
+  // `select_canonical_log`. This is the odd→even 3→4 case the naive count bound does NOT cover
+  // (`quorum(3) + quorum_view_change(4) = 2 + 2 = 4`, not `> 4`): safety rests on exact-durable-catch-up
+  // — every E+1 voter (retained OR promoted) durably committed the Reconfigure op, so it holds the full
+  // prefix `<= o`.
+  let mut e = single_change_primary_with_learner();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  let learner = MemberId::new(3);
+  assert_eq!(
+    e.membership.replica_count(),
+    3,
+    "genesis: 3 voters (slots 0-2) + learner slot 3"
+  );
   assert!(
-    log.iter().any(|entry| entry.op().get() == o),
-    "the committed op o == {o} survives when the E+1 DVC quorum includes the new voter d",
+    !e.membership.is_voter(ReplicaId::new(3)),
+    "slot 3 starts as a NON-voting learner",
+  );
+
+  // (1) Commit the client op `o == 1` under the OLD 3-voter E=0 quorum: mint + own append (own vote) +
+  // one voter ack (2-of-3). This is the pre-grow committed op the transition must preserve.
+  let o = 1u64;
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Client(ClientId::new(7)),
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(o),
+      Bytes::from(std::vec![o as u8]),
+    )),
+  );
+  while e.poll_message().is_some() {} // drop the broadcast Prepare
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable → own vote
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    client_ack(o, 1),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(o),
+    "the client op committed under the 3-voter E=0 config",
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // drain the commit-tail superblock work
+  while e.poll_message().is_some() {}
+
+  // (2) Promote the learner through the REAL gate. The first propose has no fresh proof → it emits a
+  // challenge and returns `ProofPending`; the learner answers with a frontier covering the head (`o`),
+  // so the proof validates; the retry MINTS the promote op. The challenge frontier + commit-first are
+  // exactly what make a promoted learner genuinely hold `o`.
+  assert_eq!(
+    e.propose_membership(now, &mut wal, SingleVoterDelta::PromoteLearner(learner)),
+    Err(ProposeMembershipError::ProofPending),
+    "the first propose with no fresh proof solicits one",
+  );
+  let challenge = take_proof_challenge(&mut e, 3);
+  assert_eq!(
+    challenge.at_op(),
+    OpNumber::with(o),
+    "the challenge pins the committed head `o`",
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(3)),
+    answer_proof(&challenge, 3, o), // the learner's fresh proof covers the head → it validates
+  );
+  let promote_op = e
+    .propose_membership(now, &mut wal, SingleVoterDelta::PromoteLearner(learner))
+    .expect("a caught-up learner with a fresh proof is promotable — the op mints");
+  let promote_payload = e
+    .log
+    .get(&promote_op.get())
+    .expect("the promote op is in the log")
+    .body
+    .as_reconfigure()
+    .expect("a Body::Reconfigure op")
+    .clone();
+  assert_eq!(
+    promote_payload.replica_count(),
+    4,
+    "the promote enlarges the voting set to 4",
+  );
+
+  // Commit the promote op (own vote + one voter ack, 2-of-3 under E=0) and make its `SwapEpoch` root
+  // durable → INSTALL the 4-voter E=1 config. By commit-first, every replica that votes to install it —
+  // the promoted learner included — durably holds the whole prefix `[1..=promote_op]` ⊇ `o`.
+  while e.poll_message().is_some() {} // drop the broadcast Prepare
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable → own vote
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    reconfigure_ack(promote_op.get(), &promote_payload, 1),
+  );
+  assert_eq!(
+    e.commit(),
+    promote_op,
+    "the promote op committed under the 3-voter E=0 config",
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install E=1
+  assert_eq!(
+    e.membership.replica_count(),
+    4,
+    "the promote installed a 4-voter E=1 config",
+  );
+  assert_eq!(e.membership.epoch(), crate::Epoch::new(1), "swapped to E=1");
+  assert!(
+    e.membership.is_voter(ReplicaId::new(3)),
+    "the former learner (slot 3) is now a VOTER",
+  );
+  assert!(!e.pending_swap_for_test(), "the staged swap was consumed");
+  while e.poll_event().is_some() {}
+  while e.poll_message().is_some() {}
+
+  // (3) The E+1 view change: for n=4, `quorum_view_change == 2`, so a DVC quorum is any 2 of 4. In both
+  // cases the quorum members durably committed the promote op (`op == 2`), so their DVCs carry the dense
+  // prefix `[1..=2]` ⊇ `o`. `select_canonical_log` must keep `o` in the committed band and in the log.
+
+  // The full committed identity of `o` — client 7, request `o`, body `[o]` (checksum `fnv1a_128([o])`),
+  // exactly what the commit quorum content-addressed — must ride the union INTACT, not merely leave its
+  // op-number slot occupied. Assert that identity on the surviving entry in each quorum case.
+  let o_body = [o as u8];
+  let assert_o_identity = |log: &[crate::PreparedEntry], case: &str| {
+    let entry = log
+      .iter()
+      .find(|entry| entry.op().get() == o)
+      .unwrap_or_else(|| panic!("o == {o} is absent from the canonical log ({case})"));
+    assert_eq!(
+      entry.client(),
+      ClientId::new(7),
+      "o's client id survives ({case})"
+    );
+    assert_eq!(
+      entry.request(),
+      RequestNumber::with(o),
+      "o's request number survives ({case})",
+    );
+    assert_eq!(
+      entry.body(),
+      Some(o_body.as_slice()),
+      "o's body bytes survive ({case})",
+    );
+    assert_eq!(
+      entry.body_checksum(),
+      crate::storage::fnv1a_128(&[o as u8]),
+      "o's body checksum survives ({case})",
+    );
+  };
+
+  // EXCLUDES the promoted voter: an E+1 DVC quorum of the two RETAINED voters {slot 0, slot 1}, with the
+  // promoted slot 3 absent. Each committed the promote op, so each carries `[1..=2]` with `o`'s real
+  // identity at op 1 — `o` survives even though the newly-promoted voter contributes nothing here.
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc_carrying_committed_o(0, 0, 2, 2, o));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(1), dvc_carrying_committed_o(1, 0, 2, 2, o));
+  let (log, op_head, commit_star, _) = e.select_canonical_log();
+  assert!(
+    commit_star >= o,
+    "commit* >= o: the retained-voter DVC quorum vouches o committed, got {commit_star}",
+  );
+  assert!(
+    op_head >= o,
+    "op_head >= o: o is at/below the canonical head, got {op_head}"
+  );
+  assert_o_identity(&log, "an E+1 DVC quorum that EXCLUDES the promoted voter");
+
+  // INCLUDES the promoted voter: an E+1 DVC quorum {slot 0, slot 3} that DOES contain the promoted
+  // learner. This is LEGITIMATELY backed — slot 3 answered the promote challenge with a frontier
+  // covering `o` AND, by commit-first, durably committed the promote op — so its DVC genuinely carries
+  // `[1..=2]` ⊇ `o` (unlike a brand-new voter, which the crate refuses to admit). A maximally
+  // adversarial "the promoted learner is the SOLE holder of o" case is NOT constructible here: every
+  // legitimate E+1 voter committed the promote op and by commit-first holds `o`, so none can nack `o`;
+  // the non-holding-donor hazard control below (not a fabricated illegitimate voter) is the correct
+  // non-vacuity witness. `o` survives here too, with its full identity intact.
+  e.dvc_from_mut_for_test().clear();
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc_carrying_committed_o(0, 0, 2, 2, o));
+  e.dvc_from_mut_for_test()
+    .insert(ReplicaId::new(3), dvc_carrying_committed_o(3, 0, 2, 2, o));
+  let (log, op_head, commit_star, _) = e.select_canonical_log();
+  assert!(
+    commit_star >= o && op_head >= o,
+    "the promoted learner's DVC vouches o committed (commit* {commit_star}, op_head {op_head})",
+  );
+  assert_o_identity(&log, "an E+1 DVC quorum that INCLUDES the promoted learner");
+
+  // NON-VACUITY (the hazard exact-catch-up forecloses): had an E+1 DVC quorum reached E+1 WITHOUT the
+  // reconfigure-op prefix — a lag-bound shortcut holding only the prefix BELOW `o` — its donors would
+  // carry empty/low logs and vouch a sub-`o` commit. `select_canonical_log` on THAT quorum truncates
+  // `o`: with a 2-of-4 quorum at head 0 / commit 0, `op_head` clamps to 0, so `o` is gone. This
+  // witnesses that the survival above is BECAUSE every E+1 voter durably committed the promote op (hence
+  // holds `o`), not because `select_canonical_log` always keeps `o`.
+  let mut hazard = single_change_primary();
+  hazard.membership = e.membership.clone(); // the same 4-voter E=1 config (same quorum sizes)
+  hazard
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(0), dvc_offset(0, 0, 0, 0, 0)); // a donor that holds NOTHING (head 0)
+  hazard
+    .dvc_from_mut_for_test()
+    .insert(ReplicaId::new(1), dvc_offset(1, 0, 0, 0, 0)); // the second quorum donor, also empty
+  let (hazard_log, hazard_head, hazard_commit, _) = hazard.select_canonical_log();
+  assert_eq!(
+    hazard_commit, 0,
+    "the lag-shortcut quorum vouches nothing committed"
+  );
+  assert!(
+    hazard_head < o,
+    "without the reconfigure-op prefix, o is above the canonical head"
+  );
+  assert!(
+    !hazard_log.iter().any(|entry| entry.op().get() == o),
+    "the hazard control confirms o is DROPPED when the E+1 quorum lacks the reconfigure-op prefix — \
+     so the survival above is load-bearing on exact catch-up",
   );
 }
 
@@ -3300,9 +3579,9 @@ fn an_epoch_swap_clears_an_outstanding_promote_challenge() {
 
 #[test]
 fn a_non_promote_delta_is_unaffected_by_the_catch_up_gate() {
-  // The gate is `PromoteLearner`-specific: an `AddVoter` (a brand-new voter, not a promotion) mints
-  // WITHOUT any `peer_progress` entry — there is no learner to have caught up. (The new voter's own
-  // catch-up is enforced structurally by commit-first, exactly as the CP-overlap tests pin.)
+  // The gate is `PromoteLearner`-specific: a NON-promote delta (here `AddLearner`, adding a brand-new
+  // learner) mints WITHOUT any `peer_progress` entry — the catch-up-then-promote gate never engages for
+  // it, since there is no promotion to prove a durable prefix for.
   let mut e = single_change_primary_with_learner();
   let mut wal = TestWal::default();
   assert!(e.peer_progress.is_empty(), "no progress recorded");
@@ -3310,13 +3589,13 @@ fn a_non_promote_delta_is_unaffected_by_the_catch_up_gate() {
     .propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::AddVoter(MemberId::new(4)),
+      SingleVoterDelta::AddLearner(MemberId::new(4)),
     )
-    .expect("AddVoter is unaffected by the promote gate");
-  assert_eq!(e.reconfigure_inflight, Some(op), "the AddVoter op minted");
+    .expect("a non-promote delta is unaffected by the promote gate");
+  assert_eq!(e.reconfigure_inflight, Some(op), "the AddLearner op minted");
 }
 
-// === the AddVoter XI-b admission gate (the sibling of the catch-up-then-promote gate) ===
+// === the direct AddVoter rejection (the sibling of the catch-up-then-promote gate) ===
 
 /// A 1-voter `SingleChange` endpoint whose sole member is slot 0 — the primary of view 0. The only
 /// voter is the whole write quorum AND the whole view-change quorum, so a direct `AddVoter` here would
@@ -3346,11 +3625,12 @@ fn single_change_primary_n(n: u8) -> Endpoint<CountSm, SingleChange> {
 
 #[test]
 fn add_voter_from_a_single_voter_cluster_is_rejected_breaks_quorum_intersection() {
-  // The XI-b safety gate: a DIRECT 1->2 `AddVoter` from a single-voter cluster is REFUSED. The new
-  // voter holds NO committed prefix, and the 2-voter successor's view-change quorum is 1, so the new
-  // voter could form an E+1 view-change quorum ALONE (electing itself leader with an empty log) and
-  // drop the old committed prefix — committed-op loss. (Contrast `PromoteLearner`, whose target durably
-  // caught up before promotion.)
+  // A DIRECT 1->2 `AddVoter` from a single-voter cluster is REFUSED. The new voter holds NO committed
+  // prefix, and the 2-voter successor's view-change quorum is 1, so the new voter could form an E+1
+  // view-change quorum ALONE (electing itself leader with an empty log) and drop the old committed
+  // prefix — committed-op loss. This is the extreme of the uniform direct-`AddVoter` rejection; the safe
+  // path is `AddLearner` then `PromoteLearner` (contrast `PromoteLearner`, whose target durably caught
+  // up before promotion).
   let mut e = single_change_primary_solo();
   let mut wal = TestWal::default();
   assert_eq!(
@@ -3364,44 +3644,42 @@ fn add_voter_from_a_single_voter_cluster_is_rejected_breaks_quorum_intersection(
       &mut wal,
       SingleVoterDelta::AddVoter(MemberId::new(1)),
     ),
-    Err(ProposeMembershipError::AddVoterBreaksQuorumIntersection),
-    "a brand-new voter that alone satisfies the successor view-change quorum is refused",
+    Err(ProposeMembershipError::DirectAddVoterUnsupported),
+    "a direct AddVoter is refused; the brand-new voter holds no committed prefix",
   );
   assert_eq!(e.reconfigure_inflight, None, "no op was minted");
   assert_eq!(e.op(), OpNumber::new(), "the head did not advance");
 }
 
 #[test]
-fn add_voter_from_two_or_more_voters_is_admitted() {
-  // For any predecessor of 2+ voters the change is SAFE: the successor view-change quorum
-  // (`quorum_view_change >= 2`) necessarily includes a predecessor voter, and the overlap lemma
-  // `quorum(n) + quorum_view_change(n+1) > n` makes that predecessor contingent intersect every
-  // E-committed write quorum — so the committed prefix is preserved. Confirm 2->3, and at least one
-  // larger (3->4), mint.
+fn add_voter_from_two_or_more_voters_is_also_rejected() {
+  // A direct `AddVoter` is rejected at EVERY size, not only the single-voter extreme. The old admission
+  // for 2+ voters rested on a flawed premise — that the brand-new voter would hold the committed prefix.
+  // It cannot: it was never a predecessor member, so it never appended or committed the predecessor's
+  // Reconfigure op (nor any prior op). A successor view-change quorum that includes the empty-log new
+  // voter but omits a prefix-holding retained voter can still drop a committed op, so the safe grow is
+  // ALWAYS `AddLearner` then `PromoteLearner` (the caught-up voter holds the prefix before it votes).
+  // Confirm 2->3 and 3->4 are both refused with no op minted.
   for n in [2u8, 3] {
     let mut e = single_change_primary_n(n);
     let mut wal = TestWal::default();
-    assert!(
-      e.membership
-        .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(u128::from(n))))
-        .expect("the successor is structurally valid")
-        .quorum_view_change()
-        >= 2,
-      "the {}->{} successor has a view-change quorum of at least 2",
-      n,
-      n + 1,
-    );
-    let op = e
-      .propose_membership(
+    assert_eq!(
+      e.propose_membership(
         Instant::ZERO,
         &mut wal,
         SingleVoterDelta::AddVoter(MemberId::new(u128::from(n))),
-      )
-      .unwrap_or_else(|e| panic!("AddVoter from {n} voters is admitted, got {e:?}"));
+      ),
+      Err(ProposeMembershipError::DirectAddVoterUnsupported),
+      "a direct AddVoter from {n} voters is refused (add as a learner, then promote)",
+    );
     assert_eq!(
-      e.reconfigure_inflight,
-      Some(op),
-      "the {n}-voter AddVoter op minted",
+      e.reconfigure_inflight, None,
+      "no op was minted for {n} voters"
+    );
+    assert_eq!(
+      e.op(),
+      OpNumber::new(),
+      "the head did not advance for {n} voters"
     );
   }
 }
@@ -3839,6 +4117,13 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
     config_1, genesis_config_id,
     "the first swap chained a new config_id"
   );
+  // The installed E=1 config is 3 voters {0,1,2} + 1 learner (slot 3); a learner does not raise
+  // `replica_count`, so the voting quorum stays 2.
+  assert_eq!(
+    e.membership.replica_count(),
+    3,
+    "the E=1 config is 3 voters (slots 0-2) + 1 learner (slot 3), quorum 2",
+  );
 
   // The current id and the immediately-prior (genesis) id are both in lineage.
   assert!(
@@ -3855,12 +4140,12 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
     "a forked/unknown config_id is rejected — config_id is the lineage discriminator",
   );
 
-  // A SECOND swap: propose+commit+install RemoveVoter on the current (E=1, 4-voter) config.
+  // A SECOND swap: propose+commit+install RemoveVoter on the current (E=1, 3-voter + 1-learner) config.
   let now = Instant::ZERO;
   let succ2 = e
     .membership
     .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(1)))
-    .expect("removing a voter from the 4-voter E=1 config is valid");
+    .expect("removing a voter from the 3-voter E=1 config is valid");
   let payload2 = ReconfigurePayload::from_membership(&succ2, e.membership.config_id());
   let op2 = e
     .propose_membership(
@@ -3871,19 +4156,18 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
     .expect("the primary mints the second Reconfigure op");
   while e.poll_message().is_some() {}
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own append → own vote
-  // Commit with a quorum of the E=1 4-voter config (quorum 3): the primary (slot 0) + acks from slots
-  // 2 and 3 (slot 1 is the one being removed). The acks must be stamped E=1 / config_1 — the primary's
-  // CURRENT configuration — or the strict ingress gate drops them.
-  for r in [2u16, 3] {
-    e.handle_message(
-      now,
-      &mut wal,
-      &mut sb,
-      &mut blocks,
-      Peer::Replica(ReplicaId::new(r)),
-      reconfigure_ack_at(op2.get(), &payload2, r, crate::Epoch::new(1), config_1),
-    );
-  }
+  // Commit under the E=1 3-voter quorum (2 of {0,1,2}): the primary (slot 0, via its own durable vote)
+  // + one retained-voter ack (slot 2). Slot 1 is the voter being removed; slot 3 is the learner, whose
+  // ack would not count toward the voting quorum. The ack must be stamped E=1 / config_1 — the primary's
+  // CURRENT configuration — or the strict ingress gate drops it.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    reconfigure_ack_at(op2.get(), &payload2, 2, crate::Epoch::new(1), config_1),
+  );
   assert_eq!(
     e.commit(),
     op2,
@@ -3925,8 +4209,9 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
     "the survivor is at E+1"
   );
   let now = Instant::ZERO;
-  // This node is slot 0 of the E=1 4-voter config (the primary of view 0), so feed the SVC to a BACKUP
-  // survivor to observe a view-change transition cleanly. Re-home onto slot 1.
+  // This node is slot 0 of the E=1 config (3 voters {0,1,2} + 1 learner at slot 3; the primary of view
+  // 0), so feed the SVC to a BACKUP survivor to observe a view-change transition cleanly. Re-home onto
+  // slot 1.
   let backup_cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
   let mut backup = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     backup_cfg,
@@ -3934,6 +4219,17 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
     0,
     CountSm::default(),
     u64::MAX,
+  );
+  // Pin the config the gate runs against: 3 voters, so the view-change quorum is 2 (not 3).
+  assert_eq!(
+    backup.membership.replica_count(),
+    3,
+    "the survivor runs a 3-voter config (quorum_view_change 2)",
+  );
+  assert_eq!(
+    backup.membership.quorum_view_change(),
+    2,
+    "quorum_view_change(3) == 2",
   );
 
   // A stale OLD-epoch (E=0) SVC for view 1 from a removed/forked server: dropped at the strict gate.
@@ -3970,12 +4266,19 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
       backup.membership.config_id(),
     )),
   );
-  // With its own bit (proposing view 1) plus replica 2's admitted SVC, the 4-voter SVC quorum is not
-  // yet met (quorum 3), but the message was ADMITTED — observable as the adopted SVC target.
+  // The E=1 SVC is ADMITTED: the backup adopts view 1 as its SVC target and casts its own join bit, so
+  // together with replica 2's admitted SVC the 2-of-3 view-change quorum is MET and the backup enters a
+  // view change for view 1 (status → ViewChange). The contrast is the whole point — the OLD-epoch SVC
+  // above left the survivor Normal, whereas the matching-epoch SVC drives the transition.
   assert_eq!(
     backup.svc_target_for_test(),
     View::with(1),
     "the same SVC at the matching epoch IS admitted (the drop above was the epoch gate)",
+  );
+  assert_eq!(
+    backup.status(),
+    Status::ViewChange,
+    "the admitted E=1 SVC reached the 2-of-3 quorum and drove the survivor into a view change",
   );
 }
 
@@ -3993,11 +4296,15 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = e
-    .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+    )
     .expect("the primary mints the Reconfigure op");
   // SET at propose.
   assert_eq!(
@@ -4008,7 +4315,11 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
 
   // A second proposal mid-flight is refused, and the latch still holds the FIRST op.
   assert_eq!(
-    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(4))),
+    e.propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(4))
+    ),
     Err(ProposeMembershipError::AlreadyInFlight),
     "a second change mid-flight is refused",
   );
@@ -4055,7 +4366,11 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
   // The latch is free again: a NEXT change (now under the E+1 config) can be proposed — the latch
   // re-arms, confirming the in-flight serialization is per-change, not permanent.
   let op2 = e
-    .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(4)))
+    .propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(4)),
+    )
     .expect("a new change is proposable once the prior one installed");
   assert_eq!(
     e.reconfigure_inflight,
@@ -4078,7 +4393,11 @@ fn a_view_change_truncating_an_uncommitted_proposal_releases_the_in_flight_latch
 
   // Propose on the view-0 primary → the latch is set on the uncommitted op (it is NOT driven to commit).
   let op = e
-    .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+    )
     .expect("the primary mints the Reconfigure op");
   assert_eq!(
     e.reconfigure_inflight,
@@ -4149,7 +4468,7 @@ fn an_uncommitted_non_canonical_reconfigure_op_is_truncated_and_the_cluster_stay
   // primary), held but never committed.
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   e.handle_message(
@@ -4254,7 +4573,7 @@ fn a_canonical_reconfigure_op_survives_a_view_change_and_its_swap_fires_when_rec
   let now = Instant::ZERO;
 
   let successor = genesis(3)
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let reconfig_checksum = Body::Reconfigure(payload.clone()).body_checksum();
@@ -4424,7 +4743,7 @@ fn a_committed_swap_survives_a_view_change_and_still_installs() {
   let now = Instant::ZERO;
 
   let successor = genesis(3)
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = 1u64;
@@ -4598,12 +4917,16 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter is a valid delta on a 3-voter cluster");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   let op = e
-    .propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+    )
     .expect("the primary mints the reconfiguration op");
   // DROP the one-shot broadcast Prepare: no backup ever hears the initial transmission.
   while e.poll_message().is_some() {}
@@ -4708,8 +5031,8 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter is a valid delta on a 3-voter cluster");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   // (1) Replica 1 (a view-0 backup) receives the view-0 primary's Prepares: a client op at op 1, then the
@@ -5267,5 +5590,1129 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
       .poll_message()
       .is_some_and(|o| matches!(o.msg_ref(), Message::Prepare(_))),
     "a same-config mismatched-self-id RequestPrepare is still DROPPED by the strict binding"
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The install-time voter-admission fence: a committed `Reconfigure` op may not seat a brand-new
+// voter (one that was never a member of its exact predecessor). One falsifier per reachable path —
+// the prepare-append screen, the primary commit lane, the backup/adoption re-commit lane, and the
+// recovery WAL-replay re-commit — plus the legitimate-delta positive controls. The cross-epoch
+// STATE-SYNC install has no constructible falsifier BY DESIGN: a laggard installs a wholesale,
+// hash-verified successor possibly many epochs ahead, where "voter not in my stale configuration"
+// is a LEGITIMATE shape (added-then-promoted across the skipped epochs), so no local single-change
+// diff exists to trip; that path's safety is the induction — every compliant committer runs this
+// fence, so no committed state (hence no donor checkpoint) ever contains a direct-add successor.
+// The induction's base is ENFORCED by the version witnesses: `VsrState::decode` admits only the
+// exact current `SUPERBLOCK_VERSION` (no store written by unfenced code loads) and the transport
+// hello admits only the exact current wire version (no unfenced peer connects). A
+// recovered-unfenced-donor falsifier is therefore deliberately NOT written — such a donor is
+// unconstructible through persisted bytes (that is the witness's point; its own falsifiers are the
+// byte-level decode-rejection tests), and composing one via `VsrState::try_new_v4` in-memory would
+// model an embedder fabricating a root, which no durable witness can catch — local API misuse
+// outside the replication threat model.
+//
+// The VOTE-MINT screens close the remaining ack/vote lanes for an entry that reaches a log WITHOUT
+// crossing the screened prepare append (a recovered WAL, a view-change adoption): `send_prepare_ok`
+// refuses the ack — covering the canonical re-ack and the adoption re-ack — and `record_own_vote`
+// refuses the own bit — covering the adopted-tail re-append and the peer-repair fill — with the
+// solo-voter recovery reseed applying the same refusal at its own seeding site. Each lane has a
+// falsifier below, plus legitimate-delta positive controls proving the screens admit every legal
+// shape (and the checkpoint-report re-ack, whose GC-pruned op the ack screen must let through).
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_direct_voter_add_prepare_is_dropped_before_append_and_ack() {
+  // The append-seam screen: a RECONFIGURATION `Prepare` whose successor seats a brand-new voter,
+  // pinned to THIS backup's current configuration, is dropped whole — no log entry, no head advance,
+  // no WAL append, and (append-before-ack) no PrepareOk. The op can therefore never assemble a
+  // quorum of compliant acks, which is what keeps the commit-time fence unreachable in a compliant
+  // cluster.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.encode_body(),
+    )),
+  );
+
+  assert!(
+    !e.log.contains_key(&1),
+    "the direct-add prepare was not appended to the log"
+  );
+  assert_eq!(e.op().get(), 0, "the head did not advance");
+  assert!(
+    wal.entries.is_empty(),
+    "no WAL append was submitted for the dropped prepare"
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::PrepareOk(_)),
+      "the dropped prepare must never be acked"
+    );
+  }
+}
+
+#[test]
+#[should_panic(expected = "refusing to install the committed Reconfigure op")]
+fn committing_a_direct_voter_add_panics_on_the_primary_commit_lane() {
+  // The authoritative fence, primary lane: `propose_membership` refuses to mint a direct AddVoter,
+  // so this seeds the minted-op shape directly (head at the op, a typed log entry, the op durable in
+  // the WAL, the primary's own vote recorded) — modeling an op minted without the propose guard. The
+  // one backup ack completes the 2-of-3 quorum, `try_commit` recognizes the Reconfigure op, and the
+  // commit-time fence refuses BEFORE any swap is staged or made durable.
+  let mut e = single_change_primary();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry::reconfigure(
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.clone(),
+    ),
+  );
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+  e.inflight.insert(
+    1,
+    Inflight {
+      oks: 1, // the primary's own slot-0 vote (its append landed)
+      committed: false,
+      prepare_checksum: crate::storage::prepare_identity(
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        Body::Reconfigure(payload.clone()).body_checksum(),
+      ),
+    },
+  );
+
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    reconfigure_ack(1, &payload, 1),
+  );
+}
+
+#[test]
+#[should_panic(expected = "refusing to install the committed Reconfigure op")]
+fn committing_a_direct_voter_add_panics_on_the_backup_recommit_lane() {
+  // The backup/adoption re-commit lane: an entry that reaches a log WITHOUT crossing the screened
+  // prepare append — a view-change adoption inserts canonical entries straight into `self.log`
+  // (typed, so `commit_reconfigure` recognizes them at re-commit), and this seeds that same shape
+  // directly — still cannot install: the shared commit recognition (`advance_commit` →
+  // `commit_reconfigure`) hits the fence the moment a Commit advances past the op.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry::reconfigure(ClientId::RECONFIGURATION, RequestNumber::with(1), payload),
+  );
+
+  e.handle_message(
+    Instant::ZERO,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+}
+
+#[test]
+#[should_panic(expected = "refusing to install the committed Reconfigure op")]
+fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
+  // The recovery WAL-replay lane, modeling a store written WITHOUT this fence: the WAL holds a
+  // COMMITTED direct-voter-add Reconfigure op (the durable root's commit covers it and its
+  // committed-band header names it) while the durable membership is still the predecessor — the
+  // committed-but-uninstalled window. Recovery rebuilds the typed `Body::Reconfigure` entry from the
+  // WAL through the shared reconstruction and re-commits the band above the checkpoint through the
+  // SAME commit recognition as live traffic, where the fence refuses the direct admission. (The one
+  // shape no runtime check can re-check — a direct-add successor ALREADY INSTALLED into the durable
+  // root — never reaches a running replica at all: `VsrState::decode` admits only the exact current
+  // `SUPERBLOCK_VERSION`, written exclusively by code carrying this fence; see the fence comment in
+  // `commit_reconfigure`.)
+  let successor = genesis(3)
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+
+  let mut wal = TestWal::default();
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::with(1),
+    OpNumber::new(),
+    0,
+    std::vec![header],
+  )
+  .expect("a root recording the committed reconfigure op is valid")
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut blocks = crate::block_store::MemBlockStore::new();
+
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect("recover accepts this store");
+  let mut e = match recovered {
+    Recovered::Active(e) => e,
+    Recovered::Retired(_) => panic!("a current member recovers Active"),
+  };
+
+  // Re-commit the recovered band above the checkpoint through the ordinary commit path.
+  let now = Instant::ZERO;
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+}
+
+#[test]
+#[should_panic(expected = "a commit-first swap must never install")]
+fn installing_a_direct_voter_add_swap_panics_at_the_backstop() {
+  // The single-membership-writer backstop. `install_membership` is the ONE place a successor becomes
+  // the live configuration; for a commit-first swap (a `Some` reconfigure op) its `debug_assert`
+  // re-affirms that the successor seats no brand-new voter. On every live path this is unreachable —
+  // `commit_reconfigure`'s panic refuses a direct voter admission before any swap is staged, so no
+  // such successor ever reaches the writer — so this drives the writer DIRECTLY to pin the
+  // defense-in-depth check: build a direct-add successor (a voter absent from the predecessor) and
+  // hand it to `install_membership(Some(N), ..)`. The backstop fails-stop rather than install a
+  // configuration whose new voter holds no committed prefix. (The cross-epoch state-sync install —
+  // the `None` arm — is exempt by design and is not exercised here.)
+  let mut e = single_change_primary();
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  e.install_membership(Some(OpNumber::with(1)), successor);
+}
+
+#[test]
+fn every_legitimate_delta_commits_and_installs_through_the_backup_lane() {
+  // Positive controls: each accepted delta kind — AddLearner, PromoteLearner, RemoveVoter,
+  // RemoveLearner — still passes the fence end to end on the backup lane: the prepare appends
+  // (screened), the op commits (fenced), the SwapEpoch root lands, the successor installs, and a
+  // `MembershipChanged` names the op. The promote-time challenge is a PROPOSE-side gate (covered by
+  // the propose tests); the commit lane installs whatever legitimately committed. RemoveVoter removes
+  // a NON-local voter (removing the local node retires it — a separate concern with its own tests).
+  let cases: [(Membership, SingleVoterDelta); 4] = [
+    (genesis(3), SingleVoterDelta::AddLearner(MemberId::new(3))),
+    (
+      genesis_with_learners(3, 1),
+      SingleVoterDelta::PromoteLearner(MemberId::new(3)),
+    ),
+    (genesis(3), SingleVoterDelta::RemoveVoter(MemberId::new(2))),
+    (
+      genesis_with_learners(3, 1),
+      SingleVoterDelta::RemoveLearner(MemberId::new(3)),
+    ),
+  ];
+  for (pred, delta) in cases {
+    let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+    let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+      cfg,
+      pred.clone(),
+      0,
+      CountSm::default(),
+      u64::MAX,
+    );
+    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let mut blocks = crate::block_store::MemBlockStore::new();
+    let now = Instant::ZERO;
+
+    let successor = pred
+      .apply_delta(&delta)
+      .expect("a legitimate delta derives its successor");
+    let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      primary_peer(),
+      Message::Prepare(Prepare::new(
+        View::new(),
+        OpNumber::with(1),
+        OpNumber::new(),
+        OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        payload.encode_body(),
+      )),
+    );
+    assert!(
+      e.log.contains_key(&1),
+      "the {} prepare passed the append screen",
+      delta.as_str(),
+    );
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the append (deferred PrepareOk)
+    while e.poll_message().is_some() {}
+
+    e.handle_message(
+      now,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      primary_peer(),
+      Message::Commit(Commit::new(
+        View::new(),
+        OpNumber::with(1),
+        OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+    assert!(
+      e.pending_swap_for_test(),
+      "the {} op committed and staged its swap",
+      delta.as_str(),
+    );
+    while e.poll_event().is_some() {} // drain pre-swap events so the install event is observable
+
+    e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install
+    assert_eq!(
+      e.membership,
+      successor,
+      "the {} successor installed at the durable root",
+      delta.as_str(),
+    );
+    let mut changed = false;
+    while let Some(ev) = e.poll_event() {
+      if let Event::MembershipChanged(c) = ev {
+        assert_eq!(
+          c.op().get(),
+          1,
+          "the MembershipChanged names the {} op",
+          delta.as_str(),
+        );
+        changed = true;
+      }
+    }
+    assert!(
+      changed,
+      "a MembershipChanged was emitted for {}",
+      delta.as_str(),
+    );
+  }
+}
+
+#[test]
+fn a_matching_durable_direct_voter_add_prepare_is_never_re_acked() {
+  // The canonical re-ack lane: the backup already holds the direct-add Reconfigure op DURABLY (the
+  // typed entry in `self.log`, its WAL slot Clean — the shape a recovered store or a completed
+  // append leaves), and the primary retransmits the identical Prepare. `on_prepare` takes the
+  // canonical-held branch (identity match + durable), which acks WITHOUT crossing the append-seam
+  // screen — the `send_prepare_ok` mint screen is what refuses the vouch.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry::reconfigure(
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.clone(),
+    ),
+  );
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.encode_body(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::PrepareOk(_)),
+      "a held direct-add op is never re-acked"
+    );
+  }
+}
+
+#[test]
+fn a_matching_durable_legitimate_reconfigure_prepare_is_re_acked() {
+  // The positive control on the canonical re-ack lane: an AddLearner successor (a legal delta) in
+  // the identical held-durable shape IS re-acked — the mint screen refuses only a brand-new voter
+  // admission, never a legitimate reconfiguration.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+  e.op = OpNumber::with(1);
+  e.log.insert(
+    1,
+    LogEntry::reconfigure(
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.clone(),
+    ),
+  );
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.encode_body(),
+    )),
+  );
+  let mut acked = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      assert_eq!(ok.op().get(), 1, "the re-ack names the held op");
+      acked = true;
+    }
+  }
+  assert!(acked, "the held legitimate reconfigure op is re-acked");
+}
+
+#[test]
+fn a_direct_voter_add_interior_overwrite_is_refused_before_the_log_and_wal() {
+  // The interior-overwrite lane: the backup's head is PAST the op but it holds NO entry at it (the
+  // dropped-stale interior shape), so a current-view Prepare would durably (re-)append into the
+  // interior slot. The `reappend_canonical_prepare` screen refuses the direct-add BEFORE the log
+  // insert and the WAL write — no entry, no slot, and (append-before-ack) no deferred ack. Asserted
+  // on the log + WAL state, which only this seam guards: the ack mint would independently refuse
+  // the vouch, so an ack assertion alone could not witness this screen.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.op = OpNumber::with(2);
+  e.log.insert(
+    2,
+    LogEntry::present(
+      ClientId::new(7),
+      RequestNumber::with(2),
+      Bytes::copy_from_slice(&[2u8]),
+    ),
+  );
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Prepare(Prepare::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(1),
+      payload.encode_body(),
+    )),
+  );
+
+  assert!(
+    !e.log.contains_key(&1),
+    "the direct-add interior op takes no log entry"
+  );
+  assert!(
+    wal.entries.is_empty(),
+    "no interior WAL overwrite was submitted for the dropped prepare"
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while let Some(out) = e.poll_message() {
+    assert!(
+      !matches!(out.msg_ref(), Message::PrepareOk(_)),
+      "the refused interior overwrite owes no ack"
+    );
+  }
+}
+
+#[test]
+fn an_adopted_direct_voter_add_tail_op_is_never_adopt_acked() {
+  // The view-change adoption re-ack lane: a backup adopts a StartView whose canonical tail carries
+  // an uncommitted direct-add Reconfigure op alongside a legitimate client op. After the durable
+  // view lands, `start_view_acks` re-appends each held tail op and defers its PrepareOk to the
+  // append completion — a lane that never crosses the append-seam screen. The `send_prepare_ok`
+  // mint screen refuses the direct-add op's vouch; the neighboring legitimate op IS acked (the
+  // in-test positive control), so the refusal is the screen, not a stalled adoption.
+  let cfg = Config::try_new(2, MemberId::new(2)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(crate::StartView::new(
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          Bytes::copy_from_slice(b"a"),
+        ),
+        PreparedEntry::reconfigure(
+          OpNumber::with(2),
+          ClientId::RECONFIGURATION,
+          RequestNumber::with(2),
+          payload.clone(),
+        ),
+      ],
+    )),
+  );
+  // Land the durable-view root, then the AdoptAck re-appends it schedules.
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  let (mut acked_1, mut acked_2) = (false, false);
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      match ok.op().get() {
+        1 => acked_1 = true,
+        2 => acked_2 = true,
+        _ => {}
+      }
+    }
+  }
+  assert!(
+    acked_1,
+    "the legitimate adopted tail op is adopt-acked once durable"
+  );
+  assert!(!acked_2, "the adopted direct-add op is never adopt-acked");
+}
+
+#[test]
+fn an_adopted_legitimate_reconfigure_tail_op_is_adopt_acked() {
+  // The positive control on the adoption re-ack lane: a LEGAL reconfiguration op (AddLearner)
+  // adopted as the uncommitted tail is re-appended and acked once durable — the mint screen admits
+  // every legitimate delta on this lane too.
+  let cfg = Config::try_new(2, MemberId::new(2)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(3),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartView(crate::StartView::new(
+      View::with(1),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(1),
+      std::vec![PreparedEntry::reconfigure(
+        OpNumber::with(1),
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        payload.clone(),
+      )],
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  let mut acked = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      assert_eq!(ok.op().get(), 1, "the adopt-ack names the adopted op");
+      acked = true;
+    }
+  }
+  assert!(
+    acked,
+    "the adopted legitimate reconfigure op is adopt-acked"
+  );
+}
+
+#[test]
+fn a_forged_ack_cannot_commit_an_adopted_direct_voter_add_tail_op() {
+  // The adopted-tail own-vote lane, plus the single-corruption bound: replica 1 becomes the view-1
+  // primary adopting a canonical tail whose op 1 is the direct-add Reconfigure (uncommitted). The
+  // adopted-tail re-append completes and `record_own_vote` REFUSES the own bit; one forged
+  // content-matched PrepareOk (a single corrupted message) then contributes the ONLY vote the op
+  // ever gets — 1 of the required 2 — so the op never commits: no swap is staged, the commit-time
+  // fence panic is unreachable, and the cluster survives the poison op un-committed rather than
+  // fail-stopping.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+
+  // Idle-timeout into the view change, then a second StartViewChange completes the view-change
+  // quorum for view 1 (this replica leads it).
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  while e.poll_message().is_some() {}
+  // A DoViewChange from replica 2 carries the direct-add op as the canonical uncommitted tail; the
+  // new primary adopts it (`oks: 0`) and re-appends it tagged for its own vote.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![PreparedEntry::reconfigure(
+        OpNumber::with(1),
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        payload.clone(),
+      )],
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert!(
+    e.log.contains_key(&1),
+    "precondition: the adopted direct-add op is held in the new view's log"
+  );
+
+  // The forged, content-matched ack — the single in-model corrupted message.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::PrepareOk(crate::PrepareOk::new(
+      View::with(1),
+      OpNumber::with(1),
+      ReplicaId::new(2),
+      OpNumber::new(),
+      crate::storage::prepare_identity(
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(1),
+        Body::Reconfigure(payload.clone()).body_checksum(),
+      ),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+
+  assert_eq!(
+    e.commit_min.get(),
+    0,
+    "the direct-add op never commits: its only vote is the forged ack"
+  );
+  assert!(!e.pending_swap_for_test(), "no epoch swap is staged");
+  assert_eq!(e.membership, genesis(3), "the configuration is unchanged");
+}
+
+#[test]
+fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
+  // The peer-repair own-vote lane: the new primary adopted the direct-add op HEADER-ONLY (a
+  // `Repairing` carrier), so the adoption re-append skipped it and the repair channel fetches its
+  // body. When the fill lands durably, the uncommitted-tail completion casts the primary's own
+  // vote — `record_own_vote` refuses it there (the fill inserted the TYPED body first, so the
+  // screen classifies it). A forged content-matched PrepareOk then leaves the op at 1 of the
+  // required 2 votes: never committed, no swap, no fail-stop.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body_checksum = Body::Reconfigure(payload.clone()).body_checksum();
+
+  e.handle_timeout(
+    now + core::time::Duration::from_millis(300),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  );
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(0),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  while e.poll_message().is_some() {}
+  // The canonical log: op 1 committed (a client op), op 2 the direct-add Reconfigure carried
+  // HEADER-ONLY — its durable canonical identity (client, request, body checksum) without bytes.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(1),
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![
+        PreparedEntry::new(
+          OpNumber::with(1),
+          ClientId::new(7),
+          RequestNumber::with(1),
+          Bytes::copy_from_slice(b"a"),
+        ),
+        PreparedEntry::repairing(
+          OpNumber::with(2),
+          ClientId::RECONFIGURATION,
+          RequestNumber::with(2),
+          body_checksum,
+        ),
+      ],
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert!(
+    e.log.get(&2).is_some_and(|entry| entry.body.is_repairing()),
+    "precondition: the adopted direct-add op is held header-only"
+  );
+  assert!(
+    e.has_repair_hole_for_test(2),
+    "precondition: the header-only tail op is a registered repair hole"
+  );
+
+  // A peer's Prepare carrying the canonical body answers the hole; `fill_repair` verifies the FULL
+  // kept identity (client, request, body checksum) and stages the durable fill.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::Prepare(Prepare::new(
+      View::with(1),
+      OpNumber::with(2),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ClientId::RECONFIGURATION,
+      RequestNumber::with(2),
+      payload.encode_body(),
+    )),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert!(
+    e.log
+      .get(&2)
+      .is_some_and(|entry| entry.body.as_reconfigure().is_some()),
+    "the fill landed the TYPED reconfigure body (what the vote-mint screen classifies)"
+  );
+
+  // The forged, content-matched ack — the single in-model corrupted message.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::PrepareOk(crate::PrepareOk::new(
+      View::with(1),
+      OpNumber::with(2),
+      ReplicaId::new(2),
+      OpNumber::new(),
+      crate::storage::prepare_identity(
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(2),
+        body_checksum,
+      ),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+
+  assert_eq!(
+    e.commit_min.get(),
+    1,
+    "only the legitimate committed prefix applies; the direct-add op never commits"
+  );
+  assert!(!e.pending_swap_for_test(), "no epoch swap is staged");
+  assert_eq!(e.membership, genesis(3), "the configuration is unchanged");
+}
+
+#[test]
+fn a_solo_voters_recovery_reseed_earns_no_own_vote_for_a_direct_add_tail_op() {
+  // The solo-voter recovery reseed lane, modeling a store written WITHOUT the fence: the single
+  // voter's WAL holds an UNCOMMITTED direct-add Reconfigure op at its head. Recovery rebuilds the
+  // typed entry and `resume_solo_voter_pipeline` reseeds the commit pipeline — where a solo
+  // voter's own bit alone IS a quorum of 1, so seeding it would re-commit the op straight into the
+  // commit-time fence panic. The reseed's voter-admission screen refuses the bit instead: the op
+  // stays un-committed and voteless, nothing installs, and the replica keeps running.
+  let successor = genesis(1)
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(1)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+  let mut wal = TestWal::default();
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::new(),
+    OpNumber::new(),
+    0,
+    std::vec![],
+  )
+  .expect("an empty-frontier root is valid")
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut blocks = crate::block_store::MemBlockStore::new();
+
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect("recover accepts this store");
+  let mut e = match recovered {
+    Recovered::Active(e) => e,
+    Recovered::Retired(_) => panic!("the solo voter recovers Active"),
+  };
+  let now = Instant::ZERO;
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+
+  assert!(e.status.is_normal(), "the solo voter resumed Normal");
+  assert_eq!(
+    e.commit_min.get(),
+    0,
+    "the direct-add op earns no own bit, so the quorum-of-1 never re-commits it"
+  );
+  assert!(!e.pending_swap_for_test(), "no epoch swap is staged");
+  assert_eq!(e.membership, genesis(1), "the configuration is unchanged");
+  assert!(
+    e.log.contains_key(&1),
+    "the op is still held — voteless, not erased"
+  );
+}
+
+#[test]
+fn the_checkpoint_report_re_ack_still_fires_with_a_pruned_log() {
+  // The heartbeat checkpoint report re-acks the backup's own `checkpoint_op` — an op folded into
+  // the durable snapshot and GC-pruned from the log cache, so the ack mint's admission screen reads
+  // NO entry and must let the report through: the op is committed (the commit-time fence already
+  // ruled on it) and the report's identity stamp matches no live inflight entry.
+  let mut e = single_change_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    prepare(1, 0),
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert!(
+    e.force_checkpoint(&mut sb, &mut blocks),
+    "the committed+applied boundary is checkpointable"
+  );
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  while e.poll_message().is_some() {}
+  assert_eq!(
+    e.checkpoint_op.get(),
+    1,
+    "precondition: the checkpoint advanced"
+  );
+  assert!(
+    !e.log.contains_key(&1),
+    "precondition: the checkpointed op is GC-pruned from the log cache"
+  );
+
+  // The next Commit heartbeat re-reports: a PrepareOk for `checkpoint_op` fires despite the pruned
+  // entry (its identity stamp is the absent-entry zero — inert at the primary's vote ingress).
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let mut reported = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::PrepareOk(ok) = out.msg_ref() {
+      assert_eq!(ok.op().get(), 1, "the report re-acks the checkpoint op");
+      reported = true;
+    }
+  }
+  assert!(
+    reported,
+    "the checkpoint report re-ack still fires with a pruned log entry"
   );
 }
