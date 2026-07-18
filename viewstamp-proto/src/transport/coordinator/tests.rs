@@ -848,9 +848,7 @@ fn proven_live_voters_is_empty_before_any_probe_round() {
       u64::MAX,
     ));
   assert!(
-    coord
-      .proven_live_voters(crate::Instant::ZERO, core::time::Duration::from_secs(1))
-      .is_empty(),
+    coord.proven_live_voters(crate::Instant::ZERO).is_empty(),
     "a fresh endpoint has solicited no liveness-probe round"
   );
 }

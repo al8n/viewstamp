@@ -242,6 +242,88 @@ async fn a_peer_mesh_larger_than_the_conn_cap_is_refused_at_construction() {
   );
 }
 
+/// The reconfiguration executor re-solicits the voter-liveness probe every `health_probe_interval`
+/// WITHIN a round that lives `health_proof_max_age`; a cadence at or above the round lifetime would
+/// expire the round before it could be retransmitted, so a live voter's reply could never land in the
+/// window and every shrink would stall fail-closed. The constructor refuses the misconfiguration
+/// rather than silently clamping it.
+#[compio::test]
+async fn a_probe_interval_not_below_the_round_lifetime_is_refused_at_construction() {
+  const CLUSTER: u128 = 0x7778;
+  let mk_dialer = || -> super::DialerFactory<Labeled<Passthrough>> {
+    Rc::new(|peer| {
+      let opts = LabelOptions::new(CLUSTER, peer);
+      Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+    })
+  };
+  let mk_acceptor = || -> super::AcceptorFactory<Labeled<Passthrough>> {
+    Rc::new(|| {
+      let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(0)));
+      Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+    })
+  };
+  let build = |cfg: crate::DriverConfig| async move {
+    let (_ready_tx, ready_rx) = flume::unbounded();
+    let config = Config::try_new(CLUSTER, MemberId::new(0_u128)).unwrap();
+    let wal = InMemoryWal::new();
+    let mut sb = InMemorySuperblock::new();
+    // A genesis fixture: FORMAT the store so recovery resumes rather than fail-stopping this voter.
+    viewstamp_driver::format(config, &genesis(3), &wal, &mut sb).expect("format the genesis store");
+    CompioStreamDriver::with_config(
+      config,
+      genesis(3),
+      LogSm::default(),
+      wal,
+      sb,
+      MemBlocks::default(),
+      ClientId::new(1),
+      0,
+      "127.0.0.1:0".parse().unwrap(),
+      Vec::new(),
+      mk_dialer(),
+      mk_acceptor(),
+      ready_rx,
+      cfg,
+    )
+    .await
+  };
+
+  // interval == max_age: the round would expire exactly at its first retransmit — refused, naming the
+  // offending pair.
+  let equal = crate::DriverConfig::new()
+    .with_health_probe_interval(Duration::from_millis(500))
+    .with_health_proof_max_age(Duration::from_millis(500));
+  let Err(err) = build(equal).await else {
+    panic!("a probe interval equal to the round lifetime must be refused");
+  };
+  assert!(
+    matches!(
+      err,
+      crate::DriverError::ProbeIntervalNotBelowMaxAge { interval, max_age }
+        if interval == Duration::from_millis(500) && max_age == Duration::from_millis(500)
+    ),
+    "the refusal names the offending cadence and round lifetime: {err:?}"
+  );
+
+  // interval > max_age: likewise refused.
+  let over = crate::DriverConfig::new()
+    .with_health_probe_interval(Duration::from_secs(2))
+    .with_health_proof_max_age(Duration::from_secs(1));
+  assert!(
+    matches!(
+      build(over).await,
+      Err(crate::DriverError::ProbeIntervalNotBelowMaxAge { .. })
+    ),
+    "a probe interval above the round lifetime is refused"
+  );
+
+  // interval strictly below max_age (the stock default pairing): accepted.
+  assert!(
+    build(crate::DriverConfig::new()).await.is_ok(),
+    "the default pairing (interval strictly below the round lifetime) is accepted"
+  );
+}
+
 /// Like [`test_driver`] but also returns the `Handle`, so a budget test can drive the REAL
 /// `Handle::submit` (which reserves the shared budget + `try_send`s the command) against the
 /// driver's REAL `handle_command`/`deliver_event`/`retransmit_stale`. No peers are configured, so

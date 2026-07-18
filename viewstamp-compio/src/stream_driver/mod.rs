@@ -296,9 +296,11 @@ where
   /// security configuration stays in the `dialer`/`acceptor` factories.
   ///
   /// # Errors
-  /// [`DriverError::CapBelowPeerMesh`] if `cfg.max_conns()` is below twice the configured peer
-  /// count (the mutual-dial mesh needs one dialed and one accepted connection per peer, and both
-  /// are consensus-required); [`DriverError::Bind`] if the listener cannot bind.
+  /// [`DriverError::ProbeIntervalNotBelowMaxAge`] if `cfg.health_probe_interval()` is not strictly
+  /// below `cfg.health_proof_max_age()`; [`DriverError::CapBelowPeerMesh`] if `cfg.max_conns()` is
+  /// below twice the configured peer count (the mutual-dial mesh needs one dialed and one accepted
+  /// connection per peer, and both are consensus-required); [`DriverError::Bind`] if the listener
+  /// cannot bind.
   #[allow(clippy::too_many_arguments)]
   pub async fn with_config(
     config: Config,
@@ -327,6 +329,17 @@ where
       return Err(DriverError::CapBelowPeerMesh {
         max_conns: cfg.max_conns(),
         peers: peers.len(),
+      });
+    }
+    // Refuse a probe cadence that cannot fit inside the round it retransmits. The executor re-solicits
+    // every `health_probe_interval` WITHIN a round that lives `health_proof_max_age`; unless the cadence
+    // is strictly shorter than the round, the round would expire before it could be retransmitted and a
+    // live voter's reply could never land in the window, stalling every shrink fail-closed.
+    // Misconfiguration is a constructor error, not a load condition.
+    if cfg.health_probe_interval() >= cfg.health_proof_max_age() {
+      return Err(DriverError::ProbeIntervalNotBelowMaxAge {
+        interval: cfg.health_probe_interval(),
+        max_age: cfg.health_proof_max_age(),
       });
     }
     let clock = Clock::new();
@@ -887,12 +900,10 @@ where
           // health_probe_interval while the job runs); snapshot the proven-live voters for the executor.
           self
             .coord
-            .solicit_health_proofs(now, self.cfg.health_probe_interval());
+            .solicit_health_proofs(now, self.cfg.health_proof_max_age());
           self.next_probe_at = Some(now + self.cfg.health_probe_interval());
           let live = self.coord.live_membership();
-          let fresh = self
-            .coord
-            .proven_live_voters(now, self.cfg.health_proof_max_age());
+          let fresh = self.coord.proven_live_voters(now);
           self.reconfigure = Some(viewstamp_driver::ReconfigureJob::start(
             target,
             health,
@@ -931,18 +942,18 @@ where
     let Some(mut job) = self.reconfigure.take() else {
       return;
     };
-    // Re-solicit a fresh voter-liveness-probe round on the probe cadence while the job runs, so a
-    // voter that crashed since the last round drops out of the proven-live set within one interval.
+    // Re-solicit the voter-liveness-probe round on the probe cadence while the job runs: each call
+    // RETRANSMITS the outstanding round's nonce until it expires, then opens a fresh round. A voter
+    // that crashed since the round opened drops out of the proven-live set at the round's rollover,
+    // within one `health_proof_max_age`.
     if self.next_probe_at.is_none_or(|at| now >= at) {
       self
         .coord
-        .solicit_health_proofs(now, self.cfg.health_probe_interval());
+        .solicit_health_proofs(now, self.cfg.health_proof_max_age());
       self.next_probe_at = Some(now + self.cfg.health_probe_interval());
     }
     let live = self.coord.live_membership();
-    let fresh = self
-      .coord
-      .proven_live_voters(now, self.cfg.health_proof_max_age());
+    let fresh = self.coord.proven_live_voters(now);
     let outcome = job.advance(now, live, fresh, &mut |delta| {
       self.coord.propose_membership(now, &mut self.wal, delta)
     });

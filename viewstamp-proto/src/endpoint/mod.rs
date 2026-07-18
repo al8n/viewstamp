@@ -290,26 +290,32 @@ struct LearnerProofState {
 
 /// The single outstanding voter-liveness-probe round the primary solicited to gate a reconfiguration
 /// shrink — the FRESH liveness input [`Endpoint::proven_live_voters`] exposes to the driver's shrink
-/// policy instead of a stale operator vouch or an idle-blind ack oracle. One round at a time; a
-/// re-solicit past `reuse_within` overwrites it ([`Endpoint::solicit_health_proofs`] draws a new
-/// `nonce` and RESETS `responders`), and the install-boundary clear
-/// ([`Endpoint::install_membership`]) wipes it on every epoch swap so no round survives into a
-/// successor configuration.
+/// policy instead of a stale operator vouch or an idle-blind ack oracle. One round at a time; while it
+/// is live [`Endpoint::solicit_health_proofs`] RETRANSMITS the same `nonce`, and a re-solicit past its
+/// `expires_at` supersedes it (a fresh `nonce`, `responders` RESET). Both the install-boundary clear
+/// ([`Endpoint::install_membership`]) and the view-transition clear (`reset_for_view_transition`) wipe
+/// it, so no round survives an epoch swap or a generation change into a configuration it was not
+/// solicited under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HealthProbeState {
   /// The per-round freshness token (a bump of `self.nonce`) binding the matching [`HealthProof`]
   /// replies — a replayed old-nonce reply never records, and a fresh round supersedes the old nonce.
   nonce: u64,
-  /// When this round was last (re-)solicited with a FRESH nonce. [`Endpoint::proven_live_voters`]
-  /// fails closed (returns empty) once `now - solicited_at` exceeds the caller's `max_age`, so a
-  /// round the driver stopped refreshing cannot keep a crashed voter counted; and
-  /// [`Endpoint::solicit_health_proofs`] only retransmits the SAME nonce while a round is younger
-  /// than its `reuse_within`.
+  /// When this round's FRESH nonce was drawn. Fixed at that draw and carried unchanged through the
+  /// round's retransmits (a retransmit re-sends the request without moving the round's timeline).
   solicited_at: Instant,
+  /// When this round expires: `solicited_at + lifetime`, fixed when the FRESH nonce is drawn and
+  /// carried unchanged through the round's retransmits. It is the SINGLE bound for both sides of the
+  /// round — [`Endpoint::solicit_health_proofs`] draws a fresh nonce (superseding this round) once
+  /// `now >= expires_at`, and [`Endpoint::proven_live_voters`] fails closed (returns empty) once
+  /// `now > expires_at` — so the retransmit cadence, the evidence window, and the round lifetime are
+  /// one and the same, and a round the driver stopped refreshing cannot keep a crashed voter counted
+  /// past it.
+  expires_at: Instant,
   /// The CURRENT voters (their stable [`MemberId`]) that answered THIS round with a matching fresh
   /// [`HealthProof`]. Reset to empty whenever a fresh nonce is drawn, so a voter counts only while it
-  /// keeps answering — a crashed-after-answer voter falls out within one round. Never accumulates a
-  /// stale answer.
+  /// keeps answering the round — a crashed-after-answer voter falls out at the round's rollover (within
+  /// the round lifetime). Never accumulates a stale answer.
   responders: BTreeSet<MemberId>,
 }
 
@@ -1687,7 +1693,8 @@ pub struct Endpoint<S, R = RestartOnly> {
   /// shrink, or `None` when no round is outstanding. Set/refreshed by [`Self::solicit_health_proofs`]
   /// (draws a `nonce`, emits one `RequestHealthProof` per current voter); `responders` is filled by
   /// matching [`HealthProof`] replies ([`Self::on_health_proof`]); read by [`Self::proven_live_voters`].
-  /// CLEARED on an epoch swap ([`Self::install_membership`]) so a pre-swap round never gates a
+  /// CLEARED on an epoch swap ([`Self::install_membership`]) AND on a view transition
+  /// (`reset_for_view_transition`) so a round from a prior configuration or generation never gates a
   /// successor shrink; the `(epoch, config_id)` reply binding is the backstop. Private; never
   /// hashed/serialized/emitted, and inert off the reconfig axis (only the driver's shrink executor ever
   /// solicits, so the off-axis digest is byte-identical).
@@ -3264,22 +3271,26 @@ impl<S, R> Endpoint<S, R> {
   /// positive liveness evidence the driver's reconfiguration shrink policy counts toward a successor
   /// quorum.
   ///
-  /// FAIL-CLOSED: empty when there is no outstanding round, OR when the round is older than `max_age`
-  /// (a round the driver stopped refreshing is stale and proves nothing) — so a shrink with no live
-  /// witness STALLS rather than removing on stale evidence. Otherwise the answering voters
-  /// (`responders`, each a current voter whose fresh [`HealthProof`](crate::HealthProof) recorded this
-  /// round) UNION this node (a Normal primary soliciting is itself live). Self is counted ONLY within a
-  /// live, non-expired round. A pure read: it emits nothing and adds no durable/safety surface — like
-  /// the old ack oracle it is a LIVENESS input only, never a safety input.
-  pub fn proven_live_voters(
-    &self,
-    now: Instant,
-    max_age: core::time::Duration,
-  ) -> BTreeSet<MemberId> {
+  /// FAIL-CLOSED on every axis. Empty unless this node is a Normal PRIMARY (read-side parity with
+  /// [`Self::solicit_health_proofs`]'s write gate — only the primary drives a shrink, and only in
+  /// Normal is its configuration authoritative). Empty when there is no outstanding round, OR once the
+  /// round has expired (`now > expires_at` — a round the driver stopped refreshing is stale and proves
+  /// nothing), so a shrink with no live witness STALLS rather than removing on stale evidence. That
+  /// `expires_at` is the SAME bound [`Self::solicit_health_proofs`] supersedes the round at, so the
+  /// evidence window is exactly the round lifetime — the read can never be paired with a window wider
+  /// than the round it reads. Otherwise the answering voters (`responders`, each a current voter whose
+  /// fresh [`HealthProof`](crate::HealthProof) recorded this round) UNION this node (a Normal primary
+  /// soliciting is itself live). Self is counted ONLY within a live, non-expired round. A pure read: it
+  /// emits nothing and adds no durable/safety surface — like the old ack oracle it is a LIVENESS input
+  /// only, never a safety input.
+  pub fn proven_live_voters(&self, now: Instant) -> BTreeSet<MemberId> {
+    if !self.status.is_normal() || !self.is_primary() {
+      return BTreeSet::new(); // fail-closed: only a Normal primary's own probe evidence counts.
+    }
     let Some(probe) = self.health_probe.as_ref() else {
       return BTreeSet::new();
     };
-    if now.saturating_duration_since(probe.solicited_at) > max_age {
+    if now > probe.expires_at {
       return BTreeSet::new();
     }
     let mut out = probe.responders.clone();
@@ -5529,23 +5540,26 @@ where
   /// Normal is its configuration authoritative), so the probe adds NO traffic off the reconfiguration
   /// path.
   ///
-  /// `reuse_within` is the supersede guard mirroring the learner challenge
-  /// ([`Self::propose_membership`]): while the outstanding round is younger than `reuse_within` this
-  /// RETRANSMITS the same `nonce` (a lost request is re-sent without discarding the answers already
-  /// collected); once the round is older, a FRESH `nonce` is drawn and `responders` RESET, so a voter
-  /// counts only while it keeps answering the current round. The reply's `(epoch, config_id)` binding
-  /// plus the per-round `nonce` are the freshness backstops; a crashed-after-call voter cannot answer
-  /// the current nonce. Carries no quorum authority.
-  pub fn solicit_health_proofs(&mut self, now: Instant, reuse_within: core::time::Duration) {
+  /// `lifetime` is the round's full duration, fixed when its FRESH nonce is drawn: while the round is
+  /// still live (before its `expires_at = solicited_at + lifetime`) this RETRANSMITS the same `nonce`
+  /// (a lost request is re-sent without discarding the answers already collected); once the round has
+  /// expired a FRESH `nonce` is drawn and `responders` RESET, so a voter counts only while it keeps
+  /// answering the current round. That same `expires_at` bounds [`Self::proven_live_voters`], so the
+  /// retransmit cadence and the evidence window are one round lifetime and cannot be paired with
+  /// mismatched knobs. The reply's `(epoch, config_id)` binding plus the per-round `nonce` are the
+  /// freshness backstops; a crashed-after-call voter cannot answer the current nonce. Carries no quorum
+  /// authority.
+  pub fn solicit_health_proofs(&mut self, now: Instant, lifetime: core::time::Duration) {
     if !self.status.is_normal() || !self.is_primary() {
       return; // fail-closed: only a Normal primary probes.
     }
-    // Reuse an IN-FLIGHT round (retransmit the same nonce, keeping the answers already collected) while
-    // it is younger than `reuse_within`; otherwise draw a FRESH nonce and reset the responders.
+    // RETRANSMIT the same nonce of an IN-FLIGHT round (keeping the answers already collected) while it
+    // is still live (`now < expires_at`); otherwise draw a FRESH nonce, reset the responders, and open
+    // a new round lasting `lifetime`.
     let reuse = self
       .health_probe
       .as_ref()
-      .is_some_and(|p| now.saturating_duration_since(p.solicited_at) < reuse_within);
+      .is_some_and(|p| now < p.expires_at);
     let nonce = if reuse {
       self
         .health_probe
@@ -5557,6 +5571,7 @@ where
       self.health_probe = Some(HealthProbeState {
         nonce: self.nonce,
         solicited_at: now,
+        expires_at: now + lifetime,
         responders: BTreeSet::new(),
       });
       self.nonce

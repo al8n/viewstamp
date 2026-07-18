@@ -35,20 +35,25 @@ pub const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 /// cluster), so this never refuses a legitimate peer while still bounding an accept flood.
 pub const MAX_CONNS: usize = 1024;
 
-/// Default cadence at which the reconfiguration executor RE-SOLICITS a voter-liveness-probe round
-/// while a shrink job is in flight: every `HEALTH_PROBE_INTERVAL`, the driver draws a fresh probe
-/// nonce so a voter that crashed since the last round falls out of the proven-live set. 250 ms is
-/// comfortably above the 50 ms driver loop cadence (so each round is a distinct nonce, not a
-/// same-round retransmit) yet gives ~30 fresh rounds within the default `RECONFIGURE_TIMEOUT`. Probe
-/// traffic exists ONLY while a shrink job is active.
+/// Default cadence at which the reconfiguration executor RE-SOLICITS the voter-liveness-probe round
+/// while a shrink job is in flight: every `HEALTH_PROBE_INTERVAL` the driver re-sends the outstanding
+/// round, RETRANSMITTING its nonce so a reply lost in flight (or one that takes longer than a single
+/// interval) is re-requested without discarding the answers already collected. The round itself lives
+/// `HEALTH_PROOF_MAX_AGE`, not one interval — a fresh nonce is drawn only once the round expires — so
+/// this cadence must stay STRICTLY BELOW `HEALTH_PROOF_MAX_AGE` (the drivers reject a config that
+/// violates that). 250 ms sits comfortably above the 50 ms driver loop cadence yet retransmits many
+/// times within each round. Probe traffic exists ONLY while a shrink job is active.
 pub const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Default maximum age of a voter-liveness-probe round the reconfiguration executor still trusts:
-/// `proven_live_voters` fails closed (returns empty) once the outstanding round is older than
-/// `HEALTH_PROOF_MAX_AGE`, so a driver that stopped refreshing cannot keep a crashed voter counted.
-/// 1 s must exceed `HEALTH_PROBE_INTERVAL` plus a healthy round-trip (so a live voter's answer always
-/// lands within the window) yet stay well under `RECONFIGURE_TIMEOUT`, so a genuinely dead successor
-/// quorum stalls the shrink fail-closed rather than lingering on stale evidence.
+/// Default lifetime of a voter-liveness-probe round — the single bound governing both when the probe
+/// nonce is superseded and how long its evidence is trusted. `solicit_health_proofs` retransmits the
+/// same nonce until the round reaches this age, then draws a fresh one; `proven_live_voters` fails
+/// closed (returns empty) once the outstanding round is older than `HEALTH_PROOF_MAX_AGE`, so a driver
+/// that stopped refreshing cannot keep a crashed voter counted. It is therefore the ANSWER window: a
+/// live voter's reply must round-trip within it to be recorded. 1 s must exceed `HEALTH_PROBE_INTERVAL`
+/// by a healthy round-trip (so a live voter answers well inside the round) yet stay well under
+/// `RECONFIGURE_TIMEOUT`, so a genuinely dead successor quorum stalls the shrink fail-closed rather than
+/// lingering on stale evidence.
 pub const HEALTH_PROOF_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// Default deadline for one `reconfigure_to` call: once this much wall-clock elapses without the plan
@@ -100,11 +105,13 @@ pub struct DriverConfig {
   events_cap: usize,
   /// Global live-connection cap (stream driver only).
   max_conns: usize,
-  /// Cadence at which the reconfiguration executor re-solicits a fresh voter-liveness-probe round
-  /// while a shrink job is in flight (each round draws a fresh nonce; a crashed voter falls out).
+  /// Cadence at which the reconfiguration executor re-solicits the voter-liveness-probe round while a
+  /// shrink job is in flight (retransmits the round's nonce; a fresh round opens only at expiry). Must
+  /// be strictly below `health_proof_max_age` — the drivers reject a config that violates it.
   health_probe_interval: Duration,
-  /// Maximum age of a voter-liveness-probe round the reconfiguration executor still trusts as fresh;
-  /// past it, `proven_live_voters` fails closed so a stale round cannot keep a crashed voter counted.
+  /// Lifetime of a voter-liveness-probe round: how long its nonce is retransmitted before a fresh one
+  /// is drawn AND how long `proven_live_voters` trusts its evidence (the two are one bound), so a stale
+  /// round cannot keep a crashed voter counted.
   health_proof_max_age: Duration,
   /// Deadline for one `reconfigure_to` call before its cap fires and it resolves
   /// [`ReconfigureError::Timeout`](crate::ReconfigureError::Timeout). The driver arms the deadline
@@ -192,15 +199,16 @@ impl DriverConfig {
   }
 
   /// Voter-liveness-probe re-solicit cadence for the reconfiguration executor (the
-  /// `HEALTH_PROBE_INTERVAL` default). While a shrink job is in flight the driver draws a fresh probe
-  /// round this often.
+  /// `HEALTH_PROBE_INTERVAL` default). While a shrink job is in flight the driver retransmits the
+  /// outstanding probe round this often; a fresh round opens only when the current one expires.
   #[inline(always)]
   pub const fn health_probe_interval(&self) -> Duration {
     self.health_probe_interval
   }
 
-  /// Maximum trusted age of a voter-liveness-probe round for the reconfiguration executor (the
-  /// `HEALTH_PROOF_MAX_AGE` default). `proven_live_voters` fails closed past it.
+  /// Lifetime of a voter-liveness-probe round for the reconfiguration executor (the
+  /// `HEALTH_PROOF_MAX_AGE` default): how long the round's nonce is retransmitted, and equally how long
+  /// `proven_live_voters` trusts its evidence before failing closed.
   #[inline(always)]
   pub const fn health_proof_max_age(&self) -> Duration {
     self.health_proof_max_age
@@ -353,9 +361,9 @@ impl DriverConfig {
     self
   }
 
-  /// Override the voter-liveness-probe re-solicit cadence. Keep it at or above the driver loop
-  /// cadence (50 ms) so each round is a distinct nonce, and well under `reconfigure_timeout` so a
-  /// shrink still sees many fresh rounds.
+  /// Override the voter-liveness-probe re-solicit cadence. Keep it at or above the driver loop cadence
+  /// (50 ms) and STRICTLY BELOW `health_proof_max_age` (the round lifetime it retransmits within) — the
+  /// drivers reject a config where the cadence is not below the round lifetime.
   #[must_use]
   pub const fn with_health_probe_interval(mut self, interval: Duration) -> Self {
     self.set_health_probe_interval(interval);
@@ -368,9 +376,10 @@ impl DriverConfig {
     self
   }
 
-  /// Override the maximum trusted age of a voter-liveness-probe round. Keep it above
-  /// `health_probe_interval` plus a round-trip (so a live voter's answer always lands within the
-  /// window) yet under `reconfigure_timeout` (so a dead successor quorum stalls fail-closed).
+  /// Override the voter-liveness-probe round lifetime (its combined retransmit-and-evidence window).
+  /// Keep it above `health_probe_interval` plus a healthy round-trip (so a live voter's answer lands
+  /// within the round) yet under `reconfigure_timeout` (so a dead successor quorum stalls fail-closed).
+  /// The drivers reject a config where it is not strictly above `health_probe_interval`.
   #[must_use]
   pub const fn with_health_proof_max_age(mut self, max_age: Duration) -> Self {
     self.set_health_proof_max_age(max_age);

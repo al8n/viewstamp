@@ -407,6 +407,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // reply meant for the old generation) satisfy a post-transition mint. (The `(epoch, config_id)`
     // reply binding is the backstop; this is the primary clear.)
     self.learner_proof = None;
+    // Drop any outstanding voter-liveness-probe round: it was solicited by the generation this view
+    // change ends, so its evidence must not gate a shrink the successor generation drives. A new
+    // primary re-solicits fresh on its own reconfiguration; carrying a stale round across would let a
+    // pre-transition answer count toward a post-transition removal. Symmetry with the install-boundary
+    // clear (`install_membership`); the `(epoch, config_id)` reply binding is the backstop.
+    self.health_probe = None;
     // KEEP a committed-but-not-installed epoch swap across the transition. `pending_swap` is set ONLY for
     // a COMMITTED `Reconfigure` op (`stage_epoch_swap` runs at commit, after `commit_min` advanced past
     // the op), so the change is durable in the log and MUST still install — dropping it would lose a

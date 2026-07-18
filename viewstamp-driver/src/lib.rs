@@ -115,4 +115,20 @@ pub enum DriverError {
     /// The configured peer-mesh size; the cap must be at least twice this.
     peers: usize,
   },
+  /// The configured voter-liveness-probe cadence does not fit inside the round it retransmits. A probe
+  /// round lives `health_proof_max_age` (its answer window), and the reconfiguration executor
+  /// re-solicits it every `health_probe_interval` WITHIN that round, retransmitting the same nonce so a
+  /// reply that takes longer than one interval still lands. With `health_probe_interval` at or above
+  /// `health_proof_max_age` the round would expire at or before its first retransmit, so a live voter's
+  /// answer could never land in the window and every shrink would stall fail-closed. A misconfiguration
+  /// the constructor refuses rather than silently clamps.
+  #[error(
+    "health_probe_interval ({interval:?}) must be strictly less than health_proof_max_age ({max_age:?}); the re-solicit cadence must fit inside the probe round it retransmits"
+  )]
+  ProbeIntervalNotBelowMaxAge {
+    /// The configured re-solicit cadence.
+    interval: core::time::Duration,
+    /// The configured probe-round lifetime; the cadence must be strictly less than this.
+    max_age: core::time::Duration,
+  },
 }

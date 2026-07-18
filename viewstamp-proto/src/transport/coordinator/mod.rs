@@ -103,19 +103,15 @@ where
   /// Solicit a voter-liveness-probe round — one `RequestHealthProof` per current voter — so the
   /// reconfiguration shrink executor can gate a removal on fresh per-round liveness. Delegates to
   /// [`Endpoint::solicit_health_proofs`]; a no-op off a Normal primary.
-  pub fn solicit_health_proofs(&mut self, now: Instant, reuse_within: core::time::Duration) {
-    self.endpoint.solicit_health_proofs(now, reuse_within);
+  pub fn solicit_health_proofs(&mut self, now: Instant, lifetime: core::time::Duration) {
+    self.endpoint.solicit_health_proofs(now, lifetime);
   }
 
   /// The set of voter [`MemberId`]s PROVEN LIVE by the outstanding liveness-probe round (fail-closed
   /// empty when no fresh round exists) — the reconfiguration shrink executor's sole positive liveness
   /// evidence. Delegates to [`Endpoint::proven_live_voters`].
-  pub fn proven_live_voters(
-    &self,
-    now: Instant,
-    max_age: core::time::Duration,
-  ) -> BTreeSet<MemberId> {
-    self.endpoint.proven_live_voters(now, max_age)
+  pub fn proven_live_voters(&self, now: Instant) -> BTreeSet<MemberId> {
+    self.endpoint.proven_live_voters(now)
   }
 }
 

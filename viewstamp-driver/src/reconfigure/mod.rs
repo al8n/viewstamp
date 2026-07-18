@@ -560,7 +560,7 @@ impl ReconfigureBackend for LoopBackend {
   }
 
   fn proven_live_voters(&self) -> BTreeSet<MemberId> {
-    // The driver loop snapshots `endpoint.proven_live_voters(now, max_age)` into `fresh` each refresh.
+    // The driver loop snapshots `endpoint.proven_live_voters(now)` into `fresh` each refresh.
     self
       .snapshot
       .lock()
@@ -676,9 +676,8 @@ impl LoopController {
   /// Overwrite the snapshot with the latest state from the driver's `Endpoint`. Called once per
   /// driver-loop iteration, BEFORE polling the future.
   ///
-  /// `fresh` is the set the DRIVER already snapshotted from
-  /// `endpoint.proven_live_voters(now, health_proof_max_age)`; the backend's `proven_live_voters`
-  /// returns it verbatim.
+  /// `fresh` is the set the DRIVER already snapshotted from `endpoint.proven_live_voters(now)`; the
+  /// backend's `proven_live_voters` returns it verbatim.
   pub fn refresh(&self, live: Membership, fresh: BTreeSet<MemberId>, cap_exhausted: bool) {
     let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
     snap.live = live;
@@ -800,7 +799,7 @@ impl ReconfigureJob {
   ///
   /// `live` and `fresh` are snapshotted from the coordinator BEFORE this call (disjoint borrow:
   /// the coordinator is read first, then this method holds `&mut self`). `fresh` is
-  /// `coord.proven_live_voters(now, health_proof_max_age)`. `propose` is a closure that calls
+  /// `coord.proven_live_voters(now)`. `propose` is a closure that calls
   /// `coord.propose_membership(now, wal, delta)`. Returns [`AdvanceOutcome::InFlight`] while running,
   /// [`AdvanceOutcome::Done`] when the reply has been sent.
   ///
