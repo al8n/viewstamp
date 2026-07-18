@@ -1014,7 +1014,7 @@ async fn a_queued_reconfigure_across_retirement_resolves_to_retired_quic() {
     std::collections::BTreeSet::from([viewstamp_proto::MemberId::new(1)]),
     std::collections::BTreeSet::new(),
   );
-  let fut = handle.reconfigure_to(target, viewstamp_driver::HealthHint::default());
+  let fut = handle.reconfigure_to(target, viewstamp_driver::HealthHint::default(), None);
   futures_util::pin_mut!(fut);
   let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
   assert!(
@@ -1067,7 +1067,7 @@ async fn an_active_reconfigure_across_retirement_resolves_to_retired_quic() {
     std::collections::BTreeSet::from([0u128, 1, 2, 3].map(viewstamp_proto::MemberId::new)),
     std::collections::BTreeSet::new(),
   );
-  let fut = handle.reconfigure_to(target, viewstamp_driver::HealthHint::default());
+  let fut = handle.reconfigure_to(target, viewstamp_driver::HealthHint::default(), None);
   futures_util::pin_mut!(fut);
   let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
   assert!(

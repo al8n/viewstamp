@@ -196,7 +196,7 @@ fn reconfigure_to_on_closed_channel_yields_driver_gone() {
   drop(rx);
 
   let target = MembershipTarget::new(BTreeSet::from([MemberId::new(1)]), BTreeSet::new());
-  let fut = handle.reconfigure_to(target, HealthHint::default());
+  let fut = handle.reconfigure_to(target, HealthHint::default(), None);
   futures_util::pin_mut!(fut);
   let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
   match std::future::Future::poll(fut, &mut cx) {
@@ -395,7 +395,7 @@ fn reconfigure_to_after_retirement_returns_retired() {
   );
 
   let target = MembershipTarget::new(BTreeSet::from([MemberId::new(1)]), BTreeSet::new());
-  let fut = handle.reconfigure_to(target, HealthHint::default());
+  let fut = handle.reconfigure_to(target, HealthHint::default(), None);
   futures_util::pin_mut!(fut);
   let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
   match std::future::Future::poll(fut, &mut cx) {

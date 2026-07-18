@@ -19,8 +19,8 @@ use rustls::{
 };
 use viewstamp_driver::{HealthHint, ReconfigureError};
 use viewstamp_proto::{
-  BlockAddress, BlockStore, ClusterTls, Event, IdentityConfig, MemberId, Membership,
-  MembershipTarget, QuicOptions, ReplicaId, Superblock, Wal,
+  AcceptReducedFaultTolerance, BlockAddress, BlockStore, ClusterTls, Event, IdentityConfig,
+  MemberId, Membership, MembershipTarget, QuicOptions, ReplicaId, Superblock, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
@@ -308,7 +308,7 @@ async fn single_node_reconfigure_converges_ok() {
   );
   tokio::time::timeout(
     Duration::from_secs(10),
-    handle.reconfigure_to(target, HealthHint::default()),
+    handle.reconfigure_to(target, HealthHint::default(), None),
   )
   .await
   .expect("the reconfiguration converges within 10s")
@@ -365,7 +365,11 @@ async fn single_node_shrink_with_an_unreachable_successor_voter_stalls_to_insuff
   // proven, which never happens. Generously bound the test wait above the 1s deadline.
   let outcome = tokio::time::timeout(
     Duration::from_secs(10),
-    handle.reconfigure_to(target, HealthHint::default()),
+    handle.reconfigure_to(
+      target,
+      HealthHint::default(),
+      Some(AcceptReducedFaultTolerance),
+    ),
   )
   .await
   .expect("the call resolves (InsufficientLiveness) well within 10s — it does not hang");
@@ -426,7 +430,7 @@ async fn idle_three_voter_shrink_completes_from_health_probes_alone() {
   );
   tokio::time::timeout(
     viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(2),
-    handles[0].reconfigure_to(target, HealthHint::default()),
+    handles[0].reconfigure_to(target, HealthHint::default(), Some(AcceptReducedFaultTolerance)),
   )
   .await
   .expect("the call resolves within the deadline band")
@@ -480,8 +484,15 @@ async fn a_killed_survivor_blocks_the_shrink_and_the_rest_stay_available() {
   let _ = handles[1].shutdown().await;
 
   let primary = handles[0].clone();
-  let recon =
-    tokio::spawn(async move { primary.reconfigure_to(target, HealthHint::default()).await });
+  let recon = tokio::spawn(async move {
+    primary
+      .reconfigure_to(
+        target,
+        HealthHint::default(),
+        Some(AcceptReducedFaultTolerance),
+      )
+      .await
+  });
 
   let outcome = tokio::time::timeout(
     viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(5),
@@ -740,7 +751,7 @@ async fn stream_cluster_survives_slot_shift() {
   );
   tokio::time::timeout(
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, HealthHint::default()),
+    handles[0].reconfigure_to(target, HealthHint::default(), None),
   )
   .await
   .expect("the reconfiguration converges within 20s")
@@ -935,7 +946,7 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
   // admits it.
   tokio::time::timeout(
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, HealthHint::default()),
+    handles[0].reconfigure_to(target, HealthHint::default(), None),
   )
   .await
   .expect("the promotion converges within 20s")
@@ -1116,7 +1127,7 @@ async fn quic_cluster_survives_slot_shift() {
   );
   tokio::time::timeout(
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, HealthHint::default()),
+    handles[0].reconfigure_to(target, HealthHint::default(), None),
   )
   .await
   .expect("the reconfiguration converges within 20s")

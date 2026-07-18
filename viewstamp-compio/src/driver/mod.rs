@@ -650,6 +650,7 @@ where
       Command::Reconfigure {
         target,
         health,
+        ack,
         reply,
       } => {
         if self.reconfigure.is_some() {
@@ -673,6 +674,7 @@ where
             live,
             fresh,
             self.coord.endpoint().local(),
+            ack,
           ));
         }
         false
@@ -715,10 +717,10 @@ where
     }
     let live = self.coord.live_membership();
     let fresh = self.coord.proven_live_voters(now);
-    let outcome = job.advance(now, live, fresh, &mut |delta| {
+    let outcome = job.advance(now, live, fresh, &mut |delta, ack| {
       self
         .coord
-        .propose_membership(now, &mut self.wal, delta, None)
+        .propose_membership(now, &mut self.wal, delta, ack)
     });
     if !matches!(outcome, viewstamp_driver::AdvanceOutcome::Done) {
       self.reconfigure = Some(job);
