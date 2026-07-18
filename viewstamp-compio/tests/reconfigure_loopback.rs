@@ -439,12 +439,16 @@ async fn idle_three_voter_shrink_completes_from_health_probes_alone() {
 /// A SURVIVOR THAT NEVER PROVES BLOCKS A SHRINK THAT WOULD STRAND IT, AND THE REST STAY
 /// AVAILABLE: a real 3-voter cluster {0,1,2}; the primary (0) is asked to shrink to {0,1} (the sole
 /// delta is `RemoveVoter(2)`), and voter 1 — a SURVIVOR of the target, not the departing voter — is
-/// killed right after the call. `RemoveVoter(2)` is NEVER issued: its successor `{0,1}` would leave 1
-/// dead, an immediate outage, so the shrink stalls fail-closed naming 1 unproven. Meanwhile the
-/// ORIGINAL 3-voter quorum (2 of 3) does not need voter 1: voter 0 and voter 2 alone still commit a
-/// client op after the stall, proving continued availability despite both the crash and the stall —
+/// killed BEFORE the shrink is issued. `RemoveVoter(2)` is NEVER issued: its successor `{0,1}` would
+/// leave 1 dead, an immediate outage, so the shrink stalls fail-closed naming 1 unproven. Meanwhile
+/// the ORIGINAL 3-voter quorum (2 of 3) does not need voter 1: voter 0 and voter 2 alone still commit
+/// a client op after the stall, proving continued availability despite both the crash and the stall —
 /// and, since a wrongly-installed `{0,1}` successor with 1 dead could never commit anything again,
-/// that commit landing is itself proof voter 2 was never removed.
+/// that commit landing is itself proof voter 2 was never removed. Killing BEFORE the call is
+/// deliberate: a post-call kill is structurally racy against the documented bounded point-in-time
+/// freshness residual (a survivor that answers one probe within `max_age`, then dies, legitimately
+/// authorizes the removal), so this loopback pins the deterministic end-to-end form while the
+/// crashed-after-answering nuances live in the unit/executor falsifiers.
 #[compio::test]
 async fn a_killed_survivor_blocks_the_shrink_and_the_rest_stay_available() {
   let ca = TestCa::new();
@@ -469,16 +473,16 @@ async fn a_killed_survivor_blocks_the_shrink_and_the_rest_stay_available() {
     std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
     std::collections::BTreeSet::new(),
   );
+  // Kill voter 1 BEFORE issuing the shrink: from this point on it can never answer a health-probe
+  // round, so the successor {0,1} can never be proven live and the removal deterministically stalls.
+  // The RemoveVoter op still commits via the surviving {0,2} quorum of the current 3-voter config.
+  let _ = handles[1].shutdown().await;
+
   let primary = handles[0].clone();
   let recon =
     compio::runtime::spawn(
       async move { primary.reconfigure_to(target, HealthHint::default()).await },
     );
-
-  // Kill voter 1 shortly after the call is issued: from this point on it can never answer another
-  // health-probe round.
-  compio::time::sleep(Duration::from_millis(200)).await;
-  let _ = handles[1].shutdown().await;
 
   let outcome = compio::time::timeout(
     viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(5),
