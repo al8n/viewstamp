@@ -73,8 +73,9 @@ impl Default for HealthHint {
 }
 
 /// What the plan reached when a bounded-loop outcome fired. The cluster is NOT necessarily back at
-/// `current`: the grow/promote steps commit before the shrink branch, so a stall on a `RemoveVoter` leaves
-/// the intermediate config those steps produced. `live` is the membership the loop last observed.
+/// `current`: the grow/promote steps commit before the shrink branch, so a stall on a `DemoteVoter`
+/// (or its `RemoveLearner` GC step) leaves the intermediate config those steps produced. `live` is
+/// the membership the loop last observed.
 ///
 /// INVARIANT: exactly one of `(remaining, reason)` is populated — `remaining: Some(NON-empty valid plan)`
 /// with `reason: None` (the plan toward the target is STILL VALID from `live`), OR `remaining: None` with
@@ -1051,7 +1052,7 @@ impl ReconfigureJob {
         Err(ProposeMembershipError::NotPrimary) => {
           let _ = step_reply.send(StepOutcome::Failed(ReconfigureError::NotPrimary));
         }
-        // Non-retryable terminals — a structurally `Invalid` delta, a `DirectAddVoterUnsupported`, or a
+        // Non-retryable terminals — a structurally `Invalid` delta, or a
         // `ReducedFaultToleranceUnacknowledged` (an odd-`n` demote proposed with no acknowledgement, which
         // the goal-level preflight normally forecloses; surfaced here as a terminal rather than retried).
         Err(e) => {

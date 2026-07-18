@@ -141,16 +141,14 @@ fn a_pure_reorder_yields_the_empty_plan() {
 }
 
 #[test]
-fn every_emitted_delta_applies_in_sequence_and_never_raw_add_voter() {
+fn every_emitted_delta_applies_in_sequence() {
   let c = genesis(&[1, 2, 3], &[8]);
   let t = target(&[2, 3, 4, 5], &[9]);
   let plan = plan_reconfiguration(&c, &t).unwrap();
-  // Each delta applies against its immediate predecessor (the apply_plan unwrap proves it).
+  // Each delta applies against its immediate predecessor (the apply_plan unwrap proves it). That the
+  // plan grows the voting set ONLY via AddLearner+PromoteLearner needs no runtime assert anymore:
+  // the `SingleVoterDelta` vocabulary has no raw voter add to emit.
   let _ = apply_plan(&c, &plan);
-  assert!(
-    !plan.iter().any(SingleVoterDelta::is_add_voter),
-    "the planner grows the voting set ONLY via AddLearner+PromoteLearner, never raw AddVoter"
-  );
 }
 
 #[test]

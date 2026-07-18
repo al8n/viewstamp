@@ -460,7 +460,7 @@ fn install_membership_clears_the_probe_round() {
   // Install a successor configuration (a wholesale cross-epoch install, `reconfigure_op = None`).
   let successor = e
     .membership()
-    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(2)))
+    .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(2)))
     .expect("a valid shrink successor");
   e.install_membership(None, successor);
 

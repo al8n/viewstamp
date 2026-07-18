@@ -11,12 +11,12 @@
 //! becomes a voter only through `PromoteLearner`, which the primary admits only after a PROMOTE-TIME
 //! CHALLENGE: a fresh durable-prefix proof, re-grounded in the learner's storage at propose time, showing
 //! it durably holds the committed head. So the planner grows the voting set ONLY as
-//! `AddLearner` → catch up → `PromoteLearner`, and NEVER emits a direct `AddVoter`.
+//! `AddLearner` → catch up → `PromoteLearner`.
 //!
-//! A DIRECT voter addition is rejected (`propose_membership` refuses `AddVoter` at every cluster size): a
-//! brand-new voter holds no committed prefix — it was never a member and never committed a prior op — so
-//! it would count toward the successor's view-change quorum without having caught up, which can drop a
-//! committed op. Stage the member as a learner, let it catch up, then promote it.
+//! A DIRECT voter addition is UNREPRESENTABLE (the [`SingleVoterDelta`] vocabulary has no such delta):
+//! a brand-new voter holds no committed prefix — it was never a member and never committed a prior op —
+//! so it would count toward the successor's view-change quorum without having caught up, which can drop
+//! a committed op. Stage the member as a learner, let it catch up, then promote it.
 //!
 //! # Shrinking the voting set, DEMOTE-FIRST
 //!

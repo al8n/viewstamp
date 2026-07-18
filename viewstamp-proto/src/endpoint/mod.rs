@@ -4686,7 +4686,7 @@ impl<S, R> Endpoint<S, R> {
   /// A state-sync pull stamps the requester id as the sender's `local_slot()` — for an OLD-epoch laggard,
   /// its OLD slot in its OWN (stale) membership. The transport binds `from` by resolving the peer's STABLE
   /// `MemberId` in the DONOR's ACTIVE membership — the laggard's CURRENT slot. After a legal reconfiguration
-  /// that closes/moves slots (`RemoveVoter`, `PromoteLearner`), the laggard's old claimed slot and `from`'s
+  /// that closes/moves slots (`DemoteVoter`, `RemoveLearner`, `PromoteLearner`), the laggard's old claimed slot and `from`'s
   /// current slot DIFFER, so the strict `from == Peer::Replica(claimed)` binding ([`Self::sender_is_member`])
   /// DROPS the pull before its handler — cross-epoch catch-up strands for any slot-shifting change (the
   /// laggard is triggered by `EpochAhead` but can never PULL the crossing checkpoint: the `RequestSync`
@@ -4767,10 +4767,10 @@ impl<S, R> Endpoint<S, R> {
   ///
   /// A donor stamps its reply with its CURRENT (E+1) slot. The OLD-epoch laggard, mid-crossing, resolves
   /// `from` by the donor's STABLE `MemberId` under the laggard's OWN (E) membership — the donor's OLD
-  /// slot. After a LOW-INDEX `RemoveVoter`/`PromoteLearner` shifted the donor's slot, the donor's CURRENT
+  /// slot. After a LOW-INDEX `DemoteVoter`/`PromoteLearner` shifted the donor's slot, the donor's CURRENT
   /// claimed slot and `from`'s OLD slot DIFFER, so the strict `from == Peer::Replica(claimed)` binding
   /// ([`Self::sender_is_member`]) DROPS the reply at ingress — BEFORE `apply_sync` can verify the carried
-  /// successor membership and install the crossing. A low-index `RemoveVoter(0)` can shift EVERY surviving
+  /// successor membership and install the crossing. A low-index `DemoteVoter(0)` can shift EVERY surviving
   /// donor's slot, stranding every retained old-epoch laggard and potentially wedging the successor quorum.
   ///
   /// # Why relaxing this is safe — a serve reply carries NO forgeable authority

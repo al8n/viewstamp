@@ -1385,16 +1385,16 @@ fn a_reconfigure_log_entry_carries_the_successor_membership_in_memory() {
   );
 }
 
-// ── peer_checkpoint is keyed by stable MemberId, so a slot-shifting removal cannot poison the floors ──
+// ── peer_checkpoint is keyed by stable MemberId, so a slot-shifting shrink cannot poison the floors ──
 //
 // `peer_checkpoint` (the per-peer durable-checkpoint reports feeding the GC prune floor
 // `quorum_checkpoint_op` and the force-sync floor `max_peer_checkpoint_op`) is keyed by stable
-// `MemberId`. A low-index `RemoveVoter` shifts the routing slots of every higher voter; keying by the
-// stable id is what keeps a REMOVED member's stale report out of both floors and a RETAINED voter's
-// report attributed to THAT voter after its slot shifts — never misread as whoever now occupies its old
-// slot. (If `peer_checkpoint` were slot-keyed, `install_membership` would leave the old entries in place
-// and both floors would misattribute them — committed-op loss via premature GC, or a permanent sync
-// wedge to a checkpoint no current donor can serve.)
+// `MemberId`. A low-index `DemoteVoter` shifts the routing slots of every higher voter; keying by the
+// stable id is what keeps a DEMOTED member's report out of the voters-only quorum floor and a RETAINED
+// voter's report attributed to THAT voter after its slot shifts — never misread as whoever now occupies
+// its old slot. (If `peer_checkpoint` were slot-keyed, `install_membership` would leave the old entries
+// in place and both floors would misattribute them — committed-op loss via premature GC, or a permanent
+// sync wedge to a checkpoint no current donor can serve.)
 
 /// A 5-voter primary (local `MemberId 0` at slot 0) over `NoopSm`, with its own durable checkpoint set
 /// to `own_checkpoint` and the other four voter slots seeded with reports via the production recorder.
@@ -1411,46 +1411,48 @@ fn primary5_with_seeded_reports(own_checkpoint: u64, reports: [u64; 4]) -> Endpo
 }
 
 #[test]
-fn a_removed_members_report_does_not_lift_the_force_sync_floor_after_a_slot_shift() {
-  // Seed a HIGH report (999) from the soon-removed low-index voter `MemberId 1` (slot 1) and modest
+fn a_demoted_then_gced_members_report_leaves_the_force_sync_floor_in_stages() {
+  // Seed a HIGH report (999) from the soon-demoted low-index voter `MemberId 1` (slot 1) and modest
   // reports (50) from the retained voters {2,3,4}. Own checkpoint 5.
   let mut e = primary5_with_seeded_reports(5, [999, 50, 50, 50]);
-  // Pre-swap sanity: the high removed-member report DOES dominate the force-sync floor while it is a
-  // current member — this is the value that MUST disappear once it is removed.
+  // Pre-swap sanity: the high report DOES dominate the force-sync floor while its member is a
+  // current voter.
   assert_eq!(
     e.max_peer_checkpoint_op(),
     OpNumber::with(999),
     "while MemberId 1 is a current voter its report sets the force-sync floor"
   );
 
-  // Commit-shaped low-index removal: drop `MemberId 1`. Slots close up — {0,2,3,4} now occupy {0,1,2,3}
-  // — so every retained higher voter shifts down one slot. Local `MemberId 0` stays slot 0 (the primary).
-  let successor = e
+  // STAGE 1 — the DEMOTE (commit-shaped low-index shrink): `MemberId 1` becomes the learner at the
+  // tail. The voter prefix closes up — {0,2,3,4} now occupy {0,1,2,3} — so every retained higher
+  // voter shifts down one slot. Local `MemberId 0` stays slot 0 (the primary).
+  let demoted = e
     .membership
-    .apply_delta(&crate::SingleVoterDelta::RemoveVoter(MemberId::new(1)))
-    .expect("RemoveVoter(1) on the 5-voter genesis is valid");
-  e.install_membership(Some(OpNumber::with(7)), successor);
+    .apply_delta(&crate::SingleVoterDelta::DemoteVoter(MemberId::new(1)))
+    .expect("DemoteVoter(1) on the 5-voter genesis is valid");
+  e.install_membership(Some(OpNumber::with(7)), demoted);
   assert_eq!(e.membership.replica_count(), 4, "shrank to 4 voters");
   assert_eq!(
     e.membership.slot_of(MemberId::new(2)),
     Some(ReplicaId::new(1)),
     "the retained voter MemberId 2 shifted from slot 2 to slot 1",
   );
-  assert_eq!(
-    e.membership.slot_of(MemberId::new(1)),
-    None,
-    "MemberId 1 is no longer a member",
+  let demotee_slot = e
+    .membership
+    .slot_of(MemberId::new(1))
+    .expect("the demotee keeps a seat");
+  assert!(
+    e.membership.is_learner(demotee_slot),
+    "MemberId 1 is now the learner at the tail",
   );
 
-  // The removed member's stale 999 is keyed under `MemberId 1`, which is no longer a current member, so
-  // `max_peer_checkpoint_op` (current-members-only) EXCLUDES it. The floor falls to the max retained
-  // report (50) — no current donor could serve 999, and clearing a repair hole to it would wedge sync.
-  // MUTATION-CHECK: a slot-keyed `peer_checkpoint` iterating `.values()` would still include the stale
-  // 999 (it lives under `ReplicaId 1`) and this assert would FAIL (the floor would read 999).
+  // The demotee is STILL a current member — a live, log-current donor — so its 999 legitimately
+  // remains in `max_peer_checkpoint_op` (current-members-only): a sync to 999 CAN be served by it.
+  // What it no longer does is count toward any VOTER floor (see the quorum-floor sibling below).
   assert_eq!(
     e.max_peer_checkpoint_op(),
-    OpNumber::with(50),
-    "a removed member's stale report must not lift the force-sync floor after a slot shift",
+    OpNumber::with(999),
+    "a demoted member is a live donor: its report legitimately stays in the force-sync floor",
   );
   // The retained voter's report FOLLOWED its stable id across the slot shift (slot 2 → slot 1).
   assert_eq!(
@@ -1458,32 +1460,55 @@ fn a_removed_members_report_does_not_lift_the_force_sync_floor_after_a_slot_shif
     50,
     "the retained voter MemberId 2's report is still attributed to it after its slot shifted",
   );
+
+  // STAGE 2 — the GC (`RemoveLearner`, proposable only now that the demote installed): the seat is
+  // gone, and only now does the stale 999 leave the force-sync floor — no current donor could serve
+  // it, and clearing a repair hole to it would wedge sync.
+  // MUTATION-CHECK: a slot-keyed `peer_checkpoint` would still include the stale 999 after the GC
+  // (it lives under a physical slot) and this assert would FAIL (the floor would read 999).
+  let gced = e
+    .membership
+    .apply_delta(&crate::SingleVoterDelta::RemoveLearner(MemberId::new(1)))
+    .expect("RemoveLearner(1) is valid once the demote installed");
+  e.install_membership(Some(OpNumber::with(9)), gced);
+  assert_eq!(
+    e.membership.slot_of(MemberId::new(1)),
+    None,
+    "MemberId 1 is no longer a member",
+  );
+  assert_eq!(
+    e.max_peer_checkpoint_op(),
+    OpNumber::with(50),
+    "a GC'd member's stale report must not lift the force-sync floor",
+  );
   assert_eq!(
     e.peer_checkpoint_by_member_for_test(MemberId::new(1)),
     999,
-    "the removed member's stale entry lingers under its own id (inert — excluded by the floor consumers)",
+    "the GC'd member's stale entry lingers under its own id (inert — excluded by the floor consumers)",
   );
 }
 
 #[test]
 fn a_slot_shift_does_not_misattribute_a_retained_voters_quorum_report() {
-  // Own checkpoint 5; the soon-removed low-index voter `MemberId 1` (slot 1) reports a LOW 5, and the
-  // retained voters {2,3,4} report a HIGH 50. Under correct stable-id keying the post-removal quorum
-  // floor (4 voters, quorum 3) is the 3rd-highest of {own 5, m2 50, m3 50, m4 50} = 50.
+  // Own checkpoint 5; the soon-demoted low-index voter `MemberId 1` (slot 1) reports a LOW 5, and the
+  // retained voters {2,3,4} report a HIGH 50. Under correct stable-id keying the post-demote quorum
+  // floor (4 voters, quorum 3) is the 3rd-highest of {own 5, m2 50, m3 50, m4 50} = 50 — the
+  // demotee's report is excluded from the VOTERS-ONLY floor even though it stays a member.
   let mut e = primary5_with_seeded_reports(5, [5, 50, 50, 50]);
 
   let successor = e
     .membership
-    .apply_delta(&crate::SingleVoterDelta::RemoveVoter(MemberId::new(1)))
-    .expect("RemoveVoter(1) on the 5-voter genesis is valid");
+    .apply_delta(&crate::SingleVoterDelta::DemoteVoter(MemberId::new(1)))
+    .expect("DemoteVoter(1) on the 5-voter genesis is valid");
   e.install_membership(Some(OpNumber::with(7)), successor);
 
   // The retained voters' reports follow their stable ids across the one-slot shift, so the quorum-th
   // order statistic over the CURRENT voter set is 50.
   // MUTATION-CHECK: with a slot-keyed `peer_checkpoint` (no re-key on install), the post-swap loop reads
-  // physical slots 0..3 untranslated — slot 1 now yields the REMOVED member's stale low 5 (misattributed
-  // to the voter that shifted into slot 1), displacing a retained 50 — and the quorum floor collapses to
-  // 5, failing this assert. That premature-low floor is the GC-loss hazard the re-key closes.
+  // physical voter slots 0..3 untranslated — slot 1 now yields the DEMOTED member's stale low 5
+  // (misattributed to the voter that shifted into slot 1), displacing a retained 50 — and the quorum
+  // floor collapses to 5, failing this assert. That premature-low floor is the GC-loss hazard the
+  // stable-id keying closes.
   assert_eq!(
     e.quorum_checkpoint_op(),
     OpNumber::with(50),
@@ -1499,16 +1524,19 @@ fn a_slot_shift_does_not_misattribute_a_retained_voters_quorum_report() {
 // CONSENSUS-CRITICAL (committed-op loss): the per-op commit-vote bitset `Inflight::oks` is slot-keyed
 // and SURVIVES the in-place commit-first SwapEpoch swap (the still-Normal primary's pipeline is not
 // cleared on the retained-node path). `try_commit` counts `oks.count_ones() >= membership.quorum()`
-// against the NEW (post-swap, possibly SMALLER) voter set — so a REMOVED voter's stale pre-swap ack
+// against the NEW (post-swap, possibly SMALLER) voter set — so a DEMOTED voter's stale pre-swap ack
 // must NOT count toward the successor commit quorum, or a tail op minted after the Reconfigure op could
 // commit + reply WITHOUT any retained backup holding it, then be lost in the E+1 view change. The swap
-// re-keys `oks` by stable `MemberId` (drop the removed voter's bit), so the tail op must RE-GATHER a
-// current-config quorum.
+// re-keys `oks` by stable `MemberId`, and the DEMOTE pins the re-key's `is_voter(new_slot)` leg
+// specifically: the demotee still RESOLVES to a slot (its learner seat — here even the SAME slot
+// number), so only the voterness check drops its banked bit; a removed member exercises the weaker
+// no-slot leg instead. The tail op must RE-GATHER a current-config quorum.
 #[test]
-fn a_removed_voters_pre_swap_ack_does_not_commit_a_tail_op_after_the_swap() {
-  // 4-voter cluster {0,1,2,3}; local `MemberId 0` at slot 0 is the view-0 primary. We remove the
-  // HIGHEST voter `MemberId 3` (slot 3) so the retained voters {0,1,2} keep their slots — isolating the
-  // "removed voter's stale bit" effect from any slot shift.
+fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
+  // 4-voter cluster {0,1,2,3}; local `MemberId 0` at slot 0 is the view-0 primary. We demote the
+  // HIGHEST voter `MemberId 3` (slot 3) so the retained voters {0,1,2} keep their slots AND the
+  // demotee keeps slot number 3 (now a learner seat) — isolating the "demoted voter's banked bit"
+  // effect from any slot shift.
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(4), 0, NoopSm, u64::MAX);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
@@ -1591,7 +1619,7 @@ fn a_removed_voters_pre_swap_ack_does_not_commit_a_tail_op_after_the_swap() {
     RequestNumber::with(2),
     crate::storage::fnv1a_128(&[2u8]),
   );
-  // The tail op gets ONE more ack — from the voter being REMOVED (slot 3). own(slot 0) + slot 3 = 2
+  // The tail op gets ONE more ack — from the voter being DEMOTED (slot 3). own(slot 0) + slot 3 = 2
   // bits, still BELOW the old quorum of 3, so it does NOT commit yet.
   e.handle_message(
     now,
@@ -1612,7 +1640,7 @@ fn a_removed_voters_pre_swap_ack_does_not_commit_a_tail_op_after_the_swap() {
   assert_eq!(
     e.inflight.get(&2).map(|i| i.oks),
     Some((1u64 << 0) | (1u64 << 3)),
-    "pre-swap, the tail op carries own(slot 0) + the removed voter(slot 3)"
+    "pre-swap, the tail op carries own(slot 0) + the demotee(slot 3)"
   );
   assert_eq!(
     e.commit(),
@@ -1620,32 +1648,68 @@ fn a_removed_voters_pre_swap_ack_does_not_commit_a_tail_op_after_the_swap() {
     "the tail op is below the OLD quorum of 3 (2 bits) — not committed pre-swap"
   );
 
-  // Commit the reconfigure: REMOVE `MemberId 3`. New voter set {0,1,2}, quorum 2. The swap re-keys the
-  // surviving `inflight.oks` by stable MemberId — the removed voter's slot-3 bit is DROPPED, leaving only
-  // the primary's own vote.
+  // Commit the reconfigure: DEMOTE `MemberId 3`. New voter set {0,1,2}, quorum 2; the demotee is the
+  // learner at slot 3. The swap re-keys the surviving `inflight.oks` by stable MemberId — the
+  // demotee's bit RESOLVES (member 3 → slot 3) but the seat is a LEARNER slot, so the
+  // `is_voter(new_slot)` leg DROPS it, leaving only the primary's own vote.
   let successor = e
     .membership
-    .apply_delta(&crate::SingleVoterDelta::RemoveVoter(MemberId::new(3)))
-    .expect("RemoveVoter(3) on the 4-voter genesis is valid");
+    .apply_delta(&crate::SingleVoterDelta::DemoteVoter(MemberId::new(3)))
+    .expect("DemoteVoter(3) on the 4-voter genesis is valid");
+  assert!(
+    successor.is_learner(ReplicaId::new(3)),
+    "the demotee keeps slot number 3, as a learner seat"
+  );
   let (new_epoch, new_config_id) = (successor.epoch(), successor.config_id());
   e.install_membership(Some(OpNumber::with(1)), successor);
   assert_eq!(e.membership.quorum(), 2, "3 voters → new commit quorum 2");
 
-  // THE FIX: the removed voter's stale bit was dropped at the swap, so the tail op now carries only the
+  // THE FIX: the demotee's banked bit was dropped at the swap, so the tail op now carries only the
   // primary's own vote (1 bit) — BELOW the new quorum of 2. It does NOT commit on the post-swap quorum.
-  // MUTATION-CHECK: delete the `rekey_slot_quorums_for_swap` call in `install_membership` and the stale
-  // slot-3 bit survives; `count_ones() == 2 >= quorum(2)` commits the tail op here (with NO retained
-  // backup holding it — committed-op loss across the E+1 view change), and this assert FAILS.
+  // MUTATION-CHECK: weaken the re-key to resolve-by-member WITHOUT the `is_voter(new_slot)` check and
+  // the demotee's bit re-lands at slot 3; `count_ones() == 2 >= quorum(2)` commits the tail op here
+  // (with NO retained voter holding it — committed-op loss across the E+1 view change), and this
+  // assert FAILS. (Deleting the whole `rekey_slot_quorums_for_swap` call fails it identically.)
   assert_eq!(
     e.inflight.get(&2).map(|i| i.oks),
     Some(1u64 << 0),
-    "the swap dropped the removed voter's slot-3 bit — only the primary's own vote remains"
+    "the swap dropped the demotee's slot-3 bit — only the primary's own vote remains"
   );
   e.try_commit(now, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
-    "the removed voter's stale ack does NOT count toward the new quorum — the tail op stays uncommitted"
+    "the demotee's banked ack does NOT count toward the new quorum — the tail op stays uncommitted"
+  );
+
+  // The demotee's POST-swap ack is refused at the mint too: an E+1-stamped PrepareOk from slot 3 —
+  // now a learner seat — never re-banks a vote (a learner's ack is not counted), so the demotee's
+  // voice is structurally gone from the commit quorum on BOTH sides of the swap.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(3)),
+    Message::PrepareOk(PrepareOk::new(
+      View::new(),
+      OpNumber::with(2),
+      ReplicaId::new(3),
+      OpNumber::new(),
+      id_op2,
+      new_epoch,
+      new_config_id,
+    )),
+  );
+  assert_eq!(
+    e.inflight.get(&2).map(|i| i.oks),
+    Some(1u64 << 0),
+    "a post-swap ack from the demotee's learner seat banks no vote bit"
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "the tail op stays uncommitted on the demotee's post-swap ack"
   );
 
   // A RETAINED current-config backup (`MemberId 1`, still slot 1) acks the tail op at the NEW epoch:

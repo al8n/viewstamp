@@ -400,9 +400,9 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
 #[test]
 fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
   // 3 voters {0,1,2}, no learners. After the load settles, CRASH one SURVIVOR of the intended
-  // 2-voter successor, then propose the removal of the OTHER non-primary voter. The removal's
+  // 2-voter successor, then propose the demotion of the OTHER non-primary voter. The demote's
   // successor quorum is {primary, crashed survivor} — 2-of-2 — so the op can assemble a bare
-  // predecessor quorum (primary + the LEAVING voter) but never a successor one: it must sit
+  // predecessor quorum (primary + the DEMOTEE) but never a successor one: it must sit
   // UNCOMMITTED (no commit, no swap anywhere, the 3-voter set still authoritative) for as long as
   // the survivor is down. Restarting the survivor releases it: the recovered voter acks the
   // retransmitted op, the successor quorum witnesses the commit, and the swap installs — the
@@ -436,17 +436,17 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
   let removed = others.next().expect("two non-primary voters");
   let survivor = others.next().expect("two non-primary voters");
 
-  // (2) Crash the successor-critical survivor FIRST, then propose removing the other voter: the
+  // (2) Crash the successor-critical survivor FIRST, then propose demoting the other voter: the
   // successor {primary, survivor} can never assemble its quorum while the survivor is down.
   c.crash(survivor);
   c.propose_reconfigure_single_change(
-    SingleVoterDelta::RemoveVoter(MemberId::new(removed as u128)),
+    SingleVoterDelta::DemoteVoter(MemberId::new(removed as u128)),
     // A 3 → 2 shrink reduces the cluster's crash tolerance; the test plays the operator accepting it.
     Some(AcceptReducedFaultTolerance),
   )
-  .expect("the serving primary admits the removal proposal");
+  .expect("the serving primary admits the demote proposal");
 
-  // (3) HELD: the predecessor quorum {primary, leaver} exists the whole time, yet the removal must
+  // (3) HELD: the predecessor quorum {primary, demotee} exists the whole time, yet the demote must
   // never commit or swap — no successor quorum has processed it.
   for t in 0..4_000 {
     tick_checked(&mut c, &mut dur, &mut once, &mut lin, 100_000 + t);
@@ -457,16 +457,16 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
     );
     assert!(
       c.committed_reconfigure_ops().is_empty(),
-      "the removal must stay uncommitted while the successor quorum is unacked (tick {t})"
+      "the demote must stay uncommitted while the successor quorum is unacked (tick {t})"
     );
   }
   assert_eq!(
     c.replica_voter_count(p),
     Some(3),
-    "the predecessor voter set stays authoritative while the removal is held"
+    "the predecessor voter set stays authoritative while the demote is held"
   );
 
-  // (4) RELEASED: restart the survivor; it recovers, acks the retransmitted removal, and the swap
+  // (4) RELEASED: restart the survivor; it recovers, acks the retransmitted demote, and the swap
   // installs under a successor quorum's witness.
   c.restart(survivor);
   let mut installed = false;
@@ -479,15 +479,15 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
   }
   assert!(
     installed,
-    "the removal commits and installs once the restarted survivor acks it"
+    "the demote commits and installs once the restarted survivor acks it"
   );
   assert!(
     !c.committed_reconfigure_ops().is_empty(),
-    "the removal is committed after the successor quorum acked"
+    "the demote is committed after the successor quorum acked"
   );
 
-  // (5) Settle the swap cluster-wide, then pin the successor shape: 2 voters, the removed member
-  // absent, the restarted survivor seated.
+  // (5) Settle the swap cluster-wide, then pin the successor shape: 2 voters, the demotee retained
+  // as the learner, the restarted survivor seated.
   for t in 0..20_000 {
     if c
       .serving_primary()
@@ -499,9 +499,12 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
   }
   let m = c.serving_primary_membership();
   assert_eq!(m.replica_count(), 2, "the successor is the 2-voter config");
+  let demotee_slot = m
+    .slot_of(MemberId::new(removed as u128))
+    .expect("the demotee keeps a seat in the successor");
   assert!(
-    m.slot_of(MemberId::new(removed as u128)).is_none(),
-    "the removed voter is absent from the successor"
+    m.is_learner(demotee_slot),
+    "the demotee is retained as the successor's learner"
   );
   assert!(
     m.slot_of(MemberId::new(survivor as u128)).is_some(),

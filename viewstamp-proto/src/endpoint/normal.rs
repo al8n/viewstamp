@@ -344,9 +344,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // bearing the reserved id cannot be type-erased into a `Body::Present` op on the primary while
     // every backup reconstructs the same prepare's bytes as a typed `Body::Reconfigure`
     // (`log_entry_from_prepare` → `from_committed_body` keys on this id). That would BYPASS
-    // `propose_membership`'s entire admission ladder (the direct-AddVoter rejection, the PromoteLearner
-    // catch-up gate, the single-change gate, the predecessor-delta validation, the single-writer
-    // `reconfigure_inflight` latch) and yield a primary/backup membership SPLIT or a committed-log
+    // `propose_membership`'s entire admission ladder (the closed `SingleVoterDelta` vocabulary, the
+    // PromoteLearner catch-up gate, the single-change gate, the predecessor-delta validation, the
+    // single-writer `reconfigure_inflight` latch) and yield a primary/backup membership SPLIT or a committed-log
     // divergence (the same committed op typed differently on the primary vs. the backups). Drop it
     // silently: emit no `Prepare`, mint no op, insert no session row, send no reply (this id is never
     // a real session, so there is nothing to ack). This guards ONLY the CLIENT `Request` ingress —
@@ -858,9 +858,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // PromoteLearner (the promote-time proof), never directly.
       //
       // PANIC, not skip: this arm runs only for a COMMITTED op, and no compliant cluster can commit
-      // one — `propose_membership` refuses the mint, and every vote is refused at its mint:
-      // `send_prepare_ok` never acks such an op, `record_own_vote` never counts the own bit, and the
-      // solo-voter recovery reseed seeds none (the
+      // one — the [`SingleVoterDelta`] vocabulary cannot even EXPRESS a direct voter add (there is no
+      // such delta to propose, so a compliant primary cannot mint the op), and every vote is refused
+      // at its mint: `send_prepare_ok` never acks such an op, `record_own_vote` never counts the own
+      // bit, and the solo-voter recovery reseed seeds none (the
       // append seam additionally drops the `Prepare` before it burns a WAL slot), so it can never
       // assemble a quorum of compliant votes. By that induction no committed state, and hence no
       // state-sync donor checkpoint, ever contains a direct-add configuration — and the induction's

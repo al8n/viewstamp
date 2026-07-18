@@ -115,7 +115,7 @@ fn propose_membership_on_a_backup_is_rejected_not_primary() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::AddVoter(MemberId::new(3)),
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
       None
     ),
     Err(ProposeMembershipError::NotPrimary),
@@ -134,7 +134,7 @@ fn propose_membership_while_not_normal_is_rejected_not_normal() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::AddVoter(MemberId::new(3)),
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
       None
     ),
     Err(ProposeMembershipError::NotNormal),
@@ -185,11 +185,11 @@ fn a_second_proposal_while_one_is_in_flight_is_rejected_already_in_flight() {
 fn an_invalid_delta_is_rejected_with_the_underlying_membership_error() {
   let mut e = single_change_primary();
   let mut wal = TestWal::default();
-  // Removing a voter that is not a member is structurally invalid — surfaced as `Invalid`.
+  // Demoting a voter that is not a member is structurally invalid — surfaced as `Invalid`.
   match e.propose_membership(
     Instant::ZERO,
     &mut wal,
-    SingleVoterDelta::RemoveVoter(MemberId::new(99)),
+    SingleVoterDelta::DemoteVoter(MemberId::new(99)),
     None,
   ) {
     Err(ProposeMembershipError::Invalid(crate::MembershipError::UnknownMember)) => {}
@@ -236,7 +236,7 @@ fn reconfigure_ack_at(
 /// the instant it commits, BEFORE the staged `SwapEpoch` root is made durable. Returns the endpoint,
 /// its storage, the minted op, and the successor membership / payload. `AddLearner` is the accepted
 /// membership-changing delta used to exercise the reconfigure MACHINERY (mint → commit → swap → carry)
-/// independently of any voter-set change; direct `AddVoter` is refused at propose time.
+/// independently of any voter-set change; the vocabulary has no direct voter add.
 ///
 /// Commit lifecycle: propose (mint + own Prepare) → the primary's own append lands (own vote) → one
 /// backup `PrepareOk` (2-of-3 quorum) → `try_commit` recognizes the Reconfigure op and stages the
@@ -289,7 +289,7 @@ fn reconfigure_payload_body_round_trips_through_decode() {
   // `on_prepare` decodes a RECONFIGURATION Prepare's flat wire body back to a `ReconfigurePayload`
   // and stores a typed `Body::Reconfigure` — so the encode→decode round trip must be the identity.
   let successor = genesis(3)
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(7)))
+    .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(2)))
     .unwrap();
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let bytes = payload.encode_body();
@@ -438,41 +438,11 @@ fn assert_shrink_committed(e: &Endpoint<CountSm, SingleChange>, op: OpNumber) {
 }
 
 #[test]
-fn a_three_to_two_shrink_holds_until_both_successor_voters_ack() {
-  // {0,1,2} → {0,1}: the successor quorum is BOTH survivors (2-of-2). The primary's own vote plus
-  // the LEAVING voter's ack form a predecessor quorum (2-of-3), but no successor majority has
-  // processed the removal — committing on it could seat {0,1} while voter 1 is already gone, so the
-  // op must WAIT. It commits the moment survivor 1 acks: the successor quorum witnesses the commit.
-  let mut e = single_change_primary_of(3);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::MemBlockStore::new();
-  let (op, payload) = propose_shrink_with_own_vote(
-    &mut e,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    SingleVoterDelta::RemoveVoter(MemberId::new(2)),
-  );
-
-  // Own vote + the leaver's ack = a predecessor quorum WITHOUT any successor majority: held.
-  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
-  assert_shrink_held(&e, op);
-
-  // Survivor 1's ack completes the successor quorum {0,1}: the removal commits.
-  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
-  assert_shrink_committed(&e, op);
-  assert_eq!(
-    e.membership.replica_count(),
-    3,
-    "the in-memory voter set stays the predecessor until the swap root is durable"
-  );
-}
-
-#[test]
 fn an_even_to_odd_shrink_commits_on_a_predecessor_quorum_including_the_leaver() {
-  // {0,1,2,3} → {0,1,2}: ANY predecessor quorum (3-of-4) holds at most one leaving-voter bit, so it
-  // already contains a successor quorum (2-of-3) — the successor requirement is implied and adds no
-  // wait, even when the quorum includes the LEAVER's own ack and one retained voter never acked.
+  // {0,1,2,3} → voters {0,1,2} + learner {3}: ANY predecessor quorum (3-of-4) holds at most one
+  // leaving-voter bit, so it already contains a successor quorum (2-of-3) — the successor requirement
+  // is implied and adds no wait, even when the quorum includes the DEMOTEE's own ack and one retained
+  // voter never acked.
   let mut e = single_change_primary_of(4);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -481,10 +451,10 @@ fn an_even_to_odd_shrink_commits_on_a_predecessor_quorum_including_the_leaver() 
     &mut wal,
     &mut sb,
     &mut blocks,
-    SingleVoterDelta::RemoveVoter(MemberId::new(3)),
+    SingleVoterDelta::DemoteVoter(MemberId::new(3)),
   );
 
-  // Own vote + slot 1 + the LEAVER slot 3 = a predecessor quorum whose retained subset {0,1} is
+  // Own vote + slot 1 + the DEMOTEE slot 3 = a predecessor quorum whose retained subset {0,1} is
   // already a successor majority: commits with NO ack from slot 2.
   deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 3);
   assert_shrink_held(&e, op); // two acks: not even a predecessor quorum yet.
@@ -494,9 +464,9 @@ fn an_even_to_odd_shrink_commits_on_a_predecessor_quorum_including_the_leaver() 
 
 #[test]
 fn a_five_to_four_shrink_needs_a_successor_quorum_beyond_the_predecessor_one() {
-  // {0..4} → {0..3}: a predecessor quorum (3-of-5) that leans on the LEAVING voter's ack holds only
-  // TWO retained voters — below the successor quorum (3-of-4) — so the removal waits for a third
-  // retained voter even though the uniform threshold was already met.
+  // {0..4} → voters {0..3} + learner {4}: a predecessor quorum (3-of-5) that leans on the DEMOTEE's
+  // ack holds only TWO retained voters — below the successor quorum (3-of-4) — so the demote waits
+  // for a third retained voter even though the uniform threshold was already met.
   let mut e = single_change_primary_of(5);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -505,10 +475,10 @@ fn a_five_to_four_shrink_needs_a_successor_quorum_beyond_the_predecessor_one() {
     &mut wal,
     &mut sb,
     &mut blocks,
-    SingleVoterDelta::RemoveVoter(MemberId::new(4)),
+    SingleVoterDelta::DemoteVoter(MemberId::new(4)),
   );
 
-  // Own vote + slot 1 + the leaver slot 4 = 3-of-5 base quorum, retained {0,1} = 2 < 3: held.
+  // Own vote + slot 1 + the demotee slot 4 = 3-of-5 base quorum, retained {0,1} = 2 < 3: held.
   deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 4);
   deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
   assert_shrink_held(&e, op);
@@ -543,48 +513,49 @@ fn a_three_to_two_demote_holds_until_both_successor_voters_ack() {
   // Retained voter 1's ack completes the successor quorum {0,1}: the demote commits.
   deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
   assert_shrink_committed(&e, op);
+  assert_eq!(
+    e.membership.replica_count(),
+    3,
+    "the in-memory voter set stays the predecessor until the swap root is durable"
+  );
 }
 
 #[test]
 fn a_three_to_two_shrink_proposal_needs_the_reduced_tolerance_acknowledgement() {
-  // 3 voters tolerate one crash (f = 1); 2 tolerate none (f = 0). Either shrink kind — a removal or
-  // a demote — reduces the tolerance, so a bare proposal is refused with both tolerances named and
-  // nothing minted, and the SAME delta mints once the caller names the acceptance.
-  for delta in [
-    SingleVoterDelta::RemoveVoter(MemberId::new(2)),
-    SingleVoterDelta::DemoteVoter(MemberId::new(2)),
-  ] {
-    let mut e = single_change_primary_of(3);
-    let mut wal = TestWal::default();
-    let head = e.op();
-    assert_eq!(
-      e.propose_membership(Instant::ZERO, &mut wal, delta.clone(), None),
-      Err(ProposeMembershipError::ReducedFaultToleranceUnacknowledged { from: 1, to: 0 }),
-      "an f-reducing {} is refused without the acknowledgement",
-      delta.as_str(),
-    );
-    assert_eq!(e.reconfigure_inflight, None, "nothing was minted");
-    assert_eq!(e.op(), head, "the head did not advance for the refusal");
+  // 3 voters tolerate one crash (f = 1); 2 tolerate none (f = 0): the demote reduces the tolerance,
+  // so a bare proposal is refused with both tolerances named and nothing minted, and the SAME delta
+  // mints once the caller names the acceptance.
+  let delta = SingleVoterDelta::DemoteVoter(MemberId::new(2));
+  let mut e = single_change_primary_of(3);
+  let mut wal = TestWal::default();
+  let head = e.op();
+  assert_eq!(
+    e.propose_membership(Instant::ZERO, &mut wal, delta.clone(), None),
+    Err(ProposeMembershipError::ReducedFaultToleranceUnacknowledged { from: 1, to: 0 }),
+    "an f-reducing {} is refused without the acknowledgement",
+    delta.as_str(),
+  );
+  assert_eq!(e.reconfigure_inflight, None, "nothing was minted");
+  assert_eq!(e.op(), head, "the head did not advance for the refusal");
 
-    let op = e
-      .propose_membership(
-        Instant::ZERO,
-        &mut wal,
-        delta,
-        Some(crate::AcceptReducedFaultTolerance),
-      )
-      .expect("the acknowledged shrink mints");
-    assert_eq!(
-      op.get(),
-      head.get() + 1,
-      "the acknowledged shrink is the next op"
-    );
-    assert_eq!(
-      e.reconfigure_inflight,
-      Some(op),
-      "the latch armed on the mint"
-    );
-  }
+  let op = e
+    .propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      delta,
+      Some(crate::AcceptReducedFaultTolerance),
+    )
+    .expect("the acknowledged shrink mints");
+  assert_eq!(
+    op.get(),
+    head.get() + 1,
+    "the acknowledged shrink is the next op"
+  );
+  assert_eq!(
+    e.reconfigure_inflight,
+    Some(op),
+    "the latch armed on the mint"
+  );
 }
 
 #[test]
@@ -615,16 +586,16 @@ fn a_five_to_four_shrink_proposal_needs_the_reduced_tolerance_acknowledgement() 
 #[test]
 fn an_even_to_odd_shrink_proposal_is_ungated() {
   // 4 → 3 keeps f = 1: the gate guards crash tolerance, not shrinking per se, so a bare even-to-odd
-  // shrink of either kind mints.
-  for delta in [
-    SingleVoterDelta::RemoveVoter(MemberId::new(3)),
+  // demote mints.
+  let mut e = single_change_primary_of(4);
+  let mut wal = TestWal::default();
+  e.propose_membership(
+    Instant::ZERO,
+    &mut wal,
     SingleVoterDelta::DemoteVoter(MemberId::new(3)),
-  ] {
-    let mut e = single_change_primary_of(4);
-    let mut wal = TestWal::default();
-    e.propose_membership(Instant::ZERO, &mut wal, delta, None)
-      .expect("an f-preserving shrink mints bare");
-  }
+    None,
+  )
+  .expect("an f-preserving shrink mints bare");
 
   // A superfluous acknowledgement on a non-reducing delta is accepted and ignored, so a driver may
   // thread an operator's token through unconditionally.
@@ -642,22 +613,22 @@ fn an_even_to_odd_shrink_proposal_is_ungated() {
 #[test]
 fn structural_validation_precedes_the_reduced_tolerance_gate() {
   // The gate compares the ALREADY-VALIDATED successor, so a structurally invalid delta surfaces
-  // `Invalid` — never the acknowledgement demand. The sole-voter shrink refuses as
+  // `Invalid` — never the acknowledgement demand. The sole-voter demote refuses as
   // `WouldRemoveLastVoter` even though bare…
   let mut e = single_change_primary_of(1);
   let mut wal = TestWal::default();
-  for delta in [
-    SingleVoterDelta::RemoveVoter(MemberId::new(0)),
-    SingleVoterDelta::DemoteVoter(MemberId::new(0)),
-  ] {
-    assert_eq!(
-      e.propose_membership(Instant::ZERO, &mut wal, delta, None),
-      Err(ProposeMembershipError::Invalid(
-        crate::MembershipError::WouldRemoveLastVoter
-      )),
-      "the last-voter refusal precedes the tolerance gate",
-    );
-  }
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::DemoteVoter(MemberId::new(0)),
+      None
+    ),
+    Err(ProposeMembershipError::Invalid(
+      crate::MembershipError::WouldRemoveLastVoter
+    )),
+    "the last-voter refusal precedes the tolerance gate",
+  );
 
   // …and an unknown member on an odd-sized cluster surfaces `UnknownMember`, not the gate.
   let mut e = single_change_primary_of(3);
@@ -1164,8 +1135,8 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
   let n1: u64 = 2; // the node's OWN reconfigure op N (E0 -> E1); committed band is ops (0 .. N].
   let genesis_mem = genesis(3);
   let successor_e1 = genesis_mem
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
   let genesis_config_id = genesis_mem.config_id();
 
   // A BACKUP (slot 1) at E0, Normal, that committed its own reconfigure op N (op == commit_min == N),
@@ -1337,8 +1308,8 @@ fn a_recovery_peer_fetch_install_error_re_fetches_and_completes_without_strandin
   let n1: u64 = 2; // the node's OWN reconfigure op N (E0 -> E1); committed band is ops (0 .. N].
   let genesis_mem = genesis(3);
   let successor_e1 = genesis_mem
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
   let genesis_config_id = genesis_mem.config_id();
 
   // A BACKUP (slot 1) at E0, Normal, that committed its own reconfigure op N (op == commit_min == N),
@@ -1505,8 +1476,8 @@ fn recovery_pays_the_checkpoint_debt_with_no_traffic() {
   let n = 2u64; // the reconfigure op N — the committed band is ops (0 .. N].
   let genesis_mem = genesis(3);
   let successor = genesis_mem
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter is a valid delta on a 3-voter cluster");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
 
   // The committed-band headers the durable root names — ops 1..=N, matching the WAL bodies `[op]` that
   // `ScriptedWal::with_entries` writes (so recovery's band cross-check passes and the bodies fill).
@@ -1681,8 +1652,8 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
   // exactly what the original proposer pinned. The DVC carries this as a typed `Body::Reconfigure` entry.
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter is a valid delta on a 3-voter cluster");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   // (1) Drive replica 1 into ViewChange(1): its idle timer proposes, one peer's SVC reaches the SVC
@@ -1783,7 +1754,7 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
     e.propose_membership(
       now,
       &mut wal,
-      SingleVoterDelta::AddVoter(MemberId::new(4)),
+      SingleVoterDelta::AddLearner(MemberId::new(4)),
       None
     ),
     Err(ProposeMembershipError::AlreadyInFlight),
@@ -1953,7 +1924,7 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   // under the reserved id; every backup would reconstruct that prepare's bytes via `from_committed_body`
   // (which keys on this id) as a typed `Body::Reconfigure` and, on commit, STAGE a membership change —
   // while the primary applied the same op as a state-machine command. That BYPASSES `propose_membership`
-  // entirely (the AddVoter XI-b gate, the PromoteLearner catch-up gate, the single-change gate, the
+  // entirely (the closed delta vocabulary, the PromoteLearner catch-up gate, the single-change gate, the
   // predecessor-delta validation, the single-writer latch) and forks the committed log (the same op typed
   // `Present` on the primary and `Reconfigure` on the backups). The fence DROPS it at ingress.
   //
@@ -1965,12 +1936,12 @@ fn a_client_request_bearing_the_reserved_reconfiguration_id_is_dropped_at_ingres
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
-  // A decodable reconfigure body (the AddVoter(3) successor, chained off the current config — exactly
+  // A decodable reconfigure body (the AddLearner(3) successor, chained off the current config — exactly
   // what `propose_membership` would encode), wrapped in a client `Request` under the reserved id.
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter is a valid delta on a 3-voter cluster");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, e.membership.config_id());
   let reserved_body = payload.encode_body();
 
@@ -2372,7 +2343,7 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
 // invariant on `self.membership`). So every E+1 voter durably committed the Reconfigure op, hence
 // holds the FULL E-committed prefix `<=` that op (commit-first puts the whole prefix on a node before
 // its E+1 vote can count). A RETAINED voter committed it in place; a NEWLY-ADDED voter can only be a
-// PROMOTED LEARNER — `propose_membership` refuses a direct `AddVoter`, so the sole path into the voting
+// PROMOTED LEARNER — the vocabulary has no direct voter add, so the sole path into the voting
 // set is a promote whose gate demands a fresh durable-prefix proof AND whose Reconfigure op the learner
 // must itself durably commit (commit-first) to install the swap. Either way the E+1 voter holds the
 // full prefix; there is NO path by which one joins the voting set without committing the Reconfigure op.
@@ -2519,23 +2490,25 @@ fn committed_op_then_swapped(
 }
 
 #[test]
-fn cp_overlap_3_to_2_remove_voter_in_the_old_write_quorum() {
-  // 3→2 RemoveVoter where the old WRITE quorum INCLUDES the removed voter. This is the case the naive
+fn cp_overlap_3_to_2_demote_in_the_old_write_quorum() {
+  // 3→2 DemoteVoter where the old WRITE quorum INCLUDES the demoted voter. This is the case the naive
   // count bound FAILS: `quorum(3) + quorum_view_change(2) = 2 + 1 = 3`, NOT `> 3`. Commit `o` with the
-  // primary (slot 0) and the voter that will be REMOVED (slot 2), so `o`'s old write quorum is
-  // {slot 0, slot 2} — the removed voter is one of the two nodes that acked `o`. The swap removes
+  // primary (slot 0) and the voter that will be DEMOTED (slot 2), so `o`'s old write quorum is
+  // {slot 0, slot 2} — the demotee is one of the two nodes that acked `o`. The swap demotes
   // member 2 (the highest slot), so the retained voters keep their slots (`{member0→slot0,
-  // member1→slot1}`); the lone retained non-primary voter slot 1 forms a full E+1 view-change quorum
+  // member1→slot1}`) and the demotee keeps slot 2 as a NON-VOTING learner; the lone retained
+  // non-primary voter slot 1 forms a full E+1 view-change quorum
   // (`quorum_view_change(2) == 1`) and is DISJOINT from `o`'s write quorum {slot 0, slot 2}. Only the
   // exact-durable-catch-up structure preserves `o` here: slot 1 never acked `o`, yet it reached E+1 by
   // durably committing the Reconfigure op (op 2), so it holds the full prefix `<= 2` — including the
   // client op `o == 1` — and must vouch for `o` at the view change.
-  let ack_backup = 2u16; // slot 2 (the voter being removed) acks both `o` and the Reconfigure op
+  let ack_backup = 2u16; // slot 2 (the voter being demoted) acks both `o` and the Reconfigure op
   let (mut e, _wal, _sb, o) =
-    committed_op_then_swapped(SingleVoterDelta::RemoveVoter(MemberId::new(2)), ack_backup);
+    committed_op_then_swapped(SingleVoterDelta::DemoteVoter(MemberId::new(2)), ack_backup);
 
-  // The post-swap config is the 2-voter E+1 membership; the removed voter (slot 2, one of `o`'s
-  // write-quorum acks) is gone, and slot 1 (the DVC donor) is a RETAINED voter — so the E+1 view-change
+  // The post-swap config is the 2-voter E+1 membership; the demotee (slot 2, one of `o`'s
+  // write-quorum acks) no longer VOTES — its counted ack is gone from every quorum even though it
+  // keeps a learner seat — and slot 1 (the DVC donor) is a RETAINED voter, so the E+1 view-change
   // quorum {slot 1} is DISJOINT from `o`'s write quorum {slot 0, slot 2}.
   assert_eq!(e.membership.replica_count(), 2, "E+1 is a 2-voter config");
   assert_eq!(e.membership.epoch(), crate::Epoch::new(1), "swapped to E+1");
@@ -2546,7 +2519,11 @@ fn cp_overlap_3_to_2_remove_voter_in_the_old_write_quorum() {
   );
   assert!(
     !e.membership.is_voter(ReplicaId::new(2)),
-    "the removed voter (slot 2), one of o's write-quorum acks, is NOT in the retained E+1 membership",
+    "the demotee (slot 2), one of o's write-quorum acks, is NOT an E+1 voter",
+  );
+  assert!(
+    e.membership.is_learner(ReplicaId::new(2)),
+    "the demotee keeps its seat as a NON-VOTING learner",
   );
   assert!(
     e.membership.is_voter(ReplicaId::new(1)),
@@ -2554,13 +2531,13 @@ fn cp_overlap_3_to_2_remove_voter_in_the_old_write_quorum() {
   );
 
   // The E+1 DVC quorum is the single retained voter slot 1 — the worst case: DISJOINT from `o`'s write
-  // quorum {slot 0, slot 2} (slot 1 is neither the primary nor the removed voter that acked `o`). Make
+  // quorum {slot 0, slot 2} (slot 1 is neither the primary nor the demotee that acked `o`). Make
   // that disjointness explicit against the write-quorum members {slot 0, slot ack_backup}:
   let dvc_donor = 1u16;
   assert_ne!(dvc_donor, 0, "the DVC donor is not the primary (slot 0)");
   assert_ne!(
     dvc_donor, ack_backup,
-    "the DVC donor is DISJOINT from o's write-quorum backup (slot {ack_backup}, the removed voter)",
+    "the DVC donor is DISJOINT from o's write-quorum backup (slot {ack_backup}, the demoted voter)",
   );
   // By exact catch-up slot 1 durably committed the Reconfigure op (op 2), so its DVC carries the full
   // prefix `[1..=2]` — including the client op `o`. (A real DVC's epoch/config_id stamping is irrelevant
@@ -2658,7 +2635,7 @@ fn dvc_carrying_committed_o(
 
 #[test]
 fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc() {
-  // 3→4 GROW via the LEGITIMATE promote path (direct `AddVoter` is refused at propose time). Commit a
+  // 3→4 GROW via the LEGITIMATE promote path (the vocabulary has no direct voter add). Commit a
   // client op `o` under the OLD 3-voter E=0 quorum, promote the learner into the voting set (the
   // fresh-proof challenge + commit-first install), then prove `o` rides an E+1 DVC quorum through
   // `select_canonical_log`. This is the odd→even 3→4 case the naive count bound does NOT cover
@@ -3997,101 +3974,14 @@ fn a_non_promote_delta_is_unaffected_by_the_catch_up_gate() {
   assert_eq!(e.reconfigure_inflight, Some(op), "the AddLearner op minted");
 }
 
-// === the direct AddVoter rejection (the sibling of the catch-up-then-promote gate) ===
-
-/// A 1-voter `SingleChange` endpoint whose sole member is slot 0 — the primary of view 0. The only
-/// voter is the whole write quorum AND the whole view-change quorum, so a direct `AddVoter` here would
-/// produce a 2-voter successor with `quorum_view_change == 1`.
-fn single_change_primary_solo() -> Endpoint<CountSm, SingleChange> {
-  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  Endpoint::<CountSm, SingleChange>::genesis_unchecked(
-    cfg,
-    genesis(1),
-    0,
-    CountSm::default(),
-    u64::MAX,
-  )
-}
-
-/// An `n`-voter `SingleChange` endpoint whose local member is slot 0 — the primary of view 0.
-fn single_change_primary_n(n: u8) -> Endpoint<CountSm, SingleChange> {
-  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
-  Endpoint::<CountSm, SingleChange>::genesis_unchecked(
-    cfg,
-    genesis(n),
-    0,
-    CountSm::default(),
-    u64::MAX,
-  )
-}
-
-#[test]
-fn add_voter_from_a_single_voter_cluster_is_rejected_breaks_quorum_intersection() {
-  // A DIRECT 1->2 `AddVoter` from a single-voter cluster is REFUSED. The new voter holds NO committed
-  // prefix, and the 2-voter successor's view-change quorum is 1, so the new voter could form an E+1
-  // view-change quorum ALONE (electing itself leader with an empty log) and drop the old committed
-  // prefix — committed-op loss. This is the extreme of the uniform direct-`AddVoter` rejection; the safe
-  // path is `AddLearner` then `PromoteLearner` (contrast `PromoteLearner`, whose target durably caught
-  // up before promotion).
-  let mut e = single_change_primary_solo();
-  let mut wal = TestWal::default();
-  assert_eq!(
-    e.membership.replica_count(),
-    1,
-    "the cluster is a single voter"
-  );
-  assert_eq!(
-    e.propose_membership(
-      Instant::ZERO,
-      &mut wal,
-      SingleVoterDelta::AddVoter(MemberId::new(1)),
-      None
-    ),
-    Err(ProposeMembershipError::DirectAddVoterUnsupported),
-    "a direct AddVoter is refused; the brand-new voter holds no committed prefix",
-  );
-  assert_eq!(e.reconfigure_inflight, None, "no op was minted");
-  assert_eq!(e.op(), OpNumber::new(), "the head did not advance");
-}
-
-#[test]
-fn add_voter_from_two_or_more_voters_is_also_rejected() {
-  // A direct `AddVoter` is rejected at EVERY size, not only the single-voter extreme. The old admission
-  // for 2+ voters rested on a flawed premise — that the brand-new voter would hold the committed prefix.
-  // It cannot: it was never a predecessor member, so it never appended or committed the predecessor's
-  // Reconfigure op (nor any prior op). A successor view-change quorum that includes the empty-log new
-  // voter but omits a prefix-holding retained voter can still drop a committed op, so the safe grow is
-  // ALWAYS `AddLearner` then `PromoteLearner` (the caught-up voter holds the prefix before it votes).
-  // Confirm 2->3 and 3->4 are both refused with no op minted.
-  for n in [2u8, 3] {
-    let mut e = single_change_primary_n(n);
-    let mut wal = TestWal::default();
-    assert_eq!(
-      e.propose_membership(
-        Instant::ZERO,
-        &mut wal,
-        SingleVoterDelta::AddVoter(MemberId::new(u128::from(n))),
-        None
-      ),
-      Err(ProposeMembershipError::DirectAddVoterUnsupported),
-      "a direct AddVoter from {n} voters is refused (add as a learner, then promote)",
-    );
-    assert_eq!(
-      e.reconfigure_inflight, None,
-      "no op was minted for {n} voters"
-    );
-    assert_eq!(
-      e.op(),
-      OpNumber::new(),
-      "the head did not advance for {n} voters"
-    );
-  }
-}
+// === the learner-first grow path (the closed vocabulary's only way into the voting set) ===
 
 #[test]
 fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
-  // The SAFE way to add a voter to a single-voter cluster (the path the rejected direct `AddVoter`
-  // points the operator to): `AddLearner` the new node, let it durably catch up to the head, THEN
+  // The ONLY way to add a voter to a single-voter cluster — the `SingleVoterDelta` vocabulary has no
+  // direct voter add, so the empty-log direct admission is unrepresentable (a 2-voter successor's
+  // view-change quorum is 1, and an empty-log new voter forming it alone could drop the whole
+  // committed prefix): `AddLearner` the new node, let it durably catch up to the head, THEN
   // `PromoteLearner`. The learner holds the full E-committed prefix before it ever becomes a voter, so
   // the XI-b intersection is preserved by construction (the catch-up-then-promote gate, not the
   // empty-log direct admission).
@@ -4215,7 +4105,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
 /// (slots 1 and 2) ack: a voter-set shrink commits only with a successor quorum among the acks, and
 /// for a self-removal that quorum is exactly the two survivors. The removed node's own
 /// Prepare-retransmit/commit-heartbeat timers were armed by the proposal mint.
-fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
+fn demoted_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
@@ -4223,17 +4113,17 @@ fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(0)))
-    .expect("removing one of three voters is valid");
+    .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(0)))
+    .expect("demoting one of three voters is valid");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = e
     .propose_membership(
       now,
       &mut wal,
-      SingleVoterDelta::RemoveVoter(MemberId::new(0)),
+      SingleVoterDelta::DemoteVoter(MemberId::new(0)),
       Some(crate::AcceptReducedFaultTolerance),
     )
-    .expect("the primary mints the self-removal Reconfigure op");
+    .expect("the primary mints the self-demotion Reconfigure op");
   // Drive the commit/prepare cadence once so the Normal-primary timers are armed (the thing the
   // abdication must retire). `handle_timeout` on a Normal primary bootstraps + arms `commit`.
   e.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
@@ -4248,7 +4138,8 @@ fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
     reconfigure_ack(op.get(), &payload, 1),
   );
   // A voter-set shrink commits only once the SUCCESSOR quorum is among the acks — for a
-  // self-removal that is BOTH retained voters, so slot 2's ack completes it.
+  // self-demotion that is BOTH retained voters (the demotee's own vote is masked out of the retained
+  // set), so slot 2's ack completes it.
   e.handle_message(
     now,
     &mut wal,
@@ -4260,7 +4151,7 @@ fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
   assert_eq!(
     e.commit(),
     op,
-    "the self-removal Reconfigure op committed under E=0"
+    "the self-demotion Reconfigure op committed under E=0"
   );
   assert!(
     e.commit_or_prepare_timer_armed_for_test(),
@@ -4271,31 +4162,42 @@ fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
 }
 
 #[test]
-fn a_removed_primary_retires_its_normal_primary_cadence_on_the_swap() {
-  let (e, _wal, _sb, successor) = removed_self_primary();
+fn a_demoted_primary_retires_its_normal_primary_cadence_on_the_swap() {
+  let (e, _wal, _sb, successor) = demoted_self_primary();
 
-  // The swap installed the 2-voter successor in which member 0 (this node) is absent.
+  // The swap installed the 2-voter successor in which member 0 (this node) is a NON-VOTING learner.
   assert_eq!(
     e.membership, successor,
-    "the E+1 successor (member 0 removed) is active"
+    "the E+1 successor (member 0 demoted) is active"
   );
   assert_eq!(e.membership.epoch(), crate::Epoch::new(1), "swapped to E+1");
   assert_eq!(e.membership.replica_count(), 2, "E+1 is a 2-voter config");
+  let self_slot = e
+    .membership
+    .slot_of(MemberId::new(0))
+    .expect("the demotee KEEPS a seat in the successor");
   assert!(
-    e.membership.slot_of(MemberId::new(0)).is_none(),
-    "the removed node has no slot in the successor",
+    e.membership.is_learner(self_slot),
+    "the demoted primary's seat is a learner slot",
   );
 
-  // ABDICATION: it is no longer the primary (robustly false for an absent local member, not a panic),
+  // ABDICATION: it is no longer the primary (its seat is a learner slot, not the view's leader slot),
   // the Normal-primary cadence is retired, and the forfeit sub-states are clear (so the
-  // `pending_forfeit`/`forfeit_armed` invariant — both imply a Normal primary — holds).
+  // `pending_forfeit`/`forfeit_armed` invariant — both imply a Normal primary — holds). Unlike a full
+  // removal it does NOT retire: it stays a Normal, live participant as a learner.
   assert!(
     !e.is_primary(),
-    "a removed node is not the primary (no panic on an absent slot)"
+    "a demoted node is not the primary (its slot is a learner slot)"
   );
+  assert_eq!(
+    e.status(),
+    Status::Normal,
+    "a demoted primary stays Normal-as-learner — demotion is not retirement",
+  );
+  assert!(e.is_learner(), "the demoted primary is a learner now");
   assert!(
     !e.commit_or_prepare_timer_armed_for_test(),
-    "the commit heartbeat + prepare retransmit are retired — the removed primary goes silent",
+    "the commit heartbeat + prepare retransmit are retired — the demoted primary goes silent",
   );
   assert!(
     !e.forfeit_armed_for_test(),
@@ -4308,15 +4210,17 @@ fn a_removed_primary_retires_its_normal_primary_cadence_on_the_swap() {
 }
 
 #[test]
-fn a_surviving_voter_elects_a_new_primary_without_the_removed_node() {
+fn a_surviving_voter_elects_a_new_primary_without_the_demoted_node() {
   // The other half of the abdication: with the old primary silent, a SURVIVING voter's idle timer
   // fires and it proposes the next view — the cluster elects an E+1 primary from the new voter set.
-  // Model the survivor as a fresh endpoint in the E+1 2-voter membership {member1→slot0,
-  // member2→slot1}: member 2 is slot 1, the BACKUP under view 0 (whose primary is slot 0). Its idle
-  // timer then fires and it proposes view 1 (whose primary is slot 1 = itself).
-  let (_removed, _wal, _sb, successor) = removed_self_primary();
+  // Model the survivor as a fresh endpoint in the E+1 membership {member1→slot0, member2→slot1,
+  // demoted member0→learner slot 2}: member 2 is slot 1, the BACKUP under view 0 (whose primary is
+  // slot 0). Its idle timer then fires and it proposes view 1 (whose primary is slot 1 = itself).
+  let (_demoted, _wal, _sb, successor) = demoted_self_primary();
   assert!(
-    successor.slot_of(MemberId::new(2)).is_some(),
+    successor
+      .slot_of(MemberId::new(2))
+      .is_some_and(|s| successor.is_voter(s)),
     "member 2 is a retained voter in the successor",
   );
   let survivor_cfg = Config::try_new(1, MemberId::new(2)).expect("valid cluster config");
@@ -4340,7 +4244,7 @@ fn a_surviving_voter_elects_a_new_primary_without_the_removed_node() {
   let later = Instant::ZERO + core::time::Duration::from_millis(300);
   survivor.handle_timeout(later, &mut wal, &mut sb, &mut blocks); // idle due → propose view 1, broadcast SVC
 
-  // The survivor broadcast a StartViewChange for the next view — the election the silent removed
+  // The survivor broadcast a StartViewChange for the next view — the election the silent demoted
   // primary no longer suppresses.
   let mut saw_svc = false;
   while let Some(out) = survivor.poll_message() {
@@ -4355,22 +4259,22 @@ fn a_surviving_voter_elects_a_new_primary_without_the_removed_node() {
   }
   assert!(
     saw_svc,
-    "a surviving voter's idle timer elects a new primary once the removed primary goes silent",
+    "a surviving voter's idle timer elects a new primary once the demoted primary goes silent",
   );
 }
 
-/// A 3-voter `SingleChange` BACKUP (slot 2, member 2 — a backup under view 0, NOT the primary) that
-/// learns + commits `RemoveVoter(member 2)` from the primary and installs the E+1 2-voter successor in
-/// which member 2 is absent. Modeled on the backup-install path (`on_prepare` of the Reconfigure op,
-/// then the primary's `Commit`, then the backup's own durable `SwapEpoch` root). On return the backup's
-/// `self.membership` is the successor; the removed BACKUP must now go silent on its WHOLE voter timer
-/// plane (the `retire_backup_cadence` half of the removed-node abdication), the case distinct from the
-/// removed-PRIMARY case (`removed_self_primary`, which retires the primary cadence).
-fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
-  let cfg = Config::try_new(2, MemberId::new(2)).expect("slot 2 backup of the 3-voter set");
+/// A 3-voter+1-learner `SingleChange` LEARNER (slot 3, member 3 — the non-voting learner) that
+/// learns + commits `RemoveLearner(member 3)` from the primary and installs the E+1 successor in
+/// which member 3 is absent. Modeled on the follower-install path (`on_prepare` of the Reconfigure op,
+/// then the primary's `Commit`, then the node's own durable `SwapEpoch` root). On return the node's
+/// `self.membership` is the successor; the GC'd node — its seat gone entirely (`slot_of == None`) —
+/// must transition to the structural `Retired` state and go fully silent, the case distinct from a
+/// DEMOTION (`demoted_self_primary`, which keeps the seat and stays Normal-as-learner).
+fn gc_removed_self_learner() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
+  let cfg = Config::try_new(3, MemberId::new(3)).expect("slot 3 learner of the 3-voter+1 set");
   let mut e = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     cfg,
-    genesis(3),
+    genesis_with_learners(3, 1),
     0,
     CountSm::default(),
     u64::MAX,
@@ -4379,18 +4283,18 @@ fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, M
   let mut blocks = crate::block_store::MemBlockStore::new();
   let now = Instant::ZERO;
 
-  // Remove member 2 (the HIGHEST-slot voter, so the retained voters keep their slots {0,1}); the local
-  // node is member 2, so the successor drops it entirely (`slot_of(2) == None`).
+  // GC member 3 — the local node's own learner seat. The voters {0,1,2} keep their slots; the
+  // successor drops the seat entirely (`slot_of(3) == None`), exactly the shape the second step of a
+  // demote-first shrink (`RemoveLearner` after the demote installed) commits.
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(2)))
-    .expect("removing one of three voters is valid");
+    .apply_delta(&SingleVoterDelta::RemoveLearner(MemberId::new(3)))
+    .expect("removing the learner is valid");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = 1u64;
 
-  // The primary's Prepare for the Reconfigure op (flat wire body = the encoded successor) → the backup
-  // stores a typed Body::Reconfigure and arms its backup timer plane (the idle/vote timers the swap
-  // must retire).
+  // The primary's Prepare for the Reconfigure op (flat wire body = the encoded successor) → the
+  // learner appends and stores a typed Body::Reconfigure (it emits no counted ack).
   e.handle_message(
     now,
     &mut wal,
@@ -4412,8 +4316,8 @@ fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, M
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the backup's append lands (deferred PrepareOk)
   while e.poll_message().is_some() {}
 
-  // The primary's Commit advances the backup's commit to the Reconfigure op → it commits + stages its
-  // own SwapEpoch root (still at the OLD epoch — the fence holds on the backup).
+  // The primary's Commit advances the node's commit to the Reconfigure op → it commits + stages its
+  // own SwapEpoch root (still at the OLD epoch — the fence holds on the follower lane).
   e.handle_message(
     now,
     &mut wal,
@@ -4430,48 +4334,49 @@ fn removed_self_backup() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, M
   );
   assert!(
     e.pending_swap_for_test(),
-    "the backup staged its own SwapEpoch root"
+    "the learner staged its own SwapEpoch root"
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the backup's SwapEpoch root → install the successor
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // land the SwapEpoch root → install the successor
   (e, wal, sb, successor)
 }
 
 #[test]
-fn a_removed_backup_voter_stays_silent_on_the_primary_idle_plane() {
-  // A `RemoveVoter` of a BACKUP voter (not the primary): after the swap the removed backup is a NON-VOTER
-  // (absent from the configuration), so the voter timer plane gated on `is_voter()` — `primary_idle`
-  // foremost — must be retired and stay non-serviceable. The removed node must NOT arm or service
-  // `PrimaryIdle`, must NOT propose/enter a view change when the primary goes quiet, and must NOT panic
-  // on a `local_slot()` that no longer exists (the bug the `is_voter()` gate fixed: `!is_learner()` is
-  // wrongly TRUE for an absent member, which would let it arm a consensus timer and then panic).
-  let (mut e, mut wal, mut sb, successor) = removed_self_backup();
+fn a_gc_removed_learner_retires_and_stays_fully_silent() {
+  // The learner-GC endgame of a demote-first shrink, observed at the GC'D NODE: once the committed
+  // `RemoveLearner` installs, the node's seat is gone entirely (`slot_of == None`), so it transitions
+  // to the structural `Retired` state — it arms/services no timer, proposes nothing, and must NOT
+  // panic on a `local_slot()` that no longer exists.
+  let (mut e, mut wal, mut sb, successor) = gc_removed_self_learner();
   let mut blocks = crate::block_store::MemBlockStore::new();
 
   // The swap installed the 2-voter successor in which member 2 (this node) is absent.
   assert_eq!(
     e.membership, successor,
-    "the E+1 successor (member 2 removed) is active"
+    "the E+1 successor (member 3's seat GC'd) is active"
   );
   assert_eq!(e.membership.epoch(), crate::Epoch::new(1), "swapped to E+1");
-  assert_eq!(e.membership.replica_count(), 2, "E+1 is a 2-voter config");
+  assert_eq!(
+    e.membership.replica_count(),
+    3,
+    "the voter set is untouched by a learner GC"
+  );
   assert!(
-    e.membership.slot_of(MemberId::new(2)).is_none(),
-    "the removed backup has no slot in the successor",
+    e.membership.slot_of(MemberId::new(3)).is_none(),
+    "the GC'd node has no slot in the successor",
   );
 
-  // It is a NON-VOTER now (the single-source predicate the timer plane reads), and never the primary —
+  // It is a NON-VOTER (the single-source predicate the timer plane reads), and never the primary —
   // both robustly false for an absent local member, NOT a panic on `local_slot()`.
   assert!(
     !e.is_voter(),
-    "a removed backup is not a voter (no slot in the successor)"
+    "a GC'd node is not a voter (no slot in the successor)"
   );
-  assert!(!e.is_primary(), "a removed backup is not the primary");
+  assert!(!e.is_primary(), "a GC'd node is not the primary");
 
-  // The removal site retired the backup voter timer plane: the `primary_idle` deadline (and the
-  // vote/escalation timers) is cleared, so no armed consensus deadline lingers on a removed node.
+  // No armed consensus deadline lingers on a removed node.
   assert!(
     !e.primary_idle_armed_for_test(),
-    "the removed backup holds NO armed primary_idle deadline (retire_backup_cadence ran)",
+    "the GC'd node holds NO armed primary_idle deadline",
   );
 
   // A fully-removed node transitions to the structural `Retired` state: it arms/services no timer and
@@ -4489,16 +4394,16 @@ fn a_removed_backup_voter_stays_silent_on_the_primary_idle_plane() {
   assert_eq!(
     e.status(),
     Status::Retired,
-    "the removed node stays Retired — it proposes no view change",
+    "the GC'd node stays Retired — it proposes no view change",
   );
   assert_eq!(
     e.view(),
     view_before,
-    "the removed backup's view is unchanged (it entered no view change)",
+    "the GC'd node's view is unchanged (it entered no view change)",
   );
   assert!(
     !e.primary_idle_armed_for_test(),
-    "ticking far past PRIMARY_IDLE re-armed NOTHING — the idle plane stays retired on the non-voter",
+    "ticking far past PRIMARY_IDLE re-armed NOTHING — the timer plane stays retired",
   );
   let mut saw_svc = false;
   while let Some(out) = e.poll_message() {
@@ -4511,7 +4416,7 @@ fn a_removed_backup_voter_stays_silent_on_the_primary_idle_plane() {
   }
   assert!(
     !saw_svc,
-    "a removed backup broadcasts NO StartViewChange/DoViewChange — it is silent on the voter timer plane",
+    "a GC'd node broadcasts NO StartViewChange/DoViewChange — it is fully silent",
   );
 }
 
@@ -4559,25 +4464,26 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
     "a forked/unknown config_id is rejected — config_id is the lineage discriminator",
   );
 
-  // A SECOND swap: propose+commit+install RemoveVoter on the current (E=1, 3-voter + 1-learner) config.
+  // A SECOND swap: propose+commit+install DemoteVoter on the current (E=1, 3-voter + 1-learner) config.
   let now = Instant::ZERO;
   let succ2 = e
     .membership
-    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(1)))
-    .expect("removing a voter from the 3-voter E=1 config is valid");
+    .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(1)))
+    .expect("demoting a voter from the 3-voter E=1 config is valid");
   let payload2 = ReconfigurePayload::from_membership(&succ2, e.membership.config_id());
   let op2 = e
     .propose_membership(
       now,
       &mut wal,
-      SingleVoterDelta::RemoveVoter(MemberId::new(1)),
+      SingleVoterDelta::DemoteVoter(MemberId::new(1)),
       Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the second Reconfigure op");
   while e.poll_message().is_some() {}
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own append → own vote
-  // Commit under the E=1 3-voter quorum (2 of {0,1,2}): the primary (slot 0, via its own durable vote)
-  // + one retained-voter ack (slot 2). Slot 1 is the voter being removed; slot 3 is the learner, whose
+  // Commit under the E=1 3-voter quorum (2 of {0,1,2}), which for this shrink also carries the
+  // successor quorum (both retained voters {0,2}): the primary (slot 0, via its own durable vote)
+  // + the retained-voter ack (slot 2). Slot 1 is the voter being demoted; slot 3 is the learner, whose
   // ack would not count toward the voting quorum. The ack must be stamped E=1 / config_1 — the primary's
   // CURRENT configuration — or the strict ingress gate drops it.
   e.handle_message(
@@ -5643,8 +5549,9 @@ fn header_only_adoption_preserves_the_new_primarys_local_reconfigure_body() {
 }
 
 /// Build a DONOR at E+1 holding a durable checkpoint, where a RETAINED member's slot SHIFTED across the
-/// swap. Genesis is a 4-voter cluster `[0,1,2,3]` led by `MemberId 0` (slot 0). A `RemoveVoter(MemberId 1)`
-/// commits under E (4 voters, quorum 3), then the swap lands E+1 = `[0,2,3]` (voter slots 0,1,2) and FORCES
+/// swap. Genesis is a 4-voter cluster `[0,1,2,3]` led by `MemberId 0` (slot 0). A `DemoteVoter(MemberId 1)`
+/// commits under E (4 voters, quorum 3), then the swap lands E+1 voters `[0,2,3]` (slots 0,1,2; the
+/// demotee is the learner at slot 3) and FORCES
 /// a checkpoint embedding the reconfigure op `N`. The donor `MemberId 0` keeps slot 0 (still primary); the
 /// retained `MemberId 2` SHIFTED from old slot 2 to new slot 1 — the cross-epoch slot-shifted laggard.
 /// Returns `(donor, wal, sb, predecessor_config_id, checkpoint_op)`.
@@ -5663,12 +5570,12 @@ fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWa
   let now = Instant::ZERO;
   let predecessor_config_id = e.membership.config_id();
 
-  // E+1 successor: remove the LOW-indexed MemberId 1, shifting MemberId 2 (slot 2 -> 1) and MemberId 3
-  // (slot 3 -> 2). The donor MemberId 0 keeps slot 0.
+  // E+1 successor: demote the LOW-indexed MemberId 1, shifting MemberId 2 (slot 2 -> 1) and MemberId 3
+  // (slot 3 -> 2); the demotee lands at learner slot 3. The donor MemberId 0 keeps slot 0.
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(1)))
-    .expect("RemoveVoter(1) on a 4-voter cluster is valid (leaves 3 voters)");
+    .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(1)))
+    .expect("DemoteVoter(1) on a 4-voter cluster is valid (leaves 3 voters)");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   // Propose + commit under E (quorum 3 of 4: the primary's own vote + acks from slots 1 and 2).
@@ -5676,7 +5583,7 @@ fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWa
     .propose_membership(
       now,
       &mut wal,
-      SingleVoterDelta::RemoveVoter(MemberId::new(1)),
+      SingleVoterDelta::DemoteVoter(MemberId::new(1)),
       None,
     )
     .expect("the primary mints the reconfiguration op");
@@ -5826,8 +5733,8 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
   let m2: u64 = 2; // the E+1 crossing checkpoint op the laggard is crossing to
   let genesis_mem = genesis(3);
   let successor_e1 = genesis_mem
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
 
   // A Normal BACKUP (slot 1) at the OLD epoch (E0, the genesis lineage), op == commit_min == 0, checkpoint 0.
   let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
@@ -6061,8 +5968,19 @@ fn a_direct_voter_add_prepare_is_dropped_before_append_and_ack() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   e.handle_message(
@@ -6105,7 +6023,7 @@ fn a_direct_voter_add_prepare_is_dropped_before_append_and_ack() {
 #[test]
 #[should_panic(expected = "refusing to install the committed Reconfigure op")]
 fn committing_a_direct_voter_add_panics_on_the_primary_commit_lane() {
-  // The authoritative fence, primary lane: `propose_membership` refuses to mint a direct AddVoter,
+  // The authoritative fence, primary lane: the vocabulary cannot express a direct AddVoter mint,
   // so this seeds the minted-op shape directly (head at the op, a typed log entry, the op durable in
   // the WAL, the primary's own vote recorded) — modeling an op minted without the propose guard. The
   // one backup ack completes the 2-of-3 quorum, `try_commit` recognizes the Reconfigure op, and the
@@ -6116,8 +6034,19 @@ fn committing_a_direct_voter_add_panics_on_the_primary_commit_lane() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let body = payload.encode_body();
   let header = Header::new(
@@ -6176,8 +6105,19 @@ fn committing_a_direct_voter_add_panics_on_the_backup_recommit_lane() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   e.op = OpNumber::with(1);
@@ -6216,8 +6156,19 @@ fn recovery_recommitting_a_direct_voter_add_panics_at_the_fence() {
   // `SUPERBLOCK_VERSION`, written exclusively by code carrying this fence; see the fence comment in
   // `commit_reconfigure`.)
   let successor = genesis(3)
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let body = payload.encode_body();
   let header = Header::new(
@@ -6298,26 +6249,37 @@ fn installing_a_direct_voter_add_swap_panics_at_the_backstop() {
   let mut e = single_change_primary();
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   e.install_membership(Some(OpNumber::with(1)), successor);
 }
 
 #[test]
 fn every_legitimate_delta_commits_and_installs_through_the_backup_lane() {
-  // Positive controls: each accepted delta kind — AddLearner, PromoteLearner, RemoveVoter,
+  // Positive controls: each delta of the closed vocabulary — AddLearner, PromoteLearner, DemoteVoter,
   // RemoveLearner — still passes the fence end to end on the backup lane: the prepare appends
   // (screened), the op commits (fenced), the SwapEpoch root lands, the successor installs, and a
   // `MembershipChanged` names the op. The promote-time challenge is a PROPOSE-side gate (covered by
-  // the propose tests); the commit lane installs whatever legitimately committed. RemoveVoter removes
-  // a NON-local voter (removing the local node retires it — a separate concern with its own tests).
+  // the propose tests); the commit lane installs whatever legitimately committed. DemoteVoter demotes
+  // a NON-local voter (demoting the local node abdicates it — a separate concern with its own tests).
   let cases: [(Membership, SingleVoterDelta); 4] = [
     (genesis(3), SingleVoterDelta::AddLearner(MemberId::new(3))),
     (
       genesis_with_learners(3, 1),
       SingleVoterDelta::PromoteLearner(MemberId::new(3)),
     ),
-    (genesis(3), SingleVoterDelta::RemoveVoter(MemberId::new(2))),
+    (genesis(3), SingleVoterDelta::DemoteVoter(MemberId::new(2))),
     (
       genesis_with_learners(3, 1),
       SingleVoterDelta::RemoveLearner(MemberId::new(3)),
@@ -6429,8 +6391,19 @@ fn a_matching_durable_direct_voter_add_prepare_is_never_re_acked() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let body = payload.encode_body();
   let header = Header::new(
@@ -6557,8 +6530,19 @@ fn a_direct_voter_add_interior_overwrite_is_refused_before_the_log_and_wal() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   e.op = OpNumber::with(2);
@@ -6629,8 +6613,19 @@ fn an_adopted_direct_voter_add_tail_op_is_never_adopt_acked() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   e.handle_message(
@@ -6757,8 +6752,19 @@ fn a_forged_ack_cannot_commit_an_adopted_direct_voter_add_tail_op() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
 
   // Idle-timeout into the view change, then a second StartViewChange completes the view-change
@@ -6861,8 +6867,19 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
 
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(
+      4,
+      0,
+      std::vec![
+        MemberId::new(0),
+        MemberId::new(1),
+        MemberId::new(2),
+        MemberId::new(3),
+      ],
+    )
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let body_checksum = Body::Reconfigure(payload.clone()).body_checksum();
 
@@ -6999,8 +7016,10 @@ fn a_solo_voters_recovery_reseed_earns_no_own_vote_for_a_direct_add_tail_op() {
   // commit-time fence panic. The reseed's voter-admission screen refuses the bit instead: the op
   // stays un-committed and voteless, nothing installs, and the replica keeps running.
   let successor = genesis(1)
-    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(1)))
-    .expect("the delta arithmetic still derives a direct-add successor");
+    .reconfigure(2, 0, std::vec![MemberId::new(0), MemberId::new(1)])
+    .expect(
+      "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
+    );
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let body = payload.encode_body();
   let header = Header::new(

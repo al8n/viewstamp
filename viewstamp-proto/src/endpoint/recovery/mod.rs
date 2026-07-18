@@ -1996,9 +1996,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // seeding site: a reconfiguration op seating a brand-new voter against the current
       // configuration earns no own bit (the entry is seeded voteless), so the solo voter's
       // quorum-of-1 can never re-commit it and the commit-time fence stays unreachable. On a
-      // compliant store this shape cannot occur (a solo voter's propose guard refuses the mint, it
-      // receives no Prepares, and its trivial view changes adopt only its own log) — the screen is
-      // completeness: every site that sets an own bit enforces one refusal.
+      // compliant store this shape cannot occur (the delta vocabulary cannot express a direct voter
+      // add, so a solo voter cannot mint one; it receives no Prepares, and its trivial view changes
+      // adopt only its own log) — the screen is completeness: every site that sets an own bit
+      // enforces one refusal.
       let oks = if self.op_is_direct_voter_add(op) {
         0
       } else {
