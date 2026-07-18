@@ -14,7 +14,8 @@ fn defaults_equal_the_pinned_constants() {
   assert_eq!(c.max_pending_bytes(), 128 * 1024 * 1024);
   assert_eq!(c.events_cap(), 1024);
   assert_eq!(c.max_conns(), 1024);
-  assert_eq!(c.ack_window(), 64);
+  assert_eq!(c.health_probe_interval(), Duration::from_millis(250));
+  assert_eq!(c.health_proof_max_age(), Duration::from_secs(1));
   assert_eq!(c.reconfigure_timeout(), Duration::from_millis(30 * 250));
   assert_eq!(
     c.cmd_cap(),
@@ -46,11 +47,12 @@ fn overrides_apply_and_zero_counts_clamp_to_one() {
   assert_eq!(clamped.events_cap(), 1);
   assert_eq!(clamped.max_conns(), 1);
 
-  // ack_window has no zero-clamp (0 is valid: "most recent op only").
-  let w = DriverConfig::new().with_ack_window(128);
-  assert_eq!(w.ack_window(), 128);
-  let w0 = DriverConfig::new().with_ack_window(0);
-  assert_eq!(w0.ack_window(), 0, "ack_window accepts 0 without clamping");
+  // The liveness-probe knobs are plain Duration overrides (no clamp).
+  let w = DriverConfig::new()
+    .with_health_probe_interval(Duration::from_millis(100))
+    .with_health_proof_max_age(Duration::from_millis(500));
+  assert_eq!(w.health_probe_interval(), Duration::from_millis(100));
+  assert_eq!(w.health_proof_max_age(), Duration::from_millis(500));
 
   let rc = DriverConfig::new().with_reconfigure_timeout(Duration::from_secs(2));
   assert_eq!(rc.reconfigure_timeout(), Duration::from_secs(2));

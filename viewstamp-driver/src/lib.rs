@@ -28,7 +28,8 @@ pub use session::ReservationGuard;
 pub use clock::jittered;
 #[doc(hidden)]
 pub use config::{
-  ACK_WINDOW, AUTH_DEADLINE, RECONFIGURE_TIMEOUT, REDIAL_BACKOFF_BASE, REDIAL_BACKOFF_CAP,
+  AUTH_DEADLINE, HEALTH_PROBE_INTERVAL, HEALTH_PROOF_MAX_AGE, RECONFIGURE_TIMEOUT,
+  REDIAL_BACKOFF_BASE, REDIAL_BACKOFF_CAP,
 };
 #[doc(hidden)]
 pub use session::{

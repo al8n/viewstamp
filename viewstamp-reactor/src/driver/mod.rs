@@ -129,6 +129,10 @@ pub struct ReactorQuicDriver<R: Runtime, S, W, B, L, I> {
   /// In-flight reconfiguration job, or `None`. At most one job at a time; a second
   /// `Command::Reconfigure` while `Some` is rejected immediately.
   reconfigure: Option<viewstamp_driver::ReconfigureJob>,
+  /// When the next voter-liveness-probe round is due while a reconfiguration job is in flight, or
+  /// `None` when no job is active. Paced at `DriverConfig::health_probe_interval`; probe traffic
+  /// exists ONLY while a shrink job runs.
+  next_probe_at: Option<Instant>,
 }
 
 impl<R, S, W, B, L> ReactorQuicDriver<R, S, W, B, L, ProvidedIdentity>
@@ -314,6 +318,7 @@ where
       storage_ready,
       storage_notifier_closed: false,
       reconfigure: None,
+      next_probe_at: None,
     };
     let handle = Handle::new(commands_tx, events_rx, budget, retired);
     Ok((driver, handle))
@@ -625,16 +630,23 @@ where
             viewstamp_proto::ProposeMembershipError::AlreadyInFlight,
           )));
         } else {
+          // Solicit the first voter-liveness-probe round now (and re-solicit every
+          // health_probe_interval while the job runs); snapshot the proven-live voters for the executor.
+          self
+            .coord
+            .solicit_health_proofs(now, self.cfg.health_probe_interval());
+          self.next_probe_at = Some(now + self.cfg.health_probe_interval());
           let live = self.coord.live_membership();
-          let acked = self.coord.recently_acked_voters(self.cfg.ack_window());
+          let fresh = self
+            .coord
+            .proven_live_voters(now, self.cfg.health_proof_max_age());
           self.reconfigure = Some(viewstamp_driver::ReconfigureJob::start(
             target,
             health,
-            self.cfg.ack_window(),
             self.cfg.reconfigure_timeout(),
             reply,
             live,
-            acked,
+            fresh,
             self.coord.endpoint().local(),
           ));
         }
@@ -658,20 +670,33 @@ where
     }
   }
 
-  /// Advance the in-flight reconfiguration job by one iteration, if any. Reads the live membership
-  /// and acked set from the coordinator (disjoint borrow: coordinator is read first, then the job
-  /// takes `&mut self`), then calls `job.advance` with a closure that proposes a delta.
+  /// Advance the in-flight reconfiguration job by one iteration, if any. Re-solicits the liveness
+  /// probe on cadence, then reads the live membership and proven-live voter set from the coordinator
+  /// (disjoint borrow: coordinator is read first, then the job takes `&mut self`), and calls
+  /// `job.advance` with a closure that proposes a delta.
   fn advance_reconfigure(&mut self, now: Instant) {
     let Some(mut job) = self.reconfigure.take() else {
       return;
     };
+    // Re-solicit a fresh voter-liveness-probe round on the probe cadence while the job runs, so a
+    // voter that crashed since the last round drops out of the proven-live set within one interval.
+    if self.next_probe_at.is_none_or(|at| now >= at) {
+      self
+        .coord
+        .solicit_health_proofs(now, self.cfg.health_probe_interval());
+      self.next_probe_at = Some(now + self.cfg.health_probe_interval());
+    }
     let live = self.coord.live_membership();
-    let acked = self.coord.recently_acked_voters(self.cfg.ack_window());
-    let outcome = job.advance(now, live, acked, &mut |delta| {
+    let fresh = self
+      .coord
+      .proven_live_voters(now, self.cfg.health_proof_max_age());
+    let outcome = job.advance(now, live, fresh, &mut |delta| {
       self.coord.propose_membership(now, &mut self.wal, delta)
     });
     if !matches!(outcome, viewstamp_driver::AdvanceOutcome::Done) {
       self.reconfigure = Some(job);
+    } else {
+      self.next_probe_at = None;
     }
   }
 

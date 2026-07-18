@@ -22,29 +22,40 @@ fn sets_of(m: &Membership) -> (BTreeSet<MemberId>, BTreeSet<MemberId>) {
 // ── mock backend ─────────────────────────────────────────────────────────
 
 type Injector = Box<dyn FnMut(&mut MockState, &[SingleVoterDelta])>;
+/// A per-backoff hook: the evidence-arrival tests use it to grow `fresh` (the proven-live set)
+/// over stall iterations — modelling liveness evidence that lands only after the shrink has begun
+/// waiting (a probe answer arriving a few driver ticks after the round is solicited).
+type BackoffHook = Box<dyn FnMut(&mut MockState)>;
 
 struct MockState {
   live: Membership,
-  acked: BTreeSet<MemberId>,
+  /// The set `proven_live_voters` returns — models the active liveness probe's proven-live voters
+  /// (self included), exactly as the real driver snapshots `endpoint.proven_live_voters` into it.
+  fresh: BTreeSet<MemberId>,
   issued: Vec<SingleVoterDelta>,
   steps_left: u32,
   inject: Option<Injector>,
+  backoff_hook: Option<BackoffHook>,
+  /// The last value `note_shrink_stall` recorded (the unproven-voter diagnostic), for assertions.
+  stall_note: Option<BTreeSet<MemberId>>,
 }
 
 struct Mock(RefCell<MockState>);
 
-fn mock(voters: &[u128], acked: &[u128]) -> Rc<Mock> {
+fn mock(voters: &[u128], fresh: &[u128]) -> Rc<Mock> {
   Rc::new(Mock(RefCell::new(MockState {
     live: membership_of(voters),
-    acked: acked.iter().copied().map(MemberId::new).collect(),
+    fresh: fresh.iter().copied().map(MemberId::new).collect(),
     issued: Vec::new(),
     steps_left: 64,
     inject: None,
+    backoff_hook: None,
+    stall_note: None,
   })))
 }
 
-fn mock_with_injector(voters: &[u128], acked: &[u128], inject: Injector) -> Rc<Mock> {
-  let m = mock(voters, acked);
+fn mock_with_injector(voters: &[u128], fresh: &[u128], inject: Injector) -> Rc<Mock> {
+  let m = mock(voters, fresh);
   m.0.borrow_mut().inject = Some(inject);
   m
 }
@@ -61,8 +72,12 @@ impl ReconfigureBackend for Rc<Mock> {
     self.0.borrow().live.clone()
   }
 
-  fn recently_acked_voters(&self, _window: u64) -> BTreeSet<MemberId> {
-    self.0.borrow().acked.clone()
+  fn proven_live_voters(&self) -> BTreeSet<MemberId> {
+    self.0.borrow().fresh.clone()
+  }
+
+  fn note_shrink_stall(&self, unproven: Option<BTreeSet<MemberId>>) {
+    self.0.borrow_mut().stall_note = unproven;
   }
 
   async fn propose_and_await_install(
@@ -89,6 +104,12 @@ impl ReconfigureBackend for Rc<Mock> {
   async fn backoff(&self) {
     let mut state = self.0.borrow_mut();
     state.steps_left = state.steps_left.saturating_sub(1);
+    // Run the per-backoff evidence hook (used by the evidence-arrival test to make liveness evidence arrive after N
+    // stall iterations).
+    if let Some(mut hook) = state.backoff_hook.take() {
+      hook(&mut state);
+      state.backoff_hook = Some(hook);
+    }
   }
 }
 
@@ -146,7 +167,7 @@ fn oscillate_voter(id: MemberId) -> Injector {
 #[test]
 fn health_hint_default_is_empty() {
   let h = HealthHint::default();
-  assert!(h.known_down.is_empty() && h.known_up.is_empty());
+  assert!(h.known_down.is_empty());
 }
 
 #[test]
@@ -180,6 +201,13 @@ fn reconfigure_error_display_renders_for_each_variant() {
       live.clone(),
       std::vec![SingleVoterDelta::RemoveVoter(MemberId::new(1))],
     )),
+    ReconfigureError::InsufficientLiveness {
+      progress: ReconfigureProgress::stall(
+        live.clone(),
+        std::vec![SingleVoterDelta::RemoveVoter(MemberId::new(1))],
+      ),
+      unproven: member_set(&[2, 3]),
+    },
     ReconfigureError::NotPrimary,
     ReconfigureError::DriverGone,
     ReconfigureError::Retired {
@@ -204,7 +232,6 @@ fn grow_converges_add_one_replica() {
     backend.clone(),
     target,
     HealthHint::default(),
-    64,
     MemberId::new(1),
   ));
   assert!(r.is_ok());
@@ -218,19 +245,16 @@ fn grow_converges_add_one_replica() {
 }
 
 #[test]
-fn shrink_removes_the_dead_voter_first_via_known_down_and_known_up() {
-  // {1,2,3} -> {1}, node 3 down. known_down={3}, known_up={1,2} => RemoveVoter(3) BEFORE RemoveVoter(2).
-  let backend = mock(&[1, 2, 3], &[]); // idle oracle
+fn shrink_removes_the_dead_voter_first_via_known_down_and_fresh() {
+  // {1,2,3} -> {1}, node 3 down. known_down={3}, fresh (proven live) = {1,2} => RemoveVoter(3) BEFORE
+  // RemoveVoter(2).
+  let backend = mock(&[1, 2, 3], &[1, 2]); // 1 and 2 proven live by the probe
   let target = MembershipTarget::new(member_set(&[1]), BTreeSet::new());
-  let health = HealthHint {
-    known_down: member_set(&[3]),
-    known_up: member_set(&[1, 2]),
-  };
+  let health = HealthHint::new().with_known_down(member_set(&[3]));
   let r = block_on(run_reconfigure(
     backend.clone(),
     target,
     health,
-    64,
     MemberId::new(1),
   ));
   assert!(r.is_ok());
@@ -250,25 +274,31 @@ fn shrink_removes_the_dead_voter_first_via_known_down_and_known_up() {
 }
 
 #[test]
-fn idle_cluster_with_no_witness_stalls_to_timeout_unperturbed() {
-  // Shrink-only {1,2,3} -> {1}, idle oracle, NO known_up: stalls on the FIRST removal.
-  let backend = mock(&[1, 2, 3], &[]);
+fn idle_cluster_with_no_proof_stalls_to_insufficient_liveness() {
+  // Shrink-only {1,2,3} -> {1}. Only self (1) is proven live (the peers never answer the probe): NO
+  // successor quorum is proven, so the shrink stalls fail-closed to InsufficientLiveness, naming the
+  // unproven successor voter of the most-preferred removal (RemoveVoter(2) -> successor {1,3} -> {3}).
+  let backend = mock(&[1, 2, 3], &[1]);
   let target = MembershipTarget::new(member_set(&[1]), BTreeSet::new());
   let r = block_on(run_reconfigure(
     backend.clone(),
     target,
     HealthHint::default(),
-    8,
     MemberId::new(1),
   ));
   match r {
-    Err(ReconfigureError::Timeout(p)) => {
+    Err(ReconfigureError::InsufficientLiveness { progress, unproven }) => {
       assert!(
-        p.remaining.as_ref().is_some_and(|v| !v.is_empty()) && p.reason.is_none(),
+        progress.remaining.as_ref().is_some_and(|v| !v.is_empty()) && progress.reason.is_none(),
         "stall carries a non-empty remaining plan and no reason"
       );
+      assert_eq!(
+        unproven,
+        member_set(&[3]),
+        "names the unproven successor voter blocking the most-preferred removal"
+      );
     }
-    other => panic!("expected Timeout, got {other:?}"),
+    other => panic!("expected InsufficientLiveness, got {other:?}"),
   }
   assert!(
     backend.0.borrow().issued.is_empty(),
@@ -277,22 +307,22 @@ fn idle_cluster_with_no_witness_stalls_to_timeout_unperturbed() {
 }
 
 #[test]
-fn known_down_only_on_idle_cluster_stalls_negative_is_not_life_evidence() {
-  // {1,2,3} -> {1}, ONLY known_down={3}, NO known_up, idle oracle: stalls (no positive evidence).
-  let backend = mock(&[1, 2, 3], &[]);
+fn known_down_only_stalls_to_insufficient_liveness_negative_is_not_life_evidence() {
+  // {1,2,3} -> {1}, ONLY known_down={3}, only self (1) proven live: stalls (a negative veto is not
+  // positive evidence, and no probe proved 2 alive).
+  let backend = mock(&[1, 2, 3], &[1]);
   let target = MembershipTarget::new(member_set(&[1]), BTreeSet::new());
-  let health = HealthHint {
-    known_down: member_set(&[3]),
-    known_up: BTreeSet::new(),
-  };
+  let health = HealthHint::new().with_known_down(member_set(&[3]));
   let r = block_on(run_reconfigure(
     backend.clone(),
     target,
     health,
-    8,
     MemberId::new(1),
   ));
-  assert!(matches!(r, Err(ReconfigureError::Timeout(_))));
+  assert!(matches!(
+    r,
+    Err(ReconfigureError::InsufficientLiveness { .. })
+  ));
   assert!(backend.0.borrow().issued.is_empty());
 }
 
@@ -309,7 +339,6 @@ fn concurrent_removal_of_a_needed_member_surfaces_member_concurrently_removed() 
     backend.clone(),
     target,
     HealthHint::default(),
-    64,
     MemberId::new(1),
   ));
   match r {
@@ -345,7 +374,6 @@ fn competing_planner_oscillation_surfaces_plan_conflict_within_the_cap() {
     backend.clone(),
     target,
     HealthHint::default(),
-    16,
     MemberId::new(1),
   ));
   assert!(
@@ -363,31 +391,37 @@ fn competing_planner_oscillation_surfaces_plan_conflict_within_the_cap() {
 
 #[test]
 fn resumable_progress_after_committed_grow_steps() {
-  // {1,2,3} -> {1,2,4}: grow steps commit (4 staged+promoted), then shrink stalls (no witness).
-  let backend = mock(&[1, 2, 3], &[]); // idle: the shrink stalls
+  // {1,2,3} -> {1,2,4}: grow steps commit (4 staged+promoted), then the shrink stalls (only self is
+  // proven live, so the successor {1,2,4} quorum is not proven). The stall is a missing-witness
+  // InsufficientLiveness carrying the durable intermediate + the still-valid RemoveVoter(3) suffix.
+  let backend = mock(&[1, 2, 3], &[1]); // only self proven live: the shrink stalls
   let target = MembershipTarget::new(member_set(&[1, 2, 4]), BTreeSet::new());
   let r = block_on(run_reconfigure(
     backend.clone(),
     target,
     HealthHint::default(),
-    16,
     MemberId::new(1),
   ));
   match r {
-    Err(ReconfigureError::Timeout(p)) => {
-      let (v, _) = sets_of(&p.live);
+    Err(ReconfigureError::InsufficientLiveness { progress, unproven }) => {
+      let (v, _) = sets_of(&progress.live);
       assert_eq!(
         v,
         member_set(&[1, 2, 3, 4]),
         "the durable INTERMEDIATE, not the original"
       );
       assert_eq!(
-        p.remaining,
+        progress.remaining,
         Some(std::vec![SingleVoterDelta::RemoveVoter(MemberId::new(3))])
       );
-      assert!(p.reason.is_none());
+      assert!(progress.reason.is_none());
+      assert_eq!(
+        unproven,
+        member_set(&[2, 4]),
+        "names the unproven successor voters of RemoveVoter(3): successor is 1,2,4 and only 1 is proven"
+      );
     }
-    other => panic!("expected resumable Timeout, got {other:?}"),
+    other => panic!("expected resumable InsufficientLiveness, got {other:?}"),
   }
 }
 
@@ -400,10 +434,127 @@ fn completion_before_cap_returns_ok_never_timeout_empty_some() {
     backend.clone(),
     target,
     HealthHint::default(),
-    64,
     MemberId::new(1),
   ));
   assert!(matches!(r, Ok(())));
+}
+
+// ── fresh-liveness-probe fail-closed falsifiers ─────────────────────────────
+
+#[test]
+fn shrink_completes_once_the_probe_proves_the_successor_quorum() {
+  // A HEALTHY but idle 3-voter cluster {1,2,3} -> {1,2}. Initially only self (1) is proven live,
+  // so the shrink STALLS (successor {1,2} needs 2 proven). After a few stall iterations voter 2's probe
+  // answer lands (fresh grows to {1,2}) and the shrink COMPLETES — and the removal is proposed ONLY
+  // after that evidence exists (never on the idle-blind state the old ack oracle left).
+  let backend = mock(&[1, 2, 3], &[1]); // only self proven live at first
+  let target = MembershipTarget::new(member_set(&[1, 2]), BTreeSet::new());
+  // Record how many removals had been issued at the moment evidence arrived (must be zero).
+  let issued_at_evidence: Rc<RefCell<Option<usize>>> = Rc::new(RefCell::new(None));
+  let sink = Rc::clone(&issued_at_evidence);
+  let mut ticks = 0u32;
+  backend.0.borrow_mut().backoff_hook = Some(Box::new(move |state| {
+    ticks += 1;
+    if ticks == 3 {
+      *sink.borrow_mut() = Some(state.issued.len());
+      state.fresh = member_set(&[1, 2]); // voter 2's probe answer lands
+    }
+  }));
+  let r = block_on(run_reconfigure(
+    backend.clone(),
+    target,
+    HealthHint::default(),
+    MemberId::new(1),
+  ));
+  assert!(
+    r.is_ok(),
+    "the shrink completes once the probe proves the quorum: {r:?}"
+  );
+  assert_eq!(
+    backend.0.borrow().issued,
+    std::vec![SingleVoterDelta::RemoveVoter(MemberId::new(3))],
+    "exactly the one due removal"
+  );
+  assert_eq!(
+    *issued_at_evidence.borrow(),
+    Some(0),
+    "no removal was issued BEFORE the liveness evidence arrived (fail-closed until proven)"
+  );
+}
+
+#[test]
+fn a_voter_that_never_proves_blocks_removing_its_partner_into_an_outage() {
+  // {1,2,3} -> {1,2}. The probe proves 1 and 3 live, but voter 2 NEVER answers (it crashed after
+  // the reconfigure call). The sole candidate RemoveVoter(3) is NEVER issued — removing 3 would leave
+  // {1,2} where 2 is not proven live, an outage — and the shrink stalls fail-closed with 2 named
+  // unproven. The deleted `known_up` vouch (a stale operator hint 2's crash could not retract) would
+  // have removed 3 into that outage; the fresh probe closes the door.
+  let backend = mock(&[1, 2, 3], &[1, 3]); // 2 never proves
+  let target = MembershipTarget::new(member_set(&[1, 2]), BTreeSet::new());
+  let r = block_on(run_reconfigure(
+    backend.clone(),
+    target,
+    HealthHint::default(),
+    MemberId::new(1),
+  ));
+  match r {
+    Err(ReconfigureError::InsufficientLiveness { unproven, .. }) => {
+      assert!(
+        unproven.contains(&MemberId::new(2)),
+        "voter 2 (never proved) is named unproven"
+      );
+    }
+    other => panic!("expected InsufficientLiveness, got {other:?}"),
+  }
+  assert!(
+    backend.0.borrow().issued.is_empty(),
+    "RemoveVoter(3) is NEVER issued — the successor 1,2 has no proven quorum"
+  );
+}
+
+#[test]
+fn no_negative_hint_substitutes_for_a_fresh_proof() {
+  // With `known_up` deleted, NO HealthHint input can force a removal absent a fresh proof of the
+  // SURVIVORS. Here the operator vetoes the departing voter 3 (known_down={3}) — which prioritizes its
+  // removal — but the survivor 2 is not proven live (only self is), so RemoveVoter(3) still stalls: a
+  // negative veto is never a positive substitute.
+  let backend = mock(&[1, 2, 3], &[1]);
+  let target = MembershipTarget::new(member_set(&[1, 2]), BTreeSet::new());
+  let health = HealthHint::new().with_known_down(member_set(&[3]));
+  let r = block_on(run_reconfigure(
+    backend.clone(),
+    target,
+    health,
+    MemberId::new(1),
+  ));
+  assert!(matches!(
+    r,
+    Err(ReconfigureError::InsufficientLiveness { .. })
+  ));
+  assert!(
+    backend.0.borrow().issued.is_empty(),
+    "no removal on a negative-only hint"
+  );
+}
+
+#[test]
+fn grow_phase_cap_exhaustion_is_timeout_not_insufficient_liveness() {
+  // Variant discrimination: a cap exhausted during the GROW phase (no shrink stall was ever recorded)
+  // resolves the generic Timeout, NOT the missing-witness InsufficientLiveness. Grow {1,2,3} ->
+  // {1,2,3,4} needs AddLearner(4)+PromoteLearner(4); a cap of one step exhausts after the first.
+  let backend = mock(&[1, 2, 3], &[1, 2, 3]);
+  backend.0.borrow_mut().steps_left = 1;
+  let target = MembershipTarget::new(member_set(&[1, 2, 3, 4]), BTreeSet::new());
+  let r = block_on(run_reconfigure(
+    backend.clone(),
+    target,
+    HealthHint::default(),
+    MemberId::new(1),
+  ));
+  assert!(
+    matches!(r, Err(ReconfigureError::Timeout(_))),
+    "a grow-phase cap is Timeout, never InsufficientLiveness: {r:?}"
+  );
 }
 
 // ── LoopBackend / LoopController / ReconfigureJob protocol tests ─────────────
@@ -430,26 +581,27 @@ fn apply_to(m: &Membership, step: &SingleVoterDelta) -> Membership {
     .expect("step must be valid on this membership")
 }
 
-/// (a) The backend reads the live membership and acked set from the snapshot after refresh.
+/// (a) The backend reads the live membership and proven-live voter set from the snapshot after refresh.
 #[test]
 fn loop_backend_reads_the_refreshed_snapshot() {
   let live = membership_of(&[1, 2, 3]);
-  let acked = member_set(&[1, 2]);
+  let fresh = member_set(&[1, 2]);
   let (backend, controller) = LoopBackend::new_pair(Snapshot {
     live: live.clone(),
-    acked: acked.clone(),
+    fresh: fresh.clone(),
     cap_exhausted: false,
+    shrink_stall: None,
   });
   assert_eq!(backend.live_membership(), live);
-  assert_eq!(backend.recently_acked_voters(64), acked);
+  assert_eq!(backend.proven_live_voters(), fresh);
   assert!(!backend.cap_exhausted());
 
   // After refresh the snapshot changes.
   let live2 = membership_of(&[1, 2, 3, 4]);
-  let acked2 = member_set(&[1, 2, 3]);
-  controller.refresh(live2.clone(), acked2.clone(), true);
+  let fresh2 = member_set(&[1, 2, 3]);
+  controller.refresh(live2.clone(), fresh2.clone(), true);
   assert_eq!(backend.live_membership(), live2);
-  assert_eq!(backend.recently_acked_voters(64), acked2);
+  assert_eq!(backend.proven_live_voters(), fresh2);
   assert!(backend.cap_exhausted());
 }
 
@@ -461,8 +613,9 @@ fn loop_backend_posts_proposal_controller_drains_it() {
   let initial = membership_of(&[1, 2, 3]);
   let (backend, controller) = LoopBackend::new_pair(Snapshot {
     live: initial.clone(),
-    acked: BTreeSet::new(),
+    fresh: BTreeSet::new(),
     cap_exhausted: false,
+    shrink_stall: None,
   });
 
   // Poll propose_and_await_install once: it should post into the slot and park.
@@ -495,8 +648,9 @@ fn loop_backend_retries_after_retry_outcome() {
   let initial = membership_of(&[1, 2, 3]);
   let (backend, controller) = LoopBackend::new_pair(Snapshot {
     live: initial.clone(),
-    acked: BTreeSet::new(),
+    fresh: BTreeSet::new(),
     cap_exhausted: false,
+    shrink_stall: None,
   });
 
   let step = SingleVoterDelta::AddLearner(MemberId::new(4));
@@ -537,21 +691,17 @@ fn reconfigure_job_installed_advances_and_reply_fires() {
 
   // Genesis: 1 voter + learner 2 to promote. Target: {1, 2} voters.
   let live = membership_with_learner(&[1], 2);
-  let acked = member_set(&[1]);
+  let fresh = member_set(&[1]);
   let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
 
   let target = MembershipTarget::new(member_set(&[1, 2]), BTreeSet::new());
   let mut job = ReconfigureJob::start(
     target,
-    HealthHint {
-      known_up: member_set(&[1]),
-      ..HealthHint::default()
-    },
-    64,
+    HealthHint::default(),
     Duration::from_secs(30),
     reply_tx,
     live.clone(),
-    acked.clone(),
+    fresh.clone(),
     MemberId::new(1),
   );
 
@@ -563,7 +713,7 @@ fn reconfigure_job_installed_advances_and_reply_fires() {
   // The planner should emit PromoteLearner(2). We simulate: poll -> proposal posted -> Installed.
 
   // Poll 1: refresh snapshot (already set), poll future, take proposal.
-  job.controller.refresh(live.clone(), acked.clone(), false);
+  job.controller.refresh(live.clone(), fresh.clone(), false);
   assert!(matches!(job.fut.as_mut().poll(&mut cx), Poll::Pending));
 
   let (step, step_reply) = job
@@ -584,7 +734,7 @@ fn reconfigure_job_installed_advances_and_reply_fires() {
   let new_live = apply_to(&live, &step);
   job
     .controller
-    .refresh(new_live.clone(), acked.clone(), false);
+    .refresh(new_live.clone(), fresh.clone(), false);
 
   // Send Installed from pending_step_reply.
   if let Some(sr) = job.pending_step_reply.take() {
@@ -607,7 +757,7 @@ fn reconfigure_job_installed_advances_and_reply_fires() {
           // If there's a pending proposal, answer it as Installed immediately.
           if let Some((next_step, sr)) = job.controller.take_proposal() {
             let newer_live = apply_to(&new_live, &next_step);
-            job.controller.refresh(newer_live, acked.clone(), false);
+            job.controller.refresh(newer_live, fresh.clone(), false);
             let _ = sr.send(StepOutcome::Installed);
           } else {
             // No pending proposal: fire a tick so backoff unblocks (if any).
@@ -637,29 +787,25 @@ fn reconfigure_job_failed_outcome_resolves_err() {
   use std::task::Poll;
 
   let live = membership_of(&[1, 2, 3]);
-  let acked = member_set(&[1, 2, 3]);
+  let fresh = member_set(&[1, 2, 3]);
   let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
 
-  // Target: remove voter 3. The shrink needs a known_up quorum.
+  // Target: remove voter 3. The shrink needs a proven-live successor quorum.
   let target = MembershipTarget::new(member_set(&[1, 2]), BTreeSet::new());
   let mut job = ReconfigureJob::start(
     target,
-    HealthHint {
-      known_up: member_set(&[1, 2]),
-      ..HealthHint::default()
-    },
-    64,
+    HealthHint::default(),
     Duration::from_secs(30),
     reply_tx,
     live.clone(),
-    acked.clone(),
+    fresh.clone(),
     MemberId::new(1),
   );
 
   let waker = futures_util::task::noop_waker();
   let mut cx = std::task::Context::from_waker(&waker);
 
-  job.controller.refresh(live.clone(), acked.clone(), false);
+  job.controller.refresh(live.clone(), fresh.clone(), false);
   assert!(matches!(job.fut.as_mut().poll(&mut cx), Poll::Pending));
 
   let (_, step_reply) = job
@@ -700,22 +846,18 @@ fn reconfigure_job_failed_outcome_resolves_err() {
 #[test]
 fn advance_deadline_fires_when_future_parked_in_retry_loop() {
   let live = membership_of(&[1, 2, 3]);
-  let acked = member_set(&[1, 2, 3]);
+  let fresh = member_set(&[1, 2, 3]);
   let target = MembershipTarget::new(member_set(&[1, 2]), BTreeSet::new());
   let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
 
   // Zero timeout: deadline = now + 0 = now; cap_exhausted = now >= now = true on the first advance.
   let mut job = ReconfigureJob::start(
     target,
-    HealthHint {
-      known_up: member_set(&[1, 2]),
-      ..HealthHint::default()
-    },
-    64,
+    HealthHint::default(),
     Duration::ZERO,
     reply_tx,
     live.clone(),
-    acked.clone(),
+    fresh.clone(),
     MemberId::new(1),
   );
 
@@ -724,7 +866,7 @@ fn advance_deadline_fires_when_future_parked_in_retry_loop() {
     Err(ProposeMembershipError::ProofPending)
   };
 
-  let outcome = job.advance(Instant::ZERO, live, acked, &mut propose);
+  let outcome = job.advance(Instant::ZERO, live, fresh, &mut propose);
 
   assert!(
     matches!(outcome, AdvanceOutcome::Done),
@@ -744,22 +886,18 @@ fn advance_deadline_fires_when_future_parked_in_retry_loop() {
 #[test]
 fn advance_deadline_fires_when_install_never_arrives() {
   let live = membership_of(&[1, 2, 3]);
-  let acked = member_set(&[1, 2, 3]);
+  let fresh = member_set(&[1, 2, 3]);
   let target = MembershipTarget::new(member_set(&[1, 2]), BTreeSet::new());
   let (reply_tx, mut reply_rx) = futures_channel::oneshot::channel();
 
   // 5-second timeout: first advance at ZERO arms deadline = ZERO + 5s, not yet exhausted.
   let mut job = ReconfigureJob::start(
     target,
-    HealthHint {
-      known_up: member_set(&[1, 2]),
-      ..HealthHint::default()
-    },
-    64,
+    HealthHint::default(),
     Duration::from_secs(5),
     reply_tx,
     live.clone(),
-    acked.clone(),
+    fresh.clone(),
     MemberId::new(1),
   );
 
@@ -767,7 +905,7 @@ fn advance_deadline_fires_when_install_never_arrives() {
   // but deliberately never send Installed, simulating a stuck install.
   let mut propose =
     |_: SingleVoterDelta| -> Result<OpNumber, ProposeMembershipError> { Ok(OpNumber::new()) };
-  let outcome1 = job.advance(Instant::ZERO, live.clone(), acked.clone(), &mut propose);
+  let outcome1 = job.advance(Instant::ZERO, live.clone(), fresh.clone(), &mut propose);
   assert!(
     matches!(outcome1, AdvanceOutcome::InFlight),
     "first advance before deadline is InFlight"
@@ -780,7 +918,7 @@ fn advance_deadline_fires_when_install_never_arrives() {
   let t1 = Instant::ZERO + Duration::from_secs(10);
   let mut propose2 =
     |_: SingleVoterDelta| -> Result<OpNumber, ProposeMembershipError> { Ok(OpNumber::new()) };
-  let outcome2 = job.advance(t1, live, acked, &mut propose2);
+  let outcome2 = job.advance(t1, live, fresh, &mut propose2);
   assert!(
     matches!(outcome2, AdvanceOutcome::Done),
     "advance past deadline must return Done"
@@ -803,17 +941,14 @@ fn advance_deadline_fires_when_install_never_arrives() {
 fn self_removal_is_ranked_last_when_another_safe_removal_exists() {
   // live = {1, 2, 3}, target = {2}: must remove both 1 and 3.
   // local_member = 1 (the local driver node is a removal candidate).
-  // known_up = {1, 2, 3}: all three confirmed alive, so liveness is equal for all candidates;
+  // fresh = {1, 2, 3}: all three proven live, so liveness is equal for all candidates;
   // the self-last tie-break alone must distinguish them.
   // Removing 1 → successor {2, 3}, quorum = 1, confirmed = 2 ✓
   // Removing 3 → successor {1, 2}, quorum = 1, confirmed = 2 ✓
   // Without self-last: ascending-id order picks 1 first. With self-last: 3 is picked first.
   let live = membership_of(&[1, 2, 3]);
-  let health = HealthHint {
-    known_up: member_set(&[1, 2, 3]),
-    known_down: BTreeSet::new(),
-  };
-  let responsive = member_set(&[1, 2, 3]);
+  let health = HealthHint::new();
+  let fresh = member_set(&[1, 2, 3]);
   let local_member = MemberId::new(1);
 
   let candidates = std::vec![
@@ -822,25 +957,25 @@ fn self_removal_is_ranked_last_when_another_safe_removal_exists() {
   ];
 
   let result =
-    pick_fresh_quorum_preserving_removal(&live, &candidates, &health, &responsive, local_member);
+    pick_fresh_quorum_preserving_removal(&live, &candidates, &health, &fresh, local_member);
 
   assert_eq!(
     result,
-    Some(SingleVoterDelta::RemoveVoter(MemberId::new(3))),
+    Ok(SingleVoterDelta::RemoveVoter(MemberId::new(3))),
     "RemoveVoter(3) must be chosen before RemoveVoter(1) (self) even though id 1 < 3"
   );
 }
 
 /// The self-last ordering is unconditional: it must hold even when the local node has NO
-/// positive evidence (apparently_down) and a peer IS known_up.  Under the old key
+/// positive evidence (apparently_down) and a peer IS proven live.  Under the old key
 /// `(!apparently_down, m == local_member, m.get())`, local (1) and peer (3) both land in the
-/// apparently_down bucket (local=not-witnessed, peer=not-witnessed), so the secondary key
+/// apparently_down bucket (local=not-proven, peer=not-proven), so the secondary key
 /// `m == local_member` would fire: local=true > peer=false → local wins the descending sort
 /// and is removed first, retiring the driver.  Under the correct key `(m == local_member, ...)`
 /// local always sorts last regardless of its liveness.
 ///
 /// live = {1,2,3,4,5}, local_member = 1, candidates = RemoveVoter(1) + RemoveVoter(3).
-/// known_up = {2,4,5}; local (1) and candidate (3) are BOTH absent → both apparently_down.
+/// fresh = {2,4,5}; local (1) and candidate (3) are BOTH absent → both apparently_down.
 /// Removing 3 → successor {1,2,4,5}, len=4, quorum=3, confirmed={2,4,5}=3 ≥ 3 ✓
 /// Removing 1 → successor {2,3,4,5}, len=4, quorum=3, confirmed={2,4,5}=3 ≥ 3 ✓
 /// Both pass the fail-closed gate; self-last must select RemoveVoter(3) even though local is
@@ -848,11 +983,8 @@ fn self_removal_is_ranked_last_when_another_safe_removal_exists() {
 #[test]
 fn self_removal_is_ranked_last_even_when_local_has_no_positive_evidence() {
   let live = membership_of(&[1, 2, 3, 4, 5]);
-  let health = HealthHint {
-    known_up: member_set(&[2, 4, 5]), // local (1) and peer (3) both absent from known_up
-    known_down: BTreeSet::new(),
-  };
-  let responsive = BTreeSet::new(); // no recent acks — neither local nor peer is witnessed
+  let health = HealthHint::new();
+  let fresh = member_set(&[2, 4, 5]); // local (1) and peer (3) both absent → apparently_down
   let local_member = MemberId::new(1);
 
   let candidates = std::vec![
@@ -861,11 +993,11 @@ fn self_removal_is_ranked_last_even_when_local_has_no_positive_evidence() {
   ];
 
   let result =
-    pick_fresh_quorum_preserving_removal(&live, &candidates, &health, &responsive, local_member);
+    pick_fresh_quorum_preserving_removal(&live, &candidates, &health, &fresh, local_member);
 
   assert_eq!(
     result,
-    Some(SingleVoterDelta::RemoveVoter(MemberId::new(3))),
+    Ok(SingleVoterDelta::RemoveVoter(MemberId::new(3))),
     "RemoveVoter(3) must be chosen before RemoveVoter(1) (self) even when both are apparently_down"
   );
 }
@@ -883,7 +1015,6 @@ fn finish_reconfigure_on_retire_resolves_retired_when_the_goal_is_unreached() {
   let job = ReconfigureJob::start(
     target,
     HealthHint::default(),
-    64,
     Duration::from_secs(30),
     reply_tx,
     live.clone(),
@@ -917,7 +1048,6 @@ fn finish_reconfigure_on_retire_resolves_ok_when_the_goal_is_already_reached() {
   let job = ReconfigureJob::start(
     target,
     HealthHint::default(),
-    64,
     Duration::from_secs(30),
     reply_tx,
     live.clone(),

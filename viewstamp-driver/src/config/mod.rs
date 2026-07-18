@@ -35,12 +35,21 @@ pub const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 /// cluster), so this never refuses a legitimate peer while still bounding an accept flood.
 pub const MAX_CONNS: usize = 1024;
 
-/// Default acknowledgement look-back window for the reconfiguration executor: how many ops back the
-/// driver scans for recent voter acks as a liveness signal when choosing which voter to remove in a
-/// shrink step. 64 is generous — it spans multiple heartbeat rounds in a quiescent cluster — so a
-/// transiently-quiet-but-healthy voter is not incorrectly treated as unresponsive. Smaller values
-/// converge the shrink faster but risk false-missing a merely-idle voter.
-pub const ACK_WINDOW: u64 = 64;
+/// Default cadence at which the reconfiguration executor RE-SOLICITS a voter-liveness-probe round
+/// while a shrink job is in flight: every `HEALTH_PROBE_INTERVAL`, the driver draws a fresh probe
+/// nonce so a voter that crashed since the last round falls out of the proven-live set. 250 ms is
+/// comfortably above the 50 ms driver loop cadence (so each round is a distinct nonce, not a
+/// same-round retransmit) yet gives ~30 fresh rounds within the default `RECONFIGURE_TIMEOUT`. Probe
+/// traffic exists ONLY while a shrink job is active.
+pub const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Default maximum age of a voter-liveness-probe round the reconfiguration executor still trusts:
+/// `proven_live_voters` fails closed (returns empty) once the outstanding round is older than
+/// `HEALTH_PROOF_MAX_AGE`, so a driver that stopped refreshing cannot keep a crashed voter counted.
+/// 1 s must exceed `HEALTH_PROBE_INTERVAL` plus a healthy round-trip (so a live voter's answer always
+/// lands within the window) yet stay well under `RECONFIGURE_TIMEOUT`, so a genuinely dead successor
+/// quorum stalls the shrink fail-closed rather than lingering on stale evidence.
+pub const HEALTH_PROOF_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// Default deadline for one `reconfigure_to` call: once this much wall-clock elapses without the plan
 /// converging, the executor's cap fires and the call resolves
@@ -91,10 +100,12 @@ pub struct DriverConfig {
   events_cap: usize,
   /// Global live-connection cap (stream driver only).
   max_conns: usize,
-  /// Reconfiguration executor acknowledgement look-back window: the number of ops back the driver
-  /// scans for recent voter acks as a liveness signal. Passed to `ReconfigureJob::start` and
-  /// forwarded to `recently_acked_voters` each driver-loop iteration.
-  ack_window: u64,
+  /// Cadence at which the reconfiguration executor re-solicits a fresh voter-liveness-probe round
+  /// while a shrink job is in flight (each round draws a fresh nonce; a crashed voter falls out).
+  health_probe_interval: Duration,
+  /// Maximum age of a voter-liveness-probe round the reconfiguration executor still trusts as fresh;
+  /// past it, `proven_live_voters` fails closed so a stale round cannot keep a crashed voter counted.
+  health_proof_max_age: Duration,
   /// Deadline for one `reconfigure_to` call before its cap fires and it resolves
   /// [`ReconfigureError::Timeout`](crate::ReconfigureError::Timeout). The driver arms the deadline
   /// `reconfigure_timeout` ahead of the job's first advance and feeds `now >= deadline` to the
@@ -116,7 +127,8 @@ impl DriverConfig {
       max_pending_bytes: MAX_PENDING_BYTES,
       events_cap: EVENTS_CAP,
       max_conns: MAX_CONNS,
-      ack_window: ACK_WINDOW,
+      health_probe_interval: HEALTH_PROBE_INTERVAL,
+      health_proof_max_age: HEALTH_PROOF_MAX_AGE,
       reconfigure_timeout: RECONFIGURE_TIMEOUT,
     }
   }
@@ -179,11 +191,19 @@ impl DriverConfig {
     self.max_conns
   }
 
-  /// Reconfiguration executor acknowledgement look-back window (the `ACK_WINDOW` default). Passed
-  /// to `ReconfigureJob::start` and forwarded to `recently_acked_voters` each driver-loop iteration.
+  /// Voter-liveness-probe re-solicit cadence for the reconfiguration executor (the
+  /// `HEALTH_PROBE_INTERVAL` default). While a shrink job is in flight the driver draws a fresh probe
+  /// round this often.
   #[inline(always)]
-  pub const fn ack_window(&self) -> u64 {
-    self.ack_window
+  pub const fn health_probe_interval(&self) -> Duration {
+    self.health_probe_interval
+  }
+
+  /// Maximum trusted age of a voter-liveness-probe round for the reconfiguration executor (the
+  /// `HEALTH_PROOF_MAX_AGE` default). `proven_live_voters` fails closed past it.
+  #[inline(always)]
+  pub const fn health_proof_max_age(&self) -> Duration {
+    self.health_proof_max_age
   }
 
   /// Deadline for one `reconfigure_to` call (the `RECONFIGURE_TIMEOUT` default). The driver arms it
@@ -333,18 +353,33 @@ impl DriverConfig {
     self
   }
 
-  /// Override the reconfiguration executor acknowledgement look-back window. 0 is valid (means
-  /// "most recent op only"; the executor will only see the very last ack). Raise it for clusters
-  /// with a longer heartbeat interval or to tolerate more transient quiescence.
+  /// Override the voter-liveness-probe re-solicit cadence. Keep it at or above the driver loop
+  /// cadence (50 ms) so each round is a distinct nonce, and well under `reconfigure_timeout` so a
+  /// shrink still sees many fresh rounds.
   #[must_use]
-  pub const fn with_ack_window(mut self, window: u64) -> Self {
-    self.set_ack_window(window);
+  pub const fn with_health_probe_interval(mut self, interval: Duration) -> Self {
+    self.set_health_probe_interval(interval);
     self
   }
 
-  /// In-place form of [`Self::with_ack_window`] — same semantics, chainable.
-  pub const fn set_ack_window(&mut self, window: u64) -> &mut Self {
-    self.ack_window = window;
+  /// In-place form of [`Self::with_health_probe_interval`] — same semantics, chainable.
+  pub const fn set_health_probe_interval(&mut self, interval: Duration) -> &mut Self {
+    self.health_probe_interval = interval;
+    self
+  }
+
+  /// Override the maximum trusted age of a voter-liveness-probe round. Keep it above
+  /// `health_probe_interval` plus a round-trip (so a live voter's answer always lands within the
+  /// window) yet under `reconfigure_timeout` (so a dead successor quorum stalls fail-closed).
+  #[must_use]
+  pub const fn with_health_proof_max_age(mut self, max_age: Duration) -> Self {
+    self.set_health_proof_max_age(max_age);
+    self
+  }
+
+  /// In-place form of [`Self::with_health_proof_max_age`] — same semantics, chainable.
+  pub const fn set_health_proof_max_age(&mut self, max_age: Duration) -> &mut Self {
+    self.health_proof_max_age = max_age;
     self
   }
 

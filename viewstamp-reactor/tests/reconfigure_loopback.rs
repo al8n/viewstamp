@@ -1,8 +1,11 @@
 //! Reconfiguration and peer address book tests for the reactor (tokio) QUIC driver.
 //!
-//! Reconfiguration gate: a real single-node driver drives a membership change through its own
-//! run loop to convergence (`reconfigure_to` → `Ok(())`), and a fail-closed shrink with no live
-//! witness times out within its deadline.
+//! Reconfiguration gate: a real single-node driver drives a membership change through its own run
+//! loop to convergence (`reconfigure_to` → `Ok(())`); a multi-voter cluster's shrink converges from
+//! the primary's active voter-liveness PROBE alone, even with zero client traffic ever submitted (no
+//! acked op is needed — the probe is the sole positive liveness source); and a shrink whose successor
+//! still needs a voter that never runs anywhere to answer stays fail-closed, resolving
+//! `InsufficientLiveness` once its deadline elapses rather than hanging forever.
 //!
 //! Address book gate: a driver that receives `AddPeer` commands continues to commit work correctly,
 //! and the address book accepts registrations at any point without panicking.
@@ -329,42 +332,187 @@ async fn single_node_reconfigure_converges_ok() {
   let _ = handle.shutdown().await;
 }
 
-/// SHRINK STALL → TIMEOUT: a shrink with NO positive liveness evidence fails closed and the call
-/// resolves `Timeout` once its deadline elapses. Genesis is two voters; only slot 0's node runs (no
-/// peer), the cluster is idle (the automatic ack oracle is empty), and `HealthHint::default()` offers
-/// no operator witness — so the executor's quorum-preserving removal picker can confirm no successor
-/// quorum and stalls rather than removing on a guess. With nothing ever committing, only the
-/// deadline-driven `cap_exhausted` ends the call: a short `reconfigure_timeout` makes the
-/// `ReconfigureError::Timeout` fire promptly. This is the regression for the deadline path (a
-/// hardwired `cap_exhausted = false` would hang here forever).
+/// SHRINK STALL → INSUFFICIENT LIVENESS: a shrink whose successor still needs a voter that never
+/// answers anywhere fails closed and the call resolves `InsufficientLiveness` once its deadline
+/// elapses. Genesis is THREE voters; only slot 0's node runs (no peers), so voters 1 and 2 never
+/// answer a health-probe round and can never be proven live.
+///
+/// The genesis MUST be three voters, not two: shrinking a two-voter genesis down to a SELF-ONLY
+/// successor ({0}) is exactly the idle-but-live case the probe fixes — `proven_live_voters` unions the
+/// local member into a live round unconditionally, so a lone running node can always prove ITSELF alive and
+/// that shrink now correctly COMPLETES (see the idle multi-voter completion test below). Here the
+/// target is still `{0}` alone, so the first step's successor (dropping either peer) is a TWO-voter
+/// config that needs the OTHER never-running peer proven too — evidence no probe round can ever
+/// produce — so the picker genuinely has nothing to confirm and stalls on every iteration. With
+/// nothing ever committing, only the deadline-driven `cap_exhausted` ends the call: a short
+/// `reconfigure_timeout` makes `ReconfigureError::InsufficientLiveness` fire promptly. This is the
+/// regression for the deadline path (a hardwired `cap_exhausted = false` would hang here forever).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn single_node_shrink_with_no_witness_times_out() {
+async fn single_node_shrink_with_an_unreachable_successor_voter_stalls_to_insufficient_liveness() {
   let ca = TestCa::new();
   let bind: SocketAddr = "127.0.0.1:41210".parse().unwrap();
-  // A short deadline so the fail-closed stall resolves Timeout quickly.
+  // A short deadline so the fail-closed stall resolves quickly.
   let cfg = viewstamp_reactor::DriverConfig::new().with_reconfigure_timeout(Duration::from_secs(1));
-  // Genesis: voters {0, 1}; only node 0 runs. Target: drop voter 1 (a RemoveVoter shrink).
-  let (driver, handle) = build_driver(&ca, bind, genesis(2, 0), cfg).await;
+  // Genesis: voters {0, 1, 2}; only node 0 runs. Target: drop voters 1 AND 2, down to {0} alone.
+  let (driver, handle) = build_driver(&ca, bind, genesis(3, 0), cfg).await;
   drop(tokio::spawn(driver.run()));
 
   let target = MembershipTarget::new(
     std::collections::BTreeSet::from([MemberId::new(0)]),
     std::collections::BTreeSet::new(),
   );
-  // Idle cluster + default hint = no positive successor-quorum evidence: the shrink stalls, and only
-  // the deadline ends it. Generously bound the test wait above the 1s deadline.
+  // No process ever answers for voters 1 or 2: every removal's successor still needs the OTHER one
+  // proven, which never happens. Generously bound the test wait above the 1s deadline.
   let outcome = tokio::time::timeout(
     Duration::from_secs(10),
     handle.reconfigure_to(target, HealthHint::default()),
   )
   .await
-  .expect("the call resolves (Timeout) well within 10s — it does not hang");
-  assert!(
-    matches!(outcome, Err(ReconfigureError::Timeout(_))),
-    "a fail-closed shrink with no witness resolves Timeout once the deadline elapses, got {outcome:?}"
-  );
+  .expect("the call resolves (InsufficientLiveness) well within 10s — it does not hang");
+  match outcome {
+    Err(ReconfigureError::InsufficientLiveness { unproven, .. }) => {
+      assert!(
+        !unproven.is_empty(),
+        "a genuinely unreachable successor voter is named unproven"
+      );
+      assert!(
+        unproven.is_subset(&std::collections::BTreeSet::from([
+          MemberId::new(1),
+          MemberId::new(2)
+        ])),
+        "only the two never-running peers can ever be named unproven, got {unproven:?}"
+      );
+    }
+    other => panic!(
+      "a fail-closed shrink with an unreachable successor voter resolves InsufficientLiveness once the deadline elapses, got {other:?}"
+    ),
+  }
 
   let _ = handle.shutdown().await;
+}
+
+/// THE HEALTH PROBE ALONE PROVES AN IDLE SHRINK'S SUCCESSOR QUORUM (reactor variant): a real
+/// 3-voter cluster with ZERO client traffic EVER submitted still converges a shrink to 2 voters,
+/// because the primary's active `solicit_health_proofs` round — not any inflight acked op — proves the
+/// successor voter alive. This is the direct end-to-end regression for the idle-shrink-stall defect the
+/// probe fixes: the deleted `recently_acked_voters` oracle read only in-flight uncommitted prepares and was empty on an idle
+/// cluster, so this exact scenario used to stall to `Timeout` before the probe replaced it. All three
+/// nodes run as separate driver processes over real mTLS QUIC, and the shrink is driven with the
+/// stock default `DriverConfig` (no shortened deadline, no operator `HealthHint`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_three_voter_shrink_completes_from_health_probes_alone() {
+  let ca = TestCa::new();
+  let addrs: Vec<SocketAddr> = (0..3)
+    .map(|i: u16| format!("127.0.0.1:{}", 41920 + i).parse().unwrap())
+    .collect();
+
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let (driver, handle) =
+      build_cluster_driver(&ca, id, addrs[id as usize], peers, genesis(3, 0)).await;
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+
+  // ZERO app traffic: no client op is ever submitted on any node. Only the health-probe round can
+  // supply the successor's liveness evidence. Target: drop voter 2, keeping {0, 1}.
+  let target = MembershipTarget::new(
+    std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
+    std::collections::BTreeSet::new(),
+  );
+  tokio::time::timeout(
+    viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(2),
+    handles[0].reconfigure_to(target, HealthHint::default()),
+  )
+  .await
+  .expect("the call resolves within the deadline band")
+  .expect("the shrink converges from the health-probe evidence alone, with no client traffic ever submitted");
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}
+
+/// A SURVIVOR THAT NEVER PROVES BLOCKS A SHRINK THAT WOULD STRAND IT, AND THE REST STAY
+/// AVAILABLE (reactor variant): a real 3-voter cluster {0,1,2}; the primary (0) is asked to shrink to
+/// {0,1} (the sole delta is `RemoveVoter(2)`), and voter 1 — a SURVIVOR of the target, not the
+/// departing voter — is killed right after the call. `RemoveVoter(2)` is NEVER issued: its successor
+/// `{0,1}` would leave 1 dead, an immediate outage, so the shrink stalls fail-closed naming 1
+/// unproven. Meanwhile the ORIGINAL 3-voter quorum (2 of 3) does not need voter 1: voter 0 and voter 2
+/// alone still commit a client op after the stall, proving continued availability despite both the
+/// crash and the stall — and, since a wrongly-installed `{0,1}` successor with 1 dead could never
+/// commit anything again, that commit landing is itself proof voter 2 was never removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_killed_survivor_blocks_the_shrink_and_the_rest_stay_available() {
+  let ca = TestCa::new();
+  let addrs: Vec<SocketAddr> = (0..3)
+    .map(|i: u16| format!("127.0.0.1:{}", 41930 + i).parse().unwrap())
+    .collect();
+
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let (driver, handle) =
+      build_cluster_driver(&ca, id, addrs[id as usize], peers, genesis(3, 0)).await;
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+
+  // Target {0, 1}: the sole delta is RemoveVoter(2).
+  let target = MembershipTarget::new(
+    std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
+    std::collections::BTreeSet::new(),
+  );
+  let primary = handles[0].clone();
+  let recon =
+    tokio::spawn(async move { primary.reconfigure_to(target, HealthHint::default()).await });
+
+  // Kill voter 1 shortly after the call is issued: from this point on it can never answer another
+  // health-probe round.
+  tokio::time::sleep(Duration::from_millis(200)).await;
+  let _ = handles[1].shutdown().await;
+
+  let outcome = tokio::time::timeout(
+    viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(5),
+    recon,
+  )
+  .await
+  .expect("the call resolves (does not hang) within the deadline band")
+  .expect("the spawned reconfigure_to task completes without panicking");
+  match outcome {
+    Err(ReconfigureError::InsufficientLiveness { unproven, .. }) => {
+      assert!(
+        unproven.contains(&MemberId::new(1)),
+        "voter 1 (killed, never proves again) is named unproven, got {unproven:?}"
+      );
+    }
+    other => panic!("expected InsufficientLiveness naming voter 1, got {other:?}"),
+  }
+
+  // AVAILABILITY PRESERVED: voter 0 and voter 2 (both still alive) commit a client op despite voter
+  // 1's death and the stalled shrink — the original 3-voter quorum (2 of 3) never needed voter 1.
+  let reply = tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].submit(Bytes::from_static(b"post-stall")),
+  )
+  .await
+  .expect("the commit lands within 20s despite voter 1's death and the stalled shrink")
+  .expect("a committed reply");
+  assert_eq!(
+    &reply[..],
+    &1u64.to_be_bytes(),
+    "the first (and only) committed op replies the post-apply count 1"
+  );
+
+  let _ = handles[0].shutdown().await;
+  let _ = handles[2].shutdown().await;
 }
 
 /// ADDRESS BOOK DOES NOT DISRUPT NORMAL COMMITS (reactor variant): a 3-node cluster with `add_peer`
@@ -579,20 +727,16 @@ async fn stream_cluster_survives_slot_shift() {
   );
 
   // RECONFIGURE: the primary (member 0) drives the removal of voter 1, leaving voters {0,2,3} at slots
-  // {0,1,2}. `known_up = {0,2,3}` is the operator's positive witness that the successor quorum is live,
-  // so the quorum-preserving removal picker confirms it rather than fail-closed stalling.
+  // {0,1,2}. All three nodes are live and committing, so the primary's health-probe round proves the
+  // successor quorum live and the quorum-preserving removal picker confirms it — no operator hint
+  // needed (`HealthHint::default()`).
   let target = MembershipTarget::new(
     BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
     BTreeSet::new(),
   );
-  let health = HealthHint::new().with_known_up(BTreeSet::from([
-    MemberId::new(0),
-    MemberId::new(2),
-    MemberId::new(3),
-  ]));
   tokio::time::timeout(
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, health),
+    handles[0].reconfigure_to(target, HealthHint::default()),
   )
   .await
   .expect("the reconfiguration converges within 20s")
@@ -782,11 +926,12 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
     BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
     BTreeSet::new(),
   );
-  let health =
-    HealthHint::new().with_known_up(BTreeSet::from([MemberId::new(0), MemberId::new(1)]));
+  // The health hint is irrelevant here: `PromoteLearner` is a grow-phase step the liveness gate never
+  // consults (only a `RemoveVoter` shrink does) — the promote-time durable-prefix challenge is what
+  // admits it.
   tokio::time::timeout(
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, health),
+    handles[0].reconfigure_to(target, HealthHint::default()),
   )
   .await
   .expect("the promotion converges within 20s")
@@ -959,19 +1104,15 @@ async fn quic_cluster_survives_slot_shift() {
     "the first committed op replies the post-apply count 1"
   );
 
-  // RECONFIGURE: remove voter 1, shifting members 2→slot 1 and 3→slot 2.
+  // RECONFIGURE: remove voter 1, shifting members 2→slot 1 and 3→slot 2. All four nodes are live and
+  // committing, so the primary's health-probe round proves the successor quorum live.
   let target = MembershipTarget::new(
     BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
     BTreeSet::new(),
   );
-  let health = HealthHint::new().with_known_up(BTreeSet::from([
-    MemberId::new(0),
-    MemberId::new(2),
-    MemberId::new(3),
-  ]));
   tokio::time::timeout(
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, health),
+    handles[0].reconfigure_to(target, HealthHint::default()),
   )
   .await
   .expect("the reconfiguration converges within 20s")
