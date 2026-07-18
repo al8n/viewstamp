@@ -827,6 +827,7 @@ fn propose_membership_delegates_to_the_endpoint() {
       Instant::ZERO,
       &mut wal,
       crate::SingleVoterDelta::AddLearner(MemberId::new(5)),
+      None,
     )
     .expect("a Normal primary with no in-flight change can propose");
   assert_eq!(
@@ -1090,6 +1091,7 @@ fn drive_voter_removal_to_installed(
       Instant::ZERO,
       wal,
       SingleVoterDelta::RemoveVoter(MemberId::new(removed)),
+      Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the removal Reconfigure op");
   coord.handle_storage(Instant::ZERO, wal, sb, blocks); // own append durable -> own vote

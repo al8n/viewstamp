@@ -37,9 +37,9 @@ use std::collections::BTreeSet;
 use bytes::Bytes;
 
 use crate::{
-  BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
-  ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
-  decode_message, endpoint::ProposeMembershipError,
+  AcceptReducedFaultTolerance, BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber,
+  Outgoing, Peer, Recipient, ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine,
+  Superblock, Wal, decode_message, endpoint::ProposeMembershipError,
 };
 
 /// Derive the SNI server-name a dial presents for `peer` in `cluster`.
@@ -272,8 +272,9 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     delta: SingleVoterDelta,
+    ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError> {
-    self.endpoint.propose_membership(now, wal, delta)
+    self.endpoint.propose_membership(now, wal, delta, ack)
   }
 
   /// Solicit a voter-liveness-probe round — one `RequestHealthProof` per current voter — so the

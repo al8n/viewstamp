@@ -244,6 +244,12 @@ fn single_voter_delta_predicates_and_accessors() {
   assert_eq!(promote.as_str(), "promote_learner");
   assert_eq!(promote.member(), MemberId::new(10));
 
+  let demote = SingleVoterDelta::DemoteVoter(MemberId::new(2));
+  assert!(demote.is_demote_voter());
+  assert!(!demote.is_remove_voter());
+  assert_eq!(demote.as_str(), "demote_voter");
+  assert_eq!(demote.member(), MemberId::new(2));
+
   let add_l = SingleVoterDelta::AddLearner(MemberId::new(11));
   assert!(add_l.is_add_learner());
   assert_eq!(add_l.as_str(), "add_learner");
@@ -331,6 +337,43 @@ fn promote_learner_moves_id_from_learner_range_into_voter_range() {
 }
 
 #[test]
+fn demote_voter_moves_id_from_voter_range_into_learner_range() {
+  let m0 = base_3v_1l();
+  assert!(m0.is_voter(m0.slot_of(MemberId::new(2)).unwrap()));
+
+  let m1 = m0
+    .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(2)))
+    .unwrap();
+  // replica_count − 1, learner_count + 1: the node count is invariant across a demote.
+  assert_eq!(m1.replica_count(), m0.replica_count() - 1);
+  assert_eq!(m1.learner_count(), m0.learner_count() + 1);
+  assert_eq!(m1.node_count(), m0.node_count());
+  assert_eq!(m1.epoch(), Epoch::new(m0.epoch().get() + 1));
+  assert_ne!(m1.config_id(), m0.config_id());
+  // The demoted id is now a learner, occupying a slot in the learner range.
+  let slot = m1.slot_of(MemberId::new(2)).unwrap();
+  assert!(m1.is_learner(slot));
+  assert!(!m1.is_voter(slot));
+
+  // `apply_delta` chains exactly as a `reconfigure` to the same successor members would: the demoted
+  // voter is appended at the END of the learner range, after the existing learners.
+  let expected = m0
+    .reconfigure(
+      2,
+      2,
+      std::vec![
+        MemberId::new(1),
+        MemberId::new(3),
+        MemberId::new(10),
+        MemberId::new(2),
+      ],
+    )
+    .unwrap();
+  assert_eq!(m1.config_id(), expected.config_id());
+  assert_eq!(m1.members_slice(), expected.members_slice());
+}
+
+#[test]
 fn add_learner_grows_learner_count_keeps_replica_count() {
   let m0 = base_3v_1l();
   let m1 = m0
@@ -362,10 +405,15 @@ fn remove_learner_shrinks_learner_count() {
 
 #[test]
 fn apply_delta_rejects_removing_the_last_voter() {
-  // A single-voter configuration: removing its sole voter would leave a zero-voter cluster.
+  // A single-voter configuration: removing OR demoting its sole voter would leave a zero-voter
+  // cluster.
   let m = Membership::genesis(1, 0, std::vec![MemberId::new(1)]).unwrap();
   assert!(matches!(
     m.apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(1))),
+    Err(MembershipError::WouldRemoveLastVoter)
+  ));
+  assert!(matches!(
+    m.apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(1))),
     Err(MembershipError::WouldRemoveLastVoter)
   ));
 }
@@ -383,6 +431,10 @@ fn apply_delta_rejects_unknown_member_for_removals_and_promotion() {
   ));
   assert!(matches!(
     m.apply_delta(&SingleVoterDelta::PromoteLearner(MemberId::new(99))),
+    Err(MembershipError::UnknownMember)
+  ));
+  assert!(matches!(
+    m.apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(99))),
     Err(MembershipError::UnknownMember)
   ));
 }
@@ -420,6 +472,17 @@ fn apply_delta_rejects_removing_a_voter_with_remove_learner() {
 }
 
 #[test]
+fn apply_delta_rejects_demoting_a_learner() {
+  let m = base_3v_1l();
+  // Member 10 is a learner, not a voter; `DemoteVoter` moves a voter out of the voting set (a
+  // learner is removed with `RemoveLearner`), so this reports `NotAVoter`.
+  assert!(matches!(
+    m.apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(10))),
+    Err(MembershipError::NotAVoter)
+  ));
+}
+
+#[test]
 fn apply_delta_rejects_adding_a_duplicate() {
   let m = base_3v_1l();
   // Member 2 is already a voter; member 10 is already a learner.
@@ -444,12 +507,13 @@ fn apply_delta_rejects_adding_a_duplicate() {
 #[test]
 fn apply_delta_changes_voter_count_by_at_most_one() {
   // For every successful delta variant, the voter count moves by at most one. AddLearner /
-  // RemoveLearner leave it unchanged; Add/Remove/Promote voter move it by exactly one.
+  // RemoveLearner leave it unchanged; Add/Remove/Promote/Demote voter move it by exactly one.
   let m = base_3v_1l();
   let deltas = std::vec![
     SingleVoterDelta::AddVoter(MemberId::new(7)),
     SingleVoterDelta::RemoveVoter(MemberId::new(2)),
     SingleVoterDelta::PromoteLearner(MemberId::new(10)),
+    SingleVoterDelta::DemoteVoter(MemberId::new(2)),
     SingleVoterDelta::AddLearner(MemberId::new(11)),
     SingleVoterDelta::RemoveLearner(MemberId::new(10)),
   ];
@@ -477,6 +541,7 @@ fn first_new_voter_admits_every_legitimate_delta_and_names_a_direct_add() {
     SingleVoterDelta::AddLearner(MemberId::new(11)),
     SingleVoterDelta::PromoteLearner(MemberId::new(10)),
     SingleVoterDelta::RemoveVoter(MemberId::new(2)),
+    SingleVoterDelta::DemoteVoter(MemberId::new(2)),
     SingleVoterDelta::RemoveLearner(MemberId::new(10)),
   ];
   for d in &legitimate {

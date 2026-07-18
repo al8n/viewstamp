@@ -63,6 +63,7 @@ fn propose_membership_on_the_primary_mints_a_reconfigure_op_and_latches_inflight
       now,
       &mut wal,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None,
     )
     .expect("the primary mints the reconfiguration op");
 
@@ -115,6 +116,7 @@ fn propose_membership_on_a_backup_is_rejected_not_primary() {
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::AddVoter(MemberId::new(3)),
+      None
     ),
     Err(ProposeMembershipError::NotPrimary),
     "only the primary proposes a reconfiguration",
@@ -133,6 +135,7 @@ fn propose_membership_while_not_normal_is_rejected_not_normal() {
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::AddVoter(MemberId::new(3)),
+      None
     ),
     Err(ProposeMembershipError::NotNormal),
     "a non-Normal primary does not propose",
@@ -151,6 +154,7 @@ fn a_second_proposal_while_one_is_in_flight_is_rejected_already_in_flight() {
       now,
       &mut wal,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None,
     )
     .expect("the first proposal mints an op");
 
@@ -159,7 +163,8 @@ fn a_second_proposal_while_one_is_in_flight_is_rejected_already_in_flight() {
     e.propose_membership(
       now,
       &mut wal,
-      SingleVoterDelta::AddLearner(MemberId::new(4))
+      SingleVoterDelta::AddLearner(MemberId::new(4)),
+      None
     ),
     Err(ProposeMembershipError::AlreadyInFlight),
     "only one reconfiguration is in flight at a time",
@@ -185,6 +190,7 @@ fn an_invalid_delta_is_rejected_with_the_underlying_membership_error() {
     Instant::ZERO,
     &mut wal,
     SingleVoterDelta::RemoveVoter(MemberId::new(99)),
+    None,
   ) {
     Err(ProposeMembershipError::Invalid(crate::MembershipError::UnknownMember)) => {}
     other => panic!("expected Invalid(UnknownMember), got {other:?}"),
@@ -260,6 +266,7 @@ fn proposed_and_committed_swap() -> (
       now,
       &mut wal,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None,
     )
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {} // drop the broadcast Prepare
@@ -347,35 +354,38 @@ fn single_change_primary_of(n: u8) -> Endpoint<CountSm, SingleChange> {
   )
 }
 
-/// Propose `RemoveVoter(removed)` on `e` and land the primary's own vote: mint the op, drop the
+/// Propose voter-set-shrinking `delta` on `e` and land the primary's own vote: mint the op, drop the
 /// broadcast `Prepare`, and complete the own WAL append (1 ack — the primary's own bit). Returns the
-/// minted op and the successor payload backup acks must content-address.
-fn propose_removal_with_own_vote(
+/// minted op and the successor payload backup acks must content-address. The reduced-tolerance
+/// acknowledgement is always passed — these tests exercise the COMMIT rule, not the propose gate,
+/// and a superfluous token on an f-preserving shrink is ignored.
+fn propose_shrink_with_own_vote(
   e: &mut Endpoint<CountSm, SingleChange>,
   wal: &mut TestWal,
   sb: &mut TestSb,
   blocks: &mut crate::block_store::MemBlockStore,
-  removed: u128,
+  delta: SingleVoterDelta,
 ) -> (OpNumber, ReconfigurePayload) {
   let successor = e
     .membership
-    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(removed)))
-    .expect("removing one voter is a valid delta");
+    .apply_delta(&delta)
+    .expect("shrinking the voter set by one is a valid delta");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let op = e
     .propose_membership(
       Instant::ZERO,
       wal,
-      SingleVoterDelta::RemoveVoter(MemberId::new(removed)),
+      delta,
+      Some(crate::AcceptReducedFaultTolerance),
     )
-    .expect("the primary mints the removal op");
+    .expect("the primary mints the shrink op");
   while e.poll_message().is_some() {} // drop the broadcast Prepare
   e.handle_storage(Instant::ZERO, wal, sb, blocks); // own append lands → own vote
   (op, payload)
 }
 
-/// Deliver backup `slot`'s content-addressed `PrepareOk` for the removal op.
-fn deliver_removal_ack(
+/// Deliver backup `slot`'s content-addressed `PrepareOk` for the shrink op.
+fn deliver_shrink_ack(
   e: &mut Endpoint<CountSm, SingleChange>,
   wal: &mut TestWal,
   sb: &mut TestSb,
@@ -394,29 +404,29 @@ fn deliver_removal_ack(
   );
 }
 
-/// The removal op is HELD uncommitted: `commit_min` below it, the single-writer latch still armed,
+/// The shrink op is HELD uncommitted: `commit_min` below it, the single-writer latch still armed,
 /// no `SwapEpoch` staged.
-fn assert_removal_held(e: &Endpoint<CountSm, SingleChange>, op: OpNumber) {
+fn assert_shrink_held(e: &Endpoint<CountSm, SingleChange>, op: OpNumber) {
   assert!(
     e.commit() < op,
-    "the removal must stay uncommitted (commit_min {} < op {})",
+    "the shrink must stay uncommitted (commit_min {} < op {})",
     e.commit().get(),
     op.get()
   );
   assert_eq!(
     e.reconfigure_inflight,
     Some(op),
-    "the single-writer latch stays armed while the removal is held"
+    "the single-writer latch stays armed while the shrink is held"
   );
   assert!(
     !e.pending_swap_for_test(),
-    "no SwapEpoch may be staged for a held removal"
+    "no SwapEpoch may be staged for a held shrink"
   );
 }
 
-/// The removal op COMMITTED: `commit_min` reached it, the latch cleared, the `SwapEpoch` staged.
-fn assert_removal_committed(e: &Endpoint<CountSm, SingleChange>, op: OpNumber) {
-  assert_eq!(e.commit(), op, "the removal committed");
+/// The shrink op COMMITTED: `commit_min` reached it, the latch cleared, the `SwapEpoch` staged.
+fn assert_shrink_committed(e: &Endpoint<CountSm, SingleChange>, op: OpNumber) {
+  assert_eq!(e.commit(), op, "the shrink committed");
   assert_eq!(
     e.reconfigure_inflight, None,
     "the single-writer latch cleared at commit"
@@ -436,15 +446,21 @@ fn a_three_to_two_shrink_holds_until_both_successor_voters_ack() {
   let mut e = single_change_primary_of(3);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let (op, payload) = propose_removal_with_own_vote(&mut e, &mut wal, &mut sb, &mut blocks, 2);
+  let (op, payload) = propose_shrink_with_own_vote(
+    &mut e,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    SingleVoterDelta::RemoveVoter(MemberId::new(2)),
+  );
 
   // Own vote + the leaver's ack = a predecessor quorum WITHOUT any successor majority: held.
-  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
-  assert_removal_held(&e, op);
+  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
+  assert_shrink_held(&e, op);
 
   // Survivor 1's ack completes the successor quorum {0,1}: the removal commits.
-  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
-  assert_removal_committed(&e, op);
+  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  assert_shrink_committed(&e, op);
   assert_eq!(
     e.membership.replica_count(),
     3,
@@ -460,14 +476,20 @@ fn an_even_to_odd_shrink_commits_on_a_predecessor_quorum_including_the_leaver() 
   let mut e = single_change_primary_of(4);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let (op, payload) = propose_removal_with_own_vote(&mut e, &mut wal, &mut sb, &mut blocks, 3);
+  let (op, payload) = propose_shrink_with_own_vote(
+    &mut e,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    SingleVoterDelta::RemoveVoter(MemberId::new(3)),
+  );
 
   // Own vote + slot 1 + the LEAVER slot 3 = a predecessor quorum whose retained subset {0,1} is
   // already a successor majority: commits with NO ack from slot 2.
-  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 3);
-  assert_removal_held(&e, op); // two acks: not even a predecessor quorum yet.
-  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
-  assert_removal_committed(&e, op);
+  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 3);
+  assert_shrink_held(&e, op); // two acks: not even a predecessor quorum yet.
+  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  assert_shrink_committed(&e, op);
 }
 
 #[test]
@@ -478,16 +500,180 @@ fn a_five_to_four_shrink_needs_a_successor_quorum_beyond_the_predecessor_one() {
   let mut e = single_change_primary_of(5);
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::MemBlockStore::new();
-  let (op, payload) = propose_removal_with_own_vote(&mut e, &mut wal, &mut sb, &mut blocks, 4);
+  let (op, payload) = propose_shrink_with_own_vote(
+    &mut e,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    SingleVoterDelta::RemoveVoter(MemberId::new(4)),
+  );
 
   // Own vote + slot 1 + the leaver slot 4 = 3-of-5 base quorum, retained {0,1} = 2 < 3: held.
-  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 4);
-  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
-  assert_removal_held(&e, op);
+  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 4);
+  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  assert_shrink_held(&e, op);
 
   // A third RETAINED voter's ack completes the successor quorum {0,1,2}: commits.
-  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
-  assert_removal_committed(&e, op);
+  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
+  assert_shrink_committed(&e, op);
+}
+
+#[test]
+fn a_three_to_two_demote_holds_until_both_successor_voters_ack() {
+  // {0,1,2} → voters {0,1} + learner {2}: a demote is a voter-set shrink (the successor seats FEWER
+  // voters even though the member keeps a seat), so the successor-quorum conjunction binds exactly
+  // as for a removal — the demotee's own ack cannot substitute for a successor majority. The
+  // primary's own vote plus the DEMOTEE's ack form a predecessor quorum (2-of-3), but no successor
+  // majority has processed the demote: held. It commits the moment retained voter 1 acks.
+  let mut e = single_change_primary_of(3);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let (op, payload) = propose_shrink_with_own_vote(
+    &mut e,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    SingleVoterDelta::DemoteVoter(MemberId::new(2)),
+  );
+
+  // Own vote + the demotee's ack = a predecessor quorum WITHOUT any successor majority: held.
+  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
+  assert_shrink_held(&e, op);
+
+  // Retained voter 1's ack completes the successor quorum {0,1}: the demote commits.
+  deliver_shrink_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  assert_shrink_committed(&e, op);
+}
+
+#[test]
+fn a_three_to_two_shrink_proposal_needs_the_reduced_tolerance_acknowledgement() {
+  // 3 voters tolerate one crash (f = 1); 2 tolerate none (f = 0). Either shrink kind — a removal or
+  // a demote — reduces the tolerance, so a bare proposal is refused with both tolerances named and
+  // nothing minted, and the SAME delta mints once the caller names the acceptance.
+  for delta in [
+    SingleVoterDelta::RemoveVoter(MemberId::new(2)),
+    SingleVoterDelta::DemoteVoter(MemberId::new(2)),
+  ] {
+    let mut e = single_change_primary_of(3);
+    let mut wal = TestWal::default();
+    let head = e.op();
+    assert_eq!(
+      e.propose_membership(Instant::ZERO, &mut wal, delta.clone(), None),
+      Err(ProposeMembershipError::ReducedFaultToleranceUnacknowledged { from: 1, to: 0 }),
+      "an f-reducing {} is refused without the acknowledgement",
+      delta.as_str(),
+    );
+    assert_eq!(e.reconfigure_inflight, None, "nothing was minted");
+    assert_eq!(e.op(), head, "the head did not advance for the refusal");
+
+    let op = e
+      .propose_membership(
+        Instant::ZERO,
+        &mut wal,
+        delta,
+        Some(crate::AcceptReducedFaultTolerance),
+      )
+      .expect("the acknowledged shrink mints");
+    assert_eq!(
+      op.get(),
+      head.get() + 1,
+      "the acknowledged shrink is the next op"
+    );
+    assert_eq!(
+      e.reconfigure_inflight,
+      Some(op),
+      "the latch armed on the mint"
+    );
+  }
+}
+
+#[test]
+fn a_five_to_four_shrink_proposal_needs_the_reduced_tolerance_acknowledgement() {
+  // 5 voters tolerate two crashes (f = 2); 4 tolerate one (f = 1): EVERY voter-count decrement from
+  // an odd count is f-reducing, not just the acute 3 → 2 — and the refusal names the actual pair.
+  let mut e = single_change_primary_of(5);
+  let mut wal = TestWal::default();
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::DemoteVoter(MemberId::new(4)),
+      None,
+    ),
+    Err(ProposeMembershipError::ReducedFaultToleranceUnacknowledged { from: 2, to: 1 }),
+    "a 5 → 4 shrink is refused bare",
+  );
+  e.propose_membership(
+    Instant::ZERO,
+    &mut wal,
+    SingleVoterDelta::DemoteVoter(MemberId::new(4)),
+    Some(crate::AcceptReducedFaultTolerance),
+  )
+  .expect("the acknowledged 5 → 4 shrink mints");
+}
+
+#[test]
+fn an_even_to_odd_shrink_proposal_is_ungated() {
+  // 4 → 3 keeps f = 1: the gate guards crash tolerance, not shrinking per se, so a bare even-to-odd
+  // shrink of either kind mints.
+  for delta in [
+    SingleVoterDelta::RemoveVoter(MemberId::new(3)),
+    SingleVoterDelta::DemoteVoter(MemberId::new(3)),
+  ] {
+    let mut e = single_change_primary_of(4);
+    let mut wal = TestWal::default();
+    e.propose_membership(Instant::ZERO, &mut wal, delta, None)
+      .expect("an f-preserving shrink mints bare");
+  }
+
+  // A superfluous acknowledgement on a non-reducing delta is accepted and ignored, so a driver may
+  // thread an operator's token through unconditionally.
+  let mut e = single_change_primary_of(3);
+  let mut wal = TestWal::default();
+  e.propose_membership(
+    Instant::ZERO,
+    &mut wal,
+    SingleVoterDelta::AddLearner(MemberId::new(9)),
+    Some(crate::AcceptReducedFaultTolerance),
+  )
+  .expect("a superfluous acknowledgement is ignored");
+}
+
+#[test]
+fn structural_validation_precedes_the_reduced_tolerance_gate() {
+  // The gate compares the ALREADY-VALIDATED successor, so a structurally invalid delta surfaces
+  // `Invalid` — never the acknowledgement demand. The sole-voter shrink refuses as
+  // `WouldRemoveLastVoter` even though bare…
+  let mut e = single_change_primary_of(1);
+  let mut wal = TestWal::default();
+  for delta in [
+    SingleVoterDelta::RemoveVoter(MemberId::new(0)),
+    SingleVoterDelta::DemoteVoter(MemberId::new(0)),
+  ] {
+    assert_eq!(
+      e.propose_membership(Instant::ZERO, &mut wal, delta, None),
+      Err(ProposeMembershipError::Invalid(
+        crate::MembershipError::WouldRemoveLastVoter
+      )),
+      "the last-voter refusal precedes the tolerance gate",
+    );
+  }
+
+  // …and an unknown member on an odd-sized cluster surfaces `UnknownMember`, not the gate.
+  let mut e = single_change_primary_of(3);
+  let mut wal = TestWal::default();
+  assert_eq!(
+    e.propose_membership(
+      Instant::ZERO,
+      &mut wal,
+      SingleVoterDelta::DemoteVoter(MemberId::new(99)),
+      None,
+    ),
+    Err(ProposeMembershipError::Invalid(
+      crate::MembershipError::UnknownMember
+    )),
+    "the unknown-member refusal precedes the tolerance gate",
+  );
 }
 
 #[test]
@@ -1439,7 +1625,8 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
     e.propose_membership(
       now,
       &mut wal,
-      SingleVoterDelta::AddLearner(MemberId::new(4))
+      SingleVoterDelta::AddLearner(MemberId::new(4)),
+      None
     ),
     Err(ProposeMembershipError::AlreadyInFlight),
     "a second reconfiguration is refused while the first's swap is committed-but-not-installed",
@@ -1461,6 +1648,7 @@ fn a_second_proposal_in_the_committed_swap_window_is_rejected_already_in_flight(
     now,
     &mut wal,
     SingleVoterDelta::AddLearner(MemberId::new(4)),
+    None,
   );
   assert!(
     next.is_ok(),
@@ -1592,7 +1780,12 @@ fn a_carried_uncommitted_reconfigure_blocks_a_new_proposal_after_a_view_change()
   while e.poll_message().is_some() {}
   assert!(e.is_primary() && e.status().is_normal());
   assert_eq!(
-    e.propose_membership(now, &mut wal, SingleVoterDelta::AddVoter(MemberId::new(4))),
+    e.propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::AddVoter(MemberId::new(4)),
+      None
+    ),
     Err(ProposeMembershipError::AlreadyInFlight),
     "a second reconfiguration is refused while a carried uncommitted Reconfigure rides the new view",
   );
@@ -1702,7 +1895,8 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
     e.propose_membership(
       now,
       &mut wal,
-      SingleVoterDelta::AddLearner(MemberId::new(3))
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None
     ),
     Err(ProposeMembershipError::Busy),
     "a proposal during the durable-view window is refused retryably, not minted",
@@ -1742,6 +1936,7 @@ fn propose_membership_while_a_durable_view_write_is_pending_is_a_retryable_busy(
     now,
     &mut wal,
     SingleVoterDelta::AddLearner(MemberId::new(3)),
+    None,
   );
   assert!(
     admitted.is_ok(),
@@ -1939,7 +2134,8 @@ fn propose_membership_at_wal_capacity_is_a_retryable_at_capacity() {
     e.propose_membership(
       now,
       &mut wal,
-      SingleVoterDelta::AddLearner(MemberId::new(3))
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None
     ),
     Err(ProposeMembershipError::AtCapacity),
     "a proposal that would overflow the WAL ring is refused retryably, not minted",
@@ -1953,7 +2149,8 @@ fn propose_membership_at_wal_capacity_is_a_retryable_at_capacity() {
     e.propose_membership(
       now,
       &mut roomy,
-      SingleVoterDelta::AddLearner(MemberId::new(3))
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None
     )
     .is_ok(),
     "with WAL capacity, the identical proposal is admitted",
@@ -2281,7 +2478,12 @@ fn committed_op_then_swapped(
     .expect("a valid single-voter delta on the 3-voter cluster");
   let payload = ReconfigurePayload::from_membership(&successor, 0);
   let r = e
-    .propose_membership(now, &mut wal, delta)
+    .propose_membership(
+      now,
+      &mut wal,
+      delta,
+      Some(crate::AcceptReducedFaultTolerance),
+    )
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {} // drop the broadcast Prepare
   e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // primary's own append durable → own vote
@@ -2516,7 +2718,12 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
   // so the proof validates; the retry MINTS the promote op. The challenge frontier + commit-first are
   // exactly what make a promoted learner genuinely hold `o`.
   assert_eq!(
-    e.propose_membership(now, &mut wal, SingleVoterDelta::PromoteLearner(learner)),
+    e.propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner),
+      None
+    ),
     Err(ProposeMembershipError::ProofPending),
     "the first propose with no fresh proof solicits one",
   );
@@ -2535,7 +2742,12 @@ fn cp_overlap_3_to_4_promoted_learner_grow_keeps_a_committed_op_across_the_dvc()
     answer_proof(&challenge, 3, o), // the learner's fresh proof covers the head → it validates
   );
   let promote_op = e
-    .propose_membership(now, &mut wal, SingleVoterDelta::PromoteLearner(learner))
+    .propose_membership(
+      now,
+      &mut wal,
+      SingleVoterDelta::PromoteLearner(learner),
+      None,
+    )
     .expect("a caught-up learner with a fresh proof is promotable — the op mints");
   let promote_payload = e
     .log
@@ -2886,7 +3098,8 @@ fn promote_learner_happy_path_challenge_then_fresh_proof_mints_the_op() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "the first propose with no fresh proof solicits one and returns ProofPending",
@@ -2921,6 +3134,7 @@ fn promote_learner_happy_path_challenge_then_fresh_proof_mints_the_op() {
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::PromoteLearner(learner),
+      None,
     )
     .expect("a caught-up learner with a fresh proof is promotable — the op mints");
   assert_eq!(
@@ -2962,7 +3176,8 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
   );
@@ -2974,7 +3189,8 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
   );
@@ -3002,6 +3218,7 @@ fn promote_learner_an_unpaced_re_propose_reuses_the_in_flight_challenge_and_conv
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::PromoteLearner(learner),
+      None,
     )
     .expect("the in-flight reply validated against the reused nonce — the promote mints");
   assert_eq!(
@@ -3062,7 +3279,8 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "the gate solicits a fresh proof rather than minting off the banked stale-high peer_progress",
@@ -3090,7 +3308,8 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "a fresh proof carrying the REGRESSED frontier does not mint — the stale-high accumulator is moot",
@@ -3394,7 +3613,8 @@ fn promote_learner_crash_mid_challenge_no_proof_arrives_keeps_proof_pending() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "the first propose solicits a proof",
@@ -3406,7 +3626,8 @@ fn promote_learner_crash_mid_challenge_no_proof_arrives_keeps_proof_pending() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "with no reply the proof stays None — ProofPending persists",
@@ -3429,7 +3650,8 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "the first propose solicits a proof",
@@ -3455,7 +3677,8 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "a wrong-nonce proof is dropped — proof stays None",
@@ -3483,7 +3706,8 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "a wrong-target proof is dropped — proof stays None",
@@ -3510,7 +3734,8 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "a foreign-config proof is dropped — proof stays None",
@@ -3535,7 +3760,8 @@ fn promote_learner_drops_stale_nonce_wrong_target_and_foreign_config_proofs() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     )
     .is_ok(),
     "the exactly-matching fresh proof mints the op",
@@ -3559,7 +3785,8 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "challenge at head 1",
@@ -3600,7 +3827,8 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "a proof for an older head does not mint — the gate re-challenges against the advanced head",
@@ -3629,7 +3857,8 @@ fn promote_learner_re_challenges_when_the_head_advanced_past_a_validated_proof()
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     )
     .is_ok(),
     "a fresh proof covering the advanced head mints the op",
@@ -3652,7 +3881,8 @@ fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "the first propose solicits a proof",
@@ -3682,7 +3912,8 @@ fn promote_learner_clears_a_pending_challenge_on_a_view_transition() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(learner)
+      SingleVoterDelta::PromoteLearner(learner),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "a pre-transition reply never validates the fresh challenge — ProofPending, no mint",
@@ -3729,6 +3960,7 @@ fn an_epoch_swap_clears_an_outstanding_promote_challenge() {
     Instant::ZERO,
     &mut wal,
     SingleVoterDelta::AddLearner(MemberId::new(1)),
+    None,
   )
   .expect("AddLearner on a single-voter cluster is admitted");
   e.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
@@ -3759,6 +3991,7 @@ fn a_non_promote_delta_is_unaffected_by_the_catch_up_gate() {
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::AddLearner(MemberId::new(4)),
+      None,
     )
     .expect("a non-promote delta is unaffected by the promote gate");
   assert_eq!(e.reconfigure_inflight, Some(op), "the AddLearner op minted");
@@ -3812,6 +4045,7 @@ fn add_voter_from_a_single_voter_cluster_is_rejected_breaks_quorum_intersection(
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::AddVoter(MemberId::new(1)),
+      None
     ),
     Err(ProposeMembershipError::DirectAddVoterUnsupported),
     "a direct AddVoter is refused; the brand-new voter holds no committed prefix",
@@ -3837,6 +4071,7 @@ fn add_voter_from_two_or_more_voters_is_also_rejected() {
         Instant::ZERO,
         &mut wal,
         SingleVoterDelta::AddVoter(MemberId::new(u128::from(n))),
+        None
       ),
       Err(ProposeMembershipError::DirectAddVoterUnsupported),
       "a direct AddVoter from {n} voters is refused (add as a learner, then promote)",
@@ -3878,6 +4113,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::AddLearner(newcomer),
+      None,
     )
     .expect("AddLearner on a single-voter cluster is admitted");
   assert_eq!(
@@ -3920,7 +4156,8 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
     e.propose_membership(
       Instant::ZERO,
       &mut wal,
-      SingleVoterDelta::PromoteLearner(newcomer)
+      SingleVoterDelta::PromoteLearner(newcomer),
+      None
     ),
     Err(ProposeMembershipError::ProofPending),
     "the learner has not yet proven a fresh durable catch-up",
@@ -3947,6 +4184,7 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
       Instant::ZERO,
       &mut wal,
       SingleVoterDelta::PromoteLearner(newcomer),
+      None,
     )
     .expect("a caught-up learner is promotable — the safe path grows the cluster to 2 voters");
   let entry = e
@@ -3993,6 +4231,7 @@ fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
       now,
       &mut wal,
       SingleVoterDelta::RemoveVoter(MemberId::new(0)),
+      Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the self-removal Reconfigure op");
   // Drive the commit/prepare cadence once so the Normal-primary timers are armed (the thing the
@@ -4332,6 +4571,7 @@ fn in_lineage_admits_the_recent_prior_config_ids_but_rejects_a_forked_one() {
       now,
       &mut wal,
       SingleVoterDelta::RemoveVoter(MemberId::new(1)),
+      Some(crate::AcceptReducedFaultTolerance),
     )
     .expect("the primary mints the second Reconfigure op");
   while e.poll_message().is_some() {}
@@ -4484,6 +4724,7 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
       now,
       &mut wal,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None,
     )
     .expect("the primary mints the Reconfigure op");
   // SET at propose.
@@ -4498,7 +4739,8 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
     e.propose_membership(
       now,
       &mut wal,
-      SingleVoterDelta::AddLearner(MemberId::new(4))
+      SingleVoterDelta::AddLearner(MemberId::new(4)),
+      None
     ),
     Err(ProposeMembershipError::AlreadyInFlight),
     "a second change mid-flight is refused",
@@ -4550,6 +4792,7 @@ fn the_in_flight_latch_cycles_set_at_propose_then_cleared_at_commit_stage() {
       now,
       &mut wal,
       SingleVoterDelta::AddLearner(MemberId::new(4)),
+      None,
     )
     .expect("a new change is proposable once the prior one installed");
   assert_eq!(
@@ -4577,6 +4820,7 @@ fn a_view_change_truncating_an_uncommitted_proposal_releases_the_in_flight_latch
       now,
       &mut wal,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None,
     )
     .expect("the primary mints the Reconfigure op");
   assert_eq!(
@@ -5106,6 +5350,7 @@ fn a_lost_reconfigure_prepare_is_retransmitted_and_then_commits() {
       now,
       &mut wal,
       SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None,
     )
     .expect("the primary mints the reconfiguration op");
   // DROP the one-shot broadcast Prepare: no backup ever hears the initial transmission.
@@ -5432,6 +5677,7 @@ fn donor_at_e1_with_shifted_member() -> (Endpoint<CountSm, SingleChange>, TestWa
       now,
       &mut wal,
       SingleVoterDelta::RemoveVoter(MemberId::new(1)),
+      None,
     )
     .expect("the primary mints the reconfiguration op");
   while e.poll_message().is_some() {}

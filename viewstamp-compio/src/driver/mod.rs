@@ -716,7 +716,9 @@ where
     let live = self.coord.live_membership();
     let fresh = self.coord.proven_live_voters(now);
     let outcome = job.advance(now, live, fresh, &mut |delta| {
-      self.coord.propose_membership(now, &mut self.wal, delta)
+      self
+        .coord
+        .propose_membership(now, &mut self.wal, delta, None)
     });
     if !matches!(outcome, viewstamp_driver::AdvanceOutcome::Done) {
       self.reconfigure = Some(job);

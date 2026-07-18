@@ -2478,7 +2478,9 @@ impl Vopr {
       && c.serving_primary().is_some()
     {
       let delta = self.choose_live_reconfig_delta();
-      match c.propose_reconfigure_single_change(delta.clone()) {
+      // The driven deltas only grow the voting set (see below), so no reduced-tolerance
+      // acknowledgement is ever needed here.
+      match c.propose_reconfigure_single_change(delta.clone(), None) {
         Ok(op) => {
           self.live_reconfig_actions += 1;
           self.report.live_reconfigs_proposed += 1;

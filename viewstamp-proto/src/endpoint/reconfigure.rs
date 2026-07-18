@@ -13,7 +13,7 @@
 //! only the proposal mint + the single-writer latch.
 
 use super::{normal::NewOpReject, *};
-use crate::{SingleVoterDelta, message::ReconfigurePayload};
+use crate::{AcceptReducedFaultTolerance, SingleVoterDelta, message::ReconfigurePayload};
 
 impl<S> Endpoint<S, SingleChange>
 where
@@ -56,11 +56,17 @@ where
   ///   rejected uniformly (the single-voter predecessor is only the extreme, where the new voter alone
   ///   forms the E+1 view-change quorum). The SAFE way to add a voter is `AddLearner`, catch it up, then
   ///   `PromoteLearner` once it durably holds the head — the catch-up-then-promote path.
+  /// - [`ProposeMembershipError::ReducedFaultToleranceUnacknowledged`] for a delta whose successor
+  ///   tolerates fewer voter crashes than the current configuration (`f(n) = n − quorum(n)` drops — a
+  ///   voter-count decrement from an odd count) proposed with `ack` of `None`. Structural validation
+  ///   runs first, so an invalid delta surfaces `Invalid` regardless of `ack`; a superfluous
+  ///   [`AcceptReducedFaultTolerance`] on a non-reducing delta is accepted and ignored.
   pub fn propose_membership<W>(
     &mut self,
     now: Instant,
     wal: &mut W,
     delta: SingleVoterDelta,
+    ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError>
   where
     W: Wal,
@@ -123,6 +129,26 @@ where
     // (unknown/duplicate member, non-learner promotion, last-voter removal) and returns the successor
     // configuration whose membership the op replicates.
     let successor = self.membership.apply_delta(&delta)?;
+
+    // NEVER REDUCE CRASH TOLERANCE SILENTLY: a voter-count decrement from an ODD voter count drops
+    // `f = n − quorum(n)` — the number of simultaneous voter crashes the cluster survives — by one
+    // (3 → 2 loses the only tolerated crash; 5 → 4 tolerates one instead of two). Such a delta mints
+    // only when the caller NAMES the acceptance by passing the token; every other delta keeps or
+    // grows `f`, and a superfluous token there is ignored (so a driver may thread an operator's
+    // acknowledgement through unconditionally). The comparison runs on the ALREADY-VALIDATED
+    // successor, so a structurally invalid delta surfaces `Invalid` first, and the rejection
+    // precedes both the promote challenge (no proof traffic is solicited for a proposal that cannot
+    // be admitted) and the mint.
+    let f_pred = self.membership.replica_count() - self.membership.quorum() as u8;
+    let f_succ = successor.replica_count() - successor.quorum() as u8;
+    if f_succ < f_pred && ack.is_none() {
+      return Err(
+        ProposeMembershipError::ReducedFaultToleranceUnacknowledged {
+          from: f_pred,
+          to: f_succ,
+        },
+      );
+    }
 
     // CATCH-UP-THEN-PROMOTE (a SAFETY gate, not merely liveness): a `PromoteLearner` is admitted only on
     // a FRESH proof the primary solicits at propose time, NOT on the target's accumulated self-report.

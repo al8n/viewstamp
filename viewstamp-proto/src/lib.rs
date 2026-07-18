@@ -50,7 +50,7 @@ pub use endpoint::{
 };
 pub use event::{Committed, Event, MembershipChanged, RepairStarted, ViewChanged};
 pub use id::{ClientId, Epoch, MemberId, Peer, Recipient, ReplicaId};
-pub use membership::{Membership, MembershipError, SingleVoterDelta};
+pub use membership::{AcceptReducedFaultTolerance, Membership, MembershipError, SingleVoterDelta};
 pub use message::{
   BlockResponse, Commit, DoViewChange, EpochAhead, GetView, HealthProof, LearnerProof,
   LearnerStatus, Message, Nack, Outgoing, Prepare, PrepareBatch, PrepareOk, PreparedEntry,

@@ -4,10 +4,10 @@ use bytes::Bytes;
 use smol_str::SmolStr;
 
 use viewstamp_proto::{
-  BlockAddress, BlockResponse, BlockStore, Committed, Config, DEFAULT_CHECKPOINT_OPS, Endpoint,
-  Event, Instant, MemberId, Membership, MembershipChanged, Message, OpNumber, Outgoing, Peer, Prng,
-  ProposeMembershipError, Recipient, Recovered, ReplicaId, SingleChange, SingleVoterDelta, Wal,
-  block_address, prepare_restart,
+  AcceptReducedFaultTolerance, BlockAddress, BlockResponse, BlockStore, Committed, Config,
+  DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, MemberId, Membership, MembershipChanged,
+  Message, OpNumber, Outgoing, Peer, Prng, ProposeMembershipError, Recipient, Recovered, ReplicaId,
+  SingleChange, SingleVoterDelta, Wal, block_address, prepare_restart,
 };
 
 use crate::{
@@ -1367,12 +1367,13 @@ impl Cluster {
   pub fn propose_reconfigure_single_change(
     &mut self,
     delta: SingleVoterDelta,
+    ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError> {
     let now = self.clock.now();
     let Some(primary) = self.serving_primary() else {
       return Err(ProposeMembershipError::NotPrimary);
     };
-    self.replicas[primary].propose_membership(now, &mut self.wals[primary], delta)
+    self.replicas[primary].propose_membership(now, &mut self.wals[primary], delta, ack)
   }
 
   /// The serving primary's current head op (`self.op`) — the frontier a `PromoteLearner`'s target

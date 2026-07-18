@@ -9,9 +9,9 @@ use bytes::Bytes;
 use std::collections::BTreeSet;
 
 use crate::{
-  BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
-  SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal, endpoint::ProposeMembershipError,
-  message::Request,
+  AcceptReducedFaultTolerance, BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber,
+  Outgoing, Peer, Recipient, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
+  endpoint::ProposeMembershipError, message::Request,
 };
 
 use super::{
@@ -96,8 +96,9 @@ where
     now: Instant,
     wal: &mut W,
     delta: SingleVoterDelta,
+    ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError> {
-    self.endpoint.propose_membership(now, wal, delta)
+    self.endpoint.propose_membership(now, wal, delta, ack)
   }
 
   /// Solicit a voter-liveness-probe round — one `RequestHealthProof` per current voter — so the

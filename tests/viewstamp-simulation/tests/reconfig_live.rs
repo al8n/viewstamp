@@ -26,8 +26,8 @@
 //! install check at end-of-run.
 
 use viewstamp_proto::{
-  MemberId, MembershipError, MembershipTarget, ProposeMembershipError, SingleVoterDelta,
-  plan_reconfiguration,
+  AcceptReducedFaultTolerance, MemberId, MembershipError, MembershipTarget, ProposeMembershipError,
+  SingleVoterDelta, plan_reconfiguration,
 };
 use viewstamp_simulation::{
   Cluster, ConfigLineageChecker, DurabilityChecker, Faults, ReconfigureAppliedOnceChecker,
@@ -124,7 +124,7 @@ fn live_single_change_swap_is_applied_once_and_chains_under_fault() {
   let mut saw_proof_pending = false;
   for t in 0..60_000 {
     if proposed.is_none() && t % RETRY_EVERY == 0 {
-      match c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner)) {
+      match c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner), None) {
         Ok(op) => proposed = Some(op),
         Err(ProposeMembershipError::ProofPending) => saw_proof_pending = true,
         Err(_) => {}
@@ -220,7 +220,7 @@ fn propose_reconfigure_surfaces_the_proto_gate_verdicts() {
   // rejected `Invalid`, surfaced from the driver.
   assert!(
     matches!(
-      c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(MemberId::new(0))),
+      c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(MemberId::new(0)), None),
       Err(ProposeMembershipError::Invalid(_))
     ),
     "promoting a non-learner is an invalid delta"
@@ -234,7 +234,7 @@ fn propose_reconfigure_surfaces_the_proto_gate_verdicts() {
   // is also a genuine catch-up refusal: a `LearnerProof` answered now would report a frontier below the
   // head, so even a re-propose after the round-trip would not mint until the learner catches up.
   assert_eq!(
-    c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(MemberId::new(2))),
+    c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(MemberId::new(2)), None),
     Err(ProposeMembershipError::ProofPending),
     "the first promote solicits a fresh proof and returns the retryable ProofPending"
   );
@@ -292,7 +292,7 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
   // never delivered and the `LearnerProof` never comes back (a crashed replica is not polled, and its
   // in-flight storage is discarded). The proof stays `None`.
   assert_eq!(
-    c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner)),
+    c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner), None),
     Err(ProposeMembershipError::ProofPending),
     "the first promote solicits a fresh challenge"
   );
@@ -306,7 +306,8 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
   let mut stalled_at_proof_pending = 0u64;
   for t in 0..8_000 {
     if t % RETRY_EVERY == 0 {
-      let verdict = c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner));
+      let verdict =
+        c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner), None);
       if matches!(verdict, Err(ProposeMembershipError::ProofPending)) {
         stalled_at_proof_pending += 1;
       }
@@ -365,7 +366,8 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
   for t in 0..60_000 {
     if proposed.is_none()
       && t % RETRY_EVERY == 0
-      && let Ok(op) = c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner))
+      && let Ok(op) =
+        c.propose_reconfigure_single_change(SingleVoterDelta::PromoteLearner(learner), None)
     {
       proposed = Some(op);
     }
@@ -437,9 +439,11 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
   // (2) Crash the successor-critical survivor FIRST, then propose removing the other voter: the
   // successor {primary, survivor} can never assemble its quorum while the survivor is down.
   c.crash(survivor);
-  c.propose_reconfigure_single_change(SingleVoterDelta::RemoveVoter(MemberId::new(
-    removed as u128,
-  )))
+  c.propose_reconfigure_single_change(
+    SingleVoterDelta::RemoveVoter(MemberId::new(removed as u128)),
+    // A 3 → 2 shrink reduces the cluster's crash tolerance; the test plays the operator accepting it.
+    Some(AcceptReducedFaultTolerance),
+  )
   .expect("the serving primary admits the removal proposal");
 
   // (3) HELD: the predecessor quorum {primary, leaver} exists the whole time, yet the removal must
@@ -592,7 +596,9 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
     let round_deadline = t + 60_000;
     while t < round_deadline {
       if !proposed && t.is_multiple_of(RETRY_EVERY) {
-        match c.propose_reconfigure_single_change(step.clone()) {
+        // The executor plays an operator that accepts whatever the plan requires; the token is
+        // ignored for the non-reducing steps.
+        match c.propose_reconfigure_single_change(step.clone(), Some(AcceptReducedFaultTolerance)) {
           Ok(_) => proposed = true,
           // Retryable transient: the propose gate deferred this round; re-propose next paced tick.
           Err(ProposeMembershipError::ProofPending)

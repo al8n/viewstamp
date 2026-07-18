@@ -52,21 +52,22 @@ pub enum MembershipError {
   /// or a learner).
   #[error("member already present")]
   AlreadyAMember,
-  /// A membership delta referenced a [`MemberId`] absent from the configuration (a remove or a
-  /// learner-promotion of an id that is not a member).
+  /// A membership delta referenced a [`MemberId`] absent from the configuration (a remove, a
+  /// demotion, or a learner-promotion of an id that is not a member).
   #[error("member not present")]
   UnknownMember,
   /// A `PromoteLearner` delta named a [`MemberId`] that is a voter, not a learner; only a learner can
   /// be promoted into the voting set.
   #[error("member is not a learner")]
   NotALearner,
-  /// A `RemoveVoter` delta named a [`MemberId`] that is present but a learner, not a voter; only a voter
-  /// can be removed from the voting set (a learner is removed with `RemoveLearner`).
+  /// A `RemoveVoter`/`DemoteVoter` delta named a [`MemberId`] that is present but a learner, not a
+  /// voter; only a voter can be removed from or demoted out of the voting set (a learner is removed
+  /// with `RemoveLearner`).
   #[error("member is not a voter")]
   NotAVoter,
-  /// A `RemoveVoter` delta would drop `replica_count` to zero; a configuration needs at least one
-  /// voter.
-  #[error("removing the voter would leave no voters")]
+  /// Removing or demoting the named voter would drop `replica_count` to zero; a configuration needs
+  /// at least one voter.
+  #[error("removing or demoting the voter would leave no voters")]
   WouldRemoveLastVoter,
   /// A peer-carried successor configuration (a cross-epoch state-sync answer) did NOT hash to the
   /// `config_id` it claims: the recomputed `hash(membership, prev_config_id)` differs from the carried
@@ -385,9 +386,10 @@ impl Membership {
   /// The successor's member-slot layout preserves the partition voters occupy `[0, replica_count')`
   /// and learners occupy `[replica_count', node_count')`: an added voter is appended to the end of the
   /// voter range (just before the learners), an added learner to the end of the learner range, a
-  /// removed member's slot is closed up, and a promoted learner is moved from the learner range to the
-  /// end of the voter range. Every delta changes the voter count by at most one — Add/Remove/Promote
-  /// voter by exactly ±1, Add/RemoveLearner by 0 — which holds by construction here.
+  /// removed member's slot is closed up, a promoted learner is moved from the learner range to the
+  /// end of the voter range, and a demoted voter from the voter range to the end of the learner
+  /// range. Every delta changes the voter count by at most one — Add/Remove/Promote/Demote voter by
+  /// exactly ±1, Add/RemoveLearner by 0 — which holds by construction here.
   pub fn apply_delta(&self, d: &SingleVoterDelta) -> Result<Self, MembershipError> {
     let voters = self.replica_count as usize;
     // The members split cleanly into the voter prefix and the learner suffix.
@@ -436,6 +438,23 @@ impl Membership {
         members.extend(current_learners.iter().copied().filter(|&m| m != *who));
         (self.replica_count + 1, self.learner_count - 1, members)
       }
+      SingleVoterDelta::DemoteVoter(who) => {
+        let slot = self.slot_of(*who).ok_or(MembershipError::UnknownMember)?;
+        if !self.is_voter(slot) {
+          return Err(MembershipError::NotAVoter);
+        }
+        if self.replica_count == 1 {
+          return Err(MembershipError::WouldRemoveLastVoter);
+        }
+        // Move the voter to the end of the learner range: the voter prefix loses the demoted id, the
+        // learner suffix gains it. The node count is unchanged — the member keeps a seat, only its
+        // kind changes.
+        let mut members = Vec::with_capacity(self.members.len());
+        members.extend(current_voters.iter().copied().filter(|&m| m != *who));
+        members.extend_from_slice(current_learners);
+        members.push(*who);
+        (self.replica_count - 1, self.learner_count + 1, members)
+      }
       SingleVoterDelta::AddLearner(who) => {
         if self.contains(*who) {
           return Err(MembershipError::AlreadyAMember);
@@ -468,7 +487,7 @@ impl Membership {
 
 /// A single-step change to the voting set, applied to a [`Membership`] via [`Membership::apply_delta`]
 /// to produce the successor configuration. Each variant moves the voter count by at most one: an
-/// add/remove/promote of a voter by exactly ±1, an add/remove of a learner by 0.
+/// add/remove/promote/demote of a voter by exactly ±1, an add/remove of a learner by 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SingleVoterDelta {
@@ -485,6 +504,11 @@ pub enum SingleVoterDelta {
   RemoveVoter(MemberId),
   /// Promote an existing learner [`MemberId`] into the voting set.
   PromoteLearner(MemberId),
+  /// Demote a voting [`MemberId`] to a non-voting learner. The inverse of `PromoteLearner`: the
+  /// member keeps its seat (the node count is unchanged) but leaves the voting set, so it stops
+  /// counting toward any quorum while remaining a live, replicated participant — a retained durable
+  /// copy of the committed prefix, a repair/state-sync donor, and re-promotable without re-seating.
+  DemoteVoter(MemberId),
   /// Add a brand-new [`MemberId`] as a non-voting learner.
   AddLearner(MemberId),
   /// Remove a learner [`MemberId`] from the configuration.
@@ -499,6 +523,7 @@ impl SingleVoterDelta {
       Self::AddVoter(_) => "add_voter",
       Self::RemoveVoter(_) => "remove_voter",
       Self::PromoteLearner(_) => "promote_learner",
+      Self::DemoteVoter(_) => "demote_voter",
       Self::AddLearner(_) => "add_learner",
       Self::RemoveLearner(_) => "remove_learner",
     }
@@ -511,6 +536,7 @@ impl SingleVoterDelta {
       Self::AddVoter(m)
       | Self::RemoveVoter(m)
       | Self::PromoteLearner(m)
+      | Self::DemoteVoter(m)
       | Self::AddLearner(m)
       | Self::RemoveLearner(m) => *m,
     }
@@ -534,6 +560,12 @@ impl SingleVoterDelta {
     matches!(self, Self::PromoteLearner(_))
   }
 
+  /// True iff this is [`Self::DemoteVoter`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_demote_voter(&self) -> bool {
+    matches!(self, Self::DemoteVoter(_))
+  }
+
   /// True iff this is [`Self::AddLearner`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_add_learner(&self) -> bool {
@@ -546,6 +578,22 @@ impl SingleVoterDelta {
     matches!(self, Self::RemoveLearner(_))
   }
 }
+
+/// An explicit operator acknowledgement that a proposed membership change REDUCES the cluster's
+/// crash tolerance: `f(successor) < f(current)`, where `f(n) = n − quorum(n) = ⌊(n−1)/2⌋` is the
+/// number of simultaneous voter crashes a configuration survives. Among the single-voter deltas
+/// that is exactly a voter-count decrement from an ODD voter count (3 → 2 loses the only tolerated
+/// crash; 5 → 4 tolerates one instead of two).
+///
+/// [`Endpoint::propose_membership`](crate::Endpoint::propose_membership) rejects an f-reducing delta
+/// with [`ReducedFaultToleranceUnacknowledged`](crate::ProposeMembershipError::ReducedFaultToleranceUnacknowledged)
+/// unless this token accompanies it, so crash tolerance is never reduced silently; a superfluous
+/// token on a non-reducing delta is accepted and ignored. The token is NOT an unforgeable
+/// capability — any caller can construct it, and the caller IS the operator. Its value is that the
+/// acceptance must be NAMED at the call site (deliberately no `Default`), leaving every
+/// tolerance-reducing proposal explicit in the code that makes it and greppable in review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptReducedFaultTolerance;
 
 #[cfg(test)]
 mod tests;

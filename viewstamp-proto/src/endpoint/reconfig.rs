@@ -133,6 +133,26 @@ pub enum ProposeMembershipError {
      then promote it (PromoteLearner)"
   )]
   DirectAddVoterUnsupported,
+  /// The delta's successor configuration TOLERATES FEWER voter crashes than the current one —
+  /// `f(successor) < f(current)` with `f(n) = n − quorum(n) = ⌊(n−1)/2⌋`, which among single-voter
+  /// deltas is exactly a voter-count decrement from an ODD count (3 → 2, 5 → 4, …) — and no
+  /// [`AcceptReducedFaultTolerance`](crate::AcceptReducedFaultTolerance) accompanied the proposal.
+  /// Carries both tolerances so the caller can surface exactly what would be given up. NON-RETRYABLE:
+  /// re-proposing the same delta without the acknowledgement is rejected identically; the caller
+  /// either passes the token (accepting the reduced tolerance) or abandons the change. A superfluous
+  /// token on a non-reducing delta is accepted and ignored, so a driver may thread an operator's
+  /// acknowledgement through unconditionally. The gate runs on the already-validated successor, so a
+  /// structurally invalid delta surfaces [`Self::Invalid`] instead.
+  #[error(
+    "the successor configuration tolerates fewer voter crashes ({to} < {from}); pass \
+     AcceptReducedFaultTolerance to accept the reduction"
+  )]
+  ReducedFaultToleranceUnacknowledged {
+    /// The current configuration's crash tolerance (`f = n − quorum(n)`).
+    from: u8,
+    /// The successor configuration's crash tolerance.
+    to: u8,
+  },
   /// A TRANSIENT op-admission fence is up — the SAME backpressure a client request hits before a new op
   /// is minted: a pending durable-view / state-sync / checkpoint write, a flagged forfeit step-down, or a
   /// committed-but-unapplied prefix (a repair hole). Minting now would advertise an op in a view this node
