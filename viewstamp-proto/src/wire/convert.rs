@@ -72,14 +72,22 @@ pub(crate) fn pb_entry(e: &PreparedEntry) -> pb::PreparedEntry {
 
 /// Converts a wire [`pb::PreparedEntry`] into the domain [`PreparedEntry`], moving its `Bytes`
 /// payload out rather than copying it. Rejects via [`malformed`] a wrong-length client id or
-/// `Repairing` checksum, or an absent `body_state` (every entry carries exactly one body state on
-/// the wire).
+/// `Repairing` checksum, an absent `body_state` (every entry carries exactly one body state on
+/// the wire), or a RECONFIGURATION-client op carried as a plain `Present` body (a reconfiguration
+/// op is typed `Reconfigure` on the wire, or header-only `RepairingChecksum` — never untyped).
 pub(crate) fn entry_from(w: pb::PreparedEntry) -> Result<PreparedEntry, CodecError> {
   let op = OpNumber::with(w.op);
   let client = ClientId::new(u128_from(&w.client, "PreparedEntry.client")?);
   let request = RequestNumber::with(w.request);
   match w.body_state {
     Some(pb::prepared_entry::BodyState::Present(body)) => {
+      // A RECONFIGURATION-client op is carried TYPED on the wire by construction (`pb_entry` emits
+      // `BodyState::Reconfigure`; header-only carriage is `RepairingChecksum`). A `Present` state
+      // under that client id is malformed: admitting it would seed an UNTYPED log entry that commit
+      // recognition and the voter-admission screens cannot classify — refuse it at the seam instead.
+      if client == ClientId::RECONFIGURATION {
+        return Err(malformed("PreparedEntry.body_state"));
+      }
       Ok(PreparedEntry::new(op, client, request, body))
     }
     Some(pb::prepared_entry::BodyState::RepairingChecksum(checksum)) => {

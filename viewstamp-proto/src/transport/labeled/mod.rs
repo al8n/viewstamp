@@ -13,8 +13,12 @@ const HELLO_TAG: u8 = 0x0C;
 /// which carries no per-message version of its own — a cross-version peer is refused here, at the
 /// handshake, before any consensus traffic flows. The version names the whole wire CONTRACT: the
 /// envelope AND the consensus invariants a compliant peer enforces (the voter-admission fence
-/// included), so a peer speaking any other number — a superseded numbering included — never gets a
-/// connection, and a cluster can only ever be assembled from peers running the same contract. The
+/// included), so a peer speaking any other number never gets a connection and a cluster can only
+/// ever be assembled from peers running the same contract. One superseded numbering collides: the
+/// original wire era also spoke `1`, so a peer from that era passes this version byte — and is
+/// fenced one layer later, structurally: its hand-rolled frames cannot decode under the protobuf
+/// envelope every current message rides, so no consensus traffic is ever accepted from it. Every
+/// other superseded numbering (`2`, `3`) is refused right here. The
 /// durable sibling is [`SUPERBLOCK_VERSION`](crate::SUPERBLOCK_VERSION): together they close both
 /// ways an unfenced writer's state could re-enter — through a recovered store, or through a live
 /// peer.

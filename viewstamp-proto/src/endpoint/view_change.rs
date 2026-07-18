@@ -7,11 +7,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn record_own_vote(&mut self, op: u64) {
     // Never count this replica's own bit toward a reconfiguration op that seats a brand-new voter
     // against its current configuration — the own-vote half of the vote-mint screen pair (the ack
-    // half is [`Self::send_prepare_ok`]). Covers every own-vote lane at the single site that sets
-    // the bit: the primary's normal-path append completion, the view-change adopted-tail re-append,
-    // and the peer-repair fill of an adopted header-only tail op. With both halves in place no
-    // compliant vote for such an op exists anywhere, so even a single corrupted `PrepareOk` cannot
-    // complete a commit quorum at any cluster size — the own bit it would combine with is never set.
+    // half is [`Self::send_prepare_ok`]). Covers every own-vote lane that sets the bit here: the
+    // primary's normal-path append completion, the view-change adopted-tail re-append, and the
+    // peer-repair fill of an adopted header-only tail op. The one other own-bit site — the
+    // solo-voter recovery reseed ([`Self::resume_solo_voter_pipeline`]) — applies the same refusal,
+    // so with both screen halves in place no compliant vote for such an op exists anywhere, and even
+    // a single corrupted `PrepareOk` cannot complete a commit quorum at any cluster size — the own
+    // bit it would combine with is never set.
     if self.op_is_direct_voter_add(op) {
       return;
     }

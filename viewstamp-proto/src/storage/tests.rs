@@ -663,6 +663,32 @@ fn vsr_state_decode_accepts_exactly_the_current_version() {
 }
 
 #[test]
+fn an_ancient_pre_membership_layout_fails_structurally_under_the_current_version() {
+  // The current version word `1` was also the FIRST numbering an ancient pre-membership layout
+  // ever stamped (a body ending right after the committed-band header set — no epoch, membership,
+  // lineage, scalar, or geometry tail). The exact-match gate alone cannot distinguish that one
+  // colliding number, so this pins the second layer: parsed as the CURRENT layout, such a root
+  // runs out of bytes at the mandatory epoch read and is refused `Truncated` — it can never
+  // misparse into a live state, so no store of that era decodes even though its leading word
+  // matches.
+  let mut ancient = std::vec::Vec::new();
+  ancient.extend_from_slice(&SUPERBLOCK_VERSION.to_be_bytes()); // the colliding version word
+  ancient.extend_from_slice(&4u64.to_be_bytes()); // view
+  ancient.extend_from_slice(&2u64.to_be_bytes()); // log_view
+  ancient.extend_from_slice(&7u64.to_be_bytes()); // commit
+  ancient.extend_from_slice(&5u64.to_be_bytes()); // checkpoint_op
+  ancient.extend_from_slice(&0xAABB_CCDDu128.to_be_bytes()); // checkpoint_id
+  ancient.extend_from_slice(&0u32.to_be_bytes()); // header count — the ancient layout ENDS here
+  assert!(
+    matches!(
+      VsrState::decode(&ancient),
+      Err(CodecError::Truncated { .. })
+    ),
+    "an ancient-layout body under the current version word is refused at the epoch read"
+  );
+}
+
+#[test]
 fn vsr_state_decode_rejects_corruption_without_panicking() {
   let st = VsrState::try_new(
     View::with(4),

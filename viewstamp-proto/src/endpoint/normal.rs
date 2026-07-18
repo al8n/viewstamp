@@ -774,7 +774,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       //
       // PANIC, not skip: this arm runs only for a COMMITTED op, and no compliant cluster can commit
       // one — `propose_membership` refuses the mint, and every vote is refused at its mint:
-      // `send_prepare_ok` never acks such an op and `record_own_vote` never counts the own bit (the
+      // `send_prepare_ok` never acks such an op, `record_own_vote` never counts the own bit, and the
+      // solo-voter recovery reseed seeds none (the
       // append seam additionally drops the `Prepare` before it burns a WAL slot), so it can never
       // assemble a quorum of compliant votes. By that induction no committed state, and hence no
       // state-sync donor checkpoint, ever contains a direct-add configuration — and the induction's

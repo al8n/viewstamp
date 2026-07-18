@@ -31,7 +31,8 @@ pub use recovery::{FormatError, RecoverError, Recovered, Retired, format};
 /// peer-repair fill (see `fill_repair`) owes NO ack, but is still a DURABILITY BARRIER — its apply +
 /// hole-clear + exposure wait for the append via `Pending::RepairFill`.
 ///
-/// Not `Copy`: [`Pending::RepairFill`] carries the repaired [`LogEntry`] (a [`Body::Present`] body) so
+/// Not `Copy`: [`Pending::RepairFill`] carries the repaired [`LogEntry`] (a body-bearing
+/// [`Body::Present`] client op, or a typed [`Body::Reconfigure`] membership op) so
 /// the staged op is inserted into `self.log` only once its append is durable — never staged into the
 /// in-memory log while non-durable (which would expose / apply it before the barrier).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1991,10 +1991,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         .get(&op)
         .map(|e| crate::storage::prepare_identity(e.client, e.request, e.body.body_checksum()))
         .unwrap_or(0);
+      // The same voter-admission refusal as `record_own_vote`, applied at this second own-bit
+      // seeding site: a reconfiguration op seating a brand-new voter against the current
+      // configuration earns no own bit (the entry is seeded voteless), so the solo voter's
+      // quorum-of-1 can never re-commit it and the commit-time fence stays unreachable. On a
+      // compliant store this shape cannot occur (a solo voter's propose guard refuses the mint, it
+      // receives no Prepares, and its trivial view changes adopt only its own log) — the screen is
+      // completeness: every site that sets an own bit enforces one refusal.
+      let oks = if self.op_is_direct_voter_add(op) {
+        0
+      } else {
+        own
+      };
       self.inflight.insert(
         op,
         Inflight {
-          oks: own,
+          oks,
           committed: false,
           prepare_checksum,
         },

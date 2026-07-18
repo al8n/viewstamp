@@ -5615,8 +5615,9 @@ fn a_slot_shifted_cross_epoch_request_prepare_is_served_and_routes_to_the_curren
 // The VOTE-MINT screens close the remaining ack/vote lanes for an entry that reaches a log WITHOUT
 // crossing the screened prepare append (a recovered WAL, a view-change adoption): `send_prepare_ok`
 // refuses the ack — covering the canonical re-ack and the adoption re-ack — and `record_own_vote`
-// refuses the own bit — covering the adopted-tail re-append and the peer-repair fill. Each lane has
-// a falsifier below, plus legitimate-delta positive controls proving the screens admit every legal
+// refuses the own bit — covering the adopted-tail re-append and the peer-repair fill — with the
+// solo-voter recovery reseed applying the same refusal at its own seeding site. Each lane has a
+// falsifier below, plus legitimate-delta positive controls proving the screens admit every legal
 // shape (and the checkpoint-report re-ack, whose GC-pruned op the ack screen must let through).
 // ---------------------------------------------------------------------------------------------
 
@@ -6561,6 +6562,79 @@ fn a_repair_filled_direct_voter_add_tail_op_earns_no_own_vote() {
   );
   assert!(!e.pending_swap_for_test(), "no epoch swap is staged");
   assert_eq!(e.membership, genesis(3), "the configuration is unchanged");
+}
+
+#[test]
+fn a_solo_voters_recovery_reseed_earns_no_own_vote_for_a_direct_add_tail_op() {
+  // The solo-voter recovery reseed lane, modeling a store written WITHOUT the fence: the single
+  // voter's WAL holds an UNCOMMITTED direct-add Reconfigure op at its head. Recovery rebuilds the
+  // typed entry and `resume_solo_voter_pipeline` reseeds the commit pipeline — where a solo
+  // voter's own bit alone IS a quorum of 1, so seeding it would re-commit the op straight into the
+  // commit-time fence panic. The reseed's voter-admission screen refuses the bit instead: the op
+  // stays un-committed and voteless, nothing installs, and the replica keeps running.
+  let successor = genesis(1)
+    .apply_delta(&SingleVoterDelta::AddVoter(MemberId::new(1)))
+    .expect("the delta arithmetic still derives a direct-add successor");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let body = payload.encode_body();
+  let header = Header::new(
+    OpNumber::with(1),
+    View::new(),
+    ClientId::RECONFIGURATION,
+    RequestNumber::with(1),
+    &body,
+  );
+  let mut wal = TestWal::default();
+  wal.entries.insert(1, (header, body));
+  wal.head = 1;
+  let state = VsrState::try_new(
+    View::new(),
+    View::new(),
+    OpNumber::new(),
+    OpNumber::new(),
+    0,
+    std::vec![],
+  )
+  .expect("an empty-frontier root is valid")
+  .with_wal_geometry(crate::config::DEFAULT_CHECKPOINT_OPS, u64::MAX);
+  let mut sb = TestSb {
+    state,
+    done: VecDeque::new(),
+    checkpoint: None,
+  };
+  let mut blocks = crate::block_store::MemBlockStore::new();
+
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  let recovered = Endpoint::<CountSm, SingleChange>::recover_with_reconfig(
+    cfg,
+    genesis(1),
+    0,
+    CountSm::default(),
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+  )
+  .expect("recover accepts this store");
+  let mut e = match recovered {
+    Recovered::Active(e) => e,
+    Recovered::Retired(_) => panic!("the solo voter recovers Active"),
+  };
+  let now = Instant::ZERO;
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+
+  assert!(e.status.is_normal(), "the solo voter resumed Normal");
+  assert_eq!(
+    e.commit_min.get(),
+    0,
+    "the direct-add op earns no own bit, so the quorum-of-1 never re-commits it"
+  );
+  assert!(!e.pending_swap_for_test(), "no epoch swap is staged");
+  assert_eq!(e.membership, genesis(1), "the configuration is unchanged");
+  assert!(
+    e.log.contains_key(&1),
+    "the op is still held — voteless, not erased"
+  );
 }
 
 #[test]
