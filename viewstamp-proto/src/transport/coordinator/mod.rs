@@ -100,10 +100,22 @@ where
     self.endpoint.propose_membership(now, wal, delta)
   }
 
-  /// The set of voter [`MemberId`]s that acknowledged an in-flight prepare within the last
-  /// `window` ops, as a liveness hint for the reconfiguration executor.
-  pub fn recently_acked_voters(&self, window: u64) -> BTreeSet<MemberId> {
-    self.endpoint.recently_acked_voters(window)
+  /// Solicit a voter-liveness-probe round — one `RequestHealthProof` per current voter — so the
+  /// reconfiguration shrink executor can gate a removal on fresh per-round liveness. Delegates to
+  /// [`Endpoint::solicit_health_proofs`]; a no-op off a Normal primary.
+  pub fn solicit_health_proofs(&mut self, now: Instant, reuse_within: core::time::Duration) {
+    self.endpoint.solicit_health_proofs(now, reuse_within);
+  }
+
+  /// The set of voter [`MemberId`]s PROVEN LIVE by the outstanding liveness-probe round (fail-closed
+  /// empty when no fresh round exists) — the reconfiguration shrink executor's sole positive liveness
+  /// evidence. Delegates to [`Endpoint::proven_live_voters`].
+  pub fn proven_live_voters(
+    &self,
+    now: Instant,
+    max_age: core::time::Duration,
+  ) -> BTreeSet<MemberId> {
+    self.endpoint.proven_live_voters(now, max_age)
   }
 }
 

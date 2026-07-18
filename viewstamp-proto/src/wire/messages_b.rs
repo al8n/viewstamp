@@ -1,8 +1,9 @@
 //! Wire-envelope conversions for the state-sync, windowed-repair, batching, learner-promotion,
-//! block-store, and nack messages: [`RequestSync`], [`SyncCheckpoint`], [`RequestPrepareRange`],
-//! [`RepairBatch`], [`PrepareBatch`], [`LearnerStatus`], [`EpochAhead`], [`RequestLearnerProof`],
-//! [`LearnerProof`], the [`BlockAddress`] carried by
-//! [`Message::RequestBlock`](crate::Message::RequestBlock), [`BlockResponse`], and [`Nack`].
+//! liveness-probe, block-store, and nack messages: [`RequestSync`], [`SyncCheckpoint`],
+//! [`RequestPrepareRange`], [`RepairBatch`], [`PrepareBatch`], [`LearnerStatus`], [`EpochAhead`],
+//! [`RequestLearnerProof`], [`LearnerProof`], [`RequestHealthProof`], [`HealthProof`], the
+//! [`BlockAddress`] carried by [`Message::RequestBlock`](crate::Message::RequestBlock),
+//! [`BlockResponse`], and [`Nack`].
 //!
 //! Each pair converts one direction, mirroring [`super::convert`] and [`super::messages_a`]:
 //! `pb_*` builds the wire ([`pb`]) shape from a borrowed domain value; `*_from` consumes a wire
@@ -18,9 +19,9 @@ use super::{
   pb,
 };
 use crate::{
-  BlockAddress, BlockResponse, Epoch, EpochAhead, LearnerProof, LearnerStatus, Nack, OpNumber,
-  PrepareBatch, RepairBatch, RequestLearnerProof, RequestPrepareRange, RequestSync, SyncCheckpoint,
-  View, codec::CodecError,
+  BlockAddress, BlockResponse, Epoch, EpochAhead, HealthProof, LearnerProof, LearnerStatus, Nack,
+  OpNumber, PrepareBatch, RepairBatch, RequestHealthProof, RequestLearnerProof,
+  RequestPrepareRange, RequestSync, SyncCheckpoint, View, codec::CodecError,
 };
 
 /// Converts a borrowed [`RequestSync`] into its wire form: the view/checkpoint_op/nonce scalars
@@ -262,6 +263,55 @@ pub(crate) fn learner_proof_from(w: pb::LearnerProof) -> Result<LearnerProof, Co
     OpNumber::with(w.frontier),
     Epoch::new(w.epoch),
     u128_from(&w.config_id, "LearnerProof.config_id")?,
+  ))
+}
+
+/// Converts a borrowed [`RequestHealthProof`] into its wire form: the nonce/epoch scalars carried
+/// as-is, the soliciting replica (`from`) narrowed to its wire width, and the config id as 16
+/// big-endian bytes.
+pub(crate) fn pb_request_health_proof(m: &RequestHealthProof) -> pb::RequestHealthProof {
+  pb::RequestHealthProof {
+    from: u32::from(m.from().get()),
+    nonce: m.nonce(),
+    epoch: m.epoch().get(),
+    config_id: u128_bytes(m.config_id()),
+    ..Default::default()
+  }
+}
+
+/// Converts a wire [`pb::RequestHealthProof`] into the domain [`RequestHealthProof`]. Rejects a
+/// `from` replica slot above [`u16::MAX`] or a wrong-length config id.
+pub(crate) fn request_health_proof_from(
+  w: pb::RequestHealthProof,
+) -> Result<RequestHealthProof, CodecError> {
+  Ok(RequestHealthProof::new(
+    replica_from(w.from, "RequestHealthProof.from")?,
+    w.nonce,
+    Epoch::new(w.epoch),
+    u128_from(&w.config_id, "RequestHealthProof.config_id")?,
+  ))
+}
+
+/// Converts a borrowed [`HealthProof`] into its wire form: the nonce/epoch scalars carried as-is,
+/// the replica narrowed to its wire width, and the config id as 16 big-endian bytes.
+pub(crate) fn pb_health_proof(m: &HealthProof) -> pb::HealthProof {
+  pb::HealthProof {
+    replica: u32::from(m.replica().get()),
+    nonce: m.nonce(),
+    epoch: m.epoch().get(),
+    config_id: u128_bytes(m.config_id()),
+    ..Default::default()
+  }
+}
+
+/// Converts a wire [`pb::HealthProof`] into the domain [`HealthProof`]. Rejects a replica slot
+/// above [`u16::MAX`] or a wrong-length config id.
+pub(crate) fn health_proof_from(w: pb::HealthProof) -> Result<HealthProof, CodecError> {
+  Ok(HealthProof::new(
+    replica_from(w.replica, "HealthProof.replica")?,
+    w.nonce,
+    Epoch::new(w.epoch),
+    u128_from(&w.config_id, "HealthProof.config_id")?,
   ))
 }
 

@@ -837,7 +837,7 @@ fn propose_membership_delegates_to_the_endpoint() {
 }
 
 #[test]
-fn recently_acked_voters_is_empty_before_any_prepare_ack() {
+fn proven_live_voters_is_empty_before_any_probe_round() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -848,8 +848,10 @@ fn recently_acked_voters_is_empty_before_any_prepare_ack() {
       u64::MAX,
     ));
   assert!(
-    coord.recently_acked_voters(64).is_empty(),
-    "a fresh endpoint has acknowledged no in-flight prepare"
+    coord
+      .proven_live_voters(crate::Instant::ZERO, core::time::Duration::from_secs(1))
+      .is_empty(),
+    "a fresh endpoint has solicited no liveness-probe round"
   );
 }
 

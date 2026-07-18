@@ -7,10 +7,11 @@ use super::{
 };
 use crate::{
   BlockAddress, BlockResponse, ClientId, CodecError, Commit, DoViewChange, Epoch, EpochAhead,
-  GetView, LearnerProof, LearnerStatus, MemberId, Message, Nack, OpNumber, Prepare, PrepareBatch,
-  PrepareOk, PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse, RepairBatch, ReplicaId,
-  Reply, Request, RequestLearnerProof, RequestNumber, RequestPrepare, RequestPrepareRange,
-  RequestSync, StartView, StartViewChange, SyncCheckpoint, View,
+  GetView, HealthProof, LearnerProof, LearnerStatus, MemberId, Message, Nack, OpNumber, Prepare,
+  PrepareBatch, PrepareOk, PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse,
+  RepairBatch, ReplicaId, Reply, Request, RequestHealthProof, RequestLearnerProof, RequestNumber,
+  RequestPrepare, RequestPrepareRange, RequestSync, StartView, StartViewChange, SyncCheckpoint,
+  View,
 };
 use buffa::Message as _;
 
@@ -578,6 +579,31 @@ fn learner_proof_round_trips() {
 }
 
 #[test]
+fn request_health_proof_round_trips() {
+  let m = RequestHealthProof::new(
+    ReplicaId::new(2101),
+    2102,
+    Epoch::new(2103),
+    0x8a8a_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back = messages_b::request_health_proof_from(messages_b::pb_request_health_proof(&m))
+    .expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn health_proof_round_trips() {
+  let m = HealthProof::new(
+    ReplicaId::new(2201),
+    2202,
+    Epoch::new(2203),
+    0x8b8b_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back = messages_b::health_proof_from(messages_b::pb_health_proof(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
 fn request_block_round_trips() {
   let addr = BlockAddress::from_bytes(0x8B8B_1111_2222_3333_4444_5555_6666_7777u128.to_be_bytes());
   let back =
@@ -656,7 +682,7 @@ fn block_response_with_oversized_addr_rejects() {
 
 // ── the public seam: encode_message / decode_message ──
 
-/// One exemplar of each of [`Message`]'s 24 variants, in declaration order, built with small
+/// One exemplar of each of [`Message`]'s 26 variants, in declaration order, built with small
 /// deterministic field values. Shared by the round-trip and golden-vector tests below so both
 /// exercise identical values — a golden mismatch and a round-trip failure can never disagree
 /// about what was encoded.
@@ -831,6 +857,18 @@ fn one_of_each_message() -> std::vec::Vec<Message> {
       Epoch::new(14),
       config_id,
     )),
+    Message::RequestHealthProof(RequestHealthProof::new(
+      ReplicaId::new(31),
+      17,
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::HealthProof(HealthProof::new(
+      ReplicaId::new(30),
+      17,
+      Epoch::new(14),
+      config_id
+    )),
     Message::RequestBlock(addr),
     Message::BlockResponse(BlockResponse::new(addr, Some(Bytes::from_static(b"block")))),
     Message::Nack(Nack::new(
@@ -957,7 +995,7 @@ fn unhex(s: &str) -> std::vec::Vec<u8> {
 /// wire-format change updates these vectors consciously; an accidental one fails here first.
 #[test]
 fn golden_byte_vectors() {
-  let golden: [&str; 24] = [
+  let golden: [&str; 26] = [
     "0a1a0a100000000000000000000000000000004010501a04626f6479", // Request
     "1236080a100b180c200d280e3210000000000000000000000000000000503a100000000000000000000000000000004040504a04626f6479", // Prepare
     "1a2e080a100b181e200d2a1000000000000000000000000000000060300e3a1000000000000000000000000000000050", // PrepareOk
@@ -979,6 +1017,8 @@ fn golden_byte_vectors() {
     "9a0104080e100d",                                             // EpochAhead
     "a2011a081f10151810200e2a1000000000000000000000000000000050", // RequestLearnerProof
     "aa011a081e10101816200e2a1000000000000000000000000000000050", // LearnerProof
+    "ca0118081f1011180e221000000000000000000000000000000050",     // RequestHealthProof
+    "d20118081e1011180e221000000000000000000000000000000050",     // HealthProof
     "b201120a1000000000000000000000000000000090",                 // RequestBlock
     "ba01190a10000000000000000000000000000000901205626c6f636b",   // BlockResponse
     "c20118080a100b181e221000000000000000000000000000000050",     // Nack

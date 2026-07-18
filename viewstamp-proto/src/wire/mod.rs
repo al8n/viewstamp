@@ -67,6 +67,8 @@ pub(crate) fn pb_message(msg: &Message) -> pb::Message {
     Message::EpochAhead(m) => Body::from(messages_b::pb_epoch_ahead(m)),
     Message::RequestLearnerProof(m) => Body::from(messages_b::pb_request_learner_proof(m)),
     Message::LearnerProof(m) => Body::from(messages_b::pb_learner_proof(m)),
+    Message::RequestHealthProof(m) => Body::from(messages_b::pb_request_health_proof(m)),
+    Message::HealthProof(m) => Body::from(messages_b::pb_health_proof(m)),
     Message::RequestBlock(addr) => Body::from(messages_b::pb_request_block(addr)),
     Message::BlockResponse(m) => Body::from(messages_b::pb_block_response(m)),
     Message::Nack(m) => Body::from(messages_b::pb_nack(m)),
@@ -113,6 +115,10 @@ fn message_from(wire: pb::Message) -> Result<Message, CodecError> {
       Message::RequestLearnerProof(messages_b::request_learner_proof_from(*m)?)
     }
     Body::LearnerProof(m) => Message::LearnerProof(messages_b::learner_proof_from(*m)?),
+    Body::RequestHealthProof(m) => {
+      Message::RequestHealthProof(messages_b::request_health_proof_from(*m)?)
+    }
+    Body::HealthProof(m) => Message::HealthProof(messages_b::health_proof_from(*m)?),
     Body::RequestBlock(m) => Message::RequestBlock(messages_b::request_block_from(*m)?),
     Body::BlockResponse(m) => Message::BlockResponse(messages_b::block_response_from(*m)?),
     Body::Nack(m) => Message::Nack(messages_b::nack_from(*m)?),

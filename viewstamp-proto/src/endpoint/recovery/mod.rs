@@ -876,6 +876,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       paying_checkpoint_debt: false,
       peer_progress: BTreeMap::new(),
       learner_proof: None,
+      health_probe: None,
       _reconfig: core::marker::PhantomData,
     };
 

@@ -56,6 +56,7 @@ fn genesis_with_learners(n: u8, learners: u16) -> Membership {
 mod checkpoint;
 mod epoch_ingress;
 mod forfeit;
+mod health_probe;
 mod invariants;
 mod learner_membership;
 mod normal;

@@ -482,7 +482,7 @@ fn backup_recovery_response_carries_no_log() {
   assert_eq!(rr.view(), View::with(3));
 }
 
-// ── wire codec: all 24 Message variants ──
+// ── wire codec: all 26 Message variants ──
 
 fn entry(op: u64, body: &[u8]) -> PreparedEntry {
   PreparedEntry::new(
@@ -497,7 +497,7 @@ fn entry(op: u64, body: &[u8]) -> PreparedEntry {
 /// variant's codec must handle: an EMPTY body (`Request`), a POPULATED body (`Prepare`/`Reply`/
 /// `SyncCheckpoint`/`BlockResponse`), an EMPTY log slice (`StartView`), a POPULATED multi-entry log
 /// (`DoViewChange`/`RecoveryResponse`), the `recovery` bool both ways, and `u64::MAX`/`u128::MAX`
-/// edge scalars. Covers all 24 tags so the round-trip + fuzz tests sweep the whole surface.
+/// edge scalars. Covers all 26 tags so the round-trip + fuzz tests sweep the whole surface.
 fn one_of_each_variant() -> std::vec::Vec<Message> {
   std::vec![
     Message::Request(Request::new(
@@ -725,6 +725,18 @@ fn one_of_each_variant() -> std::vec::Vec<Message> {
       ReplicaId::new(4),
       0xBEEF,
       OpNumber::with(u64::MAX), // edge scalar frontier — round-trips
+      crate::Epoch::new(0),
+      0,
+    )),
+    Message::RequestHealthProof(RequestHealthProof::new(
+      ReplicaId::new(300), // a slot above a single byte exercises both u16 bytes
+      0xBEEF,
+      crate::Epoch::new(0),
+      0,
+    )),
+    Message::HealthProof(HealthProof::new(
+      ReplicaId::new(4),
+      0xBEEF,
       crate::Epoch::new(0),
       0,
     )),
@@ -1040,7 +1052,7 @@ fn a_worst_case_header_only_band_at_max_depth_fits_the_frame_cap() {
 #[test]
 fn every_variant_round_trips_through_the_wire_codec() {
   let all = one_of_each_variant();
-  assert_eq!(all.len(), 24, "every Message variant is represented");
+  assert_eq!(all.len(), 26, "every Message variant is represented");
   for m in &all {
     let bytes = encode_message(m);
     let back = decode_message(bytes).expect("round-trip decodes");
@@ -1424,6 +1436,8 @@ fn kind_str_names_every_variant_when_read_directly() {
       Message::EpochAhead(_) => "EpochAhead",
       Message::RequestLearnerProof(_) => "RequestLearnerProof",
       Message::LearnerProof(_) => "LearnerProof",
+      Message::RequestHealthProof(_) => "RequestHealthProof",
+      Message::HealthProof(_) => "HealthProof",
       Message::RequestBlock(_) => "RequestBlock",
       Message::BlockResponse(_) => "BlockResponse",
       Message::Nack(_) => "Nack",
