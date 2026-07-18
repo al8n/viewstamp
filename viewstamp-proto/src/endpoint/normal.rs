@@ -556,6 +556,74 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // append is durable, which then calls try_commit.
   }
 
+  /// Whether op `op`'s recorded `PrepareOk` bitset `oks` meets the ADDITIONAL commit requirement a
+  /// voter-set-SHRINKING [`Body::Reconfigure`] op carries: a quorum of the SUCCESSOR configuration's
+  /// voters must be among the acks. `true` for every other op — a client op, a missing or
+  /// body-`Repairing` entry, and a non-shrinking reconfiguration — which keeps the uniform
+  /// predecessor-quorum threshold the sole requirement there.
+  ///
+  /// A shrink seats a configuration with FEWER voters. Committed on a bare predecessor quorum, the
+  /// shrink can land while a SUCCESSOR voter is already gone — an ack set the predecessor tolerates
+  /// (it can spare the missing voter) seats a successor that cannot (it needs that voter for its own
+  /// quorum), converting one tolerated crash into an installed outage. Requiring a successor quorum
+  /// IN the committing ack set is a DURABILITY witness: an ack follows a durable append, so at the
+  /// instant the shrink commits a quorum of the successor's own voters durably holds it — the
+  /// successor never seats on a thinner durable footprint than it needs to operate. The witness also
+  /// NARROWS the exposure window: a successor voter's crash strands the installed successor only if
+  /// it lands between that voter's durable ack and the commit, where an unwitnessed commit could
+  /// seat a successor missing a voter for the whole exchange. The race inside that residual window
+  /// is IRREDUCIBLE by any commit-side rule — the commit predicate reads acks banked in the past and
+  /// cannot observe liveness at the instant it fires — and is owned by the successor's own crash
+  /// tolerance, like any crash after the install.
+  ///
+  /// The requirement is ADD-ONLY — a second popcount over the same acks — so it can only delay a
+  /// commit, never admit one the predecessor-quorum rule would refuse:
+  /// - even `n` → `n−1`: any predecessor quorum holds at most one leaving voter's bit, so it already
+  ///   contains a successor quorum — the conjunction is implied and nothing changes. (Exactly the
+  ///   shrinks that preserve the cluster's crash tolerance.)
+  /// - odd `n` → `n−1`: the conjunction genuinely binds — exactly the shrinks that reduce crash
+  ///   tolerance, where a predecessor quorum can carry the shrink without any successor majority.
+  ///
+  /// While the successor quorum is absent the op (and the contiguous commit behind it) WAITS under
+  /// the still-authoritative predecessor configuration, and resumes when a successor voter acks (a
+  /// retransmitted `Prepare` reaches it, or it recovers) — the same heal condition as, and a
+  /// strictly better stuck-state than, installing a successor that cannot serve.
+  fn shrink_successor_quorum_met(&self, op: u64, oks: u64) -> bool {
+    // Only a held `Body::Reconfigure` can name a shrink. A missing or body-`Repairing` entry imposes
+    // nothing here — `commit_op` holds the commit at such a hole until peer repair supplies the
+    // body, and this predicate is then re-evaluated against it.
+    let Some(payload) = self.log.get(&op).and_then(|e| e.body.as_reconfigure()) else {
+      return true;
+    };
+    let n_pred = self.membership.replica_count();
+    let n_succ = payload.replica_count();
+    if n_succ >= n_pred {
+      return true; // not a voter-set shrink — no successor requirement beyond the uniform one.
+    }
+    // The RETAINED voters' predecessor slots: every predecessor voter seated as a SUCCESSOR voter.
+    // `oks` bits are confined to predecessor voter slots (`on_prepare_ok` bounds the slot and a
+    // learner never acks), so masking to the retained slots drops exactly the leaving voters' bits.
+    let successor_voters = &payload.members()[..n_succ as usize];
+    let predecessor_voters = &self.membership.members_slice()[..n_pred as usize];
+    let mut retained = 0u64;
+    for (slot, member) in predecessor_voters.iter().enumerate() {
+      if successor_voters.contains(member) {
+        retained |= 1u64 << slot;
+      }
+    }
+    // A single-voter shrink retains the successor's voters verbatim at predecessor slots; anything
+    // else cannot assemble here (propose validates the delta, and the committed-payload fence
+    // re-proves the successor seats no brand-new voter). The mask formula stays fail-closed for an
+    // unassemblable payload regardless: fewer retained bits can only strengthen the requirement.
+    debug_assert_eq!(
+      retained.count_ones(),
+      u32::from(n_succ),
+      "a voter-set shrink retains exactly the successor's voters at predecessor slots"
+    );
+    let successor_quorum = u32::from(n_succ) / 2 + 1;
+    (oks & retained).count_ones() >= successor_quorum
+  }
+
   /// Commits the longest contiguous quorum-acked prefix beyond `commit_min`.
   pub(crate) fn try_commit<B: Superblock>(
     &mut self,
@@ -583,9 +651,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       let ready = self
         .inflight
         .get(&next)
-        .map(|inf| (!inf.committed, inf.oks.count_ones()))
-        .map(|(not_committed, ones)| not_committed && ones >= quorum)
-        .unwrap_or(false);
+        .map(|inf| (!inf.committed, inf.oks))
+        .is_some_and(|(not_committed, oks)| {
+          // The uniform predecessor-quorum threshold, plus the successor-quorum conjunction a
+          // voter-set-shrinking `Reconfigure` op additionally carries. The conjunction only ever
+          // ADDS to the predecessor quorum — both counts read the same `oks` — so no op can commit
+          // below the predecessor quorum.
+          not_committed && oks.count_ones() >= quorum && self.shrink_successor_quorum_met(next, oks)
+        });
       if !ready {
         break;
       }
@@ -653,6 +726,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.request_repair_run(now, op);
       return false;
     };
+    // This locally-counted commit path is reached only through `try_commit`'s readiness predicate;
+    // re-derive the shrink conjunction from the log + inflight as an INDEPENDENT witness that a
+    // voter-set-shrinking `Reconfigure` op never commits here without its successor quorum.
+    // (Externally-proven commits — a backup following `Commit`, a laggard adopting a peer
+    // checkpoint or a state sync — advance through `advance_commit`, never through this path.)
+    debug_assert!(
+      self
+        .inflight
+        .get(&op)
+        .is_none_or(|inf| self.shrink_successor_quorum_met(op, inf.oks)),
+      "op {op} is committing without the successor quorum its voter-set shrink requires"
+    );
     // Consensus-layer reconfiguration: a `Body::Reconfigure` op is NOT applied to the state machine —
     // at commit it triggers the COMMIT-FIRST epoch swap (stage the successor + a durable SwapEpoch
     // root; the in-memory swap is deferred to the durable root). Recognized BEFORE the `as_present`

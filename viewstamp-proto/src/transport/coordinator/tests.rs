@@ -1068,8 +1068,9 @@ fn commit_and_install_a_voter_removal(
 
 /// Drives an already-built 3-voter primary `coord` (local = `local`, primary of view 0, durable
 /// genesis(3)) to propose `RemoveVoter(removed)` and commit + durably install it, so the trailing
-/// `reconcile_routing` inside `handle_storage` runs against the shrunk membership. The acking voter is
-/// whichever of {0,1,2} is neither `local` nor `removed`, so the 2-of-3 commit quorum always forms.
+/// `reconcile_routing` inside `handle_storage` runs against the shrunk membership. Every voter but
+/// `local` acks: a voter-set shrink commits only with a SUCCESSOR quorum among the acks (for a
+/// self-removal, both other voters), so the commit quorum always forms.
 fn drive_voter_removal_to_installed(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
   wal: &mut TestWal,
@@ -1092,29 +1093,31 @@ fn drive_voter_removal_to_installed(
     )
     .expect("the primary mints the removal Reconfigure op");
   coord.handle_storage(Instant::ZERO, wal, sb, blocks); // own append durable -> own vote
-  let acker = (0..3u128)
-    .find(|&m| m != local && m != removed)
-    .expect("a third voter exists to ack");
-  coord.inject_message_for_test(
-    Instant::ZERO,
-    wal,
-    sb,
-    blocks,
-    Peer::Replica(ReplicaId::new(acker as u16)),
-    Message::PrepareOk(crate::PrepareOk::new(
-      View::new(),
-      op,
-      ReplicaId::new(acker as u16),
-      OpNumber::new(),
-      crate::storage::prepare_identity(
-        ClientId::RECONFIGURATION,
-        RequestNumber::with(op.get()),
-        Body::Reconfigure(payload.clone()).body_checksum(),
-      ),
-      crate::Epoch::new(0),
-      0,
-    )),
-  );
+  // Every voter but the local one acks: a voter-set shrink commits only once the SUCCESSOR quorum
+  // is among the acks (for a self-removal that is BOTH other voters), and the extra ack is inert
+  // for any other removal.
+  for acker in (0..3u128).filter(|&m| m != local) {
+    coord.inject_message_for_test(
+      Instant::ZERO,
+      wal,
+      sb,
+      blocks,
+      Peer::Replica(ReplicaId::new(acker as u16)),
+      Message::PrepareOk(crate::PrepareOk::new(
+        View::new(),
+        op,
+        ReplicaId::new(acker as u16),
+        OpNumber::new(),
+        crate::storage::prepare_identity(
+          ClientId::RECONFIGURATION,
+          RequestNumber::with(op.get()),
+          Body::Reconfigure(payload.clone()).body_checksum(),
+        ),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+  }
   // The 2-of-3 commit quorum stages the SwapEpoch root; a further handle_storage lands that durable
   // root, which installs the successor (config_id changes) and triggers reconcile_routing/pump.
   coord.handle_storage(Instant::ZERO, wal, sb, blocks);

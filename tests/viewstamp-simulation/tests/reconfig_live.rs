@@ -396,6 +396,116 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
 }
 
 #[test]
+fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
+  // 3 voters {0,1,2}, no learners. After the load settles, CRASH one SURVIVOR of the intended
+  // 2-voter successor, then propose the removal of the OTHER non-primary voter. The removal's
+  // successor quorum is {primary, crashed survivor} — 2-of-2 — so the op can assemble a bare
+  // predecessor quorum (primary + the LEAVING voter) but never a successor one: it must sit
+  // UNCOMMITTED (no commit, no swap anywhere, the 3-voter set still authoritative) for as long as
+  // the survivor is down. Restarting the survivor releases it: the recovered voter acks the
+  // retransmitted op, the successor quorum witnesses the commit, and the swap installs — the
+  // successor is seated only once a quorum of it has demonstrably processed the change.
+  let seed = 0x5EED_2321;
+  let mut c = Cluster::with_members(3, 0, 1, 10, seed, 10);
+  c.set_faults(Faults {
+    latency: core::time::Duration::from_millis(1),
+    jitter: core::time::Duration::ZERO,
+    drop_per_mille: 0,
+    duplicate_per_mille: 0,
+    hold_per_mille: 0,
+  });
+  c.set_storage_faults(StorageFaults::none());
+
+  let mut dur = DurabilityChecker::new(c.replica_count());
+  let mut once = ReconfigureAppliedOnceChecker::new(c.replica_count());
+  let mut lin = ConfigLineageChecker::new(c.replica_count());
+
+  // (1) Settle: drain the client load under a serving primary.
+  for t in 0..60_000 {
+    if (0..c.client_count()).all(|i| c.client(i).is_done()) && c.serving_primary().is_some() {
+      break;
+    }
+    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+  }
+  let p = c
+    .serving_primary()
+    .expect("a serving primary after the load settles");
+  let mut others = (0..3usize).filter(|&i| i != p);
+  let removed = others.next().expect("two non-primary voters");
+  let survivor = others.next().expect("two non-primary voters");
+
+  // (2) Crash the successor-critical survivor FIRST, then propose removing the other voter: the
+  // successor {primary, survivor} can never assemble its quorum while the survivor is down.
+  c.crash(survivor);
+  c.propose_reconfigure_single_change(SingleVoterDelta::RemoveVoter(MemberId::new(
+    removed as u128,
+  )))
+  .expect("the serving primary admits the removal proposal");
+
+  // (3) HELD: the predecessor quorum {primary, leaver} exists the whole time, yet the removal must
+  // never commit or swap — no successor quorum has processed it.
+  for t in 0..4_000 {
+    tick_checked(&mut c, &mut dur, &mut once, &mut lin, 100_000 + t);
+    assert_eq!(
+      c.membership_swaps_observed(),
+      0,
+      "no swap may install while the successor quorum is unacked (tick {t})"
+    );
+    assert!(
+      c.committed_reconfigure_ops().is_empty(),
+      "the removal must stay uncommitted while the successor quorum is unacked (tick {t})"
+    );
+  }
+  assert_eq!(
+    c.replica_voter_count(p),
+    Some(3),
+    "the predecessor voter set stays authoritative while the removal is held"
+  );
+
+  // (4) RELEASED: restart the survivor; it recovers, acks the retransmitted removal, and the swap
+  // installs under a successor quorum's witness.
+  c.restart(survivor);
+  let mut installed = false;
+  for t in 0..120_000 {
+    tick_checked(&mut c, &mut dur, &mut once, &mut lin, 200_000 + t);
+    if c.membership_swaps_observed() > 0 {
+      installed = true;
+      break;
+    }
+  }
+  assert!(
+    installed,
+    "the removal commits and installs once the restarted survivor acks it"
+  );
+  assert!(
+    !c.committed_reconfigure_ops().is_empty(),
+    "the removal is committed after the successor quorum acked"
+  );
+
+  // (5) Settle the swap cluster-wide, then pin the successor shape: 2 voters, the removed member
+  // absent, the restarted survivor seated.
+  for t in 0..20_000 {
+    if c
+      .serving_primary()
+      .is_some_and(|sp| c.replica_voter_count(sp) == Some(2))
+    {
+      break;
+    }
+    tick_checked(&mut c, &mut dur, &mut once, &mut lin, 400_000 + t);
+  }
+  let m = c.serving_primary_membership();
+  assert_eq!(m.replica_count(), 2, "the successor is the 2-voter config");
+  assert!(
+    m.slot_of(MemberId::new(removed as u128)).is_none(),
+    "the removed voter is absent from the successor"
+  );
+  assert!(
+    m.slot_of(MemberId::new(survivor as u128)).is_some(),
+    "the restarted survivor is a seated successor voter"
+  );
+}
+
+#[test]
 fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
   // 3 voters {MemberId(0), MemberId(1), MemberId(2)} + 2 genesis learners {MemberId(3), MemberId(4)}.
   // The genesis learners are the target voters-to-be: the planner's Phase 1 AddLearner is a no-op for

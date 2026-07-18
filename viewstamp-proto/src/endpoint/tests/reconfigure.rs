@@ -335,6 +335,161 @@ fn at_commit_the_swap_is_staged_but_the_epoch_is_not_yet_swapped() {
   );
 }
 
+/// An `n`-voter `SingleChange` endpoint whose local member is slot 0 — the primary of view 0.
+fn single_change_primary_of(n: u8) -> Endpoint<CountSm, SingleChange> {
+  let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
+  Endpoint::<CountSm, SingleChange>::genesis_unchecked(
+    cfg,
+    genesis(n),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  )
+}
+
+/// Propose `RemoveVoter(removed)` on `e` and land the primary's own vote: mint the op, drop the
+/// broadcast `Prepare`, and complete the own WAL append (1 ack — the primary's own bit). Returns the
+/// minted op and the successor payload backup acks must content-address.
+fn propose_removal_with_own_vote(
+  e: &mut Endpoint<CountSm, SingleChange>,
+  wal: &mut TestWal,
+  sb: &mut TestSb,
+  blocks: &mut crate::block_store::MemBlockStore,
+  removed: u128,
+) -> (OpNumber, ReconfigurePayload) {
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(removed)))
+    .expect("removing one voter is a valid delta");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let op = e
+    .propose_membership(
+      Instant::ZERO,
+      wal,
+      SingleVoterDelta::RemoveVoter(MemberId::new(removed)),
+    )
+    .expect("the primary mints the removal op");
+  while e.poll_message().is_some() {} // drop the broadcast Prepare
+  e.handle_storage(Instant::ZERO, wal, sb, blocks); // own append lands → own vote
+  (op, payload)
+}
+
+/// Deliver backup `slot`'s content-addressed `PrepareOk` for the removal op.
+fn deliver_removal_ack(
+  e: &mut Endpoint<CountSm, SingleChange>,
+  wal: &mut TestWal,
+  sb: &mut TestSb,
+  blocks: &mut crate::block_store::MemBlockStore,
+  op: OpNumber,
+  payload: &ReconfigurePayload,
+  slot: u16,
+) {
+  e.handle_message(
+    Instant::ZERO,
+    wal,
+    sb,
+    blocks,
+    Peer::Replica(ReplicaId::new(slot)),
+    reconfigure_ack(op.get(), payload, slot),
+  );
+}
+
+/// The removal op is HELD uncommitted: `commit_min` below it, the single-writer latch still armed,
+/// no `SwapEpoch` staged.
+fn assert_removal_held(e: &Endpoint<CountSm, SingleChange>, op: OpNumber) {
+  assert!(
+    e.commit() < op,
+    "the removal must stay uncommitted (commit_min {} < op {})",
+    e.commit().get(),
+    op.get()
+  );
+  assert_eq!(
+    e.reconfigure_inflight,
+    Some(op),
+    "the single-writer latch stays armed while the removal is held"
+  );
+  assert!(
+    !e.pending_swap_for_test(),
+    "no SwapEpoch may be staged for a held removal"
+  );
+}
+
+/// The removal op COMMITTED: `commit_min` reached it, the latch cleared, the `SwapEpoch` staged.
+fn assert_removal_committed(e: &Endpoint<CountSm, SingleChange>, op: OpNumber) {
+  assert_eq!(e.commit(), op, "the removal committed");
+  assert_eq!(
+    e.reconfigure_inflight, None,
+    "the single-writer latch cleared at commit"
+  );
+  assert!(
+    e.pending_swap_for_test(),
+    "the successor SwapEpoch is staged at commit"
+  );
+}
+
+#[test]
+fn a_three_to_two_shrink_holds_until_both_successor_voters_ack() {
+  // {0,1,2} → {0,1}: the successor quorum is BOTH survivors (2-of-2). The primary's own vote plus
+  // the LEAVING voter's ack form a predecessor quorum (2-of-3), but no successor majority has
+  // processed the removal — committing on it could seat {0,1} while voter 1 is already gone, so the
+  // op must WAIT. It commits the moment survivor 1 acks: the successor quorum witnesses the commit.
+  let mut e = single_change_primary_of(3);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let (op, payload) = propose_removal_with_own_vote(&mut e, &mut wal, &mut sb, &mut blocks, 2);
+
+  // Own vote + the leaver's ack = a predecessor quorum WITHOUT any successor majority: held.
+  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
+  assert_removal_held(&e, op);
+
+  // Survivor 1's ack completes the successor quorum {0,1}: the removal commits.
+  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  assert_removal_committed(&e, op);
+  assert_eq!(
+    e.membership.replica_count(),
+    3,
+    "the in-memory voter set stays the predecessor until the swap root is durable"
+  );
+}
+
+#[test]
+fn an_even_to_odd_shrink_commits_on_a_predecessor_quorum_including_the_leaver() {
+  // {0,1,2,3} → {0,1,2}: ANY predecessor quorum (3-of-4) holds at most one leaving-voter bit, so it
+  // already contains a successor quorum (2-of-3) — the successor requirement is implied and adds no
+  // wait, even when the quorum includes the LEAVER's own ack and one retained voter never acked.
+  let mut e = single_change_primary_of(4);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let (op, payload) = propose_removal_with_own_vote(&mut e, &mut wal, &mut sb, &mut blocks, 3);
+
+  // Own vote + slot 1 + the LEAVER slot 3 = a predecessor quorum whose retained subset {0,1} is
+  // already a successor majority: commits with NO ack from slot 2.
+  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 3);
+  assert_removal_held(&e, op); // two acks: not even a predecessor quorum yet.
+  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  assert_removal_committed(&e, op);
+}
+
+#[test]
+fn a_five_to_four_shrink_needs_a_successor_quorum_beyond_the_predecessor_one() {
+  // {0..4} → {0..3}: a predecessor quorum (3-of-5) that leans on the LEAVING voter's ack holds only
+  // TWO retained voters — below the successor quorum (3-of-4) — so the removal waits for a third
+  // retained voter even though the uniform threshold was already met.
+  let mut e = single_change_primary_of(5);
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::MemBlockStore::new();
+  let (op, payload) = propose_removal_with_own_vote(&mut e, &mut wal, &mut sb, &mut blocks, 4);
+
+  // Own vote + slot 1 + the leaver slot 4 = 3-of-5 base quorum, retained {0,1} = 2 < 3: held.
+  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 4);
+  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 1);
+  assert_removal_held(&e, op);
+
+  // A third RETAINED voter's ack completes the successor quorum {0,1,2}: commits.
+  deliver_removal_ack(&mut e, &mut wal, &mut sb, &mut blocks, op, &payload, 2);
+  assert_removal_committed(&e, op);
+}
+
 #[test]
 fn the_swap_epoch_root_durably_records_the_reconfigure_op_as_committed() {
   // The durable SwapEpoch root MUST record the committed `Reconfigure` op as committed: a node that
@@ -2068,9 +2223,11 @@ fn client_ack(o: u64, replica: u16) -> Message {
 
 /// Drive a fresh 3-voter `SingleChange` primary (slot 0) to: (1) COMMIT a plain client op `o == 1`
 /// under the OLD (E=0) 3-voter config, held by the 2-of-3 write quorum {slot 0, the acking backup};
-/// then (2) propose `delta`, commit the Reconfigure op `r == 2`, and make its `SwapEpoch` root DURABLE
-/// — so on return `self.membership` is the E+1 successor (the epoch swap is installed). Returns the
-/// post-swap endpoint, its storage, and the committed client op `o`.
+/// then (2) propose `delta`, commit the Reconfigure op `r == 2` with BOTH backups acking (a
+/// voter-set shrink commits only with a successor quorum among its acks; `ack_backup` shapes only
+/// `o`'s write quorum), and make its `SwapEpoch` root DURABLE — so on return `self.membership` is
+/// the E+1 successor (the epoch swap is installed). Returns the post-swap endpoint, its storage, and
+/// the committed client op `o`.
 ///
 /// Op `o` committed BEFORE the reconfiguration, so by commit-first every replica that reaches E+1
 /// (it durably committed `r > o`) holds `o`. The DVC-quorum injection in each CP test then models the
@@ -2135,6 +2292,18 @@ fn committed_op_then_swapped(
     &mut blocks,
     Peer::Replica(ReplicaId::new(ack_backup)),
     reconfigure_ack(r.get(), &payload, ack_backup),
+  );
+  // BOTH backups ack the Reconfigure op — a voter-set shrink commits only with a successor quorum
+  // among its acks, and the extra ack is inert for any other delta. `ack_backup` shapes only the
+  // CLIENT op `o`'s write quorum above, which stays exactly {slot 0, ack_backup}.
+  let other_backup = if ack_backup == 1 { 2u16 } else { 1u16 };
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(other_backup)),
+    reconfigure_ack(r.get(), &payload, other_backup),
   );
   assert_eq!(e.commit(), r, "the Reconfigure op committed under E=0");
   // Make the SwapEpoch root durable → install the successor. `self.membership` is now E+1.
@@ -3804,9 +3973,10 @@ fn the_safe_path_add_learner_then_promote_grows_a_single_voter_cluster() {
 
 /// Drive a fresh 3-voter SingleChange primary (slot 0, member 0 — primary of view 0) to remove
 /// ITSELF, committing the Reconfigure op under E=0 and making its `SwapEpoch` root DURABLE, so on
-/// return `self.membership` is the E+1 successor in which member 0 is absent. The acking backup is
-/// slot 1 (a retained voter), so the 2-of-3 commit quorum forms without the removed node's body. The
-/// removed node's own Prepare-retransmit/commit-heartbeat timers were armed by the proposal mint.
+/// return `self.membership` is the E+1 successor in which member 0 is absent. BOTH retained voters
+/// (slots 1 and 2) ack: a voter-set shrink commits only with a successor quorum among the acks, and
+/// for a self-removal that quorum is exactly the two survivors. The removed node's own
+/// Prepare-retransmit/commit-heartbeat timers were armed by the proposal mint.
 fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, Membership) {
   let mut e = single_change_primary();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
@@ -3837,6 +4007,16 @@ fn removed_self_primary() -> (Endpoint<CountSm, SingleChange>, TestWal, TestSb, 
     &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     reconfigure_ack(op.get(), &payload, 1),
+  );
+  // A voter-set shrink commits only once the SUCCESSOR quorum is among the acks — for a
+  // self-removal that is BOTH retained voters, so slot 2's ack completes it.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    &mut blocks,
+    Peer::Replica(ReplicaId::new(2)),
+    reconfigure_ack(op.get(), &payload, 2),
   );
   assert_eq!(
     e.commit(),
