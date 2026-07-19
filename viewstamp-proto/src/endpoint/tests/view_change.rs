@@ -8232,6 +8232,7 @@ fn a_reverted_probe_joins_a_survivors_far_proposal() {
 /// Deliver every message one live endpoint emits to the other (and loop self-addressed traffic
 /// back), completing storage after each pass, until both are quiescent. Traffic addressed to any
 /// other replica is dropped — those replicas are dead in the scenarios that use this pump.
+#[allow(clippy::too_many_arguments)]
 fn pump_two_live_voters(
   t: Instant,
   a: &mut Endpoint<NoopSm, RestartOnly>,
