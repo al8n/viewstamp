@@ -41,6 +41,9 @@ pub enum Command {
     target: viewstamp_proto::MembershipTarget,
     /// The optional operator shrink-phase health hint.
     health: crate::reconfigure::HealthHint,
+    /// The operator's acknowledgement that the goal may reduce crash tolerance, or `None`. Threaded to
+    /// the executor's goal-level preflight and attached per-step to a forced (odd-`n`) demote.
+    ack: Option<viewstamp_proto::AcceptReducedFaultTolerance>,
     /// The completion channel.
     reply: futures_channel::oneshot::Sender<Result<(), crate::reconfigure::ReconfigureError>>,
   },
@@ -241,6 +244,12 @@ impl Handle {
   /// the only reconfiguration driver for the cluster (a driver-level plan guard serializes two calls on the
   /// same driver). See [`crate::reconfigure::ReconfigureError`] for the bounded-loop outcomes.
   ///
+  /// `ack` is the operator's [`viewstamp_proto::AcceptReducedFaultTolerance`] (or `None`). A goal that
+  /// would REDUCE the cluster's crash tolerance is refused up front with
+  /// [`crate::reconfigure::ReconfigureError::ReducedFaultToleranceUnacknowledged`] unless the token is
+  /// supplied — so tolerance is never reduced silently — and a superfluous token on a non-reducing goal
+  /// is ignored (a driver may thread an operator acknowledgement through unconditionally).
+  ///
   /// # Errors
   /// [`crate::reconfigure::ReconfigureError::Retired`] if this node removed itself from the
   /// configuration — it is no longer a cluster member and cannot drive a reconfiguration, so the goal
@@ -255,6 +264,7 @@ impl Handle {
     &self,
     target: viewstamp_proto::MembershipTarget,
     health: crate::reconfigure::HealthHint,
+    ack: Option<viewstamp_proto::AcceptReducedFaultTolerance>,
   ) -> Result<(), crate::reconfigure::ReconfigureError> {
     // A retired node is no longer a cluster member: reject the goal terminally rather than sending a
     // command the removed endpoint would only no-op (mirrors `submit`'s up-front retired rejection).
@@ -270,6 +280,7 @@ impl Handle {
     let sent = self.commands().try_send(Command::Reconfigure {
       target,
       health,
+      ack,
       reply,
     });
     if let Err(ref err) = sent {

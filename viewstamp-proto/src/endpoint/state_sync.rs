@@ -1912,6 +1912,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// STAGE time.
   pub(crate) fn install_sync<W: Wal>(
     &mut self,
+    now: Instant,
     wal: &mut W,
     blocks: &dyn BlockStore,
     install: PendingInstall,
@@ -1972,7 +1973,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // Capture the laggard's own current `config_id` BEFORE the swap — its prior-config slot in the
       // post-crossing lineage.
       let own_prior_config_id = self.membership.config_id();
-      self.install_membership(None, successor);
+      self.install_membership(now, None, successor);
       // prev_epoch from the VERIFIED chain (the backward-link scalar, the analogue of the lineage-ring fix
       // below). `install_membership` set `self.prev_epoch = old self.membership.epoch()` (the laggard's own
       // stale epoch) — correct ONLY for a SINGLE-epoch crossing, where that IS the installed config's

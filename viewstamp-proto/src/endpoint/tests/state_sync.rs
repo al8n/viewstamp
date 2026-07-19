@@ -3428,7 +3428,7 @@ fn a_swapped_donor_below_its_reconfigure_op_withholds_the_cross_epoch_membership
     .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
     .expect("AddLearner on the 3-voter genesis is valid");
   let predecessor_config_id = e.membership.config_id();
-  e.install_membership(Some(OpNumber::with(5)), successor.clone());
+  e.install_membership(Instant::ZERO, Some(OpNumber::with(5)), successor.clone());
   assert_eq!(
     e.config_install_op,
     OpNumber::with(5),
@@ -3491,8 +3491,8 @@ fn a_laggard_keeps_its_membership_when_a_below_n_donor_withholds_then_swaps_once
   // since checkpointed past N), it installs the successor.
   let predecessor = genesis(3);
   let successor = predecessor
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid");
 
   // --- Phase 1: the WITHHELD (empty) cross-epoch answer keeps the laggard's membership. ---
   let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
@@ -3622,11 +3622,11 @@ fn a_direct_e0_to_e2_crossing_stamps_the_verified_chain_so_a_reserve_verifies() 
   // asserts its crossing VERIFIES (recomputes E2's config_id) — proving the re-served bytes carry E1.
   let e0 = genesis(3); // [0,1,2]
   let e1 = e0
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter(3) on the 3-voter genesis is valid"); // [0,1,2,3], chains from E0
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner(3) on the 3-voter genesis is valid"); // [0,1,2,3], chains from E0
   let e2 = e1
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(4)))
-    .expect("AddVoter(4) on the 4-voter E1 is valid"); // [0,1,2,3,4], chains from E1
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(4)))
+    .expect("AddLearner(4) on the E1 config is valid"); // [0,1,2,3,4], chains from E1
   assert_eq!(e1.epoch(), crate::Epoch::new(1));
   assert_eq!(
     e2.epoch(),
@@ -3842,14 +3842,14 @@ fn a_direct_e0_to_e3_wholesale_crossing_installs_the_content_verified_config() {
   // distance-2 E0→E2 crossing above, which stamps the contiguous `[E1, E0]`.)
   let e0 = genesis(3); // [0,1,2]
   let e1 = e0
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter(3) on the 3-voter genesis is valid"); // E1, chains from E0
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner(3) on the 3-voter genesis is valid"); // E1, chains from E0
   let e2 = e1
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(4)))
-    .expect("AddVoter(4) on the 4-voter E1 is valid"); // E2, chains from E1
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(4)))
+    .expect("AddLearner(4) on the E1 config is valid"); // E2, chains from E1
   let e3 = e2
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(5)))
-    .expect("AddVoter(5) on the 5-voter E2 is valid"); // E3, chains from E2
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(5)))
+    .expect("AddLearner(5) on the E2 config is valid"); // E3, chains from E2
   assert_eq!(
     e3.epoch(),
     crate::Epoch::new(3),
@@ -4026,11 +4026,11 @@ fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
   );
   assert!(e.sync_target_for_test().is_none(), "no sync is armed yet");
 
-  // The successor a real swap derives off genesis (AddVoter keeps the lineage valid; epoch is E+1).
+  // The successor a real swap derives off genesis (AddLearner keeps the lineage valid; epoch is E+1).
   let predecessor = genesis(3);
   let successor = predecessor
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid");
   let laggard_config_id = e.membership.config_id();
 
   // A STRICTLY-higher-epoch Commit (E+1) advertising the cluster checkpoint at N. Dropped at the
@@ -4139,12 +4139,13 @@ fn an_op_equals_n_normal_laggard_forced_syncs_across_the_epoch() {
   );
 }
 
-/// The reconfigure op the slot-shifting `RemoveVoter(1)` swap names (the donor's checkpoint embeds it).
+/// The reconfigure op the slot-shifting `DemoteVoter(1)` swap names (the donor's checkpoint embeds it).
 const SLOT_SHIFT_N: u64 = 4;
 
 /// Build a FAR-BEHIND laggard (checkpoint 0) at the PREDECESSOR config `genesis(4) = [m0,m1,m2,m3]` that
 /// has ARMED a FORCED, crossing-required cross-epoch sync toward the E+1 successor produced by a LOW-INDEX
-/// `RemoveVoter(MemberId 1)` (the slot-shifting delta). The successor is `[m0,m2,m3]`, so the surviving
+/// `DemoteVoter(MemberId 1)` (the slot-shifting delta). The successor voters are `[m0,m2,m3]` (the
+/// demotee is the learner at the tail), so the surviving
 /// `MemberId 2` SHIFTS from OLD slot 2 (the laggard's E membership) to NEW slot 1 (the donor's E+1
 /// membership) — the slot-shifted DONOR. The laggard itself is `MemberId 3` (retained; it shifts 3->2 in
 /// E+1, but during the crossing it is still at E and resolves peers under its E membership). Returns
@@ -4159,11 +4160,11 @@ fn slot_shifted_crossing_laggard() -> (Endpoint<CountSm>, TestWal, TestSb, Membe
   let mut blocks = crate::block_store::MemBlockStore::new();
   let predecessor = genesis(4);
   let predecessor_config_id = e.membership.config_id();
-  // The E+1 successor a LOW-INDEX RemoveVoter derives: removing MemberId 1 from [m0,m1,m2,m3] leaves
-  // [m0,m2,m3], shifting m2 (slot 2 -> 1) and m3 (slot 3 -> 2).
+  // The E+1 successor a LOW-INDEX DemoteVoter derives: demoting MemberId 1 from [m0,m1,m2,m3] leaves
+  // voters [m0,m2,m3] + learner m1, shifting m2 (slot 2 -> 1) and m3 (slot 3 -> 2).
   let successor = predecessor
-    .apply_delta(&crate::SingleVoterDelta::RemoveVoter(MemberId::new(1)))
-    .expect("RemoveVoter(1) on a 4-voter cluster is valid (leaves 3 voters)");
+    .apply_delta(&crate::SingleVoterDelta::DemoteVoter(MemberId::new(1)))
+    .expect("DemoteVoter(1) on a 4-voter cluster is valid (leaves 3 voters)");
   assert_eq!(
     predecessor.member_at(ReplicaId::new(2)),
     Some(MemberId::new(2)),
@@ -4226,7 +4227,7 @@ fn slot_shift_crossing_envelope(
 
 #[test]
 fn a_slot_shifted_donor_whole_sync_checkpoint_reply_is_admitted_and_crosses() {
-  // FINDING (high) — the cross-epoch SERVE-REPLY binding. After a LOW-INDEX RemoveVoter shifts a retained
+  // FINDING (high) — the cross-epoch SERVE-REPLY binding. After a LOW-INDEX DemoteVoter shifts a retained
   // DONOR's slot, the donor stamps its WHOLE SyncCheckpoint reply with its CURRENT (E+1) slot while the
   // mid-crossing OLD-epoch laggard resolves `from` under its OLD (E) membership slot — so `from` (E-slot)
   // != claimed (E+1-slot). The STRICT `sender_is_member` binding would DROP the reply at ingress before
@@ -4344,8 +4345,8 @@ fn a_cross_epoch_fetch_rejects_a_below_n_empty_membership_reply_and_re_solicits(
   let now = Instant::ZERO;
   let predecessor = genesis(3);
   let successor = predecessor
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid");
   let laggard_config_id = e.membership.config_id();
   // A higher-epoch Commit advertising the cluster checkpoint at N → the forced crossing fetch.
   e.handle_message(
@@ -4501,8 +4502,8 @@ fn a_cross_epoch_fetch_crosses_below_an_unreachable_hinted_target_on_a_verified_
   let now = Instant::ZERO;
   let predecessor = genesis(3);
   let successor = predecessor
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid");
   let laggard_config_id = e.membership.config_id();
 
   // A higher-epoch `EpochAhead` hint carrying the BOGUS unreachable checkpoint_op → the speculative
@@ -4634,6 +4635,192 @@ fn a_cross_epoch_fetch_crosses_below_an_unreachable_hinted_target_on_a_verified_
 }
 
 #[test]
+fn a_stranded_learner_crosses_an_epoch_via_the_pulled_epoch_ahead_hint() {
+  // THE LEARNER PULL LANE. A learner stranded ONE epoch behind has NO catch-up lane when no
+  // successor-epoch primary traffic reaches it: its SOLE emission is `LearnerStatus`. This drives the
+  // full round-trip: the learner's `LearnerStatus` to an E+1 member draws an `EpochAhead` hint (the
+  // egress trigger `maybe_answer_lower_epoch` now recognizes), the learner arms the forced crossing sync
+  // off that pulled hint, and a verified successor reply crosses it to E+1. Without `LearnerStatus` in the
+  // trigger set the member answers nothing, the learner never arms the sync, and it never crosses.
+  let n: u64 = 4; // the E+1 checkpoint the member advertises and a donor serves (the crossing target).
+
+  // Epoch-0 configuration: 3 voters + the stranded learner MemberId 3. Epoch-1 successor: the same, plus
+  // a new learner MemberId 4 — a valid single-delta successor chained from E0 in which MemberId 3 stays a
+  // learner (so the member resolves its slot, and it crosses into a config it belongs to).
+  let predecessor = genesis_with_learners(3, 1);
+  let successor = predecessor
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(4)))
+    .expect("AddLearner on the 3-voter + 1-learner genesis is valid");
+
+  // The stranded LEARNER at E0: op 0, checkpoint 0 (checkpoint == its own op head), Normal.
+  let learner_cfg = Config::with_checkpoint_ops(1, MemberId::new(3), 100).unwrap();
+  let mut learner = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    learner_cfg,
+    predecessor.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (mut lwal, mut lsb) = (TestWal::default(), TestSb::default());
+  let mut lblocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  assert!(
+    learner.is_learner() && learner.membership.epoch() == crate::Epoch::new(0),
+    "the local node is a learner at E0"
+  );
+  let learner_config_id = learner.membership.config_id();
+
+  // The learner emits its progress report — its only lane, since no E+1 primary traffic reaches it.
+  // Bootstrap the cadence, then advance past it and fire; capture the emitted `LearnerStatus`.
+  learner.handle_timeout(now, &mut lwal, &mut lsb, &mut lblocks);
+  let t1 = now + core::time::Duration::from_millis(10_000);
+  learner.handle_timeout(t1, &mut lwal, &mut lsb, &mut lblocks);
+  let mut status = None;
+  while let Some(out) = learner.poll_message() {
+    if matches!(out.msg_ref(), Message::LearnerStatus(_)) {
+      status = Some(out.into_msg());
+    }
+  }
+  let status = status.expect("the stranded learner emits a LearnerStatus (its sole crossing lane)");
+
+  // The E+1 MEMBER: a settled Normal voter (MemberId 0, the view-0 primary of the successor config) whose
+  // cluster checkpoint is at N.
+  let member_cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 100).unwrap();
+  let mut member = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    member_cfg,
+    successor.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (mut mwal, mut msb) = (TestWal::default(), TestSb::default());
+  let mut mblocks = crate::block_store::MemBlockStore::new();
+  member.force_state_for_test(0, n, n, n, &[]);
+  assert!(
+    member.status().is_normal()
+      && member.membership.epoch() == crate::Epoch::new(1)
+      && member.checkpoint_op() == OpNumber::with(n),
+    "the member is a settled E+1 node with checkpoint N"
+  );
+
+  // THE HINGE: the member answers the learner's LearnerStatus with EpochAhead(E+1, N). The learner
+  // presents at slot 3 (its seat in the E+1 config); the member resolves it and pulls the hint back. This
+  // emission is exactly what F3 adds — without the `LearnerStatus` trigger the member stays silent here.
+  member.handle_message(
+    now,
+    &mut mwal,
+    &mut msb,
+    &mut mblocks,
+    Peer::Replica(ReplicaId::new(3)),
+    status,
+  );
+  let hint = member
+    .poll_message()
+    .expect("the member answers the learner's LearnerStatus with a hint");
+  assert_eq!(
+    hint.to(),
+    crate::Recipient::To(Peer::Replica(ReplicaId::new(3))),
+    "the pulled hint is addressed back to the learner",
+  );
+  let hint_msg = hint.into_msg();
+  assert!(
+    member.poll_message().is_none(),
+    "exactly one hint per inbound LearnerStatus",
+  );
+  let Message::EpochAhead(h) = &hint_msg else {
+    panic!(
+      "the response is an EpochAhead hint, got {}",
+      hint_msg.kind_str()
+    );
+  };
+  assert_eq!(h.epoch(), crate::Epoch::new(1), "carries the E+1 epoch");
+  assert_eq!(
+    h.checkpoint_op(),
+    OpNumber::with(n),
+    "carries the E+1 checkpoint_op (the crossing target)",
+  );
+
+  // The learner consumes the SAME pulled hint (delivered from a bound retained voter) → arms the forced,
+  // crossing-required cross-epoch sync targeting N.
+  learner.handle_message(
+    t1,
+    &mut lwal,
+    &mut lsb,
+    &mut lblocks,
+    primary_peer(),
+    hint_msg,
+  );
+  assert!(
+    learner.status().is_normal()
+      && learner.sync_is_forced_for_test()
+      && learner.sync_requires_cross_epoch_for_test(),
+    "the learner armed a crossing-required forced sync off the pulled hint (staying Normal)"
+  );
+  assert_eq!(
+    learner.sync_target_for_test(),
+    Some(n),
+    "the forced sync targets the hinted checkpoint_op"
+  );
+  let nonce = learner.sync_nonce_for_test();
+
+  // A donor serves the verified E+1 successor checkpoint at N → the learner crosses and installs E+1.
+  let cross_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(n),
+    crate::block_address(&CountSm::default().snapshot()),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut lblocks),
+  );
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
+      .encode_body();
+  lblocks.write_verified(CountSm::default().snapshot());
+  learner.handle_message(
+    t1,
+    &mut lwal,
+    &mut lsb,
+    &mut lblocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(n),
+      cross_id,
+      successor.epoch(),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      cross_env.clone(),
+      membership_body,
+    )),
+  );
+  for _ in 0..3 {
+    learner.handle_storage(t1, &mut lwal, &mut lsb, &mut lblocks);
+  }
+  assert_eq!(
+    learner.membership, successor,
+    "the stranded learner CROSSED to the E+1 successor membership"
+  );
+  assert_ne!(
+    learner.membership.config_id(),
+    learner_config_id,
+    "the config_id advanced off the predecessor"
+  );
+  assert_eq!(
+    learner.membership.epoch(),
+    crate::Epoch::new(1),
+    "installed E+1"
+  );
+  assert_eq!(
+    learner.forced_syncs_applied(),
+    1,
+    "exactly one crossing applied"
+  );
+  assert!(
+    learner.is_learner(),
+    "still a non-voting learner in the E+1 config"
+  );
+}
+
+#[test]
 fn a_recovered_swapped_donor_restores_config_install_op_so_the_gate_still_holds() {
   // DURABILITY of the gate: a donor that has swapped to E+1 with its checkpoint still BELOW the reconfigure
   // op N must, after a CRASH + recover, RESTORE config_install_op = N — so it keeps withholding the E+1
@@ -4641,8 +4828,8 @@ fn a_recovered_swapped_donor_restores_config_install_op_so_the_gate_still_holds(
   // and recover reads it back.
   let genesis_mem = genesis(3);
   let successor = genesis_mem
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter is valid");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is valid");
   // A REAL checkpoint envelope at op 2 (so recover's decode + bind + id checks all pass).
   let (_d, _dw, dsb) = donor_primary_at_checkpoint(2);
   let (env, env_id) = donor_envelope(&dsb);
@@ -5145,8 +5332,8 @@ fn a_successful_cross_clears_the_intent_so_on_sb_done_never_re_arms_forever() {
   let now = Instant::ZERO;
   let m = 4u64; // the E+1 crossing checkpoint
   let successor_e1 = genesis(3)
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
 
   // Arm the speculative crossing AND pin the persistent intent, as the higher-epoch trigger does.
   e.arm_cross_epoch_sync_for_test(m);
@@ -5797,8 +5984,8 @@ fn a_verified_staged_crossing_keeps_its_intent_against_stale_same_epoch_authorit
   let now = Instant::ZERO;
   let m = 4u64; // the E+1 crossing checkpoint op
   let successor_e1 = genesis(3)
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
 
   // (1) Arm a speculative crossing sync AND pin the persistent intent, as the higher-epoch trigger does.
   e.arm_cross_epoch_sync_for_test(m);
@@ -5933,8 +6120,8 @@ fn a_verified_crossing_retained_across_a_flush_fault_keeps_its_intent_against_st
   let now = Instant::ZERO;
   let m = 4u64; // the E+1 crossing checkpoint op
   let successor_e1 = genesis(3)
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
 
   // (1) Arm a speculative crossing sync AND pin the persistent intent, as the higher-epoch trigger does.
   e.arm_cross_epoch_sync_for_test(m);
@@ -6075,8 +6262,8 @@ fn a_retained_crossing_install_survives_a_stale_reply_rejected_by_apply_sync() {
   let now = Instant::ZERO;
   let m = 4u64; // the E+1 crossing checkpoint op
   let successor_e1 = genesis(3)
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
 
   // (1) Arm a speculative crossing sync + pin the persistent intent, then deliver a VERIFIED E+1
   // successor-membership reply whose SM leaf is seeded so its block-fetch drains LOCALLY and reaches
@@ -6235,8 +6422,8 @@ fn a_recovery_retained_crossing_survives_a_stale_reply_rejected_by_apply_sync() 
   let now = Instant::ZERO;
   let m = 4u64;
   let successor_e1 = genesis(3)
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid (E+1)");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
 
   // (1) Drive the laggard into a Recovering, cross-epoch (`require_cross_epoch`) peer-fetch directly, then
   // deliver a VERIFIED crossing reply with a SCRIPTED FLUSH FAULT so the recovery `apply_sync` RETAINS the
@@ -8660,8 +8847,8 @@ fn the_active_donor_absent_keeps_a_crossing_fetch_live_and_does_not_downgrade_it
   // legitimately shields the crossing from same-epoch downgrade.
   let predecessor = genesis(3);
   let successor = predecessor
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid");
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
       .encode_body();
@@ -9325,8 +9512,8 @@ fn a_quarantined_higher_epoch_hint_arms_a_bounded_probe_that_disarms() {
 /// carrying a non-empty successor membership, so `crossing_answered` is true — echoing `nonce`.
 fn crossing_checkpoint_at_4(env: &Bytes, id: u128, nonce: u64) -> Message {
   let successor = genesis(3)
-    .apply_delta(&crate::SingleVoterDelta::AddVoter(MemberId::new(3)))
-    .expect("AddVoter on the 3-voter genesis is valid");
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid");
   let membership_body =
     crate::message::ReconfigurePayload::from_membership(&successor, genesis(3).config_id())
       .encode_body();

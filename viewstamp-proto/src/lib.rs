@@ -50,13 +50,13 @@ pub use endpoint::{
 };
 pub use event::{Committed, Event, MembershipChanged, RepairStarted, ViewChanged};
 pub use id::{ClientId, Epoch, MemberId, Peer, Recipient, ReplicaId};
-pub use membership::{Membership, MembershipError, SingleVoterDelta};
+pub use membership::{AcceptReducedFaultTolerance, Membership, MembershipError, SingleVoterDelta};
 pub use message::{
-  BlockResponse, Commit, DoViewChange, EpochAhead, GetView, LearnerProof, LearnerStatus, Message,
-  Nack, Outgoing, Prepare, PrepareBatch, PrepareOk, PreparedEntry, REPLY_ENCODE_OVERHEAD,
-  ReconfigurePayload, Recovery, RecoveryResponse, RepairBatch, Reply, Request, RequestLearnerProof,
-  RequestPrepare, RequestPrepareRange, RequestSync, StartView, StartViewChange, SyncCheckpoint,
-  max_reply_body_len,
+  BlockResponse, Commit, DoViewChange, EpochAhead, GetView, HealthProof, LearnerProof,
+  LearnerStatus, Message, Nack, Outgoing, Prepare, PrepareBatch, PrepareOk, PreparedEntry,
+  REPLY_ENCODE_OVERHEAD, ReconfigurePayload, Recovery, RecoveryResponse, RepairBatch, Reply,
+  Request, RequestHealthProof, RequestLearnerProof, RequestPrepare, RequestPrepareRange,
+  RequestSync, StartView, StartViewChange, SyncCheckpoint, max_reply_body_len,
 };
 pub use number::{OpNumber, RequestNumber, View};
 pub use prng::Prng;

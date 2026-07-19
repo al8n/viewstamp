@@ -7,10 +7,11 @@ use super::{
 };
 use crate::{
   BlockAddress, BlockResponse, ClientId, CodecError, Commit, DoViewChange, Epoch, EpochAhead,
-  GetView, LearnerProof, LearnerStatus, MemberId, Message, Nack, OpNumber, Prepare, PrepareBatch,
-  PrepareOk, PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse, RepairBatch, ReplicaId,
-  Reply, Request, RequestLearnerProof, RequestNumber, RequestPrepare, RequestPrepareRange,
-  RequestSync, StartView, StartViewChange, SyncCheckpoint, View,
+  GetView, HealthProof, LearnerProof, LearnerStatus, MemberId, Message, Nack, OpNumber, Prepare,
+  PrepareBatch, PrepareOk, PreparedEntry, ReconfigurePayload, Recovery, RecoveryResponse,
+  RepairBatch, ReplicaId, Reply, Request, RequestHealthProof, RequestLearnerProof, RequestNumber,
+  RequestPrepare, RequestPrepareRange, RequestSync, StartView, StartViewChange, SyncCheckpoint,
+  View,
 };
 use buffa::Message as _;
 
@@ -578,6 +579,31 @@ fn learner_proof_round_trips() {
 }
 
 #[test]
+fn request_health_proof_round_trips() {
+  let m = RequestHealthProof::new(
+    ReplicaId::new(2101),
+    2102,
+    Epoch::new(2103),
+    0x8a8a_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back = messages_b::request_health_proof_from(messages_b::pb_request_health_proof(&m))
+    .expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
+fn health_proof_round_trips() {
+  let m = HealthProof::new(
+    ReplicaId::new(2201),
+    2202,
+    Epoch::new(2203),
+    0x8b8b_1111_2222_3333_4444_5555_6666_7777,
+  );
+  let back = messages_b::health_proof_from(messages_b::pb_health_proof(&m)).expect("round-trip");
+  assert_eq!(back, m);
+}
+
+#[test]
 fn request_block_round_trips() {
   let addr = BlockAddress::from_bytes(0x8B8B_1111_2222_3333_4444_5555_6666_7777u128.to_be_bytes());
   let back =
@@ -656,7 +682,7 @@ fn block_response_with_oversized_addr_rejects() {
 
 // ── the public seam: encode_message / decode_message ──
 
-/// One exemplar of each of [`Message`]'s 24 variants, in declaration order, built with small
+/// One exemplar of each of [`Message`]'s 26 variants, in declaration order, built with small
 /// deterministic field values. Shared by the round-trip and golden-vector tests below so both
 /// exercise identical values — a golden mismatch and a round-trip failure can never disagree
 /// about what was encoded.
@@ -831,6 +857,18 @@ fn one_of_each_message() -> std::vec::Vec<Message> {
       Epoch::new(14),
       config_id,
     )),
+    Message::RequestHealthProof(RequestHealthProof::new(
+      ReplicaId::new(31),
+      17,
+      Epoch::new(14),
+      config_id,
+    )),
+    Message::HealthProof(HealthProof::new(
+      ReplicaId::new(30),
+      17,
+      Epoch::new(14),
+      config_id
+    )),
     Message::RequestBlock(addr),
     Message::BlockResponse(BlockResponse::new(addr, Some(Bytes::from_static(b"block")))),
     Message::Nack(Nack::new(
@@ -858,14 +896,47 @@ fn public_seam_round_trips_every_variant() {
   }
 }
 
-/// An envelope with no `Message.body` oneof arm set is the wire's "no known message" case —
-/// parity with the prior codec's unknown-tag reject — and `decode_message` must reject it.
+/// A degenerate EMPTY envelope (zero fields, no `Message.body` oneof arm) decodes cleanly and
+/// classifies as the forward-compatible [`CodecError::UnknownMessage`], NOT `Malformed`: the codec
+/// keeps no witness of a skipped unknown field, so "body absent" cannot be narrowed to "body absent
+/// AND an unknown field was seen", and a zero-field envelope shares the newer-peer disposition. It
+/// carries nothing, no current peer sends it, and dropping it (rather than tearing a stream down) is
+/// equally correct — pinned deliberately as the documented degenerate case.
 #[test]
-fn envelope_without_body_rejects() {
+fn an_empty_envelope_classifies_as_unknown_message() {
   let frame = pb::Message::default().encode_to_bytes();
   match decode_message(frame) {
-    Err(CodecError::Malformed { what }) => assert_eq!(what, "Message.body"),
-    other => panic!("expected CodecError::Malformed(\"Message.body\"), got {other:?}"),
+    Err(CodecError::UnknownMessage) => {}
+    other => panic!("expected CodecError::UnknownMessage, got {other:?}"),
+  }
+}
+
+/// A newer peer's message arrives as a single unknown length-delimited field (field 99, wire type 2)
+/// with no known `Message.body` oneof arm set — byte-identical IN KIND to a HELLO-1 node receiving a
+/// field-25 body it does not yet know. A clean, bounded parse yields an absent body, which
+/// classifies as the forward-compatible [`CodecError::UnknownMessage`] (dropped by transports), NOT
+/// `Malformed` (which would terminate a stream connection).
+#[test]
+fn an_unknown_body_envelope_classifies_as_unknown_message() {
+  // Field 99, wire type 2: tag = (99 << 3) | 2 = 794, varint [0x9A, 0x06]; length 2; payload 2 bytes.
+  let frame = Bytes::from_static(&[0x9A, 0x06, 0x02, 0xAA, 0xBB]);
+  match decode_message(frame) {
+    Err(CodecError::UnknownMessage) => {}
+    other => panic!("expected CodecError::UnknownMessage, got {other:?}"),
+  }
+}
+
+/// A frame whose leading tag names an invalid protobuf wire type (7) violates the wire grammar inside
+/// buffa (stage 1) and must surface as [`CodecError::Malformed`] — NOT the forward-compat
+/// `UnknownMessage`, which is reserved for a CLEANLY-parsed envelope that merely lacks a known body.
+/// Guards the terminate-vs-drop boundary from the corruption side.
+#[test]
+fn a_corrupt_wire_type_maps_to_malformed_not_unknown_message() {
+  // Field 1, wire type 7 (invalid): tag = (1 << 3) | 7 = 15 = 0x0F.
+  let frame = Bytes::from_static(&[0x0F]);
+  match decode_message(frame) {
+    Err(CodecError::Malformed { .. }) => {}
+    other => panic!("expected CodecError::Malformed, got {other:?}"),
   }
 }
 
@@ -898,6 +969,37 @@ fn unknown_field_flood_is_bounded() {
     decode_message(frame_with_unknown_fields(MAX_UNKNOWN_FIELDS + 1)).is_err(),
     "one more than MAX_UNKNOWN_FIELDS must be rejected"
   );
+}
+
+/// `count` copies of a minimal unknown varint field (field 1000, wire type 0) with NO valid body —
+/// the degenerate flood used to prove the anti-flood bound precedes the absent-body classification.
+fn frame_of_only_unknown_fields(count: usize) -> Bytes {
+  let mut buf = std::vec::Vec::new();
+  for _ in 0..count {
+    buf.extend_from_slice(&[0xC0, 0x3E, 0x01]);
+  }
+  Bytes::from(buf)
+}
+
+/// THE FLOOD / FORWARD-COMPAT BOUNDARY FALSIFIER: the anti-flood bound fires strictly BEFORE the
+/// absent-body classification, so an unknown-field flood can never launder itself into the
+/// conn-surviving `UnknownMessage` disposition. At the allowance, a body-less envelope decodes
+/// cleanly and — its body absent — classifies as the forward-compatible
+/// [`CodecError::UnknownMessage`] (dropped, conn survives). One field past it, buffa rejects the
+/// frame inside its own bounded decode as [`CodecError::Malformed`] — terminal on a stream conn —
+/// before the absent body is ever reached. Were this to regress to a dropped `UnknownMessage` one
+/// past the allowance, a flood would be silently absorbed instead of terminating the connection: the
+/// anti-flood guarantee, gone.
+#[test]
+fn the_flood_bound_precedes_the_absent_body_classification() {
+  match decode_message(frame_of_only_unknown_fields(MAX_UNKNOWN_FIELDS)) {
+    Err(CodecError::UnknownMessage) => {}
+    other => panic!("expected UnknownMessage at the allowance, got {other:?}"),
+  }
+  match decode_message(frame_of_only_unknown_fields(MAX_UNKNOWN_FIELDS + 1)) {
+    Err(CodecError::Malformed { .. }) => {}
+    other => panic!("expected Malformed one past the allowance, got {other:?}"),
+  }
 }
 
 /// Dropping the last byte of a valid frame must surface as [`CodecError::Truncated`], not any
@@ -957,7 +1059,7 @@ fn unhex(s: &str) -> std::vec::Vec<u8> {
 /// wire-format change updates these vectors consciously; an accidental one fails here first.
 #[test]
 fn golden_byte_vectors() {
-  let golden: [&str; 24] = [
+  let golden: [&str; 26] = [
     "0a1a0a100000000000000000000000000000004010501a04626f6479", // Request
     "1236080a100b180c200d280e3210000000000000000000000000000000503a100000000000000000000000000000004040504a04626f6479", // Prepare
     "1a2e080a100b181e200d2a1000000000000000000000000000000060300e3a1000000000000000000000000000000050", // PrepareOk
@@ -979,6 +1081,8 @@ fn golden_byte_vectors() {
     "9a0104080e100d",                                             // EpochAhead
     "a2011a081f10151810200e2a1000000000000000000000000000000050", // RequestLearnerProof
     "aa011a081e10101816200e2a1000000000000000000000000000000050", // LearnerProof
+    "ca0118081f1011180e221000000000000000000000000000000050",     // RequestHealthProof
+    "d20118081e1011180e221000000000000000000000000000000050",     // HealthProof
     "b201120a1000000000000000000000000000000090",                 // RequestBlock
     "ba01190a10000000000000000000000000000000901205626c6f636b",   // BlockResponse
     "c20118080a100b181e221000000000000000000000000000000050",     // Nack

@@ -11,12 +11,46 @@
 //! becomes a voter only through `PromoteLearner`, which the primary admits only after a PROMOTE-TIME
 //! CHALLENGE: a fresh durable-prefix proof, re-grounded in the learner's storage at propose time, showing
 //! it durably holds the committed head. So the planner grows the voting set ONLY as
-//! `AddLearner` → catch up → `PromoteLearner`, and NEVER emits a direct `AddVoter`.
+//! `AddLearner` → catch up → `PromoteLearner`.
 //!
-//! A DIRECT voter addition is rejected (`propose_membership` refuses `AddVoter` at every cluster size): a
-//! brand-new voter holds no committed prefix — it was never a member and never committed a prior op — so
-//! it would count toward the successor's view-change quorum without having caught up, which can drop a
-//! committed op. Stage the member as a learner, let it catch up, then promote it.
+//! A DIRECT voter addition is UNREPRESENTABLE (the [`SingleVoterDelta`] vocabulary has no such delta):
+//! a brand-new voter holds no committed prefix — it was never a member and never committed a prior op —
+//! so it would count toward the successor's view-change quorum without having caught up, which can drop
+//! a committed op. Stage the member as a learner, let it catch up, then promote it.
+//!
+//! # Shrinking the voting set, DEMOTE-FIRST
+//!
+//! Symmetrically, a voter never leaves the voting set by a direct ejection. It is DEMOTED to a learner
+//! first (`DemoteVoter`), keeping its seat and its durable copy of the committed prefix, and only once
+//! its successor certifies is it GC'd (`RemoveLearner`) — the mirror of the `AddLearner` → `PromoteLearner`
+//! grow path. So a voter→learner demotion is a first-class goal (the planner emits `[DemoteVoter(x)]`),
+//! and a full removal is `DemoteVoter(x)` then `RemoveLearner(x)`. The planner interleaves the demotions
+//! with any promotions so the crash tolerance `f(n) = n − quorum(n) = ⌊(n−1)/2⌋` never dips below the
+//! smaller of the current and target tolerances; `f` falls only on a demote from an ODD voter count, and
+//! such a forced descent is gated at propose time by the operator's `AcceptReducedFaultTolerance`.
+//!
+//! ## The operator contract: tolerance reduction is never silent
+//!
+//! A configuration change that lowers `f` is never applied quietly. `AcceptReducedFaultTolerance` is a
+//! plain, non-`Default` unit struct the caller must NAME at the call site — not a bare `bool` — so the
+//! acceptance is self-documenting and greppable in the embedder's own code (every place a tolerance cut
+//! was knowingly taken is a literal occurrence of the type name). It is not unforgeable — the operator is
+//! the one asserting it, like any other typed intent parameter — but it turns the acceptance into an
+//! explicit, auditable act rather than an accidental side effect of a shrink target. Without it, a
+//! tolerance-reducing goal is refused WHOLE, before any step commits, at both the goal-level preflight
+//! (driver) and the per-delta propose gate (this crate).
+//!
+//! ## The honest 3→2 reality
+//!
+//! Demote-first does NOT make an acute 3→2 shrink trivially recoverable. If the surviving 2-voter
+//! successor later loses its own quorum (one of the two crashes), re-promoting the demoted third member
+//! back to a voter needs a COMMITTED op under that 2-voter successor — which the dead voter blocks, same
+//! as before demote-first existed. The stall still heals only on the crashed voter's own restart. What
+//! demote-first genuinely buys at 3→2: the demoted member stays a live, log-current LEARNER through the
+//! window — a retained THIRD durable copy (no single-copy-prefix disk-loss if the demotee is later lost
+//! too), and a live repair/state-sync DONOR for whichever voter eventually restarts. At `n >= 5` the story
+//! is materially better: the immediate re-promote recovery IS real, because the successor still holds a
+//! quorum of its own to commit the re-promotion. State this honestly rather than oversell the acute case.
 //!
 //! A new member's endpoint requires its slot to ALREADY be in the membership at construction (the genesis
 //! constructor asserts the local member occupies a slot). That constrains how a new physical process
@@ -109,9 +143,11 @@ pub enum PlanError {
     /// The rejected target voter count.
     count: usize,
   },
-  /// The grow-before-shrink VOTER peak `|Vc ∪ Vt|` would exceed the 64-voter cap mid-plan (a near-cap
-  /// disjoint replacement). Batch the change SHRINK-FIRST into remove-only then grow-only sub-targets.
-  #[error("the intermediate voter peak {peak} would exceed the 64-voter cap (batch shrink-first)")]
+  /// The plan's running VOTER count would exceed the 64-voter cap mid-plan — detected by the plan
+  /// simulation (a `PromoteLearner` that would seat a 65th voter). Demote-first sequencing keeps the
+  /// voter peak at `max(|Vc|, |Vt|) + 1`, so a well-formed target within the cap never trips this; it
+  /// is retained as a defensive simulation surface.
+  #[error("the intermediate voter peak {peak} would exceed the 64-voter cap")]
   IntermediatePeakExceedsCap {
     /// The simulated running voter-count maximum that exceeded the cap.
     peak: usize,
@@ -129,13 +165,6 @@ pub enum PlanError {
   /// The target lists an id as BOTH a voter and a learner — unrepresentable (a member holds one slot).
   #[error("a target id is both a voter and a learner (a member holds one slot)")]
   VoterLearnerOverlap,
-  /// The target asks a CURRENT voter to become a LEARNER (a voter→learner DEMOTION). Not achievable
-  /// online — `RemoveVoter` retires the live node before the follow-up `AddLearner` can reach it.
-  /// Recover the node as a learner by OUT-OF-BAND rebootstrap (start it fresh).
-  #[error(
-    "voter→learner demotion is not supported online (rebootstrap the node as a fresh learner)"
-  )]
-  VoterToLearnerDemotionUnsupported,
   /// A target member that was OBSERVED present was concurrently removed/retired, so it is a dead endpoint
   /// not online-re-addable. Executor-constructed (the pure planner never returns it). Recover the node by
   /// OUT-OF-BAND rebootstrap, or a Tier C offline path.
@@ -156,7 +185,6 @@ impl PlanError {
       Self::IntermediateNodePeakExceedsCap { .. } => "intermediate_node_peak_exceeds_cap",
       Self::RemovesLastVoter => "removes_last_voter",
       Self::VoterLearnerOverlap => "voter_learner_overlap",
-      Self::VoterToLearnerDemotionUnsupported => "voter_to_learner_demotion_unsupported",
       Self::MemberConcurrentlyRemoved { .. } => "member_concurrently_removed",
     }
   }
@@ -174,17 +202,39 @@ fn voter_learner_sets(m: &Membership) -> (BTreeSet<MemberId>, BTreeSet<MemberId>
   (v, l)
 }
 
-/// Lower a set goal to a bounded grow-before-shrink sequence of proven Tier B deltas, from `current`'s
-/// voter/learner SETS to `target` (Phase 0 prune obsolete learners → Phase 1 stage new-voter learners →
-/// Phase 2 promote → Phase 3 remove old voters → Phase 4 add residual target learners). PURE — no I/O, no
-/// `self`. The peak caps are validated by SIMULATION: it BUILDS the ordered `Vec`, folds `apply_delta`
-/// along it, and returns `IntermediatePeakExceedsCap` / `IntermediateNodePeakExceedsCap` iff the running
-/// max exceeds the 64-voter / `u16::MAX`-node cap — so it never hands back a sequence a later `apply_delta`
-/// would reject mid-plan. The set-only prechecks (disjointness, demotion, empty/oversize) are pure
-/// properties of `(current, target)`, checked before the sequence is built.
+/// Lower a set goal to a bounded DEMOTE-FIRST sequence of proven Tier B deltas, from `current`'s
+/// voter/learner SETS to `target`. PURE — no I/O, no `self`. The phases:
 ///
-/// The returned Phase-3 removals (`Vc \ Vt`) are emitted in a deterministic ascending-`MemberId` order
-/// purely for a stable output; safety is order-independent, so the executor reorders that SET health-aware.
+/// - P0 PRUNE obsolete learners (`Lc \ (Vt ∪ Lt)` → `RemoveLearner`): the GC lane. Always safe
+///   (non-voting) and it frees node-cap headroom before any add.
+/// - P1 STAGE future voters (`Vt \ (Vc ∪ Lc)` → `AddLearner`): a new voter is seated as a learner
+///   first, so the promote-time challenge can prove it holds the committed prefix before it votes.
+/// - P2 PARITY CORE — interleave the promotions (`Vt \ Vc`) and demotions (`Vc \ Vt`) so the crash
+///   tolerance `f(n) = n − quorum(n) = ⌊(n−1)/2⌋` never dips below `min(f(|Vc|), f(|Vt|))`. `f` drops
+///   only on a demote from an ODD voter count, so: at EVEN `n` prefer a demote (even→odd is f-neutral);
+///   at ODD `n` prefer a promote (odd→even is f-neutral); when only demotes remain an odd-`n` demote is
+///   the FORCED descent (the operator's `AcceptReducedFaultTolerance` gates it at propose time); when
+///   only promotes remain an even-`n` promote grows `f`. Each `DemoteVoter(x)` whose `x` the target does
+///   NOT keep as a learner is followed IMMEDIATELY by `RemoveLearner(x)` (the race-free GC), so the
+///   advisory plan matches the trajectory the executor installs (which re-plans and prunes the
+///   freshly-demoted obsolete learner in P0).
+/// - P3 ADD the residual target learners last (`Lt \ (Lc ∪ Vc)` → `AddLearner`; a voter the target
+///   keeps as a learner is seated by its P2 demote, not re-added here).
+///
+/// The peak caps are validated by SIMULATION: it BUILDS the ordered `Vec`, folds `apply_delta` along it,
+/// and returns `IntermediatePeakExceedsCap` / `IntermediateNodePeakExceedsCap` iff the running max
+/// exceeds the 64-voter / `u16::MAX`-node cap — so it never hands back a sequence a later `apply_delta`
+/// would reject mid-plan. The set-only prechecks (disjointness, empty, oversize) are pure properties of
+/// `(current, target)`, checked before the sequence is built; a voter→learner demotion is a first-class
+/// goal, no longer rejected.
+///
+/// The demotions and their GC removals are emitted in a deterministic ascending-`MemberId` order purely
+/// for a stable output; safety is order-independent among the departing voters (each demote makes the
+/// same `f` transition), so the executor reorders that SET health-aware.
+///
+/// MEMORYLESS: the greedy parity choice depends only on the CURRENT voter count and the remaining
+/// promote/demote sets, so re-planning from the membership left by executing `plan[0]` reproduces
+/// `plan[1..]` exactly — the property the per-step executor loop relies on.
 pub fn plan_reconfiguration(
   current: &Membership,
   target: &MembershipTarget,
@@ -193,60 +243,73 @@ pub fn plan_reconfiguration(
   let vt = target.voters();
   let lt = target.learners();
 
-  // PREFLIGHT set-only admission (overlap → empty → demotion → oversize → voter-union peak).
+  // PREFLIGHT set-only admission (overlap → empty → oversize). A voter→learner demotion is now a
+  // feature, and the demote-first voter peak (`max(|Vc|, |Vt|) + 1`) can never exceed the cap for a
+  // target within it, so neither the demotion precheck nor the union-peak precheck exists any more.
   if !vt.is_disjoint(lt) {
     return Err(PlanError::VoterLearnerOverlap);
   }
   if vt.is_empty() {
     return Err(PlanError::EmptyVoterSet);
   }
-  // A current voter the target wants as a LEARNER — an online voter→learner DEMOTION.
-  if vc.difference(vt).any(|x| lt.contains(x)) {
-    return Err(PlanError::VoterToLearnerDemotionUnsupported);
-  }
   if vt.len() > MAX_VOTERS {
     return Err(PlanError::TooManyVoters { count: vt.len() });
-  }
-  // The grow-before-shrink voter peak is |Vc ∪ Vt| (all current voters stay through Phase 2 while new
-  // voters are promoted). Check this BEFORE building the plan so the reported peak is the union size,
-  // not the simulation failure point — which matches the expectation a remove-then-grow batch would fix.
-  let voter_union_peak = vc.union(vt).count();
-  if voter_union_peak > MAX_VOTERS {
-    return Err(PlanError::IntermediatePeakExceedsCap {
-      peak: voter_union_peak,
-    });
   }
 
   let mut plan: Vec<SingleVoterDelta> = Vec::new();
 
-  // Phase 0 — PRUNE every obsolete learner first (a current learner kept as NEITHER a learner nor a
+  // P0 — PRUNE every obsolete learner first (a current learner kept as NEITHER a learner nor a
   // to-be-promoted voter). Always safe (non-voting) and it frees node-cap headroom before any add.
   for &x in lc.iter() {
     if !lt.contains(&x) && !vt.contains(&x) {
       plan.push(SingleVoterDelta::RemoveLearner(x));
     }
   }
-  // Phase 1 — stage every new voter as a learner first (skip those already learners).
+  // P1 — stage every future voter as a learner first (skip those already voters or learners).
   for &x in vt.iter() {
     if !vc.contains(&x) && !lc.contains(&x) {
       plan.push(SingleVoterDelta::AddLearner(x));
     }
   }
-  // Phase 2 — promote every new voter (the proto promote-time challenge gates each).
-  for &x in vt.iter() {
-    if !vc.contains(&x) {
-      plan.push(SingleVoterDelta::PromoteLearner(x));
+  // P2 — the PARITY CORE. Interleave promotions and demotions to hold `f` at or above the smaller of
+  // the current and target tolerances. `promotes` (`Vt \ Vc`) and `demotes` (`Vc \ Vt`) are ascending
+  // (BTreeSet difference); each step takes the smallest remaining of the chosen kind, so the sequence
+  // is deterministic and memoryless. `n` tracks the running voter count.
+  let promotes: Vec<MemberId> = vt.difference(&vc).copied().collect();
+  let demotes: Vec<MemberId> = vc.difference(vt).copied().collect();
+  let mut pi = 0usize;
+  let mut di = 0usize;
+  let mut n = vc.len();
+  while pi < promotes.len() || di < demotes.len() {
+    // Both remain → parity chooses the f-neutral move (promote at odd `n`, demote at even `n`). Only
+    // one remains → take it; an odd-`n` demote is then the forced descent, an even-`n` promote grows f.
+    let promote_now = match (pi < promotes.len(), di < demotes.len()) {
+      (true, true) => n % 2 == 1,
+      (true, false) => true,
+      (false, true) => false,
+      (false, false) => unreachable!("the loop condition guarantees at least one remains"),
+    };
+    if promote_now {
+      plan.push(SingleVoterDelta::PromoteLearner(promotes[pi]));
+      pi += 1;
+      n += 1;
+    } else {
+      let x = demotes[di];
+      di += 1;
+      plan.push(SingleVoterDelta::DemoteVoter(x));
+      n -= 1;
+      // GC a departing demotee immediately (the target keeps it as neither a voter nor a learner);
+      // a demotee the target keeps as a learner is left seated. Matches the executor's re-plan, which
+      // prunes the now-obsolete learner in P0.
+      if !lt.contains(&x) {
+        plan.push(SingleVoterDelta::RemoveLearner(x));
+      }
     }
   }
-  // Phase 3 — remove every departing voter (deterministic ascending order; executor reorders).
-  for &x in vc.iter() {
-    if !vt.contains(&x) {
-      plan.push(SingleVoterDelta::RemoveVoter(x));
-    }
-  }
-  // Phase 4 — add the residual target learners (the genuinely-new ones; Phase 0 pruned the obsolete).
+  // P3 — add the residual target learners last (genuinely-new ones; a demotee kept as a learner is
+  // already seated by its P2 demote, and P0 pruned the obsolete current learners).
   for &x in lt.iter() {
-    if !lc.contains(&x) {
+    if !lc.contains(&x) && !vc.contains(&x) {
       plan.push(SingleVoterDelta::AddLearner(x));
     }
   }
@@ -299,32 +362,34 @@ pub fn plan_next_step(
   Ok(plan_reconfiguration(current, target)?.first().cloned())
 }
 
-/// The Phase-3 removal SET for the live config: the departing voters `voters(current) \ target.voters`,
-/// each as a `RemoveVoter`, as an UNORDERED set (a stable ascending order for testing). EMPTY until all of
-/// `target.voters` is present (the grow/promote prefix is not yet done, so no removal is due) and when the
-/// voter set already equals `target.voters`. PURE — the executor orders the result health-aware. Exists so
-/// the executor's health-aware ordering and the pure planner share one definition of "which voters leave".
+/// The DEMOTION SET for the live config: the departing voters `voters(current) \ target.voters`, each as
+/// a `DemoteVoter`, as an UNORDERED set (a stable ascending order for testing). EMPTY when a demotion is
+/// not yet DUE — either the plan's leading step is a stage/promote (the parity core wants a promote
+/// first, so the shrink is not this iteration's move) or the voter set already equals `target.voters`.
+/// PURE — the executor orders the result health-aware. Exists so the executor's health-aware ordering and
+/// the pure planner share one definition of "which voters leave".
 pub fn shrink_candidates(
   current: &Membership,
   target: &MembershipTarget,
 ) -> Result<Vec<SingleVoterDelta>, PlanError> {
   let plan = plan_reconfiguration(current, target)?;
-  // A removal is due only once the grow/promote PREFIX is exhausted: if any AddLearner or PromoteLearner
-  // appears before the first RemoveVoter, the grow phase is still pending for this live config.
-  let first_remove = plan.iter().position(SingleVoterDelta::is_remove_voter);
-  let Some(first_remove) = first_remove else {
-    return Ok(Vec::new()); // no voter removals in this plan at all
+  // A demotion is DUE only when the plan leads with one: if any AddLearner or PromoteLearner appears
+  // before the first DemoteVoter, the parity core scheduled a grow/promote ahead of it, so no demote is
+  // this live config's next move (the executor takes that leading step instead).
+  let first_demote = plan.iter().position(SingleVoterDelta::is_demote_voter);
+  let Some(first_demote) = first_demote else {
+    return Ok(Vec::new()); // no voter demotions in this plan at all
   };
-  let grow_before_remove = plan[..first_remove]
+  let grow_before_demote = plan[..first_demote]
     .iter()
     .any(|d| d.is_add_learner() || d.is_promote_learner());
-  if grow_before_remove {
+  if grow_before_demote {
     return Ok(Vec::new());
   }
   Ok(
     plan
       .into_iter()
-      .filter(SingleVoterDelta::is_remove_voter)
+      .filter(SingleVoterDelta::is_demote_voter)
       .collect(),
   )
 }

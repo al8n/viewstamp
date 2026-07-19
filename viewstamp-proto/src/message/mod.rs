@@ -857,6 +857,129 @@ impl LearnerProof {
   }
 }
 
+/// Primary → a current voter: a FRESH-PROOF LIVENESS SOLICITATION the primary issues while it is
+/// choosing which voter to remove in a reconfiguration shrink. It carries NO quorum/vote authority —
+/// it is a request, never a vote — and asks the voter: "prove you are LIVE for this configuration,
+/// NOW." Unlike [`RequestLearnerProof`] it carries no `at_op`: a shrink gate needs only current
+/// liveness of the successor voters, not a durable-prefix position.
+///
+/// The shrink policy ([`Endpoint::proven_live_voters`](crate::Endpoint)) is LIVENESS-critical, not
+/// safety-critical: removing a voter whose successor quorum is not actually live shrinks the cluster
+/// into an outage. A voter's mere presence in the membership is no evidence it is up, and a static
+/// operator vouch goes stale the instant the voter crashes. So the shrink re-grounds liveness in an
+/// ACTIVE round-trip: the primary issues a challenge bound to `(nonce, epoch, config_id)`, and only a
+/// matching fresh [`HealthProof`] proves the voter answered THIS round. `nonce` is a per-round
+/// freshness token binding the reply; `epoch` + `config_id` are the proposer's active configuration
+/// (the STRICT epoch-policy pair), so a voter answers only for its live config and a cross-epoch reply
+/// never counts. `from` is the primary's own slot (the standard sender binding). A crashed-after-call
+/// voter cannot answer the current nonce; a replay fails the nonce; a pre-swap proof fails the strict
+/// pair; a forged sender fails `sender_is_member`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestHealthProof {
+  from: ReplicaId,
+  nonce: u64,
+  epoch: Epoch,
+  config_id: u128,
+}
+
+impl RequestHealthProof {
+  /// Creates a health-proof challenge. `from` is the soliciting primary's own slot; `nonce` is the
+  /// per-round freshness token; `epoch` + `config_id` are the proposer's active configuration (the
+  /// STRICT epoch-policy pair). Carries no vote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(from: ReplicaId, nonce: u64, epoch: Epoch, config_id: u128) -> Self {
+    Self {
+      from,
+      nonce,
+      epoch,
+      config_id,
+    }
+  }
+
+  /// The soliciting primary's own slot.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn from(&self) -> ReplicaId {
+    self.from
+  }
+
+  /// The per-round freshness token binding the matching [`HealthProof`] reply.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+
+  /// The proposer's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The proposer's configuration lineage id (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
+  }
+}
+
+/// Target voter → the soliciting primary: the FRESH-PROOF LIVENESS REPLY answering a
+/// [`RequestHealthProof`]. It carries NO quorum/vote authority — it is a reply, never a vote — and is a
+/// POINT-IN-TIME observation that the voter was LIVE for this configuration at reply time, nothing more.
+///
+/// A voter mid-crash never answers, so the proof is only ever positive evidence a live voter emitted; but
+/// it is retained for a BOUNDED WINDOW — the probe round's lifetime — so a voter that crashes AFTER
+/// answering stays counted until that round expires or rolls over. Crash-after-reply within the window is
+/// therefore possible, and the shrink policy's residual exposure window is exactly that round lifetime (see
+/// [`RequestHealthProof`]). `nonce` is echoed verbatim from the challenge so the primary binds the reply to
+/// the exact outstanding round; `epoch` + `config_id` are the voter's active configuration (the STRICT
+/// epoch-policy pair), so a cross-epoch reply never counts. `replica` is the voter's own slot (the standard
+/// sender binding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthProof {
+  replica: ReplicaId,
+  nonce: u64,
+  epoch: Epoch,
+  config_id: u128,
+}
+
+impl HealthProof {
+  /// Creates a health-proof reply. `replica` is the answering voter's own slot; `nonce` is echoed
+  /// from the challenge; `epoch` + `config_id` are the voter's active configuration (the STRICT
+  /// epoch-policy pair). Carries no vote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(replica: ReplicaId, nonce: u64, epoch: Epoch, config_id: u128) -> Self {
+    Self {
+      replica,
+      nonce,
+      epoch,
+      config_id,
+    }
+  }
+
+  /// The answering voter's own slot.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn replica(&self) -> ReplicaId {
+    self.replica
+  }
+
+  /// The freshness token echoed from the soliciting [`RequestHealthProof`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn nonce(&self) -> u64 {
+    self.nonce
+  }
+
+  /// The voter's configuration epoch (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn epoch(&self) -> Epoch {
+    self.epoch
+  }
+
+  /// The voter's configuration lineage id (the strict epoch-policy field).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn config_id(&self) -> u128 {
+    self.config_id
+  }
+}
+
 /// The successor membership carried by a consensus-layer `Body::Reconfigure` op: the full member
 /// list plus the voting/learner split (`replica_count` + `learner_count`), PLUS the `config_id` of the
 /// PREDECESSOR configuration the successor chains from. The proposing primary computes the successor
@@ -2434,6 +2557,12 @@ pub enum Message {
   /// A target learner's fresh-proof REPLY (its contiguous applied frontier, recomputed from durable
   /// state at reply time), gating the catch-up-then-promote mint; no quorum authority.
   LearnerProof(LearnerProof),
+  /// A primary's fresh-proof LIVENESS SOLICITATION to a current voter while choosing a reconfiguration
+  /// shrink removal ("prove you are live for this configuration, now"); no quorum authority.
+  RequestHealthProof(RequestHealthProof),
+  /// A voter's fresh-proof LIVENESS REPLY (it answered this round), the SOLE positive evidence the
+  /// shrink policy counts toward a successor quorum's liveness; no quorum authority.
+  HealthProof(HealthProof),
   /// Solicit the block at a content address from a peer that holds the block store.
   RequestBlock(crate::BlockAddress),
   /// Answer a `RequestBlock`: either the block bytes or an absent signal (the donor does not hold
@@ -2471,6 +2600,8 @@ impl Message {
       Self::EpochAhead(_) => "EpochAhead",
       Self::RequestLearnerProof(_) => "RequestLearnerProof",
       Self::LearnerProof(_) => "LearnerProof",
+      Self::RequestHealthProof(_) => "RequestHealthProof",
+      Self::HealthProof(_) => "HealthProof",
       Self::RequestBlock(_) => "RequestBlock",
       Self::BlockResponse(_) => "BlockResponse",
       Self::Nack(_) => "Nack",
@@ -2537,6 +2668,11 @@ impl Message {
       // vote/lead/serve. They claim no participatory view (emittable while a view write is in flight).
       | Self::RequestLearnerProof(_)
       | Self::LearnerProof(_)
+      // The health-proof challenge + reply are CONFIG-scoped liveness probes, not view-scoped: a
+      // no-authority solicitation and a no-vote reply that only gate WHICH voter a shrink removes,
+      // never a view-bearing vote/lead/serve. They claim no participatory view.
+      | Self::RequestHealthProof(_)
+      | Self::HealthProof(_)
       // Block solicitation + reply carry no view authority (content-addressed data plane).
       | Self::RequestBlock(_)
       | Self::BlockResponse(_)
@@ -2618,6 +2754,8 @@ impl Message {
       Self::EpochAhead(_) => fixed_fields_bound(2, 0),
       Self::RequestLearnerProof(_) => fixed_fields_bound(4, 1),
       Self::LearnerProof(_) => fixed_fields_bound(4, 1),
+      Self::RequestHealthProof(_) => fixed_fields_bound(3, 1),
+      Self::HealthProof(_) => fixed_fields_bound(3, 1),
       Self::RequestBlock(_) => fixed_fields_bound(0, 1),
       Self::BlockResponse(m) => fixed_fields_bound(0, 1).saturating_add(
         m.block()

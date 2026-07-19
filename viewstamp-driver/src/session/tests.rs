@@ -454,6 +454,7 @@ fn gate_command_on_retirement_fails_a_queued_reconfigure() {
       BTreeSet::new(),
     ),
     health: crate::reconfigure::HealthHint::default(),
+    ack: None,
     reply,
   };
 

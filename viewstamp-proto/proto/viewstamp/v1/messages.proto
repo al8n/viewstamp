@@ -252,6 +252,27 @@ message LearnerProof {
   bytes config_id = 5;
 }
 
+// Primary to a target voter: a fresh-proof liveness solicitation. It carries no
+// op position (pure liveness), binding the voter's answer to a per-round nonce and
+// the primary's active configuration.
+message RequestHealthProof {
+  // The soliciting primary's own replica id.
+  uint32 from = 1;
+  uint64 nonce = 2;
+  uint64 epoch = 3;
+  bytes config_id = 4;
+}
+
+// Target voter to the soliciting primary: the fresh-proof liveness reply. It echoes
+// the solicited nonce and stamps the voter's active configuration; a crashed voter
+// never answers, so the reply proves current liveness.
+message HealthProof {
+  uint32 replica = 1;
+  uint64 nonce = 2;
+  uint64 epoch = 3;
+  bytes config_id = 4;
+}
+
 // Peer to requester: the negative answer to a RequestPrepare/RequestPrepareRange
 // — the op is not durably held.
 message Nack {
@@ -313,5 +334,7 @@ message Message {
     RequestBlock request_block = 22;
     BlockResponse block_response = 23;
     Nack nack = 24;
+    RequestHealthProof request_health_proof = 25;
+    HealthProof health_proof = 26;
   }
 }

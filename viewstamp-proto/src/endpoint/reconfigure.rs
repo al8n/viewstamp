@@ -13,7 +13,7 @@
 //! only the proposal mint + the single-writer latch.
 
 use super::{normal::NewOpReject, *};
-use crate::{SingleVoterDelta, message::ReconfigurePayload};
+use crate::{AcceptReducedFaultTolerance, SingleVoterDelta, message::ReconfigurePayload};
 
 impl<S> Endpoint<S, SingleChange>
 where
@@ -50,17 +50,17 @@ where
   ///   full E-committed prefix). A regressed / stale / cross-epoch / missing reply keeps the gate
   ///   returning `ProofPending` (fail-closed). The freshness re-grounds the safety input in the
   ///   learner's durable storage at propose time rather than trusting an accumulated self-report.
-  /// - [`ProposeMembershipError::DirectAddVoterUnsupported`] for ANY `AddVoter`: a brand-new voter holds
-  ///   no committed prefix (it was never a member and never committed a prior op), so admitting it
-  ///   directly can break the cross-config quorum intersection and drop a committed op. Every size is
-  ///   rejected uniformly (the single-voter predecessor is only the extreme, where the new voter alone
-  ///   forms the E+1 view-change quorum). The SAFE way to add a voter is `AddLearner`, catch it up, then
-  ///   `PromoteLearner` once it durably holds the head — the catch-up-then-promote path.
+  /// - [`ProposeMembershipError::ReducedFaultToleranceUnacknowledged`] for a delta whose successor
+  ///   tolerates fewer voter crashes than the current configuration (`f(n) = n − quorum(n)` drops — a
+  ///   voter-count decrement from an odd count) proposed with `ack` of `None`. Structural validation
+  ///   runs first, so an invalid delta surfaces `Invalid` regardless of `ack`; a superfluous
+  ///   [`AcceptReducedFaultTolerance`] on a non-reducing delta is accepted and ignored.
   pub fn propose_membership<W>(
     &mut self,
     now: Instant,
     wal: &mut W,
     delta: SingleVoterDelta,
+    ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError>
   where
     W: Wal,
@@ -104,25 +104,33 @@ where
         return Err(ProposeMembershipError::Busy);
       }
     }
-    // NO DIRECT `AddVoter` — reject it unconditionally, at every cluster size, directing the caller to
-    // the learner-first path. A brand-new voter was never a member, so it never appended (let alone
-    // committed) any prior op: its log is empty. An empty-log voter still counts toward the successor's
-    // view-change quorum, so a successor view-change quorum formed WITHOUT the prefix-holding retained
-    // voters can elect a leader that drops a committed op (the old-write-quorum / new-view-change-quorum
-    // intersection fails). The extreme is the single-voter predecessor, whose 2-voter successor has
-    // `quorum_view_change == 1` so the new voter alone forms a view-change quorum and can elect itself
-    // with an empty log. The SAFE way to add a voter at ANY size is `AddLearner` the member, let it
-    // durably catch up to the head, then `PromoteLearner`, so the promote-time challenge (below) proves
-    // it holds the committed prefix before it ever votes. The planner never emits `AddVoter`; it only
-    // ever stages that learner-first path, so this closes the sole remaining direct voter-add.
-    if delta.is_add_voter() {
-      return Err(ProposeMembershipError::DirectAddVoterUnsupported);
-    }
-
     // Validate the delta AND derive the successor in one step: `apply_delta` rejects an invalid delta
-    // (unknown/duplicate member, non-learner promotion, last-voter removal) and returns the successor
-    // configuration whose membership the op replicates.
+    // (unknown/duplicate member, non-learner promotion, last-voter demotion) and returns the successor
+    // configuration whose membership the op replicates. There is no direct-voter-add (or -remove)
+    // screen here because the [`SingleVoterDelta`] vocabulary cannot express one: a voter enters only
+    // via `AddLearner` → catch-up → `PromoteLearner` (the promote-time challenge below), and leaves
+    // only via `DemoteVoter` → `RemoveLearner` (see the enum's closed-vocabulary rationale).
     let successor = self.membership.apply_delta(&delta)?;
+
+    // NEVER REDUCE CRASH TOLERANCE SILENTLY: a voter-count decrement from an ODD voter count drops
+    // `f = n − quorum(n)` — the number of simultaneous voter crashes the cluster survives — by one
+    // (3 → 2 loses the only tolerated crash; 5 → 4 tolerates one instead of two). Such a delta mints
+    // only when the caller NAMES the acceptance by passing the token; every other delta keeps or
+    // grows `f`, and a superfluous token there is ignored (so a driver may thread an operator's
+    // acknowledgement through unconditionally). The comparison runs on the ALREADY-VALIDATED
+    // successor, so a structurally invalid delta surfaces `Invalid` first, and the rejection
+    // precedes both the promote challenge (no proof traffic is solicited for a proposal that cannot
+    // be admitted) and the mint.
+    let f_pred = self.membership.replica_count() - self.membership.quorum() as u8;
+    let f_succ = successor.replica_count() - successor.quorum() as u8;
+    if f_succ < f_pred && ack.is_none() {
+      return Err(
+        ProposeMembershipError::ReducedFaultToleranceUnacknowledged {
+          from: f_pred,
+          to: f_succ,
+        },
+      );
+    }
 
     // CATCH-UP-THEN-PROMOTE (a SAFETY gate, not merely liveness): a `PromoteLearner` is admitted only on
     // a FRESH proof the primary solicits at propose time, NOT on the target's accumulated self-report.

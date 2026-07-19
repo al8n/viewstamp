@@ -327,7 +327,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         PendingSbAction::SwapEpoch(swap) => {
           let (op, successor) = swap.into_parts();
           self.pending_swap = None;
-          self.install_membership(Some(op), successor);
+          self.install_membership(now, Some(op), successor);
           // This node CROSSED into the new epoch via its OWN committed reconfigure op (not a sync) — so any
           // owed cross-epoch crossing intent is met. CLEAR it (it re-establishes from a fresh higher-epoch
           // hint if the cluster is ahead of THIS swap). Without this a node that armed the intent from a
@@ -490,7 +490,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
                 // never waiting for a fresh, possibly-older reply. The obligation GATES serving M / applying
                 // ops over the un-restored SM until the retry succeeds. SKIP the success tail (GC, the
                 // completion event, the Normal/recovery flip): none of it is justified until the SM holds M.
-                if let Err(_e) = self.install_sync(wal, blocks, install) {
+                if let Err(_e) = self.install_sync(now, wal, blocks, install) {
                   self.rearm_sm_reconstruct_retry(now, blocks);
                   return;
                 }

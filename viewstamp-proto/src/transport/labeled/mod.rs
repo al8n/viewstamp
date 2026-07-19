@@ -14,7 +14,11 @@ const HELLO_TAG: u8 = 0x0C;
 /// handshake, before any consensus traffic flows. The version names the whole wire CONTRACT: the
 /// envelope AND the consensus invariants a compliant peer enforces (the voter-admission fence
 /// included), so a peer speaking any other number never gets a connection and a cluster can only
-/// ever be assembled from peers running the same contract. One superseded numbering collides: the
+/// ever be assembled from peers running the same contract. Additive growth WITHIN this envelope era
+/// needs no bump — a `Message.body` oneof variant a newer peer adds is forward-compatible, decoded
+/// cleanly and then DROPPED by a peer that does not recognize it (on both transports, as
+/// [`CodecError::UnknownMessage`](crate::CodecError::UnknownMessage)), so a bump is reserved for a
+/// structural or semantic wire break, never for a new message. One superseded numbering collides: the
 /// original wire era also spoke `1`, so a peer from that era passes this version byte — and is
 /// fenced one layer later, structurally: its hand-rolled frames cannot decode under the protobuf
 /// envelope every current message rides, so no consensus traffic is ever accepted from it. Every

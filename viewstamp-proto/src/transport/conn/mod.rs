@@ -8,7 +8,7 @@ use std::vec::Vec;
 
 use bytes::Bytes;
 
-use crate::{Instant, Message, Peer, decode_message};
+use crate::{CodecError, Instant, Message, Peer, decode_message};
 
 use super::{
   CloseCause, TransportError,
@@ -198,8 +198,9 @@ impl<R: StreamTransport> Conn<R> {
   }
 
   /// Decodes buffered application frames into `(from, Message)` pairs — only while `Validated`, so a
-  /// conn never delivers application frames before its identity is validated or after it closes. An
-  /// undecodable or oversized frame makes the conn terminal.
+  /// conn never delivers application frames before its identity is validated or after it closes. A
+  /// malformed or oversized frame makes the conn terminal; an unrecognized (newer-protocol) message
+  /// is skipped and the conn stays open, exactly as the QUIC transport drops such a frame.
   pub(crate) fn poll_decoded(
     &mut self,
     out: &mut Vec<(Peer, Message)>,
@@ -214,6 +215,16 @@ impl<R: StreamTransport> Conn<R> {
     while let Some(frame) = self.decoder.next_frame() {
       match decode_message(Bytes::from(frame)) {
         Ok(msg) => out.push((from, msg)),
+        // A forward-compatible message from a newer peer (a `Message.body` variant this build does
+        // not know, or a degenerate empty envelope) decodes cleanly but names no known body: drop
+        // this ONE frame and keep draining, exactly as the QUIC transport drops an unknown datagram.
+        // `next_frame` yielded one complete length-delimited frame, so the skip consumes precisely
+        // it — the conn stays `Validated` and every frame behind it still delivers. A newer peer is
+        // not a faulty one, so this must not terminate the connection.
+        Err(CodecError::UnknownMessage) => {}
+        // A genuinely malformed or corrupt frame (truncated, over-cap within decode, a wire-grammar
+        // violation, an unknown-field flood) is a fault, not a newer peer: it makes the conn
+        // terminal, exactly as before.
         Err(e) => {
           let e = TransportError::from(e);
           self.state = State::Closed(CloseCause::from(&e));

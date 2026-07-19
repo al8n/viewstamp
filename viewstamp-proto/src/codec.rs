@@ -28,7 +28,10 @@
 /// Every variant is a *parse* outcome, never a panic: a short buffer, an unknown version,
 /// a length prefix that overruns the remaining bytes, trailing garbage, or a malformed
 /// wire field each map to a distinct variant so a caller (and the fuzz/corruption tests)
-/// can tell *why* a buffer was rejected.
+/// can tell *why* a buffer was rejected. One variant, [`UnknownMessage`](Self::UnknownMessage),
+/// is not a rejection of a *corrupt* buffer at all: it names a [`Message`](crate::Message) envelope
+/// that decoded cleanly and within every bound but carries a body a newer peer added — so a
+/// transport can drop it and keep the connection live, distinct from every fault above.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CodecError {
@@ -81,6 +84,20 @@ pub enum CodecError {
     /// A static label naming the offending field or decode context.
     what: &'static str,
   },
+  /// A [`Message`](crate::Message) envelope decoded cleanly and within every bound, but its `body`
+  /// oneof names no message this build recognizes — a FORWARD-COMPATIBLE unrecognized body from a
+  /// newer peer (an additive `Message.body` variant introduced after this build's schema), NOT a
+  /// corrupt frame. Held distinct from [`Malformed`](Self::Malformed) precisely so a transport can
+  /// DROP the frame and keep the connection live — a newer peer is not a faulty one — exactly as an
+  /// unknown datagram is dropped, rather than tear the connection down. A degenerate zero-field
+  /// envelope carries no body either and maps here too: the decoder retains no witness of a skipped
+  /// unknown field, so "body absent" cannot be narrowed to "body absent AND an unknown field was
+  /// seen"; it carries nothing, no current peer sends it, and dropping it is equally correct. Only
+  /// [`decode_message`](crate::decode_message) produces this, and only after a successful bounded
+  /// parse — a truncation, wire-grammar violation, or unknown-field flood is always
+  /// [`Malformed`](Self::Malformed)/[`Truncated`](Self::Truncated), never this.
+  #[error("forward-compatible unrecognized message body")]
+  UnknownMessage,
 }
 
 impl From<crate::MembershipError> for CodecError {

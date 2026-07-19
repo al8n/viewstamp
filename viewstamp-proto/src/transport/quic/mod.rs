@@ -37,9 +37,9 @@ use std::collections::BTreeSet;
 use bytes::Bytes;
 
 use crate::{
-  BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber, Outgoing, Peer, Recipient,
-  ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine, Superblock, Wal,
-  decode_message, endpoint::ProposeMembershipError,
+  AcceptReducedFaultTolerance, BlockStore, Endpoint, Event, Instant, MemberId, Message, OpNumber,
+  Outgoing, Peer, Recipient, ReplicaId, Request, SingleChange, SingleVoterDelta, StateMachine,
+  Superblock, Wal, decode_message, endpoint::ProposeMembershipError,
 };
 
 /// Derive the SNI server-name a dial presents for `peer` in `cluster`.
@@ -272,14 +272,23 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     delta: SingleVoterDelta,
+    ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError> {
-    self.endpoint.propose_membership(now, wal, delta)
+    self.endpoint.propose_membership(now, wal, delta, ack)
   }
 
-  /// The set of voter [`MemberId`]s that acknowledged an in-flight prepare within the last
-  /// `window` ops, as a liveness hint for the reconfiguration executor.
-  pub fn recently_acked_voters(&self, window: u64) -> BTreeSet<MemberId> {
-    self.endpoint.recently_acked_voters(window)
+  /// Solicit a voter-liveness-probe round — one `RequestHealthProof` per current voter — so the
+  /// reconfiguration shrink executor can gate a removal on fresh per-round liveness. Delegates to
+  /// [`Endpoint::solicit_health_proofs`]; a no-op off a Normal primary.
+  pub fn solicit_health_proofs(&mut self, now: Instant, lifetime: Duration) {
+    self.endpoint.solicit_health_proofs(now, lifetime);
+  }
+
+  /// The set of voter [`MemberId`]s PROVEN LIVE by the outstanding liveness-probe round (fail-closed
+  /// empty when no fresh round exists) — the reconfiguration shrink executor's sole positive liveness
+  /// evidence. Delegates to [`Endpoint::proven_live_voters`].
+  pub fn proven_live_voters(&self, now: Instant) -> BTreeSet<MemberId> {
+    self.endpoint.proven_live_voters(now)
   }
 
   /// The cluster id this coordinator authenticates for, single-sourced from the consensus endpoint's
@@ -688,7 +697,11 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
           }
         } else if self.bridge.is_validated(h) {
           // A validated connection: the frame is a consensus message. A frame that fails to decode
-          // is dropped (the consensus layer retransmits); keep draining the rest of the batch.
+          // is dropped (the consensus layer retransmits); keep draining the rest of the batch. That
+          // single drop now covers BOTH a forward-compatible unrecognized message (a newer peer's
+          // additive body — `CodecError::UnknownMessage`) and a genuinely malformed frame: QUIC has
+          // always been lossy on a validated conn, so unlike the stream transport it needs no
+          // skip-vs-terminate split — both simply fall out of this `if let (Some(from), Ok(msg))`.
           if let (Some(from), Ok(msg)) = (
             self.bridge.bound_peer_of(h),
             decode_message(Bytes::from(payload)),

@@ -1217,6 +1217,19 @@ fn vopr_reconfig_sweep_no_violations() {
 /// rationale as [`HOLD_SEEDS`]).
 const RECONFIG_LIVE_SEEDS: u64 = 16;
 
+/// Live-reconfig-axis regression seed, pinned here with the axis FORCE-ENABLED (a default-axis run of
+/// the same seed consumes different PRNG draws and never reaches this schedule).
+///
+/// - **369** — a fork-shape schedule: draws the `DemoteVoter`↔re-promote OSCILLATION lane on a
+///   3-voter, 1-learner genesis (`voting_count == 3`, odd, so the first demote is f-reducing);
+///   repeatedly flips ONE voter's role while a SEPARATE genesis learner never moves, so the two
+///   members' role trajectories fork for the run's duration — the bystander learner must still track
+///   every successive epoch/config_id hop through ordinary replication alone, never being the delta's
+///   own target. Guards the extended live-reconfig install oracle (every non-crashed, non-retired
+///   member, not just voters): a learner stranded behind a multi-hop successor chain would be
+///   invisible to a voters-only check.
+const RECONFIG_LIVE_REGRESSION_SEEDS: [u64; 1] = [369];
+
 /// LIVE single-change reconfiguration GATE: the [`run_vopr_with_reconfig_live`] axis FORCE-ENABLED over
 /// `0..RECONFIG_LIVE_SEEDS`. Each run proposes ONE live single-voter change (an `AddLearner` of a fresh
 /// sentinel id — always valid, no catch-up gate, no voting-quorum perturbation) on the serving primary,
@@ -1246,20 +1259,21 @@ const RECONFIG_LIVE_SEEDS: u64 = 16;
 #[test]
 fn vopr_reconfig_live_sweep_no_violations() {
   // `VOPR_SEEDS` widens the contiguous count at runtime (the verify gate sets `VOPR_SEEDS=128`), else
-  // the committed default `RECONFIG_LIVE_SEEDS`. The expanded axis seed-CHOOSES the delta (AddLearner /
-  // a low-index RemoveVoter / a slot-shifting PromoteLearner), so a wider range exercises more of the
-  // slot-shift class — each seed still runs the full adversarial schedule + the per-tick safety suite.
+  // the committed default `RECONFIG_LIVE_SEEDS`. The expanded axis seed-CHOOSES the lane (AddLearner /
+  // a slot-shifting PromoteLearner / a DemoteVoter↔re-promote oscillation), so a wider range exercises
+  // more of the slot-shift AND voter-shrink classes — each seed still runs the full adversarial schedule
+  // + the per-tick safety suite.
   let seeds = std::env::var("VOPR_SEEDS")
     .ok()
     .and_then(|s| s.parse::<u64>().ok())
     .unwrap_or(RECONFIG_LIVE_SEEDS);
   println!(
     "VOPR live-reconfig sweep: 0..{seeds} contiguous, {DEFAULT_TICKS} ticks each, live-reconfig axis \
-     forced on (delta seed-chosen: AddLearner / low-index RemoveVoter / slot-shifting PromoteLearner)"
+     forced on (lane seed-chosen: AddLearner / slot-shifting PromoteLearner / DemoteVoter oscillation)"
   );
   let mut total_proposed = 0u64;
   let mut total_swaps = 0u64;
-  for seed in 0..seeds {
+  for seed in (0..seeds).chain(RECONFIG_LIVE_REGRESSION_SEEDS) {
     // Fail FAST on any safety violation: the per-tick swap-correctness suite panics with its
     // `seed S tick T: <class>: ...` message, surfacing the offending seed directly.
     let r = run_vopr_with_reconfig_live(seed, DEFAULT_TICKS);

@@ -288,6 +288,37 @@ struct LearnerProofState {
   proof: Option<OpNumber>,
 }
 
+/// The single outstanding voter-liveness-probe round the primary solicited to gate a reconfiguration
+/// shrink — the FRESH liveness input [`Endpoint::proven_live_voters`] exposes to the driver's shrink
+/// policy instead of a stale operator vouch or an idle-blind ack oracle. One round at a time; while it
+/// is live [`Endpoint::solicit_health_proofs`] RETRANSMITS the same `nonce`, and a re-solicit past its
+/// `expires_at` supersedes it (a fresh `nonce`, `responders` RESET). Both the install-boundary clear
+/// ([`Endpoint::install_membership`]) and the view-transition clear (`reset_for_view_transition`) wipe
+/// it, so no round survives an epoch swap or a generation change into a configuration it was not
+/// solicited under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthProbeState {
+  /// The per-round freshness token (a bump of `self.nonce`) binding the matching [`HealthProof`]
+  /// replies — a replayed old-nonce reply never records, and a fresh round supersedes the old nonce.
+  nonce: u64,
+  /// When this round's FRESH nonce was drawn. Fixed at that draw and carried unchanged through the
+  /// round's retransmits (a retransmit re-sends the request without moving the round's timeline).
+  solicited_at: Instant,
+  /// When this round expires: `solicited_at + lifetime`, fixed when the FRESH nonce is drawn and
+  /// carried unchanged through the round's retransmits. It is the SINGLE bound for both sides of the
+  /// round — [`Endpoint::solicit_health_proofs`] draws a fresh nonce (superseding this round) once
+  /// `now >= expires_at`, and [`Endpoint::proven_live_voters`] fails closed (returns empty) once
+  /// `now > expires_at` — so the retransmit cadence, the evidence window, and the round lifetime are
+  /// one and the same, and a round the driver stopped refreshing cannot keep a crashed voter counted
+  /// past it.
+  expires_at: Instant,
+  /// The CURRENT voters (their stable [`MemberId`]) that answered THIS round with a matching fresh
+  /// [`HealthProof`]. Reset to empty whenever a fresh nonce is drawn, so a voter counts only while it
+  /// keeps answering the round — a crashed-after-answer voter falls out at the round's rollover (within
+  /// the round lifetime). Never accumulates a stale answer.
+  responders: BTreeSet<MemberId>,
+}
+
 /// One in-flight checkpoint serve-read — the value of `sync_serving`, keyed by the REQUESTER `Peer`
 /// (a current member's `Peer::Replica(slot)`, or a QUARANTINED attested member's `Peer::Member(id)`
 /// — an authenticated member the donor's active membership does not resolve, learning the current
@@ -1658,6 +1689,16 @@ pub struct Endpoint<S, R = RestartOnly> {
   /// hashed/serialized/emitted, and inert off the reconfig+learner axis (never set on the no-reconfig
   /// schedule, so the off-axis digest is byte-identical).
   learner_proof: Option<LearnerProofState>,
+  /// The single outstanding voter-liveness-probe round the primary solicited to gate a reconfiguration
+  /// shrink, or `None` when no round is outstanding. Set/refreshed by [`Self::solicit_health_proofs`]
+  /// (draws a `nonce`, emits one `RequestHealthProof` per current voter); `responders` is filled by
+  /// matching [`HealthProof`] replies ([`Self::on_health_proof`]); read by [`Self::proven_live_voters`].
+  /// CLEARED on an epoch swap ([`Self::install_membership`]) AND on a view transition
+  /// (`reset_for_view_transition`) so a round from a prior configuration or generation never gates a
+  /// successor shrink; the `(epoch, config_id)` reply binding is the backstop. Private; never
+  /// hashed/serialized/emitted, and inert off the reconfig axis (only the driver's shrink executor ever
+  /// solicits, so the off-axis digest is byte-identical).
+  health_probe: Option<HealthProbeState>,
   /// The zero-sized reconfiguration capability witness — the [`Reconfig`] type-state the
   /// (later) online-reconfiguration API gates on. `PhantomData<fn() -> R>` rather than
   /// `PhantomData<R>`: it is unconditionally `Send`/`Sync` (and covariant in `R`), so adding the
@@ -1960,6 +2001,7 @@ impl<S, R> Endpoint<S, R> {
       paying_checkpoint_debt: false,
       peer_progress: BTreeMap::new(),
       learner_proof: None,
+      health_probe: None,
       _reconfig: core::marker::PhantomData,
     }
   }
@@ -2186,7 +2228,15 @@ impl<S, R> Endpoint<S, R> {
     self.svc_from = self.rekey_slot_bitset(self.svc_from, successor);
   }
 
-  fn install_membership(&mut self, reconfigure_op: Option<OpNumber>, successor: Membership) {
+  fn install_membership(
+    &mut self,
+    now: Instant,
+    reconfigure_op: Option<OpNumber>,
+    successor: Membership,
+  ) where
+    S: StateMachine,
+    R: Reconfig,
+  {
     // A commit-first swap (`Some` reconfigure op) installs a successor the commit-time fence already
     // admitted (`commit_reconfigure`: every successor voter is a member of the predecessor), and
     // `self.membership` IS still that predecessor here — a staged swap pins it until this install (a
@@ -2215,6 +2265,12 @@ impl<S, R> Endpoint<S, R> {
     // `(epoch, config_id)` binding is the structural backstop (a proof for the predecessor config never
     // matches the successor); this is the explicit clear at the install boundary.
     self.learner_proof = None;
+    // Drop any outstanding voter-liveness-probe round across the epoch swap for the SAME reason: a
+    // round solicited under the OLD configuration must never gate a shrink in the successor. This makes
+    // per-removal freshness STRUCTURAL — every epoch swap wipes `responders`, so the next shrink step
+    // cannot reuse a prior configuration's liveness evidence (the `(epoch, config_id)` reply binding is
+    // the backstop; this is the explicit clear).
+    self.health_probe = None;
     self.prev_epoch = self.membership.epoch();
     let epoch = successor.epoch();
     let config_id = successor.config_id();
@@ -2295,6 +2351,25 @@ impl<S, R> Endpoint<S, R> {
         self.inflight.clear();
         self.set_status(Status::Retired);
       }
+    } else if self.status.is_normal() && was_primary != self.is_primary() {
+      // RETAINED voter whose PRIMARYSHIP the swap REMAPPED without a view change: the successor slot
+      // layout maps this node's (unchanged) view to a DIFFERENT primary slot, so an ex-primary is now a
+      // backup, or a backup is now the primary. The removed-node branch above already handles the case
+      // where the swap dropped this node from the voter set; here the node stays a voter but changes
+      // ROLE, so re-derive the role against the just-installed successor and re-arm the role cadences
+      // through the single timer owner (`arm_timers`). Without this a demoted ex-primary keeps a stale
+      // commit/prepare heartbeat deadline (its `serviceable_now` gate now fails, so it never fires, but
+      // it is also never re-armed) and never arms the backup idle detector, while a promoted new primary
+      // never arms its commit heartbeat — the cluster would wait out an idle timeout for leadership it
+      // already holds. Clear the primary-only forfeit sub-states FIRST: a role flip re-evaluates the
+      // step-down from scratch, and the `forfeit_armed`/`pending_forfeit` ⟹ Normal-primary invariant
+      // must hold at the handler exit (mirroring `retire_primary_cadence` on the removed-node branch).
+      // Gated on Normal: a cross-epoch state-sync install reached while Recovering has no role cadence to
+      // arm — its recovery completion arms the Normal timers. With no role flip this never runs, so the
+      // common retained-voter case is byte-identical.
+      self.pending_forfeit = false;
+      self.timers.forfeit_armed = None;
+      self.arm_timers(now);
     }
     // Emit MembershipChanged only for a commit-first swap (`Some` reconfigure op). A cross-epoch
     // state-sync install (`None`) has no LOCAL Reconfigure op to name — the laggard synced PAST it — so
@@ -3219,49 +3294,34 @@ impl<S, R> Endpoint<S, R> {
     &self.membership
   }
 
-  /// The set of current voters whose slot bit is set in some UNCOMMITTED in-flight prepare's ack
-  /// bitset — a best-effort responsiveness oracle the driver's shrink phase reads as POSITIVE
-  /// liveness evidence.
+  /// The set of CURRENT voters PROVEN LIVE by the outstanding voter-liveness-probe round — the SOLE
+  /// positive liveness evidence the driver's reconfiguration shrink policy counts toward a successor
+  /// quorum.
   ///
-  /// It reads ONLY the truly-fresh, current-round, current-layout acks: an op with
-  /// `commit_min < op <= self.op` (the live in-flight tail) AND `!inflight[op].committed`. Committed
-  /// entries are skipped — a retained committed entry's ack bits are in the predecessor slot layout
-  /// after a membership swap (only UNCOMMITTED entries are rekeyed), so reading them would be stale
-  /// and mislaid. Filtering on `!committed` sidesteps both. Each set bit's slot is resolved to its
-  /// stable [`MemberId`] via [`Membership::member_at`] and kept only if that slot is a current voter.
-  ///
-  /// When the cluster holds NO uncommitted prepare (idle, or every in-flight op already committed)
-  /// the set is EMPTY — no oracle evidence, which the fail-closed shrink rule turns into a safe
-  /// stall, NOT a guess. This is a pure read of existing state: no new wire message, no durable
-  /// field, no safety surface. Like peer progress it is a LIVENESS hint only, never a safety input.
-  ///
-  /// `window` bounds the freshness band to the last `window` ops intersected with the uncommitted
-  /// tail; a `window` at least the pipeline depth (or `u64::MAX`) considers the whole uncommitted
-  /// tail `(commit_min .. self.op]`.
-  pub fn recently_acked_voters(&self, window: u64) -> BTreeSet<MemberId> {
-    let head = self.op.get();
-    let floor = head.saturating_sub(window).max(self.commit_min.get());
-    // When floor >= head there is no uncommitted tail to inspect.
-    if floor >= head {
+  /// FAIL-CLOSED on every axis. Empty unless this node is a Normal PRIMARY (read-side parity with
+  /// [`Self::solicit_health_proofs`]'s write gate — only the primary drives a shrink, and only in
+  /// Normal is its configuration authoritative). Empty when there is no outstanding round, OR once the
+  /// round has expired (`now > expires_at` — a round the driver stopped refreshing is stale and proves
+  /// nothing), so a shrink with no live witness STALLS rather than removing on stale evidence. That
+  /// `expires_at` is the SAME bound [`Self::solicit_health_proofs`] supersedes the round at, so the
+  /// evidence window is exactly the round lifetime — the read can never be paired with a window wider
+  /// than the round it reads. Otherwise the answering voters (`responders`, each a current voter whose
+  /// fresh [`HealthProof`](crate::HealthProof) recorded this round) UNION this node (a Normal primary
+  /// soliciting is itself live). Self is counted ONLY within a live, non-expired round. A pure read: it
+  /// emits nothing and adds no durable/safety surface — like the old ack oracle it is a LIVENESS input
+  /// only, never a safety input.
+  pub fn proven_live_voters(&self, now: Instant) -> BTreeSet<MemberId> {
+    if !self.status.is_normal() || !self.is_primary() {
+      return BTreeSet::new(); // fail-closed: only a Normal primary's own probe evidence counts.
+    }
+    let Some(probe) = self.health_probe.as_ref() else {
+      return BTreeSet::new();
+    };
+    if now > probe.expires_at {
       return BTreeSet::new();
     }
-    let mut out = BTreeSet::new();
-    for (_, inf) in self.inflight.range((floor + 1)..=head) {
-      if inf.committed {
-        continue;
-      }
-      let mut bits = inf.oks;
-      while bits != 0 {
-        let slot = bits.trailing_zeros() as u16;
-        bits &= bits - 1;
-        let id = ReplicaId::new(slot);
-        if self.membership.is_voter(id)
-          && let Some(m) = self.membership.member_at(id)
-        {
-          out.insert(m);
-        }
-      }
-    }
+    let mut out = probe.responders.clone();
+    out.insert(self.local());
     out
   }
 
@@ -4551,6 +4611,11 @@ impl<S, R> Endpoint<S, R> {
       // re-validates the full `(nonce, target, epoch, config_id)` binding before acting.
       Message::RequestLearnerProof(m) => self.sender_is_member(from, m.from()),
       Message::LearnerProof(m) => self.sender_is_member(from, m.replica()),
+      // The voter-liveness-probe challenge + reply bind to the FULL membership (`sender_is_member`),
+      // exactly like the learner-proof pair: the challenge is a no-vote solicitation and the reply a
+      // no-vote liveness answer, each self-identifying by its own slot.
+      Message::RequestHealthProof(m) => self.sender_is_member(from, m.from()),
+      Message::HealthProof(m) => self.sender_is_member(from, m.replica()),
       // Primary-authority broadcasts (no self id): only the primary of the advertised view sends them.
       Message::Commit(m) => from == Peer::Replica(self.membership.primary(m.view())),
       Message::StartView(m) => from == Peer::Replica(self.membership.primary(m.view())),
@@ -4648,7 +4713,7 @@ impl<S, R> Endpoint<S, R> {
   /// A state-sync pull stamps the requester id as the sender's `local_slot()` — for an OLD-epoch laggard,
   /// its OLD slot in its OWN (stale) membership. The transport binds `from` by resolving the peer's STABLE
   /// `MemberId` in the DONOR's ACTIVE membership — the laggard's CURRENT slot. After a legal reconfiguration
-  /// that closes/moves slots (`RemoveVoter`, `PromoteLearner`), the laggard's old claimed slot and `from`'s
+  /// that closes/moves slots (`DemoteVoter`, `RemoveLearner`, `PromoteLearner`), the laggard's old claimed slot and `from`'s
   /// current slot DIFFER, so the strict `from == Peer::Replica(claimed)` binding ([`Self::sender_is_member`])
   /// DROPS the pull before its handler — cross-epoch catch-up strands for any slot-shifting change (the
   /// laggard is triggered by `EpochAhead` but can never PULL the crossing checkpoint: the `RequestSync`
@@ -4729,10 +4794,10 @@ impl<S, R> Endpoint<S, R> {
   ///
   /// A donor stamps its reply with its CURRENT (E+1) slot. The OLD-epoch laggard, mid-crossing, resolves
   /// `from` by the donor's STABLE `MemberId` under the laggard's OWN (E) membership — the donor's OLD
-  /// slot. After a LOW-INDEX `RemoveVoter`/`PromoteLearner` shifted the donor's slot, the donor's CURRENT
+  /// slot. After a LOW-INDEX `DemoteVoter`/`PromoteLearner` shifted the donor's slot, the donor's CURRENT
   /// claimed slot and `from`'s OLD slot DIFFER, so the strict `from == Peer::Replica(claimed)` binding
   /// ([`Self::sender_is_member`]) DROPS the reply at ingress — BEFORE `apply_sync` can verify the carried
-  /// successor membership and install the crossing. A low-index `RemoveVoter(0)` can shift EVERY surviving
+  /// successor membership and install the crossing. A low-index `DemoteVoter(0)` can shift EVERY surviving
   /// donor's slot, stranding every retained old-epoch laggard and potentially wedging the successor quorum.
   ///
   /// # Why relaxing this is safe — a serve reply carries NO forgeable authority
@@ -4872,6 +4937,17 @@ impl<S, R> Endpoint<S, R> {
         m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
       }
       Message::LearnerProof(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      // STRICT: the voter-liveness-probe challenge + reply are CONFIG-SCOPED — they prove/gate a
+      // reconfiguration shrink in MY configuration, so each is admitted only on an exact
+      // `(epoch, config_id)` match. A cross-epoch challenge/reply contributes NOTHING (a voter answers
+      // only for its live config; a pre-swap round never gates a successor shrink) — the
+      // `(epoch, config_id)` binding is the per-round freshness backstop.
+      Message::RequestHealthProof(m) => {
+        m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
+      }
+      Message::HealthProof(m) => {
         m.epoch() == self.membership.epoch() && self.in_lineage(m.config_id())
       }
       // PATH-SENSITIVE `Prepare`: gate the config_id (common to both arms); the normal arm's epoch
@@ -5144,8 +5220,9 @@ where
   }
 
   /// The epoch-mismatch RESPONSE: the egress half of the symmetric pre-`sender_matches` pair. When a
-  /// strictly-LOWER-epoch vote/lead message (`Prepare`/`Commit`/`StartViewChange`/`DoViewChange` — a
-  /// stranded laggard's old-epoch traffic) arrives from an ACTIVE replica member, emit a minimal
+  /// strictly-LOWER-epoch message from a stranded laggard — a voter's vote/lead traffic
+  /// (`Prepare`/`Commit`/`StartViewChange`/`DoViewChange`) or a learner's `LearnerStatus` progress
+  /// report — arrives from an ACTIVE replica member, emit a minimal
   /// `EpochAhead{epoch, checkpoint_op}` hint back to it, so a slot-shifted laggard that cannot bind the
   /// new primary still gets the catch-up trigger from a BINDABLE retained voter (us). We act on NONE of
   /// the stale message's content — it is still dropped at `sender_matches` / `epoch_authority_admits`
@@ -5164,14 +5241,19 @@ where
     if !self.status.is_normal() || self.local_slot_opt().is_none() {
       return;
     }
-    // The trigger set is the lower-epoch shape of a stranded laggard's vote/lead traffic. Read only the
-    // sender's claimed epoch (NOT any view/op/commit content). `LearnerStatus` is excluded: a non-voting
-    // learner is not a stranded VOTER laggard and crosses by its own catch-up, not this pull.
+    // The trigger set is the lower-epoch shape a stranded laggard emits: a VOTER's vote/lead traffic
+    // (`Prepare`/`Commit`/`StartViewChange`/`DoViewChange`) OR a LEARNER's `LearnerStatus` progress
+    // report. A learner one epoch behind has no other crossing lane when no successor-epoch primary
+    // traffic reaches it — its SOLE emission is `LearnerStatus` — so answering that report with the hint
+    // is exactly how it pulls the crossing sync; a voter or a learner lagging an epoch is told
+    // EpochAhead the same way. Read ONLY the sender's claimed epoch (never any view/op/commit/progress
+    // content).
     let msg_epoch = match msg {
       Message::Prepare(m) => m.epoch(),
       Message::Commit(m) => m.epoch(),
       Message::StartViewChange(m) => m.epoch(),
       Message::DoViewChange(m) => m.epoch(),
+      Message::LearnerStatus(m) => m.epoch(),
       _ => return,
     };
     if msg_epoch >= self.membership.epoch() {
@@ -5369,6 +5451,12 @@ where
       // The target learner's fresh-proof reply: validate against the outstanding challenge and record
       // the proven frontier (the catch-up-then-promote gate's fresh safety input; no accumulation).
       Message::LearnerProof(m) => self.on_learner_proof(from, m),
+      // The voter-liveness-probe challenge: reply that this node is LIVE for this configuration NOW
+      // (touches no quorum/vote state). A crashed node never answers.
+      Message::RequestHealthProof(m) => self.on_request_health_proof(m),
+      // A voter's fresh liveness reply: validate against the outstanding round and record the voter as
+      // proven-live (the shrink policy's fresh liveness input; no accumulation).
+      Message::HealthProof(m) => self.on_health_proof(from, m),
       Message::Reply(_) => {}
       // `EpochAhead` is a pure pre-binding catch-up SIGNAL — fully consumed above by
       // `maybe_request_cross_epoch_catchup` (it never reaches here: `sender_matches` drops it). Acting on
@@ -5475,6 +5563,127 @@ where
       return; // foreign-config reply (the freshness backstop) — never validates a mint here.
     }
     challenge.proof = Some(m.frontier());
+  }
+
+  /// Solicit a voter-liveness-probe round: emit one
+  /// [`RequestHealthProof`](crate::RequestHealthProof) to every CURRENT voter except this node, so the
+  /// driver's reconfiguration shrink policy can gate a removal on ACTIVE per-round liveness evidence
+  /// ([`Self::proven_live_voters`]) instead of a stale operator vouch or an idle-blind ack read. No-op
+  /// unless this node is a Normal PRIMARY (fail-closed: only the primary drives a shrink, and only in
+  /// Normal is its configuration authoritative), so the probe adds NO traffic off the reconfiguration
+  /// path.
+  ///
+  /// `lifetime` is the round's full duration, fixed when its FRESH nonce is drawn: while the round is
+  /// still live (before its `expires_at = solicited_at + lifetime`) this RETRANSMITS the same `nonce`
+  /// (a lost request is re-sent without discarding the answers already collected); once the round has
+  /// expired a FRESH `nonce` is drawn and `responders` RESET, so a voter counts only while it keeps
+  /// answering the current round. That same `expires_at` bounds [`Self::proven_live_voters`], so the
+  /// retransmit cadence and the evidence window are one round lifetime and cannot be paired with
+  /// mismatched knobs. The reply's `(epoch, config_id)` binding plus the per-round `nonce` are the
+  /// freshness backstops; a crashed-after-call voter cannot answer the current nonce. Carries no quorum
+  /// authority.
+  pub fn solicit_health_proofs(&mut self, now: Instant, lifetime: core::time::Duration) {
+    if !self.status.is_normal() || !self.is_primary() {
+      return; // fail-closed: only a Normal primary probes.
+    }
+    // RETRANSMIT the same nonce of an IN-FLIGHT round (keeping the answers already collected) while it
+    // is still live (`now < expires_at`); otherwise draw a FRESH nonce, reset the responders, and open
+    // a new round lasting `lifetime`.
+    let reuse = self
+      .health_probe
+      .as_ref()
+      .is_some_and(|p| now < p.expires_at);
+    let nonce = if reuse {
+      self
+        .health_probe
+        .as_ref()
+        .expect("reuse implies an outstanding round")
+        .nonce
+    } else {
+      self.nonce = self.nonce.wrapping_add(1);
+      self.health_probe = Some(HealthProbeState {
+        nonce: self.nonce,
+        solicited_at: now,
+        expires_at: now + lifetime,
+        responders: BTreeSet::new(),
+      });
+      self.nonce
+    };
+    let from = self.local_slot();
+    let epoch = self.membership.epoch();
+    let config_id = self.membership.config_id();
+    let voter_count = self.membership.replica_count();
+    for slot in 0..voter_count {
+      let slot = ReplicaId::new(slot as u16);
+      if slot == from {
+        continue; // never probe self.
+      }
+      self.emit(Outgoing::new(
+        Recipient::To(Peer::Replica(slot)),
+        Message::RequestHealthProof(crate::RequestHealthProof::new(
+          from, nonce, epoch, config_id,
+        )),
+      ));
+    }
+  }
+
+  /// Answers a primary's [`RequestHealthProof`](crate::RequestHealthProof) challenge with a fresh
+  /// [`HealthProof`](crate::HealthProof): this node is LIVE for this configuration, NOW.
+  ///
+  /// `sender_matches` already bound the challenge to a CURRENT member (the primary) at the claimed
+  /// slot. Here we additionally require the challenge's `(epoch, config_id)` to match THIS node's live
+  /// configuration — a cross-epoch challenge is DROPPED (the node answers only for its live config), so
+  /// a stale-config proof can never count toward a later round. The reply echoes the challenge `nonce`
+  /// (the freshness binding) and self-identifies by `local_slot()`. That this node answers AT ALL is
+  /// the load-bearing property: a crashed node never replies, so a missing answer is honest evidence of
+  /// its absence.
+  fn on_request_health_proof(&mut self, m: crate::RequestHealthProof) {
+    // Cross-epoch challenge: answer only for the live configuration (the `epoch_authority_admits`
+    // STRICT gate already enforces this on ingress; re-checked here so the reply is correct-by-
+    // construction against the live config it stamps).
+    if m.epoch() != self.membership.epoch() || m.config_id() != self.membership.config_id() {
+      return;
+    }
+    self.emit(Outgoing::new(
+      Recipient::To(Peer::Replica(m.from())),
+      Message::HealthProof(crate::HealthProof::new(
+        self.local_slot(),
+        m.nonce(),
+        self.membership.epoch(),
+        self.membership.config_id(),
+      )),
+    ));
+  }
+
+  /// Records a voter's fresh [`HealthProof`](crate::HealthProof) against the outstanding
+  /// voter-liveness-probe round ([`Self::health_probe`]) — the shrink policy's FRESH liveness input.
+  /// Validated against the outstanding round: it must be `Some`, the `nonce` must match, the reply's
+  /// `(epoch, config_id)` must match this primary's current configuration, and the authenticated `from`
+  /// must resolve to a CURRENT VOTER's stable [`MemberId`]. On a match that member is inserted into
+  /// `responders`; a stale-nonce / foreign-config / non-voter reply is DROPPED (no accumulation — a
+  /// voter counts only while it keeps answering the current round).
+  fn on_health_proof(&mut self, from: Peer, m: crate::HealthProof) {
+    let Some(probe) = self.health_probe.as_mut() else {
+      return; // no outstanding round — an unsolicited / late reply.
+    };
+    if m.nonce() != probe.nonce {
+      return; // a stale-nonce reply (a replayed / superseded round's answer).
+    }
+    if m.epoch() != self.membership.epoch() || m.config_id() != self.membership.config_id() {
+      return; // foreign-config reply (the freshness backstop).
+    }
+    // The authenticated sender must resolve to a CURRENT voter. `sender_matches` bound `from` to
+    // `m.replica()` already; resolve that slot to the stable MemberId and require it to be a voter, so
+    // a learner's / non-member's reply never counts toward a successor voter quorum's liveness.
+    let Some(slot) = from.as_replica() else {
+      return; // not a slot-addressed sender.
+    };
+    if !self.membership.is_voter(slot) {
+      return; // a non-voter (learner) reply — never positive shrink-quorum evidence.
+    }
+    if let Some(member) = self.membership.member_at(slot) {
+      probe.responders.insert(member);
+    }
   }
 
   /// Emits this learner's [`LearnerStatus`](crate::LearnerStatus) progress report when its cadence is

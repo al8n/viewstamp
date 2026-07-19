@@ -2,6 +2,17 @@
 //! planner (`plan_next_step` / `shrink_candidates`) one Tier B `propose_membership` at a time, re-planning
 //! from the live membership each step, with a health-aware fail-closed shrink ordering. Adds ZERO proto
 //! consensus surface.
+//!
+//! ## A departing node cannot drive its own exit
+//!
+//! When a full removal (`DemoteVoter(x)` then `RemoveLearner(x)`) targets THIS node, the demote step
+//! commits normally, but the node is no longer a voter — and, having just demoted itself, no longer the
+//! primary either — so it cannot drive the remaining `RemoveLearner(self)` to commit. Rather than spin
+//! against a plan it structurally cannot finish, [`run_reconfigure`] surfaces the distinguished terminal
+//! [`ReconfigureError::DemotedSelf`], carrying the RESUMABLE partial progress reached so far. The
+//! operator's contract: resume the SAME `reconfigure_to(target, ..)` call against a SURVIVING voter (the
+//! new primary), which completes the GC from where the departing node left off. The departing node itself
+//! keeps running as a live learner meanwhile — it is not retired, only unable to finish removing itself.
 
 use std::{
   collections::BTreeSet,
@@ -13,35 +24,41 @@ use std::{
 };
 
 use viewstamp_proto::{
-  Epoch, Instant, MemberId, Membership, MembershipTarget, OpNumber, PlanError,
-  ProposeMembershipError, SingleVoterDelta,
+  AcceptReducedFaultTolerance, Epoch, Instant, MemberId, Membership, MembershipTarget, OpNumber,
+  PlanError, ProposeMembershipError, SingleVoterDelta,
 };
 
-/// An OPTIONAL operator-supplied liveness hint for the shrink phase, split into a NEGATIVE set and a
-/// POSITIVE set that play DISTINCT roles. The AUTHORITATIVE health source (the automatic responsiveness
-/// oracle cannot prove survival and is blind on an idle cluster). Both fields are LIVENESS hints ONLY,
-/// NEVER a safety input: a wrong entry can only stall or re-order a (still-individually-safe) removal.
+/// `f(n) = n − quorum(n) = ⌊(n−1)/2⌋` — the number of simultaneous voter crashes a configuration of
+/// `n` voters survives. The goal-level preflight compares the target's `f` against the live config's to
+/// decide whether a reconfiguration REDUCES crash tolerance (and so needs the operator's acknowledgement).
+fn f_of(n: usize) -> usize {
+  n.saturating_sub(1) / 2
+}
+
+/// An OPTIONAL operator-supplied liveness hint for the shrink phase: a NEGATIVE veto set only. It is
+/// NOT the positive liveness source — that is the active voter-liveness probe
+/// ([`ReconfigureBackend::proven_live_voters`]), the SOLE evidence a successor voter is alive. A
+/// `known_down` entry is a LIVENESS hint only, NEVER a safety input: it can only stall or re-order a
+/// (still-individually-safe) removal.
 ///
-/// - `known_down` is NEGATIVE-only: a voter listed here is treated as down — disqualified from any
-///   successor quorum, prioritized for removal first. ABSENCE from `known_down` is NOT evidence of life.
-/// - `known_up` is POSITIVE-only: a voter listed here is operator-CONFIRMED alive and counts toward a
-///   successor quorum's positive evidence.
+/// `known_down` is NEGATIVE-only: a voter listed here is treated as down — disqualified from any
+/// successor quorum, and prioritized for removal first. ABSENCE from `known_down` is NOT evidence of
+/// life (that is precisely the class the deleted positive `known_up` vouch reintroduced: an operator
+/// vouch a voter's later crash cannot retract). Positive liveness comes ONLY from a fresh probe answer.
 ///
-/// `Default` (both empty) means "no operator hint — rely on the automatic oracle", which on an idle
-/// cluster makes the shrink STALL fail-closed rather than guess.
+/// `Default` (empty) means "no operator veto — rely on the probe alone", which on a cluster whose
+/// successor quorum is not proven live makes the shrink STALL fail-closed rather than guess.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthHint {
   known_down: BTreeSet<MemberId>,
-  known_up: BTreeSet<MemberId>,
 }
 
 impl HealthHint {
-  /// No operator hint (both sets empty) — rely on the automatic oracle alone.
+  /// No operator veto (empty) — rely on the active liveness probe alone.
   #[must_use]
   pub const fn new() -> Self {
     Self {
       known_down: BTreeSet::new(),
-      known_up: BTreeSet::new(),
     }
   }
 
@@ -53,24 +70,10 @@ impl HealthHint {
     self
   }
 
-  /// POSITIVE: voters the operator CONFIRMS are alive (counted toward a successor quorum's positive
-  /// evidence).
-  #[must_use]
-  pub fn with_known_up(mut self, members: BTreeSet<MemberId>) -> Self {
-    self.known_up = members;
-    self
-  }
-
   /// The operator-declared down set.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn known_down(&self) -> &BTreeSet<MemberId> {
     &self.known_down
-  }
-
-  /// The operator-confirmed alive set.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn known_up(&self) -> &BTreeSet<MemberId> {
-    &self.known_up
   }
 }
 
@@ -81,8 +84,9 @@ impl Default for HealthHint {
 }
 
 /// What the plan reached when a bounded-loop outcome fired. The cluster is NOT necessarily back at
-/// `current`: the grow/promote steps commit before the shrink branch, so a stall on a `RemoveVoter` leaves
-/// the intermediate config those steps produced. `live` is the membership the loop last observed.
+/// `current`: the grow/promote steps commit before the shrink branch, so a stall on a `DemoteVoter`
+/// (or its `RemoveLearner` GC step) leaves the intermediate config those steps produced. `live` is
+/// the membership the loop last observed.
 ///
 /// INVARIANT: exactly one of `(remaining, reason)` is populated — `remaining: Some(NON-empty valid plan)`
 /// with `reason: None` (the plan toward the target is STILL VALID from `live`), OR `remaining: None` with
@@ -167,6 +171,51 @@ pub enum ReconfigureError {
   /// a learner that never caught up). RESUMABLE PARTIAL PROGRESS — re-issue `reconfigure_to(same target)`.
   #[error("the reconfiguration timed out before converging (resumable)")]
   Timeout(ReconfigureProgress),
+  /// A fail-closed SHRINK stall specifically: every candidate removal's successor quorum lacked a fresh
+  /// liveness proof, so no removal could be safely proposed and the cap elapsed. Distinct from
+  /// [`Self::Timeout`] (a stuck proposal / failed re-plan) so an operator can tell a MISSING-WITNESS stall
+  /// from a generic timeout. `unproven` names the successor voters of the most-preferred candidate that
+  /// lacked a fresh proof — the voters whose liveness must be restored (or which must be added to
+  /// `HealthHint::known_down` to authorize their removal) for the shrink to make progress. RESUMABLE
+  /// PARTIAL PROGRESS — re-issue `reconfigure_to(same target)` once the successor quorum is live again
+  /// (the probe re-gathers fresh evidence).
+  #[error(
+    "the reconfiguration shrink stalled: successor voters {unproven:?} are not proven live (resumable)"
+  )]
+  InsufficientLiveness {
+    /// The resumable partial progress reached (the still-valid remaining plan from the live membership).
+    progress: ReconfigureProgress,
+    /// The successor voters of the most-preferred candidate removal that lacked a fresh liveness proof.
+    unproven: BTreeSet<MemberId>,
+  },
+  /// The GOAL reduces the cluster's crash tolerance — `f(target voters) < f(live voters)`, where
+  /// `f(n) = n − quorum(n)` — and the operator did not pass an [`AcceptReducedFaultTolerance`]. Rejected
+  /// at PREFLIGHT, before any step commits, so the cluster is provably at `current` (NOT retried without
+  /// the acknowledgement). Mirrors the proto per-delta propose gate, surfaced up front at the goal level
+  /// so the operator NAMES the acceptance rather than discovering the reduction mid-plan. A distinct
+  /// variant (not [`Self::InvalidTarget`]): the target is well-formed, only its tolerance cost is unnamed.
+  #[error(
+    "the reconfiguration would reduce crash tolerance (voters {from_voters} → {to_voters}); pass AcceptReducedFaultTolerance to proceed"
+  )]
+  ReducedFaultToleranceUnacknowledged {
+    /// The current voting-replica count.
+    from_voters: u8,
+    /// The target voting-replica count.
+    to_voters: u8,
+  },
+  /// This node DEMOTED ITSELF out of the voting set and the plan now leads with its own learner-GC
+  /// (`RemoveLearner(self)`), which a demoted node — no longer the primary — cannot drive to commit. The
+  /// demote itself committed; only the final self-removal is left, and it must be RESUMED from a
+  /// surviving voter (re-issue `reconfigure_to(same target)` against the new primary). RESUMABLE PARTIAL
+  /// PROGRESS. Distinct from [`Self::Retired`] (a full self-removal already installed) and [`Self::Timeout`]
+  /// (a generic stall): here the node continues as a live learner, it simply cannot finish the plan.
+  #[error(
+    "this node demoted itself; resume the final self-removal from a surviving voter (resumable)"
+  )]
+  DemotedSelf {
+    /// The resumable partial progress reached (the remaining self-GC from the live membership).
+    progress: ReconfigureProgress,
+  },
   /// This driver is no longer the primary; redirect to the new primary (a driver-ergonomics policy).
   #[error("this replica is no longer the primary")]
   NotPrimary,
@@ -198,8 +247,15 @@ pub enum ReconfigureError {
 pub trait ReconfigureBackend {
   /// The live active membership (re-read every iteration).
   fn live_membership(&self) -> Membership;
-  /// The proto responsiveness oracle (the uncommitted-tail recent-ack voter set).
-  fn recently_acked_voters(&self, window: u64) -> BTreeSet<MemberId>;
+  /// The set of successor voters PROVEN LIVE by the active voter-liveness probe — the SOLE positive
+  /// liveness evidence for the shrink phase. Empty (fail-closed) when no fresh probe round exists.
+  fn proven_live_voters(&self) -> BTreeSet<MemberId>;
+  /// Record (`Some`) or clear (`None`) the most-recent fail-closed shrink stall's unproven-voter
+  /// diagnostic, so the driver's advance-level hard-cancel (which fires while the executor future is
+  /// parked and cannot reach its own top-of-loop cap) can surface [`ReconfigureError::InsufficientLiveness`]
+  /// rather than a bare [`ReconfigureError::Timeout`]. Set at the shrink stall, cleared on a successful
+  /// proposal.
+  fn note_shrink_stall(&self, unproven: Option<BTreeSet<MemberId>>);
   /// Propose ONE delta and await its commit + epoch-swap install. `Ok(())` once installed; the retryable
   /// proto verdicts are handled by the implementer as backoff and surfaced as a transient retry; a
   /// non-retryable verdict is the `Err`.
@@ -212,52 +268,68 @@ pub trait ReconfigureBackend {
   async fn backoff(&self);
 }
 
-/// Among `candidates` (each a `RemoveVoter(X)` of a departing voter), return one whose successor config
-/// `voters(live) \ {X}` holds `>= quorum` voters with POSITIVE evidence of life — a voter counts ALIVE iff
-/// it is NOT in `known_down` AND it has a POSITIVE witness (in `known_up` OR in the `responsive` recent-ack
-/// set). NEGATIVE-only `known_down` can never CONFIRM the quorum (absence is not a positive witness). Prefer
-/// removing an `X` that is apparently down (in `known_down`, or absent from both `known_up` and
-/// `responsive`). Self (`local_member`) is ranked LAST unconditionally — not merely as a tie-break within
-/// the same liveness bucket — because a local node without positive evidence would otherwise sort before
-/// peers that ARE known_up, retiring the driver while peers still need removing.
-/// `None` (→ STALL fail-closed) when NO candidate's successor has a positively-confirmed quorum — never a
-/// removal on a guess.
-fn pick_fresh_quorum_preserving_removal(
+/// Among `candidates` (each a `DemoteVoter(X)` of a departing voter), return one whose successor config
+/// `voters(live) \ {X}` holds `>= quorum` voters PROVEN LIVE — a voter counts ALIVE iff it is NOT in
+/// `known_down` AND it is in `fresh` (the set the active voter-liveness probe proved answered THIS
+/// round). `fresh` is the SOLE positive source: there is no operator "known up" vouch, because such a
+/// vouch cannot be retracted by the voter's later crash (the very defect this probe replaces). The
+/// NEGATIVE-only `known_down` can never CONFIRM the quorum (absence is not a positive witness). Prefer
+/// demoting an `X` that is apparently down (in `known_down`, or absent from `fresh`). Self
+/// (`local_member`) is ranked LAST unconditionally — not merely as a tie-break within the same liveness
+/// bucket — because a local node without a fresh proof would otherwise sort before proven-live peers,
+/// demoting the driver out of the voting set while peers still need demoting.
+///
+/// The math is identical to a removal's: a demote drops `X` from the voting set exactly as a removal did,
+/// so the successor voting quorum `voters(live) \ {X}` is the same set either way. `Ok(demotion)` for a
+/// positively-confirmed demote; `Err(unproven)` (→ STALL fail-closed) when NO candidate's successor has a
+/// proven-live quorum — never a demote on a guess. `unproven` names the successor voters of the
+/// MOST-PREFERRED candidate that lack a fresh proof (the deterministic diagnostic the operator acts on).
+/// `candidates` MUST be non-empty (the caller guarantees it).
+fn pick_fresh_quorum_preserving_demotion(
   live: &Membership,
   candidates: &[SingleVoterDelta],
   health: &HealthHint,
-  responsive: &BTreeSet<MemberId>,
+  fresh: &BTreeSet<MemberId>,
   local_member: MemberId,
-) -> Option<SingleVoterDelta> {
+) -> Result<SingleVoterDelta, BTreeSet<MemberId>> {
   let live_voters: BTreeSet<MemberId> = {
     let n = live.replica_count() as usize;
     live.members_slice()[..n].iter().copied().collect()
   };
-  let is_alive = |m: &MemberId| -> bool {
-    !health.known_down().contains(m) && (health.known_up().contains(m) || responsive.contains(m))
-  };
-  // Rank: self LAST (primary sort key — retiring the local driver mid-plan ends the plan),
-  // then apparently-DOWN before live (remove unresponsive peers before live ones), then
-  // ascending id for determinism.  The self-last key is unconditional: it must not be
-  // subordinate to liveness, because otherwise a local node that has no positive evidence
-  // (apparently_down) sorts BEFORE peers that ARE known_up and would be retired first.
+  // ALIVE iff not operator-vetoed down AND proven live by a fresh probe answer this round. Absence
+  // from `fresh` is never positive evidence — a crashed voter simply stops answering and falls out.
+  let is_alive = |m: &MemberId| -> bool { !health.known_down().contains(m) && fresh.contains(m) };
+  // Rank: self LAST (primary sort key — demoting the local driver out of the voting set mid-plan
+  // strands the plan), then apparently-DOWN before live (demote unresponsive peers before live ones),
+  // then ascending id for determinism.  The self-last key is unconditional: it must not be
+  // subordinate to liveness, because otherwise a local node that has no fresh proof
+  // (apparently_down) sorts BEFORE proven-live peers and would be demoted first.
   let mut ordered: Vec<&SingleVoterDelta> = candidates.iter().collect();
   ordered.sort_by_key(|d| {
     let m = d.member();
     let apparently_down = health.known_down().contains(&m) || !is_alive(&m);
     (m == local_member, !apparently_down, m.get())
   });
-  for cand in ordered {
+  for cand in &ordered {
     let x = cand.member();
     let successor: BTreeSet<MemberId> = live_voters.iter().copied().filter(|m| *m != x).collect();
     // quorum of the SUCCESSOR config (floor(n/2)+1).
     let quorum = successor.len() / 2 + 1;
     let confirmed = successor.iter().filter(|m| is_alive(m)).count();
     if confirmed >= quorum {
-      return Some(cand.clone());
+      return Ok((**cand).clone());
     }
   }
-  None
+  // STALL fail-closed: report the successor voters of the MOST-PREFERRED candidate (the demotion the
+  // loop would try first) that lack a fresh proof, so the operator learns exactly which voters must be
+  // restored (or vetoed via `known_down`) for the shrink to proceed.
+  let preferred = ordered[0].member();
+  let unproven: BTreeSet<MemberId> = live_voters
+    .iter()
+    .copied()
+    .filter(|m| *m != preferred && !is_alive(m))
+    .collect();
+  Err(unproven)
 }
 
 /// Execute the goal as a per-step RE-PLANNING loop. After every installed step it re-derives the next delta
@@ -265,18 +337,45 @@ fn pick_fresh_quorum_preserving_removal(
 /// proto's retryable verdicts internally (via the backend) and bounds the loop with the attempt/deadline
 /// cap, surfacing `PlanConflict`/`Timeout` carrying the live intermediate rather than looping forever.
 ///
+/// `ack` is the operator's [`AcceptReducedFaultTolerance`] (or `None`). It gates the GOAL-LEVEL preflight
+/// only: a target that reduces crash tolerance without it is refused up front, before any step commits.
+/// The per-step attach of the token to a forced (odd-`n`) demote is the DRIVER's job at propose time
+/// ([`ReconfigureJob::advance`]), not this pure loop's.
+///
 /// PRECONDITIONS: SOLE-DRIVER + every target member ABSENT from `live` MUST be a FRESH, reachable node.
 /// The `members_seen` rule (passive observation) refuses to re-add an OBSERVED-then-removed member.
 pub async fn run_reconfigure<B: ReconfigureBackend>(
   backend: B,
   target: MembershipTarget,
   health: HealthHint,
-  ack_window: u64,
   local_member: MemberId,
+  ack: Option<AcceptReducedFaultTolerance>,
 ) -> Result<(), ReconfigureError> {
   use viewstamp_proto::{plan_reconfiguration, shrink_candidates};
 
+  // H2 GOAL-LEVEL PREFLIGHT: refuse a goal that REDUCES crash tolerance — `f(target voters) < f(live
+  // voters)`, `f(n) = n − quorum(n)` — unless the operator NAMED the acceptance. Runs BEFORE any step, so
+  // nothing commits and the cluster stays at `current`; it mirrors the proto per-delta propose gate,
+  // surfaced up front at the goal level so a reduction is never discovered mid-plan. A structurally
+  // invalid voter target (empty / oversize) is NOT a tolerance question — the loop surfaces its specific
+  // plan error — so the comparison is scoped to a well-formed voter count.
+  {
+    let from = backend.live_membership().replica_count() as usize;
+    let to = target.voters().len();
+    if (1..=64).contains(&to) && f_of(to) < f_of(from) && ack.is_none() {
+      return Err(ReconfigureError::ReducedFaultToleranceUnacknowledged {
+        from_voters: from as u8,
+        to_voters: to as u8,
+      });
+    }
+  }
+
   let target_members = target.members();
+  // The most-recent fail-closed shrink stall's unproven-voter diagnostic (set at the shrink None
+  // branch, cleared on a successful proposal). When the cap fires with a still-valid plan and a stall
+  // recorded, the loop surfaces `InsufficientLiveness` (a missing-witness stall) rather than a bare
+  // `Timeout` (a stuck proposal).
+  let mut last_stall: Option<BTreeSet<MemberId>> = None;
   // Seed members_seen with target members already present at the start.
   let mut members_seen: BTreeSet<MemberId> = {
     let live = backend.live_membership();
@@ -328,12 +427,34 @@ pub async fn run_reconfigure<B: ReconfigureBackend>(
       return Ok(());
     }
 
+    // SELF-DEMOTED HANDOFF: once this node has committed a step and demoted ITSELF out of the voting
+    // set, the plan leads with its own learner-GC (`RemoveLearner(self)` — P0 prunes the freshly-demoted
+    // obsolete learner). A demoted node is no longer the primary, so it cannot drive that removal of
+    // itself; surface the distinguished terminal `DemotedSelf` so the operator RESUMES from a surviving
+    // voter, rather than spinning to a bare `Timeout` or a bare `NotPrimary`. The node continues to run
+    // as a live learner meanwhile.
+    if committed_any
+      && let Ok(ref p) = plan
+      && p.first() == Some(&SingleVoterDelta::RemoveLearner(local_member))
+    {
+      return Err(ReconfigureError::DemotedSelf {
+        progress: ReconfigureProgress::stall(live, p.clone()),
+      });
+    }
+
     // Cap fires only after completion is ruled out.
     if backend.cap_exhausted() {
       return match plan {
-        Ok(p) => Err(ReconfigureError::Timeout(ReconfigureProgress::stall(
-          live, p,
-        ))),
+        // A still-valid plan with a recorded shrink stall is a MISSING-WITNESS stall specifically:
+        // surface `InsufficientLiveness` carrying the unproven voters. Without a recorded stall it is a
+        // generic (stuck-proposal) `Timeout`. `p` is non-empty here (completion was ruled out above).
+        Ok(p) => {
+          let progress = ReconfigureProgress::stall(live, p);
+          match last_stall {
+            Some(unproven) => Err(ReconfigureError::InsufficientLiveness { progress, unproven }),
+            None => Err(ReconfigureError::Timeout(progress)),
+          }
+        }
         Err(e) if !committed_any => Err(ReconfigureError::InvalidTarget(e)),
         Err(e) => Err(ReconfigureError::PlanConflict(ReconfigureProgress::failed(
           live, e,
@@ -354,17 +475,9 @@ pub async fn run_reconfigure<B: ReconfigureBackend>(
 
     match next {
       None => return Ok(()),
-      Some(step) if !step.is_remove_voter() => {
-        // Phases 0/1/2/4: follow plan order verbatim.
-        backend.propose_and_await_install(step.clone()).await?;
-        committed_any = true;
-        // Track newly-staged or promoted target members in members_seen.
-        if step.is_add_learner() || step.is_promote_learner() {
-          members_seen.insert(step.member());
-        }
-      }
-      Some(_) => {
-        // Phase 3 (shrink): choose the removal HEALTH-AWARE rather than the plan's first removal.
+      Some(step) if step.is_demote_voter() => {
+        // SHRINK (demote): choose the demotion HEALTH-AWARE rather than the plan's first demote, so the
+        // most-preferred (apparently-down / non-self) departing voter leaves first.
         let candidates = match shrink_candidates(&live, &target) {
           Ok(c) => c,
           Err(e) if !committed_any => return Err(ReconfigureError::InvalidTarget(e)),
@@ -375,24 +488,77 @@ pub async fn run_reconfigure<B: ReconfigureBackend>(
           }
         };
         if candidates.is_empty() {
-          // No removals due yet (grow phase still pending after re-plan diverged — safety net).
+          // No demotion due yet (parity re-plan diverged to a promote-first prefix — safety net).
           backend.backoff().await;
           continue;
         }
-        let acked = backend.recently_acked_voters(ack_window);
-        match pick_fresh_quorum_preserving_removal(
+        let fresh = backend.proven_live_voters();
+        match pick_fresh_quorum_preserving_demotion(
           &live,
           &candidates,
           &health,
-          &acked,
+          &fresh,
           local_member,
         ) {
-          Some(rm) => {
-            backend.propose_and_await_install(rm).await?;
+          Ok(demote) => {
+            backend.propose_and_await_install(demote).await?;
             committed_any = true;
+            // Progress was made — clear any recorded shrink stall.
+            last_stall = None;
+            backend.note_shrink_stall(None);
           }
-          // STALL fail-closed: no removal has positive successor-quorum evidence — count against cap.
-          None => backend.backoff().await,
+          // STALL fail-closed: no demotion has a proven-live successor quorum. Record the unproven-voter
+          // diagnostic (for BOTH the executor's own cap above AND the driver's advance-level hard-cancel
+          // via `note_shrink_stall`), then count against the cap.
+          Err(unproven) => {
+            last_stall = Some(unproven.clone());
+            backend.note_shrink_stall(Some(unproven));
+            backend.backoff().await;
+          }
+        }
+      }
+      Some(step) if step.is_remove_learner() => {
+        // GC LANE: removing a learner — an obsolete-learner prune, or the race-free GC of a
+        // just-demoted voter. Its op must commit under the CURRENT voting quorum, and for a demotee's
+        // GC that successor-quorum commit is a post-demote DURABILITY round under the reduced voting set
+        // plus an exposure-window narrowing: fresh point-in-time evidence that avoids discarding the
+        // retained durable copy during an evidently-dead window, NOT a guarantee the successor set is live
+        // at the discard instant. FAIL-CLOSED pre-probe: require a proven-live majority of the current
+        // voters (`|fresh ∩ voters(live)| >= quorum(live)`) before proposing — NEVER bypass it — else
+        // stall on the same `InsufficientLiveness` surface as a demote.
+        let fresh = backend.proven_live_voters();
+        let live_voters: BTreeSet<MemberId> = {
+          let n = live.replica_count() as usize;
+          live.members_slice()[..n].iter().copied().collect()
+        };
+        let confirmed = live_voters.intersection(&fresh).count();
+        if confirmed >= live.quorum() {
+          backend.propose_and_await_install(step.clone()).await?;
+          committed_any = true;
+          last_stall = None;
+          backend.note_shrink_stall(None);
+        } else {
+          // No proven-live quorum to commit the GC — stall fail-closed, naming the unproven voters.
+          let unproven: BTreeSet<MemberId> = live_voters
+            .iter()
+            .copied()
+            .filter(|m| !fresh.contains(m))
+            .collect();
+          last_stall = Some(unproven.clone());
+          backend.note_shrink_stall(Some(unproven));
+          backend.backoff().await;
+        }
+      }
+      Some(step) => {
+        // GROW (AddLearner staging, PromoteLearner): follow plan order verbatim.
+        backend.propose_and_await_install(step.clone()).await?;
+        committed_any = true;
+        // Progress was made — clear any recorded shrink stall.
+        last_stall = None;
+        backend.note_shrink_stall(None);
+        // Track newly-staged or promoted target members in members_seen.
+        if step.is_add_learner() || step.is_promote_learner() {
+          members_seen.insert(step.member());
         }
       }
     }
@@ -438,8 +604,14 @@ pub enum StepOutcome {
 /// `run_reconfigure` future is `Send` (the reactor driver spawns it on a multi-thread runtime).
 struct Snapshot {
   live: Membership,
-  acked: BTreeSet<MemberId>,
+  /// The successor voters PROVEN LIVE by the active liveness probe this iteration (the driver loop
+  /// snapshots `proven_live_voters` into it before each poll).
+  fresh: BTreeSet<MemberId>,
   cap_exhausted: bool,
+  /// The most-recent fail-closed shrink stall's unproven-voter diagnostic (`Some`), or `None` when no
+  /// stall is outstanding — written by `LoopBackend::note_shrink_stall`, read by the driver's
+  /// advance-level hard-cancel ([`ReconfigureJob::advance`]) so it can surface `InsufficientLiveness`.
+  shrink_stall: Option<BTreeSet<MemberId>>,
 }
 
 /// The shared tick state. Bundled in one `Mutex` so that `tick()` can atomically install the
@@ -507,14 +679,24 @@ impl ReconfigureBackend for LoopBackend {
       .clone()
   }
 
-  fn recently_acked_voters(&self, _window: u64) -> BTreeSet<MemberId> {
-    // The driver loop pre-computes the window-filtered acked set into the snapshot on each refresh.
+  fn proven_live_voters(&self) -> BTreeSet<MemberId> {
+    // The driver loop snapshots `endpoint.proven_live_voters(now)` into `fresh` each refresh.
     self
       .snapshot
       .lock()
       .unwrap_or_else(|e| e.into_inner())
-      .acked
+      .fresh
       .clone()
+  }
+
+  fn note_shrink_stall(&self, unproven: Option<BTreeSet<MemberId>>) {
+    // Record into the shared snapshot so the driver's advance-level hard-cancel can read it (the
+    // executor future's own top-of-loop cap uses its local `last_stall` instead).
+    self
+      .snapshot
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .shrink_stall = unproven;
   }
 
   fn cap_exhausted(&self) -> bool {
@@ -614,14 +796,26 @@ impl LoopController {
   /// Overwrite the snapshot with the latest state from the driver's `Endpoint`. Called once per
   /// driver-loop iteration, BEFORE polling the future.
   ///
-  /// `ack_window` filtering is done by the DRIVER (which calls `endpoint.recently_acked_voters(ack_window)`
-  /// and passes the result directly); the backend's `recently_acked_voters` ignores its own window
-  /// argument and returns the pre-filtered set verbatim.
-  pub fn refresh(&self, live: Membership, acked: BTreeSet<MemberId>, cap_exhausted: bool) {
+  /// `fresh` is the set the DRIVER already snapshotted from `endpoint.proven_live_voters(now)`; the
+  /// backend's `proven_live_voters` returns it verbatim.
+  pub fn refresh(&self, live: Membership, fresh: BTreeSet<MemberId>, cap_exhausted: bool) {
     let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
     snap.live = live;
-    snap.acked = acked;
+    snap.fresh = fresh;
     snap.cap_exhausted = cap_exhausted;
+  }
+
+  /// The most-recent fail-closed shrink stall's unproven-voter diagnostic (`Some`), or `None` when no
+  /// stall is outstanding — the executor future records it via `LoopBackend::note_shrink_stall`, and
+  /// the driver's advance-level hard-cancel reads it to surface `InsufficientLiveness` instead of a
+  /// bare `Timeout` when the future is parked past its own top-of-loop cap.
+  pub fn recorded_stall(&self) -> Option<BTreeSet<MemberId>> {
+    self
+      .snapshot
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .shrink_stall
+      .clone()
   }
 
   /// Drain the one-slot proposal the backend may have posted. Returns `Some((delta, reply_tx))` if
@@ -697,6 +891,10 @@ pub struct ReconfigureJob {
   /// The reconfiguration goal, stored so the advance-level Timeout path can re-plan and build
   /// accurate `ReconfigureProgress` without re-entering the executor future.
   target: MembershipTarget,
+  /// The operator's [`AcceptReducedFaultTolerance`] (or `None`). Attached to a proposal ONLY when the
+  /// step is a demote from an ODD voter count — exactly the forced f-reducing delta the proto propose
+  /// gate requires it for; every other step carries `None` so a superfluous token is never threaded.
+  ack: Option<AcceptReducedFaultTolerance>,
 }
 
 /// Outcome of one [`ReconfigureJob::advance`] call.
@@ -723,20 +921,26 @@ impl AdvanceOutcome {
 impl ReconfigureJob {
   /// Drive one iteration of the reconfiguration loop. Call after `pump_outputs` each iteration.
   ///
-  /// `live` and `acked` are snapshotted from the coordinator BEFORE this call (disjoint borrow:
-  /// the coordinator is read first, then this method holds `&mut self`). `propose` is a closure
-  /// that calls `coord.propose_membership(now, wal, delta)`. Returns [`AdvanceOutcome::InFlight`]
-  /// while running, [`AdvanceOutcome::Done`] when the reply has been sent.
+  /// `live` and `fresh` are snapshotted from the coordinator BEFORE this call (disjoint borrow:
+  /// the coordinator is read first, then this method holds `&mut self`). `fresh` is
+  /// `coord.proven_live_voters(now)`. `propose` is a closure that calls
+  /// `coord.propose_membership(now, wal, delta, ack)` — this method decides the `ack` it passes, attaching
+  /// the job's [`AcceptReducedFaultTolerance`] ONLY when the step is a demote from an ODD voter count
+  /// (the forced f-reducing delta the proto gate requires it for) and `None` otherwise. Returns
+  /// [`AdvanceOutcome::InFlight`] while running, [`AdvanceOutcome::Done`] when the reply has been sent.
   ///
   /// `now` arms the per-call deadline on the first advance and drives the executor's `cap_exhausted`
-  /// signal (`now >= deadline`), so a plan that cannot make progress resolves `Timeout` rather than
-  /// spinning forever.
+  /// signal (`now >= deadline`), so a plan that cannot make progress resolves `Timeout` (or, for a
+  /// missing-witness shrink stall, `InsufficientLiveness`) rather than spinning forever.
   pub fn advance(
     &mut self,
     now: Instant,
     live: Membership,
-    acked: std::collections::BTreeSet<MemberId>,
-    propose: &mut impl FnMut(SingleVoterDelta) -> Result<OpNumber, ProposeMembershipError>,
+    fresh: std::collections::BTreeSet<MemberId>,
+    propose: &mut impl FnMut(
+      SingleVoterDelta,
+      Option<AcceptReducedFaultTolerance>,
+    ) -> Result<OpNumber, ProposeMembershipError>,
   ) -> AdvanceOutcome {
     use std::task::Poll;
 
@@ -750,25 +954,36 @@ impl ReconfigureJob {
     // Hard-cancel at the advance level BEFORE polling the future. The executor future's own
     // `cap_exhausted` check fires only at the TOP of its loop — if it is parked inside
     // `propose_and_await_install` (waiting on a Retry backoff) or inside `backoff().await` the
-    // deadline never fires via the inner path alone. Resolving here guarantees the Timeout is
+    // deadline never fires via the inner path alone. Resolving here guarantees the cap outcome is
     // delivered regardless of where the future is parked.
     if cap_exhausted {
       use viewstamp_proto::plan_reconfiguration;
-      let progress = match plan_reconfiguration(&live, &self.target) {
-        Ok(remaining) if !remaining.is_empty() => ReconfigureProgress::stall(live, remaining),
+      // A recorded shrink stall + a still-valid plan is a MISSING-WITNESS stall (`InsufficientLiveness`);
+      // a still-valid plan with NO recorded stall is a stuck-proposal `Timeout`; a failed re-plan is a
+      // `Timeout`; an already-reached goal is the `Ok(())` race. This mirrors the executor's own
+      // top-of-loop cap for the case where the future is parked past it.
+      let recorded = self.controller.recorded_stall();
+      let err = match plan_reconfiguration(&live, &self.target) {
+        Ok(remaining) if !remaining.is_empty() => {
+          let progress = ReconfigureProgress::stall(live, remaining);
+          match recorded {
+            Some(unproven) => ReconfigureError::InsufficientLiveness { progress, unproven },
+            None => ReconfigureError::Timeout(progress),
+          }
+        }
         Ok(_) => {
           // The re-plan says the target is already reached — race between the cap and the last
-          // install completing. Surface Ok(()) rather than a spurious Timeout.
+          // install completing. Surface Ok(()) rather than a spurious cap error.
           let (dummy_tx, _dummy_rx) = futures_channel::oneshot::channel();
           let reply = std::mem::replace(&mut self.reply, dummy_tx);
           let _ = reply.send(Ok(()));
           return AdvanceOutcome::Done;
         }
-        Err(e) => ReconfigureProgress::failed(live, e),
+        Err(e) => ReconfigureError::Timeout(ReconfigureProgress::failed(live, e)),
       };
       let (dummy_tx, _dummy_rx) = futures_channel::oneshot::channel();
       let reply = std::mem::replace(&mut self.reply, dummy_tx);
-      let _ = reply.send(Err(ReconfigureError::Timeout(progress)));
+      let _ = reply.send(Err(err));
       return AdvanceOutcome::Done;
     }
 
@@ -790,7 +1005,7 @@ impl ReconfigureJob {
     }
 
     // 2. Refresh the controller snapshot with the latest state.
-    self.controller.refresh(live.clone(), acked, cap_exhausted);
+    self.controller.refresh(live.clone(), fresh, cap_exhausted);
 
     // 3. Poll the future once with a noop waker (the driver loop's timer cadence re-polls at the
     //    50ms fallback, which is the natural reconfigure advancement cadence). We construct the
@@ -821,7 +1036,17 @@ impl ReconfigureJob {
       // delta) for the EXACT install detection above. A delta the predecessor rejects yields `None`,
       // and the proto's propose gate then surfaces the same rejection as the proposal verdict.
       let expected = live.apply_delta(&delta).ok().map(|m| m.config_id());
-      match propose(delta) {
+      // Attach the operator's acknowledgement IFF this step is a demote from an ODD voter count —
+      // exactly the forced f-reducing delta the proto propose gate refuses without it. Every other step
+      // (an even-`n` demote is f-neutral; adds/promotes/GCs never reduce `f`) carries `None`, which the
+      // proto ignores if superfluous. The parity is read from `live` (the predecessor this step applies
+      // to), the same membership the future planned against.
+      let step_ack = if delta.is_demote_voter() && live.replica_count() % 2 == 1 {
+        self.ack
+      } else {
+        None
+      };
+      match propose(delta, step_ack) {
         Ok(op) => {
           self.pending_op = Some(op);
           self.expected_config_id = expected;
@@ -840,6 +1065,9 @@ impl ReconfigureJob {
         Err(ProposeMembershipError::NotPrimary) => {
           let _ = step_reply.send(StepOutcome::Failed(ReconfigureError::NotPrimary));
         }
+        // Non-retryable terminals — a structurally `Invalid` delta, or a
+        // `ReducedFaultToleranceUnacknowledged` (an odd-`n` demote proposed with no acknowledgement, which
+        // the goal-level preflight normally forecloses; surfaced here as a terminal rather than retried).
         Err(e) => {
           let _ = step_reply.send(StepOutcome::Failed(ReconfigureError::Propose(e)));
         }
@@ -867,20 +1095,23 @@ impl ReconfigureJob {
   pub fn start(
     target: MembershipTarget,
     health: HealthHint,
-    ack_window: u64,
     reconfigure_timeout: Duration,
     reply: futures_channel::oneshot::Sender<Result<(), ReconfigureError>>,
     initial_live: Membership,
-    initial_acked: BTreeSet<MemberId>,
+    initial_fresh: BTreeSet<MemberId>,
     local_member: MemberId,
+    ack: Option<AcceptReducedFaultTolerance>,
   ) -> Self {
     let (backend, controller) = LoopBackend::new_pair(Snapshot {
       live: initial_live,
-      acked: initial_acked,
+      fresh: initial_fresh,
       cap_exhausted: false,
+      shrink_stall: None,
     });
+    // `ack` threads two ways: into the executor future for its goal-level preflight, and stored on the
+    // job for `advance` to attach per-step to a forced (odd-`n`) demote at propose time.
     let fut: Pin<Box<dyn Future<Output = Result<(), ReconfigureError>> + Send>> = Box::pin(
-      run_reconfigure(backend, target.clone(), health, ack_window, local_member),
+      run_reconfigure(backend, target.clone(), health, local_member, ack),
     );
     ReconfigureJob {
       fut,
@@ -892,6 +1123,7 @@ impl ReconfigureJob {
       deadline: None,
       reconfigure_timeout,
       target,
+      ack,
     }
   }
 

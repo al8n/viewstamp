@@ -827,6 +827,7 @@ fn propose_membership_delegates_to_the_endpoint() {
       Instant::ZERO,
       &mut wal,
       crate::SingleVoterDelta::AddLearner(MemberId::new(5)),
+      None,
     )
     .expect("a Normal primary with no in-flight change can propose");
   assert_eq!(
@@ -837,7 +838,7 @@ fn propose_membership_delegates_to_the_endpoint() {
 }
 
 #[test]
-fn recently_acked_voters_is_empty_before_any_prepare_ack() {
+fn proven_live_voters_is_empty_before_any_probe_round() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
@@ -848,8 +849,8 @@ fn recently_acked_voters_is_empty_before_any_prepare_ack() {
       u64::MAX,
     ));
   assert!(
-    coord.recently_acked_voters(64).is_empty(),
-    "a fresh endpoint has acknowledged no in-flight prepare"
+    coord.proven_live_voters(crate::Instant::ZERO).is_empty(),
+    "a fresh endpoint has solicited no liveness-probe round"
   );
 }
 
@@ -1031,15 +1032,14 @@ fn submit_client_request_drops_an_over_max_body_with_no_side_effects() {
   );
 }
 
-/// Drives a fresh 3-voter primary (local = `local`, primary of view 0) to propose
-/// `RemoveVoter(removed)` and commit + durably install it — generalizes
-/// `endpoint::tests::reconfigure::removed_self_primary` to any voter, not only self-removal. Two
-/// validated conns for members 1 and 2 are registered BEFORE the removal, so the caller can inspect
-/// how `reconcile_routing` treated each afterward. The acking voter is whichever of {0,1,2} is
-/// neither `local` nor `removed`, so the 2-of-3 commit quorum always forms.
-fn commit_and_install_a_voter_removal(
+/// Drives a fresh 3-voter primary (local = `local`, primary of view 0) through a member's full
+/// demote-first DEPARTURE — `DemoteVoter(who)` committed + installed, then `RemoveLearner(who)`
+/// committed + installed — generalizing `endpoint::tests::reconfigure::demoted_self_primary` to any
+/// voter and carrying it through the GC. Two validated conns for members 1 and 2 are registered
+/// BEFORE the departure, so the caller can inspect how `reconcile_routing` treated each afterward.
+fn commit_and_install_a_voter_departure(
   local: u128,
-  removed: u128,
+  who: u128,
 ) -> (
   StreamCoordinator<CountSm, MockRecords>,
   TestWal,
@@ -1062,62 +1062,170 @@ fn commit_and_install_a_voter_removal(
     ));
   let conn1 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 1);
   let conn2 = register_and_validate_member(&mut coord, &mut wal, &mut sb, &mut blocks, 2);
-  drive_voter_removal_to_installed(&mut coord, &mut wal, &mut sb, &mut blocks, local, removed);
+  drive_voter_departure_to_installed(&mut coord, &mut wal, &mut sb, &mut blocks, local, who);
   (coord, wal, sb, blocks, conn1, conn2)
 }
 
 /// Drives an already-built 3-voter primary `coord` (local = `local`, primary of view 0, durable
-/// genesis(3)) to propose `RemoveVoter(removed)` and commit + durably install it, so the trailing
-/// `reconcile_routing` inside `handle_storage` runs against the shrunk membership. The acking voter is
-/// whichever of {0,1,2} is neither `local` nor `removed`, so the 2-of-3 commit quorum always forms.
-fn drive_voter_removal_to_installed(
+/// genesis(3)) through `who`'s full demote-first departure: swap 1 commits + installs
+/// `DemoteVoter(who)` (proposed locally; every voter but `local` acks, so the successor quorum is
+/// always among the acks), then swap 2 commits + installs `RemoveLearner(who)`. When the local node
+/// is still a voter after the demote it proposes the GC itself; when the local node IS `who` (a
+/// demoted self), it can no longer propose, so the GC arrives on the follower lane — the E+1
+/// primary's `Prepare` + `Commit` — exactly as a real demoted node learns its own GC. The trailing
+/// `reconcile_routing` inside each install's `handle_storage` runs against each successive membership.
+fn drive_voter_departure_to_installed(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
   wal: &mut TestWal,
   sb: &mut TestSb,
   blocks: &mut crate::block_store::MemBlockStore,
   local: u128,
-  removed: u128,
+  who: u128,
 ) {
   use crate::{SingleVoterDelta, View, message::Body};
-  let successor = coord
+  let demoted = coord
     .live_membership()
-    .apply_delta(&SingleVoterDelta::RemoveVoter(MemberId::new(removed)))
-    .expect("removing one of three voters is valid");
-  let payload = crate::ReconfigurePayload::from_membership(&successor, 0);
+    .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(who)))
+    .expect("demoting one of three voters is valid");
+  let payload = crate::ReconfigurePayload::from_membership(&demoted, 0);
   let op = coord
     .propose_membership(
       Instant::ZERO,
       wal,
-      SingleVoterDelta::RemoveVoter(MemberId::new(removed)),
+      SingleVoterDelta::DemoteVoter(MemberId::new(who)),
+      Some(crate::AcceptReducedFaultTolerance),
     )
-    .expect("the primary mints the removal Reconfigure op");
+    .expect("the primary mints the demote Reconfigure op");
   coord.handle_storage(Instant::ZERO, wal, sb, blocks); // own append durable -> own vote
-  let acker = (0..3u128)
-    .find(|&m| m != local && m != removed)
-    .expect("a third voter exists to ack");
-  coord.inject_message_for_test(
-    Instant::ZERO,
-    wal,
-    sb,
-    blocks,
-    Peer::Replica(ReplicaId::new(acker as u16)),
-    Message::PrepareOk(crate::PrepareOk::new(
-      View::new(),
-      op,
-      ReplicaId::new(acker as u16),
-      OpNumber::new(),
-      crate::storage::prepare_identity(
-        ClientId::RECONFIGURATION,
-        RequestNumber::with(op.get()),
-        Body::Reconfigure(payload.clone()).body_checksum(),
-      ),
-      crate::Epoch::new(0),
-      0,
-    )),
-  );
+  // Every voter but the local one acks: a voter-set shrink commits only once the SUCCESSOR quorum
+  // is among the acks (for a demoted self that is BOTH other voters), and the extra ack is inert
+  // for any other demotion.
+  for acker in (0..3u128).filter(|&m| m != local) {
+    coord.inject_message_for_test(
+      Instant::ZERO,
+      wal,
+      sb,
+      blocks,
+      Peer::Replica(ReplicaId::new(acker as u16)),
+      Message::PrepareOk(crate::PrepareOk::new(
+        View::new(),
+        op,
+        ReplicaId::new(acker as u16),
+        OpNumber::new(),
+        crate::storage::prepare_identity(
+          ClientId::RECONFIGURATION,
+          RequestNumber::with(op.get()),
+          Body::Reconfigure(payload.clone()).body_checksum(),
+        ),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+  }
   // The 2-of-3 commit quorum stages the SwapEpoch root; a further handle_storage lands that durable
-  // root, which installs the successor (config_id changes) and triggers reconcile_routing/pump.
-  coord.handle_storage(Instant::ZERO, wal, sb, blocks);
+  // root, which installs the demote successor (config_id changes) and triggers reconcile_routing/pump.
+  // Extra pumps drain the install's forced post-swap checkpoint, freeing the superblock (and the
+  // new-op admission gate) for the GC swap.
+  for _ in 0..6 {
+    coord.handle_storage(Instant::ZERO, wal, sb, blocks);
+  }
+  let e1 = coord.live_membership().clone();
+  assert_eq!(
+    e1.config_id(),
+    demoted.config_id(),
+    "swap 1 installed the demote successor"
+  );
+
+  // Swap 2 — the GC. `RemoveLearner(who)` validates only against the INSTALLED demote successor.
+  let gced = e1
+    .apply_delta(&SingleVoterDelta::RemoveLearner(MemberId::new(who)))
+    .expect("the GC validates once the demote installed");
+  let gc_payload = crate::ReconfigurePayload::from_membership(&gced, e1.config_id());
+  if local != who {
+    // The local node is a retained voter (and still the view-0 primary): it proposes the GC.
+    let gc_op = coord
+      .propose_membership(
+        Instant::ZERO,
+        wal,
+        SingleVoterDelta::RemoveLearner(MemberId::new(who)),
+        None,
+      )
+      .expect("the retained primary mints the GC Reconfigure op");
+    coord.handle_storage(Instant::ZERO, wal, sb, blocks); // own append durable -> own vote
+    for acker in (0..3u128).filter(|&m| m != local && m != who) {
+      // The E+1 slot of a retained acking voter (the demote may have shifted it).
+      let slot = e1
+        .slot_of(MemberId::new(acker))
+        .expect("a retained voter resolves in E+1");
+      coord.inject_message_for_test(
+        Instant::ZERO,
+        wal,
+        sb,
+        blocks,
+        Peer::Replica(slot),
+        Message::PrepareOk(crate::PrepareOk::new(
+          View::new(),
+          gc_op,
+          slot,
+          OpNumber::new(),
+          crate::storage::prepare_identity(
+            ClientId::RECONFIGURATION,
+            RequestNumber::with(gc_op.get()),
+            Body::Reconfigure(gc_payload.clone()).body_checksum(),
+          ),
+          e1.epoch(),
+          e1.config_id(),
+        )),
+      );
+    }
+  } else {
+    // A demoted self cannot propose (it is a learner); its GC arrives on the follower lane from the
+    // E+1 primary (slot 0 under the demote successor).
+    let gc_op = OpNumber::with(op.get() + 1);
+    coord.inject_message_for_test(
+      Instant::ZERO,
+      wal,
+      sb,
+      blocks,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::Prepare(crate::Prepare::new(
+        View::new(),
+        gc_op,
+        op,
+        OpNumber::new(),
+        e1.epoch(),
+        e1.config_id(),
+        ClientId::RECONFIGURATION,
+        RequestNumber::with(gc_op.get()),
+        gc_payload.encode_body(),
+      )),
+    );
+    coord.handle_storage(Instant::ZERO, wal, sb, blocks); // the learner's append lands (no counted ack)
+    coord.inject_message_for_test(
+      Instant::ZERO,
+      wal,
+      sb,
+      blocks,
+      Peer::Replica(ReplicaId::new(0)),
+      Message::Commit(crate::Commit::new(
+        View::new(),
+        gc_op,
+        op,
+        e1.epoch(),
+        e1.config_id(),
+      )),
+    );
+  }
+  // Land the GC's SwapEpoch root -> install the final successor (the seat is gone); extra pumps
+  // drain its forced post-swap checkpoint on the surviving-voter path (a retired node forces none).
+  for _ in 0..6 {
+    coord.handle_storage(Instant::ZERO, wal, sb, blocks);
+  }
+  assert_eq!(
+    coord.live_membership().config_id(),
+    gced.config_id(),
+    "swap 2 installed the GC successor"
+  );
 }
 
 /// Registers an ACCEPTED conn attesting `Peer::Member(out_idx)` for a member id NOT in the active
@@ -1142,12 +1250,13 @@ fn register_and_quarantine_member(
 
 #[test]
 fn a_removed_local_member_routes_nothing_gracefully() {
-  // The local member (0, primary of view 0) proposes and commits its OWN removal, all the way to a
-  // durable, installed swap. Once installed, local_slot_opt() is None: pump() (driven by the trailing
+  // The local member (0, primary of view 0) departs the configuration entirely — its OWN demote
+  // commits + installs, then its GC arrives on the follower lane and installs. Once the GC has
+  // installed, local_slot_opt() is None: pump() (driven by the trailing
   // pump inside handle_storage's own install) and submit_client_request() must each route nothing
   // rather than panic on an absent local slot.
   let (mut coord, mut wal, mut sb, mut blocks, _conn1, _conn2) =
-    commit_and_install_a_voter_removal(0, 0);
+    commit_and_install_a_voter_departure(0, 0);
   assert!(
     coord.endpoint().local_slot_opt().is_none(),
     "the removed local member has no slot in the installed successor"
@@ -1171,11 +1280,12 @@ fn a_removed_local_member_routes_nothing_gracefully() {
 
 #[test]
 fn reconcile_routing_closes_a_removed_member_and_leaves_an_unshifted_survivor_bound() {
-  // Removing member 2 (the HIGHEST-slot voter) leaves the retained voters at their OLD slots {0,1}.
+  // Member 2 (the HIGHEST-slot voter) departs — demote, then GC — leaving the retained voters at
+  // their OLD slots {0,1}.
   // reconcile_routing (driven automatically inside handle_storage, right after the installing pump)
   // must therefore close member 2's conn (slot_of(2) is now None) while leaving member 1's conn
   // untouched (still slot 1, so no churn for the unmoved retained member).
-  let (coord, _wal, _sb, _blocks, conn1, conn2) = commit_and_install_a_voter_removal(0, 2);
+  let (coord, _wal, _sb, _blocks, conn1, conn2) = commit_and_install_a_voter_departure(0, 2);
   assert_eq!(
     coord.membership_config_id(),
     coord.live_membership().config_id(),
@@ -1227,7 +1337,7 @@ fn reconcile_routing_keeps_a_still_unresolvable_quarantined_member_and_closes_a_
   );
 
   // Remove member 2: the config_id changes, but member 5 is STILL not in the membership.
-  drive_voter_removal_to_installed(&mut coord, &mut wal, &mut sb, &mut blocks, 0, 2);
+  drive_voter_departure_to_installed(&mut coord, &mut wal, &mut sb, &mut blocks, 0, 2);
 
   assert!(
     coord.router_ref().conn(replica2).is_none(),

@@ -162,16 +162,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// lands), and the posture cast no vote in it (the `catching_up` discriminant never flips, so the
   /// DVC regime was unreachable; SVCs are proposals, not votes).
   ///
-  /// KNOWN LIMITATION (deliberate, shared with the crash-recovery path): the revert lands the
-  /// replica at a durable view the cluster may have legitimately moved far beyond, and a
-  /// far-lagging replica cannot yet rejoin an IN-PROGRESS view change — `on_start_view_change`
-  /// admits only the immediate successor, and a completed view re-adopts it only through
-  /// authoritative traffic from a live primary. A view that really formed and then lost its primary
-  /// while this replica was partitioned through the whole window therefore stays unreachable until
-  /// a primary exists again, exactly as it does for a replica that CRASHED at the lagging durable
-  /// view and recovered. Unifying both shapes behind a validated far-view rejoin is a distinct
-  /// mechanism (the advertisement must re-open the memory-only probe, never move the replica
-  /// durably) and is deliberately not smuggled into this revert.
+  /// The landing is NOT sticky (shared with the crash-recovery path, which lands the same way): the
+  /// replica returns to a durable view the cluster may have legitimately moved far beyond, and
+  /// rejoins through either ordinary channel — authoritative traffic from a live primary re-opens
+  /// the higher-view catch-up ([`Self::catch_up_to_view`]), and any live voter's strictly-higher
+  /// `StartViewChange` proposal is joinable at any distance ([`Self::on_start_view_change`]), so a
+  /// view that really formed and then lost its primary while this replica was partitioned through
+  /// the whole window becomes reachable again the moment any of its survivors proposes a successor
+  /// off its idle timer.
   ///
   /// The revert's landing depends on this replica's role at the durable view:
   /// - A BACKUP resumes Normal directly. The probe's entry reset dropped only generation-local state
@@ -209,6 +207,31 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
+  /// Collect (and, when it raises our target, join) a peer voter's `StartViewChange{target}`
+  /// proposal.
+  ///
+  /// ADMISSION: any target STRICTLY above our view is joinable; a target at/below it is stale and
+  /// ignored. No upper bound is imposed, and convergence REQUIRES that: live voters can hold
+  /// FORKED Normal views at one epoch (successive commit-first reconfigurations remap primaryship
+  /// across views while a StartView / sync crossing preserves one survivor's higher view), and
+  /// each fork member's exact successor is then precisely the target the others never propose —
+  /// an exact-successor-only admission leaves NO target a quorum can ever share (every proposal
+  /// reads as stale to the higher voter or as a jump to the lower one — a permanent fault-free
+  /// wedge with no primary ever formed again), while under any-higher admission the max-view
+  /// voter's `view + 1` is strictly above every live voter's view, so every live same-epoch voter
+  /// joins it and a live-voter quorum always forms.
+  ///
+  /// Joining at any distance is vote-safe because an SVC is a PROPOSAL carrying no log/lead
+  /// authority: it reaches this handler only from an authenticated CURRENT-configuration voter at
+  /// the EXACT epoch (`sender_matches` binds the claimed slot; the `epoch_authority_admits` arm is
+  /// STRICT), and joining mutates only the flat SVC collection (`svc_target`/`svc_from`) — the
+  /// status, view, log and votes move only once `maybe_start_view_change` finds an SVC QUORUM,
+  /// whose entry persists the new view BEFORE casting the DVC (durable-view-before-participate),
+  /// and the joined view still FORMS only on a full DVC quorum + canonical-log selection. None of
+  /// those gates reads the target's distance. (The single-advertisement catch-up path is different
+  /// in kind — it ADOPTS a view off ONE unvalidated normal-traffic scalar with no quorum behind
+  /// it — and stays plausibility-clamped there: see [`Self::catch_up_to_view`] /
+  /// [`MAX_VIEW_JUMP`].)
   pub(crate) fn on_start_view_change<B: Superblock>(
     &mut self,
     now: Instant,
@@ -222,13 +245,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     let target = m.view();
-    // `View::next()` saturates, so this comparison cannot overflow even at `view == u64::MAX`
-    // (where the first clause already rejects every possible target).
-    if target.get() <= self.view.get() || target.get() > self.view.next().get() {
-      // stale (≤ our view), OR a jump beyond our immediate next view — do not drive an
-      // unverified inflated target from a lone SVC; we catch up to a genuinely-higher view
-      // via a real Prepare/Commit from its primary (the higher-view rule), not via SVCs.
-      return;
+    if target.get() <= self.view.get() {
+      return; // stale: we are already at (or beyond) the proposed view.
     }
     if m.replica().get() >= self.membership.replica_count() as u16 {
       return; // ignore malformed/out-of-range replica id
@@ -407,6 +425,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // reply meant for the old generation) satisfy a post-transition mint. (The `(epoch, config_id)`
     // reply binding is the backstop; this is the primary clear.)
     self.learner_proof = None;
+    // Drop any outstanding voter-liveness-probe round: it was solicited by the generation this view
+    // change ends, so its evidence must not gate a shrink the successor generation drives. A new
+    // primary re-solicits fresh on its own reconfiguration; carrying a stale round across would let a
+    // pre-transition answer count toward a post-transition removal. Symmetry with the install-boundary
+    // clear (`install_membership`); the `(epoch, config_id)` reply binding is the backstop.
+    self.health_probe = None;
     // KEEP a committed-but-not-installed epoch swap across the transition. `pending_swap` is set ONLY for
     // a COMMITTED `Reconfigure` op (`stage_epoch_swap` runs at commit, after `commit_min` advanced past
     // the op), so the change is durable in the log and MUST still install — dropping it would lose a

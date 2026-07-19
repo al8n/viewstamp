@@ -115,24 +115,26 @@ pub enum ProposeMembershipError {
   /// storage at propose time, never an accumulated frontier.
   #[error("the learner-promotion proof is pending: a fresh catch-up proof was solicited — retry")]
   ProofPending,
-  /// A direct `AddVoter` is not an accepted proposal, at ANY cluster size. A brand-new voter holds NO
-  /// committed prefix — it was never a member, so it never appended, let alone committed, any prior op —
-  /// yet as a voter it counts toward the successor's view-change quorum. A successor view-change quorum
-  /// formed WITHOUT the prefix-holding retained voters can then elect a leader that drops a committed op:
-  /// the old-write-quorum / new-view-change-quorum intersection fails. The extreme is the single-voter
-  /// predecessor, where `AddVoter` yields a 2-voter successor with `quorum_view_change == 1`, so the new
-  /// voter alone forms the E+1 view-change quorum and can elect itself with an empty log. Rather than
-  /// admit the larger sizes and reject only that extreme, every direct `AddVoter` is rejected uniformly.
-  /// The safe way to add a voter — at any size — is `AddLearner` the member, let it durably catch up to
-  /// the head, then `PromoteLearner`, so the promote-time challenge proves it holds the committed prefix
-  /// before it ever votes (the catch-up-then-promote path). The planner never emits `AddVoter`; it only
-  /// ever stages that learner-first path.
+  /// The delta's successor configuration TOLERATES FEWER voter crashes than the current one —
+  /// `f(successor) < f(current)` with `f(n) = n − quorum(n) = ⌊(n−1)/2⌋`, which among single-voter
+  /// deltas is exactly a voter-count decrement from an ODD count (3 → 2, 5 → 4, …) — and no
+  /// [`AcceptReducedFaultTolerance`](crate::AcceptReducedFaultTolerance) accompanied the proposal.
+  /// Carries both tolerances so the caller can surface exactly what would be given up. NON-RETRYABLE:
+  /// re-proposing the same delta without the acknowledgement is rejected identically; the caller
+  /// either passes the token (accepting the reduced tolerance) or abandons the change. A superfluous
+  /// token on a non-reducing delta is accepted and ignored, so a driver may thread an operator's
+  /// acknowledgement through unconditionally. The gate runs on the already-validated successor, so a
+  /// structurally invalid delta surfaces [`Self::Invalid`] instead.
   #[error(
-    "a direct AddVoter is not supported: a brand-new voter holds no committed prefix and could break \
-     the cross-config quorum intersection — add the member as a learner (AddLearner), catch it up, \
-     then promote it (PromoteLearner)"
+    "the successor configuration tolerates fewer voter crashes ({to} < {from}); pass \
+     AcceptReducedFaultTolerance to accept the reduction"
   )]
-  DirectAddVoterUnsupported,
+  ReducedFaultToleranceUnacknowledged {
+    /// The current configuration's crash tolerance (`f = n − quorum(n)`).
+    from: u8,
+    /// The successor configuration's crash tolerance.
+    to: u8,
+  },
   /// A TRANSIENT op-admission fence is up — the SAME backpressure a client request hits before a new op
   /// is minted: a pending durable-view / state-sync / checkpoint write, a flagged forfeit step-down, or a
   /// committed-but-unapplied prefix (a repair hole). Minting now would advertise an op in a view this node

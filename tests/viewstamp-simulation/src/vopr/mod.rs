@@ -53,7 +53,7 @@
 use bytes::Bytes;
 use core::time::Duration;
 
-use viewstamp_proto::{Instant, MemberId, Prng, SingleVoterDelta};
+use viewstamp_proto::{AcceptReducedFaultTolerance, Instant, MemberId, Prng, SingleVoterDelta};
 
 use crate::{
   checker::{
@@ -1151,10 +1151,10 @@ pub fn run_vopr_with_reconfig(seed: u64, ticks: u64) -> VoprReport {
 /// is the entry point for the committed live-reconfig sweep.
 pub fn run_vopr_with_reconfig_live(seed: u64, ticks: u64) -> VoprReport {
   // FORCE the learner topology ON for this axis (independent of `VOPR_LEARNER`): the expanded
-  // live-reconfig axis seed-chooses among `AddLearner` / a LOW-INDEX `RemoveVoter` / a slot-shifting
-  // `PromoteLearner`, and the promote needs a GENESIS LEARNER to promote. Learners only GROW the
-  // membership (a separate per-seed draw, the action stream unperturbed) and never touch the off-axis
-  // (`run_vopr`) schedule, so the standing byte-identity guard is unaffected.
+  // live-reconfig axis seed-chooses among `AddLearner` / a slot-shifting `PromoteLearner` / a
+  // `DemoteVoter`↔re-promote oscillation, and the promote needs a GENESIS LEARNER to promote. Learners
+  // only GROW the membership (a separate per-seed draw, the action stream unperturbed) and never touch
+  // the off-axis (`run_vopr`) schedule, so the standing byte-identity guard is unaffected.
   let mut v = Vopr::new(seed, true);
   v.live_reconfig_axis = true;
   run_seeded(v, ticks)
@@ -1358,12 +1358,15 @@ const CHURN_BUDGET: u64 = 48;
 const RECONFIG_BUDGET: u64 = 2;
 
 /// The per-run LIVE single-change reconfiguration budget (live-reconfig-axis runs only): at most this
-/// many live single-voter changes proposed per run. A live change commits, installs a durable epoch
-/// swap, and CONVERGES cluster-wide (every backup commits the `Reconfigure` op and installs the
-/// successor epoch); ONE change per run is enough to drive a swap and exercise the
-/// swap-correctness + convergence suite under the adversarial schedule, while keeping the run's
-/// observable history bounded.
-const LIVE_RECONFIG_BUDGET: u64 = 1;
+/// many live single-voter changes MINTED per run (the budget is consumed only on an accepted proposal,
+/// so a refused/retried propose never burns it). A live change commits, installs a durable epoch swap,
+/// and CONVERGES cluster-wide (every backup commits the `Reconfigure` op and installs the successor
+/// epoch). Several mints per run let the DEMOTE↔re-promote oscillation lane drive a genuine f-reducing
+/// voter shrink AND its recovery (demote → install → re-promote → install) more than once; the
+/// grow-only lanes (`AddLearner` / a slot-shifting `PromoteLearner`) self-cap at their single meaningful
+/// mint (a repeat add/promote of the same member is refused, so it retries harmlessly without minting).
+/// Small enough to keep each run's observable swap history bounded.
+const LIVE_RECONFIG_BUDGET: u64 = 4;
 
 /// The pseudo-`MemberId` the live-reconfig axis ADDS as a learner — a high sentinel past every genesis
 /// member id, so the `AddLearner` delta is always structurally valid (the id is brand-new) and the
@@ -1375,10 +1378,13 @@ const LIVE_RECONFIG_BUDGET: u64 = 1;
 /// unchanged, only the epoch and `config_id` advance.
 const LIVE_RECONFIG_MEMBER: u128 = 0xFFFF_0000_0000_0000;
 
-/// The seed-mix for the live-reconfig DELTA-KIND choice — a distinct local stream (NOT the action
-/// stream `self.prng`), so seed-choosing among `AddLearner` / `RemoveVoter` / `PromoteLearner` does not
-/// shift the chaos schedule's draw positions (the cadence + every other action stay where they were);
-/// the kind is a pure deterministic function of the seed. Must not collide with any other `_MAGIC`.
+/// The seed-mix for the live-reconfig LANE choice — a distinct local stream (NOT the action stream
+/// `self.prng`), so seed-choosing among `AddLearner` / a slot-shifting `PromoteLearner` / the
+/// `DemoteVoter`↔re-promote oscillation does not shift the chaos schedule's draw positions (the cadence
+/// + every other action stay where they were); the lane is a pure deterministic function of the seed.
+///
+/// The demote lane's delta then alternates off the live durable membership, itself deterministic. Must
+/// not collide with any other `_MAGIC`.
 const RECONFIG_DELTA_MAGIC: u64 = 0xD17A_5E11_C04F_1235;
 
 /// The per-client request budget the LIVE-RECONFIG axis uses (vs the much larger `requests_per_client`
@@ -1871,10 +1877,11 @@ impl Vopr {
     }
   }
 
-  /// The successor `(epoch, config_id)` a live single change minted, if one has installed anywhere: the
+  /// The FINAL successor `(epoch, config_id)` a live change minted, if one has installed anywhere: the
   /// highest `(epoch, config_id)` any replica recorded swapping into. `None` off-axis (no swap fired —
-  /// vacuous). With `LIVE_RECONFIG_BUDGET == 1` exactly one change commits, so every swap carries this
-  /// same successor; taking the max identifies it without assuming the count.
+  /// vacuous). The oscillation lane commits several changes in a run (each bumps the epoch by one), so
+  /// taking the max identifies the LATEST configuration without assuming the count — every non-crashed
+  /// member converges to it (an installed swap is committed, hence quorum-durable and repairable to all).
   fn live_reconfig_successor(c: &Cluster) -> Option<(viewstamp_proto::Epoch, u128)> {
     (0..c.node_count())
       .flat_map(|i| c.replica_membership_swaps(i).iter())
@@ -1883,16 +1890,20 @@ impl Vopr {
   }
 
   /// Whether a live single change has fully INSTALLED on the cluster: every non-crashed, non-retired
-  /// VOTER's durable `(epoch, config_id)` reached the successor the committed `Reconfigure` op minted.
-  /// `true` off-axis (no swap fired — nothing is owed). Voters occupy ids `0..voting_count`; the added
-  /// sentinel learner has no running endpoint and is not a voter, so it is correctly excluded. The
-  /// quiesce drain ticks until this holds (the change converges to every voter), so a slow voter that
-  /// has not yet durably committed the `Reconfigure` op is awaited rather than mistaken for a wedge.
+  /// MEMBER's — voter or learner — durable `(epoch, config_id)` reached the successor the committed
+  /// `Reconfigure` op minted. `true` off-axis (no swap fired — nothing is owed). Spans `0..node_count`
+  /// (voters AND learners), not just `0..voting_count`: a stranded learner that never installs the
+  /// successor is a real convergence failure a voters-only check would miss entirely. The live-reconfig
+  /// axis's endpoint-less sentinel learner (`LIVE_RECONFIG_MEMBER`) is excluded for free — it has no
+  /// backing `Endpoint` in `self.replicas`, so it is never one of these indices to begin with; there is
+  /// no separate id-based exclusion to maintain. The quiesce drain ticks until this holds (the change
+  /// converges to every member), so a slow member that has not yet durably committed the `Reconfigure`
+  /// op is awaited rather than mistaken for a wedge.
   fn live_reconfig_fully_installed(c: &Cluster) -> bool {
     let Some((succ_epoch, succ_config_id)) = Self::live_reconfig_successor(c) else {
       return true; // off-axis: no swap, nothing owed.
     };
-    (0..c.voting_count())
+    (0..c.node_count())
       .filter(|&i| !c.is_crashed(i) && !c.is_retired(i))
       .all(|i| {
         c.replica_durable_epoch(i) == succ_epoch && c.replica_durable_config_id(i) == succ_config_id
@@ -1900,14 +1911,17 @@ impl Vopr {
   }
 
   /// After the healed quiesce drain, assert a live single-change reconfiguration CONVERGED: every
-  /// non-crashed voter installed the committed change — its durable `(epoch, config_id)` advanced to
-  /// the successor the `Reconfigure` op minted. The cluster-wide durability/applied-once gates already
-  /// prove the committed-op HISTORY converged; this is the focused counterpart for the reconfiguration
-  /// itself — that every voter that should act under the new configuration actually swapped into it.
+  /// non-crashed member — voter or learner — installed the committed change — its durable
+  /// `(epoch, config_id)` advanced to the successor the `Reconfigure` op minted. The cluster-wide
+  /// durability/applied-once gates already prove the committed-op HISTORY converged; this is the focused
+  /// counterpart for the reconfiguration itself — that every member that should hold the new
+  /// configuration actually swapped into it, a non-voting learner included: it casts no vote, but it
+  /// still replicates the log and must still learn of the new configuration, and a learner stranded on
+  /// the predecessor is invisible to a voters-only check.
   ///
   /// VACUOUS off-axis (no live change is ever proposed, so no swap fired and `live_swaps_observed` is
   /// `0` — nothing is owed). NON-VACUOUS on the live-reconfig axis: a swap was observed, so the
-  /// successor `(epoch, config_id)` is well-defined and a voter still on the old epoch trips. (The
+  /// successor `(epoch, config_id)` is well-defined and a member still on the old epoch trips. (The
   /// non-vacuity is asserted explicitly: at least one swap must have installed.)
   fn assert_live_reconfig_installed(&self, c: &Cluster, ticks: u64) {
     let Some((succ_epoch, succ_config_id)) = Self::live_reconfig_successor(c) else {
@@ -1921,11 +1935,13 @@ impl Vopr {
        but `live_swaps_observed` is 0 — the non-vacuity witness disagrees",
       self.seed
     );
-    // Every non-crashed, non-retired SUCCESSOR VOTER must have installed the successor: after a
-    // fully-healed drain a voter still on the predecessor epoch is a reconfiguration that did not
-    // converge. The drain already ticked until this holds (see `run_final_quiesce`); this re-asserts it
-    // for the record.
-    for i in 0..c.voting_count() {
+    // Every non-crashed, non-retired SUCCESSOR MEMBER — voter or learner — must have installed the
+    // successor: after a fully-healed drain a member still on the predecessor epoch is a reconfiguration
+    // that did not converge. Spans `0..node_count` so a stranded learner is caught, not just a stranded
+    // voter; the endpoint-less sentinel learner is excluded for free (no backing `Endpoint`, so it is
+    // never one of these indices). The drain already ticked until this holds (see `run_final_quiesce`);
+    // this re-asserts it for the record.
+    for i in 0..c.node_count() {
       if c.is_crashed(i) || c.is_retired(i) {
         continue;
       }
@@ -1934,8 +1950,8 @@ impl Vopr {
       assert!(
         epoch == succ_epoch && config_id == succ_config_id,
         "vopr seed {} tick {ticks} (final, post-quiesce): live single change did NOT converge — \
-         voter {i} is on durable (epoch {}, config_id {config_id:#x}) but the committed reconfiguration \
-         installed successor (epoch {succ_epoch}, config_id {succ_config_id:#x}); a non-crashed voter \
+         member {i} is on durable (epoch {}, config_id {config_id:#x}) but the committed reconfiguration \
+         installed successor (epoch {succ_epoch}, config_id {succ_config_id:#x}); a non-crashed member \
          never swapped into the new configuration",
         self.seed,
         epoch.get(),
@@ -2451,14 +2467,14 @@ impl Vopr {
     // successor epoch), so this axis runs the full liveness/convergence suite — the calm-window
     // livelock + final-convergence oracle + the per-voter install assertion — like every other lane.
     //
-    // EXPANDED AXIS: the delta is SEED-CHOSEN so the SLOT-SHIFT class is exercised BY CONSTRUCTION across
-    // the seed range rather than only the non-shifting `AddLearner` (so the cross-epoch reply/solicitation
-    // binding is covered in the SYSTEM sim, not only the proto unit regressions): a slot-shifting
-    // `PromoteLearner` (the slot↔`MemberId` routing translation in `Cluster` keeps every shifted member
-    // addressable) or `AddLearner` (the no-shift case + fallback). See `choose_live_reconfig_delta` for the
-    // shift mechanics and why `RemoveVoter` is out of scope here (its removed-node reply is unroutable in
-    // a slot-addressed sim, and a voting-set shrink would need a reconfiguration-aware durability SAFETY
-    // oracle).
+    // EXPANDED AXIS: the delta is SEED-CHOSEN so the SLOT-SHIFT and voter-SHRINK classes are exercised BY
+    // CONSTRUCTION across the seed range rather than only the non-shifting `AddLearner` (so the cross-epoch
+    // reply/solicitation binding + a genuine f-reducing shrink are covered in the SYSTEM sim, not only the
+    // proto unit regressions): a slot-shifting `PromoteLearner`, a `DemoteVoter`↔re-promote OSCILLATION, or
+    // `AddLearner` (the no-shift case + fallback). See `choose_live_reconfig_delta` for the mechanics and
+    // why a DEMOTE is a sound shrink driver here where a direct voter REMOVAL is not (the demotee stays a
+    // live, routable, log-current learner, so it stays addressable AND keeps the retained durable copy the
+    // survival-based `DurabilityChecker` scans — a removed node would lose both).
     //
     // The kind is drawn from a SEPARATE per-seed PRNG (`seed ^ RECONFIG_DELTA_MAGIC`), so the action
     // stream `self.prng` keeps its exact draw positions (the cadence + every other action unchanged). The
@@ -2477,15 +2493,20 @@ impl Vopr {
       && self.live_reconfig_actions < LIVE_RECONFIG_BUDGET
       && c.serving_primary().is_some()
     {
-      let delta = self.choose_live_reconfig_delta();
-      match c.propose_reconfigure_single_change(delta.clone()) {
+      // The lane picks the delta; a f-reducing demote also carries the operator's acknowledgement (else
+      // the proto propose gate would refuse it). The grow lanes pass `None`.
+      let (delta, ack) = self.choose_live_reconfig_delta(c);
+      match c.propose_reconfigure_single_change(delta.clone(), ack) {
         Ok(op) => {
           self.live_reconfig_actions += 1;
           self.report.live_reconfigs_proposed += 1;
-          // The driven deltas (`PromoteLearner` / `AddLearner`) only GROW the voting set, so the
-          // successor's fault tolerance is >= the current `minority_budget` — the chaos budget already
-          // fits and is left unchanged. (A voting-set SHRINK would need the budget recomputed to the
-          // successor's tolerance; `RemoveVoter` is not driven — see `choose_live_reconfig_delta`.)
+          // The chaos budget (`minority_budget`) is NOT recomputed to a demote's smaller successor: a
+          // demote from an odd count lowers `f` for its window, so the schedule may knock the shrunk
+          // configuration below quorum and STALL — the HONEST reduced-tolerance reality the operator
+          // accepted, never a safety break. The demotee retains every committed op (no loss), the
+          // calm-window livelock only fires all-up (a stall while a voter is down is not flagged), and the
+          // final quiesce heals every member so the successor converges. A grow leaves the budget a strict
+          // over-approximation, as before.
           if trace {
             eprintln!(
               "tick {tick}: LIVE-RECONFIG proposed {} op={}",
@@ -2511,47 +2532,83 @@ impl Vopr {
     }
   }
 
-  /// Seed-choose the live single-change delta the axis drives this run (a pure deterministic function of
-  /// the seed, drawn from a dedicated stream so the action schedule is unperturbed): a SLOT-SHIFTING
-  /// `PromoteLearner` of the last genesis learner, else the non-shifting `AddLearner(sentinel)` (also the
-  /// fallback when no genesis learner exists). So half the applicable seeds exercise a surviving-member
-  /// SLOT SHIFT end-to-end under the full adversarial schedule, covering the cross-epoch reply +
-  /// solicitation binding in the SYSTEM sim (not only the proto unit regressions).
+  /// Seed-choose the live-reconfig LANE the axis drives this run and, with the live durable membership,
+  /// the concrete delta plus the fault-tolerance-reduction acknowledgement it carries. The LANE is a pure
+  /// deterministic function of the seed (drawn from a dedicated stream so the action schedule is
+  /// unperturbed); the demote lane's delta then alternates off the live membership (itself deterministic).
+  /// Three lanes:
   ///
-  /// `PromoteLearner` is the SOUND slot-shift driver here because it only GROWS the voting set: every
-  /// derived quorum only RISES, so NO safety oracle (durability quorum, agreement) is perturbed, and
-  /// EVERY member stays addressable (the promoted member moves slot `node_count-1`→`voting_count`, the
-  /// surviving learners shift — and the slot↔`MemberId` routing translation in `Cluster` resolves all of
-  /// them). The live-reconfig axis runs a FINITE, DRAINABLE client load (see `build_cluster`), so the
-  /// genesis learner's durable frontier reaches the head in a lull and the proto's catch-up-then-promote
-  /// gate is satisfiable — the promote COMMITS rather than being perpetually refused. The gate is a
-  /// promote-time CHALLENGE: the propose loop in `apply_actions` re-proposes across the
-  /// `RequestLearnerProof`/`LearnerProof` round-trip (the `ProofPending` retry), and once the target's
-  /// fresh proof covers the head the promote mints — the challenge is driven entirely over the existing
-  /// sim network (both new variants flow like any directed message).
+  /// - a slot-shifting `PromoteLearner` of the last genesis learner — a GROW: it moves into the voter
+  ///   range (slot `node_count-1`→`voting_count`), shifting the surviving learners' slots, so a
+  ///   surviving-member SLOT SHIFT is exercised end-to-end under the full adversarial schedule (the
+  ///   cross-epoch reply + solicitation binding in the SYSTEM sim, not only the proto unit regressions);
+  /// - a `DemoteVoter`↔re-`PromoteLearner` OSCILLATION on the last genesis voter — the genuine f-reducing
+  ///   voter shrink and its recovery (below);
+  /// - the non-shifting `AddLearner(sentinel)` — always valid, and the fallback when no genesis learner
+  ///   exists or the voting set is too small (`< 3`) for a meaningful demote.
   ///
-  /// `RemoveVoter` is DELIBERATELY NOT driven: a removed voter cannot be ROUTED its catch-up reply in this
-  /// slot-addressed simulator (it is absent from every survivor's successor membership, so a donor has no
-  /// slot to address its `SyncCheckpoint`/`EpochAhead` back to it — the real transport replies over the
-  /// CONNECTION, a back-channel the message-VOPR lacks), AND a voting-set SHRINK lowers the durable quorum
-  /// while the `DurabilityChecker` (a SAFETY oracle) is fixed at the predecessor's quorum — so driving it
-  /// would require making that safety oracle reconfiguration-aware, which risks MASKING a real
-  /// committed-op loss. Both are out of scope for a generator extension (a `RemoveVoter` lane would be a
-  /// dedicated effort with reconfiguration-aware safety checkers). The proto-level slot-shift regressions
-  /// in `viewstamp-proto` cover a low-index removal's reply + solicitation binding directly.
-  fn choose_live_reconfig_delta(&self) -> SingleVoterDelta {
-    let add_learner = SingleVoterDelta::AddLearner(MemberId::new(LIVE_RECONFIG_MEMBER));
+  /// Both grow lanes only RAISE every derived quorum, so no safety oracle is perturbed and every member
+  /// stays addressable (the slot↔`MemberId` routing in `Cluster` resolves the shifted members). The axis
+  /// runs a FINITE, DRAINABLE client load (see `build_cluster`), so a target's durable frontier reaches
+  /// the head in a lull and the proto's promote-time CHALLENGE is satisfiable — the propose loop in
+  /// `apply_actions` re-proposes across the `RequestLearnerProof`/`LearnerProof` round-trip (the
+  /// `ProofPending` retry), and once the fresh proof covers the head the promote mints.
+  ///
+  /// The DEMOTE oscillation is a SOUND voter-shrink driver here — where a direct voter REMOVAL is not —
+  /// because the demotee stays a live, routable, log-current LEARNER: learner-removal is NOT driven on
+  /// this axis, so it is never retired, the slot↔`MemberId` routing keeps addressing it, and it retains
+  /// its full applied log. So `DurabilityChecker`'s survival scan still finds every committed op on it
+  /// (the retained durable copy the shrink keeps), and no safety oracle is masked. A voter removal fails
+  /// both: the removed node is unaddressable in a slot-routed sim, and dropping its log-holder status is
+  /// exactly what a shrink could use to hide a loss. Demote keeps both properties, so the existing
+  /// oracles judge the shrink unchanged.
+  ///
+  /// The delta alternates off the primary's DURABLE membership so the axis self-paces: the last genesis
+  /// voter, while it is a voter, DEMOTES (the shrink); once that swap is durably installed it reads back a
+  /// learner and RE-PROMOTES (the recovery grow). Proposing the next phase only after the previous durably
+  /// installs means a re-propose during a change's in-flight window is simply refused and retried, never a
+  /// double change. A demote that lowers crash tolerance (an ODD live voter count, where
+  /// `f(n)=⌊(n-1)/2⌋` drops from `n` to `n-1`) carries `AcceptReducedFaultTolerance`; an even-count
+  /// (f-neutral) demote goes bare, exercising the ungated path. Every non-crashed member stays up, so the
+  /// shrink and its recovery both converge under the final quiesce.
+  fn choose_live_reconfig_delta(
+    &self,
+    c: &Cluster,
+  ) -> (SingleVoterDelta, Option<AcceptReducedFaultTolerance>) {
+    let add_learner = (
+      SingleVoterDelta::AddLearner(MemberId::new(LIVE_RECONFIG_MEMBER)),
+      None,
+    );
     let learner_count = self.node_count.saturating_sub(self.voting_count);
-    match Prng::new(self.seed ^ RECONFIG_DELTA_MAGIC).below(2) {
-      // A slot-shifting promote — only when a genesis learner exists (this axis forces learners on, so one
-      // always does). Promote the LAST learner (`MemberId node_count-1`): it moves into the voter range
-      // (slot `node_count-1`→`voting_count`), shifting the surviving learners' slots — the slot shift,
-      // with every member still addressable.
-      0 if learner_count >= 1 => {
-        SingleVoterDelta::PromoteLearner(MemberId::new(self.node_count as u128 - 1))
+    match Prng::new(self.seed ^ RECONFIG_DELTA_MAGIC).below(3) {
+      // A slot-shifting promote — only when a genesis learner exists (this axis forces learners on, so
+      // one always does). Promote the LAST learner (`MemberId node_count-1`). A GROW, so no ack is owed.
+      0 if learner_count >= 1 => (
+        SingleVoterDelta::PromoteLearner(MemberId::new(self.node_count as u128 - 1)),
+        None,
+      ),
+      // The demote↔re-promote oscillation on the last genesis voter. Needs `>= 3` voters so the odd-count
+      // demotes are a genuine f-reduction (and a `>= 1`-voter successor is never in question); smaller
+      // voting sets fall through to the always-valid grow.
+      1 if self.voting_count >= 3 => {
+        let membership = c.serving_primary_membership();
+        let target = MemberId::new(self.voting_count as u128 - 1);
+        match membership.slot_of(target) {
+          // A voter today: DEMOTE it (the shrink). The ack rides iff the live voter count is ODD, where
+          // the demote strictly lowers `f`; an even count is f-neutral and goes bare (the ungated path).
+          Some(slot) if membership.is_voter(slot) => {
+            let ack = (membership.replica_count() % 2 == 1).then_some(AcceptReducedFaultTolerance);
+            (SingleVoterDelta::DemoteVoter(target), ack)
+          }
+          // A learner today (a prior demote installed): RE-PROMOTE it (the recovery grow, no ack).
+          Some(_) => (SingleVoterDelta::PromoteLearner(target), None),
+          // Never a non-member — the lane never removes it. Fall back to the always-valid grow.
+          None => add_learner,
+        }
       }
-      // The always-valid no-slot-shift case (the original behavior) + the fallback when no genesis learner
-      // exists — so the budget is never wasted and the cross-seed swap non-vacuity holds.
+      // The always-valid no-slot-shift grow (the original behavior) + the fallback when no genesis learner
+      // exists or the voting set is too small to demote — so the budget is never wasted and the
+      // cross-seed swap non-vacuity holds.
       _ => add_learner,
     }
   }

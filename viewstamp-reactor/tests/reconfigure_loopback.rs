@@ -1,8 +1,11 @@
 //! Reconfiguration and peer address book tests for the reactor (tokio) QUIC driver.
 //!
-//! Reconfiguration gate: a real single-node driver drives a membership change through its own
-//! run loop to convergence (`reconfigure_to` → `Ok(())`), and a fail-closed shrink with no live
-//! witness times out within its deadline.
+//! Reconfiguration gate: a real single-node driver drives a membership change through its own run
+//! loop to convergence (`reconfigure_to` → `Ok(())`); a multi-voter cluster's shrink converges from
+//! the primary's active voter-liveness PROBE alone, even with zero client traffic ever submitted (no
+//! acked op is needed — the probe is the sole positive liveness source); and a shrink whose successor
+//! still needs a voter that never runs anywhere to answer stays fail-closed, resolving
+//! `InsufficientLiveness` once its deadline elapses rather than hanging forever.
 //!
 //! Address book gate: a driver that receives `AddPeer` commands continues to commit work correctly,
 //! and the address book accepts registrations at any point without panicking.
@@ -16,8 +19,8 @@ use rustls::{
 };
 use viewstamp_driver::{HealthHint, ReconfigureError};
 use viewstamp_proto::{
-  BlockAddress, BlockStore, ClusterTls, Event, IdentityConfig, MemberId, Membership,
-  MembershipTarget, QuicOptions, ReplicaId, Superblock, Wal,
+  AcceptReducedFaultTolerance, BlockAddress, BlockStore, ClusterTls, Event, IdentityConfig,
+  MemberId, Membership, MembershipTarget, QuicOptions, ReplicaId, Superblock, Wal,
 };
 use viewstamp_simulation::{InMemorySuperblock, InMemoryWal};
 
@@ -305,7 +308,7 @@ async fn single_node_reconfigure_converges_ok() {
   );
   tokio::time::timeout(
     Duration::from_secs(10),
-    handle.reconfigure_to(target, HealthHint::default()),
+    handle.reconfigure_to(target, HealthHint::default(), None),
   )
   .await
   .expect("the reconfiguration converges within 10s")
@@ -329,42 +332,315 @@ async fn single_node_reconfigure_converges_ok() {
   let _ = handle.shutdown().await;
 }
 
-/// SHRINK STALL → TIMEOUT: a shrink with NO positive liveness evidence fails closed and the call
-/// resolves `Timeout` once its deadline elapses. Genesis is two voters; only slot 0's node runs (no
-/// peer), the cluster is idle (the automatic ack oracle is empty), and `HealthHint::default()` offers
-/// no operator witness — so the executor's quorum-preserving removal picker can confirm no successor
-/// quorum and stalls rather than removing on a guess. With nothing ever committing, only the
-/// deadline-driven `cap_exhausted` ends the call: a short `reconfigure_timeout` makes the
-/// `ReconfigureError::Timeout` fire promptly. This is the regression for the deadline path (a
-/// hardwired `cap_exhausted = false` would hang here forever).
+/// SHRINK STALL → INSUFFICIENT LIVENESS: a shrink whose successor still needs a voter that never
+/// answers anywhere fails closed and the call resolves `InsufficientLiveness` once its deadline
+/// elapses. Genesis is THREE voters; only slot 0's node runs (no peers), so voters 1 and 2 never
+/// answer a health-probe round and can never be proven live.
+///
+/// The genesis MUST be three voters, not two: shrinking a two-voter genesis down to a SELF-ONLY
+/// successor ({0}) is exactly the idle-but-live case the probe fixes — `proven_live_voters` unions the
+/// local member into a live round unconditionally, so a lone running node can always prove ITSELF alive and
+/// that shrink now correctly COMPLETES (see the idle multi-voter completion test below). Here the
+/// target is still `{0}` alone, so the first step's successor (dropping either peer) is a TWO-voter
+/// config that needs the OTHER never-running peer proven too — evidence no probe round can ever
+/// produce — so the picker genuinely has nothing to confirm and stalls on every iteration. With
+/// nothing ever committing, only the deadline-driven `cap_exhausted` ends the call: a short
+/// `reconfigure_timeout` makes `ReconfigureError::InsufficientLiveness` fire promptly. This is the
+/// regression for the deadline path (a hardwired `cap_exhausted = false` would hang here forever).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn single_node_shrink_with_no_witness_times_out() {
+async fn single_node_shrink_with_an_unreachable_successor_voter_stalls_to_insufficient_liveness() {
   let ca = TestCa::new();
   let bind: SocketAddr = "127.0.0.1:41210".parse().unwrap();
-  // A short deadline so the fail-closed stall resolves Timeout quickly.
+  // A short deadline so the fail-closed stall resolves quickly.
   let cfg = viewstamp_reactor::DriverConfig::new().with_reconfigure_timeout(Duration::from_secs(1));
-  // Genesis: voters {0, 1}; only node 0 runs. Target: drop voter 1 (a RemoveVoter shrink).
-  let (driver, handle) = build_driver(&ca, bind, genesis(2, 0), cfg).await;
+  // Genesis: voters {0, 1, 2}; only node 0 runs. Target: drop voters 1 AND 2, down to {0} alone.
+  let (driver, handle) = build_driver(&ca, bind, genesis(3, 0), cfg).await;
   drop(tokio::spawn(driver.run()));
 
   let target = MembershipTarget::new(
     std::collections::BTreeSet::from([MemberId::new(0)]),
     std::collections::BTreeSet::new(),
   );
-  // Idle cluster + default hint = no positive successor-quorum evidence: the shrink stalls, and only
-  // the deadline ends it. Generously bound the test wait above the 1s deadline.
+  // No process ever answers for voters 1 or 2: every removal's successor still needs the OTHER one
+  // proven, which never happens. Generously bound the test wait above the 1s deadline.
   let outcome = tokio::time::timeout(
     Duration::from_secs(10),
-    handle.reconfigure_to(target, HealthHint::default()),
+    handle.reconfigure_to(
+      target,
+      HealthHint::default(),
+      Some(AcceptReducedFaultTolerance),
+    ),
   )
   .await
-  .expect("the call resolves (Timeout) well within 10s — it does not hang");
-  assert!(
-    matches!(outcome, Err(ReconfigureError::Timeout(_))),
-    "a fail-closed shrink with no witness resolves Timeout once the deadline elapses, got {outcome:?}"
-  );
+  .expect("the call resolves (InsufficientLiveness) well within 10s — it does not hang");
+  match outcome {
+    Err(ReconfigureError::InsufficientLiveness { unproven, .. }) => {
+      assert!(
+        !unproven.is_empty(),
+        "a genuinely unreachable successor voter is named unproven"
+      );
+      assert!(
+        unproven.is_subset(&std::collections::BTreeSet::from([
+          MemberId::new(1),
+          MemberId::new(2)
+        ])),
+        "only the two never-running peers can ever be named unproven, got {unproven:?}"
+      );
+    }
+    other => panic!(
+      "a fail-closed shrink with an unreachable successor voter resolves InsufficientLiveness once the deadline elapses, got {other:?}"
+    ),
+  }
 
   let _ = handle.shutdown().await;
+}
+
+/// THE HEALTH PROBE ALONE PROVES AN IDLE SHRINK'S SUCCESSOR QUORUM (reactor variant): a real
+/// 3-voter cluster with ZERO client traffic EVER submitted still converges a shrink to 2 voters,
+/// because the primary's active `solicit_health_proofs` round — not any inflight acked op — proves the
+/// successor voter alive. This is the direct end-to-end regression for the idle-shrink-stall defect the
+/// probe fixes: the deleted `recently_acked_voters` oracle read only in-flight uncommitted prepares and was empty on an idle
+/// cluster, so this exact scenario used to stall to `Timeout` before the probe replaced it. All three
+/// nodes run as separate driver processes over real mTLS QUIC, and the shrink is driven with the
+/// stock default `DriverConfig` (no shortened deadline, no operator `HealthHint`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_three_voter_shrink_completes_from_health_probes_alone() {
+  let ca = TestCa::new();
+  let addrs: Vec<SocketAddr> = (0..3)
+    .map(|i: u16| format!("127.0.0.1:{}", 41920 + i).parse().unwrap())
+    .collect();
+
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let (driver, handle) =
+      build_cluster_driver(&ca, id, addrs[id as usize], peers, genesis(3, 0)).await;
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+
+  // ZERO app traffic: no client op is ever submitted on any node. Only the health-probe round can
+  // supply the successor's liveness evidence. Target: drop voter 2, keeping {0, 1}.
+  let target = MembershipTarget::new(
+    std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
+    std::collections::BTreeSet::new(),
+  );
+  tokio::time::timeout(
+    viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(2),
+    handles[0].reconfigure_to(target, HealthHint::default(), Some(AcceptReducedFaultTolerance)),
+  )
+  .await
+  .expect("the call resolves within the deadline band")
+  .expect("the shrink converges from the health-probe evidence alone, with no client traffic ever submitted");
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}
+
+/// A SURVIVOR THAT NEVER PROVES BLOCKS A SHRINK THAT WOULD STRAND IT, AND THE REST STAY
+/// AVAILABLE (reactor variant): a real 3-voter cluster {0,1,2}; the primary (0) is asked to shrink to
+/// {0,1} (the sole delta is `DemoteVoter(2)`), and voter 1 — a SURVIVOR of the target, not the
+/// departing voter — is killed BEFORE the shrink is issued. `DemoteVoter(2)` is NEVER issued: its
+/// successor `{0,1}` would leave 1 dead, an immediate outage, so the shrink stalls fail-closed naming
+/// 1 unproven. Meanwhile the ORIGINAL 3-voter quorum (2 of 3) does not need voter 1: voter 0 and
+/// voter 2 alone still commit a client op after the stall, proving continued availability despite both
+/// the crash and the stall — and, since a wrongly-installed `{0,1}` successor with 1 dead could never
+/// commit anything again, that commit landing is itself proof voter 2 was never removed. Killing
+/// BEFORE the call is deliberate: a post-call kill is structurally racy against the documented bounded
+/// point-in-time freshness residual (a survivor that answers one probe within `max_age`, then dies,
+/// legitimately authorizes the removal), so this loopback pins the deterministic end-to-end form while
+/// the crashed-after-answering nuances live in the unit/executor falsifiers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_killed_survivor_blocks_the_shrink_and_the_rest_stay_available() {
+  let ca = TestCa::new();
+  let addrs: Vec<SocketAddr> = (0..3)
+    .map(|i: u16| format!("127.0.0.1:{}", 41930 + i).parse().unwrap())
+    .collect();
+
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let (driver, handle) =
+      build_cluster_driver(&ca, id, addrs[id as usize], peers, genesis(3, 0)).await;
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+
+  // Target {0, 1}: the sole delta is DemoteVoter(2).
+  let target = MembershipTarget::new(
+    std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
+    std::collections::BTreeSet::new(),
+  );
+  // Kill voter 1 BEFORE issuing the shrink: from this point on it can never answer a health-probe
+  // round, so the successor {0,1} can never be proven live and the removal deterministically stalls.
+  // The DemoteVoter op still commits via the surviving {0,2} quorum of the current 3-voter config.
+  let _ = handles[1].shutdown().await;
+
+  let primary = handles[0].clone();
+  let recon = tokio::spawn(async move {
+    primary
+      .reconfigure_to(
+        target,
+        HealthHint::default(),
+        Some(AcceptReducedFaultTolerance),
+      )
+      .await
+  });
+
+  let outcome = tokio::time::timeout(
+    viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(5),
+    recon,
+  )
+  .await
+  .expect("the call resolves (does not hang) within the deadline band")
+  .expect("the spawned reconfigure_to task completes without panicking");
+  match outcome {
+    Err(ReconfigureError::InsufficientLiveness { unproven, .. }) => {
+      assert!(
+        unproven.contains(&MemberId::new(1)),
+        "voter 1 (killed, never proves again) is named unproven, got {unproven:?}"
+      );
+    }
+    other => panic!("expected InsufficientLiveness naming voter 1, got {other:?}"),
+  }
+
+  // AVAILABILITY PRESERVED: voter 0 and voter 2 (both still alive) commit a client op despite voter
+  // 1's death and the stalled shrink — the original 3-voter quorum (2 of 3) never needed voter 1.
+  let reply = tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].submit(Bytes::from_static(b"post-stall")),
+  )
+  .await
+  .expect("the commit lands within 20s despite voter 1's death and the stalled shrink")
+  .expect("a committed reply");
+  assert_eq!(
+    &reply[..],
+    &1u64.to_be_bytes(),
+    "the first (and only) committed op replies the post-apply count 1"
+  );
+
+  let _ = handles[0].shutdown().await;
+  let _ = handles[2].shutdown().await;
+}
+
+/// DEMOTE-THEN-GC END-TO-END (reactor variant): a real 3-voter cluster {0,1,2} shrinks to {0,1} via the
+/// demote-first path, driven by a single `reconfigure_to` call from the PRIMARY (member 0) — a SURVIVING
+/// node, never the departing member itself (the H1 drive-from-a-surviving-node rule: an about-to-leave
+/// voter is never a sound driver of its own departure). The target names {0,1} as voters and retains
+/// member 2 in NEITHER the voter nor the learner set, so the planner sequences TWO steps: `DemoteVoter(2)`
+/// (voter → live learner) then, once that swap installs, `RemoveLearner(2)` (race-free GC — the successor
+/// quorum's own commit, gated on a fresh liveness probe of {0,1}). Member 2 stays a normal, connected
+/// process throughout (never crashed), so it OBSERVES both installs on its own event stream, in order:
+/// first `self_is_voter=false, self_is_learner=true` (demoted — still a member, no longer a voter), then
+/// `self_is_voter=false, self_is_learner=false` (GCed — fully out of the membership), each installing at
+/// a strictly later epoch than the one before. 3→2 is an ODD-count shrink (`f` drops from 1 to 0), so
+/// the call carries `AcceptReducedFaultTolerance` — the operator's honest acknowledgement that crash
+/// tolerance is genuinely reduced, or the propose gate would refuse the demote. After the GC installs,
+/// the SHRUNK 2-voter cluster {0,1} still commits a fresh client request through the primary, proving
+/// availability survived the whole demote-then-GC round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_demoted_voter_becomes_a_learner_then_is_gced_and_the_smaller_cluster_still_commits() {
+  let ca = TestCa::new();
+  let addrs: Vec<SocketAddr> = (0..3)
+    .map(|i: u16| format!("127.0.0.1:{}", 41960 + i).parse().unwrap())
+    .collect();
+
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let (driver, handle) =
+      build_cluster_driver(&ca, id, addrs[id as usize], peers, genesis(3, 0)).await;
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+
+  // Subscribe to member 2's OWN event stream BEFORE issuing the shrink, so neither install is missed.
+  let demotee_events = handles[2].events();
+
+  // Target {0, 1}: member 2 is named in neither the voter nor the learner set, so the planner drives
+  // `DemoteVoter(2)` then `RemoveLearner(2)` — the full demote-then-GC sequence — as ONE `reconfigure_to`
+  // call. Issued from member 0 (a survivor), never from member 2 itself.
+  let target = MembershipTarget::new(
+    std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
+    std::collections::BTreeSet::new(),
+  );
+  tokio::time::timeout(
+    viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(2),
+    handles[0].reconfigure_to(
+      target,
+      HealthHint::default(),
+      Some(AcceptReducedFaultTolerance),
+    ),
+  )
+  .await
+  .expect("the demote-then-GC shrink resolves within the deadline band")
+  .expect("reconfigure_to resolves Ok once member 2 is demoted, GCed, and the target is reached");
+
+  // Drain member 2's own two installs, in order: the demote (still a member, now a learner), then the
+  // GC (fully removed). Waited for explicitly (not opportunistically drained) — member 2's own install
+  // can lag the primary's view by a message or two, even with no faults.
+  let mut demote_swap = None;
+  let mut gc_swap = None;
+  tokio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match demotee_events.recv_async().await {
+        Ok(Event::MembershipChanged(m)) if demote_swap.is_none() => demote_swap = Some(m),
+        Ok(Event::MembershipChanged(m)) => {
+          gc_swap = Some(m);
+          break;
+        }
+        Ok(_) => {}
+        Err(_) => panic!("member 2's event channel closed before its GC install arrived"),
+      }
+    }
+  })
+  .await
+  .expect("member 2 observes both its demote-install and its GC-install within 20s");
+  let demote_swap = demote_swap.expect("the demote install was observed");
+  let gc_swap = gc_swap.expect("the GC install was observed");
+  assert!(
+    !demote_swap.self_is_voter() && demote_swap.self_is_learner(),
+    "the first install demotes member 2 to a live learner (still a member), got {demote_swap:?}"
+  );
+  assert!(
+    !gc_swap.self_is_voter() && !gc_swap.self_is_learner(),
+    "the second install GCs member 2 out of the membership entirely, got {gc_swap:?}"
+  );
+  assert!(
+    gc_swap.epoch() > demote_swap.epoch(),
+    "the GC installs at a strictly later epoch than the demote (epoch {} vs {})",
+    gc_swap.epoch(),
+    demote_swap.epoch()
+  );
+
+  // AVAILABILITY: the SHRUNK 2-voter cluster {0,1} still commits a fresh client request through the
+  // primary — the demote-then-GC round trip left the surviving quorum fully functional.
+  let reply = tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].submit(Bytes::from_static(b"post-demote-gc")),
+  )
+  .await
+  .expect("the shrunk cluster commits within 20s")
+  .expect("a committed reply");
+  assert_eq!(
+    &reply[..],
+    &1u64.to_be_bytes(),
+    "the first client op on the shrunk 2-voter cluster replies the post-apply count 1"
+  );
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
 }
 
 /// ADDRESS BOOK DOES NOT DISRUPT NORMAL COMMITS (reactor variant): a 3-node cluster with `add_peer`
@@ -473,14 +749,15 @@ async fn add_peer_is_non_blocking_and_does_not_panic() {
 /// SLOT, so a conn keeps its stable identity across a reconfiguration that renumbers slots; the
 /// coordinator's `reconcile_routing` re-resolves each conn's attested member to its NEW slot and closes
 /// only the conns whose member genuinely moved (which then re-bind under the new slot on the next
-/// handshake). Genesis is voters {0,1,2,3} at slots {0,1,2,3}; the primary (member 0) proposes
-/// `RemoveVoter(1)`, leaving voters {0,2,3} at slots {0,1,2} — members 2 and 3 each shift DOWN one slot.
-/// The post-reconfiguration commit is submitted at the primary (member 0): committing it requires a
-/// PrepareOk quorum from the SHIFTED successor voter set, so its success proves the primary's mesh conns
-/// to the shifted backups re-resolved to their NEW slots — exactly the stable-id routing the handshake
-/// redesign provides. A regression to slot-attestation routing strands the shifted conns and the second
-/// commit times out. (The compio gate submits the post-shift op at the shifted backup itself, the
-/// stronger reply-to-shifted-backup direction.)
+/// handshake). Genesis is voters {0,1,2,3} at slots {0,1,2,3}; the primary (member 0) proposes a shrink
+/// to {0,2,3}. Member 1 is named in neither the target's voter nor learner set, so the planner
+/// sequences `DemoteVoter(1)` then `RemoveLearner(1)`, leaving voters {0,2,3} at slots {0,1,2} — members
+/// 2 and 3 each shift DOWN one slot. The post-reconfiguration commit is submitted at the primary
+/// (member 0): committing it requires a PrepareOk quorum from the SHIFTED successor voter set, so its
+/// success proves the primary's mesh conns to the shifted backups re-resolved to their NEW slots —
+/// exactly the stable-id routing the handshake redesign provides. A regression to slot-attestation
+/// routing strands the shifted conns and the second commit times out. (The compio gate submits the
+/// post-shift op at the shifted backup itself, the stronger reply-to-shifted-backup direction.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_cluster_survives_slot_shift() {
   use std::{collections::BTreeSet, sync::Arc};
@@ -579,20 +856,16 @@ async fn stream_cluster_survives_slot_shift() {
   );
 
   // RECONFIGURE: the primary (member 0) drives the removal of voter 1, leaving voters {0,2,3} at slots
-  // {0,1,2}. `known_up = {0,2,3}` is the operator's positive witness that the successor quorum is live,
-  // so the quorum-preserving removal picker confirms it rather than fail-closed stalling.
+  // {0,1,2}. All three nodes are live and committing, so the primary's health-probe round proves the
+  // successor quorum live and the quorum-preserving removal picker confirms it — no operator hint
+  // needed (`HealthHint::default()`).
   let target = MembershipTarget::new(
     BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
     BTreeSet::new(),
   );
-  let health = HealthHint::new().with_known_up(BTreeSet::from([
-    MemberId::new(0),
-    MemberId::new(2),
-    MemberId::new(3),
-  ]));
   tokio::time::timeout(
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, health),
+    handles[0].reconfigure_to(target, HealthHint::default(), None),
   )
   .await
   .expect("the reconfiguration converges within 20s")
@@ -782,11 +1055,12 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
     BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
     BTreeSet::new(),
   );
-  let health =
-    HealthHint::new().with_known_up(BTreeSet::from([MemberId::new(0), MemberId::new(1)]));
+  // The health hint is irrelevant here: `PromoteLearner` is a grow-phase step the liveness gate never
+  // consults (only a `DemoteVoter` shrink does) — the promote-time durable-prefix challenge is what
+  // admits it.
   tokio::time::timeout(
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, health),
+    handles[0].reconfigure_to(target, HealthHint::default(), None),
   )
   .await
   .expect("the promotion converges within 20s")
@@ -809,6 +1083,273 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
     "the two-voter-quorum commit lands only with the promoted voter's vote (count 4)"
   );
 
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}
+
+/// PULL-LANE EPOCH CROSSING (TCP/TLS stream transport): an epoch-lagged Normal LEARNER whose ONLY link is a
+/// stream conn to a RETAINED, settled-Normal, NON-PRIMARY member of the successor epoch bootstraps its
+/// learner-status cadence, emits `LearnerStatus`, draws an `EpochAhead` hint back, completes the crossing
+/// sync, and INSTALLS the successor epoch — with NO successor-PRIMARY traffic ever reaching it.
+///
+/// This is the end-to-end regression for the stream driver servicing its consensus timer UNCONDITIONALLY. A
+/// fresh Normal learner boots with EVERY timer disarmed, so `poll_timeout()` is `None`; a due-gated
+/// `handle_timeout` would never run, so the learner-status cadence (which self-bootstraps INSIDE
+/// `handle_timeout`, its sole arm site) would never arm, the learner would never emit `LearnerStatus`, never
+/// draw `EpochAhead`, never arm the crossing sync — stranded forever. Serviced every iteration, the cadence
+/// bootstraps and the crossing completes.
+///
+/// OBSERVABILITY — asserted BY CONSEQUENCE: the record layer (`RecordIo`) is `pub(crate)`-sealed and
+/// `StreamTransport` is sealed, so the wire `LearnerStatus`/`EpochAhead` messages CANNOT be tapped from this
+/// test crate — the only observability is the public `events()` stream. The crossing is proven by two events
+/// on the LEARNER's `events()`: `StateSyncStarted` (the learner armed the forced crossing sync off the
+/// pulled hint — reachable ONLY after it emitted `LearnerStatus` and the bound member answered `EpochAhead`)
+/// and `StateSyncCompleted` (the crossing checkpoint installed + went durable). A cross-epoch sync install
+/// emits NO `MembershipChanged` (`install_membership` is passed `None` for the reconfigure op — the laggard
+/// synced PAST it), so `StateSyncCompleted` is the terminal witness; in this topology the learner's ONLY
+/// possible sync is the E0->E1 crossing (it boots at E0 checkpoint 0 with a single peer that is a settled-E1
+/// donor), so a completed sync IS the crossing. Without the timer fix neither event arrives and the wait
+/// times out.
+///
+/// NON-PRIMARY IS LOAD-BEARING: any successor-PRIMARY `Prepare`/`Commit` reaching the learner would trigger
+/// the crossing via `maybe_request_cross_epoch_catchup` (inbound-driven, INDEPENDENT of the cadence) and the
+/// test would pass even WITHOUT the fix. So the learner's sole link is member 0 — the E0 primary DEMOTED to
+/// an E1 learner-seat — which answers `EpochAhead` and serves the crossing checkpoint (its `RequestSync`
+/// `Backups` fan-out reaches every bound replica conn) but NEVER broadcasts to a learner. The E1 primary
+/// (member 1) is never wired to the learner (asymmetric peer lists), so no successor-primary traffic ever
+/// reaches it.
+///
+/// TOPOLOGY: genesis E0 = voters {0,1,2} + learner {3}. Members 0,1,2 mesh among THEMSELVES (never dialing
+/// the learner) and commit baseline ops so the donor holds a checkpoint above 0 (a donor at checkpoint 0
+/// serves nothing). The primary (member 0) then DEMOTES ITSELF (only the primary can propose its own
+/// demotion) to a learner, retaining {1,2} as voters and {0,3} as learners — a 3->2 voter shrink
+/// (`AcceptReducedFaultTolerance`). The view is durable across the swap, so primaryship remaps 0->1 WITHOUT
+/// a view change. The stranded learner (member 3) then boots formatted at E0 (never receiving the
+/// SwapEpoch), wired to dial ONLY member 0 at the learner's E0 slot 0 — so its `LearnerStatus`, addressed to
+/// `primary(view 0) = slot 0`, routes to member 0, and its `Backups` `RequestSync` fan-out (every bound
+/// replica conn) also reaches member 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stranded_learner_crosses_an_epoch_over_a_non_primary_link() {
+  use std::{collections::BTreeSet, sync::Arc};
+
+  use viewstamp_proto::{Conn, LabelOptions, Labeled, Passthrough, Peer};
+
+  const CROSS_CLUSTER: u128 = 0x5454;
+  // A small checkpoint interval so a handful of baseline ops advances the donor's checkpoint above 0 — the
+  // crossing donor serves nothing at checkpoint 0 (`on_request_sync` is silent there).
+  const CHECKPOINT_OPS: u64 = 4;
+
+  // Self-attesting factories: each node announces its OWN stable MemberId in the `Labeled` handshake, so a
+  // peer binds it by stable id and the coordinator resolves that id to whatever slot the local membership
+  // assigns it.
+  let mk_dialer = |me: u8| -> Arc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>> + Send + Sync> {
+    Arc::new(move |_peer| {
+      let opts = LabelOptions::new(CROSS_CLUSTER, Peer::Member(MemberId::new(me as u128)));
+      Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+    })
+  };
+  let mk_acceptor = |me: u8| -> Arc<dyn Fn() -> Conn<Labeled<Passthrough>> + Send + Sync> {
+    Arc::new(move || {
+      let opts = LabelOptions::new(CROSS_CLUSTER, Peer::Member(MemberId::new(me as u128)));
+      Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+    })
+  };
+
+  // Reserve four kernel-assigned TCP ports (fresh ephemeral ports keep repeated CI runs from colliding with
+  // the previous run's TIME_WAIT remnants).
+  let reservations: Vec<std::net::TcpListener> = (0..4)
+    .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port"))
+    .collect();
+  let addrs: Vec<SocketAddr> = reservations
+    .iter()
+    .map(|l| l.local_addr().expect("reserved listener has an address"))
+    .collect();
+  drop(reservations);
+
+  // Boot the three genesis voters {0,1,2}. Each dials ONLY the other two voters — never the learner (member
+  // 3) — so the learner stays stranded, reached by nobody, and no successor node ever pushes it E1 traffic.
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let config = viewstamp_proto::Config::with_checkpoint_ops(
+      CROSS_CLUSTER,
+      MemberId::new(id as u128),
+      CHECKPOINT_OPS,
+    )
+    .unwrap();
+    let (ready_tx, ready_rx) = flume::unbounded();
+    let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
+    let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    viewstamp_driver::format(config, &genesis(3, 1), &wal, &mut sb).expect("format genesis store");
+    let blocks = MemBlocks::default();
+    let (driver, handle) = viewstamp_reactor::ReactorStreamDriver::<
+      agnostic::tokio::TokioRuntime,
+      viewstamp_simulation::sm::LogSm,
+      Labeled<Passthrough>,
+      Notifying<InMemoryWal>,
+      Notifying<InMemorySuperblock>,
+      MemBlocks,
+    >::new(
+      config,
+      genesis(3, 1),
+      viewstamp_simulation::sm::LogSm::default(),
+      wal,
+      sb,
+      blocks,
+      viewstamp_proto::ClientId::new(u128::from(id) + 1),
+      0,
+      addrs[id as usize],
+      peers,
+      mk_dialer(id),
+      mk_acceptor(id),
+      ready_rx,
+    )
+    .await
+    .expect("stream driver builds");
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+
+  // Commit baseline ops through the primary (member 0) so member 0 durably holds a checkpoint above 0 — the
+  // frontier it will later serve to cross the stranded learner. With `CHECKPOINT_OPS = 4`, twelve committed
+  // ops form several checkpoints.
+  for expected in 1..=12u64 {
+    let reply = tokio::time::timeout(
+      Duration::from_secs(20),
+      handles[0].submit(Bytes::from_static(b"op")),
+    )
+    .await
+    .expect("the baseline op commits within 20s")
+    .expect("a baseline reply");
+    assert_eq!(
+      &reply[..],
+      &expected.to_be_bytes(),
+      "the baseline op replies the post-apply count {expected}"
+    );
+  }
+
+  // The primary (member 0) DEMOTES ITSELF to a learner: target voters {1,2}, learners {0,3}. Only the
+  // primary can propose its own demotion, so this is issued on member 0's handle. 3->2 voters drops `f`
+  // from 1 to 0, so the shrink carries `AcceptReducedFaultTolerance`. Spawned in the background: the
+  // readiness signal this test turns on is member 0's OWN install to the E1 learner seat (its commit-first
+  // swap DOES emit `MembershipChanged`), not whether the reconfigure future resolves on the just-demoted
+  // handle.
+  let member0_events = handles[0].events();
+  let demoter = handles[0].clone();
+  drop(tokio::spawn(async move {
+    let _ = demoter
+      .reconfigure_to(
+        MembershipTarget::new(
+          BTreeSet::from([MemberId::new(1), MemberId::new(2)]),
+          BTreeSet::from([MemberId::new(0), MemberId::new(3)]),
+        ),
+        HealthHint::default(),
+        Some(AcceptReducedFaultTolerance),
+      )
+      .await;
+  }));
+  tokio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match member0_events.recv_async().await {
+        Ok(Event::MembershipChanged(m)) if m.epoch().get() == 1 => {
+          assert!(
+            !m.self_is_voter() && m.self_is_learner(),
+            "member 0 demoted itself to an E1 learner seat, got {m:?}"
+          );
+          break;
+        }
+        Ok(_) => {}
+        Err(_) => panic!("member 0's event channel closed before its self-demote install"),
+      }
+    }
+  })
+  .await
+  .expect("member 0 installs its self-demotion to an E1 learner within 20s");
+
+  // Boot the stranded learner (member 3) AFTER E1 installed, so it never received the SwapEpoch: it is
+  // genuinely one epoch behind at E0. Its ONLY dial peer is member 0 at slot 0 (the learner's E0
+  // view-0 primary slot) — the retained, settled-Normal, NON-PRIMARY E1 learner-seat that answers
+  // `EpochAhead` and serves the crossing checkpoint.
+  let learner_id = 3u8;
+  let learner_config = viewstamp_proto::Config::with_checkpoint_ops(
+    CROSS_CLUSTER,
+    MemberId::new(learner_id as u128),
+    CHECKPOINT_OPS,
+  )
+  .unwrap();
+  let (learner_ready_tx, learner_ready_rx) = flume::unbounded();
+  let learner_wal = Notifying::new(InMemoryWal::new(), learner_ready_tx.clone());
+  let mut learner_sb = Notifying::new(InMemorySuperblock::new(), learner_ready_tx);
+  viewstamp_driver::format(
+    learner_config,
+    &genesis(3, 1),
+    &learner_wal,
+    &mut learner_sb,
+  )
+  .expect("format the stranded learner's genesis (E0) store");
+  let learner_blocks = MemBlocks::default();
+  let (learner_driver, learner_handle) = viewstamp_reactor::ReactorStreamDriver::<
+    agnostic::tokio::TokioRuntime,
+    viewstamp_simulation::sm::LogSm,
+    Labeled<Passthrough>,
+    Notifying<InMemoryWal>,
+    Notifying<InMemorySuperblock>,
+    MemBlocks,
+  >::new(
+    learner_config,
+    genesis(3, 1),
+    viewstamp_simulation::sm::LogSm::default(),
+    learner_wal,
+    learner_sb,
+    learner_blocks,
+    viewstamp_proto::ClientId::new(u128::from(learner_id) + 1),
+    0,
+    addrs[learner_id as usize],
+    // The sole link: member 0, dialed at ReplicaId 0 — the slot the learner's own E0 membership assigns
+    // member 0, so its attested id resolves to the dialed slot (a mismatch would be `IdentityRejected`).
+    vec![(ReplicaId::new(0), addrs[0])],
+    mk_dialer(learner_id),
+    mk_acceptor(learner_id),
+    learner_ready_rx,
+  )
+  .await
+  .expect("the stranded learner's stream driver builds");
+  // Subscribe to the learner's events BEFORE spawning its run loop, so no crossing event is missed.
+  let learner_events = learner_handle.events();
+  drop(tokio::spawn(learner_driver.run()));
+
+  // THE GATE: wait for `StateSyncCompleted` on the learner's events — the crossing checkpoint installed +
+  // went durable. `StateSyncStarted` must precede it (the learner armed the forced crossing sync off the
+  // pulled `EpochAhead`, which is reachable ONLY after it self-bootstrapped its cadence and emitted
+  // `LearnerStatus`). Without the driver's unconditional-timer fix the cadence never bootstraps, so neither
+  // event arrives and this wait times out.
+  let mut saw_started = false;
+  tokio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match learner_events.recv_async().await {
+        Ok(Event::StateSyncStarted(_)) => saw_started = true,
+        Ok(Event::StateSyncCompleted(_)) => break,
+        Ok(_) => {}
+        Err(_) => panic!("the learner's event channel closed before it crossed"),
+      }
+    }
+  })
+  .await
+  .expect(
+    "the stranded learner self-bootstraps its cadence, pulls an EpochAhead hint over its non-primary \
+     link, and completes the crossing sync within 20s",
+  );
+  assert!(
+    saw_started,
+    "the learner armed a crossing sync (StateSyncStarted) before completing it — the witness it emitted \
+     LearnerStatus and drew the EpochAhead hint back"
+  );
+
+  let _ = learner_handle.shutdown().await;
   for h in &handles {
     let _ = h.shutdown().await;
   }
@@ -959,19 +1500,15 @@ async fn quic_cluster_survives_slot_shift() {
     "the first committed op replies the post-apply count 1"
   );
 
-  // RECONFIGURE: remove voter 1, shifting members 2→slot 1 and 3→slot 2.
+  // RECONFIGURE: remove voter 1, shifting members 2→slot 1 and 3→slot 2. All four nodes are live and
+  // committing, so the primary's health-probe round proves the successor quorum live.
   let target = MembershipTarget::new(
     BTreeSet::from([MemberId::new(0), MemberId::new(2), MemberId::new(3)]),
     BTreeSet::new(),
   );
-  let health = HealthHint::new().with_known_up(BTreeSet::from([
-    MemberId::new(0),
-    MemberId::new(2),
-    MemberId::new(3),
-  ]));
   tokio::time::timeout(
     Duration::from_secs(20),
-    handles[0].reconfigure_to(target, health),
+    handles[0].reconfigure_to(target, HealthHint::default(), None),
   )
   .await
   .expect("the reconfiguration converges within 20s")

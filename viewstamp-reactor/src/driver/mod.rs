@@ -129,6 +129,10 @@ pub struct ReactorQuicDriver<R: Runtime, S, W, B, L, I> {
   /// In-flight reconfiguration job, or `None`. At most one job at a time; a second
   /// `Command::Reconfigure` while `Some` is rejected immediately.
   reconfigure: Option<viewstamp_driver::ReconfigureJob>,
+  /// When the next voter-liveness-probe round is due while a reconfiguration job is in flight, or
+  /// `None` when no job is active. Paced at `DriverConfig::health_probe_interval`; probe traffic
+  /// exists ONLY while a shrink job runs.
+  next_probe_at: Option<Instant>,
 }
 
 impl<R, S, W, B, L> ReactorQuicDriver<R, S, W, B, L, ProvidedIdentity>
@@ -213,7 +217,9 @@ where
   /// security configuration stays in `opts` + `identity`.
   ///
   /// # Errors
-  /// [`DriverError::Bind`] if the socket cannot bind; [`DriverError::Connect`] if a dial fails.
+  /// [`DriverError::ProbeIntervalNotBelowMaxAge`] if `cfg.health_probe_interval()` is not strictly
+  /// below `cfg.health_proof_max_age()`; [`DriverError::Bind`] if the socket cannot bind;
+  /// [`DriverError::Connect`] if a dial fails.
   #[allow(clippy::too_many_arguments)]
   pub async fn with_config(
     config: Config,
@@ -232,6 +238,17 @@ where
     storage_ready: flume::Receiver<()>,
     cfg: DriverConfig,
   ) -> Result<(Self, Handle), DriverError> {
+    // Refuse a probe cadence that cannot fit inside the round it retransmits. The executor re-solicits
+    // every `health_probe_interval` WITHIN a round that lives `health_proof_max_age`; unless the cadence
+    // is strictly shorter than the round, the round would expire before it could be retransmitted and a
+    // live voter's reply could never land in the window, stalling every shrink fail-closed.
+    // Misconfiguration is a constructor error, not a load condition.
+    if cfg.health_probe_interval() >= cfg.health_proof_max_age() {
+      return Err(DriverError::ProbeIntervalNotBelowMaxAge {
+        interval: cfg.health_probe_interval(),
+        max_age: cfg.health_proof_max_age(),
+      });
+    }
     let clock = Clock::new();
     let socket = <R::Net as Net>::UdpSocket::bind(bind_addr)
       .await
@@ -314,6 +331,7 @@ where
       storage_ready,
       storage_notifier_closed: false,
       reconfigure: None,
+      next_probe_at: None,
     };
     let handle = Handle::new(commands_tx, events_rx, budget, retired);
     Ok((driver, handle))
@@ -618,6 +636,7 @@ where
       Command::Reconfigure {
         target,
         health,
+        ack,
         reply,
       } => {
         if self.reconfigure.is_some() {
@@ -625,17 +644,23 @@ where
             viewstamp_proto::ProposeMembershipError::AlreadyInFlight,
           )));
         } else {
+          // Solicit the first voter-liveness-probe round now (and re-solicit every
+          // health_probe_interval while the job runs); snapshot the proven-live voters for the executor.
+          self
+            .coord
+            .solicit_health_proofs(now, self.cfg.health_proof_max_age());
+          self.next_probe_at = Some(now + self.cfg.health_probe_interval());
           let live = self.coord.live_membership();
-          let acked = self.coord.recently_acked_voters(self.cfg.ack_window());
+          let fresh = self.coord.proven_live_voters(now);
           self.reconfigure = Some(viewstamp_driver::ReconfigureJob::start(
             target,
             health,
-            self.cfg.ack_window(),
             self.cfg.reconfigure_timeout(),
             reply,
             live,
-            acked,
+            fresh,
             self.coord.endpoint().local(),
+            ack,
           ));
         }
         false
@@ -658,20 +683,35 @@ where
     }
   }
 
-  /// Advance the in-flight reconfiguration job by one iteration, if any. Reads the live membership
-  /// and acked set from the coordinator (disjoint borrow: coordinator is read first, then the job
-  /// takes `&mut self`), then calls `job.advance` with a closure that proposes a delta.
+  /// Advance the in-flight reconfiguration job by one iteration, if any. Re-solicits the liveness
+  /// probe on cadence, then reads the live membership and proven-live voter set from the coordinator
+  /// (disjoint borrow: coordinator is read first, then the job takes `&mut self`), and calls
+  /// `job.advance` with a closure that proposes a delta.
   fn advance_reconfigure(&mut self, now: Instant) {
     let Some(mut job) = self.reconfigure.take() else {
       return;
     };
+    // Re-solicit the voter-liveness-probe round on the probe cadence while the job runs: each call
+    // RETRANSMITS the outstanding round's nonce until it expires, then opens a fresh round. A voter
+    // that crashed since the round opened drops out of the proven-live set at the round's rollover,
+    // within one `health_proof_max_age`.
+    if self.next_probe_at.is_none_or(|at| now >= at) {
+      self
+        .coord
+        .solicit_health_proofs(now, self.cfg.health_proof_max_age());
+      self.next_probe_at = Some(now + self.cfg.health_probe_interval());
+    }
     let live = self.coord.live_membership();
-    let acked = self.coord.recently_acked_voters(self.cfg.ack_window());
-    let outcome = job.advance(now, live, acked, &mut |delta| {
-      self.coord.propose_membership(now, &mut self.wal, delta)
+    let fresh = self.coord.proven_live_voters(now);
+    let outcome = job.advance(now, live, fresh, &mut |delta, ack| {
+      self
+        .coord
+        .propose_membership(now, &mut self.wal, delta, ack)
     });
     if !matches!(outcome, viewstamp_driver::AdvanceOutcome::Done) {
       self.reconfigure = Some(job);
+    } else {
+      self.next_probe_at = None;
     }
   }
 
