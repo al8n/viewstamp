@@ -515,9 +515,11 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
 #[test]
 fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
   // 3 voters {MemberId(0), MemberId(1), MemberId(2)} + 2 genesis learners {MemberId(3), MemberId(4)}.
-  // The genesis learners are the target voters-to-be: the planner's Phase 1 AddLearner is a no-op for
-  // them (already present), and Phase 2 promotes both. Phase 3 removes MemberId(0) and MemberId(1).
-  // Total plan length: 4 steps (2 promotes + 2 removes), bumping the durable epoch from 0 to 4.
+  // The genesis learners are the target voters-to-be, and MemberId(0)/MemberId(1) are the departing
+  // voters (MemberId(2) stays). The demote-first planner interleaves promotions and demotions to hold
+  // the crash tolerance at parity: PromoteLearner(3), DemoteVoter(0) + RemoveLearner(0),
+  // PromoteLearner(4), DemoteVoter(1) + RemoveLearner(1) — 6 committed steps, each its own epoch swap,
+  // bumping the durable epoch from 0 to 6.
   let seed = 0x5EED_3450;
   let mut c = Cluster::with_members(3, 2, 2, 40, seed, 10);
   c.set_faults(Faults {
@@ -553,19 +555,29 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
     "a serving primary exists after the load settles"
   );
 
-  // (2) Drive the full plan {MemberId(0),1,2} -> {MemberId(2),3,4}: per outer iteration, re-read the
-  // live voter set from the serving primary's durable membership, plan from that live config, and
-  // propose the FIRST delta. The promote-time challenge gates each PromoteLearner step, so retries are
-  // PACED (every RETRY_EVERY ticks) to let the challenge round-trip complete before re-drawing the
-  // nonce. Tick until the swap installs (membership_swaps_observed increases), then repeat.
+  // (2) Drive the full plan {MemberId(0),1,2} -> {MemberId(2),3,4}: per outer iteration, plan from the
+  // serving primary's LIVE durable membership and propose the FIRST delta. The promote-time challenge
+  // gates each PromoteLearner step, so retries are PACED (every RETRY_EVERY ticks) to let the challenge
+  // round-trip complete before re-drawing the nonce. A round completes when ITS OWN proposed op is
+  // witnessed installed (its `MembershipChanged` appears in some replica's swap stream) — not the
+  // CLUSTER-WIDE swap count, which the previous step's still-fanning-out installs would trip early:
+  // that would end the round before its own step ever landed and leave the next round re-planning from
+  // a stale membership, re-proposing a step the cluster already applied. The outer loop runs until the
+  // plan is empty (the live membership already matches the target), bounded by a global tick budget
+  // rather than a fixed round count (an already-committed step resolves in one round with no new op, so
+  // the number of rounds needed is not exactly the plan length).
   let target = MembershipTarget::new(
     [2u128, 3, 4].into_iter().map(MemberId::new).collect(),
     Default::default(),
   );
   const RETRY_EVERY: u64 = 64;
+  const TICK_BUDGET: u64 = 700_000;
   let mut t = 0u64;
-  let mut rounds = 0;
-  'outer: while rounds < 8 {
+  loop {
+    assert!(
+      t < TICK_BUDGET,
+      "the rotation exhausted its {TICK_BUDGET}-tick budget before reaching the target membership"
+    );
     // After a voter removal installs, the cluster may re-elect a primary in the new config. Wait
     // for a serving primary before re-reading the live membership and planning the next step.
     for _ in 0..20_000 {
@@ -576,33 +588,27 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
       t += 1;
     }
 
-    // Reconstruct the live voter SET from the serving primary's durable membership.
-    let live_voters: std::collections::BTreeSet<MemberId> = {
-      let p = c
-        .serving_primary()
-        .expect("a serving primary after waiting");
-      (0..c.replica_voter_count(p).unwrap_or(0))
-        .filter_map(|s| c.replica_member_at(p, s))
-        .collect()
-    };
-    if live_voters == *target.voters() {
-      break 'outer;
-    }
+    // Plan from the LIVE membership: an empty plan means the live config already matches the target.
     let plan = plan_reconfiguration(&c.serving_primary_membership(), &target)
       .expect("the rotation plans cleanly from every intermediate membership");
-    let step = plan
-      .first()
-      .cloned()
-      .expect("non-empty plan while live voters differ from target");
-    let swaps_before = c.membership_swaps_observed();
-    let mut proposed = false;
-    let round_deadline = t + 60_000;
-    while t < round_deadline {
-      if !proposed && t.is_multiple_of(RETRY_EVERY) {
+    let Some(step) = plan.first().cloned() else {
+      break;
+    };
+
+    // Propose the step (paced), tolerating the transient verdicts and the already-committed
+    // staleness mirrors, until it mints a fresh op or is found already applied.
+    let mut op = None;
+    let mut already_done = false;
+    while op.is_none() && !already_done {
+      assert!(
+        t < TICK_BUDGET,
+        "the rotation exhausted its {TICK_BUDGET}-tick budget proposing {step:?}"
+      );
+      if t.is_multiple_of(RETRY_EVERY) {
         // The executor plays an operator that accepts whatever the plan requires; the token is
         // ignored for the non-reducing steps.
         match c.propose_reconfigure_single_change(step.clone(), Some(AcceptReducedFaultTolerance)) {
-          Ok(_) => proposed = true,
+          Ok(o) => op = Some(o),
           // Retryable transient: the propose gate deferred this round; re-propose next paced tick.
           Err(ProposeMembershipError::ProofPending)
           | Err(ProposeMembershipError::AlreadyInFlight)
@@ -613,7 +619,25 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
           // NotALearner for a PromoteLearner step means the member committed into the voting set
           // in-memory (a prior iteration already committed it) but the durable epoch root has not
           // yet landed. Treat it as already-proposed and wait for the durable swap below.
-          Err(ProposeMembershipError::Invalid(MembershipError::NotALearner)) => proposed = true,
+          Err(ProposeMembershipError::Invalid(MembershipError::NotALearner)) => {
+            already_done = true;
+          }
+          // NotAVoter for a DemoteVoter step, and UnknownMember for a RemoveLearner step, are the
+          // demote/remove mirrors of the same staleness: the primary this round happens to query
+          // already reflects the step (the member is a learner, or gone entirely) even though the
+          // plan was computed before that install was witnessed — a view change between this round's
+          // plan read and its propose attempt can hand the propose to a primary more advanced than
+          // the one just read. There is nothing further to wait for; the step already applied.
+          Err(ProposeMembershipError::Invalid(MembershipError::NotAVoter))
+            if step.is_demote_voter() =>
+          {
+            already_done = true;
+          }
+          Err(ProposeMembershipError::Invalid(MembershipError::UnknownMember))
+            if step.is_remove_learner() =>
+          {
+            already_done = true;
+          }
           // Any other Invalid variant is unexpected in this healthy rotation; convert it to an
           // immediate failure rather than a silent spin.
           Err(ProposeMembershipError::Invalid(e)) => {
@@ -624,20 +648,33 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
       }
       tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
       t += 1;
-      if proposed && c.membership_swaps_observed() > swaps_before {
-        break;
+    }
+    if let Some(op) = op {
+      // Wait for THIS round's own op to install: its `MembershipChanged` witnessed in some
+      // replica's swap stream — not any cluster-wide swap count, which an earlier step's
+      // still-fanning-out installs would trip early.
+      while !(0..c.replica_count()).any(|i| {
+        c.replica_membership_swaps(i)
+          .iter()
+          .any(|(_, mc)| mc.op().get() == op.get())
+      }) {
+        assert!(
+          t < TICK_BUDGET,
+          "the rotation exhausted its {TICK_BUDGET}-tick budget installing {step:?}"
+        );
+        tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+        t += 1;
       }
     }
-    rounds += 1;
   }
 
   // (3) The rotation reached {MemberId(2), MemberId(3), MemberId(4)}: find a replica that has
-  // installed the final 3-voter config at the expected epoch (4 steps from epoch 0 = epoch 4).
+  // installed the final 3-voter config at the expected epoch (6 steps from epoch 0 = epoch 6).
   let final_replica = (0..c.replica_count())
     .find(|&i| {
       c.replica_voter_count(i) == Some(3)
         && c.replica_is_voter(i)
-        && c.replica_durable_epoch(i).get() >= 4
+        && c.replica_durable_epoch(i).get() == 6
     })
     .expect("a replica installed the final 3-voter rotation at the expected epoch");
   let final_voters: std::collections::BTreeSet<MemberId> = (0..3u8)
@@ -653,7 +690,7 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
   );
 
   // (4) Committed continuity across the WHOLE plan: every reconfiguration applied exactly once,
-  // the config_id lineage is an unbroken chain, no committed op was lost across the 4-step rotation.
+  // the config_id lineage is an unbroken chain, no committed op was lost across the 6-step rotation.
   assert!(
     once.check(&c).is_ok(),
     "every reconfiguration applied exactly once across the rotation"
@@ -664,6 +701,6 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
   );
   assert!(
     dur.check(&c).is_ok(),
-    "no committed op was lost across the 4-step rotation"
+    "no committed op was lost across the 6-step rotation"
   );
 }
