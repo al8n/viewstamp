@@ -462,7 +462,7 @@ fn install_membership_clears_the_probe_round() {
     .membership()
     .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(2)))
     .expect("a valid shrink successor");
-  e.install_membership(None, successor);
+  e.install_membership(Instant::ZERO, None, successor);
 
   assert!(
     e.health_probe.is_none(),

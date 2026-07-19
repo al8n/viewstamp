@@ -2228,7 +2228,15 @@ impl<S, R> Endpoint<S, R> {
     self.svc_from = self.rekey_slot_bitset(self.svc_from, successor);
   }
 
-  fn install_membership(&mut self, reconfigure_op: Option<OpNumber>, successor: Membership) {
+  fn install_membership(
+    &mut self,
+    now: Instant,
+    reconfigure_op: Option<OpNumber>,
+    successor: Membership,
+  ) where
+    S: StateMachine,
+    R: Reconfig,
+  {
     // A commit-first swap (`Some` reconfigure op) installs a successor the commit-time fence already
     // admitted (`commit_reconfigure`: every successor voter is a member of the predecessor), and
     // `self.membership` IS still that predecessor here — a staged swap pins it until this install (a
@@ -2343,6 +2351,25 @@ impl<S, R> Endpoint<S, R> {
         self.inflight.clear();
         self.set_status(Status::Retired);
       }
+    } else if self.status.is_normal() && was_primary != self.is_primary() {
+      // RETAINED voter whose PRIMARYSHIP the swap REMAPPED without a view change: the successor slot
+      // layout maps this node's (unchanged) view to a DIFFERENT primary slot, so an ex-primary is now a
+      // backup, or a backup is now the primary. The removed-node branch above already handles the case
+      // where the swap dropped this node from the voter set; here the node stays a voter but changes
+      // ROLE, so re-derive the role against the just-installed successor and re-arm the role cadences
+      // through the single timer owner (`arm_timers`). Without this a demoted ex-primary keeps a stale
+      // commit/prepare heartbeat deadline (its `serviceable_now` gate now fails, so it never fires, but
+      // it is also never re-armed) and never arms the backup idle detector, while a promoted new primary
+      // never arms its commit heartbeat — the cluster would wait out an idle timeout for leadership it
+      // already holds. Clear the primary-only forfeit sub-states FIRST: a role flip re-evaluates the
+      // step-down from scratch, and the `forfeit_armed`/`pending_forfeit` ⟹ Normal-primary invariant
+      // must hold at the handler exit (mirroring `retire_primary_cadence` on the removed-node branch).
+      // Gated on Normal: a cross-epoch state-sync install reached while Recovering has no role cadence to
+      // arm — its recovery completion arms the Normal timers. With no role flip this never runs, so the
+      // common retained-voter case is byte-identical.
+      self.pending_forfeit = false;
+      self.timers.forfeit_armed = None;
+      self.arm_timers(now);
     }
     // Emit MembershipChanged only for a commit-first swap (`Some` reconfigure op). A cross-epoch
     // state-sync install (`None`) has no LOCAL Reconfigure op to name — the laggard synced PAST it — so
@@ -5193,8 +5220,9 @@ where
   }
 
   /// The epoch-mismatch RESPONSE: the egress half of the symmetric pre-`sender_matches` pair. When a
-  /// strictly-LOWER-epoch vote/lead message (`Prepare`/`Commit`/`StartViewChange`/`DoViewChange` — a
-  /// stranded laggard's old-epoch traffic) arrives from an ACTIVE replica member, emit a minimal
+  /// strictly-LOWER-epoch message from a stranded laggard — a voter's vote/lead traffic
+  /// (`Prepare`/`Commit`/`StartViewChange`/`DoViewChange`) or a learner's `LearnerStatus` progress
+  /// report — arrives from an ACTIVE replica member, emit a minimal
   /// `EpochAhead{epoch, checkpoint_op}` hint back to it, so a slot-shifted laggard that cannot bind the
   /// new primary still gets the catch-up trigger from a BINDABLE retained voter (us). We act on NONE of
   /// the stale message's content — it is still dropped at `sender_matches` / `epoch_authority_admits`
@@ -5213,14 +5241,19 @@ where
     if !self.status.is_normal() || self.local_slot_opt().is_none() {
       return;
     }
-    // The trigger set is the lower-epoch shape of a stranded laggard's vote/lead traffic. Read only the
-    // sender's claimed epoch (NOT any view/op/commit content). `LearnerStatus` is excluded: a non-voting
-    // learner is not a stranded VOTER laggard and crosses by its own catch-up, not this pull.
+    // The trigger set is the lower-epoch shape a stranded laggard emits: a VOTER's vote/lead traffic
+    // (`Prepare`/`Commit`/`StartViewChange`/`DoViewChange`) OR a LEARNER's `LearnerStatus` progress
+    // report. A learner one epoch behind has no other crossing lane when no successor-epoch primary
+    // traffic reaches it — its SOLE emission is `LearnerStatus` — so answering that report with the hint
+    // is exactly how it pulls the crossing sync; a voter or a learner lagging an epoch is told
+    // EpochAhead the same way. Read ONLY the sender's claimed epoch (never any view/op/commit/progress
+    // content).
     let msg_epoch = match msg {
       Message::Prepare(m) => m.epoch(),
       Message::Commit(m) => m.epoch(),
       Message::StartViewChange(m) => m.epoch(),
       Message::DoViewChange(m) => m.epoch(),
+      Message::LearnerStatus(m) => m.epoch(),
       _ => return,
     };
     if msg_epoch >= self.membership.epoch() {

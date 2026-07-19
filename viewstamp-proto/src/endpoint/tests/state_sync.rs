@@ -3428,7 +3428,7 @@ fn a_swapped_donor_below_its_reconfigure_op_withholds_the_cross_epoch_membership
     .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(3)))
     .expect("AddLearner on the 3-voter genesis is valid");
   let predecessor_config_id = e.membership.config_id();
-  e.install_membership(Some(OpNumber::with(5)), successor.clone());
+  e.install_membership(Instant::ZERO, Some(OpNumber::with(5)), successor.clone());
   assert_eq!(
     e.config_install_op,
     OpNumber::with(5),
@@ -4631,6 +4631,192 @@ fn a_cross_epoch_fetch_crosses_below_an_unreachable_hinted_target_on_a_verified_
     e.forced_syncs_applied(),
     1,
     "exactly one crossing applied (the empty-membership reply did not)"
+  );
+}
+
+#[test]
+fn a_stranded_learner_crosses_an_epoch_via_the_pulled_epoch_ahead_hint() {
+  // THE LEARNER PULL LANE. A learner stranded ONE epoch behind has NO catch-up lane when no
+  // successor-epoch primary traffic reaches it: its SOLE emission is `LearnerStatus`. This drives the
+  // full round-trip: the learner's `LearnerStatus` to an E+1 member draws an `EpochAhead` hint (the
+  // egress trigger `maybe_answer_lower_epoch` now recognizes), the learner arms the forced crossing sync
+  // off that pulled hint, and a verified successor reply crosses it to E+1. Without `LearnerStatus` in the
+  // trigger set the member answers nothing, the learner never arms the sync, and it never crosses.
+  let n: u64 = 4; // the E+1 checkpoint the member advertises and a donor serves (the crossing target).
+
+  // Epoch-0 configuration: 3 voters + the stranded learner MemberId 3. Epoch-1 successor: the same, plus
+  // a new learner MemberId 4 — a valid single-delta successor chained from E0 in which MemberId 3 stays a
+  // learner (so the member resolves its slot, and it crosses into a config it belongs to).
+  let predecessor = genesis_with_learners(3, 1);
+  let successor = predecessor
+    .apply_delta(&crate::SingleVoterDelta::AddLearner(MemberId::new(4)))
+    .expect("AddLearner on the 3-voter + 1-learner genesis is valid");
+
+  // The stranded LEARNER at E0: op 0, checkpoint 0 (checkpoint == its own op head), Normal.
+  let learner_cfg = Config::with_checkpoint_ops(1, MemberId::new(3), 100).unwrap();
+  let mut learner = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    learner_cfg,
+    predecessor.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (mut lwal, mut lsb) = (TestWal::default(), TestSb::default());
+  let mut lblocks = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  assert!(
+    learner.is_learner() && learner.membership.epoch() == crate::Epoch::new(0),
+    "the local node is a learner at E0"
+  );
+  let learner_config_id = learner.membership.config_id();
+
+  // The learner emits its progress report — its only lane, since no E+1 primary traffic reaches it.
+  // Bootstrap the cadence, then advance past it and fire; capture the emitted `LearnerStatus`.
+  learner.handle_timeout(now, &mut lwal, &mut lsb, &mut lblocks);
+  let t1 = now + core::time::Duration::from_millis(10_000);
+  learner.handle_timeout(t1, &mut lwal, &mut lsb, &mut lblocks);
+  let mut status = None;
+  while let Some(out) = learner.poll_message() {
+    if matches!(out.msg_ref(), Message::LearnerStatus(_)) {
+      status = Some(out.into_msg());
+    }
+  }
+  let status = status.expect("the stranded learner emits a LearnerStatus (its sole crossing lane)");
+
+  // The E+1 MEMBER: a settled Normal voter (MemberId 0, the view-0 primary of the successor config) whose
+  // cluster checkpoint is at N.
+  let member_cfg = Config::with_checkpoint_ops(1, MemberId::new(0), 100).unwrap();
+  let mut member = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    member_cfg,
+    successor.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (mut mwal, mut msb) = (TestWal::default(), TestSb::default());
+  let mut mblocks = crate::block_store::MemBlockStore::new();
+  member.force_state_for_test(0, n, n, n, &[]);
+  assert!(
+    member.status().is_normal()
+      && member.membership.epoch() == crate::Epoch::new(1)
+      && member.checkpoint_op() == OpNumber::with(n),
+    "the member is a settled E+1 node with checkpoint N"
+  );
+
+  // THE HINGE: the member answers the learner's LearnerStatus with EpochAhead(E+1, N). The learner
+  // presents at slot 3 (its seat in the E+1 config); the member resolves it and pulls the hint back. This
+  // emission is exactly what F3 adds — without the `LearnerStatus` trigger the member stays silent here.
+  member.handle_message(
+    now,
+    &mut mwal,
+    &mut msb,
+    &mut mblocks,
+    Peer::Replica(ReplicaId::new(3)),
+    status,
+  );
+  let hint = member
+    .poll_message()
+    .expect("the member answers the learner's LearnerStatus with a hint");
+  assert_eq!(
+    hint.to(),
+    crate::Recipient::To(Peer::Replica(ReplicaId::new(3))),
+    "the pulled hint is addressed back to the learner",
+  );
+  let hint_msg = hint.into_msg();
+  assert!(
+    member.poll_message().is_none(),
+    "exactly one hint per inbound LearnerStatus",
+  );
+  let Message::EpochAhead(h) = &hint_msg else {
+    panic!(
+      "the response is an EpochAhead hint, got {}",
+      hint_msg.kind_str()
+    );
+  };
+  assert_eq!(h.epoch(), crate::Epoch::new(1), "carries the E+1 epoch");
+  assert_eq!(
+    h.checkpoint_op(),
+    OpNumber::with(n),
+    "carries the E+1 checkpoint_op (the crossing target)",
+  );
+
+  // The learner consumes the SAME pulled hint (delivered from a bound retained voter) → arms the forced,
+  // crossing-required cross-epoch sync targeting N.
+  learner.handle_message(
+    t1,
+    &mut lwal,
+    &mut lsb,
+    &mut lblocks,
+    primary_peer(),
+    hint_msg,
+  );
+  assert!(
+    learner.status().is_normal()
+      && learner.sync_is_forced_for_test()
+      && learner.sync_requires_cross_epoch_for_test(),
+    "the learner armed a crossing-required forced sync off the pulled hint (staying Normal)"
+  );
+  assert_eq!(
+    learner.sync_target_for_test(),
+    Some(n),
+    "the forced sync targets the hinted checkpoint_op"
+  );
+  let nonce = learner.sync_nonce_for_test();
+
+  // A donor serves the verified E+1 successor checkpoint at N → the learner crosses and installs E+1.
+  let cross_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(n),
+    crate::block_address(&CountSm::default().snapshot()),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut lblocks),
+  );
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    crate::message::ReconfigurePayload::from_membership(&successor, predecessor.config_id())
+      .encode_body();
+  lblocks.write_verified(CountSm::default().snapshot());
+  learner.handle_message(
+    t1,
+    &mut lwal,
+    &mut lsb,
+    &mut lblocks,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(n),
+      cross_id,
+      successor.epoch(),
+      successor.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      cross_env.clone(),
+      membership_body,
+    )),
+  );
+  for _ in 0..3 {
+    learner.handle_storage(t1, &mut lwal, &mut lsb, &mut lblocks);
+  }
+  assert_eq!(
+    learner.membership, successor,
+    "the stranded learner CROSSED to the E+1 successor membership"
+  );
+  assert_ne!(
+    learner.membership.config_id(),
+    learner_config_id,
+    "the config_id advanced off the predecessor"
+  );
+  assert_eq!(
+    learner.membership.epoch(),
+    crate::Epoch::new(1),
+    "installed E+1"
+  );
+  assert_eq!(
+    learner.forced_syncs_applied(),
+    1,
+    "exactly one crossing applied"
+  );
+  assert!(
+    learner.is_learner(),
+    "still a non-voting learner in the E+1 config"
   );
 }
 

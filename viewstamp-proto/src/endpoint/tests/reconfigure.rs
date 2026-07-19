@@ -6262,7 +6262,7 @@ fn installing_a_direct_voter_add_swap_panics_at_the_backstop() {
     .expect(
       "a wholesale successor seating a brand-new voter still assembles (no delta expresses it)",
     );
-  e.install_membership(Some(OpNumber::with(1)), successor);
+  e.install_membership(Instant::ZERO, Some(OpNumber::with(1)), successor);
 }
 
 #[test]

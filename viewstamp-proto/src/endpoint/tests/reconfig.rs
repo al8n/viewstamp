@@ -1430,7 +1430,7 @@ fn a_demoted_then_gced_members_report_leaves_the_force_sync_floor_in_stages() {
     .membership
     .apply_delta(&crate::SingleVoterDelta::DemoteVoter(MemberId::new(1)))
     .expect("DemoteVoter(1) on the 5-voter genesis is valid");
-  e.install_membership(Some(OpNumber::with(7)), demoted);
+  e.install_membership(Instant::ZERO, Some(OpNumber::with(7)), demoted);
   assert_eq!(e.membership.replica_count(), 4, "shrank to 4 voters");
   assert_eq!(
     e.membership.slot_of(MemberId::new(2)),
@@ -1470,7 +1470,7 @@ fn a_demoted_then_gced_members_report_leaves_the_force_sync_floor_in_stages() {
     .membership
     .apply_delta(&crate::SingleVoterDelta::RemoveLearner(MemberId::new(1)))
     .expect("RemoveLearner(1) is valid once the demote installed");
-  e.install_membership(Some(OpNumber::with(9)), gced);
+  e.install_membership(Instant::ZERO, Some(OpNumber::with(9)), gced);
   assert_eq!(
     e.membership.slot_of(MemberId::new(1)),
     None,
@@ -1500,7 +1500,7 @@ fn a_slot_shift_does_not_misattribute_a_retained_voters_quorum_report() {
     .membership
     .apply_delta(&crate::SingleVoterDelta::DemoteVoter(MemberId::new(1)))
     .expect("DemoteVoter(1) on the 5-voter genesis is valid");
-  e.install_membership(Some(OpNumber::with(7)), successor);
+  e.install_membership(Instant::ZERO, Some(OpNumber::with(7)), successor);
 
   // The retained voters' reports follow their stable ids across the one-slot shift, so the quorum-th
   // order statistic over the CURRENT voter set is 50.
@@ -1518,6 +1518,120 @@ fn a_slot_shift_does_not_misattribute_a_retained_voters_quorum_report() {
     e.peer_checkpoint_by_member_for_test(MemberId::new(2)),
     50,
     "retained voter MemberId 2 still attributed to its own report after shifting slot 2 → slot 1",
+  );
+}
+
+// TIMER HYGIENE across a swap that REMAPS the primary among RETAINED voters (a role flip WITHOUT a view
+// change): the primary is `view % replica_count`, so a swap that shrinks the voter set / shifts slots can
+// move the view's primary slot to a DIFFERENT retained voter. The install must re-derive the role against
+// the successor and re-arm the role cadences — not leave a demoted ex-primary holding a stale, never-
+// re-armed commit/prepare heartbeat, nor a promoted new primary holding only the backup idle timer. A
+// 4-voter genesis {M0,M1,M2,M3} at VIEW 1 has primary slot 1 (1 % 4) = M1; a `DemoteVoter(M0)` swap drops
+// M0 to a learner and shifts the retained voters down ({M1→slot0, M2→slot1, M3→slot2}, replica_count 3),
+// so the new view-1 primary is slot 1 (1 % 3) = M2. One swap thus flips M1 primary→backup and M2
+// backup→primary, exercising both directions.
+#[test]
+fn a_swap_remapping_the_primary_rearms_a_retained_ex_primarys_backup_cadence() {
+  // Local node is MemberId 1 (slot 1) — the view-1 primary — that the swap DEMOTES to a backup while it
+  // stays a voter.
+  let cfg = Config::try_new(0, MemberId::new(1)).expect("valid cluster config");
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(4), 0, NoopSm, u64::MAX);
+  let now = Instant::ZERO;
+
+  // A settled Normal view-1 primary with a tail above its applied frontier: arm the role timers (the
+  // commit heartbeat + prepare retransmit) and latch a forfeit step-down grace — the exact stale
+  // Normal-primary plane the remap must clear.
+  e.force_state_for_test(1, 5, 3, 0, &[]);
+  assert!(e.is_primary(), "MemberId 1 at slot 1 is the view-1 primary");
+  e.arm_timers(now);
+  e.timers.forfeit_armed = Some(now);
+  e.pending_forfeit = true;
+  assert!(
+    e.commit_or_prepare_timer_armed_for_test(),
+    "the view-1 primary holds its Normal-primary cadence before the swap",
+  );
+  assert!(
+    !e.primary_idle_armed_for_test(),
+    "a primary arms no backup idle timer",
+  );
+
+  let successor = e
+    .membership
+    .apply_delta(&crate::SingleVoterDelta::DemoteVoter(MemberId::new(0)))
+    .expect("DemoteVoter(0) on the 4-voter genesis is valid");
+  e.install_membership(now, Some(OpNumber::with(2)), successor);
+
+  // A RETAINED voter, now a BACKUP (slot 0; the view-1 primary is slot 1 = M2).
+  assert!(e.is_voter(), "the ex-primary stays a voter");
+  assert!(
+    !e.is_primary(),
+    "the swap remapped the primary to a different retained voter",
+  );
+  assert!(e.status().is_normal(), "a retained backup stays Normal");
+  assert!(
+    !e.commit_or_prepare_timer_armed_for_test(),
+    "the remapped ex-primary retires its stale commit/prepare heartbeat",
+  );
+  assert!(
+    e.primary_idle_armed_for_test(),
+    "the remapped ex-primary arms the backup idle detector, so it can drive the next view if the new \
+     primary falls silent",
+  );
+  // The forfeit sub-states belong to a Normal primary — cleared on the flip, keeping the
+  // `forfeit_armed`/`pending_forfeit` ⟹ Normal-primary invariant intact.
+  assert!(
+    !e.forfeit_armed_for_test(),
+    "the forfeit grace timer is retired on the flip",
+  );
+  assert!(
+    !e.pending_forfeit_for_test(),
+    "the deferred-forfeit latch is clear on the flip",
+  );
+}
+
+#[test]
+fn a_swap_remapping_the_primary_arms_a_retained_new_primarys_cadence() {
+  // Local node is MemberId 2 (slot 2) — a view-1 backup — that the swap PROMOTES to the view's primary
+  // while it stays a voter.
+  let cfg = Config::try_new(0, MemberId::new(2)).expect("valid cluster config");
+  let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(4), 0, NoopSm, u64::MAX);
+  let now = Instant::ZERO;
+
+  // A settled Normal view-1 backup: arm the role timers (only the backup idle detector).
+  e.force_state_for_test(1, 5, 3, 0, &[]);
+  assert!(
+    !e.is_primary(),
+    "MemberId 2 at slot 2 is a backup under view 1",
+  );
+  e.arm_timers(now);
+  assert!(
+    e.primary_idle_armed_for_test(),
+    "the backup holds its idle detector before the swap",
+  );
+  assert!(
+    !e.commit_or_prepare_timer_armed_for_test(),
+    "a backup arms no primary cadence",
+  );
+
+  let successor = e
+    .membership
+    .apply_delta(&crate::SingleVoterDelta::DemoteVoter(MemberId::new(0)))
+    .expect("DemoteVoter(0) on the 4-voter genesis is valid");
+  e.install_membership(now, Some(OpNumber::with(2)), successor);
+
+  // A RETAINED voter, now the PRIMARY (slot 1; the view-1 primary is slot 1 = M2).
+  assert!(
+    e.is_voter() && e.is_primary(),
+    "the retained backup is the swap's new primary",
+  );
+  assert!(e.status().is_normal(), "the new primary stays Normal");
+  assert!(
+    e.commit_or_prepare_timer_armed_for_test(),
+    "the promoted new primary arms its commit heartbeat immediately, not waiting out an idle timeout",
+  );
+  assert!(
+    !e.primary_idle_armed_for_test(),
+    "the new primary drops the stale backup idle timer",
   );
 }
 
@@ -1661,7 +1775,7 @@ fn a_demoted_voters_banked_ack_does_not_commit_a_tail_op_after_the_swap() {
     "the demotee keeps slot number 3, as a learner seat"
   );
   let (new_epoch, new_config_id) = (successor.epoch(), successor.config_id());
-  e.install_membership(Some(OpNumber::with(1)), successor);
+  e.install_membership(Instant::ZERO, Some(OpNumber::with(1)), successor);
   assert_eq!(e.membership.quorum(), 2, "3 voters → new commit quorum 2");
 
   // THE FIX: the demotee's banked bit was dropped at the swap, so the tail op now carries only the
