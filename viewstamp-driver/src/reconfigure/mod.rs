@@ -520,10 +520,12 @@ pub async fn run_reconfigure<B: ReconfigureBackend>(
       Some(step) if step.is_remove_learner() => {
         // GC LANE: removing a learner — an obsolete-learner prune, or the race-free GC of a
         // just-demoted voter. Its op must commit under the CURRENT voting quorum, and for a demotee's
-        // GC that successor-quorum commit is the certificate the reduced voting set is live before the
-        // retained durable copy is discarded. FAIL-CLOSED pre-probe: require a proven-live majority of
-        // the current voters (`|fresh ∩ voters(live)| >= quorum(live)`) before proposing — NEVER bypass
-        // it — else stall on the same `InsufficientLiveness` surface as a demote.
+        // GC that successor-quorum commit is a post-demote DURABILITY round under the reduced voting set
+        // plus an exposure-window narrowing: fresh point-in-time evidence that avoids discarding the
+        // retained durable copy during an evidently-dead window, NOT a guarantee the successor set is live
+        // at the discard instant. FAIL-CLOSED pre-probe: require a proven-live majority of the current
+        // voters (`|fresh ∩ voters(live)| >= quorum(live)`) before proposing — NEVER bypass it — else
+        // stall on the same `InsufficientLiveness` surface as a demote.
         let fresh = backend.proven_live_voters();
         let live_voters: BTreeSet<MemberId> = {
           let n = live.replica_count() as usize;

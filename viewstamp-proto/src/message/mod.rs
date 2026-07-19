@@ -922,14 +922,17 @@ impl RequestHealthProof {
 }
 
 /// Target voter → the soliciting primary: the FRESH-PROOF LIVENESS REPLY answering a
-/// [`RequestHealthProof`]. It carries NO quorum/vote authority — it is a reply, never a vote — and
-/// proves only that the voter was LIVE for this configuration at reply time.
+/// [`RequestHealthProof`]. It carries NO quorum/vote authority — it is a reply, never a vote — and is a
+/// POINT-IN-TIME observation that the voter was LIVE for this configuration at reply time, nothing more.
 ///
-/// A voter mid-crash never answers, so no remembered liveness survives the fault that invalidated it —
-/// that is the load-bearing property the shrink policy relies on (see [`RequestHealthProof`]). `nonce`
-/// is echoed verbatim from the challenge so the primary binds the reply to the exact outstanding round;
-/// `epoch` + `config_id` are the voter's active configuration (the STRICT epoch-policy pair), so a
-/// cross-epoch reply never counts. `replica` is the voter's own slot (the standard sender binding).
+/// A voter mid-crash never answers, so the proof is only ever positive evidence a live voter emitted; but
+/// it is retained for a BOUNDED WINDOW — the probe round's lifetime — so a voter that crashes AFTER
+/// answering stays counted until that round expires or rolls over. Crash-after-reply within the window is
+/// therefore possible, and the shrink policy's residual exposure window is exactly that round lifetime (see
+/// [`RequestHealthProof`]). `nonce` is echoed verbatim from the challenge so the primary binds the reply to
+/// the exact outstanding round; `epoch` + `config_id` are the voter's active configuration (the STRICT
+/// epoch-policy pair), so a cross-epoch reply never counts. `replica` is the voter's own slot (the standard
+/// sender binding).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthProof {
   replica: ReplicaId,
