@@ -525,20 +525,20 @@ where
       }
       while self.storage_ready.try_recv().is_ok() {}
 
-      // Fire an already-due consensus timer, so an accept flood can't suppress heartbeats/view-
-      // changes (which would wedge liveness). `StreamCoordinator`'s `poll_timeout` reports a proto
-      // `Instant`, so map it onto the clock epoch before comparing. `handle_timeout` on a not-yet-due
-      // timer is a no-op, so this is idempotent-safe.
-      if self
+      // Service the consensus timer UNCONDITIONALLY on every iteration, NOT only when an already-armed
+      // timer is due. `handle_timeout` is where a role's cadence ARMS itself: a Normal learner (a
+      // freshly-demoted voter whose voter cadences the install retired, or any idle learner) starts with
+      // EVERY timer disarmed, so `poll_timeout()` is `None` and a due-gated call would never run — the
+      // learner-status cadence would never self-bootstrap, never emit `LearnerStatus`, never draw the
+      // `EpochAhead` hint, and an epoch-lagged learner whose only link is a non-primary member would wedge
+      // forever. Gating on an armed timer starves exactly the roles whose cadences all begin disarmed. The
+      // call is idempotent-safe: on a not-yet-due timer it is a no-op, and the loop's 50ms idle fallback
+      // (`next_deadline`) bounds how soon a freshly-disarmed cadence bootstraps. Servicing it every pass
+      // also keeps an accept flood from suppressing heartbeats/view-changes.
+      self
         .coord
-        .poll_timeout()
-        .is_some_and(|d| self.clock.to_std(d) <= std::time::Instant::now())
-      {
-        self
-          .coord
-          .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
-        self.rekey_if_needed(now);
-      }
+        .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
+      self.rekey_if_needed(now);
       self.retransmit_stale(now);
       self.pump_outputs(now).await;
       self.advance_reconfigure(now);

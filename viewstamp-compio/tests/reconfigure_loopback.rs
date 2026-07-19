@@ -1128,6 +1128,260 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
   }
 }
 
+/// PULL-LANE EPOCH CROSSING (TCP/TLS stream transport): an epoch-lagged Normal LEARNER whose ONLY link is a
+/// stream conn to a RETAINED, settled-Normal, NON-PRIMARY member of the successor epoch bootstraps its
+/// learner-status cadence, emits `LearnerStatus`, draws an `EpochAhead` hint back, completes the crossing
+/// sync, and INSTALLS the successor epoch — with NO successor-PRIMARY traffic ever reaching it.
+///
+/// This is the end-to-end regression for the stream driver servicing its consensus timer UNCONDITIONALLY. A
+/// fresh Normal learner boots with EVERY timer disarmed, so `poll_timeout()` is `None`; a due-gated
+/// `handle_timeout` would never run, so the learner-status cadence (which self-bootstraps INSIDE
+/// `handle_timeout`, its sole arm site) would never arm, the learner would never emit `LearnerStatus`, never
+/// draw `EpochAhead`, never arm the crossing sync — stranded forever. Serviced every iteration, the cadence
+/// bootstraps and the crossing completes.
+///
+/// OBSERVABILITY — asserted BY CONSEQUENCE: the record layer (`RecordIo`) is `pub(crate)`-sealed and
+/// `StreamTransport` is sealed, so the wire `LearnerStatus`/`EpochAhead` messages CANNOT be tapped from this
+/// test crate — the only observability is the public `events()` stream. The crossing is proven by two events
+/// on the LEARNER's `events()`: `StateSyncStarted` (the learner armed the forced crossing sync off the
+/// pulled hint — reachable ONLY after it emitted `LearnerStatus` and the bound member answered `EpochAhead`)
+/// and `StateSyncCompleted` (the crossing checkpoint installed + went durable). A cross-epoch sync install
+/// emits NO `MembershipChanged` (`install_membership` is passed `None` for the reconfigure op — the laggard
+/// synced PAST it), so `StateSyncCompleted` is the terminal witness; in this topology the learner's ONLY
+/// possible sync is the E0->E1 crossing (it boots at E0 checkpoint 0 with a single peer that is a settled-E1
+/// donor), so a completed sync IS the crossing. Without the timer fix neither event arrives and the wait
+/// times out.
+///
+/// NON-PRIMARY IS LOAD-BEARING: any successor-PRIMARY `Prepare`/`Commit` reaching the learner would trigger
+/// the crossing via `maybe_request_cross_epoch_catchup` (inbound-driven, INDEPENDENT of the cadence) and the
+/// test would pass even WITHOUT the fix. So the learner's sole link is member 0 — the E0 primary DEMOTED to
+/// an E1 learner-seat — which answers `EpochAhead` and serves the crossing checkpoint (its `RequestSync`
+/// `Backups` fan-out reaches every bound replica conn) but NEVER broadcasts to a learner. The E1 primary
+/// (member 1) is never wired to the learner (asymmetric peer lists), so no successor-primary traffic ever
+/// reaches it.
+///
+/// TOPOLOGY: genesis E0 = voters {0,1,2} + learner {3}. Members 0,1,2 mesh among THEMSELVES (never dialing
+/// the learner) and commit baseline ops so the donor holds a checkpoint above 0 (a donor at checkpoint 0
+/// serves nothing). The primary (member 0) then DEMOTES ITSELF (only the primary can propose its own
+/// demotion) to a learner, retaining {1,2} as voters and {0,3} as learners — a 3->2 voter shrink
+/// (`AcceptReducedFaultTolerance`). The view is durable across the swap, so primaryship remaps 0->1 WITHOUT
+/// a view change. The stranded learner (member 3) then boots formatted at E0 (never receiving the
+/// SwapEpoch), wired to dial ONLY member 0 at the learner's E0 slot 0 — so its `LearnerStatus`, addressed to
+/// `primary(view 0) = slot 0`, routes to member 0, and its `Backups` `RequestSync` fan-out (every bound
+/// replica conn) also reaches member 0.
+#[compio::test]
+async fn a_stranded_learner_crosses_an_epoch_over_a_non_primary_link() {
+  use std::{collections::BTreeSet, rc::Rc};
+
+  use viewstamp_proto::{Conn, LabelOptions, Labeled, Passthrough, Peer};
+
+  const CROSS_CLUSTER: u128 = 0x5454;
+  // A small checkpoint interval so a handful of baseline ops advances the donor's checkpoint above 0 — the
+  // crossing donor serves nothing at checkpoint 0 (`on_request_sync` is silent there).
+  const CHECKPOINT_OPS: u64 = 4;
+
+  // Self-attesting factories: each node announces its OWN stable MemberId in the `Labeled` handshake, so a
+  // peer binds it by stable id and the coordinator resolves that id to whatever slot the local membership
+  // assigns it.
+  let mk_dialer = |me: u8| -> Rc<dyn Fn(Peer) -> Conn<Labeled<Passthrough>>> {
+    Rc::new(move |_peer| {
+      let opts = LabelOptions::new(CROSS_CLUSTER, Peer::Member(MemberId::new(me as u128)));
+      Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+    })
+  };
+  let mk_acceptor = |me: u8| -> Rc<dyn Fn() -> Conn<Labeled<Passthrough>>> {
+    Rc::new(move || {
+      let opts = LabelOptions::new(CROSS_CLUSTER, Peer::Member(MemberId::new(me as u128)));
+      Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+    })
+  };
+
+  // Reserve four kernel-assigned TCP ports (fresh ephemeral ports keep repeated CI runs from colliding with
+  // the previous run's TIME_WAIT remnants).
+  let reservations: Vec<std::net::TcpListener> = (0..4)
+    .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port"))
+    .collect();
+  let addrs: Vec<SocketAddr> = reservations
+    .iter()
+    .map(|l| l.local_addr().expect("reserved listener has an address"))
+    .collect();
+  drop(reservations);
+
+  // Boot the three genesis voters {0,1,2}. Each dials ONLY the other two voters — never the learner (member
+  // 3) — so the learner stays stranded, reached by nobody, and no successor node ever pushes it E1 traffic.
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let config = viewstamp_proto::Config::with_checkpoint_ops(
+      CROSS_CLUSTER,
+      MemberId::new(id as u128),
+      CHECKPOINT_OPS,
+    )
+    .unwrap();
+    let (ready_tx, ready_rx) = flume::unbounded();
+    let wal = Notifying::new(InMemoryWal::new(), ready_tx.clone());
+    let mut sb = Notifying::new(InMemorySuperblock::new(), ready_tx);
+    viewstamp_driver::format(config, &genesis(3, 1), &wal, &mut sb).expect("format genesis store");
+    let blocks = MemBlocks::default();
+    let (driver, handle) = viewstamp_compio::CompioStreamDriver::new(
+      config,
+      genesis(3, 1),
+      viewstamp_simulation::sm::LogSm::default(),
+      wal,
+      sb,
+      blocks,
+      viewstamp_proto::ClientId::new(u128::from(id) + 1),
+      0,
+      addrs[id as usize],
+      peers,
+      mk_dialer(id),
+      mk_acceptor(id),
+      ready_rx,
+    )
+    .await
+    .expect("stream driver builds");
+    compio::runtime::spawn(driver.run()).detach();
+    handles.push(handle);
+  }
+
+  // Commit baseline ops through the primary (member 0) so member 0 durably holds a checkpoint above 0 — the
+  // frontier it will later serve to cross the stranded learner. With `CHECKPOINT_OPS = 4`, twelve committed
+  // ops form several checkpoints.
+  for expected in 1..=12u64 {
+    let reply = compio::time::timeout(
+      Duration::from_secs(20),
+      handles[0].submit(Bytes::from_static(b"op")),
+    )
+    .await
+    .expect("the baseline op commits within 20s")
+    .expect("a baseline reply");
+    assert_eq!(
+      &reply[..],
+      &expected.to_be_bytes(),
+      "the baseline op replies the post-apply count {expected}"
+    );
+  }
+
+  // The primary (member 0) DEMOTES ITSELF to a learner: target voters {1,2}, learners {0,3}. Only the
+  // primary can propose its own demotion, so this is issued on member 0's handle. 3->2 voters drops `f`
+  // from 1 to 0, so the shrink carries `AcceptReducedFaultTolerance`. Spawned in the background: the
+  // readiness signal this test turns on is member 0's OWN install to the E1 learner seat (its commit-first
+  // swap DOES emit `MembershipChanged`), not whether the reconfigure future resolves on the just-demoted
+  // handle.
+  let member0_events = handles[0].events();
+  let demoter = handles[0].clone();
+  compio::runtime::spawn(async move {
+    let _ = demoter
+      .reconfigure_to(
+        MembershipTarget::new(
+          BTreeSet::from([MemberId::new(1), MemberId::new(2)]),
+          BTreeSet::from([MemberId::new(0), MemberId::new(3)]),
+        ),
+        HealthHint::default(),
+        Some(AcceptReducedFaultTolerance),
+      )
+      .await;
+  })
+  .detach();
+  compio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match member0_events.recv_async().await {
+        Ok(Event::MembershipChanged(m)) if m.epoch().get() == 1 => {
+          assert!(
+            !m.self_is_voter() && m.self_is_learner(),
+            "member 0 demoted itself to an E1 learner seat, got {m:?}"
+          );
+          break;
+        }
+        Ok(_) => {}
+        Err(_) => panic!("member 0's event channel closed before its self-demote install"),
+      }
+    }
+  })
+  .await
+  .expect("member 0 installs its self-demotion to an E1 learner within 20s");
+
+  // Boot the stranded learner (member 3) AFTER E1 installed, so it never received the SwapEpoch: it is
+  // genuinely one epoch behind at E0. Its ONLY dial peer is member 0 at slot 0 (the learner's E0
+  // view-0 primary slot) — the retained, settled-Normal, NON-PRIMARY E1 learner-seat that answers
+  // `EpochAhead` and serves the crossing checkpoint.
+  let learner_id = 3u8;
+  let learner_config = viewstamp_proto::Config::with_checkpoint_ops(
+    CROSS_CLUSTER,
+    MemberId::new(learner_id as u128),
+    CHECKPOINT_OPS,
+  )
+  .unwrap();
+  let (learner_ready_tx, learner_ready_rx) = flume::unbounded();
+  let learner_wal = Notifying::new(InMemoryWal::new(), learner_ready_tx.clone());
+  let mut learner_sb = Notifying::new(InMemorySuperblock::new(), learner_ready_tx);
+  viewstamp_driver::format(
+    learner_config,
+    &genesis(3, 1),
+    &learner_wal,
+    &mut learner_sb,
+  )
+  .expect("format the stranded learner's genesis (E0) store");
+  let learner_blocks = MemBlocks::default();
+  let (learner_driver, learner_handle) = viewstamp_compio::CompioStreamDriver::new(
+    learner_config,
+    genesis(3, 1),
+    viewstamp_simulation::sm::LogSm::default(),
+    learner_wal,
+    learner_sb,
+    learner_blocks,
+    viewstamp_proto::ClientId::new(u128::from(learner_id) + 1),
+    0,
+    addrs[learner_id as usize],
+    // The sole link: member 0, dialed at ReplicaId 0 — the slot the learner's own E0 membership assigns
+    // member 0, so its attested id resolves to the dialed slot (a mismatch would be `IdentityRejected`).
+    vec![(ReplicaId::new(0), addrs[0])],
+    mk_dialer(learner_id),
+    mk_acceptor(learner_id),
+    learner_ready_rx,
+  )
+  .await
+  .expect("the stranded learner's stream driver builds");
+  // Subscribe to the learner's events BEFORE spawning its run loop, so no crossing event is missed.
+  let learner_events = learner_handle.events();
+  compio::runtime::spawn(learner_driver.run()).detach();
+
+  // THE GATE: wait for `StateSyncCompleted` on the learner's events — the crossing checkpoint installed +
+  // went durable. `StateSyncStarted` must precede it (the learner armed the forced crossing sync off the
+  // pulled `EpochAhead`, which is reachable ONLY after it self-bootstrapped its cadence and emitted
+  // `LearnerStatus`). Without the driver's unconditional-timer fix the cadence never bootstraps, so neither
+  // event arrives and this wait times out.
+  let mut saw_started = false;
+  compio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match learner_events.recv_async().await {
+        Ok(Event::StateSyncStarted(_)) => saw_started = true,
+        Ok(Event::StateSyncCompleted(_)) => break,
+        Ok(_) => {}
+        Err(_) => panic!("the learner's event channel closed before it crossed"),
+      }
+    }
+  })
+  .await
+  .expect(
+    "the stranded learner self-bootstraps its cadence, pulls an EpochAhead hint over its non-primary \
+     link, and completes the crossing sync within 20s",
+  );
+  assert!(
+    saw_started,
+    "the learner armed a crossing sync (StateSyncStarted) before completing it — the witness it emitted \
+     LearnerStatus and drew the EpochAhead hint back"
+  );
+
+  let _ = learner_handle.shutdown().await;
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
+}
+
 /// QUIC TLS SNI SLOT-SHIFT REGRESSION: a 4-voter cluster over real mTLS QUIC removes a low-slot
 /// voter so retained members shift slots, then commits a second request THROUGH a shifted member.
 ///
