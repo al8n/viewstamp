@@ -85,15 +85,23 @@ Beyond the core VR replication + view-change + recovery paths, the following shi
 - **Dynamic reconfiguration** — the membership mode is a compile-time choice on the
   `Endpoint<S, R>` parameter (a sealed `Reconfig` trait): `RestartOnly` (the
   default — a fixed set, membership only changes across a coordinated restart) and
-  `SingleChange` (add or remove a single member at a time on a live cluster, driven
+  `SingleChange` (evolve membership one step at a time on a live cluster, driven
   through consensus). The two form a compile-time capability ladder — `SingleChange`
   subsumes `RestartOnly` — and the planner (`plan_reconfiguration`, `MembershipTarget`)
-  turns a desired target into a legal sequence of single steps. Multi-change joint
-  consensus is future work.
+  turns a desired target into a legal sequence of single steps drawn from a closed
+  four-delta vocabulary: `AddLearner`/`PromoteLearner` grows the voting set (a new voter
+  always catches up as a learner first), and `DemoteVoter`/`RemoveLearner` shrinks it — the
+  mirror image, so a departing voter keeps a live learner seat and its durable copy of the
+  committed log until its removal is proven safe, never a direct ejection. A shrink that
+  would lower crash tolerance is refused unless the caller names
+  `AcceptReducedFaultTolerance` up front — capacity is never cut silently. Multi-change
+  joint consensus is future work.
 - **Non-voting learners / standbys** — replicas that receive the log and stay current
   without counting toward quorum, so quorum math is unchanged. A learner catches up and
   is then promoted to a voter through a fresh durable-prefix proof at promotion time — the
-  read/standby and safe-onboarding scale-out path, rather than a bigger voting set.
+  read/standby and safe-onboarding scale-out path, rather than a bigger voting set. The
+  same learner seat is also the shrink path's safety margin: a demoted voter lingers here,
+  still a reachable repair donor, until its removal is garbage-collected.
 - **Content-addressed incremental snapshots** — checkpoints are a content-addressed block
   DAG behind the `BlockStore` trait, so a laggard state-syncs only the blocks that
   actually changed instead of re-fetching the entire state machine on every transfer.

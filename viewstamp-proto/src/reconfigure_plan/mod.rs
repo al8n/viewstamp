@@ -29,6 +29,29 @@
 //! smaller of the current and target tolerances; `f` falls only on a demote from an ODD voter count, and
 //! such a forced descent is gated at propose time by the operator's `AcceptReducedFaultTolerance`.
 //!
+//! ## The operator contract: tolerance reduction is never silent
+//!
+//! A configuration change that lowers `f` is never applied quietly. `AcceptReducedFaultTolerance` is a
+//! plain, non-`Default` unit struct the caller must NAME at the call site — not a bare `bool` — so the
+//! acceptance is self-documenting and greppable in the embedder's own code (every place a tolerance cut
+//! was knowingly taken is a literal occurrence of the type name). It is not unforgeable — the operator is
+//! the one asserting it, like any other typed intent parameter — but it turns the acceptance into an
+//! explicit, auditable act rather than an accidental side effect of a shrink target. Without it, a
+//! tolerance-reducing goal is refused WHOLE, before any step commits, at both the goal-level preflight
+//! (driver) and the per-delta propose gate (this crate).
+//!
+//! ## The honest 3→2 reality
+//!
+//! Demote-first does NOT make an acute 3→2 shrink trivially recoverable. If the surviving 2-voter
+//! successor later loses its own quorum (one of the two crashes), re-promoting the demoted third member
+//! back to a voter needs a COMMITTED op under that 2-voter successor — which the dead voter blocks, same
+//! as before demote-first existed. The stall still heals only on the crashed voter's own restart. What
+//! demote-first genuinely buys at 3→2: the demoted member stays a live, log-current LEARNER through the
+//! window — a retained THIRD durable copy (no single-copy-prefix disk-loss if the demotee is later lost
+//! too), and a live repair/state-sync DONOR for whichever voter eventually restarts. At `n >= 5` the story
+//! is materially better: the immediate re-promote recovery IS real, because the successor still holds a
+//! quorum of its own to commit the re-promotion. State this honestly rather than oversell the acute case.
+//!
 //! A new member's endpoint requires its slot to ALREADY be in the membership at construction (the genesis
 //! constructor asserts the local member occupies a slot). That constrains how a new physical process
 //! bootstraps:

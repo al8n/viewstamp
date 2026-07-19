@@ -2,6 +2,17 @@
 //! planner (`plan_next_step` / `shrink_candidates`) one Tier B `propose_membership` at a time, re-planning
 //! from the live membership each step, with a health-aware fail-closed shrink ordering. Adds ZERO proto
 //! consensus surface.
+//!
+//! ## A departing node cannot drive its own exit
+//!
+//! When a full removal (`DemoteVoter(x)` then `RemoveLearner(x)`) targets THIS node, the demote step
+//! commits normally, but the node is no longer a voter — and, having just demoted itself, no longer the
+//! primary either — so it cannot drive the remaining `RemoveLearner(self)` to commit. Rather than spin
+//! against a plan it structurally cannot finish, [`run_reconfigure`] surfaces the distinguished terminal
+//! [`ReconfigureError::DemotedSelf`], carrying the RESUMABLE partial progress reached so far. The
+//! operator's contract: resume the SAME `reconfigure_to(target, ..)` call against a SURVIVING voter (the
+//! new primary), which completes the GC from where the departing node left off. The departing node itself
+//! keeps running as a live learner meanwhile — it is not retired, only unable to finish removing itself.
 
 use std::{
   collections::BTreeSet,
