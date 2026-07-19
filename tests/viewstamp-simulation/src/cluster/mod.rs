@@ -2754,23 +2754,53 @@ impl Cluster {
       // would mis-flag it. Recorded BEFORE the partition/one-way/frame drops below, so a learner's counted
       // message trips this even when a fault would later drop it; the recording changes no scheduling and
       // takes no PRNG draw. Drained by the VOPR driver each tick.
+      //
+      // STALENESS EXEMPTION (not a role check): draining into `schedule` is not atomic with the step that
+      // built the message — a `DemoteVoter` can install on THIS replica (bumping its epoch, dropping its
+      // vote) after the replica queued an older message while it was still a voter but before the driver
+      // drains that queued message. Per-replica epochs only ever advance, so the message's stamped epoch
+      // (`counted_epoch`) can never exceed the emitter's CURRENT installed epoch (`emitter_epoch`) — only
+      // lag behind it. A strictly lagging stamp proves only that the message PREDATES the emitter's most
+      // recent install — NOT that the emitter was a voter back at that older epoch: it may already have
+      // been a non-voting learner then too, and this exemption MASKS a genuine violation in that corner.
+      // That is not a new gap opened here — the pre-existing checker already carried the symmetric
+      // promote-side race, so this narrow demote-side counterpart does not lower the bar further. Nor is
+      // inertness universal; it is RECEIVER-relative: a receiver still AT the stamped epoch applies the
+      // identical STRICT `(epoch, config_id)` fence (`epoch_authority_admits`) to
+      // `PrepareOk`/`StartViewChange`/`DoViewChange` alike and ADMITS the message, because its stamped
+      // epoch matches that receiver's own. This exemption is harmless exactly in the case it is meant for —
+      // the emitter genuinely was a voter at that older epoch (the intended demote race: an old vote cast
+      // legitimately under a quorum the emitter has since left) — not in the masked corner above. Exempt
+      // ONLY the strictly-lagging case (`counted_epoch < emitter_epoch`); a message stamped with the
+      // emitter's OWN current epoch or later (`counted_epoch >= emitter_epoch`) still flags — that is the
+      // real bug this check exists to catch, a learner voting in the very configuration it is currently,
+      // actually, a non-voter in.
+      let counted_epoch = match &msg {
+        Message::PrepareOk(m) => Some(m.epoch()),
+        Message::StartViewChange(m) => Some(m.epoch()),
+        Message::DoViewChange(m) => Some(m.epoch()),
+        _ => None,
+      };
       if !self.replicas[usize::from(from_r.get())].is_voter()
-        && matches!(
-          msg,
-          Message::PrepareOk(_) | Message::StartViewChange(_) | Message::DoViewChange(_)
-        )
         && self.learner_emission_violation.is_none()
+        && let Some(counted_epoch) = counted_epoch
       {
-        self.learner_emission_violation = Some(
-          format!(
-            "learner {} emitted a counted message {} — a non-voting learner must never send a \
-             PrepareOk/StartViewChange/DoViewChange (it is never a voter, prospective primary, or \
-             active view-change participant)",
-            from_r.get(),
-            msg.kind_str(),
-          )
-          .into(),
-        );
+        let emitter_epoch = self.replicas[usize::from(from_r.get())]
+          .membership()
+          .epoch();
+        if counted_epoch >= emitter_epoch {
+          self.learner_emission_violation = Some(
+            format!(
+              "learner {} emitted a counted message {} at its own current epoch {} — a \
+               non-voting learner must never send a PrepareOk/StartViewChange/DoViewChange (it \
+               is never a voter, prospective primary, or active view-change participant)",
+              from_r.get(),
+              msg.kind_str(),
+              emitter_epoch.get(),
+            )
+            .into(),
+          );
+        }
       }
       if self.partitioned(from_r.get(), to_r) {
         return;
