@@ -8132,16 +8132,18 @@ fn a_reverted_primary_steps_down_and_a_retried_request_applies_once() {
 }
 
 #[test]
-fn a_reverted_probe_still_rejects_far_proposals() {
-  // The revert restores the durable view WITHOUT widening the jump guard: a far-ahead proposal —
-  // even a genuine survivor's, from a view that really formed while this replica's probe was
-  // partitioned — stays rejected, exactly as it does for a replica that CRASHED at the same lagging
-  // durable view and recovered. This pins the deliberate limitation the revert shares with the
-  // crash path (a far-lagging replica rejoins only through authoritative traffic from a live
-  // primary; a validated far-view rejoin is a distinct mechanism): the revert must never carry
-  // state that lets ONE message move the replica toward a durable transition — an admitted lone
-  // proposal reaches the SVC quorum instantly in a three-voter cluster (self plus sender), turning
-  // a memory-only strand into a durable one on a single corrupted message.
+fn a_reverted_probe_joins_a_survivors_far_proposal() {
+  // The revert's landing is the ORDINARY durable-view Normal state, and the ordinary SVC admission
+  // applies to it: a survivor's proposal from far beyond the abandoned neighborhood — a view that
+  // really formed and lost its primary while this replica's probe was partitioned — is JOINED, not
+  // rejected. Convergence requires this: two live voters whose Normal views diverged must meet on
+  // the higher voter's successor target or no view ever forms again (each fork member's exact
+  // successor is precisely the target the other never proposes). The join is quorum-instant here
+  // because in a three-voter cluster self plus sender IS `quorum_view_change` (2 = f + 1 — two of
+  // three voters vouching the primary is gone, exactly the view-change evidence VSR requires), and
+  // it stays vote-safe at any distance: the entry persists the joined view BEFORE the DoViewChange
+  // is cast (asserted below — no DVC until the storage completion lands), and the joined view still
+  // FORMS only on a full DVC quorum + canonical-log selection.
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(
     Config::try_new(1, MemberId::new(1)).unwrap(),
     genesis(3),
@@ -8177,30 +8179,7 @@ fn a_reverted_probe_still_rejects_far_proposals() {
   assert!(!e.pending_forfeit, "a backup's revert does not step down");
 
   let t = now + core::time::Duration::from_millis(1700);
-  // Still bounded: a proposal far beyond the abandoned neighborhood stays rejected.
-  e.handle_message(
-    t,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    Peer::Replica(ReplicaId::new(2)),
-    Message::StartViewChange(StartViewChange::new(
-      View::with(100),
-      ReplicaId::new(2),
-      crate::Epoch::new(0),
-      0,
-    )),
-  );
-  assert!(
-    e.poll_message().is_none(),
-    "a target beyond the abandoned view's successor is still rejected"
-  );
-  // Even the ABANDONED view's own successor — a genuine survivor's proposal — is rejected: the
-  // revert retained nothing that widens the guard, so no single message can move this replica
-  // toward a durable transition (an admitted lone proposal would reach the SVC quorum instantly in
-  // a three-voter cluster — self plus sender). The replica rejoins when a live primary's
-  // authoritative traffic re-opens the catch-up probe, or via the ordinary immediate-successor
-  // proposals of its own durable view.
+  // A survivor of the abandoned neighborhood proposes its successor: the reverted replica joins.
   e.handle_message(
     t,
     &mut wal,
@@ -8214,10 +8193,284 @@ fn a_reverted_probe_still_rejects_far_proposals() {
       0,
     )),
   );
-  assert!(
-    e.poll_message().is_none(),
-    "the abandoned neighborhood's successor is rejected like any far proposal"
+  assert_eq!(
+    e.status(),
+    Status::ViewChange,
+    "self plus sender is the SVC quorum — the join enters the view change"
   );
-  assert_eq!(e.status(), Status::Normal);
-  assert_eq!(e.view(), View::new());
+  assert_eq!(e.view(), View::with(6));
+  // The join is visible to peers (the SVC broadcast), but the VOTE is fenced on durability: no
+  // DoViewChange may be cast until the joined view's superblock write lands.
+  let mut saw_svc = false;
+  while let Some(out) = e.poll_message() {
+    match out.into_msg() {
+      Message::StartViewChange(svc) => {
+        assert_eq!(svc.view(), View::with(6));
+        saw_svc = true;
+      }
+      Message::DoViewChange(_) => {
+        panic!("a DoViewChange must not be cast before the joined view is durable")
+      }
+      _ => {}
+    }
+  }
+  assert!(saw_svc, "the join re-broadcasts the adopted target");
+  e.handle_storage(t, &mut wal, &mut sb, &mut blocks);
+  let mut saw_dvc = false;
+  while let Some(out) = e.poll_message() {
+    if let Message::DoViewChange(d) = out.into_msg() {
+      assert_eq!(d.view(), View::with(6));
+      saw_dvc = true;
+    }
+  }
+  assert!(
+    saw_dvc,
+    "once the joined view is durable, the DVC goes to that view's primary"
+  );
+}
+
+/// Deliver every message one live endpoint emits to the other (and loop self-addressed traffic
+/// back), completing storage after each pass, until both are quiescent. Traffic addressed to any
+/// other replica is dropped — those replicas are dead in the scenarios that use this pump.
+fn pump_two_live_voters(
+  t: Instant,
+  a: &mut Endpoint<NoopSm, RestartOnly>,
+  wal_a: &mut TestWal,
+  sb_a: &mut TestSb,
+  blocks_a: &mut crate::block_store::MemBlockStore,
+  a_slot: u16,
+  b: &mut Endpoint<NoopSm, RestartOnly>,
+  wal_b: &mut TestWal,
+  sb_b: &mut TestSb,
+  blocks_b: &mut crate::block_store::MemBlockStore,
+  b_slot: u16,
+) {
+  for _ in 0..16 {
+    let mut moved = false;
+    let mut from_a = std::vec::Vec::new();
+    while let Some(out) = a.poll_message() {
+      from_a.push(out);
+    }
+    for out in from_a {
+      let (to_peer, loopback) = match out.to() {
+        Recipient::Backups => (true, false),
+        Recipient::AllReplicas => (true, true),
+        Recipient::To(Peer::Replica(r)) => (r.get() == b_slot, r.get() == a_slot),
+        Recipient::To(_) => (false, false),
+      };
+      let msg = out.into_msg();
+      if to_peer {
+        b.handle_message(
+          t,
+          wal_b,
+          sb_b,
+          blocks_b,
+          Peer::Replica(ReplicaId::new(a_slot)),
+          msg.clone(),
+        );
+        moved = true;
+      }
+      if loopback {
+        a.handle_message(
+          t,
+          wal_a,
+          sb_a,
+          blocks_a,
+          Peer::Replica(ReplicaId::new(a_slot)),
+          msg,
+        );
+        moved = true;
+      }
+    }
+    let mut from_b = std::vec::Vec::new();
+    while let Some(out) = b.poll_message() {
+      from_b.push(out);
+    }
+    for out in from_b {
+      let (to_peer, loopback) = match out.to() {
+        Recipient::Backups => (true, false),
+        Recipient::AllReplicas => (true, true),
+        Recipient::To(Peer::Replica(r)) => (r.get() == a_slot, r.get() == b_slot),
+        Recipient::To(_) => (false, false),
+      };
+      let msg = out.into_msg();
+      if to_peer {
+        a.handle_message(
+          t,
+          wal_a,
+          sb_a,
+          blocks_a,
+          Peer::Replica(ReplicaId::new(b_slot)),
+          msg.clone(),
+        );
+        moved = true;
+      }
+      if loopback {
+        b.handle_message(
+          t,
+          wal_b,
+          sb_b,
+          blocks_b,
+          Peer::Replica(ReplicaId::new(b_slot)),
+          msg,
+        );
+        moved = true;
+      }
+    }
+    a.handle_storage(t, wal_a, sb_a, blocks_a);
+    b.handle_storage(t, wal_b, sb_b, blocks_b);
+    if !moved {
+      break;
+    }
+  }
+}
+
+#[test]
+fn forked_normal_views_converge_and_resume_committing() {
+  // Two live voters hold FORKED Normal views at the same epoch — one at view 2, one at view 3 —
+  // and the remaining voter is gone (crashed, or stranded behind an epoch boundary). The shape is
+  // left behind when successive commit-first reconfigurations remap primaryship across views while
+  // a StartView / state-sync crossing preserves one survivor's higher view: each survivor ends up
+  // a BACKUP of its own view whose primary never speaks. Both idle timers fire, but an
+  // exact-successor-only SVC admission can never converge them: the lower voter's sole admissible
+  // target (its own view + 1) is exactly the one the higher voter rejects as stale, and the higher
+  // voter's proposal is above the lower voter's exact successor — no target is ever shared by a
+  // quorum, a permanent fault-free whole-cluster write wedge. This pins the convergence contract:
+  // ANY strictly-higher SVC target is joinable, so the highest live proposal recruits every live
+  // voter, the SVC quorum forms, and the cluster elects a live primary and resumes committing.
+  let mut e0 = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(0)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let mut e1 = Endpoint::<_, RestartOnly>::genesis_unchecked(
+    Config::try_new(1, MemberId::new(1)).unwrap(),
+    genesis(3),
+    0,
+    NoopSm,
+    u64::MAX,
+  );
+  let (mut wal0, mut sb0) = (TestWal::default(), TestSb::default());
+  let (mut wal1, mut sb1) = (TestWal::default(), TestSb::default());
+  let mut blocks0 = crate::block_store::MemBlockStore::new();
+  let mut blocks1 = crate::block_store::MemBlockStore::new();
+  let now = Instant::ZERO;
+  // Voter 0 adopted view 2 from its primary (replica 2 — now dead); voter 1 adopted view 3 from
+  // its primary (replica 0 — which itself never reached view 3, the fork).
+  e0.handle_message(
+    now,
+    &mut wal0,
+    &mut sb0,
+    &mut blocks0,
+    Peer::Replica(ReplicaId::new(2)),
+    Message::StartView(StartView::new(
+      View::with(2),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(2),
+      std::vec![],
+    )),
+  );
+  e1.handle_message(
+    now,
+    &mut wal1,
+    &mut sb1,
+    &mut blocks1,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::StartView(StartView::new(
+      View::with(3),
+      OpNumber::new(),
+      OpNumber::new(),
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      std::vec![],
+    )),
+  );
+  e0.handle_storage(now, &mut wal0, &mut sb0, &mut blocks0);
+  e1.handle_storage(now, &mut wal1, &mut sb1, &mut blocks1);
+  while e0.poll_message().is_some() {}
+  while e1.poll_message().is_some() {}
+  assert_eq!(e0.status(), Status::Normal);
+  assert_eq!(e0.view(), View::with(2), "voter 0 is a backup of view 2");
+  assert_eq!(e1.status(), Status::Normal);
+  assert_eq!(e1.view(), View::with(3), "voter 1 is a backup of view 3");
+
+  // Let both idle timers fire and relay ONLY between the two live voters.
+  for ms in (100..=3000).step_by(100) {
+    let t = now + core::time::Duration::from_millis(ms);
+    e0.handle_timeout(t, &mut wal0, &mut sb0, &mut blocks0);
+    e1.handle_timeout(t, &mut wal1, &mut sb1, &mut blocks1);
+    pump_two_live_voters(
+      t,
+      &mut e0,
+      &mut wal0,
+      &mut sb0,
+      &mut blocks0,
+      0,
+      &mut e1,
+      &mut wal1,
+      &mut sb1,
+      &mut blocks1,
+      1,
+    );
+  }
+  assert_eq!(
+    e0.view(),
+    e1.view(),
+    "the forked voters converge on one view"
+  );
+  assert_eq!(e0.status(), Status::Normal, "voter 0 resumes Normal");
+  assert_eq!(e1.status(), Status::Normal, "voter 1 resumes Normal");
+  // The joined view is the highest proposal (the max-view voter's successor), whose primary is a
+  // LIVE voter — that is what makes the convergence useful, not merely shared.
+  assert_eq!(e1.view(), View::with(4));
+  assert!(e1.is_primary(), "view 4's primary is live voter 1");
+
+  // The formed view actually commits: a client request reaches quorum (primary + one backup).
+  let t = now + core::time::Duration::from_millis(3100);
+  e1.handle_message(
+    t,
+    &mut wal1,
+    &mut sb1,
+    &mut blocks1,
+    Peer::Client(ClientId::new(9)),
+    Message::Request(Request::new(
+      ClientId::new(9),
+      RequestNumber::with(1),
+      Bytes::from_static(b"R"),
+    )),
+  );
+  for ms in (3100..=4000).step_by(100) {
+    let t = now + core::time::Duration::from_millis(ms);
+    e0.handle_timeout(t, &mut wal0, &mut sb0, &mut blocks0);
+    e1.handle_timeout(t, &mut wal1, &mut sb1, &mut blocks1);
+    pump_two_live_voters(
+      t,
+      &mut e0,
+      &mut wal0,
+      &mut sb0,
+      &mut blocks0,
+      0,
+      &mut e1,
+      &mut wal1,
+      &mut sb1,
+      &mut blocks1,
+      1,
+    );
+  }
+  assert_eq!(
+    e1.commit(),
+    OpNumber::with(1),
+    "the re-formed cluster commits new client ops"
+  );
+  assert_eq!(
+    e0.commit(),
+    OpNumber::with(1),
+    "the backup learns the committed frontier"
+  );
 }
