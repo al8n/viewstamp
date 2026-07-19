@@ -20,6 +20,11 @@ pub struct InFlight {
   pub msg: Message,
   /// Tie-breaker for deterministic ordering of equal `deliver_at`.
   pub seq: u64,
+  /// Whether `from` (when it names a replica) was a VOTER, by its own membership, at the instant
+  /// this message was handed to the network — recorded once here rather than left to be re-derived
+  /// from whatever role that replica holds by the time a later reader asks. `true` for a
+  /// non-replica `from` (a client has no voter concept, so no consumer reads this bit for one).
+  pub emitter_was_voter: bool,
 }
 
 /// Tunable, seeded fault model. All probabilities are out of 1000.

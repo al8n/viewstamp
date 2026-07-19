@@ -481,6 +481,67 @@ fn durable_view_checker_flags_a_sync_checkpoint_above_the_durable_view() {
 }
 
 #[test]
+fn learner_emission_checker_exempts_a_message_minted_while_a_voter_even_if_since_demoted() {
+  // Draining a queued message into the checker is not atomic with the step that minted it, so the
+  // emitter's LIVE role by the time anything asks may no longer match its role when the message was
+  // actually built. The checker asserts against the RECORDED mint-time role passed in here, never
+  // replica 0's role right now (which this test never even touches) — so an old, legitimate vote
+  // cast while the emitter was a voter is exempt no matter what it is by the time the checker runs.
+  let mut c = Cluster::new(3, 1, 1, /*seed*/ 3);
+  let vote = Message::StartViewChange(viewstamp_proto::StartViewChange::new(
+    viewstamp_proto::View::with(1),
+    ReplicaId::new(0),
+    viewstamp_proto::Epoch::new(0),
+    0,
+  ));
+  c.record_learner_emission_violation(0, &vote, /* emitter_was_voter */ true);
+  assert!(
+    c.take_learner_emission_violation().is_none(),
+    "a counted message minted while the emitter was a voter must never be flagged"
+  );
+}
+
+#[test]
+fn learner_emission_checker_flags_a_message_minted_while_a_learner_even_if_since_promoted() {
+  // The mirror race: a learner that emits a counted message (a genuine bug) and is THEN promoted
+  // before the checker runs must still be flagged — the violation happened at mint, and a later
+  // promote cannot retroactively legitimize it. The prior epoch-lag inference could never see this:
+  // it only compared epochs once the emitter was ALREADY observed as non-voting, so a since-promoted
+  // emitter skipped the check entirely. Asserting against the recorded mint-time role closes that
+  // gap: the verdict here never reads any live role at all.
+  let mut c = Cluster::new(3, 1, 1, /*seed*/ 3);
+  let vote = Message::StartViewChange(viewstamp_proto::StartViewChange::new(
+    viewstamp_proto::View::with(1),
+    ReplicaId::new(0),
+    viewstamp_proto::Epoch::new(0),
+    0,
+  ));
+  c.record_learner_emission_violation(0, &vote, /* emitter_was_voter */ false);
+  let why = c
+    .take_learner_emission_violation()
+    .expect("a counted message minted while the emitter was NOT a voter must be flagged");
+  assert!(
+    why.contains("StartViewChange"),
+    "the violation names the offending message kind: {why}"
+  );
+  // Control: a non-counted message kind (e.g. Commit) is never this checker's concern, regardless
+  // of the emitter's recorded role — only PrepareOk/StartViewChange/DoViewChange are counted votes.
+  let mut c2 = Cluster::new(3, 1, 1, /*seed*/ 3);
+  let commit = Message::Commit(viewstamp_proto::Commit::new(
+    viewstamp_proto::View::with(1),
+    OpNumber::with(1),
+    OpNumber::with(0),
+    viewstamp_proto::Epoch::new(0),
+    0,
+  ));
+  c2.record_learner_emission_violation(0, &commit, /* emitter_was_voter */ false);
+  assert!(
+    c2.take_learner_emission_violation().is_none(),
+    "a non-counted message kind is never this checker's concern"
+  );
+}
+
+#[test]
 fn network_drops_an_oversized_inter_replica_message_but_not_small_or_client_ones() {
   // The CONVERSE that proves the frame cap is REAL: a full-`Present` 8-entry `DoViewChange` of
   // large bodies — the carrier shape header-only carriers exist to avoid — EXCEEDS `MAX_FRAME_LEN`,
