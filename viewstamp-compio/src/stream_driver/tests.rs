@@ -1996,3 +1996,157 @@ async fn an_active_reconfigure_across_retirement_resolves_to_retired_stream() {
     ),
   }
 }
+
+/// A [`BlockStore`] whose `flush` PERSISTENTLY faults after counting the attempt (so the checkpoint
+/// pointer never advances and every later `handle_timeout` re-attempts it) — otherwise identical to
+/// [`MemBlocks`]. Models a durability barrier that never recovers (e.g. a full disk), so a test can
+/// observe how many times a checkpoint flush was attempted, independent of the (always-faulting)
+/// outcome.
+#[derive(Clone)]
+struct FaultingBlocks {
+  blocks: std::collections::HashMap<BlockAddress, Bytes>,
+  flush_attempts: Arc<AtomicUsize>,
+}
+
+impl FaultingBlocks {
+  fn new(flush_attempts: Arc<AtomicUsize>) -> Self {
+    Self {
+      blocks: std::collections::HashMap::new(),
+      flush_attempts,
+    }
+  }
+}
+
+impl BlockStore for FaultingBlocks {
+  fn read_block(&self, addr: BlockAddress) -> Option<Bytes> {
+    self.blocks.get(&addr).cloned()
+  }
+  fn write_block(&mut self, addr: BlockAddress, block: Bytes) {
+    self.blocks.insert(addr, block);
+  }
+  fn has_block(&self, addr: BlockAddress) -> bool {
+    self.blocks.contains_key(&addr)
+  }
+  fn flush(&mut self) -> Result<(), viewstamp_proto::BlockStoreError> {
+    self.flush_attempts.fetch_add(1, Ordering::Relaxed);
+    Err(viewstamp_proto::BlockStoreError::new())
+  }
+}
+
+/// Falsifier for the none-or-due gate in `service_consensus_timer`: with an ARMED but NOT-YET-DUE
+/// timer, simulating many socket/accept wakes must not re-drive a faulting checkpoint flush — only a
+/// due (or disarmed) call may service it. `handle_timeout`'s Normal-primary arm retries a faulted
+/// checkpoint on every call regardless of whether any timer is actually due, so an UNGATED call site
+/// would retry the flush once per wake; reverting the gate to unconditional turns the not-yet-due
+/// loop below from 0 retries into 64.
+#[compio::test]
+async fn an_armed_not_due_timer_gates_the_checkpoint_re_drive_off_the_socket_wake_rate() {
+  const CLUSTER: u128 = 0x7777;
+  // checkpoint_ops = 1: the sole voter's own first committed op (commit_min 1 >= checkpoint_op 0 +
+  // 1) makes an ordinary checkpoint due immediately, so a single client op is enough to owe one.
+  let config = Config::with_checkpoint_ops(CLUSTER, MemberId::new(0_u128), 1).unwrap();
+  let wal = InMemoryWal::new();
+  let mut sb = InMemorySuperblock::new();
+  viewstamp_driver::format(config, &genesis(1), &wal, &mut sb).expect("format the genesis store");
+
+  let flush_attempts = Arc::new(AtomicUsize::new(0));
+  let blocks = FaultingBlocks::new(flush_attempts.clone());
+  let dialer: super::DialerFactory<Labeled<Passthrough>> = Rc::new(|peer| {
+    let opts = LabelOptions::new(CLUSTER, peer);
+    Conn::from_parts(Labeled::dialer(Passthrough::new(), &opts))
+  });
+  let acceptor: super::AcceptorFactory<Labeled<Passthrough>> = Rc::new(|| {
+    let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(0)));
+    Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
+  });
+  let (_ready_tx, ready_rx) = flume::unbounded();
+  let (mut driver, _handle) = CompioStreamDriver::new(
+    config,
+    genesis(1),
+    LogSm::default(),
+    wal,
+    sb,
+    blocks,
+    ClientId::new(1),
+    0,
+    "127.0.0.1:0".parse().unwrap(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    ready_rx,
+  )
+  .await
+  .expect("driver builds");
+
+  // Drive one client op to commit. The sole voter's own durable append is its own quorum, so
+  // draining storage both commits the op and — as the commit-advance tail — attempts (and, on this
+  // faulting store, faults) the now-due checkpoint.
+  let now = Instant::ZERO;
+  let request = viewstamp_proto::Request::new(
+    ClientId::new(7),
+    viewstamp_proto::RequestNumber::with(1),
+    Bytes::from_static(b"x"),
+  );
+  driver.coord.submit_client_request(
+    now,
+    &mut driver.wal,
+    &mut driver.sb,
+    &mut driver.blocks,
+    request,
+  );
+  driver
+    .coord
+    .handle_storage(now, &mut driver.wal, &mut driver.sb, &mut driver.blocks);
+
+  assert_eq!(
+    driver.coord.endpoint().commit().get(),
+    1,
+    "the sole voter commits its own durable append with no peer to wait on"
+  );
+  assert_eq!(
+    driver.coord.endpoint().checkpoint_op().get(),
+    0,
+    "the checkpoint's block-store flush faulted: no durable checkpoint landed"
+  );
+  let c0 = flush_attempts.load(Ordering::Relaxed);
+  assert!(
+    c0 >= 1,
+    "driving the op to commit already attempted (and faulted) the checkpoint flush"
+  );
+
+  // A Normal primary always arms its heartbeat/checkpoint-debt cadence on an accepted request. The
+  // deadline is a proto `Instant`, compared against `now` (the SAME value the gate and
+  // `handle_timeout` both use) — never a wall clock, so the test stays deterministic.
+  let deadline = driver
+    .coord
+    .poll_timeout()
+    .expect("a Normal primary arms its heartbeat cadence on every accepted request");
+  assert!(
+    deadline > Instant::ZERO,
+    "the armed deadline is in the future relative to the not-yet-due now the wakes use"
+  );
+
+  // Simulate 64 socket/accept wakes strictly before the armed deadline (each passing the same
+  // not-yet-due `now`): the gate must skip `handle_timeout` on every one, so the faulting flush is
+  // never retried.
+  for _ in 0..64 {
+    driver.service_consensus_timer(now);
+  }
+  let c1 = flush_attempts.load(Ordering::Relaxed);
+  assert_eq!(
+    c1, c0,
+    "an armed, not-yet-due timer must not re-drive the faulting checkpoint flush on every socket \
+     wake (saw {c1} attempts vs {c0} before 64 wakes)"
+  );
+
+  // A due timer: pass `deadline` itself as `now` (`deadline <= deadline` holds), so the gate must
+  // service it — exactly once, matching one due firing per cadence.
+  driver.service_consensus_timer(deadline);
+  let c2 = flush_attempts.load(Ordering::Relaxed);
+  assert_eq!(
+    c2,
+    c1 + 1,
+    "a due timer re-drives the faulting checkpoint flush exactly once (saw {c2}, expected {})",
+    c1 + 1
+  );
+}

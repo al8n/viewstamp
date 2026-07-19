@@ -494,20 +494,8 @@ where
       }
       while self.storage_ready.try_recv().is_ok() {}
 
-      // Service the consensus timer UNCONDITIONALLY on every iteration, NOT only when an already-armed
-      // timer is due. `handle_timeout` is where a role's cadence ARMS itself: a Normal learner (a
-      // freshly-demoted voter whose voter cadences the install retired, or any idle learner) starts with
-      // EVERY timer disarmed, so `poll_timeout()` is `None` and a due-gated call would never run — the
-      // learner-status cadence would never self-bootstrap, never emit `LearnerStatus`, never draw the
-      // `EpochAhead` hint, and an epoch-lagged learner whose only link is a non-primary member would wedge
-      // forever. Gating on an armed timer starves exactly the roles whose cadences all begin disarmed. The
-      // call is idempotent-safe: on a not-yet-due timer it is a no-op, and the loop's 50ms idle fallback
-      // (`next_deadline`) bounds how soon a freshly-disarmed cadence bootstraps. Servicing it every pass
-      // also keeps an accept flood from suppressing heartbeats/view-changes.
-      self
-        .coord
-        .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
-      self.rekey_if_needed(now);
+      // Service the consensus timer under the none-or-due gate (see the method).
+      self.service_consensus_timer(now);
       self.retransmit_stale(now);
       self.pump_outputs(now).await;
       self.advance_reconfigure(now);
@@ -1331,6 +1319,33 @@ where
       if !produced {
         break;
       }
+    }
+  }
+
+  /// Service the consensus timer under a NONE-OR-DUE gate: call `handle_timeout` when nothing is armed
+  /// (a disarmed role — a natal or freshly-demoted learner — must be serviced ONCE so its learner-status
+  /// cadence self-arms; after that first call the timer is armed and the due-gating below takes over) OR
+  /// when the earliest armed timer is due; SKIP when an armed timer is not yet due. The gate is required
+  /// because `handle_timeout` is NOT a no-op on a not-yet-due timer: on a Normal primary it also re-drives
+  /// a faulted checkpoint flush (`maybe_pay_checkpoint_debt` / `maybe_checkpoint`), so calling it on every
+  /// socket/accept wake would rebuild + retry a persistently-faulting flush at the wake rate, amplifying a
+  /// storage fault into unbounded work. Gating keeps that re-drive on the consensus cadence while still
+  /// letting a disarmed cadence self-bootstrap (the `None` arm). The deadline is compared against the SAME
+  /// loop-start `now` handed to `handle_timeout` below (not a freshly-sampled clock), so the gate and the
+  /// handler always agree on due-ness: a gate reading a fresher clock than the `now` `handle_timeout` runs
+  /// with could decide "due" while the handler's own internal check (against the stale `now`) leaves the
+  /// timer unserviced/un-re-armed, yet the primary arm would still re-drive the checkpoint tail — costing
+  /// a second rebuild/flush attempt next iteration for what should be one due firing per cadence.
+  fn service_consensus_timer(&mut self, now: Instant) {
+    if self
+      .coord
+      .poll_timeout()
+      .is_none_or(|deadline| deadline <= now)
+    {
+      self
+        .coord
+        .handle_timeout(now, &mut self.wal, &mut self.sb, &mut self.blocks);
+      self.rekey_if_needed(now);
     }
   }
 
