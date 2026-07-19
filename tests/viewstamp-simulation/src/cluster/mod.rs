@@ -181,6 +181,17 @@ pub struct Cluster {
   /// schedule time, which sees every emitted inter-replica message with its `from` regardless of
   /// whether a fault later drops it — recording changes no scheduling and takes no PRNG draw.
   learner_emission_violation: Option<SmolStr>,
+  /// Per-replica history of `(epoch, was_voter)` observations, appended lazily (in [`Self::schedule`],
+  /// via [`Self::observe_voter_epoch`]) whenever a replica's live epoch is seen to have advanced past
+  /// the last recorded entry. Backs the learner-emission checker's role-at-mint lookup
+  /// ([`Self::voter_at_epoch`]): a replica's LIVE role by the time anything drains its queued message
+  /// may no longer match its role when the message was minted (a demote or promote can install in
+  /// between), but its role AS OF THE MESSAGE'S OWN STAMPED EPOCH is fixed forever once that epoch has
+  /// been observed — per-replica epochs only ever advance, so an epoch a replica has already passed
+  /// through can never be revisited under a different role. Persists across `crash`/`restart`: a
+  /// recovered replica's epoch never regresses past a durable install, so replaying an epoch already
+  /// at or below the last recorded entry is always a no-op.
+  voter_history: Vec<Vec<(u64, bool)>>,
   /// `None` (default) ⇒ every replica's WAL appends SYNCHRONOUSLY (the deterministic gates' mode).
   /// `Some(d)` ⇒ async-append mode with per-append delay `d` polls — the in-flight window the
   /// append-before-ack invariant must survive. Set via [`set_async_wal_delay`] before running;
@@ -436,6 +447,7 @@ impl Cluster {
       append_before_ack_violation: None,
       durable_view_violation: None,
       learner_emission_violation: None,
+      voter_history: vec![Vec::new(); n],
       async_wal_delay: None,
       async_sb_delay: None,
       wal_capacity: None,
@@ -943,6 +955,39 @@ impl Cluster {
         .into(),
       );
     }
+  }
+
+  /// Record a learner-emission violation if `msg` (from replica `ri`) is a COUNTED message — a
+  /// `PrepareOk`, `StartViewChange`, or `DoViewChange` — and `emitter_was_voter` is `false`.
+  /// `emitter_was_voter` is the caller's recorded role for `ri` AT THE INSTANT this message was
+  /// handed to the network, not `ri`'s role now: this function never re-reads `ri`'s live role, so
+  /// its verdict cannot depend on when it happens to run relative to a later demote or promote of
+  /// `ri`. First violation only (subsequent instances are inert).
+  fn record_learner_emission_violation(
+    &mut self,
+    ri: usize,
+    msg: &Message,
+    emitter_was_voter: bool,
+  ) {
+    if self.learner_emission_violation.is_some() || emitter_was_voter {
+      return;
+    }
+    if !matches!(
+      msg,
+      Message::PrepareOk(_) | Message::StartViewChange(_) | Message::DoViewChange(_)
+    ) {
+      return;
+    }
+    self.learner_emission_violation = Some(
+      format!(
+        "learner {ri} emitted a counted message {} while it was not a voter at the instant the \
+         message was enqueued — a non-voting learner must never send a \
+         PrepareOk/StartViewChange/DoViewChange (it is never a voter, prospective primary, or \
+         active view-change participant)",
+        msg.kind_str(),
+      )
+      .into(),
+    );
   }
 
   /// True iff replica `i` is the primary of its current view (for the M3 gate's failover schedule).
@@ -2740,68 +2785,79 @@ impl Cluster {
     }
   }
 
+  /// Appends replica `ri`'s CURRENT `(epoch, is_voter)` to [`Self::voter_history`] if its epoch has
+  /// advanced past the last recorded entry — idempotent (a repeat call at the same epoch is a no-op)
+  /// and cheap (no PRNG draw, no message, no storage write). Called at the top of every [`Self::schedule`]
+  /// for a replica-sourced message: the earliest point available to the cluster, strictly before this
+  /// tick's own message/storage/timeout processing can move `ri` to a later epoch, so the epoch `ri`
+  /// is AT RIGHT NOW gets its role recorded no later than the very first `schedule` call that ever
+  /// observes it.
+  fn observe_voter_epoch(&mut self, ri: usize) {
+    let epoch = self.replicas[ri].membership().epoch().get();
+    let is_voter = self.replicas[ri].is_voter();
+    let history = &mut self.voter_history[ri];
+    if history.last().is_none_or(|&(e, _)| e < epoch) {
+      history.push((epoch, is_voter));
+    }
+  }
+
+  /// Replica `ri`'s recorded voter status AS OF `epoch`: the last [`Self::voter_history`] entry at or
+  /// below `epoch`. Falls back to `ri`'s CURRENT role if `epoch` predates every recorded entry — only
+  /// possible for a `schedule` call made before any tick has ever run for `ri` (a direct test call),
+  /// since otherwise genesis epoch 0 is always the floor entry.
+  fn voter_at_epoch(&self, ri: usize, epoch: u64) -> bool {
+    self.voter_history[ri]
+      .iter()
+      .rev()
+      .find(|&&(e, _)| e <= epoch)
+      .map_or_else(|| self.replicas[ri].is_voter(), |&(_, v)| v)
+  }
+
   /// Applies the fault model and (unless dropped) enqueues a message. With `duplicate_per_mille` a
   /// non-dropped message is enqueued a SECOND time at an independently-jittered delivery instant,
   /// exercising the protocol's idempotency / re-ack paths.
   fn schedule(&mut self, now: Instant, from: Peer, target: Target, msg: Message) {
+    // The role this message's `InFlight` entries carry: whether `from` (when it names a replica) WAS
+    // a voter as of the EPOCH this message itself carries (for a counted kind), looked up from the
+    // recorded history rather than read live — draining into `schedule` is not atomic with the step
+    // that minted the message, so the replica's LIVE role by now can already differ from its role at
+    // mint (a demote or promote can install in between), and by the time this call runs that install
+    // may already be well in the past, not merely mid-flight. A non-counted message carries no epoch
+    // to look anything up against, so its bit is just the replica's current role (nothing ever reads
+    // it for one). `true` for a non-replica `from` (a client carries no voter concept).
+    let emitter_was_voter = match from {
+      Peer::Replica(r) => {
+        let ri = usize::from(r.get());
+        self.observe_voter_epoch(ri);
+        match &msg {
+          Message::PrepareOk(m) => self.voter_at_epoch(ri, m.epoch().get()),
+          Message::StartViewChange(m) => self.voter_at_epoch(ri, m.epoch().get()),
+          Message::DoViewChange(m) => self.voter_at_epoch(ri, m.epoch().get()),
+          _ => self.replicas[ri].is_voter(),
+        }
+      }
+      _ => true,
+    };
     if let (Peer::Replica(from_r), Target::Replica(to_r)) = (from, target) {
       // A NON-VOTING learner must never emit a COUNTED message: a `PrepareOk` (a commit-quorum vote), a
       // `StartViewChange` or a `DoViewChange` (active view-change participation). It applies the committed
       // log and may solicit catch-up, but it is never a voter and never a prospective primary, so any such
-      // emission is a REAL finding (a learner taking part in consensus). Classified by the emitter's LIVE
-      // voter status (`is_voter`), NOT the static genesis `replica_count`: a `PromoteLearner` makes a
-      // genesis-learner-slot node a VOTER, whose vote is then LEGITIMATE — keying off the static count
-      // would mis-flag it. Recorded BEFORE the partition/one-way/frame drops below, so a learner's counted
-      // message trips this even when a fault would later drop it; the recording changes no scheduling and
-      // takes no PRNG draw. Drained by the VOPR driver each tick.
+      // emission is a REAL finding (a learner taking part in consensus). Classified by voter status, NOT
+      // the static genesis `replica_count`: a `PromoteLearner` makes a genesis-learner-slot node a VOTER,
+      // whose vote is then LEGITIMATE — keying off the static count would mis-flag it.
       //
-      // STALENESS EXEMPTION (not a role check): draining into `schedule` is not atomic with the step that
-      // built the message — a `DemoteVoter` can install on THIS replica (bumping its epoch, dropping its
-      // vote) after the replica queued an older message while it was still a voter but before the driver
-      // drains that queued message. Per-replica epochs only ever advance, so the message's stamped epoch
-      // (`counted_epoch`) can never exceed the emitter's CURRENT installed epoch (`emitter_epoch`) — only
-      // lag behind it. A strictly lagging stamp proves only that the message PREDATES the emitter's most
-      // recent install — NOT that the emitter was a voter back at that older epoch: it may already have
-      // been a non-voting learner then too, and this exemption MASKS a genuine violation in that corner.
-      // That is not a new gap opened here — the pre-existing checker already carried the symmetric
-      // promote-side race, so this narrow demote-side counterpart does not lower the bar further. Nor is
-      // inertness universal; it is RECEIVER-relative: a receiver still AT the stamped epoch applies the
-      // identical STRICT `(epoch, config_id)` fence (`epoch_authority_admits`) to
-      // `PrepareOk`/`StartViewChange`/`DoViewChange` alike and ADMITS the message, because its stamped
-      // epoch matches that receiver's own. This exemption is harmless exactly in the case it is meant for —
-      // the emitter genuinely was a voter at that older epoch (the intended demote race: an old vote cast
-      // legitimately under a quorum the emitter has since left) — not in the masked corner above. Exempt
-      // ONLY the strictly-lagging case (`counted_epoch < emitter_epoch`); a message stamped with the
-      // emitter's OWN current epoch or later (`counted_epoch >= emitter_epoch`) still flags — that is the
-      // real bug this check exists to catch, a learner voting in the very configuration it is currently,
-      // actually, a non-voter in.
-      let counted_epoch = match &msg {
-        Message::PrepareOk(m) => Some(m.epoch()),
-        Message::StartViewChange(m) => Some(m.epoch()),
-        Message::DoViewChange(m) => Some(m.epoch()),
-        _ => None,
-      };
-      if !self.replicas[usize::from(from_r.get())].is_voter()
-        && self.learner_emission_violation.is_none()
-        && let Some(counted_epoch) = counted_epoch
-      {
-        let emitter_epoch = self.replicas[usize::from(from_r.get())]
-          .membership()
-          .epoch();
-        if counted_epoch >= emitter_epoch {
-          self.learner_emission_violation = Some(
-            format!(
-              "learner {} emitted a counted message {} at its own current epoch {} — a \
-               non-voting learner must never send a PrepareOk/StartViewChange/DoViewChange (it \
-               is never a voter, prospective primary, or active view-change participant)",
-              from_r.get(),
-              msg.kind_str(),
-              emitter_epoch.get(),
-            )
-            .into(),
-          );
-        }
-      }
+      // Asserted against `emitter_was_voter` (computed once, above, at the top of this call) instead of
+      // reading replica `from_r`'s CURRENT role again right here: a message minted while `from_r` was a
+      // voter must clear this check no matter how long it then sat queued, and a message minted while
+      // `from_r` was a learner must trip it no matter what `from_r` has become since. Per-replica epochs
+      // only ever advance, so an epoch this replica has already passed through can never recur under a
+      // different role — that is what makes the recorded, epoch-keyed lookup a fact rather than a guess
+      // (unlike comparing epochs to infer a role, which cannot tell "was a voter back then" apart from
+      // "was already a learner back then" for a currently-non-voting emitter). Recorded BEFORE the
+      // partition/one-way/frame drops below, so a learner's counted message trips this even
+      // when a fault would later drop it; the recording changes no scheduling and takes no PRNG draw.
+      // Drained by the VOPR driver each tick.
+      self.record_learner_emission_violation(usize::from(from_r.get()), &msg, emitter_was_voter);
       if self.partitioned(from_r.get(), to_r) {
         return;
       }
@@ -2854,6 +2910,7 @@ impl Cluster {
       target,
       msg: msg.clone(),
       seq: 0,
+      emitter_was_voter,
     });
     if duplicate {
       // The second copy gets its OWN jitter (and slow extra), so it can arrive before or after the
@@ -2868,6 +2925,7 @@ impl Cluster {
         target,
         msg,
         seq: 0,
+        emitter_was_voter,
       });
     }
   }
