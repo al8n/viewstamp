@@ -634,7 +634,7 @@ fn bounded_wal_backup_below_ring_window_state_syncs_instead_of_overwriting() {
   // sub-floor holes at adoption — so the overflow confluence is rare and seed-specific, and the sync
   // the overflow rides is typically armed by the SAME delivery's carried floor a moment before the
   // ring guard runs.)
-  const PROVOKING_SEEDS: [u64; 3] = [0, 7, 11];
+  const PROVOKING_SEEDS: [u64; 3] = [9, 11, 14];
   let mut total_below_ring_window_syncs = 0u64;
   for seed in PROVOKING_SEEDS {
     // N=5 (a 4-of-5 quorum always commits + checkpoints), a SMALL checkpoint interval (4) and a SMALL ring
