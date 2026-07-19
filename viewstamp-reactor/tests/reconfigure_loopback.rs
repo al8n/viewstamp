@@ -443,8 +443,8 @@ async fn idle_three_voter_shrink_completes_from_health_probes_alone() {
 
 /// A SURVIVOR THAT NEVER PROVES BLOCKS A SHRINK THAT WOULD STRAND IT, AND THE REST STAY
 /// AVAILABLE (reactor variant): a real 3-voter cluster {0,1,2}; the primary (0) is asked to shrink to
-/// {0,1} (the sole delta is `RemoveVoter(2)`), and voter 1 — a SURVIVOR of the target, not the
-/// departing voter — is killed BEFORE the shrink is issued. `RemoveVoter(2)` is NEVER issued: its
+/// {0,1} (the sole delta is `DemoteVoter(2)`), and voter 1 — a SURVIVOR of the target, not the
+/// departing voter — is killed BEFORE the shrink is issued. `DemoteVoter(2)` is NEVER issued: its
 /// successor `{0,1}` would leave 1 dead, an immediate outage, so the shrink stalls fail-closed naming
 /// 1 unproven. Meanwhile the ORIGINAL 3-voter quorum (2 of 3) does not need voter 1: voter 0 and
 /// voter 2 alone still commit a client op after the stall, proving continued availability despite both
@@ -473,14 +473,14 @@ async fn a_killed_survivor_blocks_the_shrink_and_the_rest_stay_available() {
     handles.push(handle);
   }
 
-  // Target {0, 1}: the sole delta is RemoveVoter(2).
+  // Target {0, 1}: the sole delta is DemoteVoter(2).
   let target = MembershipTarget::new(
     std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
     std::collections::BTreeSet::new(),
   );
   // Kill voter 1 BEFORE issuing the shrink: from this point on it can never answer a health-probe
   // round, so the successor {0,1} can never be proven live and the removal deterministically stalls.
-  // The RemoveVoter op still commits via the surviving {0,2} quorum of the current 3-voter config.
+  // The DemoteVoter op still commits via the surviving {0,2} quorum of the current 3-voter config.
   let _ = handles[1].shutdown().await;
 
   let primary = handles[0].clone();
@@ -528,6 +528,119 @@ async fn a_killed_survivor_blocks_the_shrink_and_the_rest_stay_available() {
 
   let _ = handles[0].shutdown().await;
   let _ = handles[2].shutdown().await;
+}
+
+/// DEMOTE-THEN-GC END-TO-END (reactor variant): a real 3-voter cluster {0,1,2} shrinks to {0,1} via the
+/// demote-first path, driven by a single `reconfigure_to` call from the PRIMARY (member 0) — a SURVIVING
+/// node, never the departing member itself (the H1 drive-from-a-surviving-node rule: an about-to-leave
+/// voter is never a sound driver of its own departure). The target names {0,1} as voters and retains
+/// member 2 in NEITHER the voter nor the learner set, so the planner sequences TWO steps: `DemoteVoter(2)`
+/// (voter → live learner) then, once that swap installs, `RemoveLearner(2)` (race-free GC — the successor
+/// quorum's own commit, gated on a fresh liveness probe of {0,1}). Member 2 stays a normal, connected
+/// process throughout (never crashed), so it OBSERVES both installs on its own event stream, in order:
+/// first `self_is_voter=false, self_is_learner=true` (demoted — still a member, no longer a voter), then
+/// `self_is_voter=false, self_is_learner=false` (GCed — fully out of the membership), each installing at
+/// a strictly later epoch than the one before. 3→2 is an ODD-count shrink (`f` drops from 1 to 0), so
+/// the call carries `AcceptReducedFaultTolerance` — the operator's honest acknowledgement that crash
+/// tolerance is genuinely reduced, or the propose gate would refuse the demote. After the GC installs,
+/// the SHRUNK 2-voter cluster {0,1} still commits a fresh client request through the primary, proving
+/// availability survived the whole demote-then-GC round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_demoted_voter_becomes_a_learner_then_is_gced_and_the_smaller_cluster_still_commits() {
+  let ca = TestCa::new();
+  let addrs: Vec<SocketAddr> = (0..3)
+    .map(|i: u16| format!("127.0.0.1:{}", 41960 + i).parse().unwrap())
+    .collect();
+
+  let mut handles = Vec::new();
+  for id in 0u8..3 {
+    let peers: Vec<_> = (0u8..3)
+      .filter(|&p| p != id)
+      .map(|p| (ReplicaId::new(p as u16), addrs[p as usize]))
+      .collect();
+    let (driver, handle) =
+      build_cluster_driver(&ca, id, addrs[id as usize], peers, genesis(3, 0)).await;
+    drop(tokio::spawn(driver.run()));
+    handles.push(handle);
+  }
+
+  // Subscribe to member 2's OWN event stream BEFORE issuing the shrink, so neither install is missed.
+  let demotee_events = handles[2].events();
+
+  // Target {0, 1}: member 2 is named in neither the voter nor the learner set, so the planner drives
+  // `DemoteVoter(2)` then `RemoveLearner(2)` — the full demote-then-GC sequence — as ONE `reconfigure_to`
+  // call. Issued from member 0 (a survivor), never from member 2 itself.
+  let target = MembershipTarget::new(
+    std::collections::BTreeSet::from([MemberId::new(0), MemberId::new(1)]),
+    std::collections::BTreeSet::new(),
+  );
+  tokio::time::timeout(
+    viewstamp_driver::RECONFIGURE_TIMEOUT + Duration::from_secs(2),
+    handles[0].reconfigure_to(
+      target,
+      HealthHint::default(),
+      Some(AcceptReducedFaultTolerance),
+    ),
+  )
+  .await
+  .expect("the demote-then-GC shrink resolves within the deadline band")
+  .expect("reconfigure_to resolves Ok once member 2 is demoted, GCed, and the target is reached");
+
+  // Drain member 2's own two installs, in order: the demote (still a member, now a learner), then the
+  // GC (fully removed). Waited for explicitly (not opportunistically drained) — member 2's own install
+  // can lag the primary's view by a message or two, even with no faults.
+  let mut demote_swap = None;
+  let mut gc_swap = None;
+  tokio::time::timeout(Duration::from_secs(20), async {
+    loop {
+      match demotee_events.recv_async().await {
+        Ok(Event::MembershipChanged(m)) if demote_swap.is_none() => demote_swap = Some(m),
+        Ok(Event::MembershipChanged(m)) => {
+          gc_swap = Some(m);
+          break;
+        }
+        Ok(_) => {}
+        Err(_) => panic!("member 2's event channel closed before its GC install arrived"),
+      }
+    }
+  })
+  .await
+  .expect("member 2 observes both its demote-install and its GC-install within 20s");
+  let demote_swap = demote_swap.expect("the demote install was observed");
+  let gc_swap = gc_swap.expect("the GC install was observed");
+  assert!(
+    !demote_swap.self_is_voter() && demote_swap.self_is_learner(),
+    "the first install demotes member 2 to a live learner (still a member), got {demote_swap:?}"
+  );
+  assert!(
+    !gc_swap.self_is_voter() && !gc_swap.self_is_learner(),
+    "the second install GCs member 2 out of the membership entirely, got {gc_swap:?}"
+  );
+  assert!(
+    gc_swap.epoch() > demote_swap.epoch(),
+    "the GC installs at a strictly later epoch than the demote (epoch {} vs {})",
+    gc_swap.epoch(),
+    demote_swap.epoch()
+  );
+
+  // AVAILABILITY: the SHRUNK 2-voter cluster {0,1} still commits a fresh client request through the
+  // primary — the demote-then-GC round trip left the surviving quorum fully functional.
+  let reply = tokio::time::timeout(
+    Duration::from_secs(20),
+    handles[0].submit(Bytes::from_static(b"post-demote-gc")),
+  )
+  .await
+  .expect("the shrunk cluster commits within 20s")
+  .expect("a committed reply");
+  assert_eq!(
+    &reply[..],
+    &1u64.to_be_bytes(),
+    "the first client op on the shrunk 2-voter cluster replies the post-apply count 1"
+  );
+
+  for h in &handles {
+    let _ = h.shutdown().await;
+  }
 }
 
 /// ADDRESS BOOK DOES NOT DISRUPT NORMAL COMMITS (reactor variant): a 3-node cluster with `add_peer`
@@ -636,14 +749,15 @@ async fn add_peer_is_non_blocking_and_does_not_panic() {
 /// SLOT, so a conn keeps its stable identity across a reconfiguration that renumbers slots; the
 /// coordinator's `reconcile_routing` re-resolves each conn's attested member to its NEW slot and closes
 /// only the conns whose member genuinely moved (which then re-bind under the new slot on the next
-/// handshake). Genesis is voters {0,1,2,3} at slots {0,1,2,3}; the primary (member 0) proposes
-/// `RemoveVoter(1)`, leaving voters {0,2,3} at slots {0,1,2} — members 2 and 3 each shift DOWN one slot.
-/// The post-reconfiguration commit is submitted at the primary (member 0): committing it requires a
-/// PrepareOk quorum from the SHIFTED successor voter set, so its success proves the primary's mesh conns
-/// to the shifted backups re-resolved to their NEW slots — exactly the stable-id routing the handshake
-/// redesign provides. A regression to slot-attestation routing strands the shifted conns and the second
-/// commit times out. (The compio gate submits the post-shift op at the shifted backup itself, the
-/// stronger reply-to-shifted-backup direction.)
+/// handshake). Genesis is voters {0,1,2,3} at slots {0,1,2,3}; the primary (member 0) proposes a shrink
+/// to {0,2,3}. Member 1 is named in neither the target's voter nor learner set, so the planner
+/// sequences `DemoteVoter(1)` then `RemoveLearner(1)`, leaving voters {0,2,3} at slots {0,1,2} — members
+/// 2 and 3 each shift DOWN one slot. The post-reconfiguration commit is submitted at the primary
+/// (member 0): committing it requires a PrepareOk quorum from the SHIFTED successor voter set, so its
+/// success proves the primary's mesh conns to the shifted backups re-resolved to their NEW slots —
+/// exactly the stable-id routing the handshake redesign provides. A regression to slot-attestation
+/// routing strands the shifted conns and the second commit times out. (The compio gate submits the
+/// post-shift op at the shifted backup itself, the stronger reply-to-shifted-backup direction.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_cluster_survives_slot_shift() {
   use std::{collections::BTreeSet, sync::Arc};
@@ -942,7 +1056,7 @@ async fn learner_bootstraps_from_an_empty_process_and_is_promoted() {
     BTreeSet::new(),
   );
   // The health hint is irrelevant here: `PromoteLearner` is a grow-phase step the liveness gate never
-  // consults (only a `RemoveVoter` shrink does) — the promote-time durable-prefix challenge is what
+  // consults (only a `DemoteVoter` shrink does) — the promote-time durable-prefix challenge is what
   // admits it.
   tokio::time::timeout(
     Duration::from_secs(20),
