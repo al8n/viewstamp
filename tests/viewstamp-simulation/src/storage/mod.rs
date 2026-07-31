@@ -33,8 +33,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  BodyFaulty, CheckpointRead, Header, OpId, OpNumber, Prng, ReadOk, SlotStatus, Superblock,
-  SuperblockDone, VsrState, Wal, WalDone,
+  BodyFaulty, CheckpointRead, Header, OpNumber, Prng, ReadId, ReadOk, SlotStatus, Superblock,
+  SuperblockDone, VsrState, Wal, WalDone, WriteId,
 };
 
 /// Seeded storage-fault plan for one replica's WAL + superblock. Deterministic per (seed, replica):
@@ -134,7 +134,7 @@ impl Default for StorageFaults {
 struct PendingAppend {
   /// Polls remaining before this append becomes durable (counts down in `poll`, releases at 0).
   remaining: u32,
-  id: OpId,
+  id: WriteId,
   op: u64,
   header: Header,
   /// The bytes to store on completion (already torn if the torn-write roll fired at submit time).
@@ -401,7 +401,7 @@ impl InMemoryWal {
   /// Pick a deterministic MISDIRECTED-read sibling for a read of `op`: a DIFFERENT durable slot
   /// (`!= op`) whose stored `(header, body)` self-VERIFIES (`Header::verify` — excludes torn slots,
   /// whose body is corrupt) and is NOT bit-rotted. Returns its `(Header, body)` to return under the
-  /// requesting read's `OpId` (so `header.op() != op` — the placement violation the proto's recovery
+  /// requesting read's `ReadId` (so `header.op() != op` — the placement violation the proto's recovery
   /// `header.op() == op` check must reject). `None` if no such sibling exists (then the caller does the
   /// honest read). The candidate is chosen by a seeded index into the (op-ordered) candidate set, so
   /// the misdirection target is a pure function of the per-replica seed. Draws from `self.prng` (hence
@@ -564,7 +564,7 @@ impl Wal for InMemoryWal {
     }
   }
 
-  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+  fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
     // The fault verdict is decided HERE (at submit) in BOTH modes, so the same seed reproduces the
     // same torn/bit-rot decisions whether appends are synchronous or staged. In async mode the
     // verdict is merely carried on the staged entry and applied when it becomes durable.
@@ -639,7 +639,7 @@ impl Wal for InMemoryWal {
     }
   }
 
-  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+  fn submit_read(&mut self, id: ReadId, op: OpNumber) {
     // TORN-HEADER probe verdict: the slot retains NOTHING recoverable — not even the header — so the
     // read resolves `Absent`, exactly as if the append had never happened. (The contract violation
     // the probe lane measures: a real backend must never lose a completed append's header.)
@@ -706,7 +706,7 @@ impl Wal for InMemoryWal {
     self.completions.push_back(done);
   }
 
-  fn truncate(&mut self, above: OpNumber) -> Vec<OpId> {
+  fn truncate(&mut self, above: OpNumber) -> Vec<WriteId> {
     self.entries.retain(|&op, _| op <= above.get());
     // A truncated-away slot is no longer corrupt (it will be rewritten by a later append).
     self.rotted.retain(|&op| op <= above.get());
@@ -740,7 +740,7 @@ impl Wal for InMemoryWal {
     cancelled
   }
 
-  fn prune(&mut self, below: OpNumber) -> Vec<OpId> {
+  fn prune(&mut self, below: OpNumber) -> Vec<WriteId> {
     self.entries.retain(|&op, _| op >= below.get());
     self.rotted.retain(|&op| op >= below.get());
     self.torn_headers.retain(|&op| op >= below.get());
@@ -826,17 +826,17 @@ impl Wal for InMemoryWal {
 #[derive(Debug, Clone)]
 enum StagedSbWrite {
   /// A durable-root write: on completion, publishes `state` as the new durable root.
-  Root { id: OpId, state: VsrState },
+  Root { id: WriteId, state: VsrState },
   /// A checkpoint snapshot write: on completion, publishes `(op, snapshot)` as the readable checkpoint.
   Checkpoint {
-    id: OpId,
+    id: WriteId,
     op: OpNumber,
     snapshot: Bytes,
   },
 }
 
 impl StagedSbWrite {
-  fn id(&self) -> OpId {
+  fn id(&self) -> WriteId {
     match self {
       StagedSbWrite::Root { id, .. } | StagedSbWrite::Checkpoint { id, .. } => *id,
     }
@@ -950,6 +950,24 @@ impl InMemorySuperblock {
     sb
   }
 
+  /// Suspends async-write staging, returning the delay so
+  /// [`resume_async_writes`](Self::resume_async_writes) can put it back.
+  ///
+  /// Cluster creation writes the genesis root through a BLOCKING call that requires the write durable
+  /// before it returns, with no run loop yet in existence to pump an async completion. A harness that
+  /// formats a store already configured for the async steady-state window suspends staging across that
+  /// one call. The backend deliberately does not try to RECOGNIZE that write: it is an ordinary root
+  /// write, distinguished only by who submits it and when, which the caller knows and the backend
+  /// cannot soundly infer.
+  pub fn suspend_async_writes(&mut self) -> Option<u32> {
+    self.async_delay.take()
+  }
+
+  /// Restores the delay [`suspend_async_writes`](Self::suspend_async_writes) returned.
+  pub fn resume_async_writes(&mut self, delay: Option<u32>) {
+    self.async_delay = delay;
+  }
+
   /// Test-only: the number of staged (submitted-but-not-yet-durable) superblock writes. `0` in
   /// synchronous mode and whenever the async staging queue has drained. Lets a reproduction assert it
   /// is genuinely exercising the pending durable-view/checkpoint window.
@@ -1033,25 +1051,18 @@ impl Superblock for InMemorySuperblock {
     self.state.clone()
   }
 
-  fn submit_write(&mut self, id: OpId, state: VsrState) {
-    // The one-time FORMAT write is tagged with the reserved sentinel id `u64::MAX` (which `mint_op_id`
-    // never produces): it is the blocking cluster-creation write and lands SYNCHRONOUSLY even in
-    // async-write mode — distinct from the async steady-state root writes whose in-flight window this
-    // mode exists to exercise. Without this, formatting a genesis store while async mode is enabled
-    // could never complete synchronously and the store would stay unformatted.
-    let is_format = id.get() == u64::MAX;
+  fn submit_write(&mut self, id: WriteId, state: VsrState) {
     match self.async_delay {
       // ASYNC steady-state: STAGE as not-yet-durable. `self.state` is left at the prior durable root
       // until `poll` releases this write after `delay` ticks — opening the pending durable-view window.
-      Some(delay) if !is_format => self
+      Some(delay) => self
         .staged
         .push_back((delay, StagedSbWrite::Root { id, state })),
-      // SYNCHRONOUS (the default mode, or the format write in async mode): durable immediately,
-      // completion queued in this call. The new durable root may NAME a just-written snapshot
-      // generation (a checkpoint's step-2 root) — which becomes the live/readable checkpoint by virtue
-      // of `state.checkpoint_op()` now pointing at it; GC then drops strictly-older generations (staged
-      // is empty on this path — sync mode, or the genesis format write — so GC runs inline).
-      _ => {
+      // SYNCHRONOUS: durable immediately, completion queued in this call. The new durable root may
+      // NAME a just-written snapshot generation (a checkpoint's step-2 root) — which becomes the
+      // live/readable checkpoint by virtue of `state.checkpoint_op()` now pointing at it; GC then drops
+      // strictly-older generations (staged is empty on this path, so GC runs inline).
+      None => {
         self.state = state;
         self.gc_snapshots();
         self.completions.push_back(SuperblockDone::Wrote(id));
@@ -1059,7 +1070,7 @@ impl Superblock for InMemorySuperblock {
     }
   }
 
-  fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes) {
+  fn submit_write_checkpoint(&mut self, id: WriteId, op: OpNumber, snapshot: Bytes) {
     match self.async_delay {
       // SYNCHRONOUS (default): the snapshot generation lands in the store immediately, but is NOT yet
       // the live/readable checkpoint — it becomes readable only when a subsequent ROOT write names its
@@ -1078,7 +1089,7 @@ impl Superblock for InMemorySuperblock {
     }
   }
 
-  fn submit_read_checkpoint(&mut self, id: OpId) {
+  fn submit_read_checkpoint(&mut self, id: ReadId) {
     // Serve the generation the CURRENT durable root names (`state().checkpoint_op()`), so a recover
     // read ALWAYS satisfies `cr.op() == state.checkpoint_op()`. A newer staged-but-unrooted snapshot in
     // the store is deliberately NOT served (its root has not landed). `live == 0` means no checkpoint

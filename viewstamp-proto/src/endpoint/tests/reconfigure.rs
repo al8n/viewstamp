@@ -2074,16 +2074,16 @@ impl Wal for ZeroCapWal {
   fn status(&self, op: OpNumber) -> SlotStatus {
     self.inner.status(op)
   }
-  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+  fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
     self.inner.submit_append(id, op, header, body)
   }
-  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+  fn submit_read(&mut self, id: ReadId, op: OpNumber) {
     self.inner.submit_read(id, op)
   }
-  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<WriteId> {
     self.inner.truncate(above)
   }
-  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<WriteId> {
     self.inner.prune(below)
   }
   fn poll(&mut self) -> Option<WalDone> {

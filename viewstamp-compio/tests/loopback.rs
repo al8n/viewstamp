@@ -136,7 +136,7 @@ impl<T: Wal> Wal for Notifying<T> {
   }
   fn submit_append(
     &mut self,
-    id: viewstamp_proto::OpId,
+    id: viewstamp_proto::WriteId,
     op: viewstamp_proto::OpNumber,
     h: viewstamp_proto::Header,
     b: Bytes,
@@ -144,14 +144,14 @@ impl<T: Wal> Wal for Notifying<T> {
     self.inner.submit_append(id, op, h, b);
     self.signal();
   }
-  fn submit_read(&mut self, id: viewstamp_proto::OpId, op: viewstamp_proto::OpNumber) {
+  fn submit_read(&mut self, id: viewstamp_proto::ReadId, op: viewstamp_proto::OpNumber) {
     self.inner.submit_read(id, op);
     self.signal();
   }
-  fn truncate(&mut self, above: viewstamp_proto::OpNumber) -> Vec<viewstamp_proto::OpId> {
+  fn truncate(&mut self, above: viewstamp_proto::OpNumber) -> Vec<viewstamp_proto::WriteId> {
     self.inner.truncate(above)
   }
-  fn prune(&mut self, below: viewstamp_proto::OpNumber) -> Vec<viewstamp_proto::OpId> {
+  fn prune(&mut self, below: viewstamp_proto::OpNumber) -> Vec<viewstamp_proto::WriteId> {
     self.inner.prune(below)
   }
   fn poll(&mut self) -> Option<viewstamp_proto::WalDone> {
@@ -162,20 +162,20 @@ impl<T: Superblock> Superblock for Notifying<T> {
   fn state(&self) -> viewstamp_proto::VsrState {
     self.inner.state()
   }
-  fn submit_write(&mut self, id: viewstamp_proto::OpId, s: viewstamp_proto::VsrState) {
+  fn submit_write(&mut self, id: viewstamp_proto::WriteId, s: viewstamp_proto::VsrState) {
     self.inner.submit_write(id, s);
     self.signal();
   }
   fn submit_write_checkpoint(
     &mut self,
-    id: viewstamp_proto::OpId,
+    id: viewstamp_proto::WriteId,
     op: viewstamp_proto::OpNumber,
     snap: Bytes,
   ) {
     self.inner.submit_write_checkpoint(id, op, snap);
     self.signal();
   }
-  fn submit_read_checkpoint(&mut self, id: viewstamp_proto::OpId) {
+  fn submit_read_checkpoint(&mut self, id: viewstamp_proto::ReadId) {
     self.inner.submit_read_checkpoint(id);
     self.signal();
   }

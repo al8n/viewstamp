@@ -219,18 +219,6 @@ pub enum FormatError {
   WriteNotDurable,
 }
 
-/// The RESERVED [`OpId`](crate::OpId) [`format`] tags its genesis-root write with. `mint_op_id`
-/// counts up from 1, so `u64::MAX` is unmintable — no recovered/running endpoint can ever produce
-/// it. This is load-bearing on `format`'s async failure path: if the genesis write does NOT complete
-/// synchronously, `format` returns [`FormatError::WriteNotDurable`], but the write was already handed
-/// to the backend and may land LATER. Were it a mintable id (e.g. `OpId(1)`), that leaked `Wrote`
-/// could match a subsequently-recovered endpoint's first-minted `pending_sb` — a durable view-change
-/// root also gets `OpId(1)`, since recovery restarts the counter at 1 — and falsely release its
-/// `DoViewChange` before that root is durable, a durable-view-before-participate violation. A
-/// reserved id makes any leaked completion inert: it matches no minted `pending_sb`, so `on_sb_done`
-/// / `on_recover_sb_done` ignore it everywhere.
-pub(crate) const FORMAT_OP_ID: crate::OpId = crate::OpId::new(u64::MAX);
-
 /// Initialize a VIRGIN store as a member of a NEW cluster — the trusted cluster-creation step, the
 /// analogue of TigerBeetle's `format`. It writes the durable GENESIS ROOT: empty consensus state
 /// (view 0, op 0, no checkpoint) carrying the genesis `membership` and the WAL-GEOMETRY pair
@@ -294,7 +282,16 @@ pub fn format<W: Wal, B: Superblock>(
     return Err(FormatError::WalCapacityBelowMinimum { capacity, minimum });
   }
   let root = genesis_root(config, membership, capacity);
-  sb.submit_write(FORMAT_OP_ID, root.clone());
+  // Tag the write with an incarnation of its own. If the genesis write does not land synchronously
+  // this call returns `WriteNotDurable`, but the write is already with the backend and may complete
+  // LATER; that leaked `Wrote` names an incarnation no endpoint holds, so any endpoint recovered over
+  // this store refuses it at the choke. Without that, a leaked completion could match the first id a
+  // recovered endpoint mints — sequences restart at 1 — and release a `DoViewChange` before its
+  // durable-view root landed.
+  sb.submit_write(
+    crate::WriteId::new(super::next_incarnation(), 1),
+    root.clone(),
+  );
   // Drain completions so a synchronous backend's write becomes visible on `state()`, then require the
   // durable root to equal EXACTLY the root THIS call submitted. That single equality is both:
   //  - the SYNCHRONOUS-DURABILITY check: an async backend whose write has not completed leaves
@@ -302,13 +299,13 @@ pub fn format<W: Wal, B: Superblock>(
   //    silent `Ok` over a non-durable root (there is no run loop here to pump an async write — `format`
   //    precedes the driver — exactly as TigerBeetle's `format` does one blocking write + fsync);
   //  - the RETRY-SAFETY guard: a second `format` attempt over a store whose first attempt is still
-  //    outstanding must NOT confirm success off the FIRST attempt's completion. Since both attempts
-  //    share `FORMAT_OP_ID`, a bare id-match would let attempt B consume attempt A's `Wrote`; requiring
+  //    outstanding must NOT confirm success off the FIRST attempt's completion. `format` drains every
+  //    completion without inspecting ids, so requiring
   //    `state() == root` means B succeeds only when the CURRENT durable root is B's own (equal to A's
   //    only when they carry the same membership — the harmless case). Root writes complete in
   //    submission order (the write-ordering contract), so no earlier attempt lands after a later Ok.
-  // Root writes never complete `Fault` (the trait requires backends to retry internally or fail-stop),
-  // so no fault arm is needed.
+  // A root write completes only as `Wrote` — its `WriteId` admits no fault verdict — so no fault arm
+  // is needed.
   while sb.poll().is_some() {}
   if sb.state() != root {
     return Err(FormatError::WriteNotDurable);
@@ -805,13 +802,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
       timers: Timers::default(),
+      incarnation: super::next_incarnation(),
       next_op_id: 1,
+      foreign_completions_rejected: 0,
       pending: BTreeMap::new(),
       wal_writes: BTreeMap::new(),
       deferred_appends: BTreeMap::new(),
-      // A fresh incarnation has NO in-flight writes (a restart-in-place drains them first — the
-      // `has_inflight_storage` contract — and a crash discards them with the process), so no op is
-      // wrongly judged "released" before the first `run_gc` re-raises this from 0.
+      // A fresh incarnation has NO in-flight writes of its OWN: a crash discards the predecessor's
+      // with the process, and where the storage layer outlives the endpoint (a restart in place) the
+      // predecessor's completions name its incarnation and are refused rather than entered here. So
+      // no op is wrongly judged "released" before the first `run_gc` re-raises this from 0.
       wal_pruned: 0,
       appending: std::collections::BTreeSet::new(),
       pending_sb: None,
@@ -923,10 +923,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     endpoint.recover = Some(rec);
     endpoint.submit_recover_tail_batch(wal, lo, hi);
     if checkpoint_op > 0 {
-      let id = endpoint.mint_op_id();
+      let id = endpoint.mint_read_id();
       sb.submit_read_checkpoint(id);
       if let Some(rec) = endpoint.recover.as_mut() {
-        rec.checkpoint = Some(id.get());
+        rec.checkpoint = Some(id.seq());
         rec.checkpoint_retries = RECOVER_READ_RETRIES;
       }
     }
@@ -955,10 +955,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           .log
           .insert(op, LogEntry::present(h.client(), h.request(), Bytes::new()));
       }
-      let id = self.mint_op_id();
+      let id = self.mint_read_id();
       wal.submit_read(id, OpNumber::with(op));
       if let Some(rec) = self.recover.as_mut() {
-        rec.reads.insert(id.get(), op);
+        rec.reads.insert(id.seq(), op);
         rec.pending.insert(op, RECOVER_READ_RETRIES);
       }
     }
@@ -1004,7 +1004,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let Some(rec) = self.recover.as_mut() else {
       return;
     };
-    let Some(&op) = rec.reads.get(&id.get()) else {
+    let Some(&op) = rec.reads.get(&id.seq()) else {
       return; // not one of our outstanding recovery reads (stale/superseded) — ignore.
     };
     // Decide the outcome. Four cases (the canonical set is SPARSE — one entry per committed-band op the
@@ -1201,7 +1201,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // `resolve_exhausted_tail_read`. We do NOT retry/resolve here — keeping a single retry+budget
         // owner avoids the id-churn that dropped a slow completion (a re-mint that retired the id the
         // late completion arrives under).
-        rec.reads.remove(&id.get());
+        rec.reads.remove(&id.seq());
       }
       Outcome::Absent => {
         // The WAL has NO slot here (never written). DEFINITIVE — a re-read stays absent — so resolve it
@@ -2083,7 +2083,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     for op in ops {
       // Read the op's ABSOLUTE budget under a brief immutable borrow, released before the method calls
-      // below (`resolve_exhausted_tail_read`/`mint_op_id` re-borrow `self`/`self.recover`).
+      // below (`resolve_exhausted_tail_read`/`mint_read_id` re-borrow `self`/`self.recover`).
       let budget = self
         .recover
         .as_ref()
@@ -2096,10 +2096,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           // Re-submit an ADDITIVE read — a fresh id that does NOT retire the op's existing in-flight
           // ids, so a slow completion under an earlier id still resolves the op — and decrement the
           // absolute budget by one.
-          let new_id = self.mint_op_id();
+          let new_id = self.mint_read_id();
           if let Some(rec) = self.recover.as_mut() {
             rec.pending.insert(op, budget - 1);
-            rec.reads.insert(new_id.get(), op);
+            rec.reads.insert(new_id.seq(), op);
           }
           wal.submit_read(new_id, OpNumber::with(op));
         }
@@ -2124,9 +2124,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // crossing (no epoch target to pin), so target our own `checkpoint_op` with the requirement off.
         self.escalate_checkpoint_to_peer_fetch(now, self.checkpoint_op, false);
       } else {
-        let new_id = self.mint_op_id();
+        let new_id = self.mint_read_id();
         if let Some(rec) = self.recover.as_mut() {
-          rec.checkpoint = Some(new_id.get());
+          rec.checkpoint = Some(new_id.seq());
           rec.checkpoint_retries = checkpoint_retries - 1;
         }
         sb.submit_read_checkpoint(new_id);

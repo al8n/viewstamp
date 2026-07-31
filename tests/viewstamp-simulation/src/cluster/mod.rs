@@ -738,6 +738,14 @@ impl Cluster {
     })
   }
 
+  /// How many storage completions replica `i`'s CURRENT endpoint refused for naming another
+  /// incarnation — a predecessor endpoint's write landing into its successor. `0` on every replica
+  /// that has not been rebuilt over live storage, and reset by a rebuild (the counter belongs to the
+  /// endpoint instance, so read it on the successor).
+  pub fn replica_foreign_completions_rejected(&self, i: usize) -> u64 {
+    self.replicas[i].foreign_completions_rejected()
+  }
+
   /// Whether replica `i` is currently a non-voting LEARNER in its DURABLE membership. A genesis
   /// learner reads `true` until it is promoted; a voter reads `false`.
   pub fn replica_is_learner(&self, i: usize) -> bool {
@@ -1925,8 +1933,13 @@ impl Cluster {
     let membership = Self::genesis_membership(self.replica_count, self.learner_count);
     for i in 0..self.wals.len() {
       let cfg = self.replica_config(i as u16);
-      viewstamp_proto::format(&cfg, &membership, &self.wals[i], &mut self.sbs[i])
-        .expect("format a freshly-seeded virgin store");
+      // `format` requires its write durable before it returns and there is no run loop here to pump
+      // an async completion, so staging is suspended across the call and restored after — the stores
+      // may already be configured for the async steady-state window.
+      let staging = self.sbs[i].suspend_async_writes();
+      let formatted = viewstamp_proto::format(&cfg, &membership, &self.wals[i], &mut self.sbs[i]);
+      self.sbs[i].resume_async_writes(staging);
+      formatted.expect("format a freshly-seeded virgin store");
     }
   }
 

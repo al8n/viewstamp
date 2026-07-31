@@ -681,7 +681,7 @@ async fn a_dirty_store_never_boots_a_fresh_view_zero_endpoint_stream() {
   let mut sb = InMemorySuperblock::new();
   viewstamp_proto::Superblock::submit_write(
     &mut sb,
-    viewstamp_proto::OpId::new(1),
+    viewstamp_proto::WriteId::new(1, 1),
     viewstamp_proto::VsrState::try_new(
       View::with(5),
       View::with(5),
@@ -717,7 +717,7 @@ async fn a_dirty_store_never_boots_a_fresh_view_zero_endpoint_stream() {
   );
   viewstamp_proto::Wal::submit_append(
     &mut wal,
-    viewstamp_proto::OpId::new(1),
+    viewstamp_proto::WriteId::new(1, 1),
     OpNumber::with(1),
     header,
     Bytes::from_static(b"op"),

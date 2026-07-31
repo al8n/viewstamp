@@ -9,6 +9,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     blocks: &mut dyn BlockStore,
     done: WalDone,
   ) {
+    // THE CHOKE. A completion minted by a previous endpoint over this same storage names another
+    // incarnation; refuse it whole, before any correlation table is read. It must come first: every
+    // path below keys `wal_writes`/`pending` by sequence number alone, and those sequences restart at
+    // 1 in each incarnation, so a dead instance's completion reaching any of them would retire a
+    // witness or release an ack that belongs to a DIFFERENT op. Only reachable when the storage layer
+    // outlives the endpoint (a restart in place); a crash takes its in-flight ops with the process.
+    if self.is_foreign_completion(done.id()) {
+      return;
+    }
     // Recovery read completions route through the recover loop (verify + retry + progress) — but a
     // PRE-TRANSITION append's completion must be absorbed FIRST. A recovering status is not only the
     // boot path (whose write-witness set is empty by construction): the cross-epoch peer-fetch
@@ -24,8 +33,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // action (nothing is owed; `pending` was cleared at the transition). An id NOT in `wal_writes`
     // falls through to the recovery router exactly as before.
     if self.status.is_recovering() || self.status.is_recovering_head() {
-      if let WalDone::Appended(id) | WalDone::Fault(id) | WalDone::Cancelled(id) = &done
-        && let Some(op) = self.wal_writes.remove(&id.get())
+      if let WalDone::Appended(id) | WalDone::Cancelled(id) = &done
+        && let Some(op) = self.wal_writes.remove(&id.seq())
       {
         self.release_deferred_append(wal, op);
         return;
@@ -42,47 +51,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // Still absorb the write's QUIESCENCE: a retired node owes no consensus action, but the
       // physical-write witness map must drain as completions arrive, or `has_inflight_storage()`
       // would read true forever and the driver's graceful teardown could never settle.
-      if let WalDone::Appended(id) | WalDone::Fault(id) | WalDone::Cancelled(id) = done {
-        self.wal_writes.remove(&id.get());
+      if let WalDone::Appended(id) | WalDone::Cancelled(id) = done {
+        self.wal_writes.remove(&id.seq());
       }
       return;
     }
     let id = match done {
       WalDone::Appended(id) => id,
-      // DEFENSIVE: a `Fault` completion whose OpId matches a pending APPEND. The `Wal` contract
-      // requires appends to complete as `Appended` (the embedder retries / fail-stops internally —
-      // see [`Wal::submit_append`]), so this is a contract violation — but silently dropping it
-      // would LEAK the op's in-flight bookkeeping (its `Pending` entry + `appending` mark) until
-      // the next view transition: the op could never be (re-)acked, `has_inflight_storage()` would
-      // read true forever (breaking a graceful shutdown), and a leaked `RepairFill` would hold the
-      // commit at its hole. Degrade the violation to a RETRY instead: clear the stale entry/mark
-      // and re-submit the append from the still-held data, so a transient embedder fault costs one
-      // round trip, not a wedge. A `Fault` not matching a pending append is a read verdict (or
-      // stale/superseded) and is ignored. Either way the write QUIESCED (a fault is a completion):
-      // retire its witness entry first — so the re-submit passes its own slot's fence — and release
-      // any deferred append its slot was blocking after.
-      WalDone::Fault(id) => {
-        let quiesced = self.wal_writes.remove(&id.get());
-        if let Some(p) = self.pending.remove(&id.get()) {
-          self.appending.remove(&p.op().get());
-          self.resubmit_faulted_append(wal, p);
-        }
-        if let Some(op) = quiesced {
-          self.release_deferred_append(wal, op);
-        }
-        return;
-      }
       // The backend cancelled this append AFTER submission: its bytes never landed and can no
       // longer land — the write QUIESCED empty. Legal only for an op the endpoint RELEASED (above
       // the live head after a truncation, or at/below the actually-pruned floor); such an append's
       // action was already abandoned or owes nothing, so only the bookkeeping retires (keeping the
       // `appending` mark when a fence-deferred replacement owns it now). A cancellation of a LIVE
-      // append is a backend contract violation, degraded to a re-submit exactly like `Fault` (a
-      // spuriously-cancelling backend costs a retry, never a silently-lost ack/vote/fill). Either
-      // way, the quiesced slot releases any deferred append it was blocking.
+      // append is a backend contract violation, degraded to a RE-SUBMIT: clear the stale `Pending`
+      // entry + `appending` mark and re-append from the still-held data, so a spuriously-cancelling
+      // backend costs one round trip rather than LEAKING the op's in-flight bookkeeping until the
+      // next view transition (the op could never be (re-)acked, `has_inflight_storage()` would read
+      // true forever — breaking a graceful shutdown — and a leaked `RepairFill` would hold the commit
+      // at its hole). The witness entry is retired FIRST, so the re-submit passes its own slot's
+      // fence; either way the quiesced slot then releases any deferred append it was blocking.
       WalDone::Cancelled(id) => {
-        let quiesced = self.wal_writes.remove(&id.get());
-        if let Some(p) = self.pending.remove(&id.get()) {
+        let quiesced = self.wal_writes.remove(&id.seq());
+        if let Some(p) = self.pending.remove(&id.seq()) {
           let op = p.op().get();
           if op > self.op.get() || op <= self.wal_pruned {
             if !self.deferred_appends.contains_key(&op) {
@@ -90,7 +80,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
             }
           } else {
             self.appending.remove(&op);
-            self.resubmit_faulted_append(wal, p);
+            self.resubmit_cancelled_append(wal, p);
           }
         }
         if let Some(op) = quiesced {
@@ -98,16 +88,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         }
         return;
       }
-      _ => return, // Normal op: only appends matter (reads + their verdicts occur during recovery).
+      // Normal op: only appends matter, and a read completion cannot name one — a read carries a
+      // `ReadId`, an append a `WriteId`. (Reads + their verdicts occur during recovery.)
+      _ => return,
     };
     // The write quiesced WITH its bytes durably landed: retire its physical-write witness (the
     // fence's release condition for the slot; the deferred re-append, if one waits, submits after
     // the dispatch below).
-    let quiesced = self.wal_writes.remove(&id.get());
+    let quiesced = self.wal_writes.remove(&id.seq());
     // Append-before-ack dispatch by the recorded kind. An OpId not in `self.pending` is a
     // stale/superseded completion → ignore. (A peer-repair fill is tracked as `Pending::RepairFill`
     // so it is no longer an untracked bare write.)
-    let resolved = self.pending.remove(&id.get());
+    let resolved = self.pending.remove(&id.seq());
     // This op's WAL append is now durable: clear its in-flight mark BEFORE casting any ack/vote (or
     // clearing a repair hole), so the choke point (`send_prepare_ok`) sees it as durable and the
     // repair-fill apply runs off a no-longer-in-flight op. Done for every tracked kind — each variant
@@ -204,10 +196,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
-  /// Re-submit a WAL append whose completion FAULTED (an embedder [`Wal::submit_append`] contract
-  /// violation), rebuilding it from the data the endpoint still holds so the deferred ack/vote/fill
-  /// the append owes is retried rather than leaked. The caller has already removed the stale
-  /// `Pending` entry + `appending` mark; this re-records both under a fresh `OpId`. Per kind:
+  /// Re-submit a WAL append the backend CANCELLED while the endpoint still owed its action (an
+  /// embedder [`Wal::submit_append`] contract violation — a cancellation is legal only for a
+  /// RELEASED op), rebuilding it from the data the endpoint still holds so the deferred
+  /// ack/vote/fill the append owes is retried rather than leaked. The caller has already removed the
+  /// stale `Pending` entry + `appending` mark; this re-records both under a fresh `WriteId`. Per
+  /// kind:
   /// - `Ack`/`AdoptVote`/`AdoptAck`: the op's entry is in `self.log` — re-append its `Present` body
   ///   under the current view (the entry survives exactly as long as the pending action does: every
   ///   view transition clears both). An absent or body-`Repairing` entry has no bytes to re-append
@@ -215,8 +209,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ///   dropped — nothing is owed off an absent body, and the retransmit/repair paths re-drive it.
   /// - `RepairFill`: the staged canonical body rides in the variant itself — re-append it and
   ///   re-stage the same fill, leaving the hole open until the retry lands (exactly as at stage
-  ///   time; a still-faulting backend degrades to the solicit-retry cadence, never a silent leak).
-  fn resubmit_faulted_append<W: Wal>(&mut self, wal: &mut W, kind: Pending) {
+  ///   time; a still-cancelling backend degrades to the solicit-retry cadence, never a silent leak).
+  fn resubmit_cancelled_append<W: Wal>(&mut self, wal: &mut W, kind: Pending) {
     let op = kind.op();
     let (entry, kind) = match kind {
       Pending::RepairFill(rf) => {
@@ -236,11 +230,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let Some(body) = entry.body_bytes() else {
       return; // header-only: no bytes to re-append (peer-repair supplies the canonical body)
     };
-    // `body_bytes()` yields a `Present` op's bytes or a `Reconfigure` op's `encode_body()` — a faulted
+    // `body_bytes()` yields a `Present` op's bytes or a `Reconfigure` op's `encode_body()` — the
     // re-append of a body-bearing op (incl. a carried reconfiguration op) re-submits its canonical bytes
     // with the header over them, so the deferred ack/vote/fill it owes is retried, never leaked.
     let header = Header::new(op, self.view, entry.client, entry.request, &body);
-    // Through the slot-quiescence choke (uniformity: the faulted write itself just completed, so its
+    // Through the slot-quiescence choke (uniformity: the cancelled write itself just completed, so its
     // own slot is quiesced and this re-submit goes straight through; the fence still guards the
     // impossible aliased blocker).
     self.submit_or_defer_append(wal, op, header, body, kind);
@@ -255,6 +249,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     blocks: &mut dyn BlockStore,
     done: SuperblockDone,
   ) {
+    // THE CHOKE, the superblock twin of the one in `on_wal_done` — a completion naming another
+    // incarnation is refused before `pending_sb`/`pending_checkpoint` are consulted. The staged-write
+    // peel below compares ids directly, and a dead endpoint's `Wrote` could otherwise match a step id
+    // this endpoint minted independently.
+    if self.is_foreign_completion(done.id()) {
+      return;
+    }
     // Recovery checkpoint-READ completions route through the recover loop (restore SM + retry). The ONE
     // exception while Recovering is a checkpoint-WRITE completion that belongs to a STAGED re-persist: the
     // recovery peer-fetch (`on_recover_sync_checkpoint`) stages the `SyncRepersist` two-write sequence and
@@ -286,9 +287,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       SuperblockDone::Fault(id) => {
         // A faulted serve-read: drop the serving entry whose recorded read id matches (the map is
         // keyed by requester) and stay silent — the requester re-solicits and is then served by a
-        // fresh read. (A faulted root/checkpoint WRITE outside recovery is not produced by our
-        // backends; dropping is defensive.)
-        self.sync_serving.retain(|_, s| s.read != id.get());
+        // fresh read. A `Fault` names a READ by construction, so it can never reach the pending-WRITE
+        // dispatch below.
+        self.sync_serving.retain(|_, s| s.read != id.seq());
         return;
       }
     };
@@ -385,7 +386,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       match pc.step {
         CheckpointStep::AwaitSnapshot(sid) if sid == id => {
           // The snapshot is durable → advance the durable root to name the new checkpoint.
-          let root_id = self.mint_op_id();
+          let root_id = self.mint_write_id();
           // The committed band the NEW root names shrinks to `(target_op .. commit]` (the just-
           // checkpointed prefix `[1..=target_op]` now lives in the snapshot, not the band) — pass
           // `pc.target_op` as the floor so the persisted vsr_headers match this root's `checkpoint_op`.
@@ -798,7 +799,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     let envelope = Self::encode_checkpoint(target_op, sm_root, sessions_root);
     let checkpoint_id = crate::checkpoint_id(&envelope);
-    let id = self.mint_op_id();
+    let id = self.mint_write_id();
     sb.submit_write_checkpoint(id, target_op, envelope);
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op,
@@ -1282,7 +1283,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       checkpoint_id,
       self.committed_band_headers(checkpoint_op),
     );
-    let id = self.mint_op_id();
+    let id = self.mint_write_id();
     sb.submit_write(id, state);
     self.pending_sb = Some((id, action));
   }

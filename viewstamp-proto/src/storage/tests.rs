@@ -1,6 +1,13 @@
 use super::*;
 use crate::{ClientId, Epoch, MemberId, Membership, OpNumber, RequestNumber, View};
 
+/// Correlation ids for these fixture tests: the incarnation is immaterial here — the fixture
+/// only echoes the id back — so every id in this module shares one.
+const TEST_INCARNATION: u64 = 1;
+fn read_id(seq: u64) -> ReadId {
+  ReadId::new(TEST_INCARNATION, seq)
+}
+
 #[test]
 fn checkpoint_id_is_deterministic_and_sensitive() {
   let a = checkpoint_id(b"snapshot-bytes");
@@ -231,7 +238,7 @@ fn slot_status_as_str_and_predicates() {
 #[test]
 fn wal_done_variants() {
   let r = ReadOk::new(
-    OpId::new(1),
+    read_id(1),
     Header::new(
       OpNumber::with(1),
       View::new(),
@@ -248,7 +255,7 @@ fn wal_done_variants() {
 
 #[test]
 fn body_faulty_round_trips_id_and_header() {
-  let id = OpId::new(42);
+  let id = read_id(42);
   let header = Header::new(
     OpNumber::with(7),
     View::with(2),

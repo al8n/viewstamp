@@ -113,12 +113,15 @@ where
 /// with wall-clock nanos captured here: every construction is a distinct incarnation by
 /// derivation, not by an embedder-supplied value that could repeat.
 ///
-/// Construction is also the natural `OpId` drain point (the lifetime contract on
-/// [`viewstamp_proto::OpId`]): each call pairs ONE fresh endpoint with the storage handles the
-/// driver takes ownership of, and the driver never rebuilds an endpoint over live handles — so no
-/// completion this driver polls can predate its endpoint, PROVIDED the handles carry no in-flight
-/// ops from a previous incarnation (the drivers' constructor-level storage contract; a real crash
-/// satisfies it by construction because in-flight ops die with the process).
+/// Storage completions are separately fenced, and that fence needs nothing from this constructor.
+/// Each call pairs ONE fresh endpoint with the storage handles the driver takes ownership of, and
+/// the driver never rebuilds an endpoint over live handles — but even where an embedder does, the
+/// endpoint stamps its own storage-correlation incarnation into every [`viewstamp_proto::OpId`] it
+/// mints and refuses any completion carrying another. So a completion predating this endpoint lands
+/// on nothing rather than aliasing one of its ops. Draining in-flight ops before construction still
+/// makes shutdown CLEAN — it is how the endpoint's in-flight storage set settles — but it is not
+/// what makes it SAFE. (Distinct from the recovery nonce above: that fences stale RECOVERY
+/// RESPONSES between peers, this fences stale STORAGE COMPLETIONS within one process.)
 pub fn build_endpoint<S, W, B>(
   config: Config,
   membership: Membership,

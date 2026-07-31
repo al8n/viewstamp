@@ -1,7 +1,19 @@
 use super::*;
 use viewstamp_proto::{
-  ClientId, Header, OpId, OpNumber, RequestNumber, Superblock, View, VsrState, Wal, WalDone,
+  ClientId, Header, OpNumber, ReadId, RequestNumber, Superblock, View, VsrState, Wal, WalDone,
+  WriteId,
 };
+
+/// Correlation ids for these fixture tests: the incarnation is immaterial here — the fixture
+/// only echoes the id back — so every id in this module shares one. Writes and reads draw from the
+/// same sequence space, exactly as the endpoint's single counter does.
+const TEST_INCARNATION: u64 = 1;
+fn write_id(seq: u64) -> WriteId {
+  WriteId::new(TEST_INCARNATION, seq)
+}
+fn read_id(seq: u64) -> ReadId {
+  ReadId::new(TEST_INCARNATION, seq)
+}
 
 #[test]
 fn append_then_read_round_trips() {
@@ -14,15 +26,15 @@ fn append_then_read_round_trips() {
     b"x",
   );
   w.submit_append(
-    OpId::new(1),
+    write_id(1),
     OpNumber::with(1),
     h,
     bytes::Bytes::from_static(b"x"),
   );
-  assert_eq!(w.poll(), Some(WalDone::Appended(OpId::new(1))));
+  assert_eq!(w.poll(), Some(WalDone::Appended(write_id(1))));
   assert_eq!(w.op_head(), OpNumber::with(1));
   assert_eq!(w.header(OpNumber::with(1)), Some(h));
-  w.submit_read(OpId::new(2), OpNumber::with(1));
+  w.submit_read(read_id(2), OpNumber::with(1));
   match w.poll() {
     Some(WalDone::ReadOk(r)) => {
       assert_eq!(r.op(), OpNumber::with(1));
@@ -30,8 +42,8 @@ fn append_then_read_round_trips() {
     }
     other => panic!("expected ReadOk, got {other:?}"),
   }
-  w.submit_read(OpId::new(3), OpNumber::with(9));
-  assert_eq!(w.poll(), Some(WalDone::Absent(OpId::new(3))));
+  w.submit_read(read_id(3), OpNumber::with(9));
+  assert_eq!(w.poll(), Some(WalDone::Absent(read_id(3))));
 }
 
 #[test]
@@ -46,7 +58,7 @@ fn truncate_and_prune() {
       b"x",
     );
     w.submit_append(
-      OpId::new(op),
+      write_id(op),
       OpNumber::with(op),
       h,
       bytes::Bytes::from_static(b"x"),
@@ -87,7 +99,7 @@ fn superblock_write_reflects_in_state() {
     headers,
   )
   .unwrap();
-  sb.submit_write(OpId::new(1), next.clone());
+  sb.submit_write(write_id(1), next.clone());
   assert!(sb.poll().is_some());
   assert_eq!(sb.state(), next);
   assert_eq!(sb.state().committed_headers_slice().len(), 3);
@@ -103,7 +115,7 @@ fn append(w: &mut InMemoryWal, op: u64, body: &'static [u8]) {
     body,
   );
   w.submit_append(
-    OpId::new(op),
+    write_id(op),
     OpNumber::with(op),
     h,
     Bytes::from_static(body),
@@ -130,8 +142,8 @@ fn seeded_read_fault_is_deterministic_and_transient() {
   let mut saw_fault = false;
   let mut saw_ok = false;
   for i in 0..40u64 {
-    a.submit_read(OpId::new(i), OpNumber::with(1));
-    b.submit_read(OpId::new(i), OpNumber::with(1));
+    a.submit_read(read_id(i), OpNumber::with(1));
+    b.submit_read(read_id(i), OpNumber::with(1));
     let fa = a.poll().unwrap().is_fault();
     let fb = b.poll().unwrap().is_fault();
     assert_eq!(fa, fb, "deterministic per seed");
@@ -162,7 +174,7 @@ fn read_faults_clear_within_the_proto_retry_budget() {
   for round in 0..1000u64 {
     let mut cleared = false;
     for attempt in 0..9u64 {
-      w.submit_read(OpId::new(round * 9 + attempt), OpNumber::with(1));
+      w.submit_read(read_id(round * 9 + attempt), OpNumber::with(1));
       if !w.poll().unwrap().is_fault() {
         cleared = true;
         break;
@@ -206,7 +218,7 @@ fn bit_rot_makes_a_slot_permanently_body_faulty() {
   // Every read of a bit-rotted slot yields BodyFaulty carrying the durable header, not a bare
   // Fault — the op is identified, only the body is unrecoverable from this replica.
   for i in 0..5u64 {
-    w.submit_read(OpId::new(i), OpNumber::with(1));
+    w.submit_read(read_id(i), OpNumber::with(1));
     match w.poll() {
       Some(WalDone::BodyFaulty(bf)) => {
         assert_eq!(
@@ -240,7 +252,7 @@ fn torn_write_yields_body_faulty_on_read() {
   // A read of a torn slot yields BodyFaulty (header durable, body unverifiable) — not a bare
   // ReadOk with a corrupt body that the caller must re-check, and not a bare Fault that
   // discards the known-durable header.
-  w.submit_read(OpId::new(2), OpNumber::with(1));
+  w.submit_read(read_id(2), OpNumber::with(1));
   match w.poll() {
     Some(WalDone::BodyFaulty(bf)) => {
       assert_eq!(
@@ -272,7 +284,7 @@ fn misdirected_read_returns_a_wrong_op_but_valid_entry() {
   // Read op 2: every read is misdirected, so it returns SOME other op's (valid) entry, never op 2's.
   let mut saw_misdirect = false;
   for i in 0..20u64 {
-    w.submit_read(OpId::new(100 + i), OpNumber::with(2));
+    w.submit_read(read_id(100 + i), OpNumber::with(2));
     match w.poll() {
       Some(WalDone::ReadOk(r)) => {
         assert!(
@@ -310,7 +322,7 @@ fn misdirected_read_falls_through_when_no_sibling_exists() {
   );
   append(&mut w, 1, b"only");
   for i in 0..10u64 {
-    w.submit_read(OpId::new(i), OpNumber::with(1));
+    w.submit_read(read_id(i), OpNumber::with(1));
     match w.poll() {
       Some(WalDone::ReadOk(r)) => {
         assert_eq!(
@@ -341,7 +353,7 @@ fn misdirected_read_is_deterministic_per_seed() {
     }
     let mut out = std::vec::Vec::new();
     for i in 0..30u64 {
-      w.submit_read(OpId::new(i), OpNumber::with(2));
+      w.submit_read(read_id(i), OpNumber::with(2));
       match w.poll() {
         Some(WalDone::ReadOk(r)) => out.push(r.header().op().get()),
         Some(WalDone::Absent(_)) => out.push(0),
@@ -375,7 +387,7 @@ fn permanent_verdicts_survive_a_restart_via_the_persisted_struct() {
   // yields BodyFaulty (the rot verdict is permanent), proving the verdict is stable for the
   // lifetime of the durable medium.
   for i in 0..3u64 {
-    w.submit_read(OpId::new(i), OpNumber::with(1));
+    w.submit_read(read_id(i), OpNumber::with(1));
     assert!(
       w.poll().unwrap().is_body_faulty(),
       "a permanently bit-rotted slot always yields BodyFaulty"
@@ -404,10 +416,10 @@ fn rotted_op_header_survives_and_read_yields_body_faulty() {
     .expect("rotted slot still has a durable header");
   assert_eq!(stored.op(), OpNumber::with(3));
   // A read yields BodyFaulty carrying the durable header.
-  w.submit_read(OpId::new(1), OpNumber::with(3));
+  w.submit_read(read_id(1), OpNumber::with(3));
   match w.poll() {
     Some(WalDone::BodyFaulty(bf)) => {
-      assert_eq!(bf.id(), OpId::new(1));
+      assert_eq!(bf.id(), read_id(1));
       assert_eq!(bf.header(), stored, "carries the durable header");
     }
     other => panic!("rotted slot must yield BodyFaulty, got {other:?}"),
@@ -433,10 +445,10 @@ fn torn_op_header_survives_and_read_yields_body_faulty() {
     .expect("torn slot still has its original durable header");
   assert_eq!(stored.op(), OpNumber::with(7));
   // A read yields BodyFaulty carrying the durable header.
-  w.submit_read(OpId::new(1), OpNumber::with(7));
+  w.submit_read(read_id(1), OpNumber::with(7));
   match w.poll() {
     Some(WalDone::BodyFaulty(bf)) => {
-      assert_eq!(bf.id(), OpId::new(1));
+      assert_eq!(bf.id(), read_id(1));
       assert_eq!(bf.header(), stored, "carries the original durable header");
     }
     other => panic!("torn slot must yield BodyFaulty, got {other:?}"),
@@ -467,10 +479,10 @@ fn torn_header_slot_vanishes_entirely() {
     SlotStatus::Empty,
     "a torn-header slot reports Empty — as if never written"
   );
-  w.submit_read(OpId::new(1), OpNumber::with(5));
+  w.submit_read(read_id(1), OpNumber::with(5));
   assert_eq!(
     w.poll(),
-    Some(WalDone::Absent(OpId::new(1))),
+    Some(WalDone::Absent(read_id(1))),
     "a read of a torn-header slot is Absent"
   );
   // Truncating the slot away clears the verdict with it (no ghost entry under a gone op).
@@ -494,10 +506,10 @@ fn never_appended_op_yields_absent() {
     w.header(OpNumber::with(99)).is_none(),
     "a never-appended op has no durable header"
   );
-  w.submit_read(OpId::new(5), OpNumber::with(99));
+  w.submit_read(read_id(5), OpNumber::with(99));
   assert_eq!(
     w.poll(),
-    Some(WalDone::Absent(OpId::new(5))),
+    Some(WalDone::Absent(read_id(5))),
     "a never-appended op yields Absent, not BodyFaulty"
   );
 }
@@ -536,12 +548,12 @@ fn drain(sb: &mut InMemorySuperblock) {
 /// live/readable checkpoint (the full proto two-step sequence). Drains both `Wrote` completions.
 fn write_rooted_checkpoint(sb: &mut InMemorySuperblock, op: u64, snap: &'static [u8]) {
   sb.submit_write_checkpoint(
-    OpId::new(900 + op),
+    write_id(900 + op),
     OpNumber::with(op),
     Bytes::from_static(snap),
   );
   let _ = sb.poll();
-  sb.submit_write(OpId::new(800 + op), root_naming_checkpoint(op));
+  sb.submit_write(write_id(800 + op), root_naming_checkpoint(op));
   let _ = sb.poll();
 }
 
@@ -561,7 +573,7 @@ fn superblock_checkpoint_read_fault_is_transient() {
   let mut saw_fault = false;
   let mut saw_read = false;
   for i in 1..40u64 {
-    sb.submit_read_checkpoint(OpId::new(i));
+    sb.submit_read_checkpoint(read_id(i));
     match sb.poll().unwrap() {
       SuperblockDone::Fault(_) => saw_fault = true,
       SuperblockDone::CheckpointRead(cr) => {
@@ -597,7 +609,7 @@ fn superblock_corrupt_checkpoint_read_returns_parseable_but_altered_bytes() {
   let mut saw_corrupt = false;
   let mut saw_genuine = false;
   for i in 1..64u64 {
-    sb.submit_read_checkpoint(OpId::new(i));
+    sb.submit_read_checkpoint(read_id(i));
     match sb.poll().unwrap() {
       SuperblockDone::CheckpointRead(cr) => {
         assert_eq!(
@@ -636,7 +648,7 @@ fn superblock_corrupt_checkpoint_read_returns_parseable_but_altered_bytes() {
 /// returning its `(op, body)`; panics on a `Fault`/unexpected completion.
 fn read_live_checkpoint(sb: &mut InMemorySuperblock) -> (u64, Vec<u8>) {
   use viewstamp_proto::SuperblockDone;
-  sb.submit_read_checkpoint(OpId::new(7777));
+  sb.submit_read_checkpoint(read_id(7777));
   match sb.poll() {
     Some(SuperblockDone::CheckpointRead(cr)) => (cr.op().get(), cr.snapshot().to_vec()),
     other => panic!("expected a live CheckpointRead, got {other:?}"),
@@ -650,22 +662,18 @@ fn checkpoint_unreadable_until_a_root_names_it() {
   // the durable root is the authority for which generation is readable.
   let mut sb = InMemorySuperblock::new();
   // No checkpoint at all → read faults (the no-checkpoint case).
-  sb.submit_read_checkpoint(OpId::new(1));
+  sb.submit_read_checkpoint(read_id(1));
   assert!(matches!(sb.poll(), Some(SuperblockDone::Fault(_))));
   // Write a snapshot at op 4 but do NOT root it → still no live checkpoint.
-  sb.submit_write_checkpoint(
-    OpId::new(2),
-    OpNumber::with(4),
-    Bytes::from_static(b"snap4"),
-  );
+  sb.submit_write_checkpoint(write_id(2), OpNumber::with(4), Bytes::from_static(b"snap4"));
   let _ = sb.poll();
-  sb.submit_read_checkpoint(OpId::new(3));
+  sb.submit_read_checkpoint(read_id(3));
   assert!(
     matches!(sb.poll(), Some(SuperblockDone::Fault(_))),
     "an unrooted snapshot is not yet readable"
   );
   // Now write the durable root naming op 4 → the snapshot becomes the live, readable checkpoint.
-  sb.submit_write(OpId::new(4), root_naming_checkpoint(4));
+  sb.submit_write(write_id(4), root_naming_checkpoint(4));
   let _ = sb.poll();
   assert_eq!(read_live_checkpoint(&mut sb), (4, b"snap4".to_vec()));
 }
@@ -682,7 +690,7 @@ fn orphaned_checkpoint_restores_the_last_rooted_snapshot() {
   assert_eq!(read_live_checkpoint(&mut sb), (4, b"snap4".to_vec()));
   // A newer snapshot lands but its root never does.
   sb.submit_write_checkpoint(
-    OpId::new(50),
+    write_id(50),
     OpNumber::with(8),
     Bytes::from_static(b"snap8"),
   );
@@ -702,7 +710,7 @@ fn crash_discards_a_staged_but_unrooted_snapshot_keeping_the_rooted_one() {
   write_rooted_checkpoint(&mut sb, 4, b"snap4");
   // A newer snapshot lands (root not yet written).
   sb.submit_write_checkpoint(
-    OpId::new(50),
+    write_id(50),
     OpNumber::with(8),
     Bytes::from_static(b"snap8"),
   );
@@ -713,10 +721,10 @@ fn crash_discards_a_staged_but_unrooted_snapshot_keeping_the_rooted_one() {
   assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
   assert_eq!(read_live_checkpoint(&mut sb), (4, b"snap4".to_vec()));
   // A subsequent root that DOES name op 8 cannot resurrect the discarded snapshot — it was lost.
-  sb.submit_write(OpId::new(60), root_naming_checkpoint(8));
+  sb.submit_write(write_id(60), root_naming_checkpoint(8));
   let _ = sb.poll();
   use viewstamp_proto::SuperblockDone;
-  sb.submit_read_checkpoint(OpId::new(61));
+  sb.submit_read_checkpoint(read_id(61));
   assert!(
     matches!(sb.poll(), Some(SuperblockDone::Fault(_))),
     "the discarded op-8 snapshot is gone; naming it leaves no readable snapshot"
@@ -732,25 +740,17 @@ fn supersession_keeps_the_older_rooted_snapshot_readable() {
   // still be readable (not GC'd by the transient new-op-rooted window). Async mode to stage both.
   let mut sb = InMemorySuperblock::with_async_writes_and_faults(StorageFaults::none(), 1, 1);
   // Establish a rooted checkpoint at op 4 first (drain fully).
-  sb.submit_write_checkpoint(
-    OpId::new(1),
-    OpNumber::with(4),
-    Bytes::from_static(b"snap4"),
-  );
+  sb.submit_write_checkpoint(write_id(1), OpNumber::with(4), Bytes::from_static(b"snap4"));
   drain(&mut sb);
-  sb.submit_write(OpId::new(2), root_naming_checkpoint(4));
+  sb.submit_write(write_id(2), root_naming_checkpoint(4));
   drain(&mut sb);
   assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
   // A new checkpoint at op 8: snapshot written + its step-2 root staged...
-  sb.submit_write_checkpoint(
-    OpId::new(3),
-    OpNumber::with(8),
-    Bytes::from_static(b"snap8"),
-  );
+  sb.submit_write_checkpoint(write_id(3), OpNumber::with(8), Bytes::from_static(b"snap8"));
   drain(&mut sb); // snapshot durable; op-8 root not yet submitted
-  sb.submit_write(OpId::new(4), root_naming_checkpoint(8)); // step-2 root for op 8 (staged)
+  sb.submit_write(write_id(4), root_naming_checkpoint(8)); // step-2 root for op 8 (staged)
   // ...then a view change supersedes it with a durable-view root naming the OLD op 4 (staged AFTER).
-  sb.submit_write(OpId::new(5), root_naming_checkpoint(4));
+  sb.submit_write(write_id(5), root_naming_checkpoint(4));
   drain(&mut sb);
   // The FINAL durable root names op 4 (supersession), and the op-4 snapshot is STILL readable.
   assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
@@ -764,7 +764,7 @@ fn no_faults_is_byte_for_byte_reliable() {
   append(&mut w, 1, b"intact");
   assert_eq!(w.status(OpNumber::with(1)), SlotStatus::Clean);
   for i in 0..10u64 {
-    w.submit_read(OpId::new(i), OpNumber::with(1));
+    w.submit_read(read_id(i), OpNumber::with(1));
     match w.poll() {
       Some(WalDone::ReadOk(r)) => assert!(r.header().verify(r.body())),
       other => panic!("no-faults WAL must always ReadOk a present slot, got {other:?}"),
@@ -772,9 +772,9 @@ fn no_faults_is_byte_for_byte_reliable() {
   }
 }
 
-/// Submits (does NOT poll) an append at `op`, returning its `OpId` — for async-mode tests that must
-/// observe the staged (in-flight) state before completion.
-fn submit(w: &mut InMemoryWal, id: u64, op: u64, body: &'static [u8]) -> OpId {
+/// Submits (does NOT poll) an append at `op`, returning its `WriteId` — for async-mode tests that
+/// must observe the staged (in-flight) state before completion.
+fn submit(w: &mut InMemoryWal, id: u64, op: u64, body: &'static [u8]) -> WriteId {
   let h = Header::new(
     OpNumber::with(op),
     View::new(),
@@ -782,7 +782,7 @@ fn submit(w: &mut InMemoryWal, id: u64, op: u64, body: &'static [u8]) -> OpId {
     RequestNumber::with(op),
     body,
   );
-  let oid = OpId::new(id);
+  let oid = write_id(id);
   w.submit_append(oid, OpNumber::with(op), h, Bytes::from_static(body));
   oid
 }
@@ -812,7 +812,7 @@ fn async_append_stays_dirty_until_the_delay_elapses_then_becomes_durable() {
     w.header(OpNumber::with(1)).is_none(),
     "no readable header in flight"
   );
-  w.submit_read(OpId::new(100), OpNumber::with(1));
+  w.submit_read(read_id(100), OpNumber::with(1));
   assert!(
     matches!(w.poll(), Some(WalDone::Absent(_))),
     "a read of a staged slot returns Absent"
@@ -847,7 +847,7 @@ fn async_append_stays_dirty_until_the_delay_elapses_then_becomes_durable() {
     "now durable"
   );
   assert_eq!(w.op_head(), OpNumber::with(1));
-  w.submit_read(OpId::new(200), OpNumber::with(1));
+  w.submit_read(read_id(200), OpNumber::with(1));
   match w.poll() {
     Some(WalDone::ReadOk(r)) => {
       assert_eq!(r.op(), OpNumber::with(1));
@@ -921,13 +921,13 @@ fn async_mode_composes_with_a_torn_write() {
   // Tick past the delay (delay=2 → 2 countdown polls, then release).
   assert_eq!(w.poll(), None);
   assert_eq!(w.poll(), None);
-  assert_eq!(w.poll(), Some(WalDone::Appended(OpId::new(1))));
+  assert_eq!(w.poll(), Some(WalDone::Appended(write_id(1))));
   assert_eq!(
     w.status(OpNumber::with(1)),
     SlotStatus::Clean,
     "a torn slot is Clean (latent tear) once durable"
   );
-  w.submit_read(OpId::new(9), OpNumber::with(1));
+  w.submit_read(read_id(9), OpNumber::with(1));
   match w.poll() {
     Some(WalDone::BodyFaulty(bf)) => {
       assert_eq!(
@@ -1004,7 +1004,7 @@ fn discard_inflight_drops_staged_appends_but_keeps_durable_entries() {
   }
   assert_eq!(w.op_head(), OpNumber::with(1));
   // op1 still reads back intact.
-  w.submit_read(OpId::new(99), OpNumber::with(1));
+  w.submit_read(read_id(99), OpNumber::with(1));
   assert!(matches!(w.poll(), Some(WalDone::ReadOk(_))));
 }
 
@@ -1055,7 +1055,7 @@ fn bounded_ring_append_wraps_and_a_wrapped_over_op_reads_absent() {
     w.header(OpNumber::with(1)).is_none(),
     "a wrapped-over op has no resident header"
   );
-  w.submit_read(OpId::new(100), OpNumber::with(1));
+  w.submit_read(read_id(100), OpNumber::with(1));
   assert!(
     matches!(w.poll(), Some(WalDone::Absent(_))),
     "a read of the wrapped-over op is Absent (a clean wrap; its bytes are gone)"
@@ -1063,7 +1063,7 @@ fn bounded_ring_append_wraps_and_a_wrapped_over_op_reads_absent() {
   // op 4 (the new occupant of slot 1) and the untouched residents (ops 2, 3) read back intact.
   for op in [2u64, 3, 4] {
     assert_eq!(w.status(OpNumber::with(op)), SlotStatus::Clean);
-    w.submit_read(OpId::new(200 + op), OpNumber::with(op));
+    w.submit_read(read_id(200 + op), OpNumber::with(op));
     match w.poll() {
       Some(WalDone::ReadOk(r)) => assert_eq!(r.op(), OpNumber::with(op)),
       other => panic!("op {op} should read back ReadOk, got {other:?}"),

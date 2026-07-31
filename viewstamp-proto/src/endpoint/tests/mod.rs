@@ -11,8 +11,8 @@ use super::*;
 const RECOVER_TAIL_WINDOW: u64 = 8192;
 use crate::{
   BlockAddress, BlockStore, CheckpointRead, ClientId, Config, DoViewChange, Header, MemberId,
-  Membership, OpId, OpNumber, Prepare, PreparedEntry, ReadOk, ReplicaId, Request, RequestNumber,
-  SlotStatus, StartViewChange, Superblock, SuperblockDone, View, VsrState, Wal, WalDone,
+  Membership, OpNumber, Prepare, PreparedEntry, ReadId, ReadOk, ReplicaId, Request, RequestNumber,
+  SlotStatus, StartViewChange, Superblock, SuperblockDone, View, VsrState, Wal, WalDone, WriteId,
   block_address,
 };
 use std::collections::VecDeque;
@@ -316,23 +316,23 @@ impl Wal for TestWal {
       SlotStatus::Empty
     }
   }
-  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+  fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
     self.entries.insert(op.get(), (header, body));
     self.head = self.head.max(op.get());
     self.done.push_back(WalDone::Appended(id));
   }
-  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+  fn submit_read(&mut self, id: ReadId, op: OpNumber) {
     self.done.push_back(match self.entries.get(&op.get()) {
       Some((h, b)) => WalDone::ReadOk(ReadOk::new(id, *h, b.clone())),
       None => WalDone::Absent(id),
     });
   }
-  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op <= above.get());
     self.head = self.head.min(above.get());
     std::vec::Vec::new()
   }
-  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op >= below.get());
     std::vec::Vec::new()
   }
@@ -345,7 +345,7 @@ impl Wal for TestWal {
 /// the device but its completion is withheld until the test releases (or cancels) it.
 #[derive(Clone)]
 struct StagedAppend {
-  id: OpId,
+  id: WriteId,
   op: u64,
   header: Header,
   body: Bytes,
@@ -465,7 +465,7 @@ impl ReorderWal {
 
   /// The staged writes a `truncate`/`prune` for the trimmed region cancels: their ids (cleared from the
   /// staged set). Only used when `cancel_on_truncate` is set.
-  fn cancel_trimmed(&mut self, keep: impl Fn(u64) -> bool) -> std::vec::Vec<OpId> {
+  fn cancel_trimmed(&mut self, keep: impl Fn(u64) -> bool) -> std::vec::Vec<WriteId> {
     let mut cancelled = std::vec::Vec::new();
     self.staged.retain(|s| {
       if keep(s.op) {
@@ -498,7 +498,7 @@ impl Wal for ReorderWal {
       SlotStatus::Empty
     }
   }
-  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+  fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
     // STAGE only — the bytes are at the device but the completion is withheld until the test releases
     // it. `entries`/`head` are untouched, so the synchronous views keep reporting only landed data.
     self.staged.push(StagedAppend {
@@ -508,14 +508,14 @@ impl Wal for ReorderWal {
       body,
     });
   }
-  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+  fn submit_read(&mut self, id: ReadId, op: OpNumber) {
     // Reads reflect only LANDED entries (a staged slot reads `Absent`, per the poll-ordering contract).
     self.done.push_back(match self.entries.get(&op.get()) {
       Some((h, b)) => WalDone::ReadOk(ReadOk::new(id, *h, b.clone())),
       None => WalDone::Absent(id),
     });
   }
-  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op <= above.get());
     self.head = self.head.min(above.get());
     if self.cancel_on_truncate {
@@ -525,7 +525,7 @@ impl Wal for ReorderWal {
     // fence tolerates) and report NOTHING cancelled, so the endpoint awaits each completion.
     std::vec::Vec::new()
   }
-  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op >= below.get());
     if self.cancel_on_truncate {
       return self.cancel_trimmed(|op| op >= below.get());
@@ -549,15 +549,15 @@ impl Superblock for TestSb {
   fn state(&self) -> VsrState {
     self.state.clone()
   }
-  fn submit_write(&mut self, id: OpId, state: VsrState) {
+  fn submit_write(&mut self, id: WriteId, state: VsrState) {
     self.state = state;
     self.done.push_back(SuperblockDone::Wrote(id));
   }
-  fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes) {
+  fn submit_write_checkpoint(&mut self, id: WriteId, op: OpNumber, snapshot: Bytes) {
     self.checkpoint = Some((op, snapshot));
     self.done.push_back(SuperblockDone::Wrote(id));
   }
-  fn submit_read_checkpoint(&mut self, id: OpId) {
+  fn submit_read_checkpoint(&mut self, id: ReadId) {
     let done = match &self.checkpoint {
       Some((op, snap)) => {
         SuperblockDone::CheckpointRead(CheckpointRead::new(id, *op, snap.clone()))
@@ -606,18 +606,18 @@ impl Superblock for StepSb {
   fn state(&self) -> VsrState {
     self.state.clone()
   }
-  fn submit_write(&mut self, id: OpId, state: VsrState) {
+  fn submit_write(&mut self, id: WriteId, state: VsrState) {
     self.inflight.push_back(SuperblockDone::Wrote(id));
     self.inflight_states.push_back(state);
   }
-  fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes) {
+  fn submit_write_checkpoint(&mut self, id: WriteId, op: OpNumber, snapshot: Bytes) {
     // The checkpoint snapshot becomes readable only once this write is flushed; record it eagerly
     // for simplicity (the durability gate that matters is the VsrState root ordering).
     self.checkpoint = Some((op, snapshot));
     self.inflight.push_back(SuperblockDone::Wrote(id));
     self.inflight_states.push_back(self.state.clone()); // a checkpoint write does not change the root
   }
-  fn submit_read_checkpoint(&mut self, id: OpId) {
+  fn submit_read_checkpoint(&mut self, id: ReadId) {
     let done = match &self.checkpoint {
       Some((op, snap)) => {
         SuperblockDone::CheckpointRead(CheckpointRead::new(id, *op, snap.clone()))
@@ -655,13 +655,6 @@ struct ScriptedWal {
   /// unrecoverable (torn / bit-rot): every read yields `WalDone::BodyFaulty(header)`. Mirrors the sim
   /// WAL's torn/rotted-body verdict — the op EXISTS, only the body needs peer-repair.
   body_faulty: std::collections::BTreeSet<u64>,
-  /// `op → n`: the next `n` APPENDS of `op` complete as `WalDone::Fault` without landing (a
-  /// contract-violating backend; the `n+1`-th append succeeds). Drives the endpoint's defensive
-  /// faulted-append retry.
-  append_faults: BTreeMap<u64, u8>,
-  /// `op → count` of `submit_append` calls observed, so a test can prove a faulted append was
-  /// re-submitted.
-  append_submits: BTreeMap<u64, u32>,
   /// Ops whose READ is HELD (deferred), modelling a real async WAL whose read latency exceeds the
   /// recover-retry cadence: `submit_read` records the submitted id in `deferred_reads` but enqueues NO
   /// completion. `release_deferred(op)` later completes the OLDEST still-held submission under its
@@ -672,7 +665,7 @@ struct ScriptedWal {
   deferred: std::collections::BTreeSet<u64>,
   /// Per deferred op: the submitted read ids still HELD, oldest-first. Each `submit_read` of a deferred
   /// op pushes its id; `release_deferred` pops the front (the original slow read finally completing).
-  deferred_reads: BTreeMap<u64, VecDeque<OpId>>,
+  deferred_reads: BTreeMap<u64, VecDeque<ReadId>>,
   done: VecDeque<WalDone>,
 }
 impl ScriptedWal {
@@ -697,21 +690,10 @@ impl ScriptedWal {
       read_faults: BTreeMap::new(),
       corrupt: std::collections::BTreeSet::new(),
       body_faulty: std::collections::BTreeSet::new(),
-      append_faults: BTreeMap::new(),
-      append_submits: BTreeMap::new(),
       deferred: std::collections::BTreeSet::new(),
       deferred_reads: BTreeMap::new(),
       done: VecDeque::new(),
     }
-  }
-  /// Script the next `times` APPENDS of `op` to fault without landing (a contract-violating
-  /// backend; the following append succeeds).
-  fn script_append_fault(&mut self, op: OpNumber, times: u8) {
-    self.append_faults.insert(op.get(), times);
-  }
-  /// How many `submit_append` calls this WAL has seen for `op`.
-  fn append_submits(&self, op: OpNumber) -> u32 {
-    self.append_submits.get(&op.get()).copied().unwrap_or(0)
   }
   /// Script the next `times` reads of `op` to fault (transient). `u8::MAX` ⇒ never clears.
   fn script_read_fault(&mut self, op: OpNumber, times: u8) {
@@ -774,22 +756,12 @@ impl Wal for ScriptedWal {
       SlotStatus::Empty
     }
   }
-  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
-    *self.append_submits.entry(op.get()).or_default() += 1;
-    // A scripted append fault completes as `Fault` WITHOUT landing the entry (the
-    // contract-violating backend shape the endpoint's defensive retry degrades gracefully).
-    if let Some(remaining) = self.append_faults.get_mut(&op.get())
-      && *remaining > 0
-    {
-      *remaining -= 1;
-      self.done.push_back(WalDone::Fault(id));
-      return;
-    }
+  fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
     self.entries.insert(op.get(), (header, body));
     self.head = self.head.max(op.get());
     self.done.push_back(WalDone::Appended(id));
   }
-  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+  fn submit_read(&mut self, id: ReadId, op: OpNumber) {
     // A scripted transient fault takes precedence and decrements its remaining count.
     if let Some(remaining) = self.read_faults.get_mut(&op.get())
       && *remaining > 0
@@ -828,12 +800,12 @@ impl Wal for ScriptedWal {
     };
     self.done.push_back(done);
   }
-  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op <= above.get());
     self.head = self.head.min(above.get());
     std::vec::Vec::new()
   }
-  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op >= below.get());
     std::vec::Vec::new()
   }
@@ -1297,14 +1269,14 @@ impl Superblock for ScriptedCheckpointSb {
   fn state(&self) -> VsrState {
     self.state.clone()
   }
-  fn submit_write(&mut self, id: OpId, state: VsrState) {
+  fn submit_write(&mut self, id: WriteId, state: VsrState) {
     self.state = state;
     self.inflight.push_back(SuperblockDone::Wrote(id));
   }
-  fn submit_write_checkpoint(&mut self, id: OpId, _op: OpNumber, _snapshot: Bytes) {
+  fn submit_write_checkpoint(&mut self, id: WriteId, _op: OpNumber, _snapshot: Bytes) {
     self.inflight.push_back(SuperblockDone::Wrote(id));
   }
-  fn submit_read_checkpoint(&mut self, id: OpId) {
+  fn submit_read_checkpoint(&mut self, id: ReadId) {
     // Pop the next scripted response; if the script is exhausted, fault (forces the budget path).
     let done = match self.reads.pop_front() {
       Some((op, snap)) => SuperblockDone::CheckpointRead(CheckpointRead::new(id, op, snap)),
