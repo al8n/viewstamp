@@ -143,9 +143,13 @@ pub(crate) enum WalkPurpose {
   Arm,
   /// An SM-reconstruct obligation's re-armed fetch. A fully-present DAG does NOT install here — the
   /// reconstruct that just failed would immediately re-fail on the same block and spin, so a drained
-  /// re-arm only frees the fetch and lets the re-solicit drive the next attempt. `retry` is set only
-  /// when a FRESH donor reply armed it (donor failover): the reply is the new evidence that makes one
-  /// immediate reconstruct worthwhile, and it is bounded by the inbound replies.
+  /// re-arm only frees the fetch and lets the re-solicit drive the next attempt.
+  ///
+  /// `retry` carries the ANTI-SPIN RULE, and every site that sets it owes that rule: set it `true` ONLY
+  /// when a FRESH donor reply justifies exactly one immediate reconstruct (donor failover — the reply
+  /// is the new evidence, and the inbound replies are what bound how often it can fire). Set it `false`
+  /// everywhere else, above all after a FAILED reconstruct: re-issuing against the same still-faulty
+  /// block re-fails identically, so only the re-solicit cadence may drive the next attempt.
   Rearm { retry: bool },
   /// The stop-and-wait ARQ's bare re-drive of the one outstanding pull.
   Arq,
@@ -297,12 +301,23 @@ impl<S: StateMachine> core::fmt::Debug for BlockJobDone<S> {
 /// Endpoint incarnations are minted from one process-wide monotone counter and sequences grow within
 /// an incarnation, so the pair is lexicographically strictly increasing along any correct serial
 /// lane — a job executed out of issue order, or a DEAD endpoint's queued job executing after its
-/// successor's, breaks the order and is caught HERE, before it can touch the store. (The canonical
-/// hazard: a stale `Gc` carrying an old generation's roots, executed after a newer `Materialize`,
-/// would sweep the fresh blocks the next durable root is about to name.)
+/// successor's, breaks the order and is caught HERE.
+///
+/// Admission is STRICTLY GREATER, so of a reordered pair it is the EARLIER-issued job that is
+/// stopped, before IT touches the store: the later-issued one arrives first, follows the cursor, and
+/// executes fully. That is enough, because the damaging interleaving always makes the earlier job the
+/// offender. The canonical hazard is a stale `Gc` carrying one generation's roots running after the
+/// next generation's `Materialize` — the sweep would free the very blocks the next durable root is
+/// about to name — and the `Gc` is the earlier-issued of that pair, so its sweep never runs. The
+/// dead-endpoint case is the same shape: the dead incarnation is the smaller one, so its queued job
+/// is the one refused.
 ///
 /// One cursor per LANE, not per endpoint: the lane is what must be serial, and a lane shared by a
-/// dead endpoint and its successor is exactly the case the incarnation half of the order catches.
+/// dead endpoint and its successor is exactly the case the incarnation half of the order catches. The
+/// cursor therefore belongs to the STORE LANE and must OUTLIVE endpoint rebuilds over that store — a
+/// driver that mints a fresh cursor when it rebuilds its endpoint in place forfeits the
+/// cross-incarnation guarantee entirely, because a fresh cursor's first admission has nothing to
+/// follow and is unchecked.
 #[derive(Debug, Default)]
 pub struct BlockJobCursor {
   last: Option<(u64, u64)>,

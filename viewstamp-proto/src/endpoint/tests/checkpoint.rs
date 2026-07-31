@@ -1637,7 +1637,11 @@ fn two_outstanding_block_jobs() -> (
     OpNumber::with(2),
     "precondition: a durable checkpoint establishes the live GC roots"
   );
-  while e.poll_block_job().is_some() {} // drain the post-root sweep the completion queued
+  assert!(
+    e.poll_block_job().is_none(),
+    "precondition: the durable-checkpoint drive left no job outstanding, so the only jobs below are \
+     the two sweeps this helper issues"
+  );
   e.gc_blocks_for_test();
   e.gc_blocks_for_test();
   let first = e.poll_block_job().expect("the first sweep is queued");
@@ -1672,8 +1676,10 @@ fn the_storage_lane_executes_block_jobs_in_issue_order() {
 fn a_storage_lane_that_executes_out_of_issue_order_fails_stop() {
   // THE DRIVER-CONTRACT FALSIFIER. Serial execution in issue order is a storage-SAFETY obligation,
   // not a convenience: a sweep carrying one generation's live roots, run after the next generation's
-  // materialize, frees the very blocks the next durable root is about to name. A lane that reorders
-  // is CAUGHT here, before the second job touches the store — never tolerated.
+  // materialize, frees the very blocks the next durable root is about to name. Admission is strictly
+  // greater, so the later-issued job (delivered first here) executes and the EARLIER one is stopped
+  // before it touches the store — which is the direction that matters, since the damaging job (the
+  // stale sweep) is always the earlier of the pair.
   let (_e, _wal, _sb, mut blocks, first, second) = two_outstanding_block_jobs();
   let mut cursor = crate::BlockJobCursor::new();
   let _ = crate::execute_block_job(&mut cursor, second, &mut blocks);
