@@ -735,6 +735,10 @@ fn a_root_below_the_effective_epoch_is_refused() {
   s.submit_root(WriteId::new(1, 2), root_at_epoch(3, 0, 3));
 }
 
+// The assertions below the violation inspect the storage AFTER the panic surfaced, so the test
+// has to catch the unwind and resume — `catch_unwind` is a `std` facility with no `core`
+// counterpart, and a build without `std` has no unwinding runtime to resume from at all.
+#[cfg(feature = "std")]
 #[test]
 fn an_out_of_order_landing_still_releases_the_parked_tail() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());

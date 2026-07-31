@@ -10,18 +10,22 @@ use crate::{
 // --- assert_flush_then_reopen_preserves_blocks ---------------------------------------------
 
 /// A store that separates STAGED (buffered, pre-flush) content from a shared "disk": `flush` moves
-/// staged blocks onto the `Arc`, and [`reopen`](Self::reopen) drops this handle and builds a fresh
-/// one over the SAME `Arc` — the in-process stand-in for "close the file, open it again" that a
-/// real backend's harness invocation would perform against its actual medium.
+/// staged blocks onto the shared handle, and [`reopen`](Self::reopen) drops this handle and builds
+/// a fresh one over the SAME "disk" — the in-process stand-in for "close the file, open it again"
+/// that a real backend's harness invocation would perform against its actual medium.
+///
+/// The sharing is single-threaded (`Rc`/`RefCell`): both handles live in one test, and `read_block`
+/// takes `&self` while `flush` mutates the "disk", so the interior mutability is what the shape
+/// needs — no cross-thread synchronization is involved.
 struct SimulatedDiskStore {
-  disk: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<BlockAddress, Bytes>>>,
+  disk: std::rc::Rc<core::cell::RefCell<std::collections::BTreeMap<BlockAddress, Bytes>>>,
   staged: std::collections::BTreeMap<BlockAddress, Bytes>,
 }
 
 impl SimulatedDiskStore {
   fn new() -> Self {
     Self {
-      disk: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+      disk: std::rc::Rc::new(core::cell::RefCell::new(std::collections::BTreeMap::new())),
       staged: std::collections::BTreeMap::new(),
     }
   }
@@ -29,7 +33,7 @@ impl SimulatedDiskStore {
   /// The in-process stand-in for a process restart: drop this handle (as a real close would drop
   /// file descriptors) and open a fresh handle over the SAME backing "disk".
   fn reopen(self) -> Self {
-    let disk = std::sync::Arc::clone(&self.disk);
+    let disk = std::rc::Rc::clone(&self.disk);
     drop(self);
     Self {
       disk,
@@ -44,7 +48,7 @@ impl BlockStore for SimulatedDiskStore {
       .staged
       .get(&addr)
       .cloned()
-      .or_else(|| self.disk.lock().unwrap().get(&addr).cloned())
+      .or_else(|| self.disk.borrow().get(&addr).cloned())
   }
 
   fn put(&mut self, block: Bytes) -> BlockAddress {
@@ -55,12 +59,12 @@ impl BlockStore for SimulatedDiskStore {
 
   fn flush(&mut self) -> Result<(), BlockStoreError> {
     // `BTreeMap` has no `drain()`; `append` moves every entry into `disk`, leaving `staged` empty.
-    self.disk.lock().unwrap().append(&mut self.staged);
+    self.disk.borrow_mut().append(&mut self.staged);
     Ok(())
   }
 
   fn has_block(&self, addr: BlockAddress) -> bool {
-    self.staged.contains_key(&addr) || self.disk.lock().unwrap().contains_key(&addr)
+    self.staged.contains_key(&addr) || self.disk.borrow().contains_key(&addr)
   }
 }
 
