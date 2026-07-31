@@ -6469,6 +6469,284 @@ fn a_stale_below_commit_min_reply_does_not_tear_down_a_cross_epoch_forced_sync()
 }
 
 #[test]
+fn the_donor_serve_is_bounded_and_the_cap_releases_as_the_lane_drains() {
+  // THE DONOR READ RUNS OFF THE PUMP, so the rate `RequestBlock`s arrive at is independent of the rate
+  // the storage lane drains them. Without a bound, a peer (or a partition-induced retransmit storm)
+  // would grow the job queue with the inbound rate. The cap refuses past
+  // `MAX_OUTSTANDING_BLOCK_SERVES` and COUNTS the refusal; a refused request is DROPPED rather than
+  // answered ABSENT, because an absent reply for a block we hold would drive the requester's
+  // pruned-front re-solicit path instead of its plain ARQ re-send.
+  let mut e = sync_backup();
+  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let addr = blocks.put(Bytes::from_static(b"a-served-block"));
+  while e.poll_message().is_some() {}
+
+  // Fill the window exactly, then push four more past it. Nothing is drained in between, so every
+  // request lands while the previous ones are still outstanding.
+  const OVER: usize = 4;
+  for _ in 0..(super::MAX_OUTSTANDING_BLOCK_SERVES + OVER) {
+    e.on_request_block(primary_peer(), addr);
+  }
+  // ANTI-VACUITY: the cap was genuinely REACHED — the excess is refused and counted, not merely
+  // absent. Without this the assertions below would hold vacuously on an under-filled window.
+  assert_eq!(
+    e.block_serves_refused(),
+    OVER as u64,
+    "exactly the requests past the cap are refused"
+  );
+  assert!(
+    e.has_inflight_storage(),
+    "the admitted serves are outstanding storage work"
+  );
+  assert_eq!(
+    core::iter::from_fn(|| e.poll_message()).count(),
+    0,
+    "a refused request is DROPPED — it must not be answered ABSENT for a block we hold"
+  );
+
+  // Drain the lane: every ADMITTED serve answers, and exactly those.
+  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  let served: usize = core::iter::from_fn(|| e.poll_message())
+    .filter(|out| match out.msg_ref() {
+      Message::BlockResponse(m) => m.addr() == addr && m.is_present(),
+      _ => false,
+    })
+    .count();
+  assert_eq!(
+    served,
+    super::MAX_OUTSTANDING_BLOCK_SERVES,
+    "every admitted serve answered with the block, and no refused one did"
+  );
+
+  // THE CAP RELEASES. It bounds the outstanding set, not the lifetime total: a request arriving after
+  // the lane drained is served normally, so a burst costs the requester one round trip, never a wedge.
+  e.on_request_block(primary_peer(), addr);
+  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    core::iter::from_fn(|| e.poll_message())
+      .any(|out| matches!(out.msg_ref(), Message::BlockResponse(m) if m.addr() == addr)),
+    "the window freed as the lane drained — a later request is served"
+  );
+  assert_eq!(
+    e.block_serves_refused(),
+    OVER as u64,
+    "and no further refusal was counted"
+  );
+}
+
+#[test]
+fn a_restore_fault_arrives_asynchronously_while_the_reconstruct_obligation_gates_the_window() {
+  // THE RESTORE IS STORAGE WORK, NOT CONSENSUS WORK. Rebuilding the state machine from a synced
+  // checkpoint's DAG reads every block of that DAG, so it runs OFF the pump as a job — which means the
+  // verify-on-read FAULT that a bit-rotted block produces arrives ASYNCHRONOUSLY, an unbounded interval
+  // after the durable root that advanced the frontier to M.
+  //
+  // That interval is the whole point of the `SmReconstruct` obligation, and this pins its two halves:
+  //
+  //   * it is raised BEFORE the job, so it gates the ENTIRE window (not just the post-fault retry) —
+  //     the state machine is withheld while the frontier already names M;
+  //   * the fault REGRESSES NOTHING when it lands — the frontier stays at M (in lockstep with the
+  //     durable root), the obligation stays owed, and the fetch re-arms to re-pull the bad block.
+  //
+  // Before the seam this could not be expressed: the restore ran inside `install_sync`, on the pump,
+  // in the same call as the root completion, so there was no instant at which a restore was outstanding
+  // and no completion to deliver a fault through.
+  let (_donor_m, _dwal_m, dsb_m) = donor_primary_at_checkpoint(4);
+  let (env_m, id_m) = donor_envelope(&dsb_m);
+  let clean_snapshot = {
+    let mut donor_sm = CountSm::default();
+    for rn in 1..=4u64 {
+      donor_sm.apply(OpNumber::with(rn), &[rn as u8]);
+    }
+    donor_sm.snapshot()
+  };
+  let sm_root_m = crate::block_address(&clean_snapshot);
+
+  // A huge checkpoint interval so no auto-checkpoint races the sync persist.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 1_000).unwrap();
+  let mut e =
+    Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 0, CountSm::default(), u64::MAX);
+  let mut wal = TestWal::default();
+  let mut sb = StepSb::default();
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks, 4);
+  let now = Instant::ZERO;
+
+  // Trigger the sync, then deliver M's `SyncCheckpoint`: its DAG is already local, so the transfer
+  // drains on the first walk and `apply_sync` stages the two-write re-persist.
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::Commit(Commit::new(
+      View::new(),
+      OpNumber::with(2),
+      OpNumber::with(2),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  let nonce = captured_sync_nonce(&mut e);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id_m,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env_m.clone(),
+      Bytes::new(),
+    )),
+  );
+  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    e.pending_install.is_some(),
+    "setup: M is staged, its re-persist in flight (pre-root)"
+  );
+
+  // The block bit-rots AFTER the transfer drained and BEFORE the reconstruct reads it — the exact
+  // window the verify-on-read restore exists for. The planted bytes do not hash to `sm_root_m`.
+  blocks.insert_raw(sm_root_m, Bytes::copy_from_slice(b"post-drain-bit-rot"));
+
+  // Drive ONLY the superblock writes (snapshot, then root). The root completion runs `install_sync`,
+  // which advances the frontier and ISSUES the reconstruct — and stops there, because the endpoint
+  // holds no store. Deliberately NOT a lane step: this is the instant the reconstruct is outstanding.
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+  sb.flush();
+  e.handle_storage(now, &mut wal, &mut sb);
+
+  // ANTI-VACUITY: the RESTORE — not some other job — really is outstanding here, the obligation
+  // already gates it, and the frontier has already moved to M. Without these the fault below could be
+  // landing on an endpoint that never had a reconstruct in flight at all.
+  let restore = e
+    .poll_block_job()
+    .expect("the durable root issued the reconstruct");
+  assert_eq!(
+    restore.tag(),
+    crate::BlockJobTag::Restore,
+    "the outstanding job IS the SM reconstruct"
+  );
+  assert!(
+    e.sm_reconstruct_owed(),
+    "the obligation is raised BEFORE the job, so it covers the whole reconstruct window"
+  );
+  assert!(
+    e.has_inflight_storage(),
+    "an outstanding reconstruct counts as durability work the drain must wait for"
+  );
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the frontier already names M (in lockstep with the durable root) while the SM lags it"
+  );
+  assert_eq!(e.commit(), OpNumber::with(4), "and so does commit_min");
+  assert!(
+    e.state_machine().is_none(),
+    "the SM is WITHHELD across the window — it does not hold M's content yet"
+  );
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "and the sync is not complete while the reconstruct is outstanding"
+  );
+
+  // THE FAULT ARRIVES. The job read the bit-rotted block through the verify-on-read view, so its
+  // completion carries the error — an unbounded interval after the root that advanced the frontier.
+  while e.poll_message().is_some() {}
+  let mut cursor = crate::BlockJobCursor::new();
+  let faulted = crate::execute_block_job(&mut cursor, restore, &mut blocks);
+  e.on_block_done(now, &mut wal, &mut sb, faulted);
+
+  // NOTHING REGRESSED. The frontier is where the durable root put it, the obligation still gates the
+  // SM, and the fetch re-armed to re-pull exactly the block that failed.
+  assert_eq!(
+    e.checkpoint_op(),
+    OpNumber::with(4),
+    "the fault rewinds no pointer — in-memory still equals the durable root"
+  );
+  assert_eq!(
+    sb.state().checkpoint_op(),
+    OpNumber::with(4),
+    "and the durable root still names M"
+  );
+  assert_eq!(e.commit(), OpNumber::with(4), "commit_min is not rewound");
+  assert!(
+    e.sm_reconstruct_owed(),
+    "the obligation STAYS owed — the SM still does not hold M"
+  );
+  assert!(
+    e.state_machine().is_none(),
+    "so the SM stays withheld rather than exposing pre-M content under a valid M pointer"
+  );
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "and the sync is still not complete"
+  );
+  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    core::iter::from_fn(|| e.poll_message())
+      .any(|out| matches!(out.msg_ref(), Message::RequestBlock(addr) if *addr == sm_root_m)),
+    "the obligation re-armed its fetch and re-pulls the block that faulted"
+  );
+
+  // THE REPAIR. The donor answers the re-pull with the clean bytes, which overwrite the corrupt block,
+  // and re-serves M's envelope — the donor-failover path. That re-pin walks the now-complete DAG and
+  // re-issues the reconstruct, which this time succeeds: the SM reaches M and the sync completes
+  // through the SAME tail a clean first reconstruct takes. (A re-arm that followed the FAULT alone does
+  // NOT re-issue on its own — it would re-read the same bad block and spin; the fresh reply is the new
+  // evidence that makes one more attempt worthwhile.)
+  blocks.put(clean_snapshot);
+  let later = now + core::time::Duration::from_millis(101);
+  let nonce_after = e.sync_nonce_for_test();
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id_m,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce_after,
+      env_m,
+      Bytes::new(),
+    )),
+  );
+  e.block_step(later, &mut wal, &mut sb, &mut blocks);
+  for _ in 0..4 {
+    sb.flush();
+    e.storage_step(later, &mut wal, &mut sb, &mut blocks);
+  }
+  assert!(
+    !e.sm_reconstruct_owed(),
+    "the repaired DAG reconstructed the SM at M — the obligation is met"
+  );
+  assert_eq!(
+    e.state_syncs_applied(),
+    1,
+    "and the sync completed through the SAME tail a clean first reconstruct takes"
+  );
+  assert!(
+    e.state_machine().is_some(),
+    "the SM is exposed again once it genuinely holds M"
+  );
+}
+
+#[test]
 fn a_post_root_restore_fault_advances_to_m_owes_reconstruct_and_rejects_an_older_checkpoint() {
   // REDESIGN: the instant M's re-persist root is durable it is the COMMIT POINT — `checkpoint_op`
   // advances to M=4 UNCONDITIONALLY (in lockstep with the durable root), and the SM-content restore
