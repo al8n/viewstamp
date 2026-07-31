@@ -1612,6 +1612,132 @@ fn a_materialize_that_crosses_a_view_change_is_superseded_and_never_published() 
   );
 }
 
+#[test]
+fn repeated_view_changes_over_a_paused_lane_keep_one_materialize_outstanding() {
+  // THE ACCUMULATION BOUND. A view transition clears the LOGICAL `pending_checkpoint` at
+  // `FlushingBlocks`, but the `Materialize` it named cannot be retracted — the lane executes serially
+  // in issue order, so the job stays queued carrying a full state-machine image plus a session
+  // projection. With the logical guard cleared the cadence is free to capture ANOTHER image the moment
+  // Normal resumes, so churn against a lane draining slower than the churn rate would queue one large
+  // superseded image per round without bound. The PHYSICAL half is tracked independently, so at most
+  // one image capture is ever owed to the lane however many times the logical half is dropped.
+  //
+  // NEUTER CHECK: drop the `materializing` guard in `force_checkpoint` and the queue grows by one
+  // `Materialize` per round below (5 instead of 1).
+  let mut e = backup_checkpointing_every(2);
+  let (mut wal, mut sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+
+  // Cross the checkpoint boundary once: the first capture is issued and the lane is PAUSED from here
+  // on (no `poll_block_job`, so nothing the endpoint issues ever executes).
+  accept_and_commit(&mut e, &mut wal, &mut sb, &mut blocks, 1..=2, 2);
+  assert!(
+    matches!(
+      e.pending_checkpoint.map(|pc| pc.step),
+      Some(CheckpointStep::FlushingBlocks(_))
+    ),
+    "precondition: the first capture is queued on the lane and logically tracked"
+  );
+
+  // Four view transitions, each adopting a strictly higher view from that view's primary (slots 2 and
+  // 0 alternate; slot 1 is this replica). Each one runs the shared transition reset and lands back in
+  // Normal with the cadence still due — `checkpoint_op` never advances, because nothing publishes.
+  for (round, (view, primary)) in [(2u64, 2u16), (3, 0), (5, 2), (6, 0)]
+    .into_iter()
+    .enumerate()
+  {
+    let t = now + core::time::Duration::from_millis(1000 * (round as u64 + 1));
+    e.handle_message(
+      t,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(primary)),
+      Message::StartView(crate::StartView::new(
+        View::with(view),
+        OpNumber::with(2),
+        OpNumber::with(2),
+        crate::Epoch::new(0),
+        0,
+        ReplicaId::new(primary),
+        std::vec::Vec::new(),
+      )),
+    );
+    assert!(
+      e.pending_checkpoint.is_none(),
+      "round {round}: ANTI-VACUITY — the transition really DID clear the logical guard, leaving the \
+       queued image superseded"
+    );
+    // Settle the adoption's durable-view write WITHOUT touching the block lane, then re-drive the
+    // commit tail so the (still due) cadence genuinely attempts a fresh capture.
+    for _ in 0..4 {
+      sb.flush();
+      e.handle_storage(t, &mut wal, &mut sb);
+    }
+    e.handle_message(
+      t,
+      &mut wal,
+      &mut sb,
+      Peer::Replica(ReplicaId::new(primary)),
+      Message::Commit(Commit::new(
+        View::with(view),
+        OpNumber::with(2),
+        OpNumber::new(),
+        crate::Epoch::new(0),
+        0,
+      )),
+    );
+    assert_eq!(
+      e.status(),
+      Status::Normal,
+      "round {round}: back in Normal, where the cadence runs"
+    );
+    assert_eq!(
+      e.checkpoint_op(),
+      OpNumber::with(0),
+      "round {round}: ANTI-VACUITY — nothing published, so the cadence is still due at every round"
+    );
+    assert!(
+      e.commit().get() >= e.checkpoint_op().get() + 2,
+      "round {round}: ANTI-VACUITY — the checkpoint boundary really is crossed, so a capture was due"
+    );
+  }
+
+  // THE BOUND: the paused lane holds exactly ONE image, whatever the churn.
+  let mut jobs = std::vec::Vec::new();
+  while let Some(job) = e.poll_block_job() {
+    jobs.push(job);
+  }
+  let materializes = jobs
+    .iter()
+    .filter(|j| j.tag() == crate::BlockJobTag::Materialize)
+    .count();
+  assert_eq!(
+    materializes, 1,
+    "the lane holds ONE image capture across every transition, not one per round"
+  );
+
+  // ANTI-VACUITY (the closing half): run the held job and observe the endpoint REFUSE it — the image
+  // the rounds above accumulated behind really was superseded, not merely idle.
+  let mut cursor = crate::BlockJobCursor::new();
+  let superseded_before = e.block_jobs_superseded();
+  let last = now + core::time::Duration::from_millis(9000);
+  for job in jobs {
+    let done = crate::execute_block_job(&mut cursor, job, &mut blocks);
+    e.on_block_done(last, &mut wal, &mut sb, done);
+  }
+  assert!(
+    e.block_jobs_superseded() > superseded_before,
+    "ANTI-VACUITY: the queued image completed into a state that no longer owns it — a genuine \
+     supersession, which is exactly what the rounds above kept producing"
+  );
+  assert_eq!(
+    sb.state().checkpoint_op(),
+    OpNumber::with(0),
+    "and no superseded image ever advanced the durable checkpoint pointer"
+  );
+}
+
 /// Drive a backup to a DURABLE checkpoint, then hand back two freshly issued block jobs (two GC
 /// sweeps over the live roots) plus the parts. Two OUTSTANDING jobs is the precondition every
 /// issue-order falsifier needs, and it is asserted at every use.

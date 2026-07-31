@@ -9,12 +9,57 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// decision: a reply whose DAG the store already holds would have installed on its walk's
   /// completion, and a later reply arriving first would throw that away and re-pull a different
   /// donor's newer root instead — repeated every solicit round, the transfer never converges. The
-  /// refused reply costs one re-solicit; the walk lands on the very next storage step.
+  /// refused reply is RETAINED and re-delivered the moment the walk lands
+  /// ([`Self::defer_pin_until_walk_completes`]), so the refusal orders the two rather than losing one.
   pub(super) fn transfer_walk_in_flight(&self) -> bool {
     matches!(
       self.block_fetch.as_ref().map(|bf| &bf.walks),
       Some(WalkState::InFlight(_))
     )
+  }
+
+  /// REFUSE a fresh pin the live transfer's outstanding walk must decide ahead of, RETAINING the reply
+  /// for re-delivery the moment that walk completes.
+  ///
+  /// The refusal orders the two; it must not DISCARD the reply. A dropped reply costs a re-solicit only
+  /// if the next round can land it — and the round is structurally biased against that: every solicit
+  /// tick issues the ARQ walk BEFORE broadcasting `RequestSync`, so whenever the donor's round trip is
+  /// shorter than the block lane's latency the answer arrives mid-walk EVERY time. The evidence the
+  /// reply carries — a fresh root, or a live donor for a transfer pinned to one that died — would then
+  /// never be admitted at all, and a laggard or recovering voter is starved for as long as that timing
+  /// holds. Retaining it costs one envelope (op + two 16-byte roots) between two storage steps.
+  ///
+  /// The slot holds ONE reply: a later refusal overwrites an earlier retained one, since the freshest
+  /// pin is the one worth admitting. It is drained on every walk completion
+  /// ([`Self::redeliver_deferred_pin`]).
+  pub(super) fn defer_pin_until_walk_completes(&mut self, from: Peer, m: crate::SyncCheckpoint) {
+    self.walk_pins_refused += 1;
+    self.deferred_pin = Some((from, m));
+  }
+
+  /// Drain the retained pin, if any, by RE-DELIVERING it through the full ingress — run once per walk
+  /// completion, after the walk's own verdict has been consumed.
+  ///
+  /// Re-delivery (rather than resuming the arming site the refusal returned from) is what makes the
+  /// deferral safe: the walk's completion may have installed the checkpoint, torn the sync down, raised
+  /// an SM-reconstruct obligation, or left a superblock root in flight, so the reply must be re-judged
+  /// against the state that completion established. Routing it back through
+  /// [`Self::on_recover_sync_checkpoint`] / [`Self::on_sync_checkpoint`] re-runs every freshness,
+  /// integrity, and single-writer gate, exactly as if the message had been delivered a step later —
+  /// which is precisely what the refusal made it. A reply the new state no longer wants is dropped
+  /// there, as it would have been on first delivery.
+  ///
+  /// The status split mirrors the message dispatch: a `Recovering` peer-fetch owns its own ingress, and
+  /// everything else takes the Normal one (which drops the reply unless the status still admits it).
+  pub(super) fn redeliver_deferred_pin(&mut self, now: Instant) {
+    let Some((from, m)) = self.deferred_pin.take() else {
+      return;
+    };
+    if self.status.is_recovering() && self.awaiting_peer_checkpoint() {
+      self.on_recover_sync_checkpoint(now, from, m);
+    } else {
+      self.on_sync_checkpoint(now, from, m);
+    }
   }
 
   /// Move the live transfer's frontiers into a walk job, leaving the job's id behind as the token
@@ -1211,9 +1256,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     // ONE PIN AT A TIME: a reply is not admitted while the live transfer is mid-walk (see
-    // [`Self::transfer_walk_in_flight`]). The solicit re-fetches; the walk lands next storage step.
+    // [`Self::transfer_walk_in_flight`]). It is RETAINED, and re-delivered the moment that walk lands.
     if self.transfer_walk_in_flight() {
-      self.walk_pins_refused += 1;
+      self.defer_pin_until_walk_completes(from, m);
       return;
     }
     // PROVENANCE-AWARE replacement: a reply that does NOT present a crossing must never DOWNGRADE a live
@@ -1364,17 +1409,24 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     };
     match purpose {
-      // The bare ARQ re-drive: re-request the one outstanding pull, nothing more. A drained frontier
-      // emits nothing here — the drain destination is reached by the arm/response drives, and by the
-      // fresh `SyncCheckpoint` the solicit half of the ARQ fetches.
-      WalkPurpose::Arq => {
-        if let Some(addr) = next {
-          self.emit(Outgoing::new(
-            Recipient::To(donor),
-            Message::RequestBlock(addr),
-          ));
-        }
-      }
+      // The bare ARQ re-drive: re-request the one outstanding pull — or, on a frontier that has already
+      // DRAINED, run the drain destination the arm/response drive could not.
+      //
+      // A drained-but-uninstalled transfer is exactly what the single-writer fence in
+      // [`Self::on_fetch_drained`] leaves behind: a root landing between a walk's issue and its
+      // completion defers the install, and the transfer goes idle holding a COMPLETE local DAG with
+      // nothing left to pull. Emitting nothing here would make that install wait on a donor — a fresh
+      // `SyncCheckpoint` to re-pin and re-drain it — even though every block it needs is already in this
+      // store. The ARQ is the local cadence that owns re-driving a stalled transfer, and re-entering the
+      // drain here is the same self-heal `retry_install_flush` performs for an owed local install: the
+      // fence is re-checked inside, so a still-occupied superblock simply defers again to the next tick.
+      WalkPurpose::Arq => match next {
+        None => self.on_fetch_drained(now, wal),
+        Some(addr) => self.emit(Outgoing::new(
+          Recipient::To(donor),
+          Message::RequestBlock(addr),
+        )),
+      },
       // A freshly pinned transfer: install if the store already holds both DAGs, else pull the first
       // missing block.
       WalkPurpose::Arm => match next {
@@ -2215,6 +2267,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   ) {
     if from.is_client() {
       return; // a client cannot be a donor — keep the existing pin, the timer re-solicits.
+    }
+    // ONE PIN AT A TIME, checked BEFORE the obligation is re-pointed: the re-arm below would be refused
+    // by the same guard anyway, and re-pointing `donor` without re-arming the fetch leaves the ARQ still
+    // pulling from the dead donor this failover exists to replace. RETAIN the reply instead — its
+    // re-delivery redoes both halves against the state the walk establishes.
+    if self.transfer_walk_in_flight() {
+      self.defer_pin_until_walk_completes(from, m.clone());
+      return;
     }
     let donor = from;
     if let Some(recon) = self.sm_reconstruct.as_mut() {

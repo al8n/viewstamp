@@ -819,6 +819,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       appending: std::collections::BTreeSet::new(),
       pending_sb: None,
       pending_checkpoint: None,
+      // A fresh endpoint owes the lane nothing: the predecessor's jobs (if the storage outlived it)
+      // name its incarnation and are refused, never completed into this one.
+      materializing: None,
       checkpoint_op: OpNumber::with(checkpoint_op),
       // Set when the durable checkpoint envelope is read back + restored (`on_recover_sb_done`),
       // which decodes the `sm_root`; `None` until then (block GC skips a cycle without a live root).
@@ -861,6 +864,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       sync_fetch_progress: 0,
       pending_install: None,
       block_fetch: None,
+      deferred_pin: None,
       sm_reconstruct: None,
       sync_serving: BTreeMap::new(),
       state_syncs_applied: 0,
@@ -2569,9 +2573,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     // ONE PIN AT A TIME (mirrors `begin_block_sync`): a reply is not admitted while the live transfer
-    // is mid-walk. The recovery solicit re-fetches; the walk lands on the next storage step.
+    // is mid-walk. It is RETAINED, and re-delivered the moment that walk lands.
     if self.transfer_walk_in_flight() {
-      self.walk_pins_refused += 1;
+      self.defer_pin_until_walk_completes(from, m.clone());
       return;
     }
     // PROVENANCE-AWARE replacement (mirrors `begin_block_sync`): a non-crossing reply must never DOWNGRADE

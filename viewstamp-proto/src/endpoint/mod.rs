@@ -1457,6 +1457,25 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// An in-flight checkpoint, sequencing its two superblock writes. Kept separate from `pending_sb`
   /// (their ids never alias). `None` unless a checkpoint is mid-sequence; a view-change drops it.
   pending_checkpoint: Option<PendingCheckpoint>,
+  /// The `Materialize` job of the image capture the storage lane still owes a completion for — the
+  /// PHYSICAL half of a checkpoint, tracked independently of the LOGICAL `pending_checkpoint` that
+  /// publishes it.
+  ///
+  /// The two halves have different lifetimes. `pending_checkpoint` is generation state: a view
+  /// transition DROPS it at [`CheckpointStep::FlushingBlocks`], which is what makes the crossing
+  /// materialize unpublishable. The job it dropped is NOT retractable — it is already queued on
+  /// `block_jobs` (or executing) and must run to completion for the issue-order contract to hold — so
+  /// the logical drop leaves a full state-machine image plus a session projection sitting in the lane.
+  /// With the logical guard cleared, the cadence is free to capture ANOTHER image the moment Normal
+  /// resumes, and repeated view churn against a lane that drains slower than the churn rate would pile
+  /// up arbitrarily many superseded images.
+  ///
+  /// So the capture site ([`Self::force_checkpoint`]) gates on THIS instead: at most one image capture
+  /// is ever owed to the lane, whatever the logical half does. A refused capture is exactly a capture
+  /// whose flush faulted — nothing is published, no pointer moves, and the sticky cadence
+  /// (`maybe_checkpoint` / `maybe_pay_checkpoint_debt` from the commit tails and the primary heartbeat)
+  /// re-forces it once the lane returns the completion this field is waiting for.
+  materializing: Option<crate::JobId>,
   /// The op number of this replica's latest durable checkpoint (0 until the first checkpoint
   /// goes durable). Carried on `Commit` and `PrepareOk` as the checkpoint-quorum signal.
   checkpoint_op: OpNumber,
@@ -1669,6 +1688,22 @@ pub struct Endpoint<S: StateMachine, R = RestartOnly> {
   /// fetch is `is_some()` across the re-pin window, a crossing's "a donor has begun answering" signal
   /// (`crossing_is_pre_answer_speculative`) holds across it.
   block_fetch: Option<BlockFetch<S>>,
+  /// A verified `SyncCheckpoint` the one-pin admission REFUSED because the live transfer was mid-walk
+  /// ([`Self::transfer_walk_in_flight`]), HELD for re-delivery the instant that walk completes.
+  ///
+  /// The refusal itself is load-bearing — admitting a pin mid-walk would discard the decision that walk
+  /// is carrying — but DROPPING the refused reply makes the refusal lossy, and under a schedule where the
+  /// donor's round trip is consistently shorter than the block lane's latency EVERY reply lands mid-walk.
+  /// The re-pin the reply carries (a fresh root, or the same root under a LIVE donor after the pinned one
+  /// died) would then never be admitted at all: each solicit round issues the ARQ walk first, the reply
+  /// races in ahead of its completion, and the transfer is starved of the only evidence that could move
+  /// it. Retaining the reply turns the refusal into a DEFERRAL — the walk's verdict still lands first, and
+  /// the retained pin is re-delivered through the FULL ingress (`on_sync_checkpoint` /
+  /// `on_recover_sync_checkpoint`) right after, so every freshness, integrity, and single-writer gate is
+  /// re-evaluated against the state the walk just established. One slot: a later refusal overwrites an
+  /// older retained reply (the freshest pin is the one worth admitting), and the slot is drained on every
+  /// walk completion, so it can hold at most one envelope between two storage steps.
+  deferred_pin: Option<(Peer, crate::SyncCheckpoint)>,
   /// The post-advance SM-content reconstruction owed for a synced checkpoint `M` whose re-persist root is
   /// durable (so `self.checkpoint_op == M`) but whose verify-on-read `sm.restore` FAILED — see
   /// [`SmReconstruct`]. `Some` exactly while the SM lags the (already-durable) checkpoint pointer; it
@@ -2110,6 +2145,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       appending: std::collections::BTreeSet::new(),
       pending_sb: None,
       pending_checkpoint: None,
+      materializing: None,
       checkpoint_op: OpNumber::new(),
       checkpoint_sm_root: None,
       checkpoint_sessions_root: None,
@@ -2131,6 +2167,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       sync_fetch_progress: 0,
       pending_install: None,
       block_fetch: None,
+      deferred_pin: None,
       sm_reconstruct: None,
       sync_serving: BTreeMap::new(),
       state_syncs_applied: 0,
@@ -6228,7 +6265,15 @@ where
       // job, a served block carries no authority (it self-verifies by content address), and there
       // is no endpoint state a stale serve could publish — so a serve is never superseded.
       BlockJobOutput::Served { to, addr, block } => self.on_block_served(to, addr, block),
-      BlockJobOutput::Walked(walked) => self.on_walked(now, wal, done.id, walked),
+      // A walk's verdict is consumed FIRST, then the pin its outstanding walk deferred is re-delivered
+      // — the ordering the one-pin admission exists to impose. Placed on the completion rather than
+      // inside `on_walked` so every exit from it (a superseded token, a bound-breach abort, the
+      // cold-start probe that owns no transfer) drains the slot too: a retained pin must never outlive
+      // the walk it was waiting on.
+      BlockJobOutput::Walked(walked) => {
+        self.on_walked(now, wal, done.id, walked);
+        self.redeliver_deferred_pin(now);
+      }
       BlockJobOutput::Restored { purpose, result } => match purpose {
         // A synced checkpoint's content: the obligation carries the token, so a reconstruct whose
         // obligation was superseded (or torn down and re-raised) while it executed answers nothing.

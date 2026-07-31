@@ -327,6 +327,136 @@ fn durable_quorum_tracks_a_live_cluster_within_a_bounded_window() {
   );
 }
 
+/// Durable evidence for the 3-voter successor a shrink installs, held by the three retained voters
+/// (the retired fourth reports nothing).
+fn shrunk_evidence() -> Vec<DurableEvidence> {
+  (0..3)
+    .map(|_| DurableEvidence {
+      epoch: 1,
+      voters: vec![0, 1, 2],
+      voter_count: 3,
+      checkpoint_op: 0,
+    })
+    .collect()
+}
+
+#[test]
+fn durable_quorum_denies_a_wiped_learner_any_relaxation() {
+  // Holders are counted among VOTERS, so a learner's copy never stood in for one — and its lost disk
+  // therefore removed no holder the obligation was counting. Op 1 survives on one of the three
+  // voters, below their quorum of two, and the emptied learner excuses none of it.
+  let mut q = DurableQuorumChecker::new();
+  // The learner's disk really was holding op 1 as it went, and that still buys the op nothing.
+  q.note_wipe(3, 1, &|_| true);
+  let held = [(0usize, 1u64)];
+  assert!(
+    q.fold(&genesis_evidence(3, 1, &[0; 4]), &[1], &|i, op| held
+      .contains(&(i, op)))
+      .is_violation(),
+    "a wipe outside the voting set removes no voter's copy, so the voter quorum stands undiminished"
+  );
+}
+
+#[test]
+fn durable_quorum_denies_a_wipe_the_ops_its_disk_never_held() {
+  // An op the emptied medium never carried lost nothing to that wipe. Op 2 is prepared and committed
+  // only after voter 0's disk went, so the disk it might have been discounted against never saw it.
+  let mut q = DurableQuorumChecker::new();
+  let evidence = genesis_evidence(3, 0, &[0; 3]);
+  let mut held: Vec<(usize, u64)> = (0..3).map(|i| (i, 1u64)).collect();
+  assert!(
+    q.fold(&evidence, &[1], &|i, op| held.contains(&(i, op)))
+      .is_ok(),
+    "op 1 on every voter meets the quorum"
+  );
+  // Voter 0's disk is emptied holding op 1 and nothing beyond it.
+  q.note_wipe(0, 1, &|op| op == 1);
+  assert!(
+    q.fold(&evidence, &[], &|i, op| held.contains(&(i, op)))
+      .is_ok(),
+    "the ops the wipe found durable are still quorum-held"
+  );
+  // Op 2 then commits and reaches ONE voter. The emptied disk never carried it, so it buys nothing.
+  held.push((1, 2));
+  assert!(
+    q.fold(&evidence, &[2], &|i, op| held.contains(&(i, op)))
+      .is_violation(),
+    "an op the emptied disk never held lost no copy to that wipe, so it owes the full quorum"
+  );
+}
+
+#[test]
+fn durable_quorum_denies_a_wipe_outside_the_owed_configuration() {
+  // The obligation moves to the successor once it is installed on a quorum, and the wiped node is not
+  // one of the successor's voters — its copy would not have been counted, so its loss is not deducted.
+  let mut q = DurableQuorumChecker::new();
+  let quorum_held = [(0usize, 1u64), (1usize, 1u64), (2usize, 1u64)];
+  assert!(
+    q.fold(&genesis_evidence(4, 0, &[0; 4]), &[1], &|i, op| quorum_held
+      .contains(&(i, op)))
+      .is_ok(),
+    "three of the four voters meet the predecessor's quorum"
+  );
+  // Voter 3 is wiped holding op 1, and the shrink that retires it installs on all three retained
+  // voters. Its forfeit copy was a copy of the very op in question — and still counts for nothing,
+  // because the configuration now owed the op does not vote with it.
+  q.note_wipe(3, 1, &|_| true);
+  let held = [(0usize, 1u64)];
+  assert!(
+    q.fold(&shrunk_evidence(), &[], &|i, op| held.contains(&(i, op)))
+      .is_violation(),
+    "a wipe of a node the owed configuration does not vote with leaves that configuration's quorum \
+     intact"
+  );
+}
+
+#[test]
+fn durable_quorum_relaxes_by_a_wiped_voter_for_the_ops_it_held() {
+  // The concession itself, still granted where the physical loss is real: the op committed on the bare
+  // quorum {0, 1}, voter 0's disk went, and op 1 stands on voter 1 alone — the floor one lost disk is
+  // allowed to leave it at.
+  let mut q = DurableQuorumChecker::new();
+  let evidence = genesis_evidence(3, 0, &[0; 3]);
+  let mut held = vec![(0usize, 1u64), (1usize, 1u64)];
+  assert!(
+    q.fold(&evidence, &[1], &|i, op| held.contains(&(i, op)))
+      .is_ok(),
+    "a bare quorum satisfies the obligation"
+  );
+  q.note_wipe(0, 1, &|_| true);
+  held.retain(|&(i, _)| i != 0);
+  assert!(
+    q.fold(&evidence, &[], &|i, op| held.contains(&(i, op)))
+      .is_ok(),
+    "a wiped voter's forfeit copy relaxes the op it durably held to the one-holder floor"
+  );
+}
+
+#[test]
+fn durable_quorum_relaxes_for_an_op_the_disk_held_before_its_commit_was_declared() {
+  // A durable append PRECEDES the commit resting on it, by the flight time of the acknowledgement, so
+  // an emptied disk can have been holding an op the cluster only declares committed afterwards. Op 2
+  // reached voter 0's medium and its bare quorum {0, 1} before the disk went; the acknowledgement that
+  // makes op 2 committed lands after. Timing the concession by the commit instead of by the medium
+  // would refuse a copy the disk demonstrably held, and flag a run that lost nothing beyond its one
+  // disk.
+  let mut q = DurableQuorumChecker::new();
+  let evidence = genesis_evidence(3, 0, &[0; 3]);
+  let held = [(1usize, 1u64), (1usize, 2u64), (2usize, 1u64)];
+  assert!(
+    q.fold(&evidence, &[1], &|i, op| held.contains(&(i, op)))
+      .is_ok(),
+    "op 1 on two of three voters meets the quorum"
+  );
+  // Voter 0's disk goes while holding both ops — op 2 durable on it, not yet declared committed.
+  q.note_wipe(0, 2, &|_| true);
+  assert!(
+    q.fold(&evidence, &[2], &|i, op| held.contains(&(i, op)))
+      .is_ok(),
+    "an op the emptied disk was holding relaxes by that lost copy however late its commit is declared"
+  );
+}
+
 /// One fabricated apply-stream entry: incarnation `inc` applied op `op` for `(client, request)`
 /// producing `reply`.
 fn applied(

@@ -345,8 +345,10 @@ pub struct DurableQuorumChecker {
   /// The highest epoch observed installed on a quorum of its OWN voters. Latched: an op's obligation
   /// moves to the successor the moment the successor reaches a quorum, and never moves back.
   installed: u64,
-  /// How many replicas have had their durable storage WIPED over the run.
-  wipes: usize,
+  /// What each durable-storage WIPE forfeited: `replica -> the ops its durable medium held at the
+  /// instant the disk was emptied`. Keyed by replica, so repeated wipes of one node union into one
+  /// entry — a single disk can only ever cost a single holder.
+  wipes: BTreeMap<usize, BTreeSet<u64>>,
 }
 
 impl DurableQuorumChecker {
@@ -358,23 +360,48 @@ impl DurableQuorumChecker {
       applied_frontier: 0,
       configs: BTreeMap::new(),
       installed: 0,
-      wipes: 0,
+      wipes: BTreeMap::new(),
     }
   }
 
-  /// Record that a replica's durable storage was WIPED ([`Cluster::wipe_and_restart`]): its durable
-  /// copies are permanently forfeit with the disk, so the retention envelope relaxes by exactly the
-  /// wiped count, floored at one holder — a committed op held durably NOWHERE is an outright loss no
-  /// fault budget excuses.
+  /// Record that replica `i`'s durable storage was WIPED ([`Cluster::wipe_and_restart`]), capturing
+  /// WHAT the disk was holding as it went: `held(op)` reports whether replica `i`'s durable medium
+  /// retains `op`, and `reach` bounds the op numbers worth asking about (no medium holds anything
+  /// above the cluster's highest assigned op).
   ///
-  /// That relaxed bound is the ONLY concession a wipe earns. The wiped replica itself is not counted
-  /// as a holder and does not raise the discharge floor: [`Cluster::replica_checkpoint_op`] and
-  /// [`Cluster::replica_appended_op`] report an emptied disk as holding nothing, so the evidence
-  /// side stays honest. Conceding the same physical fact twice — once by lowering the bound and
-  /// again by crediting a phantom holder — would cost the oracle a second replica the wipe never
-  /// took.
-  pub fn note_wipe(&mut self) {
-    self.wipes += 1;
+  /// It must be called BEFORE the disk is replaced. The evidence exists only while the medium does,
+  /// and it is the whole basis of the concession: a wipe forfeits the copies that were on THAT disk at
+  /// THAT instant, so those are exactly the copies the retention envelope relaxes for — never one the
+  /// wipe could not have taken.
+  ///
+  /// Recording the ops themselves rather than a moment in time is what makes the concession honest in
+  /// both directions. A durable append PRECEDES the commit that rests on it, by however long the
+  /// acknowledgement takes to arrive, so an op can reach its durable quorum before a wipe and be
+  /// declared committed well after it — timing the concession by the commit would deny a copy the disk
+  /// demonstrably held. Equally, an op that never reached this disk earns nothing from its loss, no
+  /// matter when it committed.
+  ///
+  /// The concession is scoped two further ways, and a wipe that meets none of the three concedes
+  /// nothing at all:
+  ///
+  /// - by IDENTITY and MEMBERSHIP — only a wipe of a replica that VOTES in the configuration an op is
+  ///   owed removed a holder that op's obligation was counting. Holders are counted among that
+  ///   configuration's voters, so an emptied learner, an emptied non-member, and an emptied node the
+  ///   owed configuration retired all cost the count nothing;
+  /// - by the FLOOR — the relaxed requirement never falls below one holder. A committed op held
+  ///   durably NOWHERE is an outright loss no fault budget excuses.
+  ///
+  /// That bound is the ONLY concession a wipe earns. The wiped replica itself is not counted as a
+  /// holder and does not raise the discharge floor: [`Cluster::replica_checkpoint_op`] and
+  /// [`Cluster::replica_appended_op`] report an emptied disk as holding nothing, so the evidence side
+  /// stays honest. Conceding the same physical fact twice — once by lowering the bound and again by
+  /// crediting a phantom holder — would cost the oracle a second replica the wipe never took.
+  pub fn note_wipe(&mut self, i: usize, reach: u64, held: &dyn Fn(u64) -> bool) {
+    self
+      .wipes
+      .entry(i)
+      .or_default()
+      .extend((1..=reach).filter(|&op| held(op)));
   }
 
   /// Fold one tick of durable evidence into the three ledgers and assert the retention obligation for
@@ -458,22 +485,38 @@ impl DurableQuorumChecker {
       return CheckResult::Ok;
     };
     let quorum = cfg.quorum();
-    // WIPES weaken this bound HONESTLY, by exactly the wiped count: a wipe permanently forfeits one
-    // replica's durable copies, so a committed op held by a bare quorum can legitimately drop to
-    // `quorum - wipes` holders until repair/state-sync re-replicates it (the checker cannot cheaply
-    // know when that completes, so the relaxed envelope holds for the rest of the run). The floor is
-    // 1: a committed op held durably NOWHERE is an outright loss no fault budget excuses. With the
-    // wipe axis off (`wipes == 0` always) this is exactly the strict quorum bound — the base gates
-    // are untouched. The end-of-run check (post-quiesce, full committed history applied on an
-    // operational replica) stays fully strict on every lane.
+    // WIPES weaken this bound HONESTLY, and only for the copies they actually took. The deduction for
+    // an op counts the replicas that BOTH vote in the configuration this op is owed AND were holding
+    // this very op when their disk was emptied. A wipe failing either test concedes NOTHING: a
+    // non-voter's copy was never counted among the holders below, so its loss removes none, and an op
+    // that never reached the emptied medium lost nothing to it. A blanket per-replica discount instead
+    // relaxes the requirement for ops no wipe could have touched — which is the very failure this
+    // obligation exists to catch.
+    //
+    // Reading the forfeited ops off the medium is also what keeps the concession from being denied
+    // where it is due. A durable append PRECEDES the commit resting on it by the flight time of the
+    // acknowledgement, so an op can reach its durable quorum before a wipe and be declared committed
+    // after it; timing the deduction by the commit would refuse a copy the disk demonstrably held.
+    //
+    // The concession then holds for the rest of the run: the checker cannot cheaply know when
+    // repair/state-sync re-replicates what the disk took. The floor is 1 — a committed op held durably
+    // NOWHERE is an outright loss no fault budget excuses. With the wipe axis off (no wipes at all)
+    // this is exactly the strict quorum bound, so the base gates are untouched. The end-of-run check
+    // (post-quiesce, full committed history applied on an operational replica) stays fully strict on
+    // every lane.
     //
     // The wipe is conceded HERE and only here. On the evidence side a wiped replica reports an empty
     // disk — no occupied slot, no subsuming checkpoint — so it is counted in neither the holders
     // below nor the discharge floor above. Relaxing the bound AND crediting the wiped replica as a
     // holder would spend the same fault twice, leaving the obligation a full replica weaker than the
     // wipe budget actually buys.
-    let required = quorum.saturating_sub(self.wipes).max(1);
     for &op in &self.tracked {
+      let conceded = self
+        .wipes
+        .iter()
+        .filter(|(replica, forfeited)| cfg.voters.contains(replica) && forfeited.contains(&op))
+        .count();
+      let required = quorum.saturating_sub(conceded).max(1);
       let holders = cfg
         .voters
         .iter()
@@ -482,9 +525,9 @@ impl DurableQuorumChecker {
       if holders < required {
         return CheckResult::violation(format!(
           "committed op {op} (owed epoch {}'s quorum) is durably held on only {holders} voters (< \
-           required {required} = quorum {quorum} - wipes {}) — a committed op is not retained \
-           durably by the surviving quorum",
-          self.installed, self.wipes
+           required {required} = quorum {quorum} - {conceded} of its voters wiped while holding op \
+           {op}) — a committed op is not retained durably by the surviving quorum",
+          self.installed
         ));
       }
     }

@@ -416,6 +416,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // A state-sync re-persist is dropped at EVERY step (its `pending_install` + `sync` are cleared
     // above, so a kept one would be orphaned + incoherent); it re-solicits, its committed prefix
     // recovered from the canonical log.
+    //
+    // Only the LOGICAL half is dropped. The `Materialize` job a `FlushingBlocks` drop orphans is
+    // already queued on the lane and executes to completion regardless — the issue-order contract
+    // admits no retraction — so `materializing` (the PHYSICAL half) deliberately SURVIVES this reset.
+    // That is what keeps the capture site closed until the lane returns the image it is already
+    // carrying; clearing it here would re-open the very accumulation the split exists to bound.
     if self.pending_checkpoint.as_ref().is_some_and(|pc| {
       matches!(pc.kind, CheckpointKind::SyncRepersist)
         || matches!(pc.step, CheckpointStep::FlushingBlocks(_))
