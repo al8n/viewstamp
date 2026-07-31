@@ -87,6 +87,7 @@ fn assert_invariants_accepts_a_consistent_state() {
 }
 
 #[test]
+#[cfg(debug_assertions)] // provokes a debug-profile detection oracle; no panic exists in release
 #[should_panic(expected = "view_change collection present iff Status::ViewChange")]
 fn assert_invariants_rejects_view_change_collection_while_normal() {
   // The ViewChange-only collection (DVC + catch-up discriminant) is a ViewChange sub-state; a Normal
@@ -98,6 +99,7 @@ fn assert_invariants_rejects_view_change_collection_while_normal() {
 }
 
 #[test]
+#[cfg(debug_assertions)] // provokes a debug-profile detection oracle; no panic exists in release
 #[should_panic(expected = "pending_forfeit off a Normal primary")]
 fn assert_invariants_rejects_pending_forfeit_on_a_backup() {
   // The deferred-forfeit latch belongs to a Normal PRIMARY stepping down; replica 1 of 3 is a backup
@@ -108,6 +110,7 @@ fn assert_invariants_rejects_pending_forfeit_on_a_backup() {
 }
 
 #[test]
+#[cfg(debug_assertions)] // provokes a debug-profile detection oracle; no panic exists in release
 #[should_panic(expected = "commit_min")]
 fn assert_invariants_rejects_checkpoint_above_commit_min() {
   // `checkpoint_op > commit_min` is impossible (a checkpoint snapshots the SM at `commit_min`), so the
@@ -120,6 +123,7 @@ fn assert_invariants_rejects_checkpoint_above_commit_min() {
 }
 
 #[test]
+#[cfg(debug_assertions)] // provokes a debug-profile detection oracle; no panic exists in release
 #[should_panic(expected = "pending_install without an outstanding sync")]
 fn assert_invariants_rejects_pending_install_without_sync() {
   // A staged deferred install must belong to an outstanding sync (clause (1)).
@@ -162,6 +166,7 @@ fn note_sm_advanced_accepts_exactly_the_next_op() {
 }
 
 #[test]
+#[cfg(debug_assertions)] // provokes a debug-profile detection oracle; no panic exists in release
 #[should_panic(expected = "SM content advanced non-sequentially")]
 fn note_sm_advanced_skipping_an_op_panics() {
   // A skipped op means the SM missed a committed effect (or applied out of order) — the choke
@@ -172,6 +177,7 @@ fn note_sm_advanced_skipping_an_op_panics() {
 }
 
 #[test]
+#[cfg(debug_assertions)] // provokes a debug-profile detection oracle; no panic exists in release
 #[should_panic(expected = "SM content advanced non-sequentially")]
 fn note_sm_advanced_double_apply_panics() {
   // A double-apply re-runs a committed effect (non-idempotent SMs corrupt silently) — fail-stop.
@@ -193,6 +199,7 @@ fn note_sm_restored_allows_forward_and_equal_moves() {
 }
 
 #[test]
+#[cfg(debug_assertions)] // provokes a debug-profile detection oracle; no panic exists in release
 #[should_panic(expected = "SM content restored backward")]
 fn note_sm_restored_backward_panics() {
   // Every restore site installs a checkpoint at/above the applied frontier — a backward restore
@@ -203,6 +210,7 @@ fn note_sm_restored_backward_panics() {
 }
 
 #[test]
+#[cfg(debug_assertions)] // provokes a debug-profile detection oracle; no panic exists in release
 #[should_panic(expected = "SM content at")]
 fn the_sm_content_witness_trips_on_an_unflagged_behind_window() {
   // Clause (5c): the applied frontier advanced past the SM's content with NO behind-window flagged

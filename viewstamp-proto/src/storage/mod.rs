@@ -1678,6 +1678,24 @@ pub trait Wal {
 /// peer-fetch). The asymmetry is not a convenience: the durable root is the single source of truth a
 /// crash recovers from, and a root write that is allowed to "fail" without the proto re-issuing it has
 /// no owner — that durable write would simply be LOST.
+///
+/// **Every completion is delivered exactly once (load-bearing for the fail-stop fences).** Each
+/// submitted op — a root write, a checkpoint write, a checkpoint read — resolves as EXACTLY ONE
+/// completion from [`poll`](Superblock::poll): never zero (the write-fault contract above already
+/// forbids a lost ending), and never more than one. For ROOT writes specifically this is not a
+/// hygiene rule: the storage session accounts every root completion against its submission-order
+/// timeline, and that ledger is what makes the effective root — the state the medium is guaranteed
+/// to converge to — readable at all. A completion the ledger cannot account for (a `Wrote` whose id
+/// was never submitted, a DUPLICATE delivery of an already-settled root, or a root completing out
+/// of submission order) is treated as an untrusted medium and the process FAIL-STOPS: these are
+/// hard failures in every build profile, not recoverable errors, because consensus over a ledger of
+/// write facts that no longer matches the device risks silent durable-state corruption. A retry
+/// layer between the device and this trait must therefore deduplicate before delivering. Note the
+/// deliberate asymmetry with the WAL channel: a duplicate [`WalDone::Appended`] settles to a no-op
+/// in the append ledger and is ignored by the endpoint (append completions may also reorder, per
+/// the WAL's poll-ordering contract), whereas the superblock's ordering and exactly-once
+/// obligations are strict — the durable root is a single serialized timeline, and every relaxation
+/// the WAL channel tolerates is one this channel cannot.
 pub trait Superblock {
   /// The current durable root (the last root write that has completed).
   fn state(&self) -> VsrState;

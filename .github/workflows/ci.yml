@@ -297,6 +297,11 @@ jobs:
       run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features quic,tls-rustls-aws-lc-rs,tls-rustls-aws-lc-rs-fips
     - name: Test the quic transport with an explicit crypto provider
       run: cargo test -p viewstamp-proto --no-default-features --features quic,tls-rustls-ring
+    # The release profile is the one the deployed artifact and the simulator run, and the only one
+    # that exercises the release-active safety fences with debug assertions compiled out — a
+    # debug-only run can green over a fence that does not exist in the binary that ships.
+    - name: Test viewstamp-proto in the release profile
+      run: cargo test --release -p viewstamp-proto --features quic,tcp,tls,tls-rustls-ring
 
   coverage:
     name: coverage

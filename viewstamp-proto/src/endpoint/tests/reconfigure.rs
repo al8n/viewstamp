@@ -8347,3 +8347,247 @@ fn a_banked_ack_demote_at_five_voters_recovers_by_immediate_re_promote() {
     "the demotee is a voter again with the crashed voter still down"
   );
 }
+
+#[test]
+fn a_cross_epoch_sync_below_an_inherited_in_flight_configuration_is_refused() {
+  // A rebuilt endpoint over a live session can hold an INHERITED epoch-advancing root — a dead
+  // incarnation's, still in flight — while its live configuration baselines on the LANDED root.
+  // The in-flight root occupies neither `pending_sb` nor `pending_checkpoint` (both died with the
+  // predecessor endpoint), so a verified cross-epoch SyncCheckpoint clears every live ingress gate;
+  // if its successor is judged only against the LIVE membership, a reply newer than live but OLDER
+  // than the timeline stages a superseded configuration whose re-persist root lands AFTER the
+  // newer one — rewinding the durable membership, after which the correlated completion installs
+  // the stale voter set over the adopted newer one. The admission must consult the session
+  // timeline: a crossing below the effective root's configuration is refused outright.
+  //
+  // Shape: live E0 (the landed baseline), an in-flight E2 root inherited from a dead incarnation,
+  // and a verified E1 crossing reply — newer than live, below the timeline.
+  let genesis_mem = genesis(3);
+  let successor_e1 = genesis_mem
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E1)");
+  let successor_e2 = successor_e1
+    .apply_delta(&SingleVoterDelta::PromoteLearner(MemberId::new(3)))
+    .expect("promoting the E1 learner is valid (E2)");
+
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm>::genesis_unchecked(
+    cfg,
+    genesis_mem.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
+
+  // The dead predecessor's E2 root, still in flight on the session timeline (its completion is
+  // queued but not yet polled). Its incarnation can never collide with a live endpoint's.
+  let e2_root = VsrState::try_new_v4(
+    View::new(),
+    View::new(),
+    OpNumber::new(),
+    OpNumber::new(),
+    0,
+    std::vec::Vec::new(),
+    successor_e2.epoch(),
+    successor_e1.epoch(),
+    successor_e2.clone(),
+    std::vec![successor_e1.config_id(), genesis_mem.config_id()],
+    OpNumber::new(),
+  )
+  .expect("a well-formed inherited E2 root");
+  storage.submit_root(crate::WriteId::new(u64::MAX - 7, 1), e2_root);
+
+  // The rebuilt endpoint armed a crossing (a higher-epoch hint) toward the E1 checkpoint.
+  let m1: u64 = 1;
+  e.arm_cross_epoch_sync_for_test(m1);
+  let nonce = e.sync_nonce_for_test();
+
+  // A VERIFIED E1 crossing reply: chains from genesis, hashes clean — honest, merely stale.
+  let cross_snap = CountSm::default().snapshot();
+  let cross_env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(m1),
+    crate::block_address(&cross_snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  blocks.put(cross_snap.clone());
+  let cross_id = crate::checkpoint_id(&cross_env);
+  let membership_body =
+    ReconfigurePayload::from_membership(&successor_e1, genesis_mem.config_id()).encode_body();
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(m1),
+      cross_id,
+      successor_e1.epoch(),
+      successor_e1.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      cross_env,
+      membership_body,
+    )),
+  );
+  // Run only the block lane (the fetch walk drains locally and replays into the install choke),
+  // leaving the inherited root's completion queued — the exact window the admission must survive.
+  e.block_step(now, &mut storage, &mut blocks);
+  assert!(
+    e.pending_install.is_none(),
+    "an E1 crossing below the in-flight E2 configuration must not stage an install"
+  );
+
+  // Drain everything: the inherited E2 root lands and installs; nothing may rewind it.
+  for _ in 0..4 {
+    e.storage_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(
+    e.membership.epoch(),
+    successor_e2.epoch(),
+    "the live configuration is the inherited E2, never rewound to the stale E1"
+  );
+  assert_eq!(
+    storage.sb().state().epoch(),
+    successor_e2.epoch(),
+    "the durable root is the inherited E2 — no E1 root was ever submitted behind it"
+  );
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "the refused crossing installed nothing"
+  );
+}
+
+#[test]
+fn a_delayed_adopt_vote_completion_casts_no_vote_after_a_landing_driven_demotion() {
+  // A landing-driven configuration install rekeys the vote bitsets but PRESERVES the pending
+  // appends and inflight entries of a node it retains as a learner. An `AdoptVote` append staged
+  // while this node was the new primary can therefore complete AFTER the demotion; unguarded, its
+  // completion ORs the learner's slot bit into `oks` and tallies — and a retained voter's bit plus
+  // that learner bit satisfies the two-voter successor quorum, so the learner commits, applies,
+  // and advertises `Commit` with no voter authority. The vote must be refused where it is CAST and
+  // the tally where it is COUNTED, under the membership in force at that instant.
+  let mut e = single_change_primary();
+  let genesis_mem = genesis(3);
+  let successor_demote = genesis_mem
+    .apply_delta(&SingleVoterDelta::DemoteVoter(MemberId::new(0)))
+    .expect("demoting voter 0 of the 3-voter genesis is valid (E1: voters {1,2}, learner {0})");
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(ReorderWal::new(), StepSb::default());
+
+  // The primary of view 0 committed the demote op 1; its uncommitted client op 2 follows.
+  e.force_state_for_test(0, 1, 1, 0, &[]);
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Client(ClientId::new(7)),
+    Message::Request(Request::new(
+      ClientId::new(7),
+      RequestNumber::with(1),
+      Bytes::from_static(b"tail"),
+    )),
+  );
+  assert_eq!(e.op(), OpNumber::with(2), "the client op took slot 2");
+  // Land its own append so the view-change adoption below re-appends it cleanly.
+  assert!(storage.wal_mut().release_latest_for(2));
+  e.handle_storage(now, &mut storage);
+
+  // The committed demote stages its swap: the E1 root is now in flight (held by the fixture).
+  e.stage_epoch_swap(OpNumber::with(1), successor_demote.clone(), &mut storage);
+  while e.poll_message().is_some() {}
+
+  // A view change to view 3 — led by this same node — adopts op 2 with an `AdoptVote` append
+  // whose WAL completion the fixture HOLDS.
+  let t_identity = crate::storage::prepare_identity(
+    ClientId::new(7),
+    RequestNumber::with(1),
+    crate::storage::fnv1a_128(b"tail"),
+  );
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartViewChange(StartViewChange::new(
+      View::with(3),
+      ReplicaId::new(1),
+      crate::Epoch::new(0),
+      genesis_mem.config_id(),
+    )),
+  );
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::DoViewChange(DoViewChange::new(
+      View::with(3),
+      View::new(),
+      OpNumber::with(1),
+      OpNumber::with(1),
+      crate::Epoch::new(0),
+      genesis_mem.config_id(),
+      ReplicaId::new(1),
+      std::vec::Vec::new(),
+    )),
+  );
+  assert!(
+    e.appending.contains(&2),
+    "the adoption re-append of op 2 is staged and held in flight"
+  );
+  // The retained voter's ack for the adopted op arrives while this node still leads.
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::PrepareOk(PrepareOk::new(
+      View::with(3),
+      OpNumber::with(2),
+      ReplicaId::new(1),
+      OpNumber::new(),
+      t_identity,
+      crate::Epoch::new(0),
+      genesis_mem.config_id(),
+    )),
+  );
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "one voter ack is below quorum"
+  );
+
+  // The demote root lands mid-flight: the install retains this node as a LEARNER while its
+  // `AdoptVote` append is still in the air.
+  storage.sb_mut().flush();
+  e.handle_storage(now, &mut storage);
+  assert!(
+    e.is_learner(),
+    "the landing installed the successor and demoted this node to a learner"
+  );
+  while e.poll_message().is_some() {}
+
+  // The held completion is delivered AFTER the demotion.
+  assert!(storage.wal_mut().release_latest_for(2));
+  e.handle_storage(now, &mut storage);
+
+  assert_eq!(
+    e.commit(),
+    OpNumber::with(1),
+    "a learner's delayed own-vote completion must not complete a successor quorum and commit"
+  );
+  let oks = e
+    .inflight
+    .get(&2)
+    .expect("the preserved inflight entry survives the install")
+    .oks;
+  assert_eq!(
+    oks & !0b11,
+    0,
+    "no bit outside the successor's two voter slots is ever set (no learner self-vote)"
+  );
+  assert!(
+    e.poll_message().is_none(),
+    "a demoted node emits nothing off the delayed completion — no Reply, no Commit"
+  );
+}
