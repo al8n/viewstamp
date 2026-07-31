@@ -130,6 +130,203 @@ fn durability_checker_final_assertion_stays_strict_when_no_operational_replica_r
   );
 }
 
+#[test]
+fn agreement_flags_a_divergence_between_two_replicas_past_a_short_canonical_log() {
+  // Applied logs `[A]`, `[A,B]`, `[A,C]`. Comparing every log against replica 0 truncates both
+  // comparisons to one element, both pass, and the real `B` vs `C` divergence at position 1 is never
+  // examined. The canonical log must be the LONGEST — it covers every position any replica applied.
+  let a = Bytes::from_static(b"a");
+  let logs = vec![
+    vec![(1, a.clone())],
+    vec![(1, a.clone()), (2, Bytes::from_static(b"b"))],
+    vec![(1, a.clone()), (2, Bytes::from_static(b"c"))],
+  ];
+  assert!(
+    check_agreement(&logs).is_violation(),
+    "two replicas applying different bodies at op 2 is a divergence, however short the first log is"
+  );
+}
+
+#[test]
+fn agreement_passes_prefix_consistent_logs() {
+  let a = Bytes::from_static(b"a");
+  let b = Bytes::from_static(b"b");
+  let logs = vec![
+    vec![(1, a.clone())],
+    vec![(1, a.clone()), (2, b.clone())],
+    vec![(1, a.clone()), (2, b.clone())],
+  ];
+  assert!(
+    check_agreement(&logs).is_ok(),
+    "a shorter log that agrees element-for-element is a lagging replica, not a divergence"
+  );
+}
+
+/// Durable evidence for a genesis configuration of `voters` voting replicas (indices `0..voters`)
+/// followed by `learners` non-voting ones, every node at epoch 0 carrying that same membership, with
+/// `checkpoints[i]` as replica `i`'s durable checkpoint op.
+fn genesis_evidence(voters: usize, learners: usize, checkpoints: &[u64]) -> Vec<DurableEvidence> {
+  (0..voters + learners)
+    .map(|i| DurableEvidence {
+      epoch: 0,
+      voters: (0..voters).collect(),
+      voter_count: voters,
+      checkpoint_op: checkpoints[i],
+    })
+    .collect()
+}
+
+/// Durable evidence for the 4-voter successor a promotion installs, held by every node.
+fn promoted_evidence() -> Vec<DurableEvidence> {
+  (0..4)
+    .map(|_| DurableEvidence {
+      epoch: 1,
+      voters: vec![0, 1, 2, 3],
+      voter_count: 4,
+      checkpoint_op: 0,
+    })
+    .collect()
+}
+
+#[test]
+fn durable_quorum_flags_an_op_above_the_applied_length() {
+  // The committed-op-loss class an applied-LENGTH frontier cannot see. Op 3 is a committed
+  // `Reconfigure` — numbered and committed but never applied — so three applied ops (1, 2, 4) stand
+  // for a committed frontier of 4. Reading the length as an op number examines op 3, which every
+  // voter holds, and never looks at op 4, which only one of the three retains.
+  let mut q = DurableQuorumChecker::new();
+  let evidence = genesis_evidence(3, 0, &[0, 0, 0]);
+  let mut held: Vec<(usize, u64)> = Vec::new();
+  for i in 0..3 {
+    held.extend([(i, 1), (i, 2), (i, 3)]);
+  }
+  held.push((0, 4));
+  assert!(
+    q.fold(&evidence, &[1, 2, 3, 4], &|i, op| held.contains(&(i, op)))
+      .is_violation(),
+    "the committed op above the applied length must be held to the quorum obligation"
+  );
+}
+
+#[test]
+fn durable_quorum_flags_an_interior_op_while_the_newest_stays_quorum_held() {
+  // The interior committed-op loss class: ops 1 and 3 are on every voter while op 2 survives on ONE.
+  // A newest-op-only check reads op 3, finds a full quorum, and passes over the loss beneath it.
+  let mut q = DurableQuorumChecker::new();
+  let evidence = genesis_evidence(3, 0, &[0, 0, 0]);
+  let mut held: Vec<(usize, u64)> = Vec::new();
+  for i in 0..3 {
+    held.extend([(i, 1), (i, 3)]);
+  }
+  held.push((0, 2));
+  assert!(
+    q.fold(&evidence, &[1, 2, 3], &|i, op| held.contains(&(i, op)))
+      .is_violation(),
+    "an interior committed op below its quorum must be flagged even with the newest op fully held"
+  );
+}
+
+#[test]
+fn durable_quorum_flags_successor_under_replication_after_a_promotion() {
+  // The successor-quorum under-replication class: a promotion installs a 4-voter configuration whose
+  // quorum is 3, and the op committed under the 3-voter predecessor is retained by only two of those
+  // four voters — one double fault from a lost committed op. The static genesis voter count (quorum
+  // 2) calls that fully held.
+  let mut q = DurableQuorumChecker::new();
+  let held = [(0usize, 1u64), (1usize, 1u64)];
+  assert!(
+    q.fold(&genesis_evidence(3, 1, &[0; 4]), &[1], &|i, op| held
+      .contains(&(i, op)))
+      .is_ok(),
+    "a bare quorum of the predecessor satisfies the predecessor's obligation"
+  );
+  assert!(
+    q.fold(&promoted_evidence(), &[], &|i, op| held.contains(&(i, op)))
+      .is_violation(),
+    "once the successor is installed on a quorum the op is owed the successor's quorum"
+  );
+}
+
+#[test]
+fn durable_quorum_owes_the_predecessor_until_the_successor_reaches_a_quorum() {
+  // The other direction: a successor ONE node has installed is not installed on a quorum, so the op
+  // stays owed the predecessor's quorum. The protocol commits a change under the predecessor-and-
+  // retained-successor conjunction, so demanding the successor's quorum earlier would demand more
+  // than the protocol guarantees.
+  let mut q = DurableQuorumChecker::new();
+  let held = [(0usize, 1u64), (1usize, 1u64)];
+  assert!(
+    q.fold(&genesis_evidence(3, 1, &[0; 4]), &[1], &|i, op| held
+      .contains(&(i, op)))
+      .is_ok()
+  );
+  let mut crossing = genesis_evidence(3, 1, &[0; 4]);
+  crossing[3] = promoted_evidence()[3].clone();
+  assert!(
+    q.fold(&crossing, &[], &|i, op| held.contains(&(i, op)))
+      .is_ok(),
+    "a successor short of a quorum does not yet own the retention obligation"
+  );
+}
+
+#[test]
+fn durable_quorum_discharges_an_op_a_quorum_has_checkpointed() {
+  // Quorum checkpoint subsumption is the only discharge: with two of three voters holding op 1 in
+  // their durable checkpoints it lives in their snapshots, so no WAL slot need retain it — and it
+  // leaves active tracking, which is what keeps the per-tick work proportional to the
+  // un-checkpointed window instead of the whole run.
+  let mut q = DurableQuorumChecker::new();
+  assert!(
+    q.fold(&genesis_evidence(3, 0, &[1, 1, 0]), &[1], &|_, _| false)
+      .is_ok(),
+    "an op a quorum has checkpointed is permanently satisfied"
+  );
+  assert!(
+    q.tracked.is_empty(),
+    "a discharged op leaves the active window"
+  );
+}
+
+#[test]
+fn durable_quorum_tracks_a_live_cluster_within_a_bounded_window() {
+  // Non-vacuity + cost, on a live cluster: the obligation is genuinely populated (a checker that
+  // tracked nothing would pass every run vacuously), quorum checkpoint subsumption really discharges
+  // a prefix, and the active window stays bounded by the un-checkpointed tail instead of growing
+  // with the committed history — the property that keeps the per-tick scan affordable over a sweep.
+  let mut c = Cluster::new(3, 2, 150, 5);
+  let mut q = DurableQuorumChecker::new();
+  let mut max_window = 0usize;
+  for _ in 0..200_000 {
+    c.tick();
+    assert!(
+      q.observe(&c).is_ok(),
+      "a healthy cluster retains every committed op on a quorum"
+    );
+    max_window = max_window.max(q.tracked.len());
+    if (0..c.client_count()).all(|i| c.client(i).is_done()) {
+      break;
+    }
+  }
+  let committed = c.replica_sm(0).applied().len();
+  assert!(
+    committed > 200,
+    "the run committed a real history ({committed} ops)"
+  );
+  assert!(
+    max_window > 0,
+    "the checker genuinely tracked committed ops"
+  );
+  assert!(
+    q.discharged > 0,
+    "quorum checkpoint subsumption discharged a committed prefix"
+  );
+  assert!(
+    max_window < committed,
+    "the active window ({max_window}) stays below the committed history ({committed}) — the \
+     discharge floor bounds the per-tick scan"
+  );
+}
+
 /// One fabricated apply-stream entry: incarnation `inc` applied op `op` for `(client, request)`
 /// producing `reply`.
 fn applied(

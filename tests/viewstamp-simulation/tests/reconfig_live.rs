@@ -30,22 +30,32 @@ use viewstamp_proto::{
   SingleVoterDelta, plan_reconfiguration,
 };
 use viewstamp_simulation::{
-  Cluster, ConfigLineageChecker, DurabilityChecker, Faults, ReconfigureAppliedOnceChecker,
-  StorageFaults,
+  Cluster, ConfigLineageChecker, DurabilityChecker, DurableQuorumChecker, Faults,
+  ReconfigureAppliedOnceChecker, StorageFaults,
 };
 
-/// Tick the cluster once and fold the three live-reconfiguration checkers, panicking on any violation
+/// Tick the cluster once and fold the four live-reconfiguration checkers, panicking on any violation
 /// with the tick. The checkers must hold THROUGHOUT the change (the swap straddle is the load-bearing
 /// window), not merely at the end.
+///
+/// The retention oracle ([`DurableQuorumChecker`]) is folded per tick alongside the rest because this
+/// lane is where its config-aware obligation is most exercised: a promotion or a demotion moves the
+/// quorum an already-committed op is owed, and the swap straddle is exactly the window where a
+/// committed op could fall below it.
 fn tick_checked(
   c: &mut Cluster,
   dur: &mut DurabilityChecker,
+  quorum: &mut DurableQuorumChecker,
   once: &mut ReconfigureAppliedOnceChecker,
   lin: &mut ConfigLineageChecker,
   t: u64,
 ) {
   c.tick();
   assert!(dur.observe(c).is_ok(), "durability violated at tick {t}");
+  assert!(
+    quorum.observe(c).is_ok(),
+    "durable-quorum retention violated at tick {t}"
+  );
   assert!(
     once.observe(c).is_ok(),
     "reconfigure-applied-once violated at tick {t}"
@@ -79,6 +89,7 @@ fn live_single_change_swap_is_applied_once_and_chains_under_fault() {
   c.set_async_superblock_delay(Some(4));
 
   let mut dur = DurabilityChecker::new(c.replica_count());
+  let mut quorum = DurableQuorumChecker::new();
   let mut once = ReconfigureAppliedOnceChecker::new(c.replica_count());
   let mut lin = ConfigLineageChecker::new(c.replica_count());
 
@@ -93,7 +104,7 @@ fn live_single_change_swap_is_applied_once_and_chains_under_fault() {
     {
       break;
     }
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+    tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
   }
   assert!(
     c.serving_primary().is_some(),
@@ -130,7 +141,7 @@ fn live_single_change_swap_is_applied_once_and_chains_under_fault() {
         Err(_) => {}
       }
     }
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+    tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
     // Stop once the committed swap has installed somewhere (the proposing primary swaps first).
     if proposed.is_some() && c.membership_swaps_observed() >= 1 {
       break;
@@ -207,9 +218,15 @@ fn propose_reconfigure_surfaces_the_proto_gate_verdicts() {
   // head yet). A 2-voter cluster (quorum 2) with a genesis learner.
   let seed = 7u64;
   let mut c = Cluster::with_members(2, 1, 2, 50, seed, 8);
-  // Warm up to a serving primary with the head advancing under load.
-  for _ in 0..3_000 {
+  // Warm up to a serving primary with the head advancing under load, with the retention oracle
+  // watching every tick — no test in this lane advances the cluster unobserved.
+  let mut quorum = DurableQuorumChecker::new();
+  for t in 0..3_000 {
     c.tick();
+    assert!(
+      quorum.observe(&c).is_ok(),
+      "durable-quorum retention violated at tick {t}"
+    );
     if c.serving_primary().is_some() && c.replica_commit(0).get() >= 1 {
       break;
     }
@@ -264,6 +281,7 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
   c.set_storage_faults(StorageFaults::none());
 
   let mut dur = DurabilityChecker::new(c.replica_count());
+  let mut quorum = DurableQuorumChecker::new();
   let mut once = ReconfigureAppliedOnceChecker::new(c.replica_count());
   let mut lin = ConfigLineageChecker::new(c.replica_count());
   let learner = MemberId::new(3);
@@ -278,7 +296,7 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
     {
       break;
     }
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+    tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
   }
   assert!(c.serving_primary().is_some(), "a serving primary exists");
   assert!(
@@ -322,7 +340,7 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
          {verdict:?}"
       );
     }
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+    tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
   }
   // Non-vacuity of the falsifier: the gate genuinely RE-CHALLENGED a serving primary and got
   // `ProofPending` back (not merely `NotPrimary` the whole window) — a re-challenge to the crashed
@@ -352,7 +370,7 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
     {
       break;
     }
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+    tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
   }
   assert!(
     c.replica_durable_commit(3) >= head_at_challenge,
@@ -371,7 +389,7 @@ fn promote_stalls_when_the_target_crashes_between_challenge_and_reply() {
     {
       proposed = Some(op);
     }
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+    tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
     if proposed.is_some() && c.membership_swaps_observed() >= 1 {
       break;
     }
@@ -419,6 +437,7 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
   c.set_storage_faults(StorageFaults::none());
 
   let mut dur = DurabilityChecker::new(c.replica_count());
+  let mut quorum = DurableQuorumChecker::new();
   let mut once = ReconfigureAppliedOnceChecker::new(c.replica_count());
   let mut lin = ConfigLineageChecker::new(c.replica_count());
 
@@ -427,7 +446,7 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
     if (0..c.client_count()).all(|i| c.client(i).is_done()) && c.serving_primary().is_some() {
       break;
     }
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+    tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
   }
   let p = c
     .serving_primary()
@@ -449,7 +468,14 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
   // (3) HELD: the predecessor quorum {primary, demotee} exists the whole time, yet the demote must
   // never commit or swap — no successor quorum has processed it.
   for t in 0..4_000 {
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, 100_000 + t);
+    tick_checked(
+      &mut c,
+      &mut dur,
+      &mut quorum,
+      &mut once,
+      &mut lin,
+      100_000 + t,
+    );
     assert_eq!(
       c.membership_swaps_observed(),
       0,
@@ -471,7 +497,14 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
   c.restart(survivor);
   let mut installed = false;
   for t in 0..120_000 {
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, 200_000 + t);
+    tick_checked(
+      &mut c,
+      &mut dur,
+      &mut quorum,
+      &mut once,
+      &mut lin,
+      200_000 + t,
+    );
     if c.membership_swaps_observed() > 0 {
       installed = true;
       break;
@@ -495,7 +528,14 @@ fn a_shrink_holds_uncommitted_until_a_successor_voter_quorum_acks_it() {
     {
       break;
     }
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, 400_000 + t);
+    tick_checked(
+      &mut c,
+      &mut dur,
+      &mut quorum,
+      &mut once,
+      &mut lin,
+      400_000 + t,
+    );
   }
   let m = c.serving_primary_membership();
   assert_eq!(m.replica_count(), 2, "the successor is the 2-voter config");
@@ -533,6 +573,7 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
   c.set_async_superblock_delay(Some(2));
 
   let mut dur = DurabilityChecker::new(c.replica_count());
+  let mut quorum = DurableQuorumChecker::new();
   let mut once = ReconfigureAppliedOnceChecker::new(c.replica_count());
   let mut lin = ConfigLineageChecker::new(c.replica_count());
 
@@ -547,7 +588,7 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
     {
       break;
     }
-    tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+    tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
   }
   assert_eq!(c.replica_voter_count(0), Some(3), "starts at 3 voters");
   assert!(
@@ -578,13 +619,14 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
       t < TICK_BUDGET,
       "the rotation exhausted its {TICK_BUDGET}-tick budget before reaching the target membership"
     );
-    // After a voter removal installs, the cluster may re-elect a primary in the new config. Wait
-    // for a serving primary before re-reading the live membership and planning the next step.
+    // After a step installs — a demotion or a promotion shifts the voting slots — the cluster may
+    // re-elect a primary in the new config. Wait for a serving primary before re-reading the live
+    // membership and planning the next step.
     for _ in 0..20_000 {
       if c.serving_primary().is_some() {
         break;
       }
-      tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+      tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
       t += 1;
     }
 
@@ -646,7 +688,7 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
           Err(e) => panic!("unexpected propose verdict for {step:?}: {e:?}"),
         }
       }
-      tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+      tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
       t += 1;
     }
     if let Some(op) = op {
@@ -662,7 +704,7 @@ fn planner_rotation_0_1_2_to_2_3_4_preserves_committed_continuity_under_load() {
           t < TICK_BUDGET,
           "the rotation exhausted its {TICK_BUDGET}-tick budget installing {step:?}"
         );
-        tick_checked(&mut c, &mut dur, &mut once, &mut lin, t);
+        tick_checked(&mut c, &mut dur, &mut quorum, &mut once, &mut lin, t);
         t += 1;
       }
     }
