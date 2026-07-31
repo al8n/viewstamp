@@ -2649,25 +2649,38 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     // clear the correlated SwapEpoch arm and the sync install perform; it re-establishes from a
     // fresh higher-epoch hint if the cluster is ahead of even this configuration.
     self.cross_epoch_intent = None;
-    if swap_completed {
+    // The op that produced this configuration. A swap this node STAGED carries it on the staging
+    // latch; an install driven purely by the landing — a superseded root, or one inherited from a
+    // dead incarnation across a restart in place — has no local latch, and the durable root names it
+    // (`config_install_op`, adopted just above) instead.
+    let op = if swap_completed {
       let (op, _successor) = self
         .pending_swap
         .take()
         .expect("just matched Some")
         .into_parts();
-      let self_is_learner = self
-        .local_slot_opt()
-        .is_some_and(|slot| self.membership.is_learner(slot));
-      self
-        .events
-        .push_back(Event::MembershipChanged(crate::MembershipChanged::new(
-          op,
-          epoch,
-          config_id,
-          still_voter,
-          self_is_learner,
-        )));
-    }
+      op
+    } else {
+      self.config_install_op
+    };
+    // EVERY configuration install is reported, not only one this node staged. The event is the
+    // embedder's sole notification that its own role changed, so a landing-driven install that
+    // stayed silent would demote a node from voter to learner — or change the configuration under
+    // it — with nothing observable to say so. Reporting it also keeps the epoch sequence an observer
+    // reconstructs from these events complete: a silent install leaves the observer's newest known
+    // configuration permanently behind the cluster's durable one.
+    let self_is_learner = self
+      .local_slot_opt()
+      .is_some_and(|slot| self.membership.is_learner(slot));
+    self
+      .events
+      .push_back(Event::MembershipChanged(crate::MembershipChanged::new(
+        op,
+        epoch,
+        config_id,
+        still_voter,
+        self_is_learner,
+      )));
   }
 
   /// Push a just-superseded `config_id` onto the recent-prior lineage ring (most-recent-first): shift
