@@ -404,10 +404,14 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// The EFFECTIVE root: the state of the last root on the timeline — the BACK of the root queue
   /// if any root is still in flight (submitted or parked), else the durable root. This is the state
   /// the medium is guaranteed to converge to once the queue drains (root completions arrive in
-  /// submission order and the last-submitted root wins), so it is the ONLY sound recovery baseline
-  /// for an endpoint rebuilt over this live session: a successor that baselined on the landed root
-  /// instead would come up BELOW a state already owed to the medium, and its own root writes would
-  /// then rewind the durable view/commit/checkpoint the moment an inherited root landed under it.
+  /// submission order and the last-submitted root wins), so it is the sound recovery baseline for
+  /// every field a rebuilt endpoint's own root writes stamp FROM LIVE MEMORY (`view`/`log_view`/
+  /// `commit`): a successor that baselined those on the landed root instead would come up BELOW a
+  /// state already owed to the medium, and its own root writes would then rewind the durable
+  /// view/commit the moment an inherited root landed under it. The remaining root fields (the
+  /// checkpoint pair and the configuration block) are instead COPIED FORWARD from here by every
+  /// root writer, so a rebuilt endpoint holds them at the LANDED root — what a crash actually
+  /// recovers — without its writes ever rewinding the timeline.
   /// Invariant during any window in which no new root is submitted: landings drain the queue's
   /// front without moving the back, and when the queue empties the durable root EQUALS the
   /// last-submitted one — so this value is stable across the drain, never a snapshot of a moment.
@@ -468,6 +472,28 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
       "a durable-root write would rewind the checkpoint pointer ({} below effective {})",
       state.checkpoint_op().get(),
       self.effective_checkpoint_pair().0.get(),
+    );
+    // The epoch/configuration half is monotone for the same reason the view is: landings arrive in
+    // queue order, so a root carrying an epoch below the timeline's would republish a superseded
+    // configuration underneath a swap the medium already guaranteed — the durable-membership rewind
+    // a crash then recovers. Every root writer sources this half from the timeline (recovery
+    // baselines the configuration on the landed root and copies an in-flight successor forward at
+    // submit), so a regression here is a caller bug, not a reachable state.
+    debug_assert!(
+      state.epoch() >= self.effective_root().epoch(),
+      "a durable-root write would rewind the durable epoch ({} below effective {})",
+      state.epoch().get(),
+      self.effective_root().epoch().get(),
+    );
+    // Scoped to a membership-BEARING effective root: a membership-less root carries no
+    // configuration history, so its `config_install_op` is a checkpoint-op alias (the decode
+    // default), not an install record a later root could rewind.
+    debug_assert!(
+      self.effective_root().membership_opt().is_none()
+        || state.config_install_op() >= self.effective_root().config_install_op(),
+      "a durable-root write would rewind the configuration install op ({} below effective {})",
+      state.config_install_op().get(),
+      self.effective_root().config_install_op().get(),
     );
     let parked = self.roots_submitted < self.roots.len()
       || self
@@ -539,15 +565,21 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
         } else if let Some(at) = self.roots.iter().position(|(fid, _)| fid == id) {
           // Root completions must arrive in submission order (the single-serialized-writer
           // contract), and a parked root has no completion to arrive at all; either shape here is
-          // a backend violation. Settle it anyway so the ledger drains, but surface the violation.
+          // a backend violation. Settle it anyway so the ledger drains — including releasing any
+          // parked tail whose fence this settlement retired, exactly as the in-order arm does,
+          // else the parked roots would strand with nothing left to release them (`has_inflight`
+          // true forever, `into_parts` refused forever) — then surface the violation. The settle
+          // precedes the assert so the ledger is coherent even at the panic point.
+          if at < self.roots_submitted {
+            self.roots_submitted -= 1;
+          }
+          let landed = self.roots.remove(at);
+          self.release_parked_roots();
           debug_assert!(
             false,
             "a root write completed out of submission order: {id:?} at queue position {at}"
           );
-          if at < self.roots_submitted {
-            self.roots_submitted -= 1;
-          }
-          self.roots.remove(at)
+          landed
         } else {
           debug_assert!(
             false,

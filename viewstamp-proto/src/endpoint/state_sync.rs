@@ -2119,52 +2119,62 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.cross_epoch_intent = None;
       self.quarantined_donor = None;
       self.quarantine_probe_deadline = None;
-      // Capture the laggard's own current `config_id` BEFORE the swap — its prior-config slot in the
-      // post-crossing lineage.
-      let own_prior_config_id = self.membership.config_id();
-      self.install_membership(now, None, successor);
-      // prev_epoch from the VERIFIED chain (the backward-link scalar, the analogue of the lineage-ring fix
-      // below). `install_membership` set `self.prev_epoch = old self.membership.epoch()` (the laggard's own
-      // stale epoch) — correct ONLY for a SINGLE-epoch crossing, where that IS the installed config's
-      // immediate predecessor. On a MULTI-epoch skip the predecessor is `successor.epoch() - 1` (E2→E1),
-      // NOT the laggard's stale E0; leaving E0 would record "E2 chains from epoch 0" while the ring above
-      // correctly says `[E1, E0]` — the contradiction a recovered node restores and the lineage checker
-      // reads as a fork. After `install_membership`, `self.membership` IS the successor, so its epoch is the
-      // crossing target; subtract one for the predecessor. This stamps the EXACT value
-      // `durable_root_with_successor` writes (`successor.epoch() - 1`), so a node recovering off that root
-      // restores the identical scalar. Single-epoch (`old epoch == successor.epoch() - 1`) is a no-op,
-      // byte-identical. Saturating to stay underflow-free; `apply_sync`'s strictly-forward check proved
-      // `successor.epoch() > self.membership.epoch() >= 0`, so a crossing has `successor.epoch() >= 1`.
-      self.prev_epoch = crate::Epoch::new(self.membership.epoch().get().saturating_sub(1));
-      // LINEAGE from the VERIFIED chain (the XI-b hash-chain fix). `install_membership`'s default
-      // `push_lineage` placed the laggard's own prior (`own_prior_config_id`) at the ring's slot 0 — correct
-      // ONLY for a SINGLE-epoch crossing, where that prior IS the installed config's immediate predecessor.
-      // On a MULTI-epoch skip (a retained E0 laggard syncing a successor verified against E1) the installed
-      // config's immediate predecessor is the VERIFIED `prev_config_id` (E1), NOT E0 — so push that on top,
-      // making the ring `[E1, E0, ..]` most-recent-first (the verified immediate predecessor, then the
-      // laggard's own prior). Without this the ring would be `[E0, ..]` and a later re-serve of the successor
-      // membership would chain it from E0, recomputing a `config_id` that NO fresh laggard expects — breaking
-      // the documented two-prior lineage window. The single-epoch case (`prev == own_prior`) takes neither
-      // extra push, byte-identical to before. On a wholesale crossing DEEPER than the ring (past more than
-      // [`LINEAGE_RING`] changes) the ring holds `[verified_prev, own_prior]` and simply OMITS the
-      // intermediate ancestors: the immediate predecessor is always present (the value a re-serve chains
-      // from, so the recent-lineage window stays correct), and only an agnostic solicitation carrying one of
-      // the SKIPPED-OVER intermediate `config_id`s goes un-admitted here — a bounded liveness nicety
-      // (state-sync is admitted on member identity regardless — `sender_admits_solicitation`), not a safety
-      // gap. The content verification that made the crossing sound never depended on the ring.
-      if let Some(verified_prev) = successor_prev_config_id
-        && verified_prev != own_prior_config_id
-      {
-        self.push_lineage(verified_prev);
+      // The re-persist root that carried this install to durability reached `on_sb_done`'s
+      // configuration absorb BEFORE this arm, so the membership is normally ALREADY installed off
+      // the recorded root — the same values `durable_root_with_successor` wrote, which are the
+      // values the fixups below recompute. Running the fixups a second time against the
+      // post-install state would corrupt the lineage (a duplicate push of the verified
+      // predecessor), so the whole recompute block runs only when the install is still owed; the
+      // crossing teardown below applies either way.
+      let already_installed = self.membership.config_id() == successor.config_id();
+      if !already_installed {
+        // Capture the laggard's own current `config_id` BEFORE the swap — its prior-config slot in the
+        // post-crossing lineage.
+        let own_prior_config_id = self.membership.config_id();
+        self.install_membership(now, None, successor);
+        // prev_epoch from the VERIFIED chain (the backward-link scalar, the analogue of the lineage-ring fix
+        // below). `install_membership` set `self.prev_epoch = old self.membership.epoch()` (the laggard's own
+        // stale epoch) — correct ONLY for a SINGLE-epoch crossing, where that IS the installed config's
+        // immediate predecessor. On a MULTI-epoch skip the predecessor is `successor.epoch() - 1` (E2→E1),
+        // NOT the laggard's stale E0; leaving E0 would record "E2 chains from epoch 0" while the ring above
+        // correctly says `[E1, E0]` — the contradiction a recovered node restores and the lineage checker
+        // reads as a fork. After `install_membership`, `self.membership` IS the successor, so its epoch is the
+        // crossing target; subtract one for the predecessor. This stamps the EXACT value
+        // `durable_root_with_successor` writes (`successor.epoch() - 1`), so a node recovering off that root
+        // restores the identical scalar. Single-epoch (`old epoch == successor.epoch() - 1`) is a no-op,
+        // byte-identical. Saturating to stay underflow-free; `apply_sync`'s strictly-forward check proved
+        // `successor.epoch() > self.membership.epoch() >= 0`, so a crossing has `successor.epoch() >= 1`.
+        self.prev_epoch = crate::Epoch::new(self.membership.epoch().get().saturating_sub(1));
+        // LINEAGE from the VERIFIED chain (the XI-b hash-chain fix). `install_membership`'s default
+        // `push_lineage` placed the laggard's own prior (`own_prior_config_id`) at the ring's slot 0 — correct
+        // ONLY for a SINGLE-epoch crossing, where that prior IS the installed config's immediate predecessor.
+        // On a MULTI-epoch skip (a retained E0 laggard syncing a successor verified against E1) the installed
+        // config's immediate predecessor is the VERIFIED `prev_config_id` (E1), NOT E0 — so push that on top,
+        // making the ring `[E1, E0, ..]` most-recent-first (the verified immediate predecessor, then the
+        // laggard's own prior). Without this the ring would be `[E0, ..]` and a later re-serve of the successor
+        // membership would chain it from E0, recomputing a `config_id` that NO fresh laggard expects — breaking
+        // the documented two-prior lineage window. The single-epoch case (`prev == own_prior`) takes neither
+        // extra push, byte-identical to before. On a wholesale crossing DEEPER than the ring (past more than
+        // [`LINEAGE_RING`] changes) the ring holds `[verified_prev, own_prior]` and simply OMITS the
+        // intermediate ancestors: the immediate predecessor is always present (the value a re-serve chains
+        // from, so the recent-lineage window stays correct), and only an agnostic solicitation carrying one of
+        // the SKIPPED-OVER intermediate `config_id`s goes un-admitted here — a bounded liveness nicety
+        // (state-sync is admitted on member identity regardless — `sender_admits_solicitation`), not a safety
+        // gap. The content verification that made the crossing sound never depended on the ring.
+        if let Some(verified_prev) = successor_prev_config_id
+          && verified_prev != own_prior_config_id
+        {
+          self.push_lineage(verified_prev);
+        }
+        // `install_membership(None, ..)` does not set `config_install_op` (a cross-epoch sync has no LOCAL
+        // reconfigure op — the laggard synced PAST it). Set it to the synced frontier `checkpoint_op`: the
+        // donor attached this successor only because ITS checkpoint reached the reconfigure op `N`, and the
+        // laggard's synced `checkpoint_op` equals that donor checkpoint, so `checkpoint_op >= N`. This is a
+        // safe, restart-survivable lower bound that lets this node (now a potential donor) re-serve E+1 at or
+        // above its own frontier while never offering it below it. `checkpoint_op` is the synced install op
+        // (`self.checkpoint_op` is advanced to it just below, in this same call).
+        self.config_install_op = checkpoint_op;
       }
-      // `install_membership(None, ..)` does not set `config_install_op` (a cross-epoch sync has no LOCAL
-      // reconfigure op — the laggard synced PAST it). Set it to the synced frontier `checkpoint_op`: the
-      // donor attached this successor only because ITS checkpoint reached the reconfigure op `N`, and the
-      // laggard's synced `checkpoint_op` equals that donor checkpoint, so `checkpoint_op >= N`. This is a
-      // safe, restart-survivable lower bound that lets this node (now a potential donor) re-serve E+1 at or
-      // above its own frontier while never offering it below it. `checkpoint_op` is the synced install op
-      // (`self.checkpoint_op` is advanced to it just below, in this same call).
-      self.config_install_op = checkpoint_op;
       // CONSUME any LOCAL staged swap this crossing SUPERSEDED. A laggard can commit a `Reconfigure` op
       // and stage `pending_swap` (the successor membership), enter ViewChange before its SwapEpoch root
       // installs, then get crossed cross-epoch by a higher-epoch heartbeat: `enter_cross_epoch_peer_fetch`

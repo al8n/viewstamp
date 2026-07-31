@@ -261,8 +261,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // a root whose correlation was superseded by a view transition (the write itself cannot be
       // superseded; its landing is a medium fact). The monotone max never runs the witness ahead
       // of the live view: the root queue is view-monotone (asserted at submit), every queued view
-      // is at most the view its submitter held, and both recovery baselines and live transitions
-      // keep `self.view` at or above the timeline's back.
+      // is at most the view its submitter held, and every path that SETS `self.view` downward
+      // floors it at the timeline's back — recovery baselines on the effective root, and the
+      // catch-up revert lands there too rather than on the landed root.
       self.durable_view = self.durable_view.max(state.view());
       debug_assert!(
         self.durable_view <= self.view,
@@ -270,6 +271,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         self.durable_view.get(),
         self.view.get(),
       );
+      // The CONFIGURATION half of the same absorb: a landed root carrying an epoch ahead of memory
+      // is the durable proof the epoch fence was waiting for — own, superseded, or inherited — so
+      // the successor configuration installs HERE, at the landing, on every path. (The correlated
+      // arms below re-reach `install_membership` and no-op on its already-installed guard; with no
+      // epoch-advancing landing this is a no-op and every off-axis path is unchanged.)
+      self.adopt_landed_configuration(now, state);
       // An INHERITED root landing: a dead incarnation's root write just became the durable root.
       // The session settled the timeline before this router saw the completion, and the landed
       // state rides alongside it — the refused foreign completion itself carries none. Absorb the
@@ -481,6 +488,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               *successor_prev_config_id,
             ),
             None => self.durable_root(
+              // The effective configuration rides this checkpoint root exactly as it rides a
+              // view-change root: an inherited epoch-advancing root can be in flight ahead of an
+              // ordinary checkpoint a rebuilt successor started, and the copy-forward keeps this
+              // root from republishing the predecessor configuration over the swap's landing.
+              &storage.effective_root(),
               self.view,
               self.log_view,
               root_commit,
@@ -846,6 +858,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the `SwapEpoch` arm's deferral leaves that same debt owed.
   pub(crate) fn force_checkpoint<W: Wal, B: Superblock>(&mut self, storage: &mut Storage<W, B, S>) {
     if storage.materialize_owed() {
+      return;
+    }
+    // Never start a checkpoint BELOW the timeline's checkpoint frontier. A rebuilt endpoint
+    // baselines `checkpoint_op` on the LANDED root, so while an inherited checkpoint root is still
+    // in flight the cadence boundary can fall below the checkpoint that root carries — and a
+    // checkpoint produced there would submit a root the session refuses as a checkpoint rewind.
+    // Defer instead: the inherited landing raises `inherited_frontier`, the commit tails adopt it,
+    // and every force site re-fires on its own sticky cadence at/above the timeline. (With nothing
+    // epoch- or checkpoint-advancing in flight the effective pair is this endpoint's own and this
+    // never fires.)
+    if storage.effective_checkpoint_pair().0 > self.commit_min {
       return;
     }
     // Checkpoint at `commit_min` (a committed+applied boundary), not at the raw `boundary` op:
@@ -1474,10 +1497,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // assembled from `self.checkpoint_op` plus a freshly-read durable `checkpoint_id` minted a
     // mixed pair in. The persisted `checkpoint_op` is monotone non-decreasing across all
     // concurrent writers (the session asserts it at submit); `commit` + the band below derive
-    // from it.
-    let (checkpoint_op, checkpoint_id) = storage.effective_checkpoint_pair();
+    // from it. The same read hands `durable_root` the effective CONFIGURATION, copied forward the
+    // same way when an in-flight epoch swap is ahead of memory.
+    let effective = storage.effective_root();
+    let (checkpoint_op, checkpoint_id) = (effective.checkpoint_op(), effective.checkpoint_id());
     let commit = OpNumber::with(self.commit_max.get().max(checkpoint_op.get()));
     let state = self.durable_root(
+      &effective,
       self.view,
       self.log_view,
       // Persist `commit` — the KNOWN-committed frontier `commit_max` — as the durable `VsrState` commit,
@@ -1541,8 +1567,23 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// membership.epoch` holds by construction. The scalar/header invariants are the same ones
   /// [`VsrState::try_new`] checked (`log_view <= view`, `commit >= checkpoint_op`, in-band ascending
   /// headers); a violation is a caller bug, so this `expect`s like the prior `try_new` did.
+  ///
+  /// **The configuration block is copied forward from the session's EFFECTIVE root whenever the
+  /// timeline is ahead of memory** — the epoch analogue of the checkpoint-pair copy-forward.
+  /// In-memory configuration lags the timeline for exactly as long as an epoch-advancing root is
+  /// still in flight (a staged swap's own root, one a view transition superseded, or a dead
+  /// incarnation's inherited across a restart in place): the successor membership installs only at
+  /// that root's landing, so a root minted inside the window from memory alone would carry the
+  /// PREDECESSOR configuration and land AFTER the successor root — a durable-membership rewind
+  /// whose recovery baseline then forgets a committed reconfiguration outright (the committed
+  /// `Reconfigure` op is below the recovered commit, so nothing ever re-stages the swap). The
+  /// session refuses such a root at submit; this copy-forward is what makes every writer conform.
+  /// With no epoch-advancing root in flight the effective configuration IS this endpoint's and the
+  /// selection is the identity, so every path off the reconfiguration axis is unchanged.
+  #[allow(clippy::too_many_arguments)] // the durable root's own field set, in root order
   fn durable_root(
     &self,
+    effective: &crate::VsrState,
     view: View,
     log_view: View,
     commit: OpNumber,
@@ -1550,6 +1591,33 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     checkpoint_id: u128,
     committed_headers: std::vec::Vec<Header>,
   ) -> crate::VsrState {
+    let (epoch, prev_epoch, membership, lineage, config_install_op) =
+      match effective.membership_opt() {
+        Some(ahead) if ahead.epoch() > self.membership.epoch() => (
+          effective.epoch(),
+          effective.prev_epoch(),
+          ahead.clone(),
+          // The recorded post-swap ring, verbatim: the in-flight root's writer already built the
+          // push this endpoint's install will perform at the landing, so carrying it forward keeps
+          // the durable lineage identical whichever of the two roots a recovery reads.
+          effective.prior_config_ids().to_vec(),
+          effective.config_install_op(),
+        ),
+        _ => (
+          self.membership.epoch(),
+          self.prev_epoch,
+          self.membership.clone(),
+          // The CURRENT recent-prior lineage ring (the membership written here is the current one), so a
+          // node recovering off this root restores the superseded-ancestor ids and keeps admitting a retained
+          // laggard's cross-epoch catch-up.
+          self.lineage.to_vec(),
+          // The op that produced the CURRENT membership (this root stamps `self.membership`), so a recovered
+          // donor restores the cross-epoch serve gate. Once a checkpoint advances PAST a prior swap's
+          // reconfigure op, the next `durable_root` carries the same `config_install_op` with a higher
+          // `checkpoint_op`, so the gate flips from withhold to serve at exactly the right checkpoint.
+          self.config_install_op,
+        ),
+      };
     crate::VsrState::try_new_v4(
       view,
       log_view,
@@ -1557,18 +1625,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       checkpoint_op,
       checkpoint_id,
       committed_headers,
-      self.membership.epoch(),
-      self.prev_epoch,
-      self.membership.clone(),
-      // The CURRENT recent-prior lineage ring (the membership written here is the current one), so a
-      // node recovering off this root restores the superseded-ancestor ids and keeps admitting a retained
-      // laggard's cross-epoch catch-up.
-      self.lineage.to_vec(),
-      // The op that produced the CURRENT membership (this root stamps `self.membership`), so a recovered
-      // donor restores the cross-epoch serve gate. Once a checkpoint advances PAST a prior swap's
-      // reconfigure op, the next `durable_root` carries the same `config_install_op` with a higher
-      // `checkpoint_op`, so the gate flips from withhold to serve at exactly the right checkpoint.
-      self.config_install_op,
+      epoch,
+      prev_epoch,
+      membership,
+      lineage,
+      config_install_op,
     )
     // The vouched carried-log floor, raised to this root's own checkpoint: a checkpoint root is built
     // with a `checkpoint_op` param that may be AHEAD of the live `self.checkpoint_op` (the in-memory

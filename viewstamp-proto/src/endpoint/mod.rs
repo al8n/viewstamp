@@ -2392,6 +2392,15 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     S: StateMachine,
     R: Reconfig,
   {
+    // ALREADY INSTALLED: the configuration absorb in `on_sb_done` adopts a landed root's
+    // configuration before the correlated completion arms run, so a `SwapEpoch` action or a sync
+    // install can find the successor already in place. Re-running the swap would corrupt the
+    // lineage (`prev_epoch` would take the successor's own epoch; the ring would gain a duplicate
+    // push) and re-emit the event, so the second install is a no-op. `config_id` is a chain hash,
+    // so equality means the identical configuration AND history.
+    if successor.config_id() == self.membership.config_id() {
+      return;
+    }
     // A commit-first swap (`Some` reconfigure op) installs a successor the commit-time fence already
     // admitted (`commit_reconfigure`: every successor voter is a member of the predecessor), and
     // `self.membership` IS still that predecessor here — a staged swap pins it until this install (a
@@ -2411,10 +2420,68 @@ impl<S: StateMachine, R> Endpoint<S, R> {
           .is_none(),
       "a commit-first swap must never install a successor seating a brand-new voter"
     );
+    let prior_config_id = self.membership.config_id();
+    self.prev_epoch = self.membership.epoch();
+    let epoch = successor.epoch();
+    let config_id = successor.config_id();
+    let still_voter = self.swap_membership_in_place(now, successor);
+    // Push the superseded config_id onto the recent-prior lineage ring (most-recent-first), so
+    // `in_lineage` keeps admitting a bounded window of recent ancestors for live cross-epoch catch-up.
+    self.push_lineage(prior_config_id);
+    // Record the op that produced THIS membership so the cross-epoch state-sync serve gate
+    // (`checkpoint_op >= config_install_op`) holds. A commit-first swap (`Some(op)`) names its committed
+    // `Reconfigure` op `N` — until this node's checkpoint reaches `N` it must NOT serve E+1 to a laggard
+    // (the laggard would install E+1 below `N`, without the committed prefix through `N`). A cross-epoch
+    // state-sync install (`None`) sets it to the synced frontier separately in `install_sync` — that
+    // frontier is at/above the donor's `N` (the donor served it only because its own checkpoint reached
+    // `N`), so it is a safe, restart-survivable lower bound.
+    if let Some(op) = reconfigure_op {
+      self.config_install_op = op;
+    }
+    // Emit MembershipChanged only for a commit-first swap (`Some` reconfigure op). A cross-epoch
+    // state-sync install (`None`) has no LOCAL Reconfigure op to name — the laggard synced PAST it — so
+    // naming the sync frontier (a client op) would misreport the consensus-layer applied gap to an
+    // observer; the swap is observable via the sync completion + the installed membership, and the real
+    // Reconfigure op is reported by the replicas that committed it directly. The observer still learns
+    // THIS node's role under the new configuration purely from the committed membership.
+    if let Some(op) = reconfigure_op {
+      let self_is_learner = self
+        .local_slot_opt()
+        .is_some_and(|slot| self.membership.is_learner(slot));
+      self
+        .events
+        .push_back(Event::MembershipChanged(crate::MembershipChanged::new(
+          op,
+          epoch,
+          config_id,
+          still_voter,
+          self_is_learner,
+        )));
+    }
+  }
+
+  /// The in-place membership-swap core shared by every installer. Captures the abdication
+  /// precondition against the OLD membership, drops the configuration-scoped transient state (the
+  /// learner-promote challenge, the voter-liveness-probe round, the nack tally, an in-progress DVC
+  /// tally), re-keys the surviving slot-indexed quorum accumulators through the
+  /// predecessor→successor `MemberId` mapping, swaps the membership in, refreshes the cached
+  /// quorum-checkpoint statistic, and retires or re-arms the role cadences. Returns whether this
+  /// node is still a VOTER under the successor.
+  ///
+  /// The caller owes the LINEAGE bookkeeping (`prev_epoch`, the ring push, `config_install_op`)
+  /// and the observability event: the two installers source those differently —
+  /// [`Self::install_membership`] recomputes them for a live single-step install, while the
+  /// landed-root adoption ([`Self::adopt_landed_configuration`]) takes them verbatim off the
+  /// durable root, which on a multi-epoch sync crossing records links a single-step recompute
+  /// cannot reproduce.
+  fn swap_membership_in_place(&mut self, now: Instant, successor: Membership) -> bool
+  where
+    S: StateMachine,
+    R: Reconfig,
+  {
     // Capture the abdication precondition (hazard a) against the OLD membership, BEFORE the swap:
     // was this node the primary of its current view? (Robust to an already-absent local member.)
     let was_primary = self.is_primary();
-    let prior_config_id = self.membership.config_id();
     // Drop any outstanding learner-promote-proof challenge across the epoch swap: it was minted under
     // the OLD configuration, so a pre-swap reply must never validate a post-swap mint. The reply's
     // `(epoch, config_id)` binding is the structural backstop (a proof for the predecessor config never
@@ -2426,9 +2493,18 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     // cannot reuse a prior configuration's liveness evidence (the `(epoch, config_id)` reply binding is
     // the backstop; this is the explicit clear).
     self.health_probe = None;
-    self.prev_epoch = self.membership.epoch();
-    let epoch = successor.epoch();
-    let config_id = successor.config_id();
+    // A mid-ViewChange install re-scopes the vote collection: DVCs gathered under the predecessor
+    // configuration are keyed by its slot layout and counted against its quorum, so they must never
+    // form a successor-configuration quorum — the same hazard the `inflight.oks` re-key below closes
+    // for commit votes, resolved by CLEARING (the nack-tally precedent: votes are cheap to
+    // re-gather). The strict epoch admission refuses further predecessor-epoch DVCs after the swap,
+    // and the senders' retransmit cadence re-casts successor-epoch ones. A completed formation
+    // (`dvc_quorum`) already consumed its votes, so there is nothing left to miscount.
+    if let Some(vc) = self.view_change.as_mut()
+      && !vc.dvc_quorum
+    {
+      vc.dvc_from.clear();
+    }
     // Re-key the slot-indexed quorum accumulators that SURVIVE this in-place swap (the commit-first
     // SwapEpoch landing runs on the still-Normal primary; `inflight`/`svc_from` are NOT cleared on the
     // retained-node path) through the predecessor->successor MemberId mapping, BEFORE swapping the
@@ -2454,19 +2530,6 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     // behavior is byte-identical.)
     self.nack_from.clear();
     self.membership = successor;
-    // Push the superseded config_id onto the recent-prior lineage ring (most-recent-first), so
-    // `in_lineage` keeps admitting a bounded window of recent ancestors for live cross-epoch catch-up.
-    self.push_lineage(prior_config_id);
-    // Record the op that produced THIS membership so the cross-epoch state-sync serve gate
-    // (`checkpoint_op >= config_install_op`) holds. A commit-first swap (`Some(op)`) names its committed
-    // `Reconfigure` op `N` — until this node's checkpoint reaches `N` it must NOT serve E+1 to a laggard
-    // (the laggard would install E+1 below `N`, without the committed prefix through `N`). A cross-epoch
-    // state-sync install (`None`) sets it to the synced frontier separately in `install_sync` — that
-    // frontier is at/above the donor's `N` (the donor served it only because its own checkpoint reached
-    // `N`), so it is a safe, restart-survivable lower bound.
-    if let Some(op) = reconfigure_op {
-      self.config_install_op = op;
-    }
     // The voter set changed, so the quorum-checkpoint inputs (which member holds each voter slot)
     // changed: refresh the cached order statistic the GC prune floor / force-sync trigger read. No
     // explicit prune of `peer_checkpoint` is needed — it is keyed by stable `MemberId`, and both floor
@@ -2526,13 +2589,72 @@ impl<S: StateMachine, R> Endpoint<S, R> {
       self.timers.forfeit_armed = None;
       self.arm_timers(now);
     }
-    // Emit MembershipChanged only for a commit-first swap (`Some` reconfigure op). A cross-epoch
-    // state-sync install (`None`) has no LOCAL Reconfigure op to name — the laggard synced PAST it — so
-    // naming the sync frontier (a client op) would misreport the consensus-layer applied gap to an
-    // observer; the swap is observable via the sync completion + the installed membership, and the real
-    // Reconfigure op is reported by the replicas that committed it directly. The observer still learns
-    // THIS node's role under the new configuration purely from the committed membership.
-    if let Some(op) = reconfigure_op {
+    still_voter
+  }
+
+  /// Adopt the configuration a just-landed durable root carries when it is ahead of memory — the
+  /// configuration half of the landing absorb in [`Self::on_sb_done`], the epoch twin of the
+  /// durable-view lift. The landed root IS the durable proof durable-epoch-before-participate
+  /// requires, so this is the one installer that waits for no correlated completion: it covers a
+  /// swap root whose correlation a view transition superseded (the write outlives its
+  /// `pending_sb` entry) and a dead incarnation's inherited landing (a rebuild inside the swap
+  /// window, where recovery came up at the LANDED root's configuration and this landing is the
+  /// proof it was waiting for). It is what keeps "the membership installs only off a durable root
+  /// landing" true on every path — including the correlated ones, whose arms re-reach
+  /// [`Self::install_membership`] and no-op on its already-installed guard.
+  ///
+  /// The lineage block (`prev_epoch`, the prior-config ring, `config_install_op`) is adopted
+  /// VERBATIM off the root rather than recomputed: a landed sync-successor root can sit several
+  /// epochs ahead of memory, where a single-step recompute would record a wrong backward link —
+  /// and for a single-step swap root the recorded block equals the recompute by construction (the
+  /// root's writer stamped exactly the push its own install would have performed).
+  ///
+  /// `MembershipChanged` is emitted iff the landing completes this endpoint's own staged swap
+  /// (`pending_swap` names the same successor), which is CONSUMED here: the staging latch is the
+  /// one unambiguous witness that this root is the commit-first swap of a `Reconfigure` op this
+  /// node committed, and it carries that op's number for the event. Any other adoption (an
+  /// inherited landing on a successor endpoint that never re-staged, a multi-epoch crossing root)
+  /// is deliberately event-less, exactly like a cross-epoch sync install — there is no local
+  /// `Reconfigure` op to name, and the configuration change stays observable through the
+  /// installed membership.
+  fn adopt_landed_configuration(&mut self, now: Instant, state: &crate::VsrState)
+  where
+    S: StateMachine,
+    R: Reconfig,
+  {
+    let Some(successor) = state.membership_opt() else {
+      return;
+    };
+    if successor.epoch() <= self.membership.epoch() {
+      return;
+    }
+    let successor = successor.clone();
+    let epoch = successor.epoch();
+    let config_id = successor.config_id();
+    let swap_completed = self
+      .pending_swap
+      .as_ref()
+      .is_some_and(|swap| swap.successor().config_id() == config_id);
+    let still_voter = self.swap_membership_in_place(now, successor);
+    // The recorded lineage block, verbatim. The ring pads unrecorded slots with the (new) current
+    // `config_id` — a harmless self-duplicate that admits nothing extra — exactly as recovery does.
+    self.prev_epoch = state.prev_epoch();
+    let mut lineage = [self.membership.config_id(); LINEAGE_RING];
+    for (slot, id) in lineage.iter_mut().zip(state.prior_config_ids()) {
+      *slot = *id;
+    }
+    self.lineage = lineage;
+    self.config_install_op = state.config_install_op();
+    // Crossing into the durably-proven configuration meets any owed cross-epoch intent — the same
+    // clear the correlated SwapEpoch arm and the sync install perform; it re-establishes from a
+    // fresh higher-epoch hint if the cluster is ahead of even this configuration.
+    self.cross_epoch_intent = None;
+    if swap_completed {
+      let (op, _successor) = self
+        .pending_swap
+        .take()
+        .expect("just matched Some")
+        .into_parts();
       let self_is_learner = self
         .local_slot_opt()
         .is_some_and(|slot| self.membership.is_learner(slot));
@@ -3119,8 +3241,11 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     // is GATED on the durable view, so the swap WAITS — with possibly no write outstanding — until the
     // view settles, at which point the durable-view root's `on_sb_done` (or a commit tail on the
     // `catch_up_to_view` path) re-submits it. So the "write outstanding" obligation only binds in a settled
-    // view. The durable-epoch-before-participate fence holds throughout: the membership installs only at a
-    // durable SwapEpoch root, so while staged the epoch is still the predecessor's.
+    // view. The durable-epoch-before-participate fence holds throughout: the membership installs only at
+    // an epoch-advancing root's LANDING. (The landing can precede the staged swap's cleanup — a
+    // superseded swap root lands, the absorb installs and consumes a matching staged swap, and a
+    // non-matching stale one is dropped by `maybe_swap_epoch`'s chain guard at the next slot — so
+    // "staged" no longer implies "still at the predecessor epoch", only "not yet cleaned up".)
     debug_assert!(
       self.pending_swap.is_none()
         || self.pending_sb.is_some()
@@ -3522,9 +3647,12 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   ///   not apply, so a SwapEpoch must NOT suppress the primary's participation: the primary must keep
   ///   committing + heartbeating AT the predecessor epoch through the stage→durable-root window, so backups
   ///   learn the `Reconfigure` op committed, stage their OWN swap, and converge. Durable-EPOCH-before-
-  ///   participate is preserved separately and structurally — [`Self::install_membership`] (the swap to the
-  ///   successor) runs ONLY at `on_sb_done` once the durable root lands, so no node ever participates at the
-  ///   new epoch without its durable proof.
+  ///   participate is preserved separately and structurally — the successor configuration installs ONLY
+  ///   at `on_sb_done` on an epoch-advancing root LANDING (the configuration adoption in the landing
+  ///   absorb; the correlated swap/sync arms re-reach [`Self::install_membership`] and no-op on its
+  ///   already-installed guard), and recovery resolves the configuration from the LANDED root — so no
+  ///   node ever participates at the new epoch without its durable proof, on the live path and the
+  ///   rebuild path alike.
   /// - [`PendingSbAction::Seal`] persists `commit_max` + committed-band headers; the view is durable through
   ///   it too, and the Tier C protocol has already quiesced the primary, so excluding it is inert.
   ///
@@ -6194,21 +6322,23 @@ where
     self.assert_invariants();
     // The checkpoint-lockstep invariant as a single typed assertion rather than N per-writer
     // floors: when the checkpoint frontier is SETTLED, the in-memory `self.checkpoint_op` EQUALS
-    // the EFFECTIVE root's `checkpoint_op()` — the session's timeline, not the landed root, which
-    // an inherited in-flight checkpoint root legitimately lags (recovery baselines on the
-    // effective root, so the in-memory pointer leads the landed one exactly until that landing
-    // settles). No-rewind itself no longer rests on this equality — every durable-root writer
-    // sources its checkpoint pair from the session's effective root, and the session asserts
-    // monotonicity at submit — so this is the lockstep's OWN witness: any path that advances one
-    // side without the other (or without recording the owed catch-up that explains the lead)
-    // trips here rather than surfacing as a divergent pointer three views later.
+    // the LANDED root's `checkpoint_op()` — the pointer never leads what a crash would recover
+    // (recovery baselines it on the landed root; every advance runs at a root landing or behind
+    // one), which is also what makes the GC prune floor structurally safe: `run_gc` prunes at a
+    // pointer the durable root already names, so the floor cannot outrun the recovery point.
+    // No-rewind itself does not rest on this equality — every durable-root writer sources its
+    // checkpoint pair from the session's effective root, and the session asserts monotonicity at
+    // submit — so this is the lockstep's OWN witness: any path that advances one side without the
+    // other (or without recording the owed catch-up that explains the lag) trips here rather than
+    // surfacing as a divergent pointer three views later.
     // Excluded windows, each a TRACKED owed catch-up: an own checkpoint mid-flight
-    // (`pending_checkpoint` — both sides sit at the OLD value until its root lands); an owed
+    // (`pending_checkpoint` — the in-memory side advances only at the root's landing, but a
+    // SyncRepersist stages install state the landed side leads mid-window); an owed
     // SM-content reconstruction (`sm_reconstruct` — `self.checkpoint_op` is already M while the SM
     // catches up, still consistent with the durable root that names M); and an owed INHERITED
-    // frontier (`inherited_frontier` — a dead incarnation's landed root advanced the durable
-    // pointer past this endpoint's own across a restart in place, and the pointer is adopted the
-    // moment `commit_min` reaches it, `maybe_adopt_inherited_frontier`).
+    // frontier (`inherited_frontier` — an inherited landing advanced the durable pointer past this
+    // endpoint's own across a restart in place, and the pointer is adopted the moment `commit_min`
+    // reaches it, `maybe_adopt_inherited_frontier`).
     #[cfg(debug_assertions)]
     if self.pending_checkpoint.is_none()
       && self.sm_reconstruct.is_none()
@@ -6216,10 +6346,10 @@ where
     {
       debug_assert_eq!(
         self.checkpoint_op,
-        storage.effective_checkpoint_pair().0,
-        "settled in-memory checkpoint_op {} != effective {}",
+        storage.sb().state().checkpoint_op(),
+        "settled in-memory checkpoint_op {} != landed {}",
         self.checkpoint_op.get(),
-        storage.effective_checkpoint_pair().0.get(),
+        storage.sb().state().checkpoint_op().get(),
       );
     }
   }

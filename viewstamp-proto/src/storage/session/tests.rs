@@ -486,6 +486,94 @@ fn a_root_below_the_effective_view_is_refused() {
   s.submit_root(WriteId::new(2, 1), root_at_view(2, 0, 0));
 }
 
+/// A v4 root at `(view, epoch)` — its membership carries three voters and chains from `config_id`.
+fn root_at_epoch(view: u64, epoch: u64, config_id: u128) -> VsrState {
+  let membership = crate::Membership::from_durable_parts(
+    crate::Epoch::new(epoch),
+    3,
+    0,
+    (0..3).map(crate::MemberId::new).collect(),
+    config_id,
+  )
+  .expect("a well-formed test membership");
+  VsrState::try_new_v4(
+    View::with(view),
+    View::with(view),
+    OpNumber::new(),
+    OpNumber::new(),
+    0,
+    Vec::new(),
+    crate::Epoch::new(epoch),
+    crate::Epoch::new(epoch.saturating_sub(1)),
+    membership,
+    Vec::new(),
+    OpNumber::new(),
+  )
+  .expect("a well-formed test root")
+}
+
+#[test]
+#[should_panic(expected = "rewind the durable epoch")]
+fn a_root_below_the_effective_epoch_is_refused() {
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  // An in-flight SwapEpoch root carries the successor configuration at epoch 1.
+  s.submit_root(WriteId::new(1, 1), root_at_epoch(2, 1, 7));
+  // A root sourcing its configuration from state that lags the timeline (the writer's memory
+  // before the swap installed, or a recovery baselined on a stale root) would land AFTER the swap
+  // and republish the predecessor epoch — the durable-membership rewind. The view RISES here, so
+  // only the epoch check can refuse it.
+  s.submit_root(WriteId::new(1, 2), root_at_epoch(3, 0, 3));
+}
+
+#[test]
+fn an_out_of_order_landing_still_releases_the_parked_tail() {
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  let dead = WriteId::new(1, 1);
+  s.submit_root(dead, root_at_view(2, 0, 0));
+  let parked = WriteId::new(2, 1);
+  s.submit_root(parked, root_at_view(3, 0, 0));
+  assert_eq!(
+    s.sb_mut().staged_roots.len(),
+    1,
+    "the successor's root is parked behind the foreign one"
+  );
+  // A single out-of-order completion always leaves the parked tail's blocker in the queue (the
+  // front retires through the in-order arm), so the stranding shape needs the COMPOUND violation:
+  // a backend that already desynced the submitted count. Construct that state directly — it is
+  // exactly what the settle-anyway branch exists to drain.
+  s.roots_submitted = 0;
+  s.sb_mut().done.push_back(SuperblockDone::Wrote(dead));
+  let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.poll_sb()));
+  assert!(
+    polled.is_err(),
+    "the out-of-order landing surfaces the contract violation"
+  );
+  // The violating landing was settled BEFORE the panic surfaced it, and the settlement released
+  // the parked root to the backend — without the release nothing else ever would (the parked
+  // entry has no completion of its own to arrive), so `has_inflight` would hold forever.
+  assert_eq!(
+    s.sb_mut().staged_roots.len(),
+    2,
+    "settling the out-of-order landing released the parked tail"
+  );
+  // Drop the violating landing's stale stage entry (its completion already arrived above), then
+  // land the released root: it completes in order and drains the ledger.
+  let stale = s
+    .sb_mut()
+    .staged_roots
+    .pop_front()
+    .expect("the stale stage entry");
+  assert_eq!(stale.0, dead);
+  s.sb_mut().land_root();
+  assert!(
+    s.poll_sb()
+      .expect("the released root lands")
+      .landed_root
+      .is_some()
+  );
+  assert!(!s.has_inflight(), "the ledger drained");
+}
+
 #[test]
 fn an_envelope_landing_settles_without_claiming_the_root_timeline() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());

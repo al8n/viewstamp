@@ -686,8 +686,8 @@ fn the_swap_epoch_root_durably_records_the_reconfigure_op_as_committed() {
 fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
   // End-to-end: after the primary stages+writes the SwapEpoch root (but BEFORE it installs in memory),
   // a crash+recover off that durable root must read the reconfigure op as committed (`commit_max`).
-  // The recovered node holds the predecessor membership (the swap was never installed), and the
-  // committed reconfigure op sits durably in its log — so re-reaching it re-stages the swap. The
+  // The synchronous `TestSb` published the SwapEpoch root at submit, so the recovered node resolves
+  // the SUCCESSOR membership off it (the landed root is the configuration authority). The
   // load-bearing property here is that the recovered `commit_max` covers the op (no committed-loss).
   let (_e, mut storage, op, _successor, _payload) = proposed_and_committed_swap();
   let cfg = Config::try_new(0, MemberId::new(0)).expect("valid cluster config");
@@ -708,6 +708,103 @@ fn a_recovery_from_the_swap_epoch_root_reads_the_reconfigure_op_as_committed() {
     "recovery reads the reconfigure op (op {}) as committed (commit_max {}), so it is never lost",
     op.get(),
     r.commit_max().get(),
+  );
+}
+
+#[test]
+fn a_view_change_entered_inside_the_swap_window_carries_the_successor_configuration_forward() {
+  // The durable-membership rewind falsifier. A committed reconfiguration's SwapEpoch root is with
+  // the device when a view change intervenes: the view transition supersedes the swap root's
+  // correlation but not the write itself, and the view-change root is minted while memory still
+  // names the PREDECESSOR (the successor installs only at the swap root's landing). Minted from
+  // memory alone, the view-change root would land AFTER the successor root (completions are FIFO)
+  // and rewind the durable epoch/membership — and a crash inside that window recovers the
+  // predecessor with the reconfigure op already below its commit, so nothing ever re-stages the
+  // swap: the committed change is durably lost. The view-change root must therefore carry the
+  // successor configuration forward off the session timeline.
+  let mut e = single_change_primary();
+  let (wal, sb) = (TestWal::default(), StepSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+
+  let successor = e
+    .membership
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner is a valid delta on a 3-voter cluster");
+  let payload = ReconfigurePayload::from_membership(&successor, 0);
+  let op = e
+    .propose_membership(
+      now,
+      &mut storage,
+      SingleVoterDelta::AddLearner(MemberId::new(3)),
+      None,
+    )
+    .expect("the primary mints the reconfiguration op");
+  while e.poll_message().is_some() {}
+  // The primary's own append lands (the WAL is synchronous); the superblock writes stay in flight.
+  e.storage_step(now, &mut storage, &mut blocks);
+  // One backup ack commits the op and submits the SwapEpoch root — still with the device.
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(1)),
+    reconfigure_ack(op.get(), &payload, 1),
+  );
+  assert!(
+    e.pending_swap_for_test(),
+    "the successor is staged, its root in flight"
+  );
+  assert_eq!(
+    e.membership.epoch(),
+    crate::Epoch::new(0),
+    "memory still names the predecessor while the swap root is in flight"
+  );
+
+  // A view change intervenes before the swap root lands: one peer proposal joins this primary's
+  // own StartViewChange bit into the 2-of-3 quorum, and the view-1 durable-view root is submitted
+  // BEHIND the in-flight SwapEpoch root.
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(1)),
+    Message::StartViewChange(crate::StartViewChange::new(
+      View::with(1),
+      ReplicaId::new(1),
+      crate::Epoch::new(0),
+      0,
+    )),
+  );
+  assert_eq!(e.status(), Status::ViewChange);
+  while e.poll_message().is_some() {}
+
+  // Both roots land in submission order. The LAST landing is the view-change root, so whatever
+  // configuration it carries is what a crash from here recovers.
+  storage.sb_mut().flush();
+  e.storage_step(now, &mut storage, &mut blocks);
+  let durable = storage.sb().state();
+  assert_eq!(
+    durable.view(),
+    View::with(1),
+    "the view-change root landed last"
+  );
+  assert_eq!(
+    durable.epoch(),
+    crate::Epoch::new(1),
+    "the view-change root carried the in-flight successor epoch forward — the durable epoch never regressed"
+  );
+  assert_eq!(
+    durable
+      .membership_opt()
+      .expect("the view-change root carries a membership")
+      .config_id(),
+    successor.config_id(),
+    "the successor membership rode the view-change root"
+  );
+  assert_eq!(
+    durable.config_install_op(),
+    op,
+    "the reconfigure op that produced the successor is recorded for the cross-epoch serve gate"
   );
 }
 
@@ -1121,9 +1218,12 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
   //
   // The FIX is two complementary parts: (1) `maybe_swap_epoch` validates the staged successor still
   // CHAINS from the live config (`recompute_config_id(.., self.membership.config_id()) ==
-  // successor.config_id()`) and DROPS a stale swap; (2) the crossing install CONSUMES `pending_swap`
-  // directly. This test pins that the crossing leaves NO second SwapEpoch root, NO double lineage push,
-  // NO bogus `MembershipChanged`, and the legitimate ancestors are retained.
+  // successor.config_id()`) and DROPS a stale swap; (2) the staged swap is CONSUMED at the first
+  // landing that installs its successor — here the node's own superseded SwapEpoch root, whose
+  // landing the configuration absorb turns into the install, emitting the ONE legitimate
+  // `MembershipChanged` for the locally committed op N. This test pins that the crossing leaves NO
+  // second SwapEpoch root, NO double lineage push, exactly ONE `MembershipChanged` (never a bogus
+  // duplicate from a stale-swap re-fire), and the legitimate ancestors are retained.
   let n1: u64 = 2; // the node's OWN reconfigure op N (E0 -> E1); committed band is ops (0 .. N].
   let genesis_mem = genesis(3);
   let successor_e1 = genesis_mem
@@ -1262,20 +1362,23 @@ fn a_cross_epoch_crossing_consumes_a_locally_staged_swap_so_no_stale_swap_re_fir
     "the legitimate genesis ancestor is still admissible (no eviction)",
   );
 
-  // (4) NO bogus `MembershipChanged`: a cross-epoch crossing install emits none (the laggard synced PAST
-  // the Reconfigure op), and the consumed stale swap emits none either. Only `StateSyncCompleted`.
-  let mut saw_membership_changed = false;
+  // (4) Exactly ONE `MembershipChanged`, naming the LOCALLY COMMITTED op N — emitted when the node's
+  // own (superseded) SwapEpoch root landed and the absorb consumed the staged swap. The crossing
+  // install itself emits none (the sync names no local op), and the consumed swap can never re-fire
+  // a duplicate. `StateSyncCompleted` still reports the crossing.
+  let mut membership_changed_ops = std::vec::Vec::new();
   let mut saw_state_sync_completed = false;
   while let Some(ev) = e.poll_event() {
     match ev {
-      Event::MembershipChanged(_) => saw_membership_changed = true,
+      Event::MembershipChanged(mc) => membership_changed_ops.push(mc.op()),
       Event::StateSyncCompleted(_) => saw_state_sync_completed = true,
       _ => {}
     }
   }
-  assert!(
-    !saw_membership_changed,
-    "NO MembershipChanged: the crossing install names no local op, and the stale swap did not re-fire",
+  assert_eq!(
+    membership_changed_ops,
+    std::vec![OpNumber::with(n1)],
+    "exactly ONE MembershipChanged, naming the locally committed reconfigure op — never a bogus      duplicate from a stale-swap re-fire",
   );
   assert!(
     saw_state_sync_completed,
@@ -4451,8 +4554,11 @@ fn a_stale_old_epoch_svc_is_dropped_by_ingress_at_the_e_plus_1_survivor() {
   let now = Instant::ZERO;
   // This node is slot 0 of the E=1 config (3 voters {0,1,2} + 1 learner at slot 3; the primary of view
   // 0), so feed the SVC to a BACKUP survivor to observe a view-change transition cleanly. Re-home onto
-  // slot 1.
+  // slot 1, over the backup's OWN (fresh) store: a genesis endpoint holds a genesis configuration
+  // record, so parking it over the primary's store — whose durable root already records the E=1
+  // install — would mint view-change roots inconsistent with that store's timeline.
   let backup_cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut backup = Endpoint::<CountSm, SingleChange>::genesis_unchecked(
     backup_cfg,
     e.membership.clone(),
