@@ -461,7 +461,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// defers here, so every bare `Endpoint::recover(..)` call resolves unannotated.
   ///
   /// **Phase 1 (here, sync + infallible).** Reads only synchronous trait metadata — the session's
-  /// two roots (the LANDED `sb.state()` and the EFFECTIVE [`Storage::effective_root`], one value
+  /// two roots (the LANDED `sb.state()` and the EFFECTIVE `Storage::effective_root`, one value
   /// whenever no root write is in flight; the constructor body states the per-field split rule)
   /// and `wal.header(op)` (the durable-header scan that derives the written extent) — and
   /// constructs the endpoint with:
@@ -1817,21 +1817,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     self.assert_no_faulty_committed_survives();
   }
 
-  /// DEBUG-ASSERT no permanently-faulty committed-band slot survived into the terminal recovery status
+  /// Enforce that no permanently-faulty committed-band slot survived into the terminal recovery status
   /// as a POPULATED-with-bytes `self.log` entry. A faulty op left as `Some({body: Present(EMPTY)})` is
   /// NOT a hole — `advance_commit`/`adopt_log` would apply it empty cluster-wide (the original
   /// empty-body CRITICAL). After [`Self::finalize_recovery`]'s drop EVERY op in `rec.faulty` MUST be
   /// either ABSENT from `self.log` OR a `Body::Repairing` hole (a kept body-faulty op whose existence is
   /// preserved and whose body is peer-repaired on demand — also not a bytes-bearing entry, so it cannot
   /// apply empty). This fires only if a future edit leaves a faulty op as a `Present` entry, or routes a
-  /// completion through here with such a slot still populated. Body is a `debug_assert!`, a no-op in
-  /// release (zero cost, like `assert_committed_survives`). Runs while `rec` is still live (the terminal
-  /// dispatch clears `recover` only AFTER), so it can witness the final `rec.faulty` set.
+  /// completion through here with such a slot still populated. Enforced in every profile: the surviving
+  /// entry would be APPLIED, corrupting committed state cluster-wide, so a fail-stop at the recovery
+  /// exit is the safe outcome — and the walk is bounded by the recovered faulty set, once per recovery.
+  /// Runs while `rec` is still live (the terminal dispatch clears `recover` only AFTER), so it can
+  /// witness the final `rec.faulty` set.
   pub(crate) fn assert_no_faulty_committed_survives(&self) {
-    #[cfg(debug_assertions)]
     if let Some(rec) = self.recover.as_ref() {
       for &op in &rec.faulty {
-        debug_assert!(
+        assert!(
           !matches!(self.log.get(&op), Some(e) if e.body.is_present()),
           "faulty committed slot {op} survived into the terminal recovery status as a populated \
            Present log entry (would be applied empty) — the drop choke was bypassed"

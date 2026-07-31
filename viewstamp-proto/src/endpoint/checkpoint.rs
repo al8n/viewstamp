@@ -476,18 +476,32 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               })
             })
             .flatten();
+          // The successor branch consults the session timeline exactly as the ordinary branch
+          // does: a staged sync successor is stamped ONLY when it is strictly ahead of the
+          // EFFECTIVE root's epoch. `apply_sync` admits a crossing only ahead of the timeline, so
+          // a staged-yet-superseded successor here means an epoch-advancing root entered the
+          // timeline behind the admission — minting from `pending_install` alone would queue the
+          // superseded configuration BEHIND the newer root and rewind the durable membership at
+          // its landing. Falling to the ordinary branch instead copies the newer configuration
+          // forward (the same carry every other writer performs) while still persisting the
+          // synced checkpoint; the correlated install then refuses the stale successor at
+          // `install_membership`'s forward-epoch guard.
           let state = match &successor {
-            Some((successor, successor_prev_config_id)) => self.durable_root_with_successor(
-              self.view,
-              self.log_view,
-              root_commit,
-              pc.target_op,
-              dag.checkpoint_id,
-              headers,
-              successor,
-              *successor_prev_config_id,
-            ),
-            None => self.durable_root(
+            Some((successor, successor_prev_config_id))
+              if successor.epoch() > storage.effective_root().epoch() =>
+            {
+              self.durable_root_with_successor(
+                self.view,
+                self.log_view,
+                root_commit,
+                pc.target_op,
+                dag.checkpoint_id,
+                headers,
+                successor,
+                *successor_prev_config_id,
+              )
+            }
+            _ => self.durable_root(
               // The effective configuration rides this checkpoint root exactly as it rides a
               // view-change root: an inherited epoch-advancing root can be in flight ahead of an
               // ordinary checkpoint a rebuilt successor started, and the copy-forward keeps this

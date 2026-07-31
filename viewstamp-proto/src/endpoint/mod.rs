@@ -2217,11 +2217,13 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// `wal.prune` in [`Self::run_gc`] / [`Self::install_sync`], so it MUST be monotone — a rewind would
   /// prune a band a durable root still claims to cover, losing committed ops on a later recover). Both
   /// advance sites (the ordinary-checkpoint and the state-sync re-persist root completions in
-  /// `on_sb_done`) route here so the non-decreasing property is asserted in ONE place rather than left
-  /// emergent. The `new` initial set is exempt (it SETS the genesis 0, it does not advance), as are the
-  /// `#[cfg(test)]` state-injection helpers (they construct arbitrary states, bypassing the gate).
+  /// `on_sb_done`) route here so the non-decreasing property is enforced in ONE place rather than left
+  /// emergent — in every profile, because the prune the pointer gates destroys committed bytes and a
+  /// fail-stop is the crash-fault model's safe outcome. The `new` initial set is exempt (it SETS the
+  /// genesis 0, it does not advance), as are the `#[cfg(test)]` state-injection helpers (they
+  /// construct arbitrary states, bypassing the gate).
   fn advance_checkpoint_op(&mut self, to: OpNumber) {
-    debug_assert!(
+    assert!(
       to.get() >= self.checkpoint_op.get(),
       "checkpoint_op must not rewind (to {} < current {})",
       to.get(),
@@ -2246,14 +2248,16 @@ impl<S: StateMachine, R> Endpoint<S, R> {
 
   /// The sole non-constructor writer of `self.commit_min` (the applied frontier). It NEVER rewinds —
   /// an applied op is immutable, so the commit pointer is monotone — and this is the ONE place that
-  /// universal floor is asserted, rather than re-proven per site. Both ordinary advance sites (the
+  /// universal floor is enforced, rather than re-proven per site — in every profile, because a
+  /// rewound applied frontier re-applies committed effects (committed-state corruption) and a
+  /// fail-stop is the crash-fault model's safe outcome. Both ordinary advance sites (the
   /// `commit_min+1` apply loops in [`Self::commit_op`] / [`Self::advance_commit`]) and the state-sync
   /// install ([`Self::install_sync`], which advances to the synced checkpoint op) route here; the
   /// install KEEPS its own richer assert (it proves the same direction against the forced-vs-ordinary
   /// branch), so this just adds the universal monotone backstop. The `new` initial set is exempt (it
   /// SETS the genesis 0), as are the `#[cfg(test)]` state-injection helpers (arbitrary construction).
   fn set_commit_min(&mut self, to: OpNumber) {
-    debug_assert!(
+    assert!(
       to.get() >= self.commit_min.get(),
       "commit_min must not rewind (to {} < current {})",
       to.get(),
@@ -2401,6 +2405,16 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     if successor.config_id() == self.membership.config_id() {
       return;
     }
+    // FORWARD-EPOCH only, the same admission `adopt_landed_configuration` applies: every
+    // configuration change advances the epoch, so a successor at or below the current epoch is a
+    // SUPERSEDED configuration — a stale staged install whose correlated completion outlived a
+    // newer install (a cross-epoch sync staged before an inherited newer root landed, or any
+    // future stale-completion shape). Installing it would rewind the live voter set beneath an
+    // epoch this node already durably crossed. Refuse here — the single in-place installer — so
+    // no caller can re-litigate a crossed epoch.
+    if successor.epoch() <= self.membership.epoch() {
+      return;
+    }
     // A commit-first swap (`Some` reconfigure op) installs a successor the commit-time fence already
     // admitted (`commit_reconfigure`: every successor voter is a member of the predecessor), and
     // `self.membership` IS still that predecessor here — a staged swap pins it until this install (a
@@ -2412,7 +2426,11 @@ impl<S: StateMachine, R> Endpoint<S, R> {
     // assumed (the donor recovered only a root the exact-match `SUPERBLOCK_VERSION` admits — written
     // under the fence — and was admitted as a peer only by the exact-match hello version — running
     // it).
-    debug_assert!(
+    // Enforced in every profile: the vote-mint screens make a committed direct voter add
+    // unreachable, so this backstop firing means the quorum arithmetic upstream was already
+    // violated — seating an unproven voter would let it complete quorums for data it never held,
+    // and a fail-stop here is the safe outcome.
+    assert!(
       reconfigure_op.is_none()
         || self
           .membership
@@ -2896,6 +2914,25 @@ impl<S: StateMachine, R> Endpoint<S, R> {
         self.pending_swap = None;
         return;
       }
+      // The TIMELINE half of the stale-swap guard. The chain recompute above reads the LIVE
+      // configuration, but an epoch-advancing root can be in flight AHEAD of memory (an inherited
+      // root across a restart in place) with the live membership still the predecessor — the
+      // recompute then still matches while the timeline has already superseded the staged swap.
+      // Submitting it would queue a root at or below the effective epoch: a different
+      // configuration there is a durable-membership rewind (refused fail-stop at the session
+      // choke), so drop the swap instead — the in-flight root's landing installs the newer
+      // configuration and the live chain guard above retires any re-stage. An EQUAL-epoch,
+      // SAME-configuration effective root is this very swap's own root already on the timeline (a
+      // re-submission after a view transition superseded its correlation) and stays submittable.
+      let effective = storage.effective_root();
+      if effective.epoch() >= successor.epoch()
+        && effective
+          .membership_opt()
+          .is_none_or(|m| m.config_id() != successor.config_id())
+      {
+        self.pending_swap = None;
+        return;
+      }
     }
     if !self.status.is_normal() || self.log_view.get() != self.view.get() {
       return; // the view is not settled/durable — a SwapEpoch root must not persist it
@@ -3089,7 +3126,12 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   /// like the `serviceable_now` no-orphan-due assert does for timers. Each clause is verified to hold at
   /// every handler exit (the `new`/transition handlers re-establish the coupling before returning); this
   /// is detection, the per-site sets/clears remain the enforcement.
-  #[cfg(debug_assertions)]
+  ///
+  /// Compiled in every profile so the release test harness builds, but the clauses are
+  /// `debug_assert!`s — in release the body is empty. That split is deliberate: these are
+  /// IN-MEMORY coupling oracles (detection), whereas the checks that guard DURABLE state — the
+  /// storage session's no-rewind fence — are release-active hard failures, because there the
+  /// violation is a medium write no restart repairs.
   fn assert_invariants(&self) {
     // (1) A PRE-ROOT staged install belongs to an OUTSTANDING sync: `apply_sync` stages `pending_install`
     // and `sync` together, and every clear path drops `pending_install` no later than `sync` (the
@@ -5671,7 +5713,6 @@ where
     msg: Message,
   ) {
     self.handle_message_inner(now, storage, from, msg);
-    #[cfg(debug_assertions)]
     self.assert_invariants();
   }
 
@@ -6309,7 +6350,6 @@ where
         .map(TimerKind::as_str)
     );
     // Re-check the (status × sub-state-flag) coupling at every timeout exit (see `assert_invariants`).
-    #[cfg(debug_assertions)]
     self.assert_invariants();
   }
 
@@ -6331,7 +6371,6 @@ where
     }
     // Re-check the (status × sub-state-flag) coupling at every storage-drain exit (see
     // `assert_invariants`) — the async superblock/WAL completions are where the flag transitions land.
-    #[cfg(debug_assertions)]
     self.assert_invariants();
     // The checkpoint-lockstep invariant as a single typed assertion rather than N per-writer
     // floors: when the checkpoint frontier is SETTLED, the in-memory `self.checkpoint_op` EQUALS
@@ -6372,7 +6411,7 @@ where
   /// The block-storage twin of `on_wal_done` / `on_sb_done`, and gated the same two
   /// ways before any correlation state is read:
   ///
-  /// 1. **THE LANE'S OWN BOOKS** ([`Storage::settle_block_job`]), settled first and for EVERY
+  /// 1. **THE LANE'S OWN BOOKS** (`Storage::settle_block_job`), settled first and for EVERY
   ///    completion, whichever incarnation minted it. Two facts, both the lane's: the ISSUE-ORDER
   ///    WITNESS — only the front of the lane's outstanding queue may complete, because block jobs
   ///    must execute serially in issue order (a `Gc` carrying generation N's roots reordered after
@@ -6450,7 +6489,6 @@ where
         }
       },
     }
-    #[cfg(debug_assertions)]
     self.assert_invariants();
   }
 

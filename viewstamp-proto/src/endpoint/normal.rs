@@ -637,6 +637,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     storage: &mut Storage<W, B, S>,
   ) {
+    // Tallying votes into a commit — and advertising it — is the PRIMARY's authority, judged
+    // against the membership in force NOW, not when the triggering action was staged. Every
+    // legitimate caller is the primary of the current view (the own-append and repair-fill
+    // completions gate on `is_primary`, `on_prepare_ok`'s ingress does, the new-primary
+    // participation and the solo-voter resume are primary by construction); the path this refuses
+    // is a completion staged under primary authority and delivered after a landing-driven install
+    // withdrew it — a retained learner's delayed `AdoptVote` completion must not count a tally,
+    // commit, apply, or emit `Commit`. Non-primaries advance only through externally-proven
+    // commits (`advance_commit`).
+    if !self.is_primary() {
+      return;
+    }
     // Do NOT apply ops while the SM is mid-replacement or does not yet hold its checkpoint — the SAME gate
     // `advance_commit` takes. A node owing a post-root SM-reconstruct (`self.checkpoint_op == M`, SM still
     // at the OLD content) can become a Normal PRIMARY through a view change that PRESERVES the obligation;
@@ -649,6 +661,18 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     let quorum = self.membership.quorum() as u32;
+    // Count only CURRENT-VOTER slots toward the quorum. `on_prepare_ok` bounds every ingress bit
+    // to a voter slot and the install-time rekey drops removed members' bits, but a bit minted
+    // between a stage and a completion under a different membership (a preserved inflight entry's
+    // stale slot) must not be able to satisfy a quorum — masking at the tally is the structural
+    // closure that makes any such bit inert regardless of which path set it. Voting slots are
+    // `[0, replica_count)`, capped at 64 by the membership invariant.
+    let n = u32::from(self.membership.replica_count());
+    let voter_mask = if n >= u64::BITS {
+      u64::MAX
+    } else {
+      (1u64 << n) - 1
+    };
     let mut advanced = false;
     loop {
       let next = self.commit_min.get() + 1;
@@ -657,7 +681,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       let ready = self
         .inflight
         .get(&next)
-        .map(|inf| (!inf.committed, inf.oks))
+        .map(|inf| (!inf.committed, inf.oks & voter_mask))
         .is_some_and(|(not_committed, oks)| {
           // The uniform predecessor-quorum threshold, plus the successor-quorum conjunction a
           // voter-set-shrinking `Reconfigure` op additionally carries. The conjunction only ever

@@ -70,9 +70,10 @@ pub(crate) enum AppendSubmission {
 pub(crate) struct SettledCancellation {
   /// The cancelled write's id — any incarnation's.
   pub(crate) id: WriteId,
-  /// The op whose physical slot this cancellation freed, when the ledger held the write: the slot
-  /// a fence-deferred re-append may now take. `None` for an id the ledger never saw (a backend
-  /// contract violation, already debug-asserted).
+  /// The op whose physical slot this cancellation freed: the slot a fence-deferred re-append may
+  /// now take. Always `Some` past the settle choke — an id the ledger never saw is a backend
+  /// contract violation the settle fail-stops on — but kept optional so the settle can build the
+  /// record before it judges the id.
   pub(crate) freed_slot: Option<u64>,
 }
 
@@ -378,8 +379,10 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
         let freed_slot = self.wal_writes.remove(&key(id));
         // Every append over this medium was recorded at submission, whichever endpoint submitted
         // it — so an id the ledger never saw is the backend cancelling an append it was never
-        // handed, a contract violation surfaced here rather than judged per incarnation.
-        debug_assert!(
+        // handed. Enforced in every profile: a backend inventing write facts is a medium whose
+        // ledger can no longer be trusted, and consensus over an untrusted ledger risks silent
+        // durable-state corruption — fail-stop is the crash-fault model's safe outcome.
+        assert!(
           freed_slot.is_some(),
           "a backend cancelled an append id the session never submitted: {id:?}"
         );
@@ -455,23 +458,31 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
   /// checkpoint root and a view-change root in flight together, relying on ordered delivery and
   /// last-submitted-wins exactly as before.
   pub(crate) fn submit_root(&mut self, id: WriteId, state: VsrState) {
-    // The no-rewind invariants as submission-time checks: every root writer baselines on the
-    // effective root (recovery) and sources its checkpoint pair from it (the live writers), so a
-    // root that would rewind the durable view or the checkpoint pointer is a caller bug caught
-    // here, not a state the medium can reach. The view check is the durable-view-monotonicity
-    // invariant at its choke point: landings arrive in queue order, so a view-monotone queue is
-    // exactly a never-regressing durable view.
-    debug_assert!(
-      state.view() >= self.effective_root().view(),
+    // The no-rewind invariants ENFORCED at the submission choke, in every build profile. The
+    // asserts run BEFORE `Superblock::submit_write`, so a violating root is REFUSED — it never
+    // reaches the medium — and the refusal is fail-stop rather than a recoverable error because
+    // the caller's correlation state (`pending_sb`/`pending_checkpoint`) already assumes the
+    // submission: continuing past a refusal would leave the endpoint awaiting a completion that
+    // can never arrive, a silent permanent wedge — strictly worse than a crash the fault model
+    // already tolerates (a panicking replica is one of the f crash faults; a LANDED rewind is a
+    // cluster-wide durable-state loss no restart repairs). Every root writer baselines on the
+    // effective root (recovery) and sources its checkpoint/configuration halves from it (the live
+    // writers), so a rewinding root is a caller bug — unreachable by construction — and this
+    // choke is the backstop that keeps it so under release schedules, where the simulator runs.
+    // The view check is the durable-view-monotonicity invariant at its choke point: landings
+    // arrive in queue order, so a view-monotone queue is exactly a never-regressing durable view.
+    let effective = self.effective_root();
+    assert!(
+      state.view() >= effective.view(),
       "a durable-root write would rewind the durable view ({} below effective {})",
       state.view().get(),
-      self.effective_root().view().get(),
+      effective.view().get(),
     );
-    debug_assert!(
-      state.checkpoint_op() >= self.effective_checkpoint_pair().0,
+    assert!(
+      state.checkpoint_op() >= effective.checkpoint_op(),
       "a durable-root write would rewind the checkpoint pointer ({} below effective {})",
       state.checkpoint_op().get(),
-      self.effective_checkpoint_pair().0.get(),
+      effective.checkpoint_op().get(),
     );
     // The epoch/configuration half is monotone for the same reason the view is: landings arrive in
     // queue order, so a root carrying an epoch below the timeline's would republish a superseded
@@ -479,21 +490,35 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     // a crash then recovers. Every root writer sources this half from the timeline (recovery
     // baselines the configuration on the landed root and copies an in-flight successor forward at
     // submit), so a regression here is a caller bug, not a reachable state.
-    debug_assert!(
-      state.epoch() >= self.effective_root().epoch(),
+    assert!(
+      state.epoch() >= effective.epoch(),
       "a durable-root write would rewind the durable epoch ({} below effective {})",
       state.epoch().get(),
-      self.effective_root().epoch().get(),
+      effective.epoch().get(),
+    );
+    // At an UNCHANGED epoch the configuration is immutable: every configuration change advances
+    // the epoch by construction, so a root carrying the same epoch as the timeline's but a
+    // different membership would publish a divergent configuration with no epoch to order the two
+    // — a lateral rewind the epoch check alone cannot see. Scoped to both roots membership-bearing
+    // (a membership-less root carries no configuration to diverge from).
+    assert!(
+      state.epoch() != effective.epoch()
+        || match (state.membership_opt(), effective.membership_opt()) {
+          (Some(new), Some(cur)) => new.config_id() == cur.config_id(),
+          _ => true,
+        },
+      "a durable-root write would replace the configuration at an unchanged epoch ({})",
+      state.epoch().get(),
     );
     // Scoped to a membership-BEARING effective root: a membership-less root carries no
     // configuration history, so its `config_install_op` is a checkpoint-op alias (the decode
     // default), not an install record a later root could rewind.
-    debug_assert!(
-      self.effective_root().membership_opt().is_none()
-        || state.config_install_op() >= self.effective_root().config_install_op(),
+    assert!(
+      effective.membership_opt().is_none()
+        || state.config_install_op() >= effective.config_install_op(),
       "a durable-root write would rewind the configuration install op ({} below effective {})",
       state.config_install_op().get(),
-      self.effective_root().config_install_op().get(),
+      effective.config_install_op().get(),
     );
     let parked = self.roots_submitted < self.roots.len()
       || self
@@ -568,24 +593,21 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
           // a backend violation. Settle it anyway so the ledger drains — including releasing any
           // parked tail whose fence this settlement retired, exactly as the in-order arm does,
           // else the parked roots would strand with nothing left to release them (`has_inflight`
-          // true forever, `into_parts` refused forever) — then surface the violation. The settle
-          // precedes the assert so the ledger is coherent even at the panic point.
+          // true forever, `into_parts` refused forever) — then surface the violation, in every
+          // profile: out-of-order root landings break the last-submitted-wins convergence every
+          // effective-root read stands on, so continuing would be consensus over a medium whose
+          // durable root is no longer the one the timeline promised. The settle precedes the
+          // panic so the ledger is coherent at the panic point.
           if at < self.roots_submitted {
             self.roots_submitted -= 1;
           }
-          let landed = self.roots.remove(at);
+          self.roots.remove(at);
           self.release_parked_roots();
-          debug_assert!(
-            false,
-            "a root write completed out of submission order: {id:?} at queue position {at}"
-          );
-          landed
+          panic!("a root write completed out of submission order: {id:?} at queue position {at}");
         } else {
-          debug_assert!(
-            false,
-            "a superblock write completed that the session never submitted: {id:?}"
-          );
-          None
+          // A completion for a write the session never submitted — the same untrusted-medium
+          // fail-stop as the cancellation arm above.
+          panic!("a superblock write completed that the session never submitted: {id:?}");
         }
       }
       _ => None,

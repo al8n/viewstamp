@@ -5,6 +5,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the primary's normal-path own append (`Pending::Ack`) and the view-change adoption append
   /// (`Pending::AdoptVote`) — both record the own vote ONLY once the op's WAL append is durable.
   pub(crate) fn record_own_vote(&mut self, op: u64) {
+    // A vote is valid only from a voter of the membership in force when it is CAST, never the one
+    // in force when its append was staged — the own-vote instance of the rule
+    // [`Self::send_do_view_change`] states for the deferred view-change vote. A landing-driven
+    // configuration install rekeys the vote bitsets but PRESERVES the pending appends and inflight
+    // entries of a node it retains as a learner, so an `AdoptVote`/`Ack` append staged while this
+    // node held voter authority can complete after a demotion; ORing the own bit then would place
+    // a non-voter slot's bit in a tally a retained voter's bit can complete into a quorum. The
+    // check lives here — the one point every own-vote lane funnels through — so no completion
+    // path can cast a vote this node no longer holds the authority for. The append itself stays
+    // durable and correct: a learner keeps the log; it is the VOTE that is refused.
+    if !self.is_voter() {
+      return;
+    }
     // Never count this replica's own bit toward a reconfiguration op that seats a brand-new voter
     // against its current configuration — the own-vote half of the vote-mint screen pair (the ack
     // half is [`Self::send_prepare_ok`]). Covers every own-vote lane that sets the bit here: the
@@ -1216,6 +1229,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     storage: &mut Storage<W, B, S>,
   ) {
+    // Leading the view — broadcasting its canonical log and tallying its commits — is authority
+    // under the membership in force NOW, the emission-point rule `send_do_view_change` applies to
+    // the deferred vote. The durable-view completion that dispatches here can outlive a
+    // landing-driven configuration install (the landing installs BEFORE the correlated arms run),
+    // so a node staged as the new primary can arrive demoted to a learner — or a retained voter
+    // whose primary slot the successor layout remapped. Either way it no longer leads: broadcast
+    // nothing and tally nothing. The role cadences the install re-armed (or retired) already
+    // govern how this node follows the view's real primary.
+    if !self.is_primary() {
+      return;
+    }
     // Broadcast the canonical log to all backups, advertising the KNOWN-committed frontier
     // `commit_max` — NOT the APPLIED frontier `commit_min`. The two diverge when this new primary
     // adopted a committed header-only (`Repairing`) op: `advance_commit(commit_star)` raised

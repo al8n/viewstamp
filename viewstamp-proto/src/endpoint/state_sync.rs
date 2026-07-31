@@ -1774,6 +1774,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         self.op.get()
       );
     }
+    // The TIMELINE admission: never install a checkpoint strictly below the session's EFFECTIVE
+    // checkpoint. The ingress monotone gate reads the LIVE `self.checkpoint_op`, but the timeline
+    // can be AHEAD of memory — an inherited in-flight root (a dead incarnation's, across a restart
+    // in place) occupies neither `pending_sb` nor `pending_checkpoint`, so a rebuilt endpoint can
+    // reach here with a reply that clears every live gate yet sits BELOW a checkpoint the medium
+    // is already guaranteed to converge to. Minting its re-persist root would rewind the durable
+    // checkpoint pointer at its landing. Strictly-below only: an EQUAL-op reply is the recovery
+    // re-fetch of the checkpoint the timeline already names (its local blocks corrupt), which must
+    // stay admissible. A refusal keeps `sync` armed so the solicit cadence re-fetches a reply at
+    // or above the timeline.
+    if checkpoint_op < storage.effective_root().checkpoint_op() {
+      return;
+    }
     // Decode the verified envelope FIRST (before staging anything irreversible). `on_sync_checkpoint`
     // already verified `checkpoint_id(snapshot) == m.checkpoint_id()`, so the bytes are the right
     // checkpoint; but a malformed/truncated envelope (a buggy encoder, or corruption that somehow
@@ -1864,6 +1877,27 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           // member offline across more than two legal changes rejoin instead of stranding forever on a
           // "closer donor" the protocol does not preserve.
           if successor.epoch() <= self.membership.epoch() {
+            return;
+          }
+          // Strictly ordered against the session TIMELINE as well. The live check above is the
+          // seam an inherited epoch-advancing root slips through: a rebuilt endpoint whose live
+          // configuration baselines on the LANDED root can hold an in-flight successor root
+          // epochs ahead of memory, and a verified reply between the two — newer than live, older
+          // than the timeline — would stage a superseded configuration whose re-persist root
+          // lands AFTER the newer one and rewinds the durable membership. The medium converges to
+          // the effective root, so a crossing must not order BELOW it: refuse a successor at a
+          // strictly lower epoch, and at an EQUAL epoch refuse only a DIFFERENT configuration (a
+          // fork no landing order reconciles). An equal-epoch SAME-configuration reply stays
+          // admissible — it re-persists the very configuration the timeline already promises
+          // (this node's own in-flight SwapEpoch root), which is how a laggard whose swap root
+          // has not yet landed still crosses via sync.
+          let effective = storage.effective_root();
+          let below_timeline = successor.epoch() < effective.epoch()
+            || (successor.epoch() == effective.epoch()
+              && effective
+                .membership_opt()
+                .is_some_and(|m| m.config_id() != successor.config_id()));
+          if below_timeline {
             return;
           }
           Some((successor, verified_prev))
@@ -2124,10 +2158,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // the recorded root — the same values `durable_root_with_successor` wrote, which are the
       // values the fixups below recompute. Running the fixups a second time against the
       // post-install state would corrupt the lineage (a duplicate push of the verified
-      // predecessor), so the whole recompute block runs only when the install is still owed; the
-      // crossing teardown below applies either way.
-      let already_installed = self.membership.config_id() == successor.config_id();
-      if !already_installed {
+      // predecessor), so the whole recompute block runs only when the install still ADVANCES the
+      // epoch — which excludes both the already-installed case (equal epoch, equal config) and a
+      // SUPERSEDED successor (an epoch this node already crossed past, whose stale completion
+      // must neither install nor stamp its lineage over the newer configuration's; the
+      // `install_membership` forward-epoch guard refuses it, and the fixups must be scoped to the
+      // same predicate or they would corrupt what the guard preserved). The crossing teardown
+      // below applies either way.
+      let advances = successor.epoch() > self.membership.epoch();
+      if advances {
         // Capture the laggard's own current `config_id` BEFORE the swap — its prior-config slot in the
         // post-crossing lineage.
         let own_prior_config_id = self.membership.config_id();
