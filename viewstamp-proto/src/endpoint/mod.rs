@@ -749,12 +749,30 @@ const SYNC_SOLICIT: core::time::Duration = core::time::Duration::from_millis(100
 /// The value is deliberately kept out of every `Event`, digest, and message: it depends on how many
 /// endpoints a process happened to build, so leaking it would make otherwise-deterministic runs
 /// depend on test ordering.
-static NEXT_INCARNATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// Held as a pointer-width counter rather than a 64-bit one so the crate builds on a bare-metal
+/// target whose atomics stop at the pointer width; the incarnation the endpoint carries stays
+/// [`u64`], since it is the counter's storage, not its meaning, that the target constrains.
+static NEXT_INCARNATION: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
 
 /// Takes the next storage-correlation incarnation. Relaxed ordering suffices: the only requirement
 /// is that no two endpoints receive the same value, which `fetch_add` guarantees on its own.
+///
+/// # Panics
+///
+/// If the counter has wrapped, which would hand a second endpoint an incarnation a previous one
+/// already used and silently re-admit its completions at the choke every correlation table sits
+/// behind. The reserved `0` doubles as the detector: it names no live endpoint, so `fetch_add`
+/// returning it means the space is exhausted rather than merely large. Exhausting a pointer-width
+/// counter takes one endpoint construction per increment within a single process, so this is a
+/// fail-stop on an unreachable schedule, not a limit a deployment is expected to meet.
 fn next_incarnation() -> u64 {
-  NEXT_INCARNATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+  let taken = NEXT_INCARNATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+  assert!(
+    taken != 0,
+    "the storage-correlation incarnation counter wrapped; a reused incarnation would re-admit a \
+     dead endpoint's completions"
+  );
+  taken as u64
 }
 /// Learner progress (`Status::Normal` LEARNER): how often a non-voting learner re-broadcasts its
 /// [`LearnerStatus`](crate::LearnerStatus) durable-frontier report to the cluster, so the primary's
