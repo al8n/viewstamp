@@ -1,8 +1,15 @@
 use super::{super::*, *};
 use crate::{
-  ClientId, Config, Header, OpId, OpNumber, ReplicaId, Request, RequestNumber, SlotStatus, View,
+  ClientId, Config, Header, OpNumber, ReplicaId, Request, RequestNumber, SlotStatus, View, WriteId,
   encode_message,
 };
+
+/// Correlation ids for these fixture tests: the incarnation is immaterial here — the fixture
+/// only echoes the id back — so every id in this module shares one.
+const TEST_INCARNATION: u64 = 1;
+fn write_id(seq: u64) -> WriteId {
+  WriteId::new(TEST_INCARNATION, seq)
+}
 
 #[test]
 fn fresh_endpoint_state() {
@@ -614,7 +621,7 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
     &[5u8],
   );
   wal.submit_append(
-    OpId::new(5),
+    write_id(5),
     OpNumber::with(5),
     h,
     Bytes::copy_from_slice(&[5u8]),
@@ -1415,54 +1422,6 @@ fn backup_reorder_buffer_is_bounded_to_the_tail_gap_window() {
     "within-window Prepares are buffered"
   );
   assert_eq!(e.op(), OpNumber::with(0), "the head has not moved");
-}
-
-#[test]
-fn a_faulted_append_completion_retries_and_the_op_still_acks() {
-  // The `Wal` contract requires an append to complete as `Appended` — but a backend that surfaces
-  // a `Fault` for one anyway must not LEAK the op's in-flight bookkeeping (the `Pending` entry +
-  // `appending` mark would otherwise linger until the next view transition: the op could never be
-  // re-acked and `has_inflight_storage()` would read true forever). The endpoint degrades the
-  // violation to a RETRY: the fault re-submits the same append from the held entry, and the
-  // deferred ack follows the retried append's completion.
-  let mut wal = ScriptedWal::with_entries(0);
-  wal.script_append_fault(OpNumber::with(1), 1); // the first append of op 1 faults; the retry lands
-  let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::MemBlockStore::new();
-  let mut e = backup();
-  let now = Instant::ZERO;
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
-  assert_eq!(
-    wal.append_submits(OpNumber::with(1)),
-    1,
-    "the prepare submitted its append"
-  );
-  // Drain: the Fault completion re-submits the append; its Appended completion then acks.
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
-  assert_eq!(
-    wal.append_submits(OpNumber::with(1)),
-    2,
-    "the faulted append was re-submitted"
-  );
-  let mut acked = false;
-  while let Some(out) = e.poll_message() {
-    if let Message::PrepareOk(ok) = out.msg_ref() {
-      assert_eq!(ok.op(), OpNumber::with(1));
-      acked = true;
-    }
-  }
-  assert!(acked, "the op still acks once the retried append lands");
-  assert!(
-    !e.has_inflight_storage(),
-    "no in-flight bookkeeping leaks after the retry resolves"
-  );
 }
 
 /// Drive `n` distinct clients (ids `1..=n`, each submitting its request 1 with body `[id]`) through

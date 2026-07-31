@@ -6,6 +6,13 @@ use crate::{
 };
 use std::collections::VecDeque;
 
+/// Correlation ids for these fixture tests: the incarnation is immaterial here — the fixture
+/// only echoes the id back — so every id in this module shares one.
+const TEST_INCARNATION: u64 = 1;
+fn read_id(seq: u64) -> ReadId {
+  ReadId::new(TEST_INCARNATION, seq)
+}
+
 #[test]
 fn recover_carries_the_durable_commit_so_a_known_committed_op_is_not_truncated() {
   // CONSENSUS-CRITICAL regression. `recover` set BOTH commit_min AND commit_max to
@@ -4987,7 +4994,7 @@ fn recover_checkpoint_fault_storm_does_not_prematurely_escalate_then_a_valid_rea
       now,
       &mut sb,
       &mut blocks,
-      SuperblockDone::Fault(OpId::new(9000 + k)),
+      SuperblockDone::Fault(read_id(9000 + k)),
     );
   }
   assert_eq!(
@@ -6004,8 +6011,6 @@ fn recover_peer_fetch_keeps_faulty_committed_slots_as_repairing_not_applying_the
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
-    append_faults: BTreeMap::new(),
-    append_submits: BTreeMap::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
@@ -6261,8 +6266,6 @@ fn peer_sync_checkpoint_resolves_an_in_flight_committed_read_to_repairing_not_ap
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
-    append_faults: BTreeMap::new(),
-    append_submits: BTreeMap::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
@@ -6422,8 +6425,6 @@ fn peer_sync_checkpoint_resolves_an_in_flight_uncommitted_tail_read_not_applies_
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
-    append_faults: BTreeMap::new(),
-    append_submits: BTreeMap::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
@@ -6584,8 +6585,6 @@ fn peer_sync_checkpoint_drops_a_superseded_above_commit_in_flight_tail_read() {
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
-    append_faults: BTreeMap::new(),
-    append_submits: BTreeMap::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
@@ -6733,8 +6732,6 @@ fn fault_exhaustion_adopts_the_full_durable_header_identity_not_a_stale_placehol
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
-    append_faults: BTreeMap::new(),
-    append_submits: BTreeMap::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
@@ -6847,8 +6844,6 @@ fn fault_exhaustion_rejects_a_misdirected_durable_header() {
     read_faults: BTreeMap::new(),
     corrupt: std::collections::BTreeSet::new(),
     body_faulty: std::collections::BTreeSet::new(),
-    append_faults: BTreeMap::new(),
-    append_submits: BTreeMap::new(),
     deferred: std::collections::BTreeSet::new(),
     deferred_reads: BTreeMap::new(),
     done: VecDeque::new(),
@@ -7877,14 +7872,13 @@ fn format_over_an_async_superblock_reports_the_write_is_not_durable() {
 
 #[test]
 fn a_leaked_format_completion_cannot_release_a_view_change_write() {
-  // CONSENSUS-SAFETY regression. `format` writes its genesis root under a
-  // RESERVED OpId (u64::MAX) that `mint_op_id` — which counts up from 1 — can never produce. So even
-  // if a `format` on an async superblock leaks its write (it returned WriteNotDurable but the write
-  // lands later), the late `Wrote(u64::MAX)` matches NO endpoint's minted `pending_sb` and is inert.
-  // Were `format` to use `OpId(1)` (as a recovered endpoint's first-minted durable-view-change root
-  // does, since recovery restarts the counter at 1), that leaked completion would falsely release the
-  // `DoViewChange` before its own root is durable — a durable-view-before-participate violation. This
-  // pins that a `Wrote(u64::MAX)` never releases a live view-change write.
+  // CONSENSUS-SAFETY regression. `format` writes its genesis root under an INCARNATION of its own,
+  // which no endpoint recovered over the store ever holds. So even if a `format` on an async
+  // superblock leaks its write (it returned WriteNotDurable but the write lands later), the late
+  // `Wrote` is refused at the incarnation choke and is inert. Were `format` to share the recovered
+  // endpoint's incarnation, that leaked completion could match the endpoint's first-minted
+  // durable-view-change root (sequences restart at 1 in every incarnation) and falsely release the
+  // `DoViewChange` before its own root is durable — a durable-view-before-participate violation.
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap(); // member 1 leads view 1
   let wal0 = ScriptedWal::with_entries(0);
   let mut sb0 = TestSb::default();
@@ -7932,21 +7926,31 @@ fn a_leaked_format_completion_cannot_release_a_view_change_write() {
   );
   while r.poll_message().is_some() {} // discard the SVC chatter; watch for a DVC below
 
-  // Deliver a LEAKED format completion: a `Wrote` under `format`'s ACTUAL reserved id. It must NOT
-  // match the minted `pending_sb`, so the view-change write stays in flight and no DoViewChange is
-  // emitted. Injecting the real const (not a hardcoded u64::MAX) makes this a fail-before guard: were
-  // `FORMAT_OP_ID` ever changed to a mintable id, it would collide with `pending_sb` here, release the
-  // DoViewChange, and fail the assertion below.
-  r.on_sb_done(
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    crate::storage::SuperblockDone::Wrote(crate::endpoint::recovery::FORMAT_OP_ID),
+  // Deliver LEAKED format completions — the shape `format` produces when its genesis write lands
+  // after `format` already returned `WriteNotDurable`. `format` tags that write with an incarnation
+  // of its own, so the INCARNATION alone is what makes these inert. The adversarial part is therefore
+  // the sequence number: sequences restart at 1 in every incarnation, so this sweeps the range this
+  // endpoint has actually minted — including the exact seq its in-flight `pending_sb` holds. Under a
+  // seq-only correlation one of these would collide, release the view-change write, and emit a
+  // `DoViewChange` before its durable-view root was durable.
+  let foreign = r.own_incarnation().wrapping_add(1);
+  for seq in 1..=4 {
+    r.on_sb_done(
+      Instant::ZERO,
+      &mut wal,
+      &mut sb,
+      &mut blocks,
+      crate::storage::SuperblockDone::Wrote(crate::WriteId::new(foreign, seq)),
+    );
+  }
+  assert_eq!(
+    r.foreign_completions_rejected(),
+    4,
+    "every leaked completion was REFUSED at the incarnation choke, not merely left unmatched"
   );
   assert!(
     r.pending_sb_for_test(),
-    "a leaked format Wrote(u64::MAX) does NOT release the view-change write (no OpId collision)"
+    "a leaked format completion does NOT release the view-change write"
   );
   assert!(
     !r.poll_message()

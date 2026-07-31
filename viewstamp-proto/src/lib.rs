@@ -66,9 +66,9 @@ pub use reconfigure_plan::{
 pub use state_machine::{RestoreError, StateMachine};
 pub use status::Status;
 pub use storage::{
-  BodyFaulty, CheckpointRead, HEADER_ENCODED_LEN, HEADER_VERSION, Header, OpId, ReadOk,
+  BodyFaulty, CheckpointRead, HEADER_ENCODED_LEN, HEADER_VERSION, Header, OpId, ReadId, ReadOk,
   SUPERBLOCK_VERSION, SlotStatus, Superblock, SuperblockDone, VsrState, VsrStateError, Wal,
-  WalDone, checkpoint_id,
+  WalDone, WriteId, checkpoint_id,
 };
 pub use time::Instant;
 #[cfg(feature = "quic")]

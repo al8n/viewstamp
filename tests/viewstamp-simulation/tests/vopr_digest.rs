@@ -218,6 +218,50 @@ fn off_axis_digest_is_byte_identical_to_the_pre_reconfig_baseline() {
   }
 }
 
+/// A run's digests must not depend on how many endpoints the PROCESS built before it.
+///
+/// Storage correlation ids carry the incarnation of the endpoint that minted them, drawn from a
+/// process-wide counter. That counter is deliberately outside the deterministic simulation: its value
+/// depends on how many endpoints happen to have been constructed, so if it ever reached an applied
+/// stream, a report counter, an `Event`, or the ordering of an id-keyed map, the same seed would
+/// digest differently depending on what else ran first — test order would decide the result, and
+/// every pinned baseline in this file would become a coin flip.
+///
+/// So: digest a seed, build a throwaway cluster to advance the counter by several endpoints, and
+/// digest the same seed again. The two must be identical. The counter already advances during the
+/// first run, so the second run would draw different incarnations regardless; the throwaway cluster
+/// makes the gap between them large and unrelated to what either run consumes, so a leak cannot hide
+/// behind the two runs happening to line up.
+#[test]
+fn digests_are_independent_of_the_process_wide_endpoint_incarnation() {
+  const SEED: u64 = 1;
+  let before_applied = applied_digest(SEED);
+  let before_report = report_digest(&run_vopr(SEED, DEFAULT_TICKS));
+
+  // Build and drop endpoints so the next cluster's replicas mint ids under different incarnations
+  // than the first run's did. Ticking is what forces those endpoints to actually issue storage ops.
+  let mut interfering = Cluster::new(5, 2, 40, /*seed*/ 999);
+  for _ in 0..50 {
+    interfering.tick();
+  }
+  drop(interfering);
+
+  let after_applied = applied_digest(SEED);
+  let after_report = report_digest(&run_vopr(SEED, DEFAULT_TICKS));
+  assert_eq!(
+    before_applied, after_applied,
+    "the APPLIED-history digest for seed {SEED} changed after unrelated endpoints were constructed \
+     ({before_applied:#018x} then {after_applied:#018x}) — the storage-correlation incarnation is \
+     reaching the applied history, so the same seed no longer replays the same run"
+  );
+  assert_eq!(
+    before_report, after_report,
+    "the REPORT digest for seed {SEED} changed after unrelated endpoints were constructed \
+     ({before_report:#018x} then {after_report:#018x}) — a report counter is observing the \
+     process-wide incarnation instead of the seeded schedule"
+  );
+}
+
 #[test]
 #[ignore = "digest sweep: prints one stable line per seed for cross-checkout byte-identity diffing"]
 fn vopr_digest_sweep() {

@@ -24,15 +24,16 @@
 //! poll-ordering contract on [`Wal`]). Append completions may be drained in any order; root-write
 //! completions must not be (see below).
 //!
-//! ## Writes never `Fault`
+//! ## Writes never `Fault` — and cannot say so
 //!
-//! `Fault` is a READ verdict. [`Wal::submit_append`] MUST complete only as [`WalDone::Appended`];
-//! [`Superblock::submit_write`] / [`Superblock::submit_write_checkpoint`] MUST complete only as
-//! [`SuperblockDone::Wrote`]. A backend retries internally — or fail-stops the process — until the
-//! write is durable; it never reports a write as faulted. The proto has no owner for a "failed"
-//! durable write: an append-`Fault` is degraded defensively to a resubmit (costing a retry, with
-//! no liveness promise under a backend that keeps faulting), and a root-write `Fault` would be
-//! silently dropped — i.e. that durable write would be LOST. A checkpoint READ
+//! `Fault` is a READ verdict, and the id namespaces are SPLIT so that is a type-level fact rather
+//! than a rule to obey. A submitted write is named by a [`WriteId`] ([`Wal::submit_append`],
+//! [`Superblock::submit_write`], [`Superblock::submit_write_checkpoint`]) and the only completions
+//! carrying one are [`WalDone::Appended`], [`WalDone::Cancelled`], and [`SuperblockDone::Wrote`];
+//! every fault/verdict variant carries a [`ReadId`]. So there is no way to report a terminal write
+//! failure: a backend that cannot make a write durable retries internally, or fail-stops the process.
+//! The proto has no owner for a "failed" durable write — a lost root write is a lost durable state,
+//! and a lost append is an ack/vote the endpoint owes forever. A checkpoint READ
 //! ([`Superblock::submit_read_checkpoint`]) is the one superblock op that may fault:
 //! recovery/state-sync treat it as faults-as-data (retry within budget, then peer-fetch).
 //!
@@ -104,14 +105,19 @@
 //! BEFORE the root write naming it is submitted — so a backend honoring completion-means-durable
 //! can never expose a root that points at a checkpoint a crash erased.
 //!
-//! ## Drain in-flight ops before re-creating an endpoint
+//! ## Completions from a previous endpoint are refused, not aliased
 //!
-//! [`OpId`]s are unique only within one `Endpoint` incarnation: `Endpoint::new` and
-//! `Endpoint::recover` RESTART the sequence. A driver that rebuilds the endpoint over the same
-//! live storage handles (a restart-in-place) MUST first drain or cancel every in-flight storage
-//! op, so no pre-restart completion is delivered against a post-restart `OpId` it would alias. A
-//! real crash satisfies this by construction — in-flight ops die with the process. Full
-//! statement: the lifetime contract on [`OpId`].
+//! Every `Endpoint::new` and `Endpoint::recover` takes a fresh INCARNATION, and [`OpId`] carries it
+//! alongside the sequence number. A completion minted by a previous incarnation therefore cannot
+//! equal any id the current endpoint minted, and the endpoint refuses it at a single choke point
+//! before consulting any correlation table.
+//!
+//! This matters for a driver that rebuilds the endpoint over the same LIVE storage handles — a
+//! restart-in-place, where the io_uring fd or thread pool below the endpoint is never torn down and
+//! still owes completions for the dead instance's submissions. Draining or cancelling in-flight ops
+//! before constructing the new endpoint remains the right thing to do for a CLEAN shutdown (it is
+//! how `has_inflight_storage` settles), but it is not what keeps the endpoint SAFE. A real crash
+//! needs no such care: in-flight ops die with the process. Full statement: the contract on [`OpId`].
 
 use std::vec::Vec;
 
@@ -169,29 +175,137 @@ pub const HEADER_ENCODED_LEN: usize = 128;
 
 /// Correlation id matching a submitted storage op to its completion.
 ///
-/// **Lifetime contract (load-bearing for a driver that retains a completion-correlation table).**
-/// `OpId`s are unique only WITHIN a single `Endpoint` instance's lifetime: both `Endpoint::new` and
-/// `Endpoint::recover` RESTART the sequence (the first storage op after a crash + `recover` reuses
-/// `OpId(1)`). This is safe for the proto itself — a fresh `recover` issues no writes whose stale
-/// completions could alias, and the in-memory sim drops in-flight ops on crash — but a driver keeping
-/// a `user_data → op` table (e.g. an io_uring `user_data` map) ACROSS a RESTART-IN-PLACE (the endpoint
-/// rebuilt via `recover` WITHOUT tearing down the underlying io_uring fd) could collide a stale
-/// completion's `OpId(1)` with the new endpoint's `OpId(1)`. A driver that retains such a table across
-/// endpoint re-creation MUST therefore DRAIN or CANCEL all in-flight storage ops before constructing
-/// the new endpoint, so no pre-restart completion is delivered against a post-restart `OpId`.
+/// Two parts, and the pairing is what makes the id unambiguous: an **incarnation** identifying the
+/// `Endpoint` instance that minted it, and a **sequence number** unique within that instance. Every
+/// `Endpoint::new` and `Endpoint::recover` takes a fresh incarnation, so two endpoints over the same
+/// storage never mint equal ids even though both sequence from 1.
+///
+/// **Foreign completions are rejected, not aliased.** An endpoint dispatches a completion only when
+/// its incarnation matches the endpoint's own; a completion minted by a previous incarnation is
+/// refused wholesale at a single choke point before any correlation table is consulted. That closes
+/// the restart-in-place hazard structurally: a driver that rebuilds the endpoint over live storage
+/// handles — without tearing down the io_uring fd or thread pool beneath it — can deliver a
+/// pre-restart completion into the new endpoint, and it lands on nothing. Draining in-flight ops
+/// before re-creating an endpoint remains good practice for a CLEAN shutdown, but it is no longer
+/// load-bearing for SAFETY.
+///
+/// The id never reaches disk or the wire; a backend treats it as an opaque token to echo back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct OpId(u64);
+pub struct OpId {
+  incarnation: u64,
+  seq: u64,
+}
 impl OpId {
-  /// Creates an `OpId`.
+  /// Creates an `OpId` from the minting endpoint's incarnation and a sequence number unique within
+  /// it. Endpoints mint their own; a backend echoes what it was handed rather than building one.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(n: u64) -> Self {
-    Self(n)
+  pub const fn new(incarnation: u64, seq: u64) -> Self {
+    Self { incarnation, seq }
   }
 
-  /// The underlying value.
+  /// The incarnation of the `Endpoint` instance that minted this id. A completion carrying any other
+  /// incarnation belongs to a dead endpoint and is refused.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn get(self) -> u64 {
+  pub const fn incarnation(self) -> u64 {
+    self.incarnation
+  }
+
+  /// The sequence number, unique within the minting incarnation. Correlation tables key on this,
+  /// since past the incarnation check every id in hand belongs to the current endpoint.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn seq(self) -> u64 {
+    self.seq
+  }
+}
+
+/// The correlation id of a submitted WRITE: a [`Wal::submit_append`], a [`Superblock::submit_write`],
+/// or a [`Superblock::submit_write_checkpoint`].
+///
+/// **Why writes and reads carry different types.** A write ends exactly one way — durably
+/// ([`WalDone::Appended`], [`SuperblockDone::Wrote`]) or, for an append the backend discarded after
+/// submission, [`WalDone::Cancelled`]. It can never end as a fault or a read verdict: a backend that
+/// cannot make a write durable retries internally or fail-stops the process (the write-fault
+/// contracts on [`Wal`] and [`Superblock`]), because the proto has no owner for a "failed" durable
+/// write. Every fault/verdict variant carries a [`ReadId`] instead, so "this WRITE faulted" is not a
+/// value that can be constructed — the contract is enforced by the type rather than defended against
+/// at the completion router.
+///
+/// Wraps an [`OpId`], so a write id carries the same incarnation + sequence pairing and is refused by
+/// the same incarnation choke when it names a dead endpoint. Write ids and read ids are minted from
+/// ONE sequence counter per incarnation: the correlation tables key on the SEQUENCE alone, so a
+/// second counter would let a read's sequence alias a live write's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WriteId(OpId);
+
+impl WriteId {
+  /// Creates a `WriteId` from the minting endpoint's incarnation and a sequence number unique within
+  /// it. Endpoints mint their own; a backend echoes what it was handed rather than building one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(incarnation: u64, seq: u64) -> Self {
+    Self(OpId::new(incarnation, seq))
+  }
+
+  /// The underlying untyped [`OpId`] — what [`WalDone::id`]/[`SuperblockDone::id`] report, so the
+  /// incarnation choke reads every completion's id through one path regardless of its kind.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op_id(self) -> OpId {
     self.0
+  }
+
+  /// The incarnation of the `Endpoint` instance that minted this id (see [`OpId::incarnation`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn incarnation(self) -> u64 {
+    self.0.incarnation()
+  }
+
+  /// The sequence number, unique within the minting incarnation (see [`OpId::seq`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn seq(self) -> u64 {
+    self.0.seq()
+  }
+}
+
+/// The correlation id of a submitted READ: a [`Wal::submit_read`] or a
+/// [`Superblock::submit_read_checkpoint`].
+///
+/// Reads are where faults live — a torn body, bit-rot, an unreadable checkpoint slot — and the proto
+/// treats every one as data (retry within budget, then peer-repair / peer-fetch). So the fault and
+/// not-found verdicts ([`WalDone::Fault`], [`WalDone::Absent`], [`WalDone::BodyFaulty`],
+/// [`SuperblockDone::Fault`]) carry a `ReadId`, distinct from the [`WriteId`] the durable-completion
+/// variants carry. The two types cannot be exchanged, so a verdict can never name a submitted write
+/// (see [`WriteId`] for why that report has no owner).
+///
+/// Wraps an [`OpId`] on the same terms as [`WriteId`]: same incarnation + sequence pairing, same
+/// incarnation choke, and the SAME per-incarnation sequence counter as write ids — the correlation
+/// tables key on the sequence alone, so read and write sequences must not be able to collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ReadId(OpId);
+
+impl ReadId {
+  /// Creates a `ReadId` from the minting endpoint's incarnation and a sequence number unique within
+  /// it. Endpoints mint their own; a backend echoes what it was handed rather than building one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(incarnation: u64, seq: u64) -> Self {
+    Self(OpId::new(incarnation, seq))
+  }
+
+  /// The underlying untyped [`OpId`] — what [`WalDone::id`]/[`SuperblockDone::id`] report, so the
+  /// incarnation choke reads every completion's id through one path regardless of its kind.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn op_id(self) -> OpId {
+    self.0
+  }
+
+  /// The incarnation of the `Endpoint` instance that minted this id (see [`OpId::incarnation`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn incarnation(self) -> u64 {
+    self.0.incarnation()
+  }
+
+  /// The sequence number, unique within the minting incarnation (see [`OpId::seq`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn seq(self) -> u64 {
+    self.0.seq()
   }
 }
 
@@ -1079,19 +1193,19 @@ pub enum VsrStateError {
 /// A successful WAL read result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadOk {
-  id: OpId,
+  id: ReadId,
   header: Header,
   body: Bytes,
 }
 impl ReadOk {
   /// Creates a read result.
-  pub fn new(id: OpId, header: Header, body: Bytes) -> Self {
+  pub fn new(id: ReadId, header: Header, body: Bytes) -> Self {
     Self { id, header, body }
   }
 
-  /// The correlation id of the storage op that produced this result.
+  /// The correlation id of the read that produced this result.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn id(&self) -> OpId {
+  pub const fn id(&self) -> ReadId {
     self.id
   }
 
@@ -1125,18 +1239,18 @@ impl ReadOk {
 /// needs peer-repair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BodyFaulty {
-  id: OpId,
+  id: ReadId,
   header: Header,
 }
 impl BodyFaulty {
   /// Creates a body-faulty result.
-  pub const fn new(id: OpId, header: Header) -> Self {
+  pub const fn new(id: ReadId, header: Header) -> Self {
     Self { id, header }
   }
 
-  /// The correlation id of the storage op that produced this result.
+  /// The correlation id of the read that produced this result.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn id(&self) -> OpId {
+  pub const fn id(&self) -> ReadId {
     self.id
   }
 
@@ -1156,13 +1270,16 @@ impl BodyFaulty {
 #[non_exhaustive]
 pub enum WalDone {
   /// An append became durable.
-  Appended(OpId),
+  Appended(WriteId),
   /// A read returned a valid entry.
   ReadOk(ReadOk),
   /// A read found no entry at that slot.
-  Absent(OpId),
-  /// A storage-level fault (or proto-detected corruption).
-  Fault(OpId),
+  Absent(ReadId),
+  /// A READ-level fault: a storage fault or proto-detected corruption on a
+  /// [`submit_read`](Wal::submit_read). It carries a [`ReadId`], so it can never name a submitted
+  /// APPEND — an append has no faulted ending (see the write-fault contract on
+  /// [`submit_append`](Wal::submit_append)).
+  Fault(ReadId),
   /// A durable read whose header verifies but whose body failed verification or is absent.
   BodyFaulty(BodyFaulty),
   /// An append the backend cancelled AFTER submission: its bytes never became durable and can no
@@ -1174,27 +1291,43 @@ pub enum WalDone {
   /// ack/vote for is a contract violation (the endpoint degrades it to a re-submit, mirroring the
   /// [`WalDone::Fault`] shape, so a spuriously-cancelling backend costs a retry, not a wedge). Never
   /// report a cancelled append as [`Appended`](WalDone::Appended) (a false durability claim that could
-  /// release a vote for bytes that never landed) or as [`Fault`](WalDone::Fault) (which requests a
-  /// retry of a write the endpoint deliberately abandoned).
-  Cancelled(OpId),
+  /// release a vote for bytes that never landed). Reporting it as a fault is not expressible:
+  /// [`Fault`](WalDone::Fault) names a READ.
+  Cancelled(WriteId),
+}
+
+impl WalDone {
+  /// The correlation id this completion answers, whichever variant carries it, as the untyped
+  /// [`OpId`]. The endpoint reads it at one choke point to refuse completions minted by a previous
+  /// incarnation, before any correlation table is consulted — a check that turns only on the
+  /// incarnation, so it is uniform over write and read completions alike.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn id(&self) -> OpId {
+    match self {
+      Self::Appended(id) | Self::Cancelled(id) => id.op_id(),
+      Self::Absent(id) | Self::Fault(id) => id.op_id(),
+      Self::ReadOk(r) => r.id().op_id(),
+      Self::BodyFaulty(b) => b.id().op_id(),
+    }
+  }
 }
 
 /// A successful checkpoint read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointRead {
-  id: OpId,
+  id: ReadId,
   op: OpNumber,
   snapshot: Bytes,
 }
 impl CheckpointRead {
   /// Creates a checkpoint read result.
-  pub fn new(id: OpId, op: OpNumber, snapshot: Bytes) -> Self {
+  pub fn new(id: ReadId, op: OpNumber, snapshot: Bytes) -> Self {
     Self { id, op, snapshot }
   }
 
-  /// The correlation id of the storage op that produced this result.
+  /// The correlation id of the read that produced this result.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn id(&self) -> OpId {
+  pub const fn id(&self) -> ReadId {
     self.id
   }
 
@@ -1225,12 +1358,29 @@ impl CheckpointRead {
 #[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum SuperblockDone {
-  /// A superblock/checkpoint write became durable.
-  Wrote(OpId),
+  /// A superblock/checkpoint write became durable — the only ending a write has.
+  Wrote(WriteId),
   /// A checkpoint read returned its snapshot.
   CheckpointRead(CheckpointRead),
-  /// A storage-level fault.
-  Fault(OpId),
+  /// A READ-level fault: a storage fault on a
+  /// [`submit_read_checkpoint`](Superblock::submit_read_checkpoint). It carries a [`ReadId`], so it
+  /// can never name a root or checkpoint WRITE — a write has no faulted ending (see the write-fault
+  /// contract on [`Superblock`]).
+  Fault(ReadId),
+}
+
+impl SuperblockDone {
+  /// The correlation id this completion answers, whichever variant carries it, as the untyped
+  /// [`OpId`]. Read at the same choke point as [`WalDone::id`], so a foreign-incarnation completion
+  /// is refused before any correlation table is consulted.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn id(&self) -> OpId {
+    match self {
+      Self::Wrote(id) => id.op_id(),
+      Self::Fault(id) => id.op_id(),
+      Self::CheckpointRead(r) => r.id().op_id(),
+    }
+  }
 }
 
 /// A pluggable write-ahead log. The implementation owns all log bytes and a header
@@ -1347,12 +1497,12 @@ pub trait Wal {
   /// (returns `()`): the proto guarantees it never submits past [`capacity`](Wal::capacity) un-pruned
   /// slots (see the trait-level capacity contract), so a backend MAY assume room exists.
   ///
-  /// **MUST complete as [`WalDone::Appended`] — never [`WalDone::Fault`].** Mirrors the
-  /// [`Superblock`] write contract: the implementation retries (or fail-stops) internally until the
-  /// append is durable; `Fault` is a READ verdict. A `Fault` completion for an append is an embedder
-  /// contract violation — the endpoint degrades it defensively to a re-submit of the same append
-  /// (so a transiently-faulting backend costs a retry, not a leaked in-flight ack), but no liveness
-  /// is promised under a backend that keeps faulting its appends.
+  /// **An append has no faulted ending.** It takes a [`WriteId`], and the only completions that
+  /// carry one are [`WalDone::Appended`] and [`WalDone::Cancelled`] — there is no way to report a
+  /// terminal write failure, by construction. `Fault` is a READ verdict over a [`ReadId`]. Mirrors
+  /// the [`Superblock`] write contract: an implementation that cannot make the append durable
+  /// retries internally, or fail-stops the process; it never hands the proto a failure it has no
+  /// owner for.
   ///
   /// **Exactly-once completion (load-bearing for the slot-quiescence fence).** EVERY submitted append
   /// resolves exactly once: as [`WalDone::Appended`] (its bytes landed durably), as
@@ -1366,12 +1516,15 @@ pub trait Wal {
   /// conflicting re-append to that physical slot until it arrives. A swallowed completion therefore
   /// wedges the slot's replacement append forever; delivering it is a liveness requirement, not a
   /// courtesy.
-  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes);
-  /// Submit a read of `op`'s entry. Completion via [`Wal::poll`].
-  fn submit_read(&mut self, id: OpId, op: OpNumber);
-  /// Drop all slots strictly above `above` (view-change tail truncation), returning the ids of any
-  /// in-flight appends this call CANCELLED — submissions the backend can prove will now neither land
-  /// nor complete (e.g. writes still in its own queue, never issued to the device). A returned id
+  fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes);
+  /// Submit a read of `op`'s entry. Completion via [`Wal::poll`]: [`WalDone::ReadOk`] with the
+  /// entry, [`WalDone::BodyFaulty`] with the durable header alone, [`WalDone::Absent`] for a slot
+  /// holding no completed append, or [`WalDone::Fault`]. Reads are where faults live — the proto
+  /// treats every one as data (retry within budget, then peer-repair).
+  fn submit_read(&mut self, id: ReadId, op: OpNumber);
+  /// Drop all slots strictly above `above` (view-change tail truncation), returning the `WriteId`s of
+  /// any in-flight appends this call CANCELLED — submissions the backend can prove will now neither
+  /// land nor complete (e.g. writes still in its own queue, never issued to the device). A returned id
   /// receives NO further completion; the endpoint retires its bookkeeping on the spot.
   ///
   /// # Contract
@@ -1397,10 +1550,10 @@ pub trait Wal {
   /// already assume), and NO backend may reuse the physical extent of an un-quiesced write for a
   /// DIFFERENT op (a ring-less backend recycling storage must quiesce it first — ordinary allocator
   /// discipline for an extent with outstanding I/O).
-  fn truncate(&mut self, above: OpNumber) -> Vec<OpId>;
-  /// Free all slots strictly below `below` (post-checkpoint GC), returning the ids of any in-flight
-  /// appends this call CANCELLED — same semantics as the [`truncate`](Wal::truncate) return value (a
-  /// returned id receives no further completion).
+  fn truncate(&mut self, above: OpNumber) -> Vec<WriteId>;
+  /// Free all slots strictly below `below` (post-checkpoint GC), returning the `WriteId`s of any
+  /// in-flight appends this call CANCELLED — same semantics as the [`truncate`](Wal::truncate) return
+  /// value (a returned id receives no further completion).
   ///
   /// # Contract
   /// Like [`Wal::truncate`]: takes effect SYNCHRONOUSLY on the synchronous views and must not be reordered
@@ -1414,7 +1567,7 @@ pub trait Wal {
   /// its `op mod capacity` placement plus the endpoint-side fence (the endpoint defers the aliasing
   /// re-append `op + capacity` until the old write's completion); a recycling backend must honor it
   /// explicitly.
-  fn prune(&mut self, below: OpNumber) -> Vec<OpId>;
+  fn prune(&mut self, below: OpNumber) -> Vec<WriteId>;
   /// Drain the next completed op, if any. Completions for appends ([`WalDone::Appended`]) MAY be
   /// delivered in ANY order relative to their submission (a real proactor reorders); see the
   /// trait-level poll-ordering contract.
@@ -1435,28 +1588,28 @@ pub trait Wal {
 /// slot satisfies this naturally (as TigerBeetle's does); one that completes root writes out of
 /// order would violate VSR safety.
 ///
-/// **Writes MUST NOT surface a [`SuperblockDone::Fault`].** A `Fault` completion is
-/// reserved for a READ ([`submit_read_checkpoint`](Superblock::submit_read_checkpoint)) — recovery /
-/// state-sync treat a checkpoint-read fault as faults-as-data (retry within budget, then peer-fetch).
-/// An implementation MUST make a [`submit_write`](Superblock::submit_write) /
-/// [`submit_write_checkpoint`](Superblock::submit_write_checkpoint) durable, RETRYING internally until
-/// it succeeds, and complete it ONLY with [`SuperblockDone::Wrote`]; it must never report a write as
-/// faulted. The proto has no recovery path for a faulted root/checkpoint write outside the recover
-/// loop — `on_sb_done` treats a write-`Fault` it sees in Normal as not-produced-by-our-backends and
-/// drops it defensively (it does not retry it), so a backend that DID surface one would silently lose
-/// that durable write. (The durable root is the single source of truth a crash recovers from; a write
-/// that is allowed to "fail" without the proto re-issuing it has no owner.)
+/// **A write has no faulted ending.** [`submit_write`](Superblock::submit_write) and
+/// [`submit_write_checkpoint`](Superblock::submit_write_checkpoint) take a [`WriteId`], and the only
+/// completion carrying one is [`SuperblockDone::Wrote`] — there is no way to report a terminal write
+/// failure, by construction. An implementation MUST make the write durable, RETRYING internally until
+/// it succeeds, or fail-stop the process. `Fault` is reserved for a READ
+/// ([`submit_read_checkpoint`](Superblock::submit_read_checkpoint)) and carries a [`ReadId`] —
+/// recovery / state-sync treat a checkpoint-read fault as faults-as-data (retry within budget, then
+/// peer-fetch). The asymmetry is not a convenience: the durable root is the single source of truth a
+/// crash recovers from, and a root write that is allowed to "fail" without the proto re-issuing it has
+/// no owner — that durable write would simply be LOST.
 pub trait Superblock {
   /// The current durable root (the last root write that has completed).
   fn state(&self) -> VsrState;
   /// Submit an atomic write of the durable root. Completions are delivered in submission order
-  /// relative to other `submit_write` calls (see the trait-level root-write ordering contract). MUST
-  /// complete only as [`SuperblockDone::Wrote`] — never [`SuperblockDone::Fault`]; the implementation
-  /// retries internally until durable (see the trait-level write-fault contract).
-  fn submit_write(&mut self, id: OpId, state: VsrState);
-  /// Submit a write of a checkpoint snapshot at `op`. MUST complete only as [`SuperblockDone::Wrote`]
-  /// — never [`SuperblockDone::Fault`] (see the trait-level write-fault contract).
-  fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes);
+  /// relative to other `submit_write` calls (see the trait-level root-write ordering contract). It
+  /// completes only as [`SuperblockDone::Wrote`] — the [`WriteId`] admits no other ending; the
+  /// implementation retries internally until durable (see the trait-level write-fault contract).
+  fn submit_write(&mut self, id: WriteId, state: VsrState);
+  /// Submit a write of a checkpoint snapshot at `op`. Completes only as [`SuperblockDone::Wrote`],
+  /// on the same terms as [`submit_write`](Superblock::submit_write) (see the trait-level write-fault
+  /// contract).
+  fn submit_write_checkpoint(&mut self, id: WriteId, op: OpNumber, snapshot: Bytes);
   /// Submit a read of the checkpoint snapshot the CURRENT durable root names — the snapshot written at
   /// [`state`](Superblock::state)'s `checkpoint_op`, NOT merely the last snapshot write submitted.
   ///
@@ -1472,7 +1625,10 @@ pub trait Superblock {
   /// fetch. A backend keyed by checkpoint op (as the test fixture is, and as TigerBeetle's single rooted
   /// superblock slot is by construction) satisfies this naturally; one that returns the last-written
   /// snapshot regardless of which root is durable would violate it.
-  fn submit_read_checkpoint(&mut self, id: OpId);
+  ///
+  /// This is the ONE superblock op that may fault: it completes as
+  /// [`SuperblockDone::CheckpointRead`] or [`SuperblockDone::Fault`], both over its [`ReadId`].
+  fn submit_read_checkpoint(&mut self, id: ReadId);
   /// Drain the next completed op, if any.
   fn poll(&mut self) -> Option<SuperblockDone>;
 }

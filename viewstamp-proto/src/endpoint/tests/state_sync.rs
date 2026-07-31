@@ -13,7 +13,7 @@
 // a `RequestBlock` round trip) — the install assertions are unchanged.
 use super::{super::*, *};
 use crate::{
-  ClientId, Config, Header, OpId, OpNumber, Prepare, ReadOk, ReplicaId, Request, RequestNumber,
+  ClientId, Config, Header, OpNumber, Prepare, ReadOk, ReplicaId, Request, RequestNumber,
   SlotStatus, StartViewChange, View, VsrState, Wal, WalDone, block_store::MemBlockStore,
 };
 use std::collections::VecDeque;
@@ -57,7 +57,7 @@ impl Wal for RingWal {
       SlotStatus::Empty
     }
   }
-  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+  fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
     // Evict the op that last held this ring slot (op `K - capacity`), modelling the physical wrap.
     if op.get() > self.capacity {
       self.entries.remove(&(op.get() - self.capacity));
@@ -66,18 +66,18 @@ impl Wal for RingWal {
     self.head = self.head.max(op.get());
     self.done.push_back(WalDone::Appended(id));
   }
-  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+  fn submit_read(&mut self, id: ReadId, op: OpNumber) {
     self.done.push_back(match self.entries.get(&op.get()) {
       Some((h, b)) => WalDone::ReadOk(ReadOk::new(id, *h, b.clone())),
       None => WalDone::Absent(id),
     });
   }
-  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op <= above.get());
     self.head = self.head.min(above.get());
     std::vec::Vec::new()
   }
-  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op >= below.get());
     std::vec::Vec::new()
   }

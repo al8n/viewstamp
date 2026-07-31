@@ -52,9 +52,9 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use viewstamp_proto::{
   BATCH_COUNT_OVERHEAD, BATCH_UNIT_OVERHEAD, BatchBuilder, BatchView, BlockAddress, BlockStore,
-  CheckpointRead, ClientId, Config, Endpoint, Header, Instant, MemberId, Membership, Message, OpId,
-  OpNumber, Peer, Recipient, ReplicaId, ReplyBuilder, Request, RequestNumber, SlotStatus,
-  StateMachine, Superblock, SuperblockDone, VsrState, Wal, WalDone, block_address,
+  CheckpointRead, ClientId, Config, Endpoint, Header, Instant, MemberId, Membership, Message,
+  OpNumber, Peer, ReadId, Recipient, ReplicaId, ReplyBuilder, Request, RequestNumber, SlotStatus,
+  StateMachine, Superblock, SuperblockDone, VsrState, Wal, WalDone, WriteId, block_address,
   max_reply_body_len,
 };
 
@@ -94,23 +94,23 @@ impl Wal for BenchWal {
       SlotStatus::Empty
     }
   }
-  fn submit_append(&mut self, id: OpId, op: OpNumber, header: Header, body: Bytes) {
+  fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
     self.entries.insert(op.get(), (header, body));
     self.head = self.head.max(op.get());
     self.done.push_back(WalDone::Appended(id));
   }
-  fn submit_read(&mut self, id: OpId, op: OpNumber) {
+  fn submit_read(&mut self, id: ReadId, op: OpNumber) {
     self.done.push_back(match self.entries.get(&op.get()) {
       Some((h, b)) => WalDone::ReadOk(viewstamp_proto::ReadOk::new(id, *h, b.clone())),
       None => WalDone::Absent(id),
     });
   }
-  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<OpId> {
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op <= above.get());
     self.head = self.head.min(above.get());
     std::vec::Vec::new()
   }
-  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<OpId> {
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<WriteId> {
     self.entries.retain(|&op, _| op >= below.get());
     std::vec::Vec::new()
   }
@@ -133,15 +133,15 @@ impl Superblock for BenchSb {
   fn state(&self) -> VsrState {
     self.state.clone()
   }
-  fn submit_write(&mut self, id: OpId, state: VsrState) {
+  fn submit_write(&mut self, id: WriteId, state: VsrState) {
     self.state = state;
     self.done.push_back(SuperblockDone::Wrote(id));
   }
-  fn submit_write_checkpoint(&mut self, id: OpId, op: OpNumber, snapshot: Bytes) {
+  fn submit_write_checkpoint(&mut self, id: WriteId, op: OpNumber, snapshot: Bytes) {
     self.checkpoint = Some((op, snapshot));
     self.done.push_back(SuperblockDone::Wrote(id));
   }
-  fn submit_read_checkpoint(&mut self, id: OpId) {
+  fn submit_read_checkpoint(&mut self, id: ReadId) {
     self.done.push_back(match &self.checkpoint {
       Some((op, snap)) => {
         SuperblockDone::CheckpointRead(CheckpointRead::new(id, *op, snap.clone()))

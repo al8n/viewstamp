@@ -781,12 +781,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     {
       return;
     }
-    let id = self.mint_op_id();
+    let id = self.mint_read_id();
     sb.submit_read_checkpoint(id);
     self.sync_serving.insert(
       requester,
       SyncServe {
-        read: id.get(),
+        read: id.seq(),
         nonce,
       },
     );
@@ -809,7 +809,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let Some((to, nonce)) = self
       .sync_serving
       .iter()
-      .find(|(_, s)| s.read == cr.id().get())
+      .find(|(_, s)| s.read == cr.id().seq())
       .map(|(&to, s)| (to, s.nonce))
     else {
       return;
@@ -1848,7 +1848,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       blocks.read_block(sm_root).is_some() && blocks.read_block(sessions_root).is_some(),
       "the owed install's DAG roots must still be present (a live GC root) before submit_write_checkpoint"
     );
-    let id = self.mint_op_id();
+    let id = self.mint_write_id();
     sb.submit_write_checkpoint(id, target_op, snapshot);
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op,

@@ -171,15 +171,15 @@ impl EpochSwap {
 }
 
 /// Which of a checkpoint's two superblock writes is outstanding. Kept SEPARATE from
-/// `PendingSbAction` (durable-view writes) and matched by its own minted `OpId`, so a durable-view
-/// write completion and a checkpoint write completion never alias on the single `OpId`-match
-/// dispatch (`on_sb_done`).
+/// `PendingSbAction` (durable-view writes) and matched by its own minted `WriteId`, so a durable-view
+/// write completion and a checkpoint write completion never alias on the single id-match dispatch
+/// (`on_sb_done`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointStep {
   /// The snapshot write is in flight; on its completion, write the new `VsrState` root.
-  AwaitSnapshot(crate::OpId),
+  AwaitSnapshot(crate::WriteId),
   /// The `VsrState` root write is in flight; on its completion, the checkpoint is durable.
-  AwaitRoot(crate::OpId),
+  AwaitRoot(crate::WriteId),
 }
 
 /// Why an in-flight checkpoint root is being written — the typed completion discriminator the
@@ -329,7 +329,7 @@ struct HealthProbeState {
 /// gone).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SyncServe {
-  /// The serve-read's `OpId` (matches the completion back to this entry).
+  /// The serve-read's id sequence (matches the completion back to this entry).
   read: u64,
   /// The latest nonce the requester solicited with (echoed in the answer).
   nonce: u64,
@@ -654,6 +654,22 @@ const REPAIR_RETRANSMIT: core::time::Duration = core::time::Duration::from_milli
 /// solicitation while awaiting a `SyncCheckpoint` (and while the adopted checkpoint is being made
 /// durable). Mirrors the other solicitation cadences; cleared once the synced checkpoint is durable.
 const SYNC_SOLICIT: core::time::Duration = core::time::Duration::from_millis(100);
+/// Hands every `Endpoint` a distinct storage-correlation incarnation. Process-wide because that is
+/// the scope a storage backend's completion queue lives in: a driver rebuilding an endpoint over the
+/// same io_uring fd or thread pool is the case the incarnation exists to separate, and both
+/// endpoints are in one process by construction. Counting from 1 leaves `0` naming no live endpoint,
+/// so a default-constructed id is always foreign.
+///
+/// The value is deliberately kept out of every `Event`, digest, and message: it depends on how many
+/// endpoints a process happened to build, so leaking it would make otherwise-deterministic runs
+/// depend on test ordering.
+static NEXT_INCARNATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Takes the next storage-correlation incarnation. Relaxed ordering suffices: the only requirement
+/// is that no two endpoints receive the same value, which `fetch_add` guarantees on its own.
+fn next_incarnation() -> u64 {
+  NEXT_INCARNATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
 /// Learner progress (`Status::Normal` LEARNER): how often a non-voting learner re-broadcasts its
 /// [`LearnerStatus`](crate::LearnerStatus) durable-frontier report to the cluster, so the primary's
 /// catch-up-then-promote gate sees the learner advance. A status report carries no quorum authority and
@@ -1274,13 +1290,21 @@ pub struct Endpoint<S, R = RestartOnly> {
   outgoing: VecDeque<Outgoing>,
   events: VecDeque<Event>,
   timers: Timers,
-  /// Monotonic source of storage correlation ids.
+  /// This endpoint instance's storage-correlation incarnation, taken once at construction and
+  /// stamped into every [`OpId`](crate::OpId) it mints. Two endpoints over the same storage never
+  /// share one, which is what lets [`Self::own_incarnation`] refuse a dead instance's completions.
+  incarnation: u64,
+  /// Monotonic source of storage correlation ids WITHIN [`Self::incarnation`].
   next_op_id: u64,
+  /// How many completions were refused for naming another incarnation — a dead endpoint's write
+  /// landing into this one after a restart in place. Observability only: the refusal itself is the
+  /// safety property. Stays `0` on a process that never rebuilds an endpoint over live storage.
+  foreign_completions_rejected: u64,
   /// Outstanding storage submissions awaiting completion.
   pending: BTreeMap<u64, Pending>,
-  /// EVERY in-flight physical WAL append (`OpId` → op), entered at submit and removed ONLY when the
-  /// write QUIESCES: its completion arrives ([`WalDone::Appended`]/[`WalDone::Fault`]/
-  /// [`WalDone::Cancelled`]) or a [`Wal::truncate`]/[`Wal::prune`] reports it synchronously
+  /// EVERY in-flight physical WAL append (write-id sequence → op), entered at submit and removed ONLY
+  /// when the write QUIESCES: its completion arrives ([`WalDone::Appended`]/[`WalDone::Cancelled`] —
+  /// an append has no other ending) or a [`Wal::truncate`]/[`Wal::prune`] reports it synchronously
   /// cancelled. Deliberately NOT generation state: view transitions, nack truncation, and GC clear
   /// `pending`/`appending` (abandoning the append LOGICALLY) but leave this map intact, because the
   /// PHYSICAL write is still with the device and its bytes can land at any moment until the backend
@@ -1320,10 +1344,10 @@ pub struct Endpoint<S, R = RestartOnly> {
   appending: std::collections::BTreeSet<u64>,
   /// The deferred view-participation action awaiting a superblock write. Only one view-change
   /// is in flight at a time; a newer transition supersedes by overwriting this field.
-  /// `on_sb_done` runs the action only when the completed `OpId` matches the stored one.
-  pending_sb: Option<(crate::OpId, PendingSbAction)>,
+  /// `on_sb_done` runs the action only when the completed `WriteId` matches the stored one.
+  pending_sb: Option<(crate::WriteId, PendingSbAction)>,
   /// An in-flight checkpoint, sequencing its two superblock writes. Kept separate from `pending_sb`
-  /// (their `OpId`s never alias). `None` unless a checkpoint is mid-sequence; a view-change drops it.
+  /// (their ids never alias). `None` unless a checkpoint is mid-sequence; a view-change drops it.
   pending_checkpoint: Option<PendingCheckpoint>,
   /// The op number of this replica's latest durable checkpoint (0 until the first checkpoint
   /// goes durable). Carried on `Commit` and `PrepareOk` as the checkpoint-quorum signal.
@@ -1954,7 +1978,9 @@ impl<S, R> Endpoint<S, R> {
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
       timers: Timers::default(),
+      incarnation: next_incarnation(),
       next_op_id: 1,
+      foreign_completions_rejected: 0,
       pending: BTreeMap::new(),
       wal_writes: BTreeMap::new(),
       deferred_appends: BTreeMap::new(),
@@ -2679,7 +2705,7 @@ impl<S, R> Endpoint<S, R> {
     // root records no geometry (0,0), which recovery refuses fail-closed as unrecorded — bricking a
     // legitimately-reconfigured node behind an offline migration for no reason.
     .with_wal_geometry(self.config.checkpoint_ops(), self.wal_capacity);
-    let id = self.mint_op_id();
+    let id = self.mint_write_id();
     sb.submit_write(id, state);
     self.pending_sb = Some((
       id,
@@ -3731,7 +3757,7 @@ impl<S, R> Endpoint<S, R> {
   /// (drop a client while a checkpoint-persist is in flight — the op-reset risk) can be exercised.
   #[cfg(test)]
   fn stage_pending_checkpoint_for_test(&mut self) {
-    let id = self.mint_op_id();
+    let id = self.mint_write_id();
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op: self.commit_min,
       checkpoint_id: 0,
@@ -4170,7 +4196,7 @@ impl<S, R> Endpoint<S, R> {
       checkpoint_id: 0,
       sm_root: sentinel_root,
       sessions_root: sentinel_root,
-      step: CheckpointStep::AwaitSnapshot(crate::OpId::new(999)),
+      step: CheckpointStep::AwaitSnapshot(crate::WriteId::new(self.incarnation, 999)),
       kind: CheckpointKind::SyncRepersist,
     });
     self.sync = Some(SyncState {
@@ -4309,20 +4335,69 @@ impl<S, R> Endpoint<S, R> {
     self.svc_target
   }
 
-  /// Mint a fresh storage correlation id. Counts up from 1, RESERVING `u64::MAX`
-  /// ([`recovery::FORMAT_OP_ID`](crate::endpoint::recovery::FORMAT_OP_ID)) so it is never minted —
-  /// which is what keeps a leaked `format` completion from ever aliasing a real op's `pending_sb`. A
-  /// mint that would reach the reserved id fail-stops rather than wrapping (which would also break
-  /// the within-incarnation uniqueness of correlation ids); it is a ~1.8e19-submission backstop
-  /// (roughly 585 years at 10^9 submissions/second), never reached in practice.
-  fn mint_op_id(&mut self) -> crate::OpId {
-    let id = self.next_op_id;
-    assert!(
-      id < u64::MAX,
-      "OpId space exhausted: next_op_id reached the reserved FORMAT_OP_ID"
-    );
+  /// Take the next storage correlation SEQUENCE number in this endpoint's incarnation. Sequence
+  /// numbers count up from 1; a mint that would wrap fail-stops rather than reusing a sequence number
+  /// still in flight, a ~1.8e19-submission backstop (roughly 585 years at 10^9 submissions/second)
+  /// never reached in practice.
+  ///
+  /// The SINGLE source for BOTH [`Self::mint_write_id`] and [`Self::mint_read_id`]. Writes and reads
+  /// carry different TYPES but share this one counter, because every correlation table (`pending`,
+  /// `wal_writes`, `pending_sb`, `pending_checkpoint`, `recover.reads`, `sync_serving.read`) is keyed
+  /// by the sequence number ALONE: two counters would let a read's sequence equal a live write's and
+  /// alias the very tables the id split exists to keep apart.
+  ///
+  /// The same guarantee carries a second, easily-lost property: it is what keeps the removed
+  /// `WalDone::Fault` arm in `on_wal_done` dead, not the type system. `wal_writes` and `pending` key
+  /// on the bare sequence, which a `ReadId` exposes exactly as a `WriteId` does, so a lookup keyed by
+  /// a `ReadId` still compiles and finds nothing only because those tables are populated exclusively
+  /// at write-submit time. Splitting the counter would therefore do more than risk table aliasing: a
+  /// read's sequence could land on a live write's entry and resurrect the fault-into-resubmit defect
+  /// that arm used to catch, with no defense left to catch it.
+  fn next_op_seq(&mut self) -> u64 {
+    let seq = self.next_op_id;
+    assert!(seq < u64::MAX, "OpId sequence space exhausted");
     self.next_op_id += 1;
-    crate::OpId::new(id)
+    seq
+  }
+
+  /// Mint a fresh correlation id for a WRITE (a WAL append, a durable root, a checkpoint snapshot).
+  fn mint_write_id(&mut self) -> crate::WriteId {
+    let seq = self.next_op_seq();
+    crate::WriteId::new(self.incarnation, seq)
+  }
+
+  /// Mint a fresh correlation id for a READ (a WAL entry read, a checkpoint-snapshot read).
+  fn mint_read_id(&mut self) -> crate::ReadId {
+    let seq = self.next_op_seq();
+    crate::ReadId::new(self.incarnation, seq)
+  }
+
+  /// This endpoint instance's incarnation — the value every id it mints carries.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn own_incarnation(&self) -> u64 {
+    self.incarnation
+  }
+
+  /// How many storage completions this endpoint refused because they named another incarnation.
+  /// A driver that rebuilds an endpoint over live storage handles can read this to confirm the
+  /// refusal path genuinely engaged; `0` everywhere else.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn foreign_completions_rejected(&self) -> u64 {
+    self.foreign_completions_rejected
+  }
+
+  /// Whether `id` was minted by a PREVIOUS endpoint instance over this storage, counting it if so.
+  ///
+  /// The single choke: both storage completion routers call this before touching any correlation
+  /// table, so an id from a dead incarnation is refused wholesale rather than aliasing onto whatever
+  /// this endpoint happens to have in flight under the same sequence number. Reachable when a driver
+  /// rebuilds the endpoint over live storage handles that still owe the dead instance completions.
+  fn is_foreign_completion(&mut self, id: crate::OpId) -> bool {
+    if id.incarnation() == self.incarnation {
+      return false;
+    }
+    self.foreign_completions_rejected = self.foreign_completions_rejected.saturating_add(1);
+    true
   }
 
   /// This WAL's [`effective_wal_capacity`] under this endpoint's checkpoint interval — see the free
@@ -4397,10 +4472,10 @@ impl<S, R> Endpoint<S, R> {
         .insert(op.get(), DeferredAppend { kind, header, body });
       return;
     }
-    let id = self.mint_op_id();
+    let id = self.mint_write_id();
     wal.submit_append(id, op, header, body);
-    self.wal_writes.insert(id.get(), op.get());
-    self.pending.insert(id.get(), kind);
+    self.wal_writes.insert(id.seq(), op.get());
+    self.pending.insert(id.seq(), kind);
   }
 
   /// Submit a deferred append whose blocking write (to `quiesced`'s ring slot) has just quiesced.
@@ -4428,10 +4503,10 @@ impl<S, R> Endpoint<S, R> {
       .deferred_appends
       .remove(&op)
       .expect("the found key is present");
-    let id = self.mint_op_id();
+    let id = self.mint_write_id();
     wal.submit_append(id, OpNumber::with(op), d.header, d.body);
-    self.wal_writes.insert(id.get(), op);
-    self.pending.insert(id.get(), d.kind);
+    self.wal_writes.insert(id.seq(), op);
+    self.pending.insert(id.seq(), d.kind);
   }
 
   /// Retire the appends a [`Wal::truncate`]/[`Wal::prune`] reports SYNCHRONOUSLY cancelled: the
@@ -4444,14 +4519,14 @@ impl<S, R> Endpoint<S, R> {
   fn absorb_wal_cancellations<W: Wal>(
     &mut self,
     wal: &mut W,
-    cancelled: std::vec::Vec<crate::OpId>,
+    cancelled: std::vec::Vec<crate::WriteId>,
   ) {
     for id in cancelled {
-      let Some(op) = self.wal_writes.remove(&id.get()) else {
+      let Some(op) = self.wal_writes.remove(&id.seq()) else {
         debug_assert!(false, "a backend cancelled an unknown append id {id:?}");
         continue;
       };
-      if let Some(p) = self.pending.remove(&id.get()) {
+      if let Some(p) = self.pending.remove(&id.seq()) {
         // The action dies with the write — but the `appending` mark may now be OWNED by a deferred
         // replacement for the same op (deferral keeps the mark), so only clear it when no waiter
         // holds the slot.

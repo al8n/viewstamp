@@ -1,9 +1,16 @@
 use super::*;
 use crate::{
-  ClientId, Config, DoViewChange, GetView, Header, OpId, OpNumber, Prepare, PreparedEntry,
-  Recovery, ReplicaId, Request, RequestNumber, StartView, StartViewChange, Superblock, View,
-  VsrState, Wal, encode_message,
+  ClientId, Config, DoViewChange, GetView, Header, OpNumber, Prepare, PreparedEntry, Recovery,
+  ReplicaId, Request, RequestNumber, StartView, StartViewChange, Superblock, View, VsrState, Wal,
+  WriteId, encode_message,
 };
+
+/// Correlation ids for these fixture tests: the incarnation is immaterial here — the fixture
+/// only echoes the id back — so every id in this module shares one.
+const TEST_INCARNATION: u64 = 1;
+fn write_id(seq: u64) -> WriteId {
+  WriteId::new(TEST_INCARNATION, seq)
+}
 
 #[test]
 fn backup_transitions_on_svc_quorum_and_sends_dvc() {
@@ -2301,7 +2308,7 @@ fn adopting_a_canonical_head_truncates_the_wal_above_it() {
     &[0xAA],
   );
   wal.submit_append(
-    OpId::new(999),
+    write_id(999),
     OpNumber::with(3),
     stale,
     Bytes::copy_from_slice(&[0xAA]),
