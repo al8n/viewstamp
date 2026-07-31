@@ -1067,7 +1067,10 @@ fn submit_one_append_in_flight<'h>(
   );
   drain_one_command(driver);
   assert!(
-    driver.coord.endpoint().has_inflight_storage(),
+    driver
+      .coord
+      .endpoint()
+      .has_inflight_storage(&driver.storage),
     "the submitted request must leave a WAL append in flight, or the drain has nothing to prove"
   );
   fut
@@ -1138,7 +1141,10 @@ async fn the_teardown_drain_completes_an_in_flight_append_quic() {
     "the shutdown enqueues its command and parks on the ack"
   );
   assert!(
-    driver.coord.endpoint().has_inflight_storage(),
+    driver
+      .coord
+      .endpoint()
+      .has_inflight_storage(&driver.storage),
     "the append is STILL in flight now the shutdown is queued: this is the moment the drain must \
      act on"
   );

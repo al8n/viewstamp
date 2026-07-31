@@ -1304,3 +1304,103 @@ impl Superblock for InMemorySuperblock {
 
 #[cfg(test)]
 mod tests;
+
+/// A shared handle to one medium: the harness holds a clone alongside the
+/// [`Storage`](viewstamp_proto::Storage) session that owns the other.
+///
+/// The session takes ownership of its [`Wal`]/[`Superblock`] by value and never lends them back
+/// (that is what makes a reborn ledger over a live medium unrepresentable), but this harness IS the
+/// device: it injects faults, wipes slots, and reads the landing ledger the oracles judge. Those are
+/// device-side acts, not endpoint-side ones, so the harness reaches the medium through a second
+/// handle — precisely the one operational assumption the storage contract names as the embedder's
+/// (`flock` or equivalent in a real deployment). A crash then models process death exactly: the
+/// device keeps its durable bytes, its in-flight work dies, and a FRESH session is opened over the
+/// same handles — while a restart in place keeps the session, so its ledgers survive with the medium.
+#[derive(Debug)]
+pub struct Shared<T>(std::rc::Rc<core::cell::RefCell<T>>);
+
+impl<T> Clone for Shared<T> {
+  fn clone(&self) -> Self {
+    Self(self.0.clone())
+  }
+}
+
+impl<T> Shared<T> {
+  /// Wraps `inner` in a fresh medium handle.
+  pub fn new(inner: T) -> Self {
+    Self(std::rc::Rc::new(core::cell::RefCell::new(inner)))
+  }
+
+  /// Read access to the medium. Never held across a call into the endpoint or its session.
+  pub fn borrow(&self) -> core::cell::Ref<'_, T> {
+    self.0.borrow()
+  }
+
+  /// Device-side mutation: fault injection, wipes, oracle drains.
+  pub fn borrow_mut(&self) -> core::cell::RefMut<'_, T> {
+    self.0.borrow_mut()
+  }
+}
+
+impl Wal for Shared<InMemoryWal> {
+  fn op_head(&self) -> OpNumber {
+    self.0.borrow().op_head()
+  }
+
+  fn capacity(&self) -> u64 {
+    self.0.borrow().capacity()
+  }
+
+  fn header(&self, op: OpNumber) -> Option<Header> {
+    self.0.borrow().header(op)
+  }
+
+  fn status(&self, op: OpNumber) -> SlotStatus {
+    self.0.borrow().status(op)
+  }
+
+  fn submit_append(&mut self, id: WriteId, op: OpNumber, header: Header, body: Bytes) {
+    self.0.borrow_mut().submit_append(id, op, header, body);
+  }
+
+  fn submit_read(&mut self, id: ReadId, op: OpNumber) {
+    self.0.borrow_mut().submit_read(id, op);
+  }
+
+  fn truncate(&mut self, above: OpNumber) -> std::vec::Vec<WriteId> {
+    self.0.borrow_mut().truncate(above)
+  }
+
+  fn prune(&mut self, below: OpNumber) -> std::vec::Vec<WriteId> {
+    self.0.borrow_mut().prune(below)
+  }
+
+  fn poll(&mut self) -> Option<WalDone> {
+    self.0.borrow_mut().poll()
+  }
+}
+
+impl Superblock for Shared<InMemorySuperblock> {
+  fn state(&self) -> VsrState {
+    self.0.borrow().state()
+  }
+
+  fn submit_write(&mut self, id: WriteId, state: VsrState) {
+    self.0.borrow_mut().submit_write(id, state);
+  }
+
+  fn submit_write_checkpoint(&mut self, id: WriteId, op: OpNumber, snapshot: Bytes) {
+    self
+      .0
+      .borrow_mut()
+      .submit_write_checkpoint(id, op, snapshot);
+  }
+
+  fn submit_read_checkpoint(&mut self, id: ReadId) {
+    self.0.borrow_mut().submit_read_checkpoint(id);
+  }
+
+  fn poll(&mut self) -> Option<SuperblockDone> {
+    self.0.borrow_mut().poll()
+  }
+}

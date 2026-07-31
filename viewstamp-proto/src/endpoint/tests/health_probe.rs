@@ -52,11 +52,11 @@ fn deliver_proof(
   config_id: u128,
   now: Instant,
 ) {
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(from_slot)),
     Message::HealthProof(HealthProof::new(
       ReplicaId::new(from_slot),
@@ -235,12 +235,12 @@ fn a_voter_answers_a_health_challenge_with_a_live_proof() {
   // slot, echoing the challenge nonce, and carrying the live (epoch, config_id). A crashed voter never
   // answers, so a missing reply is honest evidence of absence.
   let mut e = backup_self(); // self = voter 1
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
 
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)), // from the primary
     Message::RequestHealthProof(RequestHealthProof::new(
       ReplicaId::new(0),
@@ -279,7 +279,7 @@ fn a_cross_config_health_challenge_is_dropped() {
   // inadmissible at the strict ingress gate AND dropped by the handler, so a stale-config challenge can
   // never elicit a proof a later round under that stale config could consume.
   let mut e = backup_self();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
 
   let foreign = Message::RequestHealthProof(RequestHealthProof::new(
     ReplicaId::new(0),
@@ -291,10 +291,10 @@ fn a_cross_config_health_challenge_is_dropped() {
     !e.epoch_authority_admits(&foreign),
     "a cross-epoch challenge is inadmissible at ingress"
   );
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(0)),
     foreign,
   );

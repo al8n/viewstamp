@@ -25,16 +25,17 @@ fn fresh_endpoint_state() {
 #[test]
 fn backup_appends_and_acks_then_commits_via_piggyback() {
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(!e.is_primary());
   let now = Instant::ZERO;
 
   // Prepare op=1, commit=0: submit append, pump storage so it completes, ack, commit stays 0.
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
   assert_eq!(e.op(), OpNumber::with(1));
   assert_eq!(e.commit(), OpNumber::with(0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // pump WAL → on_wal_done → PrepareOk
+  e.storage_step(now, &mut storage, &mut blocks); // pump WAL → on_wal_done → PrepareOk
   match e.poll_message().expect("prepare_ok emitted").into_msg() {
     Message::PrepareOk(ok) => {
       assert_eq!(ok.op(), OpNumber::with(1));
@@ -44,7 +45,7 @@ fn backup_appends_and_acks_then_commits_via_piggyback() {
   }
 
   // Prepare op=2, commit=1: piggybacked commit applies op 1 (synchronously), then append op 2.
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 1));
   assert_eq!(e.op(), OpNumber::with(2));
   assert_eq!(e.commit(), OpNumber::with(1));
 }
@@ -52,15 +53,16 @@ fn backup_appends_and_acks_then_commits_via_piggyback() {
 #[test]
 fn backup_buffers_out_of_order_prepares() {
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
 
   // op=2 arrives before op=1: buffered, head op stays 0.
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 0));
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 0));
   assert_eq!(e.op(), OpNumber::with(0));
 
   // op=1 arrives: append 1, then drain buffered op 2.
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
   assert_eq!(e.op(), OpNumber::with(2));
 }
 
@@ -71,20 +73,20 @@ fn a_stale_view_buffered_prepare_is_not_drained_into_the_adopted_view() {
   // new view may have re-minted a different op at that number, and a spliced stale body would apply off a
   // Commit heartbeat / poison a future DVC (`LogEntry` records no per-entry view to catch it later).
   let mut e = backup(); // replica 1 of 3, view 0, head 0
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Buffer a view-0 Prepare at op 2 (op 1 missing) — head stays 0.
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 0));
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 0));
   assert_eq!(e.op(), OpNumber::with(0));
 
   // Adopt view 2 (primary = 2 % 3 = 2, not this backup) at canonical head 0 via StartView; drain the
   // durable-view write so the backup is Normal at view 2. The buffered view-0 op-2 entry survives.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartView(crate::StartView::new(
       View::with(2),
@@ -97,7 +99,7 @@ fn a_stale_view_buffered_prepare_is_not_drained_into_the_adopted_view() {
     )),
   );
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(e.view(), View::with(2));
   assert!(e.status().is_normal());
@@ -106,8 +108,7 @@ fn a_stale_view_buffered_prepare_is_not_drained_into_the_adopted_view() {
   // stamped view 0. It must be DROPPED, not appended: the head stays at 1, op 2 is absent from the log.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(2)),
     Message::Prepare(Prepare::new(
       View::with(2),
@@ -142,16 +143,16 @@ fn backup_caches_the_reply_so_a_backup_turned_primary_can_resend_it() {
   // the backup's apply path too (it is the SM's deterministic output). Here: a backup applies op 1
   // (client 7, request 1) and must hold its cached reply.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Prepare op 1 (client 7, request 1), make it durable, then Commit to apply it.
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -190,7 +191,7 @@ fn apply_caches_the_reply_even_when_the_watermark_was_pre_seeded_without_it() {
   // can never be re-minted). The apply must cache the reply for the applied request regardless of
   // whether the watermark moved.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Pre-seed client 7's watermark at request 1 with NO reply — the snapshot-restored / backfilled row.
@@ -203,12 +204,12 @@ fn apply_caches_the_reply_even_when_the_watermark_was_pre_seeded_without_it() {
     },
   );
   // Apply op 1 (client 7, request 1) via the normal Prepare + Commit flow.
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -238,15 +239,16 @@ fn backup_below_primary_commit_solicits_the_committed_tail_gap() {
   // if it is in the only surviving quorum). The fix: on hearing a Commit whose commit is above our
   // head, solicit the band `(head .. commit]` via RequestPrepare so it arrives as ordinary Prepares.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
 
   // Bring the backup to head op 2 (append 1, 2 via in-order Prepares; commit stays 0).
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(2));
   while e.poll_message().is_some() {} // drain the acks
 
@@ -254,8 +256,7 @@ fn backup_below_primary_commit_solicits_the_committed_tail_gap() {
   // checkpoint — NOT snapshot-only). The backup holds only up to op 2 → it must solicit 3,4,5.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -302,15 +303,15 @@ fn tail_gap_repair_is_bounded_per_call() {
   // Sans-I/O core. It must emit at most `TAIL_GAP_WINDOW` RequestPrepares per call (the rest follow on
   // later heartbeats as the head advances). Before the fix this enqueued ~1,000,000 RequestPrepares.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // The backup is at head 0, checkpoint 0. A single Commit advertises a colossal commit_max — above
   // the checkpoint (so this is tail-gap territory, not state-sync) and far above the head.
   let bogus = 1_000_000u64;
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -351,13 +352,13 @@ fn tail_gap_repair_within_the_window_requests_the_whole_gap() {
   // The cap must not under-serve a SMALL gap: a backup whose gap fits inside one window still solicits
   // exactly the gap (no truncation, no over-request past commit_max).
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Head 0, checkpoint 0, commit_max 3 (< TAIL_GAP_WINDOW) → solicit exactly {1,2,3}.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -397,10 +398,11 @@ fn fresh_endpoint_log_view_is_zero() {
 fn commit_max_tracks_learned_commit_above_applied() {
   // A backup that hears commit=5 but only holds op 2 records commit_max=5, commit_min=2.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 5)); // primary says commit=5, we have op 2
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 5)); // primary says commit=5, we have op 2
   assert_eq!(
     e.commit(),
     OpNumber::with(2),
@@ -416,20 +418,21 @@ fn commit_max_tracks_learned_commit_above_applied() {
 #[test]
 fn backup_acks_only_after_append_is_durable() {
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
   assert!(
     e.poll_message().is_none(),
     "no PrepareOk before the append is durable"
   );
   assert_eq!(
-    wal.op_head(),
+    storage.wal_mut().op_head(),
     OpNumber::with(1),
     "the prepare was submitted to the WAL"
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   match e
     .poll_message()
     .expect("PrepareOk after durable")
@@ -458,7 +461,7 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // view 0 (primary is replica 0, so replica 2 is a backup), op 5 = commit_min (committed + at head),
   // checkpoint_op 0, no repair holes. `appending` is empty (fresh) and the WAL holds nothing — the
@@ -493,7 +496,8 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
 
   // The primary RETRANSMITS the current-view Prepare(5) (its PREPARE_RETRANSMIT). pop=5 <= self.op=5
   // → the re-ack branch. It must NOT ack: op 5 is not durably appended on THIS replica.
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(5, 5));
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(5, 5));
   let mut premature = 0;
   while let Some(out) = e.poll_message() {
     if let Message::PrepareOk(ok) = out.into_msg()
@@ -517,15 +521,18 @@ fn reack_suppressed_for_committed_op_not_durably_appended_locally() {
     RequestNumber::with(5),
     &[5u8],
   );
-  wal.submit_append(
+  storage.wal_mut().submit_append(
     write_id(5),
     OpNumber::with(5),
     h,
     Bytes::copy_from_slice(&[5u8]),
   );
-  let _ = wal.poll(); // TestWal is synchronous: op 5 is now durable (Clean).
-  assert_eq!(wal.status(OpNumber::with(5)), SlotStatus::Clean);
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(5, 5));
+  let _ = storage.wal_mut().poll(); // TestWal is synchronous: op 5 is now durable (Clean).
+  assert_eq!(
+    storage.wal_mut().status(OpNumber::with(5)),
+    SlotStatus::Clean
+  );
+  e.handle_message(now, &mut storage, primary_peer(), prepare(5, 5));
   let mut reacked = false;
   while let Some(out) = e.poll_message() {
     if let Message::PrepareOk(ok) = out.into_msg()
@@ -550,14 +557,14 @@ fn on_request_is_dropped_while_a_sync_or_checkpoint_persist_is_in_flight() {
     let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 4).unwrap();
     let mut ep =
       Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
-    let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+    let (wal, sb) = (TestWal::default(), TestSb::default());
+    let mut storage = Storage::new(wal, sb);
     assert!(ep.is_primary());
     let head_before = ep.op();
     arm(&mut ep);
     ep.handle_message(
       Instant::ZERO,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(9)),
       Message::Request(Request::new(
         ClientId::new(9),
@@ -597,7 +604,7 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   let cfg = Config::with_checkpoint_ops(0, MemberId::new(0), 8).unwrap();
   let mut ep =
     Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, CountSm::default(), u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // Primary holding a committed-op GAP: head op 4, commit HELD at 1 by a hole at op 2, but commit_max
   // = 4 (ops 2..=4 are known committed cluster-wide, merely unapplied here). Ops 3 + 4 are present in
@@ -624,10 +631,10 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
 
   // A FRESH client request (client 9, request 1) arrives DURING the gap → must be DROPPED: no Prepare,
   // no Reply, and the head op does NOT advance (no fresh op assigned that could later double-execute).
+  let mut storage = Storage::new(wal, sb);
   ep.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -650,12 +657,11 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   // commit_min catches up to commit_max == 4, and the repair set empties.
   ep.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     repair_prepare(0, 2, 4),
   );
-  ep.storage_step(Instant::ZERO, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply the suffix
+  ep.storage_step(Instant::ZERO, &mut storage, &mut blocks); // the repaired append completes → apply the suffix
   assert_eq!(
     ep.commit(),
     OpNumber::with(4),
@@ -670,8 +676,7 @@ fn on_request_waits_for_the_committed_prefix_to_apply_before_serving_clients() {
   // Now the SAME fresh request IS served — the primary assigns it a fresh op and broadcasts a Prepare.
   ep.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -736,7 +741,7 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
       Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
     let mut wal = ScriptedWal::with_entries(0);
     wal.capacity = depth + 8; // the backend's own ring, above the band depth
-    let mut sb = TestSb::default();
+    let mut storage = Storage::new(wal, TestSb::default());
     let head = depth - 1;
     ep.force_state_for_test(0, head, head, 0, &[]); // commit_min == op (caught up), no holes
     for op in 1..=head {
@@ -755,8 +760,7 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
     // request 1 is the canonical next request and is admitted (subject only to the band bound).
     ep.handle_message(
       Instant::ZERO,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(9)),
       Message::Request(Request::new(
         ClientId::new(9),
@@ -795,7 +799,7 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
       Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
     let mut wal = ScriptedWal::with_entries(0);
     wal.capacity = depth + 8; // the backend's own ring, above the band depth
-    let mut sb = TestSb::default();
+    let mut storage = Storage::new(wal, TestSb::default());
     ep.force_state_for_test(0, depth, depth, 0, &[]); // head exactly at the bound, caught up, no holes
     for op in 1..=depth {
       ep.log.insert(
@@ -812,8 +816,7 @@ fn op_admission_stalls_when_the_header_only_carrier_band_would_exceed_the_frame_
     let head_before = ep.op();
     ep.handle_message(
       Instant::ZERO,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(9)),
       Message::Request(Request::new(
         ClientId::new(9),
@@ -929,13 +932,13 @@ fn a_quorum_checkpoint_report_advances_prune_floor_without_a_gc_trim_yet_the_car
   // counter ticks), because admitting it would push the carrier to `depth + 1` entries — over the
   // frame. The unbounded `TestWal` (`capacity() == u64::MAX`) rules out the WAL-wrap stall, so this is
   // the carrier-band backpressure alone.
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let head_before = e.op();
   let stalls_before = e.wal_stalls();
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -989,13 +992,13 @@ fn a_backup_whose_checkpoint_lags_while_it_accepts_prepares_keeps_its_carrier_un
   // head does NOT advance and nothing is appended, because growing to `depth + 1` retained entries
   // would push the DVC carrier over the frame. `TestWal` is unbounded, so the ring-window stall is out
   // of the picture — this is the band backpressure alone.
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   let head_before = e.op();
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     prepare(depth as u64 + 1, 0),
   );
@@ -1052,7 +1055,7 @@ fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
   // arm rests on. (`recover` now produces such entries for body-faulty committed ops; this seeds one
   // directly to isolate the commit-path apply arm.)
   let mut e = backup(); // replica 1 of 3, view 0 (primary is replica 0)
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Head op 1, nothing applied yet, op 1 present in the log as a body-ABSENT `Repairing` slot carrying
@@ -1074,10 +1077,10 @@ fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
   // The primary announces commit=1. `on_commit` → `advance_commit(target=1)` reaches op 1, finds its
   // body absent, and must HOLD: commit_min stays 0, op 1 is registered for peer fault-repair, and a
   // RequestPrepare(op 1) is solicited.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -1114,14 +1117,8 @@ fn commit_holds_at_a_body_repairing_entry_and_solicits_the_body() {
 
   // The repair Prepare answers with op 1's real body: once its append is durable, the held commit
   // resumes and op 1 applies (commit_min reaches 1), proving the hold was a genuine pause, not a loss.
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    primary_peer(),
-    repair_prepare(0, 1, 1),
-  );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply op 1
+  e.handle_message(now, &mut storage, primary_peer(), repair_prepare(0, 1, 1));
+  e.storage_step(now, &mut storage, &mut blocks); // the repaired append completes → apply op 1
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
@@ -1143,17 +1140,17 @@ fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
   // and re-minted for a DIFFERENT request — even one with identical body bytes — must NOT be counted.
   let cfg = Config::try_new(1, MemberId::new(0)).expect("valid cluster config");
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(3), 7, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   assert!(e.is_primary(), "replica 0 is primary of view 0");
   let now = Instant::ZERO;
 
   // The primary serves client 9's request 1 (body [1]) → mints op 1, seeding inflight[1] with that
   // OPERATION's identity. Pump storage so the durable own append records the primary's own vote.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(9)),
     Message::Request(Request::new(
       ClientId::new(9),
@@ -1167,7 +1164,7 @@ fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
     "the clean primary serves the request — op 1 is minted"
   );
   for _ in 0..4 {
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // the own append lands → the primary's own vote
+    e.storage_step(now, &mut storage, &mut blocks); // the own append lands → the primary's own vote
   }
   let own_bit = 1u64 << 0; // replica 0
   assert_eq!(
@@ -1197,8 +1194,7 @@ fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
   // REJECTED. (With body_checksum-only voting its checksum would have MATCHED and forged a quorum.)
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -1224,8 +1220,7 @@ fn on_prepare_ok_counts_a_vote_only_when_the_full_operation_identity_matches() {
   // The SAME backup acking op 1 with the MATCHING operation identity counts → own + backup = quorum.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -1254,13 +1249,13 @@ fn backup_reorder_buffer_is_bounded_to_the_tail_gap_window() {
   // backpressure shape as the ring stall), so a buggy primary emitting sparse high-op Prepares
   // cannot grow the buffer without bound.
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // Head is 0. An op just past the window is NOT retained...
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     prepare(TAIL_GAP_WINDOW + 1, 0),
   );
@@ -1272,12 +1267,11 @@ fn backup_reorder_buffer_is_bounded_to_the_tail_gap_window() {
   // ...while one at the window edge (and an interior one) is.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     prepare(TAIL_GAP_WINDOW, 0),
   );
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 0));
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 0));
   assert_eq!(
     e.buffer_len_for_test(),
     2,
@@ -1290,20 +1284,20 @@ fn backup_reorder_buffer_is_bounded_to_the_tail_gap_window() {
 /// COMMIT on a SOLO PRIMARY (quorum 1: each op commits via `commit_op` the moment its append lands) —
 /// the primary-path half of the session-eviction determinism proof. Returns the endpoint with every
 /// op applied.
-fn solo_primary_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) {
+fn solo_primary_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, Storage<TestWal, TestSb>) {
   let cfg = Config::try_new(1, MemberId::new(0))
     .unwrap()
     .with_max_client_sessions(cap)
     .unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(1), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   for c in 1..=n {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(c as u128)),
       Message::Request(Request::new(
         ClientId::new(c as u128),
@@ -1311,29 +1305,29 @@ fn solo_primary_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, Te
         Bytes::from(std::vec![c as u8]),
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // append lands → own vote → commit_op applies op c
+    e.storage_step(now, &mut storage, &mut blocks); // append lands → own vote → commit_op applies op c
     assert_eq!(e.commit().get(), c, "the solo primary committed op {c}");
   }
-  (e, wal, sb)
+  (e, storage)
 }
 
 /// Drive the SAME op stream (op `c` = client `c`, request 1, body `[c]`) through a BACKUP's
 /// `on_prepare` + `advance_commit` apply path — the backup-path half of the determinism proof.
-fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) {
+fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, Storage<TestWal, TestSb>) {
   let cfg = Config::try_new(1, MemberId::new(1))
     .unwrap()
     .with_max_client_sessions(cap)
     .unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let from = Peer::Replica(ReplicaId::new(0)); // the view-0 primary of the 2-replica cluster
+  let mut storage = Storage::new(wal, sb);
   for c in 1..=n {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       from,
       Message::Prepare(Prepare::new(
         View::new(),
@@ -1347,13 +1341,12 @@ fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) 
         Bytes::from(std::vec![c as u8]),
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks); // append lands → PrepareOk
+    e.storage_step(now, &mut storage, &mut blocks); // append lands → PrepareOk
   }
   // The final commit advance applies op n.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     from,
     Message::Commit(Commit::new(
       View::new(),
@@ -1364,7 +1357,7 @@ fn backup_with_clients(cap: u32, n: u64) -> (Endpoint<EchoSm>, TestWal, TestSb) 
     )),
   );
   assert_eq!(e.commit().get(), n, "the backup applied through op {n}");
-  (e, wal, sb)
+  (e, storage)
 }
 
 #[test]
@@ -1375,8 +1368,8 @@ fn session_eviction_is_replica_deterministic_across_primary_and_backup_paths() {
   // IDENTICAL eviction counts, and byte-IDENTICAL checkpoint envelopes (the table rides every
   // envelope, so divergent eviction would diverge checkpoint ids — state-sync chaos).
   let (cap, n) = (4u32, 7u64);
-  let (p, _, _) = solo_primary_with_clients(cap, n);
-  let (b, _, _) = backup_with_clients(cap, n);
+  let (p, _) = solo_primary_with_clients(cap, n);
+  let (b, _) = backup_with_clients(cap, n);
 
   // Both evicted the same number of sessions (7 clients into 4 slots → 3 evictions)…
   assert_eq!(p.sessions_evicted(), 3, "primary path evicted 7 - 4 = 3");
@@ -1408,15 +1401,15 @@ fn session_table_never_exceeds_the_cap_and_victims_are_oldest_first() {
     .with_max_client_sessions(cap)
     .unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, EchoSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let from = Peer::Replica(ReplicaId::new(0));
+  let mut storage = Storage::new(wal, sb);
   for c in 1..=(3 * cap as u64) {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       from,
       Message::Prepare(Prepare::new(
         View::new(),
@@ -1430,7 +1423,7 @@ fn session_table_never_exceeds_the_cap_and_victims_are_oldest_first() {
         Bytes::from_static(b"x"),
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
     let applied = e
       .sessions_snapshot_for_test()
       .iter()
@@ -1443,8 +1436,7 @@ fn session_table_never_exceeds_the_cap_and_victims_are_oldest_first() {
   }
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     from,
     Message::Commit(Commit::new(
       View::new(),
@@ -1474,7 +1466,7 @@ fn an_evicted_client_returns_as_a_fresh_session_only_from_request_one() {
   // a resume of its old numbering is silently dropped (no session, request != 1), while a
   // RE-REGISTRATION from request 1 opens a fresh session (which is also what un-wedges a client
   // that restarted with a lost request counter once its stale row ages out).
-  let (mut e, mut wal, mut sb) = solo_primary_with_clients(2, 3); // cap 2: client 1 was evicted
+  let (mut e, mut storage) = solo_primary_with_clients(2, 3); // cap 2: client 1 was evicted
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(e.session_request_for_test(1), None, "client 1 was evicted");
@@ -1482,8 +1474,7 @@ fn an_evicted_client_returns_as_a_fresh_session_only_from_request_one() {
   // Client 1 resumes its OLD numbering (request 2) → unknown client + request != 1 → silent drop.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(1)),
     Message::Request(Request::new(
       ClientId::new(1),
@@ -1491,7 +1482,7 @@ fn an_evicted_client_returns_as_a_fresh_session_only_from_request_one() {
       Bytes::from_static(b"resume"),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(e.op().get(), 3, "a resumed evicted numbering mints no op");
   assert_eq!(
     e.session_request_for_test(1),
@@ -1502,8 +1493,7 @@ fn an_evicted_client_returns_as_a_fresh_session_only_from_request_one() {
   // Client 1 re-registers from request 1 → a FRESH session is opened and the op commits.
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Client(ClientId::new(1)),
     Message::Request(Request::new(
       ClientId::new(1),
@@ -1511,7 +1501,7 @@ fn an_evicted_client_returns_as_a_fresh_session_only_from_request_one() {
       Bytes::from_static(b"fresh"),
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(e.commit().get(), 4, "the re-registered request commits");
   assert_eq!(
     e.session_request_for_test(1),
@@ -1528,31 +1518,30 @@ fn pipeline_admission_stalls_at_the_cap_and_releases_as_commits_advance() {
   // op then advances the commit and admission RELEASES.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let submit = |e: &mut Endpoint<NoopSm>,
-                wal: &mut TestWal,
-                sb: &mut TestSb,
+                storage: &mut Storage<TestWal, TestSb>,
                 blocks: &mut dyn BlockStore,
                 rn: u64| {
     e.handle_message(
       now,
-      wal,
-      sb,
+      storage,
       Peer::Client(ClientId::new(7)),
       client_request(rn),
     );
-    e.storage_step(now, wal, sb, blocks); // land the append (own vote only — quorum 2 never commits)
+    e.storage_step(now, storage, blocks); // land the append (own vote only — quorum 2 never commits)
   };
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=MAX_PIPELINE {
-    submit(&mut e, &mut wal, &mut sb, &mut blocks, rn);
+    submit(&mut e, &mut storage, &mut blocks, rn);
   }
   assert_eq!(e.op().get(), MAX_PIPELINE, "the pipeline filled to the cap");
   assert_eq!(e.commit().get(), 0, "nothing committed (no backup acks)");
 
   // The next request is REFUSED at admission: no op minted, watermark unchanged.
-  submit(&mut e, &mut wal, &mut sb, &mut blocks, MAX_PIPELINE + 1);
+  submit(&mut e, &mut storage, &mut blocks, MAX_PIPELINE + 1);
   assert_eq!(
     e.op().get(),
     MAX_PIPELINE,
@@ -1572,8 +1561,7 @@ fn pipeline_admission_stalls_at_the_cap_and_releases_as_commits_advance() {
   );
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -1586,7 +1574,7 @@ fn pipeline_admission_stalls_at_the_cap_and_releases_as_commits_advance() {
     )),
   );
   assert_eq!(e.commit().get(), 1, "op 1 committed off the backup ack");
-  submit(&mut e, &mut wal, &mut sb, &mut blocks, MAX_PIPELINE + 1);
+  submit(&mut e, &mut storage, &mut blocks, MAX_PIPELINE + 1);
   assert_eq!(
     e.op().get(),
     MAX_PIPELINE + 1,
@@ -1602,24 +1590,24 @@ fn prepare_retransmit_is_windowed_to_the_first_unacked_ops() {
   // window), never as per-op `Prepare` frames.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let deep = PREPARE_RETRANSMIT_WINDOW + 16;
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=deep {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(7)),
       client_request(rn),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   while e.poll_message().is_some() {} // drop the initial broadcasts
   // Fire the prepare-retransmit timer.
   let later = now + PREPARE_RETRANSMIT;
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut storage);
   let mut retransmitted = std::vec::Vec::new();
   let mut batches = 0u64;
   while let Some(out) = e.poll_message() {
@@ -1672,15 +1660,15 @@ fn prepare_retransmit_splits_batches_at_the_frame_budget() {
   // so the tick emits [1,2] then [3].
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let big = 6 * 1024 * 1024usize;
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=3u64 {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(7)),
       Message::Request(Request::new(
         ClientId::new(7),
@@ -1688,7 +1676,7 @@ fn prepare_retransmit_splits_batches_at_the_frame_budget() {
         Bytes::from(std::vec![rn as u8; big]),
       )),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   assert_eq!(
     e.op(),
@@ -1696,7 +1684,7 @@ fn prepare_retransmit_splits_batches_at_the_frame_budget() {
     "three large ops minted, un-acked"
   );
   while e.poll_message().is_some() {} // drop the initial per-op broadcasts
-  e.handle_timeout(now + PREPARE_RETRANSMIT, &mut wal, &mut sb);
+  e.handle_timeout(now + PREPARE_RETRANSMIT, &mut storage);
   let mut batches: std::vec::Vec<std::vec::Vec<u64>> = std::vec::Vec::new();
   while let Some(out) = e.poll_message() {
     if let Message::PrepareBatch(b) = out.msg_ref() {
@@ -1727,18 +1715,18 @@ fn prepare_retransmit_skips_a_repairing_hole_in_the_window() {
   // either side.
   let cfg = Config::try_new(1, MemberId::new(0)).unwrap();
   let mut e = Endpoint::<_, RestartOnly>::genesis_unchecked(cfg, genesis(2), 0, NoopSm, u64::MAX);
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
   for rn in 1..=3u64 {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Client(ClientId::new(7)),
       client_request(rn),
     );
-    e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    e.storage_step(now, &mut storage, &mut blocks);
   }
   // Replace op 2's body with a `Repairing` hole (the in-memory shape a view-change adoption leaves
   // for an op whose body no donor shipped).
@@ -1751,7 +1739,7 @@ fn prepare_retransmit_skips_a_repairing_hole_in_the_window() {
     },
   );
   while e.poll_message().is_some() {}
-  e.handle_timeout(now + PREPARE_RETRANSMIT, &mut wal, &mut sb);
+  e.handle_timeout(now + PREPARE_RETRANSMIT, &mut storage);
   let mut retransmitted = std::vec::Vec::new();
   while let Some(out) = e.poll_message() {
     if let Message::PrepareBatch(b) = out.msg_ref() {
@@ -1783,13 +1771,13 @@ fn prepare_batch_delivery_is_equivalent_to_the_separate_prepares() {
 
   // Path A: the separate per-op Prepares, delivered back-to-back.
   let mut a = backup();
-  let (mut wal_a, mut sb_a) = (TestWal::default(), TestSb::default());
+  let (wal_a, sb_a) = (TestWal::default(), TestSb::default());
+  let mut storage_a = Storage::new(wal_a, sb_a);
   let mut blocks_a = crate::block_store::InMemoryBlockStore::new();
   for op in ops {
     a.handle_message(
       now,
-      &mut wal_a,
-      &mut sb_a,
+      &mut storage_a,
       primary_peer(),
       Message::Prepare(Prepare::new(
         View::new(),
@@ -1807,7 +1795,8 @@ fn prepare_batch_delivery_is_equivalent_to_the_separate_prepares() {
 
   // Path B: ONE PrepareBatch carrying the same envelope + entries.
   let mut b = backup();
-  let (mut wal_b, mut sb_b) = (TestWal::default(), TestSb::default());
+  let (wal_b, sb_b) = (TestWal::default(), TestSb::default());
+  let mut storage_b = Storage::new(wal_b, sb_b);
   let mut blocks_b = crate::block_store::InMemoryBlockStore::new();
   let entries = ops
     .iter()
@@ -1822,8 +1811,7 @@ fn prepare_batch_delivery_is_equivalent_to_the_separate_prepares() {
     .collect();
   b.handle_message(
     now,
-    &mut wal_b,
-    &mut sb_b,
+    &mut storage_b,
     primary_peer(),
     Message::PrepareBatch(crate::PrepareBatch::new(
       View::new(),
@@ -1836,8 +1824,8 @@ fn prepare_batch_delivery_is_equivalent_to_the_separate_prepares() {
   );
 
   // Land the in-flight appends on both, so the deferred acks are emitted too.
-  a.storage_step(now, &mut wal_a, &mut sb_a, &mut blocks_a);
-  b.storage_step(now, &mut wal_b, &mut sb_b, &mut blocks_b);
+  a.storage_step(now, &mut storage_a, &mut blocks_a);
+  b.storage_step(now, &mut storage_b, &mut blocks_b);
 
   // The full observable state converges — position, retained log, buffer, repair set, sessions…
   assert_eq!(a.op(), b.op());
@@ -1901,7 +1889,7 @@ fn prepare_batch_skips_a_repairing_entry_and_processes_the_rest() {
   // now a future op relative to head 1 — still flows through `on_prepare` into the tail-gap buffer
   // (hole-filling stays owned by the windowed repair channel, never the retransmit).
   let mut e = backup();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   let entry = |op: u64| {
@@ -1912,10 +1900,10 @@ fn prepare_batch_skips_a_repairing_entry_and_processes_the_rest() {
       Bytes::copy_from_slice(&[op as u8]),
     )
   };
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::PrepareBatch(crate::PrepareBatch::new(
       View::new(),
@@ -1935,7 +1923,7 @@ fn prepare_batch_skips_a_repairing_entry_and_processes_the_rest() {
       ],
     )),
   );
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut storage, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(1),

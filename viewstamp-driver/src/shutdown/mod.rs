@@ -76,12 +76,14 @@ impl ShutdownReport {
   /// landing once this endpoint is gone can never equal an id a rebuilt endpoint mints, and is
   /// refused at a single choke point before any correlation table is consulted. That is what makes
   /// a BOUNDED wait acceptable for a teardown instead of a wedge risk: an unbounded one would
-  /// trade a survivable outcome for an unbounded hang. What `false` does NOT license is rebuilding
-  /// an endpoint over the SAME still-live handles: the un-quiesced writes it reports are physical
-  /// facts the refusal cannot cancel, and a successor built over them lacks the slot-quiescence
-  /// witnesses to defer its conflicting re-appends. After an expired drain the safe successors are
-  /// process exit or releasing the handles with the process — crash semantics, which the next boot
-  /// recovers.
+  /// trade a survivable outcome for an unbounded hang. The un-quiesced writes `false` reports are
+  /// physical facts the correlation refusal cannot cancel, so what stays unsafe after an expired
+  /// drain is handing the raw HANDLES to a fresh ledger and writing over them — which is exactly
+  /// what [`Storage::into_parts`](viewstamp_proto::Storage::into_parts) refuses while anything is
+  /// in flight. Rebuilding an endpoint over the RETAINED session is unaffected: the
+  /// slot-quiescence witnesses live there, not in the endpoint, so a successor defers its
+  /// conflicting re-appends behind the predecessor's still-outstanding writes exactly as the
+  /// predecessor would have.
   ///
   /// What `false` does tell an embedder is that this stop was not orderly — some durability work
   /// the endpoint had submitted has an unknown outcome, so the next boot may have a tail to

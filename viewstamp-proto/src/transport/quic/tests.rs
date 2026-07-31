@@ -458,8 +458,7 @@ fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() 
   let cluster = 0x5151;
   // Replica 0 is the primary of view 0, so an admitted relayed Request would be served.
   let cfg = Config::try_new(cluster, MemberId::new(0)).unwrap();
-  let mut wal = TestWal::default();
-  let mut sb = TestSb::default();
+  let mut storage = Storage::new(TestWal::default(), TestSb::default());
   let mut c = QuicCoordinator::with_identity(
     Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -489,8 +488,7 @@ fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() 
   ));
   c.inject_message_for_test(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     over,
   );
@@ -517,8 +515,7 @@ fn a_relayed_over_max_request_is_dropped_at_quic_ingress_with_no_side_effects() 
   ));
   c.inject_message_for_test(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     at_max,
   );

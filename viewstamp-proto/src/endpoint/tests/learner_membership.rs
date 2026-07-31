@@ -187,21 +187,21 @@ fn on_request_prepare_serves_a_learner_requester() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold ops 1 + 2 (apply 1 via the piggybacked commit), discard the resulting acks.
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(2, 1));
+  e.storage_step(now, &mut storage, &mut blocks);
   while e.poll_message().is_some() {}
 
   let learner = ReplicaId::new(LEARNER);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(learner),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -237,14 +237,14 @@ fn on_recovery_serves_a_learner_requester() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   assert!(e.is_primary(), "voter 0 is the primary of view 0");
   let learner = ReplicaId::new(LEARNER);
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(learner),
     Message::Recovery(crate::Recovery::new(
       learner,
@@ -331,15 +331,15 @@ fn a_learner_never_acks_a_prepare_or_proposes_a_view_change_on_idle() {
   // backup acks) and a Commit (which on a voter backup defers the idle timeout), then advance far past
   // PRIMARY_IDLE and fire timers: nothing is acked, nothing is proposed, and it stays Normal.
   let mut e = learner_self();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -358,7 +358,7 @@ fn a_learner_never_acks_a_prepare_or_proposes_a_view_change_on_idle() {
   // `primary_idle` is never armed for a learner, so firing timers far past it (the no-orphan-due assert
   // inside `handle_timeout` must hold) proposes nothing and leaves it Normal.
   let later = now + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut storage);
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -381,14 +381,14 @@ fn a_quorum_of_voter_svcs_does_not_activate_a_learner() {
   // NOT transition it to an active view change (`on_start_view_change` early-returns), so `join_svc` —
   // whose `1 << id` would overflow for a high learner id — is never reached and no panic occurs.
   let mut e = learner_self();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // quorum_view_change for 3 voters is 2: deliver StartViewChange(view 1) from voters 0 and 1.
+  let mut storage = Storage::new(wal, sb);
   for v in [0u16, 1] {
     e.handle_message(
       now,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       Peer::Replica(ReplicaId::new(v)),
       Message::StartViewChange(StartViewChange::new(
         View::with(1),
@@ -404,7 +404,7 @@ fn a_quorum_of_voter_svcs_does_not_activate_a_learner() {
     "a learner does not enter ViewChange from a voter SVC quorum",
   );
   let later = now + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut storage);
   assert_eq!(
     e.status(),
     Status::Normal,
@@ -427,13 +427,13 @@ fn a_learner_catch_up_does_not_escalate_to_active_view_change() {
   // must NEVER escalate to active: `view_change_status` is voter-only, so the catch-up keeps re-soliciting
   // GetView (never flips catching_up to false, never emits SVC/DVC) until it adopts a StartView.
   let mut e = learner_self();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
   // A higher-view Commit from view 1's primary (`primary(1) == Replica(1)`) triggers catch_up_to_view(1).
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     Peer::Replica(ReplicaId::new(1)),
     Message::Commit(Commit::new(
       View::with(1),
@@ -462,7 +462,7 @@ fn a_learner_catch_up_does_not_escalate_to_active_view_change() {
   let mut t = now;
   for _ in 0..5 {
     t = t + core::time::Duration::from_millis(600);
-    e.handle_timeout(t, &mut wal, &mut sb);
+    e.handle_timeout(t, &mut storage);
   }
   assert!(
     e.status().is_view_change() && e.catching_up(),
@@ -494,24 +494,24 @@ fn a_learner_recovered_mid_view_change_catches_up_and_never_emits_a_dvc() {
   // restores `log_view == view` WITHOUT ever emitting a counted message. (Regression: a missing voter
   // gate on the mid-view-change recovery re-drive let a learner enter `enter_view_change_from_recovery`
   // and emit a DoViewChange — a non-voter taking part in consensus.)
-  let mut wal = wal_in_view(2, 0); // ops 1..=2 stamped view 0 (the not-yet-installed log)
-  let mut sb = sb_with_view(1, 0); // durable root: view 1, log_view 0 → log_view < view
+  let wal = wal_in_view(2, 0); // ops 1..=2 stamped view 0 (the not-yet-installed log)
+  let sb = sb_with_view(1, 0); // durable root: view 1, log_view 0 → log_view < view
   let now = Instant::ZERO;
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   // self = learner id 3 (slot 3 of a 3-voter set with 2 learners) — a NON-VOTER.
+  let mut storage = Storage::new(wal, sb);
   let mut r = Endpoint::recover(
     Config::try_new(1, MemberId::new(LEARNER as u128)).expect("learner id 3 of a 3-voter set"),
     genesis_with_learners(3, 2),
     0,
     NoopSm,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     crate::BlockLaneOccupancy::empty(),
   )
   .expect("recover accepts this store")
   .expect_active();
   for _ in 0..16 {
-    r.storage_step(now, &mut wal, &mut sb, &mut blocks);
+    r.storage_step(now, &mut storage, &mut blocks);
     if !r.status().is_recovering() {
       break;
     }
@@ -554,11 +554,12 @@ fn a_voter_backup_still_acks_and_proposes_unlike_a_learner() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
-  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
-  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(now, &mut storage, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut storage, &mut blocks);
   let mut acked = false;
   while let Some(out) = e.poll_message() {
     if matches!(out.into_msg(), Message::PrepareOk(_)) {
@@ -567,7 +568,7 @@ fn a_voter_backup_still_acks_and_proposes_unlike_a_learner() {
   }
   assert!(acked, "a voter backup acks a prepare");
   let later = now + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut storage);
   let mut proposed = false;
   while let Some(out) = e.poll_message() {
     if matches!(out.into_msg(), Message::StartViewChange(_)) {
@@ -607,20 +608,21 @@ fn a_learner_emits_learner_status_carrying_its_contiguous_applied_frontier_not_c
     std::vec::Vec::new(),
   )
   .expect("a valid durable root");
-  let mut sb = TestSb {
+  let sb = TestSb {
     state: durable_root,
     ..Default::default()
   };
-  let mut wal = TestWal {
+  let wal = TestWal {
     head: 6,
     ..Default::default()
   };
 
   let now = Instant::ZERO;
   // Bootstrap the cadence (the first `handle_timeout` arms it), then advance past it and fire.
-  e.handle_timeout(now, &mut wal, &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now, &mut storage);
   let later = now + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut storage);
 
   let mut reports = std::vec::Vec::new();
   while let Some(out) = e.poll_message() {
@@ -646,7 +648,7 @@ fn a_learner_emits_learner_status_carrying_its_contiguous_applied_frontier_not_c
     "self-identified by the learner's slot"
   );
   // The load-bearing assertion: the report carries the CONTIGUOUS APPLIED FRONTIER (`commit_min` == 3),
-  // NOT `commit_max` (6). Reverting the emitter to `sb.state().commit()` reports 6 and fails here.
+  // NOT `commit_max` (6). Reverting the emitter to `storage.sb_mut().state().commit()` reports 6 and fails here.
   assert_eq!(
     ls.durable_commit_min(),
     OpNumber::with(3),
@@ -673,11 +675,12 @@ fn a_voter_never_emits_learner_status() {
     NoopSm,
     u64::MAX,
   );
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   let now = Instant::ZERO;
-  e.handle_timeout(now, &mut wal, &mut sb);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_timeout(now, &mut storage);
   let later = now + core::time::Duration::from_millis(10_000);
-  e.handle_timeout(later, &mut wal, &mut sb);
+  e.handle_timeout(later, &mut storage);
   while let Some(out) = e.poll_message() {
     assert!(
       !matches!(out.into_msg(), Message::LearnerStatus(_)),
@@ -749,7 +752,7 @@ fn a_learner_answers_a_proof_challenge_with_its_fresh_contiguous_applied_frontie
   // (epoch, config_id). The frontier is read fresh: a just-regressed learner answers with its lower
   // frontier.
   let mut e = learner_self(); // self = learner slot 3, 3 voters + 2 learners, voter 0 = primary
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   // Model a learner whose head/commit_max cover op 5 but whose contiguous applied frontier is 2 (a
   // repair hole at op 3 holds apply) — `commit()` returns the hole-free frontier (2), not the head.
   e.force_state_for_test(0, 5, 2, 0, &[3, 5]);
@@ -760,10 +763,10 @@ fn a_learner_answers_a_proof_challenge_with_its_fresh_contiguous_applied_frontie
   );
 
   // The primary (voter 0) challenges the learner to prove it holds the prefix through op 5.
+  let mut storage = Storage::new(wal, sb);
   e.handle_message(
     Instant::ZERO,
-    &mut wal,
-    &mut sb,
+    &mut storage,
     primary_peer(),
     Message::RequestLearnerProof(crate::RequestLearnerProof::new(
       ReplicaId::new(0), // the soliciting primary's slot
@@ -812,7 +815,7 @@ fn a_learner_drops_a_cross_epoch_proof_challenge() {
   // and the handler re-checks — so a stale-config challenge can never elicit a proof that a later mint
   // under that stale config could consume.
   let mut e = learner_self();
-  let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
+  let (wal, sb) = (TestWal::default(), TestSb::default());
   e.force_state_for_test(0, 5, 5, 0, &[]);
 
   // A foreign-epoch challenge (epoch 1 ≠ this config's epoch 0).
@@ -827,7 +830,8 @@ fn a_learner_drops_a_cross_epoch_proof_challenge() {
     !e.epoch_authority_admits(&foreign),
     "a cross-epoch challenge is inadmissible at ingress",
   );
-  e.handle_message(Instant::ZERO, &mut wal, &mut sb, primary_peer(), foreign);
+  let mut storage = Storage::new(wal, sb);
+  e.handle_message(Instant::ZERO, &mut storage, primary_peer(), foreign);
   assert!(
     !core::iter::from_fn(|| e.poll_message())
       .any(|out| matches!(out.into_msg(), Message::LearnerProof(_))),

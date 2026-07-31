@@ -121,10 +121,6 @@ fn committed_ops_survive_crash_restart_and_view_change_through_a_checkpoint() {
 /// in the same rolling-restart window. The per-tick assertion is the invariant: the durable root's
 /// pair must always name a checkpoint envelope the store actually holds.
 #[test]
-#[ignore = "pins an open defect: a durable-view root written after an in-place restart pairs the \
-            successor's stale checkpoint_op with the predecessor's freshly-landed checkpoint_id, \
-            minting a durable root no checkpoint ever had; un-ignore when the pair is read off one \
-            root timeline"]
 fn a_view_change_over_an_inherited_checkpoint_root_never_mints_a_mixed_pair() {
   /// Small interval so the run crosses several checkpoint boundaries quickly.
   const CHECKPOINT_OPS: u64 = 4;

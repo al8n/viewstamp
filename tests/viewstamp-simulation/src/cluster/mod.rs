@@ -8,7 +8,7 @@ use viewstamp_proto::{
   AcceptReducedFaultTolerance, BlockAddress, BlockResponse, BlockStore, Committed, Config,
   DEFAULT_CHECKPOINT_OPS, Endpoint, Event, Instant, MemberId, Membership, MembershipChanged,
   Message, OpNumber, Outgoing, Peer, Prng, ProposeMembershipError, Recipient, Recovered, ReplicaId,
-  SingleChange, SingleVoterDelta, Wal, block_address, prepare_restart,
+  SingleChange, SingleVoterDelta, Storage, Wal, block_address, prepare_restart,
 };
 
 use crate::{
@@ -18,7 +18,7 @@ use crate::{
   clock::Clock,
   network::{Faults, InFlight, Network, SlowProfile, Target},
   sm::{BatchSm, LogSm, SimSm},
-  storage::{InMemorySuperblock, InMemoryWal, StorageFaults},
+  storage::{InMemorySuperblock, InMemoryWal, Shared, StorageFaults},
 };
 
 /// Mixed into the per-replica storage-fault seed so a replica's WAL/SB fault PRNG is independent of
@@ -131,10 +131,17 @@ struct HeldBlockJob {
 
 pub struct Cluster {
   replicas: Vec<Endpoint<SimSm, SingleChange>>,
-  /// Per-replica write-ahead logs (persist across crashes; see `crash`).
-  wals: Vec<InMemoryWal>,
-  /// Per-replica superblocks (persist across crashes; see `crash`).
-  sbs: Vec<InMemorySuperblock>,
+  /// Per-replica write-ahead logs (persist across crashes; see `crash`). Held as DEVICE handles:
+  /// the session below owns the medium's write facts, while the harness keeps this handle for the
+  /// device-side acts only a harness performs — fault injection, wipes, oracle drains.
+  wals: Vec<Shared<InMemoryWal>>,
+  /// Per-replica superblocks (persist across crashes; see `crash`). A device handle, like `wals`.
+  sbs: Vec<Shared<InMemorySuperblock>>,
+  /// Per-replica storage SESSIONS — one per medium, for the medium's whole life. They carry the
+  /// slot-quiescence fence, the root timeline, and the in-flight envelope ledger, so an endpoint
+  /// rebuilt over the same session ([`restart_in_place`](Self::restart_in_place)) inherits every
+  /// fence, while a `crash` opens a FRESH one (the process died; its in-flight work died with it).
+  storages: Vec<Storage<Shared<InMemoryWal>, Shared<InMemorySuperblock>>>,
   /// Per-replica content-addressed block stores holding the SM checkpoint DAGs (persist across
   /// crashes — the SM blocks must survive a restart, exactly like the WAL + superblock, and are
   /// forfeited by a wipe for the same reason).
@@ -531,7 +538,7 @@ impl Cluster {
       // the rings (`set_wal_capacity`) rebuilds the endpoints with the ring size.
       // `commit` performs the genesis write and requires it durable before it returns, with no run
       // loop yet to pump an async completion — so staging is suspended across it.
-      let staging = sbs[i as usize].suspend_async_writes();
+      let staging = sbs[i as usize].borrow_mut().suspend_async_writes();
       let committed = Endpoint::<SimSm, SingleChange>::with_reconfig(
         cfg,
         membership.clone(),
@@ -540,7 +547,7 @@ impl Cluster {
         u64::MAX,
       )
       .commit(&wals[i as usize], &mut sbs[i as usize]);
-      sbs[i as usize].resume_async_writes(staging);
+      sbs[i as usize].borrow_mut().resume_async_writes(staging);
       replica_set.push(committed.expect("genesis commit formats the seeded store"));
     }
     // GC-DISABLED: the seeded cluster holds every checkpoint block for the run's lifetime so a
@@ -550,10 +557,16 @@ impl Cluster {
     let block_stores = (0..node_count)
       .map(|_| MemBlockStore::new_gc_disabled())
       .collect();
+    // One session per medium, opened over the freshly-formatted (quiesced) handles and held for
+    // the cluster's whole life — the lifetime the medium's write facts actually have.
+    let storages = (0..n)
+      .map(|i| Storage::new(wals[i].clone(), sbs[i].clone()))
+      .collect();
     Self {
       replicas: replica_set,
       wals,
       sbs,
+      storages,
       block_stores,
       block_lanes: (0..node_count)
         .map(|_| viewstamp_proto::BlockJobCursor::new())
@@ -630,7 +643,7 @@ impl Cluster {
     async_sb_delay: Option<u32>,
     wal_capacity: Option<u64>,
     write_chaos: Option<u64>,
-  ) -> (Vec<InMemoryWal>, Vec<InMemorySuperblock>) {
+  ) -> (Vec<Shared<InMemoryWal>>, Vec<Shared<InMemorySuperblock>>) {
     let wals = (0..nodes)
       .map(|i| {
         let s = Self::storage_seed(seed, i);
@@ -646,16 +659,16 @@ impl Cluster {
         if let Some(base) = write_chaos {
           w.set_write_chaos(Some(Self::write_chaos_storage_seed(base, i)));
         }
-        w
+        Shared::new(w)
       })
       .collect();
     let sbs = (0..nodes)
       .map(|i| {
         let s = Self::storage_seed(seed, i);
-        match async_sb_delay {
+        Shared::new(match async_sb_delay {
           Some(d) => InMemorySuperblock::with_async_writes_and_faults(faults, s, d),
           None => InMemorySuperblock::with_faults(faults, s),
-        }
+        })
       })
       .collect();
     (wals, sbs)
@@ -695,6 +708,11 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
+    // handles went with the media they described.
+    self.storages = (0..self.wals.len())
+      .map(|i| Storage::new(self.wals[i].clone(), self.sbs[i].clone()))
+      .collect();
     // Re-format the reseeded (virgin) stores so a restart still recovers rather than fail-stopping a
     // voter over an empty root; the existing genesis endpoints (unchanged) already declare the matching
     // geometry.
@@ -720,6 +738,11 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
+    // handles went with the media they described.
+    self.storages = (0..self.wals.len())
+      .map(|i| Storage::new(self.wals[i].clone(), self.sbs[i].clone()))
+      .collect();
     // Re-format the reseeded (virgin) stores; the existing genesis endpoints are unchanged.
     self.format_all_stores();
   }
@@ -747,6 +770,11 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
+    // handles went with the media they described.
+    self.storages = (0..self.wals.len())
+      .map(|i| Storage::new(self.wals[i].clone(), self.sbs[i].clone()))
+      .collect();
     // Re-format the reseeded (virgin) stores; the genesis format write lands synchronously even under
     // this async-write mode, and the existing genesis endpoints are unchanged.
     self.format_all_stores();
@@ -776,6 +804,11 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
+    // handles went with the media they described.
+    self.storages = (0..self.wals.len())
+      .map(|i| Storage::new(self.wals[i].clone(), self.sbs[i].clone()))
+      .collect();
     // Re-format the reseeded (virgin) stores; the existing genesis endpoints are unchanged.
     self.format_all_stores();
   }
@@ -873,7 +906,7 @@ impl Cluster {
   /// off the superblock so it reflects the committed-and-durable configuration the node acts under.
   pub fn replica_is_voter(&self, i: usize) -> bool {
     use viewstamp_proto::Superblock;
-    let state = self.sbs[i].state();
+    let state = self.sbs[i].borrow().state();
     state.membership_opt().is_some_and(|m| {
       m.slot_of(MemberId::new(i as u128))
         .is_some_and(|slot| m.is_voter(slot))
@@ -892,7 +925,7 @@ impl Cluster {
   /// learner reads `true` until it is promoted; a voter reads `false`.
   pub fn replica_is_learner(&self, i: usize) -> bool {
     use viewstamp_proto::Superblock;
-    let state = self.sbs[i].state();
+    let state = self.sbs[i].borrow().state();
     state.membership_opt().is_some_and(|m| {
       m.slot_of(MemberId::new(i as u128))
         .is_some_and(|slot| m.is_learner(slot))
@@ -904,7 +937,7 @@ impl Cluster {
   /// legacy (pre-membership) root reads `false` too — but a v4 cluster always carries a membership.
   pub fn replica_is_member(&self, i: usize) -> bool {
     use viewstamp_proto::Superblock;
-    let state = self.sbs[i].state();
+    let state = self.sbs[i].borrow().state();
     state
       .membership_opt()
       .is_some_and(|m| m.slot_of(MemberId::new(i as u128)).is_some())
@@ -1020,7 +1053,7 @@ impl Cluster {
   pub fn replica_appended_op(&self, i: usize, op: OpNumber) -> bool {
     op.get() <= self.replica_checkpoint_op(i).get()
       || matches!(
-        self.wals[i].status(op),
+        self.wals[i].borrow().status(op),
         viewstamp_proto::SlotStatus::Clean | viewstamp_proto::SlotStatus::Faulty
       )
   }
@@ -1085,7 +1118,7 @@ impl Cluster {
     if self.durable_view_violation.is_some() {
       return;
     }
-    let durable_view = self.sbs[ri].state().view().get();
+    let durable_view = self.sbs[ri].borrow().state().view().get();
     let (kind, msg_view) = match out.msg_ref() {
       Message::StartView(sv) => ("StartView", sv.view().get()),
       // A primary's RecoveryResponse carries the canonical head (non-empty log or op > 0); a Normal
@@ -1201,7 +1234,7 @@ impl Cluster {
   /// Replica `i`'s durable WAL entry count (for the boundedness checker). After GC this is
   /// bounded by the un-pruned tail.
   pub fn wal_len(&self, i: usize) -> usize {
-    self.wals[i].len()
+    self.wals[i].borrow().len()
   }
 
   /// True iff replica `i`'s WAL PHYSICALLY holds op `op` right now — its slot is `Clean` or `Faulty`
@@ -1212,7 +1245,7 @@ impl Cluster {
   /// checkpoints past it and the slot is reused — at which point a laggard would state-sync.
   pub fn replica_wal_holds_op(&self, i: usize, op: OpNumber) -> bool {
     matches!(
-      self.wals[i].status(op),
+      self.wals[i].borrow().status(op),
       viewstamp_proto::SlotStatus::Clean | viewstamp_proto::SlotStatus::Faulty
     )
   }
@@ -1230,7 +1263,10 @@ impl Cluster {
   /// guarantee a `Dirty` slot is never a wrap-in-progress over an un-pruned op, so tolerating `Dirty`
   /// cannot mask a real wrap.
   pub fn replica_wal_slot_not_wrapped_away(&self, i: usize, op: OpNumber) -> bool {
-    !matches!(self.wals[i].status(op), viewstamp_proto::SlotStatus::Empty)
+    !matches!(
+      self.wals[i].borrow().status(op),
+      viewstamp_proto::SlotStatus::Empty
+    )
   }
 
   /// True iff replica `i` is participating in consensus (`Normal` or `ViewChange`) — i.e. it is NOT
@@ -1266,7 +1302,7 @@ impl Cluster {
   /// view the replica could ever have ACTED in. (Read off the same superblock the proto recovers from.)
   pub fn replica_durable_view(&self, i: usize) -> viewstamp_proto::View {
     use viewstamp_proto::Superblock;
-    self.sbs[i].state().view()
+    self.sbs[i].borrow().state().view()
   }
 
   /// Replica `i`'s DURABLE (superblock) configuration epoch — the high-order coordinate of the
@@ -1275,7 +1311,7 @@ impl Cluster {
   /// (a successor root is pre-written before any node recovers into it).
   pub fn replica_durable_epoch(&self, i: usize) -> viewstamp_proto::Epoch {
     use viewstamp_proto::Superblock;
-    self.sbs[i].state().epoch()
+    self.sbs[i].borrow().state().epoch()
   }
 
   /// Replica `i`'s DURABLE configuration `config_id` — the lineage hash of the active membership. A
@@ -1294,7 +1330,7 @@ impl Cluster {
   /// superblock the proto recovers from.
   pub fn replica_durable_prev_epoch(&self, i: usize) -> viewstamp_proto::Epoch {
     use viewstamp_proto::Superblock;
-    self.sbs[i].state().prev_epoch()
+    self.sbs[i].borrow().state().prev_epoch()
   }
 
   /// Whether replica `i`'s DURABLE root carries a membership (a v4 root). `false` for a node still on
@@ -1303,7 +1339,7 @@ impl Cluster {
   /// durable-root writes produce a v4 root on the first checkpoint / view change.
   pub fn replica_has_durable_membership(&self, i: usize) -> bool {
     use viewstamp_proto::Superblock;
-    self.sbs[i].state().membership_opt().is_some()
+    self.sbs[i].borrow().state().membership_opt().is_some()
   }
 
   /// Read access to client `i` (for invariant checking).
@@ -1422,8 +1458,14 @@ impl Cluster {
     // never depends on, and the crashed endpoint is never polled again.
     self.record_applied_events(i);
     self.crashed[i] = true;
-    self.sbs[i].discard_inflight();
-    self.wals[i].discard_inflight();
+    self.sbs[i].borrow_mut().discard_inflight();
+    self.wals[i].borrow_mut().discard_inflight();
+    // The storage SESSION dies with the process too. Its ledgers describe writes the crash just
+    // took with it, so carrying them into the restart would fence slots against landings that can
+    // never come; a fresh session over the same (now quiet) media is exactly what a new process
+    // opens. This is the one place a session is legitimately replaced over surviving handles — and
+    // the discards above are what make the medium quiet enough for it.
+    self.storages[i] = Storage::new(self.wals[i].clone(), self.sbs[i].clone());
     // A held block job is work IN FLIGHT on the storage lane; the power went out before it ran, so it
     // dies with the process exactly as a staged WAL write does. Dropping it also keeps the lane's
     // execution-order witness sound across the restart: the cursor persists, the successor endpoint
@@ -1551,8 +1593,7 @@ impl Cluster {
       membership,
       seed,
       self.make_sm(),
-      &mut self.wals[i],
-      &mut self.sbs[i],
+      &mut self.storages[i],
       lane,
     )? {
       Recovered::Active(endpoint) => {
@@ -1616,11 +1657,14 @@ impl Cluster {
     if let Some(base) = self.write_chaos_seed {
       w.set_write_chaos(Some(Self::write_chaos_storage_seed(base, i as u16)));
     }
-    self.wals[i] = w;
-    self.sbs[i] = match self.async_sb_delay {
+    self.wals[i] = Shared::new(w);
+    self.sbs[i] = Shared::new(match self.async_sb_delay {
       Some(d) => InMemorySuperblock::with_async_writes_and_faults(self.storage_faults, s, d),
       None => InMemorySuperblock::with_faults(self.storage_faults, s),
-    };
+    });
+    // A swapped disk is a NEW medium: its session starts empty because nothing was ever submitted
+    // to it, not because a ledger was reset over live writes.
+    self.storages[i] = Storage::new(self.wals[i].clone(), self.sbs[i].clone());
     // The third medium. Emptied in place rather than replaced so the store's seeded flush-fault plan,
     // GC mode, and lifetime fault witnesses — all deployment properties, not medium contents — carry
     // across the swap (see `MemBlockStore::wipe`).
@@ -1672,7 +1716,7 @@ impl Cluster {
     let Some(primary) = self.serving_primary() else {
       return Err(ProposeMembershipError::NotPrimary);
     };
-    self.replicas[primary].propose_membership(now, &mut self.wals[primary], delta, ack)
+    self.replicas[primary].propose_membership(now, &mut self.storages[primary], delta, ack)
   }
 
   /// The serving primary's current head op (`self.op`) — the frontier a `PromoteLearner`'s target
@@ -1692,7 +1736,7 @@ impl Cluster {
   /// report has propagated. Read off the superblock the proto recovers from.
   pub fn replica_durable_commit(&self, i: usize) -> u64 {
     use viewstamp_proto::Superblock;
-    self.sbs[i].state().commit().get()
+    self.sbs[i].borrow().state().commit().get()
   }
 
   /// A coordinated offline reconfiguration that DELIBERATELY drives the
@@ -1785,7 +1829,7 @@ impl Cluster {
         .collect();
       let uniform = commits.iter().all(|&c| c == commits[0]);
       let drained = (0..self.replicas.len())
-        .all(|i| self.retired[i] || !self.replicas[i].has_inflight_storage());
+        .all(|i| self.retired[i] || !self.replicas[i].has_inflight_storage(&self.storages[i]));
       if uniform && drained {
         settled = true;
         break;
@@ -1811,7 +1855,7 @@ impl Cluster {
       if self.retired[i] {
         continue;
       }
-      if !self.replicas[i].seal_committed_frontier(&mut self.sbs[i]) {
+      if !self.replicas[i].seal_committed_frontier(&mut self.storages[i]) {
         self.heal();
         return None;
       }
@@ -1822,7 +1866,7 @@ impl Cluster {
     for _ in 0..40_000 {
       self.tick();
       if (0..self.replicas.len())
-        .all(|i| self.retired[i] || !self.replicas[i].has_inflight_storage())
+        .all(|i| self.retired[i] || !self.replicas[i].has_inflight_storage(&self.storages[i]))
       {
         sealed = true;
         break;
@@ -1836,7 +1880,7 @@ impl Cluster {
     // the robust backstop — if a seal somehow raced an unrelated write, the successor would carry a
     // stale commit, so refuse rather than risk stranding a committed op across `prepare_restart`.
     for &v in &voters {
-      if self.sbs[v].state().commit().get() != committed_before {
+      if self.sbs[v].borrow().state().commit().get() != committed_before {
         self.heal();
         return None;
       }
@@ -1859,8 +1903,7 @@ impl Cluster {
     ));
     self.replicas[primary].handle_message(
       now,
-      &mut self.wals[primary],
-      &mut self.sbs[primary],
+      &mut self.storages[primary],
       Peer::Client(tail_client),
       req,
     );
@@ -1897,7 +1940,7 @@ impl Cluster {
       if self.retired[i] {
         continue;
       }
-      let cur = self.sbs[i].state();
+      let cur = self.sbs[i].borrow().state();
       let Some(membership) = cur.membership_opt() else {
         return None; // a legacy (pre-membership) root cannot chain a successor — never on a v4 cluster
       };
@@ -1909,7 +1952,7 @@ impl Cluster {
         members,
       )
       .ok()?;
-      self.sbs[i].install_root_for_test(succ);
+      self.sbs[i].borrow_mut().install_root_for_test(succ);
     }
 
     // (4) Crash every node, fault each VOTER's ACTUAL CURRENT HEAD, restart all. The voters cannot
@@ -1935,7 +1978,9 @@ impl Cluster {
         head > committed_before,
         "head-fault target {head} must be above the committed frontier {committed_before}"
       );
-      self.wals[v].fault_read_at(OpNumber::with(head));
+      self.wals[v]
+        .borrow_mut()
+        .fault_read_at(OpNumber::with(head));
       faulted_heads.push(head);
     }
     // Restart every voter (the sync recover-read drain only — `restart` no longer drives): the
@@ -2110,6 +2155,11 @@ impl Cluster {
     );
     self.wals = wals;
     self.sbs = sbs;
+    // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
+    // handles went with the media they described.
+    self.storages = (0..self.wals.len())
+      .map(|i| Storage::new(self.wals[i].clone(), self.sbs[i].clone()))
+      .collect();
     let membership = Self::genesis_membership(self.replica_count, self.learner_count);
     for i in 0..self.replicas.len() {
       let cfg = self.replica_config(i as u16);
@@ -2117,7 +2167,7 @@ impl Cluster {
       // Declare the capacity the current WALs report (the bounded ring size, or the unbounded default)
       // — it is stamped into every durable root, and recovery fences a mismatch.
       // Same genesis-write contract as the seeded construction path: suspend staging across `commit`.
-      let staging = self.sbs[i].suspend_async_writes();
+      let staging = self.sbs[i].borrow_mut().suspend_async_writes();
       let committed = Endpoint::<SimSm, SingleChange>::with_reconfig(
         cfg,
         membership.clone(),
@@ -2126,7 +2176,7 @@ impl Cluster {
         self.wal_capacity.unwrap_or(u64::MAX),
       )
       .commit(&self.wals[i], &mut self.sbs[i]);
-      self.sbs[i].resume_async_writes(staging);
+      self.sbs[i].borrow_mut().resume_async_writes(staging);
       self.replicas[i] = committed.expect("genesis commit formats the reseeded store");
       self.incarnations[i] += 1;
     }
@@ -2144,9 +2194,9 @@ impl Cluster {
       // `format` requires its write durable before it returns and there is no run loop here to pump
       // an async completion, so staging is suspended across the call and restored after — the stores
       // may already be configured for the async steady-state window.
-      let staging = self.sbs[i].suspend_async_writes();
+      let staging = self.sbs[i].borrow_mut().suspend_async_writes();
       let formatted = viewstamp_proto::format(&cfg, &membership, &self.wals[i], &mut self.sbs[i]);
-      self.sbs[i].resume_async_writes(staging);
+      self.sbs[i].borrow_mut().resume_async_writes(staging);
       formatted.expect("format a freshly-seeded virgin store");
     }
   }
@@ -2202,7 +2252,7 @@ impl Cluster {
 
   #[doc(hidden)]
   pub fn wal_head_for_test(&self, i: usize) -> u64 {
-    self.wals[i].op_head().get()
+    self.wals[i].borrow().op_head().get()
   }
 
   /// Test-only: the number of staged (not-yet-durable) WAL appends on replica `i` — `> 0` iff the
@@ -2211,7 +2261,7 @@ impl Cluster {
   /// (`restart_in_place` retains it where `crash` discards it), so the lane cannot pass vacuously.
   #[doc(hidden)]
   pub fn wal_staged_len_for_test(&self, i: usize) -> usize {
-    self.wals[i].staged_len()
+    self.wals[i].borrow().staged_len()
   }
 
   /// Test-only: the number of staged (not-yet-durable) superblock writes on replica `i` — `> 0` iff
@@ -2220,7 +2270,7 @@ impl Cluster {
   /// exercised (a primary sits with `pending_sb` armed while a view-change root write is in flight).
   #[doc(hidden)]
   pub fn sb_staged_len_for_test(&self, i: usize) -> usize {
-    self.sbs[i].staged_len()
+    self.sbs[i].borrow().staged_len()
   }
 
   /// Test-only: whether replica `i` is a `Normal` primary whose current view is NOT yet durable —
@@ -2232,7 +2282,7 @@ impl Cluster {
   pub fn in_pending_primary_view_window_for_test(&self, i: usize) -> bool {
     use viewstamp_proto::Superblock;
     let r = &self.replicas[i];
-    let durable_view = self.sbs[i].state().view().get();
+    let durable_view = self.sbs[i].borrow().state().view().get();
     r.status().is_normal() && r.is_primary() && r.view().get() > durable_view
   }
 
@@ -2266,16 +2316,16 @@ impl Cluster {
         viewstamp_proto::Epoch::new(0),
         0,
       ));
-      self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, gv);
+      self.replicas[i].handle_message(now, &mut self.storages[i], from, gv);
       let rec = Message::Recovery(viewstamp_proto::Recovery::new(
         peer,
         0xF2_u64,
         viewstamp_proto::Epoch::new(0),
         0,
       ));
-      self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, rec);
+      self.replicas[i].handle_message(now, &mut self.storages[i], from, rec);
       // Fire the primary timers too (the `primary_timeouts` heartbeat/retransmit gate).
-      self.replicas[i].handle_timeout(now, &mut self.wals[i], &mut self.sbs[i]);
+      self.replicas[i].handle_timeout(now, &mut self.storages[i]);
       // Inspect EVERYTHING the probe made the replica emit: a correct (gated) primary emits no
       // StartView/RecoveryResponse for its not-yet-durable view; an ungated one does → durable-view
       // violation. Drain the queue (re-enqueuing for normal routing) and check each message.
@@ -2582,7 +2632,7 @@ impl Cluster {
       );
       if deliver {
         let now = self.clock.now();
-        self.replicas[i].on_block_done(now, &mut self.wals[i], &mut self.sbs[i], done);
+        self.replicas[i].on_block_done(now, &mut self.storages[i], done);
       }
     }
   }
@@ -2745,7 +2795,7 @@ impl Cluster {
   /// would-have-wedged precondition (an envelope only the chunked path can deliver).
   #[doc(hidden)]
   pub fn replica_durable_envelope_len(&self, i: usize) -> Option<usize> {
-    self.sbs[i].live_checkpoint_len()
+    self.sbs[i].borrow().live_checkpoint_len()
   }
 
   /// Make EVERY client request carry exactly `len` body bytes (replacing the seeded small/large
@@ -2805,7 +2855,7 @@ impl Cluster {
   /// non-vacuous (the crashed replica genuinely must peer-repair some rotted committed slot).
   #[doc(hidden)]
   pub fn wal_corrupt_slots_at_or_below_for_test(&self, i: usize, op: u64) -> usize {
-    self.wals[i].corrupt_slots_at_or_below_for_test(op)
+    self.wals[i].borrow().corrupt_slots_at_or_below_for_test(op)
   }
 
   /// Test-only: how many reads replica `i`'s WAL has MISDIRECTED (returned a wrong-op valid sibling)
@@ -2813,7 +2863,7 @@ impl Cluster {
   /// misdirected-read axis genuinely fired (so the proto's recovery placement check was exercised).
   #[doc(hidden)]
   pub fn wal_misdirects_fired(&self, i: usize) -> u64 {
-    self.wals[i].misdirects_fired()
+    self.wals[i].borrow().misdirects_fired()
   }
 
   /// Test-only: how many of replica `i`'s completed WAL appends LOST their header (the torn-header
@@ -2821,7 +2871,7 @@ impl Cluster {
   /// non-vacuity witness.
   #[doc(hidden)]
   pub fn wal_torn_headers_fired(&self, i: usize) -> u64 {
-    self.wals[i].torn_headers_fired()
+    self.wals[i].borrow().torn_headers_fired()
   }
 
   /// Test-only: how many of replica `i`'s chaos-mode WAL releases landed an append OUT of submission
@@ -2829,7 +2879,7 @@ impl Cluster {
   /// completions (so the slot-quiescence fence was exercised), not merely staged them.
   #[doc(hidden)]
   pub fn wal_write_reorders_fired(&self, i: usize) -> u64 {
-    self.wals[i].chaos_reorders_fired()
+    self.wals[i].borrow().chaos_reorders_fired()
   }
 
   /// Drains the first STALE-LANDING violation any replica's WAL has recorded since the last drain: a
@@ -2840,7 +2890,7 @@ impl Cluster {
   /// the content the stale landing just evicted. `None` when no WAL holds one.
   pub fn take_stale_landing_violation(&mut self) -> Option<SmolStr> {
     for i in 0..self.wals.len() {
-      if let Some((op, why)) = self.wals[i].take_stale_landing() {
+      if let Some((op, why)) = self.wals[i].borrow_mut().take_stale_landing() {
         let vote = match self.latest_votes[i].get(&op) {
           Some((view, checksum)) => format!(
             "; the replica's latest vote for op {op} (PrepareOk in view {view}) named \
@@ -2859,7 +2909,7 @@ impl Cluster {
   /// witness that a retained predecessor write genuinely landed late over a successor's slot.
   #[doc(hidden)]
   pub fn wal_stale_landings_fired(&self, i: usize) -> u64 {
-    self.wals[i].stale_landings_fired()
+    self.wals[i].borrow().stale_landings_fired()
   }
 
   /// Test-only: the checkpoint op named by a staged (in-flight) checkpoint-advancing ROOT write on
@@ -2867,7 +2917,7 @@ impl Cluster {
   /// device" window (see the fixture accessor). `None` outside that window.
   #[doc(hidden)]
   pub fn sb_staged_checkpoint_root_op_for_test(&self, i: usize) -> Option<u64> {
-    self.sbs[i].staged_checkpoint_root_op_for_test()
+    self.sbs[i].borrow().staged_checkpoint_root_op_for_test()
   }
 
   /// Test-only: whether replica `i`'s DURABLE root names a checkpoint envelope its own store holds
@@ -2876,7 +2926,7 @@ impl Cluster {
   /// so recovery from this disk alone cannot verify its own checkpoint.
   #[doc(hidden)]
   pub fn sb_root_names_stored_checkpoint(&self, i: usize) -> bool {
-    self.sbs[i].root_names_stored_checkpoint_for_test()
+    self.sbs[i].borrow().root_names_stored_checkpoint_for_test()
   }
 
   /// Test-only: the checkpoint op replica `i`'s DURABLE root currently names — read off the
@@ -2886,7 +2936,7 @@ impl Cluster {
   #[doc(hidden)]
   pub fn sb_checkpoint_op_for_test(&self, i: usize) -> u64 {
     use viewstamp_proto::Superblock;
-    self.sbs[i].state().checkpoint_op().get()
+    self.sbs[i].borrow().state().checkpoint_op().get()
   }
 
   /// Test-only: the view replica `i`'s DURABLE root currently names. A view-adoption's durable-view
@@ -2896,7 +2946,7 @@ impl Cluster {
   #[doc(hidden)]
   pub fn sb_view_for_test(&self, i: usize) -> u64 {
     use viewstamp_proto::Superblock;
-    self.sbs[i].state().view().get()
+    self.sbs[i].borrow().state().view().get()
   }
 
   /// Partition the replicas into groups: `groups[i]` is replica `i`'s group id. Replica↔replica
@@ -3151,7 +3201,7 @@ impl Cluster {
   fn drain_storage(&mut self, i: usize, now: viewstamp_proto::Instant) {
     self.age_block_hold(i);
     loop {
-      self.replicas[i].handle_storage(now, &mut self.wals[i], &mut self.sbs[i]);
+      self.replicas[i].handle_storage(now, &mut self.storages[i]);
       if let Some(job) = self.replicas[i].poll_block_job() {
         self.hold_block_job(i, job);
       }
@@ -3176,7 +3226,7 @@ impl Cluster {
       // completion, so both deltas are attributable to THIS job: nothing else runs between them.
       let superseded_before = self.replicas[i].block_jobs_superseded();
       let checkpoint_before = self.replicas[i].checkpoint_op();
-      self.replicas[i].on_block_done(now, &mut self.wals[i], &mut self.sbs[i], done);
+      self.replicas[i].on_block_done(now, &mut self.storages[i], done);
       self.note_block_job_done(
         i,
         tag,
@@ -3275,7 +3325,7 @@ impl Cluster {
                checkpoint_op={}) — append-before-ack violated",
               op.get(),
               msg_view,
-              self.wals[ri].status(op).as_str(),
+              self.wals[ri].borrow().status(op).as_str(),
               r.view().get(),
               r.status().as_str(),
               r.op().get(),
@@ -3341,13 +3391,7 @@ impl Cluster {
             {
               self.blocks_fetch_probe[ri].push(br.addr());
             }
-            self.replicas[ri].handle_message(
-              now,
-              &mut self.wals[ri],
-              &mut self.sbs[ri],
-              from,
-              m.msg,
-            );
+            self.replicas[ri].handle_message(now, &mut self.storages[ri], from, m.msg);
           }
         }
         Target::Client(id) => {
@@ -3397,7 +3441,7 @@ impl Cluster {
       if self.crashed[ri] {
         continue;
       }
-      self.replicas[ri].handle_timeout(now, &mut self.wals[ri], &mut self.sbs[ri]);
+      self.replicas[ri].handle_timeout(now, &mut self.storages[ri]);
       // Pump storage after timeout: drives append-before-ack (on_wal_done) + durable-view (on_sb_done).
       self.drain_storage(ri, now);
     }

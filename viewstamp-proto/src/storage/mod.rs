@@ -118,15 +118,21 @@
 //! CORRELATION safety: a late completion is INERT — it can never release an ack, cast a vote, or
 //! retire a table entry of the successor. What it does NOT provide is physical cancellation:
 //! refusing the receipt does not unsend the write, and the dead instance's bytes can still land in
-//! their slot at any moment until the backend completes them. The slot-quiescence witnesses
-//! therefore have the MEDIUM's lifetime, not any endpoint's, and a rebuild over live handles is
-//! safe only if they survive it — a successor built without them cannot defer its re-appends to
-//! slots it does not know are fenced, so an abandoned old write can land OVER a slot the successor
-//! re-appended and acked (the committed-value-loss class the fence exists to close). Draining the
-//! medium to quiescence before the rebuild is what discharges that obligation. A real crash
-//! discharges it differently — in-flight ops die with the process, up to the device-latency window
-//! in which a write already at the device can still land after process death (a bounded exposure
-//! this threat model accepts, not a zero one). Full statement: the contract on [`OpId`].
+//! their slot at any moment until the backend completes them.
+//!
+//! So the two facts a completion carries have different lifetimes, and only one of them is the
+//! endpoint's. The quiesce fact — which physical slots still owe a landing — belongs to the MEDIUM,
+//! and it lives in the [`Storage`] session, which owns the handles and every such fact for the
+//! medium's whole in-process life. A rebuilt endpoint threads the SAME session, so it inherits
+//! every slot-quiescence witness and defers its conflicting re-appends behind a dead predecessor's
+//! outstanding writes exactly as the predecessor would have; the session settles those writes off
+//! the very completions the choke refuses. The alternative — a fresh ledger over a live medium,
+//! which cannot see the slots it must not write and lets an abandoned write land OVER a slot the
+//! successor re-appended and acked — is unrepresentable: the handles are inside the session until
+//! [`Storage::into_parts`] proves the medium quiet. A real crash discharges the same obligation
+//! differently: in-flight ops die with the process, up to the device-latency window in which a
+//! write already at the device can still land after process death (a bounded exposure this threat
+//! model accepts, not a zero one). Full statement: the contract on [`OpId`].
 
 use std::vec::Vec;
 
@@ -137,6 +143,10 @@ use crate::{
   codec::{CodecError, Reader},
   membership::{Membership, MembershipError},
 };
+
+mod session;
+pub use session::Storage;
+pub(crate) use session::{AppendSubmission, SbPolled, SettledCancellation, WalPolled};
 
 /// On-disk header format version (bumped on any wire/disk layout change).
 pub const HEADER_VERSION: u16 = 1;
@@ -196,11 +206,13 @@ pub const HEADER_ENCODED_LEN: usize = 128;
 /// live storage handles — without tearing down the io_uring fd or thread pool beneath it — can
 /// deliver a pre-restart completion into the new endpoint, and it lands on nothing: it releases no
 /// ack, casts no vote, retires no table entry. It does NOT close the PHYSICAL half: refusing the
-/// completion cancels nothing, so the dead instance's write can still land in its slot — and a
-/// successor that did not inherit the slot-quiescence witnesses cannot defer the conflicting
-/// re-appends the fence exists to hold. Draining in-flight ops to quiescence before re-creating an
-/// endpoint over the same live handles is therefore load-bearing for SAFETY, not merely hygiene
-/// for a clean shutdown.
+/// completion cancels nothing, so the dead instance's write can still land in its slot. That half
+/// is closed by the [`Storage`] session instead, which settles every completion in its medium
+/// ledger — foreign or own, keyed by the FULL `(incarnation, sequence)` pair so no incarnation's
+/// sequence can alias another's — BEFORE the endpoint's choke judges correlation. The successor
+/// therefore inherits the slot-quiescence witnesses and defers its conflicting re-appends behind a
+/// predecessor's outstanding write, which is why a rebuild threading the same session needs no
+/// pre-rebuild drain for SAFETY.
 ///
 /// The id never reaches disk or the wire; a backend treats it as an opaque token to echo back.
 ///

@@ -308,9 +308,6 @@ fn a_foreign_completion_is_refused_across_an_in_place_restart() {
 /// blindness: they count occupied slots, so an eviction that leaves the slot occupied is invisible
 /// to them.
 #[test]
-#[ignore = "pins an open defect: a rebuilt endpoint's empty slot-quiescence fence lets a \
-            predecessor's un-cancellable write land over a slot its successor re-appended (and may \
-            have voted); un-ignore when the fence survives an in-place rebuild"]
 fn an_in_place_restart_under_write_chaos_keeps_every_voted_slots_content() {
   use crate::checker::{CheckResult, DurableQuorumChecker};
 

@@ -6,7 +6,8 @@ use agnostic::{
 };
 use viewstamp_proto::{
   ClientId, Config, Event, IdentityConfig, Instant, MemberId, Membership, Peer, ProvidedIdentity,
-  QuicCoordinator, QuicOptions, ReplicaId, Request, RequestNumber, StateMachine, Superblock, Wal,
+  QuicCoordinator, QuicOptions, ReplicaId, Request, RequestNumber, StateMachine, Storage,
+  Superblock, Wal,
 };
 
 use viewstamp_driver::{
@@ -51,8 +52,7 @@ struct PeerLink {
 /// losing select arm drops it — so no helper task or socket clone exists.
 pub struct ReactorQuicDriver<R: Runtime, S: StateMachine, W, B, I> {
   coord: QuicCoordinator<S, I>,
-  wal: W,
-  sb: B,
+  storage: Storage<W, B>,
   /// The embedder-provided block-storage lane, the peer of `wal`/`sb` in the node's durable store:
   /// large bodies (state-sync chunks, snapshots) are addressed by content hash there while the
   /// WAL/superblock hold the consensus log and durable root. The lane owns the store; the run loop
@@ -155,11 +155,12 @@ where
   /// while ANY durable state reconstructs the endpoint via `Endpoint::recover`, resuming the
   /// durable view in `Recovering` status and re-verifying the WAL tail through the normal run-loop
   /// pumps (recovery needs no special-casing there). A restart therefore can never silently
-  /// discard the durable view/log — the VSR amnesia hazard. The supplied handles MUST carry no
-  /// in-flight storage ops from a prior endpoint incarnation (the [`viewstamp_proto::OpId`]
-  /// lifetime contract: the id sequence restarts per endpoint, so a stale completion could alias a
-  /// fresh op's id): a real crash satisfies this by construction — in-flight ops die with the
-  /// process — and an embedder that re-opens storage in-process must drain or cancel first. The
+  /// discard the durable view/log — the VSR amnesia hazard. The constructor opens the
+  /// [`Storage`](viewstamp_proto::Storage) session over the pair and keeps it for the driver's
+  /// whole life, so the handles MUST be QUIESCED here — freshly formatted, or freshly opened after
+  /// a process start, where in-flight ops died with the process. Handles carrying a live
+  /// predecessor's un-quiesced writes can only come out of another session, which releases them
+  /// only once it has proven the medium quiet. The
   /// endpoint's recovery nonce is derived fresh per construction (wall-clock-mixed, NOT from
   /// `rng_seed`), as recovery freshness requires; `rng_seed` feeds only the QUIC coordinator.
   ///
@@ -231,8 +232,8 @@ where
     config: Config,
     membership: Membership,
     state_machine: S,
-    mut wal: W,
-    mut sb: B,
+    wal: W,
+    sb: B,
     blocks: BlockLane<S>,
     client: ClientId,
     first_request: u64,
@@ -260,12 +261,17 @@ where
       .await
       .map_err(DriverError::Bind)?;
 
+    // The session that owns these handles and every physical write fact over them for the rest of
+    // this driver's life: built ONCE, here, over handles a `format` or a process start left
+    // quiesced, and threaded by `&mut` into every call from then on. Its ledgers — the
+    // slot-quiescence fence, the root timeline, the in-flight envelopes — outlive any endpoint
+    // built over it.
+    let mut storage = Storage::new(wal, sb);
     let endpoint = build_endpoint(
       config,
       membership,
       state_machine,
-      &mut wal,
-      &mut sb,
+      &mut storage,
       // The lane's own accounting: what it still holds for a dead predecessor endpoint, if an
       // embedder handed this driver a surviving lane clone; empty on a fresh lane.
       blocks.occupancy(),
@@ -316,8 +322,7 @@ where
     let retired = Retirement::new();
     let driver = Self {
       coord,
-      wal,
-      sb,
+      storage,
       block_lane: blocks,
       socket,
       recv_buf: vec![0u8; RECV_BUF_LEN].into_boxed_slice(),
@@ -432,7 +437,7 @@ where
         .earliest_deadline()
         .is_some_and(|d| d <= std::time::Instant::now())
       {
-        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self.coord.handle_timeout(now, &mut self.storage);
         self.rekey_if_needed(now);
       }
       self.retransmit_stale(now);
@@ -551,7 +556,7 @@ where
         self.recv_backoff_until = Some(std::time::Instant::now() + RECV_ERROR_BACKOFF);
       }
       if fire_timeout {
-        self.coord.handle_timeout(now, &mut self.wal, &mut self.sb);
+        self.coord.handle_timeout(now, &mut self.storage);
         self.rekey_if_needed(now);
       }
       if let Some(cmd) = command
@@ -619,11 +624,9 @@ where
     drain_storage(
       || {
         let now = self.clock.now();
-        self
-          .coord
-          .handle_storage_deferred(now, &mut self.wal, &mut self.sb);
+        self.coord.handle_storage_deferred(now, &mut self.storage);
         self.drive_block_lane(now);
-        !self.coord.endpoint().has_inflight_storage()
+        !self.coord.endpoint().has_inflight_storage(&self.storage)
       },
       R::sleep,
     )
@@ -666,9 +669,7 @@ where
   /// advances the endpoint (a checkpoint publishing its durable root), which can install a new
   /// membership.
   fn feed_block_completion(&mut self, now: Instant, done: viewstamp_proto::BlockJobDone<S>) {
-    self
-      .coord
-      .on_block_done(now, &mut self.wal, &mut self.sb, done);
+    self.coord.on_block_done(now, &mut self.storage, done);
     self.rekey_if_needed(now);
   }
 
@@ -719,7 +720,7 @@ where
         );
         self
           .coord
-          .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+          .submit_client_request(now, &mut self.storage, request);
         false
       }
       Command::Shutdown { ack } => {
@@ -799,7 +800,7 @@ where
     let outcome = job.advance(now, live, fresh, &mut |delta, ack| {
       self
         .coord
-        .propose_membership(now, &mut self.wal, delta, ack)
+        .propose_membership(now, &mut self.storage, delta, ack)
     });
     if !matches!(outcome, viewstamp_driver::AdvanceOutcome::Done) {
       self.reconfigure = Some(job);
@@ -870,14 +871,9 @@ where
   /// stale map. `rekey_if_needed` is config_id-gated, so a datagram that does not change the
   /// membership costs only a scalar compare.
   fn handle_inbound_datagram(&mut self, now: Instant, len: usize, from: SocketAddr) {
-    self.coord.handle_udp(
-      now,
-      from,
-      None,
-      &self.recv_buf[..len],
-      &mut self.wal,
-      &mut self.sb,
-    );
+    self
+      .coord
+      .handle_udp(now, from, None, &self.recv_buf[..len], &mut self.storage);
     self.rekey_if_needed(now);
   }
 
@@ -935,7 +931,7 @@ where
     for request in stale {
       self
         .coord
-        .submit_client_request(now, &mut self.wal, &mut self.sb, request);
+        .submit_client_request(now, &mut self.storage, request);
     }
   }
 
@@ -946,9 +942,7 @@ where
     // current before any subsequent dial/route/close decision.
     self.rekey_if_needed(now);
     loop {
-      self
-        .coord
-        .handle_storage_deferred(now, &mut self.wal, &mut self.sb);
+      self.coord.handle_storage_deferred(now, &mut self.storage);
       self.rekey_if_needed(now);
       let mut produced = self.drive_block_lane(now);
       // Drain the pass's datagrams, then send them SEQUENTIALLY: a readiness `send_to` on an

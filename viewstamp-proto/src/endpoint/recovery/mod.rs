@@ -447,11 +447,10 @@ impl<S: StateMachine> Endpoint<S, RestartOnly> {
     membership: Membership,
     seed: u64,
     sm: S,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     lane: crate::BlockLaneOccupancy,
   ) -> Result<Recovered<S, RestartOnly>, RecoverError> {
-    Self::recover_with_reconfig(config, membership, seed, sm, wal, sb, lane)
+    Self::recover_with_reconfig(config, membership, seed, sm, storage, lane)
   }
 }
 
@@ -577,16 +576,15 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     membership: Membership,
     seed: u64,
     sm: S,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     lane: crate::BlockLaneOccupancy,
   ) -> Result<Recovered<S, R>, RecoverError> {
-    let state = sb.state();
+    let state = storage.sb().state();
     // Fail-fast parameter validation, BEFORE any storage I/O is submitted. Order: the liveness floor
     // first (an under-sized ring is unsafe regardless of what the root pinned), then the pinned
     // geometry pair on any NON-virgin store — recorded-ness before value comparison, so the
     // changed-value fences only ever compare fully-recorded pairs.
-    let capacity = wal.capacity();
+    let capacity = storage.wal().capacity();
     let minimum = config.minimum_wal_capacity();
     if capacity < minimum {
       return Err(RecoverError::WalCapacityBelowMinimum { capacity, minimum });
@@ -698,12 +696,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // append-before-ack: a later `Prepare` for a not-held op takes the append branch (the primary
     // re-sends; idempotent) rather than a blind re-ack.
     let ring_top = checkpoint_op.saturating_add(effective_wal_capacity(
-      wal.capacity(),
+      storage.wal().capacity(),
       config.checkpoint_ops(),
     ));
     let scan_head = (checkpoint_op.saturating_add(1)..=ring_top)
       .rev()
-      .find(|&probe| wal.header(OpNumber::with(probe)).is_some())
+      .find(|&probe| storage.wal().header(OpNumber::with(probe)).is_some())
       .unwrap_or(checkpoint_op);
     // A VIRGIN VOTER must NOT boot — regardless of any surviving WAL headers. A voter's genesis ALWAYS
     // writes a durable FORMAT root (the only public route to a runnable voter is
@@ -760,7 +758,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       config,
       // The backend capacity observed THIS incarnation (validated against the pinned root geometry
       // above), stamped into every durable root this incarnation writes.
-      wal_capacity: wal.capacity(),
+      wal_capacity: storage.wal().capacity(),
       membership,
       // The durable backward link of the lineage: the root carries its own `prev_epoch`; a
       // membership-less root reads `prev_epoch == epoch == 0`, which equals the bridged genesis
@@ -830,15 +828,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       block_serves_outstanding: lane.serves,
       block_serves_refused: 0,
       pending: BTreeMap::new(),
-      // KNOWN UNSOUND over a live medium, and the reason a rebuild over live handles requires a
-      // completed drain first: this endpoint-lifetime rebirth discards the slot-quiescence
-      // witnesses for any writes a predecessor still has with the device. Their completions are
-      // refused as foreign — which cancels nothing — so the successor cannot defer conflicting
-      // re-appends to slots it does not know are fenced, and an abandoned old write can land OVER
-      // a slot the successor re-appended and acked. A crash needs no witnesses (in-flight ops die
-      // with the process, up to the device-latency window); a rebuild over live handles is safe
-      // only when the medium was drained to quiescence before this constructor ran.
-      wal_writes: BTreeMap::new(),
+      // The slot-quiescence witnesses do NOT restart with the endpoint: they live in the
+      // `Storage` session this successor is recovered over, with the medium's lifetime, so any
+      // writes a predecessor still has with the device keep fencing their slots here exactly as
+      // they did in the incarnation that submitted them. What is endpoint-lifetime is only the
+      // LOGICAL half (`pending`/`appending`/`deferred_appends`): a fresh incarnation owes no
+      // actions of its own yet.
       deferred_appends: BTreeMap::new(),
       // No op is wrongly judged "released" before the first `run_gc` re-raises this from 0: a
       // released-op judgment applies only to this incarnation's own writes.
@@ -846,6 +841,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       appending: std::collections::BTreeSet::new(),
       pending_sb: None,
       pending_checkpoint: None,
+      inherited_frontier: None,
       // INHERITED, not reset. A surviving lane may still hold the dead endpoint's `Materialize` —
       // a full image the choke's refusal cannot retract — and this guard is what keeps the capture
       // site closed until the lane hands that image back. Starting `None` over such a lane would
@@ -960,10 +956,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // extent. `recover_progress` re-derives `self.op` as the highest VERIFIED op once the reads resolve.
     let lo = checkpoint_op.saturating_add(1);
     endpoint.recover = Some(rec);
-    endpoint.submit_recover_tail_batch(wal, lo, hi);
+    endpoint.submit_recover_tail_batch(storage, lo, hi);
     if checkpoint_op > 0 {
       let id = endpoint.mint_read_id();
-      sb.submit_read_checkpoint(id);
+      storage.submit_checkpoint_read(id);
       if let Some(rec) = endpoint.recover.as_mut() {
         rec.checkpoint = Some(id.seq());
         rec.checkpoint_retries = RECOVER_READ_RETRIES;
@@ -974,7 +970,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // resumes Normal at view 0; an unformatted store abdicates / backs up — never a view-0 primary).
     // Otherwise this arms the recover_retry timer so an owner driving `poll_timeout`/`handle_timeout`
     // re-submits any read whose completion is dropped or whose transient fault clears on a later read.
-    endpoint.recover_progress(Instant::ZERO, sb);
+    endpoint.recover_progress(Instant::ZERO, storage);
     Ok(Recovered::Active(endpoint))
   }
 
@@ -983,9 +979,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// slot (even one whose header is absent/faulty now — the read is the authoritative resolution, and a
   /// `Fault`/`Absent` completion routes through the retry/verdict path). Each read gets a freshly minted
   /// `OpId` (never aliases a future real op — `next_op_id` grows).
-  fn submit_recover_tail_batch<W: Wal>(&mut self, wal: &mut W, lo: u64, hi: u64) {
+  fn submit_recover_tail_batch<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+    lo: u64,
+    hi: u64,
+  ) {
     for op in lo..=hi {
-      if let Some(h) = wal.header(OpNumber::with(op)) {
+      if let Some(h) = storage.wal().header(OpNumber::with(op)) {
         // A Phase-1 header-only PLACEHOLDER: the body is filled in by the read completion
         // (`on_recover_wal_done`). Kept as a `Present(empty)` body — NOT a `Body::Repairing` hole — a
         // recovering replica does not apply ops, so the empty placeholder is never read by the commit
@@ -995,7 +996,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           .insert(op, LogEntry::present(h.client(), h.request(), Bytes::new()));
       }
       let id = self.mint_read_id();
-      wal.submit_read(id, OpNumber::with(op));
+      storage.submit_wal_read(id, OpNumber::with(op));
       if let Some(rec) = self.recover.as_mut() {
         rec.reads.insert(id.seq(), op);
         rec.pending.insert(op, RECOVER_READ_RETRIES);
@@ -1013,8 +1014,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_recover_wal_done<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     done: WalDone,
   ) {
     // The OpId of the completed read identifies which tail op it resolves (recover.reads). An
@@ -1030,10 +1030,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // appends into `Recovering`. What remains is stale/foreign: ignore, faults-as-data.
       WalDone::Appended(_) | WalDone::Cancelled(_) => return,
     };
-    // `wal` is part of the uniform recover-completion signature (`handle_storage` passes it the same way to
-    // every `on_recover_*` handler), but a completion carries its own outcome and this handler submits no
-    // read — `recover_timeouts` owns retry/resolve.
-    let _ = &mut *wal;
+    // `storage` is part of the uniform recover-completion signature (`handle_storage` passes it the
+    // same way to every `on_recover_*` handler), but a completion carries its own outcome and this
+    // handler submits no read — `recover_timeouts` owns retry/resolve.
+    let _ = &mut *storage;
     // Capture the durable known-committed frontier + log_view BEFORE borrowing `rec` (the above-band
     // view check reads them, and `rec` mutably borrows `self.recover`). Both are
     // immutable during the recover loop (`advance_commit` runs only after recovery completes).
@@ -1255,7 +1255,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         self.log.remove(&op);
       }
     }
-    self.recover_progress(now, sb);
+    self.recover_progress(now, storage);
   }
 
   /// The identity verdict for resolving an in-flight tail op WITHOUT its body, from either durable
@@ -1274,16 +1274,16 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// identity). `None` otherwise. The SINGLE source of the verdict the Fault retry-exhaustion path
   /// (`resolve_exhausted_tail_read`) and the peer-checkpoint completion (`on_recover_sync_checkpoint`)
   /// both apply, so they cannot drift.
-  fn inflight_tail_repairing_identity<W: Wal>(
+  fn inflight_tail_repairing_identity<W: Wal, B: Superblock>(
     &self,
-    wal: &W,
+    storage: &Storage<W, B>,
     op: u64,
   ) -> Option<(ClientId, RequestNumber, u128)> {
     let canonical = self
       .recover
       .as_ref()
       .and_then(|r| r.canonical.get(&op).copied());
-    let Some(h) = wal.header(OpNumber::with(op)) else {
+    let Some(h) = storage.wal().header(OpNumber::with(op)) else {
       // No WAL header at all (the slot — header included — rotted away, or was never written): the
       // durable ROOT is the remaining witness. `rec.canonical` has entries only for committed-band ops
       // the writer HELD, so an uncommitted / never-held op still resolves `None` → faulty.
@@ -1338,8 +1338,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// no one else) is still safely removed — it reaches `f+1` nacks from the non-holders and is nack-truncated
   /// on the new primary — so keeping it here never wedges. (Dropping it to `rec.faulty` would instead let its
   /// number be silently re-minted, the committed loss this closes.)
-  fn resolve_exhausted_tail_read<W: Wal>(&mut self, wal: &W, op: u64) {
-    let keep = self.inflight_tail_repairing_identity(wal, op);
+  fn resolve_exhausted_tail_read<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &Storage<W, B>,
+    op: u64,
+  ) {
+    let keep = self.inflight_tail_repairing_identity(storage, op);
     if let Some(rec) = self.recover.as_mut() {
       rec.pending.remove(&op);
       rec.reads.retain(|_, &mut o| o != op); // drop ALL of op's in-flight ids
@@ -1374,7 +1378,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// `recover_progress`; a `Fault` or a verify-mismatch is DISCARDED — `recover_timeouts` is the sole owner
   /// of the checkpoint retry + ABSOLUTE budget (decremented per tick), re-submitting until a valid read
   /// lands or the budget exhausts into a peer fetch.
-  pub(crate) fn on_recover_sb_done<B: Superblock>(&mut self, sb: &mut B, done: SuperblockDone) {
+  pub(crate) fn on_recover_sb_done<W: Wal, B: Superblock>(
+    &mut self,
+    storage: &mut Storage<W, B>,
+    done: SuperblockDone,
+  ) {
     match done {
       SuperblockDone::CheckpointRead(cr) => {
         // React to ANY checkpoint read while one is OUTSTANDING (`recover.checkpoint.is_some()`), not only
@@ -1401,7 +1409,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // path verifies the id the same way (`on_sync_checkpoint`); the recover path must too, or a bad
         // read would restore the wrong SM/sessions while `commit_min == checkpoint_op` — silent
         // committed-prefix loss, exactly what the checkpoint hash exists to prevent.
-        let state = sb.state();
+        let state = storage.sb().state();
         let id_ok = crate::checkpoint_id(cr.snapshot()) == state.checkpoint_id();
         let op_ok = cr.op() == state.checkpoint_op();
         let decoded = Self::decode_checkpoint(cr.snapshot());
@@ -1472,10 +1480,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// detached seed): the checkpoint read stays outstanding, so `recover_timeouts` — the sole owner of
   /// the retry + ABSOLUTE budget — re-reads until a clean reconstruct lands or the budget exhausts
   /// into a peer fetch. That is the identical disposition a faulted read gets.
-  pub(super) fn on_recovered_checkpoint_restored<B: Superblock>(
+  pub(super) fn on_recovered_checkpoint_restored<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     checkpoint: RecoveredCheckpoint,
     result: Result<(S, std::collections::BTreeMap<u128, Session>), crate::RestoreError>,
   ) {
@@ -1493,10 +1501,44 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // Record the restored SM + session DAG roots as the live roots the block GC marks from.
     self.checkpoint_sm_root = Some(checkpoint.sm_root);
     self.checkpoint_sessions_root = Some(checkpoint.sessions_root);
+    // The restored checkpoint can sit ABOVE the frontier the constructor pinned: a dead
+    // incarnation's in-flight checkpoint root can land between this endpoint's construction and
+    // the read's service (a restart in place), and the read serves — and `on_recover_sb_done`
+    // verifies against — the checkpoint the CURRENT durable root names. The recovery scalars must
+    // move WITH the restore: left at the pre-landing values, `commit_min` would sit below an SM
+    // that already holds the prefix, and the committed band above it would be re-applied onto
+    // content that already reflects it — a double-apply of every op in the gap
+    // (`commit_min == checkpoint_op` at restore is exactly the guard this preserves). Everything
+    // the restored snapshot subsumes is trimmed, the same filter `complete_state_sync` applies to
+    // what an installed checkpoint subsumed.
+    if checkpoint.op > self.checkpoint_op {
+      self.advance_checkpoint_op(checkpoint.op);
+      self.set_commit_min(checkpoint.op);
+      self.commit_max = self.commit_max.max(checkpoint.op);
+      self.op = self.op.max(checkpoint.op);
+      // An owed inherited frontier at/below the restore is met by it: the landing that set the
+      // marker is the same one that advanced the durable root this restore was verified against.
+      if self.inherited_frontier.is_some_and(|f| f <= checkpoint.op) {
+        self.inherited_frontier = None;
+      }
+      // The snapshot owns `[1..=checkpoint.op]`: drop the subsumed header-cache entries and every
+      // piece of recovery bookkeeping below the restored frontier — a pending tail read's slot is
+      // now vouched by the snapshot (a late completion for a dropped read finds no entry and is
+      // ignored), a canonical cross-check entry no longer binds, and a sub-frontier faulty verdict
+      // must not count against ops the checkpoint subsumes.
+      self.trim_log_to_checkpoint(checkpoint.op.get(), checkpoint.op.get());
+      if let Some(rec) = self.recover.as_mut() {
+        let floor = checkpoint.op.get();
+        rec.canonical.retain(|&op, _| op > floor);
+        rec.faulty.retain(|&op| op > floor);
+        rec.pending.retain(|&op, _| op > floor);
+        rec.reads.retain(|_, &mut op| op > floor);
+      }
+    }
     if let Some(rec) = self.recover.as_mut() {
       rec.checkpoint = None;
     }
-    self.recover_progress(now, sb);
+    self.recover_progress(now, storage);
   }
 
   /// Escalate to a PEER FETCH: stop local checkpoint retries, arm a FORCED state-sync to `target` (so a
@@ -1801,7 +1843,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the apply path), so the replica safely returns to `Normal` and re-fetches the op on demand via
   /// `RequestPrepare` when its commit reaches it — HOLDING the commit below the hole until then. This
   /// is what lets a recovering replica with a rotted committed slot rejoin without losing the op.
-  fn recover_progress<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  fn recover_progress<W: Wal, B: Superblock>(&mut self, now: Instant, storage: &mut Storage<W, B>) {
     let Some(rec) = self.recover.as_ref() else {
       return;
     };
@@ -1873,7 +1915,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // recovered backup resumes Normal (it waits for the primary's Prepare/Commit to re-announce
       // commit); a replica that was the established PRIMARY (or crashed mid-view-change) does NOT
       // resume as that primary — `complete_recovery` abdicates / re-drives the view change instead.
-      self.complete_recovery(now, sb);
+      self.complete_recovery(now, storage);
       return;
     }
     // Some slot read back permanently faulty (the per-slot retry budget — and the on-disk recover_retry
@@ -1908,7 +1950,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // (`complete_recovery`); only a replica that actually resumes Normal can serve the hole solicitation
     // now (a Recovering/ViewChange replica drops all messages, so it could not receive the repair
     // `Prepare` — the repair_retry timer re-solicits once it next resumes Normal).
-    self.complete_recovery(now, sb);
+    self.complete_recovery(now, storage);
     if self.status.is_normal() {
       // Solicit every hole now (the timer also re-solicits on a cadence until each is filled).
       let ops: std::vec::Vec<u64> = self.repair.iter().copied().collect();
@@ -1938,7 +1980,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// would stall its recovered tail `(commit_min, op]` — ops it had already committed pre-crash. We
   /// therefore REBUILD that pipeline (own-vote set, mirroring `start_view_as_new_primary`) and drive
   /// `try_commit`, so the solo primary re-commits its tail and makes progress immediately.
-  pub(crate) fn complete_recovery<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn complete_recovery<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     // Read the FORMATTED witness before dropping the recover state — it gates the genesis-primary
     // exemption below. A re-latched recovery (`on_recover_sync_checkpoint` builds a default state)
     // carries `formatted = false`, which is correct: a re-syncing node is never at genesis.
@@ -1957,7 +2003,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       //   `log_view == view` and returns it to Normal — exactly the catching-up lane a learner uses when
       //   it falls behind in view (`view_change_status` is voter-only, so it never escalates to active).
       if self.is_voter() {
-        self.enter_view_change_from_recovery(now, sb, self.view);
+        self.enter_view_change_from_recovery(now, storage, self.view);
       } else {
         self.enter_catch_up_posture(now);
       }
@@ -1982,7 +2028,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // Was Normal as the PRIMARY (or an unformatted empty store that must not resume as one) →
       // abdicate: a restarted primary has no in-memory pipeline and a checkpoint-only session table,
       // so it forces a clean view change to view + 1 rather than resuming as the established primary.
-      self.enter_view_change_from_recovery(now, sb, self.view.next());
+      self.enter_view_change_from_recovery(now, storage, self.view.next());
     } else {
       // Backup, a non-voting learner, or a SOLO replica (its own primary, no quorum to view-change)
       // → resume Normal.
@@ -1991,7 +2037,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // Solo VOTER: rebuild the pipeline for the recovered tail so `try_commit` re-commits ops it holds
         // (an empty `inflight` would stall them). A learner in a single-voter cluster is a follower, not
         // the solo primary, so it takes the backup path.
-        self.resume_solo_voter_pipeline(now, sb);
+        self.resume_solo_voter_pipeline(now, storage);
       } else {
         self.arm_timers(now);
       }
@@ -2002,7 +2048,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // with zero heartbeats. No-op when no debt is owed (the common recovery). The primary/mid-view-
       // change branches above do NOT call this: they re-enter a transition and pay once they next settle
       // Normal (the debt is sticky — re-checked from the commit-advance tails).
-      self.maybe_pay_checkpoint_debt(now, sb);
+      self.maybe_pay_checkpoint_debt(now, storage);
     }
   }
 
@@ -2014,7 +2060,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (client, request, body) the op holds, keeping the `inflight.prepare_checksum == op driven` invariant
   /// uniform across seeding sites — a solo replica has no peers, so no PrepareOk is matched against it (the
   /// own-vote quorum-of-1 commits via `oks` directly), but the identity is stamped consistently.
-  pub(crate) fn resume_solo_voter_pipeline<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn resume_solo_voter_pipeline<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     self.inflight.clear();
     let own = 1u64 << self.local_slot().get();
     for op in (self.commit_min.get() + 1)..=self.op.get() {
@@ -2046,7 +2096,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       );
     }
     self.arm_timers(now);
-    self.try_commit(now, sb);
+    self.try_commit(now, storage);
   }
 
   /// Recover-retry timer: the SOLE retry+budget owner for the tail reads (and the checkpoint read), so
@@ -2070,8 +2120,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn recover_timeouts<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
   ) {
     if self.timers.recover_retry.is_none_or(|d| d > now) {
       return;
@@ -2122,7 +2171,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       match budget {
         // Exhausted: resolve from the durable header (keep header-only as Repairing, or route to
         // peer-repair). This both removes `op` from `rec.pending` and drops all its in-flight ids.
-        Some(0) => self.resolve_exhausted_tail_read(wal, op),
+        Some(0) => self.resolve_exhausted_tail_read(storage, op),
         Some(budget) => {
           // Re-submit an ADDITIVE read — a fresh id that does NOT retire the op's existing in-flight
           // ids, so a slow completion under an earlier id still resolves the op — and decrement the
@@ -2132,7 +2181,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
             rec.pending.insert(op, budget - 1);
             rec.reads.insert(new_id.seq(), op);
           }
-          wal.submit_read(new_id, OpNumber::with(op));
+          storage.submit_wal_read(new_id, OpNumber::with(op));
         }
         // No budget entry ⇒ `op` is no longer pending (resolved between the snapshot and here) — skip.
         None => {}
@@ -2160,7 +2209,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           rec.checkpoint = Some(new_id.seq());
           rec.checkpoint_retries = checkpoint_retries - 1;
         }
-        sb.submit_read_checkpoint(new_id);
+        storage.submit_checkpoint_read(new_id);
       }
     }
     // Re-arm so we keep retrying until the loop completes.
@@ -2171,7 +2220,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // op's budget here would leave recovery stuck `Recovering` forever (nothing else re-evaluates the
     // transition). Idempotent: it re-arms and returns while any read is still pending, and finalizes only
     // once `rec.pending` empties.
-    self.recover_progress(now, sb);
+    self.recover_progress(now, storage);
   }
 
   /// Retire the local recovery bookkeeping once a sync install is STAGED (`pending_checkpoint` set),
@@ -2222,7 +2271,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// READ-BEFORE-CLEAR: the gate is evaluated on the CURRENT `peers_recovering` snapshot, which is
   /// only then cleared for the next window — clearing first would pin G2 at 0 and never fire. On a
   /// fire we escalate and DO NOT also re-broadcast `Recovery` this tick.
-  pub(crate) fn recover_head_timeouts<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn recover_head_timeouts<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     if self.timers.recover_head.is_none_or(|d| d > now) {
       return;
     }
@@ -2252,7 +2305,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     };
     if self.may_escalate_reformation(reform_attempts, fresh_corecovering, committed_band_intact) {
-      self.retire_recover_and_escalate(now, sb);
+      self.retire_recover_and_escalate(now, storage);
       return;
     }
     self.send_recovery(now); // re-broadcasts and re-arms recover_head
@@ -2325,9 +2378,13 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// through `complete_recovery`: that path's primary/backup role-branching (abdicate to `view + 1`
   /// vs resume Normal) would split a freshly-reset cluster's view targets, whereas every wedged voter
   /// must converge on the single `view + 1`.
-  pub(crate) fn retire_recover_and_escalate<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn retire_recover_and_escalate<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     self.recover = None;
-    self.enter_view_change_from_recovery(now, sb, self.view.next());
+    self.enter_view_change_from_recovery(now, storage, self.view.next());
   }
 
   /// Receive a `SyncCheckpoint` while RECOVERING and AWAITING A PEER CHECKPOINT — the escalation
@@ -2433,10 +2490,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (`Peer::Replica`) or a quarantined attested member (`Peer::Member`) — never the checkpoint's
   /// self-claimed, possibly-shifted `replica()`; a client could not have answered (the arming path
   /// dropped it).
-  pub(super) fn complete_recover_peer_fetch<W: Wal>(
+  pub(super) fn complete_recover_peer_fetch<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
+    storage: &mut Storage<W, B>,
     donor: Peer,
     m: crate::SyncCheckpoint,
   ) {
@@ -2482,7 +2539,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     for op in pending_tail {
       // The SAME placement + `classify_committed_slot` verdict the storage-path exhaustion uses
       // (`resolve_exhausted_tail_read`), via the one shared source so the two paths cannot drift.
-      let keep = self.inflight_tail_repairing_identity(wal, op);
+      let keep = self.inflight_tail_repairing_identity(storage, op);
       if let Some(rec) = self.recover.as_mut() {
         rec.pending.remove(&op);
         rec.reads.retain(|_, &mut o| o != op);
@@ -2898,8 +2955,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   pub(crate) fn on_recovery_response<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
+    storage: &mut Storage<W, B>,
     m: crate::RecoveryResponse,
   ) {
     if !self.status.is_recovering_head() {
@@ -2929,14 +2985,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     self.adopt_canonical_head(
       now,
-      sb,
+      storage,
       m.view(),
       m.op(),
       m.commit(),
       m.checkpoint_op(),
       m.log_slice(),
     );
-    self.truncate_wal_above_adopted_head(wal);
+    self.truncate_wal_above_adopted_head(storage);
   }
 }
 

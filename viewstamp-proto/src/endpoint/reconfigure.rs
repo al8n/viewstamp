@@ -55,10 +55,10 @@ where
   ///   voter-count decrement from an odd count) proposed with `ack` of `None`. Structural validation
   ///   runs first, so an invalid delta surfaces `Invalid` regardless of `ack`; a superfluous
   ///   [`AcceptReducedFaultTolerance`] on a non-reducing delta is accepted and ignored.
-  pub fn propose_membership<W>(
+  pub fn propose_membership<W, B: Superblock>(
     &mut self,
     now: Instant,
-    wal: &mut W,
+    storage: &mut Storage<W, B>,
     delta: SingleVoterDelta,
     ack: Option<AcceptReducedFaultTolerance>,
   ) -> Result<OpNumber, ProposeMembershipError>
@@ -92,7 +92,7 @@ where
     // primary/Normal checks above already foreclose `NotNormalPrimary`; every other verdict is TRANSIENT,
     // mapped to a RETRYABLE `ProposeMembershipError` so the operator/driver retries rather than treating it
     // as a permanent rejection.
-    match self.check_new_op_admission(wal) {
+    match self.check_new_op_admission(storage) {
       Ok(()) | Err(NewOpReject::NotNormalPrimary) => {}
       // Capacity backpressure (a full pipeline OR a WAL-ring/carrier-band stall) → `AtCapacity`.
       Err(NewOpReject::PipelineFull | NewOpReject::AtCapacity) => {
@@ -231,7 +231,7 @@ where
     let body_bytes = payload.encode_body();
     self.mint_op(
       now,
-      wal,
+      storage,
       client,
       request,
       body_bytes,

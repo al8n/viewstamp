@@ -9,12 +9,15 @@ use crate::{
   ClientId, Config, Conn, ConnId, Endpoint, Instant, LabelOptions, Labeled, MemberId, Message,
   Passthrough, Peer, ReplicaId, RequestNumber, SingleChange, StreamCoordinator, StreamTransport,
   message::Request,
+  storage::Storage,
   transport::testutil::{CountSm, TestSb, TestWal, genesis},
 };
 
 const CLUSTER: u128 = 0x5151;
 
-fn replica<R: StreamTransport>(id: u16) -> (StreamCoordinator<CountSm, R>, TestWal, TestSb) {
+fn replica<R: StreamTransport>(
+  id: u16,
+) -> (StreamCoordinator<CountSm, R>, Storage<TestWal, TestSb>) {
   let cfg = Config::try_new(CLUSTER, MemberId::new(id as u128)).unwrap();
   let coord = StreamCoordinator::new(Endpoint::<_, SingleChange>::genesis_unchecked(
     cfg,
@@ -23,7 +26,7 @@ fn replica<R: StreamTransport>(id: u16) -> (StreamCoordinator<CountSm, R>, TestW
     CountSm::default(),
     u64::MAX,
   ));
-  (coord, TestWal::default(), TestSb::default())
+  (coord, Storage::new(TestWal::default(), TestSb::default()))
 }
 
 fn sized_request(body: &[u8]) -> Message {
@@ -37,29 +40,27 @@ fn sized_request(body: &[u8]) -> Message {
 #[allow(clippy::too_many_arguments)]
 fn run_until_converged<R: StreamTransport>(
   r0: &mut StreamCoordinator<CountSm, R>,
-  wal0: &mut TestWal,
-  sb0: &mut TestSb,
+  storage0: &mut Storage<TestWal, TestSb>,
   blocks0: &mut crate::block_store::InMemoryBlockStore,
   c0: ConnId,
   r1: &mut StreamCoordinator<CountSm, R>,
-  wal1: &mut TestWal,
-  sb1: &mut TestSb,
+  storage1: &mut Storage<TestWal, TestSb>,
   blocks1: &mut crate::block_store::InMemoryBlockStore,
   c1: ConnId,
 ) -> bool {
   let mut now = Instant::ZERO;
   for _ in 0..8000 {
     now = now + Duration::from_millis(10);
-    r0.handle_storage(now, wal0, sb0, blocks0);
-    r1.handle_storage(now, wal1, sb1, blocks1);
-    r0.handle_timeout(now, wal0, sb0);
-    r1.handle_timeout(now, wal1, sb1);
+    r0.handle_storage(now, storage0, blocks0);
+    r1.handle_storage(now, storage1, blocks1);
+    r0.handle_timeout(now, storage0);
+    r1.handle_timeout(now, storage1);
     for _ in 0..2 {
       while let Some((_id, bytes)) = r0.poll_conn_transmit() {
-        r1.handle_conn_data(c1, &bytes, false, now, wal1, sb1);
+        r1.handle_conn_data(c1, &bytes, false, now, storage1);
       }
       while let Some((_id, bytes)) = r1.poll_conn_transmit() {
-        r0.handle_conn_data(c0, &bytes, false, now, wal0, sb0);
+        r0.handle_conn_data(c0, &bytes, false, now, storage0);
       }
     }
     if r0.endpoint().state_machine_ref().applied().len() == 1
@@ -104,28 +105,25 @@ fn two_replicas_commit_over_plain_tcp() {
     let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   }
-  let (mut r0, mut wal0, mut sb0) = replica::<Labeled<Passthrough>>(0);
-  let (mut r1, mut wal1, mut sb1) = replica::<Labeled<Passthrough>>(1);
+  let (mut r0, mut storage0) = replica::<Labeled<Passthrough>>(0);
+  let (mut r1, mut storage1) = replica::<Labeled<Passthrough>>(1);
   let mut blocks0 = crate::block_store::InMemoryBlockStore::new();
   let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
   let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0));
   let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1));
   r0.inject_message_for_test(
     Instant::ZERO,
-    &mut wal0,
-    &mut sb0,
+    &mut storage0,
     Peer::Client(ClientId::new(1)),
     sized_request(b"x"),
   );
   let converged = run_until_converged(
     &mut r0,
-    &mut wal0,
-    &mut sb0,
+    &mut storage0,
     &mut blocks0,
     c0,
     &mut r1,
-    &mut wal1,
-    &mut sb1,
+    &mut storage1,
     &mut blocks1,
     c1,
   );
@@ -146,16 +144,15 @@ fn public_submit_client_request_over_tcp_converges() {
     let opts = LabelOptions::new(CLUSTER, Peer::Replica(ReplicaId::new(me)));
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   }
-  let (mut r0, mut wal0, mut sb0) = replica::<Labeled<Passthrough>>(0);
-  let (mut r1, mut wal1, mut sb1) = replica::<Labeled<Passthrough>>(1);
+  let (mut r0, mut storage0) = replica::<Labeled<Passthrough>>(0);
+  let (mut r1, mut storage1) = replica::<Labeled<Passthrough>>(1);
   let mut blocks0 = crate::block_store::InMemoryBlockStore::new();
   let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
   let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0));
   let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1));
   r0.submit_client_request(
     Instant::ZERO,
-    &mut wal0,
-    &mut sb0,
+    &mut storage0,
     Request::new(
       ClientId::new(1),
       RequestNumber::with(1),
@@ -164,13 +161,11 @@ fn public_submit_client_request_over_tcp_converges() {
   );
   let converged = run_until_converged(
     &mut r0,
-    &mut wal0,
-    &mut sb0,
+    &mut storage0,
     &mut blocks0,
     c0,
     &mut r1,
-    &mut wal1,
-    &mut sb1,
+    &mut storage1,
     &mut blocks1,
     c1,
   );
@@ -190,28 +185,25 @@ fn two_replicas_commit_over_raw_passthrough() {
     let opts = LabelOptions::new(CLUSTER, Peer::Member(MemberId::new(me as u128)));
     Conn::from_parts(Labeled::acceptor(Passthrough::new(), &opts))
   }
-  let (mut r0, mut wal0, mut sb0) = replica::<Labeled<Passthrough>>(0);
-  let (mut r1, mut wal1, mut sb1) = replica::<Labeled<Passthrough>>(1);
+  let (mut r0, mut storage0) = replica::<Labeled<Passthrough>>(0);
+  let (mut r1, mut storage1) = replica::<Labeled<Passthrough>>(1);
   let mut blocks0 = crate::block_store::InMemoryBlockStore::new();
   let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
   let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0));
   let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1));
   r0.inject_message_for_test(
     Instant::ZERO,
-    &mut wal0,
-    &mut sb0,
+    &mut storage0,
     Peer::Client(ClientId::new(1)),
     sized_request(b"x"),
   );
   let converged = run_until_converged(
     &mut r0,
-    &mut wal0,
-    &mut sb0,
+    &mut storage0,
     &mut blocks0,
     c0,
     &mut r1,
-    &mut wal1,
-    &mut sb1,
+    &mut storage1,
     &mut blocks1,
     c1,
   );
@@ -254,28 +246,25 @@ mod tls {
 
   fn run_tls(body: &[u8]) {
     let opts = tls_options();
-    let (mut r0, mut wal0, mut sb0) = replica::<Labeled<TlsRecords>>(0);
-    let (mut r1, mut wal1, mut sb1) = replica::<Labeled<TlsRecords>>(1);
+    let (mut r0, mut storage0) = replica::<Labeled<TlsRecords>>(0);
+    let (mut r1, mut storage1) = replica::<Labeled<TlsRecords>>(1);
     let mut blocks0 = crate::block_store::InMemoryBlockStore::new();
     let mut blocks1 = crate::block_store::InMemoryBlockStore::new();
     let c0 = r0.register_dialed(Peer::Replica(ReplicaId::new(1)), dialer(0, &opts));
     let c1 = r1.register_accepted(Peer::Replica(ReplicaId::new(0)), acceptor(1, &opts));
     r0.inject_message_for_test(
       Instant::ZERO,
-      &mut wal0,
-      &mut sb0,
+      &mut storage0,
       Peer::Client(ClientId::new(1)),
       sized_request(body),
     );
     let converged = run_until_converged(
       &mut r0,
-      &mut wal0,
-      &mut sb0,
+      &mut storage0,
       &mut blocks0,
       c0,
       &mut r1,
-      &mut wal1,
-      &mut sb1,
+      &mut storage1,
       &mut blocks1,
       c1,
     );

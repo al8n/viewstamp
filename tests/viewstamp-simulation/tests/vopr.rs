@@ -1824,20 +1824,69 @@ fn replay_single_seed() {
   );
 }
 
+/// Replay ONE restart-in-place seed in isolation, with the axis forced on — the per-seed lane the
+/// sweep's regression list needs when a pinned seed has to be attributed rather than merely
+/// counted. Set `VOPR_RESTART_SEED` and run with `--ignored --nocapture`. (Ignored for the same
+/// reason as [`replay_single_seed`]: a debugging aid, not a gate.)
+#[test]
+#[ignore = "single-seed replay: set VOPR_RESTART_SEED and run with --ignored --nocapture to attribute one restart-in-place seed"]
+fn replay_single_restart_in_place_seed() {
+  let seed = std::env::var("VOPR_RESTART_SEED")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(33);
+  let r = run_vopr_with_restart_in_place(seed, DEFAULT_TICKS);
+  println!(
+    "vopr restart-in-place seed {} OK: ticks={} max_committed={} in_place_restarts={} \
+     crashes={} restarts={} calm_windows={} max_view={}",
+    r.seed(),
+    r.ticks(),
+    r.max_committed(),
+    r.in_place_restarts(),
+    r.crashes(),
+    r.restarts(),
+    r.calm_windows(),
+    r.max_view(),
+  );
+}
+
 /// The contiguous seed range for the restart-in-place sweep (same budget rationale as
 /// [`HOLD_SEEDS`]).
 const RESTART_IN_PLACE_SEEDS: u64 = 16;
 
-/// Restart-in-place regression seeds: every seed of `0..192` on which the crossed axis fails
-/// today, pinned with the axis FORCED ON. Two failure shapes, both deterministic per seed:
+/// Restart-in-place regression seeds: the applied-history safety violations the crossed axis used
+/// to produce — a replica's state machine applying an op number BELOW the position it sits at
+/// (e.g. seed 33: `applied op 1580 at position 1583`), the applied-stream shape of a committed op
+/// re-served with the wrong sequencing. All of them were consequences of a rebuilt endpoint losing
+/// the medium's slot-quiescence witnesses; they are pinned here so the session that carries those
+/// witnesses cannot regress without a failing seed.
 ///
-/// - **33, 59, 64, 78, 134, 179, 186** — an applied-history safety violation shortly after an
-///   in-place rebuild under chaos landings: a replica's state machine applies an op number BELOW
-///   the position it sits at (e.g. seed 33: `applied op 1580 at position 1583`), the
-///   applied-stream shape of a committed op being re-served with the wrong sequencing.
-/// - **162** — a calm-window LIVELOCK: with every replica up, the network healed, and client work
-///   outstanding, the committed high-water stops advancing.
-const RESTART_IN_PLACE_REGRESSION_SEEDS: [u64; 8] = [33, 59, 64, 78, 134, 162, 179, 186];
+/// Seed 162 sat in this list too, with a different shape — a calm-window livelock — and it still
+/// fails. It is pinned on its own in [`restart_in_place_livelock_seed`], which states what is
+/// known about it.
+const RESTART_IN_PLACE_REGRESSION_SEEDS: [u64; 7] = [33, 59, 64, 78, 134, 179, 186];
+
+/// Seed 162 of the restart-in-place axis: a calm-window LIVELOCK — every replica up, the network
+/// healed, no faults, client work outstanding, and the committed high-water stops advancing (at 96,
+/// tick 1697). It is NOT the medium-lifetime defect the sweep above pins: the storage session
+/// closed every applied-history seed and both stale-landing falsifiers, and this seed's failure is
+/// unchanged by it. The remaining suspect is the block lane's occupancy — an endpoint-sourced
+/// snapshot that can claim an image no lane holds, which permanently closes the successor's capture
+/// site (see the proto-side pin
+/// `a_capture_queued_but_never_polled_does_not_wedge_the_successors_capture_site`) and would freeze
+/// the checkpoint frontier exactly this way. That attribution is unproven, so this stays a pinned
+/// open seed rather than a claim.
+#[test]
+#[ignore = "pins an open defect: a calm-window livelock on the restart-in-place axis that the \
+            storage session does not close; un-ignore when the lane's occupancy has an owner whose \
+            lifetime is the lane's"]
+fn restart_in_place_livelock_seed() {
+  let r = run_vopr_with_restart_in_place(162, DEFAULT_TICKS);
+  assert!(
+    r.in_place_restarts() > 0,
+    "the axis must actually rebuild an endpoint on this seed"
+  );
+}
 
 /// The committed RESTART-IN-PLACE sweep: [`run_vopr_with_restart_in_place`] over
 /// `0..RESTART_IN_PLACE_SEEDS` plus the pinned regression seeds — the in-place endpoint rebuild
@@ -1852,10 +1901,6 @@ const RESTART_IN_PLACE_REGRESSION_SEEDS: [u64; 8] = [33, 59, 64, 78, 134, 162, 1
 /// regression seed), so this lane runs them on its own seeds, the same pattern as the other axis
 /// sweeps.
 #[test]
-#[ignore = "pins an open defect: rebuilding an endpoint over live storage discards the \
-            slot-quiescence fence and the lane state the medium still owes, and the pinned seeds \
-            fail on the consequences (stale landings, applied-history violations, a calm-window \
-            livelock); un-ignore when an in-place rebuild carries them"]
 fn vopr_restart_in_place_sweep_no_violations() {
   let mut total_in_place = 0u64;
   let mut total_committed = 0usize;

@@ -34,7 +34,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// reports) and bounded at a *full* interval, so a single ahead peer cannot induce a forfeit and a
   /// healthy primary that checkpoints in lock-step never arms it. `saturating_sub` guards the
   /// (defensive) case where the primary's own checkpoint is somehow ahead of the quorum's.
-  pub(crate) fn maybe_forfeit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn maybe_forfeit<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     // Only ever called from `primary_timeouts` (the Normal-primary tick); a backup behind on
     // checkpoint catches up via state-sync/force-sync and never forfeits.
     debug_assert!(self.status.is_normal() && self.is_primary());
@@ -79,7 +83,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // Newly stuck: arm the grace timer; do NOT step down yet.
       (true, None) => self.timers.forfeit_armed = Some(now + FORFEIT_GRACE),
       // Stuck for the whole grace window: forfeit.
-      (true, Some(deadline)) if deadline <= now => self.forfeit(now, sb),
+      (true, Some(deadline)) if deadline <= now => self.forfeit(now, storage),
       // Still within the grace window: wait.
       (true, Some(_)) => {}
     }
@@ -105,10 +109,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// The flag is cleared only when this replica LEAVES Normal-primary (the transition handlers clear
   /// it), so the latch self-resolves exactly when the forfeit succeeds and never leaks across views.
   /// The grace timer is disarmed here (the persistent latch, not the grace timer, now drives retries).
-  pub(crate) fn forfeit<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn forfeit<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     self.timers.forfeit_armed = None;
     self.pending_forfeit = true;
-    self.propose_next_view(now, sb);
+    self.propose_next_view(now, storage);
   }
 
   /// Flag the DEFERRED-forfeit step-down a PRIMARY raises off the force-sync / sync-checkpoint
@@ -169,8 +177,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
-  pub(crate) fn on_primary_idle<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
-    self.propose_next_view(now, sb);
+  pub(crate) fn on_primary_idle<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
+    self.propose_next_view(now, storage);
   }
 
   /// Propose moving to `self.view + 1`: adopt it as the SVC target (if higher than the current
@@ -181,7 +193,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// monotone-view guarantee (durable-view, stale-message rejection) behind a "view 0" the whole
   /// cluster believes is ancient. A replica that somehow holds `view == u64::MAX` keeps proposing
   /// `u64::MAX` — its peers ignore the stale target and no quorum forms — which is inert, not corrupt.
-  pub(crate) fn propose_next_view<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
+  pub(crate) fn propose_next_view<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    storage: &mut Storage<W, B>,
+  ) {
     if self.is_learner() {
       // A non-voting replica never initiates or joins a view change: it has no vote to cast and is
       // never a candidate primary. It learns of a completed change from the new primary's StartView.
@@ -193,6 +209,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.svc_from = 0;
     }
     self.join_svc(now);
-    self.maybe_start_view_change(now, sb);
+    self.maybe_start_view_change(now, storage);
   }
 }
