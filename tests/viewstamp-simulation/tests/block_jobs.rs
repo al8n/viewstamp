@@ -9,9 +9,10 @@
 //! - commits and heartbeats keep flowing while a storage lane is stalled;
 //! - a failed durability barrier leaves no durable root naming its blocks, and the checkpoint the
 //!   fault dropped is re-forced on cadence;
-//! - a reconstruct whose reads fault leaves the live state machine untouched and the obligation owed,
-//!   and the replica still converges;
-//! - a job executed OUT of issue order fail-stops rather than silently corrupting the store.
+//! - a reconstruct whose reads fault still lets the replica converge on the same applied history as
+//!   its peers;
+//! - a job executed OUT of issue order fail-stops rather than silently corrupting the store, and so
+//!   does a completion delivered out of issue order.
 
 use core::time::Duration;
 
@@ -36,15 +37,20 @@ struct Watch {
   roots: Option<(BlockAddress, BlockAddress)>,
 }
 
-/// Drives `c` for one tick and asserts the two standing block-layer invariants hold afterwards: no
-/// replica's durable checkpoint pointer regressed, and no durable checkpoint root names an un-flushed
-/// block.
+/// Drives `c` for one tick and asserts the standing block-layer invariants hold afterwards: no
+/// superseded completion published, no replica's durable checkpoint pointer regressed, and no durable
+/// checkpoint root names an un-flushed block.
 ///
 /// The flush oracle walks a replica's DAG only when it has PUBLISHED new roots. That is complete, not
 /// just cheap: the property can only break at publication, since a held block never leaves the
 /// store's flushed set (only the sweep removes it, and the sweep removes the block too).
 fn tick_checked(c: &mut Cluster, watch: &mut [Watch]) {
   c.tick();
+  assert_eq!(
+    c.take_stale_publication_violation(),
+    None,
+    "a superseded block-job completion advanced a durable checkpoint pointer"
+  );
   for (i, w) in watch.iter_mut().enumerate() {
     let op = c.replica_checkpoint_op(i).get();
     assert!(
@@ -95,15 +101,34 @@ fn cluster(seed: u64) -> Cluster {
 /// materialize at the moment its view advances — that confirmation is the whole point, since a test
 /// that let the job finish first would assert about a window it never entered.
 ///
-/// Replica 1 is then ISOLATED before the lane is released, which is what makes the publication claim
-/// exact: cut off, it commits nothing and can form no new checkpoint, so its durable checkpoint
-/// pointer has exactly ONE thing that could move it — the superseded completion. It must not move.
+/// The publication claim is judged PER COMPLETION by `tick_checked`, not by comparing the pointer
+/// before and after: the cadence RE-FORCES the checkpoint the transition dropped, so the pointer
+/// legitimately advances again moments later on a different completion, and a before/after comparison
+/// would report that as a stale publication. The cluster instead samples the pointer across each
+/// `on_block_done`, so a rise on a SUPERSEDED completion is attributable to it and to nothing else.
 #[test]
 fn a_materialize_superseded_by_a_view_change_publishes_nothing() {
   let mut c = cluster(7);
   let mut watch: Vec<Watch> = (0..c.node_count()).map(|_| Watch::default()).collect();
 
-  // Stall replica 1's lane and wait for a materialize to land at its head.
+  // Let replica 1 publish a real durable checkpoint FIRST. Stalling its lane from tick zero would
+  // leave it with no checkpoint at all, and every claim below about its pointer would then be a claim
+  // about a replica that never had one to move.
+  let mut published = false;
+  for _ in 0..SEARCH_TICKS {
+    tick_checked(&mut c, &mut watch);
+    if c.replica_checkpoint_op(1).get() > 0 {
+      published = true;
+      break;
+    }
+  }
+  assert!(
+    published,
+    "replica 1 never published a durable checkpoint — it has no pointer a stale publication could \
+     move"
+  );
+
+  // Now stall its lane and wait for a materialize to land at the head.
   c.set_block_lane_paused(1, true);
   let mut found = false;
   for _ in 0..SEARCH_TICKS {
@@ -153,9 +178,12 @@ fn a_materialize_superseded_by_a_view_change_publishes_nothing() {
     "a supersession was counted before the lane was released"
   );
 
-  // Isolate replica 1, then release its lane: nothing else can move its checkpoint pointer now.
-  c.partition(vec![0, 1, 0]);
-  let checkpoint_at_transition = c.replica_checkpoint_op(1).get();
+  // Release the lane. What must NOT happen is that the superseded completion PUBLISHES, and that is
+  // judged per completion by `tick_checked` — the cluster samples the durable checkpoint pointer
+  // across each `on_block_done`, so a rise on a superseded one is attributable to it and nothing
+  // else. A bare before/after comparison would not do: the cadence RE-FORCES the checkpoint the
+  // transition dropped, so the pointer legitimately advances again moments later, on a different
+  // completion.
   c.set_block_lane_paused(1, false);
   let mut superseded = false;
   for _ in 0..SEARCH_TICKS {
@@ -174,17 +202,8 @@ fn a_materialize_superseded_by_a_view_change_publishes_nothing() {
      have abandoned the checkpoint it answered",
     c.materializes_superseded_in_flight()
   );
-  // NO STALE PUBLICATION: the only completion that could have advanced this isolated replica's
-  // checkpoint pointer was the superseded one, and it advanced nothing.
-  assert_eq!(
-    c.replica_checkpoint_op(1).get(),
-    checkpoint_at_transition,
-    "the superseded materialize PUBLISHED: replica 1's durable checkpoint pointer moved on a \
-     completion whose checkpoint the view transition had already abandoned"
-  );
 
-  // And the cluster recovers: heal, restart, drain, and every replica agrees.
-  c.heal();
+  // And the cluster recovers: restart the crashed primary, drain, and every replica agrees.
   c.restart(primary);
   c.set_faults(Faults::none());
   for _ in 0..SEARCH_TICKS {
@@ -197,6 +216,19 @@ fn a_materialize_superseded_by_a_view_change_publishes_nothing() {
     matches!(check_safety(&c), viewstamp_simulation::CheckResult::Ok),
     "replicas diverged after a superseded materialize: {:?}",
     check_safety(&c)
+  );
+  // Agreement alone is satisfied by a replica holding nothing, so assert the catch-up directly: the
+  // replica whose materialize was superseded is back at the cluster's committed frontier.
+  let frontier = committed_frontier(&c);
+  assert!(
+    frontier > 0,
+    "the cluster committed nothing, so catching up means nothing"
+  );
+  assert_eq!(
+    c.replica_commit_max(1).get(),
+    frontier,
+    "replica 1 never caught back up after its materialize was superseded — the dropped checkpoint \
+     must cost a cadence, not the replica"
   );
 }
 
@@ -324,6 +356,28 @@ fn a_failed_flush_publishes_no_checkpoint_and_the_cadence_re_forces_it() {
     "replicas diverged under block-store flush faults: {:?}",
     check_safety(&c)
   );
+  // One final whole-cluster verdict, unmemoized: every replica's durable checkpoint, walked in full.
+  // The per-tick path above only walks a replica that published new roots, which is complete but
+  // narrow; this closes the run by re-checking every held DAG at once.
+  assert_eq!(
+    c.check_durable_checkpoint_flushed(),
+    None,
+    "a durable checkpoint root names an un-flushed block at the end of a flush-fault run"
+  );
+  // And the faults cost intervals, not progress: every replica ends at the committed frontier.
+  let frontier = committed_frontier(&c);
+  assert!(
+    frontier > 0,
+    "the cluster committed nothing under flush faults, so agreement means nothing"
+  );
+  for i in 0..c.node_count() {
+    assert_eq!(
+      c.replica_commit_max(i).get(),
+      frontier,
+      "replica {i} did not reach the committed frontier under flush faults — a failed barrier is \
+       costing progress rather than a checkpoint interval"
+    );
+  }
 }
 
 /// Builds a cluster whose replica 0 has TWO jobs queued on a stalled storage lane, ready to be
@@ -431,5 +485,19 @@ fn a_faulted_reconstruct_still_converges() {
     matches!(check_safety(&c), viewstamp_simulation::CheckResult::Ok),
     "replicas diverged after a faulted reconstruct: {:?}",
     check_safety(&c)
+  );
+  // Agreement alone would be satisfied by a replica that holds NOTHING (the empty prefix agrees with
+  // every history), so the catch-up is asserted directly: the replica whose rebuilds were faulted
+  // reached the cluster's committed frontier.
+  let frontier = committed_frontier(&c);
+  assert!(
+    frontier > 0,
+    "the cluster committed nothing, so catching up means nothing"
+  );
+  assert_eq!(
+    c.replica_commit_max(2).get(),
+    frontier,
+    "replica 2 never caught up after its reconstructs were faulted — a faulted rebuild must cost a \
+     retry, not the catch-up"
   );
 }

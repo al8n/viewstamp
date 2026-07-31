@@ -3069,6 +3069,16 @@ impl Vopr {
     if let Some(why) = c.take_durable_view_violation() {
       panic!("vopr seed {} tick {tick}: {why}", self.seed);
     }
+    // NO STALE PUBLICATION: a superseded block-job completion answers state the endpoint has already
+    // abandoned, so it must advance no durable checkpoint pointer. Observed structurally at the
+    // moment of the completion (the cluster samples the pointer across it), so this only ever fires on
+    // a real one.
+    if let Some(why) = c.take_stale_publication_violation() {
+      panic!(
+        "vopr seed {} tick {tick}: stale publication: {why}",
+        self.seed
+      );
+    }
     // THE DURABLE-CHECKPOINT FLUSH ORACLE: no block a durable checkpoint root names may be
     // un-flushed. Observed on EVERY lane — it is a pure read over bookkeeping the store already
     // keeps, so it costs the default schedule nothing and cannot perturb it, and off-axis (where no

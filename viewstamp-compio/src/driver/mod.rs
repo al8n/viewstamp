@@ -622,6 +622,10 @@ where
   /// checkpoint transaction. Only the storage half is pumped: outputs a completion produces
   /// (datagrams, events) belong to a driver that is still running, and this one is closing its
   /// socket next.
+  ///
+  /// If the deadline elapses with a job still executing on a spawned lane, the block store's
+  /// release does NOT happen here: see [`BlockLane::spawn`](viewstamp_driver::BlockLane::spawn) for
+  /// why the store can outlive this whole `run()` call, asynchronously, on the lane's own thread.
   async fn quiesce_storage(&mut self) -> StorageQuiescence {
     drain_storage(
       || {

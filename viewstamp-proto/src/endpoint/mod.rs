@@ -4571,7 +4571,7 @@ impl<S: StateMachine, R> Endpoint<S, R> {
   }
 
   /// How many peer `RequestBlock`s this endpoint dropped at its outstanding-serve cap
-  /// ([`MAX_OUTSTANDING_BLOCK_SERVES`]): the requester's stop-and-wait ARQ re-sends, so the drop
+  /// (`MAX_OUTSTANDING_BLOCK_SERVES`): the requester's stop-and-wait ARQ re-sends, so the drop
   /// costs a round trip and bounds the job queue against an inbound rate above the storage lane's
   /// drain rate.
   ///
@@ -6180,7 +6180,7 @@ where
 
   /// Consumes the completion of a block-storage job the driver executed off the pump.
   ///
-  /// The block-storage twin of [`Self::on_wal_done`] / [`Self::on_sb_done`], and gated the same two
+  /// The block-storage twin of `on_wal_done` / `on_sb_done`, and gated the same two
   /// ways before any correlation state is read:
   ///
   /// 1. **THE INCARNATION CHOKE.** A [`JobId`](crate::JobId) carries the incarnation of the endpoint

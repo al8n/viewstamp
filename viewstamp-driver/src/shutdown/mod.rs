@@ -62,6 +62,11 @@ impl ShutdownReport {
   /// owes). In-flight RECOVERY reads are excluded: dropping one loses nothing durable, and a
   /// `Recovering` endpoint is itself the product of `recover()`.
   ///
+  /// One block-job case always ends here rather than racing the deadline: a job that PANICS on a
+  /// spawned lane kills its worker thread, so that job's completion can never arrive at all (see
+  /// [`BlockLane::submit`](crate::BlockLane::submit)'s panic docs). The endpoint owes it forever, so
+  /// the drain always runs out the clock in that case and this reports `false`.
+  ///
   /// `false` is a legitimate, SAFE outcome — not a failure the driver papers over, and not
   /// something to retry. On expiry the driver drops storage mid-write, which is exactly what a
   /// crash does, and a crash is an event this system is built to survive: a WAL slot either holds a

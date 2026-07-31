@@ -81,6 +81,14 @@ impl<S: StateMachine> Clone for BlockLane<S> {
   /// The completions channel is shared too, so exactly one holder may consume from a lane at a
   /// time: clone to carry a lane ACROSS drivers (the rebuild case), never to run two drivers off
   /// one store at once.
+  ///
+  /// That single-consumer rule is a RUNTIME discipline, not one the type system enforces: nothing
+  /// stops two live clones from calling [`try_recv`](Self::try_recv) or [`recv`](Self::recv)
+  /// concurrently — it compiles and runs. The channel underneath is multi-consumer, so doing so
+  /// would silently SPLIT completions between the two callers (each one landing wherever
+  /// `recv`/`try_recv` happens to win the race) rather than duplicate them, so whichever clone does
+  /// not feed a given completion into an endpoint's `on_block_done` leaves that job's completion
+  /// permanently unaccounted for. Keeping to one consumer at a time is on the embedder.
   fn clone(&self) -> Self {
     Self {
       sink: match &self.sink {
@@ -131,6 +139,16 @@ impl<S: StateMachine + Send + 'static> BlockLane<S> {
   /// completion and its result is discarded — crash-equivalent, and safe for exactly the reason a
   /// crash is: the completion names a dead endpoint's incarnation, which the endpoint refuses
   /// before it consults any correlation state.
+  ///
+  /// That exit is DETACHED, not awaited, which matters beyond the discarded result: if a driver's
+  /// teardown drops its last handle while this thread is mid-job (the bounded shutdown drain hit
+  /// its deadline with a job still running — see
+  /// [`SHUTDOWN_DRAIN_DEADLINE`](crate::SHUTDOWN_DRAIN_DEADLINE)), `store` is NOT dropped by the
+  /// time the driver's `run()` returns or a `shutdown().await` resolves. It drops later, on this
+  /// thread, once the in-flight job finishes and the thread notices its channel is gone. An
+  /// embedder whose `store` holds an OS-level exclusive lock (a `flock`'d file, say) cannot assume
+  /// that lock is released the instant teardown reports back — reopening the same backing media
+  /// right after an unclean shutdown can race this still-live worker thread.
   pub fn spawn<L: BlockStore + Send + 'static>(store: L) -> Self {
     let (jobs_tx, jobs_rx) = flume::unbounded::<BlockJob<S>>();
     let (done_tx, done_rx) = flume::unbounded::<BlockJobDone<S>>();
@@ -190,6 +208,12 @@ impl<S: StateMachine> BlockLane<S> {
   /// [`BlockJobCursor`]'s issue-order fail-stop, or the embedder's own store. The lane cannot
   /// execute anything after that, and a driver that kept submitting into the dead queue would stall
   /// its storage silently, so the panic is re-raised at the submit that discovers it.
+  ///
+  /// That re-raise depends on a NEXT submit arriving. If none does — the panicked job was the last
+  /// one issued, or nothing else needs the store before teardown — the panic never surfaces here at
+  /// all: the endpoint is simply left owing that job's completion forever. It stays in-flight, a
+  /// bounded shutdown drain (see [`ShutdownReport`](crate::ShutdownReport)) can never see it
+  /// resolve, and teardown reports unquiesced once its deadline elapses rather than hanging.
   pub fn submit(&self, job: BlockJob<S>) {
     match &self.sink {
       Sink::Spawned(jobs) => {

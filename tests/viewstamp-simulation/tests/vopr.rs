@@ -39,7 +39,14 @@
 //! ([`vopr_slow_replica_sweep_no_violations`]) force-enables per-replica gray-failure delivery
 //! (messages a few seeded milliseconds late, never dropped). A committed WRITE-CHAOS sweep
 //! ([`vopr_wal_write_chaos_sweep_no_violations`]) force-enables the out-of-submission-order,
-//! un-cancellable WAL device model the endpoint's slot-quiescence fence is built for. An `#[ignore]`d
+//! un-cancellable WAL device model the endpoint's slot-quiescence fence is built for. Two committed
+//! BLOCK-LAYER sweeps cover the storage-job seam, the one piece of storage the others never touch:
+//! [`vopr_block_delay_sweep_no_violations`] holds each polled block job on its replica's serial lane
+//! for a few storage steps (so a job is genuinely OUTSTANDING while the pump must keep committing,
+//! and a materialize can still be running when a view transition abandons it), and
+//! [`vopr_block_fault_sweep_no_violations`] fails durability barriers and faults reconstruct reads,
+//! under the standing oracle that no durable checkpoint root ever names an un-flushed block. An
+//! `#[ignore]`d
 //! TORN-HEADER probe
 //! ([`vopr_torn_header_sweep_no_violations`])
 //! deliberately violates the `Wal` header-durability contract to measure its blast radius — it is a

@@ -58,6 +58,9 @@ impl RestoreError {
 ///   (hence identical addresses), so a laggard recognizes and skips them. WITHOUT it, incrementality
 ///   silently degrades to a full re-fetch (correct but not incremental).
 /// - **Bounded blocks** — every emitted block fits one transport frame.
+///
+/// A third-party implementation can check the checkpoint-purity and restore-as-constructor
+/// properties against its own type with [`assert_restore_contract`](crate::assert_restore_contract).
 pub trait StateMachine: Sized {
   /// A captured, self-contained image of the checkpointed state: everything
   /// [`materialize`](Self::materialize) needs to write the checkpoint DAG, detached from `self`.
