@@ -418,8 +418,10 @@ pub fn execute_block_job<S: StateMachine>(
       purpose,
     } => {
       // Ingest first (a fetched block's children extend the frontier), then drain the
-      // locally-present prefix. A bound breach at either step aborts the drain: the transfer is
-      // dropped by the completion, so there is nothing for a further walk to advance.
+      // locally-present prefix — so the post-condition is always "the front is a MISSING block",
+      // which is what makes the NEXT ingest match the address its pull asked for. A bound breach at
+      // either step aborts the drain: the transfer is dropped by the completion, so there is nothing
+      // for a further walk to advance.
       let mut accepted = false;
       let mut capped = false;
       if let Some((addr, bytes)) = fetched {

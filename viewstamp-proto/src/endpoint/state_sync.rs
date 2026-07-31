@@ -1,6 +1,22 @@
 use super::*;
 
 impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
+  /// Whether the live transfer has a frontier WALK outstanding — its frontiers are inside a job, and
+  /// the decision that walk carries (install the drained checkpoint, or pull the next missing block)
+  /// has not been made yet.
+  ///
+  /// A fresh pin is REFUSED while this holds. Replacing the transfer here would discard that pending
+  /// decision: a reply whose DAG the store already holds would have installed on its walk's
+  /// completion, and a later reply arriving first would throw that away and re-pull a different
+  /// donor's newer root instead — repeated every solicit round, the transfer never converges. The
+  /// refused reply costs one re-solicit; the walk lands on the very next storage step.
+  pub(super) fn transfer_walk_in_flight(&self) -> bool {
+    matches!(
+      self.block_fetch.as_ref().map(|bf| &bf.walks),
+      Some(WalkState::InFlight(_))
+    )
+  }
+
   /// Move the live transfer's frontiers into a walk job, leaving the job's id behind as the token
   /// its completion must match.
   ///
@@ -1194,6 +1210,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if from.is_client() {
       return;
     }
+    // ONE PIN AT A TIME: a reply is not admitted while the live transfer is mid-walk (see
+    // [`Self::transfer_walk_in_flight`]). The solicit re-fetches; the walk lands next storage step.
+    if self.transfer_walk_in_flight() {
+      self.walk_pins_refused += 1;
+      return;
+    }
     // PROVENANCE-AWARE replacement: a reply that does NOT present a crossing must never DOWNGRADE a live
     // crossing fetch. The cross-epoch solicit admits below-target same-config / empty-membership replies
     // onto the fetch path (they may arm a fetch when none exists), and `send_request_sync` solicits both
@@ -2218,6 +2240,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let Some(recon) = self.sm_reconstruct.as_ref() else {
       return; // no obligation owed — nothing to re-arm (defensive; the caller stashed it just above).
     };
+    // ONE PIN AT A TIME, as at every arming site: a transfer mid-walk owns its frontiers and its
+    // pending decision. The obligation stays owed either way, so the solicit cadence re-arms.
+    if self.transfer_walk_in_flight() {
+      self.walk_pins_refused += 1;
+      return;
+    }
     let sm_root = recon.sm_root;
     let sessions_root = recon.sessions_root;
     let donor = recon.donor;

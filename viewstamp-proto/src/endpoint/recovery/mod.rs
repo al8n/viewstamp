@@ -868,6 +868,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       wal_stalls: 0,
       below_ring_window_syncs: 0,
       dag_walks_capped: 0,
+      walk_pins_refused: 0,
       unions_floored: 0,
       repair_batches_served: 0,
       prepare_batches_sent: 0,
@@ -2565,6 +2566,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // for the re-solicit) rather than fabricate a target.
     if from.is_client() {
       self.block_fetch = None;
+      return;
+    }
+    // ONE PIN AT A TIME (mirrors `begin_block_sync`): a reply is not admitted while the live transfer
+    // is mid-walk. The recovery solicit re-fetches; the walk lands on the next storage step.
+    if self.transfer_walk_in_flight() {
+      self.walk_pins_refused += 1;
       return;
     }
     // PROVENANCE-AWARE replacement (mirrors `begin_block_sync`): a non-crossing reply must never DOWNGRADE
