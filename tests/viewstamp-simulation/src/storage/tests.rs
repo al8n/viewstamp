@@ -958,6 +958,65 @@ fn envelope_lag_completes_a_later_root_around_the_lagging_envelope() {
 }
 
 #[test]
+fn repeated_root_over_envelope_overtakes_retain_a_constant_generation_count() {
+  // The relocated backlog the in-flight ledgers cannot see: each cycle stages one envelope (the
+  // fence's one outstanding write), a later view root overtakes it (the lag mode's cross-kind
+  // release) naming the OLD live checkpoint, and the envelope then completes into the store with
+  // no correlation left to root it. In-flight counts stay at one root / one envelope throughout —
+  // yet without collection at the envelope landing the store retained every such completed
+  // orphan, one distinct generation per view/checkpoint cycle, indefinitely. The collect holds
+  // the retained set to live + staged-root-named + newest completed: at most three, every cycle.
+  use viewstamp_proto::SuperblockDone;
+  let mut sb = InMemorySuperblock::with_async_writes_and_faults(StorageFaults::none(), 1, 1);
+  sb.set_envelope_lag(Some(9));
+  // A rooted live checkpoint at op 4, never advanced by the orphaned cycles below.
+  sb.submit_write_checkpoint(write_id(1), OpNumber::with(4), Bytes::from_static(b"live4"));
+  drain(&mut sb);
+  sb.submit_write(write_id(2), root_naming_checkpoint(4));
+  drain(&mut sb);
+  assert_eq!(sb.state().checkpoint_op(), OpNumber::with(4));
+
+  let overtakes_before = sb.envelope_overtakes_fired();
+  for cycle in 0..16u64 {
+    // The cycle's checkpoint attempt writes its envelope at a fresh op...
+    let op = 8 + 4 * cycle;
+    sb.submit_write_checkpoint(
+      write_id(100 + 2 * cycle),
+      OpNumber::with(op),
+      Bytes::from_static(b"orphan"),
+    );
+    // ...and a view transition drops the correlation and submits a durable-view root that still
+    // names the OLD live checkpoint. Under the lag mode the root completes AROUND the staged
+    // envelope; the envelope then lands with nothing left to root it.
+    sb.submit_write(write_id(101 + 2 * cycle), root_naming_checkpoint(4));
+    let mut landed = 0;
+    for _ in 0..64 {
+      if let Some(SuperblockDone::Wrote(_)) = sb.poll() {
+        landed += 1;
+      }
+      if landed == 2 && sb.staged_len() == 0 {
+        break;
+      }
+    }
+    assert_eq!(landed, 2, "cycle {cycle}: both writes completed");
+    assert!(
+      sb.retained_snapshot_generations() <= 3,
+      "cycle {cycle}: {} generations retained — the completed orphans are accumulating \
+       outside every in-flight bound",
+      sb.retained_snapshot_generations(),
+    );
+    // The live checkpoint stays served, untouched by the collection.
+    assert_eq!(read_live_checkpoint(&mut sb), (4, b"live4".to_vec()));
+  }
+  // Non-vacuity: the cross-kind overtake genuinely fired (the axis was exercised, not staged
+  // FIFO), so the constant count above was held UNDER overtakes, not in their absence.
+  assert!(
+    sb.envelope_overtakes_fired() > overtakes_before,
+    "no root ever overtook a staged envelope — the schedule under test never occurred"
+  );
+}
+
+#[test]
 #[should_panic(expected = "a second checkpoint-envelope write was submitted")]
 fn a_second_staged_envelope_trips_the_backend_assert() {
   // The envelope-fence oracle: the proto session admits ONE outstanding envelope write, so a second
