@@ -47,7 +47,7 @@ fn repeated_in_place_rebuilds_behind_a_held_root_keep_the_timeline_constant() {
     c.crash(0);
     let victim = 2usize;
     let mut max_roots = 0usize;
-    let mut drive = |c: &mut Cluster, max_roots: &mut usize, phase: &str| {
+    let drive = |c: &mut Cluster, max_roots: &mut usize, phase: &str| {
       for _ in 0..6_000 {
         c.tick();
         *max_roots = (*max_roots).max(c.replica_roots_in_flight(victim));

@@ -437,7 +437,7 @@ where
   /// Both orderly exits — and therefore the ack a [`Handle::shutdown`] awaits — are
   /// STORAGE-QUIESCE and listener-release barriers. The teardown first drains the endpoint's
   /// in-flight storage — WAL, superblock, and the block jobs on its lane (bounded; see
-  /// [`Self::quiesce_storage`]) — so an orderly stop is
+  /// `Self::quiesce_storage`) — so an orderly stop is
   /// distinguishable from a crash, and reports the outcome in the ack's [`ShutdownReport`]. It then
   /// waits for the accept task's listener clone and its in-flight op's fd reference to drop and
   /// CLOSES the listener fd, so an embedder may bind a new driver to the same address the moment
