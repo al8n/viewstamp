@@ -1140,12 +1140,14 @@ impl StagedSbWrite {
 /// the last-rooted one even when its root never landed → the recover checkpoint read returned bytes
 /// whose op disagreed with the durable root → retry exhaustion → peer-fetch escalation.)
 ///
-/// Retention stays bounded: snapshots STRICTLY OLDER than the live root's `checkpoint_op` are GC'd —
-/// but only once the in-flight `staged` queue has drained, so an older rooted snapshot is retained
-/// until no queued root could re-name it — at most a couple of generations. (The proto session now
-/// refuses a checkpoint-pointer rewind at its submission choke and hands this backend one root
-/// write at a time, so no reachable schedule re-names an older generation; the drain-before-collect
-/// deferral stays as a general-backend belt.)
+/// Retention stays bounded: at every root/envelope landing the collect (`collect_snapshots`) drops
+/// every generation that is neither the LIVE one, nor named by a STAGED root, nor the LATEST
+/// envelope completion's — at most three retained at any
+/// observable instant. The latest completion is retained by IDENTITY, never by numeric op order: a
+/// cancelled pre-root install can leave a dead completed orphan ABOVE the local frontier, and the
+/// only unrooted generation still nameable is the one the latest completion deposited (the session's
+/// envelope lane admits one write at a time, and a fresh correlation rewrites its envelope before
+/// rooting).
 ///
 /// # Async-write mode (opt-in, [`InMemorySuperblock::with_async_writes_and_faults`])
 ///
@@ -1165,13 +1167,24 @@ pub struct InMemorySuperblock {
   state: VsrState,
   /// Recent checkpoint snapshot generations, keyed by op (the value `submit_write_checkpoint` was
   /// called with). `submit_read_checkpoint` serves the entry the CURRENT durable root names
-  /// (`state().checkpoint_op()`); the newest completed-but-unrooted generation is retained but not
+  /// (`state().checkpoint_op()`); the LATEST-completed unrooted generation is retained but not
   /// served (a live correlation's step-2 root may yet name it), and every other generation is
   /// collected at each root/envelope landing ([`Self::collect_snapshots`]) — at most three retained
   /// at any observable instant, which the boundedness checker asserts per tick. Modelling
   /// redundant copies, not a single clobberable slot — but bounded copies, as a real redundant
   /// zone's fixed slots are.
   snapshots: BTreeMap<u64, Bytes>,
+  /// The generation the most recent checkpoint-envelope COMPLETION deposited, if any — the ONE
+  /// unrooted generation whose writing correlation can still be live, so the only one a future
+  /// step-2 root may yet name. The identity is exact, not an ordering heuristic: the session's
+  /// envelope lane admits one outstanding write and a fresh correlation rewrites its envelope
+  /// before rooting, so a newer completion is itself the witness that every OTHER unrooted
+  /// generation's correlation is dead. Numeric op order cannot stand in for this identity — a
+  /// cancelled pre-root install leaves a completed orphan ABOVE the local frontier, and the next
+  /// local checkpoint completes BELOW it. `None` until a first envelope completes, and again
+  /// after a crash ([`Self::discard_inflight`] — no correlation survives the process, so nothing
+  /// can root an unrooted deposit afterwards).
+  last_completed_envelope: Option<u64>,
   completions: VecDeque<SuperblockDone>,
   faults: StorageFaults,
   prng: Prng,
@@ -1224,6 +1237,7 @@ impl InMemorySuperblock {
     Self {
       state: VsrState::new(),
       snapshots: BTreeMap::new(),
+      last_completed_envelope: None,
       completions: VecDeque::new(),
       faults,
       prng: Prng::new(seed),
@@ -1319,11 +1333,13 @@ impl InMemorySuperblock {
   /// but whose durable ROOT never did (the `state` still names an OLDER checkpoint). Such a snapshot
   /// was never the live checkpoint, so a faithful redundant-copy backend's crash leaves only the
   /// last-rooted snapshot readable. Concretely: drop every `snapshots` entry whose op
-  /// is NOT the live root's `checkpoint_op` (strictly newer unrooted generations; older ones are
-  /// already GC'd in steady state). After this the only retained snapshot is exactly the one the
+  /// is NOT the live root's `checkpoint_op`, and forfeit the latest-completion identity with them —
+  /// no correlation survives the process, so nothing can root an unrooted deposit after a crash.
+  /// After this the only retained snapshot is exactly the one the
   /// durable root names, so a restart's recover restores from its OWN disk — not a spurious peer fetch.
   pub fn discard_inflight(&mut self) {
     self.staged.clear();
+    self.last_completed_envelope = None;
     let live = self.state.checkpoint_op().get();
     self.snapshots.retain(|&op, _| op == live);
   }
@@ -1420,17 +1436,24 @@ impl InMemorySuperblock {
 
   /// Collect checkpoint snapshot generations nothing can reach any more, holding the store to a
   /// CONSTANT retained set: the LIVE generation (the durable root serves reads from it), any
-  /// generation a STAGED root still names (it is about to become live), and the NEWEST completed
-  /// generation when it is ahead of live (the one a live correlation's step-2 root may yet name —
+  /// generation a STAGED root still names (it is about to become live), and the generation the
+  /// LATEST envelope completion deposited (the one a live correlation's step-2 root may yet name —
   /// the proto submits that root only after its envelope completed, and every fresh correlation
   /// REWRITES its envelope before rooting, so no other unrooted generation can ever be named
   /// again). Everything else is superseded: an older-than-live generation can never be re-rooted
   /// (the proto session refuses a checkpoint-pointer rewind at its submission choke, and a staged
   /// root's pointer is at/above the live one by the same monotonicity), and an unrooted
-  /// generation behind a newer completed one lost the only correlation that could have rooted it.
+  /// generation that is not the latest completion lost the only correlation that could root it.
+  ///
+  /// The latest completion is retained BY IDENTITY ([`Self::last_completed_envelope`]), never by
+  /// numeric op order: a cancelled pre-root install leaves a completed orphan ABOVE the local
+  /// frontier, so the numeric maximum can name a DEAD generation while the just-completed valid
+  /// envelope sits below it — and a completion must never collect its own still-correlated
+  /// generation, or the step-2 root submitted next names an absent snapshot and the durable root
+  /// is poisoned on a medium with no injected fault anywhere.
   ///
   /// Runs at every completion that changes what is reachable — a root landing (live moves) and an
-  /// envelope landing (a newer generation completes) — in both the synchronous and async modes,
+  /// envelope landing (the completion identity moves) — in both the synchronous and async modes,
   /// so the retained count is at most three at every observable instant (the boundedness
   /// checker's constant). The previous shape deferred collection until the staged queue drained,
   /// which let every view/checkpoint cycle that orphaned a completed envelope behind an
@@ -1439,12 +1462,7 @@ impl InMemorySuperblock {
   /// store growing exactly where the in-flight ledgers (one root, one envelope) could not see.
   fn collect_snapshots(&mut self) {
     let live = self.live_checkpoint_op();
-    let newest = self
-      .snapshots
-      .keys()
-      .next_back()
-      .copied()
-      .filter(|&op| op > live);
+    let completed = self.last_completed_envelope;
     let staged_named: Vec<u64> = self
       .staged
       .iter()
@@ -1455,11 +1473,11 @@ impl InMemorySuperblock {
       .collect();
     self
       .snapshots
-      .retain(|&op, _| op == live || Some(op) == newest || staged_named.contains(&op));
+      .retain(|&op, _| op == live || Some(op) == completed || staged_named.contains(&op));
   }
 
   /// The number of retained checkpoint snapshot generations — the live one, a staged root's, and
-  /// the newest completed one ([`Self::collect_snapshots`]), so at most three at every observable
+  /// the latest-completed one ([`Self::collect_snapshots`]), so at most three at every observable
   /// instant. The boundedness checker asserts that constant per tick: growth here is the
   /// relocated backlog the in-flight ledgers (one root, one envelope) cannot see, one completed
   /// orphan per view/checkpoint cycle.
@@ -1497,7 +1515,7 @@ impl Superblock for InMemorySuperblock {
       // SYNCHRONOUS: durable immediately, completion queued in this call. The new durable root may
       // NAME a just-written snapshot generation (a checkpoint's step-2 root) — which becomes the
       // live/readable checkpoint by virtue of `state.checkpoint_op()` now pointing at it; the
-      // collect then drops every generation neither live, staged-root-named, nor newest-completed.
+      // collect then drops every generation neither live, staged-root-named, nor latest-completed.
       None => {
         self.state = state;
         self.collect_snapshots();
@@ -1512,11 +1530,12 @@ impl Superblock for InMemorySuperblock {
       // the live/readable checkpoint — it becomes readable only when a subsequent ROOT write names its
       // op (the proto's step 2). Until then `submit_read_checkpoint` still serves the last-rooted
       // generation. (Modelling redundant copies: a written-but-unrooted snapshot is not yet authority.)
-      // Completing a NEWER generation is what supersedes an unrooted older one — the only
-      // correlation that could still root it is gone, or it would have rooted before writing anew —
-      // so the collect runs here as well as at root landings.
+      // Completing an envelope supersedes every OTHER unrooted generation — each one's correlation
+      // is gone, or it would have rooted before a fresh correlation wrote anew — so the completion
+      // identity moves here and the collect runs here as well as at root landings.
       None => {
         self.snapshots.insert(op.get(), snapshot);
+        self.last_completed_envelope = Some(op.get());
         self.collect_snapshots();
         self.completions.push_back(SuperblockDone::Wrote(id));
       }
@@ -1661,7 +1680,7 @@ impl Superblock for InMemorySuperblock {
         // A root becoming durable publishes the new `state`; if it NAMES a written snapshot
         // generation, that generation becomes the live/readable checkpoint (served by
         // `submit_read_checkpoint` via `state.checkpoint_op()`). The collect then trims every
-        // generation neither live, staged-root-named, nor newest-completed — a still-staged
+        // generation neither live, staged-root-named, nor latest-completed — a still-staged
         // envelope is not yet IN the store, so it is untouched, and a still-staged root's named
         // generation is explicitly retained.
         StagedSbWrite::Root { state, .. } => {
@@ -1671,12 +1690,13 @@ impl Superblock for InMemorySuperblock {
         // A checkpoint snapshot becoming durable lands in the store, but is NOT yet readable — it
         // becomes the live checkpoint only when a later ROOT names its op (above). Until then the
         // prior rooted generation stays the one `submit_read_checkpoint` serves. Its completion
-        // SUPERSEDES any older unrooted generation (the collect drops those): under the
+        // SUPERSEDES every other unrooted generation (the collect drops those): under the
         // envelope-lag mode a view root overtaking an orphaned envelope used to leave that
         // envelope's bytes retained forever — one completed orphan per view/checkpoint cycle,
         // invisible to the in-flight count, which stayed at one.
         StagedSbWrite::Checkpoint { op, snapshot, .. } => {
           self.snapshots.insert(op.get(), snapshot);
+          self.last_completed_envelope = Some(op.get());
           self.collect_snapshots();
         }
       }

@@ -45,6 +45,9 @@ impl CheckResult {
 ///    (full content comparison, not just op numbers). Reconfigure ops are uniformly absent on every
 ///    replica, so the applied sequences still agree element-for-element.
 /// 3. **Client safety** — each client's replies are for strictly increasing request numbers `1..=n`.
+/// 4. **Medium integrity** — delegated to [`check_medium_integrity`]: every replica's durable root
+///    names a checkpoint envelope its own store holds. Folded in here so every lane that asks the
+///    per-tick safety question asks the medium one too.
 pub fn check_safety(cluster: &Cluster) -> CheckResult {
   // The committed `Reconfigure` op numbers — absent from every replica's applied stream, so the
   // expected applied op number at each position SKIPS them. Empty on a run that never reconfigures, so
@@ -81,6 +84,32 @@ pub fn check_safety(cluster: &Cluster) -> CheckResult {
           idx + 1
         ));
       }
+    }
+  }
+  check_medium_integrity(cluster)
+}
+
+/// Checks **medium integrity**: every replica's durable root names a checkpoint envelope its own
+/// store actually holds — the stored generation at the root's `checkpoint_op` exists and its bytes
+/// hash to the root's `checkpoint_id` (vacuously true while no checkpoint is rooted). A
+/// `Violation` is the self-poisoned medium: with no injected fault anywhere, recovery's placement
+/// and content-address verification cannot succeed from local disk, so a solo replica cannot
+/// recover and a cluster escalates to a needless peer fetch.
+///
+/// This predicate asks about the IDENTITY of what the store retains; the boundedness checker's
+/// generation arm asks about the SIZE of what it retains. The two are independent: a collector
+/// that keeps the wrong generations can delete the one the next monotone root names while the
+/// retained count stays constant — green on the count bound, poisoned on this one. Folded into
+/// [`check_safety`] so every per-tick lane asks both; pure reads over the medium, so observing it
+/// perturbs no schedule.
+pub fn check_medium_integrity(cluster: &Cluster) -> CheckResult {
+  for i in 0..cluster.replica_count() {
+    if !cluster.sb_root_names_stored_checkpoint(i) {
+      return CheckResult::violation(format!(
+        "replica {i}: the durable root's (checkpoint_op, checkpoint_id) pair names no checkpoint \
+         envelope its own store holds — the medium self-poisoned: local recovery would reject its \
+         own checkpoint and force a peer fetch with no fault injected anywhere"
+      ));
     }
   }
   CheckResult::Ok
@@ -1313,8 +1342,11 @@ impl MembershipMonotonicChecker {
 /// is checked against the CONSTANT bound of one (the envelope fence's guarantee), so an
 /// orphaned-envelope backlog accumulating under a backend slow on envelope writes trips at its
 /// second concurrent write. The medium's RETAINED snapshot generations are checked against the
-/// CONSTANT bound of three (live + staged-root-named + newest completed), so a completed orphan
+/// CONSTANT bound of three (live + staged-root-named + latest completed), so a completed orphan
 /// accumulating behind overtaking view roots trips even while every in-flight count stays at one.
+/// This arm bounds the retained set's SIZE only; whether the durable root's generation still
+/// EXISTS in the store is a different property, asked per tick by [`check_medium_integrity`] —
+/// a collector can hold the count constant while deleting the one generation the root names.
 /// The block lane's total depth is checked against the serve cap plus constant headroom, so a
 /// quota that stopped releasing (or an obligation that re-issues without consuming) trips within a
 /// few cycles.
@@ -1400,16 +1432,17 @@ impl BoundednessChecker {
         ));
       }
       // The RETAINED snapshot generations on the medium itself: CONSTANT three — the live
-      // generation, a staged root's, and the newest completed one. This is the store the
+      // generation, a staged root's, and the latest-completed one. This is the store the
       // in-flight ledgers cannot see: with one envelope outstanding and one root with the
       // backend, a view root overtaking an orphaned envelope still deposits that envelope's
       // bytes, and without collection at the envelope landing each view/checkpoint cycle retains
-      // one more completed orphan forever while every in-flight count stays green.
+      // one more completed orphan forever while every in-flight count stays green. SIZE only:
+      // that the durable root's generation still EXISTS is `check_medium_integrity`'s question.
       let generations = cluster.replica_retained_snapshot_generations(i);
       if generations > 3 {
         return CheckResult::violation(format!(
           "replica {i}: {generations} checkpoint snapshot generations retained \
-           (the superblock collect keeps live + staged-root-named + newest)"
+           (the superblock collect keeps live + staged-root-named + latest-completed)"
         ));
       }
       // The block lane's total depth: the serve cap (128 in the proto) plus headroom for the
