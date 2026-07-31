@@ -1179,6 +1179,27 @@ pub struct InMemorySuperblock {
   /// Async mode: writes submitted but not yet durable, in submission order (a serial superblock writer
   /// completes them FIFO). Empty in synchronous mode.
   staged: VecDeque<(u32, StagedSbWrite)>,
+  /// `None` (default) ⇒ async completions release strictly FIFO across BOTH write kinds — a backend
+  /// MORE ordered than the trait requires, under which a root can never complete around an earlier
+  /// envelope. `Some(prng)` ⇒ the ENVELOPE-LAG mode ([`set_envelope_lag`](Self::set_envelope_lag)):
+  /// each checkpoint-envelope write draws an extra seeded delay, and `poll` releases per KIND — roots
+  /// still strictly in submission order among themselves (the trait's whole ordering contract), while
+  /// a lagging envelope is completed on its own expiry, letting later roots complete around it. This
+  /// is the contract's actual latitude; a harness stricter than its contract hides exactly the
+  /// schedules that need it.
+  envelope_lag: Option<Prng>,
+  /// How many lag-mode releases completed a ROOT while an EARLIER-submitted checkpoint-envelope
+  /// write was still staged — a genuine cross-kind overtake. Every overtake shape requires a
+  /// same-replica root submitted DURING an envelope's in-flight window (a view transition crossing
+  /// a staged envelope), so this counts a protocol coincidence the seeded schedules produce only
+  /// occasionally; the deterministic falsifiers pin the overtake semantics, and the sweep reports
+  /// this as a diagnostic. Persists for the superblock's lifetime.
+  envelope_overtakes_fired: u64,
+  /// How many checkpoint-envelope writes drew a nonzero extra lag — one per envelope submission in
+  /// lag mode. The reorder sweep's non-vacuity witness: `0` means the axis is not plumbed through
+  /// (the mode never reached this superblock, or no checkpoint ever wrote), independent of whether
+  /// a view transition happened to cross any window. Persists for the superblock's lifetime.
+  envelope_lags_drawn: u64,
 }
 
 impl Default for InMemorySuperblock {
@@ -1205,6 +1226,9 @@ impl InMemorySuperblock {
       prng: Prng::new(seed),
       async_delay: None,
       staged: VecDeque::new(),
+      envelope_lag: None,
+      envelope_overtakes_fired: 0,
+      envelope_lags_drawn: 0,
     }
   }
 
@@ -1220,6 +1244,35 @@ impl InMemorySuperblock {
     let mut sb = Self::with_faults(faults, seed);
     sb.async_delay = Some(delay_ticks);
     sb
+  }
+
+  /// Enables (or, with `None`, disables) the **envelope-lag mode**: in async-write mode, each
+  /// checkpoint-envelope write draws an extra seeded delay from its own PRNG, and completions
+  /// release per KIND — roots strictly in submission order among themselves, a lagging envelope on
+  /// its own expiry — so a later root can complete around an earlier envelope. That is exactly the
+  /// latitude the `Superblock` trait grants (its ordering contract covers `submit_write` calls
+  /// relative to each other only); the default FIFO release is stricter than the contract and can
+  /// never exhibit the schedules that latitude admits. A no-op in synchronous mode (writes complete
+  /// inline, so there is nothing to lag).
+  pub fn set_envelope_lag(&mut self, seed: Option<u64>) {
+    self.envelope_lag = seed.map(Prng::new);
+  }
+
+  /// Test-only: how many lag-mode releases completed a root AROUND an earlier-submitted envelope
+  /// write (the cross-kind overtake the envelope-lag mode exists to produce). `0` off-mode and
+  /// whenever no same-replica root was submitted during an envelope's window; a diagnostic the
+  /// reorder sweep reports (the deterministic falsifiers pin the overtake semantics).
+  #[doc(hidden)]
+  pub fn envelope_overtakes_fired(&self) -> u64 {
+    self.envelope_overtakes_fired
+  }
+
+  /// Test-only: how many envelope writes drew a nonzero extra lag — one per envelope submission in
+  /// lag mode. `0` off-mode; the reorder sweep's non-vacuity witness that the axis is plumbed
+  /// through end to end.
+  #[doc(hidden)]
+  pub fn envelope_lags_drawn(&self) -> u64 {
+    self.envelope_lags_drawn
   }
 
   /// Suspends async-write staging, returning the delay so
@@ -1428,10 +1481,35 @@ impl Superblock for InMemorySuperblock {
       }
       // ASYNC: STAGE; the snapshot is not even WRITTEN (let alone rooted) until this write completes
       // (the prior live checkpoint stays readable meanwhile). The proto sequences the snapshot write
-      // before its root write, and FIFO completion preserves that ordering.
-      Some(delay) => self
-        .staged
-        .push_back((delay, StagedSbWrite::Checkpoint { id, op, snapshot })),
+      // before its root write, and completion — FIFO, or per-kind under the envelope-lag mode —
+      // preserves that ordering (a root naming a generation is only ever submitted after that
+      // generation's envelope completed).
+      Some(delay) => {
+        // The proto's storage session fences the envelope lane: at most one checkpoint-envelope
+        // write is ever with the backend — orphans included, across endpoint rebuilds — however
+        // slowly completions arrive. A second staged envelope here means the session's fence
+        // regressed. A hard assert (the VOPR runs release) — this backend is the oracle for the
+        // one-outstanding envelope lane under arbitrary schedules, the mirror of the root assert
+        // in `submit_write`.
+        assert!(
+          !self
+            .staged
+            .iter()
+            .any(|(_, w)| matches!(w, StagedSbWrite::Checkpoint { .. })),
+          "a second checkpoint-envelope write was submitted while one is outstanding"
+        );
+        let lag = self
+          .envelope_lag
+          .as_mut()
+          .map_or(0, |p| 1 + p.below(48) as u32);
+        if lag > 0 {
+          self.envelope_lags_drawn += 1;
+        }
+        self.staged.push_back((
+          delay.saturating_add(lag),
+          StagedSbWrite::Checkpoint { id, op, snapshot },
+        ));
+      }
     }
   }
 
@@ -1488,37 +1566,74 @@ impl Superblock for InMemorySuperblock {
   }
 
   fn poll(&mut self) -> Option<SuperblockDone> {
-    // Async mode: tick the staged (in-flight) writes. A serial superblock writer completes them in
-    // submission order, so we count down the FRONT entry and PUBLISH its effect when it reaches zero —
-    // the new durable root, or the now-readable checkpoint snapshot. FIFO completion satisfies the
-    // trait's root-write ordering contract (the LAST-submitted root wins once all complete). This is
-    // the ONLY place a staged write becomes durable: until then `state()`/the readable checkpoint sit
+    // Async mode: tick the staged (in-flight) writes and release AT MOST ONE per poll. This is the
+    // ONLY place a staged write becomes durable: until then `state()`/the readable checkpoint sit
     // at their prior values (the pending-durable-view window). A no-op in synchronous mode.
-    if let Some((remaining, _)) = self.staged.front_mut() {
-      if *remaining == 0 {
-        let (_, write) = self.staged.pop_front().expect("front exists");
-        let id = write.id();
-        match write {
-          // A root becoming durable publishes the new `state`; if it NAMES a written snapshot
-          // generation, that generation becomes the live/readable checkpoint (served by
-          // `submit_read_checkpoint` via `state.checkpoint_op()`). GC then trims strictly-older
-          // generations — but only once `staged` has drained, so a later root that re-names an older
-          // checkpoint (supersession) can still find its snapshot.
-          StagedSbWrite::Root { state, .. } => {
-            self.state = state;
-            self.gc_snapshots();
-          }
-          // A checkpoint snapshot becoming durable lands in the store, but is NOT yet readable — it
-          // becomes the live checkpoint only when a later ROOT names its op (above). Until then the
-          // prior rooted generation stays the one `submit_read_checkpoint` serves.
-          StagedSbWrite::Checkpoint { op, snapshot, .. } => {
-            self.snapshots.insert(op.get(), snapshot);
+    //
+    // Default (no envelope lag): a serial superblock writer completes writes in submission order,
+    // so count down the FRONT entry and publish its effect at zero — strictly FIFO across both
+    // kinds, byte-identical to the pre-lag harness. Under the ENVELOPE-LAG mode every staged entry
+    // ticks together and the first EXPIRED entry releases, wherever it sits: a lagging envelope no
+    // longer holds back the roots submitted after it, so later roots complete around it — while
+    // roots still release strictly in submission order among themselves, because they share the
+    // fixed base delay and tick together (an earlier root's counter is never behind a later
+    // root's). Both shapes satisfy the trait: root completions in submission order, and once all
+    // outstanding writes complete the durable state equals the LAST-submitted root (root effects
+    // apply in root order either way).
+    let release_at = match self.envelope_lag {
+      None => match self.staged.front_mut() {
+        Some((remaining, _)) if *remaining == 0 => Some(0),
+        Some((remaining, _)) => {
+          *remaining -= 1;
+          None
+        }
+        None => None,
+      },
+      Some(_) => {
+        let expired = self
+          .staged
+          .iter()
+          .position(|(remaining, _)| *remaining == 0);
+        if expired.is_none() {
+          for (remaining, _) in &mut self.staged {
+            *remaining = remaining.saturating_sub(1);
           }
         }
-        self.completions.push_back(SuperblockDone::Wrote(id));
-      } else {
-        *remaining -= 1;
+        expired
       }
+    };
+    if let Some(at) = release_at {
+      // A root releasing past an earlier-staged envelope is the cross-kind overtake the lag mode
+      // exists to produce — count it so the reorder sweep can prove the axis is non-vacuous.
+      if matches!(self.staged[at].1, StagedSbWrite::Root { .. })
+        && self
+          .staged
+          .iter()
+          .take(at)
+          .any(|(_, w)| matches!(w, StagedSbWrite::Checkpoint { .. }))
+      {
+        self.envelope_overtakes_fired += 1;
+      }
+      let (_, write) = self.staged.remove(at).expect("the expired entry exists");
+      let id = write.id();
+      match write {
+        // A root becoming durable publishes the new `state`; if it NAMES a written snapshot
+        // generation, that generation becomes the live/readable checkpoint (served by
+        // `submit_read_checkpoint` via `state.checkpoint_op()`). GC then trims strictly-older
+        // generations — but only once `staged` has drained, so a later root that re-names an older
+        // checkpoint (supersession) can still find its snapshot.
+        StagedSbWrite::Root { state, .. } => {
+          self.state = state;
+          self.gc_snapshots();
+        }
+        // A checkpoint snapshot becoming durable lands in the store, but is NOT yet readable — it
+        // becomes the live checkpoint only when a later ROOT names its op (above). Until then the
+        // prior rooted generation stays the one `submit_read_checkpoint` serves.
+        StagedSbWrite::Checkpoint { op, snapshot, .. } => {
+          self.snapshots.insert(op.get(), snapshot);
+        }
+      }
+      self.completions.push_back(SuperblockDone::Wrote(id));
     }
     self.completions.pop_front()
   }

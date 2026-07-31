@@ -738,6 +738,68 @@ impl Superblock for StepSb {
   }
 }
 
+/// A superblock that separates the two write KINDS the way the trait contract permits: root writes
+/// complete in submission order among THEMSELVES (`flush_roots`), while checkpoint-envelope writes
+/// are HELD until `flush_envelopes` releases them (in their own submission order) — a conforming
+/// backend that is merely slow on envelope writes. The `Superblock` ordering contract covers
+/// `submit_write` calls relative to each other only, so completing a later root ahead of an earlier
+/// envelope is within contract; a globally-FIFO fixture (`StepSb`, the sim backend) can never
+/// exhibit that schedule, which is exactly why the envelope-lane bound needs this one.
+#[derive(Default)]
+struct KindSb {
+  state: VsrState,
+  /// In-flight ROOT writes, in submission order, each with the state it publishes on completion.
+  root_inflight: VecDeque<(SuperblockDone, VsrState)>,
+  /// In-flight ENVELOPE writes, in submission order, each with the generation it lands.
+  env_inflight: VecDeque<(SuperblockDone, OpNumber, Bytes)>,
+  ready: VecDeque<SuperblockDone>,
+  /// The landed checkpoint generations, keyed by op; reads serve the one the durable root names.
+  checkpoints: std::collections::BTreeMap<u64, Bytes>,
+}
+impl KindSb {
+  /// Complete every in-flight ROOT write, in submission order, leaving envelope writes held.
+  fn flush_roots(&mut self) {
+    while let Some((done, state)) = self.root_inflight.pop_front() {
+      self.state = state;
+      self.ready.push_back(done);
+    }
+  }
+  /// Complete every in-flight ENVELOPE write, in submission order.
+  fn flush_envelopes(&mut self) {
+    while let Some((done, op, snapshot)) = self.env_inflight.pop_front() {
+      self.checkpoints.insert(op.get(), snapshot);
+      self.ready.push_back(done);
+    }
+  }
+}
+impl Superblock for KindSb {
+  fn state(&self) -> VsrState {
+    self.state.clone()
+  }
+  fn submit_write(&mut self, id: WriteId, state: VsrState) {
+    self
+      .root_inflight
+      .push_back((SuperblockDone::Wrote(id), state));
+  }
+  fn submit_write_checkpoint(&mut self, id: WriteId, op: OpNumber, snapshot: Bytes) {
+    self
+      .env_inflight
+      .push_back((SuperblockDone::Wrote(id), op, snapshot));
+  }
+  fn submit_read_checkpoint(&mut self, id: ReadId) {
+    // Serve the generation the CURRENT durable root names — never a landed-but-unrooted one.
+    let live = self.state.checkpoint_op();
+    let done = match self.checkpoints.get(&live.get()) {
+      Some(snap) => SuperblockDone::CheckpointRead(CheckpointRead::new(id, live, snap.clone())),
+      None => SuperblockDone::Fault(id),
+    };
+    self.ready.push_back(done);
+  }
+  fn poll(&mut self) -> Option<SuperblockDone> {
+    self.ready.pop_front()
+  }
+}
+
 /// A WAL whose reads can be *scripted* to fault, so a test can drive the async `Recovering`
 /// loop's retry/RecoveringHead branches deterministically. Each slot carries a real
 /// `(header, body)` (so a clean read verifies) plus an optional fault script:

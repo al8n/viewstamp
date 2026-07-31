@@ -1308,7 +1308,9 @@ impl MembershipMonotonicChecker {
 /// The session's durable-root queue is checked against its own bound — affine in the replica's
 /// incarnation (restart) count and independent of ops, views, and time — so a root backlog
 /// accumulating under a slow superblock (one superseded root per view-change window) trips within a
-/// few windows.
+/// few windows. The session's checkpoint-envelope lane is checked against the CONSTANT bound of one
+/// (the envelope fence's guarantee, incarnation-independent), so an orphaned-envelope backlog
+/// accumulating under a backend slow on envelope writes trips at its second concurrent write.
 #[derive(Debug)]
 pub struct BoundednessChecker {
   /// Max allowed entries in any per-op map (`log`, `inflight`) and any WAL.
@@ -1371,6 +1373,20 @@ impl BoundednessChecker {
         return CheckResult::violation(format!(
           "replica {i}: durable-root queue {roots} exceeds bound {roots_bound} \
            (the submission gate / forfeiture is not bounding the root timeline)"
+        ));
+      }
+      // The checkpoint-envelope lane: CONSTANT one, with no per-incarnation concession — the
+      // session's envelope fence refuses a second submission while one write is outstanding, and
+      // the fence reads the session ledger, which survives endpoint rebuilds and catch-up
+      // postures. An envelope is never parked and an orphan cannot be forfeited (it is with the
+      // medium), so admission is the lane's only bound; a second concurrent envelope anywhere is
+      // the fence regressed, and under a backend that is merely slow on envelope writes the count
+      // would then grow by one per view-change window with a completed sync handshake.
+      let envelopes = cluster.replica_checkpoints_in_flight(i);
+      if envelopes > 1 {
+        return CheckResult::violation(format!(
+          "replica {i}: {envelopes} checkpoint-envelope writes in flight \
+           (the session's envelope fence admits one)"
         ));
       }
     }

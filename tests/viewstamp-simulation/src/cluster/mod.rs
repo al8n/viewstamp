@@ -30,6 +30,11 @@ const STORAGE_SEED_MAGIC: u64 = 0x5151_DEAD_BEEF_0F0F;
 /// protocol PRNG — even when a caller passes the cluster's own seed as the chaos base.
 const WRITE_CHAOS_SEED_MAGIC: u64 = 0xC4A0_50DE_0DD5_EED5;
 
+/// Mixed into the per-replica ENVELOPE-LAG seed (the superblock's per-kind completion-order axis) so
+/// a replica's lag PRNG is independent of its storage-fault, write-chaos, and protocol PRNGs — even
+/// when a caller passes the cluster's own seed as the lag base.
+const ENVELOPE_LAG_SEED_MAGIC: u64 = 0xE57E_10FE_5EED_1A6A;
+
 /// The virtual delay applied to a message the network elects to HOLD ([`Faults::hold_per_mille`]).
 /// Far past the proto's repair-or-truncate grace (5 s) so a held `PrepareOk` can outlive its op's
 /// truncation + re-mint and arrive at the new primary as a STALE-body vote — the op-reuse class the
@@ -344,6 +349,16 @@ pub struct Cluster {
   /// running; persists across `crash`/`restart` because the WAL struct does (a `crash` still discards
   /// staged writes — in-flight ops die with the process).
   write_chaos_seed: Option<u64>,
+  /// `None` (default) ⇒ every replica's superblock releases its async completions strictly FIFO
+  /// across both write kinds — stricter than the trait's ordering contract, which covers root
+  /// writes only. `Some(base)` ⇒ ENVELOPE-LAG mode on every replica's superblock with a
+  /// per-replica seed derived from `base`: each checkpoint-envelope write draws an extra seeded
+  /// delay and later roots complete around it (roots stay strictly ordered among themselves) — the
+  /// contract's actual latitude, the schedule under which the session's one-outstanding envelope
+  /// fence must hold. Set via [`set_sb_envelope_lag`] before running; persists across
+  /// `crash`/`restart` because the superblock struct does. Only meaningful alongside
+  /// [`set_async_superblock_delay`] (synchronous writes complete inline — nothing lags).
+  sb_envelope_lag: Option<u64>,
   /// How many INTER-REPLICA messages this cluster dropped because their `encoded_len()` exceeded the
   /// transport frame cap [`MAX_FRAME_LEN`] — modelling the real transport's send-path frame guard,
   /// which refuses a peer message larger than one frame. Only `replica → replica` traffic is measured
@@ -528,8 +543,16 @@ impl Cluster {
       .collect();
     let n = node_count as usize;
     let storage_faults = StorageFaults::none();
-    let (wals, mut sbs, loss_budget) =
-      Self::seed_storage(&membership, seed, storage_faults, None, None, None, None);
+    let (wals, mut sbs, loss_budget) = Self::seed_storage(
+      &membership,
+      seed,
+      storage_faults,
+      None,
+      None,
+      None,
+      None,
+      None,
+    );
     // GENESIS: commit each replica over its freshly-seeded (virgin) store. `commit` writes the durable
     // genesis root a later restart recovers over — a voter with no durable root fail-stops — and builds
     // the same in-memory genesis state the bare constructor produced.
@@ -614,6 +637,7 @@ impl Cluster {
       async_sb_delay: None,
       wal_capacity: None,
       write_chaos_seed: None,
+      sb_envelope_lag: None,
       oversized_dropped: 0,
       holds_fired: 0,
       one_way_dropped: 0,
@@ -648,6 +672,11 @@ impl Cluster {
   /// Every WAL seeded together shares ONE [`PermanentLossBudget`], sized by the `f` this membership's
   /// quorum implies and returned alongside them: fresh media hold no destroyed copy of anything, so a
   /// reseed legitimately starts the budget empty.
+  // The parameters mirror the cluster's storage-mode fields one to one, in field order: every
+  // caller is a reseed that must carry EVERY mode forward, so a positional list the compiler
+  // forces each caller to complete is the guard against a new mode being silently dropped by one
+  // of them.
+  #[allow(clippy::too_many_arguments)]
   fn seed_storage(
     membership: &Membership,
     seed: u64,
@@ -656,6 +685,7 @@ impl Cluster {
     async_sb_delay: Option<u32>,
     wal_capacity: Option<u64>,
     write_chaos: Option<u64>,
+    sb_envelope_lag: Option<u64>,
   ) -> (
     Vec<Shared<InMemoryWal>>,
     Vec<Shared<InMemorySuperblock>>,
@@ -691,10 +721,16 @@ impl Cluster {
     let sbs = (0..nodes)
       .map(|i| {
         let s = Self::storage_seed(seed, i);
-        Shared::new(match async_sb_delay {
+        let mut sb = match async_sb_delay {
           Some(d) => InMemorySuperblock::with_async_writes_and_faults(faults, s, d),
           None => InMemorySuperblock::with_faults(faults, s),
-        })
+        };
+        // Envelope lag: per-kind completion release with a seeded extra envelope delay, composed
+        // with the async mode above. Skipped entirely off-axis (the byte-identical FIFO default).
+        if let Some(base) = sb_envelope_lag {
+          sb.set_envelope_lag(Some(Self::envelope_lag_storage_seed(base, i)));
+        }
+        Shared::new(sb)
       })
       .collect();
     (wals, sbs, budget)
@@ -710,6 +746,13 @@ impl Cluster {
   /// every other replica's chaos stream.
   fn write_chaos_storage_seed(base: u64, replica: u16) -> u64 {
     base ^ (replica as u64).wrapping_mul(WRITE_CHAOS_SEED_MAGIC) ^ WRITE_CHAOS_SEED_MAGIC
+  }
+
+  /// The per-replica ENVELOPE-LAG seed, derived from the lag `base` with its own magic (mirrors
+  /// [`Self::write_chaos_storage_seed`]) so each replica's lag PRNG is independent of its fault and
+  /// chaos PRNGs and of every other replica's lag stream.
+  fn envelope_lag_storage_seed(base: u64, replica: u16) -> u64 {
+    base ^ (replica as u64).wrapping_mul(ENVELOPE_LAG_SEED_MAGIC) ^ ENVELOPE_LAG_SEED_MAGIC
   }
 
   /// Replaces the network fault model (call before running).
@@ -731,6 +774,7 @@ impl Cluster {
       self.async_sb_delay,
       self.wal_capacity,
       self.write_chaos_seed,
+      self.sb_envelope_lag,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -762,6 +806,7 @@ impl Cluster {
       self.async_sb_delay,
       self.wal_capacity,
       self.write_chaos_seed,
+      self.sb_envelope_lag,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -795,6 +840,7 @@ impl Cluster {
       delay,
       self.wal_capacity,
       self.write_chaos_seed,
+      self.sb_envelope_lag,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -829,6 +875,42 @@ impl Cluster {
       self.async_wal_delay,
       self.async_sb_delay,
       self.wal_capacity,
+      seed,
+      self.sb_envelope_lag,
+    );
+    self.wals = wals;
+    self.sbs = sbs;
+    self.loss_budget = loss_budget;
+    // Fresh media, so fresh sessions: nothing was ever submitted to these, and the old sessions'
+    // handles went with the media they described.
+    self.storages = (0..self.wals.len())
+      .map(|i| Storage::new(self.wals[i].clone(), self.sbs[i].clone()))
+      .collect();
+    // Re-format the reseeded (virgin) stores; the existing genesis endpoints are unchanged.
+    self.format_all_stores();
+  }
+
+  /// Enables (or, with `None`, disables) **envelope-lag mode** on every replica's superblock, each
+  /// seeded from `seed` with a per-replica derivation. In this mode a checkpoint-envelope write draws
+  /// an extra seeded delay and later ROOT writes complete around it (roots stay strictly ordered
+  /// among themselves) — the completion order the `Superblock` trait actually permits, under which an
+  /// orphaned envelope outlives the view roots submitted after it. The default FIFO release is
+  /// stricter than the contract and can never exhibit that schedule, which is exactly what kept the
+  /// envelope lane's growth invisible to the sweeps. Composes with the current fault/async modes
+  /// (meaningful only alongside [`set_async_superblock_delay`](Self::set_async_superblock_delay)).
+  /// Call before running; the mode persists across `crash`/`restart` because the superblock struct
+  /// does. `None` (the default) keeps every superblock's FIFO release byte-identical to the pre-axis
+  /// harness. Rebuilds the (empty) superblocks, like [`set_async_wal_delay`](Self::set_async_wal_delay).
+  pub fn set_sb_envelope_lag(&mut self, seed: Option<u64>) {
+    self.sb_envelope_lag = seed;
+    let (wals, sbs, loss_budget) = Self::seed_storage(
+      &Self::genesis_membership(self.replica_count, self.learner_count),
+      self.seed,
+      self.storage_faults,
+      self.async_wal_delay,
+      self.async_sb_delay,
+      self.wal_capacity,
+      self.write_chaos_seed,
       seed,
     );
     self.wals = wals;
@@ -1275,6 +1357,13 @@ impl Cluster {
     self.storages[i].roots_in_flight()
   }
 
+  /// Replica `i`'s in-flight checkpoint-envelope write count (for the boundedness checker). The
+  /// session's envelope fence admits one outstanding envelope, so this never exceeds 1 — constant
+  /// across endpoint rebuilds and catch-up postures, because the fence reads the session ledger.
+  pub fn replica_checkpoints_in_flight(&self, i: usize) -> usize {
+    self.storages[i].checkpoints_in_flight()
+  }
+
   /// True iff replica `i`'s WAL PHYSICALLY holds op `op` right now — its slot is `Clean` or `Faulty`
   /// (durably written, possibly later corrupt). UNLIKE [`Self::replica_appended_op`] this does NOT fold
   /// in the `op <= checkpoint_op` snapshot-subsumption clause, so it distinguishes "still in the WAL
@@ -1705,10 +1794,16 @@ impl Cluster {
     // every seat the replaced disk held: an empty medium holds no destroyed copy of anything.
     w.set_loss_budget(self.loss_budget.clone(), i as u16);
     self.wals[i] = Shared::new(w);
-    self.sbs[i] = Shared::new(match self.async_sb_delay {
+    let mut sb = match self.async_sb_delay {
       Some(d) => InMemorySuperblock::with_async_writes_and_faults(self.storage_faults, s, d),
       None => InMemorySuperblock::with_faults(self.storage_faults, s),
-    });
+    };
+    // The replaced disk keeps the cluster's envelope-lag mode (per-DEPLOYMENT, like write chaos),
+    // re-seeded with the same per-replica derivation the initial seeding used.
+    if let Some(base) = self.sb_envelope_lag {
+      sb.set_envelope_lag(Some(Self::envelope_lag_storage_seed(base, i as u16)));
+    }
+    self.sbs[i] = Shared::new(sb);
     // A swapped disk is a NEW medium: its session starts empty because nothing was ever submitted
     // to it, not because a ledger was reset over live writes.
     self.storages[i] = Storage::new(self.wals[i].clone(), self.sbs[i].clone());
@@ -2197,6 +2292,7 @@ impl Cluster {
       self.async_sb_delay,
       self.wal_capacity,
       self.write_chaos_seed,
+      self.sb_envelope_lag,
     );
     self.wals = wals;
     self.sbs = sbs;
@@ -2926,6 +3022,22 @@ impl Cluster {
   #[doc(hidden)]
   pub fn wal_write_reorders_fired(&self, i: usize) -> u64 {
     self.wals[i].borrow().chaos_reorders_fired()
+  }
+
+  /// Test-only: how many of replica `i`'s lag-mode superblock releases completed a ROOT around an
+  /// earlier-submitted envelope write. The reorder sweep sums this across replicas and reports it
+  /// as a diagnostic (an overtake needs a view transition crossing an envelope's window — a
+  /// coincidence the seeded schedules produce only occasionally).
+  #[doc(hidden)]
+  pub fn sb_envelope_overtakes_fired(&self, i: usize) -> u64 {
+    self.sbs[i].borrow().envelope_overtakes_fired()
+  }
+
+  /// Test-only: how many of replica `i`'s envelope writes drew a nonzero extra lag. The reorder
+  /// sweep sums this across replicas as its non-vacuity witness that the axis is plumbed through.
+  #[doc(hidden)]
+  pub fn sb_envelope_lags_drawn(&self, i: usize) -> u64 {
+    self.sbs[i].borrow().envelope_lags_drawn()
   }
 
   /// Drains the first STALE-LANDING violation any replica's WAL has recorded since the last drain: a

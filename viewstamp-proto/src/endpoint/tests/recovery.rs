@@ -7795,3 +7795,78 @@ fn a_second_format_attempt_does_not_confirm_off_the_first_attempts_completion() 
     "the store stays unformatted — neither attempt confirmed a durable root"
   );
 }
+
+#[test]
+fn a_rebuild_over_an_inherited_walk_defers_the_recovery_probe_until_it_settles() {
+  // The lane's one-walk quota has the SESSION's lifetime, but the recovery probe's own
+  // reconstruct guard is per incarnation: an endpoint rebuilt over a live session inherits its
+  // predecessor's queued walk, and a successor whose valid checkpoint read completes before that
+  // walk settles must DEFER its probe (discard the read; the retry cadence re-reads) rather than
+  // enqueue a second walk into the lane's admission assert.
+  let (_donor, mut storage) = donor_primary_at_checkpoint(4);
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks, 4);
+  // Recover as BACKUP member 1 over the checkpointed store (a backup completes recovery straight
+  // to Normal; the view-0 primary would abdicate into a view change, which is not this test's
+  // subject). The store carries no member identity, so the config names the local member.
+  let cfg = Config::with_checkpoint_ops(1, MemberId::new(1), 4).unwrap();
+  let now = Instant::ZERO;
+
+  // Incarnation 1: recover to the point its valid checkpoint read enqueues the probe walk —
+  // QUEUED, not executed — then die (drop the endpoint; the session keeps the lane).
+  let mut r1 = Endpoint::recover(cfg, genesis(3), 1, CountSm::default(), &mut storage)
+    .expect("recover accepts the checkpointed store")
+    .expect_active();
+  r1.handle_storage(now, &mut storage);
+  assert!(
+    storage.walk_owed(),
+    "precondition: the predecessor's probe walk is queued on the lane"
+  );
+  drop(r1);
+
+  // Incarnation 2, in place, over the same session. Its own checkpoint read completes while the
+  // inherited walk is still owed: the probe must defer, leaving the checkpoint read outstanding
+  // for the retry cadence.
+  let mut r2 = Endpoint::recover(cfg, genesis(3), 2, CountSm::default(), &mut storage)
+    .expect("the rebuild accepts the same store")
+    .expect_active();
+  r2.handle_storage(now, &mut storage);
+  assert!(
+    storage.walk_owed(),
+    "the successor deferred its probe behind the inherited walk (no second admission)"
+  );
+  assert!(
+    r2.status().is_recovering(),
+    "the deferral keeps recovery pending, not wedged into a panic"
+  );
+
+  // The inherited walk executes and settles — its completion is refused by the incarnation choke
+  // but releases the lane quota — and the retry cadence re-reads the checkpoint; the successor's
+  // probe now admits, reconstructs, and recovery completes.
+  let mut t = now;
+  for _ in 0..8 {
+    r2.storage_step(t, &mut storage, &mut blocks);
+    if r2.status() == Status::Normal {
+      break;
+    }
+    if let Some(deadline) = r2.poll_timeout() {
+      t = deadline;
+      r2.handle_timeout(t, &mut storage);
+    }
+  }
+  assert_eq!(
+    r2.status(),
+    Status::Normal,
+    "the deferred probe resumed once the inherited walk settled"
+  );
+  assert_eq!(
+    r2.checkpoint_op(),
+    OpNumber::with(4),
+    "recovery restored the durable checkpoint"
+  );
+  assert!(
+    !storage.walk_owed(),
+    "the lane owes no walk once recovery completed"
+  );
+  while r2.poll_message().is_some() {}
+}

@@ -1486,6 +1486,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // reconstruct when both drain, and treats a missing/malformed block like a corrupt read —
         // DISCARD, leaving the checkpoint outstanding so `recover_timeouts` exhausts the budget and
         // escalates to a peer block-fetch.
+        //
+        // Defer while the LANE still owes a walk. The `rec.reconstruct` guard above is this
+        // incarnation's, but the lane's one-walk quota has the SESSION's lifetime: an endpoint
+        // rebuilt over a live session inherits a predecessor's queued-or-executing walk (a transfer
+        // ARQ's, or this same probe's), and admitting a second one is refused fail-stop at the
+        // lane's admission assert. Discarding the read here is the same disposition as a fault:
+        // the checkpoint stays outstanding, `recover_timeouts` re-reads on its cadence, and the
+        // inherited walk's completion — refused by the incarnation choke but settled by the lane —
+        // frees the quota for the retry's probe. (The transfer walk's issuer, `issue_walk`,
+        // observes this same gate.)
+        if storage.walk_owed() {
+          return;
+        }
         let id = self.mint_job_id();
         storage.enqueue_block_job(
           id,

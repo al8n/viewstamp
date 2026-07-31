@@ -3,7 +3,7 @@ use std::vec::Vec;
 
 use bytes::Bytes;
 
-use super::{AppendSubmission, Storage};
+use super::{AppendSubmission, CheckpointSubmission, Storage};
 use crate::block_job::{BlockJobDone, BlockJobKind, BlockJobOutput, BlockJobTag, WalkPurpose};
 use crate::block_store::{BlockAddress, BlockStore};
 use crate::endpoint::block_sync::BlockWalks;
@@ -705,10 +705,13 @@ fn an_out_of_order_landing_still_releases_the_parked_tail() {
 #[test]
 fn an_envelope_landing_settles_without_claiming_the_root_timeline() {
   let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
-  s.submit_checkpoint(
-    WriteId::new(1, 1),
-    OpNumber::with(4),
-    Bytes::from_static(&[9]),
+  assert_eq!(
+    s.submit_checkpoint(
+      WriteId::new(1, 1),
+      OpNumber::with(4),
+      Bytes::from_static(&[9]),
+    ),
+    CheckpointSubmission::Submitted,
   );
   s.submit_root(WriteId::new(1, 2), root(4, 40));
   assert!(s.has_inflight());
@@ -724,6 +727,95 @@ fn an_envelope_landing_settles_without_claiming_the_root_timeline() {
   s.sb_mut().land_root();
   assert!(s.poll_sb().expect("the root lands").landed_root.is_some());
   assert!(!s.has_inflight());
+}
+
+#[test]
+fn a_second_envelope_is_fenced_until_the_outstanding_one_completes() {
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  assert_eq!(
+    s.submit_checkpoint(
+      WriteId::new(1, 1),
+      OpNumber::with(4),
+      Bytes::from_static(&[9]),
+    ),
+    CheckpointSubmission::Submitted,
+  );
+  // The submitter's correlation may since have ended (a dropped re-persist, a rebuild) — the
+  // session cannot see that, and it does not matter: the medium holds one envelope write, so a
+  // second submission is refused whole, whoever submits it.
+  assert_eq!(
+    s.submit_checkpoint(
+      WriteId::new(2, 1),
+      OpNumber::with(6),
+      Bytes::from_static(&[8]),
+    ),
+    CheckpointSubmission::EnvelopeFenced,
+  );
+  assert_eq!(
+    s.sb_mut().staged_checkpoints.len(),
+    1,
+    "the fenced envelope never reached the backend"
+  );
+  assert_eq!(s.checkpoints_in_flight(), 1);
+
+  // The refusal is deferral: the outstanding write completes, the lane empties, and the deferred
+  // checkpoint's re-forced submission is admitted.
+  s.sb_mut().land_checkpoint();
+  assert!(
+    s.poll_sb()
+      .expect("the envelope lands")
+      .landed_root
+      .is_none()
+  );
+  assert_eq!(s.checkpoints_in_flight(), 0);
+  assert_eq!(
+    s.submit_checkpoint(
+      WriteId::new(2, 2),
+      OpNumber::with(6),
+      Bytes::from_static(&[8]),
+    ),
+    CheckpointSubmission::Submitted,
+  );
+  s.sb_mut().land_checkpoint();
+  assert!(s.poll_sb().is_some());
+  assert!(!s.has_inflight(), "the drained lane quiesces the session");
+}
+
+#[test]
+fn an_envelope_fence_holds_across_the_submitting_correlations_end() {
+  // The rebuild shape: incarnation 1 submits an envelope and dies (its correlation state dies with
+  // it — the session cannot observe that); incarnation 2 stages its own checkpoint. The fence
+  // holds on the SESSION ledger, which survived the rebuild, so the successor's submission defers
+  // until the orphan drains — the medium never holds two envelope writes.
+  let mut s = Storage::<_, _, MockSm>::new(MockWal::unbounded(), MockSb::new());
+  assert_eq!(
+    s.submit_checkpoint(
+      WriteId::new(1, 7),
+      OpNumber::with(4),
+      Bytes::from_static(&[9]),
+    ),
+    CheckpointSubmission::Submitted,
+  );
+  assert_eq!(
+    s.submit_checkpoint(
+      WriteId::new(2, 1),
+      OpNumber::with(4),
+      Bytes::from_static(&[9]),
+    ),
+    CheckpointSubmission::EnvelopeFenced,
+  );
+  // The orphan's completion drains the ledger even though no live correlation awaits it.
+  s.sb_mut().land_checkpoint();
+  assert!(s.poll_sb().is_some());
+  assert_eq!(s.checkpoints_in_flight(), 0);
+  assert_eq!(
+    s.submit_checkpoint(
+      WriteId::new(2, 2),
+      OpNumber::with(4),
+      Bytes::from_static(&[9]),
+    ),
+    CheckpointSubmission::Submitted,
+  );
 }
 
 #[test]

@@ -29,7 +29,7 @@ pub use vopr::{
   DEFAULT_TICKS, VoprReport, run_vopr, run_vopr_one, run_vopr_with_asym, run_vopr_with_batching,
   run_vopr_with_block_delay, run_vopr_with_block_faults, run_vopr_with_churn, run_vopr_with_hold,
   run_vopr_with_learners, run_vopr_with_reconfig, run_vopr_with_reconfig_live,
-  run_vopr_with_restart_in_place, run_vopr_with_slow, run_vopr_with_stale_read,
-  run_vopr_with_swap_root_rebuild, run_vopr_with_torn_headers, run_vopr_with_wipe,
-  run_vopr_with_wipe_learners, run_vopr_with_write_chaos,
+  run_vopr_with_restart_in_place, run_vopr_with_sb_reorder, run_vopr_with_slow,
+  run_vopr_with_stale_read, run_vopr_with_swap_root_rebuild, run_vopr_with_torn_headers,
+  run_vopr_with_wipe, run_vopr_with_wipe_learners, run_vopr_with_write_chaos,
 };

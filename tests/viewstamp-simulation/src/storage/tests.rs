@@ -918,6 +918,57 @@ fn a_staged_root_defers_the_live_checkpoint_handoff_until_it_lands() {
 }
 
 #[test]
+fn envelope_lag_completes_a_later_root_around_the_lagging_envelope() {
+  // The per-kind release the trait contract permits: an envelope write draws an extra seeded delay,
+  // and a ROOT submitted after it completes FIRST — the cross-kind overtake under which an orphaned
+  // envelope outlives the durable-view roots submitted after it. Both writes still complete exactly
+  // once, and the durable state ends at the last-submitted root.
+  use viewstamp_proto::SuperblockDone;
+  let mut sb = InMemorySuperblock::with_async_writes_and_faults(StorageFaults::none(), 1, 1);
+  sb.set_envelope_lag(Some(9));
+  // The orphan shape: an envelope whose correlation a view transition dropped, then the
+  // transition's durable-view root (carrying the old checkpoint pair) submitted after it.
+  sb.submit_write_checkpoint(write_id(1), OpNumber::with(4), Bytes::from_static(b"snap4"));
+  sb.submit_write(write_id(2), root_naming_checkpoint(0));
+  let mut landed = Vec::new();
+  for _ in 0..64 {
+    if let Some(SuperblockDone::Wrote(id)) = sb.poll() {
+      landed.push(id);
+    }
+    if sb.staged_len() == 0 && landed.len() == 2 {
+      break;
+    }
+  }
+  assert_eq!(
+    landed,
+    std::vec![write_id(2), write_id(1)],
+    "the later root completed AROUND the lagging envelope, then the envelope landed"
+  );
+  assert_eq!(
+    sb.envelope_overtakes_fired(),
+    1,
+    "the cross-kind overtake was counted (the reorder sweep's non-vacuity witness)"
+  );
+  assert_eq!(
+    sb.state(),
+    root_naming_checkpoint(0),
+    "the durable state is the last-submitted root"
+  );
+  assert!(sb.poll().is_none(), "every write completed exactly once");
+}
+
+#[test]
+#[should_panic(expected = "a second checkpoint-envelope write was submitted")]
+fn a_second_staged_envelope_trips_the_backend_assert() {
+  // The envelope-fence oracle: the proto session admits ONE outstanding envelope write, so a second
+  // concurrent submission reaching the backend is a fence regression — refused fail-stop in every
+  // profile, mirroring the one-root assert in `submit_write`.
+  let mut sb = InMemorySuperblock::with_async_writes_and_faults(StorageFaults::none(), 1, 2);
+  sb.submit_write_checkpoint(write_id(1), OpNumber::with(4), Bytes::from_static(b"a"));
+  sb.submit_write_checkpoint(write_id(2), OpNumber::with(8), Bytes::from_static(b"b"));
+}
+
+#[test]
 fn no_faults_is_byte_for_byte_reliable() {
   // StorageFaults::none() must reproduce the old reliable behaviour exactly.
   let mut w = InMemoryWal::with_faults(StorageFaults::none(), 42);

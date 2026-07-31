@@ -7,6 +7,27 @@
 //! handles together with every such fact, so the slot-quiescence fence, the root timeline, and the
 //! in-flight checkpoint-envelope ledger survive an endpoint rebuild by construction instead of by a
 //! caller remembering to carry them.
+//!
+//! # Every queue the session fronts is admission-bounded at its submission chokepoint
+//!
+//! The session is the only route to every backend submission, so each lane's bound is enforced
+//! where the lane is entered — never trusted to the callers' discipline, which endpoint rebuilds
+//! and abandoned correlations reset:
+//!
+//! - **appends** — the slot-quiescence fence: at most one in-flight write per physical ring slot
+//!   ([`Storage::submit_append`] returns [`AppendSubmission::SlotFenced`] otherwise), so the append
+//!   ledger never exceeds the ring capacity;
+//! - **durable roots** — the one-deep pipeline: at most one root with the backend
+//!   ([`Storage::submit_root`] parks the rest in queue order), and forfeiture
+//!   ([`Storage::forfeit_root`]) keeps the parked queue within the live correlations;
+//! - **checkpoint envelopes** — the one-outstanding fence: at most one envelope write on the
+//!   medium ([`Storage::submit_checkpoint`] returns [`CheckpointSubmission::EnvelopeFenced`]
+//!   otherwise);
+//! - **block jobs** — the lane front's per-kind admission quotas (one image capture, one frontier
+//!   walk, the serve cap).
+//!
+//! Each bound has a per-tick oracle in the simulation (the backend asserts and the boundedness
+//! checker), so a caller change that would re-open a lane trips a sweep instead of growing quietly.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::vec::Vec;
@@ -62,6 +83,24 @@ pub(crate) enum AppendSubmission {
     /// The refused submission's body, returned for parking.
     body: Bytes,
   },
+}
+
+/// The verdict of a fenced checkpoint-envelope submission: either the envelope went to the
+/// backend, or an earlier envelope write still holds the medium and nothing was submitted.
+///
+/// The fence is this return value, not a predicate consulted beforehand: there is no way to reach
+/// [`Superblock::submit_write_checkpoint`] through the session without receiving — and having to
+/// handle — the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an unhandled EnvelopeFenced verdict drops the checkpoint silently — drop the staged \
+              step and let the cadence re-force it"]
+pub(crate) enum CheckpointSubmission {
+  /// The envelope was submitted; its write is now in the session ledger until it completes.
+  Submitted,
+  /// An earlier checkpoint-envelope write — this endpoint's or an orphan a dead correlation left —
+  /// is still outstanding; nothing was submitted. The caller drops its staged checkpoint and its
+  /// cadence re-forces one once the outstanding write completes and leaves the ledger.
+  EnvelopeFenced,
 }
 
 /// One synchronously-cancelled append reported by a [`Wal::truncate`]/[`Wal::prune`], already
@@ -182,9 +221,18 @@ pub struct Storage<W, B, S: StateMachine> {
   roots_submitted: usize,
   /// EVERY in-flight checkpoint-envelope write: full id → the checkpoint op it stages. Tracked so
   /// quiescence ([`Self::has_inflight`], [`Self::into_parts`]) covers the envelope leg of a
-  /// checkpoint exactly as it covers appends and roots. The envelope needs no submission fence:
-  /// the durable root stores the envelope's content hash, so a lost same-slot race is DETECTED at
-  /// the next recovery (checksum mismatch → peer fetch) rather than silently restored.
+  /// checkpoint exactly as it covers appends and roots. CONTENT safety needs no fence — the
+  /// durable root stores the envelope's content hash, so a lost same-slot race is DETECTED at the
+  /// next recovery (checksum mismatch → peer fetch) rather than silently restored — but
+  /// BOUNDEDNESS does: an entry here was handed to the backend at submission (envelopes are never
+  /// parked), so an orphan — a `SyncRepersist` correlation a view transition dropped at its
+  /// envelope step, or a dead incarnation's write — is owed to the medium and cannot be forfeited;
+  /// it drains only at its completion. Admission is therefore the only available bound, and
+  /// [`Self::submit_checkpoint`] enforces it: at most ONE envelope write outstanding, ever. The
+  /// superblock's completion-order contract covers root writes only, so without the fence a
+  /// conforming backend slow on envelope writes alone would let every view-change window orphan
+  /// one more envelope — each entry retaining its full snapshot bytes — while later durable-view
+  /// roots complete around them and re-open the endpoint's own staging gates.
   checkpoints: BTreeMap<SessionKey, u64>,
   /// The block lane's front: every job issued over this store and not yet completed, the quotas
   /// they occupy, and the order they must execute in.
@@ -313,6 +361,19 @@ impl<W, B, S: StateMachine> Storage<W, B, S> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn roots_in_flight(&self) -> usize {
     self.roots.len()
+  }
+
+  /// The number of in-flight checkpoint-envelope writes — `0` or `1`, never more: the envelope
+  /// fence ([`Self::submit_checkpoint`]) refuses a second submission while one is outstanding.
+  ///
+  /// The endpoint's staging gates read it to defer a checkpoint start while an orphaned envelope
+  /// drains (any entry here with no live correlation is an orphan — a live correlation and a bare
+  /// staging gate cannot coexist), and the simulation boundedness checker asserts the constant
+  /// bound per tick. Not part of the stable API.
+  #[doc(hidden)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn checkpoints_in_flight(&self) -> usize {
+    self.checkpoints.len()
   }
 
   /// Test-only escape hatch to the raw WAL handle, for fixture knobs (staging, landing order,
@@ -592,11 +653,33 @@ impl<W: Wal, B: Superblock, S: StateMachine> Storage<W, B, S> {
     }
   }
 
-  /// Submit a checkpoint-envelope write at `op`, recording it in the envelope ledger. The ONLY
-  /// route to [`Superblock::submit_write_checkpoint`].
-  pub(crate) fn submit_checkpoint(&mut self, id: WriteId, op: OpNumber, snapshot: Bytes) {
+  /// Fenced checkpoint-envelope submission — the ONLY route to
+  /// [`Superblock::submit_write_checkpoint`]. Either records the write in the envelope ledger and
+  /// submits it, or reports the medium fenced by an earlier envelope write (this endpoint's or an
+  /// orphan a dead correlation left) and submits nothing.
+  ///
+  /// One outstanding envelope is the whole lane. Unlike a root, an envelope is never parked — the
+  /// write goes to the backend at submission — and unlike a parked root it cannot be forfeited
+  /// once disowned: an orphaned envelope is owed to the medium until its completion drains it. So
+  /// the bound has to hold at admission, and it has to hold HERE rather than in the callers'
+  /// staging gates: those gates read endpoint correlation state, which a view transition or an
+  /// endpoint rebuild resets while the session's ledger still carries the orphan. The refusal is
+  /// deferral, not loss — the caller drops its staged step exactly as it does for a failed flush,
+  /// and its cadence re-forces the checkpoint once the outstanding write completes; the blocks the
+  /// dropped step named are content-addressed, so the re-forced attempt re-derives them
+  /// byte-identically.
+  pub(crate) fn submit_checkpoint(
+    &mut self,
+    id: WriteId,
+    op: OpNumber,
+    snapshot: Bytes,
+  ) -> CheckpointSubmission {
+    if !self.checkpoints.is_empty() {
+      return CheckpointSubmission::EnvelopeFenced;
+    }
     self.sb.submit_write_checkpoint(id, op, snapshot);
     self.checkpoints.insert(key(id), op.get());
+    CheckpointSubmission::Submitted
   }
 
   /// Submit a checkpoint read. Reads carry no physical-write fact; the session only forwards them.
