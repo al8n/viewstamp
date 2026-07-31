@@ -5434,7 +5434,6 @@ where
     msg: Message,
   ) {
     self.handle_message_inner(now, wal, sb, blocks, from, msg);
-    self.run_block_lane(now, sb, blocks);
     #[cfg(debug_assertions)]
     self.assert_invariants();
   }
@@ -6051,7 +6050,6 @@ where
       // re-broadcasts its durable frontier so the primary's promote gate sees it catch up.
       self.learner_status_timeouts(now, wal);
     }
-    self.run_block_lane(now, sb, blocks);
     // No-orphan-due invariant: after dispatch, NO serviceable timer may remain armed-and-due
     // (`serviceable_now(kind) && armed(kind) <= now`). `poll_timeout` returns only serviceable timers, so
     // every such timer either was just serviced (re-armed strictly forward, or cleared) or was never
@@ -6125,12 +6123,18 @@ where
 
   /// Runs every queued block job to completion on the endpoint's OWN inline storage lane.
   ///
-  /// The `handle_*` entry points call this at their tail while the remaining block-I/O paths are
-  /// still executed on the pump: it drains [`Self::poll_block_job`], executes each job with
-  /// [`execute_block_job`](crate::execute_block_job) against the store the entry point was handed,
-  /// and feeds each completion back through [`Self::on_block_done`] — the same sequence a driver's
-  /// storage lane performs, run inline. It executes strictly in poll order, so it satisfies the
-  /// lane's serial-in-issue-order obligation by construction.
+  /// [`Self::handle_storage`] — the endpoint's storage-progress step — calls this while the
+  /// remaining block-I/O paths are still executed on the pump: it drains [`Self::poll_block_job`],
+  /// executes each job with [`execute_block_job`](crate::execute_block_job) against the store it was
+  /// handed, and feeds each completion back through [`Self::on_block_done`] — the same sequence a
+  /// driver's storage lane performs, run inline. It executes strictly in poll order, so it satisfies
+  /// the lane's serial-in-issue-order obligation by construction.
+  ///
+  /// DELIBERATELY not called by [`Self::handle_message`] / [`Self::handle_timeout`]: the ingress and
+  /// timer paths must be able to make consensus progress — commit, ack, heartbeat, change view —
+  /// while a checkpoint's blocks are still being written, which is the whole point of moving the
+  /// write off the pump. A materialize issued from either therefore stays outstanding until the next
+  /// storage step.
   fn run_block_lane<B: Superblock>(
     &mut self,
     now: Instant,
