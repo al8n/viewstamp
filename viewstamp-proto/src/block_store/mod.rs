@@ -205,6 +205,10 @@ pub trait BlockStore {
   /// would publish checkpoint roots naming blocks a crash discards. An in-memory store is durable
   /// for the lifetime it models and returns `Ok(())` explicitly ([`InMemoryBlockStore`] does); a
   /// store backed by real media implements its `fsync`/barrier here.
+  ///
+  /// A third-party implementation can check the stage → flush → reopen property against its own
+  /// type with
+  /// [`assert_flush_then_reopen_preserves_blocks`](crate::assert_flush_then_reopen_preserves_blocks).
   fn flush(&mut self) -> Result<(), BlockStoreError>;
 
   /// Returns `true` if a block has been written at `addr`.
@@ -250,17 +254,30 @@ pub trait BlockStore {
   }
 }
 
-/// A volatile in-memory [`BlockStore`] backed by a `BTreeMap`.
+/// A volatile in-memory [`BlockStore`] backed by a `BTreeMap` — a supported public implementation,
+/// not merely an internal test fixture.
 ///
-/// Every `put` is recorded immediately and `flush` succeeds (in-memory content is durable for the
-/// process lifetime it models), so it is a correct store for tests, simulations, and embedders
-/// whose checkpoint content is reconstructible. Iteration order is deterministic (`BTreeMap` keyed
-/// by address), which seeded harnesses rely on.
+/// **What it is for:** tests, simulations, and any embedder whose checkpoint content is cheaply
+/// reconstructible from elsewhere, so losing it across a restart is acceptable — anywhere a
+/// correct, zero-configuration store is worth more than a persistent one.
+///
+/// **It is volatile — explicitly NOT a durability example.** Every block lives only in this
+/// process's heap: there is no disk, no `fsync`, nothing that outlives the process. `flush`
+/// returning `Ok` here means only "recorded in this map", never "survives a crash". Do NOT copy
+/// this type's `flush` body as a template for a real backend's durability barrier — see
+/// [`BlockStore::flush`] for what an implementation backed by real media owes instead. Likewise
+/// every `put` is recorded immediately (a read observes it before any `flush`), which is a
+/// correct-but-vacuous way to satisfy the trait that a backend buffering toward real I/O may not
+/// have the luxury of.
+///
+/// Iteration order is deterministic (`BTreeMap` keyed by address), which seeded harnesses rely on.
 ///
 /// Fault injection for tests rides on the same type: [`script_flush_fault`](Self::script_flush_fault)
 /// makes the next flushes fail so a harness can prove the checkpoint pointer is not advanced over
 /// an unflushed DAG, and [`insert_raw`](Self::insert_raw) plants bytes under an arbitrary address
-/// so verify-on-read paths can be exercised against corrupt blocks.
+/// so verify-on-read paths can be exercised against corrupt blocks — the same backdoor
+/// [`assert_restore_contract`](crate::assert_restore_contract) uses to manufacture a corrupt
+/// checkpoint.
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryBlockStore {
   blocks: std::collections::BTreeMap<BlockAddress, Bytes>,

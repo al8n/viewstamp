@@ -155,6 +155,21 @@ fn report_digest(r: &VoprReport) -> u64 {
     r.bodies_with_multiple_units(),
     r.max_units_per_body(),
     r.groups_submitted(),
+    // Pins refused while a transfer's frontier walk was outstanding. Folded, unlike the axis-gated
+    // witnesses below, because it is LIVE on the default schedule: the one-pin-at-a-time guard sits
+    // on every arming path, so a plain `run_vopr` reaches it on a good fraction of seeds. That makes
+    // it a real behavioural quantity for a cross-checkout diff to compare, which is exactly what this
+    // hash is for.
+    r.walk_pins_refused(),
+    // The BLOCK-LANE witnesses (block_jobs_delayed / materializes_superseded_in_flight /
+    // block_job_outstanding_ticks / commits_while_block_job_outstanding /
+    // heartbeats_while_block_job_outstanding / block_flush_faults_fired /
+    // block_restore_faults_armed / block_read_faults_fired) are deliberately NOT folded, for the same
+    // reason as the stale-read, learner and reconfig witnesses above: they are identically zero on
+    // the default schedule (both block axes are opt-in, and with them off no job is ever held, no
+    // barrier ever fails and no read is ever faulted), so folding them would change this hash's
+    // schema without any behavioural change. An accidental off-axis engagement would hold jobs across
+    // ticks and so perturb the applied-history and committed columns regardless.
     // The stale-read witnesses are deliberately NOT folded here: they are zero on the default
     // schedule, but folding a field changes this report hash's schema, which would make the report
     // column differ between checkouts for a reason other than a behavioral change. The report hash
@@ -200,11 +215,20 @@ fn report_digest(r: &VoprReport) -> u64 {
 /// 456 -> 409. That is the intended consequence of the change, and it is bounded — all four
 /// APPLIED-history digests stay byte-identical (what gets applied is unchanged, there is simply one
 /// fewer op inside the budget), seeds 1-3's report digests are untouched, and no oracle fires.
+/// The REPORT digests were re-pinned once more when `walk_pins_refused` joined the fold. That counter
+/// is LIVE on the default schedule (the one-pin-at-a-time guard sits on every arming path), so it
+/// belongs in a hash whose job is to compare what a seed observably produced — but adding any field
+/// changes the FNV schema, so all four move. The move is PURELY schema: on all four pinned seeds the
+/// counter's value is `0`, and the digest recomputed with the new field OMITTED reproduces the
+/// previous baseline byte for byte, so every other column is unchanged. The APPLIED-history digests
+/// are untouched, as they must be — the block-lane plumbing added alongside is inert with both block
+/// axes off (no job is held, no barrier fails, no read is faulted), and those witnesses are
+/// deliberately NOT folded here for exactly that reason.
 const BASELINE_DIGESTS: &[(u64, u64, u64)] = &[
-  (0, 0x3011_cd95_7970_09d6, 0xe92c_4ebb_0e1d_332f),
-  (1, 0x8180_484c_aaf2_15a4, 0x704d_dc76_945b_97c0),
-  (2, 0x27fd_ef6b_3b83_c631, 0x07a5_5860_35bf_4bf9),
-  (3, 0x94d1_3cab_40a7_0dc2, 0x0249_a3f9_dcb7_b704),
+  (0, 0x3011_cd95_7970_09d6, 0x5c5d_df1a_e170_2f0f),
+  (1, 0x8180_484c_aaf2_15a4, 0x8bf2_5d5b_c5ec_0fc0),
+  (2, 0x27fd_ef6b_3b83_c631, 0x02ba_1540_e115_c519),
+  (3, 0x94d1_3cab_40a7_0dc2, 0x316a_24d0_9351_bf84),
 ];
 
 #[test]

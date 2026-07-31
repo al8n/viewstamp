@@ -193,7 +193,7 @@ pub(crate) struct RecoveredCheckpoint {
 
 /// One unit of block I/O the endpoint has issued, opaque to the driver: hand it to
 /// [`execute_block_job`] with the store, and feed the returned [`BlockJobDone`] back into the
-/// endpoint. See the [module docs](self) for the serial-in-issue-order contract.
+/// endpoint. See the module documentation for the serial-in-issue-order contract.
 pub struct BlockJob<S: StateMachine> {
   pub(crate) id: JobId,
   pub(crate) kind: BlockJobKind<S>,
@@ -348,8 +348,8 @@ impl BlockJobCursor {
 /// jobs touch a store, shared by every driver and harness.
 ///
 /// Runs OFF the consensus pump (the whole point of the seam); the caller owns `cursor` for the lane
-/// and passes it on every call so issue-order violations fail loudly here. See the
-/// [module docs](self) for the full contract.
+/// and passes it on every call so issue-order violations fail loudly here. See the module
+/// documentation for the full contract.
 pub fn execute_block_job<S: StateMachine>(
   cursor: &mut BlockJobCursor,
   job: BlockJob<S>,

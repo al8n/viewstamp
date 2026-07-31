@@ -181,6 +181,12 @@ pub struct Cluster {
   /// block job. `0` off-axis (the lane is never non-empty at an observation point); the anti-stall
   /// witness that block I/O does not silence the liveness cadence it runs beside.
   heartbeats_while_block_job_outstanding: u64,
+  /// Set when a SUPERSEDED block-job completion advanced a replica's durable checkpoint pointer — a
+  /// STALE PUBLICATION. Stays `None` for a correct proto; a recorded value is a real finding. Drained
+  /// each tick by the VOPR driver via [`Self::take_stale_publication_violation`]. Recorded
+  /// structurally, by sampling the endpoint's supersession counter and its durable checkpoint pointer
+  /// ACROSS one `on_block_done`, so a rise in both can only come from the completion just delivered.
+  stale_publication_violation: Option<SmolStr>,
   /// Per-replica STALLED storage lane: while `true`, no held job is released however long it has
   /// waited. All `false` by default. Deterministic (no draw), and the only way a test can hold one
   /// specific job across an event it chooses — a seeded hold length cannot be aimed at a view change
@@ -537,6 +543,7 @@ impl Cluster {
       materializes_superseded_in_flight: 0,
       block_restore_faults_armed: 0,
       heartbeats_while_block_job_outstanding: 0,
+      stale_publication_violation: None,
       block_lane_paused: vec![false; n],
       clients: client_set,
       net: Network::new(),
@@ -2914,22 +2921,48 @@ impl Cluster {
     true
   }
 
-  /// Fold one executed job's witnesses. `superseded_before` is the endpoint's supersession counter
-  /// sampled immediately BEFORE this completion was delivered, so a rise across it names this job.
+  /// Fold one executed job's witnesses. `superseded_before` and `checkpoint_before` are the
+  /// endpoint's supersession counter and durable checkpoint pointer sampled immediately BEFORE this
+  /// completion was delivered, so a rise in either names this job and nothing else.
   fn note_block_job_done(
     &mut self,
     i: usize,
     tag: viewstamp_proto::BlockJobTag,
     held_steps: u32,
     superseded_before: u64,
+    checkpoint_before: OpNumber,
   ) {
+    let superseded = self.replicas[i].block_jobs_superseded() > superseded_before;
+    // NO STALE PUBLICATION, checked per completion. A superseded completion answers state the
+    // endpoint has already abandoned — a checkpoint a view transition dropped, an install a teardown
+    // cancelled — so it must publish NOTHING. Advancing the durable checkpoint pointer on one would
+    // name a checkpoint over roots the endpoint no longer means, the exact failure supersession
+    // exists to prevent. Checked whatever the job waited: a job that executed inline can still find
+    // its state gone, and the claim is about the completion, not about the delay.
+    if superseded && self.replicas[i].checkpoint_op() > checkpoint_before {
+      let after = self.replicas[i].checkpoint_op().get();
+      let before = checkpoint_before.get();
+      self.stale_publication_violation.get_or_insert_with(|| {
+        format_smolstr!(
+          "replica {i}: a SUPERSEDED {tag} completion advanced the durable checkpoint pointer \
+           ({before} -> {after}), publishing over state the endpoint had already abandoned"
+        )
+      });
+    }
     if held_steps == 0 {
       return; // executed in the iteration that polled it — nothing the delay lane can claim.
     }
     self.block_jobs_delayed += 1;
-    if tag.is_materialize() && self.replicas[i].block_jobs_superseded() > superseded_before {
+    if superseded && tag.is_materialize() {
       self.materializes_superseded_in_flight += 1;
     }
+  }
+
+  /// Take the recorded STALE-PUBLICATION violation, if any (a superseded block-job completion that
+  /// advanced the durable checkpoint pointer). `None` for a correct proto; a per-tick observer drains
+  /// this and fails on it.
+  pub fn take_stale_publication_violation(&mut self) -> Option<SmolStr> {
+    self.stale_publication_violation.take()
   }
 
   /// One simulation step.
@@ -2960,7 +2993,8 @@ impl Cluster {
       let tag = held.job.tag();
       // Deliver an armed read fault into THIS job's reads and nowhere else: the store cannot see what
       // it is serving, so the lane arms immediately before the executor runs and disarms immediately
-      // after. Off-axis `read_fault_arm` is `None` and neither call is made.
+      // after. With no `block_restore_fault_plan` installed nothing is ever armed, so neither call is
+      // made and no draw is taken.
       let faulted_reads = self.arm_block_read_fault(i, tag);
       let done = viewstamp_proto::execute_block_job(
         &mut self.block_lanes[i],
@@ -2970,11 +3004,18 @@ impl Cluster {
       if faulted_reads {
         self.block_stores[i].arm_read_faults(0);
       }
-      // Sample the endpoint's supersession counter ACROSS the completion so a drop is attributable to
-      // THIS job: the delta can only come from the completion just delivered.
+      // Sample the endpoint's supersession counter AND its durable checkpoint pointer ACROSS the
+      // completion, so both deltas are attributable to THIS job: nothing else runs between them.
       let superseded_before = self.replicas[i].block_jobs_superseded();
+      let checkpoint_before = self.replicas[i].checkpoint_op();
       self.replicas[i].on_block_done(now, &mut self.wals[i], &mut self.sbs[i], done);
-      self.note_block_job_done(i, tag, held.held_steps, superseded_before);
+      self.note_block_job_done(
+        i,
+        tag,
+        held.held_steps,
+        superseded_before,
+        checkpoint_before,
+      );
     }
     // Incrementality witness (closing half): a block the delivery observed MISSING and the walk has
     // now written was hash-verified + accepted by the frontier. An address still absent stays a

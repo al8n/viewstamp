@@ -20,6 +20,7 @@ mod block_job;
 mod block_store;
 mod codec;
 mod config;
+mod conformance;
 mod endpoint;
 mod event;
 mod id;
@@ -49,6 +50,7 @@ pub use codec::CodecError;
 pub use config::{
   Config, ConfigError, DEFAULT_CHECKPOINT_OPS, MAX_CHECKPOINT_OPS, MAX_CLIENT_SESSIONS,
 };
+pub use conformance::{assert_flush_then_reopen_preserves_blocks, assert_restore_contract};
 pub use endpoint::{
   Endpoint, FormatError, Genesis, ProposeMembershipError, Reconfig, ReconfigError, RecoverError,
   Recovered, RestartOnly, Retired, SessionImage, SingleChange, format, prepare_restart,
