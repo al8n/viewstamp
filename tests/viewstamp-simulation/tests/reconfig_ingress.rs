@@ -114,27 +114,19 @@ fn drive_workload(
   e: &mut Endpoint<viewstamp_simulation::sm::LogSm>,
   wal: &mut InMemoryWal,
   sb: &mut InMemorySuperblock,
-  blocks: &mut MemBlockStore,
+  _blocks: &mut MemBlockStore,
 ) {
   let now = Instant::ZERO;
   let primary = Peer::Replica(ReplicaId::new(0));
   for op in 1..=3u64 {
-    e.handle_message(
-      now,
-      wal,
-      sb,
-      blocks,
-      primary,
-      prepare(op, op.saturating_sub(1)),
-    );
-    e.handle_storage(now, wal, sb, blocks);
+    e.handle_message(now, wal, sb, primary, prepare(op, op.saturating_sub(1)));
+    e.handle_storage(now, wal, sb);
   }
   // Commit up to 3 (same config) — advances commit_max and applies the held prefix.
   e.handle_message(
     now,
     wal,
     sb,
-    blocks,
     primary,
     Message::Commit(Commit::new(
       View::new(),
@@ -144,7 +136,7 @@ fn drive_workload(
       0,
     )),
   );
-  e.handle_storage(now, wal, sb, blocks);
+  e.handle_storage(now, wal, sb);
   while e.poll_message().is_some() {} // drain emitted acks (observation-only)
 }
 
@@ -161,7 +153,6 @@ fn foreign_epoch_strict_message_has_zero_effect_on_the_accumulators() {
   // authority gate drops each for authority, so the accumulators must end BYTE-IDENTICAL to the clean
   // run (the foreign configuration's voter contributed nothing).
   let (mut witness, mut ww, mut ws) = backup();
-  let mut wb = MemBlockStore::new();
   let now = Instant::ZERO;
   let primary = Peer::Replica(ReplicaId::new(0));
   for op in 1..=3u64 {
@@ -169,17 +160,15 @@ fn foreign_epoch_strict_message_has_zero_effect_on_the_accumulators() {
       now,
       &mut ww,
       &mut ws,
-      &mut wb,
       primary,
       prepare(op, op.saturating_sub(1)),
     );
-    witness.handle_storage(now, &mut ww, &mut ws, &mut wb);
+    witness.handle_storage(now, &mut ww, &mut ws);
     // Foreign-epoch head-advancing Prepare (would advance `op` if admitted) from the claimed primary.
     witness.handle_message(
       now,
       &mut ww,
       &mut ws,
-      &mut wb,
       primary,
       Message::Prepare(Prepare::new(
         View::new(),
@@ -198,7 +187,6 @@ fn foreign_epoch_strict_message_has_zero_effect_on_the_accumulators() {
       now,
       &mut ww,
       &mut ws,
-      &mut wb,
       Peer::Replica(ReplicaId::new(2)),
       Message::PrepareOk(PrepareOk::new(
         View::new(),
@@ -210,13 +198,12 @@ fn foreign_epoch_strict_message_has_zero_effect_on_the_accumulators() {
         0,
       )),
     );
-    witness.handle_storage(now, &mut ww, &mut ws, &mut wb);
+    witness.handle_storage(now, &mut ww, &mut ws);
   }
   witness.handle_message(
     now,
     &mut ww,
     &mut ws,
-    &mut wb,
     primary,
     Message::Commit(Commit::new(
       View::new(),
@@ -226,7 +213,7 @@ fn foreign_epoch_strict_message_has_zero_effect_on_the_accumulators() {
       0,
     )),
   );
-  witness.handle_storage(now, &mut ww, &mut ws, &mut wb);
+  witness.handle_storage(now, &mut ww, &mut ws);
   while witness.poll_message().is_some() {}
   let witnessed = snapshot(&witness, &ws);
 
@@ -256,7 +243,6 @@ fn same_epoch_foreign_config_id_strict_message_has_zero_effect() {
   let clean = snapshot(&control, &cs);
 
   let (mut witness, mut ww, mut ws) = backup();
-  let mut wb = MemBlockStore::new();
   let now = Instant::ZERO;
   let primary = Peer::Replica(ReplicaId::new(0));
   for op in 1..=3u64 {
@@ -264,18 +250,16 @@ fn same_epoch_foreign_config_id_strict_message_has_zero_effect() {
       now,
       &mut ww,
       &mut ws,
-      &mut wb,
       primary,
       prepare(op, op.saturating_sub(1)),
     );
-    witness.handle_storage(now, &mut ww, &mut ws, &mut wb);
+    witness.handle_storage(now, &mut ww, &mut ws);
     // Same-epoch, FOREIGN-config_id head-advancing Prepare + a foreign-config Commit (would advance
     // the commit if admitted). Both dropped by the lineage gate.
     witness.handle_message(
       now,
       &mut ww,
       &mut ws,
-      &mut wb,
       primary,
       Message::Prepare(Prepare::new(
         View::new(),
@@ -293,7 +277,6 @@ fn same_epoch_foreign_config_id_strict_message_has_zero_effect() {
       now,
       &mut ww,
       &mut ws,
-      &mut wb,
       primary,
       Message::Commit(Commit::new(
         View::new(),
@@ -303,13 +286,12 @@ fn same_epoch_foreign_config_id_strict_message_has_zero_effect() {
         FOREIGN_CONFIG_ID,
       )),
     );
-    witness.handle_storage(now, &mut ww, &mut ws, &mut wb);
+    witness.handle_storage(now, &mut ww, &mut ws);
   }
   witness.handle_message(
     now,
     &mut ww,
     &mut ws,
-    &mut wb,
     primary,
     Message::Commit(Commit::new(
       View::new(),
@@ -319,7 +301,7 @@ fn same_epoch_foreign_config_id_strict_message_has_zero_effect() {
       0,
     )),
   );
-  witness.handle_storage(now, &mut ww, &mut ws, &mut wb);
+  witness.handle_storage(now, &mut ww, &mut ws);
   while witness.poll_message().is_some() {}
   let witnessed = snapshot(&witness, &ws);
 
@@ -339,14 +321,12 @@ fn foreign_epoch_start_view_change_does_not_perturb_the_view() {
   let clean = snapshot(&control, &cs);
 
   let (mut witness, mut ww, mut ws) = backup();
-  let mut wb = MemBlockStore::new();
   let now = Instant::ZERO;
   for v in 1..=3u64 {
     witness.handle_message(
       now,
       &mut ww,
       &mut ws,
-      &mut wb,
       Peer::Replica(ReplicaId::new(2)),
       Message::StartViewChange(StartViewChange::new(
         View::with(v),
@@ -355,7 +335,7 @@ fn foreign_epoch_start_view_change_does_not_perturb_the_view() {
         0,
       )),
     );
-    witness.handle_storage(now, &mut ww, &mut ws, &mut wb);
+    witness.handle_storage(now, &mut ww, &mut ws);
   }
   while witness.poll_message().is_some() {}
   let witnessed = snapshot(&witness, &ws);

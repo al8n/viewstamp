@@ -37,8 +37,8 @@ use std::{
 
 use bytes::Bytes;
 use viewstamp_proto::{
-  BlockStore, ClientId, Config, Endpoint, Epoch, Event, Instant, MemberId, Membership, Recovered,
-  Request, RequestNumber, SingleChange, StateMachine, Superblock, Wal,
+  ClientId, Config, Endpoint, Epoch, Event, Instant, MemberId, Membership, Recovered, Request,
+  RequestNumber, SingleChange, StateMachine, Superblock, Wal,
 };
 
 use crate::{Command, DriverError};
@@ -128,7 +128,6 @@ pub fn build_endpoint<S, W, B>(
   sm: S,
   wal: &mut W,
   sb: &mut B,
-  blocks: &mut dyn BlockStore,
 ) -> Result<Endpoint<S, SingleChange>, DriverError>
 where
   S: StateMachine,
@@ -149,9 +148,7 @@ where
   // zero-sized PhantomData witness with no runtime representation; the driver always carries the
   // capability so the coordinators can call `propose_membership` without the embedder opting in
   // per-instance.
-  match Endpoint::<S, SingleChange>::recover_with_reconfig(
-    config, membership, seed, sm, wal, sb, blocks,
-  )? {
+  match Endpoint::<S, SingleChange>::recover_with_reconfig(config, membership, seed, sm, wal, sb)? {
     Recovered::Active(endpoint) => Ok(endpoint),
     Recovered::Retired(retired) => Err(DriverError::Retired {
       local: retired.local(),

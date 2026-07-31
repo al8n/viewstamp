@@ -25,7 +25,6 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -33,7 +32,7 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
       Bytes::from_static(b"a"),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // own append durable → own vote recorded
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // own append durable → own vote recorded
   assert_eq!(e.op(), OpNumber::with(1));
   assert_eq!(
     e.commit(),
@@ -46,7 +45,6 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(1)), // authenticated sender
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -58,7 +56,7 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
       0,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::new(),
@@ -70,7 +68,6 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -86,7 +83,7 @@ fn forged_prepare_ok_from_a_different_sender_is_dropped() {
       0,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
@@ -115,13 +112,11 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
     now + core::time::Duration::from_millis(300),
     &mut wal,
     &mut sb,
-    &mut blocks,
   );
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -139,7 +134,6 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)), // authenticated sender
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -152,7 +146,7 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
       std::vec![],
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.status(),
     Status::ViewChange,
@@ -164,7 +158,6 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::DoViewChange(DoViewChange::new(
       View::with(1),
@@ -177,7 +170,7 @@ fn forged_do_view_change_from_a_different_sender_is_dropped() {
       std::vec![],
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks); // durable-view write lands → it serves as primary
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks); // durable-view write lands → it serves as primary
   assert_eq!(e.view(), View::with(1));
   assert!(
     e.is_primary() && e.status().is_normal() && !e.pending_sb_for_test(),
@@ -193,7 +186,6 @@ fn forged_start_view_change_from_a_different_sender_is_dropped() {
   // replica 2 is forged: it must NOT contribute, so the backup does not reach the SVC quorum.
   let mut e = backup(); // replica 1 of 3 — a backup of view 0
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   assert_eq!(e.status(), Status::Normal);
 
@@ -202,7 +194,6 @@ fn forged_start_view_change_from_a_different_sender_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)), // authenticated sender
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -223,7 +214,6 @@ fn forged_start_view_change_from_a_different_sender_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::StartViewChange(StartViewChange::new(
       View::with(1),
@@ -255,15 +245,8 @@ fn forged_commit_from_a_non_primary_is_dropped_by_the_sender_binding() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // The real primary (replica 0) prepares op 1; the backup appends + acks it.
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(e.op(), OpNumber::with(1));
   assert_eq!(e.commit(), OpNumber::new());
   while e.poll_message().is_some() {}
@@ -273,7 +256,6 @@ fn forged_commit_from_a_non_primary_is_dropped_by_the_sender_binding() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)), // not the primary of view 0
     Message::Commit(Commit::new(
       View::new(),
@@ -293,7 +275,6 @@ fn forged_commit_from_a_non_primary_is_dropped_by_the_sender_binding() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -325,26 +306,18 @@ fn forged_prepare_from_a_client_is_dropped_by_the_sender_binding() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Client(ClientId::new(7)),
     prepare(1, 0),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::new(),
     "a Prepare from a client `from` is dropped: the backup does not append it",
   );
   // Positive control: the identical Prepare from the genuine primary IS appended.
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(1),
@@ -371,11 +344,10 @@ fn forged_prepare_from_a_non_primary_replica_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     prepare(1, 0),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::new(),
@@ -386,15 +358,8 @@ fn forged_prepare_from_a_non_primary_replica_is_dropped() {
     "the dropped Prepare emits no PrepareOk (no forged vote reaches the primary's quorum)",
   );
   // Positive control: the identical Prepare from the genuine primary (replica 0) IS appended + acked.
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(1),
@@ -434,7 +399,6 @@ fn forged_prepare_batch_from_a_non_primary_is_dropped_by_the_sender_binding() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     batch(),
   );
@@ -442,11 +406,10 @@ fn forged_prepare_batch_from_a_non_primary_is_dropped_by_the_sender_binding() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Client(ClientId::new(7)),
     batch(),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::new(),
@@ -457,8 +420,8 @@ fn forged_prepare_batch_from_a_non_primary_is_dropped_by_the_sender_binding() {
     "the dropped batch emits no PrepareOk (no forged vote reaches the primary's quorum)",
   );
   // Positive control: the identical batch from the genuine primary (replica 0) is appended + acked.
-  e.handle_message(now, &mut wal, &mut sb, &mut blocks, primary_peer(), batch());
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), batch());
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.op(),
     OpNumber::with(1),
@@ -487,7 +450,6 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Client(ClientId::new(7)),
     Message::Request(Request::new(
       ClientId::new(7),
@@ -495,7 +457,7 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
       Bytes::from_static(b"a"),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::new(),
@@ -506,7 +468,6 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(5)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -518,7 +479,7 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
       0,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::new(),
@@ -529,7 +490,6 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     Message::PrepareOk(PrepareOk::new(
       View::new(),
@@ -545,7 +505,7 @@ fn out_of_range_prepare_ok_is_not_counted_toward_quorum() {
       0,
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.commit(),
     OpNumber::with(1),
@@ -571,7 +531,6 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -587,7 +546,6 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(5)),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -601,7 +559,7 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
       Bytes::new(),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::new(),
@@ -617,7 +575,6 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::SyncCheckpoint(crate::SyncCheckpoint::new(
       View::new(),
@@ -631,7 +588,7 @@ fn out_of_range_sync_checkpoint_is_dropped_by_the_membership_check() {
       Bytes::new(),
     )),
   );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert_eq!(
     e.checkpoint_op(),
     OpNumber::with(4),
@@ -657,7 +614,6 @@ fn repair_hole_prepare_from_a_client_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -677,11 +633,10 @@ fn repair_hole_prepare_from_a_client_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Client(ClientId::new(7)),
     repair_prepare(0, 2, 2),
   );
-  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // pump: no RepairFill should have been staged
+  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // pump: no RepairFill should have been staged
   assert!(
     r.has_repair_hole_for_test(2),
     "a repair Prepare from a client `from` is dropped: the committed hole stays OPEN",
@@ -697,11 +652,10 @@ fn repair_hole_prepare_from_a_client_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
-  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → clear hole + resume
+  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → clear hole + resume
   assert!(
     !r.has_repair_hole_for_test(2),
     "the same repair Prepare from a valid replica holder DOES fill the hole",
@@ -728,7 +682,6 @@ fn repair_hole_prepare_from_an_out_of_range_replica_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -748,11 +701,10 @@ fn repair_hole_prepare_from_an_out_of_range_replica_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(5)),
     repair_prepare(0, 2, 2),
   );
-  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // pump: no RepairFill should have been staged
+  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // pump: no RepairFill should have been staged
   assert!(
     r.has_repair_hole_for_test(2),
     "a repair Prepare from an out-of-range replica `from` is dropped: the hole stays OPEN",
@@ -768,11 +720,10 @@ fn repair_hole_prepare_from_an_out_of_range_replica_is_dropped() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
-  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     !r.has_repair_hole_for_test(2),
     "the same repair Prepare from an in-range replica holder DOES fill the hole",
@@ -793,7 +744,6 @@ fn higher_view_non_canonical_hole_prepare_does_not_trigger_catch_up() {
   // repair-hole ingress escape) would yank the replica into a spurious view change off a body it
   // explicitly rejected. The replica must stay in its current view/status and keep the hole open.
   let (mut r, mut wal, mut sb) = recovering_with_hole(3, 2);
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   while r.poll_message().is_some() {} // discard the recovery solicitation
   let now = Instant::ZERO;
   // Learn commit up to 3 → applies op 1, registers + holds at the op-2 hole. (View stays 0.)
@@ -801,7 +751,6 @@ fn higher_view_non_canonical_hole_prepare_does_not_trigger_catch_up() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -824,7 +773,6 @@ fn higher_view_non_canonical_hole_prepare_does_not_trigger_catch_up() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(1, 2, 1),
   );

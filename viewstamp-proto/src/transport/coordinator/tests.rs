@@ -38,7 +38,7 @@ fn register_and_validate_member(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
   wal: &mut TestWal,
   sb: &mut TestSb,
-  blocks: &mut crate::block_store::InMemoryBlockStore,
+  _blocks: &mut crate::block_store::InMemoryBlockStore,
   member_idx: u128,
 ) -> ConnId {
   let member = MemberId::new(member_idx);
@@ -46,7 +46,7 @@ fn register_and_validate_member(
     Peer::Replica(ReplicaId::new(member_idx as u16)),
     Conn::from_parts(MockRecords::new(false, Some(Peer::Member(member)))),
   );
-  coord.handle_conn_data(id, &[], false, Instant::ZERO, wal, sb, blocks);
+  coord.handle_conn_data(id, &[], false, Instant::ZERO, wal, sb);
   id
 }
 
@@ -72,7 +72,6 @@ fn inbound_request_produces_outbound_to_a_backup() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Client(ClientId::new(7)),
     req(),
   );
@@ -85,7 +84,7 @@ fn inbound_request_produces_outbound_to_a_backup() {
     }
     now = now + core::time::Duration::from_millis(50);
     coord.handle_storage(now, &mut wal, &mut sb, &mut blocks);
-    coord.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
+    coord.handle_timeout(now, &mut wal, &mut sb);
     produced = coord.poll_conn_transmit().is_some();
   }
   assert!(
@@ -136,7 +135,6 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     over,
   );
@@ -173,7 +171,6 @@ fn a_relayed_over_max_request_is_dropped_at_ingress_with_no_side_effects() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(1)),
     at_max,
   );
@@ -224,15 +221,7 @@ fn a_large_multi_chunk_read_is_processed_without_closing_the_conn() {
   while frames.len() <= 64 * 1024 {
     encode_frame(&encode_message(&req()), &mut frames);
   }
-  coord.handle_conn_data(
-    id,
-    &frames,
-    false,
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-  );
+  coord.handle_conn_data(id, &frames, false, Instant::ZERO, &mut wal, &mut sb);
   assert!(
     coord.router_ref().conn(id).is_some(),
     "a large valid multi-chunk read keeps the conn open"
@@ -269,7 +258,6 @@ fn wrong_cluster_conn_is_reaped() {
   let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -291,15 +279,7 @@ fn wrong_cluster_conn_is_reaped() {
   );
   let mut hello = Vec::new();
   wrong.poll_transport_transmit(&mut hello);
-  coord.handle_conn_data(
-    id,
-    &hello,
-    false,
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-  );
+  coord.handle_conn_data(id, &hello, false, Instant::ZERO, &mut wal, &mut sb);
   assert!(
     coord.router_ref().conn(id).is_none(),
     "wrong-cluster conn must be reaped"
@@ -316,7 +296,6 @@ fn an_internally_reaped_conn_surfaces_through_poll_conn_closed() {
   let cfg = Config::try_new(0xAAAA, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -340,15 +319,7 @@ fn an_internally_reaped_conn_surfaces_through_poll_conn_closed() {
   );
   let mut hello = Vec::new();
   wrong.poll_transport_transmit(&mut hello);
-  coord.handle_conn_data(
-    id,
-    &hello,
-    false,
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-  );
+  coord.handle_conn_data(id, &hello, false, Instant::ZERO, &mut wal, &mut sb);
   assert!(
     coord.router_ref().conn(id).is_none(),
     "the wrong-cluster conn is reaped"
@@ -388,15 +359,7 @@ fn a_bad_frame_close_yields_its_cause_through_poll_conn_closed() {
   // A well-formed frame header carrying an undecodable payload: decode fails, the conn closes.
   let mut frames = Vec::new();
   crate::transport::frame::encode_frame(&[0xFF; 8], &mut frames);
-  coord.handle_conn_data(
-    id,
-    &frames,
-    false,
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-  );
+  coord.handle_conn_data(id, &frames, false, Instant::ZERO, &mut wal, &mut sb);
   assert!(
     coord.router_ref().conn(id).is_none(),
     "the bad-frame conn is reaped"
@@ -416,7 +379,6 @@ fn a_redial_is_registered_but_not_authoritative_until_validated() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -436,15 +398,7 @@ fn a_redial_is_registered_but_not_authoritative_until_validated() {
   );
   let mut hello = Vec::new();
   wrong.poll_transport_transmit(&mut hello);
-  coord.handle_conn_data(
-    a,
-    &hello,
-    false,
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-  );
+  coord.handle_conn_data(a, &hello, false, Instant::ZERO, &mut wal, &mut sb);
   assert!(coord.router_ref().conn(a).is_none(), "A reaped");
   let b = coord.register_dialed(p, labeled_conn(0xABCD, 0, false));
   assert!(
@@ -488,7 +442,6 @@ fn route_skips_a_handshaking_conn() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Client(ClientId::new(7)),
     req(),
   );
@@ -496,7 +449,7 @@ fn route_skips_a_handshaking_conn() {
   for _ in 0..5 {
     now = now + core::time::Duration::from_millis(50);
     coord.handle_storage(now, &mut wal, &mut sb, &mut blocks);
-    coord.handle_timeout(now, &mut wal, &mut sb, &mut blocks);
+    coord.handle_timeout(now, &mut wal, &mut sb);
   }
   assert!(
     coord.poll_conn_transmit().is_none(),
@@ -553,7 +506,6 @@ fn a_final_frame_response_routes_to_a_promoted_standby_in_the_same_call() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
   );
   // The peer-finished conn was reaped and the standby promoted BEFORE the StartView was routed.
   assert!(
@@ -951,7 +903,6 @@ fn a_settling_client_handshake_is_validated_through_try_note_established_member(
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord = StreamCoordinator::<CountSm, Labeled<Passthrough>>::new(Endpoint::<
     _,
     SingleChange,
@@ -980,15 +931,7 @@ fn a_settling_client_handshake_is_validated_through_try_note_established_member(
   );
   let mut hello = Vec::new();
   dialer.poll_transport_transmit(&mut hello);
-  coord.handle_conn_data(
-    id,
-    &hello,
-    false,
-    Instant::ZERO,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-  );
+  coord.handle_conn_data(id, &hello, false, Instant::ZERO, &mut wal, &mut sb);
   assert!(
     coord.is_conn_validated(id),
     "the settled Client handshake is validated via note_established (Client is never blocked)"
@@ -1006,7 +949,6 @@ fn submit_client_request_drops_an_over_max_body_with_no_side_effects() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -1020,7 +962,7 @@ fn submit_client_request_drops_an_over_max_body_with_no_side_effects() {
     RequestNumber::with(1),
     Bytes::from(vec![0u8; max_request_body_len() + 1]),
   );
-  coord.submit_client_request(Instant::ZERO, &mut wal, &mut sb, &mut blocks, over);
+  coord.submit_client_request(Instant::ZERO, &mut wal, &mut sb, over);
   assert_eq!(
     coord.endpoint().op().get(),
     0,
@@ -1105,7 +1047,6 @@ fn drive_voter_departure_to_installed(
       Instant::ZERO,
       wal,
       sb,
-      blocks,
       Peer::Replica(ReplicaId::new(acker as u16)),
       Message::PrepareOk(crate::PrepareOk::new(
         View::new(),
@@ -1161,7 +1102,6 @@ fn drive_voter_departure_to_installed(
         Instant::ZERO,
         wal,
         sb,
-        blocks,
         Peer::Replica(slot),
         Message::PrepareOk(crate::PrepareOk::new(
           View::new(),
@@ -1186,7 +1126,6 @@ fn drive_voter_departure_to_installed(
       Instant::ZERO,
       wal,
       sb,
-      blocks,
       Peer::Replica(ReplicaId::new(0)),
       Message::Prepare(crate::Prepare::new(
         View::new(),
@@ -1205,7 +1144,6 @@ fn drive_voter_departure_to_installed(
       Instant::ZERO,
       wal,
       sb,
-      blocks,
       Peer::Replica(ReplicaId::new(0)),
       Message::Commit(crate::Commit::new(
         View::new(),
@@ -1236,7 +1174,7 @@ fn register_and_quarantine_member(
   coord: &mut StreamCoordinator<CountSm, MockRecords>,
   wal: &mut TestWal,
   sb: &mut TestSb,
-  blocks: &mut crate::block_store::InMemoryBlockStore,
+  _blocks: &mut crate::block_store::InMemoryBlockStore,
   out_idx: u128,
 ) -> ConnId {
   let member = MemberId::new(out_idx);
@@ -1244,7 +1182,7 @@ fn register_and_quarantine_member(
     Peer::Member(member),
     Conn::from_parts(MockRecords::new(false, Some(Peer::Member(member)))),
   );
-  coord.handle_conn_data(id, &[], false, Instant::ZERO, wal, sb, blocks);
+  coord.handle_conn_data(id, &[], false, Instant::ZERO, wal, sb);
   id
 }
 
@@ -1255,7 +1193,7 @@ fn a_removed_local_member_routes_nothing_gracefully() {
   // installed, local_slot_opt() is None: pump() (driven by the trailing
   // pump inside handle_storage's own install) and submit_client_request() must each route nothing
   // rather than panic on an absent local slot.
-  let (mut coord, mut wal, mut sb, mut blocks, _conn1, _conn2) =
+  let (mut coord, mut wal, mut sb, _blocks, _conn1, _conn2) =
     commit_and_install_a_voter_departure(0, 0);
   assert!(
     coord.endpoint().local_slot_opt().is_none(),
@@ -1265,7 +1203,6 @@ fn a_removed_local_member_routes_nothing_gracefully() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Request::new(
       ClientId::new(1),
       RequestNumber::with(1),
@@ -1431,7 +1368,6 @@ fn poll_timeout_reports_a_scheduled_deadline_for_a_fresh_primary() {
   let cfg = Config::try_new(0xABCD, MemberId::new(0)).unwrap();
   let mut wal = TestWal::default();
   let mut sb = TestSb::default();
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let mut coord =
     StreamCoordinator::<CountSm, MockRecords>::new(Endpoint::<_, SingleChange>::genesis_unchecked(
       cfg,
@@ -1442,7 +1378,7 @@ fn poll_timeout_reports_a_scheduled_deadline_for_a_fresh_primary() {
     ));
   // A brand-new endpoint has no timer armed yet; the first handle_timeout bootstraps the Normal
   // primary's cadence (its own commit-heartbeat / prepare-retransmit deadline).
-  coord.handle_timeout(Instant::ZERO, &mut wal, &mut sb, &mut blocks);
+  coord.handle_timeout(Instant::ZERO, &mut wal, &mut sb);
   assert!(
     coord.poll_timeout().is_some(),
     "a bootstrapped Normal primary has a scheduled timer deadline (poll_timeout delegates to the endpoint)"

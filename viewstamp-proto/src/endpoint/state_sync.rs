@@ -1,26 +1,42 @@
 use super::*;
 
-impl<S: StateMachine> BlockFetch<S> {
-  /// Pumps BOTH the SM and session frontiers and returns the next MISSING block to fetch across the two
-  /// DAGs, or `None` when BOTH are fully present (the install can run). The SM DAG is drained first and
-  /// the session DAG second — a deterministic order so the fetch sequence is stable — but completion
-  /// requires both: a missing SM block is returned while the SM frontier has one, else the next missing
-  /// session block, else `None`. A bound breach in EITHER walk surfaces as `Err` (the caller aborts the
-  /// fetch). `addr` and `on_block` route to whichever frontier owns the address: a `BlockResponse` for an
-  /// SM address feeds `block_sync`, one for a session address feeds `session_sync`; an off-frontier
-  /// address is inert in both.
-  pub(crate) fn next_missing(
-    &mut self,
-    blocks: &dyn BlockStore,
-  ) -> Result<Option<BlockAddress>, super::block_sync::BlockSyncError> {
-    if let Some(addr) = self.block_sync.next_request(blocks)? {
-      return Ok(Some(addr));
-    }
-    self.session_sync.next_request(blocks)
-  }
-}
-
 impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
+  /// Move the live transfer's frontiers into a walk job, leaving the job's id behind as the token
+  /// its completion must match.
+  ///
+  /// A no-op when there is no live transfer, or when one is ALREADY walking: the frontiers are then
+  /// inside that job, and a second walk over the same transfer is unrepresentable rather than
+  /// merely avoided. The caller's own re-drive (the stop-and-wait ARQ, or the completion's next
+  /// pull) is what resumes the transfer.
+  pub(super) fn issue_walk(
+    &mut self,
+    purpose: WalkPurpose,
+    fetched: Option<(BlockAddress, Bytes)>,
+  ) {
+    if !matches!(
+      self.block_fetch.as_ref().map(|bf| &bf.walks),
+      Some(WalkState::Idle(_))
+    ) {
+      return;
+    }
+    let id = self.mint_job_id();
+    let bf = self
+      .block_fetch
+      .as_mut()
+      .expect("just matched a live fetch");
+    let WalkState::Idle(walks) = core::mem::replace(&mut bf.walks, WalkState::InFlight(id)) else {
+      unreachable!("just matched an idle walk state")
+    };
+    self.enqueue_block_job(
+      id,
+      BlockJobKind::Walk {
+        walks,
+        fetched,
+        purpose,
+      },
+    );
+  }
+
   // ── State-sync: the trigger + the lagging replica's solicitation ──
 
   /// The state-sync TRIGGER. A replica enters state-sync iff it is `Normal` AND it learns of a cluster
@@ -483,7 +499,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// re-broadcast `RequestSync` (dead-donor replacement: a fresh `SyncCheckpoint` from any live holder
   /// re-pins the donor and the block-fetch resumes at the same frontier). Cleared when the synced
   /// checkpoint goes durable (`on_sb_done` clears `sync` + this timer).
-  pub(crate) fn sync_timeouts(&mut self, now: Instant, blocks: &mut dyn BlockStore) {
+  pub(crate) fn sync_timeouts(&mut self, now: Instant) {
     if self.timers.sync_solicit.is_none_or(|d| d > now) {
       return;
     }
@@ -501,7 +517,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // `RequestSync` (the 100ms ARQ heartbeat — the lost-checkpoint retry, and dead-donor failover). The
     // active-donor-absent per-front re-solicit is bounded ON THE FETCH (`BlockFetch::resolicited_front`), so
     // a dropped re-solicit is retried here without a marker to clear.
-    self.send_request_block(now, blocks);
+    self.send_request_block(now);
     self.send_request_sync(now);
   }
 
@@ -600,38 +616,19 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (nothing missing — the next `BlockResponse` / completion installs). A bound breach in either DAG (a
   /// malformed/foreign DAG) aborts the block-fetch (dropped here) but keeps `sync` armed so the solicit
   /// timer re-solicits a fresh checkpoint.
-  pub(super) fn send_request_block(&mut self, now: Instant, blocks: &mut dyn BlockStore) {
+  pub(super) fn send_request_block(&mut self, now: Instant) {
     if self.sync.is_none() {
       return;
     }
-    // No live block-fetch (a `None` soliciting state) is inert by this match: the solicit half of the ARQ
-    // still re-broadcasts `RequestSync` to fetch a fresh checkpoint. A live fetch whose front was just
-    // GC-pruned re-requests that front here once more (harmless — the absent reply keeps the fetch live and
-    // re-solicits a fresh checkpoint, which re-seeds the front).
-    let Some(bf) = self.block_fetch.as_mut() else {
-      return;
-    };
-    let donor = bf.donor;
-    // Re-request the next missing block across BOTH frontiers (SM DAG first, then session DAG) — the
-    // same combined drain `next_missing` the install path pumps. Pumping only `block_sync` here would
-    // stop retransmitting once the SM DAG drains and the sole outstanding block is a SESSION block: a
-    // dropped session `RequestBlock`/`BlockResponse` would then strand the install until a fresh
-    // `SyncCheckpoint` re-pinned it. The combined frontier re-drives whichever DAG still owes a block.
-    let next = match bf.next_missing(&*blocks) {
-      Ok(next) => next,
-      Err(_) => {
-        // A malformed/foreign DAG exceeded the reachable-block bound: abort the transfer (counted, freed)
-        // but keep `sync` armed — the solicit timer re-solicits and a fresh checkpoint re-pins.
-        self.abort_oversized_block_fetch();
-        return;
-      }
-    };
-    if let Some(addr) = next {
-      self.emit(Outgoing::new(
-        Recipient::To(donor),
-        Message::RequestBlock(addr),
-      ));
-    }
+    // No live block-fetch (a `None` soliciting state) is inert: the solicit half of the ARQ still
+    // re-broadcasts `RequestSync` to fetch a fresh checkpoint. A live fetch whose front was just
+    // GC-pruned re-requests that front once more (harmless — the absent reply keeps the fetch live and
+    // re-solicits a fresh checkpoint, which re-seeds the front). Issue the walk that recomputes the
+    // next missing block across BOTH frontiers (SM DAG first, then session DAG): walking only the SM
+    // DAG would stop retransmitting once it drains and the sole outstanding block is a SESSION block,
+    // stranding the install until a fresh `SyncCheckpoint` re-pinned it. Its completion emits the
+    // pull; a walk already in flight makes this a no-op (that walk emits it instead).
+    self.issue_walk(WalkPurpose::Arq, None);
     if self.status.is_normal() {
       self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
     }
@@ -901,31 +898,50 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     ));
   }
 
-  /// Serve a peer's `RequestBlock` for one content-addressed SM checkpoint block: reply with a
-  /// `BlockResponse` carrying the block bytes if we hold the addressed block, or an ABSENT response if
-  /// we do not. STATELESS and content-addressed: there is no donor cache, no cold-cache re-read, and no
-  /// pin — the block IS its hash, so the requester verifies it on receipt and any member that holds it
-  /// is an interchangeable donor. A block fetch carries no quorum authority (the block self-verifies),
-  /// so any status / view is fine to serve from; the requester is the authenticated `from` (the ingress
-  /// `sender_matches` bound it to a configured member), to whom the reply routes.
-  pub(crate) fn on_request_block(
-    &mut self,
-    from: Peer,
-    addr: crate::BlockAddress,
-    blocks: &dyn BlockStore,
-  ) {
+  /// Serve a peer's `RequestBlock` for one content-addressed SM checkpoint block: issue a `Serve`
+  /// block job whose completion replies with a `BlockResponse` carrying the block bytes if we hold
+  /// the addressed block, or an ABSENT response if we do not. STATELESS and content-addressed: there
+  /// is no donor cache, no cold-cache re-read, and no pin — the block IS its hash, so the requester
+  /// verifies it on receipt and any member that holds it is an interchangeable donor. A block fetch
+  /// carries no quorum authority (the block self-verifies), so any status / view is fine to serve
+  /// from; the requester is the authenticated `from` (the ingress `sender_matches` bound it to a
+  /// configured member), to whom the completion's reply routes.
+  ///
+  /// BOUNDED. The read runs off the pump now, so requests can arrive faster than the storage lane
+  /// drains them; without a cap a peer (or a partition-induced retransmit storm) could grow the job
+  /// queue without limit. At most [`MAX_OUTSTANDING_BLOCK_SERVES`] serves may be outstanding — beyond
+  /// that the request is DROPPED and counted ([`Self::block_serves_refused`]). Dropping (rather than
+  /// answering ABSENT) is what keeps the requester's frontier intact: an absent reply for a block we
+  /// actually hold would drive its pruned-front re-solicit path, while a dropped request is simply
+  /// re-sent by the requester's stop-and-wait ARQ.
+  pub(crate) fn on_request_block(&mut self, from: Peer, addr: crate::BlockAddress) {
     // The requester is `from` — a current member (`Peer::Replica`) or a quarantined attested member
     // (`Peer::Member`) fetching the SM DAG of the checkpoint it is installing; a client / raw non-peer
     // never reaches here (the binding dropped it).
     if from.is_client() {
       return;
     }
-    // Serve the block only if its local bytes hash back to `addr`; a corrupt local block (bit-rot, a
-    // misdirected write) is served as ABSENT rather than handed over to fail the requester's verify and
-    // force a reject-and-retry. The requester then solicits a clean copy from another donor.
-    let block = crate::block_store::read_verified_block(blocks, addr);
+    if self.block_serves_outstanding >= MAX_OUTSTANDING_BLOCK_SERVES {
+      self.block_serves_refused = self.block_serves_refused.saturating_add(1);
+      return;
+    }
+    self.block_serves_outstanding += 1;
+    self.issue_block_job(BlockJobKind::Serve { to: from, addr });
+  }
+
+  /// Answer the peer whose `RequestBlock` the completed `Serve` job read for. The bytes are already
+  /// verified against their content address by the executor (a corrupt local block is reported
+  /// ABSENT rather than handed over to fail the requester's verify and force a reject-and-retry —
+  /// the requester then solicits a clean copy from another donor).
+  pub(super) fn on_block_served(
+    &mut self,
+    to: Peer,
+    addr: crate::BlockAddress,
+    block: Option<Bytes>,
+  ) {
+    self.block_serves_outstanding = self.block_serves_outstanding.saturating_sub(1);
     self.emit(Outgoing::new(
-      Recipient::To(from),
+      Recipient::To(to),
       Message::BlockResponse(crate::BlockResponse::new(addr, block)),
     ));
   }
@@ -937,16 +953,8 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// gate — `checkpoint_id(snapshot) == checkpoint_id` — and only then begins fetching the SM
   /// checkpoint DAG (`apply_sync` once the DAG drains). A failed integrity check (a corrupt/forged
   /// snapshot) is REJECTED without touching the SM, leaving `sync` armed so the timer re-solicits.
-  pub(crate) fn on_sync_checkpoint<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-    from: Peer,
-    m: crate::SyncCheckpoint,
-  ) {
-    self.handle_sync_checkpoint(now, wal, sb, blocks, from, m);
+  pub(crate) fn on_sync_checkpoint(&mut self, now: Instant, from: Peer, m: crate::SyncCheckpoint) {
+    self.handle_sync_checkpoint(now, from, m);
   }
 
   /// The body of [`Self::on_sync_checkpoint`]. Runs the §2.5 guard cascade + integrity gate, then —
@@ -957,15 +965,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// the transfer underneath them (a target raised mid-fetch aborts a FORCED pin via
   /// [`Self::drop_transfer_below_forced_target`], and keeps an ORDINARY pin — it installs below the
   /// raised floor as strict progress, the next `Commit` chasing the newer checkpoint).
-  fn handle_sync_checkpoint<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-    from: Peer,
-    m: crate::SyncCheckpoint,
-  ) {
+  fn handle_sync_checkpoint(&mut self, now: Instant, from: Peer, m: crate::SyncCheckpoint) {
     // Freshness + relevance: we must be a Normal replica with an outstanding sync whose nonce matches.
     if !self.status.is_normal() {
       return;
@@ -1017,7 +1017,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       if crate::checkpoint_id(m.snapshot()) != m.checkpoint_id() {
         return;
       }
-      self.refetch_sm_reconstruct(now, wal, sb, blocks, from, &m);
+      self.refetch_sm_reconstruct(now, from, &m);
       return;
     }
     if m.checkpoint_op().get() < s.target.get() && !s.require_cross_epoch {
@@ -1100,7 +1100,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       self.timers.sync_solicit = None;
       return;
     }
-    self.begin_block_sync(now, blocks, from, m);
+    self.begin_block_sync(now, from, m);
   }
 
   /// Carry the re-solicit latch ([`BlockFetch::resolicited_front`]) forward across a re-pin that
@@ -1137,11 +1137,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// state is no longer carried inline — only a 16-byte `sm_root` — so before `apply_sync` can restore
   /// the SM, the laggard must hold every block reachable from `sm_root`. Decode the root, then:
   ///
-  /// - If the store ALREADY HOLDS the whole DAG (an unchanged checkpoint, or a re-delivered one), the
-  ///   block-fetch completes immediately and we install via [`Self::apply_sync`].
-  /// - Otherwise arm a [`BlockFetch`] (a `BlockSync` frontier seeded at `sm_root` + the pinned donor)
-  ///   and send the first `RequestBlock`. The transfer drains over the `BlockResponse`/ARQ cadence;
-  ///   when it does, [`Self::on_block_response`] replays this exact message into `apply_sync`.
+  /// Arm a [`BlockFetch`] (frontiers seeded at both roots + the pinned donor) and issue its first
+  /// WALK. That walk's completion decides:
+  ///
+  /// - the store ALREADY HOLDS both DAGs (an unchanged checkpoint, or a re-delivered one) — install
+  ///   via [`Self::apply_sync`];
+  /// - blocks are missing — send the first `RequestBlock`. The transfer then drains over the
+  ///   `BlockResponse`/ARQ cadence; when it does, the drain replays this exact message into
+  ///   `apply_sync`.
   ///
   /// The pinned donor is the message's AUTHENTICATED sender slot (`from.as_replica()` — the slot the
   /// sender-binding check established this laggard can route to), NOT the donor's SELF-CLAIMED
@@ -1151,16 +1154,10 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// actually reaches. Pinning to `from` is what makes the follow-up `RequestBlock` reach the real donor;
   /// `replica()` remains the self-claimed identity / config payload field only. A non-routeable `from` (a
   /// client peer, never a checkpoint sender) or a malformed envelope (no decodable root) is dropped
-  /// (nothing staged; `sync` stays armed so the solicit timer re-fetches). `next_request` is pumped
-  /// immediately so a root the store already holds reports complete on the first pump (not only after a
+  /// (nothing staged; `sync` stays armed so the solicit timer re-fetches). The walk is issued
+  /// immediately so a DAG the store already holds reports complete on the first step (not only after a
   /// reply).
-  fn begin_block_sync(
-    &mut self,
-    now: Instant,
-    blocks: &mut dyn BlockStore,
-    from: Peer,
-    m: crate::SyncCheckpoint,
-  ) {
+  fn begin_block_sync(&mut self, now: Instant, from: Peer, m: crate::SyncCheckpoint) {
     // Decode the envelope to extract BOTH content-addressed DAG roots. The bytes already passed the
     // `checkpoint_id` integrity gate, but a malformed/truncated envelope must not panic — reject it as a
     // fault and leave `sync` armed so the solicit timer re-fetches from another peer.
@@ -1177,7 +1174,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // stale SM (divergence) — and if this fetch STALLS, or `apply_sync` REJECTS the reply (a same-config /
     // empty-membership reply admitted here under `require_cross_epoch`), or a view transition CANCELS the
     // pre-root install, the obligation must survive to keep reconstructing M rather than vanish.
-    // The drain (`on_block_response`) routes by comparing the drained fetch's checkpoint op to
+    // The drain (`on_fetch_drained`) routes by comparing the drained fetch's checkpoint op to
     // `self.checkpoint_op`: a SAME-M fetch is the SM-content retry, a NEWER M' re-stages via `apply_sync`.
     // A RETAINED-but-not-staged install (a prior verified install whose flush faulted, still owed as
     // `pending_install` with no in-flight checkpoint — the ingress gate above rules out a staged one) is LEFT
@@ -1217,82 +1214,44 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       return;
     }
     let donor = from;
-    // Seed both frontiers (SM + session) and pump them once so a DAG the store already holds reports
-    // complete immediately (a root the store holds advances to drained only after the first
-    // `next_request`, never on `new` alone). A bound breach (a foreign/malformed DAG) in either drops the
-    // fetch and keeps `sync` armed.
-    let mut bf = BlockFetch {
+    // This fresh `SyncCheckpoint` re-pins to a LIVE address + routeable donor. REPLACING the whole
+    // `block_fetch` supersedes any prior fetch by construction (including one whose front an
+    // active-donor absent left GC-pruned), abandoning its frontier; the already-written blocks survive
+    // in the store and are re-discovered if still reachable. A walk outstanding for the superseded
+    // fetch answers nothing — its completion finds a different transfer waiting on a different token.
+    // The re-solicit latch is CARRIED FORWARD across a same-root re-pin, so a duplicate same-root
+    // checkpoint cannot re-arm it; only a genuine NEW root re-opens one re-solicit. (No separate
+    // clear: the early returns above — a malformed envelope / non-routeable donor — leave the existing
+    // fetch untouched, so the solicit timer keeps re-soliciting until a clean checkpoint arrives.)
+    self.block_fetch = Some(BlockFetch {
       checkpoint: m.clone(),
       sm_root,
       sessions_root,
       donor,
-      block_sync: super::block_sync::BlockSync::new(sm_root),
-      session_sync: super::block_sync::BlockSync::new(sessions_root),
+      walks: WalkState::Idle(super::block_sync::BlockWalks::new(sm_root, sessions_root)),
       // Record whether this reply genuinely PRESENTS a crossing (foreign config + non-empty membership),
       // computed before `apply_sync` verifies the membership hash-chain. A same-config / empty-membership
       // reply the cross-epoch solicit admitted below target arms a NON-crossing fetch, which must not shield
       // a stale `cross_epoch_intent` — the crossing-answer predicates read this bit, not `block_fetch.is_some()`.
       crossing_answered: self.checkpoint_presents_crossing(&m),
-      // Carry the re-solicit latch forward iff this re-pin names the SAME content-addressed DAG: a
-      // DUPLICATE same-root checkpoint re-walks the same front, so it inherits the latch and re-solicits no
-      // more. A re-pin to a DIFFERENT root resets to `None`, so the new pin's first absent legitimately
-      // re-solicits.
       resolicited_front: self.carry_resolicit_latch(sm_root, sessions_root),
-    };
-    let next = match bf.next_missing(&*blocks) {
-      Ok(next) => next,
-      // The fresh checkpoint's DAG breached the reachable-block bound: count it and drop the new (local,
-      // not-yet-installed) `bf`; any prior fetch is left to its own ARQ.
-      Err(_) => {
-        self.dag_walks_capped += 1;
-        return;
-      }
-    };
-    // This fresh `SyncCheckpoint` re-pins to a LIVE address + routeable donor, re-seeding the frontier's
-    // front. Both arms below REPLACE the whole `block_fetch` field, so a prior fetch whose front an
-    // active-donor absent left GC-pruned is superseded by construction. The re-solicit latch is CARRIED
-    // FORWARD across a same-root re-pin (above), so a duplicate same-root checkpoint cannot re-arm it; only
-    // a genuine NEW root re-opens one re-solicit (no separate clear; the early returns above — a malformed
-    // envelope / non-routeable donor — leave the existing fetch untouched, so the solicit timer keeps
-    // re-soliciting until a clean checkpoint arrives).
-    match next {
-      None => {
-        // BOTH DAGs are already present — install now (no fetch needed). Drop any prior fetch (a
-        // superseding checkpoint replaced it) before staging.
-        self.block_fetch = None;
-        self.apply_sync(now, donor, &m);
-      }
-      Some(addr) => {
-        // Arm the block-fetch and send the first pull. Supersedes any prior fetch (a strictly newer
-        // checkpoint passed the gates above), abandoning its frontier; the already-written blocks survive
-        // in the store and are re-discovered if still reachable.
-        self.block_fetch = Some(bf);
-        self.emit(Outgoing::new(
-          Recipient::To(donor),
-          Message::RequestBlock(addr),
-        ));
-        self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
-      }
-    }
+    });
+    // Drain both frontiers once: a DAG the store already holds reports complete on this first walk
+    // and installs, otherwise the first pull goes out from the completion. (A root the store holds
+    // advances to drained only after a walk, never on seeding alone.)
+    self.issue_walk(WalkPurpose::Arm, None);
+    self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
   }
 
-  /// Receive a `BlockResponse` — one fetched block of the SM checkpoint DAG the in-progress block-fetch
-  /// is pulling. Feeds the bytes into the [`BlockSync`] frontier (which VERIFIES the block hashes to the
-  /// requested address, writes it to the store, and enqueues its not-yet-held children), then either
-  /// sends the next `RequestBlock` or — when the frontier drains — replays the pinned `SyncCheckpoint`
-  /// into the install path ([`Self::apply_sync`] for a Normal receiver, `on_recover_sync_checkpoint` for
-  /// the recovery peer-fetch). An ABSENT response, a hash mismatch, or a non-frontier address is inert:
-  /// the frontier's next-missing is re-requested. A bound breach (a malformed/foreign DAG) aborts the
-  /// block-fetch but keeps `sync` armed so the solicit timer re-solicits a fresh checkpoint.
-  pub(crate) fn on_block_response<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-    from: Peer,
-    m: crate::BlockResponse,
-  ) {
+  /// Receive a `BlockResponse` — one fetched block of the checkpoint DAG the in-progress transfer is
+  /// pulling. The bytes ride into a WALK JOB, which verifies the block against the requested address,
+  /// writes it, enqueues its not-yet-held children, and drains the locally-present prefix; the
+  /// completion ([`Self::on_walked`]) then either sends the next `RequestBlock` or — when both DAGs
+  /// have drained — replays the pinned `SyncCheckpoint` into the install path. An ABSENT response, a
+  /// hash mismatch, or a non-frontier address is inert: the frontier's next-missing is re-requested.
+  /// A bound breach (a malformed/foreign DAG) aborts the transfer but keeps `sync` armed so the
+  /// solicit timer re-solicits a fresh checkpoint.
+  pub(crate) fn on_block_response(&mut self, now: Instant, from: Peer, m: crate::BlockResponse) {
     let recovering = self.status.is_recovering() && self.awaiting_peer_checkpoint();
     if !self.status.is_normal() && !recovering {
       return;
@@ -1302,7 +1261,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
     // Whether this response carried a block. An ABSENT response means the pinned donor does NOT hold the
     // requested block — it checkpointed forward and GC pruned the (now-superseded) block this frontier is
-    // pinned to — and drives the re-pin below (re-solicit a fresh checkpoint the donors still hold) rather
+    // pinned to — and drives the re-pin (re-solicit a fresh checkpoint the donors still hold) rather
     // than the ordinary next-block pull.
     let present = m.block().is_some();
     // Defer while a superblock root is in flight (the same single-writer fence the rest of the install
@@ -1311,76 +1270,146 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
       return;
     }
+    // A walk already in flight for this transfer makes the response INERT — its bytes would have
+    // nowhere to go (the frontiers are inside that job), and the stop-and-wait ARQ re-requests the
+    // outstanding front once the walk lands. Only a duplicate or retransmitted reply can reach this,
+    // since the next pull is emitted from the walk's own completion.
+    let fetched = m
+      .block()
+      .map(|bytes| (m.addr(), Bytes::copy_from_slice(bytes)));
+    self.issue_walk(
+      WalkPurpose::Response {
+        from,
+        addr: m.addr(),
+        present,
+      },
+      fetched,
+    );
+    let _ = now;
+  }
+
+  /// One frontier step completed. Hands the walks back to the transfer that owns them and resumes the
+  /// drive that issued the step.
+  ///
+  /// SUPERSESSION is structural: the walks are grafted back ONLY onto a transfer still waiting on
+  /// THIS job. A transfer replaced by a fresher `SyncCheckpoint`, or torn down by a view transition,
+  /// leaves its outstanding walk answering nothing — the returned frontiers are dropped and counted,
+  /// never merged into its successor's (which would graft one pin's discovery order onto another's
+  /// DAG).
+  pub(super) fn on_walked<W: Wal>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    job: crate::JobId,
+    done: crate::block_job::WalkDone<S>,
+  ) {
+    let crate::block_job::WalkDone {
+      walks,
+      accepted,
+      next,
+      purpose,
+    } = done;
+    // The cold-start LOCAL presence probe owns no transfer: its frontiers are throwaway and only the
+    // verdict matters.
+    if let WalkPurpose::RecoverProbe(checkpoint) = purpose {
+      self.on_recover_probe_walked(job, checkpoint, next);
+      return;
+    }
     let Some(bf) = self.block_fetch.as_mut() else {
-      return; // no live block-fetch (soliciting / already drained) — ignore.
+      self.block_jobs_superseded = self.block_jobs_superseded.saturating_add(1);
+      return;
     };
+    if !matches!(bf.walks, WalkState::InFlight(id) if id == job) {
+      self.block_jobs_superseded = self.block_jobs_superseded.saturating_add(1);
+      return;
+    }
+    bf.walks = WalkState::Idle(walks);
+    let donor = bf.donor;
     // Whether THIS fetch is draining a genuine CROSSING reply — only crossing progress counts toward the
     // quarantine probe. A non-crossing (below-target same-config / empty-membership) fetch the cross-epoch
     // solicit admitted accepts blocks too, but that progress is NOT the crossing's: were it counted, an
     // old-config donor could feed one non-crossing block, then a quarantined donor re-pins crossing
-    // metadata with NO block, and the stale delta would refresh a stalled crossing forever.
-    let crossing = bf.crossing_answered;
-    // Feed a PRESENT block into BOTH frontiers (an absent response carries nothing to write). The block
-    // belongs to exactly one DAG — the owning frontier `Accepts` it; the other reports `NonFrontier`
-    // (the address is not the address it is waiting on), which is inert by construction. A hash mismatch
-    // or a bound breach is surfaced by `on_block`: a mismatch leaves the block re-requestable; a bound
-    // breach (in either DAG) aborts the fetch.
-    // Whether this response ADVANCED a frontier — a block was accepted into the SM or session DAG. The
-    // bounded quarantine probe reads `sync_fetch_progress` as its "the crossing is genuinely progressing"
-    // signal, so it is bumped (once) below — for a CROSSING fetch only — after the `bf` borrow releases.
-    let mut accepted = false;
-    if let Some(bytes) = m.block() {
-      let bytes = Bytes::copy_from_slice(bytes);
-      let sm_outcome = bf
-        .block_sync
-        .on_block(m.addr(), bytes.clone(), &mut *blocks);
-      let session_outcome = bf.session_sync.on_block(m.addr(), bytes, &mut *blocks);
-      for outcome in [sm_outcome, session_outcome] {
-        match outcome {
-          Ok(super::block_sync::BlockOutcome::Accepted) => accepted = true,
-          Ok(super::block_sync::BlockOutcome::NonFrontier) => {
-            // The block is not this frontier's outstanding address (the OTHER DAG owns it, or it is a
-            // delayed/superseded response): inert by construction. Re-drive the pull below.
-          }
-          Err(super::block_sync::BlockSyncError::AddressMismatch { .. }) => {
-            // A corrupt/substituted block: not written, still re-requestable. Re-drive the pull below.
-          }
-          Err(super::block_sync::BlockSyncError::TooManyBlocks) => {
-            // A malformed/foreign DAG: abort the transfer (counted), keep `sync` armed (solicit re-fetches).
-            self.abort_oversized_block_fetch();
-            return;
-          }
-        }
-      }
-    }
-    // Re-pump BOTH frontiers: both drained ⇒ install; otherwise request the next missing block (SM DAG
-    // first, then session DAG) from the pinned donor (dead-donor failover is the `sync_solicit` ARQ's
-    // job: it re-broadcasts `RequestSync`, and a fresh `SyncCheckpoint` re-pins the donor — the
-    // content-addressed blocks already written survive).
-    let next = match bf.next_missing(&*blocks) {
-      Ok(next) => next,
-      Err(_) => {
-        // Bound breach while draining: abort the transfer (counted, freed); the solicit ARQ re-pins.
-        self.abort_oversized_block_fetch();
-        return;
-      }
-    };
-    // The `bf` borrow has released: record CROSSING frontier progress for the bounded probe. Only a block
-    // accepted into a genuine crossing fetch (`crossing`) counts — a non-crossing fetch's progress must not
-    // refresh a later crossing probe. A stalled crossing (a donor that presented a crossing checkpoint then
-    // went silent) never reaches here with `accepted && crossing`, so its deadline is not refreshed and it
-    // disarms; a genuinely advancing crossing transfer bumps this and the probe survives.
-    if accepted && crossing {
+    // metadata with NO block, and the stale delta would refresh a stalled crossing forever. A stalled
+    // crossing (a donor that presented a crossing checkpoint then went silent) never reaches here with
+    // an accepted block, so its deadline is not refreshed and it disarms.
+    if accepted && bf.crossing_answered {
       self.sync_fetch_progress = self.sync_fetch_progress.wrapping_add(1);
     }
-    match next {
-      Some(addr) if present => {
-        // Genuine transfer PROGRESS: re-request the next missing block from the pinned donor and re-arm
-        // the ARQ deadline. The pinned checkpoint is still serviceable, so stay on it.
-        let donor = bf.donor;
-        self.emit(Outgoing::new(
+    let Ok(next) = next else {
+      // A malformed/foreign DAG exceeded the reachable-block bound: abort the transfer (counted,
+      // freed) but keep `sync` armed — the solicit timer re-solicits and a fresh checkpoint re-pins.
+      self.abort_oversized_block_fetch();
+      return;
+    };
+    match purpose {
+      // The bare ARQ re-drive: re-request the one outstanding pull, nothing more. A drained frontier
+      // emits nothing here — the drain destination is reached by the arm/response drives, and by the
+      // fresh `SyncCheckpoint` the solicit half of the ARQ fetches.
+      WalkPurpose::Arq => {
+        if let Some(addr) = next {
+          self.emit(Outgoing::new(
+            Recipient::To(donor),
+            Message::RequestBlock(addr),
+          ));
+        }
+      }
+      // A freshly pinned transfer: install if the store already holds both DAGs, else pull the first
+      // missing block.
+      WalkPurpose::Arm => match next {
+        None => self.on_fetch_drained(now, wal),
+        Some(addr) => self.emit(Outgoing::new(
           Recipient::To(donor),
           Message::RequestBlock(addr),
+        )),
+      },
+      // An SM-reconstruct obligation's re-armed fetch.
+      WalkPurpose::Rearm { retry } => match next {
+        // The whole DAG reads back present-and-verified (the corrupt block was repaired out of band,
+        // or this donor's reply already carried it): there is no fetch to keep. Re-issue the
+        // reconstruct ONLY when a fresh donor reply armed this re-arm — a re-arm that followed a
+        // FAILED reconstruct would otherwise re-fail on the same block and spin, so there the
+        // re-solicit is what drives the next attempt.
+        None => {
+          self.block_fetch = None;
+          if retry {
+            self.retry_sm_reconstruct();
+          }
+        }
+        Some(addr) => self.emit(Outgoing::new(
+          Recipient::To(donor),
+          Message::RequestBlock(addr),
+        )),
+      },
+      WalkPurpose::Response {
+        from,
+        addr,
+        present,
+      } => self.on_response_walked(now, wal, from, addr, present, next),
+      WalkPurpose::RecoverProbe(_) => unreachable!("handled above, before the transfer graft"),
+    }
+  }
+
+  /// The `BlockResponse` continuation, after its block was ingested and the frontiers re-drained.
+  fn on_response_walked<W: Wal>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    from: Peer,
+    addr: BlockAddress,
+    present: bool,
+    next: Option<BlockAddress>,
+  ) {
+    let Some(bf) = self.block_fetch.as_mut() else {
+      return;
+    };
+    let donor = bf.donor;
+    match next {
+      Some(next) if present => {
+        // Genuine transfer PROGRESS: re-request the next missing block from the pinned donor and re-arm
+        // the ARQ deadline. The pinned checkpoint is still serviceable, so stay on it.
+        self.emit(Outgoing::new(
+          Recipient::To(donor),
+          Message::RequestBlock(next),
         ));
         self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
       }
@@ -1388,13 +1417,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // ABSENT reply: the pinned donor does NOT hold the requested block — it checkpointed forward and
         // GC pruned this now-superseded block, so re-requesting it from the same donor can never succeed.
         // Two conditions gate the re-solicit below: the absent response must be for the CURRENTLY
-        // OUTSTANDING frontier address (`m.addr() == active`) and from the PINNED DONOR (`from ==
+        // OUTSTANDING frontier address (`addr == active`) and from the PINNED DONOR (`from ==
         // bf.donor`). A response for an already-fetched or off-frontier address, or from a non-donor, is
         // INERT — leave the fetch pinned and let the ARQ re-drive the outstanding pull at the next solicit
         // deadline. This prevents a stale out-of-order absent (or a spoofed absent from a non-donor) from
         // triggering a re-solicit.
-        let donor = bf.donor;
-        if m.addr() != active || from != donor {
+        if addr != active || from != donor {
           return;
         }
         // KEEP THE FETCH LIVE and re-solicit a fresh `SyncCheckpoint` immediately. The fetch is NOT
@@ -1429,51 +1457,53 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         // the re-pin window — a same-epoch trigger cannot wrongly downgrade a genuine in-progress crossing.
         self.send_request_sync(now);
       }
-      None => {
-        // The DAG is fully present. TWO drain destinations:
-        //
-        // - An SM-RECONSTRUCT obligation is owed (a post-root restore faulted; M's root is already durable
-        //   and `self.checkpoint_op == M`): RETRY `sm.restore` DIRECTLY against the unchanged M pointer — do
-        //   NOT re-stage (re-writing M's root would be redundant, and `apply_sync` would reject M anyway as
-        //   `<= self.checkpoint_op`). On success the obligation clears + the sync completes; on a still-bad
-        //   block the obligation re-arms and re-pulls.
-        // - Otherwise this is the ORDINARY first drain of a staged sync: replay the pinned checkpoint into
-        //   the install path. The recovery replay re-derives a routeable `from` from the donor the
-        //   block-fetch was pinned to (the slot the original sender-binding check established): if it has to
-        //   re-arm a peer-fetch it must address the SAME routeable donor, never the checkpoint's self-claimed
-        //   (possibly shifted) `replica()`.
-        // Route by comparing the drained fetch's checkpoint op to `self.checkpoint_op` (`== M` while an
-        // obligation is owed), NOT by the bare owed flag: with the obligation now KEPT across a superseding
-        // fetch, the owed flag alone can no longer distinguish the SM-content retry (a fetch still pinned to
-        // M) from a strictly-newer M' fetch that must re-stage. A SAME-M fetch reconstructs the SM directly
-        // against M's unchanged pointer; a NEWER M' falls through to `apply_sync` (which stages the M'
-        // install and atomically clears the M obligation).
-        let same_checkpoint_retry = self.sm_reconstruct_owed()
-          && self
-            .block_fetch
-            .as_ref()
-            .is_some_and(|bf| bf.checkpoint.checkpoint_op() == self.checkpoint_op);
-        if same_checkpoint_retry {
-          self.block_fetch = None;
-          if self.retry_sm_reconstruct(now, wal, sb, blocks) {
-            // The SM reconstructed + the sync completed → a staged epoch swap that was waiting for a free
-            // superblock now gets its slot (the same re-trigger `on_sb_done`'s tail makes).
-            self.maybe_swap_epoch(sb);
-          }
-          return;
-        }
-        let bf = self
-          .block_fetch
-          .take()
-          .expect("just held a live block-fetch");
-        let donor = bf.donor;
-        let checkpoint = bf.checkpoint;
-        if recovering {
-          self.on_recover_sync_checkpoint(now, wal, sb, blocks, donor, checkpoint);
-        } else {
-          self.apply_sync(now, donor, &checkpoint);
-        }
-      }
+      None => self.on_fetch_drained(now, wal),
+    }
+  }
+
+  /// BOTH DAGs of the pinned transfer are fully present. TWO drain destinations:
+  ///
+  /// - An SM-RECONSTRUCT obligation is owed for the SAME checkpoint M (its root is already durable and
+  ///   `self.checkpoint_op == M`): RE-ISSUE the reconstruct directly against the unchanged M pointer —
+  ///   do NOT re-stage (re-writing M's root would be redundant, and `apply_sync` would reject M anyway
+  ///   as `<= self.checkpoint_op`).
+  /// - Otherwise this is the ORDINARY first drain of a pinned checkpoint: replay it into the install
+  ///   path — `apply_sync` for a Normal receiver, the recovery peer-fetch's post-fetch tail for a
+  ///   Recovering one — using the donor the transfer was pinned to (the authenticated slot the original
+  ///   sender-binding check established), never the checkpoint's self-claimed (possibly shifted)
+  ///   `replica()`.
+  ///
+  /// Routing on the drained fetch's checkpoint op (NOT the bare owed flag) is what distinguishes the
+  /// SM-content retry — a fetch still pinned to M — from a strictly-newer M' fetch that must re-stage:
+  /// the obligation is deliberately KEPT across a superseding fetch, so the flag alone cannot tell them
+  /// apart.
+  ///
+  /// Fenced on a free superblock, the same single-writer fence the ingress applies: a root landing
+  /// between the walk's issue and its completion must not let a re-persist stage underneath it. The
+  /// transfer stays pinned and drained, and the solicit cadence re-drives it once the root lands.
+  fn on_fetch_drained<W: Wal>(&mut self, now: Instant, wal: &mut W) {
+    if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
+      return;
+    }
+    let same_checkpoint_retry = self.sm_reconstruct_owed()
+      && self
+        .block_fetch
+        .as_ref()
+        .is_some_and(|bf| bf.checkpoint.checkpoint_op() == self.checkpoint_op);
+    if same_checkpoint_retry {
+      self.block_fetch = None;
+      self.retry_sm_reconstruct();
+      return;
+    }
+    let Some(bf) = self.block_fetch.take() else {
+      return;
+    };
+    let donor = bf.donor;
+    let checkpoint = bf.checkpoint;
+    if self.status.is_recovering() && self.awaiting_peer_checkpoint() {
+      self.complete_recover_peer_fetch(now, wal, donor, checkpoint);
+    } else {
+      self.apply_sync(now, donor, &checkpoint);
     }
   }
 
@@ -1811,11 +1841,17 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     if self.pending_sb.is_some() || self.pending_checkpoint.is_some() {
       return;
     }
-    // Issue the durability barrier over the (still-present) drained blocks as a block job. Only its
-    // CLEAN completion stages the two-write re-persist ([`Self::on_checkpoint_blocks_flushed`]) — a
-    // fault leaves `pending_install` owed, and `sync` stays armed so the cadence re-attempts.
+    // Issue the durability barrier over the drained blocks as a block job, NAMING the two roots it is
+    // for: the executor holds the store, so it is where "the install's roots are still held when the
+    // barrier that will let a durable pointer name them runs" is checked. Only the barrier's CLEAN
+    // completion stages the two-write re-persist ([`Self::on_checkpoint_blocks_flushed`]) — a fault
+    // leaves `pending_install` owed, and `sync` stays armed so the cadence re-attempts.
     let target_op = install.checkpoint_op;
-    let job = self.issue_block_job(BlockJobKind::Flush);
+    let (sm_root, sessions_root) = (install.sm_root, install.sessions_root);
+    let job = self.issue_block_job(BlockJobKind::Flush {
+      sm_root,
+      sessions_root,
+    });
     self.pending_checkpoint = Some(PendingCheckpoint {
       target_op,
       step: CheckpointStep::FlushingBlocks(job),
@@ -1868,13 +1904,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// (`advance_commit` is suppressed while `pending_install`, and `on_prepare` drops while `sync.is_some()`),
   /// so the captured `held_tail` and the monotonic advances below are exactly as they would have been at
   /// STAGE time.
-  pub(crate) fn install_sync<W: Wal>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    blocks: &dyn BlockStore,
-    install: PendingInstall,
-  ) -> Result<(), crate::RestoreError> {
+  pub(crate) fn install_sync(&mut self, now: Instant, install: PendingInstall) {
     let PendingInstall {
       checkpoint_op,
       sessions_root,
@@ -2025,50 +2055,90 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // written; its un-quiesced blocker stays in `wal_writes`, fencing the slot until it completes).
     self.appending.clear();
     self.deferred_appends.clear();
-    // Reconstruct the proto-owned CLIENT SESSION TABLE and the SM CONTENT from their checkpoint DAGs,
-    // both through a VERIFY-ON-READ view: the block-fetch drained BOTH DAGs before STAGE, but this
-    // reconstruct runs later, so a block that bit-rots or is misdirected in that window must not be
-    // installed under this valid checkpoint id. Each read checks bytes against their content address;
-    // a corrupt/missing session block aborts `decode_sessions` with `None` and a corrupt/missing SM
-    // block surfaces as a `RestoreError`. Reconstruct the SESSION table FIRST into a LOCAL value (so a
-    // fault leaves `self.clients` unchanged), then restore the SM into a LOCAL value (committed only on
-    // success). The FRONTIER is already at M (advanced above), so a fault in EITHER REGRESSES NOTHING —
-    // it raises the SAME retryable [`SmReconstruct`] obligation (the caller re-arms a block-fetch to
-    // re-pull both DAGs' bad blocks, which `write_block` overwrites, and retries the reconstruct against
-    // the unchanged M pointer) and leaves the WAL untouched. This is the warm analogue of cold-start
-    // `recover()`'s lazy reconstruct under a fixed pointer.
-    let Some(sessions) = super::session_blocks::decode_sessions(sessions_root, blocks) else {
-      self.sm_reconstruct = Some(SmReconstruct {
-        checkpoint_op,
-        sm_root,
-        sessions_root,
-        checkpoint,
-        donor,
-      });
-      return Err(crate::RestoreError::new(sessions_root));
+    // Reconstruct the proto-owned CLIENT SESSION TABLE and the SM CONTENT from their checkpoint DAGs
+    // OFF the pump, as a [`BlockJob`](crate::BlockJob). RAISE the retryable [`SmReconstruct`]
+    // obligation FIRST, so the existing `sm_reconstruct_owed()` gate covers the whole reconstruct
+    // window: the frontier already names M while the SM still holds pre-M content, and that gate is
+    // what keeps a Commit heartbeat from applying over it or this node from serving M's content. The
+    // obligation carries the job token, so a reconstruct superseded while it executed cannot answer
+    // the obligation that replaced it.
+    //
+    // Both DAGs are read through a VERIFY-ON-READ view inside the job: the block-fetch drained them
+    // before STAGE, but this reconstruct runs later, so a block that bit-rots or is misdirected in
+    // that window must not be installed under this valid checkpoint id. The FRONTIER is already at M
+    // (advanced above), so a fault REGRESSES NOTHING — the obligation simply stays owed, the caller
+    // re-arms a block-fetch to re-pull the bad block, and the reconstruct is re-issued against the
+    // unchanged M pointer. This is the warm analogue of cold-start `recover()`'s lazy reconstruct
+    // under a fixed pointer. The WAL prune the snapshot justifies is the one effect held for restore
+    // SUCCESS, so it runs from the completion ([`Self::on_sm_restored`]), never here.
+    self.sm_reconstruct = Some(SmReconstruct {
+      checkpoint_op,
+      sm_root,
+      sessions_root,
+      checkpoint,
+      donor,
+      restore: None,
+    });
+    self.issue_sm_restore();
+  }
+
+  /// Issue the reconstruct job for the owed [`SmReconstruct`] obligation, recording its token on the
+  /// obligation. A no-op when nothing is owed, or when a reconstruct is ALREADY executing for it —
+  /// two concurrent restores of the same obligation would leave the loser's verdict answering a
+  /// token it no longer holds, and the second seed capture would be wasted work.
+  pub(crate) fn issue_sm_restore(&mut self) {
+    let Some(recon) = self.sm_reconstruct.as_ref() else {
+      return;
     };
-    // Restore into a DETACHED seed (the live SM's configuration with empty logical state) and swap
-    // it in only on success, so a fault leaves the live SM untouched — partial mutation is
-    // structurally unrepresentable.
-    let verified = crate::block_store::VerifiedView::new(blocks);
-    let mut seed = self.sm.restore_seed();
-    if let Err(e) = seed.restore(sm_root, &verified) {
-      self.sm_reconstruct = Some(SmReconstruct {
-        checkpoint_op,
-        sm_root,
-        sessions_root,
-        checkpoint,
-        donor,
-      });
-      return Err(e);
+    if recon.restore.is_some() {
+      return;
     }
+    let (sm_root, sessions_root) = (recon.sm_root, recon.sessions_root);
+    // A DETACHED seed carrying the live SM's configuration with empty logical state: the job fills
+    // it, and the endpoint swaps it in only on success — so a failed reconstruct can never leave the
+    // live SM partially mutated.
+    let seed = self.sm.restore_seed();
+    let job = self.issue_block_job(BlockJobKind::Restore {
+      sm_root,
+      sessions_root,
+      seed,
+      purpose: RestorePurpose::SyncedCheckpoint,
+    });
+    if let Some(recon) = self.sm_reconstruct.as_mut() {
+      recon.restore = Some(job);
+    }
+  }
+
+  /// The synced checkpoint's reconstruct completed. THE INSTALL GATE for SM content: the restored SM
+  /// and session table are installed together, and only then does the IRREVERSIBLE WAL prune the
+  /// snapshot justifies run — the one effect held for restore success.
+  ///
+  /// A fault in EITHER DAG regresses nothing (the frontier already names M): the obligation stays
+  /// owed, its block-fetch re-arms to re-pull the bad block, and the reconstruct is re-issued.
+  pub(super) fn on_sm_restored<W: Wal, B: Superblock>(
+    &mut self,
+    now: Instant,
+    wal: &mut W,
+    sb: &mut B,
+    result: Result<(S, std::collections::BTreeMap<u128, Session>), crate::RestoreError>,
+  ) {
+    let Some(recon) = self.sm_reconstruct.as_mut() else {
+      return;
+    };
+    recon.restore = None;
+    let checkpoint_op = recon.checkpoint_op;
+    let Ok((sm, sessions)) = result else {
+      // A still-bad block in either DAG: keep the obligation owed and re-pull it from the donor. No
+      // immediate re-issue on a complete DAG — that would re-read the same bad block and spin; the
+      // re-solicit drives the next attempt.
+      self.rearm_sm_reconstruct_retry(now, false);
+      return;
+    };
     // Both DAGs read back clean — install the restored SM and the session table together.
-    self.sm = seed;
+    self.sm = sm;
     self.clients = sessions;
     self.note_sm_restored(checkpoint_op);
-    // The SM now holds this checkpoint's content — clear any owed reconstruction (this install is either the
-    // first for this point, where none was owed, or a strictly-newer one superseding an older M obligation
-    // forward; either way no SM debt remains after a clean restore).
+    // The SM now holds this checkpoint's content — the obligation is met.
     self.sm_reconstruct = None;
     // Restore succeeded → rebuild the durable WAL (the IRREVERSIBLE GC, the one effect held for restore
     // success). Drop any stale slots strictly ABOVE our head (a stale higher generation that would
@@ -2083,13 +2153,28 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // with `op_head() == checkpoint_op`, not an empty WAL that would read back head 0 on restart. This
     // is why the WAL prune is NOT folded into the shared post-checkpoint trim: `run_gc` frees `<= floor`
     // (`prune(floor+1)`) because it has no such WAL-head constraint, so the two sites legitimately use a
-    // different prune FLOOR. Only the in-memory log trim above is common ([`Self::trim_log_to_checkpoint`]).
+    // different prune FLOOR. Only the in-memory log trim is common ([`Self::trim_log_to_checkpoint`]).
+    //
+    // No below-floor deferred retire precedes this absorb — none can exist: `install_sync` cleared
+    // `deferred_appends` wholesale at its reset, and `checkpoint_op` was already advanced to the synced
+    // M before the reconstruct, so every deferral a post-install append could have parked sits strictly
+    // ABOVE the floor this prune frees.
     let cancelled = wal.truncate(self.op);
     self.absorb_wal_cancellations(wal, cancelled);
     let cancelled = wal.prune(checkpoint_op);
     self.wal_pruned = self.wal_pruned.max(checkpoint_op.get().saturating_sub(1));
     self.absorb_wal_cancellations(wal, cancelled);
-    Ok(())
+    // The synced checkpoint is durable + installed: prune SM blocks unreachable from the new durable
+    // checkpoint root, GC the WAL caches, and complete the sync bookkeeping. This is the SINGLE
+    // completion tail — a clean first reconstruct and one that succeeded only after several re-pulls
+    // reach it identically.
+    self.complete_state_sync(now, sb);
+    // The install advanced `checkpoint_op` (the ring window slid forward): re-drive any adopted-tail
+    // append that was skipped over the old window.
+    self.retry_unappended_adopted_tail(wal);
+    // The SM reconstructed + the sync completed → a staged epoch swap that was waiting for a free
+    // superblock now gets its slot (the same re-trigger `on_sb_done`'s tail makes).
+    self.maybe_swap_epoch(sb);
   }
 
   /// Re-pin the owed SM-reconstruct's block-fetch to a FRESH donor (its prior donor went dark, and a new
@@ -2100,12 +2185,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// walk resumes against the same DAG. If the DAG is ALREADY complete in the store (the missing block was
   /// repaired out of band, or this donor's reply already carried it), retry the restore IMMEDIATELY — the
   /// re-arm left no block-fetch to drain, so nothing else would drive the completion.
-  pub(crate) fn refetch_sm_reconstruct<W: Wal, B: Superblock>(
+  pub(crate) fn refetch_sm_reconstruct(
     &mut self,
     now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
     from: Peer,
     m: &crate::SyncCheckpoint,
   ) {
@@ -2117,15 +2199,22 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       recon.donor = donor;
       recon.checkpoint = m.clone();
     }
-    self.rearm_sm_reconstruct_retry(now, blocks);
-    // The re-arm left `block_fetch` None iff M's DAG is already fully present — in which case no
-    // `BlockResponse` will arrive to drive the drain, so retry the restore right here.
-    if self.block_fetch.is_none() && self.sm_reconstruct_owed() {
-      self.retry_sm_reconstruct(now, wal, sb, blocks);
-    }
+    // A FRESH donor reply is the new evidence, so a DAG that already reads back complete re-issues the
+    // reconstruct straight from the walk's verdict — the re-arm would otherwise leave no fetch to drain
+    // and nothing to drive it.
+    self.rearm_sm_reconstruct_retry(now, true);
   }
 
-  pub(crate) fn rearm_sm_reconstruct_retry(&mut self, now: Instant, blocks: &mut dyn BlockStore) {
+  /// Re-arm the owed SM-reconstruct's block-fetch so the missing/corrupt block of M's DAG is
+  /// re-pulled from the pinned donor, and re-arm the serviced ARQ for the node's current status.
+  ///
+  /// `retry` says what a fully-present DAG means here. A re-arm driven by a FRESH donor reply (donor
+  /// failover) sets it: the reply is new evidence, so if the DAG already reads back complete the
+  /// reconstruct is re-issued immediately — the re-arm left no fetch to drain, and nothing else would
+  /// drive it. A re-arm that followed a FAILED reconstruct leaves it clear: re-issuing against the
+  /// same still-faulty block would fail identically and spin, so there the re-solicit drives the next
+  /// attempt.
+  pub(crate) fn rearm_sm_reconstruct_retry(&mut self, now: Instant, retry: bool) {
     let Some(recon) = self.sm_reconstruct.as_ref() else {
       return; // no obligation owed — nothing to re-arm (defensive; the caller stashed it just above).
     };
@@ -2133,17 +2222,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     let sessions_root = recon.sessions_root;
     let donor = recon.donor;
     let checkpoint = recon.checkpoint.clone();
-    // Re-arm the block-fetch to re-pull M's missing/corrupt block from EITHER DAG (SM or session). Both
-    // arms REPLACE the whole `block_fetch` field, so any prior fetch is superseded by construction — a
-    // malformed/foreign DAG (the walk's reachable-set bound breaches) leaves `block_fetch` None and the
-    // serviced timer below re-solicits.
-    let mut bf = BlockFetch {
+    // Re-arm the block-fetch to re-pull M's missing/corrupt block from EITHER DAG (SM or session).
+    // REPLACING the whole `block_fetch` field supersedes any prior fetch by construction.
+    self.block_fetch = Some(BlockFetch {
       checkpoint: checkpoint.clone(),
       sm_root,
       sessions_root,
       donor,
-      block_sync: super::block_sync::BlockSync::new(sm_root),
-      session_sync: super::block_sync::BlockSync::new(sessions_root),
+      walks: WalkState::Idle(super::block_sync::BlockWalks::new(sm_root, sessions_root)),
       // M is already installed (its epoch already advanced for a crossing), so this re-pin re-pulls M's DAG
       // to retry the restore — the independent `sm_reconstruct_owed()` shield governs the crossing predicates
       // here. Compute the presentation bit for consistency; against the now-current config it reads false.
@@ -2152,28 +2238,11 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // duplicate active-donor absent in the retry window cannot re-arm it. (A root change here is not
       // possible — M is fixed — so this only ever carries; the `else None` is for uniformity.)
       resolicited_front: self.carry_resolicit_latch(sm_root, sessions_root),
-    };
-    match bf.next_missing(&*blocks) {
-      Ok(Some(addr)) => {
-        self.block_fetch = Some(bf);
-        self.emit(Outgoing::new(
-          Recipient::To(donor),
-          Message::RequestBlock(addr),
-        ));
-      }
-      // The whole DAG reads back present-and-verified (the corrupt block was already repaired out of band):
-      // no fetch to arm. The serviced re-solicit still drives the retry — a fresh M re-served by the donor
-      // re-arms this fetch and retries the restore.
-      Ok(None) => {
-        self.block_fetch = None;
-      }
-      // The walk breached its reachable-block bound: count the abort and drop the fetch; the serviced
-      // re-solicit still retries off a fresh M.
-      Err(_) => {
-        self.abort_oversized_block_fetch();
-      }
-    }
-    // Re-arm the serviced ARQ for the node's current status.
+    });
+    self.issue_walk(WalkPurpose::Rearm { retry }, None);
+    // Re-arm the serviced ARQ for the node's current status. Done at ISSUE, not on the walk's verdict:
+    // the cadence must keep running whatever the walk finds, and while Recovering the peer-fetch flag
+    // is what keeps the recovery open and admits the answering `SyncCheckpoint`.
     if self.status.is_recovering() {
       match self.recover.as_mut() {
         Some(rec) => rec.awaiting_peer_checkpoint = true,
@@ -2190,66 +2259,14 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     }
   }
 
-  /// Retry the SM-content restore for the owed checkpoint `M` once its DAG has re-drained into the block
-  /// store ([`Self::on_block_response`] calls this instead of re-staging — M's root is already durable and
-  /// `self.checkpoint_op == M`, so the only thing left is to reconstruct the SM). On success: clear the
-  /// obligation, prune the WAL band the snapshot subsumes (the irreversible GC, held for restore success),
-  /// GC unreachable SM blocks, and signal the state-sync as complete. On a still-faulty block: leave the
-  /// obligation owed and re-arm the fetch/ARQ to pull again. Returns whether the SM is now reconstructed.
-  pub(crate) fn retry_sm_reconstruct<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) -> bool {
-    let Some(recon) = self.sm_reconstruct.as_ref() else {
-      return true; // nothing owed — already reconstructed.
-    };
-    let sm_root = recon.sm_root;
-    let sessions_root = recon.sessions_root;
-    let checkpoint_op = recon.checkpoint_op;
-    // Re-attempt BOTH reconstructs (the session table FIRST into a local value, then the SM into a
-    // detached seed): a block still bit-rotted/missing in EITHER DAG keeps the obligation owed and
-    // re-pulls. (The DAG drained per the content-addressed store but a leaf still fails the
-    // verify-on-read; the re-armed fetch re-requests it from the donor, whose reply overwrites the
-    // bad bytes.)
-    let sessions = super::session_blocks::decode_sessions(sessions_root, &*blocks);
-    let Some(sessions) = sessions else {
-      self.rearm_sm_reconstruct_retry(now, blocks);
-      return false;
-    };
-    let verified = crate::block_store::VerifiedView::new(&*blocks);
-    let mut seed = self.sm.restore_seed();
-    if seed.restore(sm_root, &verified).is_err() {
-      self.rearm_sm_reconstruct_retry(now, blocks);
-      return false;
-    }
-    // Both DAGs read back clean — install the restored SM and the session table together.
-    self.sm = seed;
-    self.clients = sessions;
-    self.note_sm_restored(checkpoint_op);
-    // The SM now holds M's content. The obligation is met: clear it and run the success effects the
-    // `install_sync` happy path runs (the WAL prune is the irreversible GC held for restore success).
-    self.sm_reconstruct = None;
-    let cancelled = wal.truncate(self.op);
-    self.absorb_wal_cancellations(wal, cancelled);
-    // Unlike `run_gc`, no below-floor deferred retire precedes this absorb — none can exist here:
-    // `install_sync` cleared `deferred_appends` wholesale at its reset, and `checkpoint_op` was
-    // already advanced to the synced M BEFORE this fallible restore retried, so every deferral a
-    // post-failure append could have parked sits strictly ABOVE the floor this prune frees. The
-    // absorb can therefore only release above-floor waiters, the same postcondition `run_gc`
-    // establishes explicitly.
-    let cancelled = wal.prune(checkpoint_op);
-    self.wal_pruned = self.wal_pruned.max(checkpoint_op.get().saturating_sub(1));
-    self.absorb_wal_cancellations(wal, cancelled);
-    // The synced checkpoint is durable + installed: prune SM blocks unreachable from the new durable
-    // checkpoint root, GC the WAL caches, and complete the sync bookkeeping — the same tail as a clean
-    // first-try install (it lands at exactly this point), now reached after the retry.
-    self.complete_state_sync(now, sb, blocks);
-    // The install advanced `checkpoint_op` (the ring window slid forward): re-drive any adopted-tail
-    // append that was skipped over the old window.
-    self.retry_unappended_adopted_tail(wal);
-    true
+  /// Retry the SM-content reconstruct for the owed checkpoint `M` once its DAG has re-drained into
+  /// the block store ([`Self::on_block_response`] calls this instead of re-staging — M's root is
+  /// already durable and `self.checkpoint_op == M`, so the only thing left is to rebuild the SM).
+  ///
+  /// Re-issues the reconstruct job; its completion ([`Self::on_sm_restored`]) either installs the
+  /// content and runs the success tail, or leaves the obligation owed and re-arms the fetch/ARQ to
+  /// pull the still-faulty block again.
+  pub(crate) fn retry_sm_reconstruct(&mut self) {
+    self.issue_sm_restore();
   }
 }

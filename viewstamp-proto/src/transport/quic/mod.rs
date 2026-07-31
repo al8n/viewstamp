@@ -121,6 +121,9 @@ pub struct QuicCoordinator<S: StateMachine, I> {
   /// construction (the genesis config is already reconciled by construction — every bound peer was
   /// dialed/accepted under it).
   last_reconciled_config_id: u128,
+  /// The execution-order witness of this coordinator's inline storage lane — one cursor per LANE, so
+  /// a job executed out of the order the endpoint issued it fail-stops before it touches the store.
+  block_lane: crate::BlockJobCursor,
   /// Test-only: count of consensus frames `drain_bridge` decoded and fed to the endpoint. The
   /// per-pump receive-pacing test reads this before/after each pump to assert ONE budget's worth is
   /// delivered per pump and that the whole burst eventually arrives.
@@ -253,6 +256,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       layout,
       clock_anchor: None,
       last_reconciled_config_id,
+      block_lane: crate::BlockJobCursor::new(),
       #[cfg(test)]
       consensus_frames_delivered: 0,
     }
@@ -393,11 +397,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     data: &[u8],
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
   ) {
     let std_now = self.quinn_now(now);
     self.bridge.handle_datagram(std_now, remote, ecn, data);
-    self.drain_bridge(now, wal, sb, blocks);
+    self.drain_bridge(now, wal, sb);
     // The just-completed drain may have delivered a frame that INSTALLED a new membership; reconcile
     // routing against it BEFORE the pump routes this pass's outputs, so they never ride a stale slot.
     self.reconcile_routing(now);
@@ -405,21 +408,40 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   }
 
   /// Fire all QUIC + consensus timers at `now`, then drain the bridge and pump.
-  pub fn handle_timeout<W: Wal, B: Superblock>(
+  pub fn handle_timeout<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
+    let std_now = self.quinn_now(now);
+    self.bridge.handle_timeout(std_now);
+    self.endpoint.handle_timeout(now, wal, sb);
+    self.drain_bridge(now, wal, sb);
+    // A timeout-driven advance (or a frame the drain delivered) may have installed a new membership;
+    // reconcile routing against it BEFORE the pump, so no current-config output rides a stale slot.
+    self.reconcile_routing(now);
+    self.pump(now);
+  }
+
+  /// Runs every block job the endpoint has queued against `blocks`, feeding each completion back,
+  /// and re-drains WAL/superblock completions between jobs — a completion can submit the superblock
+  /// write it gates (a materialized checkpoint publishing its snapshot), and a superblock completion
+  /// can queue the next job. The loop settles once neither side produces work.
+  ///
+  /// This is the coordinator's INLINE storage lane, and the ONLY place it holds a block store. It
+  /// satisfies the executor contract by construction: jobs execute strictly in poll order on ONE
+  /// cursor, and their completions are fed back in that same order.
+  fn drain_storage<W: Wal, B: Superblock>(
     &mut self,
     now: Instant,
     wal: &mut W,
     sb: &mut B,
     blocks: &mut dyn BlockStore,
   ) {
-    let std_now = self.quinn_now(now);
-    self.bridge.handle_timeout(std_now);
-    self.endpoint.handle_timeout(now, wal, sb, blocks);
-    self.drain_bridge(now, wal, sb, blocks);
-    // A timeout-driven advance (or a frame the drain delivered) may have installed a new membership;
-    // reconcile routing against it BEFORE the pump, so no current-config output rides a stale slot.
-    self.reconcile_routing(now);
-    self.pump(now);
+    loop {
+      self.endpoint.handle_storage(now, wal, sb);
+      let Some(job) = self.endpoint.poll_block_job() else {
+        break;
+      };
+      let done = crate::execute_block_job(&mut self.block_lane, job, blocks);
+      self.endpoint.on_block_done(now, wal, sb, done);
+    }
   }
 
   /// Drive storage completions through the consensus endpoint, then pump its resulting messages.
@@ -430,8 +452,8 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     sb: &mut B,
     blocks: &mut dyn BlockStore,
   ) {
-    self.endpoint.handle_storage(now, wal, sb, blocks);
-    self.drain_bridge(now, wal, sb, blocks);
+    self.drain_storage(now, wal, sb, blocks);
+    self.drain_bridge(now, wal, sb);
     // A storage-completion advance (e.g. a reconfig op becoming durable) may have installed a new
     // membership; reconcile routing against it BEFORE the pump, so this pass's outputs use new slots.
     self.reconcile_routing(now);
@@ -588,7 +610,6 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     request: Request,
   ) {
     if request.body().len() > crate::transport::frame::max_request_body_len() {
@@ -602,7 +623,6 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
       now,
       wal,
       sb,
-      blocks,
       Peer::Client(request.client()),
       Message::Request(request.clone()),
     );
@@ -631,13 +651,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
   ///   stream bytes still readable defers the connection to the NEXT pump, so a buffered receive window
   ///   drains one budget per pump rather than all at once;
   /// - `lost` → reap the closed connection.
-  fn drain_bridge<W: Wal, B: Superblock>(
-    &mut self,
-    now: Instant,
-    wal: &mut W,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
+  fn drain_bridge<W: Wal, B: Superblock>(&mut self, now: Instant, wal: &mut W, sb: &mut B) {
     let std_now = self.quinn_now(now);
     while let Some(h) = self.bridge.take_connected() {
       // Open the send stream and write our control preface as frame-0. `Hello` writes the hello
@@ -706,7 +720,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
             self.bridge.bound_peer_of(h),
             decode_message(Bytes::from(payload)),
           ) {
-            self.deliver_decoded(now, wal, sb, blocks, from, msg);
+            self.deliver_decoded(now, wal, sb, from, msg);
           }
         } else {
           // `Closed` (or otherwise no longer routable): drop the remaining frames.
@@ -723,7 +737,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
             self.bridge.bound_peer_of(h),
             decode_message(Bytes::from(payload)),
           ) {
-            self.deliver_decoded(now, wal, sb, blocks, from, msg);
+            self.deliver_decoded(now, wal, sb, from, msg);
           }
         }
       }
@@ -764,7 +778,6 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
@@ -773,9 +786,7 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     {
       return;
     }
-    self
-      .endpoint
-      .handle_message(now, wal, sb, blocks, from, msg);
+    self.endpoint.handle_message(now, wal, sb, from, msg);
     #[cfg(test)]
     {
       self.consensus_frames_delivered += 1;
@@ -1024,11 +1035,10 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     from: Peer,
     msg: Message,
   ) {
-    self.deliver_decoded(now, wal, sb, blocks, from, msg);
+    self.deliver_decoded(now, wal, sb, from, msg);
     self.pump(now);
   }
 
@@ -1091,9 +1101,8 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
   ) {
-    self.drain_bridge(now, wal, sb, blocks);
+    self.drain_bridge(now, wal, sb);
     self.pump(now);
   }
 

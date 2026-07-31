@@ -96,6 +96,12 @@ pub struct Cluster {
   /// Per-replica content-addressed block stores holding the SM checkpoint DAGs (persist across
   /// crashes — the SM blocks must survive a restart, exactly like the WAL + superblock).
   block_stores: Vec<MemBlockStore>,
+  /// Per-replica storage-lane execution-order witnesses. ONE cursor per replica because each drives
+  /// its own inline serial lane; a job executed out of the order its endpoint issued it fail-stops
+  /// before it touches the store. They persist across a restart in place, exactly like the stores —
+  /// which is what makes a dead incarnation's queued job executing after its successor's a caught
+  /// order violation rather than silent corruption.
+  block_lanes: Vec<viewstamp_proto::BlockJobCursor>,
   clients: Vec<ClientModel>,
   net: Network,
   clock: Clock,
@@ -431,6 +437,9 @@ impl Cluster {
       wals,
       sbs,
       block_stores,
+      block_lanes: (0..node_count)
+        .map(|_| viewstamp_proto::BlockJobCursor::new())
+        .collect(),
       clients: client_set,
       net: Network::new(),
       clock: Clock::new(),
@@ -1365,7 +1374,6 @@ impl Cluster {
       self.make_sm(),
       &mut self.wals[i],
       &mut self.sbs[i],
-      &mut self.block_stores[i],
     )? {
       Recovered::Active(endpoint) => {
         self.replicas[i] = endpoint;
@@ -1374,12 +1382,7 @@ impl Cluster {
         // CALLER — `restart` advances the shared clock for a single node, while `reconfigure_offline` ticks
         // the whole cluster so every voter recovers IN PARALLEL (aligned recover-head windows, which the
         // re-formation escalation's two-window gate needs). Driving here, per node, would stagger them.
-        self.replicas[i].handle_storage(
-          self.clock.now(),
-          &mut self.wals[i],
-          &mut self.sbs[i],
-          &mut self.block_stores[i],
-        );
+        self.drain_storage(i, self.clock.now());
         // Witness the recover read-window's HELD TAIL above the durable checkpoint, captured ONCE here at
         // construction: `op` is the held head the read loop scans/repairs, fixed at recover and never
         // raised by it (see `recovered_band_high_water`), so there is no later completion-edge instant to
@@ -1657,7 +1660,6 @@ impl Cluster {
       now,
       &mut self.wals[primary],
       &mut self.sbs[primary],
-      &mut self.block_stores[primary],
       Peer::Client(tail_client),
       req,
     );
@@ -2063,35 +2065,16 @@ impl Cluster {
         viewstamp_proto::Epoch::new(0),
         0,
       ));
-      self.replicas[i].handle_message(
-        now,
-        &mut self.wals[i],
-        &mut self.sbs[i],
-        &mut self.block_stores[i],
-        from,
-        gv,
-      );
+      self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, gv);
       let rec = Message::Recovery(viewstamp_proto::Recovery::new(
         peer,
         0xF2_u64,
         viewstamp_proto::Epoch::new(0),
         0,
       ));
-      self.replicas[i].handle_message(
-        now,
-        &mut self.wals[i],
-        &mut self.sbs[i],
-        &mut self.block_stores[i],
-        from,
-        rec,
-      );
+      self.replicas[i].handle_message(now, &mut self.wals[i], &mut self.sbs[i], from, rec);
       // Fire the primary timers too (the `primary_timeouts` heartbeat/retransmit gate).
-      self.replicas[i].handle_timeout(
-        now,
-        &mut self.wals[i],
-        &mut self.sbs[i],
-        &mut self.block_stores[i],
-      );
+      self.replicas[i].handle_timeout(now, &mut self.wals[i], &mut self.sbs[i]);
       // Inspect EVERYTHING the probe made the replica emit: a correct (gated) primary emits no
       // StartView/RecoveryResponse for its not-yet-durable view; an ungated one does → durable-view
       // violation. Drain the queue (re-enqueuing for normal routing) and check each message.
@@ -2492,6 +2475,29 @@ impl Cluster {
   }
 
   /// One simulation step.
+  /// Drain replica `i`'s storage: WAL + superblock completions, and every block job it has queued,
+  /// executed inline on that replica's own serial lane.
+  ///
+  /// The loop re-drains WAL/superblock completions between jobs because a job completion can submit
+  /// the superblock write it gates (a materialized checkpoint publishing its snapshot) and a
+  /// superblock completion can queue the next job; it settles once neither side produces work. Jobs
+  /// execute strictly in poll order on one cursor and their completions are fed back in that same
+  /// order, so the executor's serial-in-issue-order contract holds by construction.
+  fn drain_storage(&mut self, i: usize, now: viewstamp_proto::Instant) {
+    loop {
+      self.replicas[i].handle_storage(now, &mut self.wals[i], &mut self.sbs[i]);
+      let Some(job) = self.replicas[i].poll_block_job() else {
+        break;
+      };
+      let done = viewstamp_proto::execute_block_job(
+        &mut self.block_lanes[i],
+        job,
+        &mut self.block_stores[i],
+      );
+      self.replicas[i].on_block_done(now, &mut self.wals[i], &mut self.sbs[i], done);
+    }
+  }
+
   pub fn tick(&mut self) {
     let now = self.clock.now();
 
@@ -2618,7 +2624,6 @@ impl Cluster {
               now,
               &mut self.wals[ri],
               &mut self.sbs[ri],
-              &mut self.block_stores[ri],
               from,
               m.msg,
             );
@@ -2642,12 +2647,7 @@ impl Cluster {
       if self.crashed[ri] {
         continue;
       }
-      self.replicas[ri].handle_storage(
-        now,
-        &mut self.wals[ri],
-        &mut self.sbs[ri],
-        &mut self.block_stores[ri],
-      );
+      self.drain_storage(ri, now);
     }
 
     for ri in 0..self.replicas.len() {
@@ -2681,19 +2681,9 @@ impl Cluster {
       if self.crashed[ri] {
         continue;
       }
-      self.replicas[ri].handle_timeout(
-        now,
-        &mut self.wals[ri],
-        &mut self.sbs[ri],
-        &mut self.block_stores[ri],
-      );
+      self.replicas[ri].handle_timeout(now, &mut self.wals[ri], &mut self.sbs[ri]);
       // Pump storage after timeout: drives append-before-ack (on_wal_done) + durable-view (on_sb_done).
-      self.replicas[ri].handle_storage(
-        now,
-        &mut self.wals[ri],
-        &mut self.sbs[ri],
-        &mut self.block_stores[ri],
-      );
+      self.drain_storage(ri, now);
     }
 
     // Drain the apply/swap events this second pump produced BEFORE the per-tick invariant check reads the

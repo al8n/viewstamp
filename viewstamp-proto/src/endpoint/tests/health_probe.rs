@@ -53,12 +53,10 @@ fn deliver_proof(
   now: Instant,
 ) {
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
   e.handle_message(
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(from_slot)),
     Message::HealthProof(HealthProof::new(
       ReplicaId::new(from_slot),
@@ -238,13 +236,11 @@ fn a_voter_answers_a_health_challenge_with_a_live_proof() {
   // answers, so a missing reply is honest evidence of absence.
   let mut e = backup_self(); // self = voter 1
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   e.handle_message(
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)), // from the primary
     Message::RequestHealthProof(RequestHealthProof::new(
       ReplicaId::new(0),
@@ -284,7 +280,6 @@ fn a_cross_config_health_challenge_is_dropped() {
   // never elicit a proof a later round under that stale config could consume.
   let mut e = backup_self();
   let (mut wal, mut sb) = (TestWal::default(), TestSb::default());
-  let mut blocks = crate::block_store::InMemoryBlockStore::new();
 
   let foreign = Message::RequestHealthProof(RequestHealthProof::new(
     ReplicaId::new(0),
@@ -300,7 +295,6 @@ fn a_cross_config_health_challenge_is_dropped() {
     Instant::ZERO,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(0)),
     foreign,
   );

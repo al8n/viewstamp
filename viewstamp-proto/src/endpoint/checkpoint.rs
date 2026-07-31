@@ -6,7 +6,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     done: WalDone,
   ) {
     // THE CHOKE. A completion minted by a previous endpoint over this same storage names another
@@ -39,7 +38,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         self.release_deferred_append(wal, op);
         return;
       }
-      self.on_recover_wal_done(now, wal, sb, blocks, done);
+      self.on_recover_wal_done(now, wal, sb, done);
       return;
     }
     // A Retired (removed) replica is no longer a cluster member: drop any straggling WAL completion (a
@@ -113,7 +112,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         if self.is_primary() {
           // the primary's own append is durable → record its vote and try to commit
           self.record_own_vote(op.get());
-          self.try_commit(now, sb, blocks);
+          self.try_commit(now, sb);
         } else {
           self.send_prepare_ok(op);
         }
@@ -124,7 +123,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       // it has not durably appended (append-before-ack for the view-change adoption path).
       Some(Pending::AdoptVote(op)) => {
         self.record_own_vote(op.get());
-        self.try_commit(now, sb, blocks);
+        self.try_commit(now, sb);
       }
       // a backup's adopted uncommitted-tail op is now durable → send the deferred
       // PrepareOk. No PrepareOk was sent for this op before its append completed (append-before-ack).
@@ -175,12 +174,12 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
           && self.inflight.contains_key(&op.get())
         {
           self.record_own_vote(op.get());
-          self.try_commit(now, sb, blocks);
+          self.try_commit(now, sb);
         } else {
           // The hole is filled + durable → resume applying the held committed prefix from where it
           // stalled (committed-repair case, or a backup that owes no vote).
           let target = self.commit_max.get();
-          self.advance_commit(now, sb, blocks, target);
+          self.advance_commit(now, sb, target);
         }
       }
       None => {}
@@ -246,7 +245,6 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     now: Instant,
     wal: &mut W,
     sb: &mut B,
-    blocks: &mut dyn BlockStore,
     done: SuperblockDone,
   ) {
     // THE CHOKE, the superblock twin of the one in `on_wal_done` — a completion naming another
@@ -267,7 +265,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       let is_staged_repersist_write =
         matches!(done, SuperblockDone::Wrote(id) if staged_step == Some(id));
       if !is_staged_repersist_write {
-        self.on_recover_sb_done(now, sb, blocks, done);
+        self.on_recover_sb_done(sb, done);
         return;
       }
     }
@@ -306,7 +304,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
       match action {
         PendingSbAction::SendDoViewChange => self.send_do_view_change(now),
         PendingSbAction::StartViewAsPrimary => {
-          self.start_view_participate(now, sb, blocks);
+          self.start_view_participate(now, sb);
           // A checkpoint root that completed while this view write was in flight advanced the
           // ring window with the sweep gated (durable-view-before-participate): re-drive the
           // still-unappended adopted tail now that the view is durable. (A backup needs no such
@@ -478,30 +476,20 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
               // `pending_install` is `Some` and the install runs now, atomically with the durable root. The
               // recovery path then flips to Normal via `complete_recovery` below.
               if let Some(install) = self.pending_install.take() {
-                // The frontier advances regardless; only the SM-content restore can fail (a checkpoint
-                // block bit-rotted/was misdirected between the block-fetch drain and this verify-on-read
-                // restore). On that fault `install_sync` has ALREADY advanced the pointer to M (so NOTHING
-                // is rewound — in-memory `checkpoint_op` now equals the durable root) and stashed an
-                // `sm_reconstruct` obligation; the SM still holds the OLD content. RE-ARM the obligation's
-                // block-fetch to re-pull M's bad block (which `write_block` overwrites), so the SAME M's DAG
-                // re-drains and retries `sm.restore` DIRECTLY against the unchanged M pointer — no re-stage,
-                // never waiting for a fresh, possibly-older reply. The obligation GATES serving M / applying
-                // ops over the un-restored SM until the retry succeeds. SKIP the success tail (GC, the
-                // completion event, the Normal/recovery flip): none of it is justified until the SM holds M.
-                if let Err(_e) = self.install_sync(now, wal, blocks, install) {
-                  self.rearm_sm_reconstruct_retry(now, blocks);
-                  return;
-                }
+                // The frontier advances HERE and unconditionally (the durable root is the commit
+                // point); the SM CONTENT is reconstructed OFF the pump, as a job `install_sync`
+                // issues under the `sm_reconstruct` obligation it raises first. So this arm never
+                // sees a restore verdict: the completion ([`Self::on_sm_restored`]) either installs
+                // the content and runs the shared sync-completion tail (GC, the completion event,
+                // the sync teardown, the Normal/recovery flip, the crossing re-arm), or leaves the
+                // obligation owed and re-pulls the faulted block. None of that tail is justified
+                // until the SM actually holds M, which is exactly why it hangs off the completion.
+                self.install_sync(now, install);
               }
-              // The SM holds M's content (a clean first-try restore) → run the shared sync-completion tail
-              // (GC, the completion event, the sync teardown, the Normal/recovery flip, the crossing re-arm).
-              // The retry path (`retry_sm_reconstruct`) reaches the IDENTICAL tail once a re-pull finally
-              // reconstructs the SM, so it lands at exactly this point.
-              self.complete_state_sync(now, sb, blocks);
-              // The install advanced `checkpoint_op` (the ring window slid forward): re-drive any
-              // adopted-tail append that was skipped over the old window. (No-op unless the tail
-              // above the completion exit's frontier holds an un-durable body — see the fn doc.)
-              self.retry_unappended_adopted_tail(wal);
+              // The reconstruct is outstanding: the sync-completion tail, and the epoch-swap
+              // re-trigger below it, run from its completion. Returning here keeps a swap root from
+              // being submitted while the SM still lags the checkpoint it names.
+              return;
             }
             CheckpointKind::Ordinary => {
               // ORDINARY checkpoint: advance the in-memory checkpoint_op, then GC the WAL + per-op caches
@@ -543,12 +531,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// after a post-root restore fault — so the completion is IDENTICAL whether the SM restored on the first
   /// attempt or after a retry. It GCs the now-unreachable SM blocks, signals the sync complete, tears down
   /// the sync handshake, and completes recovery (recovery peer-fetch path) or resumes as a Normal backup.
-  pub(crate) fn complete_state_sync<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
+  pub(crate) fn complete_state_sync<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // The synced checkpoint is durable + installed: prune SM blocks unreachable from the new durable
     // checkpoint root (the old checkpoint's no-longer-referenced blocks). The sync's own block-fetch
     // already drained + cleared, so no in-flight sync-target root is live.
@@ -613,7 +596,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
         self.send_recovery(now);
         return;
       }
-      self.complete_recovery(now, sb, blocks);
+      self.complete_recovery(now, sb);
     } else {
       self.arm_timers(now);
     }
@@ -920,12 +903,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// The proactive `advance_commit` is RE-ENTRANCY-guarded ([`Self::paying_checkpoint_debt`]): reached
   /// FROM a commit-advance tail it would otherwise re-enter `advance_commit` without bound; the flag makes
   /// the inner advance a no-op (the outer advance already drove commit as far as the held log permits).
-  pub(crate) fn maybe_pay_checkpoint_debt<B: Superblock>(
-    &mut self,
-    now: Instant,
-    sb: &mut B,
-    blocks: &mut dyn BlockStore,
-  ) {
+  pub(crate) fn maybe_pay_checkpoint_debt<B: Superblock>(&mut self, now: Instant, sb: &mut B) {
     // No debt unless the durable root names a membership AHEAD of the checkpoint.
     if self.config_install_op.get() <= self.checkpoint_op.get() {
       return;
@@ -956,7 +934,7 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     // commit-advance-tail re-entry: the outer advance already moved commit as far as the held log allows.
     if !self.paying_checkpoint_debt {
       self.paying_checkpoint_debt = true;
-      self.advance_commit(now, sb, blocks, self.commit_max.get());
+      self.advance_commit(now, sb, self.commit_max.get());
       self.paying_checkpoint_debt = false;
     }
     // (b) Once the band reached the reconfigure op, force the owed checkpoint at `commit_min` (>= N), so

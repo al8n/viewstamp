@@ -11,24 +11,10 @@ fn on_request_prepare_holder_replies_with_the_prepare() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold ops 1 + 2 (apply 1 via the piggybacked commit).
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(2, 1),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {} // discard acks
 
   // Replica 2 asks us for op 1.
@@ -36,7 +22,6 @@ fn on_request_prepare_holder_replies_with_the_prepare() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -69,7 +54,7 @@ fn on_request_prepare_is_serve_silent_or_nack_by_local_holding() {
   //   * durably LACKS it, op <= checkpoint_op → SILENT (subsumed by its snapshot — it HOLDS the op).
   // A new primary holding op 1 `Present`, op 2 header-only `Repairing`, checkpoint 0, head 2 covers the
   // first three; a separate replica with a non-zero checkpoint covers the fourth.
-  let (mut e, mut wal, mut sb, mut blocks) = new_primary_with_op2_candidate(genesis(3));
+  let (mut e, mut wal, mut sb, _blocks) = new_primary_with_op2_candidate(genesis(3));
   let now = Instant::ZERO;
   let request_prepare = |op: u64| {
     Message::RequestPrepare(crate::RequestPrepare::new(
@@ -85,7 +70,6 @@ fn on_request_prepare_is_serve_silent_or_nack_by_local_holding() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     request_prepare(1),
   );
@@ -102,7 +86,6 @@ fn on_request_prepare_is_serve_silent_or_nack_by_local_holding() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     request_prepare(2),
   );
@@ -116,7 +99,6 @@ fn on_request_prepare_is_serve_silent_or_nack_by_local_holding() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     request_prepare(5),
   );
@@ -142,12 +124,10 @@ fn on_request_prepare_is_serve_silent_or_nack_by_local_holding() {
   let mut b = backup();
   b.force_state_for_test(0, 5, 5, 5, &[]); // op/commit/checkpoint all 5 (a self-consistent snapshot)
   let (mut wal2, mut sb2) = (TestWal::default(), TestSb::default());
-  let mut blocks2 = crate::block_store::InMemoryBlockStore::new();
   b.handle_message(
     now,
     &mut wal2,
     &mut sb2,
-    &mut blocks2,
     Peer::Replica(ReplicaId::new(2)),
     request_prepare(3), // 3 <= checkpoint 5: subsumed
   );
@@ -174,24 +154,10 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let now = Instant::ZERO;
   // Hold ops 1 + 2 but COMMIT only op 1 (prepare(2,1) piggybacks commit=1 → commit_min == 1, op == 2).
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(1, 0),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
-  e.handle_message(
-    now,
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-    primary_peer(),
-    prepare(2, 1),
-  );
-  e.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(1, 0));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
+  e.handle_message(now, &mut wal, &mut sb, primary_peer(), prepare(2, 1));
+  e.storage_step(now, &mut wal, &mut sb, &mut blocks);
   while e.poll_message().is_some() {} // discard acks
   assert_eq!(e.commit(), OpNumber::with(1), "committed through op 1 only");
   assert_eq!(
@@ -206,7 +172,6 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -235,7 +200,6 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -266,7 +230,6 @@ fn on_request_prepare_serves_a_held_op_with_a_truthful_commit_field() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     Peer::Replica(ReplicaId::new(2)),
     Message::RequestPrepare(crate::RequestPrepare::new(
       View::new(),
@@ -303,7 +266,6 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -321,7 +283,6 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 3),
   );
@@ -330,7 +291,7 @@ fn repaired_prepare_fills_the_hole_and_resumes_the_held_commit() {
     OpNumber::with(1),
     "commit still held until the repaired append is durable"
   );
-  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + resume
+  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + resume
   assert_eq!(
     r.commit(),
     OpNumber::with(3),
@@ -366,7 +327,6 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -382,7 +342,6 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(0, 5, 3),
   );
@@ -402,11 +361,10 @@ fn a_misplaced_repaired_prepare_is_rejected_not_adopted() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 3),
   );
-  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + resume
+  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply + resume
   assert_eq!(
     r.commit(),
     OpNumber::with(3),
@@ -431,7 +389,6 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -450,7 +407,6 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 1),
   );
@@ -476,11 +432,10 @@ fn fill_repair_rejects_a_stale_uncommitted_prepare_for_a_committed_hole() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
-  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → clear hole + resume
+  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → clear hole + resume
   assert!(
     !r.has_repair_hole_for_test(2),
     "a committed-vouching Prepare (commit >= op) clears the hole"
@@ -523,7 +478,6 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
       now,
       &mut wal,
       &mut sb,
-      &mut blocks,
       primary_peer(),
       Message::Commit(Commit::new(
         View::new(),
@@ -555,11 +509,10 @@ fn repair_holds_the_commit_across_a_long_unrepaired_window() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 4),
   );
-  r.handle_storage(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply the held suffix
+  r.storage_step(now, &mut wal, &mut sb, &mut blocks); // the repaired append completes → apply the held suffix
   assert_eq!(r.commit(), OpNumber::with(4));
   assert_eq!(
     r.state_machine_ref().applied(),
@@ -620,17 +573,9 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
   let mut blocks = crate::block_store::InMemoryBlockStore::new();
   let cfg = Config::try_new(1, MemberId::new(1)).unwrap();
   let now = Instant::ZERO;
-  let mut r = Endpoint::recover(
-    cfg,
-    genesis(3),
-    0,
-    CountSm::default(),
-    &mut wal,
-    &mut sb,
-    &mut blocks,
-  )
-  .expect("recover accepts this store")
-  .expect_active();
+  let mut r = Endpoint::recover(cfg, genesis(3), 0, CountSm::default(), &mut wal, &mut sb)
+    .expect("recover accepts this store")
+    .expect_active();
   drive_recovery(&mut r, &mut wal, &mut sb, &mut blocks, now);
   assert_eq!(r.status(), Status::Normal, "recovers to Normal");
   assert_eq!(r.commit_max(), OpNumber::with(2), "op 2 is KNOWN committed");
@@ -644,7 +589,6 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     Message::Commit(Commit::new(
       View::new(),
@@ -675,7 +619,6 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
     now,
     &mut wal,
     &mut sb,
-    &mut blocks,
     primary_peer(),
     repair_prepare(0, 2, 2),
   );
@@ -716,7 +659,7 @@ fn fill_repair_defers_apply_until_the_repaired_append_is_durable() {
 
   // Now the repaired append completes (on_wal_done's RepairFill arm): the body lands in self.log, the
   // hole clears, and the held commit resumes through ops 1 + 2.
-  r.handle_storage(now, &mut wal, &mut sb, &mut blocks);
+  r.storage_step(now, &mut wal, &mut sb, &mut blocks);
   assert!(
     !r.has_repair_hole_for_test(2),
     "the durable repair fill clears the hole"
