@@ -457,6 +457,32 @@ impl ReorderWal {
     self.staged.iter().map(|s| s.op).collect()
   }
 
+  /// The ids of the staged appends, in submission order — the live-write identity a test reads to
+  /// construct a COLLIDING id (the same sequence number under a different incarnation).
+  fn staged_ids(&self) -> std::vec::Vec<WriteId> {
+    self.staged.iter().map(|s| s.id).collect()
+  }
+
+  /// Stage a write AS IF a previous endpoint over this storage had submitted it and the device still
+  /// held it across a restart in place: the id is the caller's (a dead incarnation's), and the bytes
+  /// are immaterial — the write either cancels via `truncate`/`prune` or lands like any staged append.
+  fn stage_predecessor_write(&mut self, id: WriteId, op: u64) {
+    let body = Bytes::from_static(b"predecessor");
+    let header = Header::new(
+      OpNumber::with(op),
+      View::new(),
+      ClientId::new(9),
+      RequestNumber::with(1),
+      &body,
+    );
+    self.staged.push(StagedAppend {
+      id,
+      op,
+      header,
+      body,
+    });
+  }
+
   /// The LANDED body at `op` (the durable slot content), or `None` if no completed append holds it — the
   /// final-state witness that the durable slot holds exactly the value this replica's vote/ack named.
   fn durable_body(&self, op: u64) -> Option<Bytes> {

@@ -4388,10 +4388,12 @@ impl<S, R> Endpoint<S, R> {
 
   /// Whether `id` was minted by a PREVIOUS endpoint instance over this storage, counting it if so.
   ///
-  /// The single choke: both storage completion routers call this before touching any correlation
-  /// table, so an id from a dead incarnation is refused wholesale rather than aliasing onto whatever
-  /// this endpoint happens to have in flight under the same sequence number. Reachable when a driver
-  /// rebuilds the endpoint over live storage handles that still owe the dead instance completions.
+  /// The single choke: both storage completion routers — and the synchronous-cancellation absorber
+  /// ([`Self::absorb_wal_cancellations`]), whose ids are completion-equivalent — call this before
+  /// touching any correlation table, so an id from a dead incarnation is refused wholesale rather
+  /// than aliasing onto whatever this endpoint happens to have in flight under the same sequence
+  /// number. Reachable when a driver rebuilds the endpoint over live storage handles that still owe
+  /// the dead instance completions.
   fn is_foreign_completion(&mut self, id: crate::OpId) -> bool {
     if id.incarnation() == self.incarnation {
       return false;
@@ -4516,12 +4518,23 @@ impl<S, R> Endpoint<S, R> {
   /// deferred append their slots were blocking. Keeping this in the same call that truncated/pruned
   /// means the common backend (one that can discard its own queue synchronously) never even opens a
   /// deferral window — behavior is byte-identical to the pre-fence code there.
+  ///
+  /// A synchronously-cancelled id is COMPLETION-EQUIVALENT data, so the incarnation rule the
+  /// completion routers enforce applies here too: after a restart in place the backend may still
+  /// hold — and now cancel — writes a PREVIOUS endpoint submitted, and sequences restart at 1 in
+  /// every incarnation, so keying the tables by a foreign id's sequence could retire a fence
+  /// witness belonging to a LIVE write of this endpoint. A foreign id is refused (and counted)
+  /// before any table is touched; the unknown-id assertion below therefore only ever fires for an
+  /// id this endpoint itself minted — a real backend-contract violation.
   fn absorb_wal_cancellations<W: Wal>(
     &mut self,
     wal: &mut W,
     cancelled: std::vec::Vec<crate::WriteId>,
   ) {
     for id in cancelled {
+      if self.is_foreign_completion(id.op_id()) {
+        continue;
+      }
       let Some(op) = self.wal_writes.remove(&id.seq()) else {
         debug_assert!(false, "a backend cancelled an unknown append id {id:?}");
         continue;
