@@ -862,8 +862,8 @@ fn view_checker_tracks_the_durable_view_across_an_undurable_catch_up_regression(
   // lagging backup catches its in-memory view up to 1 BEFORE persisting it (the un-durable window:
   // `replica_view > replica_durable_view`). We crash that backup IN that window and restart it — it
   // recovers to durable view 0, regressing its in-memory view. The durable-view checker stays Ok
-  // throughout; we also assert the in-memory view actually regressed (non-vacuity: the bug this fixes
-  // would have tripped here).
+  // throughout; we also assert the in-memory view actually regressed (non-vacuity: a checker
+  // watching the in-memory view instead of the durable one would trip right here).
   use crate::Faults;
   use core::time::Duration;
 

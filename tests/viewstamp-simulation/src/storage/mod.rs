@@ -1511,11 +1511,12 @@ impl InMemorySuperblock {
   /// Runs at every completion that changes what is reachable — a root landing (live moves) and an
   /// envelope landing (the completion identity moves) — in both the synchronous and async modes,
   /// so the retained count is at most three at every observable instant (the boundedness
-  /// checker's constant). The previous shape deferred collection until the staged queue drained,
-  /// which let every view/checkpoint cycle that orphaned a completed envelope behind an
-  /// overtaking root retain one more generation forever: the root arm ran while the envelope was
-  /// still staged (collecting nothing) and the envelope arm never collected at all — an unbounded
-  /// store growing exactly where the in-flight ledgers (one root, one envelope) could not see.
+  /// checker's constant). BOTH landings are load-bearing, and deferring the collect until the
+  /// staged queue drained would cover neither: on a view/checkpoint cycle that orphans a completed
+  /// envelope behind an overtaking root the root arm runs while the envelope is still staged
+  /// (collecting nothing of it), so without the envelope arm each such cycle retains one more
+  /// generation forever — an unbounded store growing exactly where the in-flight ledgers (one
+  /// root, one envelope) cannot see.
   fn collect_snapshots(&mut self) {
     let live = self.live_checkpoint_op();
     let completed = self.last_completed_envelope;
@@ -1749,10 +1750,10 @@ impl Superblock for InMemorySuperblock {
         // A checkpoint snapshot becoming durable lands in the store, but is NOT yet readable — it
         // becomes the live checkpoint only when a later ROOT names its op (above). Until then the
         // prior rooted generation stays the one `submit_read_checkpoint` serves. Its completion
-        // SUPERSEDES every other unrooted generation (the collect drops those): under the
-        // envelope-lag mode a view root overtaking an orphaned envelope used to leave that
+        // SUPERSEDES every other unrooted generation (the collect drops those): without collecting
+        // here, under the envelope-lag mode a view root overtaking an orphaned envelope leaves that
         // envelope's bytes retained forever — one completed orphan per view/checkpoint cycle,
-        // invisible to the in-flight count, which stayed at one.
+        // invisible to the in-flight count, which stays at one.
         StagedSbWrite::Checkpoint { op, snapshot, .. } => {
           self.snapshots.insert(op.get(), snapshot);
           self.last_completed_envelope = Some(op.get());

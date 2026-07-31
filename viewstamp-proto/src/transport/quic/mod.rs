@@ -583,8 +583,8 @@ impl<S: StateMachine, I: IdentitySource> QuicCoordinator<S, I> {
         }
         // Resolved to a DIFFERENT routing peer than it is bound under — a retained member whose slot
         // shifted, OR a quarantined member the new config now RESOLVES (`Peer::Member(id)` != any
-        // `Peer::Replica(slot)`): close so it reconnects and binds under its slot. This is the #65
-        // rejoin completion — the laggard's install resolves its donors, and they re-bind normally.
+        // `Peer::Replica(slot)`): close so it reconnects and binds under its slot. This completes the
+        // stranded-laggard rejoin — the laggard's install resolves its donors, and they re-bind normally.
         Some(new_slot) if Peer::Replica(new_slot) != bound_peer => {
           self
             .bridge

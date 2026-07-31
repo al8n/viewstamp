@@ -2430,8 +2430,8 @@ fn the_primary_advertises_the_committed_reconfigure_through_the_swap_window_so_a
 // Any E+1 DVC-quorum member therefore holds any E-committed op `o`, so `o` rides
 // `select_canonical_log`'s union and is never nack-truncated.
 //
-// The audit of the strict E+1 emission paths (PrepareOk, StartViewChange, DoViewChange, StartView,
-// Commit, Prepare) found NO gap, so no `may_participate_under_new_epoch` gate was added:
+// The strict E+1 emission paths (PrepareOk, StartViewChange, DoViewChange, StartView,
+// Commit, Prepare) need NO separate `may_participate_under_new_epoch` gate:
 //   - Every strict path stamps `self.membership.epoch()` / `self.membership.config_id()`, which are
 //     E+1 only AFTER `install_membership` — i.e. only after this node's durable SwapEpoch root landed.
 //     There is no path that stamps an E+1 strict message while still at E in memory.
@@ -3353,7 +3353,7 @@ fn promote_learner_crash_regress_falsifier_a_regressed_fresh_proof_does_not_mint
 
 #[test]
 fn promote_learner_regressed_after_an_honest_high_proof_cannot_install_the_swap_until_repaired() {
-  // THE COMMIT-FIRST GATE — the decisive defense over the finding's EXACT window (the falsifier above
+  // THE COMMIT-FIRST GATE — the decisive defense over the EXACT window where an accepted proof goes stale (the falsifier above
   // covers only a learner that REPORTS a low frontier; this covers an HONEST HIGH proof followed by a
   // regression in the proof->commit/install gap). The primary already minted the `PromoteLearner`
   // Reconfigure op `N` off a fresh proof covering the head, and that op reaches this learner. But the
@@ -3550,7 +3550,7 @@ fn a_promoted_learner_voters_committed_repairing_op_rides_the_dvc_and_is_not_tru
   // (`view_change::committed_repairing_op_survives_a_second_view_change_before_repair`,
   // `view_change::c_committed_repairing_op_kept_across_view_changes_and_repaired_within_the_grace`, and
   // the reconfigure-band `header_only_adoption_preserves_the_new_primarys_local_reconfigure_body`),
-  // asserted here for the promoted-learner band the finding cares about.
+  // asserted here for the promoted-learner band.
   let op2_checksum = crate::storage::fnv1a_128(&[2u8]);
 
   // The committed donor is the PROMOTED EX-LEARNER (slot 3 of the 4-voter post-promotion set): head op 2,

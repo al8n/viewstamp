@@ -11,7 +11,8 @@
 //! preface) and `CertOid` (CA-attested certificate extension) — AND the [`StreamLayout`] (`Single` and
 //! `ControlBulk`): all four combinations converge over the same mTLS link. A separate test commits a
 //! large (over-64-KiB) op whose `Prepare` routes to the Bulk class, proving the per-class routing
-//! delivers end-to-end (routing + delivery, NOT head-of-line isolation under pressure — that is Phase D).
+//! delivers end-to-end (routing + delivery, NOT head-of-line isolation under pressure — that is the
+//! seeded `datagram_sim`'s job).
 //!
 //! A negative companion proves the separation guarantee is load-bearing: a replica whose cert chains
 //! to a DIFFERENT CA fails chain validation at the TLS layer, so its connection never reaches
@@ -169,8 +170,8 @@ fn run_until_converged(
 }
 
 /// Like [`run_until_converged`] but returns the viewstamp [`Instant`] convergence happened at (or
-/// `None` if the budget ran out), so a follow-on phase can thread the SAME monotonic clock forward
-/// without a >1 s idle-timeout gap closing the connections.
+/// `None` if the budget ran out), so a later stage of the same test can thread the SAME monotonic
+/// clock forward without a >1 s idle-timeout gap closing the connections.
 fn converged_at(
   r0: &mut Replica,
   addr0: std::net::SocketAddr,
@@ -372,7 +373,7 @@ fn converges_under_both_layouts() {
 /// carry data).
 ///
 /// Scope: the instant loopback has NO flow-control pressure, so this proves Bulk ROUTING and delivery,
-/// NOT head-of-line isolation under congestion (that is Phase D's seeded datagram sim).
+/// NOT head-of-line isolation under congestion — that is the seeded `datagram_sim`'s job.
 #[test]
 fn large_op_commits_over_bulk() {
   // A body strictly larger than the bulk threshold so its Prepare routes to the Bulk class.
