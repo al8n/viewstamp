@@ -272,3 +272,124 @@ fn gc_does_not_follow_a_corrupt_block_and_does_not_sweep_it() {
     }
   }
 }
+
+#[test]
+fn a_put_is_staged_and_only_a_successful_flush_makes_it_durable() {
+  let mut store = MemBlockStore::new();
+  let addr = store.put(Bytes::from_static(b"a block"));
+  assert!(
+    store.has_block(addr),
+    "a staged block reads back exactly like a durable one — a write-back backend's would"
+  );
+  assert!(
+    !store.is_flushed(addr),
+    "a put alone carries no durability: the barrier is what establishes it"
+  );
+  assert_eq!(store.staged_len(), 1);
+
+  store.flush().expect("no fault plan installed");
+  assert!(store.is_flushed(addr));
+  assert_eq!(store.staged_len(), 0);
+}
+
+#[test]
+fn re_putting_a_durable_block_does_not_take_it_back_out_of_the_durable_set() {
+  let mut store = MemBlockStore::new();
+  let block = Bytes::from_static(b"a block");
+  let addr = store.put(block.clone());
+  store.flush().expect("no fault plan installed");
+
+  // Content-addressing makes this a no-op on the medium: identical bytes under an identical key. It
+  // must not read as a fresh un-durable write, or the durable-checkpoint oracle would blame an
+  // already-durable checkpoint for a barrier it does not owe.
+  assert_eq!(store.put(block), addr);
+  assert!(store.is_flushed(addr));
+  assert_eq!(store.staged_len(), 0);
+}
+
+#[test]
+fn a_faulted_flush_leaves_every_staged_block_owed_to_the_next_barrier() {
+  let mut store = MemBlockStore::new();
+  // A rate of 150-per-mille reaches a fault quickly; the loop stops at the first one.
+  store.set_flush_faults(Some(0x5EED_B10C_F105_4FA0));
+  let mut faulted = None;
+  for i in 0..64u32 {
+    let addr = store.put(Bytes::copy_from_slice(&i.to_be_bytes()));
+    if store.flush().is_err() {
+      faulted = Some(addr);
+      break;
+    }
+    assert!(
+      store.is_flushed(addr),
+      "a clean barrier makes its block durable"
+    );
+  }
+  let faulted = faulted.expect("the seeded plan failed a barrier within 64 attempts");
+  assert!(
+    store.has_block(faulted),
+    "a failed barrier does not un-write the block — it only leaves it un-durable"
+  );
+  assert!(
+    !store.is_flushed(faulted),
+    "a failed barrier must NOT carry its staged blocks across: that is the whole fault"
+  );
+  assert_eq!(store.flush_faults_fired(), 1);
+
+  // The next clean barrier still owes them, so the block becomes durable then.
+  while store.flush().is_err() {}
+  assert!(store.is_flushed(faulted));
+  assert_eq!(store.staged_len(), 0);
+}
+
+#[test]
+fn the_sweep_drops_freed_addresses_from_the_durability_bookkeeping() {
+  let mut store = MemBlockStore::new();
+  let live = checkpoint_log(6, &mut store);
+  let garbage = store.put(Bytes::from_static(b"unreferenced"));
+  store.flush().expect("no fault plan installed");
+  assert!(store.is_flushed(garbage));
+
+  store.gc(&sm_walk(&[live]));
+  assert!(
+    !store.has_block(garbage),
+    "the sweep frees an unreachable block"
+  );
+  assert!(
+    !store.is_flushed(garbage),
+    "a freed address must leave the durable set too — the medium no longer carries it, so a later \
+     re-put must stage rather than read as already-durable"
+  );
+  for addr in reachable_from(live, &store) {
+    assert!(
+      store.is_flushed(addr),
+      "the sweep must not disturb a live block's durability"
+    );
+  }
+}
+
+#[test]
+fn armed_read_faults_answer_absent_and_are_counted() {
+  let mut store = MemBlockStore::new();
+  let addr = store.put(Bytes::from_static(b"a block"));
+  store.flush().expect("no fault plan installed");
+  assert!(store.read_block(addr).is_some());
+
+  store.arm_read_faults(2);
+  assert!(
+    store.read_block(addr).is_none(),
+    "an armed read answers ABSENT — the shape the verify-on-read path treats as data"
+  );
+  assert!(store.read_block(addr).is_none());
+  assert_eq!(store.read_faults_fired(), 2);
+  assert!(
+    store.read_block(addr).is_some(),
+    "the arm is CONSUMED per read, so it cannot outlive the job it was installed for"
+  );
+
+  // Disarming mid-arm is what the executor does after the job it armed, so a partly-consumed arm
+  // never leaks into the next one.
+  store.arm_read_faults(4);
+  store.arm_read_faults(0);
+  assert!(store.read_block(addr).is_some());
+  assert_eq!(store.read_faults_fired(), 2);
+}
