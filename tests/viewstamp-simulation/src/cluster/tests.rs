@@ -1103,3 +1103,71 @@ fn a_wiped_learner_that_rejoins_reports_its_own_empty_disk() {
     "the rejoined learner recovered an empty store and reports it"
   );
 }
+
+#[test]
+fn a_transiently_poisoned_durable_root_is_latched_until_the_checker_observes_it() {
+  // The delay-zero poison-then-repair shape: an INVALID durable root lands and is REPLACED by a
+  // valid one inside a single drain — before any per-tick sample runs — exactly what
+  // `handle_storage` can produce (settling one root releases the next in the same tick). A crash
+  // between the two landings recovers against the invalid root, so the medium must LATCH the
+  // violation at the landing; an end-state sample alone reads the repaired medium as green and
+  // the poisoning becomes invisible.
+  let mut c = Cluster::with_checkpoint_ops(3, 2, 40, 21, 4);
+  for _ in 0..40_000 {
+    c.tick();
+    if c.sb_checkpoint_op_for_test(0) > 0 {
+      break;
+    }
+  }
+  assert!(
+    c.sb_checkpoint_op_for_test(0) > 0,
+    "the warmup rooted a checkpoint on replica 0"
+  );
+  assert!(
+    crate::check_safety(&c).is_ok(),
+    "the medium is healthy before the poisoning"
+  );
+  c.poison_then_repair_root_for_test(0);
+  assert!(
+    c.sb_root_names_stored_checkpoint(0),
+    "the END STATE is already repaired — a point-in-time sample alone would read green"
+  );
+  let observed = crate::check_safety(&c);
+  assert!(
+    observed.is_violation(),
+    "the per-landing latch surfaces the crash-observable transient poisoning: {observed:?}"
+  );
+  assert!(
+    crate::check_safety(&c).is_ok(),
+    "the latch is consumed by exactly one checker pass; the repaired medium is green again"
+  );
+}
+
+#[test]
+fn a_poisoning_buried_under_offline_reconfiguration_ticks_still_surfaces() {
+  // `reconfigure_offline` runs tens of thousands of INTERNAL `Cluster::tick` calls — quiesce,
+  // seal, mint, wedge, none of which invoke any checker — and its route installs fresh valid
+  // roots on every node. A transient poisoning that lands just before it would therefore be
+  // repaired and replaced long before the caller's next `check_safety`; the medium's latch is
+  // what carries the violation across the checker-less window.
+  let mut c = Cluster::with_checkpoint_ops(3, 2, 60, 9, 4);
+  for _ in 0..6_000 {
+    c.tick();
+    if c.is_quiescent() {
+      break;
+    }
+  }
+  assert!(
+    c.sb_checkpoint_op_for_test(0) > 0,
+    "the warmup rooted a checkpoint on replica 0"
+  );
+  c.poison_then_repair_root_for_test(0);
+  c.reconfigure_offline()
+    .expect("a healthy quiesced cluster performs the offline reconfiguration");
+  let observed = crate::check_safety(&c);
+  assert!(
+    observed.is_violation(),
+    "the poisoning latched before the offline window still surfaces at the next checker pass: \
+     {observed:?}"
+  );
+}

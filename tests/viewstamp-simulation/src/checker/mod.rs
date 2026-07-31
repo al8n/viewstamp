@@ -96,14 +96,29 @@ pub fn check_safety(cluster: &Cluster) -> CheckResult {
 /// and content-address verification cannot succeed from local disk, so a solo replica cannot
 /// recover and a cluster escalates to a needless peer fetch.
 ///
+/// Two lanes, both required:
+/// - the medium's own PER-LANDING LATCH, consumed first: the sim superblock asks the question at
+///   every root and envelope landing and latches the FIRST violation until consumed here. This is
+///   what makes a TRANSIENT poisoning crash-faithful: `handle_storage` drains completions to
+///   exhaustion — settling one root releases the next in the same drain, and block work re-enters
+///   storage in the same tick — so an invalid root can become durable and be repaired before this
+///   function ever runs, and internal offline-reconfiguration ticks run whole `Cluster::tick`
+///   loops with no checker at all. A crash inside any such window recovers against the invalid
+///   root, so the latch keeps the violation until a checker pass observes it;
+/// - the END-STATE sample: the current durable root still names a stored generation. Kept
+///   alongside the latch because test-only bypass paths (an offline pre-written root, a wiped
+///   store) mutate the medium without a landing, which only a direct sample sees.
+///
 /// This predicate asks about the IDENTITY of what the store retains; the boundedness checker's
 /// generation arm asks about the SIZE of what it retains. The two are independent: a collector
 /// that keeps the wrong generations can delete the one the next monotone root names while the
 /// retained count stays constant — green on the count bound, poisoned on this one. Folded into
-/// [`check_safety`] so every per-tick lane asks both; pure reads over the medium, so observing it
-/// perturbs no schedule.
+/// [`check_safety`] so every per-tick lane asks both.
 pub fn check_medium_integrity(cluster: &Cluster) -> CheckResult {
   for i in 0..cluster.replica_count() {
+    if let Some(why) = cluster.take_medium_integrity_violation(i) {
+      return CheckResult::violation(format!("replica {i}: {why}"));
+    }
     if !cluster.sb_root_names_stored_checkpoint(i) {
       return CheckResult::violation(format!(
         "replica {i}: the durable root's (checkpoint_op, checkpoint_id) pair names no checkpoint \

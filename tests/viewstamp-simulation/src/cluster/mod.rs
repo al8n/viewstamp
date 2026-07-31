@@ -3133,6 +3133,70 @@ impl Cluster {
     self.sbs[i].borrow().root_names_stored_checkpoint_for_test()
   }
 
+  /// Test-only: consume replica `i`'s FIRST latched medium-integrity violation — the sticky
+  /// per-landing record the medium keeps so a transient poisoning repaired before the next
+  /// checker pass (or buried under checker-less internal ticks) still surfaces exactly once.
+  /// `None` when every landing so far found the durable root's checkpoint pair stored and
+  /// hash-matching.
+  #[doc(hidden)]
+  pub fn take_medium_integrity_violation(&self, i: usize) -> Option<String> {
+    self.sbs[i].borrow_mut().take_integrity_violation()
+  }
+
+  /// Test-only: make replica `i`'s durable root TRANSIENTLY name a checkpoint its store does not
+  /// hold, then restore the original root — both through the medium's landing path, with the two
+  /// completions drained here so the replica's storage session never observes them. This is the
+  /// crash-observable transient-poisoning shape (an invalid root becomes durable and is replaced
+  /// by a valid one inside a single drain, before any per-tick sample runs): a crash between the
+  /// two landings would recover against a root whose checkpoint the local store cannot verify.
+  /// Requires a rooted checkpoint (`checkpoint_op > 0`) so the pair can be de-matched.
+  #[doc(hidden)]
+  pub fn poison_then_repair_root_for_test(&mut self, i: usize) {
+    use viewstamp_proto::Superblock;
+    let mut sb = self.sbs[i].borrow_mut();
+    let original = sb.state();
+    assert!(
+      original.checkpoint_op().get() > 0,
+      "poisoning de-matches the checkpoint pair, so a checkpoint must be rooted first"
+    );
+    let poisoned = Self::root_with_flipped_checkpoint_id(&original);
+    // Two fresh-incarnation writes, landed back-to-back through the same publish path a real
+    // drain uses; the completions are drained HERE so the session (which never submitted them)
+    // is not handed a foreign completion it would fail-stop on.
+    sb.submit_write(viewstamp_proto::WriteId::new(u64::MAX - 1, 1), poisoned);
+    sb.submit_write(viewstamp_proto::WriteId::new(u64::MAX - 1, 2), original);
+    while sb.poll().is_some() {}
+  }
+
+  /// A copy of `state` whose `checkpoint_id` is bit-flipped — a durable root naming a checkpoint
+  /// generation the store cannot hold (the id matches no stored bytes), with every other field,
+  /// the lineage block, and the recorded geometry carried verbatim.
+  fn root_with_flipped_checkpoint_id(
+    state: &viewstamp_proto::VsrState,
+  ) -> viewstamp_proto::VsrState {
+    let membership = state
+      .membership_opt()
+      .expect("a formatted sim root carries its membership")
+      .clone();
+    viewstamp_proto::VsrState::try_new_v4(
+      state.view(),
+      state.log_view(),
+      state.commit(),
+      state.checkpoint_op(),
+      state.checkpoint_id() ^ 1,
+      state.committed_headers_slice().to_vec(),
+      state.epoch(),
+      state.prev_epoch(),
+      membership,
+      state.prior_config_ids().to_vec(),
+      state.config_install_op(),
+    )
+    .expect("flipping the checkpoint id preserves every structural invariant")
+    .with_log_floor(state.log_floor())
+    .expect("the original log floor is unchanged")
+    .with_wal_geometry(state.checkpoint_ops(), state.wal_capacity())
+  }
+
   /// Test-only: the checkpoint op replica `i`'s DURABLE root currently names — read off the
   /// superblock, not the endpoint (across an in-place rebuild the two can legitimately disagree
   /// while a predecessor's root write is still landing, which is exactly what a test asserting on

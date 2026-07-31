@@ -1216,6 +1216,18 @@ pub struct InMemorySuperblock {
   /// (the mode never reached this superblock, or no checkpoint ever wrote), independent of whether
   /// a view transition happened to cross any window. Persists for the superblock's lifetime.
   envelope_lags_drawn: u64,
+  /// The FIRST medium-integrity violation observed at a landing (see
+  /// [`Self::take_integrity_violation`]): the durable root's `(checkpoint_op, checkpoint_id)`
+  /// named no stored generation at the instant a root or envelope write became durable. LATCHED —
+  /// held until the checker consumes it — because the very next landing can REPAIR the medium
+  /// (settling one root releases the next in the same drain, and block work re-enters storage in
+  /// the same tick), so an end-of-tick sample alone reads a transiently poisoned medium as green
+  /// even though a crash inside the window would have recovered against the poisoned root. Later
+  /// violations only advance the counter, mirroring the WAL's stale-landing latch.
+  integrity_violation: Option<String>,
+  /// How many landings observed a medium-integrity violation since construction. Persists for the
+  /// superblock's lifetime; the latch above keeps only the first description.
+  integrity_violations_fired: u64,
 }
 
 impl Default for InMemorySuperblock {
@@ -1246,6 +1258,8 @@ impl InMemorySuperblock {
       envelope_lag: None,
       envelope_overtakes_fired: 0,
       envelope_lags_drawn: 0,
+      integrity_violation: None,
+      integrity_violations_fired: 0,
     }
   }
 
@@ -1434,6 +1448,48 @@ impl InMemorySuperblock {
       .is_some_and(|snap| checkpoint_id(snap) == self.state.checkpoint_id())
   }
 
+  /// Ask the medium-integrity question AT THIS LANDING — the durable root names a stored,
+  /// hash-matching generation — and LATCH the first violation until the checker consumes it
+  /// ([`Self::take_integrity_violation`]). Runs at every publish point (a root or envelope
+  /// becoming durable, synchronous and async modes alike), because that is the only place the
+  /// question is crash-faithful: `handle_storage` drains completions to exhaustion and settling
+  /// one root releases the next in the same drain, so an invalid root can become durable and be
+  /// REPLACED by a valid one before any per-tick sample runs — yet a crash inside that window
+  /// recovers against the invalid root. A sample that only reads the end state therefore misses
+  /// exactly the poisonings it exists to catch; the latch makes the first one durable until
+  /// observed, however many landings (or checker-less internal ticks) follow.
+  fn note_integrity(&mut self, landing: &str) {
+    if self.root_names_stored_checkpoint_for_test() {
+      return;
+    }
+    self.integrity_violations_fired += 1;
+    if self.integrity_violation.is_none() {
+      self.integrity_violation = Some(format!(
+        "at a {landing} landing the durable root's (checkpoint_op {}, checkpoint_id {:#x}) named \
+         no stored checkpoint generation — the medium was (at least transiently) self-poisoned: \
+         a crash at this instant recovers against a root whose checkpoint the local store cannot \
+         verify",
+        self.state.checkpoint_op().get(),
+        self.state.checkpoint_id(),
+      ));
+    }
+  }
+
+  /// Test-only: consume the FIRST latched medium-integrity violation, if any — the checker's
+  /// sticky read. `None` when every landing so far found the durable root's checkpoint pair
+  /// stored and hash-matching.
+  #[doc(hidden)]
+  pub fn take_integrity_violation(&mut self) -> Option<String> {
+    self.integrity_violation.take()
+  }
+
+  /// Test-only: how many landings observed a medium-integrity violation since construction (the
+  /// latch keeps only the first description; this counts them all).
+  #[doc(hidden)]
+  pub fn integrity_violations_fired(&self) -> u64 {
+    self.integrity_violations_fired
+  }
+
   /// Collect checkpoint snapshot generations nothing can reach any more, holding the store to a
   /// CONSTANT retained set: the LIVE generation (the durable root serves reads from it), any
   /// generation a STAGED root still names (it is about to become live), and the generation the
@@ -1519,6 +1575,7 @@ impl Superblock for InMemorySuperblock {
       None => {
         self.state = state;
         self.collect_snapshots();
+        self.note_integrity("synchronous root");
         self.completions.push_back(SuperblockDone::Wrote(id));
       }
     }
@@ -1537,6 +1594,7 @@ impl Superblock for InMemorySuperblock {
         self.snapshots.insert(op.get(), snapshot);
         self.last_completed_envelope = Some(op.get());
         self.collect_snapshots();
+        self.note_integrity("synchronous envelope");
         self.completions.push_back(SuperblockDone::Wrote(id));
       }
       // ASYNC: STAGE; the snapshot is not even WRITTEN (let alone rooted) until this write completes
@@ -1686,6 +1744,7 @@ impl Superblock for InMemorySuperblock {
         StagedSbWrite::Root { state, .. } => {
           self.state = state;
           self.collect_snapshots();
+          self.note_integrity("async root");
         }
         // A checkpoint snapshot becoming durable lands in the store, but is NOT yet readable — it
         // becomes the live checkpoint only when a later ROOT names its op (above). Until then the
@@ -1698,6 +1757,7 @@ impl Superblock for InMemorySuperblock {
           self.snapshots.insert(op.get(), snapshot);
           self.last_completed_envelope = Some(op.get());
           self.collect_snapshots();
+          self.note_integrity("async envelope");
         }
       }
       self.completions.push_back(SuperblockDone::Wrote(id));
