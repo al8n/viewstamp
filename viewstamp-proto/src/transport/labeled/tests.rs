@@ -473,8 +473,10 @@ fn classify_hello_incomplete_and_rejected_edge_cases() {
   ));
   // A COMPLETE, otherwise-well-formed hello whose version byte is any other numbering is a terminal
   // reject — the concrete superseded values are pinned (not just the symbolic wrapping_add above),
-  // so a peer from any differently-versioned wire contract can never assemble a connection.
-  for wrong in [0u8, 2, 3] {
+  // so a peer from any differently-versioned wire contract can never assemble a connection. `1` is
+  // the load-bearing member of the set: the immediately-superseded era whose encoders cannot
+  // express the producing-op presence a membership-bearing sync answer now requires.
+  for wrong in [0u8, 1, 3] {
     assert_ne!(
       wrong, HELLO_VERSION,
       "the refused set must not contain the current version"

@@ -113,17 +113,22 @@ fn main() {
     )
     .with_checkpoint_op(OpNumber::with(3)),
   );
-  let sync_checkpoint = Message::SyncCheckpoint(SyncCheckpoint::new(
-    View::with(4),
-    OpNumber::with(8),
-    0xBEEF,
-    Epoch::new(0),
-    0xC0FFEE,
-    ReplicaId::new(2),
-    0x1234,
-    Bytes::from_static(b"snapshot-body"),
-    Bytes::from_static(b"membership-body"),
-  ));
+  let sync_checkpoint = Message::SyncCheckpoint(
+    SyncCheckpoint::new(
+      View::with(4),
+      OpNumber::with(8),
+      0xBEEF,
+      Epoch::new(0),
+      0xC0FFEE,
+      ReplicaId::new(2),
+      0x1234,
+      Bytes::from_static(b"snapshot-body"),
+      Bytes::from_static(b"membership-body"),
+    )
+    // Membership-bearing, so the producing op is stamped — decode refuses the pair split apart,
+    // and the corpus seeds the ACCEPTED shape (the fuzzer mutates its way to the refusals).
+    .with_config_install_op(OpNumber::with(7)),
+  );
   let block_response_present = Message::BlockResponse(BlockResponse::new(
     BlockAddress::from_bytes(0xAA55u128.to_be_bytes()),
     Some(Bytes::from_static(b"block-body")),

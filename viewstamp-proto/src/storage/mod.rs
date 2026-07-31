@@ -180,11 +180,21 @@ pub const HEADER_VERSION: u16 = 1;
 /// property.
 ///
 /// A contract change — a layout change OR a strengthening of the writer-enforced invariants — bumps
-/// this constant, atomically invalidating every store written under the previous contract. (An
-/// ancient store that carried this same leading number under a superseded layout is still refused:
-/// parsed as the current layout its bytes fail structurally — the current layout reads a mandatory
-/// epoch/membership/lineage/scalar/geometry tail such a root never wrote — so no such root decodes.)
-pub const SUPERBLOCK_VERSION: u16 = 1;
+/// this constant, atomically invalidating every store written under the previous contract.
+///
+/// Version `2` strengthens the `config_install_op` invariant: a v2 writer records the VERBATIM
+/// producing op of the root's membership (the committed reconfigure op, or the donor-carried op a
+/// crossing validated — never a checkpoint-frontier approximation), so a recovered v2 root's value
+/// can be re-served as exact. A version-`1` root's slot may instead hold the crossing checkpoint
+/// frontier its writer approximated with — byte-wise indistinguishable from a real producing op —
+/// so every version-`1` root is refused at decode (`UnknownVersion(1)`) rather than recovered and
+/// re-served as exact; the one supported path for such a store is a re-format. No earlier writer
+/// generation ever stamped a leading `2` (the shared-constant era stamped `1`; the split numbering
+/// ran `3..=8`; the previous generation reset to `1`), so the current word collides with no
+/// ancient root at all — and any superseded numbering that ever reused a current word is refused
+/// structurally anyway: parsed as the current layout, a shorter-era body runs out of bytes at the
+/// mandatory epoch/membership/lineage/scalar/geometry tail such a root never wrote.
+pub const SUPERBLOCK_VERSION: u16 = 2;
 
 /// The canonical-body length of an encoded [`Header`]: the six checksummed fields, each
 /// widened to a big-endian `u128` (the exact bytes [`Header`]'s checksum hashes). These are

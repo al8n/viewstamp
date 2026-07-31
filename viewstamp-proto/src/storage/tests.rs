@@ -494,7 +494,7 @@ fn vsr_state_golden_bytes_pin_the_layout() {
   .unwrap()
   .with_wal_geometry(32, 4096);
   let expected: std::vec::Vec<u8> = std::vec![
-    0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
+    0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
     0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 187, 204, 221, 0, 0, 0, 1, 231, 44, 98, 75, 124,
     48, 233, 147, 216, 34, 176, 46, 56, 195, 194, 217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -631,7 +631,7 @@ fn vsr_state_decode_accepts_exactly_the_current_version() {
     &SUPERBLOCK_VERSION.to_be_bytes(),
     "a new durable root leads with SUPERBLOCK_VERSION"
   );
-  assert_eq!(SUPERBLOCK_VERSION, 1, "the accepted version is exactly 1");
+  assert_eq!(SUPERBLOCK_VERSION, 2, "the accepted version is exactly 2");
   assert_eq!(
     VsrState::decode(&bytes).unwrap(),
     root,
@@ -671,13 +671,14 @@ fn vsr_state_decode_accepts_exactly_the_current_version() {
 
 #[test]
 fn an_ancient_pre_membership_layout_fails_structurally_under_the_current_version() {
-  // The current version word `1` was also the FIRST numbering an ancient pre-membership layout
-  // ever stamped (a body ending right after the committed-band header set — no epoch, membership,
-  // lineage, scalar, or geometry tail). The exact-match gate alone cannot distinguish that one
-  // colliding number, so this pins the second layer: parsed as the CURRENT layout, such a root
-  // runs out of bytes at the mandatory epoch read and is refused `Truncated` — it can never
-  // misparse into a live state, so no store of that era decodes even though its leading word
-  // matches.
+  // No superseded superblock generation ever stamped the current word `2` (the shared-constant era
+  // stamped `1`, the split numbering ran `3..=8`, and the previous generation reset to `1`), so
+  // the exact-match gate alone already refuses every root an earlier writer produced. This pins
+  // the SECOND, structural layer regardless — the defense that holds even if a numbering is ever
+  // reused: an ancient pre-membership body (one ending right after the committed-band header set —
+  // no epoch, membership, lineage, scalar, or geometry tail) re-tagged with the CURRENT version
+  // word runs out of bytes at the mandatory epoch read and is refused `Truncated` — it can never
+  // misparse into a live state.
   let mut ancient = std::vec::Vec::new();
   ancient.extend_from_slice(&SUPERBLOCK_VERSION.to_be_bytes()); // the colliding version word
   ancient.extend_from_slice(&4u64.to_be_bytes()); // view
@@ -693,6 +694,54 @@ fn an_ancient_pre_membership_layout_fails_structurally_under_the_current_version
     ),
     "an ancient-layout body under the current version word is refused at the epoch read"
   );
+}
+
+#[test]
+fn a_previous_generation_crossing_root_is_refused_not_reinterpreted() {
+  // The durable face of the producing-op correction. A version-1 crossing root wrote the crossing
+  // checkpoint FRONTIER `M` into `config_install_op` — an approximation, not the op of the
+  // reconfigure that produced the membership — and nothing in the bytes distinguishes such a root
+  // from one whose slot holds the real producing op: the layouts are identical, only the writer's
+  // invariant differs. A migration would therefore have to guess which meaning the slot holds;
+  // refusal guesses nothing. So the version word is the whole gate: this byte-valid root — a
+  // membership-bearing crossing shape whose install-op slot holds its own frontier `M`, the real
+  // reconfigure op `N < M` simply not represented anywhere — is refused UNPARSED as
+  // `UnknownVersion(1)` the moment it leads with the superseded word: never recovered, never
+  // serving state-sync, never re-served to a laggard as an exact producing op.
+  let mem = Membership::genesis(3, 0, (1..=3).map(MemberId::new).collect())
+    .unwrap()
+    .reconfigure(
+      3,
+      0,
+      std::vec![MemberId::new(1), MemberId::new(2), MemberId::new(4)],
+    )
+    .unwrap();
+  let m = 9; // the crossing checkpoint frontier a v1 writer approximated with
+  let root = VsrState::try_new_v4(
+    View::with(3),
+    View::with(3),
+    OpNumber::with(m),
+    OpNumber::with(m),
+    0xCC01,
+    std::vec![],
+    Epoch::new(1),
+    Epoch::new(0),
+    mem,
+    std::vec![0x7777u128],
+    OpNumber::with(m), // == the frontier: the pre-change approximation shape
+  )
+  .unwrap()
+  .with_wal_geometry(16, 128);
+  let mut v1 = root.encode().to_vec();
+  v1[0..2].copy_from_slice(&1u16.to_be_bytes());
+  assert!(
+    matches!(VsrState::decode(&v1), Err(CodecError::UnknownVersion(1))),
+    "a version-1 root is refused at the word, whatever its install-op slot holds"
+  );
+  // The refusal is the version fence, not a content judgment: the SAME bytes under the current
+  // word decode fine (the shape itself is byte-valid) — which is exactly why the WORD must fence
+  // the previous generation, since no content is left to tell the two meanings apart.
+  assert_eq!(VsrState::decode(&root.encode()).unwrap(), root);
 }
 
 #[test]

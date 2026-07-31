@@ -618,31 +618,36 @@ fn one_of_each_variant() -> std::vec::Vec<Message> {
       true,
       0, // recovery flag set
     )),
-    Message::SyncCheckpoint(SyncCheckpoint::new(
-      View::with(4),
-      OpNumber::with(8),
-      u128::MAX,
-      crate::Epoch::new(1), // non-zero successor epoch — round-trips
-      0,
-      ReplicaId::new(0),
-      0xBEEF,
-      Bytes::from_static(b"snapshot-envelope"),
-      // A populated successor-membership encoding so the round-trip + `encoded_len` equivalence
-      // exercise the carried length-prefixed `membership` Bytes (a cross-epoch sync ships it).
-      ReconfigurePayload::new(
-        3,
-        1,
-        std::vec![
-          crate::MemberId::new(1),
-          crate::MemberId::new(2),
-          crate::MemberId::new(3),
-          crate::MemberId::new(4),
-        ]
-        .into_boxed_slice(),
+    Message::SyncCheckpoint(
+      SyncCheckpoint::new(
+        View::with(4),
+        OpNumber::with(8),
+        u128::MAX,
+        crate::Epoch::new(1), // non-zero successor epoch — round-trips
         0,
+        ReplicaId::new(0),
+        0xBEEF,
+        Bytes::from_static(b"snapshot-envelope"),
+        // A populated successor-membership encoding so the round-trip + `encoded_len` equivalence
+        // exercise the carried length-prefixed `membership` Bytes (a cross-epoch sync ships it).
+        ReconfigurePayload::new(
+          3,
+          1,
+          std::vec![
+            crate::MemberId::new(1),
+            crate::MemberId::new(2),
+            crate::MemberId::new(3),
+            crate::MemberId::new(4),
+          ]
+          .into_boxed_slice(),
+          0,
+        )
+        .encode_body(),
       )
-      .encode_body(),
-    )),
+      // The membership travels with the op that produced it (the codec refuses the pair split
+      // apart); stamped at the serve-gate boundary (== the checkpoint op).
+      .with_config_install_op(OpNumber::with(8)),
+    ),
     Message::RequestPrepareRange(RequestPrepareRange::new(
       View::with(2),
       OpNumber::with(7),

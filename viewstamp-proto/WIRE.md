@@ -20,10 +20,17 @@ the SEMANTICS.
 **Envelope semantics (protobuf, accepted as-is):**
 
 - Absent scalar fields decode as zero/empty — identical in meaning to an explicit zero (proto3's
-  default-value rule); this equivalence applies to SCALARS. For the exactly-16-byte id/checksum
-  `bytes` fields (below), an absent field decodes as EMPTY bytes and is REJECTED by the length
-  check, so absence is NOT equivalent to an explicit all-zero 16-byte id (which decodes to `0`
-  and is accepted).
+  default-value rule); this equivalence applies to IMPLICIT-presence SCALARS. For the
+  exactly-16-byte id/checksum `bytes` fields (below), an absent field decodes as EMPTY bytes and is
+  REJECTED by the length check, so absence is NOT equivalent to an explicit all-zero 16-byte id
+  (which decodes to `0` and is accepted). EXPLICIT-presence (`optional`) fields carry
+  presence as meaning: `BlockResponse.block` maps absence/presence onto the domain's
+  `None`/`Some(..)` (an empty present block is distinct from an absent one), and
+  `SyncCheckpoint.config_install_op` — the op of the reconfigure that produced the carried
+  membership — must be PRESENT iff `membership` is non-empty (an explicit `0` names a
+  genesis/offline-born producing point and is distinct from absence; either half of the pair
+  without the other rejects at conversion, so an omitted producing op can never default to `0`
+  and install a membership under an op no reconfigure committed).
 - Duplicate fields follow protobuf merge semantics precisely: duplicate singular SCALAR fields are
   last-wins; duplicate singular EMBEDDED-MESSAGE fields MERGE their field sets; a `oneof`
   re-occurrence of the SAME message-typed variant (e.g. two `PreparedEntry.reconfigure` arms in
@@ -66,6 +73,9 @@ the SEMANTICS.
 - `ReconfigurePayload.replica_count` must be `<= u8::MAX` (255) and `.learner_count` must be
   `<= u16::MAX` (65535) — the wire's `uint32` widening of the domain's narrower voting/learner
   counts narrows back down at conversion.
+- `SyncCheckpoint.config_install_op` must be present iff `SyncCheckpoint.membership` is non-empty
+  (see the explicit-presence rule above): a membership-bearing answer with the producing op absent,
+  or a producing op with no membership attached, rejects as `CodecError::Malformed`.
 - `Message.body` must be present: an envelope with no oneof arm set is the wire's "no known
   message" case (parity with the retired codec's unknown-tag reject).
 - `PreparedEntry.body_state` must be present: every log entry carries exactly one of `present` /
@@ -129,7 +139,11 @@ source of truth and does not restate the numbers.
 
 ## 3. The hello + versioning
 
-`HELLO_VERSION` (`src/transport/labeled/mod.rs`, currently `3`) is THE wire-version fence for every
+`HELLO_VERSION` (`src/transport/labeled/mod.rs`, currently `2` — bumped `1` → `2` when
+`SyncCheckpoint.config_install_op` became presence-bearing, a semantic change to an existing field:
+a version-`1` peer's encoder cannot distinguish an omitted producing op from a legitimate `0`, so
+such a peer is refused at the handshake instead of having its membership-bearing sync answers
+misread) is THE wire-version fence for every
 transport: the stream `Labeled` hello (the dialer sends eagerly; the acceptor answers only after
 validating the dialer's) and the QUIC control-stream preface written by the `Hello` identity source
 (`src/transport/quic/identity/mod.rs`), which encodes and parses through the IDENTICAL
@@ -158,9 +172,13 @@ dispatch on. Versioning happens exactly once, at the hello, before any consensus
 
 ## 4. Durable state
 
-The WAL `Header` (`HEADER_VERSION`) and the durable superblock root `VsrState`
-(`SUPERBLOCK_VERSION`, currently `7`) are hand-rolled, fixed-width / length-prefixed big-endian
-encodings — UNCHANGED by the protobuf envelope cutover, and NOT protobuf. Their layout, per-version
+The WAL `Header` (`HEADER_VERSION`, currently `1`) and the durable superblock root `VsrState`
+(`SUPERBLOCK_VERSION`, currently `2` — bumped `1` → `2` when `config_install_op` became the
+VERBATIM producing op of the root's membership: a version-`1` root's slot may hold a
+checkpoint-frontier approximation instead, indistinguishable byte-wise, so every version-`1` root
+is refused at decode rather than recovered and re-served as exact) are hand-rolled, fixed-width /
+length-prefixed big-endian encodings — UNCHANGED by the protobuf envelope cutover, and NOT
+protobuf. Their layout, per-version
 decode dispatch, and rejection surface (`CodecError::UnknownVersion` / `LengthOverflow` /
 `TrailingBytes` / …) are documented at their definitions in `src/storage/mod.rs`, which is
 normative for the on-disk format; this document does not restate it.

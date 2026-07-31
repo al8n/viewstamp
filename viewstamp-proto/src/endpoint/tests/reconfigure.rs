@@ -5777,17 +5777,22 @@ fn a_slot_shifted_cross_epoch_sync_checkpoint_fetches_blocks_from_the_authentica
     now,
     &mut storage,
     Peer::Replica(routeable_from_slot),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(m2),
-      cross_id,
-      successor_e1.epoch(),
-      successor_e1.config_id(), // a DESCENDANT of the laggard's genesis config — the crossing reply
-      shifted_claimed_slot,     // the donor's self-claimed SUCCESSOR-epoch (shifted) slot
-      nonce,
-      cross_env.clone(),
-      membership_body.clone(),
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m2),
+        cross_id,
+        successor_e1.epoch(),
+        successor_e1.config_id(), // a DESCENDANT of the laggard's genesis config — the crossing reply
+        shifted_claimed_slot,     // the donor's self-claimed SUCCESSOR-epoch (shifted) slot
+        nonce,
+        cross_env.clone(),
+        membership_body.clone(),
+      )
+      // The op that produced E+1 — the donor checkpointed exactly at the reconfigure op, the
+      // serve-gate boundary shape (a membership-bearing answer always carries its producing op).
+      .with_config_install_op(OpNumber::with(m2)),
+    ),
   );
   e.block_step(now, &mut storage, &mut blocks);
 
@@ -7654,23 +7659,27 @@ fn a_partitioned_demotee_rejoins_via_the_cross_epoch_lane_and_finds_itself_a_lea
   let membership_body =
     ReconfigurePayload::from_membership(&successor, genesis(3).config_id()).encode_body();
 
-  // The donor (member 0 — slot 0 in BOTH configs) answers with the verified E+1 crossing.
+  // The donor (member 0 — slot 0 in BOTH configs) answers with the verified E+1 crossing, its
+  // producing op stamped (the demote op the crossing checkpoint embeds).
   let mut storage = Storage::new(wal, sb);
   e.handle_message(
     now,
     &mut storage,
     Peer::Replica(ReplicaId::new(0)),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(m),
-      cross_id,
-      successor.epoch(),
-      successor.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env,
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m),
+        cross_id,
+        successor.epoch(),
+        successor.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env,
+        membership_body,
+      )
+      .with_config_install_op(OpNumber::with(m)),
+    ),
   );
   for _ in 0..6 {
     e.storage_step(now, &mut storage, &mut blocks); // two-write re-persist → durable root → install
@@ -8441,17 +8450,22 @@ fn a_cross_epoch_sync_below_an_inherited_in_flight_configuration_is_refused() {
     now,
     &mut storage,
     Peer::Replica(ReplicaId::new(0)),
-    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
-      View::new(),
-      OpNumber::with(m1),
-      cross_id,
-      successor_e1.epoch(),
-      successor_e1.config_id(),
-      ReplicaId::new(0),
-      nonce,
-      cross_env,
-      membership_body,
-    )),
+    Message::SyncCheckpoint(
+      crate::SyncCheckpoint::new(
+        View::new(),
+        OpNumber::with(m1),
+        cross_id,
+        successor_e1.epoch(),
+        successor_e1.config_id(),
+        ReplicaId::new(0),
+        nonce,
+        cross_env,
+        membership_body,
+      )
+      // A well-formed membership-bearing answer carries its producing op; the refusal under test
+      // is the epoch-timeline ordering, not a malformed pairing.
+      .with_config_install_op(OpNumber::with(m1)),
+    ),
   );
   // Run only the block lane (the fetch walk drains locally and replays into the install choke),
   // leaving the inherited root's completion queued — the exact window the admission must survive.
@@ -8706,5 +8720,97 @@ fn a_cross_epoch_sync_install_reports_the_reconfigure_op_not_the_crossing_fronti
     storage.sb().state().config_install_op(),
     OpNumber::with(n),
     "the crossing durable root records the producing op, not the frontier"
+  );
+}
+
+#[test]
+fn a_membership_bearing_sync_answer_without_a_producing_op_installs_nothing() {
+  // The same crossing shape as the test above, except the donor NEVER STAMPS the producing op on
+  // its membership-bearing answer — what a sender that cannot supply the op (an encoder that
+  // predates the presence-bearing field, or one that omits it) hands to the receipt path when a
+  // codec is not in front of it (direct delivery: tests, the simulation's in-memory network). The
+  // receipt refuses the reply wholesale BEFORE anything stages: no install applies, no
+  // `MembershipChanged` is reported, the membership stays at genesis, and no crossing root is
+  // submitted — absence never turns into an install record of op 0 (or of anything else). The
+  // armed sync survives the refusal, so the laggard simply re-solicits until a donor that carries
+  // its producing op answers.
+  let m: u64 = 3;
+  let genesis_mem = genesis(3);
+  let successor_e1 = genesis_mem
+    .apply_delta(&SingleVoterDelta::AddLearner(MemberId::new(3)))
+    .expect("AddLearner on the 3-voter genesis is valid (E+1)");
+  let cfg = Config::try_new(1, MemberId::new(1)).expect("valid cluster config");
+  let mut e = Endpoint::<CountSm>::genesis_unchecked(
+    cfg,
+    genesis_mem.clone(),
+    0,
+    CountSm::default(),
+    u64::MAX,
+  );
+  let (wal, sb) = (TestWal::default(), TestSb::default());
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  let now = Instant::ZERO;
+  let mut storage = Storage::new(wal, sb);
+  e.arm_cross_epoch_sync_for_test(m);
+  let nonce = e.sync_nonce_for_test();
+  let snap = CountSm::default().snapshot();
+  let env = Endpoint::<CountSm>::encode_checkpoint(
+    OpNumber::with(m),
+    crate::block_address(&snap),
+    super::super::session_blocks::encode_sessions(&std::collections::BTreeMap::new(), &mut blocks),
+  );
+  blocks.put(snap.clone());
+  let id = crate::checkpoint_id(&env);
+  let membership_body =
+    ReconfigurePayload::from_membership(&successor_e1, genesis_mem.config_id()).encode_body();
+  // Content-wise this reply verifies perfectly (the membership hash-chains to its config_id, the
+  // epoch is strictly forward, the frontier matches the armed crossing) — ONLY the producing op is
+  // absent, so the refusal under test is exactly the absent-op arm.
+  e.handle_message(
+    now,
+    &mut storage,
+    Peer::Replica(ReplicaId::new(0)),
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(m),
+      id,
+      successor_e1.epoch(),
+      successor_e1.config_id(),
+      ReplicaId::new(0),
+      nonce,
+      env,
+      membership_body,
+    )),
+  );
+  e.block_step(now, &mut storage, &mut blocks);
+  for _ in 0..6 {
+    e.storage_step(now, &mut storage, &mut blocks);
+    e.block_step(now, &mut storage, &mut blocks);
+  }
+  assert_eq!(
+    e.state_syncs_applied(),
+    0,
+    "a membership-bearing answer without a producing op must not install"
+  );
+  assert!(
+    e.pending_install.is_none(),
+    "nothing stages off the refused reply"
+  );
+  assert_eq!(
+    e.membership, genesis_mem,
+    "the laggard keeps its genesis membership"
+  );
+  assert!(
+    !core::iter::from_fn(|| e.poll_event()).any(|ev| matches!(ev, Event::MembershipChanged(_))),
+    "no MembershipChanged is fabricated from an absent producing op"
+  );
+  assert_eq!(
+    e.config_install_op,
+    OpNumber::new(),
+    "the in-memory install record never moves"
+  );
+  assert!(
+    e.sync.is_some(),
+    "the armed sync survives the refusal, so the solicit timer re-fetches from another donor"
   );
 }
