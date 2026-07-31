@@ -10243,3 +10243,94 @@ fn quarantined_serves_are_capped_independently_of_the_transport() {
      how many distinct member ids solicited"
   );
 }
+
+#[test]
+fn a_transfer_drained_under_the_superblock_fence_installs_on_the_next_donor_reply() {
+  // THE DEFERRED-TRANSFER RECOVERY PATH. `on_fetch_drained` observes the single-superblock-writer
+  // fence: a transfer whose frontier drains while a root is in flight installs NOTHING and stays
+  // pinned. Nothing local then re-drives it — the ARQ walk deliberately emits nothing for a drained
+  // frontier — so the deferred drain is recovered ONLY by a fresh donor reply, which re-pins the
+  // transfer and re-walks it against a now-free fence. This pins both halves: the drop under the
+  // fence is real, and one solicit round with any live donor stages the install.
+  let (mut e, mut wal, mut sb, env, id) = sync_apply_harness(4);
+  let mut blocks = crate::block_store::InMemoryBlockStore::new();
+  seed_donor_blocks(&mut blocks, 4);
+  let now = Instant::ZERO;
+  let reply = |nonce: u64| {
+    Message::SyncCheckpoint(crate::SyncCheckpoint::new(
+      View::new(),
+      OpNumber::with(4),
+      id,
+      crate::Epoch::new(0),
+      0,
+      ReplicaId::new(0),
+      nonce,
+      env.clone(),
+      Bytes::new(), // empty membership — an ordinary same-config install
+    ))
+  };
+
+  // (1) Arm a sync and deliver a checkpoint whose WHOLE DAG is already local, so the freshly pinned
+  // transfer's first (Arm) walk drains both frontiers in one step with no `RequestBlock` round trip.
+  e.arm_forced_sync_for_test(4);
+  e.handle_message(
+    now,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    reply(e.sync_nonce_for_test()),
+  );
+
+  // (2) Occupy the fence BEFORE that walk's completion lands — a root submitted between the walk's
+  // issue and its verdict is exactly the race the fence exists for.
+  while e.poll_message().is_some() {} // drain the arming traffic
+  e.stage_pending_checkpoint_for_test();
+  e.block_step(now, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    !std::iter::from_fn(|| e.poll_message())
+      .any(|out| matches!(out.msg_ref(), Message::RequestBlock(_))),
+    "ANTI-VACUITY: the DAG really is local — the walk DRAINED both frontiers rather than emitting a \
+     pull, so the drain destination was reached under the fence"
+  );
+  assert!(
+    e.pending_install.is_none(),
+    "the drain under an occupied fence staged NOTHING — no re-persist began underneath the root"
+  );
+  assert!(
+    e.block_fetch.is_some(),
+    "and the drained transfer stays PINNED rather than being dropped with its verdict"
+  );
+
+  // (3) The occupying root lands, freeing the fence. The solicit cadence fires and re-drives the
+  // stop-and-wait ARQ, but a drained frontier gives the ARQ walk nothing to emit — so the deferred
+  // drain is still NOT installed. This is the step that makes the fresh reply load-bearing.
+  e.pending_checkpoint = None;
+  let later = now + SYNC_SOLICIT;
+  e.sync_timeouts(later);
+  assert!(
+    std::iter::from_fn(|| e.poll_message())
+      .any(|out| matches!(out.msg_ref(), Message::RequestSync(_))),
+    "ANTI-VACUITY: the solicit cadence really fired, so the ARQ round below is a live one"
+  );
+  e.block_step(later, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    e.pending_install.is_none(),
+    "the freed fence plus the ARQ alone does not resume the drained transfer — only a fresh donor \
+     reply does"
+  );
+
+  // (4) One fresh donor reply for the SAME root re-pins the transfer; its walk re-drains against the
+  // now-free fence and the install stages. The path self-heals in a single solicit round.
+  e.handle_message(
+    later,
+    &mut wal,
+    &mut sb,
+    primary_peer(),
+    reply(e.sync_nonce_for_test()),
+  );
+  e.block_step(later, &mut wal, &mut sb, &mut blocks);
+  assert!(
+    e.pending_install.is_some(),
+    "the fresh donor reply drove the deferred transfer all the way to a STAGED install"
+  );
+}

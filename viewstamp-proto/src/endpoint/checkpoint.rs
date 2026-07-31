@@ -825,9 +825,9 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
   /// snapshot write is submitted only on a matching token AND an `Ok` barrier.
   ///
   /// On a FAULT nothing is staged and `pending_install` stays OWED (the install stays retained, its
-  /// drained DAG GC-protected as a live root) with the solicit cadence re-armed, so a transient disk
-  /// fault self-heals locally via [`Self::retry_install_flush`] instead of stalling the sync forever
-  /// once the donor goes dark — the same outcome the inline barrier's fault arm produced.
+  /// drained DAG GC-protected as a live root) with the retry cadence for the node's status re-armed, so
+  /// a transient disk fault self-heals locally via [`Self::retry_install_flush`] instead of stalling the
+  /// sync forever once the donor goes dark — the same outcome the inline barrier's fault arm produced.
   pub(super) fn on_checkpoint_blocks_flushed<B: Superblock>(
     &mut self,
     now: Instant,
@@ -852,7 +852,36 @@ impl<S: StateMachine, R: Reconfig> Endpoint<S, R> {
     };
     if flush.is_err() {
       self.pending_checkpoint = None;
-      self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+      // Re-arm the cadence THIS status actually services. `sync_solicit` is serviced by the Normal-only
+      // `sync_timeouts`; while Recovering the barrier is re-attempted from `recover_timeouts`
+      // (→ `retry_install_flush`) on the `recover_retry` deadline, which that handler keeps armed across
+      // this fault. Arming `sync_solicit` there would leave a deadline nothing ever services. The
+      // recovery deadline may only move EARLIER outside its own servicer, so an already-armed one stands.
+      if self.status.is_recovering() {
+        let retry = now + RECOVER_READ_RETRANSMIT;
+        self.timers.recover_retry = Some(self.timers.recover_retry.map_or(retry, |d| d.min(retry)));
+      } else {
+        // `RecoveringHead` cannot reach this arm, which is why `sync_solicit` is the right cadence
+        // here. Reaching it needs a `Flush` barrier outstanding for a live `pending_install`, and
+        // NEITHER entry into that status can hold the pair:
+        //
+        // - `recover_progress` decides the faulty head BEHIND its `awaiting_peer_checkpoint` gate,
+        //   and every install this lane stages runs UNDER that flag — `on_fetch_drained` routes to
+        //   `complete_recover_peer_fetch` only while it is set, and the `recover_timeouts` re-flush
+        //   re-drives the install that same lane owed. Only a CLEAN barrier retires the flag
+        //   (`retire_recover_for_staged_sync`), so an outstanding one pins the node in `Recovering`.
+        // - `complete_state_sync` resumes the carried verdicts only once the re-persist ROOT landed:
+        //   `on_sb_done` has already taken `pending_install` and cleared `pending_checkpoint`, and the
+        //   flip clears `sync` + `block_fetch` ahead of itself. Nor can that node re-stage — staging
+        //   needs a `sync`, and the only site that arms one from `None` (`arm_sync`) is reached from
+        //   Normal-gated triggers or from `enter_cross_epoch_peer_fetch`, which enters `Recovering`
+        //   and drops any owed install on the way in.
+        //
+        // A change that lets `RecoveringHead` hold a staged install must re-arm a deadline
+        // `recover_head_timeouts` drives AND teach it to re-flush: `sync_solicit` is non-serviceable
+        // in that status (`serviceable_now`), so it would leave the barrier with no retry at all.
+        self.timers.sync_solicit = Some(now + SYNC_SOLICIT);
+      }
       return;
     }
     let dag = CheckpointDag {

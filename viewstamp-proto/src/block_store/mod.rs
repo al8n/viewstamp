@@ -237,6 +237,14 @@ pub trait BlockStore {
   /// ([`block_address`]) BEFORE following its edges: a corrupt block's edges are garbage, and following
   /// them would free an arbitrary live block. A corrupt block's address must NOT be swept either — it
   /// is left for a later sync to re-fetch the verified replacement.
+  ///
+  /// A walk that reaches an address the store does NOT hold simply stops there — a partially-fetched
+  /// DAG (a checkpoint transfer still pulling blocks) is the ordinary case. Blocks reachable ONLY
+  /// THROUGH such a missing interior block are therefore unmarked, and MAY be swept. That is BENIGN and
+  /// needs no special handling: presence is recomputed from what the store actually holds every time a
+  /// transfer re-walks the frontier, so a swept descendant is simply re-fetched. It costs a round trip
+  /// and can never corrupt a checkpoint — a durable root is published only over a DAG the store held
+  /// whole at its barrier. [`InMemoryBlockStore`]'s sweep behaves exactly this way.
   fn gc(&mut self, walks: &[BlockDagWalk<'_>]) {
     let _ = walks;
   }
